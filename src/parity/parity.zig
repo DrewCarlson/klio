@@ -1,1 +1,2336 @@
-//parity module — port in progress
+//! Parity harness: locate / install the reference Kotlin compilers
+//! (`kotlinc` on the JVM by default; Kotlin/Native is also supported) so a
+//! `.kt` file can be compiled and run as a baseline against `klio`.
+//!
+//! We default to the JVM compiler because native compilation per-file is
+//! dominated by LLVM codegen and linking, which makes a corpus sweep take
+//! hours. JVM `kotlinc` compiles each file in ~1s and the produced jar runs
+//! under `java` in ~200ms, keeping the full sweep tractable. The native path
+//! is kept for callers that need a native runtime baseline (e.g. `klio-bench`).
+
+const std = @import("std");
+
+const ast = @import("ast");
+const interp_ir = @import("interp_ir");
+const kotlinx_atomicfu = @import("kotlinx_atomicfu");
+const kotlinx_coroutines = @import("kotlinx_coroutines");
+const lexer = @import("lexer");
+const pack = @import("pack");
+const parser = @import("parser");
+const runtime = @import("runtime");
+const span = @import("span");
+const stdlib = @import("stdlib");
+const stdlib_pack = @import("stdlib_pack");
+
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const SourceMap = span.SourceMap;
+const KotlinFile = ast.KotlinFile;
+const HostBindings = stdlib.HostBindings;
+
+/// Harness entry point (`klio-parity <file.kt>`). The orchestrator wires the
+/// real exe; `main.run` is the program logic.
+pub const main = @import("main.zig");
+
+/// Default kotlinc version we target (applies to both JVM and Native).
+pub const TARGET_VERSION: []const u8 = "2.3.21";
+
+/// Diagnostic outcomes for a locate/install/compile attempt. Carried as data
+/// so the caller decides how to surface it. Variants owning heap text document
+/// the owner; `deinit` frees them.
+pub const ParityError = union(enum) {
+    NoKotlinc,
+    NoJava,
+    Compile: []const u8,
+    Install: []const u8,
+    UnsupportedPlatform: []const u8,
+    Io: []const u8,
+
+    pub fn deinit(self: ParityError, allocator: Allocator) void {
+        switch (self) {
+            .Compile => |s| allocator.free(s),
+            .Install => |s| allocator.free(s),
+            .UnsupportedPlatform => |s| allocator.free(s),
+            .Io => |s| allocator.free(s),
+            .NoKotlinc, .NoJava => {},
+        }
+    }
+
+    /// Render the error the way the Rust `Display` impl does. Caller owns the
+    /// returned bytes.
+    pub fn message(self: ParityError, allocator: Allocator) Allocator.Error![]u8 {
+        return switch (self) {
+            .NoKotlinc => allocator.dupe(
+                u8,
+                "kotlinc not found. Set KLIO_KOTLINC_JVM_HOME to a kotlinc dist, or let the harness auto-install.",
+            ),
+            .NoJava => allocator.dupe(
+                u8,
+                "java not found on PATH (required to run JVM kotlinc output); set JAVA_HOME or install a JDK.",
+            ),
+            .Compile => |s| std.fmt.allocPrint(allocator, "kotlinc compile failed:\n{s}", .{s}),
+            .Install => |s| std.fmt.allocPrint(allocator, "kotlinc install failed: {s}", .{s}),
+            .UnsupportedPlatform => |s| std.fmt.allocPrint(allocator, "no kotlinc prebuilt for platform: {s}", .{s}),
+            .Io => |s| std.fmt.allocPrint(allocator, "io error: {s}", .{s}),
+        };
+    }
+};
+
+/// `Result<PathBuf, ParityError>` carried as data. `ok` is an owned path; the
+/// caller frees it.
+pub const PathResult = union(enum) {
+    ok: []u8,
+    err: ParityError,
+};
+
+/// Which Kotlin compiler distribution to download/locate.
+pub const KotlincKind = enum {
+    /// JVM `kotlinc` (`kotlin-compiler-<v>.zip` from JetBrains GitHub).
+    Jvm,
+    /// `kotlinc-native` (`kotlin-native-prebuilt-<slug>-<v>.tar.gz` from the
+    /// JetBrains CDN, extracted under `~/.konan/`).
+    Native,
+
+    fn binaryName(self: KotlincKind) []const u8 {
+        return switch (self) {
+            .Jvm => "kotlinc",
+            .Native => "kotlinc-native",
+        };
+    }
+
+    fn envOverride(self: KotlincKind) []const u8 {
+        return switch (self) {
+            .Jvm => "KLIO_KOTLINC_JVM_HOME",
+            .Native => "KLIO_KOTLINC_NATIVE",
+        };
+    }
+};
+
+fn javaFilename() []const u8 {
+    return "java";
+}
+
+/// Get a throwaway threaded `Io` for the duration of a call that does its own
+/// filesystem work without an externally-threaded `Io`. Mirrors the in-repo
+/// `stdlib_pack.readFile` pattern.
+fn threadedIo(allocator: Allocator) std.Io.Threaded {
+    return std.Io.Threaded.init(allocator, .{});
+}
+
+/// Look up one environment variable from the parent process. Reads
+/// `/proc/self/environ`; returns an owned copy of the value or `null`.
+fn getEnvVar(allocator: Allocator, io: Io, name: []const u8) Allocator.Error!?[]u8 {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/environ", allocator, .unlimited) catch
+        return null;
+    defer allocator.free(data);
+    var it = std.mem.splitScalar(u8, data, 0);
+    while (it.next()) |entry| {
+        if (entry.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        if (std.mem.eql(u8, entry[0..eq], name)) {
+            return try allocator.dupe(u8, entry[eq + 1 ..]);
+        }
+    }
+    return null;
+}
+
+/// Build an `Environ.Map` from the parent process environment so spawned
+/// children inherit PATH/JAVA_HOME/etc. Caller deinits the map.
+fn procEnvMap(allocator: Allocator, io: Io) Allocator.Error!std.process.Environ.Map {
+    var map = std.process.Environ.Map.init(allocator);
+    errdefer map.deinit();
+    const data = std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/environ", allocator, .unlimited) catch
+        return map;
+    defer allocator.free(data);
+    var it = std.mem.splitScalar(u8, data, 0);
+    while (it.next()) |entry| {
+        if (entry.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        map.put(entry[0..eq], entry[eq + 1 ..]) catch {};
+    }
+    return map;
+}
+
+fn isFile(io: Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .file;
+}
+
+fn isDir(io: Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .directory;
+}
+
+fn termOk(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+}
+
+/// The workspace root. The Rust harness derives this from
+/// `CARGO_MANIFEST_DIR`'s grandparent; here we run from the workspace
+/// directory, so the current directory is the root.
+fn workspaceRoot(allocator: Allocator) Allocator.Error![]u8 {
+    return allocator.dupe(u8, ".");
+}
+
+fn parityCacheDir(allocator: Allocator, io: Io) Allocator.Error![]u8 {
+    if (try getEnvVar(allocator, io, "CARGO_TARGET_DIR")) |target| {
+        defer allocator.free(target);
+        return std.fs.path.join(allocator, &.{ target, "parity-cache" });
+    }
+    const root = try workspaceRoot(allocator);
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, "target", "parity-cache" });
+}
+
+/// `~/.konan` (or `KONAN_DATA_DIR`), where Kotlin/Native distributions live.
+fn konanRoot(allocator: Allocator, io: Io) Allocator.Error!PathResult {
+    if (try getEnvVar(allocator, io, "KONAN_DATA_DIR")) |v| {
+        return .{ .ok = v };
+    }
+    if (try getEnvVar(allocator, io, "HOME")) |home| {
+        defer allocator.free(home);
+        return .{ .ok = try std.fs.path.join(allocator, &.{ home, ".konan" }) };
+    }
+    return .{ .err = .{ .Install = try allocator.dupe(u8, "HOME not set; cannot resolve ~/.konan") } };
+}
+
+const NativeSlug = struct {
+    slug: []const u8,
+    subdir: []const u8,
+    ext: []const u8,
+};
+
+/// Kotlin/Native distribution descriptor: (archive os-arch slug, CDN subdir,
+/// archive extension). Returns the unsupported-platform string on no match;
+/// caller owns it.
+fn nativePlatformSlug(allocator: Allocator) Allocator.Error!union(enum) { ok: NativeSlug, err: []u8 } {
+    const builtin = @import("builtin");
+    const os = builtin.os.tag;
+    const arch = builtin.cpu.arch;
+    if (os == .macos and arch == .aarch64) {
+        return .{ .ok = .{ .slug = "macos-aarch64", .subdir = "macos", .ext = "tar.gz" } };
+    } else if (os == .macos and arch == .x86_64) {
+        return .{ .ok = .{ .slug = "macos-x86_64", .subdir = "macos", .ext = "tar.gz" } };
+    } else if (os == .linux and arch == .x86_64) {
+        return .{ .ok = .{ .slug = "linux-x86_64", .subdir = "linux", .ext = "tar.gz" } };
+    } else if (os == .windows and arch == .x86_64) {
+        return .{ .ok = .{ .slug = "windows-x86_64", .subdir = "windows", .ext = "zip" } };
+    }
+    return .{ .err = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ @tagName(os), @tagName(arch) }) };
+}
+
+/// JVM install directory for `version` (default-cached layout). Caller owns.
+fn jvmInstallDir(allocator: Allocator, io: Io, version: []const u8) Allocator.Error![]u8 {
+    const cache = try parityCacheDir(allocator, io);
+    defer allocator.free(cache);
+    const name = try std.fmt.allocPrint(allocator, "kotlinc-{s}", .{version});
+    defer allocator.free(name);
+    return std.fs.path.join(allocator, &.{ cache, name });
+}
+
+/// Backwards-compatible alias for `findKotlinc(.Jvm)`.
+pub fn findKotlinc(allocator: Allocator, io: Io) Allocator.Error!PathResult {
+    _ = io;
+    return findKotlincKind(allocator, .Jvm);
+}
+
+/// Locate the requested `kotlinc` binary. Search order (per kind):
+///   1. Kind-specific env var (`KLIO_KOTLINC_JVM_HOME` / `KLIO_KOTLINC_NATIVE`).
+///   2. Default cached install location.
+///   3. `PATH`.
+///
+/// When not found, attempts to auto-install unless
+/// `KLIO_NO_AUTO_INSTALL_KOTLINC=1`. The returned path is owned by the caller.
+pub fn findKotlincKind(allocator: Allocator, kind: KotlincKind) Allocator.Error!PathResult {
+    var threaded = threadedIo(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    if (try locateKotlinc(allocator, io, kind)) |p| {
+        return .{ .ok = p };
+    }
+    if (try getEnvVar(allocator, io, "KLIO_NO_AUTO_INSTALL_KOTLINC")) |v| {
+        defer allocator.free(v);
+        if (v.len != 0 and !std.mem.eql(u8, v, "0")) {
+            return .{ .err = .NoKotlinc };
+        }
+    }
+    switch (try installKotlincKind(allocator, io, kind, TARGET_VERSION)) {
+        .ok => |p| allocator.free(p),
+        .err => |e| return .{ .err = e },
+    }
+    if (try locateKotlinc(allocator, io, kind)) |p| {
+        return .{ .ok = p };
+    }
+    return .{ .err = .NoKotlinc };
+}
+
+fn locateKotlinc(allocator: Allocator, io: Io, kind: KotlincKind) Allocator.Error!?[]u8 {
+    const binary = kind.binaryName();
+    if (try getEnvVar(allocator, io, kind.envOverride())) |v| {
+        defer allocator.free(v);
+        // The JVM override is a kotlinc dist root (with bin/kotlinc inside);
+        // the native override historically points at the kotlinc-native
+        // binary directly. Accept either form for both.
+        if (isFile(io, v)) {
+            return try allocator.dupe(u8, v);
+        }
+        const inside = try std.fs.path.join(allocator, &.{ v, "bin", binary });
+        if (isFile(io, inside)) {
+            return inside;
+        }
+        allocator.free(inside);
+    }
+    switch (kind) {
+        .Jvm => {
+            const dir = try jvmInstallDir(allocator, io, TARGET_VERSION);
+            defer allocator.free(dir);
+            const p = try std.fs.path.join(allocator, &.{ dir, "bin", binary });
+            if (isFile(io, p)) {
+                return p;
+            }
+            allocator.free(p);
+        },
+        .Native => {
+            // Match any kotlin-native-prebuilt-*-{TARGET_VERSION} dir under
+            // ~/.konan (not just our default slug), to honor pre-existing
+            // installs.
+            switch (try konanRoot(allocator, io)) {
+                .err => |e| e.deinit(allocator),
+                .ok => |root| {
+                    defer allocator.free(root);
+                    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch
+                        return null;
+                    defer dir.close(io);
+                    var it = dir.iterate();
+                    while (it.next(io) catch null) |entry| {
+                        const s = entry.name;
+                        if (std.mem.startsWith(u8, s, "kotlin-native-prebuilt-") and
+                            std.mem.indexOf(u8, s, TARGET_VERSION) != null and
+                            std.mem.indexOf(u8, s, "-RC") == null)
+                        {
+                            const p = try std.fs.path.join(allocator, &.{ root, s, "bin", binary });
+                            if (isFile(io, p)) {
+                                return p;
+                            }
+                            allocator.free(p);
+                        }
+                    }
+                },
+            }
+        },
+    }
+    if (try getEnvVar(allocator, io, "PATH")) |path| {
+        defer allocator.free(path);
+        var it = std.mem.splitScalar(u8, path, ':');
+        while (it.next()) |seg| {
+            if (seg.len == 0) continue;
+            const p = try std.fs.path.join(allocator, &.{ seg, binary });
+            if (isFile(io, p)) {
+                return p;
+            }
+            allocator.free(p);
+        }
+    }
+    return null;
+}
+
+fn locateJava(allocator: Allocator, io: Io) Allocator.Error!PathResult {
+    if (try getEnvVar(allocator, io, "JAVA_HOME")) |home| {
+        defer allocator.free(home);
+        const p = try std.fs.path.join(allocator, &.{ home, "bin", javaFilename() });
+        if (isFile(io, p)) return .{ .ok = p };
+        allocator.free(p);
+    }
+    if (try getEnvVar(allocator, io, "PATH")) |path| {
+        defer allocator.free(path);
+        var it = std.mem.splitScalar(u8, path, ':');
+        while (it.next()) |seg| {
+            if (seg.len == 0) continue;
+            const p = try std.fs.path.join(allocator, &.{ seg, javaFilename() });
+            if (isFile(io, p)) return .{ .ok = p };
+            allocator.free(p);
+        }
+    }
+    return .{ .err = .NoJava };
+}
+
+/// Backwards-compatible alias for `installKotlincKind(.Jvm, ...)`.
+pub fn installKotlinc(allocator: Allocator, io: Io, version: []const u8) Allocator.Error!PathResult {
+    return installKotlincKind(allocator, io, .Jvm, version);
+}
+
+/// Download + extract the requested kotlinc distribution. Idempotent: if the
+/// destination already has a working binary, this is a no-op. The returned
+/// path is the install directory, owned by the caller.
+pub fn installKotlincKind(allocator: Allocator, io: Io, kind: KotlincKind, version: []const u8) Allocator.Error!PathResult {
+    return switch (kind) {
+        .Jvm => installJvm(allocator, io, version),
+        .Native => installNative(allocator, io, version),
+    };
+}
+
+fn installJvm(allocator: Allocator, io: Io, version: []const u8) Allocator.Error!PathResult {
+    const builtin = @import("builtin");
+    switch (builtin.os.tag) {
+        .macos, .linux, .windows => {},
+        else => return .{ .err = .{ .UnsupportedPlatform = try std.fmt.allocPrint(
+            allocator,
+            "{s}-{s}",
+            .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) },
+        ) } },
+    }
+
+    const cache = try parityCacheDir(allocator, io);
+    defer allocator.free(cache);
+    std.Io.Dir.cwd().createDirPath(io, cache) catch {};
+
+    const dest_name = try std.fmt.allocPrint(allocator, "kotlinc-{s}", .{version});
+    defer allocator.free(dest_name);
+    const dest = try std.fs.path.join(allocator, &.{ cache, dest_name });
+    errdefer allocator.free(dest);
+    const kotlinc = try std.fs.path.join(allocator, &.{ dest, "bin", KotlincKind.Jvm.binaryName() });
+    defer allocator.free(kotlinc);
+    if (isFile(io, kotlinc)) {
+        return .{ .ok = dest };
+    }
+
+    var env = try procEnvMap(allocator, io);
+    defer env.deinit();
+
+    const archive_name = try std.fmt.allocPrint(allocator, "kotlin-compiler-{s}.zip", .{version});
+    defer allocator.free(archive_name);
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "https://github.com/JetBrains/kotlin/releases/download/v{s}/{s}",
+        .{ version, archive_name },
+    );
+    defer allocator.free(url);
+    const archive_path = try std.fs.path.join(allocator, &.{ cache, archive_name });
+    defer allocator.free(archive_path);
+    printErr("[parity] installing JVM kotlinc {s} into {s}\n", .{ version, cache });
+    printErr("[parity] downloading {s}\n", .{url});
+    if (try download(allocator, io, &env, url, archive_path)) |e| {
+        allocator.free(dest);
+        return .{ .err = e };
+    }
+
+    const staging = try std.fmt.allocPrint(allocator, "{s}/.kotlinc-{s}.partial", .{ cache, version });
+    defer allocator.free(staging);
+    std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+    std.Io.Dir.cwd().createDirPath(io, staging) catch {};
+    if (try extractArchive(allocator, io, &env, archive_path, staging, "zip")) |e| {
+        allocator.free(dest);
+        return .{ .err = e };
+    }
+
+    const inner = try std.fs.path.join(allocator, &.{ staging, "kotlinc" });
+    defer allocator.free(inner);
+    if (!isDir(io, inner)) {
+        allocator.free(dest);
+        return .{ .err = .{ .Install = try allocator.dupe(u8, "kotlinc/ missing in archive") } };
+    }
+    std.Io.Dir.cwd().deleteTree(io, dest) catch {};
+    std.Io.Dir.cwd().rename(inner, std.Io.Dir.cwd(), dest, io) catch |e| {
+        const msg = try std.fmt.allocPrint(allocator, "rename {s} -> {s}: {s}", .{ inner, dest, @errorName(e) });
+        allocator.free(dest);
+        return .{ .err = .{ .Install = msg } };
+    };
+    std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+    std.Io.Dir.cwd().deleteFile(io, archive_path) catch {};
+
+    for ([_][]const u8{ "kotlinc", "kotlin", "kotlinc-jvm" }) |name| {
+        const p = std.fs.path.join(allocator, &.{ dest, "bin", name }) catch continue;
+        defer allocator.free(p);
+        if (isFile(io, p)) {
+            const chmod = std.process.run(allocator, io, .{
+                .argv = &.{ "chmod", "+x", p },
+                .environ_map = &env,
+            }) catch continue;
+            allocator.free(chmod.stdout);
+            allocator.free(chmod.stderr);
+        }
+    }
+
+    if (!isFile(io, kotlinc)) {
+        const msg = try std.fmt.allocPrint(allocator, "{s} missing after extract", .{kotlinc});
+        allocator.free(dest);
+        return .{ .err = .{ .Install = msg } };
+    }
+    printErr("[parity] kotlinc {s} ready at {s}\n", .{ version, dest });
+    return .{ .ok = dest };
+}
+
+fn installNative(allocator: Allocator, io: Io, version: []const u8) Allocator.Error!PathResult {
+    const slug = switch (try nativePlatformSlug(allocator)) {
+        .ok => |s| s,
+        .err => |s| return .{ .err = .{ .UnsupportedPlatform = s } },
+    };
+    const root = switch (try konanRoot(allocator, io)) {
+        .ok => |r| r,
+        .err => |e| return .{ .err = e },
+    };
+    defer allocator.free(root);
+    std.Io.Dir.cwd().createDirPath(io, root) catch {};
+
+    const dir_name = try std.fmt.allocPrint(allocator, "kotlin-native-prebuilt-{s}-{s}", .{ slug.slug, version });
+    defer allocator.free(dir_name);
+    const dest = try std.fs.path.join(allocator, &.{ root, dir_name });
+    errdefer allocator.free(dest);
+    const kotlinc = try std.fs.path.join(allocator, &.{ dest, "bin", KotlincKind.Native.binaryName() });
+    defer allocator.free(kotlinc);
+    if (isFile(io, kotlinc)) {
+        return .{ .ok = dest };
+    }
+
+    var env = try procEnvMap(allocator, io);
+    defer env.deinit();
+
+    const archive_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ dir_name, slug.ext });
+    defer allocator.free(archive_name);
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "https://download.jetbrains.com/kotlin/native/builds/releases/{s}/{s}/{s}",
+        .{ version, slug.subdir, archive_name },
+    );
+    defer allocator.free(url);
+    const archive_path = try std.fs.path.join(allocator, &.{ root, archive_name });
+    defer allocator.free(archive_path);
+    printErr("[parity] installing kotlin-native {s} ({s}) into {s}\n", .{ version, slug.slug, root });
+    printErr("[parity] downloading {s}\n", .{url});
+    if (try download(allocator, io, &env, url, archive_path)) |e| {
+        allocator.free(dest);
+        return .{ .err = e };
+    }
+
+    const staging = try std.fmt.allocPrint(allocator, "{s}/.{s}.partial", .{ root, dir_name });
+    defer allocator.free(staging);
+    std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+    std.Io.Dir.cwd().createDirPath(io, staging) catch {};
+    if (try extractArchive(allocator, io, &env, archive_path, staging, slug.ext)) |e| {
+        allocator.free(dest);
+        return .{ .err = e };
+    }
+
+    const extracted = blk: {
+        const named = try std.fs.path.join(allocator, &.{ staging, dir_name });
+        if (isDir(io, named)) break :blk named;
+        allocator.free(named);
+        // Fallback: pick the single top-level dir the archive produced.
+        var dir = std.Io.Dir.cwd().openDir(io, staging, .{ .iterate = true }) catch {
+            allocator.free(dest);
+            return .{ .err = .{ .Install = try std.fmt.allocPrint(
+                allocator,
+                "unexpected archive layout under {s}",
+                .{staging},
+            ) } };
+        };
+        defer dir.close(io);
+        var only: ?[]u8 = null;
+        var count: usize = 0;
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            count += 1;
+            if (only) |o| allocator.free(o);
+            only = try std.fs.path.join(allocator, &.{ staging, entry.name });
+        }
+        if (count != 1) {
+            if (only) |o| allocator.free(o);
+            allocator.free(dest);
+            return .{ .err = .{ .Install = try std.fmt.allocPrint(
+                allocator,
+                "unexpected archive layout under {s}",
+                .{staging},
+            ) } };
+        }
+        break :blk only.?;
+    };
+    defer allocator.free(extracted);
+
+    std.Io.Dir.cwd().deleteTree(io, dest) catch {};
+    std.Io.Dir.cwd().rename(extracted, std.Io.Dir.cwd(), dest, io) catch |e| {
+        const msg = try std.fmt.allocPrint(allocator, "rename {s} -> {s}: {s}", .{ extracted, dest, @errorName(e) });
+        allocator.free(dest);
+        return .{ .err = .{ .Install = msg } };
+    };
+    std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+    std.Io.Dir.cwd().deleteFile(io, archive_path) catch {};
+
+    if (!isFile(io, kotlinc)) {
+        const msg = try std.fmt.allocPrint(allocator, "{s} missing after extract", .{kotlinc});
+        allocator.free(dest);
+        return .{ .err = .{ .Install = msg } };
+    }
+    printErr("[parity] kotlin-native {s} ready at {s}\n", .{ version, dest });
+    return .{ .ok = dest };
+}
+
+/// Download `url` to `dest`, trying curl then wget. Returns a `ParityError` on
+/// failure, or `null` on success.
+fn download(allocator: Allocator, io: Io, env: *std.process.Environ.Map, url: []const u8, dest: []const u8) Allocator.Error!?ParityError {
+    const tmp = try std.fmt.allocPrint(allocator, "{s}.part", .{dest});
+    defer allocator.free(tmp);
+    std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+
+    var ok = false;
+    if (std.process.run(allocator, io, .{
+        .argv = &.{ "curl", "-fL", "--retry", "3", "--retry-delay", "2", "-o", tmp, url },
+        .environ_map = env,
+    })) |c| {
+        defer allocator.free(c.stdout);
+        defer allocator.free(c.stderr);
+        ok = termOk(c.term);
+    } else |_| {}
+
+    if (!ok) {
+        std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        if (std.process.run(allocator, io, .{
+            .argv = &.{ "wget", "-O", tmp, url },
+            .environ_map = env,
+        })) |w| {
+            defer allocator.free(w.stdout);
+            defer allocator.free(w.stderr);
+            ok = termOk(w.term);
+        } else |_| {}
+    }
+
+    if (!ok) {
+        std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        return ParityError{ .Install = try std.fmt.allocPrint(allocator, "download failed: {s}", .{url}) };
+    }
+    std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), dest, io) catch {};
+    return null;
+}
+
+/// Extract `archive` into `into` (zip via unzip, otherwise tar). Returns a
+/// `ParityError` on failure, or `null` on success.
+fn extractArchive(allocator: Allocator, io: Io, env: *std.process.Environ.Map, archive: []const u8, into: []const u8, ext: []const u8) Allocator.Error!?ParityError {
+    const r = if (std.mem.eql(u8, ext, "zip"))
+        std.process.run(allocator, io, .{
+            .argv = &.{ "unzip", "-q", archive, "-d", into },
+            .environ_map = env,
+        })
+    else
+        std.process.run(allocator, io, .{
+            .argv = &.{ "tar", "-xf", archive, "-C", into },
+            .environ_map = env,
+        });
+    const out = r catch |e| {
+        return ParityError{ .Install = try std.fmt.allocPrint(allocator, "extract spawn: {s}", .{@errorName(e)}) };
+    };
+    defer allocator.free(out.stdout);
+    defer allocator.free(out.stderr);
+    if (!termOk(out.term)) {
+        return ParityError{ .Install = try std.fmt.allocPrint(
+            allocator,
+            "extract {s} failed (exit {any})",
+            .{ archive, out.term },
+        ) };
+    }
+    return null;
+}
+
+/// Worker count for a parallel sweep. Capped at 6 regardless of core count;
+/// override with `KLIO_PARITY_JOBS`.
+pub fn defaultJobs(allocator: Allocator) usize {
+    var threaded = threadedIo(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+    if (getEnvVar(allocator, io, "KLIO_PARITY_JOBS") catch null) |v| {
+        defer allocator.free(v);
+        if (std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t\r\n"), 10) catch null) |j| {
+            return @max(j, 1);
+        }
+    }
+    const cores = std.Thread.getCpuCount() catch 4;
+    return std.math.clamp(cores, 1, 6);
+}
+
+/// The workspace corpus directory (`crates/klio-parity/tests/corpus`).
+pub fn corpusDir(allocator: Allocator) Allocator.Error![]u8 {
+    return std.fs.path.join(allocator, &.{ "crates", "klio-parity", "tests", "corpus" });
+}
+
+/// The workspace `examples/` directory.
+pub fn examplesDir(allocator: Allocator) Allocator.Error![]u8 {
+    return allocator.dupe(u8, "examples");
+}
+
+/// Every `.kt` file directly under `dir`, sorted by path. Each path is owned by
+/// the caller; the outer slice too.
+pub fn collectKt(allocator: Allocator, io: Io, dir: []const u8) Allocator.Error![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
+    }
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch
+        return out.toOwnedSlice(allocator);
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".kt")) continue;
+        const p = try std.fs.path.join(allocator, &.{ dir, entry.name });
+        try out.append(allocator, p);
+    }
+    std.mem.sort([]u8, out.items, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    return out.toOwnedSlice(allocator);
+}
+
+fn writeFd(fd: i32, data: []const u8) void {
+    var off: usize = 0;
+    while (off < data.len) {
+        const rc = std.os.linux.write(fd, data.ptr + off, data.len - off);
+        const e = std.os.linux.errno(rc);
+        if (e == .INTR) continue;
+        if (e != .SUCCESS) return;
+        if (rc == 0) return;
+        off += rc;
+    }
+}
+
+fn printErr(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    writeFd(2, s);
+}
+
+// =========================================================================
+// kotlinc compile + run, expected-output cache, the klio in-process runners,
+// the full parity check + diff, and the corpus build + parallel sweep.
+// =========================================================================
+
+pub const ExpectedHit = struct { stdout: []u8, exit: ?i32 };
+
+/// `Result<T, ParityError>` carried as data.
+pub fn PResult(comptime T: type) type {
+    return union(enum) {
+        ok: T,
+        err: ParityError,
+    };
+}
+
+/// `Result<T, String>` carried as data, for the klio-side runners whose Rust
+/// signatures return `Result<String, String>`.
+pub fn SResult(comptime T: type) type {
+    return union(enum) {
+        ok: T,
+        err: []u8,
+    };
+}
+
+pub const ParityReport = struct {
+    matched: bool,
+    kotlinc_stdout: []const u8,
+    klio_stdout: []const u8,
+    kotlinc_exit: ?i32,
+    klio_error: ?[]const u8,
+};
+
+fn termExit(term: std.process.Child.Term) ?i32 {
+    return switch (term) {
+        .exited => |c| @intCast(c),
+        else => null,
+    };
+}
+
+fn readFileOrEmpty(allocator: Allocator, io: Io, path: []const u8) []u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch
+        (allocator.alloc(u8, 0) catch unreachable);
+}
+
+fn readFileOpt(allocator: Allocator, io: Io, path: []const u8) ?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch null;
+}
+
+fn writeFile(io: Io, path: []const u8, contents: []const u8) void {
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents }) catch {};
+}
+
+/// 16-hex-digit render of the std default hasher over `bytes`. Matches the
+/// stable rendering the corpus cache keys rely on.
+fn hashHex(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
+    const h = std.hash.Wyhash.hash(0, bytes);
+    return std.fmt.allocPrint(allocator, "{x:0>16}", .{h});
+}
+
+/// Content-hash key for `file`, over the file bytes, rendered as 16 hex digits.
+fn cacheKey(allocator: Allocator, io: Io, file: []const u8) Allocator.Error![]u8 {
+    const bytes = readFileOrEmpty(allocator, io, file);
+    defer allocator.free(bytes);
+    return hashHex(allocator, bytes);
+}
+
+fn envFlag(allocator: Allocator, io: Io, name: []const u8) bool {
+    const v = (getEnvVar(allocator, io, name) catch return false) orelse return false;
+    defer allocator.free(v);
+    return v.len != 0 and !std.mem.eql(u8, v, "0");
+}
+
+fn javaXmxMb(allocator: Allocator, io: Io) u64 {
+    if (getEnvVar(allocator, io, "KLIO_PARITY_JAVA_XMX_MB") catch null) |v| {
+        defer allocator.free(v);
+        if (std.fmt.parseInt(u64, std.mem.trim(u8, v, " \t\r\n"), 10) catch null) |n| {
+            if (n > 0) return n;
+        }
+    }
+    return 2048;
+}
+
+fn javaTimeout(allocator: Allocator, io: Io) Io.Timeout {
+    var secs: u64 = 60;
+    if (getEnvVar(allocator, io, "KLIO_PARITY_JAVA_TIMEOUT_SECS") catch null) |v| {
+        defer allocator.free(v);
+        if (std.fmt.parseInt(u64, std.mem.trim(u8, v, " \t\r\n"), 10) catch null) |n| {
+            if (n > 0) secs = n;
+        }
+    }
+    return .{ .duration = .{ .raw = Io.Duration.fromSeconds(@intCast(secs)), .clock = .awake } };
+}
+
+/// Compile a `.kt` file with JVM `kotlinc` into a self-contained jar, cached
+/// by content hash. The returned jar path is owned.
+pub fn compileWithKotlinc(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!PResult([]u8) {
+    const kotlinc = switch (try findKotlinc(allocator, io)) {
+        .err => |e| return .{ .err = e },
+        .ok => |k| k,
+    };
+    defer allocator.free(kotlinc);
+    var env = try procEnvMap(allocator, io);
+    defer env.deinit();
+    const cache = try parityCacheDir(allocator, io);
+    defer allocator.free(cache);
+    const dir = try std.fs.path.join(allocator, &.{ cache, "jars" });
+    defer allocator.free(dir);
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    const key = try cacheKey(allocator, io, file);
+    defer allocator.free(key);
+    const out = try std.fmt.allocPrint(allocator, "{s}/{s}.jar", .{ dir, key });
+    errdefer allocator.free(out);
+    if (isFile(io, out)) return .{ .ok = out };
+    const err_path = try std.fmt.allocPrint(allocator, "{s}/{s}.err", .{ dir, key });
+    defer allocator.free(err_path);
+    if (readFileOpt(allocator, io, err_path)) |prior| {
+        allocator.free(out);
+        return .{ .err = .{ .Compile = prior } };
+    }
+    const r = std.process.run(allocator, io, .{
+        .argv = &.{ kotlinc, file, "-include-runtime", "-d", out },
+        .environ_map = &env,
+    }) catch {
+        allocator.free(out);
+        return .{ .err = .{ .Io = try allocator.dupe(u8, "spawn kotlinc") } };
+    };
+    defer allocator.free(r.stdout);
+    defer allocator.free(r.stderr);
+    if (!termOk(r.term)) {
+        const msg = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ r.stdout, r.stderr });
+        writeFile(io, err_path, msg);
+        allocator.free(out);
+        return .{ .err = .{ .Compile = msg } };
+    }
+    return .{ .ok = out };
+}
+
+/// Run a previously-compiled jar under `java -jar`, returning captured stdout
+/// and exit code (stdout owned).
+pub fn runKotlincJar(allocator: Allocator, io: Io, jar: []const u8) Allocator.Error!PResult(ExpectedHit) {
+    const java = switch (try locateJava(allocator, io)) {
+        .err => |e| return .{ .err = e },
+        .ok => |j| j,
+    };
+    defer allocator.free(java);
+    var env = try procEnvMap(allocator, io);
+    defer env.deinit();
+    const xmx = try std.fmt.allocPrint(allocator, "-Xmx{d}m", .{javaXmxMb(allocator, io)});
+    defer allocator.free(xmx);
+    const r = std.process.run(allocator, io, .{
+        .argv = &.{ java, xmx, "-jar", jar },
+        .environ_map = &env,
+        .timeout = javaTimeout(allocator, io),
+    }) catch {
+        return .{ .err = .{ .Io = try allocator.dupe(u8, "spawn java") } };
+    };
+    allocator.free(r.stderr);
+    return .{ .ok = .{ .stdout = r.stdout, .exit = termExit(r.term) } };
+}
+
+// ---------------------- expected-output cache ----------------------
+
+fn expectedCacheDir(allocator: Allocator, io: Io) Allocator.Error![]u8 {
+    const cache = try parityCacheDir(allocator, io);
+    defer allocator.free(cache);
+    const name = try std.fmt.allocPrint(allocator, "expected-{s}", .{TARGET_VERSION});
+    defer allocator.free(name);
+    return std.fs.path.join(allocator, &.{ cache, name });
+}
+
+fn readExpected(allocator: Allocator, io: Io, key: []const u8) Allocator.Error!?ExpectedHit {
+    const dir = try expectedCacheDir(allocator, io);
+    defer allocator.free(dir);
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.out", .{ dir, key });
+    defer allocator.free(out_path);
+    const out = readFileOpt(allocator, io, out_path) orelse return null;
+    const exit_path = try std.fmt.allocPrint(allocator, "{s}/{s}.exit", .{ dir, key });
+    defer allocator.free(exit_path);
+    var exit: ?i32 = null;
+    if (readFileOpt(allocator, io, exit_path)) |raw| {
+        defer allocator.free(raw);
+        exit = std.fmt.parseInt(i32, std.mem.trim(u8, raw, " \t\r\n"), 10) catch null;
+    }
+    return .{ .stdout = out, .exit = exit };
+}
+
+fn writeExpected(allocator: Allocator, io: Io, key: []const u8, stdout: []const u8, exit: ?i32) Allocator.Error!void {
+    const dir = try expectedCacheDir(allocator, io);
+    defer allocator.free(dir);
+    std.Io.Dir.cwd().createDirPath(io, dir) catch return;
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.out", .{ dir, key });
+    defer allocator.free(out_path);
+    writeFile(io, out_path, stdout);
+    if (exit) |code| {
+        const exit_path = try std.fmt.allocPrint(allocator, "{s}/{s}.exit", .{ dir, key });
+        defer allocator.free(exit_path);
+        const s = try std.fmt.allocPrint(allocator, "{d}", .{code});
+        defer allocator.free(s);
+        writeFile(io, exit_path, s);
+    }
+}
+
+/// kotlinc output for a single `.kt` file, cached by content hash. The
+/// returned stdout is owned.
+pub fn kotlincOutput(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!PResult(ExpectedHit) {
+    const key = try cacheKey(allocator, io, file);
+    defer allocator.free(key);
+    if (try readExpected(allocator, io, key)) |hit| return .{ .ok = hit };
+    const jar = switch (try compileWithKotlinc(allocator, io, file)) {
+        .err => |e| return .{ .err = e },
+        .ok => |j| j,
+    };
+    defer allocator.free(jar);
+    const run = switch (try runKotlincJar(allocator, io, jar)) {
+        .err => |e| return .{ .err = e },
+        .ok => |r| r,
+    };
+    try writeExpected(allocator, io, key, run.stdout, run.exit);
+    return .{ .ok = run };
+}
+
+// ---------------------- stdout capture sink ----------------------
+
+/// Stdout sink that captures every `println` line for parity diffing. Faithful
+/// port of the Rust `CaptureOutput`: lines accumulate in `cur` and split on
+/// `\n`, trimming the trailing `\n` per line.
+pub const CaptureOutput = struct {
+    lines: std.ArrayList([]u8),
+    cur: std.ArrayList(u8),
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) CaptureOutput {
+        return .{ .lines = .empty, .cur = .empty, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *CaptureOutput) void {
+        for (self.lines.items) |l| self.allocator.free(l);
+        self.lines.deinit(self.allocator);
+        self.cur.deinit(self.allocator);
+    }
+
+    fn writeStr(self: *CaptureOutput, s: []const u8) void {
+        self.cur.appendSlice(self.allocator, s) catch return;
+        while (std.mem.indexOfScalar(u8, self.cur.items, '\n')) |idx| {
+            const line = self.allocator.dupe(u8, self.cur.items[0..idx]) catch return;
+            self.lines.append(self.allocator, line) catch {
+                self.allocator.free(line);
+                return;
+            };
+            const remaining = self.cur.items.len - (idx + 1);
+            std.mem.copyForwards(u8, self.cur.items[0..remaining], self.cur.items[idx + 1 ..]);
+            self.cur.shrinkRetainingCapacity(remaining);
+        }
+    }
+
+    fn vtWrite(ctx: *anyopaque, s: []const u8) void {
+        const self: *CaptureOutput = @ptrCast(@alignCast(ctx));
+        self.writeStr(s);
+    }
+    fn vtWriteln(ctx: *anyopaque, s: []const u8) void {
+        const self: *CaptureOutput = @ptrCast(@alignCast(ctx));
+        self.writeStr(s);
+        self.writeStr("\n");
+    }
+
+    const vtable: runtime.Output.VTable = .{ .writeln = vtWriteln, .write = vtWrite };
+
+    pub fn output(self: *CaptureOutput) runtime.Output {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    /// Join captured lines into the final program-output string. Owned by
+    /// `allocator`.
+    pub fn intoJoined(self: *CaptureOutput, allocator: Allocator) Allocator.Error![]u8 {
+        if (self.cur.items.len != 0) {
+            const trailing = try self.allocator.dupe(u8, self.cur.items);
+            try self.lines.append(self.allocator, trailing);
+            self.cur.clearRetainingCapacity();
+        }
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(allocator);
+        for (self.lines.items, 0..) |l, i| {
+            if (i != 0) try joined.append(allocator, '\n');
+            try joined.appendSlice(allocator, l);
+        }
+        if (joined.items.len != 0) try joined.append(allocator, '\n');
+        return joined.toOwnedSlice(allocator);
+    }
+};
+
+// ---------------------- klio in-process runners ----------------------
+
+fn joinIdentPath(allocator: Allocator, path: []const ast.Ident) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    for (path, 0..) |seg, i| {
+        if (i != 0) try out.append(allocator, '.');
+        try out.appendSlice(allocator, seg.name);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn packageName(allocator: Allocator, file: *const KotlinFile) Allocator.Error![]u8 {
+    if (file.package) |p| return joinIdentPath(allocator, p.path);
+    return allocator.alloc(u8, 0);
+}
+
+fn collectImportPrefixes(allocator: Allocator, file: *const KotlinFile, set: *std.StringHashMap(void)) Allocator.Error!void {
+    for (file.imports) |imp| {
+        const p = try joinIdentPath(allocator, imp.path);
+        if (p.len != 0) {
+            const gop = try set.getOrPut(p);
+            if (gop.found_existing) allocator.free(p);
+        } else allocator.free(p);
+    }
+}
+
+/// `outer.startsWith(inner ++ ".")`.
+fn startsWithDot(allocator: Allocator, outer: []const u8, inner: []const u8) bool {
+    const dotted = std.fmt.allocPrint(allocator, "{s}.", .{inner}) catch return false;
+    defer allocator.free(dotted);
+    return std.mem.startsWith(u8, outer, dotted);
+}
+
+/// `imp == pkg || imp.startsWith("pkg.") || pkg.startsWith("imp.")`.
+fn matchesImportPrefix(allocator: Allocator, imp: []const u8, pkg: []const u8) bool {
+    if (std.mem.eql(u8, imp, pkg)) return true;
+    if (startsWithDot(allocator, imp, pkg)) return true;
+    if (startsWithDot(allocator, pkg, imp)) return true;
+    return false;
+}
+
+fn formatVmError(allocator: Allocator, e: interp_ir.VmError) Allocator.Error![]u8 {
+    return switch (e) {
+        .InvalidMain => allocator.dupe(u8, "runtime error: main function not found in module"),
+        .Eval => |s| std.fmt.allocPrint(allocator, "runtime error: {s}", .{s}),
+    };
+}
+
+/// Parse the embedded stdlib pack's curated `SOURCES` and return the subset
+/// whose declared packages are imported (directly or by prefix) somewhere in
+/// `existing`. ASTs are allocated into `arena`.
+fn embeddedStdlibSources(arena: Allocator, io: Io, existing: []const KotlinFile, map: *SourceMap) Allocator.Error![]KotlinFile {
+    var import_prefixes = std.StringHashMap(void).init(arena);
+    for (existing) |*f| {
+        try collectImportPrefixes(arena, f, &import_prefixes);
+    }
+
+    var perr: pack.PackError = undefined;
+    var env = try procEnvMap(arena, io);
+    defer env.deinit();
+    const bytes = (try stdlib_pack.stdlibPackBytes(arena, &env, &perr)) orelse return &.{};
+    var reader = (try pack.PackReader.fromBytes(arena, bytes, &perr)) orelse return &.{};
+    defer reader.deinit();
+    const payload = (try reader.readSection(pack.section_names.SOURCES, &perr)) orelse return &.{};
+    defer payload.deinit(arena);
+    var bundle = (try pack.schema.decode(pack.schema.SourceBundle, arena, payload.slice(), &perr)) orelse return &.{};
+    defer bundle.deinit(arena);
+
+    const Parsed = struct { pkg: []u8, ast: KotlinFile };
+    var parsed: std.ArrayList(Parsed) = .empty;
+    defer parsed.deinit(arena);
+
+    for (bundle.files) |sf| {
+        if (stdlib.isConsumptionDeferredSource(sf.rel_path)) continue;
+        const fid = try map.add(sf.rel_path, sf.bytes);
+        const srcf = map.get(fid).source;
+        var lx = try lexer.Lexer.init(arena, fid, srcf);
+        const lexed = try lx.tokenize();
+        if (lexed.diagnostics.hasErrors()) continue;
+        const p = parser.Parser.new(arena, fid, srcf, lexed.tokens);
+        const file_ast = p.parseFile();
+        if (p.diagnostics.hasErrors()) continue;
+        const pkg = try packageName(arena, &file_ast);
+        try parsed.append(arena, .{ .pkg = pkg, .ast = file_ast });
+    }
+
+    var any_non_implicit = false;
+    for (parsed.items) |pr| {
+        if (pr.pkg.len != 0 and !stdlib.isImplicitlyImportedPackage(pr.pkg)) {
+            any_non_implicit = true;
+            break;
+        }
+    }
+
+    var imported_match = false;
+    outer: for (parsed.items) |pr| {
+        if (pr.pkg.len == 0) continue;
+        var it = import_prefixes.keyIterator();
+        while (it.next()) |imp_ptr| {
+            if (matchesImportPrefix(arena, imp_ptr.*, pr.pkg)) {
+                imported_match = true;
+                break :outer;
+            }
+        }
+    }
+
+    const load_gated = imported_match or !any_non_implicit;
+
+    var out: std.ArrayList(KotlinFile) = .empty;
+    errdefer out.deinit(arena);
+    for (parsed.items) |pr| {
+        const is_implicit = pr.pkg.len != 0 and stdlib.isImplicitlyImportedPackage(pr.pkg);
+        if (is_implicit or load_gated) {
+            try out.append(arena, pr.ast);
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Run a `.kt` file directly through the `klio` interpreter library, returning
+/// captured stdout (ok) or an error message (err), owned by `allocator`.
+pub fn runWithKtc(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const src = readFileOpt(arena, io, file) orelse {
+        return .{ .err = try std.fmt.allocPrint(allocator, "read {s}", .{file}) };
+    };
+    var map = SourceMap.init(arena);
+    defer map.deinit();
+    const id = try map.add(file, src);
+    const owned = map.get(id).source;
+    var lx = try lexer.Lexer.init(arena, id, owned);
+    const lexed = try lx.tokenize();
+    if (lexed.diagnostics.hasErrors()) {
+        return .{ .err = try std.fmt.allocPrint(allocator, "lex diagnostics: {d} error(s)", .{lexed.diagnostics.diags().len}) };
+    }
+    const p = parser.Parser.new(arena, id, owned, lexed.tokens);
+    const file_ast = p.parseFile();
+    if (p.diagnostics.hasErrors()) {
+        return .{ .err = try std.fmt.allocPrint(allocator, "parse diagnostics: {d} error(s)", .{p.diagnostics.diags().len}) };
+    }
+
+    var user_asts = [_]KotlinFile{file_ast};
+    const stdlib_asts = try embeddedStdlibSources(arena, io, &user_asts, &map);
+
+    var asts: std.ArrayList(KotlinFile) = .empty;
+    defer asts.deinit(arena);
+    try asts.appendSlice(arena, stdlib_asts);
+    try asts.appendSlice(arena, &user_asts);
+
+    interp_ir.setCoroutineTimeMode(.Virtual);
+    var out = CaptureOutput.init(allocator);
+    defer out.deinit();
+
+    var built = try interp_ir.build.buildModuleFiles(arena, asts.items);
+    const main_id = built.main orelse {
+        built.deinit();
+        return .{ .err = try allocator.dupe(u8, "no main function in module") };
+    };
+    const pair = try interp_ir.Vm.fromBuilt(arena, &built);
+    built.deinit();
+    var vm = pair.vm;
+    defer vm.deinit();
+    const result = try vm.run(main_id, out.output());
+    switch (result) {
+        .ok => {},
+        .err => |e| return .{ .err = try formatVmError(allocator, e) },
+    }
+    return .{ .ok = try out.intoJoined(allocator) };
+}
+
+// ---------------------- klio.toml manifest parsing ----------------------
+
+const ManifestRoot = struct {
+    root: []const u8,
+    include: [][]const u8,
+    exclude: [][]const u8,
+};
+
+fn manifestPatMatch(rel: []const u8, pat: []const u8) bool {
+    if (std.mem.endsWith(u8, pat, "/")) {
+        const prefix = pat[0 .. pat.len - 1];
+        return std.mem.eql(u8, rel, prefix) or std.mem.startsWith(u8, rel, pat);
+    }
+    if (std.mem.startsWith(u8, pat, "*")) {
+        return std.mem.endsWith(u8, rel, pat[1..]);
+    }
+    if (std.mem.endsWith(u8, pat, "*")) {
+        return std.mem.startsWith(u8, rel, pat[0 .. pat.len - 1]);
+    }
+    return std.mem.eql(u8, rel, pat);
+}
+
+fn stringArray(allocator: Allocator, rest: []const u8) Allocator.Error![][]const u8 {
+    var trimmed = std.mem.trim(u8, rest, " \t\r\n");
+    trimmed = std.mem.trimStart(u8, trimmed, "[");
+    trimmed = std.mem.trimEnd(u8, trimmed, "]");
+    var out: std.ArrayList([]const u8) = .empty;
+    defer out.deinit(allocator);
+    var it = std.mem.splitScalar(u8, trimmed, ',');
+    while (it.next()) |s| {
+        const t = std.mem.trim(u8, std.mem.trim(u8, s, " \t\r\n"), "\"");
+        if (t.len != 0) try out.append(allocator, try allocator.dupe(u8, t));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Minimal `klio.toml` reader for `source_roots` + `[[source]]` tables.
+fn parseManifestRoots(allocator: Allocator, toml: []const u8) Allocator.Error![]ManifestRoot {
+    var logical: std.ArrayList([]u8) = .empty;
+    defer {
+        for (logical.items) |l| allocator.free(l);
+        logical.deinit(allocator);
+    }
+    var pending: ?std.ArrayList(u8) = null;
+    var lines_it = std.mem.splitScalar(u8, toml, '\n');
+    while (lines_it.next()) |raw| {
+        const before_hash = std.mem.sliceTo(raw, '#');
+        const line = std.mem.trim(u8, before_hash, " \t\r\n");
+        if (pending) |*buf| {
+            try buf.append(allocator, ' ');
+            try buf.appendSlice(allocator, line);
+            if (std.mem.indexOfScalar(u8, line, ']') != null) {
+                try logical.append(allocator, try buf.toOwnedSlice(allocator));
+                pending = null;
+            }
+            continue;
+        }
+        if (line.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, line, '[') != null and
+            std.mem.indexOfScalar(u8, line, ']') == null and
+            std.mem.indexOfScalar(u8, line, '=') != null)
+        {
+            var buf: std.ArrayList(u8) = .empty;
+            try buf.appendSlice(allocator, line);
+            pending = buf;
+            continue;
+        }
+        try logical.append(allocator, try allocator.dupe(u8, line));
+    }
+    if (pending) |*buf| {
+        try logical.append(allocator, try buf.toOwnedSlice(allocator));
+    }
+
+    var plain: [][]const u8 = &.{};
+    var tables: std.ArrayList(ManifestRoot) = .empty;
+    errdefer tables.deinit(allocator);
+    var cur: ?ManifestRoot = null;
+    var in_source_table = false;
+    for (logical.items) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.eql(u8, line, "[[source]]")) {
+            if (cur) |c| try tables.append(allocator, c);
+            cur = ManifestRoot{ .root = try allocator.alloc(u8, 0), .include = &.{}, .exclude = &.{} };
+            in_source_table = true;
+            continue;
+        }
+        if (line.len != 0 and line[0] == '[') {
+            if (cur) |c| try tables.append(allocator, c);
+            cur = null;
+            in_source_table = false;
+            continue;
+        }
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t\r\n");
+        const val = std.mem.trim(u8, line[eq + 1 ..], " \t\r\n");
+        if (in_source_table) {
+            if (cur) |*c| {
+                if (std.mem.eql(u8, key, "root")) {
+                    allocator.free(c.root);
+                    c.root = try allocator.dupe(u8, std.mem.trim(u8, val, "\""));
+                } else if (std.mem.eql(u8, key, "include")) {
+                    c.include = try stringArray(allocator, val);
+                } else if (std.mem.eql(u8, key, "exclude")) {
+                    c.exclude = try stringArray(allocator, val);
+                }
+            }
+        } else if (std.mem.eql(u8, key, "source_roots")) {
+            plain = try stringArray(allocator, val);
+        }
+    }
+    if (cur) |c| try tables.append(allocator, c);
+
+    var out: std.ArrayList(ManifestRoot) = .empty;
+    errdefer out.deinit(allocator);
+    for (plain) |root| {
+        try out.append(allocator, .{ .root = root, .include = &.{}, .exclude = &.{} });
+    }
+    allocator.free(plain);
+    try out.appendSlice(allocator, tables.items);
+    tables.deinit(allocator);
+    return out.toOwnedSlice(allocator);
+}
+
+fn freeManifestRoots(allocator: Allocator, roots: []ManifestRoot) void {
+    for (roots) |r| {
+        allocator.free(r.root);
+        for (r.include) |s| allocator.free(s);
+        if (r.include.len != 0) allocator.free(r.include);
+        for (r.exclude) |s| allocator.free(s);
+        if (r.exclude.len != 0) allocator.free(r.exclude);
+    }
+    allocator.free(roots);
+}
+
+const RelAbs = struct { rel: []u8, abs: []u8 };
+
+fn walkKt(allocator: Allocator, io: Io, dir: []const u8, base: []const u8, out: *std.ArrayList(RelAbs)) Allocator.Error!void {
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+    {
+        var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return;
+        defer d.close(io);
+        var it = d.iterate();
+        while (it.next(io) catch null) |entry| {
+            try names.append(allocator, try std.fs.path.join(allocator, &.{ dir, entry.name }));
+        }
+    }
+    std.mem.sort([]u8, names.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    for (names.items) |p| {
+        if (isDir(io, p)) {
+            try walkKt(allocator, io, p, base, out);
+        } else if (std.mem.endsWith(u8, p, ".kt")) {
+            const stripped = if (std.mem.startsWith(u8, p, base) and p.len > base.len)
+                p[base.len + 1 ..]
+            else
+                p;
+            const rel = try allocator.dupe(u8, stripped);
+            std.mem.replaceScalar(u8, rel, '\\', '/');
+            try out.append(allocator, .{ .rel = rel, .abs = try allocator.dupe(u8, p) });
+        }
+    }
+}
+
+fn anyMatch(rel: []const u8, pats: [][]const u8) bool {
+    for (pats) |pat| {
+        if (manifestPatMatch(rel, pat)) return true;
+    }
+    return false;
+}
+
+/// Collect a pack's Kotlin sources from its `klio.toml`. Returns owned absolute
+/// paths sorted by root-relative path, deduplicated.
+fn collectManifestSources(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.Error!SResult([][]u8) {
+    const toml_path = try std.fs.path.join(allocator, &.{ pack_dir, "klio.toml" });
+    defer allocator.free(toml_path);
+    const toml = readFileOpt(allocator, io, toml_path) orelse {
+        return .{ .err = try std.fmt.allocPrint(allocator, "read {s}", .{toml_path}) };
+    };
+    defer allocator.free(toml);
+    const roots = try parseManifestRoots(allocator, toml);
+    defer freeManifestRoots(allocator, roots);
+    var default_root_buf: [1]ManifestRoot = undefined;
+    var roots_view: []ManifestRoot = roots;
+    if (roots.len == 0) {
+        default_root_buf[0] = .{ .root = "src", .include = &.{}, .exclude = &.{} };
+        roots_view = default_root_buf[0..1];
+    }
+
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var ki = seen.keyIterator();
+        while (ki.next()) |k| allocator.free(k.*);
+        seen.deinit();
+    }
+    const Picked = struct { rel: []u8, abs: []const u8 };
+    var picked: std.ArrayList(Picked) = .empty;
+    defer {
+        for (picked.items) |pk| allocator.free(pk.rel);
+        picked.deinit(allocator);
+    }
+
+    for (roots_view) |r| {
+        const root_path = try std.fs.path.join(allocator, &.{ pack_dir, r.root });
+        defer allocator.free(root_path);
+        if (!isDir(io, root_path)) continue;
+        var found: std.ArrayList(RelAbs) = .empty;
+        defer {
+            for (found.items) |f| {
+                allocator.free(f.rel);
+                allocator.free(f.abs);
+            }
+            found.deinit(allocator);
+        }
+        try walkKt(allocator, io, root_path, root_path, &found);
+        for (found.items) |f| {
+            const included = r.include.len == 0 or anyMatch(f.rel, r.include);
+            if (!included) continue;
+            if (anyMatch(f.rel, r.exclude)) continue;
+            const gop = try seen.getOrPut(f.abs);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try allocator.dupe(u8, f.abs);
+                try picked.append(allocator, .{ .rel = try allocator.dupe(u8, f.rel), .abs = gop.key_ptr.* });
+            }
+        }
+    }
+    std.mem.sort(Picked, picked.items, {}, struct {
+        fn lt(_: void, a: Picked, b: Picked) bool {
+            return std.mem.lessThan(u8, a.rel, b.rel);
+        }
+    }.lt);
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |o| allocator.free(o);
+        out.deinit(allocator);
+    }
+    for (picked.items) |pk| {
+        try out.append(allocator, try allocator.dupe(u8, pk.abs));
+    }
+    return .{ .ok = try out.toOwnedSlice(allocator) };
+}
+
+fn parsePackFile(arena: Allocator, map: *SourceMap, path: []const u8, text: []const u8) Allocator.Error!SResult(KotlinFile) {
+    const id = try map.add(path, text);
+    const srcf = map.get(id).source;
+    var lx = try lexer.Lexer.init(arena, id, srcf);
+    const lexed = try lx.tokenize();
+    if (lexed.diagnostics.hasErrors()) {
+        return .{ .err = try std.fmt.allocPrint(arena, "lex: {d} error(s)", .{lexed.diagnostics.diags().len}) };
+    }
+    const p = parser.Parser.new(arena, id, srcf, lexed.tokens);
+    const file_ast = p.parseFile();
+    if (p.diagnostics.hasErrors()) {
+        return .{ .err = try std.fmt.allocPrint(arena, "parse: {d} error(s)", .{p.diagnostics.diags().len}) };
+    }
+    return .{ .ok = file_ast };
+}
+
+fn manifestLibraryId(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.Error!?[]u8 {
+    const toml_path = try std.fs.path.join(allocator, &.{ pack_dir, "klio.toml" });
+    defer allocator.free(toml_path);
+    const toml = readFileOpt(allocator, io, toml_path) orelse return null;
+    defer allocator.free(toml);
+    var it = std.mem.splitScalar(u8, toml, '\n');
+    while (it.next()) |line| {
+        const l = std.mem.trim(u8, std.mem.sliceTo(line, '#'), " \t\r\n");
+        if (std.mem.startsWith(u8, l, "id")) {
+            const rest = std.mem.trimStart(u8, l[2..], " =");
+            const v = std.mem.trim(u8, std.mem.trim(u8, rest, " \t\r\n"), "\"");
+            if (v.len != 0) return try allocator.dupe(u8, v);
+        }
+    }
+    return null;
+}
+
+fn registerAstPackage(arena: Allocator, file_ast: *const KotlinFile) Allocator.Error!void {
+    if (file_ast.package) |pkg| {
+        const path = try joinIdentPath(arena, pkg.path);
+        if (path.len != 0) stdlib.registerKnownPackage(path);
+    }
+}
+
+fn loadKotlinxPacks(
+    arena: Allocator,
+    io: Io,
+    pack_dirs: []const []const u8,
+    import_prefixes: *const std.StringHashMap(void),
+    imports_coroutines: bool,
+    map: *SourceMap,
+    asts: *std.ArrayList(KotlinFile),
+) Allocator.Error!SResult(void) {
+    for (pack_dirs) |pack_dir| {
+        const lib_id = (try manifestLibraryId(arena, io, pack_dir)) orelse try arena.alloc(u8, 0);
+        var wanted = false;
+        var it = import_prefixes.keyIterator();
+        while (it.next()) |imp_ptr| {
+            const imp = imp_ptr.*;
+            if (std.mem.eql(u8, imp, lib_id) or
+                startsWithDot(arena, imp, lib_id) or
+                startsWithDot(arena, lib_id, imp))
+            {
+                wanted = true;
+                break;
+            }
+        }
+        if (std.mem.eql(u8, lib_id, "kotlinx.atomicfu") and imports_coroutines) wanted = true;
+        if (!wanted) continue;
+
+        const sources = switch (try collectManifestSources(arena, io, pack_dir)) {
+            .err => |e| return .{ .err = e },
+            .ok => |s| s,
+        };
+        for (sources) |src_path| {
+            const text = readFileOpt(arena, io, src_path) orelse {
+                return .{ .err = try std.fmt.allocPrint(arena, "read {s}", .{src_path}) };
+            };
+            const file_ast = switch (try parsePackFile(arena, map, src_path, text)) {
+                .err => |e| return .{ .err = e },
+                .ok => |a| a,
+            };
+            try registerAstPackage(arena, &file_ast);
+            try asts.append(arena, file_ast);
+        }
+    }
+    return .{ .ok = {} };
+}
+
+/// Run a `.kt` file through the `klio` interpreter with the in-repo kotlinx
+/// packs (coroutines, atomicfu, io) loaded and their host bindings installed.
+pub fn runWithPacks(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
+    // The Rust harness wraps this in `stacker::grow(16 MiB, ...)`. Zig has no
+    // portable equivalent; the body runs directly.
+    return runWithPacksInner(allocator, io, file);
+}
+
+fn runWithPacksInner(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const ws = try workspaceRoot(arena);
+    const pack_dirs = [_][]const u8{
+        try std.fs.path.join(arena, &.{ ws, "crates", "klio-kotlinx-coroutines" }),
+        try std.fs.path.join(arena, &.{ ws, "crates", "klio-kotlinx-atomicfu" }),
+        try std.fs.path.join(arena, &.{ ws, "crates", "klio-kotlinx-io" }),
+    };
+
+    var map = SourceMap.init(arena);
+    defer map.deinit();
+    var asts: std.ArrayList(KotlinFile) = .empty;
+    defer asts.deinit(arena);
+
+    const user_src = readFileOpt(arena, io, file) orelse {
+        return .{ .err = try std.fmt.allocPrint(allocator, "read {s}", .{file}) };
+    };
+    const user_ast = switch (try parsePackFile(arena, &map, file, user_src)) {
+        .err => |e| return .{ .err = try allocator.dupe(u8, e) },
+        .ok => |a| a,
+    };
+
+    var user_import_prefixes = std.StringHashMap(void).init(arena);
+    try collectImportPrefixes(arena, &user_ast, &user_import_prefixes);
+    var imports_coroutines = false;
+    {
+        var it = user_import_prefixes.keyIterator();
+        while (it.next()) |imp_ptr| {
+            const imp = imp_ptr.*;
+            if (std.mem.eql(u8, imp, "kotlinx.coroutines") or
+                std.mem.startsWith(u8, imp, "kotlinx.coroutines."))
+            {
+                imports_coroutines = true;
+                break;
+            }
+        }
+    }
+
+    switch (try loadKotlinxPacks(arena, io, &pack_dirs, &user_import_prefixes, imports_coroutines, &map, &asts)) {
+        .err => |e| return .{ .err = try allocator.dupe(u8, e) },
+        .ok => {},
+    }
+
+    var probe: std.ArrayList(KotlinFile) = .empty;
+    defer probe.deinit(arena);
+    try probe.appendSlice(arena, asts.items);
+    try probe.append(arena, user_ast);
+    const stdlib_asts = try embeddedStdlibSources(arena, io, probe.items, &map);
+    for (stdlib_asts) |a| {
+        try registerAstPackage(arena, &a);
+        try asts.append(arena, a);
+    }
+    try asts.append(arena, user_ast);
+
+    var bindings = try HostBindings.withStdlibDefaults(arena);
+    {
+        var co = try kotlinx_coroutines.hostBindings(arena);
+        var it = co.table.iterator();
+        while (it.next()) |e| try bindings.register(e.key_ptr.*, e.value_ptr.*);
+        co.deinit();
+    }
+    {
+        var af = try kotlinx_atomicfu.hostBindings(arena);
+        var it = af.table.iterator();
+        while (it.next()) |e| try bindings.register(e.key_ptr.*, e.value_ptr.*);
+        af.deinit();
+    }
+
+    interp_ir.setCoroutineTimeMode(.Virtual);
+    var built = try interp_ir.build.buildModuleFiles(arena, asts.items);
+    const main_id = built.main orelse {
+        built.deinit();
+        return .{ .err = try allocator.dupe(u8, "no main function in module") };
+    };
+    const pair = try interp_ir.Vm.fromBuilt(arena, &built);
+    built.deinit();
+    var vm = pair.vm;
+    defer vm.deinit();
+    try vm.setInstalledBindings(bindings);
+
+    var out = CaptureOutput.init(allocator);
+    defer out.deinit();
+    const result = try vm.run(main_id, out.output());
+    switch (result) {
+        .ok => {},
+        .err => |e| return .{ .err = try formatVmError(allocator, e) },
+    }
+    return .{ .ok = try out.intoJoined(allocator) };
+}
+
+// ---------------------- staging helpers ----------------------
+
+const RESERVED = [_][]const u8{
+    "as",        "break",     "class",        "continue",  "do",       "else",
+    "false",     "for",       "fun",          "if",        "in",       "interface",
+    "is",        "null",      "object",       "package",   "return",   "super",
+    "this",      "throw",     "true",         "try",       "typealias", "typeof",
+    "val",       "var",       "when",         "while",     "abstract", "assert",
+    "boolean",   "byte",      "case",         "catch",     "char",     "const",
+    "default",   "double",    "enum",         "extends",   "final",    "finally",
+    "float",     "goto",      "implements",   "import",    "instanceof", "int",
+    "long",      "native",    "new",          "private",   "protected", "public",
+    "short",     "static",    "strictfp",     "switch",    "synchronized", "throws",
+    "transient", "void",      "volatile",
+};
+
+fn sanitizePkgSegment(allocator: Allocator, stem: []const u8) Allocator.Error![]u8 {
+    for (RESERVED) |w| {
+        if (std.mem.eql(u8, stem, w)) {
+            return std.fmt.allocPrint(allocator, "{s}_", .{stem});
+        }
+    }
+    return allocator.dupe(u8, stem);
+}
+
+fn capitalizeFirst(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
+    if (s.len == 0) return allocator.alloc(u8, 0);
+    const out = try allocator.alloc(u8, s.len);
+    @memcpy(out, s);
+    out[0] = std.ascii.toUpper(out[0]);
+    return out;
+}
+
+const VALUE_CLASS_MODIFIERS = [_][]const u8{
+    "public ",     "private ",   "internal ",  "protected ", "expect ", "actual ",
+    "external ",   "open ",      "final ",     "abstract ",  "sealed ", "data ",
+    "enum ",       "annotation ", "companion ", "inner ",    "inline ",
+};
+
+fn declaresValueClass(line: []const u8) bool {
+    var rest = std.mem.trimStart(u8, line, " \t\r\n");
+    while (true) {
+        if (rest.len != 0 and rest[0] == '@') {
+            const after_at = rest[1..];
+            var end: usize = after_at.len;
+            for (after_at, 0..) |c, i| {
+                if (c == ' ' or c == '\t' or c == '\r' or c == '\n' or c == '(') {
+                    end = i;
+                    break;
+                }
+            }
+            var tail = after_at[end..];
+            if (tail.len != 0 and tail[0] == '(') {
+                var depth: i32 = 0;
+                var i: usize = 0;
+                while (i < tail.len) : (i += 1) {
+                    switch (tail[i]) {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if (depth == 0) {
+                                i += 1;
+                                break;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                tail = tail[i..];
+            }
+            rest = std.mem.trimStart(u8, tail, " \t\r\n");
+            continue;
+        }
+        var advanced: ?[]const u8 = null;
+        for (VALUE_CLASS_MODIFIERS) |m| {
+            if (std.mem.startsWith(u8, rest, m)) {
+                advanced = std.mem.trimStart(u8, rest[m.len..], " \t\r\n");
+                break;
+            }
+        }
+        if (advanced) |next| {
+            rest = next;
+        } else break;
+    }
+    return std.mem.startsWith(u8, rest, "value class ") or std.mem.startsWith(u8, rest, "value class\t");
+}
+
+/// Inject `@JvmInline` before a `value class` declaration that lacks one.
+fn injectJvmInline(allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var prev_had_jvminline = false;
+    var idx: usize = 0;
+    while (idx < src.len) {
+        const nl = std.mem.indexOfScalarPos(u8, src, idx, '\n');
+        const line_end = if (nl) |n| n + 1 else src.len;
+        const line = src[idx..line_end];
+        idx = line_end;
+
+        if (declaresValueClass(line) and !prev_had_jvminline) {
+            const trimmed = std.mem.trimStart(u8, line, " \t\r\n");
+            const indent = line[0 .. line.len - trimmed.len];
+            try out.appendSlice(allocator, indent);
+            try out.appendSlice(allocator, "@JvmInline\n");
+        }
+        try out.appendSlice(allocator, line);
+        const t = std.mem.trim(u8, line, " \t\r\n");
+        if (t.len != 0) {
+            prev_had_jvminline = std.mem.startsWith(u8, t, "@JvmInline");
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// ---------------------- float-diff tolerance ----------------------
+
+/// True when the two outputs differ only by a ULP-1 double on `double_pow.kt`.
+pub fn knownJvmFloatDiff(path: []const u8, kotlinc_out: []const u8, klio_out: []const u8) bool {
+    const files = [_][]const u8{"double_pow.kt"};
+    const basename = std.fs.path.basename(path);
+    var listed = false;
+    for (files) |f| {
+        if (std.mem.eql(u8, f, basename)) {
+            listed = true;
+            break;
+        }
+    }
+    if (!listed) return false;
+    var a_buf: [8192][]const u8 = undefined;
+    var b_buf: [8192][]const u8 = undefined;
+    const na = splitLines(kotlinc_out, &a_buf) orelse return false;
+    const nb = splitLines(klio_out, &b_buf) orelse return false;
+    if (na != nb) return false;
+    for (a_buf[0..na], b_buf[0..nb]) |x, y| {
+        if (std.mem.eql(u8, x, y)) continue;
+        const xd = std.fmt.parseFloat(f64, x) catch return false;
+        const yd = std.fmt.parseFloat(f64, y) catch return false;
+        const xb: u64 = @bitCast(xd);
+        const yb: u64 = @bitCast(yd);
+        if (@max(xb, yb) - @min(xb, yb) > 1) return false;
+    }
+    return true;
+}
+
+fn splitLines(s: []const u8, buf: [][]const u8) ?usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, '\n');
+    while (it.next()) |l| {
+        if (n >= buf.len) return null;
+        buf[n] = l;
+        n += 1;
+    }
+    if (n > 0 and buf[n - 1].len == 0) n -= 1;
+    return n;
+}
+
+// ---------------------- full parity check + diff ----------------------
+
+/// Full parity check: compile + run both compilers, return a report. The
+/// report's strings are owned by `allocator`.
+pub fn check(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!PResult(ParityReport) {
+    if (envFlag(allocator, io, "KLIO_SKIP_KOTLINC_PARITY")) {
+        return .{ .err = .NoKotlinc };
+    }
+    const ko = switch (try kotlincOutput(allocator, io, file)) {
+        .err => |e| return .{ .err = e },
+        .ok => |v| v,
+    };
+    switch (try runWithKtc(allocator, io, file)) {
+        .ok => |klio_stdout| {
+            return .{ .ok = .{
+                .matched = std.mem.eql(u8, ko.stdout, klio_stdout),
+                .kotlinc_stdout = ko.stdout,
+                .klio_stdout = klio_stdout,
+                .kotlinc_exit = ko.exit,
+                .klio_error = null,
+            } };
+        },
+        .err => |e| {
+            return .{ .ok = .{
+                .matched = false,
+                .kotlinc_stdout = ko.stdout,
+                .klio_stdout = try allocator.alloc(u8, 0),
+                .kotlinc_exit = ko.exit,
+                .klio_error = e,
+            } };
+        },
+    }
+}
+
+/// Render a unified-style diff between the two outputs. Empty string when they
+/// match. The returned string is owned by `allocator`.
+pub fn renderDiff(allocator: Allocator, report: *const ParityReport) Allocator.Error![]u8 {
+    if (report.matched) return allocator.alloc(u8, 0);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "--- kotlinc\n");
+    try out.appendSlice(allocator, "+++ klio\n");
+
+    var a_list: std.ArrayList([]const u8) = .empty;
+    defer a_list.deinit(allocator);
+    var b_list: std.ArrayList([]const u8) = .empty;
+    defer b_list.deinit(allocator);
+    try collectLines(allocator, report.kotlinc_stdout, &a_list);
+    try collectLines(allocator, report.klio_stdout, &b_list);
+    const max = @max(a_list.items.len, b_list.items.len);
+    var i: usize = 0;
+    while (i < max) : (i += 1) {
+        const x: ?[]const u8 = if (i < a_list.items.len) a_list.items[i] else null;
+        const y: ?[]const u8 = if (i < b_list.items.len) b_list.items[i] else null;
+        if (x != null and y != null) {
+            if (std.mem.eql(u8, x.?, y.?)) {
+                try out.append(allocator, ' ');
+                try out.appendSlice(allocator, x.?);
+                try out.append(allocator, '\n');
+            } else {
+                try out.append(allocator, '-');
+                try out.appendSlice(allocator, x.?);
+                try out.append(allocator, '\n');
+                try out.append(allocator, '+');
+                try out.appendSlice(allocator, y.?);
+                try out.append(allocator, '\n');
+            }
+        } else if (x != null) {
+            try out.append(allocator, '-');
+            try out.appendSlice(allocator, x.?);
+            try out.append(allocator, '\n');
+        } else if (y != null) {
+            try out.append(allocator, '+');
+            try out.appendSlice(allocator, y.?);
+            try out.append(allocator, '\n');
+        }
+    }
+    if (report.klio_error) |e| {
+        try out.appendSlice(allocator, "klio error: ");
+        try out.appendSlice(allocator, e);
+        try out.append(allocator, '\n');
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// `str.lines()` semantics: split on `\n`, drop a final trailing empty token.
+fn collectLines(allocator: Allocator, s: []const u8, out: *std.ArrayList([]const u8)) Allocator.Error!void {
+    var it = std.mem.splitScalar(u8, s, '\n');
+    while (it.next()) |l| {
+        try out.append(allocator, l);
+    }
+    if (out.items.len > 0 and out.items[out.items.len - 1].len == 0) {
+        _ = out.pop();
+    }
+}
+
+// ---------------------- corpus build + parallel sweep ----------------------
+
+pub const CorpusEntry = struct {
+    original: []u8,
+    staged: []u8,
+    fqcn: []u8,
+
+    pub fn deinit(self: CorpusEntry, allocator: Allocator) void {
+        allocator.free(self.original);
+        allocator.free(self.staged);
+        allocator.free(self.fqcn);
+    }
+};
+
+pub const CorpusBuild = struct {
+    jar: []u8,
+    stage_dir: []u8,
+    classes: []CorpusEntry,
+
+    pub fn deinit(self: CorpusBuild, allocator: Allocator) void {
+        allocator.free(self.jar);
+        allocator.free(self.stage_dir);
+        for (self.classes) |c| c.deinit(allocator);
+        allocator.free(self.classes);
+    }
+};
+
+pub const SweepVerdict = union(enum) {
+    Pass,
+    Mismatch: *ParityReport,
+    KlioError: []u8,
+    KotlincError: []u8,
+    Timeout,
+
+    pub fn deinit(self: SweepVerdict, allocator: Allocator) void {
+        switch (self) {
+            .Mismatch => |r| {
+                allocator.free(r.kotlinc_stdout);
+                allocator.free(r.klio_stdout);
+                if (r.klio_error) |e| allocator.free(e);
+                allocator.destroy(r);
+            },
+            .KlioError, .KotlincError => |m| allocator.free(m),
+            .Pass, .Timeout => {},
+        }
+    }
+};
+
+pub const SweepEntryResult = struct {
+    path: []u8,
+    verdict: SweepVerdict,
+
+    pub fn deinit(self: SweepEntryResult, allocator: Allocator) void {
+        allocator.free(self.path);
+        self.verdict.deinit(allocator);
+    }
+};
+
+pub const SweepResult = struct {
+    results: []SweepEntryResult,
+
+    pub fn deinit(self: SweepResult, allocator: Allocator) void {
+        for (self.results) |r| r.deinit(allocator);
+        allocator.free(self.results);
+    }
+
+    pub fn passed(self: *const SweepResult) usize {
+        var n: usize = 0;
+        for (self.results) |r| {
+            if (r.verdict == .Pass) n += 1;
+        }
+        return n;
+    }
+};
+
+fn corpusEntryKey(allocator: Allocator, io: Io, staged: []const u8) Allocator.Error![]u8 {
+    const bytes = readFileOrEmpty(allocator, io, staged);
+    defer allocator.free(bytes);
+    const hex = try hashHex(allocator, bytes);
+    defer allocator.free(hex);
+    return std.fmt.allocPrint(allocator, "corpus-{s}", .{hex});
+}
+
+fn corpusCacheKey(allocator: Allocator, io: Io, label: []const u8, files: []const []const u8) Allocator.Error![]u8 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(label);
+    const sorted = try allocator.dupe([]const u8, files);
+    defer allocator.free(sorted);
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    for (sorted) |f| {
+        h.update(std.fs.path.basename(f));
+        const bytes = readFileOrEmpty(allocator, io, f);
+        defer allocator.free(bytes);
+        h.update(bytes);
+    }
+    return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
+}
+
+/// True when every staged entry already has a cached corpus output.
+pub fn corpusOutputsAllCached(allocator: Allocator, io: Io, staged: []const []const u8) bool {
+    for (staged) |s| {
+        const key = corpusEntryKey(allocator, io, s) catch return false;
+        defer allocator.free(key);
+        const hit = readExpected(allocator, io, key) catch return false;
+        if (hit) |h| {
+            allocator.free(h.stdout);
+        } else return false;
+    }
+    return true;
+}
+
+/// Run a specific fully-qualified main class out of `jar`.
+pub fn runClass(allocator: Allocator, io: Io, jar: []const u8, fqcn: []const u8) Allocator.Error!PResult(ExpectedHit) {
+    const java = switch (try locateJava(allocator, io)) {
+        .err => |e| return .{ .err = e },
+        .ok => |j| j,
+    };
+    defer allocator.free(java);
+    var env = try procEnvMap(allocator, io);
+    defer env.deinit();
+    const xmx = try std.fmt.allocPrint(allocator, "-Xmx{d}m", .{javaXmxMb(allocator, io)});
+    defer allocator.free(xmx);
+    const r = std.process.run(allocator, io, .{
+        .argv = &.{ java, xmx, "-cp", jar, fqcn },
+        .environ_map = &env,
+        .timeout = javaTimeout(allocator, io),
+    }) catch {
+        return .{ .err = .{ .Io = try allocator.dupe(u8, "spawn java") } };
+    };
+    allocator.free(r.stderr);
+    return .{ .ok = .{ .stdout = r.stdout, .exit = termExit(r.term) } };
+}
+
+/// kotlinc output for one corpus entry, cached by staged-source hash. On a miss
+/// the class is run via `runClass`.
+pub fn corpusEntryOutput(allocator: Allocator, io: Io, staged: []const u8, jar: []const u8, fqcn: []const u8) Allocator.Error!PResult(ExpectedHit) {
+    const key = try corpusEntryKey(allocator, io, staged);
+    defer allocator.free(key);
+    if (try readExpected(allocator, io, key)) |hit| return .{ .ok = hit };
+    const run = switch (try runClass(allocator, io, jar, fqcn)) {
+        .err => |e| return .{ .err = e },
+        .ok => |r| r,
+    };
+    try writeExpected(allocator, io, key, run.stdout, run.exit);
+    return .{ .ok = run };
+}
+
+/// Compile a whole list of `.kt` files in one `kotlinc` invocation, each staged
+/// under a unique package. Cached by `(label, file contents)`.
+pub fn compileCorpus(allocator: Allocator, io: Io, label: []const u8, files: []const []const u8) Allocator.Error!PResult(CorpusBuild) {
+    const kotlinc = switch (try findKotlinc(allocator, io)) {
+        .err => |e| return .{ .err = e },
+        .ok => |k| k,
+    };
+    defer allocator.free(kotlinc);
+    var env = try procEnvMap(allocator, io);
+    defer env.deinit();
+    const cache = try parityCacheDir(allocator, io);
+    defer allocator.free(cache);
+    std.Io.Dir.cwd().createDirPath(io, cache) catch {};
+
+    const key = try corpusCacheKey(allocator, io, label, files);
+    defer allocator.free(key);
+    const jar = try std.fmt.allocPrint(allocator, "{s}/corpus-{s}-{s}.jar", .{ cache, label, key });
+    errdefer allocator.free(jar);
+    const stage = try std.fmt.allocPrint(allocator, "{s}/stage-{s}-{s}", .{ cache, label, key });
+    errdefer allocator.free(stage);
+
+    std.Io.Dir.cwd().deleteTree(io, stage) catch {};
+    std.Io.Dir.cwd().createDirPath(io, stage) catch {};
+    var classes: std.ArrayList(CorpusEntry) = .empty;
+    errdefer {
+        for (classes.items) |c| c.deinit(allocator);
+        classes.deinit(allocator);
+    }
+    for (files) |file| {
+        const stem_full = std.fs.path.basename(file);
+        const stem = if (std.mem.lastIndexOfScalar(u8, stem_full, '.')) |dot| stem_full[0..dot] else stem_full;
+        const pkg_seg = try sanitizePkgSegment(allocator, stem);
+        defer allocator.free(pkg_seg);
+        const pkg = try std.fmt.allocPrint(allocator, "klio_parity.{s}.{s}", .{ label, pkg_seg });
+        defer allocator.free(pkg);
+        const cap = try capitalizeFirst(allocator, stem);
+        defer allocator.free(cap);
+        const fqcn = try std.fmt.allocPrint(allocator, "{s}.{s}Kt", .{ pkg, cap });
+        const src = readFileOpt(allocator, io, file) orelse {
+            allocator.free(fqcn);
+            allocator.free(jar);
+            allocator.free(stage);
+            return .{ .err = .{ .Io = try std.fmt.allocPrint(allocator, "read {s}", .{file}) } };
+        };
+        defer allocator.free(src);
+        const rewritten = try injectJvmInline(allocator, src);
+        defer allocator.free(rewritten);
+        const shimmed = try std.fmt.allocPrint(allocator, "package {s}\n\n{s}", .{ pkg, rewritten });
+        defer allocator.free(shimmed);
+        const staged = try std.fmt.allocPrint(allocator, "{s}/{s}.kt", .{ stage, stem });
+        writeFile(io, staged, shimmed);
+        try classes.append(allocator, .{
+            .original = try allocator.dupe(u8, file),
+            .staged = staged,
+            .fqcn = fqcn,
+        });
+    }
+
+    const classes_slice = try classes.toOwnedSlice(allocator);
+    errdefer {
+        for (classes_slice) |c| c.deinit(allocator);
+        allocator.free(classes_slice);
+    }
+
+    if (isFile(io, jar)) {
+        return .{ .ok = .{ .jar = jar, .stage_dir = stage, .classes = classes_slice } };
+    }
+
+    const tmp = try std.fmt.allocPrint(allocator, "{s}/corpus-{s}-{s}.partial.jar", .{ cache, label, key });
+    defer allocator.free(tmp);
+    std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    std.Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    const r = std.process.run(allocator, io, .{
+        .argv = &.{ kotlinc, stage, "-include-runtime", "-d", tmp },
+        .environ_map = &env,
+    }) catch {
+        for (classes_slice) |c| c.deinit(allocator);
+        allocator.free(classes_slice);
+        allocator.free(jar);
+        allocator.free(stage);
+        return .{ .err = .{ .Io = try allocator.dupe(u8, "spawn kotlinc") } };
+    };
+    defer allocator.free(r.stdout);
+    defer allocator.free(r.stderr);
+    if (!termOk(r.term)) {
+        std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        for (classes_slice) |c| c.deinit(allocator);
+        allocator.free(classes_slice);
+        allocator.free(jar);
+        allocator.free(stage);
+        return .{ .err = .{ .Compile = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ r.stdout, r.stderr }) } };
+    }
+    std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), jar, io) catch {};
+    return .{ .ok = .{ .jar = jar, .stage_dir = stage, .classes = classes_slice } };
+}
+
+const SweepCtx = struct {
+    allocator: Allocator,
+    io: Io,
+    jar: []const u8,
+    entries: []const CorpusEntry,
+    next: std.atomic.Value(usize),
+    slots: []?SweepVerdict,
+};
+
+fn sweepOne(allocator: Allocator, io: Io, jar: []const u8, entry: *const CorpusEntry) Allocator.Error!SweepVerdict {
+    const ko = switch (try corpusEntryOutput(allocator, io, entry.staged, jar, entry.fqcn)) {
+        .err => |e| {
+            const msg = try e.message(allocator);
+            e.deinit(allocator);
+            return .{ .KotlincError = msg };
+        },
+        .ok => |v| v,
+    };
+    switch (try runWithKtc(allocator, io, entry.staged)) {
+        .ok => |klio_stdout| {
+            if (std.mem.eql(u8, ko.stdout, klio_stdout) or
+                knownJvmFloatDiff(entry.original, ko.stdout, klio_stdout))
+            {
+                allocator.free(ko.stdout);
+                allocator.free(klio_stdout);
+                return .Pass;
+            }
+            const report = try allocator.create(ParityReport);
+            report.* = .{
+                .matched = false,
+                .kotlinc_stdout = ko.stdout,
+                .klio_stdout = klio_stdout,
+                .kotlinc_exit = ko.exit,
+                .klio_error = null,
+            };
+            return .{ .Mismatch = report };
+        },
+        .err => |e| {
+            allocator.free(ko.stdout);
+            return .{ .KlioError = e };
+        },
+    }
+}
+
+fn sweepWorker(ctx: *SweepCtx) void {
+    while (true) {
+        const i = ctx.next.fetchAdd(1, .monotonic);
+        if (i >= ctx.entries.len) break;
+        const verdict = sweepOne(ctx.allocator, ctx.io, ctx.jar, &ctx.entries[i]) catch SweepVerdict.Timeout;
+        ctx.slots[i] = verdict;
+    }
+}
+
+/// Run the corpus/examples parity sweep for `paths`.
+pub fn runSweep(allocator: Allocator, io: Io, label: []const u8, paths: []const []const u8, jobs: usize) Allocator.Error!PResult(SweepResult) {
+    const build = switch (try compileCorpus(allocator, io, label, paths)) {
+        .err => |e| return .{ .err = e },
+        .ok => |b| b,
+    };
+    defer build.deinit(allocator);
+
+    const slots = try allocator.alloc(?SweepVerdict, build.classes.len);
+    defer allocator.free(slots);
+    for (slots) |*s| s.* = null;
+
+    var ctx = SweepCtx{
+        .allocator = allocator,
+        .io = io,
+        .jar = build.jar,
+        .entries = build.classes,
+        .next = std.atomic.Value(usize).init(0),
+        .slots = slots,
+    };
+
+    const n = @max(jobs, 1);
+    const threads = try allocator.alloc(?std.Thread, n);
+    defer allocator.free(threads);
+    var spawned_any = false;
+    for (threads) |*t| {
+        t.* = std.Thread.spawn(.{}, sweepWorker, .{&ctx}) catch null;
+    }
+    for (threads) |t| {
+        if (t) |th| {
+            th.join();
+            spawned_any = true;
+        }
+    }
+    if (!spawned_any) sweepWorker(&ctx);
+
+    const results = try allocator.alloc(SweepEntryResult, build.classes.len);
+    errdefer allocator.free(results);
+    for (build.classes, slots, 0..) |entry, slot, i| {
+        results[i] = .{
+            .path = try allocator.dupe(u8, entry.original),
+            .verdict = slot orelse SweepVerdict.Timeout,
+        };
+    }
+    return .{ .ok = .{ .results = results } };
+}
+
+// ---------------------- additional ported tests ----------------------
+
+test "plain_value_class_gets_annotation" {
+    const out = try injectJvmInline(std.testing.allocator, "value class UserId(val raw: Int)\n");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "@JvmInline\nvalue class UserId"));
+}
+
+test "modifier_chain_handled" {
+    const out = try injectJvmInline(std.testing.allocator, "public value class X(val a: Int)\n");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "@JvmInline\npublic value class X") != null);
+}
+
+test "existing_annotation_left_alone" {
+    const src = "@JvmInline\nvalue class X(val a: Int)\n";
+    const out = try injectJvmInline(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "indented_value_class_preserves_indent" {
+    const src = "    value class Inner(val a: Int)\n";
+    const out = try injectJvmInline(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("    @JvmInline\n    value class Inner(val a: Int)\n", out);
+}
+
+test "unrelated_lines_unchanged" {
+    const src = "fun main() { println(\"value class\") }\n";
+    const out = try injectJvmInline(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "cache_key_is_stable_for_same_contents" {
+    const a = std.testing.allocator;
+    var threaded = threadedIo(a);
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "klio-parity-cache-key.kt";
+    writeFile(io, path, "fun main() { println(1) }");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const k1 = try cacheKey(a, io, path);
+    defer a.free(k1);
+    const k2 = try cacheKey(a, io, path);
+    defer a.free(k2);
+    try std.testing.expectEqualStrings(k1, k2);
+}
+
+test "manifest_pat_match forms" {
+    try std.testing.expect(manifestPatMatch("a/b", "a/"));
+    try std.testing.expect(manifestPatMatch("a/b/c", "a/"));
+    try std.testing.expect(manifestPatMatch("foo.kt", "*.kt"));
+    try std.testing.expect(manifestPatMatch("foobar", "foo*"));
+    try std.testing.expect(manifestPatMatch("exact", "exact"));
+    try std.testing.expect(!manifestPatMatch("other", "exact"));
+}
+
+test "sanitize_pkg_segment suffixes reserved words" {
+    const a = std.testing.allocator;
+    const s1 = try sanitizePkgSegment(a, "class");
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("class_", s1);
+    const s2 = try sanitizePkgSegment(a, "widget");
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("widget", s2);
+}
+
+test "capitalize_first uppercases leading byte" {
+    const a = std.testing.allocator;
+    const s = try capitalizeFirst(a, "main");
+    defer a.free(s);
+    try std.testing.expectEqualStrings("Main", s);
+}
+
+test "known_jvm_float_diff only for listed file" {
+    try std.testing.expect(!knownJvmFloatDiff("other.kt", "1.0\n", "1.0\n"));
+    try std.testing.expect(knownJvmFloatDiff("double_pow.kt", "1.0\n", "1.0\n"));
+}
+
+test "capture output line splitting and join" {
+    var out = CaptureOutput.init(std.testing.allocator);
+    defer out.deinit();
+    out.output().writeln("hello");
+    out.output().write("wor");
+    out.output().write("ld\n");
+    const joined = try out.intoJoined(std.testing.allocator);
+    defer std.testing.allocator.free(joined);
+    try std.testing.expectEqualStrings("hello\nworld\n", joined);
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}
+
+test "TARGET_VERSION is the expected default" {
+    try std.testing.expectEqualStrings("2.3.21", TARGET_VERSION);
+}
+
+test "KotlincKind binary and env names" {
+    try std.testing.expectEqualStrings("kotlinc", KotlincKind.Jvm.binaryName());
+    try std.testing.expectEqualStrings("kotlinc-native", KotlincKind.Native.binaryName());
+    try std.testing.expectEqualStrings("KLIO_KOTLINC_JVM_HOME", KotlincKind.Jvm.envOverride());
+    try std.testing.expectEqualStrings("KLIO_KOTLINC_NATIVE", KotlincKind.Native.envOverride());
+}
+
+test "ParityError messages render like the Rust Display impl" {
+    const a = std.testing.allocator;
+    {
+        const m = try (ParityError{ .NoKotlinc = {} }).message(a);
+        defer a.free(m);
+        try std.testing.expect(std.mem.startsWith(u8, m, "kotlinc not found."));
+    }
+    {
+        const m = try (ParityError{ .NoJava = {} }).message(a);
+        defer a.free(m);
+        try std.testing.expect(std.mem.startsWith(u8, m, "java not found on PATH"));
+    }
+    {
+        var e = ParityError{ .Compile = try a.dupe(u8, "boom") };
+        defer e.deinit(a);
+        const m = try e.message(a);
+        defer a.free(m);
+        try std.testing.expectEqualStrings("kotlinc compile failed:\nboom", m);
+    }
+    {
+        var e = ParityError{ .UnsupportedPlatform = try a.dupe(u8, "linux-riscv64") };
+        defer e.deinit(a);
+        const m = try e.message(a);
+        defer a.free(m);
+        try std.testing.expectEqualStrings("no kotlinc prebuilt for platform: linux-riscv64", m);
+    }
+}
