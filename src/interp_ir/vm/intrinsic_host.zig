@@ -780,6 +780,21 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value, elastic: bool, gated
         var it = og.get().valueIterator();
         while (it.next()) |v| v.publishDeep(self.allocator);
     }
+    // Transition the shared container cells the child reads to the SHARED
+    // (rwlock) discipline so concurrent borrows from the worker don't race
+    // the parent's `RefCell`-style flag. Mirrors Rust's `Arc<...>` roots:
+    // `classes`, `anon_methods`, `class_default_outer`, plus the
+    // build-time-immutable `prog` image and its `installed_bindings`
+    // overlay every dispatch path borrows.
+    self.classes.publish();
+    self.anon_methods.publish();
+    self.class_default_outer.publish();
+    self.prog.publish();
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        pg.get().installed_bindings.publish();
+    }
     runtime.fenceAndPublish();
 
     const id = blk: {
