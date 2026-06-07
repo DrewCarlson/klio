@@ -819,11 +819,20 @@ fn schubfachF32(bits: u32) DigitsExp {
     return .{ .digits = s + @intFromBool(round_up), .exponent = k + dk };
 }
 
+/// A `Double`/`Float` rendered in Kotlin `toString` form never exceeds this
+/// many bytes: optional sign + 17 significant digits + `.` + `E` + sign +
+/// 3 exponent digits, with comfortable slack. Keeping the layout in a fixed
+/// stack buffer means rendering never allocates and never fails, so the
+/// callers (println, string templates, `Double.toString`) cannot fall back
+/// to a non-Kotlin shape on an allocator hiccup.
+pub const MAX_LEN: usize = 32;
+
 /// Render `(neg, digits, exponent)` (value = `+/-digits.10^exponent`) into
-/// Kotlin's `Double`/`Float` `toString` form: plain decimal when the
-/// scientific exponent is in `[-3, 6]`, else `d.ddddE+/-x` notation, always
-/// with a fractional part (`.0` for integers, single-digit mantissas).
-fn layoutKotlin(allocator: std.mem.Allocator, neg: bool, digits_in: u64, exponent_in: i32) ![]u8 {
+/// Kotlin's `Double`/`Float` `toString` form, writing into `buf` and
+/// returning the populated prefix: plain decimal when the scientific
+/// exponent is in `[-3, 6]`, else `d.ddddE+/-x` notation, always with a
+/// fractional part (`.0` for integers, single-digit mantissas).
+fn layoutKotlin(buf: *[MAX_LEN]u8, neg: bool, digits_in: u64, exponent_in: i32) []u8 {
     var digits = digits_in;
     var exponent = exponent_in;
     // Strip trailing zeros -- Schubfach may return e.g. `10.10^k`, which is
@@ -839,80 +848,102 @@ fn layoutKotlin(allocator: std.mem.Allocator, neg: bool, digits_in: u64, exponen
     const sci_exp = decimal_point - 1;
     const scientific = !(sci_exp >= -3 and sci_exp < 7);
 
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, @as(usize, @intCast(num_digits)) + 8);
+    var len: usize = 0;
+    const push = struct {
+        fn byte(b: *[MAX_LEN]u8, n: *usize, c: u8) void {
+            b[n.*] = c;
+            n.* += 1;
+        }
+        fn slice(b: *[MAX_LEN]u8, n: *usize, s: []const u8) void {
+            @memcpy(b[n.*..][0..s.len], s);
+            n.* += s.len;
+        }
+    };
     if (neg) {
-        try out.append(allocator, '-');
+        push.byte(buf, &len, '-');
     }
     if (scientific) {
-        try out.appendSlice(allocator, digit_str[0..1]);
-        try out.append(allocator, '.');
+        push.slice(buf, &len, digit_str[0..1]);
+        push.byte(buf, &len, '.');
         if (num_digits == 1) {
-            try out.append(allocator, '0');
+            push.byte(buf, &len, '0');
         } else {
-            try out.appendSlice(allocator, digit_str[1..]);
+            push.slice(buf, &len, digit_str[1..]);
         }
-        try out.append(allocator, 'E');
+        push.byte(buf, &len, 'E');
         // Kotlin prints a bare exponent: `E20`, `E-324` (no `+`, no pad).
         var exp_buf: [12]u8 = undefined;
         const exp_str = std.fmt.bufPrint(&exp_buf, "{d}", .{sci_exp}) catch unreachable;
-        try out.appendSlice(allocator, exp_str);
+        push.slice(buf, &len, exp_str);
     } else if (decimal_point <= 0) {
-        try out.appendSlice(allocator, "0.");
+        push.slice(buf, &len, "0.");
         var i: i32 = 0;
         while (i < -decimal_point) : (i += 1) {
-            try out.append(allocator, '0');
+            push.byte(buf, &len, '0');
         }
-        try out.appendSlice(allocator, digit_str);
+        push.slice(buf, &len, digit_str);
     } else if (decimal_point < num_digits) {
         const dp: usize = @intCast(decimal_point);
-        try out.appendSlice(allocator, digit_str[0..dp]);
-        try out.append(allocator, '.');
-        try out.appendSlice(allocator, digit_str[dp..]);
+        push.slice(buf, &len, digit_str[0..dp]);
+        push.byte(buf, &len, '.');
+        push.slice(buf, &len, digit_str[dp..]);
     } else {
-        try out.appendSlice(allocator, digit_str);
+        push.slice(buf, &len, digit_str);
         var i: i32 = 0;
         while (i < decimal_point - num_digits) : (i += 1) {
-            try out.append(allocator, '0');
+            push.byte(buf, &len, '0');
         }
-        try out.appendSlice(allocator, ".0");
+        push.slice(buf, &len, ".0");
     }
-    return out.toOwnedSlice(allocator);
+    return buf[0..len];
+}
+
+/// `kotlin.Double.toString` digit/layout engine, rendering into the
+/// caller's fixed `buf` and returning the populated prefix. Never allocates.
+pub fn formatDouble(buf: *[MAX_LEN]u8, d: f64) []const u8 {
+    if (std.math.isNan(d)) {
+        return "NaN";
+    }
+    if (std.math.isInf(d)) {
+        return if (d > 0.0) "Infinity" else "-Infinity";
+    }
+    if (d == 0.0) {
+        return if (std.math.signbit(d)) "-0.0" else "0.0";
+    }
+    const neg = std.math.signbit(d);
+    const de = schubfachF64(@bitCast(d));
+    return layoutKotlin(buf, neg, de.digits, de.exponent);
+}
+
+/// `kotlin.Float.toString` digit/layout engine, rendering into the caller's
+/// fixed `buf` and returning the populated prefix. Never allocates.
+pub fn formatFloat(buf: *[MAX_LEN]u8, f: f32) []const u8 {
+    if (std.math.isNan(f)) {
+        return "NaN";
+    }
+    if (std.math.isInf(f)) {
+        return if (f > 0.0) "Infinity" else "-Infinity";
+    }
+    if (f == 0.0) {
+        return if (std.math.signbit(f)) "-0.0" else "0.0";
+    }
+    const neg = std.math.signbit(f);
+    const de = schubfachF32(@bitCast(f));
+    return layoutKotlin(buf, neg, de.digits, de.exponent);
 }
 
 /// `kotlin.Double.toString` digit/layout engine. Caller owns the returned
 /// slice (allocated with `allocator`).
 pub fn doubleToString(allocator: std.mem.Allocator, d: f64) ![]u8 {
-    if (std.math.isNan(d)) {
-        return allocator.dupe(u8, "NaN");
-    }
-    if (std.math.isInf(d)) {
-        return allocator.dupe(u8, if (d > 0.0) "Infinity" else "-Infinity");
-    }
-    if (d == 0.0) {
-        return allocator.dupe(u8, if (std.math.signbit(d)) "-0.0" else "0.0");
-    }
-    const neg = std.math.signbit(d);
-    const de = schubfachF64(@bitCast(d));
-    return layoutKotlin(allocator, neg, de.digits, de.exponent);
+    var buf: [MAX_LEN]u8 = undefined;
+    return allocator.dupe(u8, formatDouble(&buf, d));
 }
 
 /// `kotlin.Float.toString` digit/layout engine. Caller owns the returned
 /// slice (allocated with `allocator`).
 pub fn floatToString(allocator: std.mem.Allocator, f: f32) ![]u8 {
-    if (std.math.isNan(f)) {
-        return allocator.dupe(u8, "NaN");
-    }
-    if (std.math.isInf(f)) {
-        return allocator.dupe(u8, if (f > 0.0) "Infinity" else "-Infinity");
-    }
-    if (f == 0.0) {
-        return allocator.dupe(u8, if (std.math.signbit(f)) "-0.0" else "0.0");
-    }
-    const neg = std.math.signbit(f);
-    const de = schubfachF32(@bitCast(f));
-    return layoutKotlin(allocator, neg, de.digits, de.exponent);
+    var buf: [MAX_LEN]u8 = undefined;
+    return allocator.dupe(u8, formatFloat(&buf, f));
 }
 
 /// Kotlin-compatible `Float.toString`. Caller owns the returned slice.

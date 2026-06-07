@@ -1156,23 +1156,13 @@ fn writeInstance(writer: *std.Io.Writer, inst_ref: ObjRef(InstanceData)) std.Io.
 }
 
 fn writeFloat64(writer: *std.Io.Writer, v: f64) std.Io.Writer.Error!void {
-    var buf: [64]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const s = float_fmt.kotlinDoubleToString(fba.allocator(), v) catch {
-        try writer.print("{d}", .{v});
-        return;
-    };
-    try writer.writeAll(s);
+    var buf: [float_fmt.MAX_LEN]u8 = undefined;
+    try writer.writeAll(float_fmt.formatDouble(&buf, v));
 }
 
 fn writeFloat32(writer: *std.Io.Writer, v: f32) std.Io.Writer.Error!void {
-    var buf: [64]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const s = float_fmt.kotlinFloatToString(fba.allocator(), v) catch {
-        try writer.print("{d}", .{v});
-        return;
-    };
-    try writer.writeAll(s);
+    var buf: [float_fmt.MAX_LEN]u8 = undefined;
+    try writer.writeAll(float_fmt.formatFloat(&buf, v));
 }
 
 fn writeChar(writer: *std.Io.Writer, unit: u16) std.Io.Writer.Error!void {

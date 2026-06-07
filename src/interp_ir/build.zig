@@ -378,7 +378,7 @@ fn literalToConst(e: *const ast.Expr) ?Const {
 
 /// Default `Value` for a non-nullable primitive property with no
 /// initializer — so such a field starts as `0`/`false` instead of `Null`.
-fn primitiveZeroFor(p: *const ast.Property) ?Value {
+pub fn primitiveZeroFor(p: *const ast.Property) ?Value {
     if (p.init != null or p.is_abstract or p.is_lateinit or p.getter != null or p.delegate != null) return null;
     const ty = p.ty orelse return null;
     if (ty.nullable) return null;

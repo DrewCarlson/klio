@@ -463,20 +463,48 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
 }
 
 pub fn readLambdaCapture(self: *VmHost, allocator: Allocator, lambda: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    _ = self;
-    _ = allocator;
-    _ = lambda;
-    _ = name;
-    return unsupported("VmHost.read_lambda_capture");
+    if (lambda.* == .IrClosure) {
+        const id = lambda.IrClosure.id;
+        const info = self.closures.get(@intCast(id)) orelse {
+            return .{ .err = .{ .Type = try std.fmt.allocPrint(allocator, "unknown IrClosure id {d}", .{id}) } };
+        };
+        for (info.capture_names, 0..) |cap_name, idx| {
+            if (std.mem.eql(u8, cap_name, name)) {
+                const g = info.captures.borrow();
+                defer g.deinit();
+                const items = g.get().items;
+                return .{ .ok = if (idx < items.len) items[idx] else .Null };
+            }
+        }
+        return .{ .err = .{ .Unbound = try std.fmt.allocPrint(allocator, "capture `{s}` not found in lambda", .{name}) } };
+    }
+    return .{ .err = .{ .Type = try std.fmt.allocPrint(allocator, "read_lambda_capture on non-lambda value `{s}`", .{lambda.typeFqn()}) } };
 }
 
 pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {
-    _ = self;
-    _ = allocator;
-    _ = module;
-    _ = body_func;
-    _ = captures;
-    return unsupported("VmHost.build_closure");
+    // Derive the lambda's param count + capture-name list from the body
+    // func so `LoadCapture` reads the right snapshot per closure.
+    var n_params: usize = 0;
+    var capture_names: [][]const u8 = &.{};
+    const i = @intFromEnum(body_func);
+    if (i < module.funcs.items.len) {
+        const f = &module.funcs.items[i];
+        n_params = f.params.len;
+        capture_names = try allocator.dupe([]const u8, f.capture_order);
+    }
+    // Live capture cell shared with the lambda body so its `StoreGlobal`
+    // writes propagate back to the closure's captures.
+    var cell_list: std.ArrayList(Value) = .empty;
+    try cell_list.appendSlice(allocator, captures);
+    const cell = try ObjRef(std.ArrayList(Value)).init(allocator, cell_list);
+    const id = try self.closures.push(.{
+        .body_func = body_func,
+        .n_params = n_params,
+        .capture_names = capture_names,
+        .captures = cell,
+    });
+    const caps_ref = try ValueSlice.init(allocator, try allocator.dupe(Value, captures));
+    return .{ .ok = .{ .IrClosure = .{ .id = id, .captures = caps_ref } } };
 }
 
 pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, params: []const []const u8, body: *const ast.Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {

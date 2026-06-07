@@ -945,15 +945,19 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
         }
         return 8;
     }
-    // Subtype / builtin-supers distance scoring.
-    const builtin_supers = builtinSupers(nm);
-    const nm_simple = simpleName(nm);
+    // Subtype distance scoring for an instance argument.
     if (arg.* == .Instance) {
         if (instanceSubtypeDistance(self, arg, nm)) |dist| {
             const d: i32 = @intCast(@min(dist, @as(usize, 20)));
             return 75 - d;
         }
     }
+    // Builtin runtime types satisfy their nominal supertypes (a `String`
+    // arg matches a `CharSequence` param, a `List` matches `Iterable`,
+    // etc.). Key the supertype list on the *argument's* value type and
+    // check whether the *parameter* name is among them.
+    const builtin_supers = builtinSupers(v_ty);
+    const nm_simple = simpleName(nm);
     for (builtin_supers, 0..) |s, pos| {
         if (std.mem.eql(u8, s, nm) or std.mem.eql(u8, s, nm_simple)) {
             const dist: i32 = @intCast(@min(pos, @as(usize, 20)));
@@ -1066,9 +1070,19 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
 /// Materialise a lazy sequence pipeline into a list. Delegates to the
 /// stdlib sequence materialiser through a `VmIntrinsicHost`.
 fn materialiseSequence(self: *VmHost, allocator: Allocator, seq_val: *const Value) Allocator.Error!union(enum) { ok: std.ArrayList(Value), err: EvalError } {
-    _ = self;
-    _ = seq_val;
-    return .{ .err = .{ .Unsupported = try std.fmt.allocPrint(allocator, "VmHost.materialise_sequence", .{}) } };
+    var sink = self.out_sink;
+    var intrinsic = makeIntrinsicHost(self);
+    defer deinitIntrinsicHost(&intrinsic);
+    const ihost = intrinsic.intrinsicHost();
+    const outcome = try stdlib.materialise_sequence(allocator, ihost, sink.output(), seq_val.*);
+    switch (outcome) {
+        .items => |items| {
+            var list: std.ArrayList(Value) = .empty;
+            try list.appendSlice(allocator, items);
+            return .{ .ok = list };
+        },
+        .err => |e| return .{ .err = try mapRuntimeError(allocator, e) },
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -2984,10 +2998,10 @@ const root_mod = @import("../interp_ir.zig");
 const NameValue = root_mod.NameValue;
 const AnonMethodEntry = root_mod.AnonMethodEntry;
 
-/// `(class, member)` key for `anon_methods`, joined with a NUL so the two
-/// segments can't collide.
+/// `(class, member)` key for `anon_methods`, unit-separated so the two
+/// segments can't collide. Must match `run.zig`/`host_fields.zig`.
 fn anonKey(allocator: Allocator, class_name: []const u8, member: []const u8) Allocator.Error![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ class_name, member });
+    return std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ class_name, member });
 }
 
 fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const u8, arity_name: []const u8, name: []const u8) ?AnonMethodEntry {
@@ -4060,31 +4074,379 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
 }
 
 pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    _ = self;
-    _ = allocator;
-    _ = receiver;
-    _ = name;
-    return unsupported("VmHost.member_ref");
+    // `X::class` is a class reference — return the class itself. For an
+    // instance receiver, reach into the runtime ClassDef.
+    if (std.mem.eql(u8, name, "class")) {
+        if (receiver.* == .Instance) {
+            const ig = receiver.Instance.borrow();
+            defer ig.deinit();
+            return .{ .ok = .{ .Class = ig.get().class.clone() } };
+        }
+        return .{ .ok = receiver.* };
+    }
+    // `recv::method` produces a callable wrapper backed by a synthetic
+    // Instance carrying `__bound_receiver__` + `__bound_name__`; the
+    // call_value path dispatches through them.
+    const identity = blk: {
+        const g = self.instance_id_counter.borrowMut();
+        defer g.deinit();
+        break :blk g.get().fetchAdd(1, .monotonic) + 1;
+    };
+    const cls_name = try std.fmt.allocPrint(allocator, "$bound_ref${s}", .{name});
+    const env = try ObjRef(runtime.Env).init(allocator, runtime.Env.init(allocator));
+    const synth_class = try ObjRef(ClassDef).init(allocator, .{
+        .name = cls_name,
+        .fqn = cls_name,
+        .annotation_names = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .body_properties = &.{},
+        .init_blocks = &.{},
+        .init_block_property_positions = &.{},
+        .is_data = false,
+        .is_value = false,
+        .is_object = false,
+        .is_enum = false,
+        .is_sealed = false,
+        .supertype_names = &.{},
+        .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+        .is_interface = false,
+        .is_fun_interface = false,
+        .parent_ctor_args = &.{},
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .is_anonymous = true,
+        .secondary_ctors = &.{},
+        .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(allocator, .empty),
+        .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(allocator, .empty),
+        .captured_env = env,
+        .supertype_delegates = try ObjRef(std.ArrayList(runtime.SupertypeDelegate)).init(allocator, .empty),
+        .delegate_forwarders = try ObjRef(std.ArrayList(runtime.MethodDef)).init(allocator, .empty),
+        .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+    });
+    var fields: std.ArrayList(InstanceData.Field) = .empty;
+    try fields.append(allocator, .{ .name = "__bound_receiver__", .value = receiver.* });
+    const name_dup = try allocator.dupe(u8, name);
+    try fields.append(allocator, .{ .name = "__bound_name__", .value = .{ .String = try ObjRef([]const u8).init(allocator, name_dup) } });
+    const inst = try ObjRef(InstanceData).init(allocator, .{
+        .class = synth_class,
+        .fields = fields,
+        .outer = null,
+        .identity = identity,
+        .native_state = null,
+    });
+    return .{ .ok = .{ .Instance = inst } };
+}
+
+/// First supertype name registered for `class_name` in the runtime class
+/// table (the head of the inheritance chain), if any. Caller owns nothing.
+fn firstSupertypeName(self: *VmHost, allocator: Allocator, class_name: []const u8) ?[]const u8 {
+    const g = self.classes.borrow();
+    defer g.deinit();
+    const d = g.get().get(class_name) orelse return null;
+    const dg = d.borrow();
+    defer dg.deinit();
+    const sups = dg.get().supertype_names;
+    if (sups.len == 0) return null;
+    return allocator.dupe(u8, sups[0]) catch null;
+}
+
+/// Whether `q` is one of `class_name`'s registered supertypes.
+fn ownerHasSupertype(self: *VmHost, class_name: []const u8, q: []const u8) bool {
+    const g = self.classes.borrow();
+    defer g.deinit();
+    const d = g.get().get(class_name) orelse return false;
+    const dg = d.borrow();
+    defer dg.deinit();
+    for (dg.get().supertype_names) |s| {
+        if (std.mem.eql(u8, s, q)) return true;
+    }
+    return false;
 }
 
 pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    _ = self;
-    _ = allocator;
-    _ = receiver;
-    _ = owner_class;
-    _ = qualifier;
-    _ = name;
-    _ = args;
     _ = arg_names;
-    return unsupported("VmHost.call_super");
+    // Find the parent class of owner_class — `super.method()` walks one
+    // step up the inheritance chain. With `super<Q>`, dispatch on Q
+    // directly; with `super@Q`, dispatch on Q's own parent.
+    var parent_name: ?[]const u8 = null;
+    if (qualifier) |q| {
+        if (ownerHasSupertype(self, owner_class, q)) {
+            parent_name = try allocator.dupe(u8, q);
+        } else {
+            parent_name = firstSupertypeName(self, allocator, q);
+        }
+    } else {
+        parent_name = firstSupertypeName(self, allocator, owner_class);
+    }
+    const start = parent_name orelse {
+        return .{ .err = try typeErr(allocator, "super.{s}: owner_class `{s}` has no parent", .{ name, owner_class }) };
+    };
+
+    // Walk the supertype chain starting at `start` and dispatch the first
+    // class on the chain that declares the method. Falling through to
+    // call_member would re-enter virtual dispatch on the original
+    // receiver and recurse forever for overriding methods.
+    var current: ?[]const u8 = start;
+    var step: usize = 0;
+    while (current) |cname| {
+        if (step > 128) break;
+        step += 1;
+        current = null;
+        // First, an IR class method named `name` on this class.
+        {
+            const mg = self.module.borrow();
+            const m = mg.get();
+            var found_fid: ?FuncId = null;
+            for (m.classes.items) |*cls_ir| {
+                if (!std.mem.eql(u8, cls_ir.name, cname)) continue;
+                for (cls_ir.methods) |fid| {
+                    const i = @intFromEnum(fid);
+                    if (i >= m.funcs.items.len) continue;
+                    if (std.mem.eql(u8, m.funcs.items[i].name, name)) {
+                        found_fid = fid;
+                        break;
+                    }
+                }
+                break;
+            }
+            if (found_fid) |fid| {
+                const func = m.funcs.items[@intFromEnum(fid)];
+                mg.deinit();
+                var all: std.ArrayList(Value) = .empty;
+                try all.append(allocator, receiver.*);
+                try all.appendSlice(allocator, args);
+                var iface = self.hostInterface();
+                const module_ref = self.module.clone();
+                defer module_ref.deinit();
+                return ir.eval.evalWith(allocator, module_ref.borrow().get(), &func, all, &iface);
+            }
+            mg.deinit();
+        }
+        // `super.<prop>` (a property read, lowered as a 0-arg CallSuper):
+        // no method named `name` on this class — look for its property
+        // getter. Walking from the parent skips the overriding subclass's
+        // getter, so `override val x get() = super.x` reads the base.
+        if (args.len == 0) {
+            const getter_fid: ?FuncId = blk: {
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                break :blk pg.get().instance_prop_getters.get(.{ .a = cname, .b = name });
+            };
+            if (getter_fid) |fid| {
+                const i = @intFromEnum(fid);
+                const mg = self.module.borrow();
+                const m = mg.get();
+                if (i < m.funcs.items.len) {
+                    const func = m.funcs.items[i];
+                    mg.deinit();
+                    var all: std.ArrayList(Value) = .empty;
+                    try all.append(allocator, receiver.*);
+                    var iface = self.hostInterface();
+                    const module_ref = self.module.clone();
+                    defer module_ref.deinit();
+                    return ir.eval.evalWith(allocator, module_ref.borrow().get(), &func, all, &iface);
+                }
+                mg.deinit();
+            }
+        }
+        // Step to the next non-interface supertype.
+        current = firstSupertypeName(self, allocator, cname);
+    }
+
+    // `super.<prop>` where the base property has no custom getter (a stored
+    // val/var): read the backing field off the receiver instance directly.
+    if (args.len == 0 and receiver.* == .Instance) {
+        const ig = receiver.Instance.borrow();
+        defer ig.deinit();
+        if (ig.get().get(name)) |v| return .{ .ok = v };
+    }
+
+    // The chain bottomed out at a builtin (`Any` / `Throwable`), which
+    // declares no IR method. Supply the inherited `Any`/`Throwable`
+    // semantics so `override fun toString() = "${super.toString()} …"`
+    // works through the exception hierarchy.
+    if (receiver.* == .Instance) {
+        const inst = receiver.Instance;
+        if (std.mem.eql(u8, name, "toString") and args.len == 0) {
+            const is_throwable = instanceIsThrowable(self, allocator, inst);
+            const ig = inst.borrow();
+            defer ig.deinit();
+            const fqn = blk: {
+                const cg = ig.get().class.borrow();
+                defer cg.deinit();
+                break :blk cg.get().fqn;
+            };
+            if (is_throwable) {
+                const msg: ?[]const u8 = if (ig.get().get("message")) |mv| switch (mv) {
+                    .String => |s| blk2: {
+                        const sg = s.borrow();
+                        defer sg.deinit();
+                        break :blk2 try allocator.dupe(u8, sg.get().*);
+                    },
+                    else => null,
+                } else null;
+                const s = if (msg) |m|
+                    try std.fmt.allocPrint(allocator, "{s}: {s}", .{ fqn, m })
+                else
+                    try allocator.dupe(u8, fqn);
+                return .{ .ok = .{ .String = try ObjRef([]const u8).init(allocator, s) } };
+            }
+            const s = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ fqn, ig.get().identity });
+            return .{ .ok = .{ .String = try ObjRef([]const u8).init(allocator, s) } };
+        }
+        if (std.mem.eql(u8, name, "hashCode") and args.len == 0) {
+            const ig = inst.borrow();
+            defer ig.deinit();
+            const hash: i64 = @bitCast(ig.get().identity);
+            return .{ .ok = Value.newInt(hash) };
+        }
+        if (std.mem.eql(u8, name, "equals") and args.len == 1) {
+            const same = switch (args[0]) {
+                .Instance => |o| ObjRef(InstanceData).ptrEq(inst, o),
+                else => false,
+            };
+            return .{ .ok = .{ .Bool = same } };
+        }
+    }
+    return .{ .err = try typeErr(allocator, "super.{s}: no matching method up the supertype chain from `{s}`", .{ name, owner_class }) };
 }
 
 pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {
-    _ = self;
-    _ = allocator;
-    _ = receiver;
-    _ = qualifier;
-    return unsupported("VmHost.qualified_this");
+    // Walk parent chain on the receiver's class for direct matches, then
+    // traverse the `outer` chain for inner-class / local-class scenarios.
+    // `this@Outer` from an Inner method walks to the captured outer.
+    if (receiver.* == .Instance) {
+        var cur: ?ObjRef(ClassDef) = blk: {
+            const ig = receiver.Instance.borrow();
+            defer ig.deinit();
+            break :blk ig.get().class.clone();
+        };
+        var step: usize = 0;
+        while (cur) |c| {
+            if (step > 128) {
+                c.deinit();
+                break;
+            }
+            step += 1;
+            const cg = c.borrow();
+            const matched = std.mem.eql(u8, cg.get().name, qualifier) or std.mem.eql(u8, cg.get().fqn, qualifier);
+            const next = blk: {
+                const pg = cg.get().parent.borrow();
+                defer pg.deinit();
+                break :blk if (pg.get().*) |p| p.clone() else null;
+            };
+            cg.deinit();
+            c.deinit();
+            if (matched) return .{ .ok = receiver.* };
+            cur = next;
+        }
+        // Walk the `outer` chain (inner-class / local-class capture).
+        var outer: ?Value = blk: {
+            const ig = receiver.Instance.borrow();
+            defer ig.deinit();
+            break :blk ig.get().outer;
+        };
+        var ostep: usize = 0;
+        while (outer) |ov| {
+            if (ostep > 128) break;
+            ostep += 1;
+            if (ov != .Instance) break;
+            const o_inst = ov.Instance;
+            var ocur: ?ObjRef(ClassDef) = blk: {
+                const ig = o_inst.borrow();
+                defer ig.deinit();
+                break :blk ig.get().class.clone();
+            };
+            var inner_step: usize = 0;
+            while (ocur) |c| {
+                if (inner_step > 128) {
+                    c.deinit();
+                    break;
+                }
+                inner_step += 1;
+                const cg = c.borrow();
+                const matched = std.mem.eql(u8, cg.get().name, qualifier) or std.mem.eql(u8, cg.get().fqn, qualifier);
+                const next = blk: {
+                    const pg = cg.get().parent.borrow();
+                    defer pg.deinit();
+                    break :blk if (pg.get().*) |p| p.clone() else null;
+                };
+                cg.deinit();
+                c.deinit();
+                if (matched) return .{ .ok = .{ .Instance = o_inst.clone() } };
+                ocur = next;
+            }
+            outer = blk: {
+                const ig = o_inst.borrow();
+                defer ig.deinit();
+                break :blk ig.get().outer;
+            };
+        }
+    }
+    // No class match — `this@<fn-label>` (extension/lambda label) resolves
+    // to the immediate receiver if the qualifier isn't a known class.
+    // First try matching the qualifier against the enclosing-`this` chain.
+    const chain = try enclosingThisChain(self, allocator);
+    defer allocator.free(chain);
+    for (chain) |encl_v| {
+        if (encl_v != .Instance) continue;
+        const o_inst = encl_v.Instance;
+        var ocur: ?ObjRef(ClassDef) = blk: {
+            const ig = o_inst.borrow();
+            defer ig.deinit();
+            break :blk ig.get().class.clone();
+        };
+        var inner_step: usize = 0;
+        while (ocur) |c| {
+            if (inner_step > 128) {
+                c.deinit();
+                break;
+            }
+            inner_step += 1;
+            const cg = c.borrow();
+            const matched = std.mem.eql(u8, cg.get().name, qualifier) or std.mem.eql(u8, cg.get().fqn, qualifier);
+            const next = blk: {
+                const pg = cg.get().parent.borrow();
+                defer pg.deinit();
+                break :blk if (pg.get().*) |p| p.clone() else null;
+            };
+            cg.deinit();
+            c.deinit();
+            if (matched) return .{ .ok = .{ .Instance = o_inst.clone() } };
+            ocur = next;
+        }
+    }
+    const known_class = blk: {
+        const g = self.classes.borrow();
+        defer g.deinit();
+        break :blk g.get().contains(qualifier);
+    };
+    if (!known_class and receiver.* != .Null) {
+        // `this@<fn-label>` — the qualifier is an extension/fn label.
+        // When the receiver isn't a real bound Instance, prefer the
+        // enclosing receiver if it differs from the lambda's own `this`.
+        const receiver_is_bound_instance = receiver.* == .Instance;
+        if (!receiver_is_bound_instance and chain.len > 0) {
+            const encl = chain[0];
+            const same = switch (encl) {
+                .Instance => |a| switch (receiver.*) {
+                    .Instance => |b| ObjRef(InstanceData).ptrEq(a, b),
+                    else => false,
+                },
+                else => false,
+            };
+            if (!same and encl != .Null and encl != .Unit) {
+                return .{ .ok = encl };
+            }
+        }
+        return .{ .ok = receiver.* };
+    }
+    return .{ .err = try typeErr(allocator, "`this@{s}` is not bound in this scope", .{qualifier}) };
 }
 
 const testing = std.testing;

@@ -12,9 +12,23 @@ const ir = @import("ir");
 const runtime = @import("runtime");
 const ast = @import("ast");
 
+const root = @import("../interp_ir.zig");
+const build = @import("../build.zig");
 const VmHost = @import("vmhost.zig").VmHost;
 
 const Allocator = std.mem.Allocator;
+const Module = ir.Module;
+const FuncId = ir.FuncId;
+const Env = runtime.Env;
+const InstanceData = runtime.InstanceData;
+const TypeShape = runtime.TypeShape;
+const ClassParamDef = runtime.ClassParamDef;
+const PropertyDef = runtime.PropertyDef;
+const MethodDef = runtime.MethodDef;
+const SupertypeDelegate = runtime.SupertypeDelegate;
+const StringSet = std.StringHashMap(void);
+const AnonMethodEntry = root.AnonMethodEntry;
+const NameValue = root.NameValue;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const ClassDef = runtime.ClassDef;
@@ -413,17 +427,209 @@ fn builtinExceptionParentMatch(tail: []const u8, target: []const u8) bool {
     return false;
 }
 
-pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!UnitResult {
+/// `(class, member)` key for `anon_methods`, unit-separated. Must match
+/// `run.zig`/`host_fields.zig`/`host_call_member.zig`.
+fn anonKey(allocator: Allocator, class_name: []const u8, member: []const u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ class_name, member });
+}
+
+/// Synthesize a runtime `ClassDef` matching `build_module`'s shape for a
+/// local (function-body) class lowered at runtime.
+fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!ObjRef(ClassDef) {
     _ = self;
-    _ = allocator;
-    _ = class;
-    return .{ .err = .{ .Unsupported = "VmHost.register_class" } };
+    var primary_params = try allocator.alloc(ClassParamDef, class.primary_params.len);
+    for (class.primary_params, 0..) |*p, i| {
+        primary_params[i] = .{
+            .property = p.property,
+            .name = p.name.name,
+            .default = if (p.default) |*e| e else null,
+            .declared_type = p.ty.name.name,
+            .declared_shape = try TypeShape.fromTypeRef(allocator, &p.ty),
+        };
+    }
+    var body_props: std.ArrayList(PropertyDef) = .empty;
+    for (class.members) |*m| {
+        if (m.* != .Property) continue;
+        const p = &m.Property;
+        try body_props.append(allocator, .{
+            .name = p.name.name,
+            .mutable = p.mutable,
+            .init = if (p.init) |*e| e else null,
+            .getter = if (p.getter) |*g| g else null,
+            .setter = if (p.setter) |*s| s else null,
+            .delegate = if (p.delegate) |*e| e else null,
+            .is_abstract = p.is_abstract,
+            .is_lateinit = p.is_lateinit,
+            .primitive_zero = build.primitiveZeroFor(p),
+        });
+    }
+    var supertype_names = try allocator.alloc([]const u8, class.supertypes.len);
+    for (class.supertypes, 0..) |*t, i| supertype_names[i] = t.name.name;
+
+    const env = try ObjRef(Env).init(allocator, Env.init(allocator));
+    return ObjRef(ClassDef).init(allocator, .{
+        .name = class.name.name,
+        .fqn = class.name.name,
+        .annotation_names = &.{},
+        .primary_params = primary_params,
+        .methods = &.{},
+        .body_properties = try body_props.toOwnedSlice(allocator),
+        .init_blocks = &.{},
+        .init_block_property_positions = &.{},
+        .is_data = class.is_data,
+        .is_value = class.is_value,
+        .is_object = false,
+        .is_enum = class.is_enum,
+        .is_sealed = class.is_sealed,
+        .supertype_names = supertype_names,
+        .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+        .is_interface = class.is_interface,
+        .is_fun_interface = class.is_fun_interface,
+        .parent_ctor_args = &.{},
+        .is_open = class.is_open,
+        .is_abstract = class.is_abstract,
+        .is_inner = class.is_inner,
+        .is_anonymous = false,
+        .secondary_ctors = &.{},
+        .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(allocator, .empty),
+        .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(allocator, .empty),
+        .captured_env = env,
+        .supertype_delegates = try ObjRef(std.ArrayList(SupertypeDelegate)).init(allocator, .empty),
+        .delegate_forwarders = try ObjRef(std.ArrayList(MethodDef)).init(allocator, .empty),
+        .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+    });
+}
+
+/// Lower each member function of `class` into a per-method side module and
+/// register it in `anon_methods` under both the arity-qualified and bare
+/// keys, with `capture_pairs` bound. `own_members` scopes bare-name
+/// resolution inside the bodies.
+fn lowerAndRegisterMethods(
+    self: *VmHost,
+    allocator: Allocator,
+    class: *const ast.Class,
+    own_members: *const StringSet,
+    capture_pairs: []const NameValue,
+) Allocator.Error!void {
+    for (class.members) |*m| {
+        if (m.* != .Function) continue;
+        const f = &m.Function;
+        if (f.body == null) continue;
+        const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+        const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, class.name.name, own_members);
+        const fid = func.id;
+        const caps = try allocator.dupe(NameValue, capture_pairs);
+        const entry: AnonMethodEntry = .{ .module = sub_ref, .func = fid, .captures = caps };
+        const tbl = self.anon_methods.borrowMut();
+        defer tbl.deinit();
+        const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
+        try tbl.get().put(try anonKey(allocator, class.name.name, arity_name), entry);
+        try tbl.get().put(try anonKey(allocator, class.name.name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = caps });
+    }
+}
+
+/// Collect a local class's own member names (primary-ctor properties, body
+/// properties, methods) into `out`.
+fn collectOwnMembers(class: *const ast.Class, out: *StringSet) Allocator.Error!void {
+    for (class.primary_params) |*p| {
+        if (p.property != null) try out.put(p.name.name, {});
+    }
+    for (class.members) |*m| {
+        switch (m.*) {
+            .Property => |*p| try out.put(p.name.name, {}),
+            .Function => |*f| try out.put(f.name.name, {}),
+            else => {},
+        }
+    }
+}
+
+pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!UnitResult {
+    // Local classes declared inside fn bodies arrive here at runtime.
+    // Synthesise the same ClassDef shape build_module produces and stash
+    // it in the Vm's class table.
+    const def = try synthLocalClassDef(self, allocator, class);
+    {
+        const g = self.classes.borrowMut();
+        defer g.deinit();
+        try g.get().put(class.name.name, def);
+    }
+    // Lower local-class methods into per-method side modules.
+    var own_members = StringSet.init(allocator);
+    defer own_members.deinit();
+    try collectOwnMembers(class, &own_members);
+    try lowerAndRegisterMethods(self, allocator, class, &own_members, &.{});
+    return .ok;
 }
 
 pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const ast.Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult {
-    _ = captured_names;
-    _ = captures;
-    return registerClass(self, allocator, class);
+    switch (try registerClass(self, allocator, class)) {
+        .ok => {},
+        .err => |e| return .{ .err = e },
+    }
+    // Snapshot `this` from the captured outer env so instances of this
+    // local class get an `outer` pointing back at the enclosing receiver.
+    var captured_this: ?Value = null;
+    for (captured_names, 0..) |n, i| {
+        if (std.mem.eql(u8, n, "this") and i < captures.len) {
+            captured_this = captures[i];
+            break;
+        }
+    }
+    if (captured_this) |this_val| {
+        const g = self.class_default_outer.borrowMut();
+        defer g.deinit();
+        try g.get().put(class.name.name, this_val);
+    }
+    // Re-lower the local class's methods with the captured outer's field
+    // + member names merged into own_members, so bare references to outer
+    // properties lower as `this.X` and resolve via the outer chain.
+    if (captured_this) |tv| {
+        if (tv == .Instance) {
+            var own_members = StringSet.init(allocator);
+            defer own_members.deinit();
+            {
+                const ig = tv.Instance.borrow();
+                defer ig.deinit();
+                const cg = ig.get().class.borrow();
+                defer cg.deinit();
+                for (cg.get().primary_params) |p| try own_members.put(p.name, {});
+                for (cg.get().body_properties) |p| try own_members.put(p.name, {});
+            }
+            try collectOwnMembers(class, &own_members);
+            const capture_pairs = try buildCapturePairs(allocator, captured_names, captures);
+            try lowerAndRegisterMethods(self, allocator, class, &own_members, capture_pairs);
+            return .ok;
+        }
+    }
+    // No `this` instance captured: patch the just-registered method
+    // entries with the captured outer-env so dispatch can layer them
+    // under globals.
+    const capture_pairs = try buildCapturePairs(allocator, captured_names, captures);
+    if (capture_pairs.len == 0) return .ok;
+    const tbl = self.anon_methods.borrowMut();
+    defer tbl.deinit();
+    for (class.members) |*m| {
+        if (m.* != .Function) continue;
+        const f = &m.Function;
+        const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
+        for ([_][]const u8{ arity_name, f.name.name }) |member| {
+            const key = try anonKey(allocator, class.name.name, member);
+            if (tbl.get().getPtr(key)) |entry| {
+                entry.captures = capture_pairs;
+            }
+        }
+    }
+    return .ok;
+}
+
+fn buildCapturePairs(allocator: Allocator, captured_names: []const []const u8, captures: []const Value) Allocator.Error![]NameValue {
+    const n = @min(captured_names.len, captures.len);
+    var pairs = try allocator.alloc(NameValue, n);
+    for (0..n) |i| pairs[i] = .{ .name = captured_names[i], .value = captures[i] };
+    return pairs;
 }
 
 // -------------------------------------------------------------------------

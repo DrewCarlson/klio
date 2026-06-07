@@ -18,11 +18,18 @@ const vmhost = @import("vmhost.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
+const build = @import("../build.zig");
+
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const InstanceData = runtime.InstanceData;
 const ClassDef = runtime.ClassDef;
+const Env = runtime.Env;
+const PropertyDef = runtime.PropertyDef;
+const MethodDef = runtime.MethodDef;
+const SupertypeDelegate = runtime.SupertypeDelegate;
+const TypeShape = runtime.TypeShape;
 const StdlibFn = runtime.StdlibFn;
 const CallCtx = runtime.CallCtx;
 const Module = ir.Module;
@@ -32,6 +39,9 @@ const TypeRef = ir.TypeRef;
 const EvalResult = ir.eval.EvalResult;
 const EvalError = ir.eval.EvalError;
 const StrPair = ir.StrPair;
+const StringSet = std.StringHashMap(void);
+const AnonMethodEntry = root.AnonMethodEntry;
+const NameValue = root.NameValue;
 
 fn unsupported(name: []const u8) EvalResult {
     return .{ .err = .{ .Unsupported = name } };
@@ -957,6 +967,16 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     }
     // Builtin Throwable hierarchy: host-backed via the intrinsic.
     if (root.isBuiltinThrowableFqn(ir_fqn)) {
+        if (lookupIntrinsic(self, ir_fqn)) |intrinsic| {
+            return dispatchIntrinsic(self, intrinsic, args);
+        }
+    }
+    // Builtin tuple classes (`kotlin.Pair` / `kotlin.Triple`) have a
+    // distinct runtime `Value` representation and an intrinsic
+    // constructor; route construction there so the result is a
+    // `Value.Pair` / `Value.Triple` rather than a generic data-class
+    // Instance (which would print as `Pair(first=…, second=…)`).
+    if (std.mem.eql(u8, ir_fqn, "kotlin.Pair") or std.mem.eql(u8, ir_fqn, "kotlin.Triple")) {
         if (lookupIntrinsic(self, ir_fqn)) |intrinsic| {
             return dispatchIntrinsic(self, intrinsic, args);
         }
@@ -2036,13 +2056,457 @@ fn isThrowableChainName(name: []const u8) bool {
 // `build_object` lives in `host_classes.rs`; the vtable routes it here.
 // -------------------------------------------------------------------------
 
+/// `(class, member)` key for `anon_methods`, unit-separated. Must match
+/// `run.zig`/`host_fields.zig`/`host_call_member.zig`.
+fn anonKey(allocator: Allocator, class_name: []const u8, member: []const u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ class_name, member });
+}
+
+fn buildCapturePairs(allocator: Allocator, captured_names: []const []const u8, captures: []const Value) Allocator.Error![]NameValue {
+    const n = @min(captured_names.len, captures.len);
+    var pairs = try allocator.alloc(NameValue, n);
+    for (0..n) |i| pairs[i] = .{ .name = captured_names[i], .value = captures[i] };
+    return pairs;
+}
+
+fn findCapture(pairs: []const NameValue, name: []const u8) ?Value {
+    for (pairs) |p| {
+        if (std.mem.eql(u8, p.name, name)) return p.value;
+    }
+    return null;
+}
+
+/// Synthesize a body-less 0-arg getter/init thunk `Function` from an
+/// accessor or expression body so it can be lowered as an anon method.
+fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef, is_override: bool) ast.Function {
+    return .{
+        .name = name,
+        .receiver_type = null,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = &.{},
+        .return_type = return_type,
+        .body = body,
+        .is_open = false,
+        .is_override = is_override,
+        .is_abstract = false,
+        .is_operator = false,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = name.span,
+    };
+}
+
 pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult {
+    if (expr.* != .ObjectExpr) {
+        return .{ .err = try typeErr(allocator, "Vm::build_object: not an ObjectExpr AST node", .{}) };
+    }
+    const obj = expr.ObjectExpr;
+    const members = obj.members;
+    const supertypes = obj.supertypes;
+    const supertype_args = obj.supertype_args;
+
+    const capture_pairs = try buildCapturePairs(allocator, captured_names, captures);
+    const identity = nextInstanceId(self);
+    const synth_class_name = try std.fmt.allocPrint(allocator, "$anon${d}", .{identity});
+
+    // Collect the anon object's own + inherited + enclosing member names so
+    // bare identifiers inside method bodies resolve through `this`.
+    var own_members = StringSet.init(allocator);
+    defer own_members.deinit();
+    for (members) |*m| {
+        switch (m.*) {
+            .Property => |*p| try own_members.put(p.name.name, {}),
+            .Function => |*f| try own_members.put(f.name.name, {}),
+            else => {},
+        }
+    }
+    for (supertypes) |*sup| {
+        const pdef = classDefByName(self, sup.name.name) orelse continue;
+        defer pdef.deinit();
+        const dg = pdef.borrow();
+        defer dg.deinit();
+        for (dg.get().primary_params) |p| try own_members.put(p.name, {});
+        for (dg.get().body_properties) |p| try own_members.put(p.name, {});
+        for (dg.get().methods) |me| try own_members.put(me.name, {});
+    }
+    if (findCapture(capture_pairs, "this")) |tv| {
+        if (tv == .Instance) {
+            const ig = tv.Instance.borrow();
+            defer ig.deinit();
+            const cg = ig.get().class.borrow();
+            defer cg.deinit();
+            for (cg.get().primary_params) |p| try own_members.put(p.name, {});
+            for (cg.get().body_properties) |p| try own_members.put(p.name, {});
+            for (cg.get().methods) |me| try own_members.put(me.name, {});
+        }
+    }
+
+    // Names the object closes over that name a top-level *extension* fn
+    // must NOT be value-captured; drop them so the body resolves them
+    // through the global/member path.
+    var anon_cap_set = StringSet.init(allocator);
+    for (captured_names) |n| {
+        var names_extension = false;
+        const mg = self.module.borrow();
+        const m = mg.get();
+        for (m.funcsBySimpleName(n)) |fid| {
+            const i = @intFromEnum(fid);
+            if (i < m.funcs.items.len) {
+                const f = &m.funcs.items[i];
+                if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) {
+                    names_extension = true;
+                    break;
+                }
+            }
+        }
+        mg.deinit();
+        if (!names_extension) try anon_cap_set.put(n, {});
+    }
+    ir.lower.setLowerAnonCaptures(anon_cap_set);
+    // `setLowerAnonCaptures` takes ownership; clear it after lowering.
+
+    // Lower each method + getter, and collect complex property-init thunks.
+    const ComplexInit = struct { name: []const u8, module: ObjRef(Module), func: FuncId };
+    var complex_prop_inits: std.ArrayList(ComplexInit) = .empty;
+    for (members) |*m| {
+        switch (m.*) {
+            .Function => |*f| {
+                if (f.body == null) continue;
+                const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, synth_class_name, &own_members);
+                const fid = func.id;
+                const tbl = self.anon_methods.borrowMut();
+                const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
+                tbl.get().put(try anonKey(allocator, synth_class_name, arity_name), .{ .module = sub_ref, .func = fid, .captures = capture_pairs }) catch {};
+                tbl.get().put(try anonKey(allocator, synth_class_name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = capture_pairs }) catch {};
+                tbl.deinit();
+            },
+            .Property => |*p| {
+                if (p.getter) |*getter| {
+                    const thunk = synthThunk(p.name, getter.body, getter.return_type, p.is_override);
+                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
+                    const fid = func.id;
+                    const key = try std.fmt.allocPrint(allocator, "$get${s}", .{p.name.name});
+                    const tbl = self.anon_methods.borrowMut();
+                    tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = fid, .captures = capture_pairs }) catch {};
+                    tbl.deinit();
+                }
+                const init_expr = if (p.init) |*e| e else continue;
+                const is_bare_path = init_expr.* == .Path and init_expr.Path.segments.len == 1;
+                const is_lit = (try simpleLiteral(allocator, init_expr)) != null;
+                if (is_lit or is_bare_path) continue;
+                const thunk_name: ast.Ident = .{
+                    .name = try std.fmt.allocPrint(allocator, "$init${s}", .{p.name.name}),
+                    .span = p.name.span,
+                };
+                const thunk = synthThunk(thunk_name, .{ .Expr = init_expr.* }, null, false);
+                const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
+                try complex_prop_inits.append(allocator, .{ .name = p.name.name, .module = sub_ref, .func = func.id });
+            },
+            else => {},
+        }
+    }
+    ir.lower.setLowerAnonCaptures(null);
+
+    // Body-property defs from the object's own properties.
+    var body_props: std.ArrayList(PropertyDef) = .empty;
+    for (members) |*m| {
+        if (m.* != .Property) continue;
+        const p = &m.Property;
+        try body_props.append(allocator, .{
+            .name = p.name.name,
+            .mutable = p.mutable,
+            .init = if (p.init) |*e| e else null,
+            .getter = if (p.getter) |*g| g else null,
+            .setter = if (p.setter) |*s| s else null,
+            .delegate = if (p.delegate) |*e| e else null,
+            .is_abstract = p.is_abstract,
+            .is_lateinit = p.is_lateinit,
+            .primitive_zero = build.primitiveZeroFor(p),
+        });
+    }
+    var supertype_names = try allocator.alloc([]const u8, supertypes.len);
+    for (supertypes, 0..) |*t, i| supertype_names[i] = t.name.name;
+
+    // First non-interface supertype as resolved parent class.
+    var anon_parent: ?ObjRef(ClassDef) = null;
+    for (supertype_names) |sn| {
+        const def = classDefByName(self, sn) orelse continue;
+        const is_iface = blk: {
+            const dg = def.borrow();
+            defer dg.deinit();
+            break :blk dg.get().is_interface;
+        };
+        if (!is_iface) {
+            anon_parent = def;
+            break;
+        }
+        def.deinit();
+    }
+
+    const env = try ObjRef(Env).init(allocator, Env.init(allocator));
+    const class_def = try ObjRef(ClassDef).init(allocator, .{
+        .name = synth_class_name,
+        .fqn = synth_class_name,
+        .annotation_names = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .body_properties = try body_props.toOwnedSlice(allocator),
+        .init_blocks = &.{},
+        .init_block_property_positions = &.{},
+        .is_data = false,
+        .is_value = false,
+        .is_object = false,
+        .is_enum = false,
+        .is_sealed = false,
+        .supertype_names = supertype_names,
+        .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, anon_parent),
+        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+        .is_interface = false,
+        .is_fun_interface = false,
+        .parent_ctor_args = &.{},
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .is_anonymous = true,
+        .secondary_ctors = &.{},
+        .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(allocator, .empty),
+        .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(allocator, .empty),
+        .captured_env = env,
+        .supertype_delegates = try ObjRef(std.ArrayList(SupertypeDelegate)).init(allocator, .empty),
+        .delegate_forwarders = try ObjRef(std.ArrayList(MethodDef)).init(allocator, .empty),
+        .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+    });
+
+    // Initialise body-property fields.
+    var fields: std.ArrayList(InstanceData.Field) = .empty;
+    {
+        const cg = class_def.borrow();
+        defer cg.deinit();
+        for (cg.get().body_properties) |p| {
+            var v: Value = .Null;
+            if (p.init) |init_expr| {
+                if (try simpleLiteral(allocator, init_expr)) |lit| {
+                    v = lit;
+                } else if (init_expr.* == .Path and init_expr.Path.segments.len == 1) {
+                    const nm = init_expr.Path.segments[0].name;
+                    if (findCapture(capture_pairs, nm)) |cv| {
+                        v = cv;
+                    } else if (findCapture(capture_pairs, "this")) |tv| {
+                        if (tv == .Instance) {
+                            const ig = tv.Instance.borrow();
+                            defer ig.deinit();
+                            if (ig.get().get(nm)) |fv| v = fv;
+                        }
+                    }
+                }
+            } else if (p.primitive_zero) |pz| {
+                v = pz;
+            }
+            try fields.append(allocator, .{ .name = p.name, .value = v });
+        }
+    }
+
+    // Populate parent primary-param fields from supertype ctor args, and
+    // stash each supertype's evaluated ctor args.
+    var super_args_by_class = std.StringHashMap([]Value).init(allocator);
+    for (supertypes, 0..) |*sup, idx| {
+        const arg_exprs = if (idx < supertype_args.len) (supertype_args[idx] orelse continue) else continue;
+        var vals = try allocator.alloc(Value, arg_exprs.len);
+        for (arg_exprs, 0..) |*ae, ai| {
+            vals[ai] = try evalSuperArg(self, allocator, ae, capture_pairs);
+        }
+        const parent_def = classDefByName(self, sup.name.name);
+        if (parent_def) |pdef| {
+            defer pdef.deinit();
+            const dg = pdef.borrow();
+            defer dg.deinit();
+            for (dg.get().primary_params, 0..) |param, pi| {
+                if (param.property == null) continue;
+                if (pi < vals.len) try fields.append(allocator, .{ .name = param.name, .value = vals[pi] });
+            }
+        }
+        try super_args_by_class.put(sup.name.name, vals);
+    }
+
+    // Register the anon ClassDef.
+    {
+        const g = self.classes.borrowMut();
+        defer g.deinit();
+        try g.get().put(synth_class_name, class_def.clone());
+    }
+
+    const outer: ?Value = findCapture(capture_pairs, "this");
+    const inst = try ObjRef(InstanceData).init(allocator, .{
+        .class = class_def,
+        .fields = fields,
+        .outer = outer,
+        .identity = identity,
+        .native_state = null,
+    });
+    const inst_value: Value = .{ .Instance = inst.clone() };
+
+    // Run the concrete superclass chain's body-property initializers.
+    var parent_chain: std.ArrayList(ObjRef(ClassDef)) = .empty;
+    defer {
+        for (parent_chain.items) |c| c.deinit();
+        parent_chain.deinit(allocator);
+    }
+    {
+        var cur: ?ObjRef(ClassDef) = blk: {
+            const ig = inst.borrow();
+            defer ig.deinit();
+            const cg = ig.get().class.borrow();
+            defer cg.deinit();
+            const pg = cg.get().parent.borrow();
+            defer pg.deinit();
+            break :blk if (pg.get().*) |p| p.clone() else null;
+        };
+        var step: usize = 0;
+        while (cur) |c| {
+            if (step > 128) {
+                c.deinit();
+                break;
+            }
+            step += 1;
+            const next = blk: {
+                const cg = c.borrow();
+                defer cg.deinit();
+                const pg = cg.get().parent.borrow();
+                defer pg.deinit();
+                break :blk if (pg.get().*) |p| p.clone() else null;
+            };
+            try parent_chain.append(allocator, c);
+            cur = next;
+        }
+    }
+    // Bottom-up so a parent's field exists before a nearer ancestor.
+    var ci: usize = parent_chain.items.len;
+    while (ci > 0) {
+        ci -= 1;
+        const cls = parent_chain.items[ci];
+        const cls_name = blk: {
+            const cg = cls.borrow();
+            defer cg.deinit();
+            break :blk cg.get().name;
+        };
+        const cls_args: []Value = super_args_by_class.get(cls_name) orelse &.{};
+        const props = blk: {
+            const cg = cls.borrow();
+            defer cg.deinit();
+            break :blk try allocator.dupe(PropertyDef, cg.get().body_properties);
+        };
+        for (props) |p| {
+            const fid = bodyPropInit(self, cls_name, p.name) orelse continue;
+            const mg = self.module.borrow();
+            const m = mg.get();
+            if (@intFromEnum(fid) >= m.funcs.items.len) {
+                mg.deinit();
+                continue;
+            }
+            const func = m.funcs.items[@intFromEnum(fid)];
+            mg.deinit();
+            var all: std.ArrayList(Value) = .empty;
+            try all.append(allocator, inst_value);
+            try all.appendSlice(allocator, cls_args);
+            var iface = self.hostInterface();
+            const module_ref = self.module.clone();
+            const r = try ir.eval.evalWith(allocator, module_ref.borrow().get(), &func, all, &iface);
+            module_ref.deinit();
+            switch (r) {
+                .ok => |v| {
+                    const already = blk: {
+                        const ig = inst.borrow();
+                        defer ig.deinit();
+                        break :blk ig.get().get(p.name) != null;
+                    };
+                    if (!already) {
+                        const ig = inst.borrowMut();
+                        defer ig.deinit();
+                        try ig.get().define(allocator, p.name, v);
+                    }
+                },
+                .err => |e| return .{ .err = e },
+            }
+        }
+    }
+
+    // Run the anon object's own complex property inits.
+    for (complex_prop_inits.items) |cpi| {
+        const mref = cpi.module;
+        const i = @intFromEnum(cpi.func);
+        const mg = mref.borrow();
+        const sub_mod = mg.get();
+        if (i >= sub_mod.funcs.items.len) {
+            mg.deinit();
+            continue;
+        }
+        const func = sub_mod.funcs.items[i];
+        const prev = self.globals.clone();
+        if (capture_pairs.len != 0) {
+            const scoped = try ObjRef(Env).init(allocator, Env.withParent(allocator, self.globals.clone()));
+            const sg = scoped.borrowMut();
+            for (capture_pairs) |nv| sg.get().define(nv.name, nv.value) catch {};
+            sg.deinit();
+            self.globals = scoped;
+        }
+        var cap_vec: std.ArrayList(Value) = .empty;
+        for (func.capture_order) |cn| {
+            if (std.mem.eql(u8, cn, "this")) {
+                try cap_vec.append(allocator, inst_value);
+            } else {
+                try cap_vec.append(allocator, findCapture(capture_pairs, cn) orelse .Null);
+            }
+        }
+        var all: std.ArrayList(Value) = .empty;
+        try all.append(allocator, inst_value);
+        var iface = self.hostInterface();
+        const r = try ir.eval.evalWithCaptures(allocator, sub_mod, &func, all, cap_vec, &iface);
+        mg.deinit();
+        self.globals.deinit();
+        self.globals = prev;
+        switch (r) {
+            .ok => |v| {
+                const ig = inst.borrowMut();
+                defer ig.deinit();
+                try ig.get().define(allocator, cpi.name, v);
+            },
+            .err => |e| return .{ .err = e },
+        }
+    }
+
+    return .{ .ok = inst_value };
+}
+
+/// Evaluate a supertype ctor-arg expression to a value: literals, then a
+/// bare captured name, then a field reached through the captured outer
+/// `this`.
+fn evalSuperArg(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, capture_pairs: []const NameValue) Allocator.Error!Value {
     _ = self;
-    _ = allocator;
-    _ = expr;
-    _ = captured_names;
-    _ = captures;
-    return unsupported("VmHost.build_object");
+    if (try simpleLiteral(allocator, expr)) |v| return v;
+    if (expr.* == .Path and expr.Path.segments.len == 1) {
+        const nm = expr.Path.segments[0].name;
+        if (findCapture(capture_pairs, nm)) |v| return v;
+        if (findCapture(capture_pairs, "this")) |tv| {
+            if (tv == .Instance) {
+                const ig = tv.Instance.borrow();
+                defer ig.deinit();
+                if (ig.get().get(nm)) |v| return v;
+            }
+        }
+    }
+    return .Null;
 }
 
 const testing = std.testing;
