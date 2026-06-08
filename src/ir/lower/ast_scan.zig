@@ -8,7 +8,7 @@ const ast = @import("ast");
 const Allocator = std.mem.Allocator;
 const Expr = ast.Expr;
 const Stmt = ast.Stmt;
-const StringSet = std.StringHashMap(void);
+pub const StringSet = std.StringHashMap(void);
 
 /// `expr as Any` (or transitively wrapped) — used by the
 /// boxed-equality routing.
@@ -282,6 +282,186 @@ fn collectVarDeclsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
     }
 }
 
+/// Names that any nested lambda inside these statements *assigns to*
+/// (plain `=`, compound `+=`, or `++`/`--`) — the write half of capture
+/// analysis. Recurses into nested lambdas. Unlike `namesReferencedInLambdas`
+/// (which records reads and writes alike), this records only mutation
+/// targets, so a caller can box exactly the captured names a closure
+/// writes regardless of whether they are `var` decls in the same scope or
+/// names bound elsewhere (e.g. an inlined function's parameters).
+pub fn namesAssignedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.Error!void {
+    for (stmts) |*s| try assignedInLambdasStmt(s, out);
+}
+
+fn assignedInLambdasStmt(s: *const Stmt, out: *StringSet) Allocator.Error!void {
+    switch (s.*) {
+        .Expr => |*e| try assignedInLambdasExpr(e, out),
+        .Assign => |a| {
+            try assignedInLambdasExpr(&a.target, out);
+            try assignedInLambdasExpr(&a.value, out);
+        },
+        .DestructuringDecl => |d| try assignedInLambdasExpr(&d.init, out),
+        .Decl => |d| switch (d) {
+            .Property => |p| {
+                if (p.init) |*e| try assignedInLambdasExpr(e, out);
+            },
+            .Function => |f| {
+                if (f.body) |fb| switch (fb) {
+                    .Block => |blk| try collectLambdaBodyAssigns(blk.stmts, out),
+                    .Expr => |*ex| try collectAssignTargets(ex, out),
+                };
+            },
+            else => {},
+        },
+    }
+}
+
+/// Recurse through non-lambda expression forms looking for a nested
+/// `Lambda`/`AnonFun`; once inside a lambda body, collect every assignment
+/// target it names.
+fn assignedInLambdasExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
+    switch (e.*) {
+        .Lambda => |l| try collectLambdaBodyAssigns(l.body.stmts, out),
+        .AnonFun => |af| {
+            if (af.body) |fb| switch (fb.*) {
+                .Block => |b| try collectLambdaBodyAssigns(b.stmts, out),
+                .Expr => |*ex| try collectAssignTargets(ex, out),
+            };
+        },
+        .Member => |m| try assignedInLambdasExpr(m.receiver, out),
+        .MemberRef => |m| try assignedInLambdasExpr(m.receiver, out),
+        .Unary => |u| try assignedInLambdasExpr(u.expr, out),
+        .Postfix => |u| try assignedInLambdasExpr(u.expr, out),
+        .Spread => |u| try assignedInLambdasExpr(u.expr, out),
+        .Throw => |u| try assignedInLambdasExpr(u.value, out),
+        .Labeled => |u| try assignedInLambdasExpr(u.expr, out),
+        .As => |u| try assignedInLambdasExpr(u.expr, out),
+        .IsCheck => |u| try assignedInLambdasExpr(u.expr, out),
+        .Call => |c| {
+            try assignedInLambdasExpr(c.callee, out);
+            for (c.args) |*a| try assignedInLambdasExpr(a, out);
+        },
+        .Index => |idx| {
+            try assignedInLambdasExpr(idx.receiver, out);
+            for (idx.args) |*a| try assignedInLambdasExpr(a, out);
+        },
+        .Binary => |bin| {
+            try assignedInLambdasExpr(bin.lhs, out);
+            try assignedInLambdasExpr(bin.rhs, out);
+        },
+        .If => |f| {
+            try assignedInLambdasExpr(f.cond, out);
+            try assignedInLambdasExpr(f.then_branch, out);
+            if (f.else_branch) |els| try assignedInLambdasExpr(els, out);
+        },
+        .While => |w| {
+            try assignedInLambdasExpr(w.cond, out);
+            try assignedInLambdasExpr(w.body, out);
+        },
+        .DoWhile => |w| {
+            if (w.body) |b| try assignedInLambdasExpr(b, out);
+            try assignedInLambdasExpr(w.cond, out);
+        },
+        .For => |f| {
+            try assignedInLambdasExpr(f.iter, out);
+            try assignedInLambdasExpr(f.body, out);
+        },
+        .Return => |r| {
+            if (r.value) |v| try assignedInLambdasExpr(v, out);
+        },
+        .Block => |b| try namesAssignedInLambdas(b.stmts, out),
+        .When => |w| {
+            if (w.subject) |s| try assignedInLambdasExpr(s, out);
+            for (w.branches) |*br| try assignedInLambdasExpr(&br.body, out);
+        },
+        .Try => |t| {
+            try namesAssignedInLambdas(t.body.stmts, out);
+            for (t.catches) |*c| try namesAssignedInLambdas(c.body.stmts, out);
+            if (t.finally) |fb| try namesAssignedInLambdas(fb.stmts, out);
+        },
+        .StringTemplate => |st| {
+            for (st.parts) |*p| switch (p.*) {
+                .Interp => |*ex| try assignedInLambdasExpr(ex, out),
+                else => {},
+            };
+        },
+        else => {},
+    }
+}
+
+/// Inside a lambda body, collect every single-segment assignment target
+/// (the names the lambda mutates), recursing into deeper lambdas too.
+fn collectLambdaBodyAssigns(stmts: []const Stmt, out: *StringSet) Allocator.Error!void {
+    for (stmts) |*s| {
+        switch (s.*) {
+            .Assign => |a| {
+                try collectAssignTargetPath(&a.target, out);
+                // The value side may itself contain deeper nested lambdas.
+                try assignedInLambdasExpr(&a.value, out);
+            },
+            .Expr => |*e| try collectAssignTargets(e, out),
+            .DestructuringDecl => |d| try assignedInLambdasExpr(&d.init, out),
+            .Decl => |d| switch (d) {
+                .Property => |p| {
+                    if (p.init) |*e| try assignedInLambdasExpr(e, out);
+                },
+                else => {},
+            },
+        }
+    }
+}
+
+/// Collect single-segment assignment / increment targets reachable through
+/// expression forms (covers `++`/`--`, and assignments nested in control
+/// flow), and recurse into any deeper lambda via `assignedInLambdasExpr`.
+fn collectAssignTargets(e: *const Expr, out: *StringSet) Allocator.Error!void {
+    switch (e.*) {
+        .Postfix => |u| {
+            if (u.op == .Inc or u.op == .Dec) try collectAssignTargetPath(u.expr, out);
+            try collectAssignTargets(u.expr, out);
+        },
+        .Unary => |u| {
+            if (u.op == .PreInc or u.op == .PreDec) try collectAssignTargetPath(u.expr, out);
+            try collectAssignTargets(u.expr, out);
+        },
+        .Block => |b| try collectLambdaBodyAssigns(b.stmts, out),
+        .If => |f| {
+            try collectAssignTargets(f.cond, out);
+            try collectAssignTargets(f.then_branch, out);
+            if (f.else_branch) |els| try collectAssignTargets(els, out);
+        },
+        .While => |w| {
+            try collectAssignTargets(w.cond, out);
+            try collectAssignTargets(w.body, out);
+        },
+        .DoWhile => |w| {
+            if (w.body) |b| try collectAssignTargets(b, out);
+            try collectAssignTargets(w.cond, out);
+        },
+        .For => |f| try collectAssignTargets(f.body, out),
+        .When => |w| {
+            for (w.branches) |*br| try collectAssignTargets(&br.body, out);
+        },
+        .Try => |t| {
+            try collectLambdaBodyAssigns(t.body.stmts, out);
+            for (t.catches) |*c| try collectLambdaBodyAssigns(c.body.stmts, out);
+            if (t.finally) |fb| try collectLambdaBodyAssigns(fb.stmts, out);
+        },
+        // A deeper nested lambda's writes also count for the outer scope.
+        .Lambda, .AnonFun => try assignedInLambdasExpr(e, out),
+        else => {},
+    }
+}
+
+fn collectAssignTargetPath(e: *const Expr, out: *StringSet) Allocator.Error!void {
+    switch (e.*) {
+        .Path => |p| {
+            if (p.segments.len == 1) try out.put(p.segments[0].name, {});
+        },
+        else => {},
+    }
+}
+
 /// `var`s declared in this frame and captured by a nested lambda need to
 /// be boxed into a shared `Value.Cell` (Kotlin `Ref` semantics) so a
 /// write from a coroutine / closure is visible at the decl site. The
@@ -458,4 +638,54 @@ test "compute boxed vars keeps only captured var decls" {
     defer boxed.deinit();
     try testing.expect(boxed.contains("captured"));
     try testing.expect(!boxed.contains("untouched"));
+}
+
+test "names assigned in lambdas reports writes but not bare reads" {
+    // { x -> written = x }  — `written` is an assignment target inside a
+    // nested lambda; `onlyread` is referenced but never assigned.
+    var wseg = [_]ast.Ident{.{ .name = "written", .span = dummySpan() }};
+    var wtarget = Expr{ .Path = .{ .segments = &wseg, .span = dummySpan() } };
+    var rseg = [_]ast.Ident{.{ .name = "onlyread", .span = dummySpan() }};
+    var rval = Expr{ .Path = .{ .segments = &rseg, .span = dummySpan() } };
+
+    var assign_stmt = Stmt{ .Assign = .{
+        .target = wtarget,
+        .op = .Assign,
+        .value = rval,
+        .span = dummySpan(),
+    } };
+    var lam_stmts = [_]Stmt{assign_stmt};
+    var lam = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &lam_stmts, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    var stmts = [_]Stmt{.{ .Expr = lam }};
+    _ = .{ &wtarget, &rval, &assign_stmt, &lam };
+
+    var out = StringSet.init(testing.allocator);
+    defer out.deinit();
+    try namesAssignedInLambdas(&stmts, &out);
+    try testing.expect(out.contains("written"));
+    try testing.expect(!out.contains("onlyread"));
+}
+
+test "names assigned in lambdas catches postfix increment target" {
+    // { _ -> count++ }
+    var cseg = [_]ast.Ident{.{ .name = "count", .span = dummySpan() }};
+    var ctarget = Expr{ .Path = .{ .segments = &cseg, .span = dummySpan() } };
+    var postfix = Expr{ .Postfix = .{ .op = .Inc, .expr = &ctarget, .span = dummySpan() } };
+    var lam_stmts = [_]Stmt{.{ .Expr = postfix }};
+    var lam = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &lam_stmts, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    var stmts = [_]Stmt{.{ .Expr = lam }};
+    _ = .{ &ctarget, &postfix, &lam };
+
+    var out = StringSet.init(testing.allocator);
+    defer out.deinit();
+    try namesAssignedInLambdas(&stmts, &out);
+    try testing.expect(out.contains("count"));
 }

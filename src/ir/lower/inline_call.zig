@@ -8,6 +8,7 @@ const ir = @import("../ir.zig");
 const build = @import("../build.zig");
 const expr_lower = @import("expr.zig");
 const inline_state = @import("inline_state.zig");
+const ast_scan = @import("ast_scan.zig");
 
 const Allocator = std.mem.Allocator;
 const FuncBuilder = build.FuncBuilder;
@@ -391,11 +392,61 @@ pub fn tryInlineCallWithTypeArgs(
     }
     try b.pushInlineName(fname);
     try b.pushScope();
+    // Precise captured-`var` carrier across the inline splice. The inline
+    // body is lowered into THIS (the caller's) builder, so its own `var`
+    // decls — and any inline parameter — that a nested closure inside the
+    // body *writes* must be boxed into a shared `Value.Cell` here, exactly
+    // as a captured `var` is at an ordinary lambda boundary. Without this
+    // the body lowers the write through the `StoreGlobal`-for-capture
+    // fallback, which only round-trips on the stdlib-HOF scoped env. Box
+    // them so the write lowers to `CellSet` on the shared cell and is
+    // visible on every closure-execution path. Names newly boxed here are
+    // recorded and unboxed after the splice so the mark never leaks onto a
+    // same-named caller local.
+    var boxed_here: std.ArrayList([]const u8) = .empty;
+    defer boxed_here.deinit(b.allocator);
+    var splice_boxed = ast_scan.StringSet.init(b.allocator);
+    defer splice_boxed.deinit();
+    if (body.* == .Block) {
+        // Body-declared `var`s captured-and-written by a nested closure.
+        var body_boxed = try ast_scan.computeBoxedVars(b.allocator, body.Block.stmts);
+        defer body_boxed.deinit();
+        var bit = body_boxed.keyIterator();
+        while (bit.next()) |k| try splice_boxed.put(k.*, {});
+        // Inline parameters written by a nested closure in the body. A
+        // parameter is not a body `var` decl, so `computeBoxedVars` does
+        // not see it; collect mutation targets inside nested lambdas and
+        // box any that name a parameter.
+        var assigned = ast_scan.StringSet.init(b.allocator);
+        defer assigned.deinit();
+        try ast_scan.namesAssignedInLambdas(body.Block.stmts, &assigned);
+        for (f.params) |*p| {
+            if (assigned.contains(p.name.name)) try splice_boxed.put(p.name.name, {});
+        }
+    }
     var lambda_map = std.StringHashMap(*const ast.Expr).init(b.allocator);
     for (f.params, 0..) |*p, i| {
         const a = ordered[i].?; // filled above
         const r = try lowerExpr(b, a);
-        try b.bind(p.name.name, r);
+        // A lambda argument is spliced inline (its body is expanded at the
+        // call site), so it is never a closure value to box — skip boxing
+        // it even if a deeper nested lambda mentions the param name.
+        const box_param = splice_boxed.contains(p.name.name) and a.* != .Lambda;
+        if (box_param and !b.isBoxed(p.name.name)) {
+            // Box the parameter into a shared cell. The scope-local `bind`
+            // is enough for `boxedCellReg` to recover the cell (it falls to
+            // `resolve` when no `mutable_home` is set), so the boxing mark
+            // and binding live only inside the spliced scope and are torn
+            // down with it — no flat `mutable_homes`/`mutables` entry leaks
+            // onto a same-named caller local.
+            const home = b.allocReg();
+            try b.push(.{ .MakeCell = .{ .dst = home, .src = r } });
+            try b.markBoxed(p.name.name);
+            try b.bind(p.name.name, home);
+            try boxed_here.append(b.allocator, p.name.name);
+        } else {
+            try b.bind(p.name.name, r);
+        }
         // `noinline` parameters opt out of the inline-lambda splicing
         // path. Their argument value still flows through the binding
         // above, but a call to that parameter inside the inlined body
@@ -493,6 +544,22 @@ pub fn tryInlineCallWithTypeArgs(
         const tp_global = try b.module.internConst(b.allocator, .{ .String = tp.name.name });
         try b.push(.{ .StoreGlobal = .{ .name = tp_global, .value = cls_reg } });
     }
+    // Mark body-declared `var`s that a nested closure writes as boxed so
+    // their decl emits `MakeCell` and the closure's write lands on the
+    // shared cell. (Params were boxed at bind time above; this covers
+    // `var`s declared inside the spliced body.) Record newly-boxed names so
+    // the mark is removed after the splice and cannot reach a same-named
+    // caller local.
+    {
+        var sit = splice_boxed.keyIterator();
+        while (sit.next()) |k| {
+            if (paramIndex(f, k.*) != null) continue; // params handled at bind time
+            if (!b.isBoxed(k.*)) {
+                try b.markBoxed(k.*);
+                try boxed_here.append(b.allocator, k.*);
+            }
+        }
+    }
     const result = b.allocReg();
     const unit0 = try b.emitConst(Const.Unit);
     try b.push(.{ .Move = .{ .dst = result, .src = unit0 } });
@@ -508,6 +575,9 @@ pub fn tryInlineCallWithTypeArgs(
     for (marked_rlp.items) |n| {
         b.unmarkReceiverLambdaParam(n);
     }
+    // Remove the boxing marks added for this splice so a same-named caller
+    // local keeps its own (un)boxed status.
+    for (boxed_here.items) |n| b.unmarkBoxed(n);
     b.popInlineReturn();
     b.popInlineLambdaFrame();
     try b.popScope();

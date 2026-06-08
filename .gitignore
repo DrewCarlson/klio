@@ -4,6 +4,7 @@ Cargo.lock.bak
 .DS_Store
 kotlin-language-spec
 kotlin
-.ideazig-out/
+.idea
+zig-out/
 .zig-cache/
 zig-pkg/

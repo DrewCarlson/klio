@@ -393,6 +393,11 @@ pub const FuncBuilder = struct {
     pub fn markBoxed(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.boxed_vars.put(name, {});
     }
+    /// Remove a boxing mark added transiently (e.g. for the duration of an
+    /// inline-body splice) so it cannot leak onto a same-named caller local.
+    pub fn unmarkBoxed(self: *FuncBuilder, name: []const u8) void {
+        _ = self.boxed_vars.remove(name);
+    }
     pub fn isBoxed(self: *const FuncBuilder, name: []const u8) bool {
         return self.boxed_vars.contains(name);
     }
