@@ -58,7 +58,6 @@ pub const collectVarDecls = ast_scan.collectVarDecls;
 
 // Builder-side helpers.
 pub const isAnyTypedPath = helpers.isAnyTypedPath;
-pub const lambdaMutatedOuterVars = helpers.lambdaMutatedOuterVars;
 pub const lambdaWritesOuterVar = helpers.lambdaWritesOuterVar;
 pub const boxedCellReg = helpers.boxedCellReg;
 pub const calleeLabel = helpers.calleeLabel;

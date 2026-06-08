@@ -1622,18 +1622,6 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
                 .backing = null,
             } });
         },
-        .WritebackCaptures => |wb| {
-            const lam = frame.read(wb.lambda);
-            var i: usize = 0;
-            while (i < wb.names.len and i < wb.dsts.len) : (i += 1) {
-                const name_str = constStr(frame.module, wb.names[i]) orelse
-                    return errResult(.{ .Type = "WritebackCaptures: name not a string const" });
-                switch (try host.readLambdaCapture(allocator, &lam, name_str)) {
-                    .ok => |v| try frame.write(wb.dsts[i], v),
-                    .err => |e| return errResult(e),
-                }
-            }
-        },
         .QualifiedThis => |qt| {
             const recv = frame.read(qt.receiver);
             const qual_str = constStr(frame.module, qt.qualifier) orelse
@@ -2587,7 +2575,6 @@ pub const Host = struct {
         call_value_with_this: ?*const fn (ctx: *anyopaque, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
         call_super: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
         qualified_this: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult = null,
-        read_lambda_capture: ?*const fn (ctx: *anyopaque, allocator: Allocator, lambda: *const Value, name: []const u8) Allocator.Error!EvalResult = null,
         member_ref: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult = null,
         build_closure: ?*const fn (ctx: *anyopaque, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult = null,
         build_ast_lambda: ?*const fn (ctx: *anyopaque, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult = null,
@@ -2741,11 +2728,6 @@ pub const Host = struct {
     pub fn qualifiedThis(self: Host, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {
         if (self.vtable.qualified_this) |f| return f(self.ctx, allocator, receiver, qualifier);
         return errResult(.{ .Unsupported = "Host.qualified_this" });
-    }
-
-    pub fn readLambdaCapture(self: Host, allocator: Allocator, lambda: *const Value, name: []const u8) Allocator.Error!EvalResult {
-        if (self.vtable.read_lambda_capture) |f| return f(self.ctx, allocator, lambda, name);
-        return errResult(.{ .Unsupported = "Host.read_lambda_capture" });
     }
 
     pub fn memberRef(self: Host, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {

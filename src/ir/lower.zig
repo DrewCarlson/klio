@@ -37,7 +37,6 @@ pub const collectVarDecls = mod.collectVarDecls;
 
 // Builder-side helpers.
 pub const isAnyTypedPath = mod.isAnyTypedPath;
-pub const lambdaMutatedOuterVars = mod.lambdaMutatedOuterVars;
 pub const lambdaWritesOuterVar = mod.lambdaWritesOuterVar;
 pub const boxedCellReg = mod.boxedCellReg;
 pub const calleeLabel = mod.calleeLabel;

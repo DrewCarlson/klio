@@ -261,46 +261,19 @@ pub fn evalClosureRaw(
         }
     }
 
-    // Layer a fresh env carrying the captures on top of globals so the
-    // body's StoreGlobal writes land there, then read them back into the
-    // closure's captures cell for the outer WritebackCaptures.
-    const scoped_env = try ObjRef(Env).init(self.allocator, Env.withParent(self.allocator, self.globals.clone()));
-    defer scoped_env.deinit();
-    {
-        const se = scoped_env.borrowMut();
-        defer se.deinit();
-        const n = @min(info.capture_names.len, capture_values.items.len);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            try se.get().define(info.capture_names[i], capture_values.items[i]);
-        }
-    }
-
+    // Run the body over the real top-level env. Captured `var`s a nested
+    // closure writes are shared `Value.Cell`s carried positionally in the
+    // captures, so a write is a `CellSet` on the shared cell and is visible
+    // at the declaration site with no name-seeded scratch env or read-back.
     var args_owned: std.ArrayList(Value) = .empty;
     try args_owned.appendSlice(self.allocator, call_args.items);
     var caps_owned: std.ArrayList(Value) = .empty;
     try caps_owned.appendSlice(self.allocator, capture_values.items);
 
-    var host = VmHost.borrowed(vmhost.SharedHandles.fromIntrinsic(self), scoped_env, out);
+    const state = vmhost.SharedHandles.fromIntrinsic(self);
+    var host = VmHost.borrowed(state, state.globals, out);
     var iface = host.hostInterface();
-    const result = try ir.eval.evalWithCaptures(self.allocator, module, func, args_owned, caps_owned, &iface);
-
-    // Read back updated capture values into the closure's captures cell.
-    var new_captures: std.ArrayList(Value) = .empty;
-    {
-        const se = scoped_env.borrow();
-        defer se.deinit();
-        for (info.capture_names) |n| {
-            try new_captures.append(self.allocator, se.get().lookup(n) orelse .Null);
-        }
-    }
-    {
-        const cap_g = info.captures.borrowMut();
-        defer cap_g.deinit();
-        cap_g.get().deinit(self.allocator);
-        cap_g.get().* = new_captures;
-    }
-    return result;
+    return ir.eval.evalWithCaptures(self.allocator, module, func, args_owned, caps_owned, &iface);
 }
 
 /// Resume a parked activation with `value`, raw `EvalError` out.
@@ -426,26 +399,11 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         }
         const func = &module.funcs.items[info.body_func.int()];
 
-        var capture_values: std.ArrayList(Value) = .empty;
+        var caps_owned: std.ArrayList(Value) = .empty;
         {
             const cap_g = info.captures.borrow();
             defer cap_g.deinit();
-            try capture_values.appendSlice(self.allocator, cap_g.get().items);
-        }
-
-        // Pre-define each captured name in a fresh env layered on globals
-        // so the body's StoreGlobal writes land there, then read the
-        // updated values back into the closure's captures.
-        const scoped_env = try ObjRef(Env).init(self.allocator, Env.withParent(self.allocator, self.globals.clone()));
-        defer scoped_env.deinit();
-        {
-            const se = scoped_env.borrowMut();
-            defer se.deinit();
-            const n = @min(info.capture_names.len, capture_values.items.len);
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                try se.get().define(info.capture_names[i], capture_values.items[i]);
-            }
+            try caps_owned.appendSlice(self.allocator, cap_g.get().items);
         }
 
         // Pad args to the body's declared arity with Null.
@@ -461,28 +419,14 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
             }
         }
 
-        var caps_owned: std.ArrayList(Value) = .empty;
-        try caps_owned.appendSlice(self.allocator, capture_values.items);
-        capture_values.deinit(self.allocator);
-
-        var host = VmHost.borrowed(vmhost.SharedHandles.fromIntrinsic(self), scoped_env, out);
+        // Run the body over the real top-level env. A captured `var` a nested
+        // closure writes is a shared `Value.Cell` carried positionally, so the
+        // write is a `CellSet` on the shared cell — visible at the declaration
+        // site with no name-seeded scratch env or capture read-back.
+        const state = vmhost.SharedHandles.fromIntrinsic(self);
+        var host = VmHost.borrowed(state, state.globals, out);
         var iface = host.hostInterface();
         const result = try ir.eval.evalWithCaptures(self.allocator, module, func, call_args, caps_owned, &iface);
-
-        var new_captures: std.ArrayList(Value) = .empty;
-        {
-            const se = scoped_env.borrow();
-            defer se.deinit();
-            for (info.capture_names) |n| {
-                try new_captures.append(self.allocator, se.get().lookup(n) orelse .Null);
-            }
-        }
-        {
-            const cap_g = info.captures.borrowMut();
-            defer cap_g.deinit();
-            cap_g.get().deinit(self.allocator);
-            cap_g.get().* = new_captures;
-        }
         return flattenEval(result);
     }
 

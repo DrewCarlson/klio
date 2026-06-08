@@ -547,22 +547,16 @@ fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg) Al
             }
             const seg = p.segments[0].name;
             if (b.isBoxed(seg)) {
+                // A captured-and-written outer var is boxed into a shared
+                // `Value.Cell` at its binding site (var decl, function /
+                // lambda parameter, or inline-splice parameter), so the
+                // write lands on the cell and is visible at the declaration
+                // site on every closure-execution path. This subsumes the
+                // former captured-outer `StoreGlobal` fallback.
                 const cell = try boxedCellReg(b, seg);
                 try b.push(.{ .CellSet = .{ .cell = cell, .value = combined } });
             } else if (b.mutableHome(seg)) |home| {
                 try b.push(.{ .Move = .{ .dst = home, .src = combined } });
-            } else if (b.knowsOuter(seg)) {
-                // Lambda body writing back to an outer-frame
-                // capture: emit StoreGlobal (which lands in
-                // the closure's scoped env) so the enclosing
-                // call site's `WritebackCaptures` syncs the
-                // value to the caller. Also rebind locally
-                // so subsequent reads inside the same body
-                // see the new value.
-                _ = try b.recordCapture(seg);
-                const n = try b.module.internConst(b.allocator, .{ .String = seg });
-                try b.push(.{ .StoreGlobal = .{ .name = n, .value = combined } });
-                try b.rebind(seg, combined);
             } else if (b.resolve(seg) != null) {
                 try b.rebind(seg, combined);
             } else if (b.hasOwnMember(seg) and b.resolve("this") != null) {

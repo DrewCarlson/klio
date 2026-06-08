@@ -302,9 +302,6 @@ fn vtCallSuper(ctx: *anyopaque, a: Allocator, receiver: *const Value, owner_clas
 fn vtQualifiedThis(ctx: *anyopaque, a: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {
     return host_call_member.qualifiedThis(hp(ctx), a, receiver, qualifier);
 }
-fn vtReadLambdaCapture(ctx: *anyopaque, a: Allocator, lambda: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return host_call_value.readLambdaCapture(hp(ctx), a, lambda, name);
-}
 fn vtBuildClosure(ctx: *anyopaque, a: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {
     return host_call_value.buildClosure(hp(ctx), a, module, body_func, captures);
 }
@@ -377,7 +374,6 @@ const host_vtable: Host.VTable = .{
     .build_object = vtBuildObject,
     .call_super = vtCallSuper,
     .qualified_this = vtQualifiedThis,
-    .read_lambda_capture = vtReadLambdaCapture,
     .build_closure = vtBuildClosure,
     .build_ast_lambda_with_flag_funcid = vtBuildAstLambdaWithFlagFuncid,
     .call_func = vtCallFunc,

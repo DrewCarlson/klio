@@ -116,26 +116,31 @@ the capturing frame never sees it; only the HOF path's `scoped_env` catches it.
 silently ignores a closure value rebound with overridden captures (the
 receiver-lambda binding the main path produces).
 
-**Why it is currently masked.** The HOF path's `scoped_env` write-back
-(`intrinsic_host.zig:523-536`) is, today, the **only** mechanism that makes a
-captured-`var` *write* from a stdlib HOF lambda visible at the declaration site
-when `computeBoxedVars` under-approximated (i.e. the var was not boxed into a
-`Cell`). So on the HOF path the syntactic StoreGlobal-for-capture fallback is
-quietly caught by the seeded child env, and on the direct path captured-`var`
-reads recover through the positional `LoadCapture` / enclosing-`this` chain. The
-green `closures_advanced` / `closures_deep` itests pass under this layering. The
-divergence is therefore a latent mechanism — provably present in the code, not
-yet exhibited by a failing program. This is exactly why §4.1's deletion of
-`scoped_env` + StoreGlobal-for-capture must NOT land before precise boxing /
-`StoreCapture` is proven (see §4.1 and the §6 sequencing note).
+**Resolved (4a + 4b).** This divergence was the HOF path's `scoped_env`
+write-back: historically the only mechanism that made a captured-`var` *write*
+from a stdlib HOF lambda visible at the declaration site when `computeBoxedVars`
+under-approximated (i.e. the var was not boxed into a `Cell`). 4a made the
+carrier precise (boxing captured-and-written `var`s — including across the inline
+splice — into a shared `Cell`); 4b then extended that boxing to function/lambda
+*parameters* a nested closure writes (the captured-param gap surfaced by a
+prove-dead pass: `toMap(destination){ consumeEach { destination += it } }`) and
+deleted both the `scoped_env` layering and the `StoreGlobal`-for-capture lowering
+(plus the now-dead `WritebackCaptures`/`readLambdaCapture` capture-sync). The HOF
+invoke path now runs the closure body over the real top-level env, identical to
+the main value path; a captured write is a `CellSet` on the shared cell and is
+visible by reference on every closure-execution path. `globals` is path-
+independent again. The `captured_var_carrier` e2e + `closures_advanced` /
+`closures_deep` itests pass unmodified.
 
-**Evidence summary.**
+**Evidence summary** (the `runtime env` / `write-back` rows are the pre-4b state;
+post-4b both paths run over the real top-level env with no write-back — captured
+writes round-trip through the shared `Cell`).
 
 | concern | main path | HOF/coroutine path |
 | --- | --- | --- |
 | capture source | value snapshot `host_call_value.zig:393-398` | side-table cell `intrinsic_host.zig:465-470` |
-| runtime env | raw `self.globals` | name-seeded `scoped_env` `intrinsic_host.zig:472-518` |
-| write-back | none | back into `info.captures` `intrinsic_host.zig:523-536` |
+| runtime env | raw `self.globals` | raw `self.globals` (post-4b; was name-seeded `scoped_env`) |
+| write-back | none | none (post-4b; was read-back into `info.captures`) |
 | `this` override | fresh closure value `host_call_value.zig:306-360` | mutate cell + restore `intrinsic_host.zig:603-660` |
 
 ### Class B — Receiver context lost across `suspend`/`inline`
@@ -423,26 +428,15 @@ class.
   becomes a thin adapter that forwards ALL callable/method invocation to the
   eval.Host implementations — as `invokeMethod` already does for members —
   keeping only genuinely intrinsic-only slots (coroutine seams, thread spawn).
-- **Stop swapping `self.globals`** — in two ordered steps that must NOT land
-  together. The `scoped_env` write-back (`intrinsic_host.zig:523-536`) is today
-  the *only* path that makes a captured-`var` write from a stdlib HOF lambda
-  visible at the decl site when `computeBoxedVars` under-approximated (§2 Class A,
-  "why it is currently masked"). Deleting it before captured-`var` writes have a
-  precise carrier would silently drop those mutations and regress
-  `closures_advanced` / `closures_deep`.
-  1. **First, prove a precise carrier.** Add an explicit, symmetric
-     `StoreCapture {idx}` instruction (mirroring positional `LoadCapture`), OR
-     make `computeBoxedVars` precise so every mutated capture is a `Cell`
-     (replacing the syntactic over-approximation at `ast_scan.zig:289-306`).
-     Land this with the differential harness (§5.1) and the closures itests
-     green, demonstrating captured-`var` writes round-trip with `globals`
-     unchanged.
-  2. **Only then, delete the fallbacks.** Remove the `StoreGlobal`-for-capture
-     lowering (`expr.zig:665-669`, `1424-1428`) and the `scoped_env` layering, so
-     `globals` always points at the real top-level env on every path. With the
-     precise carrier in place, `isShadowingCapture`/`storeGlobal`/`lookupGlobal`
-     (`host_globals.zig:624-690`) become path-independent, and reads and writes of
-     a captured name share one path on both invocation routes.
+- **Stop swapping `self.globals`** — DONE (4a then 4b). The precise carrier was
+  proven first (4a: box captured-and-written `var`s, including across the inline
+  splice, into a shared `Cell`; 4b extended it to function/lambda parameters a
+  nested closure writes), then the fallbacks were deleted (4b): the
+  `StoreGlobal`-for-capture lowering, the `scoped_env` layering on both HOF invoke
+  sites, and the now-dead `WritebackCaptures`/`readLambdaCapture` capture-sync.
+  `globals` now always points at the real top-level env on every path;
+  `isShadowingCapture`/`storeGlobal`/`lookupGlobal` are path-independent, and
+  reads and writes of a captured name share one path on both invocation routes.
 - **One capture-metadata authority.** Treat `func.capture_order` as canonical:
   the construction site emits capture values strictly in capture-order index
   order (assert it); `invokeClosure` stores exactly one capture vector keyed by
@@ -668,7 +662,7 @@ refactors, then the structural unifications in dependency order.
 | 2 | Single `dispatchUserFunc` choke point + invariant asserts (§5.3) | A/B detect | high | medium | L |
 | 3 | Fuzz generator for closures + suspend (§5.4) | A/B detect | high | low | M |
 | 4a | Precise captured-`var` carrier FIRST: `StoreCapture` instr OR precise boxing (replace syntactic `computeBoxedVars`), proven green with closures itests + §5.1 (§4.1) | A | high | medium | L |
-| 4b | THEN unify closure execution: one routine, one capture store, stop swapping `self.globals`, delete `StoreGlobal`-for-capture + `scoped_env` (§4.1) — must NOT land with 4a | A | high | high | L |
+| 4b | DONE — stop swapping `self.globals`, deleted `StoreGlobal`-for-capture + `scoped_env` + the now-dead `WritebackCaptures`/`readLambdaCapture` capture-sync; the HOF invoke path runs over the real top-level env and captured-`var` writes round-trip through the shared `Cell`. Required extending 4a's boxing to function/lambda *parameters* a nested closure writes (the captured-param gap, e.g. `toMap(destination){ consumeEach { destination += it } }`). (§4.1) | A | high | high | L |
 | 5 | `VmIntrinsicHost` becomes thin adapter delegating to eval.Host (§4.1) | A | high | medium | L |
 | 6 | Receiver context on `Frame`/`FrameSnapshot`; drop `outer_this`/`inner_outer_hint`; guards become params (§4.2) | B | high | high | XL |
 | 7 | Single name-resolution function; collapse "Or" instructions to `CallUnresolved`; registry func-kind (member-extension as its own kind, §4.3 caution) for extension scorer | A/B | high | medium | L |
