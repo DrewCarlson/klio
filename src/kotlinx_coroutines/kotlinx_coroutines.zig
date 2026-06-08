@@ -340,8 +340,7 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
         const exc = try closedReceiveExc(ctx.allocator);
         for (recvs) |slot| {
-            const payload = try ctx.allocator.create(Value);
-            payload.* = exc;
+            const payload = try Value.box(ctx.allocator, exc);
             const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
             ctx.host.coroutineResumeSlotValue(slot, failure);
         }
@@ -352,8 +351,7 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
         const send_exc = try closedSendExc(ctx.allocator);
         for (sends) |sw| {
-            const payload = try ctx.allocator.create(Value);
-            payload.* = send_exc;
+            const payload = try Value.box(ctx.allocator, send_exc);
             const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
             ctx.host.coroutineResumeSlotValue(sw.slot, failure);
         }
