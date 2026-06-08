@@ -133,87 +133,64 @@ pub const ProgramImage = struct {
     }
 };
 
-/// Spin mutex. Zig 0.16's std has no blocking `Thread.Mutex`, so this is
-/// a small spin lock with an exclusive-access discipline, mirroring the
-/// runtime's `objcell` / `SharedOutput` locks.
-pub const SpinMutex = struct {
-    locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    pub fn lock(self: *SpinMutex) void {
-        while (self.locked.swap(true, .acquire)) {
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
-        }
-    }
-    pub fn unlock(self: *SpinMutex) void {
-        self.locked.store(false, .release);
-    }
-};
+/// Single exclusive spin lock, re-exported from `runtime.objcell` so the
+/// interpreter, the stdlib concurrency intrinsics, and the shared
+/// output/closure handles all share one definition (`coroutines.zig`
+/// imports it as `root.SpinMutex`).
+pub const SpinMutex = runtime.SpinMutex;
 
 /// Shared serialized stdout sink. The root and every spawned thread
 /// write through this so concurrent `println` is serialized; on
 /// completion the recorded calls replay into the caller's real sink.
-/// A refcounted handle around a `runtime.RecordingSink`, matching the
-/// runtime's own `SharedOutput` (which is not re-exported from the
-/// dependency module root).
+///
+/// A thin handle over `ObjRef(RecordingSink)` — the same adaptive shared
+/// cell `ThreadTable` is built on. The cell is `publish`ed at `new` so
+/// every access takes the SHARED reader/writer lock's exclusive
+/// `borrowMut`, serializing concurrent writes exactly as the prior
+/// hand-rolled mutex did.
 pub const SharedOutput = struct {
-    inner: *Inner,
-
-    const Inner = struct {
-        refcount: std.atomic.Value(usize),
-        mutex: SpinMutex,
-        sink: runtime.RecordingSink,
-        allocator: Allocator,
-    };
+    obj: ObjRef(runtime.RecordingSink),
 
     pub fn new(allocator: Allocator) Allocator.Error!SharedOutput {
-        const inner = try allocator.create(Inner);
-        inner.* = .{
-            .refcount = std.atomic.Value(usize).init(1),
-            .mutex = .{},
-            .sink = runtime.RecordingSink.init(allocator),
-            .allocator = allocator,
-        };
-        return .{ .inner = inner };
+        const obj = try ObjRef(runtime.RecordingSink).init(allocator, runtime.RecordingSink.init(allocator));
+        // Published immediately: this sink is shared across every thread
+        // of the program from creation, so all writes serialize through
+        // the cell's exclusive lock.
+        obj.publish();
+        return .{ .obj = obj };
     }
 
     pub fn clone(self: SharedOutput) SharedOutput {
-        _ = self.inner.refcount.fetchAdd(1, .monotonic);
-        return .{ .inner = self.inner };
+        return .{ .obj = self.obj.clone() };
     }
 
     pub fn deinit(self: SharedOutput) void {
-        if (self.inner.refcount.fetchSub(1, .release) == 1) {
-            _ = self.inner.refcount.load(.acquire);
-            const allocator = self.inner.allocator;
-            self.inner.sink.deinit();
-            allocator.destroy(self.inner);
-        }
+        self.obj.deinit();
     }
 
     pub fn replayInto(self: SharedOutput, out: Output) void {
-        self.inner.mutex.lock();
-        defer self.inner.mutex.unlock();
-        self.inner.sink.replayInto(out);
+        const g = self.obj.borrowMut();
+        defer g.deinit();
+        g.get().replayInto(out);
     }
 
     fn vtWriteln(ctx: *anyopaque, s: []const u8) void {
-        const inner: *Inner = @ptrCast(@alignCast(ctx));
-        inner.mutex.lock();
-        defer inner.mutex.unlock();
-        inner.sink.output().writeln(s);
+        const self: SharedOutput = .{ .obj = .{ .cell = @ptrCast(@alignCast(ctx)) } };
+        const g = self.obj.borrowMut();
+        defer g.deinit();
+        g.get().output().writeln(s);
     }
     fn vtWrite(ctx: *anyopaque, s: []const u8) void {
-        const inner: *Inner = @ptrCast(@alignCast(ctx));
-        inner.mutex.lock();
-        defer inner.mutex.unlock();
-        inner.sink.output().write(s);
+        const self: SharedOutput = .{ .obj = .{ .cell = @ptrCast(@alignCast(ctx)) } };
+        const g = self.obj.borrowMut();
+        defer g.deinit();
+        g.get().output().write(s);
     }
 
     const vtable: Output.VTable = .{ .writeln = vtWriteln, .write = vtWrite };
 
     pub fn output(self: SharedOutput) Output {
-        return .{ .ctx = self.inner, .vtable = &vtable };
+        return .{ .ctx = self.obj.cell, .vtable = &vtable };
     }
 };
 
@@ -233,53 +210,40 @@ pub const ClosureInfo = struct {
 /// only ever extends — so a shared mutex-guarded list keeps cross-thread
 /// closure creation sound while every existing id stays valid.
 pub const SharedClosures = struct {
-    inner: *Inner,
-
-    const Inner = struct {
-        refcount: std.atomic.Value(usize),
-        mutex: SpinMutex,
-        list: std.ArrayList(ClosureInfo),
-        allocator: Allocator,
-    };
+    obj: ObjRef(std.ArrayList(ClosureInfo)),
 
     pub fn new(allocator: Allocator) Allocator.Error!SharedClosures {
-        const inner = try allocator.create(Inner);
-        inner.* = .{
-            .refcount = std.atomic.Value(usize).init(1),
-            .mutex = .{},
-            .list = .empty,
-            .allocator = allocator,
-        };
-        return .{ .inner = inner };
+        const obj = try ObjRef(std.ArrayList(ClosureInfo)).init(allocator, .empty);
+        // Published immediately: the side-table is shared across every
+        // thread from creation, so `get`/`push` go through the cell's
+        // reader/writer lock.
+        obj.publish();
+        return .{ .obj = obj };
     }
 
     pub fn clone(self: SharedClosures) SharedClosures {
-        _ = self.inner.refcount.fetchAdd(1, .monotonic);
-        return .{ .inner = self.inner };
+        return .{ .obj = self.obj.clone() };
     }
 
     pub fn deinit(self: SharedClosures) void {
-        if (self.inner.refcount.fetchSub(1, .release) == 1) {
-            _ = self.inner.refcount.load(.acquire);
-            const allocator = self.inner.allocator;
-            self.inner.list.deinit(allocator);
-            allocator.destroy(self.inner);
-        }
+        self.obj.deinit();
     }
 
     pub fn get(self: SharedClosures, id: usize) ?ClosureInfo {
-        self.inner.mutex.lock();
-        defer self.inner.mutex.unlock();
-        if (id >= self.inner.list.items.len) return null;
-        return self.inner.list.items[id];
+        const g = self.obj.borrow();
+        defer g.deinit();
+        const list = g.get();
+        if (id >= list.items.len) return null;
+        return list.items[id];
     }
 
     /// Append `info`, returning its stable id.
     pub fn push(self: SharedClosures, info: ClosureInfo) Allocator.Error!u64 {
-        self.inner.mutex.lock();
-        defer self.inner.mutex.unlock();
-        const id: u64 = self.inner.list.items.len;
-        try self.inner.list.append(self.inner.allocator, info);
+        const g = self.obj.borrowMut();
+        defer g.deinit();
+        const list = g.get();
+        const id: u64 = list.items.len;
+        try list.append(self.obj.cell.allocator, info);
         return id;
     }
 };
@@ -667,4 +631,40 @@ test "shared closures push is append-stable" {
     try testing.expectEqual(@as(u64, 1), id1);
     try testing.expect(sc.get(0) != null);
     try testing.expect(sc.get(2) == null);
+}
+
+test "shared output records and replays into the real sink" {
+    const shared = try SharedOutput.new(testing.allocator);
+    defer shared.deinit();
+    const sink = shared.output();
+    sink.write("x");
+    sink.writeln("y");
+    sink.writeln("z");
+
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    shared.replayInto(cap.output());
+
+    try testing.expectEqual(@as(usize, 2), cap.lines.items.len);
+    try testing.expectEqualStrings("xy", cap.lines.items[0]);
+    try testing.expectEqualStrings("z", cap.lines.items[1]);
+}
+
+test "shared output clone shares one inner sink" {
+    const shared = try SharedOutput.new(testing.allocator);
+    defer shared.deinit();
+    const other = shared.clone();
+    defer other.deinit();
+    try testing.expect(ObjRef(runtime.RecordingSink).ptrEq(shared.obj, other.obj));
+
+    shared.output().writeln("a");
+    other.output().writeln("b");
+
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    other.replayInto(cap.output());
+
+    try testing.expectEqual(@as(usize, 2), cap.lines.items.len);
+    try testing.expectEqualStrings("a", cap.lines.items[0]);
+    try testing.expectEqualStrings("b", cap.lines.items[1]);
 }

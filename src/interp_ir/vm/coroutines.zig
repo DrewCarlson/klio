@@ -162,6 +162,18 @@ const SlotOwners = struct {
 /// Publish `slot` → `wakeup` so a worker thread's completion resume
 /// routes back through the driver's mailbox.
 pub fn registerSlotOwner(slot: i64, wakeup: *const ObjRef(DriverWakeup)) Allocator.Error!void {
+    // Registering the slot makes this `DriverWakeup` reachable from the
+    // process-global `SlotOwners` map, where a `Dispatchers.Default`/`IO`
+    // worker thread will `lookupSlotOwner` it and `borrowMut` to post a
+    // completion resume, concurrently with this driver's pump borrowing
+    // it in `drainWakeupInto`/`pending`. That is the cross-thread escape
+    // seam, so transition the cell to the SHARED reader/writer discipline
+    // here (before the clone lands in the registry). While it stayed
+    // UNSHARED those concurrent borrows raced its non-atomic `RefCell`
+    // flag (a torn read panics as a phantom mutable borrow). The release
+    // store is sequenced before the registry insert below, so the worker
+    // only ever observes the cell already SHARED. Idempotent.
+    wakeup.publish();
     {
         const w = wakeup.borrowMut();
         defer w.deinit();
@@ -1121,4 +1133,99 @@ test "slot owner registry routes lookups and clears on release" {
         w.get().releaseOwnedSlots();
     }
     try testing.expectEqual(@as(?ObjRef(DriverWakeup), null), lookupSlotOwner(101));
+}
+
+// -------------------------------------------------------------------------
+// Cross-thread publication regression: the `DriverWakeup` cell escapes to
+// dispatcher worker threads through the process-global `SlotOwners`
+// registry (`setPendingSlot` -> `registerSlotOwner`). A
+// `Dispatchers.Default`/`IO` worker resumes a parent `await`/`join` by
+// `lookupSlotOwner` + `borrowMut(postResume)` while the driver pump
+// concurrently `borrowMut`s the same cell in `drainMailbox`. Before the
+// cell is published these concurrent borrows raced its non-atomic
+// `RefCell` flag and a torn read aborted with "ObjRef already borrowed".
+// `registerSlotOwner` now `publish()`es at that escape seam, so the
+// borrows take the SHARED reader/writer lock. This test reproduces the
+// exact escape + concurrent-borrow pattern; built with `KLIO_RACE_JITTER`
+// it widens the window so a regression aborts here deterministically.
+// -------------------------------------------------------------------------
+
+const WakeupRaceCtx = struct {
+    /// First slot id this round owns; workers route through these.
+    base_slot: i64,
+    n_slots: i64,
+    stop: *std.atomic.Value(bool),
+};
+
+fn wakeupRaceDriver(ctx: WakeupRaceCtx) void {
+    // The driver pump: spin draining whatever slot owners are live,
+    // exactly like `drainWakeupInto` does each idle round.
+    const a = std.heap.page_allocator;
+    while (!ctx.stop.load(.acquire)) {
+        var s: i64 = ctx.base_slot;
+        while (s < ctx.base_slot + ctx.n_slots) : (s += 1) {
+            if (lookupSlotOwner(s)) |w| {
+                var ww = w;
+                const g = ww.borrowMut();
+                const drained = g.get().drainMailbox(a) catch &.{};
+                a.free(drained);
+                g.deinit();
+                ww.deinit();
+            }
+        }
+    }
+}
+
+fn wakeupRaceWorker(ctx: WakeupRaceCtx) void {
+    // The dispatcher worker: route a completion resume back through the
+    // owning driver's mailbox, exactly like `coroutineResumeExternal`'s
+    // cross-thread branch.
+    var round: usize = 0;
+    while (round < 400) : (round += 1) {
+        var s: i64 = ctx.base_slot;
+        while (s < ctx.base_slot + ctx.n_slots) : (s += 1) {
+            if (lookupSlotOwner(s)) |w| {
+                var ww = w;
+                const g = ww.borrowMut();
+                g.get().postResume(s, .Unit) catch {};
+                g.deinit();
+                ww.deinit();
+            }
+        }
+    }
+}
+
+test "DriverWakeup survives concurrent cross-thread borrows once published" {
+    const a = std.heap.page_allocator;
+    // A fresh interceptor mints a `DriverWakeup`; registering a span of
+    // slots below escapes the cell into the global registry.
+    var ci = try CooperativeInterceptor.new(a);
+    defer ci.deinit();
+
+    const base: i64 = (1 << 40) + @as(i64, @intCast(std.Thread.getCurrentId() & 0xffff)) * 64;
+    const n: i64 = 8;
+    var s: i64 = base;
+    // Registering each slot escapes the wakeup cell into the global
+    // registry, the real escape seam, which now publishes the cell.
+    while (s < base + n) : (s += 1) try ci.setPendingSlot(s);
+    // Published at registration; this is the property the fix guarantees.
+    try testing.expect(ci.wakeup.isShared());
+
+    var stop = std.atomic.Value(bool).init(false);
+    const ctx = WakeupRaceCtx{ .base_slot = base, .n_slots = n, .stop = &stop };
+
+    const driver = try std.Thread.spawn(.{}, wakeupRaceDriver, .{ctx});
+    var workers: [4]std.Thread = undefined;
+    for (&workers) |*wt| wt.* = try std.Thread.spawn(.{}, wakeupRaceWorker, .{ctx});
+    for (&workers) |wt| wt.join();
+    stop.store(true, .release);
+    driver.join();
+
+    // Drop the registry entries this round owns so the global map does not
+    // leak across the suite.
+    {
+        const w = ci.wakeup.borrowMut();
+        defer w.deinit();
+        w.get().releaseOwnedSlots();
+    }
 }

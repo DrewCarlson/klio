@@ -25,6 +25,7 @@ pub const ObjGuard = objcell.ObjGuard;
 pub const ObjGuardMut = objcell.ObjGuardMut;
 pub const ControlBlock = objcell.ControlBlock;
 pub const BorrowMutError = objcell.BorrowMutError;
+pub const SpinMutex = objcell.SpinMutex;
 
 // value
 pub const Value = value_mod.Value;

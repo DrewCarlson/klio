@@ -95,6 +95,7 @@ const RUNNABLE = [_][]const u8{
     "tl_withcontext_io",
     "tl_dispatch_many",
     "tl_thread_sleep",
+    "tl_wakeup_hammer",
 };
 
 /// Guarantees that only become meaningful with real OS-thread spawning.
@@ -129,6 +130,23 @@ test "tl_dispatch_many" {
 }
 test "tl_thread_sleep" {
     try check("tl_thread_sleep");
+}
+test "tl_wakeup_hammer" {
+    try check("tl_wakeup_hammer");
+}
+
+// Continuously exercise the cross-thread `DriverWakeup` publication seam:
+// a batch of `Dispatchers.Default` jobs route their completion resume
+// through the single driver's wakeup mailbox (the global `SlotOwners`
+// registry escape) while the driver pump drains it concurrently. Looped so
+// a publication regression (the wakeup cell left UNSHARED when it escapes to
+// a worker thread) aborts here instead of flaking through. `tl_wakeup_hammer`
+// itself launches 60 in-flight awaits over 20 rounds per run.
+test "tl_wakeup_hammer repeated stress" {
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        try check("tl_wakeup_hammer");
+    }
 }
 
 // Every litmus file on disk is classified exactly once. Guards against an

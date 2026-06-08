@@ -15,6 +15,7 @@ const stdlib = @import("stdlib");
 const root = @import("../interp_ir.zig");
 const build = @import("../build.zig");
 const vmhost = @import("vmhost.zig");
+const trace = @import("trace.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -215,8 +216,19 @@ pub fn vmMakeHost(self: *Vm, out: Output) VmHost {
 }
 
 /// A snapshot of every handle a freshly spawned OS thread needs to
-/// materialize its own child `Vm`.
+/// materialize its own child `Vm`. The seed carries `self.allocator`
+/// verbatim; the child allocates and frees against it on another thread.
+/// That sharing is sound under Zig 0.16 only while the backing allocator
+/// is thread-safe and nothing calls `.reset()`/`.deinit()` on it while a
+/// worker is live — the two invariants documented and guarded at the live
+/// spawn seam (`assertSpawnAllocatorInvariant` in `intrinsic_host.zig`).
+/// Here we assert the cheaply-checkable part: a non-degenerate allocator.
 pub fn vmSpawnChild(self: *Vm) SendableVmSeed {
+    const ok = @intFromPtr(self.allocator.vtable) != 0;
+    if (!ok and trace.invariantsEnabled()) {
+        trace.invariant("kind=spawn_allocator site=vmSpawnChild detail=degenerate_allocator", .{});
+    }
+    std.debug.assert(ok);
     return .{
         .module = self.module.clone(),
         .globals = self.globals.clone(),
