@@ -27,16 +27,15 @@ const proc_env = @import("proc_env.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Default RSS cap. The Rust harness used 6 GiB, but it ran each program in a
-/// separate `klio-parity` subprocess; the in-process harness here runs the
-/// whole corpus through one long-lived process (the differential / e2e itests
-/// sweep every example across load modes), whose legitimate resident peak is
-/// tens of GiB. The cap is set comfortably above that aggregate peak yet far
-/// below system RAM, so a single runaway program — which races unbounded
-/// toward system OOM, not a bounded plateau — is still aborted long before the
-/// machine is endangered. For a single-program `klio run`, set
-/// `KLIO_RSS_CAP_KB` back down (e.g. to the Rust 6 GiB) to tighten the bound.
-const DEFAULT_RSS_CAP_KB: u64 = 64 * 1024 * 1024;
+/// Default RSS cap, matching the Rust harness's 6 GiB. The in-process harnesses
+/// (differential / e2e / fuzz) run the whole corpus through one long-lived
+/// process, but each program is run on a per-program arena that is reset (or
+/// destroyed) between programs, so the resident peak is a single program's
+/// worth rather than the accumulated corpus. A single runaway program — which
+/// races unbounded toward system OOM, not a bounded plateau — is still aborted
+/// long before the machine is endangered. Override with `KLIO_RSS_CAP_KB` (or
+/// the legacy `KLIO_PARITY_RSS_CAP_KB`) to raise or lower the bound.
+const DEFAULT_RSS_CAP_KB: u64 = 6 * 1024 * 1024;
 
 /// How often the watchdogs sample, in nanoseconds (100ms — same as Rust).
 const POLL_NS: u64 = 100 * std.time.ns_per_ms;

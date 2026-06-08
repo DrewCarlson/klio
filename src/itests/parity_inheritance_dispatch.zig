@@ -17,7 +17,12 @@ const TMP_DIR = "/tmp/klio_itest_parity_inheritance_dispatch";
 var shared_arena: ?std.heap.ArenaAllocator = null;
 
 fn arenaAllocator() std.mem.Allocator {
-    if (shared_arena == null) {
+    if (shared_arena) |*a| {
+        // Reset the per-program arena so each program's allocations are
+        // reclaimed instead of accumulating across this file's tests. Safe:
+        // the cross-program globals are page_allocator-backed, not this arena.
+        _ = a.reset(.retain_capacity);
+    } else {
         shared_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     }
     return shared_arena.?.allocator();
