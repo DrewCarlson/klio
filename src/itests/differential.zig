@@ -60,11 +60,23 @@ fn runOne(gpa: std.mem.Allocator, io: std.Io, file: []const u8, mode: parity.Loa
 
 /// Run every program in `files` through every applicable mode and assert the
 /// stdout is byte-identical across modes. Returns the number of divergences.
-fn checkCorpus(gpa: std.mem.Allocator, io: std.Io, files: []const []const u8) !usize {
+///
+/// Each program (and each mode within it) is run on a per-program arena that is
+/// reset between iterations so the per-run phase-scoped data — ASTs, IR, the
+/// rebuilt kotlinx/coroutines packs, the VM graph — is reclaimed instead of
+/// accumulating across the whole corpus in one process. Safe because the
+/// cross-program global state (inline-fn tables, receiver guard stacks) is
+/// backed by page_allocator, not this arena.
+fn checkCorpus(io: std.Io, files: []const []const u8) !usize {
+    var run_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer run_arena.deinit();
+
     var failures: usize = 0;
     var pack_programs: usize = 0;
     for (files) |file| {
-        const src = std.Io.Dir.cwd().readFileAlloc(io, file, gpa, .unlimited) catch |e| {
+        _ = run_arena.reset(.retain_capacity);
+        const ra = run_arena.allocator();
+        const src = std.Io.Dir.cwd().readFileAlloc(io, file, ra, .unlimited) catch |e| {
             std.debug.print("differential SKIP {s}: read failed ({s})\n", .{ file, @errorName(e) });
             continue;
         };
@@ -74,7 +86,7 @@ fn checkCorpus(gpa: std.mem.Allocator, io: std.Io, files: []const []const u8) !u
         var baseline: ?RunOutcome = null;
         var baseline_mode: parity.LoadMode = undefined;
         for (modes) |mode| {
-            const outcome = try runOne(gpa, io, file, mode);
+            const outcome = try runOne(ra, io, file, mode);
             if (baseline) |base| {
                 const a = switch (base) {
                     .out => |o| o,
@@ -110,35 +122,34 @@ fn checkCorpus(gpa: std.mem.Allocator, io: std.Io, files: []const []const u8) !u
 }
 
 test "examples + coroutine smoke are byte-identical across load modes" {
-    // The pipeline installs process-global lowering/VM state backed by the
-    // run's allocator; a per-test arena would be torn down while those globals
-    // still point into it. One file-scoped arena over the page allocator backs
-    // every run here (matching e2e / coroutine-smoke harnesses).
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const gpa = arena.allocator();
-    var threaded: std.Io.Threaded = .init(gpa, .{});
+    // Stable arena for the corpus file list + io (lives for the whole test).
+    // The per-program pipeline allocations live in checkCorpus's own arena,
+    // which it resets between programs so they do not accumulate.
+    var list_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer list_arena.deinit();
+    const la = list_arena.allocator();
+    var threaded: std.Io.Threaded = .init(la, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     var corpus: std.ArrayList([]u8) = .empty;
-    defer corpus.deinit(gpa);
+    defer corpus.deinit(la);
 
-    const examples = parity.collectKt(gpa, io, EXAMPLES) catch |e| {
+    const examples = parity.collectKt(la, io, EXAMPLES) catch |e| {
         std.debug.print("differential: collectKt(examples) failed ({s})\n", .{@errorName(e)});
         return error.SkipZigTest;
     };
-    try corpus.appendSlice(gpa, examples);
+    try corpus.appendSlice(la, examples);
 
-    const smoke = parity.collectKt(gpa, io, SMOKE_DIR) catch &.{};
-    try corpus.appendSlice(gpa, smoke);
+    const smoke = parity.collectKt(la, io, SMOKE_DIR) catch &.{};
+    try corpus.appendSlice(la, smoke);
 
     if (corpus.items.len == 0) {
         std.debug.print("differential: empty corpus; skipping\n", .{});
         return error.SkipZigTest;
     }
 
-    const failures = try checkCorpus(gpa, io, corpus.items);
+    const failures = try checkCorpus(io, corpus.items);
     if (failures != 0) {
         std.debug.print("differential: {d} program(s) diverged across load modes\n", .{failures});
         return error.PackVsDirectDivergence;

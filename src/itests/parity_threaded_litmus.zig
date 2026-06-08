@@ -49,6 +49,10 @@ fn expectedStdout(allocator: std.mem.Allocator, io: std.Io, file: []const u8) ![
 }
 
 fn check(stem: []const u8) !void {
+    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
+    // is reclaimed instead of accumulating across this file's tests. Safe:
+    // the cross-program globals are page_allocator-backed, not this arena.
+    _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();

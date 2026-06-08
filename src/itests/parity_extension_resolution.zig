@@ -20,6 +20,10 @@ var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 /// testing allocator never backs the pipeline (it would abort on the
 /// intentional arena lifetime).
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
+    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
+    // is reclaimed instead of accumulating across this file's tests. Safe:
+    // the cross-program globals are page_allocator-backed, not this arena.
+    _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
 
     var threaded: std.Io.Threaded = .init(a, .{});
