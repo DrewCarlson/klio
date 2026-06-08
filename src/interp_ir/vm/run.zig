@@ -187,24 +187,31 @@ pub fn vmSetInstalledBindings(self: *Vm, bindings: stdlib.HostBindings) Allocato
     g.get().installed_bindings = try ObjRef(stdlib.HostBindings).init(self.allocator, bindings);
 }
 
-/// Build a `VmHost` bound to this Vm's shared state for the duration of
-/// one evaluation. The immutable program image, closure table, id
-/// counter, and stdout sink are shared by handle.
-pub fn vmMakeHost(self: *Vm, out: Output) VmHost {
+/// A borrowed view over this Vm's shared program-state handles. Copying
+/// the handles by value bumps no refcount; the `Vm` keeps every cell alive
+/// for the view's whole lifetime, so the view owns nothing.
+fn sharedHandles(self: *Vm) vmhost.SharedHandles {
     return .{
-        .globals = self.globals.clone(),
-        .module = self.module.clone(),
-        .out = out,
-        .instance_id_counter = self.instance_id_counter.clone(),
-        .classes = self.classes.clone(),
-        .prog = self.prog.clone(),
-        .anon_methods = self.anon_methods.clone(),
-        .class_default_outer = self.class_default_outer.clone(),
-        .closures = self.closures.clone(),
-        .out_sink = self.out_sink.clone(),
-        .threads = self.threads.clone(),
+        .globals = self.globals,
+        .module = self.module,
+        .instance_id_counter = self.instance_id_counter,
+        .classes = self.classes,
+        .prog = self.prog,
+        .anon_methods = self.anon_methods,
+        .class_default_outer = self.class_default_outer,
+        .closures = self.closures,
+        .out_sink = self.out_sink,
+        .threads = self.threads,
         .allocator = self.allocator,
     };
+}
+
+/// Build a `VmHost` that borrows this Vm's shared state for the duration of
+/// one evaluation. The handles are copied by value with no refcount bump,
+/// so the host owns nothing and is dropped just by going out of scope — the
+/// `Vm` keeps every cell alive for the call's whole lifetime.
+pub fn vmMakeHost(self: *Vm, out: Output) VmHost {
+    return VmHost.borrowed(sharedHandles(self), self.globals, out);
 }
 
 /// A snapshot of every handle a freshly spawned OS thread needs to
@@ -228,31 +235,11 @@ pub fn vmSpawnChild(self: *Vm) SendableVmSeed {
 /// Invoke a thread-body callable on this (child) Vm, writing through the
 /// shared serialized sink.
 pub fn vmRunThreadBlock(self: *Vm, block: *const Value) Allocator.Error!runtime.EvalResult {
-    var intrinsic = VmIntrinsicHost{
-        .module = self.module.clone(),
-        .closures = self.closures.clone(),
-        .globals = self.globals.clone(),
-        .classes = self.classes.clone(),
-        .prog = self.prog.clone(),
-        .anon_methods = self.anon_methods.clone(),
-        .class_default_outer = self.class_default_outer.clone(),
-        .instance_id_counter = self.instance_id_counter.clone(),
-        .out_sink = self.out_sink.clone(),
-        .threads = self.threads.clone(),
-        .allocator = self.allocator,
-    };
-    defer {
-        intrinsic.module.deinit();
-        intrinsic.closures.deinit();
-        intrinsic.globals.deinit();
-        intrinsic.classes.deinit();
-        intrinsic.prog.deinit();
-        intrinsic.anon_methods.deinit();
-        intrinsic.class_default_outer.deinit();
-        intrinsic.instance_id_counter.deinit();
-        intrinsic.out_sink.deinit();
-        intrinsic.threads.deinit();
-    }
+    // The intrinsic host borrows the child Vm's shared handles by value (no
+    // refcount bump) and runs for the duration of this one call on the same
+    // (worker) thread, so it owns nothing and needs no matching deinit — the
+    // child `Vm` keeps every cell alive across the call.
+    var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
     const host = intrinsic.intrinsicHost();
     const r = try host.invokeCallable(block, &.{}, self.out_sink.output());
     return r;
@@ -316,7 +303,6 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
             const class_id = module.classId(obj_name) orelse continue;
             const inst = blk: {
                 var host = vmMakeHost(self, sink);
-                defer hostDeinit(&host);
                 var iface = host.hostInterface();
                 switch (try iface.newInstance(self.allocator, class_id, &.{})) {
                     .ok => |v| break :blk v,
@@ -353,7 +339,6 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
         if (nf.func.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
         const init_func = &module.funcs.items[nf.func.int()];
         var host = vmMakeHost(self, sink);
-        defer hostDeinit(&host);
         var iface = host.hostInterface();
         const r = try ir.eval.evalWith(self.allocator, module, init_func, .empty, &iface);
         switch (r) {
@@ -406,7 +391,6 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
             const init_func = &module.funcs.items[fid.int()];
             const v = blk: {
                 var host = vmMakeHost(self, sink);
-                defer hostDeinit(&host);
                 var iface = host.hostInterface();
                 switch (try ir.eval.evalWith(self.allocator, module, init_func, .empty, &iface)) {
                     .ok => |val| break :blk val,
@@ -424,7 +408,6 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     if (main.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
     const func = &module.funcs.items[main.int()];
     var host = vmMakeHost(self, sink);
-    defer hostDeinit(&host);
     var iface = host.hostInterface();
     const r = try ir.eval.evalWith(self.allocator, module, func, .empty, &iface);
     const result: VmResult = switch (r) {
@@ -541,20 +524,6 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
         .StackOverflow => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "uncaught java.lang.StackOverflowError: {s}", .{s}) catch s },
         else => return .{ .Eval = "IR eval error" },
     }
-}
-
-/// Drop the shared handles a `VmHost` cloned in `vmMakeHost`.
-fn hostDeinit(host: *VmHost) void {
-    host.globals.deinit();
-    host.module.deinit();
-    host.instance_id_counter.deinit();
-    host.classes.deinit();
-    host.prog.deinit();
-    host.anon_methods.deinit();
-    host.class_default_outer.deinit();
-    host.closures.deinit();
-    host.out_sink.deinit();
-    host.threads.deinit();
 }
 
 /// Release every owned handle of the Vm.

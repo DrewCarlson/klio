@@ -49,70 +49,21 @@ const RawResult = EvalResult;
 // Transient hosts over the shared state.
 // -------------------------------------------------------------------------
 
-/// Build a transient `VmHost` over the same shared state, bound to `out`
-/// for the duration of one delegated evaluation. Every handle is cloned;
-/// release them with `vmHostDeinit` once the delegated call returns.
+/// Build a transient `VmHost` that borrows this host's shared state, bound
+/// to `out` for the duration of one delegated evaluation. The handles are
+/// copied by value with no refcount bump, so the view owns nothing and is
+/// dropped just by going out of scope — no matching deinit. `self` keeps
+/// every cell alive for the call's whole lifetime.
 pub fn vmHost(self: *VmIntrinsicHost, out: Output) VmHost {
-    return .{
-        .globals = self.globals.clone(),
-        .module = self.module.clone(),
-        .out = out,
-        .instance_id_counter = self.instance_id_counter.clone(),
-        .classes = self.classes.clone(),
-        .prog = self.prog.clone(),
-        .anon_methods = self.anon_methods.clone(),
-        .class_default_outer = self.class_default_outer.clone(),
-        .closures = self.closures.clone(),
-        .out_sink = self.out_sink.clone(),
-        .threads = self.threads.clone(),
-        .allocator = self.allocator,
-    };
-}
-
-/// Release the cloned handles a `vmHost` produced.
-fn vmHostDeinit(host: *VmHost) void {
-    host.globals.deinit();
-    host.module.deinit();
-    host.instance_id_counter.deinit();
-    host.classes.deinit();
-    host.prog.deinit();
-    host.anon_methods.deinit();
-    host.class_default_outer.deinit();
-    host.closures.deinit();
-    host.out_sink.deinit();
-    host.threads.deinit();
+    const state = vmhost.SharedHandles.fromIntrinsic(self);
+    return VmHost.borrowed(state, state.globals, out);
 }
 
 /// A sibling `VmIntrinsicHost` over the same shared state, used when an
-/// intrinsic recursively dispatches another intrinsic.
+/// intrinsic recursively dispatches another intrinsic. Borrows by value;
+/// owns nothing and needs no matching deinit.
 pub fn childHost(self: *VmIntrinsicHost) VmIntrinsicHost {
-    return .{
-        .module = self.module.clone(),
-        .closures = self.closures.clone(),
-        .globals = self.globals.clone(),
-        .classes = self.classes.clone(),
-        .prog = self.prog.clone(),
-        .anon_methods = self.anon_methods.clone(),
-        .class_default_outer = self.class_default_outer.clone(),
-        .instance_id_counter = self.instance_id_counter.clone(),
-        .out_sink = self.out_sink.clone(),
-        .threads = self.threads.clone(),
-        .allocator = self.allocator,
-    };
-}
-
-/// Release the cloned handles a `childHost` produced.
-fn childHostDeinit(child: *VmIntrinsicHost) void {
-    child.module.deinit();
-    child.closures.deinit();
-    child.globals.deinit();
-    child.classes.deinit();
-    child.prog.deinit();
-    child.anon_methods.deinit();
-    child.class_default_outer.deinit();
-    child.instance_id_counter.deinit();
-    child.out_sink.deinit();
-    child.threads.deinit();
+    return VmIntrinsicHost.borrowed(vmhost.SharedHandles.fromIntrinsic(self));
 }
 
 /// Build a `SendableVmSeed` snapshot of the shared program state for a
@@ -175,7 +126,6 @@ fn flattenEval(r: EvalResult) RuntimeEvalResult {
 /// from stdlib higher-order ops like `map`/`fold`.
 pub fn construct(self: *VmIntrinsicHost, class_id: ClassId, args: []const Value, out: Output) Allocator.Error!RawResult {
     var host = vmHost(self, out);
-    defer vmHostDeinit(&host);
     var iface = host.hostInterface();
     return iface.newInstance(self.allocator, class_id, args);
 }
@@ -286,21 +236,7 @@ pub fn evalClosureRaw(
     var caps_owned: std.ArrayList(Value) = .empty;
     try caps_owned.appendSlice(self.allocator, capture_values.items);
 
-    var host = VmHost{
-        .globals = scoped_env.clone(),
-        .module = self.module.clone(),
-        .out = out,
-        .instance_id_counter = self.instance_id_counter.clone(),
-        .classes = self.classes.clone(),
-        .prog = self.prog.clone(),
-        .anon_methods = self.anon_methods.clone(),
-        .class_default_outer = self.class_default_outer.clone(),
-        .closures = self.closures.clone(),
-        .out_sink = self.out_sink.clone(),
-        .threads = self.threads.clone(),
-        .allocator = self.allocator,
-    };
-    defer vmHostDeinit(&host);
+    var host = VmHost.borrowed(vmhost.SharedHandles.fromIntrinsic(self), scoped_env, out);
     var iface = host.hostInterface();
     const result = try ir.eval.evalWithCaptures(self.allocator, module, func, args_owned, caps_owned, &iface);
 
@@ -328,7 +264,6 @@ pub fn resumeRaw(self: *VmIntrinsicHost, state: *SuspendState, value: Value, out
     defer module_g.deinit();
     const module = module_g.get();
     var host = vmHost(self, out);
-    defer vmHostDeinit(&host);
     var iface = host.hostInterface();
     return ir.eval.resumeContinuation(self.allocator, module, state, value, &iface);
 }
@@ -418,7 +353,6 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
             const as_property = member_args.len == 0 and
                 root.memberIsProperty(self.allocator, &self.classes, &target, nm);
             var host = vmHost(self, out);
-            defer vmHostDeinit(&host);
             var iface = host.hostInterface();
             const result = if (as_property)
                 try iface.getField(self.allocator, &target, nm)
@@ -486,21 +420,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         try caps_owned.appendSlice(self.allocator, capture_values.items);
         capture_values.deinit(self.allocator);
 
-        var host = VmHost{
-            .globals = scoped_env.clone(),
-            .module = self.module.clone(),
-            .out = out,
-            .instance_id_counter = self.instance_id_counter.clone(),
-            .classes = self.classes.clone(),
-            .prog = self.prog.clone(),
-            .anon_methods = self.anon_methods.clone(),
-            .class_default_outer = self.class_default_outer.clone(),
-            .closures = self.closures.clone(),
-            .out_sink = self.out_sink.clone(),
-            .threads = self.threads.clone(),
-            .allocator = self.allocator,
-        };
-        defer vmHostDeinit(&host);
+        var host = VmHost.borrowed(vmhost.SharedHandles.fromIntrinsic(self), scoped_env, out);
         var iface = host.hostInterface();
         const result = try ir.eval.evalWithCaptures(self.allocator, module, func, call_args, caps_owned, &iface);
 
@@ -542,7 +462,6 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
 
     if (callable.* == .Intrinsic) {
         var child = childHost(self);
-        defer childHostDeinit(&child);
         var ctx = runtime.CallCtx{
             .args = args,
             .out = out,
@@ -556,7 +475,6 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
     // dispatch through its `invoke` member.
     if (callable.* == .Instance) {
         var host = vmHost(self, out);
-        defer vmHostDeinit(&host);
         var iface = host.hostInterface();
         const r = try iface.callMember(self.allocator, callable, "invoke", args);
         return flattenEval(r);
@@ -668,7 +586,6 @@ pub fn invokeMethod(self: *VmIntrinsicHost, receiver: *const Value, name: []cons
     // Build a VmHost that shares this IntrinsicHost's tables and route
     // through call_member so the dispatch picks up user override methods.
     var host = vmHost(self, out);
-    defer vmHostDeinit(&host);
     var iface = host.hostInterface();
     const r = try iface.callMember(self.allocator, receiver, name, args);
     return switch (r) {
