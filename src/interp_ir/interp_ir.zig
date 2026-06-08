@@ -39,7 +39,6 @@ const ObjRef = runtime.ObjRef;
 const Env = runtime.Env;
 const ClassDef = runtime.ClassDef;
 const InstanceData = runtime.InstanceData;
-const Scheduler = runtime.Scheduler;
 const HostBindings = stdlib.HostBindings;
 const Module = ir.Module;
 pub const FuncId = ir.FuncId;
@@ -342,7 +341,6 @@ pub fn coroutineTimeMode() TimeMode {
 pub const Vm = struct {
     module: ObjRef(Module),
     globals: ObjRef(Env),
-    scheduler: *runtime.InProcessScheduler,
     /// Process-wide monotonic instance-id source.
     instance_id_counter: ObjRef(std.atomic.Value(u64)),
     /// Per-class runtime metadata produced by `build.build_module`.
@@ -394,12 +392,9 @@ pub const SendableVmSeed = struct {
 
     /// Materialize a child `Vm` on the current (new) OS thread.
     pub fn materialize(self: SendableVmSeed) Allocator.Error!Vm {
-        const sched = try self.allocator.create(runtime.InProcessScheduler);
-        sched.* = runtime.InProcessScheduler.init(self.allocator);
         return .{
             .module = self.module,
             .globals = self.globals,
-            .scheduler = sched,
             .instance_id_counter = self.instance_id_counter,
             .classes = self.classes,
             .top_level_props = .empty,

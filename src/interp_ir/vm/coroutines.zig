@@ -857,11 +857,6 @@ pub fn coroutineLaunch(self: *VmIntrinsicHost, block: *const Value, scope: *cons
     };
 }
 
-pub fn coroutineParkSlot(self: *VmIntrinsicHost, slot: i64) void {
-    _ = self;
-    if (coroTop()) |top| top.setPendingSlot(slot) catch {};
-}
-
 pub fn coroutineArmSlot(self: *VmIntrinsicHost, slot: i64) void {
     _ = self;
     if (coroTop()) |top| top.setPendingSlot(slot) catch {};
@@ -870,15 +865,6 @@ pub fn coroutineArmSlot(self: *VmIntrinsicHost, slot: i64) void {
 pub fn coroutineDisarmSlot(self: *VmIntrinsicHost) void {
     _ = self;
     if (coroTop()) |top| top.clearPendingSlot();
-}
-
-pub fn coroutineResumeSlot(self: *VmIntrinsicHost, slot: i64) void {
-    _ = self;
-    var i: usize = coro_stack.items.len;
-    while (i > 0) {
-        i -= 1;
-        if (coro_stack.items[i].resumeSlot(slot) catch false) break;
-    }
 }
 
 pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value) void {

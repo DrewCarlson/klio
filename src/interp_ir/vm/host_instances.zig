@@ -347,7 +347,6 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 
 fn dispatchIntrinsic(self: *VmHost, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     var ih = VmIntrinsicHost{
-        .scheduler = self.scheduler,
         .module = self.module.clone(),
         .closures = self.closures.clone(),
         .globals = self.globals.clone(),

@@ -101,7 +101,6 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// `EvalError`, preserving the thrown `Value` for try/catch matching.
 fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, func: StdlibFn, args: []const Value) Allocator.Error!union(enum) { ok: Value, err: EvalError } {
     var intrinsic = VmIntrinsicHost{
-        .scheduler = self.scheduler,
         .module = self.module.clone(),
         .closures = self.closures.clone(),
         .globals = self.globals.clone(),

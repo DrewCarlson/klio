@@ -73,8 +73,6 @@ pub const PropertyHit = class_mod.PropertyHit;
 pub const StdlibFn = host_mod.StdlibFn;
 pub const CallCtx = host_mod.CallCtx;
 pub const IntrinsicHost = host_mod.IntrinsicHost;
-pub const Scheduler = host_mod.Scheduler;
-pub const InProcessScheduler = host_mod.InProcessScheduler;
 pub const NoopHost = host_mod.NoopHost;
 pub const HostResultU64 = host_mod.HostResultU64;
 

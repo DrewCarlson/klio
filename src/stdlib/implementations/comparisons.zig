@@ -232,19 +232,15 @@ fn makeCtx(host: runtime.IntrinsicHost, out: runtime.Output, args: []const Value
 /// function over the single supplied argument. Used to drive the
 /// selector-invoking `compareValuesBy` path without a real interpreter.
 const SelectorHost = struct {
-    scheduler_impl: runtime.InProcessScheduler,
     /// Maps an input arg to the key the selector "returns".
     keyFn: *const fn (arg: Value) Value,
 
     fn init(allocator: std.mem.Allocator, keyFn: *const fn (arg: Value) Value) SelectorHost {
-        return .{ .scheduler_impl = runtime.InProcessScheduler.init(allocator), .keyFn = keyFn };
+        _ = allocator;
+        return .{ .keyFn = keyFn };
     }
     fn deinit(self: *SelectorHost) void {
-        self.scheduler_impl.deinit();
-    }
-    fn vtScheduler(c: *anyopaque) runtime.Scheduler {
-        const self: *SelectorHost = @ptrCast(@alignCast(c));
-        return self.scheduler_impl.scheduler();
+        _ = self;
     }
     fn vtInvokeCallable(c: *anyopaque, callable: *const Value, args: []const Value, out: runtime.Output) std.mem.Allocator.Error!EvalResult {
         _ = callable;
@@ -258,7 +254,6 @@ const SelectorHost = struct {
         return vtInvokeCallable(c, callable, args, out);
     }
     const vtable: runtime.IntrinsicHost.VTable = .{
-        .scheduler = vtScheduler,
         .invoke_callable = vtInvokeCallable,
         .invoke_callable_with_this = vtInvokeCallableWithThis,
     };

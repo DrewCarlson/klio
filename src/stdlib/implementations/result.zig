@@ -244,7 +244,7 @@ pub fn coro_park(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |s| s,
         .err => |e| return .{ .err = e },
     };
-    ctx.host.coroutineParkSlot(slot);
+    ctx.host.coroutineArmSlot(slot);
     return .{ .err = .{ .Suspend = -1 } };
 }
 
@@ -363,7 +363,6 @@ const CaptureOutput = runtime.CaptureOutput;
 /// recording the args/this it was handed. Lets the higher-order Result
 /// intrinsics be exercised without a full interpreter.
 const StubHost = struct {
-    scheduler_impl: runtime.InProcessScheduler,
     /// What `invoke_callable` / `invoke_callable_with_this` hand back.
     reply: EvalResult = .{ .ok = Value.Unit },
     /// Most recent first-arg / this seen by an invocation.
@@ -372,16 +371,13 @@ const StubHost = struct {
     invoked: usize = 0,
 
     fn init(allocator: std.mem.Allocator) StubHost {
-        return .{ .scheduler_impl = runtime.InProcessScheduler.init(allocator) };
+        _ = allocator;
+        return .{};
     }
     fn deinit(self: *StubHost) void {
-        self.scheduler_impl.deinit();
+        _ = self;
     }
 
-    fn vtScheduler(ctx: *anyopaque) runtime.Scheduler {
-        const self: *StubHost = @ptrCast(@alignCast(ctx));
-        return self.scheduler_impl.scheduler();
-    }
     fn vtInvokeCallable(ctx: *anyopaque, callable: *const Value, args: []const Value, out: runtime.Output) std.mem.Allocator.Error!EvalResult {
         _ = callable;
         _ = out;
@@ -401,7 +397,6 @@ const StubHost = struct {
     }
 
     const vtable: runtime.IntrinsicHost.VTable = .{
-        .scheduler = vtScheduler,
         .invoke_callable = vtInvokeCallable,
         .invoke_callable_with_this = vtInvokeCallableWithThis,
     };
