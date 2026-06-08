@@ -26,7 +26,6 @@ const ObjRef = runtime.ObjRef;
 const Env = runtime.Env;
 const ClassDef = runtime.ClassDef;
 const Output = runtime.Output;
-const Scheduler = runtime.Scheduler;
 const SharedOutput = root.SharedOutput;
 const RuntimeError = runtime.RuntimeError;
 const IntrinsicHost = runtime.IntrinsicHost;
@@ -87,7 +86,6 @@ pub fn resetReceiverThreadLocals() void {
 pub const VmHost = struct {
     globals: ObjRef(Env),
     module: ObjRef(Module),
-    scheduler: *runtime.InProcessScheduler,
     out: Output,
     instance_id_counter: ObjRef(std.atomic.Value(u64)),
     classes: ObjRef(ClassTable),
@@ -109,7 +107,6 @@ pub const VmHost = struct {
 /// (`map`, `forEach`, scope fns, …) reach back through this adapter to
 /// invoke the lambda they were passed.
 pub const VmIntrinsicHost = struct {
-    scheduler: *runtime.InProcessScheduler,
     module: ObjRef(Module),
     closures: SharedClosures,
     globals: ObjRef(Env),
@@ -310,9 +307,6 @@ fn ip(ctx: *anyopaque) *VmIntrinsicHost {
     return @ptrCast(@alignCast(ctx));
 }
 
-fn ivScheduler(ctx: *anyopaque) Scheduler {
-    return intrinsic_host.scheduler(ip(ctx));
-}
 fn ivInvokeCallable(ctx: *anyopaque, callable: *const Value, args: []const Value, out: Output) Allocator.Error!RuntimeEvalResult {
     return intrinsic_host.invokeCallable(ip(ctx), callable, args, out);
 }
@@ -340,17 +334,11 @@ fn ivCoroutineRunRoot(ctx: *anyopaque, scope: ?*const Value, block: *const Value
 fn ivCoroutineLaunch(ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineLaunch(ip(ctx), block, scope, out);
 }
-fn ivCoroutineParkSlot(ctx: *anyopaque, slot: i64) void {
-    intrinsic_host.coroutineParkSlot(ip(ctx), slot);
-}
 fn ivCoroutineArmSlot(ctx: *anyopaque, slot: i64) void {
     intrinsic_host.coroutineArmSlot(ip(ctx), slot);
 }
 fn ivCoroutineDisarmSlot(ctx: *anyopaque) void {
     intrinsic_host.coroutineDisarmSlot(ip(ctx));
-}
-fn ivCoroutineResumeSlot(ctx: *anyopaque, slot: i64) void {
-    intrinsic_host.coroutineResumeSlot(ip(ctx), slot);
 }
 fn ivCoroutineResumeSlotValue(ctx: *anyopaque, slot: i64, value: Value) void {
     intrinsic_host.coroutineResumeSlotValue(ip(ctx), slot, value);
@@ -373,15 +361,8 @@ fn ivJoinOsThread(ctx: *anyopaque, id: u64) Allocator.Error!?RuntimeError {
 fn ivOsThreadAlive(ctx: *anyopaque, id: u64) bool {
     return intrinsic_host.osThreadAlive(ip(ctx), id);
 }
-fn ivDispatchCoroutine(ctx: *anyopaque, block: *const Value, elastic: bool, out: Output) Allocator.Error!HostResultU64 {
-    return intrinsic_host.dispatchCoroutine(ip(ctx), block, elastic, out);
-}
-fn ivJoinDispatched(ctx: *anyopaque, id: u64) Allocator.Error!?RuntimeError {
-    return intrinsic_host.joinDispatched(ip(ctx), id);
-}
 
 const intrinsic_vtable: IntrinsicHost.VTable = .{
-    .scheduler = ivScheduler,
     .invoke_callable = ivInvokeCallable,
     .invoke_callable_with_this = ivInvokeCallableWithThis,
     .invoke_method = ivInvokeMethod,
@@ -391,10 +372,8 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .run_blocking = ivRunBlocking,
     .coroutine_run_root = ivCoroutineRunRoot,
     .coroutine_launch = ivCoroutineLaunch,
-    .coroutine_park_slot = ivCoroutineParkSlot,
     .coroutine_arm_slot = ivCoroutineArmSlot,
     .coroutine_disarm_slot = ivCoroutineDisarmSlot,
-    .coroutine_resume_slot = ivCoroutineResumeSlot,
     .coroutine_resume_slot_value = ivCoroutineResumeSlotValue,
     .coroutine_cancel_timed_parks_with = ivCoroutineCancelTimedParksWith,
     .coroutine_resume_external = ivCoroutineResumeExternal,
@@ -402,8 +381,6 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .spawn_os_thread = ivSpawnOsThread,
     .join_os_thread = ivJoinOsThread,
     .os_thread_alive = ivOsThreadAlive,
-    .dispatch_coroutine = ivDispatchCoroutine,
-    .join_dispatched = ivJoinDispatched,
 };
 
 const testing = std.testing;

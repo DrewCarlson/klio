@@ -185,9 +185,8 @@ const testing = std.testing;
 
 /// Host that records `invoke_callable_with_this` calls and, when armed,
 /// mutates the supplied `this` buildable so the builder intrinsics have an
-/// effect to observe. The default scheduler is the in-process one.
+/// effect to observe.
 const RecordingHost = struct {
-    scheduler_impl: runtime.InProcessScheduler,
     /// Values appended to a `List`/`Set` buildable on invocation.
     append_values: []const Value = &.{},
     /// Bytes appended to a `StringBuilder` buildable on invocation.
@@ -200,16 +199,12 @@ const RecordingHost = struct {
     invoked: usize = 0,
 
     fn init(allocator: std.mem.Allocator) RecordingHost {
-        return .{ .scheduler_impl = runtime.InProcessScheduler.init(allocator), .allocator = allocator };
+        return .{ .allocator = allocator };
     }
     fn deinit(self: *RecordingHost) void {
-        self.scheduler_impl.deinit();
+        _ = self;
     }
 
-    fn vtScheduler(ctx: *anyopaque) runtime.Scheduler {
-        const self: *RecordingHost = @ptrCast(@alignCast(ctx));
-        return self.scheduler_impl.scheduler();
-    }
     fn vtInvokeCallable(ctx: *anyopaque, callable: *const Value, args: []const Value, out: runtime.Output) std.mem.Allocator.Error!EvalResult {
         _ = ctx;
         _ = callable;
@@ -246,7 +241,6 @@ const RecordingHost = struct {
     }
 
     const vtable: runtime.IntrinsicHost.VTable = .{
-        .scheduler = vtScheduler,
         .invoke_callable = vtInvokeCallable,
         .invoke_callable_with_this = vtInvokeCallableWithThis,
     };

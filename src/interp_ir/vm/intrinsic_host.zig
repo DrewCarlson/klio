@@ -26,7 +26,6 @@ const ObjRef = runtime.ObjRef;
 const Env = runtime.Env;
 const ClassDef = runtime.ClassDef;
 const Output = runtime.Output;
-const Scheduler = runtime.Scheduler;
 const RuntimeError = runtime.RuntimeError;
 const HostResultU64 = runtime.HostResultU64;
 const InstanceData = runtime.InstanceData;
@@ -57,7 +56,6 @@ pub fn vmHost(self: *VmIntrinsicHost, out: Output) VmHost {
     return .{
         .globals = self.globals.clone(),
         .module = self.module.clone(),
-        .scheduler = self.scheduler,
         .out = out,
         .instance_id_counter = self.instance_id_counter.clone(),
         .classes = self.classes.clone(),
@@ -89,7 +87,6 @@ fn vmHostDeinit(host: *VmHost) void {
 /// intrinsic recursively dispatches another intrinsic.
 pub fn childHost(self: *VmIntrinsicHost) VmIntrinsicHost {
     return .{
-        .scheduler = self.scheduler,
         .module = self.module.clone(),
         .closures = self.closures.clone(),
         .globals = self.globals.clone(),
@@ -292,7 +289,6 @@ pub fn evalClosureRaw(
     var host = VmHost{
         .globals = scoped_env.clone(),
         .module = self.module.clone(),
-        .scheduler = self.scheduler,
         .out = out,
         .instance_id_counter = self.instance_id_counter.clone(),
         .classes = self.classes.clone(),
@@ -341,10 +337,6 @@ pub fn resumeRaw(self: *VmIntrinsicHost, state: *SuspendState, value: Value, out
 // `runtime.IntrinsicHost` vtable entry points.
 // -------------------------------------------------------------------------
 
-pub fn scheduler(self: *VmIntrinsicHost) Scheduler {
-    return self.scheduler.scheduler();
-}
-
 // The cooperative coroutine driver (the engine behind `runBlocking` /
 // `coroutineRunRoot` and the park / resume / launch / drain seams) lives
 // with its `CooperativeInterceptor` machinery in `coroutines.zig`. The
@@ -363,20 +355,12 @@ pub fn coroutineLaunch(self: *VmIntrinsicHost, block: *const Value, scope: *cons
     return coroutines.coroutineLaunch(self, block, scope, out);
 }
 
-pub fn coroutineParkSlot(self: *VmIntrinsicHost, slot: i64) void {
-    coroutines.coroutineParkSlot(self, slot);
-}
-
 pub fn coroutineArmSlot(self: *VmIntrinsicHost, slot: i64) void {
     coroutines.coroutineArmSlot(self, slot);
 }
 
 pub fn coroutineDisarmSlot(self: *VmIntrinsicHost) void {
     coroutines.coroutineDisarmSlot(self);
-}
-
-pub fn coroutineResumeSlot(self: *VmIntrinsicHost, slot: i64) void {
-    coroutines.coroutineResumeSlot(self, slot);
 }
 
 pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value) void {
@@ -505,7 +489,6 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         var host = VmHost{
             .globals = scoped_env.clone(),
             .module = self.module.clone(),
-            .scheduler = self.scheduler,
             .out = out,
             .instance_id_counter = self.instance_id_counter.clone(),
             .classes = self.classes.clone(),
@@ -783,8 +766,6 @@ const WorkerArgs = struct {
     time_mode: root.TimeMode,
     threads: root.ThreadTable,
     id: u64,
-    elastic: bool,
-    gated: bool,
 };
 
 fn publishThreadResult(threads: root.ThreadTable, id: u64, result: ThreadResult) void {
@@ -826,7 +807,7 @@ fn workerEntry(wargs: WorkerArgs) void {
 }
 
 /// Publish the escaping graph then spawn a worker thread for `block`.
-fn startWorker(self: *VmIntrinsicHost, block: *const Value, elastic: bool, gated: bool) Allocator.Error!HostResultU64 {
+fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!HostResultU64 {
     // Publish the escaping block and every shared root the child can
     // reach so observing them from the new thread is sound.
     block.publishDeep(self.allocator);
@@ -888,8 +869,6 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value, elastic: bool, gated
         .time_mode = root.coroutineTimeMode(),
         .threads = self.threads.clone(),
         .id = id,
-        .elastic = elastic,
-        .gated = gated,
     };
 
     const handle = std.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, workerEntry, .{wargs}) catch {
@@ -907,9 +886,11 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value, elastic: bool, gated
 }
 
 /// Spawn `block` on a real OS thread, returning an opaque thread id.
+/// `Dispatchers.Default` / `Dispatchers.IO` and `kotlin.concurrent.thread`
+/// share this one path: one OS thread per call.
 pub fn spawnOsThread(self: *VmIntrinsicHost, block: *const Value, out: Output) Allocator.Error!HostResultU64 {
     _ = out;
-    return startWorker(self, block, false, false);
+    return startWorker(self, block);
 }
 
 /// Join the OS thread previously returned by `spawnOsThread`,
@@ -950,18 +931,6 @@ pub fn osThreadAlive(self: *VmIntrinsicHost, id: u64) bool {
         return !entry.finished.load(.acquire);
     }
     return false;
-}
-
-/// Dispatch a coroutine body onto a worker thread (`Dispatchers.Default`
-/// / `Dispatchers.IO`). Reuses the spawned-thread publication + join
-/// machinery; `elastic` selects the unbounded (IO) pool.
-pub fn dispatchCoroutine(self: *VmIntrinsicHost, block: *const Value, elastic: bool, out: Output) Allocator.Error!HostResultU64 {
-    _ = out;
-    return startWorker(self, block, elastic, true);
-}
-
-pub fn joinDispatched(self: *VmIntrinsicHost, id: u64) Allocator.Error!?RuntimeError {
-    return joinOsThread(self, id);
 }
 
 // -------------------------------------------------------------------------

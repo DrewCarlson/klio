@@ -284,7 +284,6 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, func: StdlibFn, args: 
 
 fn makeIntrinsicHost(self: *VmHost) VmIntrinsicHost {
     return .{
-        .scheduler = self.scheduler,
         .module = self.module.clone(),
         .closures = self.closures.clone(),
         .globals = self.globals.clone(),

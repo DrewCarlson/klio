@@ -51,13 +51,10 @@ pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
         }
     }
     const globals = try ObjRef(Env).init(allocator, env);
-    const sched = try allocator.create(runtime.InProcessScheduler);
-    sched.* = runtime.InProcessScheduler.init(allocator);
 
     return .{
         .module = module,
         .globals = globals,
-        .scheduler = sched,
         .instance_id_counter = try ObjRef(std.atomic.Value(u64)).init(allocator, std.atomic.Value(u64).init(0)),
         .classes = try ObjRef(ClassTable).init(allocator, ClassTable.init(allocator)),
         .top_level_props = .empty,
@@ -197,7 +194,6 @@ pub fn vmMakeHost(self: *Vm, out: Output) VmHost {
     return .{
         .globals = self.globals.clone(),
         .module = self.module.clone(),
-        .scheduler = self.scheduler,
         .out = out,
         .instance_id_counter = self.instance_id_counter.clone(),
         .classes = self.classes.clone(),
@@ -233,7 +229,6 @@ pub fn vmSpawnChild(self: *Vm) SendableVmSeed {
 /// shared serialized sink.
 pub fn vmRunThreadBlock(self: *Vm, block: *const Value) Allocator.Error!runtime.EvalResult {
     var intrinsic = VmIntrinsicHost{
-        .scheduler = self.scheduler,
         .module = self.module.clone(),
         .closures = self.closures.clone(),
         .globals = self.globals.clone(),
@@ -566,8 +561,6 @@ fn hostDeinit(host: *VmHost) void {
 pub fn vmDeinit(self: *Vm) void {
     self.module.deinit();
     self.globals.deinit();
-    self.scheduler.deinit();
-    self.allocator.destroy(self.scheduler);
     self.instance_id_counter.deinit();
     self.classes.deinit();
     self.top_level_props.deinit(self.allocator);

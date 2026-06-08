@@ -1,10 +1,10 @@
 //! Side-channels the runtime exposes to Rust-native stdlib intrinsics:
-//! the `StdlibFn` pointer, the `CallCtx` it receives, the `IntrinsicHost`
-//! it calls back through, and the cooperative `Scheduler`.
+//! the `StdlibFn` pointer, the `CallCtx` it receives, and the
+//! `IntrinsicHost` it calls back through.
 //!
-//! The Rust `IntrinsicHost` / `Scheduler` traits become `{ctx, vtable}`
-//! pairs. Trait methods that carried a default body keep that default by
-//! letting the vtable slot be optional (`null` = use the default).
+//! The Rust `IntrinsicHost` trait becomes a `{ctx, vtable}` pair. Trait
+//! methods that carried a default body keep that default by letting the
+//! vtable slot be optional (`null` = use the default).
 
 const std = @import("std");
 const value_mod = @import("value.zig");
@@ -27,7 +27,7 @@ pub const CallCtx = struct {
     args: []const Value,
     out: Output,
     /// Single host handle the intrinsic uses to reach the rest of the
-    /// runtime — the scheduler and the lambda invoker.
+    /// runtime — the lambda invoker and coroutine/thread machinery.
     host: IntrinsicHost,
     /// Allocator for any heap the intrinsic produces.
     allocator: std.mem.Allocator,
@@ -42,8 +42,6 @@ pub const IntrinsicHost = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Cooperative scheduler accessor (required).
-        scheduler: *const fn (ctx: *anyopaque) Scheduler,
         /// Invoke a callable `Value` with the supplied args (required).
         invoke_callable: *const fn (ctx: *anyopaque, callable: *const Value, args: []const Value, out: Output) std.mem.Allocator.Error!EvalResult,
         /// Invoke a callable binding `this` to `this_value` (required).
@@ -63,10 +61,8 @@ pub const IntrinsicHost = struct {
         coroutine_run_root: ?*const fn (ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
         /// Spawn a child coroutine. `null` => default (run eagerly).
         coroutine_launch: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
-        coroutine_park_slot: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
         coroutine_arm_slot: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
         coroutine_disarm_slot: ?*const fn (ctx: *anyopaque) void = null,
-        coroutine_resume_slot: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
         coroutine_resume_slot_value: ?*const fn (ctx: *anyopaque, slot: i64, value: Value) void = null,
         coroutine_cancel_timed_parks_with: ?*const fn (ctx: *anyopaque, cause: ?Value) void = null,
         coroutine_drain_to_idle: ?*const fn (ctx: *anyopaque, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
@@ -74,13 +70,7 @@ pub const IntrinsicHost = struct {
         spawn_os_thread: ?*const fn (ctx: *anyopaque, block: *const Value, out: Output) std.mem.Allocator.Error!HostResultU64 = null,
         join_os_thread: ?*const fn (ctx: *anyopaque, id: u64) std.mem.Allocator.Error!?RuntimeError = null,
         os_thread_alive: ?*const fn (ctx: *anyopaque, id: u64) bool = null,
-        dispatch_coroutine: ?*const fn (ctx: *anyopaque, block: *const Value, elastic: bool, out: Output) std.mem.Allocator.Error!HostResultU64 = null,
-        join_dispatched: ?*const fn (ctx: *anyopaque, id: u64) std.mem.Allocator.Error!?RuntimeError = null,
     };
-
-    pub fn scheduler(self: IntrinsicHost) Scheduler {
-        return self.vtable.scheduler(self.ctx);
-    }
 
     pub fn invokeCallable(self: IntrinsicHost, callable: *const Value, args: []const Value, out: Output) !EvalResult {
         return self.vtable.invoke_callable(self.ctx, callable, args, out);
@@ -129,20 +119,12 @@ pub const IntrinsicHost = struct {
         };
     }
 
-    pub fn coroutineParkSlot(self: IntrinsicHost, slot: i64) void {
-        if (self.vtable.coroutine_park_slot) |f| f(self.ctx, slot);
-    }
-
     pub fn coroutineArmSlot(self: IntrinsicHost, slot: i64) void {
         if (self.vtable.coroutine_arm_slot) |f| f(self.ctx, slot);
     }
 
     pub fn coroutineDisarmSlot(self: IntrinsicHost) void {
         if (self.vtable.coroutine_disarm_slot) |f| f(self.ctx);
-    }
-
-    pub fn coroutineResumeSlot(self: IntrinsicHost, slot: i64) void {
-        if (self.vtable.coroutine_resume_slot) |f| f(self.ctx, slot);
     }
 
     pub fn coroutineResumeSlotValue(self: IntrinsicHost, slot: i64, value: Value) void {
@@ -188,16 +170,6 @@ pub const IntrinsicHost = struct {
         if (self.vtable.os_thread_alive) |f| return f(self.ctx, id);
         return false;
     }
-
-    pub fn dispatchCoroutine(self: IntrinsicHost, block: *const Value, elastic: bool, out: Output) !HostResultU64 {
-        if (self.vtable.dispatch_coroutine) |f| return f(self.ctx, block, elastic, out);
-        return self.spawnOsThread(block, out);
-    }
-
-    pub fn joinDispatched(self: IntrinsicHost, id: u64) !?RuntimeError {
-        if (self.vtable.join_dispatched) |f| return f(self.ctx, id);
-        return self.joinOsThread(id);
-    }
 };
 
 /// `Result<u64, RuntimeError>` for the OS-thread/dispatch entry points.
@@ -206,100 +178,18 @@ pub const HostResultU64 = union(enum) {
     err: RuntimeError,
 };
 
-/// Cooperative scheduler the runtime exposes. A `{ctx, vtable}` pair
-/// mirroring Rust's `&mut dyn Scheduler`. Drain calls hand back an owned
-/// slice the caller frees.
-pub const Scheduler = struct {
-    ctx: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        spawn: *const fn (ctx: *anyopaque, block: Value) std.mem.Allocator.Error!void,
-        schedule_resume: *const fn (ctx: *anyopaque, cont: Value) std.mem.Allocator.Error!void,
-        drain_launches: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Value,
-        drain_resumes: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Value,
-    };
-
-    pub fn spawn(self: Scheduler, block: Value) !void {
-        return self.vtable.spawn(self.ctx, block);
-    }
-    pub fn scheduleResume(self: Scheduler, cont: Value) !void {
-        return self.vtable.schedule_resume(self.ctx, cont);
-    }
-    pub fn drainLaunches(self: Scheduler, allocator: std.mem.Allocator) ![]Value {
-        return self.vtable.drain_launches(self.ctx, allocator);
-    }
-    pub fn drainResumes(self: Scheduler, allocator: std.mem.Allocator) ![]Value {
-        return self.vtable.drain_resumes(self.ctx, allocator);
-    }
-};
-
-/// Default scheduler — keeps spawn/resume queues in a pair of lists.
-pub const InProcessScheduler = struct {
-    launches: std.ArrayList(Value) = .empty,
-    resumes: std.ArrayList(Value) = .empty,
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) InProcessScheduler {
-        return .{ .launches = .empty, .resumes = .empty, .allocator = allocator };
-    }
-
-    pub fn deinit(self: *InProcessScheduler) void {
-        self.launches.deinit(self.allocator);
-        self.resumes.deinit(self.allocator);
-    }
-
-    fn vtSpawn(ctx: *anyopaque, block: Value) std.mem.Allocator.Error!void {
-        const self: *InProcessScheduler = @ptrCast(@alignCast(ctx));
-        try self.launches.append(self.allocator, block);
-    }
-    fn vtScheduleResume(ctx: *anyopaque, cont: Value) std.mem.Allocator.Error!void {
-        const self: *InProcessScheduler = @ptrCast(@alignCast(ctx));
-        try self.resumes.append(self.allocator, cont);
-    }
-    fn vtDrainLaunches(ctx: *anyopaque, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Value {
-        const self: *InProcessScheduler = @ptrCast(@alignCast(ctx));
-        const out = try self.launches.toOwnedSlice(self.allocator);
-        _ = allocator;
-        return out;
-    }
-    fn vtDrainResumes(ctx: *anyopaque, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Value {
-        const self: *InProcessScheduler = @ptrCast(@alignCast(ctx));
-        const out = try self.resumes.toOwnedSlice(self.allocator);
-        _ = allocator;
-        return out;
-    }
-
-    const vtable: Scheduler.VTable = .{
-        .spawn = vtSpawn,
-        .schedule_resume = vtScheduleResume,
-        .drain_launches = vtDrainLaunches,
-        .drain_resumes = vtDrainResumes,
-    };
-
-    pub fn scheduler(self: *InProcessScheduler) Scheduler {
-        return .{ .ctx = self, .vtable = &vtable };
-    }
-};
-
 /// Bare-minimum host for unit tests of pure intrinsics. The callable
-/// entry points return `RuntimeError.Unimplemented` data; the scheduler
-/// is the in-process default.
+/// entry points return `RuntimeError.Unimplemented` data.
 pub const NoopHost = struct {
-    scheduler_impl: InProcessScheduler,
-
     pub fn init(allocator: std.mem.Allocator) NoopHost {
-        return .{ .scheduler_impl = InProcessScheduler.init(allocator) };
+        _ = allocator;
+        return .{};
     }
 
     pub fn deinit(self: *NoopHost) void {
-        self.scheduler_impl.deinit();
+        _ = self;
     }
 
-    fn vtScheduler(ctx: *anyopaque) Scheduler {
-        const self: *NoopHost = @ptrCast(@alignCast(ctx));
-        return self.scheduler_impl.scheduler();
-    }
     fn vtInvokeCallable(ctx: *anyopaque, callable: *const Value, args: []const Value, out: Output) std.mem.Allocator.Error!EvalResult {
         _ = ctx;
         _ = callable;
@@ -317,7 +207,6 @@ pub const NoopHost = struct {
     }
 
     const vtable: IntrinsicHost.VTable = .{
-        .scheduler = vtScheduler,
         .invoke_callable = vtInvokeCallable,
         .invoke_callable_with_this = vtInvokeCallableWithThis,
     };
@@ -331,21 +220,6 @@ const InstanceData = @import("class.zig").InstanceData;
 
 const testing = std.testing;
 
-test "in-process scheduler spawns and drains FIFO" {
-    var sched = InProcessScheduler.init(testing.allocator);
-    defer sched.deinit();
-    const s = sched.scheduler();
-    try s.spawn(.{ .Int = 1 });
-    try s.spawn(.{ .Int = 2 });
-    const launches = try s.drainLaunches(testing.allocator);
-    defer testing.allocator.free(launches);
-    try testing.expectEqual(@as(usize, 2), launches.len);
-    // Draining again yields an empty batch.
-    const again = try s.drainLaunches(testing.allocator);
-    defer testing.allocator.free(again);
-    try testing.expectEqual(@as(usize, 0), again.len);
-}
-
 test "noop host reports unimplemented for callables" {
     var h = NoopHost.init(testing.allocator);
     defer h.deinit();
@@ -354,4 +228,16 @@ test "noop host reports unimplemented for callables" {
     const callable: Value = .Unit;
     const r = try h.host().invokeCallable(&callable, &.{}, cap.output());
     try testing.expect(r == .err);
+}
+
+test "intrinsic host slot seams default to a no-op without a vtable slot" {
+    var h = NoopHost.init(testing.allocator);
+    defer h.deinit();
+    const ih = h.host();
+    // The merged one-arm / one-resume coroutine surface: an unwired host
+    // tolerates each call as a no-op rather than dereferencing a null slot.
+    ih.coroutineArmSlot(1);
+    ih.coroutineResumeSlotValue(1, .Unit);
+    ih.coroutineDisarmSlot();
+    try testing.expect(!ih.osThreadAlive(0));
 }

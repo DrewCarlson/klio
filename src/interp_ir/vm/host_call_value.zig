@@ -562,7 +562,6 @@ fn nextInstanceId(self: *VmHost) u64 {
 /// stdlib bindings can recursively invoke lambdas via the closure table.
 fn makeIntrinsicHost(self: *VmHost) VmIntrinsicHost {
     return .{
-        .scheduler = self.scheduler,
         .module = self.module.clone(),
         .closures = self.closures.clone(),
         .globals = self.globals.clone(),

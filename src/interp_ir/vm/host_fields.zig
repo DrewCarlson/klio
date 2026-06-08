@@ -199,7 +199,6 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// `EvalError`.
 fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     var ih = VmIntrinsicHost{
-        .scheduler = self.scheduler,
         .module = self.module,
         .closures = self.closures,
         .globals = self.globals,
