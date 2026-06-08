@@ -313,14 +313,6 @@ pub fn ObjGuardMut(comptime T: type) type {
     };
 }
 
-/// Named memory-model seam, retained as the explicit ordering site for
-/// `synchronized` enter/exit and `thread` start/join. The concrete
-/// happens-before edges live in `ObjRef.publish` (release store) paired
-/// with the acquire load in every borrow, plus the per-cell lock. This
-/// function does not itself emit a fence; it is kept as a stable, named
-/// call site so the boundary is visible in the code.
-pub inline fn fenceAndPublish() void {}
-
 // -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------

@@ -72,13 +72,6 @@ fn makeStringOwned(a: Allocator, s: []const u8) Error!Value {
     return .{ .String = try StringRef.init(a, s) };
 }
 
-/// Heap-box a `Value` (`Box::new(v)` -> `*Value`).
-fn box(a: Allocator, v: Value) Error!*Value {
-    const p = try a.create(Value);
-    p.* = v;
-    return p;
-}
-
 /// `make_list(items, mutable)` — wrap a slice of values into a `List`.
 fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var list: std.ArrayList(Value) = .empty;
@@ -144,14 +137,14 @@ fn makeMapFromArrayList(a: Allocator, entries: std.ArrayList(MapPair), mutable: 
 }
 
 fn makePair(a: Allocator, first: Value, second: Value) Error!Value {
-    return .{ .Pair = .{ .first = try box(a, first), .second = try box(a, second) } };
+    return .{ .Pair = .{ .first = try Value.box(a, first), .second = try Value.box(a, second) } };
 }
 
 fn makeTriple(a: Allocator, first: Value, second: Value, third: Value) Error!Value {
     return .{ .Triple = .{
-        .first = try box(a, first),
-        .second = try box(a, second),
-        .third = try box(a, third),
+        .first = try Value.box(a, first),
+        .second = try Value.box(a, second),
+        .third = try Value.box(a, third),
     } };
 }
 
@@ -493,8 +486,8 @@ fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcome {
             var out = try a.alloc(Value, src.len);
             for (src, 0..) |kv, i| {
                 out[i] = .{ .MapEntry = .{
-                    .key = try box(a, kv.key),
-                    .value = try box(a, kv.value),
+                    .key = try Value.box(a, kv.key),
+                    .value = try Value.box(a, kv.value),
                     .backing = null,
                 } };
             }
@@ -3614,8 +3607,8 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
         defer g.deinit();
         for (g.get().items) |kv| {
             try map_entries.append(a, .{ .MapEntry = .{
-                .key = try box(a, kv.key),
-                .value = try box(a, kv.value),
+                .key = try Value.box(a, kv.key),
+                .value = try Value.box(a, kv.value),
                 .backing = entries,
             } });
         }

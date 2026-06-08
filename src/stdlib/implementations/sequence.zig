@@ -319,8 +319,7 @@ pub fn seq_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const args = ctx.args;
     if (args.len == 1 and isLambdaLike(args[0])) {
-        const next = try ctx.allocator.create(Value);
-        next.* = args[0];
+        const next = try Value.box(ctx.allocator, args[0]);
         const data = try ObjRef(SequenceData).init(ctx.allocator, .{
             .source = .{ .Generate = .{ .seed = null, .next = next } },
             .ops = &.{},
@@ -330,12 +329,9 @@ pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (args.len == 2 and isLambdaLike(args[1])) {
         var seed: ?*Value = null;
         if (args[0] != .Null) {
-            const sp = try ctx.allocator.create(Value);
-            sp.* = args[0];
-            seed = sp;
+            seed = try Value.box(ctx.allocator, args[0]);
         }
-        const next = try ctx.allocator.create(Value);
-        next.* = args[1];
+        const next = try Value.box(ctx.allocator, args[1]);
         const data = try ObjRef(SequenceData).init(ctx.allocator, .{
             .source = .{ .Generate = .{ .seed = seed, .next = next } },
             .ops = &.{},

@@ -56,7 +56,7 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
                 // A builtin exception is `Value.Exception`; a user / pack
                 // exception subclass is a `Value.Instance` of a
                 // Throwable-derived class. Both are valid causes.
-                .Exception, .Instance => cause = try boxValue(ctx.allocator, c),
+                .Exception, .Instance => cause = try Value.box(ctx.allocator, c.*),
                 else => {
                     if (message) |m| freeMessage(ctx.allocator, m);
                     return typeErr("Throwable cause must be a Throwable or null");
@@ -64,7 +64,7 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
             }
         } else {
             if (v.* == .Exception) {
-                cause = try boxValue(ctx.allocator, v);
+                cause = try Value.box(ctx.allocator, v.*);
             } else {
                 message = try messageOf(ctx.allocator, v);
             }
@@ -88,13 +88,6 @@ fn messageOf(allocator: std.mem.Allocator, v: *const Value) std.mem.Allocator.Er
             break :blk try StringRef.init(allocator, s);
         },
     };
-}
-
-/// Heap-box a shallow copy of `v`, mirroring Rust's `Box::new(v.clone())`.
-fn boxValue(allocator: std.mem.Allocator, v: *const Value) std.mem.Allocator.Error!*Value {
-    const p = try allocator.create(Value);
-    p.* = v.*;
-    return p;
 }
 
 /// Free a message handle built by `messageOf` (its rendered bytes and the

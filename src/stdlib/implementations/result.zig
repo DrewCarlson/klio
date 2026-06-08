@@ -34,16 +34,9 @@ fn recvResult(args: []const Value) ?Recv {
     return null;
 }
 
-/// Box a `Value` on the heap so it can fill a `*Value` payload slot.
-fn boxValue(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error!*Value {
-    const p = try allocator.create(Value);
-    p.* = v;
-    return p;
-}
-
 /// Construct a `Value::Result { ok, payload }` with a heap-boxed payload.
 fn makeResult(allocator: std.mem.Allocator, ok: bool, payload: Value) std.mem.Allocator.Error!Value {
-    return .{ .Result = .{ .ok = ok, .payload = try boxValue(allocator, payload) } };
+    return .{ .Result = .{ .ok = ok, .payload = try Value.box(allocator, payload) } };
 }
 
 pub fn result_success(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {

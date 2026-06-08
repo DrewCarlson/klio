@@ -138,6 +138,7 @@ pub const SpinMutex = struct {
     pub fn lock(self: *SpinMutex) void {
         while (self.locked.swap(true, .acquire)) {
             std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
     }
     pub fn unlock(self: *SpinMutex) void {

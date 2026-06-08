@@ -83,8 +83,8 @@ fn monitorFor(key: usize) std.mem.Allocator.Error!*Monitor {
 /// serializes, and the same thread re-entering the same lock does
 /// not self-deadlock (Kotlin/JVM monitors are reentrant). The body
 /// runs with the monitor held; it is released (even on a thrown
-/// exception) before returning. `fenceAndPublish` marks the
-/// monitor enter and exit boundaries.
+/// exception) before returning. The monitor enter/exit ordering is
+/// carried by the monitor's own `SpinMutex` acquire/release.
 pub fn concurrent_synchronized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const lock: Value = if (ctx.args.len > 0) ctx.args[0] else .Unit;
     const block: Value = if (ctx.args.len > 0)
@@ -117,11 +117,11 @@ pub fn concurrent_synchronized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
             break;
         }
     }
-    runtime.fenceAndPublish(); // monitor enter
+    // Monitor enter: ordering carried by the SpinMutex acquire above.
 
     const result = ctx.host.invokeCallable(&block, &.{}, ctx.out);
 
-    runtime.fenceAndPublish(); // monitor exit
+    // Monitor exit: ordering carried by the SpinMutex release below.
     // Release one level; clear ownership when fully released so a
     // waiter can acquire.
     {
@@ -174,7 +174,8 @@ pub fn concurrent_thread(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // explicitly. Without a real deferred-start handle we still spawn
     // (the body runs concurrently regardless); a later `.start()` is
     // a no-op. Defaulting to start=true matches the common case.
-    runtime.fenceAndPublish(); // thread start
+    // Thread start: happens-before is carried by Thread.spawn inside
+    // spawnOsThread, paired with publish()'s release store on the seed.
     const spawned = try ctx.host.spawnOsThread(&body, ctx.out);
     const id: u64 = switch (spawned) {
         .ok => |v| v,

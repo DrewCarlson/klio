@@ -415,6 +415,14 @@ pub const Value = union(enum) {
         return .{ .Cell = try ObjRef(Value).init(allocator, v) };
     }
 
+    /// Heap-box a `Value` so it can fill a `*Value` payload slot
+    /// (`Box::new(v)` -> `*Value`).
+    pub fn box(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error!*Value {
+        const p = try allocator.create(Value);
+        p.* = v;
+        return p;
+    }
+
     pub fn isIntegral(self: Value) bool {
         return switch (self) {
             .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte => true,

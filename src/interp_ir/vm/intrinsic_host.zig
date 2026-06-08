@@ -807,7 +807,8 @@ fn workerEntry(wargs: WorkerArgs) void {
         publishThreadResult(args.threads, args.id, .{ .err = .{ .Type = "worker out of memory" } });
         return;
     };
-    runtime.fenceAndPublish();
+    // Worker result publication: happens-before to the joining parent is
+    // carried by publishDeep's release stores plus the parent's join().
     switch (r) {
         .ok => |v| {
             v.publishDeep(args.seed.allocator);
@@ -852,13 +853,19 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value, elastic: bool, gated
     self.classes.publish();
     self.anon_methods.publish();
     self.class_default_outer.publish();
+    // The worker writes its result into `threads` (borrowMut via
+    // publishThreadResult) while the parent borrows it in joinSpawned/
+    // joinAllThreads. Publish it so those concurrent borrows go through the
+    // SHARED rwlock instead of the non-atomic UNSHARED flag (data race).
+    self.threads.publish();
     self.prog.publish();
     {
         const pg = self.prog.borrow();
         defer pg.deinit();
         pg.get().installed_bindings.publish();
     }
-    runtime.fenceAndPublish();
+    // The publish() release stores above pair with Thread.spawn's ordering
+    // (below) to make the published roots visible on the worker.
 
     const id = blk: {
         const g = self.instance_id_counter.borrowMut();
@@ -918,8 +925,8 @@ pub fn joinOsThread(self: *VmIntrinsicHost, id: u64) Allocator.Error!?RuntimeErr
         break :blk null;
     };
     if (handle) |h| {
+        // join() establishes happens-before with the worker's writes.
         h.join();
-        runtime.fenceAndPublish();
     }
     const g = self.threads.borrow();
     defer g.deinit();
