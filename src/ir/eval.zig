@@ -2438,10 +2438,24 @@ fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?b
                 else => unreachable,
             };
         }
+        // The relational operators `<` `<=` `>` `>=` on concrete Double/Float
+        // follow IEEE-754: any comparison involving a NaN is false. Zig's
+        // native float operators already honor this, so compare directly
+        // instead of going through `std.math.order` (which asserts non-NaN).
+        fn cmpFloat(o: BinOp, a: f64, b: f64) bool {
+            return switch (o) {
+                .Less => a < b,
+                .LessEq => a <= b,
+                .Greater => a > b,
+                .GreaterEq => a >= b,
+                else => unreachable,
+            };
+        }
     };
     if (l.* == .Int and r.* == .Int) return Pair.cmpOrder(op, std.math.order(l.Int, r.Int));
     if (l.* == .Long and r.* == .Long) return Pair.cmpOrder(op, std.math.order(l.Long, r.Long));
-    if (l.* == .Double and r.* == .Double) return Pair.cmpOrder(op, std.math.order(l.Double, r.Double));
+    if (l.* == .Double and r.* == .Double) return Pair.cmpFloat(op, l.Double, r.Double);
+    if (l.* == .Float and r.* == .Float) return Pair.cmpFloat(op, @as(f64, l.Float), @as(f64, r.Float));
     if (l.* == .Char and r.* == .Char) return Pair.cmpOrder(op, std.math.order(l.Char, r.Char));
     if (l.* == .UInt and r.* == .UInt) return Pair.cmpOrder(op, std.math.order(l.UInt, r.UInt));
     if (l.* == .ULong and r.* == .ULong) return Pair.cmpOrder(op, std.math.order(l.ULong, r.ULong));
@@ -2450,11 +2464,11 @@ fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?b
     // Mixed Int/Long.
     if (l.* == .Int and r.* == .Long) return Pair.cmpOrder(op, std.math.order(@as(i64, l.Int), r.Long));
     if (l.* == .Long and r.* == .Int) return Pair.cmpOrder(op, std.math.order(l.Long, @as(i64, r.Int)));
-    // Mixed with Double.
-    if (l.* == .Int and r.* == .Double) return Pair.cmpOrder(op, std.math.order(@as(f64, @floatFromInt(l.Int)), r.Double));
-    if (l.* == .Double and r.* == .Int) return Pair.cmpOrder(op, std.math.order(l.Double, @as(f64, @floatFromInt(r.Int))));
-    if (l.* == .Long and r.* == .Double) return Pair.cmpOrder(op, std.math.order(@as(f64, @floatFromInt(l.Long)), r.Double));
-    if (l.* == .Double and r.* == .Long) return Pair.cmpOrder(op, std.math.order(l.Double, @as(f64, @floatFromInt(r.Long))));
+    // Mixed with Double (IEEE relational semantics: the Double side may be NaN).
+    if (l.* == .Int and r.* == .Double) return Pair.cmpFloat(op, @as(f64, @floatFromInt(l.Int)), r.Double);
+    if (l.* == .Double and r.* == .Int) return Pair.cmpFloat(op, l.Double, @as(f64, @floatFromInt(r.Int)));
+    if (l.* == .Long and r.* == .Double) return Pair.cmpFloat(op, @as(f64, @floatFromInt(l.Long)), r.Double);
+    if (l.* == .Double and r.* == .Long) return Pair.cmpFloat(op, l.Double, @as(f64, @floatFromInt(r.Long)));
     if (l.* == .String and r.* == .String) {
         const lg = l.String.borrow();
         defer lg.deinit();
