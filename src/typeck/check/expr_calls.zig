@@ -751,12 +751,14 @@ pub fn inferCallReturnWithArgs(
             .depth = 0,
         };
     }
+    // Values are the inference-var `TypeParam`s handed back by
+    // `ConstraintSystem.fresh`; their name slices are owned by the
+    // constraint system's arena, which outlives this map (the session
+    // is torn down at the very end of this function). The map only
+    // borrows them, so its teardown frees the spine but never the
+    // arena-owned values.
     var local_subst = std.StringHashMap(Type).init(self.allocator);
-    defer {
-        var it = local_subst.valueIterator();
-        while (it.next()) |t| t.deinit(self.allocator);
-        local_subst.deinit();
-    }
+    defer local_subst.deinit();
     var vars: std.ArrayList(constraints.InferenceVar) = .empty;
     defer vars.deinit(self.allocator);
     {
@@ -767,12 +769,7 @@ pub fn inferCallReturnWithArgs(
             defer self.allocator.free(unique);
             const fresh = try session.cs.fresh(unique);
             session.cs.setPreference(fresh[0], .PullUp);
-            // `fresh[1]` is a `TypeParam` whose name slice is owned by the
-            // constraint system's arena. `local_subst`'s cleanup frees its
-            // values with `self.allocator`, so store a self-owned clone
-            // rather than the arena-owned encoding (freeing arena memory
-            // through `self.allocator` corrupts the live var-name keys).
-            try local_subst.put(name, try fresh[1].clone(self.allocator));
+            try local_subst.put(name, fresh[1]);
             try vars.append(self.allocator, fresh[0]);
         }
         // Map each argument to its parameter slot, honouring a trailing

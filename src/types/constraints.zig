@@ -91,15 +91,16 @@ pub const BoundSet = struct {
     postponed: ?PostponedKind,
 
     /// Fresh bound set seeded with the implicit `Nothing <: α`
-    /// and `α <: Any?` bounds. The list backing stores use `gpa`; the
-    /// seeded `Any` box is allocated in `arena` so the system owns it.
-    pub fn new(gpa: Allocator, arena: Allocator) Allocator.Error!BoundSet {
+    /// and `α <: Any?` bounds. Both list spines and the seeded `Any`
+    /// box are allocated in `arena`, so the system owns everything and
+    /// nothing here is freed through a foreign allocator.
+    pub fn new(arena: Allocator) Allocator.Error!BoundSet {
         var lower: std.ArrayList(Type) = .empty;
-        try lower.append(gpa, .Nothing);
+        try lower.append(arena, .Nothing);
         var upper: std.ArrayList(Type) = .empty;
         const any = try arena.create(Type);
         any.* = .Any;
-        try upper.append(gpa, .{ .Nullable = any });
+        try upper.append(arena, .{ .Nullable = any });
         return .{
             .lower = lower,
             .upper = upper,
@@ -314,11 +315,11 @@ fn hashType(h: *std.hash.Wyhash, t: Type) void {
     }
 }
 
-const VarMap = std.AutoHashMap(InferenceVar, BoundSet);
-const NameMap = std.StringHashMap(InferenceVar);
-const SeenSet = std.HashMap(SeenKey, void, SeenContext, std.hash_map.default_max_load_percentage);
-const TypeIndex = std.HashMap(Type, TypeId, TypeContext, std.hash_map.default_max_load_percentage);
-const EquivMap = std.AutoHashMap(InferenceVar, InferenceVar);
+const VarMap = std.AutoHashMapUnmanaged(InferenceVar, BoundSet);
+const NameMap = std.StringHashMapUnmanaged(InferenceVar);
+const SeenSet = std.HashMapUnmanaged(SeenKey, void, SeenContext, std.hash_map.default_max_load_percentage);
+const TypeIndex = std.HashMapUnmanaged(Type, TypeId, TypeContext, std.hash_map.default_max_load_percentage);
+const EquivMap = std.AutoHashMapUnmanaged(InferenceVar, InferenceVar);
 const ResolvedMap = std.AutoHashMap(InferenceVar, Type);
 
 /// The last unsatisfied constraint together with the provenance that
@@ -366,31 +367,25 @@ pub const ConstraintSystem = struct {
         return .{
             .type_arena = std.heap.ArenaAllocator.init(gpa),
             .gpa = gpa,
-            .bounds = VarMap.init(gpa),
-            .var_names = NameMap.init(gpa),
+            .bounds = .empty,
+            .var_names = .empty,
             .next_id = 0,
             .pending = .empty,
-            .seen = SeenSet.init(gpa),
+            .seen = .empty,
             .type_pool = .empty,
-            .type_index = TypeIndex.init(gpa),
-            .equiv = EquivMap.init(gpa),
+            .type_index = .empty,
+            .equiv = .empty,
             .last_error_val = null,
         };
     }
 
+    /// Single ownership story: every container the system holds is
+    /// arena-backed, so the whole solver workspace — map spines, bound
+    /// lists, interned `Type`s, and `var_names` keys — is reclaimed by
+    /// the one `type_arena.deinit()`. No system memory is freed through
+    /// `gpa`, and no arena memory is ever handed to a foreign allocator
+    /// to free.
     pub fn deinit(self: *ConstraintSystem) void {
-        var it = self.bounds.valueIterator();
-        while (it.next()) |bs| {
-            bs.lower.deinit(self.gpa);
-            bs.upper.deinit(self.gpa);
-        }
-        self.bounds.deinit();
-        self.var_names.deinit();
-        self.pending.deinit(self.gpa);
-        self.seen.deinit();
-        self.type_pool.deinit(self.gpa);
-        self.type_index.deinit();
-        self.equiv.deinit();
         self.type_arena.deinit();
     }
 
@@ -408,9 +403,10 @@ pub const ConstraintSystem = struct {
     pub fn fresh(self: *ConstraintSystem, hint: []const u8) Allocator.Error!struct { InferenceVar, Type } {
         const id = InferenceVar.from(self.next_id);
         self.next_id += 1;
-        const name = try std.fmt.allocPrint(self.arena(), "?{s}{d}", .{ hint, id.int() });
-        try self.var_names.put(name, id);
-        try self.bounds.put(id, try BoundSet.new(self.gpa, self.arena()));
+        const a = self.arena();
+        const name = try std.fmt.allocPrint(a, "?{s}{d}", .{ hint, id.int() });
+        try self.var_names.put(a, name, id);
+        try self.bounds.put(a, id, try BoundSet.new(a));
         return .{ id, .{ .TypeParam = name } };
     }
 
@@ -490,7 +486,7 @@ pub const ConstraintSystem = struct {
         if (self.seen.contains(key)) {
             return;
         }
-        try self.pending.append(self.gpa, .{
+        try self.pending.append(self.arena(), .{
             .lhs = owned_lhs,
             .rhs = owned_rhs,
             .kind = kind,
@@ -506,8 +502,9 @@ pub const ConstraintSystem = struct {
             return id;
         }
         const id = TypeId.from(@intCast(self.type_pool.items.len));
-        try self.type_pool.append(self.gpa, t);
-        try self.type_index.put(t, id);
+        const a = self.arena();
+        try self.type_pool.append(a, t);
+        try self.type_index.put(a, t, id);
         return id;
     }
 
@@ -520,22 +517,23 @@ pub const ConstraintSystem = struct {
         // Point the higher-id var at the lower-id one; stable choice.
         const keep = if (ra.int() <= rb.int()) ra else rb;
         const drop = if (ra.int() <= rb.int()) rb else ra;
-        try self.equiv.put(drop, keep);
-        // Merge bound sets: drop's bounds become keep's bounds.
+        const arena_alloc = self.arena();
+        try self.equiv.put(arena_alloc, drop, keep);
+        // Merge bound sets: drop's bounds become keep's bounds. The
+        // dropped set's lists are arena-owned and reclaimed at teardown,
+        // so there is nothing to free here.
         if (self.bounds.fetchRemove(drop)) |entry| {
-            var dropped = entry.value;
+            const dropped = entry.value;
             const target = self.bounds.getPtr(keep).?;
             for (dropped.lower.items) |t| {
-                _ = try target.addLower(self.gpa, t);
+                _ = try target.addLower(arena_alloc, t);
             }
             for (dropped.upper.items) |t| {
-                _ = try target.addUpper(self.gpa, t);
+                _ = try target.addUpper(arena_alloc, t);
             }
             if (dropped.preference == .PushDown) {
                 target.preference = .PushDown;
             }
-            dropped.lower.deinit(self.gpa);
-            dropped.upper.deinit(self.gpa);
         }
     }
 
@@ -562,9 +560,10 @@ pub const ConstraintSystem = struct {
 
     /// Ensures a bound set exists for `v`, creating one if needed.
     fn boundsEntry(self: *ConstraintSystem, v: InferenceVar) Allocator.Error!*BoundSet {
-        const gop = try self.bounds.getOrPut(v);
+        const a = self.arena();
+        const gop = try self.bounds.getOrPut(a, v);
         if (!gop.found_existing) {
-            gop.value_ptr.* = try BoundSet.new(self.gpa, self.arena());
+            gop.value_ptr.* = try BoundSet.new(a);
         }
         return gop.value_ptr;
     }
@@ -580,7 +579,7 @@ pub const ConstraintSystem = struct {
                 .rhs = try self.intern(c.rhs),
                 .kind = c.kind,
             };
-            const gop = try self.seen.getOrPut(key);
+            const gop = try self.seen.getOrPut(self.arena(), key);
             if (gop.found_existing) {
                 continue;
             }
@@ -604,18 +603,18 @@ pub const ConstraintSystem = struct {
         if (self.isInferenceVar(lhs)) |raw| {
             const v = self.findRoot(raw);
             const bs = try self.boundsEntry(v);
-            _ = try bs.addUpper(self.gpa, try self.own(rhs));
+            _ = try bs.addUpper(self.arena(), try self.own(rhs));
             if (kind == .Equality) {
-                _ = try bs.addLower(self.gpa, try self.own(rhs));
+                _ = try bs.addLower(self.arena(), try self.own(rhs));
             }
             return null;
         }
         if (self.isInferenceVar(rhs)) |raw| {
             const v = self.findRoot(raw);
             const bs = try self.boundsEntry(v);
-            _ = try bs.addLower(self.gpa, try self.own(lhs));
+            _ = try bs.addLower(self.arena(), try self.own(lhs));
             if (kind == .Equality) {
-                _ = try bs.addUpper(self.gpa, try self.own(lhs));
+                _ = try bs.addUpper(self.arena(), try self.own(lhs));
             }
             return null;
         }
@@ -1130,7 +1129,7 @@ fn isInferenceVarType(t: Type) bool {
 fn collectVars(
     gpa: Allocator,
     t: Type,
-    var_names: *const std.StringHashMap(InferenceVar),
+    var_names: *const NameMap,
     out: *std.ArrayList(InferenceVar),
 ) Allocator.Error!void {
     switch (t) {
@@ -1169,7 +1168,7 @@ fn substituteVars(
     arena: Allocator,
     t: Type,
     resolved: *const std.AutoHashMap(InferenceVar, Type),
-    var_names: *const std.StringHashMap(InferenceVar),
+    var_names: *const NameMap,
 ) Allocator.Error!Type {
     switch (t) {
         .TypeParam => |name| {
@@ -1366,11 +1365,7 @@ fn prov() Provenance {
 test "implicit bounds seeded" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    var bs = try BoundSet.new(testing.allocator, ar.allocator());
-    defer {
-        bs.lower.deinit(testing.allocator);
-        bs.upper.deinit(testing.allocator);
-    }
+    const bs = try BoundSet.new(ar.allocator());
     var has_nothing = false;
     for (bs.lower.items) |t| {
         if (t == .Nothing) has_nothing = true;
