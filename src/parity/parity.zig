@@ -1342,6 +1342,12 @@ pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) A
 /// captured stdout (ok) or an error message (err), owned by `allocator`. The
 /// single tail shared by all three load configurations.
 pub fn runInMode(allocator: Allocator, io: Io, file: []const u8, mode: LoadMode) Allocator.Error!SResult([]u8) {
+    // In-process run path shared by e2e / itests / differential / fuzzer:
+    // cap RSS and arm the opt-in deadline so a runaway program can't OOM or
+    // hang the harness process. Call-once.
+    runtime.startMemoryWatchdog();
+    runtime.startRunDeadline();
+
     var arena_inst = std.heap.ArenaAllocator.init(allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -1369,12 +1375,37 @@ pub fn runInMode(allocator: Allocator, io: Io, file: []const u8, mode: LoadMode)
 
     var out = CaptureOutput.init(allocator);
     defer out.deinit();
-    const result = try vm.run(main_id, out.output());
+    const result = runMainBigStack(&vm, main_id, out.output());
     switch (result) {
         .ok => {},
         .err => |e| return .{ .err = try formatVmError(allocator, e) },
     }
     return .{ .ok = try out.intoJoined(allocator) };
+}
+
+/// Run `main` on a large-stack worker thread so deep legitimate recursion
+/// runs to completion rather than overflowing the harness's main stack. The
+/// coroutine time mode is thread-local, so it is re-established on the worker.
+const MainRunCtx = struct {
+    vm: *interp_ir.Vm,
+    main: interp_ir.FuncId,
+    out: interp_ir.Output,
+    time_mode: interp_ir.TimeMode,
+};
+
+fn runMainBigStack(vm: *interp_ir.Vm, main_id: interp_ir.FuncId, out: interp_ir.Output) interp_ir.VmResult {
+    const ctx = MainRunCtx{
+        .vm = vm,
+        .main = main_id,
+        .out = out,
+        .time_mode = interp_ir.coroutineTimeMode(),
+    };
+    return runtime.runOnBigStack(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
+}
+
+fn runMainEntry(ctx: MainRunCtx) interp_ir.VmResult {
+    interp_ir.setCoroutineTimeMode(ctx.time_mode);
+    return ctx.vm.run(ctx.main, ctx.out) catch return .{ .err = .{ .Eval = "out of memory" } };
 }
 
 /// Run a `.kt` file directly through the `klio` interpreter library, returning
@@ -1677,8 +1708,8 @@ fn registerAstPackage(arena: Allocator, file_ast: *const KotlinFile) Allocator.E
 /// packs (coroutines, atomicfu, io) loaded from source and their host bindings
 /// installed.
 pub fn runWithPacks(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
-    // The Rust harness wrapped this in `stacker::grow(16 MiB, ...)`. Zig has no
-    // portable equivalent; the body runs directly.
+    // `runInMode` runs `main` on a 64 MiB worker stack (the Zig equivalent of
+    // the Rust harness's `stacker::grow`), so deep recursion has headroom.
     return runInMode(allocator, io, file, .SourcePacks);
 }
 
@@ -1843,6 +1874,8 @@ fn splitLines(s: []const u8, buf: [][]const u8) ?usize {
 /// Full parity check: compile + run both compilers, return a report. The
 /// report's strings are owned by `allocator`.
 pub fn check(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!PResult(ParityReport) {
+    runtime.startMemoryWatchdog();
+    runtime.startRunDeadline();
     if (envFlag(allocator, io, "KLIO_SKIP_KOTLINC_PARITY")) {
         return .{ .err = .NoKotlinc };
     }

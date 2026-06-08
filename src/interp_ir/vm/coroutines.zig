@@ -606,6 +606,7 @@ fn mapDriverErr(allocator: Allocator, e: EvalError) RuntimeError {
         .Unbound => |s| .{ .Unbound = s },
         .Unimplemented => |s| .{ .Unimplemented = s },
         .Arity => |s| .{ .Arity = s },
+        .StackOverflow => |s| .{ .Type = s },
         .Suspended => .{ .Type = std.fmt.allocPrint(allocator, "coroutine suspended outside a driver", .{}) catch "coroutine suspended outside a driver" },
     };
 }

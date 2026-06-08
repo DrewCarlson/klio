@@ -42,7 +42,7 @@ const InstanceData = runtime.InstanceData;
 const Scheduler = runtime.Scheduler;
 const HostBindings = stdlib.HostBindings;
 const Module = ir.Module;
-const FuncId = ir.FuncId;
+pub const FuncId = ir.FuncId;
 const TypeRef = ir.TypeRef;
 const RuntimeError = runtime.RuntimeError;
 
