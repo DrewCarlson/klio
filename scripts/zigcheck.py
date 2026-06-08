@@ -6,8 +6,15 @@ without editing build.zig or pulling in still-broken sibling modules.
 Usage: scripts/zigcheck.py <module>            # run `zig test`
        scripts/zigcheck.py <module> --build-only # `zig build-obj` (compile, no run)
 """
+import os
 import subprocess
 import sys
+
+# Installed by `zig build` / `zig build zstd-lib` from the vendored zstd C
+# sources. Any module whose dep-closure includes `pack` declares the ZSTD_*
+# symbols extern (src/pack/zstd.zig); linking this static lib + libc satisfies
+# them, matching what build.zig attaches to the pack module.
+ZSTD_LIB = "zig-out/lib/libzstd.a"
 
 # module -> direct (non-dev) dependencies. Mirrors build.zig mod_list.
 GRAPH = {
@@ -44,6 +51,19 @@ GRAPH = {
 
 def path(mod):
     return f"src/{mod}/{mod}.zig"
+
+
+def ensure_zstd_lib():
+    """Make sure the vendored zstd static library is installed, building it
+    via the dedicated `zig build zstd-lib` step if it is missing."""
+    if os.path.exists(ZSTD_LIB):
+        return True
+    print(f"+ zig build zstd-lib  (missing {ZSTD_LIB})", file=sys.stderr)
+    rc = subprocess.call(["zig", "build", "zstd-lib"])
+    if rc != 0 or not os.path.exists(ZSTD_LIB):
+        print(f"error: could not produce {ZSTD_LIB}", file=sys.stderr)
+        return False
+    return True
 
 
 def closure(root):
@@ -88,6 +108,13 @@ def main():
         cmd += [f"-M{m}={path(m)}"]
     if build_only:
         cmd += ["-femit-bin=/dev/null"]
+
+    # Modules reaching `pack` need the vendored zstd library to satisfy the
+    # extern ZSTD_* symbols; modules that don't are linked exactly as before.
+    if "pack" in mods:
+        if not ensure_zstd_lib():
+            return 1
+        cmd += [ZSTD_LIB, "-lc"]
 
     print("+", " ".join(cmd), file=sys.stderr)
     return subprocess.call(cmd)
