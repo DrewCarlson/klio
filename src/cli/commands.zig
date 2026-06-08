@@ -224,6 +224,9 @@ pub fn runFileIrVm(
     path: []const u8,
     features: *const RequestedFeatures,
 ) u8 {
+    // Catch any receiver/coroutine thread-local state leaked from a prior run
+    // on this thread before assembling the next program.
+    interp_ir.resetReceiverThreadLocals();
     var map = SourceMap.init(gpa);
     defer map.deinit();
     const id = load(gpa, &map, path) orelse return 1;

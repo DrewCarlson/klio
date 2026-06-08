@@ -29,6 +29,11 @@ const run_mod = @import("vm/run.zig");
 pub const VmHost = vmhost.VmHost;
 pub const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
+/// Assert-empty + clear the process-wide receiver/coroutine thread-locals at a
+/// run boundary. Called by `Vm.deinit` and by the public runners so leaked
+/// cross-run state is a loud Debug failure.
+pub const resetReceiverThreadLocals = vmhost.resetReceiverThreadLocals;
+
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const Env = runtime.Env;

@@ -16,6 +16,7 @@ const stdlib = @import("stdlib");
 const vmhost = @import("vmhost.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
+const trace = @import("trace.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -72,6 +73,16 @@ fn outerThisStack() *std.ArrayList(Value) {
     return s;
 }
 
+/// Assert (Debug) the enclosing-`this` stack is empty at a run boundary and
+/// clear it so leaked-across-runs receiver context is a loud failure rather
+/// than silently threaded into the next program.
+pub fn resetReceiverTls() void {
+    if (outer_this) |s| {
+        std.debug.assert(s.items.len == 0);
+        s.clearRetainingCapacity();
+    }
+}
+
 fn unsupported(name: []const u8) EvalResult {
     return .{ .err = .{ .Unsupported = name } };
 }
@@ -106,6 +117,90 @@ fn boolVal(b: bool) Value {
 fn simpleName(name: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
+}
+
+// -------------------------------------------------------------------------
+// Dispatch invariants (KLIO_TRACE_INVARIANTS, default OFF). These detect — but
+// never repair — structural dispatch hazards at the candidate-selection choke
+// point (execution-architecture §5.3). A violation emits one machine-readable
+// `[INVARIANT]` line through the tracer; it is not a panic, so the default
+// build stays green.
+// -------------------------------------------------------------------------
+
+/// Invariant (i): the overload candidate set must select a unique winner.
+/// When two distinct candidates tie on the chosen score, declaration order
+/// silently breaks the tie — a non-deterministic resolution hazard. Called
+/// with the candidates that scored equal to the winner; emits a violation
+/// when more than one (distinct) function ties.
+fn checkOverloadUnique(name: []const u8, winner: *const Func, tied: []const Func) void {
+    if (!trace.invariantsEnabled()) return;
+    var distinct: usize = 0;
+    for (tied) |f| {
+        if (@intFromEnum(f.id) != @intFromEnum(winner.id)) distinct += 1;
+    }
+    if (distinct == 0) return;
+    trace.invariant(
+        "kind=overload_tie site=pickMethodOverload name={s} chosen_fid={d} chosen_fqn={s} tied_count={d}",
+        .{ name, @intFromEnum(winner.id), winner.fqn, distinct + 1 },
+    );
+}
+
+/// Invariant (ii): a selected `FuncId` must be in range for the module's func
+/// table and its `params` slice must be addressable. Emits a violation and
+/// returns when out of range.
+fn checkFuncInRange(self: *VmHost, site: []const u8, fid: FuncId) void {
+    if (!trace.invariantsEnabled()) return;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const n = mg.get().funcs.items.len;
+    if (@intFromEnum(fid) >= n) {
+        trace.invariant(
+            "kind=funcid_oob site={s} fid={d} func_count={d}",
+            .{ site, @intFromEnum(fid), n },
+        );
+    }
+}
+
+/// Instance identity (control-block pointer) of a `Value`, or `null` for
+/// non-instances.
+fn instancePtr(v: *const Value) ?*const anyopaque {
+    return switch (v.*) {
+        .Instance => |i| @ptrCast(i.cell),
+        else => null,
+    };
+}
+
+/// Invariant (iii): receiver-chain consistency. When both a `"this"` param and
+/// a `"this"` capture are present they must refer to the same `Instance`, and
+/// the enclosing-`this` chain must have no interior `Null`/`Unit` entries
+/// (those indicate a receiver that was lost or never set). Emits one violation
+/// line per inconsistency found; never repairs.
+fn checkReceiverChain(self: *VmHost, allocator: Allocator, site: []const u8, this_param: ?*const Value, this_capture: ?*const Value) void {
+    if (!trace.invariantsEnabled()) return;
+    if (this_param != null and this_capture != null) {
+        const pp = instancePtr(this_param.?);
+        const cp = instancePtr(this_capture.?);
+        if (pp != null and cp != null and pp.? != cp.?) {
+            trace.invariant(
+                "kind=this_mismatch site={s} param_tag={s} capture_tag={s}",
+                .{ site, @tagName(this_param.?.*), @tagName(this_capture.?.*) },
+            );
+        }
+    }
+    const chain = enclosingThisChain(self, allocator) catch return;
+    defer allocator.free(chain);
+    if (chain.len < 2) return;
+    // Interior entries are everything but the outermost element; a Null/Unit
+    // interior receiver is a hole in the enclosing-`this` chain.
+    for (chain[0 .. chain.len - 1], 0..) |v, i| {
+        switch (v) {
+            .Null, .Unit => trace.invariant(
+                "kind=chain_hole site={s} index={d} tag={s} depth={d}",
+                .{ site, i, @tagName(v), chain.len },
+            ),
+            else => {},
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -718,6 +813,54 @@ fn enclosingCallableProperty(self: *VmHost, allocator: Allocator, name: []const 
     return null;
 }
 
+/// Whether `ty_name` denotes a top type or a bare type parameter — a
+/// maximally-unspecific receiver/param type that every value satisfies but
+/// which loses to any concrete match during most-specific selection.
+fn isTopOrGenericType(ty_name: []const u8) bool {
+    var pn = simpleName(ty_name);
+    pn = std.mem.trimEnd(u8, pn, "?");
+    if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
+    if (std.mem.startsWith(u8, pn, "Function")) return true;
+    if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) return true;
+    return false;
+}
+
+/// Most-specific receiver ranking for overload selection. Returns how
+/// specifically the receiver's runtime type satisfies `ty_name`:
+///   * a positive rank when the receiver concretely IS-A `ty_name` — larger
+///     for a closer (smaller subtype-distance) match;
+///   * `0` for a top type or bare type parameter (`Any`, `T`, `FunctionN`):
+///     satisfied by everything, so least specific;
+///   * `-1` when the receiver definitely does not satisfy a concrete
+///     `ty_name`.
+/// This is the primary discriminator the most-specific rule ranks on: a
+/// `Flow` receiver prefers a `Flow` receiver param over the generic
+/// `Iterable`, and an `Iterable`-implementing collection prefers an
+/// `Iterable` param over an unrelated `CharSequence`/`Sequence`/`Array`.
+fn extReceiverSpecificity(self: *VmHost, receiver: *const Value, ty_name: []const u8) i32 {
+    if (isTopOrGenericType(ty_name)) return 0;
+    const pn = std.mem.trimEnd(u8, simpleName(ty_name), "?");
+    if (receiver.* == .Instance) {
+        if (instanceSubtypeDistance(self, receiver, pn)) |dist| {
+            const d: i32 = @intCast(@min(dist, @as(usize, 50)));
+            return 100 - d;
+        }
+        // Builtin interface (Iterable/Collection/CharSequence/…) reached
+        // through the instance's supertype names but not the user-class graph.
+        if (receiverImplementsType(self, receiver, pn)) return 50;
+        return -1;
+    }
+    if (receiver.isRuntimeType(pn)) return 100;
+    const v_ty = simpleName(receiver.typeFqn());
+    for (builtinSupers(v_ty), 0..) |s, pos| {
+        if (std.mem.eql(u8, s, pn)) {
+            const d: i32 = @intCast(@min(pos, @as(usize, 50)));
+            return 90 - d;
+        }
+    }
+    return -1;
+}
+
 /// Does the receiver's actual runtime type satisfy `ty_name`?
 fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []const u8) bool {
     var pn = simpleName(ty_name);
@@ -891,8 +1034,15 @@ pub fn enclosingThisChain(self: *VmHost, allocator: Allocator) Allocator.Error![
 }
 
 pub fn pushAccessEnclosing(self: *VmHost, v: *const Value) void {
+    _ = self;
     const s = outerThisStack();
-    s.append(self.allocator, v.*) catch {};
+    // Backing lives on `page_allocator` — the same persistent backing as the
+    // sibling receiver thread-locals `inner_outer_hint` / `ctor_guard` /
+    // `coro_stack`. The stack itself is a process-global cleared
+    // (capacity-retaining) at run boundaries; backing it with the transient
+    // per-run arena would leave the retained capacity dangling once that arena
+    // is freed or reset between runs.
+    s.append(std.heap.page_allocator, v.*) catch {};
 }
 
 pub fn popAccessEnclosing(self: *VmHost) void {
@@ -906,8 +1056,9 @@ pub fn popAccessEnclosing(self: *VmHost) void {
 /// captured `this` with an explicit receiver and must keep the displaced
 /// instance reachable as an outer implicit receiver.
 pub fn pushOuterThis(allocator: Allocator, v: *const Value) void {
+    _ = allocator;
     const s = outerThisStack();
-    s.append(allocator, v.*) catch {};
+    s.append(std.heap.page_allocator, v.*) catch {};
 }
 
 pub fn popOuterThis() void {
@@ -1165,6 +1316,12 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
     }
     var best: ?Func = null;
     var best_score: i32 = std.math.minInt(i32);
+    // Track candidates that scored equal to the current best, for the
+    // overload-uniqueness invariant (KLIO_TRACE_INVARIANTS). Only populated
+    // when the gate is on; otherwise stays empty and costs nothing.
+    const check_inv = trace.invariantsEnabled();
+    var tied: std.ArrayList(Func) = .empty;
+    defer tied.deinit(self.allocator);
     for (candidates) |f| {
         const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         const effective = f.params[skip..];
@@ -1203,9 +1360,16 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
                         total += s;
                     } else ok = false;
                 }
-                if (ok and total > best_score) {
-                    best_score = total;
-                    best = f;
+                if (ok) {
+                    if (check_inv and total == best_score) tied.append(self.allocator, f) catch {};
+                    if (total > best_score) {
+                        best_score = total;
+                        best = f;
+                        if (check_inv) {
+                            tied.clearRetainingCapacity();
+                            tied.append(self.allocator, f) catch {};
+                        }
+                    }
                 }
                 continue;
             }
@@ -1239,9 +1403,21 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         if (!ok) continue;
         // Prefer an exact-arity overload over one relying on defaults.
         if (args.len == effective.len) score += 5;
+        if (check_inv and score == best_score) tied.append(self.allocator, f) catch {};
         if (score > best_score) {
             best_score = score;
             best = f;
+            if (check_inv) {
+                tied.clearRetainingCapacity();
+                tied.append(self.allocator, f) catch {};
+            }
+        }
+    }
+    if (check_inv) {
+        if (best) |w| {
+            const name: []const u8 = if (candidates.len > 0) candidates[0].name else "";
+            checkOverloadUnique(name, &w, tied.items);
+            checkFuncInRange(self, "pickMethodOverload", w.id);
         }
     }
     return best;
@@ -3429,6 +3605,10 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                     var iface = self.hostInterface();
                     var packed_list = try argsListFromSlice(allocator, packed_args);
                     _ = &packed_list;
+                    if (trace.invariantsEnabled()) {
+                        checkFuncInRange(self, "irMethodWalk", f.id);
+                        checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
+                    }
                     const r = try ir.eval.evalWith(allocator, mod, &f, packed_list, &iface);
                     mg.deinit();
                     return r;
@@ -3787,23 +3967,57 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     return null;
 }
 
+/// Kotlin-faithful most-specific extension-overload selection.
+///
+/// Each candidate is ranked by a strict, total ordering so the winner is
+/// unique and deterministic (no declaration-order tie-break). Ranked, in
+/// descending priority:
+///   0. receiver specificity — the candidate whose receiver param most
+///      specifically matches the receiver's runtime type (a `Flow` receiver
+///      selects `Flow.forEach`, not the generic `Iterable.forEach`);
+///   1. applicability score — the numeric arg/param compatibility;
+///   2. owner rank — a member extension visible nearer on the enclosing-`this`
+///      chain;
+///   3. subtype specificity — how many other candidates' receiver types are
+///      supertypes of this one;
+///   4. parameter specificity — the most-specific declared parameter types
+///      for the supplied value args;
+///   5. a stable key (lowest `FuncId`) so the winner is always unique.
+const ExtKey = [6]i32;
+
+fn extKeyGreater(a: ExtKey, b: ExtKey) bool {
+    inline for (0..a.len) |i| {
+        if (a[i] != b[i]) return a[i] > b[i];
+    }
+    return false;
+}
+
 fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Value, candidates: []const Candidate, args: []const Value, want: usize) Allocator.Error!?Candidate {
     var chain_owners = try enclosingChainClassOrder(self, allocator);
     defer chain_owners.deinit(allocator);
 
+    const check_inv = trace.invariantsEnabled();
+    var tied: std.ArrayList(Func) = .empty;
+    defer tied.deinit(self.allocator);
     var best: ?Candidate = null;
-    var best_key: [3]i32 = .{ std.math.minInt(i32), std.math.minInt(i32), std.math.minInt(i32) };
+    var best_key: ExtKey = .{std.math.minInt(i32)} ** 6;
     for (candidates, 0..) |c, idx| {
         const f = c.func;
         const recv_score = overloadScoreArg(self, &f.params[0].ty, receiver) orelse -1;
         var score: i32 = recv_score *| 1000;
+        var param_spec: i32 = 0;
         for (args, 0..) |*a, i| {
             if (f.params.len > i + 1) {
                 score += overloadScoreArg(self, &f.params[i + 1].ty, a) orelse -1;
+                // A concrete (non-top, non-generic) param type that the arg
+                // satisfies is more specific than a top/`Any`/`T` param.
+                if (!isTopOrGenericType(f.params[i + 1].ty.name)) param_spec += 1;
             }
         }
         if (f.params.len == want) score += 5;
-        // Specificity: how many other candidates' receiver types are
+        // Receiver specificity: most-specific receiver-type match wins.
+        const recv_match = extReceiverSpecificity(self, receiver, f.params[0].ty.name);
+        // Subtype specificity: how many other candidates' receiver types are
         // supertypes of this one.
         var spec: i32 = 0;
         for (candidates, 0..) |o, j| {
@@ -3824,19 +4038,30 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
             }
             mg.deinit();
         }
-        const key = [3]i32{ score, owner_rank, spec };
-        if (best == null or keyGreater(key, best_key)) {
+        // Stable final discriminator: lowest FuncId. Negated so a smaller id
+        // ranks higher, guaranteeing a unique winner.
+        const neg_fid: i32 = -@as(i32, @intCast(@intFromEnum(c.fid) & 0x7fff_ffff));
+        const key: ExtKey = .{ recv_match, score, owner_rank, spec, param_spec, neg_fid };
+        if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
+            tied.append(self.allocator, f) catch {};
+        }
+        if (best == null or extKeyGreater(key, best_key)) {
             best = c;
             best_key = key;
+            if (check_inv) {
+                tied.clearRetainingCapacity();
+                tied.append(self.allocator, f) catch {};
+            }
+        }
+    }
+    if (check_inv) {
+        if (best) |w| {
+            const name: []const u8 = if (candidates.len > 0) candidates[0].func.name else "";
+            checkOverloadUnique(name, &w.func, tied.items);
+            checkFuncInRange(self, "scoreExtCandidates", w.fid);
         }
     }
     return best;
-}
-
-fn keyGreater(a: [3]i32, b: [3]i32) bool {
-    if (a[0] != b[0]) return a[0] > b[0];
-    if (a[1] != b[1]) return a[1] > b[1];
-    return a[2] > b[2];
 }
 
 fn isSubtypeName(self: *VmHost, allocator: Allocator, a: []const u8, b: []const u8) bool {

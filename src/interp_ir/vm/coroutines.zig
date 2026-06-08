@@ -530,6 +530,17 @@ fn coroStackAllocator() Allocator {
     return std.heap.page_allocator;
 }
 
+/// Assert (Debug) the coroutine interceptor and active-scope stacks are empty
+/// at a run boundary and clear them so leaked-across-runs coroutine context is
+/// a loud failure. `persisted_parked` is intentionally NOT reset here: it holds
+/// continuations that outlive the driver that started them.
+pub fn resetReceiverTls() void {
+    std.debug.assert(coro_stack.items.len == 0);
+    std.debug.assert(active_scope_stack.items.len == 0);
+    coro_stack.clearRetainingCapacity();
+    active_scope_stack.clearRetainingCapacity();
+}
+
 /// The active interceptor (top of this thread's stack), or `null`.
 fn coroTop() ?*CooperativeInterceptor {
     if (coro_stack.items.len == 0) return null;

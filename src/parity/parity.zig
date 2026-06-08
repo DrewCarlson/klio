@@ -1113,44 +1113,250 @@ fn embeddedStdlibSources(arena: Allocator, io: Io, existing: []const KotlinFile,
     return out.toOwnedSlice(arena);
 }
 
-/// Run a `.kt` file directly through the `klio` interpreter library, returning
-/// captured stdout (ok) or an error message (err), owned by `allocator`.
-pub fn runWithKtc(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
+// ---------------------- canonical program loader ----------------------
+
+/// How a program's dependency ASTs are assembled. All three modes flow through
+/// the same `buildModuleFiles` + `Vm.run` tail; they differ only in which
+/// dependency sources are folded in and how the kotlinx packs are materialized.
+pub const LoadMode = enum {
+    /// Embedded stdlib only (what `check`'s kotlinc oracle compares against).
+    EmbeddedOnly,
+    /// Embedded stdlib + the in-repo kotlinx packs parsed straight from source.
+    SourcePacks,
+    /// Embedded stdlib + the in-repo kotlinx packs round-tripped through a
+    /// compiled `.klio-pack` byte image (encode -> decode -> parse), exercising
+    /// the compiled-pack load path rather than the raw-source one.
+    CompiledPacks,
+};
+
+/// A program assembled for one `LoadMode`: the full AST set in build order
+/// (deps first, user last), the host bindings to install (none for
+/// `EmbeddedOnly`), and whether a `main` declaration is present. The ASTs and
+/// bindings are allocated into the caller-provided arena.
+pub const LoadedProgram = struct {
+    asts: []KotlinFile,
+    bindings: ?HostBindings,
+};
+
+/// One in-repo kotlinx pack source file: path (for spans / pack rel_path) and
+/// its UTF-8 bytes, both arena-owned.
+const PackSource = struct { path: []u8, text: []u8 };
+
+/// The in-repo kotlinx pack directories, in load order.
+fn kotlinxPackDirs(arena: Allocator) Allocator.Error![3][]u8 {
+    const ws = try workspaceRoot(arena);
+    return .{
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-coroutines" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-atomicfu" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-io" }),
+    };
+}
+
+/// Gather the source files of every in-repo kotlinx pack the user program pulls
+/// in (by import prefix; coroutines also pulls atomicfu). The returned records
+/// are the inputs both `SourcePacks` (parse directly) and `CompiledPacks`
+/// (pack-roundtrip then parse) consume.
+fn collectKotlinxPackSources(
+    arena: Allocator,
+    io: Io,
+    pack_dirs: []const []const u8,
+    import_prefixes: *const std.StringHashMap(void),
+    imports_coroutines: bool,
+) Allocator.Error!SResult([]PackSource) {
+    var out: std.ArrayList(PackSource) = .empty;
+    defer out.deinit(arena);
+    for (pack_dirs) |pack_dir| {
+        const lib_id = (try manifestLibraryId(arena, io, pack_dir)) orelse try arena.alloc(u8, 0);
+        var wanted = false;
+        var it = import_prefixes.keyIterator();
+        while (it.next()) |imp_ptr| {
+            const imp = imp_ptr.*;
+            if (std.mem.eql(u8, imp, lib_id) or
+                startsWithDot(arena, imp, lib_id) or
+                startsWithDot(arena, lib_id, imp))
+            {
+                wanted = true;
+                break;
+            }
+        }
+        if (std.mem.eql(u8, lib_id, "kotlinx.atomicfu") and imports_coroutines) wanted = true;
+        if (!wanted) continue;
+
+        const sources = switch (try collectManifestSources(arena, io, pack_dir)) {
+            .err => |e| return .{ .err = e },
+            .ok => |s| s,
+        };
+        for (sources) |src_path| {
+            const text = readFileOpt(arena, io, src_path) orelse {
+                return .{ .err = try std.fmt.allocPrint(arena, "read {s}", .{src_path}) };
+            };
+            try out.append(arena, .{ .path = src_path, .text = text });
+        }
+    }
+    return .{ .ok = try out.toOwnedSlice(arena) };
+}
+
+/// Round-trip the collected pack sources through a compiled `.klio-pack` byte
+/// image: encode a `SourceBundle` into the `SOURCES` section, then read it back
+/// out. This drives the compiled-pack codepath (encode -> decode) for the same
+/// bytes `SourcePacks` parses directly, so the differential harness can compare
+/// the two load paths. Returns the decoded source files, arena-owned.
+fn packRoundtrip(arena: Allocator, sources: []const PackSource) Allocator.Error!SResult([]pack.schema.SourceFile) {
+    var files = try arena.alloc(pack.schema.SourceFile, sources.len);
+    for (sources, 0..) |s, i| {
+        files[i] = .{ .rel_path = s.path, .bytes = s.text };
+    }
+    const bundle = pack.schema.SourceBundle{ .files = files };
+
+    var perr: pack.PackError = undefined;
+    const payload = (try pack.schema.encode(pack.schema.SourceBundle, arena, &bundle, &perr)) orelse
+        return .{ .err = try arena.dupe(u8, "encode SourceBundle") };
+
+    var w = pack.PackWriter.init(arena);
+    defer w.deinit();
+    _ = try w.addZstd(pack.section_names.SOURCES, payload.items);
+    const image = (try w.finish(&perr)) orelse
+        return .{ .err = try arena.dupe(u8, "write pack image") };
+
+    var reader = (try pack.PackReader.fromBytes(arena, image.items, &perr)) orelse
+        return .{ .err = try arena.dupe(u8, "read pack image") };
+    defer reader.deinit();
+    const section = (try reader.readSection(pack.section_names.SOURCES, &perr)) orelse
+        return .{ .err = try arena.dupe(u8, "pack SOURCES section missing") };
+    defer section.deinit(arena);
+    const decoded = (try pack.schema.decode(pack.schema.SourceBundle, arena, section.slice(), &perr)) orelse
+        return .{ .err = try arena.dupe(u8, "decode SourceBundle") };
+    return .{ .ok = decoded.files };
+}
+
+/// Build the full AST set (and host bindings) for `file` under `mode`. The
+/// canonical loader behind `runWithKtc` / `runWithPacks`: each runner is this
+/// plus the shared build + `Vm.run` tail. ASTs and bindings live in `arena`.
+pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) Allocator.Error!SResult(LoadedProgram) {
+    var map = SourceMap.init(arena);
+    // The SourceMap is borrowed by the parsed ASTs for the arena's lifetime;
+    // it is not deinit'd here so spans stay valid through build + run.
+
+    const user_src = readFileOpt(arena, io, file) orelse {
+        return .{ .err = try std.fmt.allocPrint(arena, "read {s}", .{file}) };
+    };
+    const user_ast = switch (try parsePackFile(arena, &map, file, user_src)) {
+        .err => |e| return .{ .err = e },
+        .ok => |a| a,
+    };
+
+    var asts: std.ArrayList(KotlinFile) = .empty;
+    defer asts.deinit(arena);
+    var bindings: ?HostBindings = null;
+
+    if (mode == .EmbeddedOnly) {
+        var user_only = [_]KotlinFile{user_ast};
+        const stdlib_asts = try embeddedStdlibSources(arena, io, &user_only, &map);
+        try asts.appendSlice(arena, stdlib_asts);
+        try asts.append(arena, user_ast);
+        return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = null } };
+    }
+
+    // SourcePacks / CompiledPacks: fold in the in-repo kotlinx packs.
+    const pack_dirs = try kotlinxPackDirs(arena);
+
+    var user_import_prefixes = std.StringHashMap(void).init(arena);
+    try collectImportPrefixes(arena, &user_ast, &user_import_prefixes);
+    var imports_coroutines = false;
+    {
+        var it = user_import_prefixes.keyIterator();
+        while (it.next()) |imp_ptr| {
+            const imp = imp_ptr.*;
+            if (std.mem.eql(u8, imp, "kotlinx.coroutines") or
+                std.mem.startsWith(u8, imp, "kotlinx.coroutines."))
+            {
+                imports_coroutines = true;
+                break;
+            }
+        }
+    }
+
+    const pack_sources = switch (try collectKotlinxPackSources(arena, io, &pack_dirs, &user_import_prefixes, imports_coroutines)) {
+        .err => |e| return .{ .err = e },
+        .ok => |s| s,
+    };
+
+    switch (mode) {
+        .SourcePacks => {
+            for (pack_sources) |s| {
+                const file_ast = switch (try parsePackFile(arena, &map, s.path, s.text)) {
+                    .err => |e| return .{ .err = e },
+                    .ok => |a| a,
+                };
+                try registerAstPackage(arena, &file_ast);
+                try asts.append(arena, file_ast);
+            }
+        },
+        .CompiledPacks => {
+            const decoded = switch (try packRoundtrip(arena, pack_sources)) {
+                .err => |e| return .{ .err = e },
+                .ok => |d| d,
+            };
+            for (decoded) |sf| {
+                const file_ast = switch (try parsePackFile(arena, &map, sf.rel_path, sf.bytes)) {
+                    .err => |e| return .{ .err = e },
+                    .ok => |a| a,
+                };
+                try registerAstPackage(arena, &file_ast);
+                try asts.append(arena, file_ast);
+            }
+        },
+        .EmbeddedOnly => unreachable,
+    }
+
+    var probe: std.ArrayList(KotlinFile) = .empty;
+    defer probe.deinit(arena);
+    try probe.appendSlice(arena, asts.items);
+    try probe.append(arena, user_ast);
+    const stdlib_asts = try embeddedStdlibSources(arena, io, probe.items, &map);
+    for (stdlib_asts) |a| {
+        try registerAstPackage(arena, &a);
+        try asts.append(arena, a);
+    }
+    try asts.append(arena, user_ast);
+
+    var b = try HostBindings.withStdlibDefaults(arena);
+    {
+        var co = try kotlinx_coroutines.hostBindings(arena);
+        var it = co.table.iterator();
+        while (it.next()) |e| try b.register(e.key_ptr.*, e.value_ptr.*);
+        co.deinit();
+    }
+    {
+        var af = try kotlinx_atomicfu.hostBindings(arena);
+        var it = af.table.iterator();
+        while (it.next()) |e| try b.register(e.key_ptr.*, e.value_ptr.*);
+        af.deinit();
+    }
+    bindings = b;
+
+    return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = bindings } };
+}
+
+/// Assemble `file` under `mode`, build the module, and run `main`, returning
+/// captured stdout (ok) or an error message (err), owned by `allocator`. The
+/// single tail shared by all three load configurations.
+pub fn runInMode(allocator: Allocator, io: Io, file: []const u8, mode: LoadMode) Allocator.Error!SResult([]u8) {
     var arena_inst = std.heap.ArenaAllocator.init(allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    const src = readFileOpt(arena, io, file) orelse {
-        return .{ .err = try std.fmt.allocPrint(allocator, "read {s}", .{file}) };
+    // Catch any receiver/coroutine thread-local state leaked from a prior run
+    // on this thread before assembling the next program.
+    interp_ir.resetReceiverThreadLocals();
+
+    const loaded = switch (try loadProgram(arena, io, file, mode)) {
+        .err => |e| return .{ .err = try allocator.dupe(u8, e) },
+        .ok => |p| p,
     };
-    var map = SourceMap.init(arena);
-    defer map.deinit();
-    const id = try map.add(file, src);
-    const owned = map.get(id).source;
-    var lx = try lexer.Lexer.init(arena, id, owned);
-    const lexed = try lx.tokenize();
-    if (lexed.diagnostics.hasErrors()) {
-        return .{ .err = try std.fmt.allocPrint(allocator, "lex diagnostics: {d} error(s)", .{lexed.diagnostics.diags().len}) };
-    }
-    const p = parser.Parser.new(arena, id, owned, lexed.tokens);
-    const file_ast = p.parseFile();
-    if (p.diagnostics.hasErrors()) {
-        return .{ .err = try std.fmt.allocPrint(allocator, "parse diagnostics: {d} error(s)", .{p.diagnostics.diags().len}) };
-    }
-
-    var user_asts = [_]KotlinFile{file_ast};
-    const stdlib_asts = try embeddedStdlibSources(arena, io, &user_asts, &map);
-
-    var asts: std.ArrayList(KotlinFile) = .empty;
-    defer asts.deinit(arena);
-    try asts.appendSlice(arena, stdlib_asts);
-    try asts.appendSlice(arena, &user_asts);
 
     interp_ir.setCoroutineTimeMode(.Virtual);
-    var out = CaptureOutput.init(allocator);
-    defer out.deinit();
-
-    var built = try interp_ir.build.buildModuleFiles(arena, asts.items);
+    var built = try interp_ir.build.buildModuleFiles(arena, loaded.asts);
     const main_id = built.main orelse {
         built.deinit();
         return .{ .err = try allocator.dupe(u8, "no main function in module") };
@@ -1159,12 +1365,24 @@ pub fn runWithKtc(allocator: Allocator, io: Io, file: []const u8) Allocator.Erro
     built.deinit();
     var vm = pair.vm;
     defer vm.deinit();
+    if (loaded.bindings) |bindings| try vm.setInstalledBindings(bindings);
+
+    var out = CaptureOutput.init(allocator);
+    defer out.deinit();
     const result = try vm.run(main_id, out.output());
     switch (result) {
         .ok => {},
         .err => |e| return .{ .err = try formatVmError(allocator, e) },
     }
     return .{ .ok = try out.intoJoined(allocator) };
+}
+
+/// Run a `.kt` file directly through the `klio` interpreter library, returning
+/// captured stdout (ok) or an error message (err), owned by `allocator`.
+/// Embedded stdlib only — the configuration `check`'s kotlinc oracle compares
+/// against.
+pub fn runWithKtc(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
+    return runInMode(allocator, io, file, .EmbeddedOnly);
 }
 
 // ---------------------- klio.toml manifest parsing ----------------------
@@ -1455,150 +1673,13 @@ fn registerAstPackage(arena: Allocator, file_ast: *const KotlinFile) Allocator.E
     }
 }
 
-fn loadKotlinxPacks(
-    arena: Allocator,
-    io: Io,
-    pack_dirs: []const []const u8,
-    import_prefixes: *const std.StringHashMap(void),
-    imports_coroutines: bool,
-    map: *SourceMap,
-    asts: *std.ArrayList(KotlinFile),
-) Allocator.Error!SResult(void) {
-    for (pack_dirs) |pack_dir| {
-        const lib_id = (try manifestLibraryId(arena, io, pack_dir)) orelse try arena.alloc(u8, 0);
-        var wanted = false;
-        var it = import_prefixes.keyIterator();
-        while (it.next()) |imp_ptr| {
-            const imp = imp_ptr.*;
-            if (std.mem.eql(u8, imp, lib_id) or
-                startsWithDot(arena, imp, lib_id) or
-                startsWithDot(arena, lib_id, imp))
-            {
-                wanted = true;
-                break;
-            }
-        }
-        if (std.mem.eql(u8, lib_id, "kotlinx.atomicfu") and imports_coroutines) wanted = true;
-        if (!wanted) continue;
-
-        const sources = switch (try collectManifestSources(arena, io, pack_dir)) {
-            .err => |e| return .{ .err = e },
-            .ok => |s| s,
-        };
-        for (sources) |src_path| {
-            const text = readFileOpt(arena, io, src_path) orelse {
-                return .{ .err = try std.fmt.allocPrint(arena, "read {s}", .{src_path}) };
-            };
-            const file_ast = switch (try parsePackFile(arena, map, src_path, text)) {
-                .err => |e| return .{ .err = e },
-                .ok => |a| a,
-            };
-            try registerAstPackage(arena, &file_ast);
-            try asts.append(arena, file_ast);
-        }
-    }
-    return .{ .ok = {} };
-}
-
 /// Run a `.kt` file through the `klio` interpreter with the in-repo kotlinx
-/// packs (coroutines, atomicfu, io) loaded and their host bindings installed.
+/// packs (coroutines, atomicfu, io) loaded from source and their host bindings
+/// installed.
 pub fn runWithPacks(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
-    // The Rust harness wraps this in `stacker::grow(16 MiB, ...)`. Zig has no
+    // The Rust harness wrapped this in `stacker::grow(16 MiB, ...)`. Zig has no
     // portable equivalent; the body runs directly.
-    return runWithPacksInner(allocator, io, file);
-}
-
-fn runWithPacksInner(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
-    var arena_inst = std.heap.ArenaAllocator.init(allocator);
-    defer arena_inst.deinit();
-    const arena = arena_inst.allocator();
-
-    const ws = try workspaceRoot(arena);
-    const pack_dirs = [_][]const u8{
-        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-coroutines" }),
-        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-atomicfu" }),
-        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-io" }),
-    };
-
-    var map = SourceMap.init(arena);
-    defer map.deinit();
-    var asts: std.ArrayList(KotlinFile) = .empty;
-    defer asts.deinit(arena);
-
-    const user_src = readFileOpt(arena, io, file) orelse {
-        return .{ .err = try std.fmt.allocPrint(allocator, "read {s}", .{file}) };
-    };
-    const user_ast = switch (try parsePackFile(arena, &map, file, user_src)) {
-        .err => |e| return .{ .err = try allocator.dupe(u8, e) },
-        .ok => |a| a,
-    };
-
-    var user_import_prefixes = std.StringHashMap(void).init(arena);
-    try collectImportPrefixes(arena, &user_ast, &user_import_prefixes);
-    var imports_coroutines = false;
-    {
-        var it = user_import_prefixes.keyIterator();
-        while (it.next()) |imp_ptr| {
-            const imp = imp_ptr.*;
-            if (std.mem.eql(u8, imp, "kotlinx.coroutines") or
-                std.mem.startsWith(u8, imp, "kotlinx.coroutines."))
-            {
-                imports_coroutines = true;
-                break;
-            }
-        }
-    }
-
-    switch (try loadKotlinxPacks(arena, io, &pack_dirs, &user_import_prefixes, imports_coroutines, &map, &asts)) {
-        .err => |e| return .{ .err = try allocator.dupe(u8, e) },
-        .ok => {},
-    }
-
-    var probe: std.ArrayList(KotlinFile) = .empty;
-    defer probe.deinit(arena);
-    try probe.appendSlice(arena, asts.items);
-    try probe.append(arena, user_ast);
-    const stdlib_asts = try embeddedStdlibSources(arena, io, probe.items, &map);
-    for (stdlib_asts) |a| {
-        try registerAstPackage(arena, &a);
-        try asts.append(arena, a);
-    }
-    try asts.append(arena, user_ast);
-
-    var bindings = try HostBindings.withStdlibDefaults(arena);
-    {
-        var co = try kotlinx_coroutines.hostBindings(arena);
-        var it = co.table.iterator();
-        while (it.next()) |e| try bindings.register(e.key_ptr.*, e.value_ptr.*);
-        co.deinit();
-    }
-    {
-        var af = try kotlinx_atomicfu.hostBindings(arena);
-        var it = af.table.iterator();
-        while (it.next()) |e| try bindings.register(e.key_ptr.*, e.value_ptr.*);
-        af.deinit();
-    }
-
-    interp_ir.setCoroutineTimeMode(.Virtual);
-    var built = try interp_ir.build.buildModuleFiles(arena, asts.items);
-    const main_id = built.main orelse {
-        built.deinit();
-        return .{ .err = try allocator.dupe(u8, "no main function in module") };
-    };
-    const pair = try interp_ir.Vm.fromBuilt(arena, &built);
-    built.deinit();
-    var vm = pair.vm;
-    defer vm.deinit();
-    try vm.setInstalledBindings(bindings);
-
-    var out = CaptureOutput.init(allocator);
-    defer out.deinit();
-    const result = try vm.run(main_id, out.output());
-    switch (result) {
-        .ok => {},
-        .err => |e| return .{ .err = try formatVmError(allocator, e) },
-    }
-    return .{ .ok = try out.intoJoined(allocator) };
+    return runInMode(allocator, io, file, .SourcePacks);
 }
 
 // ---------------------- staging helpers ----------------------

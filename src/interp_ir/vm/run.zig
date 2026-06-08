@@ -577,6 +577,10 @@ pub fn vmDeinit(self: *Vm) void {
     self.prog.deinit();
     self.out_sink.deinit();
     self.threads.deinit();
+    // The receiver/coroutine thread-locals are balanced within a run; assert
+    // they are empty at the boundary and clear them so leaked-across-runs
+    // state is a loud Debug failure for the next program in this thread.
+    vmhost.resetReceiverThreadLocals();
 }
 
 const testing = std.testing;

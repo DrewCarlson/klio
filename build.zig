@@ -58,7 +58,8 @@ const itests_files = [_][]const u8{
     "parity_ranges_arrays", "parity_sealed_when_patterns", "parity_string_processing",
     "parity_strings_numbers", "parity_suspend_shapes", "parity_threaded_litmus",
     "parity_type_system_shapes", "parity_visibility_modifiers", "parser_corpus",
-    "runtime_objref_threads", "typeck_negative",
+    "runtime_objref_threads", "typeck_negative", "differential",
+    "fuzz_closures_suspend",
 };
 
 pub fn build(b: *std.Build) void {
@@ -90,6 +91,13 @@ pub fn build(b: *std.Build) void {
     const pack_mod = mods.get("pack").?;
     pack_mod.link_libc = true;
     pack_mod.linkLibrary(zstd);
+
+    // Install the compiled static library to zig-out/lib/libzstd.a so
+    // per-module verification (scripts/zigcheck.py) can link the extern
+    // ZSTD_* symbols without re-running the whole build graph.
+    b.installArtifact(zstd);
+    const zstd_lib_step = b.step("zstd-lib", "Build and install the vendored zstd static library");
+    zstd_lib_step.dependOn(&b.addInstallArtifact(zstd, .{}).step);
 
     const exe = b.addExecutable(.{
         .name = "klio",

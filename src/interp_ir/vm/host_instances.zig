@@ -61,6 +61,16 @@ fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloca
 threadlocal var ctor_guard: std.ArrayListUnmanaged([]const u8) = .empty;
 threadlocal var inner_outer_hint: std.ArrayListUnmanaged(Value) = .empty;
 
+/// Assert (Debug) the constructor-shell guard and inner-class outer hint are
+/// clear at a run boundary and reset them so leaked-across-runs state is a
+/// loud failure.
+pub fn resetReceiverTls() void {
+    std.debug.assert(ctor_guard.items.len == 0);
+    std.debug.assert(inner_outer_hint.items.len == 0);
+    ctor_guard.clearRetainingCapacity();
+    inner_outer_hint.clearRetainingCapacity();
+}
+
 fn ctorGuardContains(name: []const u8) bool {
     for (ctor_guard.items) |n| {
         if (std.mem.eql(u8, n, name)) return true;
@@ -175,9 +185,11 @@ fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator
     const mg = module_ref.borrow();
     defer mg.deinit();
     var args_list: std.ArrayList(Value) = .empty;
-    defer args_list.deinit(self.allocator);
+    errdefer args_list.deinit(self.allocator);
     try args_list.appendSlice(self.allocator, args);
     var iface = self.hostInterface();
+    // Ownership of `args_list` transfers into `evalWith`: the frame adopts
+    // it as its `params` backing and frees it on `frame.deinit()`.
     return ir.eval.evalWith(self.allocator, mg.get(), func, args_list, &iface);
 }
 
