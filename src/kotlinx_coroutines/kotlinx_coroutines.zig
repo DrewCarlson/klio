@@ -292,7 +292,7 @@ fn channelReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
     switch (outcome) {
         .Got => |g| {
-            if (g.resumed) |slot| ctx.host.coroutineResumeSlot(slot);
+            if (g.resumed) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
             return .{ .ok = g.value };
         },
         .ParkOnSlot => |slot| {
@@ -320,7 +320,7 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
         // else: closed or empty — value stays null.
     }
-    if (resumed_slot) |slot| ctx.host.coroutineResumeSlot(slot);
+    if (resumed_slot) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
     return .{ .ok = value orelse .Null };
 }
 
@@ -430,7 +430,7 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     if (had_state) {
-        if (resumed_slot) |slot| ctx.host.coroutineResumeSlot(slot);
+        if (resumed_slot) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
         if (maybe_v) |v| {
             try iter_inst.asPtr().define(regAllocator(), "__pending__", v);
             return .{ .ok = .{ .Bool = true } };
@@ -668,31 +668,31 @@ fn spawnLaunchBlock(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .Unit };
 }
 
-/// `__kxco_dispatch { … }` — dispatch a coroutine body onto the real
-/// parallel worker pool (`Dispatchers.Default`). Returns an opaque job
-/// id the caller joins with `__kxco_joinDispatched`. The body, its
-/// captures, and any value it returns cross threads; the host
-/// `publish_deep`'s the escaping graph before the worker starts and again
-/// on completion (mirrors the spawned-thread boundary).
+/// `__kxco_dispatch { … }` — dispatch a coroutine body onto a real OS
+/// thread (`Dispatchers.Default`). Returns an opaque job id the caller
+/// joins with `__kxco_joinDispatched`. The body, its captures, and any
+/// value it returns cross threads; the host `publish_deep`'s the escaping
+/// graph before the worker starts and again on completion (mirrors the
+/// spawned-thread boundary).
 fn dispatchCoroutine(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Type = "__kxco_dispatch: expected the coroutine block as the first arg" } };
     }
     const block = ctx.args[0];
-    return switch (try ctx.host.dispatchCoroutine(&block, false, ctx.out)) {
+    return switch (try ctx.host.spawnOsThread(&block, ctx.out)) {
         .ok => |id| .{ .ok = .{ .Long = @bitCast(id) } },
         .err => |e| .{ .err = e },
     };
 }
 
-/// `__kxco_dispatchIo { … }` — same as `__kxco_dispatch` but routes to
-/// the elastic (`Dispatchers.IO`) pool for blocking offload.
+/// `__kxco_dispatchIo { … }` — `Dispatchers.IO`. One OS thread per call,
+/// same as `__kxco_dispatch`.
 fn dispatchCoroutineIo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Type = "__kxco_dispatchIo: expected the coroutine block as the first arg" } };
     }
     const block = ctx.args[0];
-    return switch (try ctx.host.dispatchCoroutine(&block, true, ctx.out)) {
+    return switch (try ctx.host.spawnOsThread(&block, ctx.out)) {
         .ok => |id| .{ .ok = .{ .Long = @bitCast(id) } },
         .err => |e| .{ .err = e },
     };
@@ -709,21 +709,20 @@ fn joinDispatched(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     // The job id was stored bit-for-bit; recover the opaque u64.
     const job: u64 = @bitCast(id);
-    if (try ctx.host.joinDispatched(job)) |e| {
+    if (try ctx.host.joinOsThread(job)) |e| {
         return .{ .err = e };
     }
     return .{ .ok = .Unit };
 }
 
-/// Park the active `suspendCoroutine` continuation on the scheduler's
-/// resume queue. The interpreter fires `cont.resume(Unit)` on each parked
-/// continuation between rounds, advancing the corresponding paused frame.
+/// `__kxco_scheduleResume(cont)` — historically queued a continuation for
+/// the interpreter to fire between rounds. The cooperative driver resumes
+/// parked activations directly through the slot mailbox, so no resume
+/// queue is drained and this is a no-op kept for binding stability.
 fn scheduleResume(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Type = "__kxco_scheduleResume: expected the continuation arg" } };
     }
-    const cont = ctx.args[0];
-    try ctx.host.scheduler().scheduleResume(cont);
     return .{ .ok = .Unit };
 }
 
@@ -756,7 +755,7 @@ fn parkSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .Int => |i| @as(i64, i),
         else => return .{ .err = .{ .Type = "__kxco_parkSlot: argument must be Long" } },
     };
-    ctx.host.coroutineParkSlot(slot);
+    ctx.host.coroutineArmSlot(slot);
     return .{ .err = .{ .Suspend = -1 } };
 }
 
@@ -769,7 +768,7 @@ fn resumeSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .Int => |i| @as(i64, i),
         else => return .{ .err = .{ .Type = "__kxco_resumeSlot: argument must be Long" } },
     };
-    ctx.host.coroutineResumeSlot(slot);
+    ctx.host.coroutineResumeSlotValue(slot, .Unit);
     return .{ .ok = .Unit };
 }
 
