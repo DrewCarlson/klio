@@ -72,6 +72,16 @@ fn outerThisStack() *std.ArrayList(Value) {
     return s;
 }
 
+/// Assert (Debug) the enclosing-`this` stack is empty at a run boundary and
+/// clear it so leaked-across-runs receiver context is a loud failure rather
+/// than silently threaded into the next program.
+pub fn resetReceiverTls() void {
+    if (outer_this) |s| {
+        std.debug.assert(s.items.len == 0);
+        s.clearRetainingCapacity();
+    }
+}
+
 fn unsupported(name: []const u8) EvalResult {
     return .{ .err = .{ .Unsupported = name } };
 }

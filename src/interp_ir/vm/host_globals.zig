@@ -54,6 +54,16 @@ const SuspendState = ir.eval.SuspendState;
 threadlocal var ctor_guard: std.ArrayListUnmanaged([]const u8) = .empty;
 threadlocal var top_level_init_depth: usize = 0;
 
+/// Assert (Debug) the constructor-shell guard and top-level-init depth are
+/// clear at a run boundary and reset them so leaked-across-runs state is a
+/// loud failure.
+pub fn resetReceiverTls() void {
+    std.debug.assert(ctor_guard.items.len == 0);
+    std.debug.assert(top_level_init_depth == 0);
+    ctor_guard.clearRetainingCapacity();
+    top_level_init_depth = 0;
+}
+
 /// True while a top-level property initializer is running on this thread.
 fn inTopLevelInit() bool {
     return top_level_init_depth > 0;

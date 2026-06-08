@@ -69,6 +69,18 @@ threadlocal var field_resolve_stack: std.ArrayList(ResolvePair) = .empty;
 /// Re-entrancy flag for the inner-class outer-chain field fallback.
 threadlocal var field_outer_active: bool = false;
 
+/// Assert (Debug) the field-resolution stack and its re-entrancy flags are
+/// clear at a run boundary and reset them so leaked-across-runs state is a
+/// loud failure.
+pub fn resetReceiverTls() void {
+    std.debug.assert(field_resolve_stack.items.len == 0);
+    std.debug.assert(!cc_explicit_read);
+    std.debug.assert(!field_outer_active);
+    field_resolve_stack.clearRetainingCapacity();
+    cc_explicit_read = false;
+    field_outer_active = false;
+}
+
 const ResolvePair = struct { id: usize, name: []const u8 };
 
 /// The active coroutine scope (top of the driver stack), if any. The

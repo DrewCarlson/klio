@@ -58,7 +58,7 @@ const itests_files = [_][]const u8{
     "parity_ranges_arrays", "parity_sealed_when_patterns", "parity_string_processing",
     "parity_strings_numbers", "parity_suspend_shapes", "parity_threaded_litmus",
     "parity_type_system_shapes", "parity_visibility_modifiers", "parser_corpus",
-    "runtime_objref_threads", "typeck_negative",
+    "runtime_objref_threads", "typeck_negative", "differential",
 };
 
 pub fn build(b: *std.Build) void {

@@ -69,6 +69,17 @@ pub const intrinsic_host = @import("intrinsic_host.zig");
 pub const coroutines = @import("coroutines.zig");
 pub const trace = @import("trace.zig");
 
+/// Assert (Debug) that the process-wide receiver/coroutine thread-locals are
+/// empty at a run boundary, then clear them. Run between programs so leaked
+/// state is a loud failure rather than silently threaded into the next run.
+pub fn resetReceiverThreadLocals() void {
+    host_call_member.resetReceiverTls();
+    host_globals.resetReceiverTls();
+    host_instances.resetReceiverTls();
+    host_fields.resetReceiverTls();
+    coroutines.resetReceiverTls();
+}
+
 /// IR Host implementation. Every method native to the Vm lives as a
 /// free function over `*VmHost` in a sibling file; this struct holds the
 /// shared state those functions read and write for the duration of one

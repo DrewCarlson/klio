@@ -61,6 +61,16 @@ fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloca
 threadlocal var ctor_guard: std.ArrayListUnmanaged([]const u8) = .empty;
 threadlocal var inner_outer_hint: std.ArrayListUnmanaged(Value) = .empty;
 
+/// Assert (Debug) the constructor-shell guard and inner-class outer hint are
+/// clear at a run boundary and reset them so leaked-across-runs state is a
+/// loud failure.
+pub fn resetReceiverTls() void {
+    std.debug.assert(ctor_guard.items.len == 0);
+    std.debug.assert(inner_outer_hint.items.len == 0);
+    ctor_guard.clearRetainingCapacity();
+    inner_outer_hint.clearRetainingCapacity();
+}
+
 fn ctorGuardContains(name: []const u8) bool {
     for (ctor_guard.items) |n| {
         if (std.mem.eql(u8, n, name)) return true;
