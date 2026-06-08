@@ -801,6 +801,20 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!Host
     self.classes.publish();
     self.anon_methods.publish();
     self.class_default_outer.publish();
+    // The build-time-immutable IR image. Every worker `borrow()`s it on
+    // each call/dispatch (the closure body func, nested closure bodies,
+    // every member resolution), so multiple running workers borrow this
+    // one cell concurrently. While it stays UNSHARED those borrows race
+    // its non-atomic `RefCell` `flag` (a torn increment reads back as a
+    // phantom mutable borrow and panics). Publish it so those concurrent
+    // read borrows go through the SHARED reader/writer lock. It is never
+    // mutated after build, so concurrent shared borrows are correct.
+    self.module.publish();
+    // The monotonic id source: the parent `borrowMut`s it below to mint
+    // this worker's id while an already-running worker may `borrowMut` it
+    // to mint an instance id. Publish so those concurrent borrows take the
+    // SHARED write lock instead of racing the UNSHARED flag.
+    self.instance_id_counter.publish();
     // The worker writes its result into `threads` (borrowMut via
     // publishThreadResult) while the parent borrows it in joinSpawned/
     // joinAllThreads. Publish it so those concurrent borrows go through the
