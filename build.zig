@@ -119,6 +119,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run all ported module tests");
+    const itest_bin_step = b.step("itest-bin", "Build+install standalone itest binaries for stress looping");
     for (mod_list) |m| {
         if (!m.tested) continue;
         if (std.mem.eql(u8, m.name, "itests")) {
@@ -132,9 +133,16 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                     .imports = imports,
                 });
-                const run_t = b.addRunArtifact(b.addTest(.{ .root_module = tmod }));
+                const tbin = b.addTest(.{ .root_module = tmod });
+                const run_t = b.addRunArtifact(tbin);
                 run_t.setCwd(b.path("."));
                 test_step.dependOn(&run_t.step);
+                // Also install the raw test binary so it can be looped from a
+                // shell without the build graph re-running each iteration.
+                const inst = b.addInstallArtifact(tbin, .{
+                    .dest_sub_path = b.fmt("itest-{s}", .{name}),
+                });
+                itest_bin_step.dependOn(&inst.step);
             }
             continue;
         }

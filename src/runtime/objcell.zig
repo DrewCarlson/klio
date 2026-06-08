@@ -111,6 +111,100 @@ pub const SpinMutex = struct {
     }
 };
 
+/// `KLIO_BORROW_DEBUG`-gated diagnostic for the borrow-conflict panic
+/// path. Prints the cell's payload type, mode (UNSHARED vs SHARED), the
+/// raw `RefCell` `flag`, the SHARED rwlock `state`, the cell pointer, and
+/// the borrowing thread id so a cross-thread UNSHARED conflict can be
+/// pinned to an exact cell. Off (no output) unless the env var is set;
+/// reads it once per process and caches the result. Never allocates on
+/// the panic path beyond the cached flag read.
+var borrow_debug_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0); // 0 unknown, 1 off, 2 on
+
+fn borrowDebugEnabled() bool {
+    switch (borrow_debug_state.load(.monotonic)) {
+        1 => return false,
+        2 => return true,
+        else => {},
+    }
+    const on = procEnvironHas("KLIO_BORROW_DEBUG");
+    borrow_debug_state.store(if (on) 2 else 1, .monotonic);
+    return on;
+}
+
+/// True when `name=<non-empty,!=0>` appears in `/proc/self/environ`.
+/// Allocation-free: streams the procfs file through a stack buffer. Zig
+/// 0.16's std env API moved behind `Io`; this is the no-`Io` reader the
+/// panic path can use safely.
+fn procEnvironHas(comptime name: []const u8) bool {
+    if (@import("builtin").os.tag != .linux) return false;
+    const fd = std.os.linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
+    if (@as(isize, @bitCast(fd)) < 0) return false;
+    const ifd: i32 = @intCast(fd);
+    defer _ = std.os.linux.close(ifd);
+    var buf: [16384]u8 = undefined;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const rc = std.os.linux.read(ifd, buf[len..].ptr, buf.len - len);
+        const e = std.os.linux.errno(rc);
+        if (e == .INTR) continue;
+        if (e != .SUCCESS) break;
+        if (rc == 0) break;
+        len += rc;
+    }
+    var it = std.mem.splitScalar(u8, buf[0..len], 0);
+    while (it.next()) |entry| {
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        if (std.mem.eql(u8, entry[0..eq], name)) {
+            const val = entry[eq + 1 ..];
+            return val.len != 0 and !std.mem.eql(u8, val, "0");
+        }
+    }
+    return false;
+}
+
+/// `KLIO_RACE_JITTER`-gated interleaving widener. Inserted into the
+/// UNSHARED `flag` read-modify-write window so a genuine cross-thread
+/// UNSHARED borrow (a publication gap) reproduces reliably under test
+/// instead of only on a rare interleaving. Off (zero cost beyond the
+/// cached branch) unless the env var is set. Diagnostic-only; never
+/// enabled in the shipped suite.
+var race_jitter_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0); // 0 unknown, 1 off, 2 on
+
+fn raceJitterEnabled() bool {
+    switch (race_jitter_state.load(.monotonic)) {
+        1 => return false,
+        2 => return true,
+        else => {},
+    }
+    const on = procEnvironHas("KLIO_RACE_JITTER");
+    race_jitter_state.store(if (on) 2 else 1, .monotonic);
+    return on;
+}
+
+inline fn raceJitter() void {
+    if (!raceJitterEnabled()) return;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) std.atomic.spinLoopHint();
+    std.Thread.yield() catch {};
+}
+
+fn borrowDebugReport(comptime T: type, cell: anytype, comptime op: []const u8) void {
+    if (!borrowDebugEnabled()) return;
+    const mode = cell.state.load(.acquire);
+    std.debug.print(
+        "[KLIO_BORROW_DEBUG] conflict op={s} T={s} mode={s} flag={d} lock_state={d} cell=0x{x} thread={d}\n",
+        .{
+            op,
+            @typeName(T),
+            if (mode == SHARED) "SHARED" else "UNSHARED",
+            cell.flag,
+            cell.lock.state.load(.monotonic),
+            @intFromPtr(cell),
+            std.Thread.getCurrentId(),
+        },
+    );
+}
+
 /// Heap-allocated control block for one `ObjRef`: an atomic strong
 /// count plus the adaptive cell (publication `state`, the UNSHARED
 /// `RefCell` borrow `flag`, the SHARED reader/writer `lock`, the data,
@@ -206,13 +300,19 @@ pub fn ObjRef(comptime T: type) type {
         /// Shared borrow, exactly like `RefCell::borrow`.
         /// Panics if the cell is already mutably borrowed (UNSHARED path).
         pub fn borrow(self: Self) ObjGuard(T) {
-            return self.tryBorrow() orelse @panic("ObjRef already mutably borrowed");
+            return self.tryBorrow() orelse {
+                borrowDebugReport(T, self.cell, "borrow");
+                @panic("ObjRef already mutably borrowed");
+            };
         }
 
         /// Mutable borrow, exactly like `RefCell::borrow_mut`.
         /// Panics if the cell is already borrowed (UNSHARED path).
         pub fn borrowMut(self: Self) ObjGuardMut(T) {
-            return self.tryBorrowMut() catch @panic("ObjRef already borrowed");
+            return self.tryBorrowMut() catch {
+                borrowDebugReport(T, self.cell, "borrowMut");
+                @panic("ObjRef already borrowed");
+            };
         }
 
         /// Fallible shared borrow (mirrors `RefCell::try_borrow`).
@@ -228,6 +328,7 @@ pub fn ObjRef(comptime T: type) type {
             }
             const f = cell.flag;
             if (f < 0) return null;
+            raceJitter();
             cell.flag = f + 1;
             return .{ .cell = cell, .shared = false };
         }
@@ -245,6 +346,7 @@ pub fn ObjRef(comptime T: type) type {
                 return .{ .cell = cell, .shared = true };
             }
             if (cell.flag != 0) return BorrowMutError.AlreadyBorrowed;
+            raceJitter();
             cell.flag = -1;
             return .{ .cell = cell, .shared = false };
         }
