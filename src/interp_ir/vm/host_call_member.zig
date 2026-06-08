@@ -2092,10 +2092,8 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             defer g.deinit();
             var items: std.ArrayList(Value) = .empty;
             for (g.get().items) |kv| {
-                const k = try allocator.create(Value);
-                k.* = kv.key;
-                const v = try allocator.create(Value);
-                v.* = kv.value;
+                const k = try Value.box(allocator, kv.key);
+                const v = try Value.box(allocator, kv.value);
                 try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = null } });
             }
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };

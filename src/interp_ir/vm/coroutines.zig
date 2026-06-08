@@ -885,8 +885,7 @@ pub fn coroutineCancelTimedParksWith(self: *VmIntrinsicHost, cause: ?Value) Allo
         .message = try runtime.StringRef.init(a, "StandaloneCoroutine was cancelled"),
         .cause = null,
     } };
-    const payload = try a.create(Value);
-    payload.* = exc;
+    const payload = try Value.box(a, exc);
     const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
     if (coroTop()) |top| try top.cancelTimedParks(failure);
 }

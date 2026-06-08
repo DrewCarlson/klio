@@ -24,7 +24,6 @@ pub const ObjGuard = objcell.ObjGuard;
 pub const ObjGuardMut = objcell.ObjGuardMut;
 pub const ControlBlock = objcell.ControlBlock;
 pub const BorrowMutError = objcell.BorrowMutError;
-pub const fenceAndPublish = objcell.fenceAndPublish;
 
 // value
 pub const Value = value_mod.Value;

@@ -1195,18 +1195,29 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.concurrent.Thread.sleep", .names = &.{"millis"} },
 };
 
+/// Hashed lookup map built from `TABLE`, the single source of truth. The
+/// FqnIterator/COUNT still read `TABLE` directly so the table stays canonical.
+const TABLE_MAP = blk: {
+    @setEvalBranchQuota(TABLE.len * TABLE.len);
+    var kvs: [TABLE.len]struct { []const u8, StdlibFn } = undefined;
+    for (TABLE, 0..) |e, i| kvs[i] = .{ e.fqn, e.f };
+    break :blk std.StaticStringMap(StdlibFn).initComptime(kvs);
+};
+
+/// Hashed lookup map built from `PARAM_NAMES`, its single source of truth.
+const PARAM_NAMES_MAP = blk: {
+    @setEvalBranchQuota(PARAM_NAMES.len * PARAM_NAMES.len);
+    var kvs: [PARAM_NAMES.len]struct { []const u8, []const []const u8 } = undefined;
+    for (PARAM_NAMES, 0..) |e, i| kvs[i] = .{ e.fqn, e.names };
+    break :blk std.StaticStringMap([]const []const u8).initComptime(kvs);
+};
+
 pub fn lookupParamNames(fqn: []const u8) ?[]const []const u8 {
-    for (PARAM_NAMES) |e| {
-        if (std.mem.eql(u8, e.fqn, fqn)) return e.names;
-    }
-    return null;
+    return PARAM_NAMES_MAP.get(fqn);
 }
 
 pub fn lookup(fqn: []const u8) ?StdlibFn {
-    for (TABLE) |e| {
-        if (std.mem.eql(u8, e.fqn, fqn)) return e.f;
-    }
-    return null;
+    return TABLE_MAP.get(fqn);
 }
 
 /// Iterator over every registered intrinsic FQN.

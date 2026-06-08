@@ -476,8 +476,8 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
             break :blk null;
         };
         if (handle) |h| {
+            // join() establishes happens-before with the worker's writes.
             h.join();
-            runtime.fenceAndPublish();
         }
         const g = self.threads.borrow();
         defer g.deinit();

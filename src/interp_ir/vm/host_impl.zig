@@ -100,8 +100,8 @@ pub const JoinResult = union(enum) { ok: void, err: RuntimeError };
 
 /// Join the spawned OS thread `id`, propagating a thrown Throwable as a
 /// `RuntimeError`. Idempotent: a second join (or an unknown id) is a no-op
-/// since the happens-before edge was already established.
-/// `fenceAndPublish` marks the boundary.
+/// since the happens-before edge was already established. The join() below
+/// is itself the memory-model boundary.
 pub fn joinSpawned(self: *VmHost, id: u64) JoinResult {
     const handle = blk: {
         const g = self.threads.borrowMut();
@@ -112,8 +112,8 @@ pub fn joinSpawned(self: *VmHost, id: u64) JoinResult {
         break :blk h;
     };
     const h = handle orelse return .{ .ok = {} };
+    // join() establishes happens-before with the worker's writes.
     h.join();
-    runtime.fenceAndPublish(); // thread join
     const g = self.threads.borrow();
     defer g.deinit();
     const entry = g.get().getPtr(id) orelse return .{ .ok = {} };
