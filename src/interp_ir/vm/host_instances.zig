@@ -185,9 +185,11 @@ fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator
     const mg = module_ref.borrow();
     defer mg.deinit();
     var args_list: std.ArrayList(Value) = .empty;
-    defer args_list.deinit(self.allocator);
+    errdefer args_list.deinit(self.allocator);
     try args_list.appendSlice(self.allocator, args);
     var iface = self.hostInterface();
+    // Ownership of `args_list` transfers into `evalWith`: the frame adopts
+    // it as its `params` backing and frees it on `frame.deinit()`.
     return ir.eval.evalWith(self.allocator, mg.get(), func, args_list, &iface);
 }
 
