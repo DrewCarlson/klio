@@ -853,6 +853,11 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value, elastic: bool, gated
     self.classes.publish();
     self.anon_methods.publish();
     self.class_default_outer.publish();
+    // The worker writes its result into `threads` (borrowMut via
+    // publishThreadResult) while the parent borrows it in joinSpawned/
+    // joinAllThreads. Publish it so those concurrent borrows go through the
+    // SHARED rwlock instead of the non-atomic UNSHARED flag (data race).
+    self.threads.publish();
     self.prog.publish();
     {
         const pg = self.prog.borrow();
