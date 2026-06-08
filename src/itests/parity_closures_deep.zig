@@ -205,3 +205,76 @@ test "primitive_box_observability" {
     ;
     try assertKlio("box_obs", src, "5\n");
 }
+
+// 11. Precise captured-`var` carrier: the SAME captured var, mutated by a
+//     lambda invoked three different ways (called directly, passed to a
+//     stdlib HOF, captured across launch/suspend), must round-trip
+//     identically on every path. Proves the carrier is uniform, not
+//     path-dependent.
+test "captured_var_carrier_uniform_across_paths" {
+    const src =
+        \\import kotlinx.coroutines.*
+        \\fun callTwice(f: () -> Unit) { f(); f() }
+        \\fun main() = runBlocking {
+        \\    var direct = 0
+        \\    val bump = { direct = direct + 1 }
+        \\    bump()
+        \\    callTwice(bump)
+        \\    println("direct=$direct")
+        \\    var hof = 0
+        \\    listOf(1, 2, 3, 4).forEach { hof = hof + it }
+        \\    println("hof=$hof")
+        \\    var sus = 0
+        \\    val job = launch { delay(10L); sus = sus + 100 }
+        \\    job.join()
+        \\    println("sus=$sus")
+        \\}
+        \\
+    ;
+    try assertKlio("carrier_uniform", src, "direct=3\nhof=10\nsus=100\n");
+}
+
+// 12. A captured `var` written across the inline-splice boundary: the
+//     inline HOF's own body `var` and the spliced user lambda both write
+//     captured state. Before the precise carrier, the inlined body's
+//     captured-`var` write lowered to the StoreGlobal fallback (only
+//     round-tripping on the HOF scoped env); now it lands on a shared cell.
+test "captured_var_across_inline_splice" {
+    const src =
+        \\inline fun runAndCount(times: Int, block: (Int) -> Unit): Int {
+        \\    var invoked = 0
+        \\    var k = 0
+        \\    while (k < times) {
+        \\        block(k)
+        \\        invoked = invoked + 1
+        \\        k = k + 1
+        \\    }
+        \\    return invoked
+        \\}
+        \\fun main() {
+        \\    var acc = 0
+        \\    val n = runAndCount(4) { step -> acc = acc + step }
+        \\    println("acc=$acc n=$n")
+        \\}
+        \\
+    ;
+    try assertKlio("carrier_inline", src, "acc=6 n=4\n");
+}
+
+// 13. Sibling closures over one captured var: one writes, one reads, while
+//     a stdlib HOF lambda writes the same var. All three observe one cell.
+test "captured_var_sibling_closures_and_hof" {
+    const src =
+        \\fun main() {
+        \\    var shared = 0
+        \\    val inc = { shared = shared + 1 }
+        \\    val read = { shared }
+        \\    inc(); inc()
+        \\    listOf(10, 20).forEach { shared = shared + it }
+        \\    inc()
+        \\    println(read())
+        \\}
+        \\
+    ;
+    try assertKlio("carrier_siblings", src, "33\n");
+}

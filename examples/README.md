@@ -65,6 +65,7 @@ Run any program with:
 | `dsl_marker.kt`, `build_helpers.kt` | `@DslMarker` and builder-style DSLs.                 |
 | `vararg_spread.kt`            | `vararg` and the spread operator.                           |
 | `typealias.kt`                | `typealias`.                                                |
+| `captured_var_carrier.kt`     | A captured `var` mutated inside a lambda round-trips identically whether the closure is called directly, passed to a stdlib HOF (`forEach`/`fold`), spliced through an `inline` HOF, or captured across a `launch`/`suspend`. |
 
 ## Properties and delegation
 
