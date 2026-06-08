@@ -10,6 +10,7 @@
 const std = @import("std");
 
 const interp_ir = @import("interp_ir");
+const runtime = @import("runtime");
 
 const io = @import("io.zig");
 
@@ -55,6 +56,12 @@ const USAGE =
 /// subcommand, and returns the process exit code. The exe's `main`
 /// calls this, passing the entry-point command-line arguments.
 pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
+    // Host-protection backstops: cap the process's RSS (default 6 GiB) so a
+    // runaway program aborts before OOMing the machine, and arm the opt-in
+    // wall-clock run deadline. Both are call-once and default-safe.
+    runtime.startMemoryWatchdog();
+    runtime.startRunDeadline();
+
     const argv = try io.processArgs(gpa, args_in);
     defer io.freeArgs(gpa, argv);
 

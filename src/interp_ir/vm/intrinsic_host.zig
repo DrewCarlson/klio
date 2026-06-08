@@ -153,6 +153,7 @@ fn runtimeErrorFromEval(e: EvalError) RuntimeError {
         .Unbound => |s| .{ .Unbound = s },
         .Unimplemented => |s| .{ .Unimplemented = s },
         .Arity => |s| .{ .Arity = s },
+        .StackOverflow => |s| .{ .Type = s },
         .LabeledReturn => |lr| .{ .LabeledReturn = .{ .label = lr.label, .value = lr.value } },
     };
 }

@@ -543,6 +543,7 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
         .Unbound => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
         .Unimplemented => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
         .Arity => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
+        .StackOverflow => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "uncaught java.lang.StackOverflowError: {s}", .{s}) catch s },
         else => return .{ .Eval = "IR eval error" },
     }
 }

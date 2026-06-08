@@ -33,6 +33,8 @@ const typeck = @import("typeck");
 const interp_ir = @import("interp_ir");
 const Vm = interp_ir.Vm;
 
+const runtime = @import("runtime");
+
 const stdlib = @import("stdlib");
 const HostBindings = stdlib.HostBindings;
 
@@ -224,6 +226,8 @@ pub fn runFileIrVm(
     path: []const u8,
     features: *const RequestedFeatures,
 ) u8 {
+    runtime.startMemoryWatchdog();
+    runtime.startRunDeadline();
     // Catch any receiver/coroutine thread-local state leaked from a prior run
     // on this thread before assembling the next program.
     interp_ir.resetReceiverThreadLocals();
@@ -277,7 +281,7 @@ fn runBuilt(
     };
 
     var stdout = io.StdoutSink{};
-    const res = vm.run(main, stdout.output()) catch return 1;
+    const res = runMainBigStack(&vm, main, stdout.output());
     return switch (res) {
         .ok => 0,
         .err => |e| blk: {
@@ -288,6 +292,32 @@ fn runBuilt(
             break :blk 1;
         },
     };
+}
+
+/// Run `main` on a large-stack worker thread so deep-but-finite legitimate
+/// recursion runs to completion instead of overflowing the ~8 MiB main stack
+/// (the eval-depth cap remains the backstop against unbounded recursion). The
+/// coroutine time mode is thread-local, so it is re-established on the worker.
+const MainRunCtx = struct {
+    vm: *Vm,
+    main: interp_ir.FuncId,
+    out: interp_ir.Output,
+    time_mode: interp_ir.TimeMode,
+};
+
+fn runMainBigStack(vm: *Vm, main: interp_ir.FuncId, out: interp_ir.Output) interp_ir.VmResult {
+    const ctx = MainRunCtx{
+        .vm = vm,
+        .main = main,
+        .out = out,
+        .time_mode = interp_ir.coroutineTimeMode(),
+    };
+    return runtime.runOnBigStack(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
+}
+
+fn runMainEntry(ctx: MainRunCtx) interp_ir.VmResult {
+    interp_ir.setCoroutineTimeMode(ctx.time_mode);
+    return ctx.vm.run(ctx.main, ctx.out) catch return .{ .err = .{ .Eval = "out of memory" } };
 }
 
 /// `klio repl`: minimal interactive read-eval loop.

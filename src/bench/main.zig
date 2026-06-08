@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const bench = @import("bench.zig");
+const runtime = @import("runtime");
 const schema = bench.schema;
 const refrunner = bench.refrunner;
 
@@ -108,6 +109,11 @@ fn reportDiff(allocator: std.mem.Allocator, io: std.Io, base_path: []const u8, r
 /// `main` but takes args + allocator explicitly so the orchestrator wires
 /// the real executable.
 pub fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) u8 {
+    // Cap the bench process's RSS so a runaway corpus entry can't OOM the
+    // machine. Call-once.
+    runtime.startMemoryWatchdog();
+    runtime.startRunDeadline();
+
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();

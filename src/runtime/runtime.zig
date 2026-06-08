@@ -17,6 +17,7 @@ const proc_env_mod = @import("proc_env.zig");
 const clock_mod = @import("clock.zig");
 const float_fmt_mod = @import("float_fmt.zig");
 const gc_traverse_mod = @import("gc_traverse.zig");
+const safety_mod = @import("safety.zig");
 
 // objcell
 pub const ObjRef = objcell.ObjRef;
@@ -113,6 +114,14 @@ pub const publishValue = gc_traverse_mod.publishValue;
 pub const floatToString = float_fmt_mod.floatToString;
 pub const doubleToString = float_fmt_mod.doubleToString;
 
+// safety (host-protection backstops)
+pub const startMemoryWatchdog = safety_mod.startMemoryWatchdog;
+pub const startRunDeadline = safety_mod.startRunDeadline;
+pub const runCapped = safety_mod.runCapped;
+pub const CapResult = safety_mod.CapResult;
+pub const runOnBigStack = safety_mod.runOnBigStack;
+pub const INTERPRET_STACK_SIZE = safety_mod.INTERPRET_STACK_SIZE;
+
 test {
     std.testing.refAllDecls(@This());
     _ = objcell;
@@ -125,6 +134,7 @@ test {
     _ = clock_mod;
     _ = float_fmt_mod;
     _ = gc_traverse_mod;
+    _ = safety_mod;
 }
 
 // -------------------------------------------------------------------------

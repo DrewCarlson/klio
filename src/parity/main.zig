@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const parity = @import("parity.zig");
+const runtime = @import("runtime");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -12,6 +13,10 @@ const Io = std.Io;
 /// Run the parity harness over `args` (the full argv, including argv[0]).
 /// Returns the process exit code (0 / 1 / 2).
 pub fn run(allocator: Allocator, io: Io, args: []const []const u8) Allocator.Error!u8 {
+    // Cap the harness process's RSS so a runaway program can't OOM the
+    // machine; arm the opt-in run deadline. Call-once.
+    runtime.startMemoryWatchdog();
+    runtime.startRunDeadline();
     const file = if (args.len > 1) args[1] else {
         printErr(
             "usage: klio-parity <file.kt> [<file.kt> ...]\n       " ++
