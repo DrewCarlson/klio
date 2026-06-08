@@ -28,17 +28,17 @@ called out explicitly.
 
 ## Summary table
 
-| Class | Guards catalogued | Deletable (point-fix) | Keep (load-bearing) | Needs-verification |
-| --- | --- | --- | --- | --- |
-| A — closure execution / lambda variable access | 9 | 7 | 1 | 1 |
-| B — receiver/`this` across suspend/inline | 14 | 11 | 1 | 2 |
-| C — pack-vs-direct resolution | 12 | 10 | 1 | 1 |
-| Other-correctness / re-entrancy | 7 | 1 | 6 | 0 |
-| **Total** | **42** | **29** | **9** | **4** |
+| Class | Guards catalogued | Deletable (point-fix) | Keep (load-bearing) | Needs-verification | Removed |
+| --- | --- | --- | --- | --- | --- |
+| A — closure execution / lambda variable access | 9 | 7 | 1 | 1 | 2 (A1, A2 via 4b) |
+| B — receiver/`this` across suspend/inline | 14 | 11 | 1 | 2 | 0 |
+| C — pack-vs-direct resolution | 12 | 10 | 1 | 1 | 0 |
+| Other-correctness / re-entrancy | 7 | 1 | 6 | 0 | 0 |
+| **Total** | **42** | **29** | **9** | **4** | **2** |
 
 (A guard counted "needs-verification" is also counted in exactly one of
 deletable/keep per its best-current assessment; the four NV rows are A4, B9,
-B13, C12.)
+B13, C12. A1 and A2 are now REMOVED via §6 item 4b — see their entries.)
 
 The **keep list** (load-bearing branches that are NOT point-fixes and must not be
 deleted) is consolidated at the bottom.
@@ -51,43 +51,51 @@ The root mechanism (`execution-architecture.md` §2 Class A): an `IrClosure` is
 executed by three engines that disagree on capture store and env. These guards
 are the seams and the fallbacks that paper over the disagreement.
 
-### A1 — `scoped_env` name-seeding + write-back on the HOF path
+### A1 — `scoped_env` name-seeding + write-back on the HOF path — REMOVED (4b)
 
-- **Location:** `src/interp_ir/vm/intrinsic_host.zig:472-485` (seed a child env
-  with each capture *name*), `:504-518` (swap that env in as the host's
-  `globals`), `:523-536` (read names back, overwrite `info.captures`).
-- **What it does:** before running a HOF-invoked lambda body, defines every
-  captured name into a fresh `Env.withParent(globals)`, runs the body over that
-  child env, then copies the post-run values back into the side-table capture
-  cell. This is the *only* path on which a captured-`var` write that lowered to
-  `StoreGlobal` (see A3) becomes visible at the declaration site.
+- **Status:** REMOVED in §6 item **4b**. Both the `evalClosureRaw` and
+  `invokeCallable` scoped-env setups (the `Env.withParent(globals)` seed, the
+  swap-in as the host `globals`, and the post-run read-back into `info.captures`)
+  are deleted. The HOF invoke path now runs the closure body over the real
+  top-level env, exactly like the main value path. A captured-and-written outer
+  `var` is boxed into a shared `Value.Cell` at its binding site (var decl,
+  function/lambda parameter, or inline-splice parameter), so the write is a
+  `CellSet` on the shared cell and is visible at the declaration site by
+  reference — no name-seeded scratch env or capture read-back.
+- **Was at:** `src/interp_ir/vm/intrinsic_host.zig` (the two scoped-env blocks).
 - **Class:** A.
-- **Deletable?** Deletable — but **load-bearing until 4a lands** (see the keep
-  list note). It is a true point-fix (the main path has no equivalent), yet
-  deleting it *before* a precise captured-`var` carrier exists would silently
-  drop HOF-lambda mutations and regress `closures_advanced`/`closures_deep`.
-- **Removes via:** §6 item **4b** (after **4a**: `StoreCapture` instr or precise
-  `computeBoxedVars`).
-- **Removal test:** differential harness (§5.1) + `parity_closures_advanced` +
-  `parity_closures_deep` (both already in `itests_files`) green after 4a, with a
-  program that *writes* a captured `var` from a `map`/`forEach`/`apply` lambda and
-  reads it back at the decl site, `globals` unmodified.
+- **Verified by:** `zig build test` (1517/1517, incl. the differential harness
+  byte-identical across SourcePacks/CompiledPacks, the closures+suspend fuzzer,
+  `parity_closures_advanced`/`parity_closures_deep`, and the
+  `captured_var_carrier` e2e), corpus 80/80, `KLIO_FUZZ_SEEDS=128`,
+  `KLIO_TRACE_INVARIANTS=1` (0 violations). A prove-dead pass replaced the
+  captured-`var` `StoreGlobal` emission with a hard panic across the full detector
+  set; the only hit was a captured *function parameter*
+  (`kotlinx-coroutines-core/.../channels/Deprecated.kt`'s
+  `toMap(destination: M) { consumeEach { destination += it } }`), root-caused as a
+  boxing gap — `computeBoxedVars` boxed only `var` decls, not parameters a nested
+  closure writes — and fixed by boxing such parameters, not by restoring the guard.
 
-### A2 — `StoreGlobal`-for-capture lowering (the write half of A1)
+### A2 — `StoreGlobal`-for-capture lowering (the write half of A1) — REMOVED (4b)
 
-- **Location:** `src/ir/lower/expr.zig:665-669` (compound assignment write-back),
-  `:1424-1428` (postfix `++`/`--`). Both fire on the `b.knowsOuter(nm)` arm:
-  record a capture, emit `StoreGlobal name`, then `rebind`.
-- **What it does:** a write to a captured (non-boxed) outer `var` is lowered to a
-  global store, relying on A1's seeded env to catch it. Runtime `StoreGlobal`
-  assigns through `self.globals` (`host_globals.zig:628-632`).
+- **Status:** REMOVED in §6 item **4b**. The three `b.knowsOuter(...)` capture
+  arms that recorded a capture, emitted `StoreGlobal name`, and rebound locally
+  are deleted: `writeBackLvalue` (compound assignment), the postfix `++`/`--`
+  path (both `src/ir/lower/expr.zig`), and `storeCombinedToTarget`
+  (`src/ir/lower/stmt.zig`). A captured-and-written outer var now always reaches
+  the boxed `CellSet` branch (boxed at its binding site). The now-dead capture
+  write-back machinery is also removed: the `WritebackCaptures` instruction
+  (`ir.zig` + its `eval.zig` handler), the `emitWritebacks`/`lowerCallWith*`
+  capture-writeback emission, `Host.readLambdaCapture` (the eval vtable slot, its
+  `vmhost.zig` wiring, and the `host_call_value.zig` impl), and
+  `lambdaMutatedOuterVars` + its walkers. `StoreGlobal` itself is kept — it is
+  still the legit instruction for genuine top-level-global `var` writes (the final
+  `else` "top-level binding" arm) and the inline trampoline `tp_global`.
+- **Was at:** `src/ir/lower/expr.zig`, `src/ir/lower/stmt.zig`.
 - **Class:** A.
-- **Deletable?** Deletable — same 4a/4b sequencing as A1. The pair (A1 read-back +
-  A2 store) is one fallback in two places.
-- **Removes via:** §6 item **4b** (replaced by `StoreCapture` from 4a).
-- **Removal test:** same as A1; additionally the captured-`var`-write program must
-  pass with `KLIO_TRACE_PATH` (§5.5) showing a `StoreCapture`, not a
-  `StoreGlobal`, at the write site.
+- **Verified by:** same gates as A1. A `KLIO_FUZZ_SEEDS=128`-wide prove-dead pass
+  confirmed no non-boxed mutated outer var reaches the writeback emission before it
+  was deleted.
 
 ### A3 — Receiver-lambda value rebuild on the main value path
 
@@ -740,10 +748,9 @@ point-fixes. They implement real semantics or bound real recursion. The
 structural roadmap *relocates* most (TLS→frame field / TLS→param / heuristic→
 registry-kind) rather than deleting the behavior.
 
-1. **`scoped_env` write-back (A1) / `StoreGlobal`-for-capture (A2)** — load-bearing
-   *until* §6 item 4a lands a precise captured-`var` carrier. Deleting first
-   silently drops HOF-lambda mutations (`closures_advanced`/`closures_deep`). This
-   is the single most important "do not delete yet" in the tree (§4.1 sequencing).
+1. **`scoped_env` write-back (A1) / `StoreGlobal`-for-capture (A2)** — REMOVED in
+   §6 item 4b (4a's precise captured-`var` carrier landed first, then 4b deleted
+   both). No longer a keep entry; see the A1/A2 entries above.
 2. **`map_fallback_active` / `iterable_fallback_active` (O1)** — the *flag* is a TLS
    to relocate, but the re-entrancy protection it provides is mandatory (infinite
    recursion otherwise).

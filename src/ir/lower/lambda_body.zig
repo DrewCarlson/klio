@@ -191,13 +191,25 @@ pub fn lowerLambdaBodyCapturingKindWith(
             }
         }
     }
-    b.setBoxedVars(boxed);
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(b.allocator);
     for (params) |p| try names.append(b.allocator, p.name);
     if (params.len == 0) {
         try names.append(b.allocator, "it");
     }
+    // A lambda parameter that a deeper nested lambda *writes* is itself a
+    // captured-and-mutated local: box it so the write lands on a shared cell
+    // (the same carrier as a body `var`), not the StoreGlobal capture
+    // fallback. Symmetric to the function-body and inline-splice param boxing.
+    {
+        var assigned = ast_scan.StringSet.init(b.allocator);
+        defer assigned.deinit();
+        try ast_scan.namesAssignedInLambdas(body.stmts, &assigned);
+        for (names.items) |pname| {
+            if (assigned.contains(pname)) try boxed.put(pname, {});
+        }
+    }
+    b.setBoxedVars(boxed);
     try decl.bindParams(&b, names.items);
     const result = try expr.lowerBlock(&b, body);
     b.terminate(.{ .Return = result });

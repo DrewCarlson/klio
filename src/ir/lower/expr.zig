@@ -52,7 +52,6 @@ const internTypeArgs = helpers.internTypeArgs;
 const exprSpan = helpers.exprSpan;
 const isAnyTypedPath = helpers.isAnyTypedPath;
 const lambdaWritesOuterVar = helpers.lambdaWritesOuterVar;
-const lambdaMutatedOuterVars = helpers.lambdaMutatedOuterVars;
 
 const isBoxedToAnyForm = ast_scan.isBoxedToAnyForm;
 const collectDottedFqn = ast_scan.collectDottedFqn;
@@ -654,6 +653,9 @@ fn writeBackLvalue(b: *FuncBuilder, target: *const Expr, val: Reg) Allocator.Err
             if (p.segments.len != 1) return;
             const name = p.segments[0].name;
             if (b.isBoxed(name)) {
+                // Captured-and-written outer var: boxed at its binding site,
+                // so the write is a `CellSet` on the shared cell (subsumes
+                // the former captured-outer `StoreGlobal` fallback).
                 const cell = try boxedCellReg(b, name);
                 try b.push(.{ .CellSet = .{ .cell = cell, .value = val } });
             } else if (b.mutableHome(name)) |home| {
@@ -662,11 +664,6 @@ fn writeBackLvalue(b: *FuncBuilder, target: *const Expr, val: Reg) Allocator.Err
                 const this_reg = b.resolve("this").?;
                 const field = try b.module.internConst(b.allocator, .{ .String = name });
                 try b.push(.{ .SetField = .{ .receiver = this_reg, .field = field, .value = val } });
-            } else if (b.knowsOuter(name)) {
-                _ = try b.recordCapture(name);
-                const n = try b.module.internConst(b.allocator, .{ .String = name });
-                try b.push(.{ .StoreGlobal = .{ .name = n, .value = val } });
-                try b.rebind(name, val);
             } else {
                 try b.rebind(name, val);
             }
@@ -1413,6 +1410,10 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     if (p.segments.len == 1) {
                         const nm = p.segments[0].name;
                         if (b.isBoxed(nm)) {
+                            // Captured-and-written outer var: boxed at its
+                            // binding site, so `++`/`--` is a `CellSet` on
+                            // the shared cell (subsumes the former captured-
+                            // outer `StoreGlobal` fallback).
                             const cell = try boxedCellReg(b, nm);
                             try b.push(.{ .CellSet = .{ .cell = cell, .value = new } });
                         } else if (b.mutableHome(nm)) |home| {
@@ -1421,11 +1422,6 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                             const this_reg = b.resolve("this").?;
                             const field = try b.module.internConst(b.allocator, .{ .String = nm });
                             try b.push(.{ .SetField = .{ .receiver = this_reg, .field = field, .value = new } });
-                        } else if (b.knowsOuter(nm)) {
-                            _ = try b.recordCapture(nm);
-                            const n = try b.module.internConst(b.allocator, .{ .String = nm });
-                            try b.push(.{ .StoreGlobal = .{ .name = n, .value = new } });
-                            try b.rebind(nm, new);
                         } else {
                             try b.rebind(nm, new);
                         }
@@ -1707,7 +1703,6 @@ fn lowerCallWithWritebackMember(
         .n_args = @intCast(args.len),
         .arg_names = arg_names,
     } });
-    try emitWritebacks(b, args, arg_regs);
     return dst;
 }
 
@@ -1794,36 +1789,7 @@ fn lowerCallWithWritebackPath(
             .arg_names = arg_names,
         } });
     }
-    try emitWritebacks(b, args, arg_regs);
     return dst;
-}
-
-/// Emit `WritebackCaptures` insts for each closure-mutating lambda argument.
-fn emitWritebacks(b: *FuncBuilder, args: []const Expr, arg_regs: []const Reg) Allocator.Error!void {
-    for (args, 0..) |*a, i| {
-        const mutated = try lambdaMutatedOuterVars(b, a);
-        defer if (mutated.len != 0) b.allocator.free(mutated);
-        if (mutated.len == 0) continue;
-        const lambda_reg = arg_regs[i];
-        var names: std.ArrayList(ConstId) = .empty;
-        defer names.deinit(b.allocator);
-        var dsts: std.ArrayList(Reg) = .empty;
-        defer dsts.deinit(b.allocator);
-        for (mutated) |name| {
-            if (b.resolve(name)) |src_reg| {
-                const n = try b.module.internConst(b.allocator, .{ .String = name });
-                try names.append(b.allocator, n);
-                try dsts.append(b.allocator, src_reg);
-            }
-        }
-        if (names.items.len != 0) {
-            try b.push(.{ .WritebackCaptures = .{
-                .lambda = lambda_reg,
-                .names = try names.toOwnedSlice(b.allocator),
-                .dsts = try dsts.toOwnedSlice(b.allocator),
-            } });
-        }
-    }
 }
 
 /// Compact a list of registers into a contiguous run, returning the start

@@ -270,16 +270,6 @@ pub const Inst = union(enum) {
     },
     /// Build a `List` from a range of registers.
     NewList: struct { dst: Reg, args: Reg, n_args: u8 },
-    /// After calling a lambda that mutates outer-scope `var`s,
-    /// read each captured name back from the lambda's env and
-    /// write the updated value into the source reg in the
-    /// caller's frame. Pairs with `Inst.AstLambda` whose captured
-    /// names mirror the writeback list.
-    WritebackCaptures: struct {
-        lambda: Reg,
-        names: []ConstId,
-        dsts: []Reg,
-    },
     /// `this@Qualifier` — walk the receiver's outer chain
     /// looking for an instance whose class matches `qualifier`,
     /// and write that instance into `dst`.

@@ -462,25 +462,6 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
     };
 }
 
-pub fn readLambdaCapture(self: *VmHost, allocator: Allocator, lambda: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    if (lambda.* == .IrClosure) {
-        const id = lambda.IrClosure.id;
-        const info = self.closures.get(@intCast(id)) orelse {
-            return .{ .err = .{ .Type = try std.fmt.allocPrint(allocator, "unknown IrClosure id {d}", .{id}) } };
-        };
-        for (info.capture_names, 0..) |cap_name, idx| {
-            if (std.mem.eql(u8, cap_name, name)) {
-                const g = info.captures.borrow();
-                defer g.deinit();
-                const items = g.get().items;
-                return .{ .ok = if (idx < items.len) items[idx] else .Null };
-            }
-        }
-        return .{ .err = .{ .Unbound = try std.fmt.allocPrint(allocator, "capture `{s}` not found in lambda", .{name}) } };
-    }
-    return .{ .err = .{ .Type = try std.fmt.allocPrint(allocator, "read_lambda_capture on non-lambda value `{s}`", .{lambda.typeFqn()}) } };
-}
-
 pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {
     // Derive the lambda's param count + capture-name list from the body
     // func so `LoadCapture` reads the right snapshot per closure.
@@ -492,8 +473,9 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
         n_params = f.params.len;
         capture_names = try allocator.dupe([]const u8, f.capture_order);
     }
-    // Live capture cell shared with the lambda body so its `StoreGlobal`
-    // writes propagate back to the closure's captures.
+    // Canonical capture store for this closure (read by the HOF invoke
+    // path). A captured `var` a nested closure writes is itself a shared
+    // `Value.Cell` carried here, so its mutation is visible by reference.
     var cell_list: std.ArrayList(Value) = .empty;
     try cell_list.appendSlice(allocator, captures);
     const cell = try ObjRef(std.ArrayList(Value)).init(allocator, cell_list);
@@ -511,8 +493,9 @@ pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, params:
     _ = body;
     _ = absorb_return;
     const fid = body_func orelse return .{ .err = .{ .Unimplemented = "Vm: lambda lower did not provide body_func" } };
-    // Live capture cell shared with the lambda body so its `StoreGlobal`
-    // writes propagate back to the closure's captures.
+    // Canonical capture store for this closure (read by the HOF invoke
+    // path). A captured `var` a nested closure writes is itself a shared
+    // `Value.Cell` carried here, so its mutation is visible by reference.
     var cell_list: std.ArrayList(Value) = .empty;
     try cell_list.appendSlice(allocator, captures);
     const cell = try ObjRef(std.ArrayList(Value)).init(allocator, cell_list);

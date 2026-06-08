@@ -35,7 +35,21 @@ pub fn bindParams(b: *FuncBuilder, names: []const []const u8) Allocator.Error!vo
     for (names, 0..) |name, i| {
         const dst = b.allocReg();
         try b.push(.{ .LoadParam = .{ .dst = dst, .idx = @intCast(i) } });
-        try b.bind(name, dst);
+        if (b.isBoxed(name)) {
+            // A parameter that a nested closure *writes* (e.g.
+            // `consumeEach { destination += it }`) is a captured-and-mutated
+            // enclosing local just like a body `var`: box it into a shared
+            // `Value.Cell` so the closure's write lands on the cell and is
+            // visible here (Kotlin `Ref` semantics). Reads emit `CellGet`,
+            // writes `CellSet`, off the home reg holding the cell.
+            const home = b.allocReg();
+            try b.push(.{ .MakeCell = .{ .dst = home, .src = dst } });
+            try b.setMutableHome(name, home);
+            try b.markMutable(name);
+            try b.bind(name, home);
+        } else {
+            try b.bind(name, dst);
+        }
         try b.markParam(name);
     }
 }
@@ -645,6 +659,22 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
     defer names.deinit(a);
     try names.appendSlice(a, implicit_params);
     for (f.params) |*p| try names.append(a, p.name.name);
+    // Compute the boxed-var set before binding params so a parameter that a
+    // nested closure *writes* is bound as a shared cell (Kotlin `Ref`). The
+    // body-`var` half comes from `computeBoxedVars`; here we additionally box
+    // any parameter a nested lambda mutates.
+    if (f.body) |body| {
+        if (body == .Block) {
+            var boxed = try mod.computeBoxedVars(a, body.Block.stmts);
+            var assigned = mod.ast_scan.StringSet.init(a);
+            defer assigned.deinit();
+            try mod.ast_scan.namesAssignedInLambdas(body.Block.stmts, &assigned);
+            for (names.items) |pname| {
+                if (assigned.contains(pname)) try boxed.put(pname, {});
+            }
+            b.setBoxedVars(boxed);
+        }
+    }
     try bindParams(&b, names.items);
     // A param whose declared type is a receiver-typed function
     // (`block: T.() -> R`) carries that fact so a bare call `block(...)`
@@ -696,11 +726,8 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
     // expression body (`fun f(): T = …`) and a `return …` inside a block
     // body, so a reified inline call can infer its type argument.
     b.setDeclaredReturn(f.return_type);
-    if (f.body) |body| {
-        if (body == .Block) {
-            b.setBoxedVars(try mod.computeBoxedVars(a, body.Block.stmts));
-        }
-    }
+    // The boxed-var set (body `var`s plus nested-closure-written params) was
+    // computed and set before `bindParams` above so the params bind as cells.
     var result: ?ir.Reg = null;
     if (f.body) |body| {
         switch (body) {
