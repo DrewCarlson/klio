@@ -88,6 +88,29 @@ const SpinRwLock = struct {
     }
 };
 
+/// Exclusive spin lock. Zig 0.16's std has no blocking `Thread.Mutex`
+/// (synchronization moved behind the `Io` interface), so this is a small
+/// spin lock over `std.atomic.Value` with the same `spinLoopHint`/
+/// `Thread.yield` backoff as `SpinRwLock`. It is the one shared mutex
+/// definition imported by the interpreter, the stdlib concurrency
+/// intrinsics, and the shared output/closure handles; it provides the
+/// exclusive-access discipline a `Mutex` would, with acquire/release
+/// ordering.
+pub const SpinMutex = struct {
+    locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub fn lock(self: *SpinMutex) void {
+        while (self.locked.swap(true, .acquire)) {
+            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
+        }
+    }
+
+    pub fn unlock(self: *SpinMutex) void {
+        self.locked.store(false, .release);
+    }
+};
+
 /// Heap-allocated control block for one `ObjRef`: an atomic strong
 /// count plus the adaptive cell (publication `state`, the UNSHARED
 /// `RefCell` borrow `flag`, the SHARED reader/writer `lock`, the data,

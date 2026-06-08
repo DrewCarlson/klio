@@ -9,24 +9,11 @@ const EvalResult = runtime.EvalResult;
 const RuntimeError = runtime.RuntimeError;
 const Value = runtime.Value;
 
-/// Spin mutex for the monitor table and each monitor's state. Zig
-/// 0.16's std has no blocking `Thread.Mutex` (it moved behind the `Io`
-/// interface), so synchronization here follows the same atomic
-/// spin/yield discipline the rest of the runtime uses.
-const SpinMutex = struct {
-    locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn lock(self: *SpinMutex) void {
-        while (self.locked.swap(true, .acquire)) {
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
-        }
-    }
-
-    fn unlock(self: *SpinMutex) void {
-        self.locked.store(false, .release);
-    }
-};
+/// Spin mutex for the monitor table and each monitor's state, shared
+/// with the rest of the runtime (`runtime.objcell`). Zig 0.16's std has
+/// no blocking `Thread.Mutex` (it moved behind the `Io` interface), so
+/// synchronization follows the same atomic spin/yield discipline.
+const SpinMutex = runtime.SpinMutex;
 
 /// State of one reentrant monitor: which thread (if any) currently
 /// owns it and how deep its nesting is.

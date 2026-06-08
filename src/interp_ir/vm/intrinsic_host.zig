@@ -17,6 +17,7 @@ const runtime = @import("runtime");
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const host_call_member = @import("host_call_member.zig");
+const trace = @import("trace.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -68,7 +69,51 @@ pub fn childHost(self: *VmIntrinsicHost) VmIntrinsicHost {
 
 /// Build a `SendableVmSeed` snapshot of the shared program state for a
 /// freshly spawned OS thread / dispatch worker.
+/// Worker spawn precondition guard.
+///
+/// A worker materializes its own child `Vm` on a fresh OS thread
+/// (`workerEntry` → `seed.materialize`) and allocates Values, Envs,
+/// instance fields, and `ObjRef` control blocks — and runs `vm.deinit()`
+/// — all against the *same* allocator the parent passed in (`spawnSeed`
+/// copies `self.allocator` verbatim into the seed). That sharing is sound
+/// under Zig 0.16 only while two invariants hold, and the runtime never
+/// enforces them:
+///
+///   1. The shared backing allocator is thread-safe. Zig 0.16's
+///      `ArenaAllocator` is documented thread-safe for the `Allocator`
+///      interface (its lock-free `alloc`/free advance `end_index` with
+///      atomic RMW) *when its child allocator is thread-safe*; the CLI
+///      backs the `Vm` with an arena over `page_allocator`, which is
+///      thread-safe. `std.heap.smp_allocator` is the other thread-safe
+///      option. A bare `FixedBufferAllocator` or a single-threaded debug
+///      allocator would silently reintroduce a data race. (Zig 0.16 has
+///      no `std.heap.ThreadSafeAllocator`, so this is a precondition to
+///      assert, not a wrapper to apply.)
+///   2. No `arena.reset()` / `arena.deinit()` runs on the backing
+///      allocator while any worker is live. The only `ArenaAllocator`
+///      teardown is the process-exit `defer arena.deinit()`, and `Vm.run`
+///      joins every outstanding worker (`joinAllThreads`) before
+///      returning, so teardown never overlaps a live worker. Re-running a
+///      `Vm` against a `reset()`-reused arena would break this.
+///
+/// Neither is fully introspectable from a `std.mem.Allocator` (the arena's
+/// child thread-safety and the lifetime ordering are not in the vtable),
+/// so this asserts the cheaply-checkable part — the allocator about to be
+/// shared with the worker is a non-degenerate, real allocator (a
+/// zeroed/torn allocator at the seam is a clear bug) — and emits a
+/// machine-readable invariant line under `KLIO_TRACE_INVARIANTS` when it
+/// is not. Invariant (2) is enforced structurally by `joinAllThreads` and
+/// cannot be checked at the seam.
+fn assertSpawnAllocatorInvariant(allocator: Allocator, comptime site: []const u8) void {
+    const ok = @intFromPtr(allocator.vtable) != 0;
+    if (!ok and trace.invariantsEnabled()) {
+        trace.invariant("kind=spawn_allocator site=" ++ site ++ " detail=degenerate_allocator", .{});
+    }
+    std.debug.assert(ok);
+}
+
 fn spawnSeed(self: *VmIntrinsicHost) SendableVmSeed {
+    assertSpawnAllocatorInvariant(self.allocator, "spawnSeed");
     return .{
         .module = self.module.clone(),
         .globals = self.globals.clone(),
@@ -696,6 +741,10 @@ fn publishThreadResult(threads: root.ThreadTable, id: u64, result: ThreadResult)
 
 fn workerEntry(wargs: WorkerArgs) void {
     var args = wargs;
+    // The seed allocator is about to back every allocation this worker
+    // makes and its `vm.deinit()`; the invariants it relies on are
+    // documented on `assertSpawnAllocatorInvariant`.
+    assertSpawnAllocatorInvariant(args.seed.allocator, "workerEntry");
     root.setCoroutineTimeMode(args.time_mode);
     var vm = args.seed.materialize() catch {
         publishThreadResult(args.threads, args.id, .{ .err = .{ .Type = "failed to materialize worker Vm" } });
