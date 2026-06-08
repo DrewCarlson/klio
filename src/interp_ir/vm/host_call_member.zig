@@ -813,6 +813,54 @@ fn enclosingCallableProperty(self: *VmHost, allocator: Allocator, name: []const 
     return null;
 }
 
+/// Whether `ty_name` denotes a top type or a bare type parameter — a
+/// maximally-unspecific receiver/param type that every value satisfies but
+/// which loses to any concrete match during most-specific selection.
+fn isTopOrGenericType(ty_name: []const u8) bool {
+    var pn = simpleName(ty_name);
+    pn = std.mem.trimEnd(u8, pn, "?");
+    if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
+    if (std.mem.startsWith(u8, pn, "Function")) return true;
+    if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) return true;
+    return false;
+}
+
+/// Most-specific receiver ranking for overload selection. Returns how
+/// specifically the receiver's runtime type satisfies `ty_name`:
+///   * a positive rank when the receiver concretely IS-A `ty_name` — larger
+///     for a closer (smaller subtype-distance) match;
+///   * `0` for a top type or bare type parameter (`Any`, `T`, `FunctionN`):
+///     satisfied by everything, so least specific;
+///   * `-1` when the receiver definitely does not satisfy a concrete
+///     `ty_name`.
+/// This is the primary discriminator the most-specific rule ranks on: a
+/// `Flow` receiver prefers a `Flow` receiver param over the generic
+/// `Iterable`, and an `Iterable`-implementing collection prefers an
+/// `Iterable` param over an unrelated `CharSequence`/`Sequence`/`Array`.
+fn extReceiverSpecificity(self: *VmHost, receiver: *const Value, ty_name: []const u8) i32 {
+    if (isTopOrGenericType(ty_name)) return 0;
+    const pn = std.mem.trimEnd(u8, simpleName(ty_name), "?");
+    if (receiver.* == .Instance) {
+        if (instanceSubtypeDistance(self, receiver, pn)) |dist| {
+            const d: i32 = @intCast(@min(dist, @as(usize, 50)));
+            return 100 - d;
+        }
+        // Builtin interface (Iterable/Collection/CharSequence/…) reached
+        // through the instance's supertype names but not the user-class graph.
+        if (receiverImplementsType(self, receiver, pn)) return 50;
+        return -1;
+    }
+    if (receiver.isRuntimeType(pn)) return 100;
+    const v_ty = simpleName(receiver.typeFqn());
+    for (builtinSupers(v_ty), 0..) |s, pos| {
+        if (std.mem.eql(u8, s, pn)) {
+            const d: i32 = @intCast(@min(pos, @as(usize, 50)));
+            return 90 - d;
+        }
+    }
+    return -1;
+}
+
 /// Does the receiver's actual runtime type satisfy `ty_name`?
 fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []const u8) bool {
     var pn = simpleName(ty_name);
@@ -3919,6 +3967,31 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     return null;
 }
 
+/// Kotlin-faithful most-specific extension-overload selection.
+///
+/// Each candidate is ranked by a strict, total ordering so the winner is
+/// unique and deterministic (no declaration-order tie-break). Ranked, in
+/// descending priority:
+///   0. receiver specificity — the candidate whose receiver param most
+///      specifically matches the receiver's runtime type (a `Flow` receiver
+///      selects `Flow.forEach`, not the generic `Iterable.forEach`);
+///   1. applicability score — the numeric arg/param compatibility;
+///   2. owner rank — a member extension visible nearer on the enclosing-`this`
+///      chain;
+///   3. subtype specificity — how many other candidates' receiver types are
+///      supertypes of this one;
+///   4. parameter specificity — the most-specific declared parameter types
+///      for the supplied value args;
+///   5. a stable key (lowest `FuncId`) so the winner is always unique.
+const ExtKey = [6]i32;
+
+fn extKeyGreater(a: ExtKey, b: ExtKey) bool {
+    inline for (0..a.len) |i| {
+        if (a[i] != b[i]) return a[i] > b[i];
+    }
+    return false;
+}
+
 fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Value, candidates: []const Candidate, args: []const Value, want: usize) Allocator.Error!?Candidate {
     var chain_owners = try enclosingChainClassOrder(self, allocator);
     defer chain_owners.deinit(allocator);
@@ -3927,18 +4000,24 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
     var tied: std.ArrayList(Func) = .empty;
     defer tied.deinit(self.allocator);
     var best: ?Candidate = null;
-    var best_key: [3]i32 = .{ std.math.minInt(i32), std.math.minInt(i32), std.math.minInt(i32) };
+    var best_key: ExtKey = .{std.math.minInt(i32)} ** 6;
     for (candidates, 0..) |c, idx| {
         const f = c.func;
         const recv_score = overloadScoreArg(self, &f.params[0].ty, receiver) orelse -1;
         var score: i32 = recv_score *| 1000;
+        var param_spec: i32 = 0;
         for (args, 0..) |*a, i| {
             if (f.params.len > i + 1) {
                 score += overloadScoreArg(self, &f.params[i + 1].ty, a) orelse -1;
+                // A concrete (non-top, non-generic) param type that the arg
+                // satisfies is more specific than a top/`Any`/`T` param.
+                if (!isTopOrGenericType(f.params[i + 1].ty.name)) param_spec += 1;
             }
         }
         if (f.params.len == want) score += 5;
-        // Specificity: how many other candidates' receiver types are
+        // Receiver specificity: most-specific receiver-type match wins.
+        const recv_match = extReceiverSpecificity(self, receiver, f.params[0].ty.name);
+        // Subtype specificity: how many other candidates' receiver types are
         // supertypes of this one.
         var spec: i32 = 0;
         for (candidates, 0..) |o, j| {
@@ -3959,11 +4038,14 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
             }
             mg.deinit();
         }
-        const key = [3]i32{ score, owner_rank, spec };
+        // Stable final discriminator: lowest FuncId. Negated so a smaller id
+        // ranks higher, guaranteeing a unique winner.
+        const neg_fid: i32 = -@as(i32, @intCast(@intFromEnum(c.fid) & 0x7fff_ffff));
+        const key: ExtKey = .{ recv_match, score, owner_rank, spec, param_spec, neg_fid };
         if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
             tied.append(self.allocator, f) catch {};
         }
-        if (best == null or keyGreater(key, best_key)) {
+        if (best == null or extKeyGreater(key, best_key)) {
             best = c;
             best_key = key;
             if (check_inv) {
@@ -3980,12 +4062,6 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         }
     }
     return best;
-}
-
-fn keyGreater(a: [3]i32, b: [3]i32) bool {
-    if (a[0] != b[0]) return a[0] > b[0];
-    if (a[1] != b[1]) return a[1] > b[1];
-    return a[2] > b[2];
 }
 
 fn isSubtypeName(self: *VmHost, allocator: Allocator, a: []const u8, b: []const u8) bool {
