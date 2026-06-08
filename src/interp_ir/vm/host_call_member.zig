@@ -16,6 +16,7 @@ const stdlib = @import("stdlib");
 const vmhost = @import("vmhost.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
+const trace = @import("trace.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -116,6 +117,90 @@ fn boolVal(b: bool) Value {
 fn simpleName(name: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
+}
+
+// -------------------------------------------------------------------------
+// Dispatch invariants (KLIO_TRACE_INVARIANTS, default OFF). These detect — but
+// never repair — structural dispatch hazards at the candidate-selection choke
+// point (execution-architecture §5.3). A violation emits one machine-readable
+// `[INVARIANT]` line through the tracer; it is not a panic, so the default
+// build stays green.
+// -------------------------------------------------------------------------
+
+/// Invariant (i): the overload candidate set must select a unique winner.
+/// When two distinct candidates tie on the chosen score, declaration order
+/// silently breaks the tie — a non-deterministic resolution hazard. Called
+/// with the candidates that scored equal to the winner; emits a violation
+/// when more than one (distinct) function ties.
+fn checkOverloadUnique(name: []const u8, winner: *const Func, tied: []const Func) void {
+    if (!trace.invariantsEnabled()) return;
+    var distinct: usize = 0;
+    for (tied) |f| {
+        if (@intFromEnum(f.id) != @intFromEnum(winner.id)) distinct += 1;
+    }
+    if (distinct == 0) return;
+    trace.invariant(
+        "kind=overload_tie site=pickMethodOverload name={s} chosen_fid={d} chosen_fqn={s} tied_count={d}",
+        .{ name, @intFromEnum(winner.id), winner.fqn, distinct + 1 },
+    );
+}
+
+/// Invariant (ii): a selected `FuncId` must be in range for the module's func
+/// table and its `params` slice must be addressable. Emits a violation and
+/// returns when out of range.
+fn checkFuncInRange(self: *VmHost, site: []const u8, fid: FuncId) void {
+    if (!trace.invariantsEnabled()) return;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const n = mg.get().funcs.items.len;
+    if (@intFromEnum(fid) >= n) {
+        trace.invariant(
+            "kind=funcid_oob site={s} fid={d} func_count={d}",
+            .{ site, @intFromEnum(fid), n },
+        );
+    }
+}
+
+/// Instance identity (control-block pointer) of a `Value`, or `null` for
+/// non-instances.
+fn instancePtr(v: *const Value) ?*const anyopaque {
+    return switch (v.*) {
+        .Instance => |i| @ptrCast(i.cell),
+        else => null,
+    };
+}
+
+/// Invariant (iii): receiver-chain consistency. When both a `"this"` param and
+/// a `"this"` capture are present they must refer to the same `Instance`, and
+/// the enclosing-`this` chain must have no interior `Null`/`Unit` entries
+/// (those indicate a receiver that was lost or never set). Emits one violation
+/// line per inconsistency found; never repairs.
+fn checkReceiverChain(self: *VmHost, allocator: Allocator, site: []const u8, this_param: ?*const Value, this_capture: ?*const Value) void {
+    if (!trace.invariantsEnabled()) return;
+    if (this_param != null and this_capture != null) {
+        const pp = instancePtr(this_param.?);
+        const cp = instancePtr(this_capture.?);
+        if (pp != null and cp != null and pp.? != cp.?) {
+            trace.invariant(
+                "kind=this_mismatch site={s} param_tag={s} capture_tag={s}",
+                .{ site, @tagName(this_param.?.*), @tagName(this_capture.?.*) },
+            );
+        }
+    }
+    const chain = enclosingThisChain(self, allocator) catch return;
+    defer allocator.free(chain);
+    if (chain.len < 2) return;
+    // Interior entries are everything but the outermost element; a Null/Unit
+    // interior receiver is a hole in the enclosing-`this` chain.
+    for (chain[0 .. chain.len - 1], 0..) |v, i| {
+        switch (v) {
+            .Null, .Unit => trace.invariant(
+                "kind=chain_hole site={s} index={d} tag={s} depth={d}",
+                .{ site, i, @tagName(v), chain.len },
+            ),
+            else => {},
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -901,8 +986,15 @@ pub fn enclosingThisChain(self: *VmHost, allocator: Allocator) Allocator.Error![
 }
 
 pub fn pushAccessEnclosing(self: *VmHost, v: *const Value) void {
+    _ = self;
     const s = outerThisStack();
-    s.append(self.allocator, v.*) catch {};
+    // Backing lives on `page_allocator` — the same persistent backing as the
+    // sibling receiver thread-locals `inner_outer_hint` / `ctor_guard` /
+    // `coro_stack`. The stack itself is a process-global cleared
+    // (capacity-retaining) at run boundaries; backing it with the transient
+    // per-run arena would leave the retained capacity dangling once that arena
+    // is freed or reset between runs.
+    s.append(std.heap.page_allocator, v.*) catch {};
 }
 
 pub fn popAccessEnclosing(self: *VmHost) void {
@@ -916,8 +1008,9 @@ pub fn popAccessEnclosing(self: *VmHost) void {
 /// captured `this` with an explicit receiver and must keep the displaced
 /// instance reachable as an outer implicit receiver.
 pub fn pushOuterThis(allocator: Allocator, v: *const Value) void {
+    _ = allocator;
     const s = outerThisStack();
-    s.append(allocator, v.*) catch {};
+    s.append(std.heap.page_allocator, v.*) catch {};
 }
 
 pub fn popOuterThis() void {
@@ -1175,6 +1268,12 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
     }
     var best: ?Func = null;
     var best_score: i32 = std.math.minInt(i32);
+    // Track candidates that scored equal to the current best, for the
+    // overload-uniqueness invariant (KLIO_TRACE_INVARIANTS). Only populated
+    // when the gate is on; otherwise stays empty and costs nothing.
+    const check_inv = trace.invariantsEnabled();
+    var tied: std.ArrayList(Func) = .empty;
+    defer tied.deinit(self.allocator);
     for (candidates) |f| {
         const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         const effective = f.params[skip..];
@@ -1213,9 +1312,16 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
                         total += s;
                     } else ok = false;
                 }
-                if (ok and total > best_score) {
-                    best_score = total;
-                    best = f;
+                if (ok) {
+                    if (check_inv and total == best_score) tied.append(self.allocator, f) catch {};
+                    if (total > best_score) {
+                        best_score = total;
+                        best = f;
+                        if (check_inv) {
+                            tied.clearRetainingCapacity();
+                            tied.append(self.allocator, f) catch {};
+                        }
+                    }
                 }
                 continue;
             }
@@ -1249,9 +1355,21 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         if (!ok) continue;
         // Prefer an exact-arity overload over one relying on defaults.
         if (args.len == effective.len) score += 5;
+        if (check_inv and score == best_score) tied.append(self.allocator, f) catch {};
         if (score > best_score) {
             best_score = score;
             best = f;
+            if (check_inv) {
+                tied.clearRetainingCapacity();
+                tied.append(self.allocator, f) catch {};
+            }
+        }
+    }
+    if (check_inv) {
+        if (best) |w| {
+            const name: []const u8 = if (candidates.len > 0) candidates[0].name else "";
+            checkOverloadUnique(name, &w, tied.items);
+            checkFuncInRange(self, "pickMethodOverload", w.id);
         }
     }
     return best;
@@ -3439,6 +3557,10 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                     var iface = self.hostInterface();
                     var packed_list = try argsListFromSlice(allocator, packed_args);
                     _ = &packed_list;
+                    if (trace.invariantsEnabled()) {
+                        checkFuncInRange(self, "irMethodWalk", f.id);
+                        checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
+                    }
                     const r = try ir.eval.evalWith(allocator, mod, &f, packed_list, &iface);
                     mg.deinit();
                     return r;
@@ -3801,6 +3923,9 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
     var chain_owners = try enclosingChainClassOrder(self, allocator);
     defer chain_owners.deinit(allocator);
 
+    const check_inv = trace.invariantsEnabled();
+    var tied: std.ArrayList(Func) = .empty;
+    defer tied.deinit(self.allocator);
     var best: ?Candidate = null;
     var best_key: [3]i32 = .{ std.math.minInt(i32), std.math.minInt(i32), std.math.minInt(i32) };
     for (candidates, 0..) |c, idx| {
@@ -3835,9 +3960,23 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
             mg.deinit();
         }
         const key = [3]i32{ score, owner_rank, spec };
+        if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
+            tied.append(self.allocator, f) catch {};
+        }
         if (best == null or keyGreater(key, best_key)) {
             best = c;
             best_key = key;
+            if (check_inv) {
+                tied.clearRetainingCapacity();
+                tied.append(self.allocator, f) catch {};
+            }
+        }
+    }
+    if (check_inv) {
+        if (best) |w| {
+            const name: []const u8 = if (candidates.len > 0) candidates[0].func.name else "";
+            checkOverloadUnique(name, &w.func, tied.items);
+            checkFuncInRange(self, "scoreExtCandidates", w.fid);
         }
     }
     return best;

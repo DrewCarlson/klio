@@ -114,7 +114,10 @@ fn withFieldResolvePair(
     for (field_resolve_stack.items) |k| {
         if (k.id == id and std.mem.eql(u8, k.name, name)) return null;
     }
-    try field_resolve_stack.append(allocator, .{ .id = id, .name = name });
+    // Back the process-global guard stack on `page_allocator` (it is cleared
+    // capacity-retaining at run boundaries; a per-run-arena backing would
+    // leave the retained capacity dangling once that arena is torn down).
+    field_resolve_stack.append(std.heap.page_allocator, .{ .id = id, .name = name }) catch {};
     const r = try getField(self, allocator, receiver, name);
     var i: usize = field_resolve_stack.items.len;
     while (i > 0) {

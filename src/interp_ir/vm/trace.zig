@@ -5,6 +5,11 @@
 //! Set `KLIO_TRACE_CHAIN=1` to also print the enclosing-`this` chain
 //! after a traced member dispatch.
 //!
+//! Set `KLIO_TRACE_INVARIANTS=1` to emit machine-readable dispatch-invariant
+//! violation records to stderr (one `[INVARIANT]` line each). The checks are
+//! opt-in and never panic, so the default build stays green; they exist to
+//! surface latent dispatch bugs for triage (see execution-architecture §5.3).
+//!
 //! Zero cost when unset: the filter is parsed once and cached, and every
 //! trace point is guarded by `enabled`.
 
@@ -147,6 +152,46 @@ fn labelOwned(v: Value) bool {
 /// static-literal variants.
 pub fn freeLabel(allocator: std.mem.Allocator, v: Value, label: []const u8) void {
     if (labelOwned(v)) allocator.free(label);
+}
+
+// -------------------------------------------------------------------------
+// Dispatch-invariant checks (KLIO_TRACE_INVARIANTS, default OFF).
+//
+// These detect — but never repair — structural dispatch hazards. A violation
+// is emitted as a single machine-readable `[INVARIANT]` line so a harness can
+// grep them; it is NOT a panic, so the default build is unaffected.
+// -------------------------------------------------------------------------
+
+var inv_inited = std.atomic.Value(bool).init(false);
+var inv_done = std.atomic.Value(bool).init(false);
+var inv_on: bool = false;
+
+fn ensureInvariants() void {
+    if (inv_done.load(.acquire)) return;
+    if (inv_inited.swap(true, .acquire)) {
+        while (!inv_done.load(.acquire)) std.atomic.spinLoopHint();
+        return;
+    }
+    var ibuf: [64]u8 = undefined;
+    if (readEnv("KLIO_TRACE_INVARIANTS", &ibuf)) |v| {
+        inv_on = v.len != 0 and !std.mem.eql(u8, v, "0");
+    } else inv_on = false;
+    inv_done.store(true, .release);
+}
+
+/// True when dispatch-invariant checks should run and emit. Callers guard the
+/// (potentially non-trivial) check work behind this so it is free when unset.
+pub fn invariantsEnabled() bool {
+    ensureInvariants();
+    return inv_on;
+}
+
+/// Emit one machine-readable invariant-violation record. Format (stable, one
+/// line, key=value space-separated for grep/scripted triage):
+///   `[INVARIANT] kind=<id> site=<site> <detail...>`
+/// Callers gate with `invariantsEnabled`.
+pub fn invariant(comptime detail_fmt: []const u8, args: anytype) void {
+    std.debug.print("[INVARIANT] " ++ detail_fmt ++ "\n", args);
 }
 
 const testing = std.testing;
