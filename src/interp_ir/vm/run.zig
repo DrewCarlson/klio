@@ -576,22 +576,36 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
 }
 
 /// Release every owned handle of the Vm.
+///
+/// Under the arena fast path (`runtime.reclaimEnabled() == false`) the
+/// value-graph teardown is a no-op: every handle here is an `ObjRef`/
+/// ArrayList backed by the run arena, and `ObjRef.deinit` already
+/// short-circuits, so the arena reclaims them en masse on reset. Only the
+/// NON-memory side effect survives the fast path: the receiver/coroutine
+/// thread-locals must still be cleared so leaked-across-runs state stays a
+/// loud failure for the next program on this thread. Real OS thread join
+/// handles are not freed here — they are joined in `joinAllThreads` at the
+/// end of `vmRunInner`, before this is reached, on both the full and fast
+/// paths.
 pub fn vmDeinit(self: *Vm) void {
-    self.module.deinit();
-    self.globals.deinit();
-    self.instance_id_counter.deinit();
-    self.classes.deinit();
-    self.top_level_props.deinit(self.allocator);
-    self.enum_entry_arg_inits.deinit(self.allocator);
-    self.class_default_outer.deinit();
-    self.anon_methods.deinit();
-    self.closures.deinit();
-    self.prog.deinit();
-    self.out_sink.deinit();
-    self.threads.deinit();
+    if (runtime.reclaimEnabled()) {
+        self.module.deinit();
+        self.globals.deinit();
+        self.instance_id_counter.deinit();
+        self.classes.deinit();
+        self.top_level_props.deinit(self.allocator);
+        self.enum_entry_arg_inits.deinit(self.allocator);
+        self.class_default_outer.deinit();
+        self.anon_methods.deinit();
+        self.closures.deinit();
+        self.prog.deinit();
+        self.out_sink.deinit();
+        self.threads.deinit();
+    }
     // The receiver/coroutine thread-locals are balanced within a run; assert
     // they are empty at the boundary and clear them so leaked-across-runs
-    // state is a loud Debug failure for the next program in this thread.
+    // state is a loud Debug failure for the next program in this thread. This
+    // runs on both paths — it is a thread-local clear, not arena memory.
     vmhost.resetReceiverThreadLocals();
 }
 

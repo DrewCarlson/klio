@@ -1352,6 +1352,15 @@ pub fn runInMode(allocator: Allocator, io: Io, file: []const u8, mode: LoadMode)
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
+    // Arena-backed run: every cell allocates from `arena_inst`, which frees
+    // en masse on `deinit` above, so per-cell `ObjRef.deinit` teardown is
+    // wasted work. Switch this thread to the reclaim fast path for the run
+    // and restore the prior mode after (the harness runs many programs on
+    // one thread, and other tests on it leak-check on `testing.allocator`).
+    const prev_reclaim = runtime.reclaimEnabled();
+    runtime.setReclaim(false);
+    defer runtime.setReclaim(prev_reclaim);
+
     // Catch any receiver/coroutine thread-local state leaked from a prior run
     // on this thread before assembling the next program.
     interp_ir.resetReceiverThreadLocals();
@@ -1391,6 +1400,7 @@ const MainRunCtx = struct {
     main: interp_ir.FuncId,
     out: interp_ir.Output,
     time_mode: interp_ir.TimeMode,
+    reclaim: bool,
 };
 
 fn runMainBigStack(vm: *interp_ir.Vm, main_id: interp_ir.FuncId, out: interp_ir.Output) interp_ir.VmResult {
@@ -1399,12 +1409,14 @@ fn runMainBigStack(vm: *interp_ir.Vm, main_id: interp_ir.FuncId, out: interp_ir.
         .main = main_id,
         .out = out,
         .time_mode = interp_ir.coroutineTimeMode(),
+        .reclaim = runtime.reclaimEnabled(),
     };
     return runtime.runOnBigStack(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
 }
 
 fn runMainEntry(ctx: MainRunCtx) interp_ir.VmResult {
     interp_ir.setCoroutineTimeMode(ctx.time_mode);
+    runtime.setReclaim(ctx.reclaim);
     return ctx.vm.run(ctx.main, ctx.out) catch return .{ .err = .{ .Eval = "out of memory" } };
 }
 

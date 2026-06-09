@@ -268,6 +268,15 @@ fn runBuilt(
     bindings: HostBindings,
     no_main_msg: []const u8,
 ) u8 {
+    // The whole `klio` process runs on one process-lifetime arena
+    // (`main.zig`), freed once at exit, so per-cell `ObjRef.deinit` and the
+    // `vm.deinit()` value-graph walk are wasted work — the arena reclaims
+    // everything. Switch this thread to the reclaim fast path and restore
+    // the prior mode after so the REPL's next program is unaffected.
+    const prev_reclaim = runtime.reclaimEnabled();
+    runtime.setReclaim(false);
+    defer runtime.setReclaim(prev_reclaim);
+
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch return 1;
     const main_id = built.main;
     const fb = Vm.fromBuilt(gpa, &built) catch return 1;
@@ -303,6 +312,7 @@ const MainRunCtx = struct {
     main: interp_ir.FuncId,
     out: interp_ir.Output,
     time_mode: interp_ir.TimeMode,
+    reclaim: bool,
 };
 
 fn runMainBigStack(vm: *Vm, main: interp_ir.FuncId, out: interp_ir.Output) interp_ir.VmResult {
@@ -311,12 +321,14 @@ fn runMainBigStack(vm: *Vm, main: interp_ir.FuncId, out: interp_ir.Output) inter
         .main = main,
         .out = out,
         .time_mode = interp_ir.coroutineTimeMode(),
+        .reclaim = runtime.reclaimEnabled(),
     };
     return runtime.runOnBigStack(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
 }
 
 fn runMainEntry(ctx: MainRunCtx) interp_ir.VmResult {
     interp_ir.setCoroutineTimeMode(ctx.time_mode);
+    runtime.setReclaim(ctx.reclaim);
     return ctx.vm.run(ctx.main, ctx.out) catch return .{ .err = .{ .Eval = "out of memory" } };
 }
 
