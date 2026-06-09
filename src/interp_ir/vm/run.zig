@@ -475,8 +475,17 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
 /// join-all loop at the end of Rust's `Vm::run`. If `main` succeeded but a
 /// child threw, the child's error is surfaced; if `main` already failed,
 /// child errors are swallowed (the original failure wins).
+///
+/// After the last worker has joined this is the only run-boundary seam that
+/// runs exclusively on the top-level driver thread (workers run through
+/// `vmRunThreadBlock`, which never reaches here), so it is where the
+/// process-global slot-owner registry is drained: any slot a driver left
+/// registered on an error/abort/cancel path holds a clone of an arena-backed
+/// `DriverWakeup`, and draining here — once no worker can still route through
+/// it — keeps a stale entry from surviving into the next run's reset arena.
 fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     var out = result;
+    defer vmhost.coroutines.drainSlotOwners();
     while (true) {
         // Take one outstanding handle under the lock, then join it
         // without holding the lock so the worker's own result
@@ -576,22 +585,36 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
 }
 
 /// Release every owned handle of the Vm.
+///
+/// Under the arena fast path (`runtime.reclaimEnabled() == false`) the
+/// value-graph teardown is a no-op: every handle here is an `ObjRef`/
+/// ArrayList backed by the run arena, and `ObjRef.deinit` already
+/// short-circuits, so the arena reclaims them en masse on reset. Only the
+/// NON-memory side effect survives the fast path: the receiver/coroutine
+/// thread-locals must still be cleared so leaked-across-runs state stays a
+/// loud failure for the next program on this thread. Real OS thread join
+/// handles are not freed here — they are joined in `joinAllThreads` at the
+/// end of `vmRunInner`, before this is reached, on both the full and fast
+/// paths.
 pub fn vmDeinit(self: *Vm) void {
-    self.module.deinit();
-    self.globals.deinit();
-    self.instance_id_counter.deinit();
-    self.classes.deinit();
-    self.top_level_props.deinit(self.allocator);
-    self.enum_entry_arg_inits.deinit(self.allocator);
-    self.class_default_outer.deinit();
-    self.anon_methods.deinit();
-    self.closures.deinit();
-    self.prog.deinit();
-    self.out_sink.deinit();
-    self.threads.deinit();
+    if (runtime.reclaimEnabled()) {
+        self.module.deinit();
+        self.globals.deinit();
+        self.instance_id_counter.deinit();
+        self.classes.deinit();
+        self.top_level_props.deinit(self.allocator);
+        self.enum_entry_arg_inits.deinit(self.allocator);
+        self.class_default_outer.deinit();
+        self.anon_methods.deinit();
+        self.closures.deinit();
+        self.prog.deinit();
+        self.out_sink.deinit();
+        self.threads.deinit();
+    }
     // The receiver/coroutine thread-locals are balanced within a run; assert
     // they are empty at the boundary and clear them so leaked-across-runs
-    // state is a loud Debug failure for the next program in this thread.
+    // state is a loud Debug failure for the next program in this thread. This
+    // runs on both paths — it is a thread-local clear, not arena memory.
     vmhost.resetReceiverThreadLocals();
 }
 

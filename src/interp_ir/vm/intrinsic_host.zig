@@ -670,6 +670,10 @@ const WorkerArgs = struct {
     seed: SendableVmSeed,
     block: Value,
     time_mode: root.TimeMode,
+    /// Teardown mode inherited from the spawning run: the worker's child
+    /// `Vm` shares the same arena, so it must use the same `ObjRef.deinit`
+    /// path (fast under an arena-backed run, full under leak-checking).
+    reclaim: bool,
     threads: root.ThreadTable,
     id: u64,
 };
@@ -690,6 +694,10 @@ fn workerEntry(wargs: WorkerArgs) void {
     // documented on `assertSpawnAllocatorInvariant`.
     assertSpawnAllocatorInvariant(args.seed.allocator, "workerEntry");
     root.setCoroutineTimeMode(args.time_mode);
+    // Inherit the spawning run's teardown mode so the worker's child-Vm
+    // `ObjRef.deinit`/`vm.deinit()` take the same path as the parent over
+    // the shared arena.
+    runtime.setReclaim(args.reclaim);
     var vm = args.seed.materialize() catch {
         publishThreadResult(args.threads, args.id, .{ .err = .{ .Type = "failed to materialize worker Vm" } });
         return;
@@ -734,6 +742,7 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!Host
         .seed = spawnSeed(self),
         .block = block.*,
         .time_mode = root.coroutineTimeMode(),
+        .reclaim = runtime.reclaimEnabled(),
         .threads = self.threads.clone(),
         .id = id,
     };

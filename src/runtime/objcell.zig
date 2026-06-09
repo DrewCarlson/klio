@@ -36,6 +36,39 @@
 
 const std = @import("std");
 
+/// Per-thread teardown mode for `ObjRef.deinit`.
+///
+/// `true` (the default) runs the full Arc/Drop path: the atomic refcount
+/// decrement, `T.deinit`, and `allocator.destroy(cell)`. This is the only
+/// mode the leak-checking unit tests and the real-thread objcell/objref
+/// stress tests ever run under, so they keep exercising the full
+/// refcount/free path that catches use-after-free and leaks.
+///
+/// `false` is the arena fast path: `ObjRef.deinit` returns immediately
+/// without touching the refcount, the payload `T.deinit`, or the destroy,
+/// because the backing arena frees every cell en masse on reset. It is
+/// opt-in by the arena-backed run configs (the `klio` binary's run path,
+/// the e2e/parity/differential harnesses) for the duration of one program
+/// and restored afterward. It must NEVER be set on a thread that runs on a
+/// leak-checking `testing.allocator`, or a UAF/leak would be masked.
+///
+/// Threadlocal so a spawned worker inherits the spawning run's mode the
+/// same way the coroutine time mode does: the worker explicitly carries
+/// the flag through the spawn seed and sets it on entry.
+threadlocal var reclaim_tls: bool = true;
+
+/// Set the current thread's `ObjRef.deinit` teardown mode. `true` = full
+/// refcount/destroy/`T.deinit` path; `false` = arena fast path (skip
+/// per-cell teardown, the arena reclaims). Defaults to `true`.
+pub fn setReclaim(on: bool) void {
+    reclaim_tls = on;
+}
+
+/// Whether the current thread runs `ObjRef.deinit`'s full teardown path.
+pub fn reclaimEnabled() bool {
+    return reclaim_tls;
+}
+
 /// Reader/writer spin lock. `state` encodes the lock as `RefCell` does
 /// its flag: `0` free, `n > 0` n active readers, `WRITER` (the sign bit)
 /// exclusive writer. Many readers proceed concurrently; a writer is
@@ -216,7 +249,16 @@ pub fn ObjRef(comptime T: type) type {
         /// Drop one handle: decrement the strong count and, when it hits
         /// zero, run `T.deinit` if present and free the control block
         /// (Rust's `Drop for Arc`).
+        ///
+        /// Under the arena fast path (`reclaimEnabled() == false`) this
+        /// returns immediately without the atomic decrement, the payload
+        /// `T.deinit`, or the destroy: the backing arena reclaims every
+        /// cell wholesale on reset, so the per-cell teardown is wasted
+        /// work. The default is the full path, so the leak-checking and
+        /// real-thread stress configs (which never disable reclaim) keep
+        /// the refcount/free discipline that catches UAF/leaks.
         pub fn deinit(self: Self) void {
+            if (!reclaim_tls) return;
             if (self.cell.refcount.fetchSub(1, .release) == 1) {
                 // Acquire-load pairs with the release decrements of the
                 // other handles so all their writes happen-before this
