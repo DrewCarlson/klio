@@ -323,6 +323,8 @@ fn resolveFqn(allocator: Allocator, overrides: *const SpanStrMap, decl_span: Spa
     return std.fmt.allocPrint(allocator, "{s}.{s}", .{ package_prefix, simple });
 }
 
+const packageOfFqn = ir.packageOfFqn;
+
 // -------------------------------------------------------------------------
 // AST-walk helpers (member-name collection across the class hierarchy).
 // -------------------------------------------------------------------------
@@ -721,7 +723,13 @@ fn buildModuleWithOverrides(
         }
     }
 
-    // Reserve a stub Func slot per top-level function.
+    // Phase 1 of two-phase consumption: register every top-level
+    // function's HEADER — its package-qualified FQN, declaring package,
+    // and receiver type — into the complete header set BEFORE any body is
+    // lowered. Classes were reserved just above; together these phase-1
+    // headers span every pack, feature, and user file, so phase-2 body
+    // lowering resolves bare calls against the full package-qualified set
+    // through the symbol index rather than a partially-populated table.
     var stub_ids: std.ArrayList(FuncId) = .empty;
     defer stub_ids.deinit(a);
     for (decls) |*d| {
@@ -746,6 +754,7 @@ fn buildModuleWithOverrides(
                 .id = id,
                 .name = f.name.name,
                 .fqn = fqn,
+                .package = packageOfFqn(fqn, f.name.name),
                 .params = stub_params,
                 .return_ty = ir.build.typeUnit(),
                 .n_locals = 0,
@@ -777,7 +786,9 @@ fn buildModuleWithOverrides(
         }
     }
 
-    // Lower each function body into its reserved slot.
+    // Phase 2 of two-phase consumption: lower each function body into its
+    // reserved slot, resolving bodies and extension-receiver bindings
+    // against the now-complete phase-1 header set (above).
     var main_id: ?FuncId = null;
     var func_defaults = std.AutoHashMap(u32, []?FuncId).init(a);
     var func_type_params = std.AutoHashMap(u32, [][]const u8).init(a);
@@ -785,13 +796,17 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* == .Function) {
             const f = &d.Function;
+            const stub_pkg = module.funcs.items[stub_ids.items[stub_cursor].int()].package;
+            const prev_pkg = ir.lower.decl.setLowerSelfPackage(stub_pkg);
             const func = try ir.lower.lowerFunctionBodyInto(module, f, &file_classes);
+            _ = ir.lower.decl.setLowerSelfPackage(prev_pkg);
             const id = stub_ids.items[stub_cursor];
             stub_cursor += 1;
             var placed = func;
             placed.id = id;
-            // Preserve the stub's FQN (carries the package prefix).
+            // Preserve the stub's FQN + package (carry the package prefix).
             placed.fqn = module.funcs.items[id.int()].fqn;
+            placed.package = module.funcs.items[id.int()].package;
             module.funcs.items[id.int()] = placed;
             if (std.mem.eql(u8, f.name.name, "main")) main_id = id;
             try module.top_level.append(a, id);

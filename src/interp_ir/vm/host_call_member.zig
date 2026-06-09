@@ -3740,6 +3740,28 @@ fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(Instanc
     return false;
 }
 
+/// Whether `fid` is a member extension. Authoritative via the func's
+/// first-class `kind`; the `member_ext_owner_class` side table carries the
+/// owner-gating data (the kind selects which funcs are gated, the side
+/// table says by which owner class).
+fn isMemberExt(mod: *const Module, fid: FuncId) bool {
+    if (funcAt(mod, fid)) |f| return f.kind == .member_extension;
+    return false;
+}
+
+/// Member-extension visibility gate: a member-extension `fid` is visible
+/// at a call site only when its declaring (owner) class is reachable
+/// through `visible_owners`. Non-member-extensions are unconditionally
+/// visible (this function gates nothing for them). Preserves the prior
+/// `member_ext_owner_class.get(fid)`-then-`visible_owners.contains(owner)`
+/// behavior exactly: the kind selects the gated funcs, the side table
+/// supplies the owner.
+fn memberExtVisible(mod: *const Module, fid: FuncId, visible_owners: *const std.StringHashMap(void)) bool {
+    if (!isMemberExt(mod, fid)) return true;
+    const owner = mod.registry.member_ext_owner_class.get(fid) orelse return true;
+    return visible_owners.contains(owner);
+}
+
 /// A visible member-extension on the receiver type declared in the
 /// enclosing-class chain shadows the stdlib type-name probe.
 fn userMemberExtShadows(self: *VmHost, allocator: Allocator, name: []const u8, argc: usize) Allocator.Error!bool {
@@ -3750,6 +3772,7 @@ fn userMemberExtShadows(self: *VmHost, allocator: Allocator, name: []const u8, a
     defer mg.deinit();
     const mod = mg.get();
     for (mod.funcsBySimpleName(name)) |fid| {
+        if (!isMemberExt(mod, fid)) continue;
         const owner = mod.registry.member_ext_owner_class.get(fid) orelse continue;
         if (!owners.contains(owner)) continue;
         if (funcAt(mod, fid)) |f| {
@@ -3842,9 +3865,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         for (mod.funcsBySimpleName(name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
-            if (mod.registry.member_ext_owner_class.get(fid)) |owner| {
-                if (!visible_owners.contains(owner)) continue;
-            }
+            if (!memberExtVisible(mod, fid, &visible_owners)) continue;
             try candidates.append(allocator, .{ .fid = fid, .func = f });
         }
     }
@@ -3895,7 +3916,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     // member-extension's receiver doesn't accept the actual receiver.
     const defer_to_property = blk: {
         const c = chosen.?;
-        const is_member_ext = self.module.borrow().get().registry.member_ext_owner_class.contains(c.fid);
+        const is_member_ext = isMemberExt(self.module.borrow().get(), c.fid);
         if (!is_member_ext) break :blk false;
         if (c.func.params.len == 0) break :blk false;
         if (receiverImplementsType(self, receiver, c.func.params[0].ty.name)) break :blk false;
@@ -3989,11 +4010,14 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         var owner_rank: i32 = 0;
         {
             const mg = self.module.borrow();
-            if (mg.get().registry.member_ext_owner_class.get(c.fid)) |owner| {
-                for (chain_owners.items, 0..) |co, pos| {
-                    if (std.mem.eql(u8, co, owner)) {
-                        owner_rank = @as(i32, @intCast(chain_owners.items.len)) - @as(i32, @intCast(pos));
-                        break;
+            const mod = mg.get();
+            if (isMemberExt(mod, c.fid)) {
+                if (mod.registry.member_ext_owner_class.get(c.fid)) |owner| {
+                    for (chain_owners.items, 0..) |co, pos| {
+                        if (std.mem.eql(u8, co, owner)) {
+                            owner_rank = @as(i32, @intCast(chain_owners.items.len)) - @as(i32, @intCast(pos));
+                            break;
+                        }
                     }
                 }
             }
@@ -4392,9 +4416,7 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
         for (mod.funcsBySimpleName(name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
-            if (mod.registry.member_ext_owner_class.get(fid)) |owner| {
-                if (!visible_owners.contains(owner)) continue;
-            }
+            if (!memberExtVisible(mod, fid, &visible_owners)) continue;
             candidates.append(allocator, .{ .fid = fid, .func = f }) catch {};
         }
     }

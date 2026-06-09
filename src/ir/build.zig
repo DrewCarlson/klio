@@ -102,6 +102,11 @@ pub const FuncBuilder = struct {
     /// the owning class. Used by `super.method()` lowering to
     /// emit `Inst.CallSuper` with the right starting class.
     owner_class: ?[]const u8 = null,
+    /// Declaring package of the function currently being lowered
+    /// (`""` for a user script). The symbol index keys bare-call
+    /// preference on this so a same-named function in the caller's
+    /// own package wins over an imported / stdlib sibling.
+    self_package: []const u8 = "",
     /// Declared receiver-type name of the enclosing *extension* function
     /// (`fun Source.forEach(...)` → `"Source"`). Lets bare-call resolution
     /// prefer a same-named extension overload whose `this`-param type

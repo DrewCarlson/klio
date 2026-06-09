@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const ast = @import("ast");
+const runtime = @import("runtime");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
 
@@ -82,20 +83,34 @@ const lowerForLabeled = for_loop.lowerForLabeled;
 const lowerWhen = when_expr.lowerWhen;
 const lowerStmt = stmt_mod.lowerStmt;
 
+/// The single lowering-time `this`-register resolver shared by the bare
+/// `::name`/member-ref site and the bare-extension-call sites. A bound
+/// local `this` always wins; otherwise `this` is recovered from an outer
+/// capture when it is a known outer name — and, when `in_lambda_body` is
+/// set, also for any lambda body (whose implicit `this` arrives via the
+/// closure's own capture slot even without a `knowsOuter` record). When
+/// `bind_local` is set the recovered capture register is bound as the
+/// frame's `this` so later references reuse it. Returns `null` at top
+/// level / in a non-receiver context.
+fn resolveThisRegKind(b: *FuncBuilder, in_lambda_body: bool, bind_local: bool) Allocator.Error!?Reg {
+    if (b.resolve("this")) |r| return r;
+    if (b.knowsOuter("this") or (in_lambda_body and b.isLambdaBody())) {
+        const idx = try b.recordCapture("this");
+        const dst = b.allocReg();
+        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+        if (bind_local) try b.bind("this", dst);
+        return dst;
+    }
+    return null;
+}
+
 /// The register holding the current implicit receiver (`this`), if one is
 /// in scope: either bound directly (a method / extension / receiver lambda
 /// body) or reachable as an outer capture. Returns `null` at top level / in
 /// a non-receiver context. Used to bind a bare `::name` member reference to
 /// its receiver at creation time.
 fn resolveThisReg(b: *FuncBuilder) Allocator.Error!?Reg {
-    if (b.resolve("this")) |r| return r;
-    if (b.knowsOuter("this")) {
-        const idx = try b.recordCapture("this");
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-        return dst;
-    }
-    return null;
+    return resolveThisRegKind(b, false, false);
 }
 
 /// Lower an expression that appears as the *receiver / qualifier head* of a
@@ -1806,29 +1821,15 @@ fn packContiguous(b: *FuncBuilder, regs: []const Reg) Allocator.Error!Reg {
 }
 
 /// Resolve a `this` reg for a bare extension call: bound local, else a
-/// capture inside a lambda body, else null.
+/// capture inside a lambda body, else null. Binds the recovered capture
+/// locally so later references reuse it.
 fn resolveThisForBareCall(b: *FuncBuilder) Allocator.Error!?Reg {
-    if (b.resolve("this")) |r| return r;
-    if (b.knowsOuter("this") or b.isLambdaBody()) {
-        const idx = try b.recordCapture("this");
-        const d = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = d, .idx = idx } });
-        try b.bind("this", d);
-        return d;
-    }
-    return null;
+    return resolveThisRegKind(b, true, true);
 }
 
 /// Like `resolveThisForBareCall` but does not bind `this` locally.
 fn resolveThisForBareCallNoBind(b: *FuncBuilder) Allocator.Error!?Reg {
-    if (b.resolve("this")) |r| return r;
-    if (b.knowsOuter("this") or b.isLambdaBody()) {
-        const idx = try b.recordCapture("this");
-        const d = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = d, .idx = idx } });
-        return d;
-    }
-    return null;
+    return resolveThisRegKind(b, true, false);
 }
 
 fn lowerCallSpread(
@@ -2415,12 +2416,78 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
 
     const was_cast = cast_pick != null and bare_func_id != null and bare_func_id.? == cast_pick.?;
 
+    // Symbol-index resolution (the PRIMARY path): resolve the bare name as
+    // a pure function of (caller package, caller imports, complete header
+    // set). Where it resolves to a unique target the lowered call binds by
+    // exact FQN; otherwise the order-based heuristic pick above is retained
+    // as the fallback. The index is a faithful superset — it never selects
+    // a different target than the heuristic for a name it resolves; the
+    // KLIO_RESOLVE_AUDIT detector below proves zero divergence over the
+    // green corpus.
+    const index_pick = b.module.resolveBareCallIndexed(
+        name0,
+        b.self_package,
+        segments[0].span.file,
+        want,
+        last_arg_lambda,
+    );
+    resolveAudit(b, name0, bare_func_id, index_pick);
+
     if (bare_func_id) |func_id| {
         if (!shadowed_by_class) {
-            return try emitBareFuncCall(b, expr, func_id, was_cast);
+            // Prefer the index's unique FQN-qualified target when it
+            // resolves; it equals the heuristic pick on the green corpus,
+            // so this routes the same call through the exact-FQN binding
+            // instead of the order-sensitive path.
+            const final_id = index_pick orelse func_id;
+            return try emitBareFuncCall(b, expr, final_id, was_cast);
         }
     }
     return null;
+}
+
+/// Opt-in consistency detector for the symbol index (`KLIO_RESOLVE_AUDIT`).
+/// For every bare call it compares the index's resolved FQN against the
+/// order-based heuristic's pick and logs any divergence. A non-zero count
+/// means the index is not yet a faithful superset of the heuristic on the
+/// audited program — the index must equal the heuristic (or defer) for
+/// every currently-green program.
+fn resolveAudit(b: *FuncBuilder, name: []const u8, heuristic: ?FuncId, index: ?FuncId) void {
+    if (!resolveAuditOn()) return;
+    // The index only commits when it resolves a UNIQUE target; a `null`
+    // index pick means "defer to the heuristic" and is never a divergence.
+    const idx = index orelse return;
+    const heur = heuristic orelse {
+        resolveAuditLog(b, name, null, idx);
+        return;
+    };
+    if (idx.int() != heur.int()) resolveAuditLog(b, name, heur, idx);
+}
+
+var resolve_audit_checked: bool = false;
+var resolve_audit_enabled: bool = false;
+
+fn resolveAuditOn() bool {
+    if (!resolve_audit_checked) {
+        resolve_audit_checked = true;
+        const a = std.heap.page_allocator;
+        if (runtime.procEnvGetVar(a, "KLIO_RESOLVE_AUDIT") catch null) |v| {
+            a.free(v);
+            resolve_audit_enabled = true;
+        }
+    }
+    return resolve_audit_enabled;
+}
+
+fn resolveAuditLog(b: *FuncBuilder, name: []const u8, heuristic: ?FuncId, index: FuncId) void {
+    const heur_fqn = if (heuristic) |h| fqnOf(b, h) else "<none>";
+    const idx_fqn = fqnOf(b, index);
+    std.debug.print("[KLIO_RESOLVE_AUDIT] divergence: bare '{s}' heuristic={s} index={s}\n", .{ name, heur_fqn, idx_fqn });
+}
+
+fn fqnOf(b: *FuncBuilder, id: FuncId) []const u8 {
+    if (idGet(Func, b.module.funcs.items, id.int())) |f| return f.fqn;
+    return "<invalid>";
 }
 
 fn matchesRecv(b: *FuncBuilder, fid: FuncId, recv: []const u8) bool {

@@ -182,10 +182,28 @@ fn anonMethodKey(allocator: Allocator, class: []const u8, method: []const u8) Al
 /// `stdlib.implementation` during dispatch so a pack's FQN-keyed
 /// bindings shadow the stdlib's default lookup. Called before `run`.
 pub fn vmSetInstalledBindings(self: *Vm, bindings: stdlib.HostBindings) Allocator.Error!void {
+    {
+        const g = self.prog.borrowMut();
+        defer g.deinit();
+        g.get().installed_bindings.deinit();
+        g.get().installed_bindings = try ObjRef(stdlib.HostBindings).init(self.allocator, bindings);
+    }
+    // Re-settle each symbol's single executable form against the new
+    // overlay so dispatch consults the link-time form, not a per-call probe.
+    try linkProgramForms(self);
+}
+
+/// Resolve every symbol's single executable form once against the current
+/// `installed_bindings` overlay. The VM dispatch paths consult the recorded
+/// form rather than probing the overlay per call.
+fn linkProgramForms(self: *Vm) Allocator.Error!void {
+    const module_ref = self.module.clone();
+    defer module_ref.deinit();
+    const mg = module_ref.borrow();
+    defer mg.deinit();
     const g = self.prog.borrowMut();
     defer g.deinit();
-    g.get().installed_bindings.deinit();
-    g.get().installed_bindings = try ObjRef(stdlib.HostBindings).init(self.allocator, bindings);
+    try g.get().linkResolvedForms(mg.get());
 }
 
 /// A borrowed view over this Vm's shared program-state handles. Copying
@@ -274,6 +292,25 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     defer mg.deinit();
     const module = mg.get();
     const sink = self.out_sink.output();
+
+    // Settle each symbol's single executable form before any user code
+    // runs. `setInstalledBindings` already links when a pack overlay is
+    // installed; this covers the no-overlay configurations (the embedded
+    // run path, the bench harness) so every dispatch consults a populated
+    // resolved-form table. Idempotent — skip if already linked for the
+    // current overlay.
+    {
+        const linked = blk: {
+            const g = self.prog.borrow();
+            defer g.deinit();
+            break :blk g.get().resolved_linked;
+        };
+        if (!linked) {
+            const g = self.prog.borrowMut();
+            defer g.deinit();
+            try g.get().linkResolvedForms(module);
+        }
+    }
 
     // Top-level `const val`s are compile-time constants; bind them in
     // globals up front — before the object / companion initializers

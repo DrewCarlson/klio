@@ -15,6 +15,7 @@ const ast = @import("ast");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
+const host_call_func = @import("host_call_func.zig");
 const host_call_member = @import("host_call_member.zig");
 const host_fields = @import("host_fields.zig");
 const host_globals = @import("host_globals.zig");
@@ -267,18 +268,15 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             return .{ .err = .{ .Type = msg } };
         }
         const func = &module.funcs.items[info.body_func.int()];
-        // Pack binding overlay short-circuit for the wrapped
-        // top-level fn: e.g. a closure-of `kotlinx.datetime.__kxdt_*`
-        // dispatches the Rust binding instead of running the
-        // shim placeholder body.
-        {
-            const pg = self.prog.borrow();
-            defer pg.deinit();
-            const bg = pg.get().installed_bindings.borrow();
-            defer bg.deinit();
-            if (bg.get().resolve(func.fqn)) |intrinsic| {
-                return dispatchIntrinsic(self, intrinsic, args);
-            }
+        // One executable form per symbol: when the wrapped top-level fn's
+        // single form was resolved to a native binding at link time
+        // (e.g. a closure-of `kotlinx.datetime.__kxdt_*`), dispatch that
+        // binding instead of running the shim placeholder body. The form
+        // was settled once by `linkResolvedForms`; this consults it by
+        // `FuncId` with no per-call FQN probe.
+        host_call_func.linkAuditCheck(self, func.id, func.fqn);
+        if (host_call_func.resolvedNativeForm(self, func.id)) |intrinsic| {
+            return dispatchIntrinsic(self, intrinsic, args);
         }
         // Value-style invocation of a receiver lambda
         // (`block.invoke(receiver, p)` / `block(receiver, p)` for a
