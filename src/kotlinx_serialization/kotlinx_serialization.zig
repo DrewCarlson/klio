@@ -305,9 +305,7 @@ fn decodeField(
                         defer cls_ref.deinit();
                         const cls = cls_ref.asPtr();
                         if (cls.is_enum) {
-                            const eg = cls.enum_entries.borrow();
-                            defer eg.deinit();
-                            for (eg.get().items) |entry| {
+                            for (cls.enum_entries) |entry| {
                                 if (std.mem.eql(u8, entry.name, s)) {
                                     return .{ .ok = entry.value };
                                 }
@@ -618,8 +616,8 @@ fn makeClass(
         .is_enum = is_enum,
         .is_sealed = false,
         .supertype_names = &.{},
-        .parent = try ObjRef(?ObjRef(ClassDef)).init(a, null),
-        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(a, .empty),
+        .parent = null,
+        .interfaces = &.{},
         .is_interface = false,
         .is_fun_interface = false,
         .parent_ctor_args = &.{},
@@ -628,13 +626,13 @@ fn makeClass(
         .is_inner = false,
         .is_anonymous = false,
         .secondary_ctors = &.{},
-        .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(a, .empty),
+        .enum_entries = &.{},
         .companion = try ObjRef(?ObjRef(InstanceData)).init(a, null),
         .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(a, null),
-        .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(a, .empty),
+        .nested_classes = &.{},
         .captured_env = try ObjRef(Env).init(a, Env.init(a)),
-        .supertype_delegates = try ObjRef(std.ArrayList(runtime.SupertypeDelegate)).init(a, .empty),
-        .delegate_forwarders = try ObjRef(std.ArrayList(runtime.MethodDef)).init(a, .empty),
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
         .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(a, null),
     };
     return ObjRef(ClassDef).init(a, cd);

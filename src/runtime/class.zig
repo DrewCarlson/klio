@@ -39,9 +39,12 @@ pub const ClassDef = struct {
     /// Simple supertype names recorded from `class Foo : Bar(), Baz`.
     supertype_names: []const []const u8,
     /// Resolved parent class for method-resolution chain walking.
-    parent: ObjRef(?ObjRef(ClassDef)),
-    /// Resolved interface supertypes (any number).
-    interfaces: ObjRef(std.ArrayList(ObjRef(ClassDef))),
+    /// Backpatched once during two-phase class linking, then immutable for
+    /// the rest of the process; read lock-free on the dispatch path.
+    parent: ?ObjRef(ClassDef),
+    /// Resolved interface supertypes (any number). Arena slice filled once
+    /// during linking; immutable and lock-free thereafter.
+    interfaces: []const ObjRef(ClassDef),
     /// `true` for a class declared with the `interface` keyword.
     is_interface: bool,
     /// `true` for a `fun interface`.
@@ -58,20 +61,22 @@ pub const ClassDef = struct {
     is_anonymous: bool,
     /// Secondary constructors in source-declared order.
     secondary_ctors: []*const ast.SecondaryCtor,
-    /// Eagerly-constructed enum entries in source order.
-    enum_entries: ObjRef(std.ArrayList(EnumEntry)),
+    /// Eagerly-constructed enum entries in source order. Arena slice filled
+    /// once during linking; immutable and lock-free thereafter.
+    enum_entries: []const EnumEntry,
     /// Companion object instance, if any.
     companion: ObjRef(?ObjRef(InstanceData)),
     /// For a companion-object class, the enclosing class.
     enclosing_class: ObjRef(?ObjRef(ClassDef)),
-    /// Nested classes by simple name.
-    nested_classes: ObjRef(std.ArrayList(NestedClass)),
+    /// Nested classes by simple name. Immutable arena slice.
+    nested_classes: []const NestedClass,
     /// Captured env in which the class was declared.
     captured_env: ObjRef(Env),
-    /// Inheritance-delegation table.
-    supertype_delegates: ObjRef(std.ArrayList(SupertypeDelegate)),
-    /// Synthesized forwarder methods for delegated interfaces.
-    delegate_forwarders: ObjRef(std.ArrayList(MethodDef)),
+    /// Inheritance-delegation table. Immutable arena slice.
+    supertype_delegates: []const SupertypeDelegate,
+    /// Synthesized forwarder methods for delegated interfaces. Immutable
+    /// arena slice.
+    delegate_forwarders: []const MethodDef,
     /// Lazily-constructed singleton for nested `is_object` classes.
     object_singleton: ObjRef(?ObjRef(InstanceData)),
 
@@ -119,9 +124,7 @@ pub const ClassDef = struct {
     /// The list of declared interface supertypes (resolved). Caller owns
     /// the returned slice.
     pub fn interfaceRefs(self: *const ClassDef, allocator: std.mem.Allocator) ![]ObjRef(ClassDef) {
-        const g = self.interfaces.borrow();
-        defer g.deinit();
-        return allocator.dupe(ObjRef(ClassDef), g.get().items);
+        return allocator.dupe(ObjRef(ClassDef), self.interfaces);
     }
 
     /// Collect companions reachable from this class. Caller owns the slice.
@@ -403,12 +406,8 @@ fn collectCompanionsWalk(
         defer parent.deinit();
         try collectCompanionsWalk(allocator, parent, out, seen);
     }
-    {
-        const g = ptr.interfaces.borrow();
-        defer g.deinit();
-        for (g.get().items) |iface| {
-            try collectCompanionsWalk(allocator, iface, out, seen);
-        }
+    for (ptr.interfaces) |iface| {
+        try collectCompanionsWalk(allocator, iface, out, seen);
     }
     if (enclosingClone(ptr)) |encl| {
         defer encl.deinit();
@@ -432,23 +431,15 @@ fn findMethodWalk(
             return .{ .method = m, .class = cls.clone() };
         }
     }
-    {
-        const g = ptr.delegate_forwarders.borrow();
-        defer g.deinit();
-        for (g.get().items) |m| {
-            if (std.mem.eql(u8, m.name, name)) return .{ .method = m, .class = cls.clone() };
-        }
+    for (ptr.delegate_forwarders) |m| {
+        if (std.mem.eql(u8, m.name, name)) return .{ .method = m, .class = cls.clone() };
     }
     if (parentClone(ptr)) |parent| {
         defer parent.deinit();
         if (findMethodWalk(allocator, parent, name, seen)) |found| return found;
     }
-    {
-        const g = ptr.interfaces.borrow();
-        defer g.deinit();
-        for (g.get().items) |iface| {
-            if (findMethodWalk(allocator, iface, name, seen)) |found| return found;
-        }
+    for (ptr.interfaces) |iface| {
+        if (findMethodWalk(allocator, iface, name, seen)) |found| return found;
     }
     for (ptr.methods) |m| {
         if (std.mem.eql(u8, m.name, name)) return .{ .method = m, .class = cls.clone() };
@@ -475,12 +466,8 @@ fn findMethodForArgWalk(
         defer parent.deinit();
         if (findMethodForArgWalk(allocator, parent, name, arg_type_name, seen)) |found| return found;
     }
-    {
-        const g = ptr.interfaces.borrow();
-        defer g.deinit();
-        for (g.get().items) |iface| {
-            if (findMethodForArgWalk(allocator, iface, name, arg_type_name, seen)) |found| return found;
-        }
+    for (ptr.interfaces) |iface| {
+        if (findMethodForArgWalk(allocator, iface, name, arg_type_name, seen)) |found| return found;
     }
     return null;
 }
@@ -506,21 +493,15 @@ fn findBodyPropertyWalk(
         defer parent.deinit();
         if (findBodyPropertyWalk(allocator, parent, name, seen)) |found| return found;
     }
-    {
-        const g = ptr.interfaces.borrow();
-        defer g.deinit();
-        for (g.get().items) |iface| {
-            if (findBodyPropertyWalk(allocator, iface, name, seen)) |found| return found;
-        }
+    for (ptr.interfaces) |iface| {
+        if (findBodyPropertyWalk(allocator, iface, name, seen)) |found| return found;
     }
     return null;
 }
 
 /// Return a fresh clone of the resolved parent `ClassDef` handle, or null.
 fn parentClone(cls: *const ClassDef) ?ObjRef(ClassDef) {
-    const g = cls.parent.borrow();
-    defer g.deinit();
-    return if (g.get().*) |p| p.clone() else null;
+    return if (cls.parent) |p| p.clone() else null;
 }
 
 /// Return a fresh clone of the enclosing `ClassDef` handle, or null.
@@ -569,8 +550,8 @@ const ClassFixture = struct {
             .is_enum = false,
             .is_sealed = false,
             .supertype_names = supertype_names,
-            .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-            .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+            .parent = null,
+            .interfaces = &.{},
             .is_interface = false,
             .is_fun_interface = false,
             .parent_ctor_args = &.{},
@@ -579,13 +560,13 @@ const ClassFixture = struct {
             .is_inner = false,
             .is_anonymous = false,
             .secondary_ctors = &.{},
-            .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(allocator, .empty),
+            .enum_entries = &.{},
             .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
             .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-            .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(allocator, .empty),
+            .nested_classes = &.{},
             .captured_env = env.clone(),
-            .supertype_delegates = try ObjRef(std.ArrayList(SupertypeDelegate)).init(allocator, .empty),
-            .delegate_forwarders = try ObjRef(std.ArrayList(MethodDef)).init(allocator, .empty),
+            .supertype_delegates = &.{},
+            .delegate_forwarders = &.{},
             .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
         };
         return .{
@@ -602,30 +583,19 @@ const ClassFixture = struct {
 
     /// Link `parent` as this class's resolved superclass.
     fn setParent(self: *const ClassFixture, parent: ObjRef(ClassDef)) void {
-        const g = self.ptr().parent.borrowMut();
-        defer g.deinit();
-        g.get().* = parent.clone();
+        self.ptr().parent = parent.clone();
     }
 
     fn deinit(self: *ClassFixture, allocator: std.mem.Allocator) void {
         _ = allocator;
         const cd = self.ptr();
-        {
-            const g = cd.parent.borrow();
-            defer g.deinit();
-            if (g.get().*) |p| p.deinit();
-        }
-        cd.parent.deinit();
-        // The list-holding `ObjRef`s free their backing buffer in their own
-        // `deinit` (the cell runs `ArrayList.deinit(allocator)`); here we
-        // only release the element clones the cell does not own.
-        {
-            const g = cd.interfaces.borrowMut();
-            defer g.deinit();
-            for (g.get().items) |iface| iface.deinit();
-        }
-        cd.interfaces.deinit();
-        cd.enum_entries.deinit();
+        // `parent`/`interfaces`/`enum_entries`/`nested_classes`/
+        // `supertype_delegates`/`delegate_forwarders` are now plain immutable
+        // slices/optionals (arena-owned in the runtime). Release only the
+        // resolved-handle clones the fixture installed; the empty slices own
+        // no backing buffer.
+        if (cd.parent) |p| p.deinit();
+        for (cd.interfaces) |iface| iface.deinit();
         {
             const g = cd.companion.borrow();
             defer g.deinit();
@@ -633,10 +603,7 @@ const ClassFixture = struct {
         }
         cd.companion.deinit();
         cd.enclosing_class.deinit();
-        cd.nested_classes.deinit();
         cd.captured_env.deinit();
-        cd.supertype_delegates.deinit();
-        cd.delegate_forwarders.deinit();
         cd.object_singleton.deinit();
         self.handle.deinit();
         // The `Env` cell is shared with `captured_env`; its last `deinit`

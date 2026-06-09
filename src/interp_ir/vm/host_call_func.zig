@@ -794,11 +794,9 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
                         if (is_enum) {
                             if (std.mem.eql(u8, f.name, "enumValues")) {
                                 var items: std.ArrayList(Value) = .empty;
-                                const eg = cd.get().enum_entries.borrow();
-                                for (eg.get().items) |entry| {
+                                for (cd.get().enum_entries) |entry| {
                                     items.append(allocator, entry.value) catch {};
                                 }
-                                eg.deinit();
                                 const enum_class = try StringRef.init(allocator, cd.get().name);
                                 cd.deinit();
                                 return .{ .ok = .{ .List = .{
@@ -812,17 +810,14 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
                             if (args.len > 0 and args[0] == .String) {
                                 const sg = args[0].String.borrow();
                                 const want = sg.get().*;
-                                const eg = cd.get().enum_entries.borrow();
-                                for (eg.get().items) |entry| {
+                                for (cd.get().enum_entries) |entry| {
                                     if (std.mem.eql(u8, entry.name, want)) {
                                         const out = entry.value;
-                                        eg.deinit();
                                         sg.deinit();
                                         cd.deinit();
                                         return .{ .ok = out };
                                     }
                                 }
-                                eg.deinit();
                                 const fqn = try StringRef.init(allocator, "kotlin.IllegalArgumentException");
                                 const msg = try StringRef.init(allocator, try std.fmt.allocPrint(allocator, "No enum constant {s}.{s}", .{ cd.get().fqn, want }));
                                 sg.deinit();

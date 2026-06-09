@@ -64,7 +64,11 @@ const narrowing = @import("check/narrowing.zig");
 
 pub const helpers = @import("check/helpers.zig");
 
-/// Output of the type-checking pass.
+/// Output of the type-checking pass. Every container the checker fills —
+/// the `types`/`cfgs` side tables, the diagnostics, and all the scratch the
+/// `Checker` holds — is allocated from the single driver-owned arena passed
+/// to `typecheck`/`typecheckModule`. The driver frees that arena once the
+/// last reader of this output is done, so the result exposes no teardown.
 pub const TypeCheck = struct {
     /// Type assigned to each expression by its span. Statements have no
     /// entry. Spans not in this map were either skipped or assigned
@@ -81,31 +85,7 @@ pub const TypeCheck = struct {
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
         return self.types.getPtr(sp);
     }
-
-    pub fn deinit(self: *TypeCheck, allocator: Allocator) void {
-        var it = self.types.valueIterator();
-        while (it.next()) |t| t.deinit(allocator);
-        self.types.deinit();
-        self.diagnostics.deinit(allocator);
-        var cit = self.cfgs.valueIterator();
-        while (cit.next()) |c| freeCfg(c, allocator);
-        self.cfgs.deinit();
-    }
 };
-
-/// Free the structural buffers a `Cfg` owns. The `Cfg` type lives in the
-/// `cfa` module and carries no `deinit`; in Rust its `Vec`s drop with the
-/// owning map, so the Zig port frees them here when the typeck-owned `cfgs`
-/// table is torn down.
-fn freeCfg(cfg: *Cfg, allocator: Allocator) void {
-    for (cfg.blocks.items) |*blk| {
-        blk.nodes.deinit(allocator);
-        blk.preds.deinit(allocator);
-        blk.succs.deinit(allocator);
-    }
-    cfg.blocks.deinit(allocator);
-    cfg.exits.deinit(allocator);
-}
 
 /// Public entry point. `resolution` is the resolver's output for the same
 /// file; the checker reads it but does not mutate it.
@@ -542,20 +522,6 @@ pub const ClassInfo = struct {
             .member_visibility = std.StringHashMap(Visibility).init(allocator),
         };
     }
-
-    pub fn deinit(self: *ClassInfo, allocator: Allocator) void {
-        self.members.deinit();
-        self.member_mutable.deinit();
-        self.member_flags.deinit();
-        self.member_sigs.deinit();
-        self.member_class.deinit();
-        self.member_visibility.deinit();
-        self.abstract_members.deinit(allocator);
-        self.concrete_members.deinit(allocator);
-        self.supertypes.deinit(allocator);
-        self.typed_supertypes.deinit(allocator);
-        self.type_param_names.deinit(allocator);
-    }
 };
 
 /// Visibility + declaring file of one declaration overload.
@@ -668,54 +634,6 @@ pub const Checker = struct {
     pub const checkCall = expr_calls.checkCall;
     pub const checkVisibility = visibility.checkVisibility;
     pub const narrow = narrowing.narrow;
-
-    pub fn deinit(self: *Checker) void {
-        const a = self.allocator;
-        var tit = self.types.valueIterator();
-        while (tit.next()) |t| t.deinit(a);
-        self.types.deinit();
-        self.expr_class.deinit();
-        var lit = self.list_elem.valueIterator();
-        while (lit.next()) |t| t.deinit(a);
-        self.list_elem.deinit();
-        self.diagnostics.deinit(a);
-        for (self.frames.items) |*f| f.deinit();
-        self.frames.deinit(a);
-        deinitMapOfList(FnSig, &self.fns, a);
-        deinitMapOfList(ExtensionSig, &self.extensions, a);
-        deinitMapOfList(ExtensionPropSig, &self.extension_properties, a);
-        var cit = self.classes.valueIterator();
-        while (cit.next()) |c| c.deinit(a);
-        self.classes.deinit();
-        self.class_stack.deinit(a);
-        self.fn_return_stack.deinit(a);
-        self.label_stack.deinit(a);
-        deinitMapOfList(VisFile, &self.fn_visibility, a);
-        self.prop_visibility.deinit();
-        self.setter_visibility.deinit();
-        self.aliases.deinit();
-        self.public_inline_stack.deinit(a);
-        self.suspend_context_stack.deinit(a);
-        for (self.reified_type_params.items) |*s| s.deinit();
-        self.reified_type_params.deinit(a);
-        for (self.type_params_in_scope.items) |*s| s.deinit();
-        self.type_params_in_scope.deinit(a);
-        deinitMapOfList([]Annotation, &self.fn_annotations, a);
-        self.prop_annotations.deinit();
-        self.annotation_class_names.deinit();
-        self.enum_class_names.deinit();
-        self.dsl_marker_annotations.deinit();
-        var dit = self.dsl_class_markers.valueIterator();
-        while (dit.next()) |s| s.deinit();
-        self.dsl_class_markers.deinit();
-        self.dsl_receiver_stack.deinit(a);
-        var cgit = self.cfgs.valueIterator();
-        while (cgit.next()) |c| freeCfg(c, a);
-        self.cfgs.deinit();
-        self.lowerings.deinit();
-        self.cfg_fn_stack.deinit(a);
-        if (self.inference_session) |*s| s.cs.deinit();
-    }
 };
 
 /// A dsl-receiver-stack entry: an implicit `this` class name plus its set
@@ -724,12 +642,6 @@ pub const DslReceiver = struct {
     name: []const u8,
     markers: std.StringHashMap(void),
 };
-
-fn deinitMapOfList(comptime T: type, map: *std.StringHashMap(std.ArrayList(T)), allocator: Allocator) void {
-    var it = map.valueIterator();
-    while (it.next()) |list| list.deinit(allocator);
-    map.deinit();
-}
 
 test {
     std.testing.refAllDecls(@This());

@@ -112,15 +112,16 @@ pub fn runCheck(
     combined.appendSlice(gpa, loaded.asts) catch return 2;
     combined.appendSlice(gpa, user_asts.items) catch return 2;
 
-    var r = resolver.resolveModule(gpa, combined.items) catch return 2;
-    defer r.deinit();
+    // `gpa` here is the process-lifetime arena (`main.zig`), so the resolver
+    // and type checker allocate their whole workspace from it and free
+    // nothing — the arena reclaims everything at process exit.
+    const r = resolver.resolveModule(gpa, combined.items) catch return 2;
     for (r.diagnostics.diags()) |d| {
         if (user_file_ids.contains(d.primary.span.file.int())) {
             all.emit(gpa, d) catch return 2;
         }
     }
-    var tc = typeck.typecheckModule(gpa, combined.items, &r) catch return 2;
-    defer tc.deinit(gpa);
+    const tc = typeck.typecheckModule(gpa, combined.items, &r) catch return 2;
     for (tc.diagnostics.diags()) |d| {
         if (user_file_ids.contains(d.primary.span.file.int())) {
             all.emit(gpa, d) catch return 2;

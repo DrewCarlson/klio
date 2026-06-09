@@ -107,13 +107,13 @@ pub const Scope = struct {
     parent: ?ScopeId,
     kind: ScopeKind,
     bindings: std.StringHashMap(SymbolId),
-
-    pub fn deinit(self: *Scope) void {
-        self.bindings.deinit();
-    }
 };
 
-/// Output of name resolution.
+/// Output of name resolution. Every container and every string the resolver
+/// produces is allocated from the single driver-owned arena passed to
+/// `resolve`/`resolveModule`; the arena is freed by the driver after the
+/// last reader of this output (typeck, then lowering) is done, so the
+/// resolution exposes no teardown of its own.
 pub const Resolution = struct {
     scopes: std.ArrayList(Scope),
     symbols: std.ArrayList(Symbol),
@@ -121,22 +121,6 @@ pub const Resolution = struct {
     /// symbol it resolves to.
     uses: std.AutoHashMap(Span, SymbolId),
     diagnostics: DiagnosticSink,
-    allocator: std.mem.Allocator,
-    /// Owns every string the resolver allocated (diagnostic messages,
-    /// signature keys, joined package paths). Mirrors Rust dropping those
-    /// owned `String`s when the `Resolver`/`Resolution` goes out of scope.
-    arena: *std.heap.ArenaAllocator,
-
-    pub fn deinit(self: *Resolution) void {
-        for (self.scopes.items) |*s| s.deinit();
-        self.scopes.deinit(self.allocator);
-        self.symbols.deinit(self.allocator);
-        self.uses.deinit();
-        self.diagnostics.deinit(self.allocator);
-        const gpa = self.arena.child_allocator;
-        self.arena.deinit();
-        gpa.destroy(self.arena);
-    }
 
     pub fn symbol(self: *const Resolution, id: SymbolId) *const Symbol {
         return &self.symbols.items[id.int()];
@@ -186,17 +170,18 @@ const BUILTINS = [_][]const u8{
 
 /// Resolve a parsed file. The returned `Resolution` always contains a
 /// builtins scope and a file scope, even if the input has no declarations.
+/// Resolve a single file. `allocator` must be a driver-owned arena: the
+/// resolver allocates every container and string from it and frees nothing,
+/// so the driver reclaims the whole workspace by freeing that arena once the
+/// resolution's last reader is done.
 pub fn resolve(allocator: std.mem.Allocator, file: *const KotlinFile) !Resolution {
     var r = try Resolver.init(allocator);
-    defer r.fn_sig_keys.deinit();
     try r.run(file);
     return .{
         .scopes = r.scopes,
         .symbols = r.symbols,
         .uses = r.uses,
         .diagnostics = r.diagnostics,
-        .allocator = allocator,
-        .arena = r.arena,
     };
 }
 
@@ -207,7 +192,6 @@ pub fn resolve(allocator: std.mem.Allocator, file: *const KotlinFile) !Resolutio
 /// each Span.
 pub fn resolveModule(allocator: std.mem.Allocator, files: []const KotlinFile) !Resolution {
     var r = try Resolver.init(allocator);
-    defer r.fn_sig_keys.deinit();
     const builtins = ScopeId.from(0);
     const module_scope = try r.pushScope(builtins, .File);
     // Phase 1: forward-declare every file's top-level decls into the
@@ -236,8 +220,6 @@ pub fn resolveModule(allocator: std.mem.Allocator, files: []const KotlinFile) !R
         .symbols = r.symbols,
         .uses = r.uses,
         .diagnostics = r.diagnostics,
-        .allocator = allocator,
-        .arena = r.arena,
     };
 }
 
@@ -266,31 +248,25 @@ const SigKeyMap = std.HashMap(SigKey, void, SigKeyContext, std.hash_map.default_
 const ResolveError = error{OutOfMemory};
 
 const Resolver = struct {
+    /// Driver-owned arena. Every container spine and every string the
+    /// resolver produces is allocated from it; the resolver frees nothing.
     allocator: std.mem.Allocator,
-    /// Owns every string the resolver produces. Strings live as long as the
-    /// resulting `Resolution`, matching Rust dropping the owned `String`s
-    /// when the `Resolver`/`Resolution` is dropped.
-    arena: *std.heap.ArenaAllocator,
     scopes: std.ArrayList(Scope),
     symbols: std.ArrayList(Symbol),
     uses: std.AutoHashMap(Span, SymbolId),
     diagnostics: DiagnosticSink,
     /// Dotted package name from the file's `package` header, if any.
-    /// Allocated from `arena`; overwritten per file.
+    /// Overwritten per file.
     file_package: ?[]const u8,
     /// Top-level function signature keys already declared, per
     /// `(scope, name, arity, param-type-names)`. Lets overloads with
     /// distinct signatures coexist while still flagging an exact
     /// duplicate (`fun foo()` declared twice) as a redeclaration.
-    /// Key strings are arena-owned.
     fn_sig_keys: SigKeyMap,
 
     fn init(allocator: std.mem.Allocator) !Resolver {
-        const arena = try allocator.create(std.heap.ArenaAllocator);
-        arena.* = std.heap.ArenaAllocator.init(allocator);
         var r = Resolver{
             .allocator = allocator,
-            .arena = arena,
             .scopes = .empty,
             .symbols = .empty,
             .uses = std.AutoHashMap(Span, SymbolId).init(allocator),
@@ -308,7 +284,7 @@ const Resolver = struct {
 
     /// Allocator for resolver-owned strings.
     fn strs(self: *Resolver) std.mem.Allocator {
-        return self.arena.allocator();
+        return self.allocator;
     }
 
     fn setFilePackage(self: *Resolver, file: *const KotlinFile) !void {
@@ -1270,8 +1246,9 @@ test "resolves forward reference between top level funs" {
     var decls = [_]Decl{ .{ .Function = main_fn }, .{ .Function = greet_fn } };
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     try testing.expect(!r.diagnostics.hasErrors());
 }
 
@@ -1289,8 +1266,9 @@ test "resolves println as builtin" {
     var decls = [_]Decl{.{ .Function = main_fn }};
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     try testing.expect(anyUseOfKind(&r, .Builtin));
 }
 
@@ -1309,8 +1287,9 @@ test "unresolved identifier emits r0001" {
     var decls = [_]Decl{.{ .Function = main_fn }};
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     var cs = try codes(a, &r);
     defer cs.deinit(a);
     try testing.expect(hasCode(cs.items, "R0001"));
@@ -1327,8 +1306,9 @@ test "non kotlin import emits r0003" {
     var decls = [_]Decl{.{ .Function = main_fn }};
     const file = KotlinFile{ .package = null, .imports = &imports, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     var cs = try codes(a, &r);
     defer cs.deinit(a);
     try testing.expect(hasCode(cs.items, "R0003"));
@@ -1345,8 +1325,9 @@ test "kotlin import is accepted" {
     var decls = [_]Decl{.{ .Function = main_fn }};
     const file = KotlinFile{ .package = null, .imports = &imports, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     var cs = try codes(a, &r);
     defer cs.deinit(a);
     try testing.expect(!hasCode(cs.items, "R0003"));
@@ -1363,8 +1344,9 @@ test "duplicate top level emits r0004" {
     var decls = [_]Decl{ .{ .Function = foo1 }, .{ .Function = foo2 } };
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     var cs = try codes(a, &r);
     defer cs.deinit(a);
     try testing.expect(hasCode(cs.items, "R0004"));
@@ -1399,8 +1381,9 @@ test "shadowing in inner scope emits r0002" {
     var decls = [_]Decl{.{ .Function = main_fn }};
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     var cs = try codes(a, &r);
     defer cs.deinit(a);
     try testing.expect(hasCode(cs.items, "R0002"));
@@ -1438,8 +1421,9 @@ test "for loop variable is resolvable in body" {
     var decls = [_]Decl{.{ .Function = main_fn }};
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     try testing.expect(!r.diagnostics.hasErrors());
     try testing.expect(anyUseOfKind(&r, .ForVar));
 }
@@ -1457,8 +1441,9 @@ test "function parameter resolves inside body" {
     var decls = [_]Decl{.{ .Function = id_fn }};
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     try testing.expect(!r.diagnostics.hasErrors());
     try testing.expect(anyUseOfKind(&r, .Parameter));
 }
@@ -1514,8 +1499,9 @@ test "mutual recursion resolves" {
     var decls = [_]Decl{ .{ .Function = even_fn }, .{ .Function = odd_fn } };
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     try testing.expect(!r.diagnostics.hasErrors());
 }
 
@@ -1550,8 +1536,9 @@ test "unnecessary safe call on non nullable" {
     var decls = [_]Decl{.{ .Function = main_fn }};
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     try testing.expectEqual(@as(usize, 1), countCode(&r, "UNNECESSARY_SAFE_CALL"));
 }
 
@@ -1585,8 +1572,9 @@ test "safe call on nullable is silent" {
     var decls = [_]Decl{.{ .Function = main_fn }};
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     try testing.expectEqual(@as(usize, 0), countCode(&r, "UNNECESSARY_SAFE_CALL"));
 }
 
@@ -1636,8 +1624,9 @@ test "class member sibling reference resolves" {
     var decls = [_]Decl{ .{ .Class = class_c }, .{ .Function = main_fn } };
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     try testing.expect(!r.diagnostics.hasErrors());
 }
 
@@ -1666,8 +1655,9 @@ test "forward reference to local val in statement scope errors" {
     var decls = [_]Decl{.{ .Function = main_fn }};
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     var cs = try codes(a, &r);
     defer cs.deinit(a);
     try testing.expect(hasCode(cs.items, "R0001"));
@@ -1742,8 +1732,9 @@ test "object literal member forward reference resolves" {
     var decls = [_]Decl{ .{ .Class = greeter }, .{ .Function = main_fn } };
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     try testing.expect(!r.diagnostics.hasErrors());
 }
 
@@ -1777,7 +1768,8 @@ test "safe call without annotation is silent" {
     var decls = [_]Decl{.{ .Function = main_fn }};
     const file = KotlinFile{ .package = null, .imports = &.{}, .decls = &decls, .span = ts() };
 
-    var r = try resolve(a, &file);
-    defer r.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolve(arena.allocator(), &file);
     try testing.expectEqual(@as(usize, 0), countCode(&r, "UNNECESSARY_SAFE_CALL"));
 }

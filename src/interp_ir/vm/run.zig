@@ -422,9 +422,7 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
             const dg = cdef.borrow();
             defer dg.deinit();
             for (dg.get().primary_params) |p| try param_names.append(self.allocator, p.name);
-            const eg = dg.get().enum_entries.borrow();
-            defer eg.deinit();
-            for (eg.get().items) |e| {
+            for (dg.get().enum_entries) |e| {
                 if (std.mem.eql(u8, e.name, entry.entry_name)) {
                     if (e.value == .Instance) entry_inst = e.value.Instance.clone();
                     break;

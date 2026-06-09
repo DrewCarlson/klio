@@ -460,18 +460,14 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                 const enum_name = blk: {
                     const g = receiver.Class.borrow();
                     defer g.deinit();
-                    const eg = g.get().enum_entries.borrow();
-                    defer eg.deinit();
-                    for (eg.get().items) |e| try items.append(allocator, e.value);
+                    for (g.get().enum_entries) |e| try items.append(allocator, e.value);
                     break :blk g.get().name;
                 };
                 return ok(try frozenList(allocator, items, try StringRef.init(allocator, enum_name)));
             }
             const g = receiver.Class.borrow();
             defer g.deinit();
-            const eg = g.get().enum_entries.borrow();
-            defer eg.deinit();
-            for (eg.get().items) |e| {
+            for (g.get().enum_entries) |e| {
                 if (std.mem.eql(u8, e.name, name)) return ok(e.value);
             }
         }
@@ -1194,11 +1190,9 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         const cg = g.get().class.borrow();
         const is_enum = cg.get().is_enum;
         if (is_enum) {
-            const eg = cg.get().enum_entries.borrow();
-            for (eg.get().items) |e| {
+            for (cg.get().enum_entries) |e| {
                 if (std.mem.eql(u8, e.name, name)) {
                     const v = e.value;
-                    eg.deinit();
                     cg.deinit();
                     g.deinit();
                     return ok(v);
@@ -1207,15 +1201,13 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (std.mem.eql(u8, name, "entries")) {
                 var items: std.ArrayList(Value) = .empty;
                 errdefer items.deinit(allocator);
-                for (eg.get().items) |e| try items.append(allocator, e.value);
+                for (cg.get().enum_entries) |e| try items.append(allocator, e.value);
                 const ename = cg.get().name;
                 const enum_class = try StringRef.init(allocator, ename);
-                eg.deinit();
                 cg.deinit();
                 g.deinit();
                 return ok(try frozenList(allocator, items, enum_class));
             }
-            eg.deinit();
         }
         cg.deinit();
         g.deinit();
@@ -1398,16 +1390,8 @@ fn companionParentWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(Instanc
                 }
             }
         }
-        {
-            const pg = cg.get().parent.borrow();
-            defer pg.deinit();
-            if (pg.get().*) |p| try queue.append(allocator, p.clone());
-        }
-        {
-            const ig = cg.get().interfaces.borrow();
-            defer ig.deinit();
-            for (ig.get().items) |ifc| try queue.append(allocator, ifc.clone());
-        }
+        if (cg.get().parent) |p| try queue.append(allocator, p.clone());
+        for (cg.get().interfaces) |ifc| try queue.append(allocator, ifc.clone());
         cg.deinit();
     }
     return null;
@@ -1680,16 +1664,8 @@ fn setCompanionParentWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(Inst
                 }
             }
         }
-        {
-            const pg = cg.get().parent.borrow();
-            defer pg.deinit();
-            if (pg.get().*) |p| try queue.append(allocator, p.clone());
-        }
-        {
-            const ig = cg.get().interfaces.borrow();
-            defer ig.deinit();
-            for (ig.get().items) |ifc| try queue.append(allocator, ifc.clone());
-        }
+        if (cg.get().parent) |p| try queue.append(allocator, p.clone());
+        for (cg.get().interfaces) |ifc| try queue.append(allocator, ifc.clone());
         cg.deinit();
     }
     return null;
@@ -1745,8 +1721,8 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         .is_enum = false,
         .is_sealed = false,
         .supertype_names = &.{},
-        .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+        .parent = null,
+        .interfaces = &.{},
         .is_interface = false,
         .is_fun_interface = false,
         .parent_ctor_args = &.{},
@@ -1755,13 +1731,13 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         .is_inner = false,
         .is_anonymous = true,
         .secondary_ctors = &.{},
-        .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(allocator, .empty),
+        .enum_entries = &.{},
         .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
         .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-        .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(allocator, .empty),
+        .nested_classes = &.{},
         .captured_env = try ObjRef(Env).init(allocator, Env.init(allocator)),
-        .supertype_delegates = try ObjRef(std.ArrayList(SupertypeDelegate)).init(allocator, .empty),
-        .delegate_forwarders = try ObjRef(std.ArrayList(MethodDef)).init(allocator, .empty),
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
         .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
     });
     var fields: std.ArrayList(InstanceData.Field) = .empty;

@@ -599,13 +599,11 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_name: []const u8, 
         var parent_name: ?[]const u8 = null;
         if (classDefByName(self, class_name)) |def| {
             const dg = def.borrow();
-            const pg = dg.get().parent.borrow();
-            if (pg.get().*) |parent| {
+            if (dg.get().parent) |parent| {
                 const pcg = parent.borrow();
                 parent_name = pcg.get().name;
                 pcg.deinit();
             }
-            pg.deinit();
             dg.deinit();
             def.deinit();
         }
@@ -1338,9 +1336,7 @@ fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, class_de
     var parent_def: ?ObjRef(ClassDef) = null;
     {
         const dg = class_def.borrow();
-        const pg = dg.get().parent.borrow();
-        if (pg.get().*) |p| parent_def = p.clone();
-        pg.deinit();
+        if (dg.get().parent) |p| parent_def = p.clone();
         if (parent_def == null) {
             if (dg.get().supertype_names.len > 0) {
                 parent_def = classDefByName(self, dg.get().supertype_names[0]);
@@ -1780,9 +1776,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                     if (!exists) try fields.append(allocator, .{ .name = p.name, .value = zv });
                 }
             }
-            const pg = g.get().parent.borrow();
-            const next: ?ObjRef(ClassDef) = if (pg.get().*) |p| p.clone() else null;
-            pg.deinit();
+            const next: ?ObjRef(ClassDef) = if (g.get().parent) |p| p.clone() else null;
             g.deinit();
             c.deinit();
             cur = next;
@@ -1883,9 +1877,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         while (cur) |c| {
             try chain_classes.append(allocator, c.clone());
             const g = c.borrow();
-            const pg = g.get().parent.borrow();
-            const next: ?ObjRef(ClassDef) = if (pg.get().*) |p| p.clone() else null;
-            pg.deinit();
+            const next: ?ObjRef(ClassDef) = if (g.get().parent) |p| p.clone() else null;
             g.deinit();
             c.deinit();
             cur = next;
@@ -2269,8 +2261,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         .is_enum = false,
         .is_sealed = false,
         .supertype_names = supertype_names,
-        .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, anon_parent),
-        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+        .parent = anon_parent,
+        .interfaces = &.{},
         .is_interface = false,
         .is_fun_interface = false,
         .parent_ctor_args = &.{},
@@ -2279,13 +2271,13 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         .is_inner = false,
         .is_anonymous = true,
         .secondary_ctors = &.{},
-        .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(allocator, .empty),
+        .enum_entries = &.{},
         .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
         .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-        .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(allocator, .empty),
+        .nested_classes = &.{},
         .captured_env = env,
-        .supertype_delegates = try ObjRef(std.ArrayList(SupertypeDelegate)).init(allocator, .empty),
-        .delegate_forwarders = try ObjRef(std.ArrayList(MethodDef)).init(allocator, .empty),
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
         .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
     });
 
@@ -2369,9 +2361,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             defer ig.deinit();
             const cg = ig.get().class.borrow();
             defer cg.deinit();
-            const pg = cg.get().parent.borrow();
-            defer pg.deinit();
-            break :blk if (pg.get().*) |p| p.clone() else null;
+            break :blk if (cg.get().parent) |p| p.clone() else null;
         };
         var step: usize = 0;
         while (cur) |c| {
@@ -2383,9 +2373,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             const next = blk: {
                 const cg = c.borrow();
                 defer cg.deinit();
-                const pg = cg.get().parent.borrow();
-                defer pg.deinit();
-                break :blk if (pg.get().*) |p| p.clone() else null;
+                break :blk if (cg.get().parent) |p| p.clone() else null;
             };
             try parent_chain.append(allocator, c);
             cur = next;
