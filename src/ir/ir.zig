@@ -575,6 +575,12 @@ pub const Func = struct {
     id: FuncId,
     name: []const u8,
     fqn: []const u8,
+    /// Declaring package path (`"foo.bar"`), the empty string for a
+    /// user script with no package header. Uniform on every func — the
+    /// symbol index keys bare-call preference on the caller's package,
+    /// and `""` is the ordinary "no package" case, not a separate code
+    /// path.
+    package: []const u8 = "",
     params: []Param,
     return_ty: TypeRef,
     n_locals: u32,
@@ -642,6 +648,9 @@ pub const Class = struct {
     id: ClassId,
     name: []const u8,
     fqn: []const u8,
+    /// Declaring package path (`"foo.bar"`), the empty string for a
+    /// user script with no package header. Uniform on every class.
+    package: []const u8 = "",
     primary_params: []Param,
     methods: []FuncId,
     init_block: ?FuncId,
@@ -852,6 +861,132 @@ pub const Module = struct {
         return null;
     }
 
+    /// Bare-call preference tier of a candidate func, ranked low-to-high
+    /// urgency: 0 = own package, 1 = file-named-import, 2 = built-in
+    /// stdlib, 3 = any other package. `caller_pkg` is the caller's
+    /// declaring package (`""` for a user script). A non-wildcard import
+    /// of `name` in `caller_file` whose full path equals the candidate's
+    /// FQN matches tier 1.
+    fn bareCallTier(self: *const Module, f: *const Func, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
+        if (std.mem.eql(u8, f.package, caller_pkg)) return 0;
+        if (self.importAliasIn(caller_file, name)) |segs| {
+            if (segs.len >= 1) {
+                // Reconstruct the import's dotted path and compare to the
+                // candidate's FQN.
+                var matches = true;
+                var idx: usize = 0;
+                var rest: []const u8 = f.fqn;
+                while (idx < segs.len) : (idx += 1) {
+                    if (!std.mem.startsWith(u8, rest, segs[idx])) {
+                        matches = false;
+                        break;
+                    }
+                    rest = rest[segs[idx].len..];
+                    if (idx + 1 < segs.len) {
+                        if (rest.len == 0 or rest[0] != '.') {
+                            matches = false;
+                            break;
+                        }
+                        rest = rest[1..];
+                    }
+                }
+                if (matches and rest.len == 0) return 1;
+            }
+        }
+        if (isShippedFqn(f.fqn)) return 2;
+        return 3;
+    }
+
+    /// Number of *user* parameters a func declares (excluding a leading
+    /// synthesized extension/member `this`).
+    fn funcUserArity(f: *const Func) usize {
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) {
+            return f.params.len - 1;
+        }
+        return f.params.len;
+    }
+
+    /// True for a func declared with a leading synthesized `this`
+    /// param — an instance method, a top-level extension, or a member
+    /// extension. A true bare call (no qualifier) only ever binds a
+    /// *non-extension* top-level function; receiver-based resolution of
+    /// the extension forms is the heuristic's domain, not the index's.
+    fn funcHasImplicitThis(f: *const Func) bool {
+        return f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+    }
+
+    /// Names whose bare call the lowerer always routes to an intrinsic
+    /// rather than a same-named lowered body. The index must defer on
+    /// these so it agrees with that routing (it would otherwise bind the
+    /// shipped body the lowerer deliberately skips). Mirrors the
+    /// `intrinsic_owns_all` gate in bare-call lowering.
+    fn intrinsicOwnsBareName(name: []const u8) bool {
+        return std.mem.eql(u8, name, "compareValues") or
+            std.mem.eql(u8, name, "compareValuesBy");
+    }
+
+    /// Principled bare-call resolution: resolve `name` (called with
+    /// `want_arity` user args, `last_arg_lambda` set when a trailing
+    /// lambda is supplied) to a UNIQUE `FuncId` as a function of the
+    /// caller's package + imports + the complete header set, independent
+    /// of declaration order.
+    ///
+    /// Preference order — own package, then file-named imports, then
+    /// built-in stdlib — picks the highest non-empty tier; within that
+    /// tier the candidate is returned only when exactly one body-bearing
+    /// non-extension func matches the requested arity. Extension funcs
+    /// (a leading synthesized `this`) are never index-resolved: a bare
+    /// call to one needs a receiver the index does not model, so it is
+    /// left to the order-based heuristic. A name the index cannot resolve
+    /// to a single non-extension target returns `null`, deferring to the
+    /// heuristic fallback. The index never selects a *different* target
+    /// than the heuristic for a name it resolves: it is a faithful
+    /// superset gated by uniqueness, proven by the resolve audit.
+    pub fn resolveBareCallIndexed(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+        want_arity: usize,
+        last_arg_lambda: bool,
+    ) ?FuncId {
+        _ = last_arg_lambda;
+        if (intrinsicOwnsBareName(name)) return null;
+        const cands = self.funcsBySimpleName(name);
+        if (cands.len == 0) return null;
+
+        // Highest-priority tier among the *non-extension* body-bearing
+        // candidates.
+        var best_tier: u8 = 255;
+        for (cands) |id| {
+            const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
+            if (f.blocks.len == 0) continue;
+            if (funcHasImplicitThis(f)) continue;
+            const t = self.bareCallTier(f, name, caller_pkg, caller_file);
+            if (t < best_tier) best_tier = t;
+        }
+        if (best_tier == 255) return null;
+
+        // Within the best tier, look for a unique exact-arity,
+        // non-low-priority, non-extension candidate.
+        var chosen: ?FuncId = null;
+        var count: usize = 0;
+        for (cands) |id| {
+            const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
+            if (f.blocks.len == 0) continue;
+            if (f.low_priority) continue;
+            if (funcHasImplicitThis(f)) continue;
+            if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
+            const last_not_vararg = f.params.len == 0 or !f.params[f.params.len - 1].is_vararg;
+            if (!last_not_vararg) continue;
+            if (funcUserArity(f) != want_arity) continue;
+            chosen = id;
+            count += 1;
+        }
+        if (count == 1) return chosen;
+        return null;
+    }
+
     /// Register a class declaration and return its id. If the name
     /// was previously `reserveClass`d, the reserved slot/id is reused
     /// so forward references that resolved to that id stay valid.
@@ -948,6 +1083,23 @@ pub const Module = struct {
         return id;
     }
 };
+
+/// The declaring package of a top-level decl whose fully-qualified name
+/// is `fqn` and whose simple name is `simple`: the FQN with its trailing
+/// `.{simple}` stripped, the empty string when the FQN equals the simple
+/// name (no package header). One uniform derivation — `""` is the
+/// no-package case, not a separate branch.
+pub fn packageOfFqn(fqn: []const u8, simple: []const u8) []const u8 {
+    if (std.mem.eql(u8, fqn, simple)) return "";
+    if (fqn.len > simple.len + 1 and
+        std.mem.endsWith(u8, fqn, simple) and
+        fqn[fqn.len - simple.len - 1] == '.')
+    {
+        return fqn[0 .. fqn.len - simple.len - 1];
+    }
+    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| return fqn[0..dot];
+    return "";
+}
 
 fn isShippedFqn(fqn: []const u8) bool {
     return std.mem.startsWith(u8, fqn, "kotlin.") or
@@ -1209,4 +1361,115 @@ test "string consts are owned by the pool" {
     testing.allocator.free(tmp2);
     try testing.expectEqual(id, id2);
     try testing.expectEqual(@as(usize, 1), m.consts.items.len);
+}
+
+test "packageOfFqn strips the trailing simple name" {
+    try testing.expectEqualStrings("", packageOfFqn("foo", "foo"));
+    try testing.expectEqualStrings("a.b", packageOfFqn("a.b.foo", "foo"));
+    try testing.expectEqualStrings("kotlin.math", packageOfFqn("kotlin.math.abs", "abs"));
+    // A mangled nested FQN: the package is everything up to the last dot.
+    try testing.expectEqualStrings("pkg", packageOfFqn("pkg.Outer$Name", "Name"));
+}
+
+/// Push a body-bearing top-level func with the given simple name, FQN,
+/// package, and user-parameter count, returning its id. Used by the
+/// symbol-index tests.
+fn pushTestFunc(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, package: []const u8, user_params: usize) !FuncId {
+    const id = FuncId.from(@intCast(m.funcs.items.len));
+    const params = try a.alloc(Param, user_params);
+    for (params) |*p| p.* = .{ .name = "x", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null };
+    const blocks = try a.alloc(Block, 1);
+    blocks[0] = .{ .id = BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
+    try m.funcs.append(a, .{
+        .id = id,
+        .name = name,
+        .fqn = fqn,
+        .package = package,
+        .params = params,
+        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
+        .n_locals = 0,
+        .blocks = blocks,
+        .entry = BlockId.from(0),
+        .is_suspend = false,
+    });
+    try m.func_index.append(a, .{ .name = name, .id = id });
+    return id;
+}
+
+test "symbol index prefers the caller's own package" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| {
+            a.free(f.params);
+            a.free(f.blocks);
+        }
+        m.deinit(a);
+    }
+    // Two same-name, same-arity funcs in different packages.
+    const own = try pushTestFunc(&m, a, "greet", "app.greet", "app", 0);
+    _ = try pushTestFunc(&m, a, "greet", "lib.greet", "lib", 0);
+    try m.rebuildFuncNameIndex(a);
+
+    // A caller in package `app` resolves its own `greet`, not lib's.
+    const got = m.resolveBareCallIndexed("greet", "app", FileId.from(0), 0, false);
+    try testing.expect(got != null);
+    try testing.expectEqual(own.int(), got.?.int());
+}
+
+test "symbol index defers when the preferred tier is ambiguous" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| {
+            a.free(f.params);
+            a.free(f.blocks);
+        }
+        m.deinit(a);
+    }
+    // Two same-name same-arity funcs in two non-caller packages: neither
+    // is in the caller's package or imports, so they share the lowest
+    // (other) tier and the index must defer rather than pick one.
+    _ = try pushTestFunc(&m, a, "h", "p.h", "p", 1);
+    _ = try pushTestFunc(&m, a, "h", "q.h", "q", 1);
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("h", "user", FileId.from(0), 1, false);
+    try testing.expect(got == null);
+}
+
+test "symbol index never resolves an extension form" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| {
+            a.free(f.params);
+            a.free(f.blocks);
+        }
+        m.deinit(a);
+    }
+    // One candidate, an extension (leading `this` param): the index does
+    // not model receiver resolution, so it defers to the heuristic.
+    const id = FuncId.from(@intCast(m.funcs.items.len));
+    const params = try a.alloc(Param, 1);
+    params[0] = .{ .name = "this", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
+    const blocks = try a.alloc(Block, 1);
+    blocks[0] = .{ .id = BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
+    try m.funcs.append(a, .{
+        .id = id,
+        .name = "ext",
+        .fqn = "app.ext",
+        .package = "app",
+        .params = params,
+        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
+        .n_locals = 0,
+        .blocks = blocks,
+        .entry = BlockId.from(0),
+        .is_suspend = false,
+    });
+    try m.func_index.append(a, .{ .name = "ext", .id = id });
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("ext", "app", FileId.from(0), 0, false);
+    try testing.expect(got == null);
 }

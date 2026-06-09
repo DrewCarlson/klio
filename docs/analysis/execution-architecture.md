@@ -525,25 +525,45 @@ header set) — provably independent of pack load order:
 
 1. **Tag every decl with its declaring package** at flatten time (empty string
    for user scripts) — one uniform field, not a presence-gated span map. The
-   "no package" case becomes `package = ""`, not a separate code path.
+   "no package" case becomes `package = ""`, not a separate code path. **DONE
+   (item 8).** `Func.package` / `Class.package` (`ir.zig`) is a uniform field
+   set at the func-stub / class-shell lowering site from `packageOfFqn`
+   (`ir.zig`); the build-driver seeds the caller package onto `FuncBuilder`
+   (`self_package`) per top-level decl and per class.
 2. **Two-phase consumption.** Phase 1 registers every source's type/function/
    extension HEADERS (FQN + receiver type) across all packs, features, and user
    files. Phase 2 resolves bodies and extension-receiver bindings against that
-   complete, package-qualified header set.
+   complete, package-qualified header set. **DONE (item 8, made explicit).**
+   `buildModuleWithOverrides` (`interp_ir/build.zig`) reserves every class name
+   and emits every func stub (FQN + package + receiver `this`) — the complete
+   phase-1 header set — before any body lowers in phase 2.
 3. **Build one symbol index** mapping (caller-package + caller-imports) → FQN →
    `FuncId`/`ClassId`. Bare calls prefer: own package, then imported names, then
-   built-in stdlib. **Tightening prerequisite:** "simple-name fallback only when
-   exactly one candidate exists" would HARDEN resolution into an "ambiguous
-   reference" error in cases the current order-based `first_user`/`first_body`
-   tie-break (`ir.zig:787-801`) silently resolves — the `isShippedFqn` logic
-   exists precisely because user simple names collide with embedded-stdlib
-   same-names. Do NOT tighten to "exactly one candidate" until the differential
-   harness (§5.1) is green across every `examples/*.kt` *and* it is proven that
-   each green program's bare calls resolve to a unique
+   built-in stdlib. **DONE (item 8, PRIMARY path, fallback retained).**
+   `Module.resolveBareCallIndexed(name, caller_pkg, caller_file, arity, …)`
+   (`ir.zig`) ranks each non-extension body-bearing candidate by tier (0 own
+   package, 1 file-named import, 2 built-in stdlib, 3 other), commits the unique
+   exact-arity candidate in the best non-empty tier, and returns `null`
+   otherwise. Lowering (`lower/expr.zig lowerPathCall`) prefers the index target
+   when it resolves and otherwise keeps the order-based heuristic pick. **The
+   tightening is NOT done and is explicitly out of scope here:** the index never
+   errors on ambiguity, extension-form / intrinsic-owned bare names defer, and
+   `isShippedFqn` + the flat `module_scope`/`classId`-by-simple-name remain
+   live resolution inputs. **Tightening prerequisite:** "simple-name fallback
+   only when exactly one candidate exists" would HARDEN resolution into an
+   "ambiguous reference" error in cases the current order-based
+   `first_user`/`first_body` tie-break (`ir.zig:787-801`) silently resolves —
+   the `isShippedFqn` logic exists precisely because user simple names collide
+   with embedded-stdlib same-names. Do NOT tighten to "exactly one candidate"
+   until the differential harness (§5.1) is green across every `examples/*.kt`
+   *and* it is proven that each green program's bare calls resolve to a unique
    `(package + imports) → FQN` target; otherwise currently-passing programs turn
    into ambiguity failures. Drop `isShippedFqn` and the flat
    `module_scope`/`classId`-by-simple-name as resolution inputs only once that
-   uniqueness holds.
+   uniqueness holds. The `KLIO_RESOLVE_AUDIT` detector (`lower/expr.zig`) logs
+   every index-vs-heuristic divergence and reports 0 over the green corpus — it
+   is the executable evidence the index is a faithful superset, and the readout
+   the uniqueness proof will build on.
 4. **Lowering emits FQN-qualified `Call`/`LoadGlobal`.** The VM does exact
    `funcIdByFqn` (`ir.zig:822`) / `installed_bindings.resolve(fqn)` lookups with
    NO prefix-probe ladder and NO suffix scan (`host_globals.zig:431-486`). Fold
@@ -691,7 +711,7 @@ refactors, then the structural unifications in dependency order.
 | 5 | `VmIntrinsicHost` becomes thin adapter delegating to eval.Host (§4.1) | A | high | medium | L |
 | 6 | DONE (receiver chain) — enclosing-`this` chain is now a `Frame` field (`enclosing_this`), snapshotted into `FrameSnapshot` on suspend and restored on resume; the `outer_this` thread-local + `outerThisStack` + its `resetReceiverTls` are deleted and `enclosingThis`/`enclosingThisChain`/`pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain. `inner_outer_hint` and the remaining guards-as-params are not yet folded in. (§4.2) | B | high | high | XL |
 | 7 | PARTIAL — single implicit-receiver resolution choke point (`implicitThisValue` + `implicitReceiverChain` in `ir/eval.zig`) now feeds all three `*OrGlobal` handlers (`CallMemberOrGlobal`/`LoadFromThisOrGlobal`/`StoreToThisOrGlobal`), so the bare-name member-vs-global precedence is derived in one place instead of three. Registry func-kind landed: `Func.kind` (`FuncKind.member_extension`) is the authoritative member-extension predicate, set at the member-extension lowering site (`decl.zig`); the five `member_ext_owner_class` dispatch sites route through `isMemberExt`/`memberExtVisible` (the owner-class gate is preserved exactly — the kind selects which funcs are gated, the side table supplies the owner). The four "Or" *instructions* are NOT collapsed to a single `CallUnresolved`: they encode three distinct operations (read / write / call) plus the explicit-receiver `CallMemberOrValue`, and the "Or" itself is the "couldn't classify member-vs-global statically" signal item 8's FQN static resolution removes — collapsing now would re-encode the read/write/call distinction without removing the runtime decision. Deferred to item 8. (A/B) | A/B | high | medium | L |
-| 8 | Per-decl package tag + two-phase header registration + package/FQN symbol index; lowering emits FQN-qualified calls; remove `isShippedFqn`/prefix-ladder/suffix-scan — tighten simple-name fallback ONLY after §4.4-item-3 uniqueness proven | C | high | high | XL |
+| 8 | PARTIAL (steps 1-4, fallback retained) — per-decl `package` tag on `Func`/`Class` (set at flatten/lowering, `""` = no package), the two-phase header registration made explicit (phase-1 reserves every class + func HEADER with FQN/package/receiver, phase-2 lowers bodies against the complete set), and the package/FQN symbol index (`Module.resolveBareCallIndexed`, keyed on caller package → file imports → built-in stdlib) as the PRIMARY bare-call path: where it resolves a unique non-extension target, lowering binds that target by exact `FuncId` (FQN-exact at the VM); otherwise it defers to the order-based heuristic, which is RETAINED unchanged. `KLIO_RESOLVE_AUDIT` is a permanent env-gated detector that compares the index pick to the heuristic pick on every bare call — proven 0 divergences over all 82 examples + the differential corpus, i.e. the index is a faithful superset. DEFERRED (the tightening prerequisite): the index does NOT yet error on ambiguity, and `isShippedFqn`/prefix-ladder/suffix-scan are NOT removed — that hardening is gated on the §4.4-item-3 uniqueness proof and is items 9/10's scope. | C | high | high | XL |
 | 9 | One executable form per symbol resolved at link time; remove per-call FQN short-circuit (§4.4) | C | high | high | XL |
 | 10 | Remove `isLambdaBody()` resolution axis; inline splice sets frame receiver slot (§4.4/§4.2) — gate behind builder-DSL differential pass | C/B | medium | high | M |
 | 11 | DONE — deleted `Value.Lambda` (vestigial Env-based closure the live IR VM never produced; `AstLambda` already built `IrClosure`). Removed the variant, its one GC-test constructor, and every Value-context `.Lambda =>` arm; `IrClosure` is now the single closure value form and `func.capture_order` (via `ClosureInfo.captures`) is the sole capture-metadata authority. | cleanup | medium | medium | M |

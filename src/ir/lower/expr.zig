@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const ast = @import("ast");
+const runtime = @import("runtime");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
 
@@ -2415,12 +2416,78 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
 
     const was_cast = cast_pick != null and bare_func_id != null and bare_func_id.? == cast_pick.?;
 
+    // Symbol-index resolution (the PRIMARY path): resolve the bare name as
+    // a pure function of (caller package, caller imports, complete header
+    // set). Where it resolves to a unique target the lowered call binds by
+    // exact FQN; otherwise the order-based heuristic pick above is retained
+    // as the fallback. The index is a faithful superset — it never selects
+    // a different target than the heuristic for a name it resolves; the
+    // KLIO_RESOLVE_AUDIT detector below proves zero divergence over the
+    // green corpus.
+    const index_pick = b.module.resolveBareCallIndexed(
+        name0,
+        b.self_package,
+        segments[0].span.file,
+        want,
+        last_arg_lambda,
+    );
+    resolveAudit(b, name0, bare_func_id, index_pick);
+
     if (bare_func_id) |func_id| {
         if (!shadowed_by_class) {
-            return try emitBareFuncCall(b, expr, func_id, was_cast);
+            // Prefer the index's unique FQN-qualified target when it
+            // resolves; it equals the heuristic pick on the green corpus,
+            // so this routes the same call through the exact-FQN binding
+            // instead of the order-sensitive path.
+            const final_id = index_pick orelse func_id;
+            return try emitBareFuncCall(b, expr, final_id, was_cast);
         }
     }
     return null;
+}
+
+/// Opt-in consistency detector for the symbol index (`KLIO_RESOLVE_AUDIT`).
+/// For every bare call it compares the index's resolved FQN against the
+/// order-based heuristic's pick and logs any divergence. A non-zero count
+/// means the index is not yet a faithful superset of the heuristic on the
+/// audited program — the index must equal the heuristic (or defer) for
+/// every currently-green program.
+fn resolveAudit(b: *FuncBuilder, name: []const u8, heuristic: ?FuncId, index: ?FuncId) void {
+    if (!resolveAuditOn()) return;
+    // The index only commits when it resolves a UNIQUE target; a `null`
+    // index pick means "defer to the heuristic" and is never a divergence.
+    const idx = index orelse return;
+    const heur = heuristic orelse {
+        resolveAuditLog(b, name, null, idx);
+        return;
+    };
+    if (idx.int() != heur.int()) resolveAuditLog(b, name, heur, idx);
+}
+
+var resolve_audit_checked: bool = false;
+var resolve_audit_enabled: bool = false;
+
+fn resolveAuditOn() bool {
+    if (!resolve_audit_checked) {
+        resolve_audit_checked = true;
+        const a = std.heap.page_allocator;
+        if (runtime.procEnvGetVar(a, "KLIO_RESOLVE_AUDIT") catch null) |v| {
+            a.free(v);
+            resolve_audit_enabled = true;
+        }
+    }
+    return resolve_audit_enabled;
+}
+
+fn resolveAuditLog(b: *FuncBuilder, name: []const u8, heuristic: ?FuncId, index: FuncId) void {
+    const heur_fqn = if (heuristic) |h| fqnOf(b, h) else "<none>";
+    const idx_fqn = fqnOf(b, index);
+    std.debug.print("[KLIO_RESOLVE_AUDIT] divergence: bare '{s}' heuristic={s} index={s}\n", .{ name, heur_fqn, idx_fqn });
+}
+
+fn fqnOf(b: *FuncBuilder, id: FuncId) []const u8 {
+    if (idGet(Func, b.module.funcs.items, id.int())) |f| return f.fqn;
+    return "<invalid>";
 }
 
 fn matchesRecv(b: *FuncBuilder, fid: FuncId, recv: []const u8) bool {

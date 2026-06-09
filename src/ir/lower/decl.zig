@@ -89,7 +89,9 @@ pub fn lowerClassWithExtrasFqn(
     class_fqn: []const u8,
 ) Allocator.Error!ClassId {
     lower_class_fqn = class_fqn;
+    const prev_pkg = setLowerSelfPackage(ir.packageOfFqn(class_fqn, c.name.name));
     const id = try lowerClassWithExtras(module, c, file_classes, extra_members);
+    _ = setLowerSelfPackage(prev_pkg);
     lower_class_fqn = null;
     return id;
 }
@@ -99,6 +101,21 @@ pub fn lowerClassWithExtrasFqn(
 /// created. A module-level global keeps the existing public signatures
 /// (and their other callers/tests) unchanged.
 var lower_class_fqn: ?[]const u8 = null;
+
+/// Declaring package of the function/class whose body is being lowered.
+/// Seeded by the build driver per top-level decl (and per class while
+/// its methods lower) so a `FuncBuilder` can key the symbol index on the
+/// caller's package. `""` is the no-package case.
+threadlocal var lower_self_package: []const u8 = "";
+
+/// Set the caller package read into the next `FuncBuilder`. Returns the
+/// previous value so a nested lowering (a class method, a local fn) can
+/// restore the enclosing package on exit.
+pub fn setLowerSelfPackage(pkg: []const u8) []const u8 {
+    const prev = lower_self_package;
+    lower_self_package = pkg;
+    return prev;
+}
 
 /// Names captured by the anonymous object whose method is being lowered
 /// (`object : Flow { collect(c) { c.block() } }` where `block` is an
@@ -301,6 +318,7 @@ pub fn lowerClassWithExtras(
         .id = ClassId.from(0),
         .name = c.name.name,
         .fqn = class_fqn,
+        .package = ir.packageOfFqn(class_fqn, c.name.name),
         .primary_params = try primary_params.toOwnedSlice(a),
         .methods = &.{},
         .init_block = null,
@@ -655,6 +673,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
     const a = module.registry.allocator;
     var b = try FuncBuilder.init(a, module);
     defer b.deinit();
+    b.self_package = lower_self_package;
 
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(a);
