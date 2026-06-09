@@ -488,6 +488,20 @@ through this one resolver. Mark every func with an explicit kind in the registry
 (`instance-method` / `member-extension` / `top-level-extension`) so the
 extension scorer selects candidates by kind, not by `param[0] == "this"`.
 
+**Landed (item 7, member-extension kind).** `Func.kind: FuncKind` now carries
+`member_extension` as a first-class category (`src/ir/ir.zig`), set at the
+member-extension lowering site (`src/ir/lower/decl.zig`) alongside the existing
+`member_ext_owner_class` side-table entry — the two are co-populated for the same
+`FuncId`, so `kind == .member_extension` and `member_ext_owner_class.contains(fid)`
+are equivalent predicates over the same set. The five member-extension dispatch
+sites in `host_call_member.zig` route through `isMemberExt(mod, fid)` (kind is
+authoritative) and `memberExtVisible(mod, fid, &visible_owners)` (the owner-class
+gate). The side table is kept as the owner-class data source (per the caution
+below — the kind is additive, the gate is preserved exactly). The single
+implicit-receiver resolution choke point (`implicitThisValue` +
+`implicitReceiverChain` in `ir/eval.zig`) feeds the three `*OrGlobal` handlers;
+the four "Or" *instructions* are kept (collapse deferred to item 8 — see §6 row 7).
+
 **Caution — the taxonomy must distinguish member-extension from plain
 instance-method, not collapse "is in `class.methods`" ⇒ "not an extension".**
 The current `extensionFnFallback` (`host_call_member.zig:3692-3711`) deliberately
@@ -676,7 +690,7 @@ refactors, then the structural unifications in dependency order.
 | 4b | DONE — stop swapping `self.globals`, deleted `StoreGlobal`-for-capture + `scoped_env` + the now-dead `WritebackCaptures`/`readLambdaCapture` capture-sync; the HOF invoke path runs over the real top-level env and captured-`var` writes round-trip through the shared `Cell`. Required extending 4a's boxing to function/lambda *parameters* a nested closure writes (the captured-param gap, e.g. `toMap(destination){ consumeEach { destination += it } }`). (§4.1) | A | high | high | L |
 | 5 | `VmIntrinsicHost` becomes thin adapter delegating to eval.Host (§4.1) | A | high | medium | L |
 | 6 | DONE (receiver chain) — enclosing-`this` chain is now a `Frame` field (`enclosing_this`), snapshotted into `FrameSnapshot` on suspend and restored on resume; the `outer_this` thread-local + `outerThisStack` + its `resetReceiverTls` are deleted and `enclosingThis`/`enclosingThisChain`/`pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain. `inner_outer_hint` and the remaining guards-as-params are not yet folded in. (§4.2) | B | high | high | XL |
-| 7 | Single name-resolution function; collapse "Or" instructions to `CallUnresolved`; registry func-kind (member-extension as its own kind, §4.3 caution) for extension scorer | A/B | high | medium | L |
+| 7 | PARTIAL — single implicit-receiver resolution choke point (`implicitThisValue` + `implicitReceiverChain` in `ir/eval.zig`) now feeds all three `*OrGlobal` handlers (`CallMemberOrGlobal`/`LoadFromThisOrGlobal`/`StoreToThisOrGlobal`), so the bare-name member-vs-global precedence is derived in one place instead of three. Registry func-kind landed: `Func.kind` (`FuncKind.member_extension`) is the authoritative member-extension predicate, set at the member-extension lowering site (`decl.zig`); the five `member_ext_owner_class` dispatch sites route through `isMemberExt`/`memberExtVisible` (the owner-class gate is preserved exactly — the kind selects which funcs are gated, the side table supplies the owner). The four "Or" *instructions* are NOT collapsed to a single `CallUnresolved`: they encode three distinct operations (read / write / call) plus the explicit-receiver `CallMemberOrValue`, and the "Or" itself is the "couldn't classify member-vs-global statically" signal item 8's FQN static resolution removes — collapsing now would re-encode the read/write/call distinction without removing the runtime decision. Deferred to item 8. (A/B) | A/B | high | medium | L |
 | 8 | Per-decl package tag + two-phase header registration + package/FQN symbol index; lowering emits FQN-qualified calls; remove `isShippedFqn`/prefix-ladder/suffix-scan — tighten simple-name fallback ONLY after §4.4-item-3 uniqueness proven | C | high | high | XL |
 | 9 | One executable form per symbol resolved at link time; remove per-call FQN short-circuit (§4.4) | C | high | high | XL |
 | 10 | Remove `isLambdaBody()` resolution axis; inline splice sets frame receiver slot (§4.4/§4.2) — gate behind builder-DSL differential pass | C/B | medium | high | M |

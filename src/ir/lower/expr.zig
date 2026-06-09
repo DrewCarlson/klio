@@ -82,20 +82,34 @@ const lowerForLabeled = for_loop.lowerForLabeled;
 const lowerWhen = when_expr.lowerWhen;
 const lowerStmt = stmt_mod.lowerStmt;
 
+/// The single lowering-time `this`-register resolver shared by the bare
+/// `::name`/member-ref site and the bare-extension-call sites. A bound
+/// local `this` always wins; otherwise `this` is recovered from an outer
+/// capture when it is a known outer name — and, when `in_lambda_body` is
+/// set, also for any lambda body (whose implicit `this` arrives via the
+/// closure's own capture slot even without a `knowsOuter` record). When
+/// `bind_local` is set the recovered capture register is bound as the
+/// frame's `this` so later references reuse it. Returns `null` at top
+/// level / in a non-receiver context.
+fn resolveThisRegKind(b: *FuncBuilder, in_lambda_body: bool, bind_local: bool) Allocator.Error!?Reg {
+    if (b.resolve("this")) |r| return r;
+    if (b.knowsOuter("this") or (in_lambda_body and b.isLambdaBody())) {
+        const idx = try b.recordCapture("this");
+        const dst = b.allocReg();
+        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+        if (bind_local) try b.bind("this", dst);
+        return dst;
+    }
+    return null;
+}
+
 /// The register holding the current implicit receiver (`this`), if one is
 /// in scope: either bound directly (a method / extension / receiver lambda
 /// body) or reachable as an outer capture. Returns `null` at top level / in
 /// a non-receiver context. Used to bind a bare `::name` member reference to
 /// its receiver at creation time.
 fn resolveThisReg(b: *FuncBuilder) Allocator.Error!?Reg {
-    if (b.resolve("this")) |r| return r;
-    if (b.knowsOuter("this")) {
-        const idx = try b.recordCapture("this");
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-        return dst;
-    }
-    return null;
+    return resolveThisRegKind(b, false, false);
 }
 
 /// Lower an expression that appears as the *receiver / qualifier head* of a
@@ -1806,29 +1820,15 @@ fn packContiguous(b: *FuncBuilder, regs: []const Reg) Allocator.Error!Reg {
 }
 
 /// Resolve a `this` reg for a bare extension call: bound local, else a
-/// capture inside a lambda body, else null.
+/// capture inside a lambda body, else null. Binds the recovered capture
+/// locally so later references reuse it.
 fn resolveThisForBareCall(b: *FuncBuilder) Allocator.Error!?Reg {
-    if (b.resolve("this")) |r| return r;
-    if (b.knowsOuter("this") or b.isLambdaBody()) {
-        const idx = try b.recordCapture("this");
-        const d = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = d, .idx = idx } });
-        try b.bind("this", d);
-        return d;
-    }
-    return null;
+    return resolveThisRegKind(b, true, true);
 }
 
 /// Like `resolveThisForBareCall` but does not bind `this` locally.
 fn resolveThisForBareCallNoBind(b: *FuncBuilder) Allocator.Error!?Reg {
-    if (b.resolve("this")) |r| return r;
-    if (b.knowsOuter("this") or b.isLambdaBody()) {
-        const idx = try b.recordCapture("this");
-        const d = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = d, .idx = idx } });
-        return d;
-    }
-    return null;
+    return resolveThisRegKind(b, true, false);
 }
 
 fn lowerCallSpread(

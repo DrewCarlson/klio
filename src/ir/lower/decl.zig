@@ -595,6 +595,7 @@ pub fn lowerMethodWithPrivate(
         const id = FuncId.from(@intCast(module.funcs.items.len));
         var placed = func;
         placed.id = id;
+        placed.kind = .member_extension;
         try module.funcs.append(a, placed);
         const nm = f.name.name;
         try module.func_index.append(a, .{ .name = nm, .id = id });

@@ -1596,10 +1596,7 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
             const name_str = constStr(frame.module, stg.name) orelse
                 return errResult(.{ .Type = "StoreToThisOrGlobal: name not a string const" });
             const v = frame.read(stg.value);
-            const this_val = if (stg.this_idx < frame.captures.items.len)
-                frame.captures.items[stg.this_idx]
-            else
-                Value.Null;
+            const this_val = implicitThisValue(frame, stg.this_idx, false);
             const route_to_member = this_val == .Instance and host.hostHasMember(&this_val, name_str);
             if (route_to_member) {
                 switch (try host.setField(allocator, &this_val, name_str, v)) {
@@ -1655,25 +1652,14 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
         .LoadFromThisOrGlobal => |lt| {
             const name_str = constStr(frame.module, lt.name) orelse
                 return errResult(.{ .Type = "LoadFromThisOrGlobal: name not a string const" });
-            const this_val = if (lt.this_idx < frame.captures.items.len)
-                frame.captures.items[lt.this_idx]
-            else
-                Value.Null;
+            const this_val = implicitThisValue(frame, lt.this_idx, false);
             var resolved: ?Value = null;
-            if (this_val != .Null and this_val != .Unit) {
-                switch (try host.getField(allocator, &this_val, name_str)) {
-                    .ok => |v| if (v != .Unit) {
-                        resolved = v;
-                    },
-                    .err => {},
-                }
-            }
-            if (resolved == null) {
-                const chain = try host.enclosingThisChain(allocator);
+            {
+                const chain = try implicitReceiverChain(allocator, host, this_val);
                 defer allocator.free(chain);
-                for (chain) |outer| {
-                    if (outer == .Null or outer == .Unit) continue;
-                    switch (try host.getField(allocator, &outer, name_str)) {
+                for (chain) |recv| {
+                    if (recv == .Null or recv == .Unit) continue;
+                    switch (try host.getField(allocator, &recv, name_str)) {
                         .ok => |v| if (v != .Unit) {
                             resolved = v;
                             break;
@@ -1770,17 +1756,9 @@ fn execCallMemberOrGlobal(allocator: Allocator, frame: *Frame, cmg: anytype, hos
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cmg.arg_names);
     defer allocator.free(names);
-    var this_val = if (cmg.this_idx < frame.captures.items.len)
-        frame.captures.items[cmg.this_idx]
-    else
-        Value.Null;
-    // The receiver may be the enclosing function's `this` *parameter*
-    // rather than a lambda capture.
-    if ((this_val == .Null or this_val == .Unit)) {
-        if (frameThisParam(frame)) |idx| {
-            if (idx < frame.params.items.len) this_val = frame.params.items[idx];
-        }
-    }
+    // The receiver is the lambda capture slot, or — when that is empty —
+    // the enclosing function's `this` *parameter*.
+    const this_val = implicitThisValue(frame, cmg.this_idx, true);
     // A bare callee whose name starts uppercase is a constructor / type,
     // never an instance member.
     const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]);
@@ -1797,13 +1775,9 @@ fn execCallMemberOrGlobal(allocator: Allocator, frame: *Frame, cmg: anytype, hos
     // own `this` or of any lexically enclosing `this@…` outranks a
     // same-named top-level extension.
     if (!is_ctor_name and !shadow_capture) {
-        var chain: std.ArrayList(Value) = .empty;
-        defer chain.deinit(allocator);
-        if (this_val != .Null and this_val != .Unit) try chain.append(allocator, this_val);
-        const ec = try host.enclosingThisChain(allocator);
-        defer allocator.free(ec);
-        try chain.appendSlice(allocator, ec);
-        for (chain.items) |recv| {
+        const chain = try implicitReceiverChain(allocator, host, this_val);
+        defer allocator.free(chain);
+        for (chain) |recv| {
             if (recv == .Null or recv == .Unit) continue;
             switch (try host.callMemberOnly(allocator, &recv, name_str, arg_values, names)) {
                 .ok => |v| {
@@ -1888,14 +1862,10 @@ fn execCallMemberOrGlobal(allocator: Allocator, frame: *Frame, cmg: anytype, hos
     }
     // Lexically-enclosing receivers as extension candidates.
     if (resolved == null and !is_ctor_name and !shadow_capture) {
-        var chain: std.ArrayList(Value) = .empty;
-        defer chain.deinit(allocator);
-        if (this_val != .Null and this_val != .Unit) try chain.append(allocator, this_val);
-        const ec = try host.enclosingThisChain(allocator);
-        defer allocator.free(ec);
-        try chain.appendSlice(allocator, ec);
-        if (chain.items.len > 1) {
-            for (chain.items[1..]) |recv| {
+        const chain = try implicitReceiverChain(allocator, host, this_val);
+        defer allocator.free(chain);
+        if (chain.len > 1) {
+            for (chain[1..]) |recv| {
                 if (recv == .Null or recv == .Unit) continue;
                 switch (try host.callMemberNamed(allocator, &recv, name_str, arg_values, names)) {
                     .ok => |v| {
@@ -2017,6 +1987,50 @@ fn callerThisValue(frame: *const Frame) ?Value {
         }
     }
     return null;
+}
+
+// -------------------------------------------------------------------------
+// Implicit-receiver resolution choke point.
+//
+// The `*OrGlobal` instructions (`LoadFromThisOrGlobal`, `StoreToThisOrGlobal`,
+// `CallMemberOrGlobal`) all resolve a bare name against an *implicit*
+// receiver — the lambda/method's own `this` plus any lexically-enclosing
+// `this@…` — before falling back to a top-level global. The front step
+// (recover the implicit `this`) and the traversal order (own `this`, then
+// the enclosing-`this` chain) are identical across the three; these helpers
+// are the single place that derives them so the read / write / call arms
+// share one resolution path instead of re-deriving it three ways.
+// -------------------------------------------------------------------------
+
+/// Recover the implicit receiver for an `*OrGlobal` instruction:
+/// `captures[this_idx]` if in range, else `Null`. When `consult_param` is
+/// set and the capture slot did not yield an instance receiver, fall back
+/// to the frame's `this` *parameter* (the call form needs this; the bare
+/// read/write forms carry the receiver in the capture slot only).
+fn implicitThisValue(frame: *const Frame, this_idx: usize, consult_param: bool) Value {
+    var this_val: Value = if (this_idx < frame.captures.items.len)
+        frame.captures.items[this_idx]
+    else
+        Value.Null;
+    if (consult_param and (this_val == .Null or this_val == .Unit)) {
+        if (frameThisParam(frame)) |idx| {
+            if (idx < frame.params.items.len) this_val = frame.params.items[idx];
+        }
+    }
+    return this_val;
+}
+
+/// The ordered implicit-receiver chain a bare name is resolved against:
+/// the frame's own implicit `this` (when present) followed by each
+/// lexically-enclosing `this@…`. Caller frees the returned slice.
+fn implicitReceiverChain(allocator: Allocator, host: *Host, this_val: Value) Allocator.Error![]Value {
+    var chain: std.ArrayList(Value) = .empty;
+    errdefer chain.deinit(allocator);
+    if (this_val != .Null and this_val != .Unit) try chain.append(allocator, this_val);
+    const ec = try host.enclosingThisChain(allocator);
+    defer allocator.free(ec);
+    try chain.appendSlice(allocator, ec);
+    return chain.toOwnedSlice(allocator);
 }
 
 fn stripScopeGetter(name: []const u8) []const u8 {

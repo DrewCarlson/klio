@@ -739,13 +739,24 @@ catalogued so nobody mistakes them for Class-A/B/C point-fixes; most are **keep*
 - **Class:** other / dispatch-taxonomy. This is the §4.3 "Caution": it is NOT a pure
   point-fix — collapsing "is in `class.methods`" ⇒ "not an extension" would drop the
   member-extension dispatch ktor relies on.
-- **Deletable?** **Keep the behavior**; replace the *heuristic* (`param[0]=="this"`)
-  with an explicit registry func-kind where `member-extension` is a first-class
-  category (§4.3). Do not delete the `member_ext_owner_class` gate without the kind
-  field.
-- **Removes via:** §6 item **7** (registry func-kind), preserving the gate semantics.
-- **Removal test:** the ktor builder itests (member-extension `with(a){ memberExtFn() }`)
-  green under the kind-based scorer; differential identical.
+- **Deletable?** **Keep the behavior.** The member-extension *recognition* heuristic
+  is now backed by a first-class registry kind (item 7): `Func.kind ==
+  .member_extension` is authoritative via `isMemberExt`, and the five owner-gated
+  dispatch sites route through `memberExtVisible`/`isMemberExt` in
+  `host_call_member.zig` instead of probing `member_ext_owner_class` directly. The
+  `param[0]=="this"` admission in `extensionFnFallback`/`resolveExtOverloadLocal`
+  stays as the *candidate-shape* filter (it still admits top-level extensions and
+  synthesized method receivers, which also lead with `"this"`); the kind only
+  disambiguates which of those candidates are owner-gated member extensions. The
+  `member_ext_owner_class` gate is preserved exactly — the side table is kept as
+  the owner-class data source.
+- **Removes via:** §6 item **7** (registry func-kind) — PARTIAL: kind landed and is
+  authoritative for recognition + gating; the gate semantics are preserved, not
+  removed.
+- **Removal test:** `parity_extension_resolution` (17/17), `parity_inner_classes`
+  (member-extension on outer / on `String`), `parity_dsl_operators`,
+  `parity_functional_patterns` green under the kind-based scorer; differential
+  identical across modes.
 
 ---
 

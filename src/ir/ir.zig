@@ -549,6 +549,28 @@ pub const Block = struct {
 };
 
 /// A function body in IR form.
+/// First-class classification of a lowered function, used by the
+/// runtime extension scorer to recognize a member-extension directly
+/// instead of probing the `member_ext_owner_class` side table. A
+/// *member extension* (`class C { fun R.f(p) { … } }`) lowers to a func
+/// with a leading `"this"` param exactly like an `instance_method` and a
+/// `top_level_extension`, so `param[0] == "this"` alone cannot tell them
+/// apart — this kind makes the distinction authoritative. The owner-class
+/// gate that decides member-extension *visibility* stays in
+/// `ModuleRegistry.member_ext_owner_class` (keyed by `FuncId`); the kind
+/// is the additive predicate that selects which funcs are gated.
+pub const FuncKind = enum {
+    /// Ordinary top-level / local function, or a constructor/init thunk.
+    plain,
+    /// Instance method `class C { fun f(p) { … } }` (leading `"this"`).
+    instance_method,
+    /// Top-level extension `fun R.f(p) { … }` (leading `"this"`).
+    top_level_extension,
+    /// Member extension `class C { fun R.f(p) { … } }` (leading `"this"`),
+    /// gated by its declaring class through `member_ext_owner_class`.
+    member_extension,
+};
+
 pub const Func = struct {
     id: FuncId,
     name: []const u8,
@@ -559,6 +581,11 @@ pub const Func = struct {
     blocks: []Block,
     entry: BlockId,
     is_suspend: bool,
+    /// First-class func classification for the extension scorer. Defaults
+    /// to `plain`; set to `member_extension` at the member-extension
+    /// lowering site, distinguishing it from a same-shaped instance method
+    /// or top-level extension.
+    kind: FuncKind = .plain,
     is_tailrec: bool = false,
     /// True for synthetic lambda bodies. `return` inside the body
     /// propagates as a non-local return through this frame instead
