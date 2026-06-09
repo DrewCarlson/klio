@@ -211,8 +211,7 @@ pub fn runFull(allocator: std.mem.Allocator, prog: *const Program) std.mem.Alloc
         return .{ .err = "lex errors" };
     }
     var ast_file = parse(allocator, &lexed);
-    var res = resolveOnly(allocator, &ast_file) catch return .{ .err = "resolve error" };
-    defer res.deinit();
+    _ = resolveOnly(allocator, &ast_file) catch return .{ .err = "resolve error" };
 
     var cap = CaptureOutput.init(allocator);
     defer cap.deinit();
@@ -334,8 +333,7 @@ pub fn timePipelineStages(
             var map = SourceMap.init(aa);
             var lexed = lex(aa, &map, self.p) catch return;
             const file = parse(aa, &lexed);
-            var res = resolveOnly(aa, &file) catch return;
-            res.deinit();
+            _ = resolveOnly(aa, &file) catch return;
         }
     }{ .a = allocator, .p = prog };
     const resolve_t = try timeIters(allocator, resolve_ctx, budget_per_stage_ns, 5);
@@ -350,9 +348,8 @@ pub fn timePipelineStages(
             var map = SourceMap.init(aa);
             var lexed = lex(aa, &map, self.p) catch return;
             const file = parse(aa, &lexed);
-            var res = resolveOnly(aa, &file) catch return;
-            var tc = typeckOnly(aa, &file, &res) catch return;
-            tc.deinit(aa);
+            const res = resolveOnly(aa, &file) catch return;
+            _ = typeckOnly(aa, &file, &res) catch return;
         }
     }{ .a = allocator, .p = prog };
     const typeck_t = try timeIters(allocator, typeck_ctx, budget_per_stage_ns, 5);

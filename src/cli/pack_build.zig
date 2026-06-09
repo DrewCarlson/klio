@@ -1281,8 +1281,11 @@ fn buildAstBundle(a: std.mem.Allocator, files: []const schema.SourceFile) schema
 /// builder. Allocated from `a`.
 fn buildTypeckBundle(a: std.mem.Allocator, asts: []const KotlinFile) schema.TypeckBundle {
     if (asts.len == 0) return .{};
-    var r = resolver.resolveModule(a, asts) catch return .{};
-    var tc = typeck.typecheckModule(a, asts, &r) catch return .{};
+    // `a` is a build-scoped arena: the resolver and checker allocate their
+    // whole workspace from it and free nothing, so the entries the bundle
+    // clones out stay valid until the arena is reclaimed by the caller.
+    const r = resolver.resolveModule(a, asts) catch return .{};
+    const tc = typeck.typecheckModule(a, asts, &r) catch return .{};
     if (tc.diagnostics.hasErrors()) return .{};
 
     var entries: std.ArrayList(schema.TypeckEntry) = .empty;
