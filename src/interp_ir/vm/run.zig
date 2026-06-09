@@ -475,8 +475,17 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
 /// join-all loop at the end of Rust's `Vm::run`. If `main` succeeded but a
 /// child threw, the child's error is surfaced; if `main` already failed,
 /// child errors are swallowed (the original failure wins).
+///
+/// After the last worker has joined this is the only run-boundary seam that
+/// runs exclusively on the top-level driver thread (workers run through
+/// `vmRunThreadBlock`, which never reaches here), so it is where the
+/// process-global slot-owner registry is drained: any slot a driver left
+/// registered on an error/abort/cancel path holds a clone of an arena-backed
+/// `DriverWakeup`, and draining here — once no worker can still route through
+/// it — keeps a stale entry from surviving into the next run's reset arena.
 fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     var out = result;
+    defer vmhost.coroutines.drainSlotOwners();
     while (true) {
         // Take one outstanding handle under the lock, then join it
         // without holding the lock so the worker's own result

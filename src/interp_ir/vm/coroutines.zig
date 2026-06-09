@@ -135,17 +135,21 @@ pub const DriverWakeup = struct {
 
 /// Process-global slot → owning `DriverWakeup` registry. A worker
 /// thread routes its completion resume back through the driver that
-/// owns the slot it parked on. The registry and its backing map live
-/// for the whole process, mirroring the Rust `static LazyLock<Mutex<
-/// HashMap<…>>>`: the map itself is never freed, so it is backed by the
-/// page allocator rather than any per-run allocator. The `DriverWakeup`
-/// handles it holds are owned clones, dropped on `unregisterSlot` /
-/// `releaseOwnedSlots`.
+/// owns the slot it parked on. The map's spine is `page_allocator`-
+/// backed (it must outlive any one run's allocator while workers route
+/// through it), but the `ObjRef(DriverWakeup)` clones it holds reach
+/// into the per-run value graph, so the registry is tied to the run:
+/// `drainAll` empties it and frees the spine capacity at the run
+/// boundary (after every worker has joined), so no entry can survive a
+/// run to dangle into the next run's reset/reused arena. Live entries
+/// are dropped on `unregisterSlot` / `releaseOwnedSlots`; `drainAll` is
+/// the defensive sweep that covers the error/abort/cancel paths where
+/// neither ran.
 const SlotOwners = struct {
     var mutex: SpinMutex = .{};
     var map: ?std.AutoHashMap(i64, ObjRef(DriverWakeup)) = null;
 
-    /// Allocator backing the process-global registry; never freed.
+    /// Allocator backing the process-global registry spine.
     fn allocator() Allocator {
         return std.heap.page_allocator;
     }
@@ -157,7 +161,34 @@ const SlotOwners = struct {
         }
         return &map.?;
     }
+
+    /// Drop every entry and free the map's spine. Run at the run
+    /// boundary once all workers have joined, so a slot left registered
+    /// by an error/abort/cancel path (whose `DriverWakeup` cell is
+    /// arena-backed) cannot survive into the next run's reset arena.
+    fn drainAll() void {
+        mutex.lock();
+        defer mutex.unlock();
+        if (map) |*m| {
+            var it = m.valueIterator();
+            while (it.next()) |w| w.deinit();
+            m.deinit();
+            map = null;
+        }
+    }
 };
+
+/// Empty the process-global slot-owner registry. Called at the run
+/// boundary from `joinAllThreads` (the top-level driver thread, after
+/// every worker has joined) so the registry never holds a clone of an
+/// arena-backed `DriverWakeup` into the next run's reset arena. Balances
+/// `registerSlotOwner` on every path the per-driver `releaseOwnedSlots`
+/// misses (error, abort, cancellation, worker-error). Not called from the
+/// per-thread `resetReceiverTls`: that also runs on worker threads, which
+/// must not tear down the registry the live driver is still routing through.
+pub fn drainSlotOwners() void {
+    SlotOwners.drainAll();
+}
 
 /// Register `slot` → `wakeup` so a worker thread's completion resume
 /// routes back through the driver's mailbox.
@@ -1128,6 +1159,45 @@ test "slot owner registry routes lookups and clears on release" {
         w.get().releaseOwnedSlots();
     }
     try testing.expectEqual(@as(?ObjRef(DriverWakeup), null), lookupSlotOwner(101));
+}
+
+// -------------------------------------------------------------------------
+// Cross-run dangle regression. `setPendingSlot` registers an arena-backed
+// `DriverWakeup` clone in the process-global registry. A driver that ends
+// on an error/abort/cancel path pops without `releaseOwnedSlots`, leaving
+// the entry behind; under the in-process harness the run arena is then
+// reset, freeing the cell the stale clone points at. `drainSlotOwners` —
+// the run-boundary sweep — must empty the registry before that reset so the
+// next run never resolves a slot to a clone into reused arena memory.
+// -------------------------------------------------------------------------
+test "drainSlotOwners clears registry entries an error path left behind" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Run N: a driver arms a slot on its arena-backed wakeup, then exits on
+    // an error path (no `releaseOwnedSlots`). The interceptor itself is torn
+    // down (the `coroPop` deinit) but the global entry survives.
+    const slot: i64 = 909;
+    {
+        var ci = try CooperativeInterceptor.new(arena.allocator());
+        defer ci.deinit();
+        try ci.setPendingSlot(slot);
+        try testing.expect(lookupSlotOwner(slot) != null);
+    }
+    // The entry is still live here — exactly the leak the error path causes.
+    {
+        const stale = lookupSlotOwner(slot);
+        try testing.expect(stale != null);
+        stale.?.deinit();
+    }
+
+    // Run-boundary sweep, then the arena reset that frees run N's cells.
+    drainSlotOwners();
+    _ = arena.reset(.retain_capacity);
+
+    // Run N+1 reuses the same arena. The registry must be empty — a surviving
+    // clone would dangle into the reset arena.
+    try testing.expectEqual(@as(?ObjRef(DriverWakeup), null), lookupSlotOwner(slot));
 }
 
 // -------------------------------------------------------------------------

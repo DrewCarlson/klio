@@ -256,8 +256,10 @@ order: (1) scan this thread's `coro_stack`; (2) `lookupSlotOwner(slot)` →
 `postResume` into the owning driver's `DriverWakeup` mailbox (the real
 cross-thread case); (3) drain from `persisted_parked` inline. `SlotOwners`
 (`src/interp_ir/vm/coroutines.zig:136-159`) is a process-global `AutoHashMap`
-backed by `std.heap.page_allocator` and **explicitly never freed** (`:148-150`),
-holding `ObjRef(DriverWakeup)` clones. The driver pump
+whose spine is `std.heap.page_allocator`-backed; since R14 it is **run-scoped**:
+`drainSlotOwners` empties it and frees the spine at the run boundary
+(`joinAllThreads`, after every worker has joined), holding `ObjRef(DriverWakeup)`
+clones only for the duration of one run. The driver pump
 (`src/interp_ir/vm/coroutines.zig:719-739`) busy-polls with `sleepMillis(1)` while
 a worker is pending. The `DriverWakeup` mailbox is the one genuinely needed
 cross-thread primitive; the never-freed global registry and the 1 ms busy-poll
@@ -385,14 +387,18 @@ port dropped the value-drop on the floor.
 Each `ControlBlock(T)` captures its `allocator` at `init`
 (`src/runtime/objcell.zig:104`, `:128-163`). A value graph can therefore freely
 mix cells from different allocators with no record at the graph level. The
-coroutine `SlotOwners` registry is process-global and `page_allocator`-backed
-(`src/interp_ir/vm/coroutines.zig:144-159`), holding `ObjRef(DriverWakeup)`
-clones — yet a `DriverWakeup` graph can point at Env/Value cells from the per-run
-arena. When the run arena is torn down, a surviving slot-owner clone references
-freed arena cells through a control block whose own `allocator` still says
-`page_allocator`, and its `deinit` (`:174`) would `page_allocator.destroy` a
-block whose sub-graph was arena-freed. Acceptable for a one-shot CLI; a real
-hazard under repeated in-process runs / the parity harness.
+coroutine `SlotOwners` registry is process-global with a `page_allocator`-backed
+spine (`src/interp_ir/vm/coroutines.zig:144-159`), holding `ObjRef(DriverWakeup)`
+clones — and a `DriverWakeup` cell is itself arena-backed (minted from the Vm's
+allocator). This was a real latent cross-run UAF under the in-process harnesses:
+an error/abort path could leave a slot registered (register/unregister was not
+balanced on the `driveRoot` error `coroPop` paths), and the next program's arena
+reset reused the cell the stale clone pointed at. **R14 fixed it** by run-scoping
+the registry — `drainSlotOwners` empties the map and frees the spine at the run
+boundary (after every worker has joined), so no entry can survive a run. The
+broader `ObjRef`-per-cell-allocator observation (a value graph may still mix cells
+from different allocators with no graph-level record) stands as a lower-priority
+hygiene note.
 
 #### 2C.5 Resolver/Resolution duplicate the "arena + gpa containers + manual deinit" pattern redundantly
 
@@ -624,7 +630,7 @@ These are isolated, mechanically verifiable, and cannot regress the suite.
 |---|------|--------|------|--------|------|
 | R12 | **Assert the worker-shared allocator's thread-safety precondition at the spawn seam** (2C.1) — *not* a `ThreadSafeAllocator` wrap (that type does not exist in Zig 0.16). The arena alloc/free path is already lock-free thread-safe over `page_allocator`, so this is a guard, not a fix: document the two invariants (thread-safe child allocator; no `.reset()`/`.deinit()` while a worker is live) and add a debug assert at `vmSpawnChild`/`workerEntry`. For any entry point that cannot guarantee a thread-safe child, back the `Vm` with `std.heap.smp_allocator`. | low | low | S | none |
 | R13 | **Collapse `ConstraintSystem` to a single ownership story** — make all container storage arena-owned and delete the per-field `gpa` deinit (option a), removing the cross-allocator-free class entirely and making the defensive `clone(self.allocator)` at `expr_calls.zig:775` unnecessary; also reconcile the `BoundSet` spine-allocator mismatch (`gpa` seed append vs `arena` later appends, `gpa` deinit) (2C.2). | high | medium | M | none |
-| R14 | **Tie `SlotOwners` to the run allocator (not `page_allocator`)** or store only slot-id + completion channel, not graph-reaching ObjRefs (2C.4). | medium | medium | L | R13/R16 (arena model) |
+| R14 | **DONE.** Run-scoped the process-global `SlotOwners` registry (option b). **Found a real latent cross-run UAF:** `setPendingSlot`→`registerSlotOwner` stores an `ObjRef(DriverWakeup)` clone, and `DriverWakeup` is created from the Vm's allocator (`CooperativeInterceptor.new` → `DriverWakeup.new(allocator)`), i.e. the **per-program arena** under the in-process e2e/parity/differential harnesses. register/unregister was **NOT balanced on every path**: the four error/early-return `coroPop` sites in `driveRoot` (a root that `.Throw`s / `NonLocalReturn`s / hits any non-suspend error while a slot is still armed) pop+deinit the interceptor but never call `releaseOwnedSlots`, so the registry kept a clone of the arena-backed wakeup after the run ended. The harness then `arena.reset(.retain_capacity)`s under `reclaim=false` (no cell deinit), so the surviving clone dangles into reused arena memory — a later `lookupSlotOwner`/`deinit` on it is a UAF (a stubbed-drain negative test segfaults deterministically, confirming UAF not hygiene). Fix: `SlotOwners.drainAll`/`drainSlotOwners` empties the map and frees its `page_allocator` spine; called from `joinAllThreads` (the one run-boundary seam that runs only on the top-level driver thread, after every worker has joined — workers go through `vmRunThreadBlock`, which never reaches it), so the defensive sweep balances `registerSlotOwner` on **all** paths incl. error/abort/cancel/worker-error and reclaims the per-run map capacity. Worker→driver resume routing is unchanged: register/lookup/unregister behave identically during a run; the wakeup mailbox cell + R15 rwlock are untouched (no publish reintroduced). Net +49 LOC. Gates: `zig build test` 139/139 steps · 1521/1521 tests · 0 skips; `corpus_check.py --no-rust` 83/83; differential byte-identical (3 pack modes); `tl_wakeup_hammer`/`parity_threaded_litmus`/`runtime_objref_threads` green under `KLIO_RACE_JITTER=1` (repeated); suspend fuzzer `KLIO_FUZZ_SEEDS=128` clean; cross-run coroutine-heavy stress (arena reset between programs) clean; `KLIO_TRACE_INVARIANTS=1`/`KLIO_RESOLVE_AUDIT=1`/`KLIO_LINK_AUDIT=1` = 0. 2C.4's `SlotOwners` half and 2B.5's never-freed-registry half retired. | medium | medium | L | R13/R16 (arena model) |
 
 ### Tier 3 — Larger structural refactors (gated, incremental)
 
