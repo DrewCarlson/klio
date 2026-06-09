@@ -34,7 +34,6 @@ const RuntimeEvalResult = runtime.EvalResult;
 
 const Module = ir.Module;
 const ClassId = ir.ClassId;
-const Host = ir.eval.Host;
 const EvalError = ir.eval.EvalError;
 const EvalResult = ir.eval.EvalResult;
 const SuspendState = ir.eval.SuspendState;
@@ -171,8 +170,7 @@ fn flattenEval(r: EvalResult) RuntimeEvalResult {
 /// from stdlib higher-order ops like `map`/`fold`.
 pub fn construct(self: *VmIntrinsicHost, class_id: ClassId, args: []const Value, out: Output) Allocator.Error!RawResult {
     var host = vmHost(self, out);
-    var iface = host.hostInterface();
-    return iface.newInstance(self.allocator, class_id, args);
+    return host.newInstance(self.allocator, class_id, args);
 }
 
 /// Evaluate an `IrClosure` and return the *raw* `EvalError` so the
@@ -272,8 +270,7 @@ pub fn evalClosureRaw(
 
     const state = vmhost.SharedHandles.fromIntrinsic(self);
     var host = VmHost.borrowed(state, state.globals, out);
-    var iface = host.hostInterface();
-    return ir.eval.evalWithCaptures(self.allocator, module, func, args_owned, caps_owned, &iface);
+    return ir.eval.evalWithCaptures(VmHost, self.allocator, module, func, args_owned, caps_owned, &host);
 }
 
 /// Resume a parked activation with `value`, raw `EvalError` out.
@@ -282,8 +279,7 @@ pub fn resumeRaw(self: *VmIntrinsicHost, state: *SuspendState, value: Value, out
     defer module_g.deinit();
     const module = module_g.get();
     var host = vmHost(self, out);
-    var iface = host.hostInterface();
-    return ir.eval.resumeContinuation(self.allocator, module, state, value, &iface);
+    return ir.eval.resumeContinuation(VmHost, self.allocator, module, state, value, &host);
 }
 
 // -------------------------------------------------------------------------
@@ -371,11 +367,10 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
             const as_property = member_args.len == 0 and
                 root.memberIsProperty(self.allocator, &self.classes, &target, nm);
             var host = vmHost(self, out);
-            var iface = host.hostInterface();
             const result = if (as_property)
-                try iface.getField(self.allocator, &target, nm)
+                try host.getField(self.allocator, &target, nm)
             else
-                try iface.callMember(self.allocator, &target, nm, member_args);
+                try host.callMember(self.allocator, &target, nm, member_args);
             return flattenEval(result);
         }
     }
@@ -425,8 +420,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         // site with no name-seeded scratch env or capture read-back.
         const state = vmhost.SharedHandles.fromIntrinsic(self);
         var host = VmHost.borrowed(state, state.globals, out);
-        var iface = host.hostInterface();
-        const result = try ir.eval.evalWithCaptures(self.allocator, module, func, call_args, caps_owned, &iface);
+        const result = try ir.eval.evalWithCaptures(VmHost, self.allocator, module, func, call_args, caps_owned, &host);
         return flattenEval(result);
     }
 
@@ -464,8 +458,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
     // dispatch through its `invoke` member.
     if (callable.* == .Instance) {
         var host = vmHost(self, out);
-        var iface = host.hostInterface();
-        const r = try iface.callMember(self.allocator, callable, "invoke", args);
+        const r = try host.callMember(self.allocator, callable, "invoke", args);
         return flattenEval(r);
     }
 
@@ -575,8 +568,7 @@ pub fn invokeMethod(self: *VmIntrinsicHost, receiver: *const Value, name: []cons
     // Build a VmHost that shares this IntrinsicHost's tables and route
     // through call_member so the dispatch picks up user override methods.
     var host = vmHost(self, out);
-    var iface = host.hostInterface();
-    const r = try iface.callMember(self.allocator, receiver, name, args);
+    const r = try host.callMember(self.allocator, receiver, name, args);
     return switch (r) {
         .ok => |v| RuntimeEvalResult{ .ok = v },
         .err => |e| switch (e) {

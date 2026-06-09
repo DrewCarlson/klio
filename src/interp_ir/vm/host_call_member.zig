@@ -4,8 +4,8 @@
 //! enclosing-`this` chain, and the member-only probe Kotlin's member-vs-
 //! extension precedence rule needs.
 //!
-//! Free functions over `*VmHost`, wired into the `ir.eval.Host` vtable
-//! by `vmhost.zig`.
+//! Free functions over `*VmHost`, aliased as `VmHost` methods by
+//! `vmhost.zig` and invoked directly by the generic IR evaluator.
 
 const std = @import("std");
 
@@ -181,49 +181,39 @@ fn checkReceiverChain(self: *VmHost, allocator: Allocator, site: []const u8, thi
 }
 
 // -------------------------------------------------------------------------
-// Host-interface bridge. The IR evaluator and the recursive dispatch in
-// this file route through the `{ctx, vtable}` Host built from `self`.
+// Recursive dispatch in this file routes back through `VmHost`'s own
+// host methods (the same ones the generic IR evaluator invokes).
 // -------------------------------------------------------------------------
 
-fn hostOf(self: *VmHost) ir.eval.Host {
-    return self.hostInterface();
-}
-
-/// Recursive `callMember` over the Host interface — used for the many
-/// self-forwarding branches (`map.containsKey`, delegation, companion
-/// forwarding, range materialisation, …).
+/// Recursive `callMember` — used for the many self-forwarding branches
+/// (`map.containsKey`, delegation, companion forwarding, range
+/// materialisation, …).
 fn callMemberRec(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
     return callMember(self, allocator, receiver, name, args);
 }
 
 fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
-    var host = hostOf(self);
-    return host.callValue(allocator, callee, args);
+    return self.callValue(allocator, callee, args);
 }
 
 fn callValueWithThisRec(self: *VmHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value) Allocator.Error!EvalResult {
-    var host = hostOf(self);
-    return host.callValueWithThis(allocator, callee, this_value, args, &.{});
+    return self.callValueWithThis(allocator, callee, this_value, args, &.{});
 }
 
 fn newInstanceById(self: *VmHost, allocator: Allocator, class: ir.ClassId, args: []const Value) Allocator.Error!EvalResult {
-    var host = hostOf(self);
-    return host.newInstance(allocator, class, args);
+    return self.newInstance(allocator, class, args);
 }
 
 fn getFieldRec(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    var host = hostOf(self);
-    return host.getField(allocator, receiver, name);
+    return self.getField(allocator, receiver, name);
 }
 
 fn callFuncRec(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value) Allocator.Error!EvalResult {
-    var host = hostOf(self);
-    return host.callFunc(allocator, module, func, args);
+    return self.callFunc(allocator, module, func, args);
 }
 
 fn callFuncNamedRec(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, names: []const ?[]const u8) Allocator.Error!EvalResult {
-    var host = hostOf(self);
-    return host.callFuncNamed(allocator, module, func, args, names);
+    return self.callFuncNamed(allocator, module, func, args, names);
 }
 
 // -------------------------------------------------------------------------
@@ -3430,10 +3420,9 @@ fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Value,
             try cap_vec.append(allocator, found);
         }
     }
-    var iface = self.hostInterface();
     var packed_list = try argsListFromSlice(allocator, packed_args);
     _ = &packed_list;
-    return ir.eval.evalWithCapturesIn(allocator, module_rc, module_rc, &f, packed_list, cap_vec, &iface);
+    return ir.eval.evalWithCapturesIn(VmHost, allocator, module_rc, module_rc, &f, packed_list, cap_vec, self);
 }
 
 /// Build the `n_params`-length argument vector, filling positions past
@@ -3454,9 +3443,8 @@ fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Modul
             };
             var captures: std.ArrayList(Value) = .empty;
             if (call_args.items.len != 0) try captures.append(allocator, call_args.items[0]);
-            var iface = self.hostInterface();
             const cur = try argsListFromSlice(allocator, call_args.items);
-            const r = try ir.eval.evalWithCaptures(allocator, module, &dfunc, cur, captures, &iface);
+            const r = try ir.eval.evalWithCaptures(VmHost, allocator, module, &dfunc, cur, captures, self);
             switch (r) {
                 .ok => |v| try call_args.append(allocator, v),
                 .err => |e| {
@@ -3563,14 +3551,13 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                         }
                     }
                     const packed_args = try packVarargArgs(self, allocator, &f, all);
-                    var iface = self.hostInterface();
                     var packed_list = try argsListFromSlice(allocator, packed_args);
                     _ = &packed_list;
                     if (trace.invariantsEnabled()) {
                         checkFuncInRange(self, "irMethodWalk", f.id);
                         checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
                     }
-                    const r = try ir.eval.evalWith(allocator, mod, &f, packed_list, &iface);
+                    const r = try ir.eval.evalWith(VmHost, allocator, mod, &f, packed_list, self);
                     mg.deinit();
                     return r;
                 }
@@ -4644,10 +4631,9 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                 var all: std.ArrayList(Value) = .empty;
                 try all.append(allocator, receiver.*);
                 try all.appendSlice(allocator, args);
-                var iface = self.hostInterface();
                 const module_ref = self.module.clone();
                 defer module_ref.deinit();
-                return ir.eval.evalWith(allocator, module_ref.borrow().get(), &func, all, &iface);
+                return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), &func, all, self);
             }
             mg.deinit();
         }
@@ -4670,10 +4656,9 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                     mg.deinit();
                     var all: std.ArrayList(Value) = .empty;
                     try all.append(allocator, receiver.*);
-                    var iface = self.hostInterface();
                     const module_ref = self.module.clone();
                     defer module_ref.deinit();
-                    return ir.eval.evalWith(allocator, module_ref.borrow().get(), &func, all, &iface);
+                    return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), &func, all, self);
                 }
                 mg.deinit();
             }

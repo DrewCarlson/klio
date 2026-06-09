@@ -2,9 +2,8 @@
 //! `is_concrete_cast_target`) and runtime class registration for
 //! locally-declared / anonymous-object classes lowered during eval.
 //!
-//! Free functions over `*VmHost`, wired into the `ir.eval.Host` vtable
-//! by `vmhost.zig`. Bodies are filled in as the Vm's native execution
-//! paths grow.
+//! Free functions over `*VmHost`, aliased as `VmHost` methods by
+//! `vmhost.zig` and invoked directly by the generic IR evaluator.
 
 const std = @import("std");
 

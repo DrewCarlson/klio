@@ -352,8 +352,7 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
             const class_id = module.classId(obj_name) orelse continue;
             const inst = blk: {
                 var host = vmMakeHost(self, sink);
-                var iface = host.hostInterface();
-                switch (try iface.newInstance(self.allocator, class_id, &.{})) {
+                switch (try host.newInstance(self.allocator, class_id, &.{})) {
                     .ok => |v| break :blk v,
                     // Defer an object whose eager initializer throws — it is
                     // initialized on first access in `lookupGlobal` instead.
@@ -388,8 +387,7 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
         if (nf.func.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
         const init_func = &module.funcs.items[nf.func.int()];
         var host = vmMakeHost(self, sink);
-        var iface = host.hostInterface();
-        const r = try ir.eval.evalWith(self.allocator, module, init_func, .empty, &iface);
+        const r = try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host);
         switch (r) {
             .ok => |v| {
                 const g = self.globals.borrowMut();
@@ -440,8 +438,7 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
             const init_func = &module.funcs.items[fid.int()];
             const v = blk: {
                 var host = vmMakeHost(self, sink);
-                var iface = host.hostInterface();
-                switch (try ir.eval.evalWith(self.allocator, module, init_func, .empty, &iface)) {
+                switch (try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host)) {
                     .ok => |val| break :blk val,
                     .err => |e| return .{ .err = vmErrorFromEval(self.allocator, e) },
                 }
@@ -457,8 +454,7 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     if (main.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
     const func = &module.funcs.items[main.int()];
     var host = vmMakeHost(self, sink);
-    var iface = host.hostInterface();
-    const r = try ir.eval.evalWith(self.allocator, module, func, .empty, &iface);
+    const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, .empty, &host);
     const result: VmResult = switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = vmErrorFromEval(self.allocator, e) },

@@ -1,10 +1,12 @@
-//! `VmHost` lifecycle helpers that are not part of the `ir.eval.Host`
-//! vtable: on-demand top-level property init, spawned-thread join, and
-//! the spawned-thread liveness check.
+//! `VmHost` lifecycle helpers that are not host-dispatch methods:
+//! on-demand top-level property init, spawned-thread join, and the
+//! spawned-thread liveness check.
 //!
-//! In Rust the `impl Host for VmHost` glue lived here; in Zig that glue
-//! is the vtable wiring in `vmhost.zig`, so this file holds the inherent
-//! free functions over `*VmHost` instead.
+//! In Rust the `impl Host for VmHost` glue lived here; in Zig the IR
+//! evaluator is generic over its host type and `vmhost.zig` aliases the
+//! per-operation free functions over `*VmHost` as `VmHost` methods, so
+//! this file holds the inherent free functions that are not part of that
+//! dispatch surface.
 
 const std = @import("std");
 
@@ -111,8 +113,7 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
     defer module_ref.deinit();
     const mg = module_ref.borrow();
     defer mg.deinit();
-    var iface = self.hostInterface();
-    const r = try ir.eval.evalWith(self.allocator, mg.get(), func, .empty, &iface);
+    const r = try ir.eval.evalWith(VmHost, self.allocator, mg.get(), func, .empty, self);
     switch (r) {
         .ok => |v| {
             const g = self.globals.borrowMut();

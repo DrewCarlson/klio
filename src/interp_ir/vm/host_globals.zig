@@ -2,8 +2,9 @@
 //! the throwing variant used during top-level init, on-demand lazy
 //! `object` initialization, and the shadowing-capture check.
 //!
-//! Free functions over `*VmHost`, wired into the `ir.eval.Host` vtable
-//! by `vmhost.zig`. The name-resolution probe chain in `lookupGlobal`
+//! Free functions over `*VmHost`, aliased as `VmHost` methods by
+//! `vmhost.zig` and invoked directly by the generic IR evaluator.
+//! The name-resolution probe chain in `lookupGlobal`
 //! mirrors the Rust `lookup_global`: cached global, deferred-`object`
 //! init, top-level-property init, delegate auto-resolve, user
 //! class/function, stdlib FQN probes, the loaded-pack overlay, the
@@ -291,8 +292,7 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
             break :blk_cid mg.get().classId(name);
         };
         if (class_id_opt) |class_id| {
-            const iface = self.hostInterface();
-            const r = iface.newInstance(allocator, class_id, &.{}) catch return null;
+            const r = self.newInstance(allocator, class_id, &.{}) catch return null;
             if (r == .ok and r.ok == .Instance) {
                 const inst = r.ok;
                 if (std.mem.indexOf(u8, name, "$Companion$")) |sep| {
@@ -338,8 +338,7 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
         if (cached) |v| {
             if (v == .Instance) {
                 const prop_ref = makePropertyRef(allocator, name) catch return null;
-                const iface = self.hostInterface();
-                const r = iface.callMember(allocator, &v, "getValue", &.{ Value.Null, prop_ref }) catch return null;
+                const r = self.callMember(allocator, &v, "getValue", &.{ Value.Null, prop_ref }) catch return null;
                 if (r == .ok) return r.ok;
             }
         }
@@ -358,8 +357,7 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
                 .Lazy => |lz| {
                     if (lz.cached) |c| return c;
                     const prod = lz.producer;
-                    const iface = self.hostInterface();
-                    const r = iface.callValue(allocator, &prod, &.{}) catch return v;
+                    const r = self.callValue(allocator, &prod, &.{}) catch return v;
                     if (r == .ok) {
                         const result = r.ok;
                         const g = d.borrowMut();
@@ -579,8 +577,7 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
         if (existing) |d| {
             if (d == .Instance) {
                 const prop_ref = try makePropertyRef(allocator, name);
-                const iface = self.hostInterface();
-                const r = try iface.callMember(allocator, &d, "setValue", &.{ Value.Null, prop_ref, value });
+                const r = try self.callMember(allocator, &d, "setValue", &.{ Value.Null, prop_ref, value });
                 if (r == .err) return .{ .err = r.err };
                 return .{ .ok = {} };
             }
@@ -620,8 +617,7 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
                         g.get().* = .{ .Observable = .{ .value = value, .on_change = on_change } };
                     }
                     const prop_ref = try makePropertyRef(allocator, name);
-                    const iface = self.hostInterface();
-                    const r = try iface.callValue(allocator, &on_change, &.{ prop_ref, old, value });
+                    const r = try self.callValue(allocator, &on_change, &.{ prop_ref, old, value });
                     if (r == .err) return .{ .err = r.err };
                     return .{ .ok = {} };
                 },
@@ -674,8 +670,7 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name: []const u
         if (raw) |rv| {
             if (rv == .Instance) {
                 const prop_ref = try makePropertyRef(allocator, name);
-                const iface = self.hostInterface();
-                const r = try iface.callMember(allocator, &rv, "getValue", &.{ Value.Null, prop_ref });
+                const r = try self.callMember(allocator, &rv, "getValue", &.{ Value.Null, prop_ref });
                 switch (r) {
                     .ok => |result| return .{ .ok = result },
                     .err => |e| return .{ .err = e },

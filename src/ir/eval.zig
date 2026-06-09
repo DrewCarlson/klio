@@ -430,21 +430,23 @@ fn coerceIntArgsToLong(func: *const Func, params: []Value) void {
 /// `args` ownership transfers in (it is the frame's params backing).
 pub fn eval(allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value)) Allocator.Error!EvalResult {
     var host = nullHost();
-    return evalWith(allocator, module, func, args, &host);
+    return evalWith(NullHost, allocator, module, func, args, &host);
 }
 
 /// Run a function body, routing non-trivial dispatch (`CallValue` /
 /// `CallMember` / `NewInstance` / `InstanceOf`) through the supplied
-/// host implementation.
-pub fn evalWith(allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value), host: *Host) Allocator.Error!EvalResult {
-    return evalWithCaptures(allocator, module, func, args, .empty, host);
+/// host implementation. `H` is the concrete host type, supplied at the
+/// call site (`VmHost` in the interpreter, `NullHost` in ir's own tests);
+/// every `host.method(...)` is a comptime-duck-typed direct call.
+pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value), host: *H) Allocator.Error!EvalResult {
+    return evalWithCaptures(H, allocator, module, func, args, .empty, host);
 }
 
 /// Like `evalWith` but seeds the frame with a captured-values vector.
 /// Used by closure invocation so `Inst.LoadCapture` reads from the
 /// closure's snapshotted env rather than the call args.
-pub fn evalWithCaptures(allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value), captures: std.ArrayList(Value), host: *Host) Allocator.Error!EvalResult {
-    return evalWithCapturesIn(allocator, module, null, func, args, captures, host);
+pub fn evalWithCaptures(comptime H: type, allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value), captures: std.ArrayList(Value), host: *H) Allocator.Error!EvalResult {
+    return evalWithCapturesIn(H, allocator, module, null, func, args, captures, host);
 }
 
 /// Run a method/closure that was lowered into a per-method *sub-module*
@@ -454,13 +456,14 @@ pub fn evalWithCaptures(allocator: Allocator, module: *const Module, func: *cons
 /// module, not the main one. `module` must be `owning` when `owning` is
 /// non-null.
 pub fn evalWithCapturesIn(
+    comptime H: type,
     allocator: Allocator,
     module: *const Module,
     owning: ?*const Module,
     func: *const Func,
     args: std.ArrayList(Value),
     captures: std.ArrayList(Value),
-    host: *Host,
+    host: *H,
 ) Allocator.Error!EvalResult {
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
@@ -471,7 +474,7 @@ pub fn evalWithCapturesIn(
     try frame.activateChain();
     defer frame.deactivateChain();
     const cur = func.entry;
-    var result = try runFrame(allocator, module, &frame, &try_stack, cur, 0, host);
+    var result = try runFrame(H, allocator, module, &frame, &try_stack, cur, 0, host);
     // A labeled return whose target is this function exits it as a
     // normal return. Other labels propagate further outward until the
     // matching frame catches them.
@@ -495,11 +498,12 @@ pub fn evalWithCapturesIn(
 /// completion (or re-suspends). When it returns, its value feeds the
 /// next-outer frame's resume register, and so on up the stack.
 pub fn resumeContinuation(
+    comptime H: type,
     allocator: Allocator,
     module: *const Module,
     state: *SuspendState,
     resume_value: Value,
-    host: *Host,
+    host: *H,
 ) Allocator.Error!EvalResult {
     var carry = resume_value;
     // `frames` is innermost-first (the deepest activation snapshots
@@ -556,7 +560,7 @@ pub fn resumeContinuation(
         var try_stack: std.ArrayList(TryFrame) = .empty;
         defer try_stack.deinit(allocator);
         try try_stack.appendSlice(allocator, snap.try_stack);
-        const r = try runFrameInner(allocator, m, &frame, &try_stack, snap.block, snap.inst_idx, resume_throw, host);
+        const r = try runFrameInner(H, allocator, m, &frame, &try_stack, snap.block, snap.inst_idx, resume_throw, host);
         switch (r) {
             .ok => |v| carry = v,
             .err => |e| switch (e) {
@@ -591,13 +595,14 @@ pub fn resumeContinuation(
 /// instruction index to begin at within `cur` (0 for a fresh call, the
 /// post-suspension index on resume).
 fn runFrame(
+    comptime H: type,
     allocator: Allocator,
     module: *const Module,
     frame: *Frame,
     try_stack: *std.ArrayList(TryFrame),
     cur: BlockId,
     resume_idx: usize,
-    host: *Host,
+    host: *H,
 ) Allocator.Error!EvalResult {
     // Every nested Kotlin call re-enters here (the host invokes a callable by
     // calling back into the evaluator). Bounding this depth converts an
@@ -608,7 +613,7 @@ fn runFrame(
     }
     eval_depth += 1;
     defer eval_depth -= 1;
-    return runFrameInner(allocator, module, frame, try_stack, cur, resume_idx, null, host);
+    return runFrameInner(H, allocator, module, frame, try_stack, cur, resume_idx, null, host);
 }
 
 fn typeRefName(name: []const u8) TypeRef {
@@ -622,6 +627,7 @@ fn typeRefName(name: []const u8) TypeRef {
 /// suspending call's value. This makes a cancellation actually preempt
 /// a parked `delay` / acquire.
 fn runFrameInner(
+    comptime H: type,
     allocator: Allocator,
     module: *const Module,
     frame: *Frame,
@@ -629,7 +635,7 @@ fn runFrameInner(
     cur_in: BlockId,
     resume_idx_in: usize,
     resume_throw_in: ?Value,
-    host: *Host,
+    host: *H,
 ) Allocator.Error!EvalResult {
     var cur = cur_in;
     var resume_idx = resume_idx_in;
@@ -667,7 +673,7 @@ fn runFrameInner(
         while (idx < insts.len) : (idx += 1) {
             if (idx < start_idx) continue;
             const inst = &insts[idx];
-            const r = try execInst(allocator, frame, inst, host);
+            const r = try execInst(H, allocator, frame, inst, host);
             switch (r) {
                 .ok => {},
                 .err => |e| switch (e) {
@@ -719,7 +725,7 @@ fn runFrameInner(
             // Mid-block throw — same try-stack walk as Terminator.Throw.
             var routed = false;
             while (try_stack.pop()) |tf| {
-                if (findCatch(host, &exc, tf.catches)) |h| {
+                if (findCatch(H, host, &exc, tf.catches)) |h| {
                     try frame.write(h.exception_reg, exc);
                     cur = h.handler;
                     routed = true;
@@ -790,7 +796,7 @@ fn runFrameInner(
                 pending_rethrow = null;
                 var routed = false;
                 while (try_stack.pop()) |tf| {
-                    if (findCatch(host, &exc, tf.catches)) |h| {
+                    if (findCatch(H, host, &exc, tf.catches)) |h| {
                         try frame.write(h.exception_reg, exc);
                         cur = h.handler;
                         routed = true;
@@ -868,7 +874,7 @@ fn runFrameInner(
                 // Walk the try stack for a matching handler.
                 var routed = false;
                 while (try_stack.pop()) |tf| {
-                    if (findCatch(host, &exc, tf.catches)) |h| {
+                    if (findCatch(H, host, &exc, tf.catches)) |h| {
                         try frame.write(h.exception_reg, exc);
                         cur = h.handler;
                         routed = true;
@@ -968,7 +974,7 @@ fn rpositionByFinallyEntry(items: []const TryFrame, cur: BlockId) ?usize {
     return null;
 }
 
-fn findCatch(host: *Host, exc: *const Value, catches: []const ir.CatchHandler) ?ir.CatchHandler {
+fn findCatch(comptime H: type, host: *H, exc: *const Value, catches: []const ir.CatchHandler) ?ir.CatchHandler {
     for (catches) |h| {
         if (host.instanceOf(exc, typeRefName(h.type_name))) return h;
     }
@@ -1002,7 +1008,7 @@ fn constStr(module: *const Module, id: ConstId) ?[]const u8 {
     };
 }
 
-fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host) Allocator.Error!EvalResult {
+fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!EvalResult {
     switch (inst.*) {
         .SuspendResumePoint => {
             // No runtime effect on its own.
@@ -1088,11 +1094,11 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
             // visibility filter accepts the member-ext owner.
             var pushed_enclosing = false;
             if (frame.params.items.len > 0 and frame.params.items[0] == .Instance) {
-                host.pushAccessEnclosing(&frame.params.items[0]);
+                pushEnclosing(&frame.params.items[0]);
                 pushed_enclosing = true;
             }
             const extension_result = try host.callMember(allocator, &v, method, &.{});
-            if (pushed_enclosing) host.popAccessEnclosing();
+            if (pushed_enclosing) popEnclosing();
             switch (extension_result) {
                 .ok => |rv| {
                     try frame.write(u.dst, rv);
@@ -1114,11 +1120,11 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
             // StringConcat over a Value.Instance routes the instance
             // through toString so user-defined overrides fire.
             if (bo.op == .StringConcat) {
-                const ls = switch (try stringify(allocator, host, &l)) {
+                const ls = switch (try stringify(H, allocator, host, &l)) {
                     .ok => |s| s,
                     .err => |e| return errResult(e),
                 };
-                const rs = switch (try stringify(allocator, host, &r)) {
+                const rs = switch (try stringify(H, allocator, host, &r)) {
                     .ok => |s| s,
                     .err => |e| return errResult(e),
                 };
@@ -1238,12 +1244,12 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
                 const pi = frame.params.items[0].Instance;
                 const same = recv == .Instance and ObjRef(InstanceData).ptrEq(pi, recv.Instance);
                 if (!same) {
-                    host.pushAccessEnclosing(&frame.params.items[0]);
+                    pushEnclosing(&frame.params.items[0]);
                     pushed_enclosing = true;
                 }
             }
             const got = host.getField(allocator, &recv, name);
-            if (pushed_enclosing) host.popAccessEnclosing();
+            if (pushed_enclosing) popEnclosing();
             switch (try got) {
                 .ok => |v| try frame.write(gf.dst, v),
                 .err => |e| return errResult(e),
@@ -1287,14 +1293,14 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
                         const same = arg_values.len > 0 and arg_values[0] == .Instance and
                             ObjRef(InstanceData).ptrEq(p.Instance, arg_values[0].Instance);
                         if (!same) {
-                            host.pushAccessEnclosing(&frame.params.items[ct_idx]);
+                            pushEnclosing(&frame.params.items[ct_idx]);
                             pushed_enclosing = true;
                         }
                     }
                 }
             }
             const res = host.callFuncTyped(allocator, frame.module, call.func, arg_values, names, ta.items, call.exact);
-            if (pushed_enclosing) host.popAccessEnclosing();
+            if (pushed_enclosing) popEnclosing();
             switch (try res) {
                 .ok => |result| try frame.write(call.dst, result),
                 .err => |e| return errResult(e),
@@ -1338,12 +1344,12 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
             var pushed_caller_this = false;
             if (callee_v == .IrClosure) {
                 if (caller_this) |ct| {
-                    host.pushAccessEnclosing(&ct);
+                    pushEnclosing(&ct);
                     pushed_caller_this = true;
                 }
             }
             const result = host.callValueNamed(allocator, &callee_v, arg_values_list.items, names_list.items);
-            if (pushed_caller_this) host.popAccessEnclosing();
+            if (pushed_caller_this) popEnclosing();
             switch (try result) {
                 .ok => |rv| try frame.write(cv.dst, rv),
                 .err => |e| return errResult(e),
@@ -1409,7 +1415,7 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
                 .err => |e| return errResult(e),
             }
         },
-        .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(allocator, frame, cmg, host),
+        .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |cm| {
             const recv = frame.read(cm.receiver);
             const name_str = constStr(frame.module, cm.name) orelse
@@ -1425,12 +1431,12 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
                 const pi = frame.params.items[0].Instance;
                 const same = recv == .Instance and ObjRef(InstanceData).ptrEq(pi, recv.Instance);
                 if (!same) {
-                    host.pushAccessEnclosing(&frame.params.items[0]);
+                    pushEnclosing(&frame.params.items[0]);
                     pushed_enclosing = true;
                 }
             }
             const res = host.callMemberNamed(allocator, &recv, name_str, arg_values, names);
-            if (pushed_enclosing) host.popAccessEnclosing();
+            if (pushed_enclosing) popEnclosing();
             switch (try res) {
                 .ok => |rv| try frame.write(cm.dst, rv),
                 .err => |e| return errResult(e),
@@ -1537,7 +1543,7 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
             const v = frame.read(cast.src);
             if (host.instanceOf(&v, cast.ty)) {
                 try frame.write(cast.dst, v);
-            } else if (typeParamCastPasses(frame, cast.ty, host)) {
+            } else if (typeParamCastPasses(H, frame, cast.ty, host)) {
                 try frame.write(cast.dst, v);
             } else if (cast.safe) {
                 try frame.write(cast.dst, .Null);
@@ -1624,7 +1630,7 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
             } else {
                 // Receiver-lambda fallback.
                 var resolved: ?Value = null;
-                const chain = try host.enclosingThisChain(allocator);
+                const chain = try enclosingThisChainAlloc(allocator);
                 defer allocator.free(chain);
                 for (chain) |outer| {
                     if (outer == .Null or outer == .Unit) continue;
@@ -1655,7 +1661,7 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
             const this_val = implicitThisValue(frame, lt.this_idx, false);
             var resolved: ?Value = null;
             {
-                const chain = try implicitReceiverChain(allocator, host, this_val);
+                const chain = try implicitReceiverChain(allocator, this_val);
                 defer allocator.free(chain);
                 for (chain) |recv| {
                     if (recv == .Null or recv == .Unit) continue;
@@ -1749,7 +1755,7 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
 /// `name(args)` where `name` resolves to an in-scope value that also
 /// names a member function of the enclosing class. Mirrors the Rust
 /// `Inst::CallMemberOrGlobal` arm.
-fn execCallMemberOrGlobal(allocator: Allocator, frame: *Frame, cmg: anytype, host: *Host) Allocator.Error!EvalResult {
+fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!EvalResult {
     const name_str = constStr(frame.module, cmg.name) orelse
         return errResult(.{ .Type = "CallMemberOrGlobal: name not a string const" });
     const arg_values = try readArgRun(allocator, frame, cmg.args, cmg.n_args);
@@ -1775,7 +1781,7 @@ fn execCallMemberOrGlobal(allocator: Allocator, frame: *Frame, cmg: anytype, hos
     // own `this` or of any lexically enclosing `this@…` outranks a
     // same-named top-level extension.
     if (!is_ctor_name and !shadow_capture) {
-        const chain = try implicitReceiverChain(allocator, host, this_val);
+        const chain = try implicitReceiverChain(allocator, this_val);
         defer allocator.free(chain);
         for (chain) |recv| {
             if (recv == .Null or recv == .Unit) continue;
@@ -1808,7 +1814,7 @@ fn execCallMemberOrGlobal(allocator: Allocator, frame: *Frame, cmg: anytype, hos
     }
     // Enclosing-receiver fallback.
     if (resolved == null and !shadow_capture) {
-        if (host.enclosingThis()) |outer| {
+        if (enclosingThisLast()) |outer| {
             if (outer != .Null and outer != .Unit) {
                 switch (try host.callMemberNamed(allocator, &outer, name_str, arg_values, names)) {
                     .ok => |v| resolved = v,
@@ -1862,7 +1868,7 @@ fn execCallMemberOrGlobal(allocator: Allocator, frame: *Frame, cmg: anytype, hos
     }
     // Lexically-enclosing receivers as extension candidates.
     if (resolved == null and !is_ctor_name and !shadow_capture) {
-        const chain = try implicitReceiverChain(allocator, host, this_val);
+        const chain = try implicitReceiverChain(allocator, this_val);
         defer allocator.free(chain);
         if (chain.len > 1) {
             for (chain[1..]) |recv| {
@@ -1917,7 +1923,7 @@ fn execCallMemberOrGlobal(allocator: Allocator, frame: *Frame, cmg: anytype, hos
                     }
                 }
                 if (own_this == null) {
-                    const ec = try host.enclosingThisChain(allocator);
+                    const ec = try enclosingThisChainAlloc(allocator);
                     defer allocator.free(ec);
                     for (ec) |v| {
                         if (v == .Instance and host.hostHasMember(&v, name_str)) {
@@ -2023,11 +2029,11 @@ fn implicitThisValue(frame: *const Frame, this_idx: usize, consult_param: bool) 
 /// The ordered implicit-receiver chain a bare name is resolved against:
 /// the frame's own implicit `this` (when present) followed by each
 /// lexically-enclosing `this@…`. Caller frees the returned slice.
-fn implicitReceiverChain(allocator: Allocator, host: *Host, this_val: Value) Allocator.Error![]Value {
+fn implicitReceiverChain(allocator: Allocator, this_val: Value) Allocator.Error![]Value {
     var chain: std.ArrayList(Value) = .empty;
     errdefer chain.deinit(allocator);
     if (this_val != .Null and this_val != .Unit) try chain.append(allocator, this_val);
-    const ec = try host.enclosingThisChain(allocator);
+    const ec = try enclosingThisChainAlloc(allocator);
     defer allocator.free(ec);
     try chain.appendSlice(allocator, ec);
     return chain.toOwnedSlice(allocator);
@@ -2190,7 +2196,7 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
 /// `Value.Instance`, dispatches `toString()` through the host so
 /// user-defined overrides fire; primitives use `renderValue`'s fast
 /// path. Caller owns the returned string.
-fn stringify(allocator: Allocator, host: *Host, v: *const Value) Allocator.Error!union(enum) { ok: []const u8, err: EvalError } {
+fn stringify(comptime H: type, allocator: Allocator, host: *H, v: *const Value) Allocator.Error!union(enum) { ok: []const u8, err: EvalError } {
     if (v.* == .Instance) {
         switch (try host.callMember(allocator, v, "toString", &.{})) {
             .ok => |result| {
@@ -2229,7 +2235,7 @@ fn isErasedTypeParamName(name: []const u8) bool {
 
 /// Whether a non-`instance_of` cast still passes because the target is
 /// an erased type parameter (unchecked cast on the JVM).
-fn typeParamCastPasses(frame: *const Frame, ty: TypeRef, host: *Host) bool {
+fn typeParamCastPasses(comptime H: type, frame: *const Frame, ty: TypeRef, host: *H) bool {
     if (frame.module.registry.func_type_params.get(frame.func.id)) |tps| {
         for (tps.items) |t| {
             if (std.mem.eql(u8, t, ty.name)) return true;
@@ -2671,90 +2677,51 @@ pub const UnitResult = union(enum) {
 /// `(n_params, first_param_is_this)` shape report for a callable.
 pub const ReceiverShape = struct { n_params: usize, first_is_this: bool };
 
-/// Pluggable callbacks the evaluator delegates non-trivial dispatch
-/// through. A `{ctx, vtable}` pair mirroring Rust's `&mut dyn Host`.
-/// Vtable slots that were trait defaults are optional; `null` selects
-/// the default behavior implemented in the wrapper methods below.
-pub const Host = struct {
-    ctx: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        call_value: ?*const fn (ctx: *anyopaque, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult = null,
-        call_value_named: ?*const fn (ctx: *anyopaque, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
-        call_member: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult = null,
-        call_member_named: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
-        host_has_member: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8) bool = null,
-        new_instance: ?*const fn (ctx: *anyopaque, allocator: Allocator, class: ClassId, args: []const Value) Allocator.Error!EvalResult = null,
-        new_instance_named: ?*const fn (ctx: *anyopaque, allocator: Allocator, class: ClassId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
-        get_field: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult = null,
-        set_field: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult = null,
-        instance_of: ?*const fn (ctx: *anyopaque, value: *const Value, ty: TypeRef) bool = null,
-        is_concrete_cast_target: ?*const fn (ctx: *anyopaque, name: []const u8) bool = null,
-        lookup_global: ?*const fn (ctx: *anyopaque, name: []const u8) ?Value = null,
-        lookup_global_throwing: ?*const fn (ctx: *anyopaque, allocator: Allocator, name: []const u8) Allocator.Error!MaybeValueResult = null,
-        store_global: ?*const fn (ctx: *anyopaque, allocator: Allocator, name: []const u8, value: Value) Allocator.Error!UnitResult = null,
-        register_class: ?*const fn (ctx: *anyopaque, allocator: Allocator, class: *const @import("ast").Class) Allocator.Error!UnitResult = null,
-        register_class_captured: ?*const fn (ctx: *anyopaque, allocator: Allocator, class: *const @import("ast").Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult = null,
-        build_object: ?*const fn (ctx: *anyopaque, allocator: Allocator, ast: *const @import("ast").Expr, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult = null,
-        call_value_with_this: ?*const fn (ctx: *anyopaque, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
-        call_super: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
-        qualified_this: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult = null,
-        member_ref: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult = null,
-        build_closure: ?*const fn (ctx: *anyopaque, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult = null,
-        build_ast_lambda: ?*const fn (ctx: *anyopaque, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult = null,
-        build_ast_lambda_with_flag: ?*const fn (ctx: *anyopaque, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool) Allocator.Error!EvalResult = null,
-        build_ast_lambda_with_flag_funcid: ?*const fn (ctx: *anyopaque, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult = null,
-        call_func: ?*const fn (ctx: *anyopaque, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value) Allocator.Error!EvalResult = null,
-        call_func_named: ?*const fn (ctx: *anyopaque, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
-        call_func_typed: ?*const fn (ctx: *anyopaque, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult = null,
-        call_named_overload: ?*const fn (ctx: *anyopaque, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult = null,
-        callable_receiver_shape: ?*const fn (ctx: *anyopaque, v: *const Value) ?ReceiverShape = null,
-        closure_needs_this_capture: ?*const fn (ctx: *anyopaque, v: *const Value) bool = null,
-        override_closure_this: ?*const fn (ctx: *anyopaque, v: *const Value, new_this: *const Value) void = null,
-        call_member_only: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
-        push_inner_outer_hint: ?*const fn (ctx: *anyopaque, v: *const Value) void = null,
-        pop_inner_outer_hint: ?*const fn (ctx: *anyopaque) void = null,
-        is_shadowing_capture: ?*const fn (ctx: *anyopaque, name: []const u8) bool = null,
-    };
-
-    pub fn callValue(self: Host, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
-        if (self.vtable.call_value) |f| return f(self.ctx, allocator, callee, args);
+/// No-op host for ir's own unit tests and IR-shape exercises, and the
+/// default host for the bare `eval` entry. A concrete second host type
+/// alongside the interpreter's `VmHost`: every method is the trait-default
+/// the old vtable returned when a slot was `null`
+/// (`Unsupported`/`null`/`false`/empty), so all dispatch paths behave
+/// exactly like Rust's `NullHost`. The evaluator is generic over the host
+/// type and calls these as plain comptime-duck-typed methods.
+pub const NullHost = struct {
+    pub fn callValue(self: *NullHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, callee, args };
         return errResult(.{ .Unsupported = "Host.call_value" });
     }
 
-    pub fn callValueNamed(self: Host, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-        if (self.vtable.call_value_named) |f| return f(self.ctx, allocator, callee, args, arg_names);
+    pub fn callValueNamed(self: *NullHost, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+        _ = arg_names;
         return self.callValue(allocator, callee, args);
     }
 
-    pub fn callMember(self: Host, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
-        if (self.vtable.call_member) |f| return f(self.ctx, allocator, receiver, name, args);
+    pub fn callMember(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, receiver, name, args };
         return errResult(.{ .Unsupported = "Host.call_member" });
     }
 
-    pub fn callMemberNamed(self: Host, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-        if (self.vtable.call_member_named) |f| return f(self.ctx, allocator, receiver, name, args, arg_names);
+    pub fn callMemberNamed(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+        _ = arg_names;
         return self.callMember(allocator, receiver, name, args);
     }
 
-    pub fn hostHasMember(self: Host, receiver: *const Value, name: []const u8) bool {
-        if (self.vtable.host_has_member) |f| return f(self.ctx, receiver, name);
+    pub fn hostHasMember(self: *NullHost, receiver: *const Value, name: []const u8) bool {
+        _ = .{ self, receiver, name };
         return false;
     }
 
-    pub fn newInstance(self: Host, allocator: Allocator, class: ClassId, args: []const Value) Allocator.Error!EvalResult {
-        if (self.vtable.new_instance) |f| return f(self.ctx, allocator, class, args);
+    pub fn newInstance(self: *NullHost, allocator: Allocator, class: ClassId, args: []const Value) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, class, args };
         return errResult(.{ .Unsupported = "Host.new_instance" });
     }
 
-    pub fn newInstanceNamed(self: Host, allocator: Allocator, class: ClassId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-        if (self.vtable.new_instance_named) |f| return f(self.ctx, allocator, class, args, arg_names);
+    pub fn newInstanceNamed(self: *NullHost, allocator: Allocator, class: ClassId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+        _ = arg_names;
         return self.newInstance(allocator, class, args);
     }
 
-    pub fn getField(self: Host, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-        if (self.vtable.get_field) |f| return f(self.ctx, allocator, receiver, name);
+    pub fn getField(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+        _ = self;
         switch (receiver.*) {
             .Instance => |inst| {
                 const g = inst.borrow();
@@ -2769,8 +2736,8 @@ pub const Host = struct {
         }
     }
 
-    pub fn setField(self: Host, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {
-        if (self.vtable.set_field) |f| return f(self.ctx, allocator, receiver, name, value);
+    pub fn setField(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {
+        _ = self;
         switch (receiver.*) {
             .Instance => |inst| {
                 const g = inst.borrowMut();
@@ -2787,8 +2754,8 @@ pub const Host = struct {
         }
     }
 
-    pub fn instanceOf(self: Host, value: *const Value, ty: TypeRef) bool {
-        if (self.vtable.instance_of) |f| return f(self.ctx, value, ty);
+    pub fn instanceOf(self: *NullHost, value: *const Value, ty: TypeRef) bool {
+        _ = self;
         const nominal = value.typeFqn();
         if (std.mem.eql(u8, nominal, ty.name)) return true;
         // nominal.ends_with(".{ty.name}")
@@ -2801,83 +2768,83 @@ pub const Host = struct {
         return false;
     }
 
-    pub fn isConcreteCastTarget(self: Host, name: []const u8) bool {
-        if (self.vtable.is_concrete_cast_target) |f| return f(self.ctx, name);
+    pub fn isConcreteCastTarget(self: *NullHost, name: []const u8) bool {
+        _ = .{ self, name };
         return true;
     }
 
-    pub fn lookupGlobal(self: Host, name: []const u8) ?Value {
-        if (self.vtable.lookup_global) |f| return f(self.ctx, name);
+    pub fn lookupGlobal(self: *NullHost, name: []const u8) ?Value {
+        _ = .{ self, name };
         return null;
     }
 
-    pub fn lookupGlobalThrowing(self: Host, allocator: Allocator, name: []const u8) Allocator.Error!MaybeValueResult {
-        if (self.vtable.lookup_global_throwing) |f| return f(self.ctx, allocator, name);
+    pub fn lookupGlobalThrowing(self: *NullHost, allocator: Allocator, name: []const u8) Allocator.Error!MaybeValueResult {
+        _ = allocator;
         return .{ .ok = self.lookupGlobal(name) };
     }
 
-    pub fn storeGlobal(self: Host, allocator: Allocator, name: []const u8, value: Value) Allocator.Error!UnitResult {
-        if (self.vtable.store_global) |f| return f(self.ctx, allocator, name, value);
+    pub fn storeGlobal(self: *NullHost, allocator: Allocator, name: []const u8, value: Value) Allocator.Error!UnitResult {
+        _ = .{ self, allocator, name, value };
         return .{ .err = .{ .Unsupported = "Host.store_global" } };
     }
 
-    pub fn registerClass(self: Host, allocator: Allocator, class: *const @import("ast").Class) Allocator.Error!UnitResult {
-        if (self.vtable.register_class) |f| return f(self.ctx, allocator, class);
+    pub fn registerClass(self: *NullHost, allocator: Allocator, class: *const @import("ast").Class) Allocator.Error!UnitResult {
+        _ = .{ self, allocator, class };
         return .{ .err = .{ .Unsupported = "Host.register_class" } };
     }
 
-    pub fn registerClassCaptured(self: Host, allocator: Allocator, class: *const @import("ast").Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult {
-        if (self.vtable.register_class_captured) |f| return f(self.ctx, allocator, class, captured_names, captures);
+    pub fn registerClassCaptured(self: *NullHost, allocator: Allocator, class: *const @import("ast").Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult {
+        _ = .{ captured_names, captures };
         return self.registerClass(allocator, class);
     }
 
-    pub fn buildObject(self: Host, allocator: Allocator, ast: *const @import("ast").Expr, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult {
-        if (self.vtable.build_object) |f| return f(self.ctx, allocator, ast, captured_names, captures);
+    pub fn buildObject(self: *NullHost, allocator: Allocator, ast: *const @import("ast").Expr, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, ast, captured_names, captures };
         return errResult(.{ .Unsupported = "Host.build_object" });
     }
 
-    pub fn callValueWithThis(self: Host, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-        if (self.vtable.call_value_with_this) |f| return f(self.ctx, allocator, callee, this_value, args, arg_names);
+    pub fn callValueWithThis(self: *NullHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, callee, this_value, args, arg_names };
         return errResult(.{ .Unsupported = "Host.call_value_with_this" });
     }
 
-    pub fn callSuper(self: Host, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-        if (self.vtable.call_super) |f| return f(self.ctx, allocator, receiver, owner_class, qualifier, name, args, arg_names);
+    pub fn callSuper(self: *NullHost, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, receiver, owner_class, qualifier, name, args, arg_names };
         return errResult(.{ .Unsupported = "Host.call_super" });
     }
 
-    pub fn qualifiedThis(self: Host, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {
-        if (self.vtable.qualified_this) |f| return f(self.ctx, allocator, receiver, qualifier);
+    pub fn qualifiedThis(self: *NullHost, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, receiver, qualifier };
         return errResult(.{ .Unsupported = "Host.qualified_this" });
     }
 
-    pub fn memberRef(self: Host, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-        if (self.vtable.member_ref) |f| return f(self.ctx, allocator, receiver, name);
+    pub fn memberRef(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, receiver, name };
         return errResult(.{ .Unsupported = "Host.member_ref" });
     }
 
-    pub fn buildClosure(self: Host, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {
-        if (self.vtable.build_closure) |f| return f(self.ctx, allocator, module, body_func, captures);
+    pub fn buildClosure(self: *NullHost, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, module, body_func, captures };
         return errResult(.{ .Unsupported = "Host.build_closure" });
     }
 
-    pub fn buildAstLambda(self: Host, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult {
-        if (self.vtable.build_ast_lambda) |f| return f(self.ctx, allocator, params, body, captured_names, captures);
+    pub fn buildAstLambda(self: *NullHost, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, params, body, captured_names, captures };
         return errResult(.{ .Unsupported = "Host.build_ast_lambda" });
     }
 
-    pub fn buildAstLambdaWithFlag(self: Host, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool) Allocator.Error!EvalResult {
-        if (self.vtable.build_ast_lambda_with_flag) |f| return f(self.ctx, allocator, params, body, captured_names, captures, absorb_return);
+    pub fn buildAstLambdaWithFlag(self: *NullHost, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool) Allocator.Error!EvalResult {
+        _ = absorb_return;
         return self.buildAstLambda(allocator, params, body, captured_names, captures);
     }
 
-    pub fn buildAstLambdaWithFlagFuncid(self: Host, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
-        if (self.vtable.build_ast_lambda_with_flag_funcid) |f| return f(self.ctx, allocator, params, body, captured_names, captures, absorb_return, body_func);
+    pub fn buildAstLambdaWithFlagFuncid(self: *NullHost, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
+        _ = body_func;
         return self.buildAstLambdaWithFlag(allocator, params, body, captured_names, captures, absorb_return);
     }
 
-    pub fn callFunc(self: Host, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value) Allocator.Error!EvalResult {
-        if (self.vtable.call_func) |f| return f(self.ctx, allocator, module, func, args);
+    pub fn callFunc(self: *NullHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value) Allocator.Error!EvalResult {
+        _ = self;
         if (func.int() >= module.funcs.items.len) {
             const msg = try std.fmt.allocPrint(allocator, "unknown FuncId {d}", .{func.int()});
             return errResult(.{ .Type = msg });
@@ -2888,82 +2855,55 @@ pub const Host = struct {
         return eval(allocator, module, f, args_list);
     }
 
-    pub fn callFuncNamed(self: Host, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-        if (self.vtable.call_func_named) |f| return f(self.ctx, allocator, module, func, args, arg_names);
+    pub fn callFuncNamed(self: *NullHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+        _ = arg_names;
         return self.callFunc(allocator, module, func, args);
     }
 
-    pub fn callFuncTyped(self: Host, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
-        if (self.vtable.call_func_typed) |f| return f(self.ctx, allocator, module, func, args, arg_names, type_args, exact);
+    pub fn callFuncTyped(self: *NullHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
+        _ = .{ type_args, exact };
         return self.callFuncNamed(allocator, module, func, args, arg_names);
     }
 
-    pub fn callNamedOverload(self: Host, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
-        if (self.vtable.call_named_overload) |f| return f(self.ctx, allocator, module, name, args, arg_names);
+    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
+        _ = .{ self, allocator, module, name, args, arg_names };
         return .{ .ok = null };
     }
 
-    pub fn enclosingThis(self: Host) ?Value {
-        _ = self;
-        return enclosingThisLast();
-    }
-
-    pub fn enclosingThisChain(self: Host, allocator: Allocator) Allocator.Error![]Value {
-        _ = self;
-        return enclosingThisChainAlloc(allocator);
-    }
-
-    pub fn callableReceiverShape(self: Host, v: *const Value) ?ReceiverShape {
-        if (self.vtable.callable_receiver_shape) |f| return f(self.ctx, v);
+    pub fn callableReceiverShape(self: *NullHost, v: *const Value) ?ReceiverShape {
+        _ = .{ self, v };
         return null;
     }
 
-    pub fn closureNeedsThisCapture(self: Host, v: *const Value) bool {
-        if (self.vtable.closure_needs_this_capture) |f| return f(self.ctx, v);
+    pub fn closureNeedsThisCapture(self: *NullHost, v: *const Value) bool {
+        _ = .{ self, v };
         return false;
     }
 
-    pub fn overrideClosureThis(self: Host, v: *const Value, new_this: *const Value) void {
-        if (self.vtable.override_closure_this) |f| f(self.ctx, v, new_this);
+    pub fn overrideClosureThis(self: *NullHost, v: *const Value, new_this: *const Value) void {
+        _ = .{ self, v, new_this };
     }
 
-    pub fn callMemberOnly(self: Host, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-        if (self.vtable.call_member_only) |f| return f(self.ctx, allocator, receiver, name, args, arg_names);
+    pub fn callMemberOnly(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
         return self.callMemberNamed(allocator, receiver, name, args, arg_names);
     }
 
-    pub fn pushAccessEnclosing(self: Host, v: *const Value) void {
+    pub fn pushInnerOuterHint(self: *NullHost, v: *const Value) void {
+        _ = .{ self, v };
+    }
+
+    pub fn popInnerOuterHint(self: *NullHost) void {
         _ = self;
-        pushEnclosing(v);
     }
 
-    pub fn popAccessEnclosing(self: Host) void {
-        _ = self;
-        popEnclosing();
-    }
-
-    pub fn pushInnerOuterHint(self: Host, v: *const Value) void {
-        if (self.vtable.push_inner_outer_hint) |f| f(self.ctx, v);
-    }
-
-    pub fn popInnerOuterHint(self: Host) void {
-        if (self.vtable.pop_inner_outer_hint) |f| f(self.ctx);
-    }
-
-    pub fn isShadowingCapture(self: Host, name: []const u8) bool {
-        if (self.vtable.is_shadowing_capture) |f| return f(self.ctx, name);
+    pub fn isShadowingCapture(self: *NullHost, name: []const u8) bool {
+        _ = .{ self, name };
         return false;
     }
 };
 
-/// No-op host for unit tests and IR-shape exercises. Every vtable slot
-/// is left at its default, so all dispatch paths report
-/// `Unsupported`/`null`/`false` exactly like Rust's `NullHost`.
-const null_vtable: Host.VTable = .{};
-var null_ctx: u8 = 0;
-
-pub fn nullHost() Host {
-    return .{ .ctx = &null_ctx, .vtable = &null_vtable };
+pub fn nullHost() NullHost {
+    return .{};
 }
 
 // -------------------------------------------------------------------------
