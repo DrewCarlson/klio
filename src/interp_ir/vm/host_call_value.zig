@@ -92,7 +92,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             // a top-level fn) keeps dispatching the member.
             if (r == .err and r.err == .Unimplemented) {
                 if (host_globals.lookupGlobal(self, name)) |callable| {
-                    if (callable == .Function or callable == .IrClosure or callable == .Lambda) {
+                    if (callable == .Function or callable == .IrClosure) {
                         return callValue(self, allocator, &callable, args);
                     }
                 }
@@ -212,7 +212,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 if (mg.get().funcId(name) != null) break :blk true;
             }
             if (host_globals.lookupGlobal(self, name)) |g| {
-                break :blk (g == .Function or g == .IrClosure or g == .Lambda);
+                break :blk (g == .Function or g == .IrClosure);
             }
             break :blk false;
         };

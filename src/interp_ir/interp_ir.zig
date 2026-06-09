@@ -557,7 +557,7 @@ pub fn isFunctionType(ty: *const TypeRef) bool {
 /// Whether a runtime value can be invoked as `f(...)`.
 pub fn valueIsCallable(v: *const Value) bool {
     return switch (v.*) {
-        .IrClosure, .Lambda, .Function, .Intrinsic, .BoundMethod, .PropertyRef => true,
+        .IrClosure, .Function, .Intrinsic, .BoundMethod, .PropertyRef => true,
         else => false,
     };
 }

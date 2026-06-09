@@ -127,7 +127,7 @@ pub fn concurrent_synchronized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
 /// Whether a value is something we can invoke as a thread body.
 fn isCallable(v: Value) bool {
     return switch (v) {
-        .Function, .Lambda, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => true,
+        .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => true,
         else => false,
     };
 }

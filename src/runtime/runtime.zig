@@ -140,8 +140,6 @@ test {
 // Tests (mirrors the Rust crate's `lib.rs` `mod tests`)
 // -------------------------------------------------------------------------
 
-const ast = @import("ast");
-const span = @import("span");
 const testing = std.testing;
 
 const InstanceField = class_mod.InstanceData.Field;
@@ -355,7 +353,8 @@ test "publish deep cyclic graph terminates" {
         try g.get().fields.append(a, .{ .name = "self", .value = .{ .Cell = cell } });
     }
 
-    // Env whose parent chain loops back on itself.
+    // Env whose parent chain loops back on itself, reachable from the
+    // instance through its class's captured env.
     const env_cell = try ObjRef(Env).init(a, Env.init(a));
     {
         const g = env_cell.borrowMut();
@@ -363,17 +362,13 @@ test "publish deep cyclic graph terminates" {
         g.get().parent = env_cell;
         try g.get().define("here", .{ .Instance = inst });
     }
-    const empty_block = try a.create(ast.Block);
-    empty_block.* = .{ .stmts = &.{}, .span = span.Span.init(span.FileId.from(0), 0, 0) };
-    const lam = Value{ .Lambda = .{
-        .params = try ObjRef([]const []const u8).init(a, &.{}),
-        .body = empty_block,
-        .env = env_cell,
-        .absorb_return = false,
-    } };
+    {
+        const cg = cls.borrowMut();
+        defer cg.deinit();
+        cg.get().captured_env = env_cell;
+    }
 
     (Value{ .Instance = inst }).publishDeep(a);
-    lam.publishDeep(a);
 
     try testing.expect(inst.isShared());
     try testing.expect(cell.isShared());

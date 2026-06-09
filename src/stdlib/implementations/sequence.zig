@@ -342,7 +342,7 @@ pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 fn isLambdaLike(v: Value) bool {
-    return v == .Lambda or v == .IrClosure;
+    return v == .IrClosure;
 }
 
 // ============================================================

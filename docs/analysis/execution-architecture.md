@@ -397,13 +397,16 @@ that these agree.
 `intrinsic_host.zig:308,521`, plus the resume path). Capture metadata is also
 computed twice: lowering records `capture_order` (`src/ir/build.zig:435-458`),
 and runtime `buildClosure` re-reads it (`host_call_value.zig:484-527`), so a
-mismatch silently mis-binds captures by position. `Value.Lambda`
-(`src/runtime/value.zig:287-303`) is a dead AST-closure representation
-constructed only in tests — two sites, both test-only: a GC unit test
-(`src/runtime/runtime.zig:360`) and a typeck unit test
-(`src/typeck/check/tests.zig:313`) — yet handled in **31** `.Lambda =>` switch
-arms across the tree. Deleting it (§4.5 / §6 item 11) therefore means removing
-the two test constructors and auditing all 31 arms, not a handful.
+mismatch silently mis-binds captures by position. `Value.Lambda` (formerly
+`src/runtime/value.zig:287-303`) was a dead Env-based closure representation
+parallel to `Value.IrClosure`: the live interp_ir pipeline never produced it (the
+`AstLambda` instruction's runtime handler `buildAstLambdaWithFlagFuncid` already
+built an `IrClosure`), and the only constructor was a single GC unit test
+(`src/runtime/runtime.zig`). **Deleted (§6 item 11):** the variant, the test
+constructor, and every Value-context `.Lambda =>` arm. The capture authority is
+now `func.capture_order` flowing through `ClosureInfo.captures`; there is no
+parallel per-value Env snapshot. (`tests.zig:313` builds `Expr.Lambda`, the AST
+syntax node, which is unrelated and stays.)
 
 ---
 
@@ -416,10 +419,12 @@ class.
 
 ### 4.1 One closure value, one capture store, one invocation routine (→ Class A)
 
-- **One representation.** `Value.IrClosure` holds only the stable `id`. The
-  single source-of-truth capture vector lives in `ClosureInfo.captures` (the
-  shared cell). Delete the per-value snapshot slice and `Value.Lambda` (the
-  unused AST closure) once confirmed unreachable.
+- **One representation.** `Value.IrClosure` holds the stable `id` plus its
+  capture snapshot. The single source-of-truth capture vector lives in
+  `ClosureInfo.captures` (the shared cell). `Value.Lambda` (the parallel
+  Env-based closure) is deleted (§6 item 11): it was unreachable on the live
+  interp_ir pipeline, so `IrClosure` is the sole closure value form. The
+  per-value snapshot slice on `IrClosure` is the remaining duplication to fold.
 - **One routine.** A single `invokeClosure(id, args, this_override)` reads/writes
   the cell and uses one env strategy. `host_call_value.callValue` and
   `intrinsic_host.invokeCallable`/`invokeCallableWithThis`/`evalClosureRaw` all
@@ -675,7 +680,7 @@ refactors, then the structural unifications in dependency order.
 | 8 | Per-decl package tag + two-phase header registration + package/FQN symbol index; lowering emits FQN-qualified calls; remove `isShippedFqn`/prefix-ladder/suffix-scan — tighten simple-name fallback ONLY after §4.4-item-3 uniqueness proven | C | high | high | XL |
 | 9 | One executable form per symbol resolved at link time; remove per-call FQN short-circuit (§4.4) | C | high | high | XL |
 | 10 | Remove `isLambdaBody()` resolution axis; inline splice sets frame receiver slot (§4.4/§4.2) — gate behind builder-DSL differential pass | C/B | medium | high | M |
-| 11 | Delete `Value.Lambda` (two test constructors + 31 `.Lambda =>` arms); single capture-metadata authority via `capture_order` | cleanup | medium | medium | M |
+| 11 | DONE — deleted `Value.Lambda` (vestigial Env-based closure the live IR VM never produced; `AstLambda` already built `IrClosure`). Removed the variant, its one GC-test constructor, and every Value-context `.Lambda =>` arm; `IrClosure` is now the single closure value form and `func.capture_order` (via `ClosureInfo.captures`) is the sole capture-metadata authority. | cleanup | medium | medium | M |
 | 12 | `KLIO_TRACE_PATH` structured trace + `scripts/assert_single_path.py` (§5.5) | detect | medium | low | M |
 
 **Critical path.** 0a–0c and 1–3 are detection scaffolding that should land

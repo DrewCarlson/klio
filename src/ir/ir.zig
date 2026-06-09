@@ -386,11 +386,10 @@ pub const Inst = union(enum) {
         body_func: FuncId,
         captures: []Reg,
     },
-    /// Construct a `Value.Lambda` directly from a stashed AST
-    /// `Block` plus a snapshot of captured registers indexed by
-    /// name. Used so tree-walker-style dispatch paths that
-    /// pattern-match on `Value.Lambda` can call IR-lowered lambdas
-    /// without each site needing a separate `IrClosure` branch.
+    /// Materialise a closure from a stashed AST `Block` plus a
+    /// snapshot of captured registers indexed by name. The body is
+    /// lowered as a separate Func referenced by `body_func`; the VM
+    /// builds an `IrClosure` over the captured values.
     AstLambda: struct {
         dst: Reg,
         params: [][]const u8,

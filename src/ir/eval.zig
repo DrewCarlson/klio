@@ -1336,7 +1336,7 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
             // Receiver-lambda fallback for bare names lowered as
             // LoadGlobal.
             var pushed_caller_this = false;
-            if (callee_v == .IrClosure or callee_v == .Lambda) {
+            if (callee_v == .IrClosure) {
                 if (caller_this) |ct| {
                     host.pushAccessEnclosing(&ct);
                     pushed_caller_this = true;
@@ -1464,7 +1464,7 @@ fn execInst(allocator: Allocator, frame: *Frame, inst: *const Inst, host: *Host)
             const names = try resolveArgNames(allocator, frame.module, cvm.arg_names);
             defer allocator.free(names);
             const invocable = switch (callee_v) {
-                .Function, .Lambda, .Intrinsic, .IrClosure, .BoundMethod, .BoundUserMethod => true,
+                .Function, .Intrinsic, .IrClosure, .BoundMethod, .BoundUserMethod => true,
                 .Instance => |i| blk: {
                     const g = i.borrow();
                     defer g.deinit();
