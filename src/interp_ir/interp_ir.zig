@@ -40,6 +40,7 @@ const Env = runtime.Env;
 const ClassDef = runtime.ClassDef;
 const InstanceData = runtime.InstanceData;
 const HostBindings = stdlib.HostBindings;
+const StdlibFn = stdlib.StdlibFn;
 const Module = ir.Module;
 pub const FuncId = ir.FuncId;
 const TypeRef = ir.TypeRef;
@@ -93,6 +94,19 @@ pub const ProgramImage = struct {
     class_delegates: std.StringHashMap([]StrFunc),
     func_defaults: std.AutoHashMap(u32, []?FuncId),
     installed_bindings: ObjRef(HostBindings),
+    /// Link-time resolved executable form per top-level `FuncId`
+    /// (keyed by `FuncId.int()`). A present entry binds that symbol's
+    /// single executable form to the native binding it maps to; an
+    /// absent entry runs the lowered body. Populated once by
+    /// `linkResolvedForms` after both the module funcs and
+    /// `installed_bindings` exist, so pack-vs-source identity is settled
+    /// up front, deterministically, independent of load order. The VM
+    /// dispatch paths consult this directly instead of re-deciding the
+    /// form per call against `installed_bindings`.
+    resolved_native: std.AutoHashMap(u32, StdlibFn),
+    /// Whether `linkResolvedForms` has run for the current
+    /// `installed_bindings` snapshot.
+    resolved_linked: bool,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) Allocator.Error!ProgramImage {
@@ -111,6 +125,8 @@ pub const ProgramImage = struct {
             .class_delegates = std.StringHashMap([]StrFunc).init(allocator),
             .func_defaults = std.AutoHashMap(u32, []?FuncId).init(allocator),
             .installed_bindings = try ObjRef(HostBindings).init(allocator, HostBindings.init(allocator)),
+            .resolved_native = std.AutoHashMap(u32, StdlibFn).init(allocator),
+            .resolved_linked = false,
             .allocator = allocator,
         };
     }
@@ -130,6 +146,43 @@ pub const ProgramImage = struct {
         self.class_delegates.deinit();
         self.func_defaults.deinit();
         self.installed_bindings.deinit();
+        self.resolved_native.deinit();
+    }
+
+    /// Resolve each symbol's single executable form ONCE: for every
+    /// body-bearing top-level `FuncId` whose FQN maps to a native
+    /// binding in `installed_bindings`, record that binding as the
+    /// symbol's form. Funcs with no matching binding run their lowered
+    /// body and are simply absent from the table.
+    ///
+    /// This is the link/finalize step of the two-phase build: it settles
+    /// pack-vs-source identity deterministically, as a pure function of
+    /// `(FuncId → fqn, installed_bindings)`, with no per-call FQN probe.
+    /// It mirrors exactly what the per-call short-circuit in
+    /// `callFunc`/`callValue` used to decide on every dispatch
+    /// (`installed_bindings.resolve(func.fqn)`), but does it once.
+    /// Idempotent: re-running after an `installed_bindings` change
+    /// rebuilds the table.
+    pub fn linkResolvedForms(self: *ProgramImage, module: *const Module) Allocator.Error!void {
+        self.resolved_native.clearRetainingCapacity();
+        const bg = self.installed_bindings.borrow();
+        defer bg.deinit();
+        const bindings = bg.get();
+        if (!bindings.isEmpty()) {
+            for (module.funcs.items) |*f| {
+                if (bindings.resolve(f.fqn)) |intrinsic| {
+                    try self.resolved_native.put(f.id.int(), intrinsic);
+                }
+            }
+        }
+        self.resolved_linked = true;
+    }
+
+    /// The link-time-resolved native form for `func`, or `null` when the
+    /// symbol's single form is its lowered body. Consulted by the VM
+    /// dispatch paths in place of the deleted per-call FQN short-circuit.
+    pub fn resolvedNativeForm(self: *const ProgramImage, func: FuncId) ?StdlibFn {
+        return self.resolved_native.get(func.int());
     }
 };
 
@@ -618,6 +671,76 @@ test "ext_decl_recv_is_user_class rejects builtins and type params" {
     try testing.expect(!extDeclRecvIsUserClass("String"));
     try testing.expect(!extDeclRecvIsUserClass("T"));
     try testing.expect(extDeclRecvIsUserClass("com.example.Widget"));
+}
+
+fn linkTestNativeFn(ctx: *runtime.CallCtx) std.mem.Allocator.Error!runtime.EvalResult {
+    _ = ctx;
+    return .{ .ok = Value.Unit };
+}
+
+fn pushLinkTestFunc(m: *Module, a: Allocator, name: []const u8, fqn: []const u8) Allocator.Error!FuncId {
+    const id = FuncId.from(@intCast(m.funcs.items.len));
+    const blocks = try a.alloc(ir.Block, 1);
+    blocks[0] = .{ .id = ir.BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
+    try m.funcs.append(a, .{
+        .id = id,
+        .name = name,
+        .fqn = fqn,
+        .package = "",
+        .params = &.{},
+        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
+        .n_locals = 0,
+        .blocks = blocks,
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+    return id;
+}
+
+test "linkResolvedForms binds one form per symbol from the installed overlay" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| a.free(f.blocks);
+        m.deinit(a);
+    }
+    // Two body-bearing funcs; only the first's FQN has a native binding.
+    const shimmed = try pushLinkTestFunc(&m, a, "now", "kotlinx.datetime.now");
+    const plain = try pushLinkTestFunc(&m, a, "plain", "app.plain");
+
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+
+    // Empty overlay: every symbol's form is its lowered body.
+    try prog.linkResolvedForms(&m);
+    try testing.expect(prog.resolved_linked);
+    try testing.expect(prog.resolvedNativeForm(shimmed) == null);
+    try testing.expect(prog.resolvedNativeForm(plain) == null);
+
+    // Install a binding for the shimmed FQN, re-link, and confirm the
+    // resolved form is the native binding for that symbol and the lowered
+    // body (absent) for the other — exactly what the deleted per-call
+    // `installed_bindings.resolve(fqn)` short-circuit would have picked.
+    {
+        const bg = prog.installed_bindings.borrowMut();
+        defer bg.deinit();
+        try bg.get().register("kotlinx.datetime.now", linkTestNativeFn);
+    }
+    try prog.linkResolvedForms(&m);
+    const resolved = prog.resolvedNativeForm(shimmed);
+    try testing.expect(resolved != null);
+    try testing.expect(resolved.? == linkTestNativeFn);
+    try testing.expect(prog.resolvedNativeForm(plain) == null);
+
+    // Re-linking is idempotent and rebuilds the table from the current
+    // overlay: clearing the binding drops the resolved native form.
+    {
+        const bg = prog.installed_bindings.borrowMut();
+        defer bg.deinit();
+        _ = bg.get().table.remove("kotlinx.datetime.now");
+    }
+    try prog.linkResolvedForms(&m);
+    try testing.expect(prog.resolvedNativeForm(shimmed) == null);
 }
 
 test "shared closures push is append-stable" {

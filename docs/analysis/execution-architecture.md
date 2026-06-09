@@ -237,11 +237,15 @@ is keyed by bare simple name and tie-broken by order:
   **suffix scan** of `installed_bindings` matching any FQN ending in `.{name}`,
   returning the first hash-map hit (`src/interp_ir/vm/host_globals.zig:431-486`)
   — iteration-order nondeterministic.
-- **Two executable forms.** `callFunc`/`callValue` short-circuit any FQN matching
-  an `installed_bindings` entry to `dispatchIntrinsic` (a native binding) instead
-  of the lowered body (`src/interp_ir/vm/host_call_func.zig:456-466`,
-  `host_call_value.zig:270-282`). Which form runs depends on pack-install state,
-  and the two forms route through the divergent closure engines of Class A.
+- **Two executable forms. RESOLVED (item 9).** `callFunc`/`callValue` used to
+  short-circuit any FQN matching an `installed_bindings` entry to
+  `dispatchIntrinsic` (a native binding) instead of the lowered body, deciding the
+  form per call from pack-install state. That per-call probe is deleted: each
+  symbol's single form is now resolved once at link time
+  (`ProgramImage.linkResolvedForms` → the `resolved_native` table keyed by
+  `FuncId`), and both dispatch paths consult that resolved form by `FuncId`
+  (`host_call_func.resolvedNativeForm`). The form is fixed at link time
+  independent of load order, so it no longer depends on how a symbol was loaded.
 
 **Aggravating factors.** Lowering forks FQN resolution on `isLambdaBody()`
 (`src/ir/lower/expr.zig:867`, also `1058`, `2897`, `2956`), so the same dotted
@@ -569,10 +573,20 @@ header set) — provably independent of pack load order:
    NO prefix-probe ladder and NO suffix scan (`host_globals.zig:431-486`). Fold
    inline-fn resolution into the same entry point so there is one selection
    algorithm, not a parallel simple-name inline table.
-5. **One executable form per symbol.** Resolve pack-vs-source identity once at
-   load/link time — bind each symbol to a single executable form (native binding
-   OR lowered body) in the program image. Remove the per-call FQN short-circuit
-   in `callFunc`/`callValue`.
+5. **One executable form per symbol. DONE (item 9).** Pack-vs-source identity is
+   resolved once at link time: `ProgramImage.linkResolvedForms` (`interp_ir.zig`)
+   runs after the two-phase build and the `installed_bindings` overlay exist, and
+   for every top-level `FuncId` whose FQN maps to a native binding records that
+   binding in `resolved_native` (keyed by `FuncId.int()`); funcs with no binding
+   run their lowered body and are absent. The decision is a pure function of
+   `(FuncId → fqn, installed_bindings)`, settled deterministically independent of
+   load order. The per-call FQN short-circuit in `callFunc` and `callValue` (the
+   "Pack-installed binding fast path" / closure-body overlay probe) is deleted;
+   both now consult `host_call_func.resolvedNativeForm` by `FuncId`. The
+   `KLIO_LINK_AUDIT` detector compares the link form to the deleted per-call
+   probe's pick on every dispatch and reports 0 divergences over the green corpus
+   — the executable proof the link form is a faithful, behavior-preserving
+   replacement.
 6. **Remove `isLambdaBody()` as a resolution axis** (`expr.zig:867`, also
    `1058`, `2897`, `2956`). Package-head vs receiver-member would instead be
    decided by resolving the head against the caller's imports/package and the
@@ -712,7 +726,7 @@ refactors, then the structural unifications in dependency order.
 | 6 | DONE (receiver chain) — enclosing-`this` chain is now a `Frame` field (`enclosing_this`), snapshotted into `FrameSnapshot` on suspend and restored on resume; the `outer_this` thread-local + `outerThisStack` + its `resetReceiverTls` are deleted and `enclosingThis`/`enclosingThisChain`/`pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain. `inner_outer_hint` and the remaining guards-as-params are not yet folded in. (§4.2) | B | high | high | XL |
 | 7 | PARTIAL — single implicit-receiver resolution choke point (`implicitThisValue` + `implicitReceiverChain` in `ir/eval.zig`) now feeds all three `*OrGlobal` handlers (`CallMemberOrGlobal`/`LoadFromThisOrGlobal`/`StoreToThisOrGlobal`), so the bare-name member-vs-global precedence is derived in one place instead of three. Registry func-kind landed: `Func.kind` (`FuncKind.member_extension`) is the authoritative member-extension predicate, set at the member-extension lowering site (`decl.zig`); the five `member_ext_owner_class` dispatch sites route through `isMemberExt`/`memberExtVisible` (the owner-class gate is preserved exactly — the kind selects which funcs are gated, the side table supplies the owner). The four "Or" *instructions* are NOT collapsed to a single `CallUnresolved`: they encode three distinct operations (read / write / call) plus the explicit-receiver `CallMemberOrValue`, and the "Or" itself is the "couldn't classify member-vs-global statically" signal item 8's FQN static resolution removes — collapsing now would re-encode the read/write/call distinction without removing the runtime decision. Deferred to item 8. (A/B) | A/B | high | medium | L |
 | 8 | PARTIAL (steps 1-4, fallback retained) — per-decl `package` tag on `Func`/`Class` (set at flatten/lowering, `""` = no package), the two-phase header registration made explicit (phase-1 reserves every class + func HEADER with FQN/package/receiver, phase-2 lowers bodies against the complete set), and the package/FQN symbol index (`Module.resolveBareCallIndexed`, keyed on caller package → file imports → built-in stdlib) as the PRIMARY bare-call path: where it resolves a unique non-extension target, lowering binds that target by exact `FuncId` (FQN-exact at the VM); otherwise it defers to the order-based heuristic, which is RETAINED unchanged. `KLIO_RESOLVE_AUDIT` is a permanent env-gated detector that compares the index pick to the heuristic pick on every bare call — proven 0 divergences over all 82 examples + the differential corpus, i.e. the index is a faithful superset. DEFERRED (the tightening prerequisite): the index does NOT yet error on ambiguity, and `isShippedFqn`/prefix-ladder/suffix-scan are NOT removed — that hardening is gated on the §4.4-item-3 uniqueness proof and is items 9/10's scope. | C | high | high | XL |
-| 9 | One executable form per symbol resolved at link time; remove per-call FQN short-circuit (§4.4) | C | high | high | XL |
+| 9 | DONE — one executable form per symbol resolved at link time (`ProgramImage.linkResolvedForms` → the `resolved_native` table keyed by `FuncId`, populated once after the module + `installed_bindings` exist); the per-call FQN short-circuit in `callFunc` and `callValue` is deleted, both now consulting the resolved form by `FuncId` (`host_call_func.resolvedNativeForm`). Pack-vs-source identity is settled at link time, load-order-independent. `KLIO_LINK_AUDIT` is a permanent env-gated detector proving the link form equals the deleted per-call probe's pick (0 divergences over the full suite + 82 examples + the differential corpus). (§4.4) | C | high | high | XL |
 | 10 | Remove `isLambdaBody()` resolution axis; inline splice sets frame receiver slot (§4.4/§4.2) — gate behind builder-DSL differential pass | C/B | medium | high | M |
 | 11 | DONE — deleted `Value.Lambda` (vestigial Env-based closure the live IR VM never produced; `AstLambda` already built `IrClosure`). Removed the variant, its one GC-test constructor, and every Value-context `.Lambda =>` arm; `IrClosure` is now the single closure value form and `func.capture_order` (via `ClosureInfo.captures`) is the sole capture-metadata authority. | cleanup | medium | medium | M |
 | 12 | `KLIO_TRACE_PATH` structured trace + `scripts/assert_single_path.py` (§5.5) | detect | medium | low | M |

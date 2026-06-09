@@ -30,15 +30,17 @@ called out explicitly.
 
 | Class | Guards catalogued | Deletable (point-fix) | Keep (load-bearing) | Needs-verification | Removed |
 | --- | --- | --- | --- | --- | --- |
-| A — closure execution / lambda variable access | 9 | 7 | 1 | 1 | 2 (A1, A2 via 4b) |
+| A — closure execution / lambda variable access | 9 | 7 | 1 | 1 | 3 (A1, A2 via 4b; A5 via item 9) |
 | B — receiver/`this` across suspend/inline | 14 | 11 | 1 | 2 | 1 (B1 via item 6; B2–B5 relocated onto the frame chain) |
-| C — pack-vs-direct resolution | 12 | 10 | 1 | 1 | 0 |
+| C — pack-vs-direct resolution | 12 | 10 | 1 | 1 | 1 (C6 via item 9) |
 | Other-correctness / re-entrancy | 7 | 1 | 6 | 0 | 0 |
-| **Total** | **42** | **29** | **9** | **4** | **2** |
+| **Total** | **42** | **29** | **9** | **4** | **4** |
 
 (A guard counted "needs-verification" is also counted in exactly one of
 deletable/keep per its best-current assessment; the four NV rows are A4, B9,
-B13, C12. A1 and A2 are now REMOVED via §6 item 4b — see their entries.)
+B13, C12. A1 and A2 are now REMOVED via §6 item 4b; A5 (a Class-C
+two-executable-forms guard catalogued under Class A) and C6 are now REMOVED via
+§6 item 9 — see their entries.)
 
 The **keep list** (load-bearing branches that are NOT point-fixes and must not be
 deleted) is consolidated at the bottom.
@@ -138,18 +140,24 @@ are the seams and the fallbacks that paper over the disagreement.
   `parity_suspend_shapes` green; verify the `Sender(this,…)` case parks/resumes
   identically.
 
-### A5 — Pack-binding short-circuit inside `callValue` for a closure body
+### A5 — Pack-binding short-circuit inside `callValue` for a closure body — REMOVED (item 9)
 
-- **Location:** `src/interp_ir/vm/host_call_value.zig:274-282`: before running an
-  `IrClosure` body, probe `installed_bindings.resolve(func.fqn)` and
-  `dispatchIntrinsic` instead of the lowered body.
-- **What it does:** a closure wrapping a pack top-level fn (`kotlinx.datetime.__kxdt_*`)
-  runs the native binding rather than the shim body.
+- **Status:** REMOVED in §6 item **9**. The per-call
+  `installed_bindings.resolve(func.fqn)` probe before running an `IrClosure` body
+  is deleted. Each symbol's single executable form (native binding OR lowered
+  body) is now resolved ONCE at link time by `ProgramImage.linkResolvedForms`
+  into the `resolved_native` table keyed by `FuncId`. The closure-body path
+  consults `host_call_func.resolvedNativeForm(self, func.id)` directly — no
+  per-call FQN probe — so a closure wrapping a pack top-level fn
+  (`kotlinx.datetime.__kxdt_*`) still dispatches the native binding, but the
+  decision is fixed at link time and load-order-independent.
+- **Was at:** `src/interp_ir/vm/host_call_value.zig` (the closure-body short-circuit block).
 - **Class:** C primarily (two-executable-forms, `execution-architecture.md` §2
-  Class C "Two executable forms"), surfacing inside the Class-A closure engine.
-- **Deletable?** Deletable. §4.4-item-5 binds each symbol to one executable form at
-  link time, so no per-call FQN short-circuit is needed.
-- **Removes via:** §6 item **9** (one executable form per symbol).
+  Class C "Two executable forms"), surfaced inside the Class-A closure engine.
+- **Verified by:** `KLIO_LINK_AUDIT=1` (the link form equals the per-call probe's
+  pick — 0 divergences over the full suite + all 82 examples + the differential
+  corpus), `zig build test` green, corpus 82/82, the differential harness
+  byte-identical across SourcePacks/CompiledPacks/EmbeddedOnly.
 - **Removal test:** differential harness with `mode=CompiledPacks` vs `SourcePacks`
   byte-identical for a `kotlinx.datetime`-using example.
 
@@ -532,19 +540,22 @@ get a fixed insertion position.
 - **Removal test:** differential `SourcePacks` vs `CompiledPacks` byte-identical (a
   HashMap-iteration-order divergence would show here first).
 
-### C6 — `callFunc` pack-binding FQN short-circuit
+### C6 — `callFunc` pack-binding FQN short-circuit — REMOVED (item 9)
 
-- **Location:** `src/interp_ir/vm/host_call_func.zig:456-466`: if `f.fqn` matches an
-  `installed_bindings` entry, `dispatchIntrinsic` instead of running the lowered
-  body (the "two executable forms" of §2 Class C).
-- **What it does:** picks native-binding-vs-lowered-body per call site based on
-  pack-install state.
+- **Status:** REMOVED in §6 item **9**. The per-call branch that matched `f.fqn`
+  against `installed_bindings` and `dispatchIntrinsic`'d instead of running the
+  lowered body is deleted. `callFunc` now consults the link-time-resolved form
+  (`host_call_func.resolvedNativeForm(self, func)` against the `resolved_native`
+  table populated once by `ProgramImage.linkResolvedForms`) — native-binding vs
+  lowered-body is no longer decided per call site, so the call no longer forks on
+  pack-install state. The "two executable forms" of §2 Class C are collapsed to
+  one form per symbol, settled at link time independent of load order.
+- **Was at:** `src/interp_ir/vm/host_call_func.zig` (the "Pack-installed binding fast path" block).
 - **Class:** C.
-- **Deletable?** Deletable. §4.4-item-5: bind one executable form per symbol at link
-  time; remove the per-call short-circuit.
-- **Removes via:** §6 item **9**.
-- **Removal test:** differential across modes identical for a pack-shimmed function
-  (the form is fixed at link, so the call site no longer forks).
+- **Verified by:** `KLIO_LINK_AUDIT=1` (the link form equals the per-call probe's
+  pick — 0 divergences over the full suite + all 82 examples + the differential
+  corpus), differential across modes byte-identical for a pack-shimmed function,
+  `zig build test` green, corpus 82/82.
 
 ### C7 — `callFunc` mis-bound type-specialized-overload fallback
 

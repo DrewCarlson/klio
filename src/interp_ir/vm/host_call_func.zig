@@ -198,6 +198,65 @@ fn runtimeErrorToEval(allocator: Allocator, e: RuntimeError) EvalError {
 }
 
 // -------------------------------------------------------------------------
+// Link-time resolved executable form (one form per symbol).
+// -------------------------------------------------------------------------
+
+/// The single executable native form bound to `func` at link time, or
+/// `null` when the symbol's form is its lowered body. This replaces the
+/// per-call `installed_bindings.resolve(func.fqn)` short-circuit that
+/// `callFunc`/`callValue` used to run on every dispatch: the form is now
+/// settled once by `ProgramImage.linkResolvedForms` and consulted here by
+/// `FuncId` against the resolved table.
+pub fn resolvedNativeForm(self: *VmHost, func: FuncId) ?StdlibFn {
+    const g = self.prog.borrow();
+    defer g.deinit();
+    return g.get().resolvedNativeForm(func);
+}
+
+/// Opt-in audit (`KLIO_LINK_AUDIT`): assert the link-time resolved form for
+/// `func` equals what the deleted per-call short-circuit would have picked
+/// (`installed_bindings.resolve(fqn)`). Used to prove the link table is a
+/// faithful, behavior-preserving replacement before the short-circuit is
+/// removed. Logs every divergence; a clean corpus run proves zero.
+pub fn linkAuditCheck(self: *VmHost, func: FuncId, fqn: []const u8) void {
+    if (!linkAuditOn()) return;
+    const per_call: ?StdlibFn = blk: {
+        const g = self.prog.borrow();
+        defer g.deinit();
+        const bg = g.get().installed_bindings.borrow();
+        defer bg.deinit();
+        break :blk bg.get().resolve(fqn);
+    };
+    const linked = resolvedNativeForm(self, func);
+    if (per_call != linked) {
+        std.debug.print(
+            "[KLIO_LINK_AUDIT] divergence: fid={d} fqn={s} per_call={s} linked={s}\n",
+            .{
+                func.int(),
+                fqn,
+                if (per_call != null) "native" else "body",
+                if (linked != null) "native" else "body",
+            },
+        );
+    }
+}
+
+var link_audit_checked: bool = false;
+var link_audit_enabled: bool = false;
+
+fn linkAuditOn() bool {
+    if (!link_audit_checked) {
+        link_audit_checked = true;
+        const a = std.heap.page_allocator;
+        if (runtime.procEnvGetVar(a, "KLIO_LINK_AUDIT") catch null) |v| {
+            a.free(v);
+            link_audit_enabled = true;
+        }
+    }
+    return link_audit_enabled;
+}
+
+// -------------------------------------------------------------------------
 // Overload scoring + selection (mirror `overload_score_arg`,
 // `overload_score`, `pick_overload` in vmhost.rs).
 // -------------------------------------------------------------------------
@@ -447,16 +506,14 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         trace.emit("call_func {s} fid={d} fqn={s} argc={d}", .{ f.name, func.int(), f.fqn, args_in.len });
     }
 
-    // Pack-installed binding fast path: a top-level function whose
-    // package-qualified FQN matches a registered binding shadows the shim
-    // body shipped in source.
-    {
-        const g = self.prog.borrow();
-        const bg = g.get().installed_bindings.borrow();
-        const hit = bg.get().resolve(f.fqn);
-        bg.deinit();
-        g.deinit();
-        if (hit) |intrinsic| return dispatchIntrinsic(self, allocator, intrinsic, args_in);
+    // One executable form per symbol: a top-level function whose single
+    // form was resolved to a native binding at link time dispatches that
+    // binding instead of running its lowered shim body. The form was
+    // settled once by `linkResolvedForms`; this consults it by `FuncId`
+    // with no per-call FQN probe.
+    linkAuditCheck(self, func, f.fqn);
+    if (resolvedNativeForm(self, func)) |intrinsic| {
+        return dispatchIntrinsic(self, allocator, intrinsic, args_in);
     }
 
     // Mis-bound type-specialized overload fallback. A bare call is lowered
