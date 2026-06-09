@@ -338,14 +338,6 @@ pub fn publishValue(v: *const Value, seen: *Seen) void {
                 publishEnv(g.get(), seen);
             }
         },
-        .Lambda => |l| {
-            if (markCell(Env, l.env, seen)) {
-                const g = l.env.borrow();
-                defer g.deinit();
-                publishEnv(g.get(), seen);
-            }
-        },
-
         .Pair => |p| {
             publishValue(p.first, seen);
             publishValue(p.second, seen);

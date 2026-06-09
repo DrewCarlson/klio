@@ -284,14 +284,6 @@ pub const Value = union(enum) {
         decl: *const ast.Function,
         env: ObjRef(Env),
     },
-    Lambda: struct {
-        params: ObjRef([]const []const u8),
-        body: *const ast.Block,
-        env: ObjRef(Env),
-        /// `true` for an anonymous-function expression (bare `return`
-        /// absorbed at the call boundary); `false` for a lambda literal.
-        absorb_return: bool,
-    },
     Intrinsic: struct {
         fqn: []const u8,
         func: StdlibFn,
@@ -615,7 +607,7 @@ pub const Value = union(enum) {
                 .Long => if (r.step == 1) "kotlin.ranges.LongRange" else "kotlin.ranges.LongProgression",
                 .Char => if (r.step == 1) "kotlin.ranges.CharRange" else "kotlin.ranges.CharProgression",
             },
-            .Function, .Lambda, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => "kotlin.Function",
+            .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => "kotlin.Function",
             .Exception => "kotlin.Throwable",
             .List => |l| if (l.mutable) "kotlin.collections.MutableList" else "kotlin.collections.List",
             .Array => |a| if (a.prim) |k| k.typeFqn() else "kotlin.Array",
@@ -741,7 +733,7 @@ pub const Value = union(enum) {
                 };
             },
             .Comparator => matchesAny(name, &.{ "Comparator", "Any" }),
-            .Function, .Lambda, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => isFunctionType(self, name),
+            .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => isFunctionType(self, name),
             .Exception => |e| blk: {
                 const g = e.fqn.borrow();
                 defer g.deinit();
@@ -868,7 +860,6 @@ pub const Value = union(enum) {
                 structuralEqBoxed(x.key, b.MapEntry.key) and structuralEqBoxed(x.value, b.MapEntry.value),
             .Result => |x| b.* == .Result and x.ok == b.Result.ok and structuralEq(x.payload, b.Result.payload),
             .Class => |x| b.* == .Class and classFqnEq(x, b.Class),
-            .Lambda => |x| b.* == .Lambda and x.body == b.Lambda.body and ObjRef(Env).ptrEq(x.env, b.Lambda.env),
             .IrClosure => |x| b.* == .IrClosure and x.id == b.IrClosure.id and ValueSlice.ptrEq(x.captures, b.IrClosure.captures),
             .BoundMethod => |x| b.* == .BoundMethod and std.mem.eql(u8, x.fqn, b.BoundMethod.fqn) and structuralEq(x.receiver, b.BoundMethod.receiver),
             .Instance => |x| b.* == .Instance and instanceEq(x, b.Instance),
@@ -971,7 +962,6 @@ pub const Value = union(enum) {
                 }
             },
             .Function => |fnv| try writer.print("fun {s}(...)", .{fnv.decl.name.name}),
-            .Lambda => try writer.writeAll("{lambda}"),
             .IrClosure => |c| try writer.print("{{ir-closure#{d}}}", .{c.id}),
             .Intrinsic => |i| try writer.print("fun {s}(...)", .{i.fqn}),
             .BoundMethod => |m| try writer.print("fun {s}(...)", .{m.fqn}),
@@ -1217,11 +1207,6 @@ fn isFunctionType(self: Value, name: []const u8) bool {
     if (stripped) |s| {
         const n = std.fmt.parseInt(usize, s, 10) catch return false;
         return switch (self) {
-            .Lambda => |l| blk: {
-                const g = l.params.borrow();
-                defer g.deinit();
-                break :blk g.get().len == n;
-            },
             .Function => |f| f.decl.params.len == n,
             else => false,
         };

@@ -221,7 +221,7 @@ fn findKeyIndexBoxed(entries: []const MapPair, key: *const Value) ?usize {
 
 fn isCallable(v: Value) bool {
     return switch (v) {
-        .Lambda, .IrClosure, .Function, .Intrinsic, .Instance => true,
+        .IrClosure, .Function, .Intrinsic, .Instance => true,
         else => false,
     };
 }
@@ -229,7 +229,7 @@ fn isCallable(v: Value) bool {
 /// Match the trailing-lambda detection the join/zip ops use.
 fn isTransformCallable(v: Value) bool {
     return switch (v) {
-        .IrClosure, .Lambda, .BoundMethod => true,
+        .IrClosure, .BoundMethod => true,
         .Instance => |inst| blk: {
             const g = inst.borrow();
             defer g.deinit();
@@ -3140,7 +3140,7 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
 
 fn isZipTransform(v: Value) bool {
     return switch (v) {
-        .IrClosure, .Lambda, .BoundMethod, .Instance => true,
+        .IrClosure, .BoundMethod, .Instance => true,
         else => false,
     };
 }

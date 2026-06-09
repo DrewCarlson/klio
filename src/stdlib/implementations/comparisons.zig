@@ -83,7 +83,7 @@ fn isNull(v: Value) bool {
 
 fn isCallable(v: Value) bool {
     return switch (v) {
-        .Lambda, .IrClosure => true,
+        .IrClosure => true,
         else => false,
     };
 }

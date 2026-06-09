@@ -727,7 +727,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         const gg = self.globals.borrow();
         defer gg.deinit();
         break :blk switch (gg.get().lookup(name) orelse Value.Null) {
-            .Function, .Lambda, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => true,
+            .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => true,
             else => false,
         };
     };
@@ -740,7 +740,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                 if (try withFieldResolvePair(self, allocator, oid, name, &outer)) |r| {
                     if (r == .ok) {
                         switch (r.ok) {
-                            .Unit, .Function, .Lambda, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => {},
+                            .Unit, .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => {},
                             else => return r,
                         }
                     }

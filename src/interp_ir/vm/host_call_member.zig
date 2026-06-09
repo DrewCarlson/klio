@@ -316,7 +316,7 @@ fn mapRuntimeError(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalEr
 
 fn isCallable(v: *const Value) bool {
     return switch (v.*) {
-        .Lambda, .IrClosure, .Function, .BoundMethod => true,
+        .IrClosure, .Function, .BoundMethod => true,
         else => false,
     };
 }
@@ -1059,11 +1059,6 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
 
     const arg_arity: ?usize = switch (arg.*) {
-        .Lambda => |l| blk: {
-            const g = l.params.borrow();
-            defer g.deinit();
-            break :blk g.get().len;
-        },
         .IrClosure => |c| blk: {
             if (self.closures.get(@intCast(c.id))) |info| break :blk info.n_params;
             break :blk null;
@@ -1652,7 +1647,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     }
 
     // KFunction reflection surface on a callable value.
-    if (receiver.* == .IrClosure or receiver.* == .Lambda or receiver.* == .Function) {
+    if (receiver.* == .IrClosure or receiver.* == .Function) {
         if (std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) {
             return callValueRec(self, allocator, receiver, args);
         }
@@ -2007,7 +2002,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         };
         if (field) |f| {
             switch (f) {
-                .Function, .IrClosure, .Lambda, .Class => return callValueRec(self, allocator, &f, args),
+                .Function, .IrClosure, .Class => return callValueRec(self, allocator, &f, args),
                 else => {},
             }
         }
@@ -2290,7 +2285,7 @@ fn eqIgnoreCase(allocator: Allocator, a: StringRef, b: StringRef) bool {
 
 fn isCallableOrIntrinsic(v: *const Value) bool {
     return switch (v.*) {
-        .Lambda, .IrClosure, .Function, .Intrinsic => true,
+        .IrClosure, .Function, .Intrinsic => true,
         else => false,
     };
 }
@@ -2600,7 +2595,7 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
     if ((std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) and r == .err and r.err == .Unimplemented) {
         if (lookupGlobalValue(self, n)) |callable| {
             switch (callable) {
-                .Function, .IrClosure, .Lambda => return try callValueRec(self, allocator, &callable, args),
+                .Function, .IrClosure => return try callValueRec(self, allocator, &callable, args),
                 else => {},
             }
         }
@@ -2659,7 +2654,7 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
         const has_fn = self.module.borrow().get().funcId(pname) != null;
         const callable = lookupGlobalValue(self, pname);
         const is_callable_global = callable != null and switch (callable.?) {
-            .Function, .IrClosure, .Lambda => true,
+            .Function, .IrClosure => true,
             else => false,
         };
         if ((has_fn or is_callable_global) and callable != null) {
@@ -2849,7 +2844,7 @@ fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Value,
                 sg.deinit();
                 return .{ .ok = .{ .Comparator = .{ .steps = try ObjRef([]ComparatorStep).init(allocator, chain), .descending = cmp.descending } } };
             },
-            .Lambda, .IrClosure => {
+            .IrClosure => {
                 const sg = cmp.steps.borrow();
                 var chain = try allocator.alloc(ComparatorStep, sg.get().len + 1);
                 @memcpy(chain[0..sg.get().len], sg.get().*);
@@ -3537,7 +3532,7 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                         while (i < args.len and i + skip < f.params.len) : (i += 1) {
                             const a = args[i];
                             const callable = switch (a) {
-                                .Lambda, .IrClosure, .Function, .BoundMethod => true,
+                                .IrClosure, .Function, .BoundMethod => true,
                                 else => false,
                             };
                             const pn = f.params[i + skip].ty.name;
@@ -4335,7 +4330,7 @@ fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
         // Trailing lambda binds to the last parameter.
         if (positionals.items.len != 0) {
             const last = positionals.items[positionals.items.len - 1];
-            if ((last == .IrClosure or last == .Lambda) and params.len != 0 and slots[params.len - 1] == null) {
+            if (last == .IrClosure and params.len != 0 and slots[params.len - 1] == null) {
                 slots[params.len - 1] = positionals.pop();
             }
         }

@@ -246,11 +246,6 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
 
     // A callable argument against a function-typed parameter.
     const arg_arity: ?usize = switch (arg.*) {
-        .Lambda => |l| blk: {
-            const pg = l.params.borrow();
-            defer pg.deinit();
-            break :blk pg.get().*.len;
-        },
         .IrClosure => |c| if (self.closures.get(c.id)) |info| info.n_params else null,
         else => null,
     };
