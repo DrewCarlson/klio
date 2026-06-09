@@ -75,6 +75,7 @@ pub fn resetReceiverThreadLocals() void {
     host_globals.resetReceiverTls();
     host_instances.resetReceiverTls();
     host_fields.resetReceiverTls();
+    host_impl.resetReceiverTls();
     coroutines.resetReceiverTls();
 }
 

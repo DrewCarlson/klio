@@ -23,18 +23,42 @@ pub const MaybeValueResult = ir.eval.MaybeValueResult;
 
 /// Top-level property initializers currently executing on this thread —
 /// breaks initializer cycles, mirroring Rust's `IN_PROGRESS` thread-local.
-/// Owns its key copies (allocated from `std.heap.page_allocator`, like the
-/// owned `String` Rust pushed) so they outlive the borrowed `name` slice.
-threadlocal var in_progress: std.StringHashMapUnmanaged(void) = .empty;
+/// Stores the program-image-owned key slices (run-stable, shared by the
+/// `prog` handle), so the entries outlive the borrowed `name` slice without
+/// per-key duplication. Page-allocator backed and cleared capacity-retaining
+/// like the sibling resolution guards, so it leaks nothing across runs.
+threadlocal var in_progress: std.ArrayListUnmanaged([]const u8) = .empty;
+
+/// Assert (Debug) the in-progress top-level-init set is empty at a run
+/// boundary and clear it capacity-retaining, so state leaked across runs is a
+/// loud failure rather than silently threaded into the next run.
+pub fn resetReceiverTls() void {
+    std.debug.assert(in_progress.items.len == 0);
+    in_progress.clearRetainingCapacity();
+}
+
+/// True when `name` is already initializing on this thread's stack.
+fn inProgressContains(name: []const u8) bool {
+    for (in_progress.items) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
 
 /// Clears a top-level property name from the in-progress set when an
-/// on-demand initializer returns, breaking re-entrant init cycles.
+/// on-demand initializer returns, breaking re-entrant init cycles. Removes
+/// the matching key by identity (the run-stable key, not a fresh copy).
 const InitGuard = struct {
-    name: []const u8,
+    key: []const u8,
 
     fn release(self: InitGuard) void {
-        if (in_progress.fetchRemove(self.name)) |kv| {
-            std.heap.page_allocator.free(kv.key);
+        var i: usize = in_progress.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, in_progress.items[i], self.key)) {
+                _ = in_progress.orderedRemove(i);
+                return;
+            }
         }
     }
 };
@@ -55,17 +79,22 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
             return .{ .ok = v };
         }
     }
-    const fid = blk: {
+    const init = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
-        break :blk pg.get().top_level_prop_inits.get(name) orelse return .{ .ok = null };
+        const inits = &pg.get().top_level_prop_inits;
+        const fid = inits.get(name) orelse return .{ .ok = null };
+        // The program-image key is run-stable (shared by the `prog` handle),
+        // so it outlives this guard frame without a per-key copy.
+        break :blk .{ .fid = fid, .key = inits.getKey(name) orelse name };
     };
-    if (in_progress.contains(name)) {
+    const fid = init.fid;
+    const init_key = init.key;
+    if (inProgressContains(init_key)) {
         return .{ .ok = null };
     }
-    const owned = try std.heap.page_allocator.dupe(u8, name);
-    try in_progress.put(std.heap.page_allocator, owned, {});
-    const guard = InitGuard{ .name = owned };
+    in_progress.append(std.heap.page_allocator, init_key) catch {};
+    const guard = InitGuard{ .key = init_key };
     defer guard.release();
 
     const func = blk: {
