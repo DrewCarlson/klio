@@ -72,7 +72,6 @@ pub const trace = @import("trace.zig");
 /// empty at a run boundary, then clear them. Run between programs so leaked
 /// state is a loud failure rather than silently threaded into the next run.
 pub fn resetReceiverThreadLocals() void {
-    host_call_member.resetReceiverTls();
     host_globals.resetReceiverTls();
     host_instances.resetReceiverTls();
     host_fields.resetReceiverTls();
@@ -320,12 +319,6 @@ fn vtCallFuncTyped(ctx: *anyopaque, a: Allocator, module: *const Module, func: F
 fn vtCallNamedOverload(ctx: *anyopaque, a: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
     return host_call_func.callNamedOverload(hp(ctx), a, module, name, args, arg_names);
 }
-fn vtEnclosingThis(ctx: *anyopaque) ?Value {
-    return host_call_member.enclosingThis(hp(ctx));
-}
-fn vtEnclosingThisChain(ctx: *anyopaque, a: Allocator) Allocator.Error![]Value {
-    return host_call_member.enclosingThisChain(hp(ctx), a);
-}
 fn vtCallableReceiverShape(ctx: *anyopaque, v: *const Value) ?ReceiverShape {
     return host_call_value.callableReceiverShape(hp(ctx), v);
 }
@@ -334,12 +327,6 @@ fn vtClosureNeedsThisCapture(ctx: *anyopaque, v: *const Value) bool {
 }
 fn vtOverrideClosureThis(ctx: *anyopaque, v: *const Value, new_this: *const Value) void {
     host_call_value.overrideClosureThis(hp(ctx), v, new_this);
-}
-fn vtPushAccessEnclosing(ctx: *anyopaque, v: *const Value) void {
-    host_call_member.pushAccessEnclosing(hp(ctx), v);
-}
-fn vtPopAccessEnclosing(ctx: *anyopaque) void {
-    host_call_member.popAccessEnclosing(hp(ctx));
 }
 fn vtPushInnerOuterHint(ctx: *anyopaque, v: *const Value) void {
     host_instances.pushInnerOuterHint(hp(ctx), v);
@@ -380,13 +367,9 @@ const host_vtable: Host.VTable = .{
     .call_func_named = vtCallFuncNamed,
     .call_func_typed = vtCallFuncTyped,
     .call_named_overload = vtCallNamedOverload,
-    .enclosing_this = vtEnclosingThis,
-    .enclosing_this_chain = vtEnclosingThisChain,
     .callable_receiver_shape = vtCallableReceiverShape,
     .closure_needs_this_capture = vtClosureNeedsThisCapture,
     .override_closure_this = vtOverrideClosureThis,
-    .push_access_enclosing = vtPushAccessEnclosing,
-    .pop_access_enclosing = vtPopAccessEnclosing,
     .push_inner_outer_hint = vtPushInnerOuterHint,
     .pop_inner_outer_hint = vtPopInnerOuterHint,
     .is_shadowing_capture = vtIsShadowingCapture,

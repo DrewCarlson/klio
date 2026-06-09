@@ -268,3 +268,44 @@ test "bare_coroutine_context_in_scope_member_is_own_property" {
     ;
     try assertKlio("bare_cc_scope_member", src, "EXEC(req)\n");
 }
+
+// The enclosing-`this` (implicit receiver) chain must survive a coroutine
+// park. A `suspend` member-extension declared inside `Owner` has the `Helper`
+// receiver as its own `this`; a bare `owned()` inside its body resolves to the
+// enclosing `this@Owner`, reachable only through the implicit-receiver chain
+// (it is neither the body's `this` param nor a closed-over capture). The body
+// parks at `delay` and references `owned()` strictly *after* resume, so the
+// chain must travel with the parked continuation and be restored on resume —
+// not recovered from whatever process-global receiver state the resuming
+// driver iteration happens to hold. Without the frame-carried chain this
+// reports `unresolved global 'owned'` after the park.
+test "enclosing_this_chain_survives_suspend" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\class Helper { val hid = "H"; fun localTag() = "helper=$hid" }
+        \\class Owner(val oid: String) {
+        \\    fun owned() = "owner=$oid"
+        \\    suspend fun Helper.process(): String {
+        \\        val before = "$hid:${owned()}"
+        \\        delay(5)
+        \\        return "$before|${localTag()}:${owned()}"
+        \\    }
+        \\    suspend fun drive(h: Helper) = h.process()
+        \\}
+        \\fun main() = runBlocking {
+        \\    val h = Helper()
+        \\    val a = async { Owner("A").drive(h) }
+        \\    val b = async { Owner("B").drive(h) }
+        \\    println(a.await())
+        \\    println(b.await())
+        \\    println(Owner("seq").drive(h))
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "enclosing_this_chain_suspend",
+        src,
+        "H:owner=A|helper=H:owner=A\nH:owner=B|helper=H:owner=B\nH:owner=seq|helper=H:owner=seq\n",
+    );
+}

@@ -60,29 +60,6 @@ threadlocal var map_fallback_active: bool = false;
 /// Guards `drainIterableToList` re-entry while the Iterable fallback runs.
 threadlocal var iterable_fallback_active: bool = false;
 
-/// Enclosing-`this` stack. Pushed by the receiver-lambda dispatch and the
-/// access-enclosing wiring; read by the extension shadowing / member-ext
-/// visibility scans and `enclosingCallableProperty`.
-threadlocal var outer_this: ?*std.ArrayList(Value) = null;
-
-fn outerThisStack() *std.ArrayList(Value) {
-    if (outer_this) |s| return s;
-    const s = std.heap.page_allocator.create(std.ArrayList(Value)) catch unreachable;
-    s.* = .empty;
-    outer_this = s;
-    return s;
-}
-
-/// Assert (Debug) the enclosing-`this` stack is empty at a run boundary and
-/// clear it so leaked-across-runs receiver context is a loud failure rather
-/// than silently threaded into the next program.
-pub fn resetReceiverTls() void {
-    if (outer_this) |s| {
-        std.debug.assert(s.items.len == 0);
-        s.clearRetainingCapacity();
-    }
-}
-
 fn unsupported(name: []const u8) EvalResult {
     return .{ .err = .{ .Unsupported = name } };
 }
@@ -1014,55 +991,45 @@ fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const Val
 // Enclosing-this stack accessors.
 // -------------------------------------------------------------------------
 
+// The enclosing-`this` chain is the *current eval frame's* live state
+// (`Frame.enclosing_this`), snapshotted into `FrameSnapshot` on suspend and
+// restored on resume, so it travels with a parked continuation instead of
+// living in process-global state. These thin wrappers delegate to the
+// frame-scoped primitives in `ir.eval`; a push made by member dispatch just
+// before invoking a callable is inherited by the invoked frame and removed by
+// the matching pop once the call returns.
+
 pub fn enclosingThis(self: *VmHost) ?Value {
     _ = self;
-    const s = outerThisStack();
-    if (s.items.len == 0) return null;
-    return s.items[s.items.len - 1];
+    return ir.eval.enclosingThisLast();
 }
 
 pub fn enclosingThisChain(self: *VmHost, allocator: Allocator) Allocator.Error![]Value {
     _ = self;
-    const s = outerThisStack();
-    var out = try allocator.alloc(Value, s.items.len);
-    var i: usize = 0;
-    while (i < s.items.len) : (i += 1) {
-        out[i] = s.items[s.items.len - 1 - i];
-    }
-    return out;
+    return ir.eval.enclosingThisChainAlloc(allocator);
 }
 
 pub fn pushAccessEnclosing(self: *VmHost, v: *const Value) void {
     _ = self;
-    const s = outerThisStack();
-    // Backing lives on `page_allocator` — the same persistent backing as the
-    // sibling receiver thread-locals `inner_outer_hint` / `ctor_guard` /
-    // `coro_stack`. The stack itself is a process-global cleared
-    // (capacity-retaining) at run boundaries; backing it with the transient
-    // per-run arena would leave the retained capacity dangling once that arena
-    // is freed or reset between runs.
-    s.append(std.heap.page_allocator, v.*) catch {};
+    ir.eval.pushEnclosing(v);
 }
 
 pub fn popAccessEnclosing(self: *VmHost) void {
     _ = self;
-    const s = outerThisStack();
-    if (s.items.len > 0) _ = s.pop();
+    ir.eval.popEnclosing();
 }
 
-/// Push/pop the enclosing-`this` stack without a `VmHost` handle. Used by
-/// the intrinsic-host receiver-lambda dispatch, which displaces a lambda's
+/// Push/pop the enclosing-`this` chain without a `VmHost` handle. Used by the
+/// intrinsic-host receiver-lambda dispatch, which displaces a lambda's
 /// captured `this` with an explicit receiver and must keep the displaced
-/// instance reachable as an outer implicit receiver.
+/// instance reachable as an outer implicit receiver for the lambda body.
 pub fn pushOuterThis(allocator: Allocator, v: *const Value) void {
     _ = allocator;
-    const s = outerThisStack();
-    s.append(std.heap.page_allocator, v.*) catch {};
+    ir.eval.pushEnclosing(v);
 }
 
 pub fn popOuterThis() void {
-    const s = outerThisStack();
-    if (s.items.len > 0) _ = s.pop();
+    ir.eval.popEnclosing();
 }
 
 // -------------------------------------------------------------------------
