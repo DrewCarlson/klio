@@ -619,23 +619,37 @@ get a fixed insertion position.
 - **Removal test:** `parity_named_args_defaults` + `parity_properties_accessors`
   green; differential identical.
 
-### C11 — `isLambdaBody()` forks FQN-head resolution
+### C11 — `isLambdaBody()` forks FQN-head resolution — REMOVED (item 10)
 
-- **Location:** `src/ir/lower/expr.zig:867`, `:1058`, `:2897`, `:2956` (each a
+- **Location (was):** `src/ir/lower/expr.zig` four sites, each a
   `(isPkgRoot(head) or !b.isLambdaBody())` gate on whether a dotted head lowers to a
-  `LoadGlobal`-of-FQN vs a member/`this` walk).
-- **What it does:** the same dotted path lowers differently inside a lambda; since
-  pack/DSL code is consumed almost entirely through builder lambdas, this is a
+  `LoadGlobal`-of-FQN vs a member/`this` walk.
+- **What it did:** the same dotted path lowered differently inside a lambda; since
+  pack/DSL code is consumed almost entirely through builder lambdas, this was a
   primary Class-C aggravator (§2 Class C "Aggravating factors").
-- **Class:** C (with the B facet at B12 for the `this` capture).
-- **Deletable?** Deletable as a *resolution axis* — package-head vs receiver-member
-  is decided by resolving the head against caller imports/package + lexical capture
-  set (§4.4-item-6), one predicate, no lambda special case. **Broad behavioral
-  change**, must be gated behind a builder-DSL differential pass (§4.4 caution; §6
-  item 10 risk).
-- **Removes via:** §6 item **10**.
-- **Removal test:** builder-DSL-heavy differential (kotlinx/ktor builder itests +
-  examples) byte-identical with `isLambdaBody` removed from these four sites.
+- **Class:** C.
+- **Removed (item 10).** `isLambdaBody()` is gone from all four resolution sites.
+  Package-head vs receiver-member is now decided by the one principled predicate
+  `headIsPackage(b, head)` (`expr.zig`): a head is a package head when it is a real
+  package root (`isPkgRoot`) or names a package the program contributes a top-level
+  symbol to (`Module.packageHeadDeclared` — `head.<rest>` is a declared FQN prefix
+  over the complete phase-1 header set). A captured/local name or an enclosing-class
+  member shadows a package head (the sites filter those with
+  `resolve`/`knowsOuter`/`hasEnclosingMember`/`classId` guards). The same head
+  resolves the same way regardless of lambda nesting — independent of declaration
+  order and load mode. The inline splice already binds the inline body's receiver as
+  a scope local named `"this"` (`inline_call.zig`), so inline-body dotted heads
+  resolve through the same predicate without a lambda axis (no new frame-receiver
+  slot needed at the splice).
+- **Removal test:** the builder-DSL differential — `examples/dsl_dotted_head.kt`
+  (package head + receiver-member dotted heads inside `@DslMarker` / `apply` / `with`
+  receiver lambdas) and `tests/fixtures/coroutine_smoke/cs8_dotted_in_builder.kt`
+  (`kotlin.math.*` dotted heads inside `flow`/`launch`/`coroutineScope` builders) —
+  byte-identical across EmbeddedOnly / SourcePacks / CompiledPacks, plus the
+  unmodified `parity_extension_resolution` / `parity_dsl_operators` /
+  `parity_suspend_shapes` / `parity_inner_classes` / `parity_functional_patterns` /
+  `parity_lambdas_and_dispatch` itests and `KLIO_RESOLVE_AUDIT`/`KLIO_LINK_AUDIT` =
+  0 over the corpus.
 
 ### C12 — Inline-fn table keyed by bare simple name
 

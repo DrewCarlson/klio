@@ -851,6 +851,26 @@ pub const Module = struct {
         return null;
     }
 
+    /// True when `head` is the first dotted segment of some declared
+    /// top-level symbol's FQN — i.e. `head` names a real package the
+    /// program contributes a function or class to (`head.` is a known
+    /// package prefix). Lets a dotted-head reference distinguish a
+    /// package-qualified global (`mypkg.foo(...)`) from a member of an
+    /// implicit receiver (`inner.value`) by package membership rather
+    /// than lambda nesting: the FQN headers are complete after phase-1
+    /// registration, so this answer is independent of declaration order
+    /// and of whether the reference is lexically inside a lambda.
+    pub fn packageHeadDeclared(self: *const Module, head: []const u8) bool {
+        if (head.len == 0) return false;
+        for (self.funcs.items) |f| {
+            if (fqnHasHeadSegment(f.fqn, head)) return true;
+        }
+        for (self.classes.items) |c| {
+            if (fqnHasHeadSegment(c.fqn, head)) return true;
+        }
+        return false;
+    }
+
     /// The full segment path of a non-wildcard import whose leaf is
     /// `name`, as seen from source file `file`. A named import is
     /// file-scoped, so only imports declared in `file` are consulted.
@@ -1083,6 +1103,16 @@ pub const Module = struct {
         return id;
     }
 };
+
+/// True when `head` is the first dotted segment of `fqn` and `fqn` has
+/// at least one further segment — i.e. `fqn` is `head.<rest>`, so `head`
+/// is a package prefix of a real symbol rather than the symbol's own
+/// simple name.
+fn fqnHasHeadSegment(fqn: []const u8, head: []const u8) bool {
+    return fqn.len > head.len and
+        std.mem.startsWith(u8, fqn, head) and
+        fqn[head.len] == '.';
+}
 
 /// The declaring package of a top-level decl whose fully-qualified name
 /// is `fqn` and whose simple name is `simple`: the FQN with its trailing
@@ -1472,4 +1502,31 @@ test "symbol index never resolves an extension form" {
 
     const got = m.resolveBareCallIndexed("ext", "app", FileId.from(0), 0, false);
     try testing.expect(got == null);
+}
+
+test "packageHeadDeclared distinguishes a package head from a member head" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| {
+            a.free(f.params);
+            a.free(f.blocks);
+        }
+        m.deinit(a);
+    }
+    // A top-level func in package `mypkg` makes `mypkg` a declared package
+    // head; a top-level func with no package (`helper`) is not a head.
+    _ = try pushTestFunc(&m, a, "build", "mypkg.build", "mypkg", 0);
+    _ = try pushTestFunc(&m, a, "helper", "helper", "", 0);
+
+    // `mypkg.build(...)` — `mypkg` is the first segment of a declared FQN,
+    // so it is a package head that flattens to a global load.
+    try testing.expect(m.packageHeadDeclared("mypkg"));
+    // `helper.foo` — `helper` names a top-level symbol, not a package
+    // prefix, so it is a member/receiver head, not a package head.
+    try testing.expect(!m.packageHeadDeclared("helper"));
+    // A name with no declaration at all (a receiver member like `inner`)
+    // is never a package head.
+    try testing.expect(!m.packageHeadDeclared("inner"));
+    try testing.expect(!m.packageHeadDeclared(""));
 }

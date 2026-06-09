@@ -88,3 +88,6 @@ test "cs6_flow_operators" {
 test "cs7_scope_builders" {
     try runSmoke("cs7_scope_builders");
 }
+test "cs8_dotted_in_builder" {
+    try runSmoke("cs8_dotted_in_builder");
+}

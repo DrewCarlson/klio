@@ -876,8 +876,10 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Multi-segment paths. Try the full FQN against the host first.
     if (segments.len >= 2 and
         isPackageHead(segments[0].name) and
-        (isPkgRoot(segments[0].name) or !b.isLambdaBody()) and
+        headIsPackage(b, segments[0].name) and
         b.resolve(segments[0].name) == null and
+        !b.knowsOuter(segments[0].name) and
+        !b.hasEnclosingMember(segments[0].name) and
         b.module.classId(segments[0].name) == null)
     {
         // The const pool stores the slice by reference, so the joined FQN
@@ -1067,9 +1069,10 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         defer b.allocator.free(fqn);
         const head = firstSegment(fqn);
         if (isPackageHead(head) and
-            (isPkgRoot(head) or !b.isLambdaBody()) and
+            headIsPackage(b, head) and
             b.resolve(head) == null and
             !b.knowsOuter(head) and
+            !b.hasEnclosingMember(head) and
             b.module.classId(head) == null and
             b.resolve("this") == null)
         {
@@ -2927,9 +2930,10 @@ fn lowerFqnFlattenCall(
     const head_is_real_pkg = isPkgRoot(head);
     if (std.mem.eql(u8, tail, fqn)) return null;
     if (isPackageHead(head) and
-        (head_is_real_pkg or !b.isLambdaBody()) and
+        headIsPackage(b, head) and
         b.resolve(head) == null and
         !b.knowsOuter(head) and
+        !b.hasEnclosingMember(head) and
         b.module.classId(head) == null and
         (head_is_real_pkg or !isTopLevelProp(head)) and
         (head_is_real_pkg or b.resolve("this") == null))
@@ -2986,9 +2990,10 @@ fn lowerFqnGlobalCall(
     const head = firstSegment(fqn);
     const head_is_real_pkg = isPkgRoot(head);
     if (isPackageHead(head) and
-        (head_is_real_pkg or !b.isLambdaBody()) and
+        headIsPackage(b, head) and
         b.resolve(head) == null and
         !b.knowsOuter(head) and
+        !b.hasEnclosingMember(head) and
         b.module.classId(head) == null and
         (head_is_real_pkg or !isTopLevelProp(head)) and
         (head_is_real_pkg or b.resolve("this") == null))
@@ -3230,6 +3235,23 @@ fn idGet(comptime T: type, items: []const T, idx: u32) ?*const T {
 fn idGetMut(comptime T: type, items: []T, idx: u32) ?*T {
     if (idx >= items.len) return null;
     return &items[idx];
+}
+
+/// Decide whether a dotted head `head` is a package-qualified global
+/// (flatten the dotted path to a `LoadGlobal`-of-FQN) rather than a member
+/// of an implicit receiver (walk `this`).
+///
+/// A head is a package head when it is a real package root (`kotlin`, `io`,
+/// `org`, …) or names a package the program contributes a top-level symbol
+/// to (`head.<rest>` is a declared FQN prefix). This is the one principled
+/// predicate that replaces the former `isLambdaBody()` resolution axis: a
+/// member/captured/local name shadows a package head (the caller filters
+/// those with `resolve`/`knowsOuter`/`classId` guards at the use site), and
+/// a name resolving to a package/imported/stdlib FQN resolves globally —
+/// the same answer whether or not the reference is lexically inside a
+/// lambda.
+fn headIsPackage(b: *FuncBuilder, head: []const u8) bool {
+    return isPkgRoot(head) or b.module.packageHeadDeclared(head);
 }
 
 /// The last segment after the final `sep`, or the whole string when absent.
