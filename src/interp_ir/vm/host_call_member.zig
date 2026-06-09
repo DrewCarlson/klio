@@ -390,9 +390,7 @@ fn memberIsProperty(self: *VmHost, receiver: *const Value, name: []const u8) boo
                 return true;
             }
         }
-        const pg = cd.parent.borrow();
-        if (pg.get().*) |p| stack.append(a, p.clone()) catch {};
-        pg.deinit();
+        if (cd.parent) |p| stack.append(a, p.clone()) catch {};
         const classes_g = self.classes.borrow();
         for (cd.supertype_names) |sn| {
             if (classes_g.get().get(sn)) |sc| stack.append(a, sc.clone()) catch {};
@@ -2401,9 +2399,7 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         if (cg.get().get(cls_name)) |def| {
             var cur = blk: {
                 const dg = def.borrow();
-                const pg = dg.get().parent.borrow();
-                const p = pg.get().*;
-                pg.deinit();
+                const p = dg.get().parent;
                 dg.deinit();
                 break :blk if (p) |pp| pp.clone() else null;
             };
@@ -2411,9 +2407,7 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
                 const pg = p.borrow();
                 try probe_classes.append(allocator, pg.get().name);
                 if (pg.get().fqn.len != 0 and !std.mem.eql(u8, pg.get().fqn, pg.get().name)) try probe_classes.append(allocator, pg.get().fqn);
-                const ppg = pg.get().parent.borrow();
-                const next = ppg.get().*;
-                ppg.deinit();
+                const next = pg.get().parent;
                 pg.deinit();
                 p.deinit();
                 cur = if (next) |n| n.clone() else null;
@@ -2471,11 +2465,9 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
     // Enum.values()
     if (is_enum and std.mem.eql(u8, name, "values") and args.len == 0) {
         const cg = cls.borrow();
-        const eg = cg.get().enum_entries.borrow();
         var items: std.ArrayList(Value) = .empty;
-        for (eg.get().items) |e| try items.append(allocator, e.value);
+        for (cg.get().enum_entries) |e| try items.append(allocator, e.value);
         const enum_name = try StringRef.init(allocator, cg.get().name);
-        eg.deinit();
         cg.deinit();
         return .{ .ok = .{ .List = .{
             .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
@@ -2489,18 +2481,15 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         const cg = cls.borrow();
         const sg = args[0].String.borrow();
         const want = sg.get().*;
-        const eg = cg.get().enum_entries.borrow();
-        for (eg.get().items) |e| {
+        for (cg.get().enum_entries) |e| {
             if (std.mem.eql(u8, e.name, want)) {
                 const v = e.value;
-                eg.deinit();
                 sg.deinit();
                 cg.deinit();
                 return .{ .ok = v };
             }
         }
         const msg = try std.fmt.allocPrint(allocator, "No enum constant {s}.{s}", .{ cg.get().fqn, want });
-        eg.deinit();
         sg.deinit();
         cg.deinit();
         return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
@@ -3784,9 +3773,7 @@ fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!std.St
                 set.put(cg.get().name, {}) catch {};
                 set.put(cg.get().fqn, {}) catch {};
                 var p = blk: {
-                    const pg = cg.get().parent.borrow();
-                    const pp = pg.get().*;
-                    pg.deinit();
+                    const pp = cg.get().parent;
                     break :blk if (pp) |x| x.clone() else null;
                 };
                 cg.deinit();
@@ -3794,9 +3781,7 @@ fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!std.St
                     const ppg = pp.borrow();
                     set.put(ppg.get().name, {}) catch {};
                     set.put(ppg.get().fqn, {}) catch {};
-                    const npg = ppg.get().parent.borrow();
-                    const next = npg.get().*;
-                    npg.deinit();
+                    const next = ppg.get().parent;
                     ppg.deinit();
                     pp.deinit();
                     p = if (next) |x| x.clone() else null;
@@ -4070,18 +4055,14 @@ fn enclosingChainClassOrder(self: *VmHost, allocator: Allocator) Allocator.Error
                 const cg = g.get().class.borrow();
                 try v.append(allocator, cg.get().name);
                 var p = blk: {
-                    const pg = cg.get().parent.borrow();
-                    const pp = pg.get().*;
-                    pg.deinit();
+                    const pp = cg.get().parent;
                     break :blk if (pp) |x| x.clone() else null;
                 };
                 cg.deinit();
                 while (p) |pp| {
                     const ppg = pp.borrow();
                     try v.append(allocator, ppg.get().name);
-                    const npg = ppg.get().parent.borrow();
-                    const next = npg.get().*;
-                    npg.deinit();
+                    const next = ppg.get().parent;
                     ppg.deinit();
                     pp.deinit();
                     p = if (next) |x| x.clone() else null;
@@ -4520,8 +4501,8 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         .is_enum = false,
         .is_sealed = false,
         .supertype_names = &.{},
-        .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+        .parent = null,
+        .interfaces = &.{},
         .is_interface = false,
         .is_fun_interface = false,
         .parent_ctor_args = &.{},
@@ -4530,13 +4511,13 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         .is_inner = false,
         .is_anonymous = true,
         .secondary_ctors = &.{},
-        .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(allocator, .empty),
+        .enum_entries = &.{},
         .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
         .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-        .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(allocator, .empty),
+        .nested_classes = &.{},
         .captured_env = env,
-        .supertype_delegates = try ObjRef(std.ArrayList(runtime.SupertypeDelegate)).init(allocator, .empty),
-        .delegate_forwarders = try ObjRef(std.ArrayList(runtime.MethodDef)).init(allocator, .empty),
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
         .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
     });
     var fields: std.ArrayList(InstanceData.Field) = .empty;
@@ -4745,9 +4726,7 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
             const cg = c.borrow();
             const matched = std.mem.eql(u8, cg.get().name, qualifier) or std.mem.eql(u8, cg.get().fqn, qualifier);
             const next = blk: {
-                const pg = cg.get().parent.borrow();
-                defer pg.deinit();
-                break :blk if (pg.get().*) |p| p.clone() else null;
+                break :blk if (cg.get().parent) |p| p.clone() else null;
             };
             cg.deinit();
             c.deinit();
@@ -4781,9 +4760,7 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
                 const cg = c.borrow();
                 const matched = std.mem.eql(u8, cg.get().name, qualifier) or std.mem.eql(u8, cg.get().fqn, qualifier);
                 const next = blk: {
-                    const pg = cg.get().parent.borrow();
-                    defer pg.deinit();
-                    break :blk if (pg.get().*) |p| p.clone() else null;
+                    break :blk if (cg.get().parent) |p| p.clone() else null;
                 };
                 cg.deinit();
                 c.deinit();
@@ -4820,9 +4797,7 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
             const cg = c.borrow();
             const matched = std.mem.eql(u8, cg.get().name, qualifier) or std.mem.eql(u8, cg.get().fqn, qualifier);
             const next = blk: {
-                const pg = cg.get().parent.borrow();
-                defer pg.deinit();
-                break :blk if (pg.get().*) |p| p.clone() else null;
+                break :blk if (cg.get().parent) |p| p.clone() else null;
             };
             cg.deinit();
             c.deinit();

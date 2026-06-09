@@ -1010,13 +1010,14 @@ fn buildModuleWithOverrides(
             }
         }
         const g = class_def.borrowMut();
-        const eg = g.get().enum_entries.borrowMut();
-        eg.get().* = entries;
-        eg.deinit();
+        g.get().enum_entries = try entries.toOwnedSlice(a);
         g.deinit();
     }
 
-    // Resolve runtime parent + interface references.
+    // Resolve runtime parent + interface references. The class headers are
+    // already registered; this is the second linker phase that backpatches
+    // each `parent`/`interfaces` slot once. After it returns the fields are
+    // immutable for the rest of the process and read lock-free on dispatch.
     {
         var vit = classes.valueIterator();
         while (vit.next()) |def_ptr| {
@@ -1024,6 +1025,7 @@ fn buildModuleWithOverrides(
             const dg = def.borrow();
             const supertype_names = dg.get().supertype_names;
             dg.deinit();
+            var ifaces: std.ArrayList(ObjRef(ClassDef)) = .empty;
             for (supertype_names) |sup_name| {
                 const sup_def = classes.get(sup_name) orelse continue;
                 if (def.cell == sup_def.cell) continue;
@@ -1031,18 +1033,19 @@ fn buildModuleWithOverrides(
                 const sup_is_interface = sg.get().is_interface;
                 sg.deinit();
                 if (sup_is_interface) {
-                    const dg2 = def.borrowMut();
-                    const ig = dg2.get().interfaces.borrowMut();
-                    try ig.get().append(a, sup_def.clone());
-                    ig.deinit();
-                    dg2.deinit();
+                    try ifaces.append(a, sup_def.clone());
                 } else {
                     const dg2 = def.borrowMut();
-                    const pg = dg2.get().parent.borrowMut();
-                    if (pg.get().* == null) pg.get().* = sup_def.clone();
-                    pg.deinit();
+                    if (dg2.get().parent == null) dg2.get().parent = sup_def.clone();
                     dg2.deinit();
                 }
+            }
+            if (ifaces.items.len != 0) {
+                const dg2 = def.borrowMut();
+                dg2.get().interfaces = try ifaces.toOwnedSlice(a);
+                dg2.deinit();
+            } else {
+                ifaces.deinit(a);
             }
         }
     }
@@ -1550,8 +1553,8 @@ fn buildClassDef(
         .is_enum = c.is_enum,
         .is_sealed = c.is_sealed,
         .supertype_names = supertype_names,
-        .parent = try ObjRef(?ObjRef(ClassDef)).init(a, null),
-        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(a, .empty),
+        .parent = null,
+        .interfaces = &.{},
         .is_interface = c.is_interface,
         .is_fun_interface = c.is_fun_interface,
         .parent_ctor_args = &.{},
@@ -1560,13 +1563,13 @@ fn buildClassDef(
         .is_inner = c.is_inner,
         .is_anonymous = false,
         .secondary_ctors = secondary,
-        .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(a, .empty),
+        .enum_entries = &.{},
         .companion = try ObjRef(?ObjRef(InstanceData)).init(a, null),
         .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(a, null),
-        .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(a, .empty),
+        .nested_classes = &.{},
         .captured_env = globals_for_capture.clone(),
-        .supertype_delegates = try ObjRef(std.ArrayList(runtime.SupertypeDelegate)).init(a, .empty),
-        .delegate_forwarders = try ObjRef(std.ArrayList(runtime.MethodDef)).init(a, .empty),
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
         .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(a, null),
     });
 }

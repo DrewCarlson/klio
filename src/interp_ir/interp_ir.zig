@@ -474,12 +474,8 @@ pub fn memberIsProperty(allocator: Allocator, classes: *const ObjRef(ClassTable)
         for (cdef.body_properties) |p| {
             if (std.mem.eql(u8, p.name, name)) return true;
         }
-        {
-            const pg = cdef.parent.borrow();
-            defer pg.deinit();
-            if (pg.get().*) |parent| {
-                stack.append(allocator, parent.clone()) catch return false;
-            }
+        if (cdef.parent) |parent| {
+            stack.append(allocator, parent.clone()) catch return false;
         }
         for (cdef.supertype_names) |sn| {
             const tg = classes.borrow();

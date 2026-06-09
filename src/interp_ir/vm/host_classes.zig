@@ -323,9 +323,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                         if (std.mem.eql(u8, n, ty.name)) return true;
                     }
                 }
-                const pg = cdef.parent.borrow();
-                defer pg.deinit();
-                if (pg.get().*) |parent| {
+                if (cdef.parent) |parent| {
                     cur = parent.clone();
                 }
             }
@@ -360,17 +358,13 @@ fn interfaceChainMatches(self: *VmHost, cdef: *const ClassDef, name: []const u8)
     var seen: std.ArrayList([]const u8) = .empty;
     defer seen.deinit(a);
 
-    {
-        const ig = cdef.interfaces.borrow();
-        defer ig.deinit();
-        for (ig.get().items) |iface| {
-            const fg = iface.borrow();
-            defer fg.deinit();
-            if (std.mem.eql(u8, fg.get().name, name) or std.mem.eql(u8, fg.get().fqn, name)) {
-                return true;
-            }
-            queue.append(a, iface.clone()) catch return false;
+    for (cdef.interfaces) |iface| {
+        const fg = iface.borrow();
+        defer fg.deinit();
+        if (std.mem.eql(u8, fg.get().name, name) or std.mem.eql(u8, fg.get().fqn, name)) {
+            return true;
         }
+        queue.append(a, iface.clone()) catch return false;
     }
 
     var head: usize = 0;
@@ -391,12 +385,8 @@ fn interfaceChainMatches(self: *VmHost, cdef: *const ClassDef, name: []const u8)
                 queue.append(a, d.clone()) catch return false;
             }
         }
-        {
-            const sg = idef.interfaces.borrow();
-            defer sg.deinit();
-            for (sg.get().items) |sup| {
-                queue.append(a, sup.clone()) catch return false;
-            }
+        for (idef.interfaces) |sup| {
+            queue.append(a, sup.clone()) catch return false;
         }
     }
     return false;
@@ -481,8 +471,8 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         .is_enum = class.is_enum,
         .is_sealed = class.is_sealed,
         .supertype_names = supertype_names,
-        .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+        .parent = null,
+        .interfaces = &.{},
         .is_interface = class.is_interface,
         .is_fun_interface = class.is_fun_interface,
         .parent_ctor_args = &.{},
@@ -491,13 +481,13 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         .is_inner = class.is_inner,
         .is_anonymous = false,
         .secondary_ctors = &.{},
-        .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(allocator, .empty),
+        .enum_entries = &.{},
         .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
         .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-        .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(allocator, .empty),
+        .nested_classes = &.{},
         .captured_env = env,
-        .supertype_delegates = try ObjRef(std.ArrayList(SupertypeDelegate)).init(allocator, .empty),
-        .delegate_forwarders = try ObjRef(std.ArrayList(MethodDef)).init(allocator, .empty),
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
         .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
     });
 }
