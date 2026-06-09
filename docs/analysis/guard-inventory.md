@@ -31,7 +31,7 @@ called out explicitly.
 | Class | Guards catalogued | Deletable (point-fix) | Keep (load-bearing) | Needs-verification | Removed |
 | --- | --- | --- | --- | --- | --- |
 | A — closure execution / lambda variable access | 9 | 7 | 1 | 1 | 2 (A1, A2 via 4b) |
-| B — receiver/`this` across suspend/inline | 14 | 11 | 1 | 2 | 0 |
+| B — receiver/`this` across suspend/inline | 14 | 11 | 1 | 2 | 1 (B1 via item 6; B2–B5 relocated onto the frame chain) |
 | C — pack-vs-direct resolution | 12 | 10 | 1 | 1 | 0 |
 | Other-correctness / re-entrancy | 7 | 1 | 6 | 0 | 0 |
 | **Total** | **42** | **29** | **9** | **4** | **2** |
@@ -227,22 +227,30 @@ chain and its companion resolution flags live in process-wide thread-locals that
 are NOT part of `FrameSnapshot` (`eval.zig:149-167`), so they leak across a park
 or a re-entrant dispatch.
 
-### B1 — `outer_this` thread-local stack + two push helpers
+### B1 — `outer_this` thread-local stack + two push helpers — REMOVED (item 6)
 
-- **Location:** `src/interp_ir/vm/host_call_member.zig:65-73` (the TLS + lazy
-  page-allocator init), push/pop helpers `:893-916` (`pushAccessEnclosing`/
-  `popAccessEnclosing`/`pushOuterThis`/`popOuterThis`), readers
-  `enclosingThis`/`enclosingThisChain` `:875-891`.
-- **What it does:** the entire enclosing-`this` mechanism — one backing store, two
-  push helpers (VmHost-handle vs allocator-only), read by every implicit-receiver
-  fallback. Not in `FrameSnapshot`.
+- **Status:** REMOVED in §6 item **6**. The `outer_this` thread-local, its lazy
+  `outerThisStack` page-allocator init, and the run-boundary `resetReceiverTls`
+  (plus its call site in `resetReceiverThreadLocals`) are deleted. The
+  enclosing-`this` chain is now the current `Frame`'s `enclosing_this` field in
+  `src/ir/eval.zig`: it is seeded at frame entry from the caller's active chain
+  (so a frame inherits the enclosing implicit receivers a dispatch pushed),
+  snapshotted into `FrameSnapshot.enclosing_this` on suspend, and restored
+  verbatim in `resumeContinuation`. A thread-local `active_chain` pointer routes
+  reads/pushes to the *currently executing* frame's field; it is never receiver
+  state of its own (it always points at a live frame, or is `null` between
+  runs), so a frame-scoped chain cannot leak past the frame or across a `run`
+  boundary. The push helpers (`pushAccessEnclosing`/`popAccessEnclosing`/
+  `pushOuterThis`/`popOuterThis`) and readers (`enclosingThis`/
+  `enclosingThisChain`) are kept as thin wrappers delegating to the `ir.eval`
+  frame-chain primitives, so all existing call sites are unchanged.
+- **Was at:** `src/interp_ir/vm/host_call_member.zig` (the TLS + helpers).
 - **Class:** B (the root carrier).
-- **Deletable?** Deletable. Replaced by a `ReceiverContext` field on `Frame` and
-  `FrameSnapshot` (§4.2).
-- **Removes via:** §6 item **6**.
-- **Removal test:** the closures+suspend fuzzer (§5.4) — a `this@Outer` needed only
-  via `outer_this` across a real `delay`/park resolves identically pre- and
-  post-suspend; differential `runWithPacks` vs `runWithKtc` identical.
+- **Verified by:** `examples/receiver_across_suspend.kt` (e2e corpus, byte-
+  identical) and the `enclosing_this_chain_survives_suspend` itest — a `suspend`
+  member-extension parks at `delay` then resolves a bare member of its enclosing
+  `this@Owner` after resume; before the fix this reported `unresolved global
+  'owned'`. Reverting the frame carrier (restoring the TLS) makes both fail.
 
 ### B2 — Push-enclosing around `Call` for an extension callee
 

@@ -191,18 +191,17 @@ scan does not see it, and nested-receiver references fall back to the same
 suspend-fragile `outer_this` stack. The inline tables themselves are
 build-scoped thread-locals (`src/ir/lower/inline_state.zig:31-49`).
 
-**Why it is currently masked.** Three layered fallbacks recover the receiver in
-the common case, which is why no green test fails today: (a) the receiver-lambda
-paths push the enclosing `this` onto `outer_this` *around* the call and pop after
-(`host_call_value.zig:339-358`, `intrinsic_host.zig:636-661`); (b) a `this`
-carried as a frame param (`frameThisParam`) or a `this`-named capture
-(`callerThisValue`) survives a snapshot by construction. The vulnerability is the
-**narrow window** where a `this@Outer` is needed *only* via the `outer_this` TLS
-(not present as a param/capture) across a real `delay`/park — the unwind does not
-run the matching pop, and `resumeContinuation` rebuilds the frame from a snapshot
-that never carried the chain. The taxonomy here establishes the mechanism; §6
-item 3 (the closures+suspend fuzzer) is what is meant to *exhibit* this window as
-a concrete failing program, since it is not demonstrated by any current itest.
+**Resolved (item 6).** The enclosing-`this` chain is no longer a process-global
+thread-local: it is the current `Frame`'s `enclosing_this` field, snapshotted
+into `FrameSnapshot` on suspend and restored verbatim on resume, so the **narrow
+window** that masked this — a `this@Outer` needed *only* via the chain (not a
+param/capture) across a real `delay`/park — is closed structurally. The
+regression is pinned by `examples/receiver_across_suspend.kt` (e2e corpus) and
+the `enclosing_this_chain_survives_suspend` itest: a `suspend` member-extension
+parks at `delay`, then resolves a bare member of its enclosing `this@Owner`
+*after* resume; before the fix this reported `unresolved global 'owned'`. The
+inline-receiver variant below (a lowering-time scope local named `"this"`) is a
+separate facet handled by item 10.
 
 ### Class C — Pack-vs-direct resolution divergence
 
@@ -444,11 +443,18 @@ class.
 
 ### 4.2 One receiver context, threaded on the Frame (→ Class B)
 
-- Introduce an explicit `ReceiverContext` (the frame's own `this`, the enclosing
-  `this@` chain, and the inner-class outer receiver) as a **field of `Frame` and
-  of `FrameSnapshot`** (`eval.zig:149-167`). Dup it on suspend, restore it
-  verbatim in `resumeContinuation`. The receiver chain travels with the parked
-  continuation by construction; the suspend-`this` bug disappears.
+- **Receiver chain: DONE (item 6).** The enclosing-`this@` chain is now an
+  `enclosing_this` field of `Frame` (seeded at frame entry from the caller's
+  active chain so the frame inherits the enclosing implicit receivers a
+  `with`/member-extension/receiver-lambda dispatch pushed) and of
+  `FrameSnapshot`. It is duped on suspend and restored verbatim in
+  `resumeContinuation`, so the chain travels with the parked continuation by
+  construction; the suspend-`this` bug disappears. The `outer_this` thread-local
+  and `outerThisStack` are deleted, and `enclosingThis`/`enclosingThisChain`/
+  `pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain
+  via a thread-local `active_chain` pointer that only ever points at a live
+  frame's field. Still pending: folding the frame's own `this` and the
+  inner-class outer receiver (`inner_outer_hint`) into the same carrier.
 - Set the frame receiver slot at call entry on every dispatch path (method walk,
   extension call, closure invoke, inline splice). `frameThisParam`/
   `callerThisValue`/`execCallMemberOrGlobal` read one field instead of recovering
@@ -664,7 +670,7 @@ refactors, then the structural unifications in dependency order.
 | 4a | Precise captured-`var` carrier FIRST: `StoreCapture` instr OR precise boxing (replace syntactic `computeBoxedVars`), proven green with closures itests + §5.1 (§4.1) | A | high | medium | L |
 | 4b | DONE — stop swapping `self.globals`, deleted `StoreGlobal`-for-capture + `scoped_env` + the now-dead `WritebackCaptures`/`readLambdaCapture` capture-sync; the HOF invoke path runs over the real top-level env and captured-`var` writes round-trip through the shared `Cell`. Required extending 4a's boxing to function/lambda *parameters* a nested closure writes (the captured-param gap, e.g. `toMap(destination){ consumeEach { destination += it } }`). (§4.1) | A | high | high | L |
 | 5 | `VmIntrinsicHost` becomes thin adapter delegating to eval.Host (§4.1) | A | high | medium | L |
-| 6 | Receiver context on `Frame`/`FrameSnapshot`; drop `outer_this`/`inner_outer_hint`; guards become params (§4.2) | B | high | high | XL |
+| 6 | DONE (receiver chain) — enclosing-`this` chain is now a `Frame` field (`enclosing_this`), snapshotted into `FrameSnapshot` on suspend and restored on resume; the `outer_this` thread-local + `outerThisStack` + its `resetReceiverTls` are deleted and `enclosingThis`/`enclosingThisChain`/`pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain. `inner_outer_hint` and the remaining guards-as-params are not yet folded in. (§4.2) | B | high | high | XL |
 | 7 | Single name-resolution function; collapse "Or" instructions to `CallUnresolved`; registry func-kind (member-extension as its own kind, §4.3 caution) for extension scorer | A/B | high | medium | L |
 | 8 | Per-decl package tag + two-phase header registration + package/FQN symbol index; lowering emits FQN-qualified calls; remove `isShippedFqn`/prefix-ladder/suffix-scan — tighten simple-name fallback ONLY after §4.4-item-3 uniqueness proven | C | high | high | XL |
 | 9 | One executable form per symbol resolved at link time; remove per-call FQN short-circuit (§4.4) | C | high | high | XL |

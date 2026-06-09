@@ -499,6 +499,32 @@ allocator; `outerThisStack` leaks a page-allocator ArrayList
 `thread_local!`, but each worker already materializes its own `Vm`/`VmHost`
 (`spawnSeed`/`materialize`), so this is per-instance state masquerading as global.
 
+**R11 progress.** The one true bug is fixed: `in_progress` (`host_impl.zig`)
+leaked its hash-map bucket backing per thread-lifetime, on top of the manual
+`page_allocator` per-key dupe/free. `in_progress` is now an
+`ArrayListUnmanaged([]const u8)` of the program-image-owned (run-stable) key
+slices, page-allocator backed and `clearRetainingCapacity`-reset at the run
+boundary through `resetReceiverTls`, exactly like its sibling guards
+(`field_resolve_stack`, `ctor_guard`, `inner_outer_hint`). No bucket array, no
+per-key copy, so nothing leaks and the cycle-breaking semantics (a re-entrant
+read of a still-initializing top-level prop returns `null`) are unchanged.
+
+The broader move (onto `Vm`/`VmHost`) is NOT as safe as §2D.6 first assumed:
+after R6, `VmHost`/`VmIntrinsicHost` are transient borrowed value-types rebuilt
+per call (`VmHost.borrowed` from `SharedHandles`, with no back-pointer to the
+owning `Vm`), so a field on the host would not survive across a re-entrant
+synchronous call stack, which is the exact thing each guard exists to detect. A
+field on `Vm` would survive (one `Vm` per thread), but reaching it from the
+sibling free functions would mean threading a handle through
+`SharedHandles`/`borrowed`/the seed and every ad-hoc
+`VmHost{...}`/`VmIntrinsicHost{...}` literal, and the `eval.zig` guards
+(`eval_depth`, `active_chain`) live a layer below `interp_ir` where `Vm` is not
+even visible. The guards are also deliberately page-allocator backed and
+capacity-retained across runs (a per-run-arena backing would dangle the retained
+capacity once that arena is torn down). So the remaining guards stay
+thread-local: correct re-entrancy detection on a per-thread call stack with no
+leak, and `active_chain` stays per-thread as item 6 already established.
+
 #### 2D.7 `Box<Value>` boxing helper re-implemented in ~7 files
 
 `Pair`/`Triple`/`MapEntry`/`Result`/`Exception`/`Generate`/`BoundMethod` store

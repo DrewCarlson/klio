@@ -132,6 +132,62 @@ threadlocal var eval_depth: usize = 0;
 /// first `runFrame` reads the env once and caches the result.
 threadlocal var eval_depth_cap: usize = 0;
 
+/// The enclosing-`this` chain of the *currently executing* frame.
+///
+/// This is NOT receiver state of its own: it always points at a live `Frame`'s
+/// `enclosing_this` field (or is `null` between runs / before the first
+/// frame). On frame entry it is repointed at the new frame's chain and restored
+/// to the caller's chain on exit, so the chain a frame reads is its own
+/// frame-scoped data, snapshotted into `FrameSnapshot.enclosing_this` on
+/// suspend and restored verbatim on resume. A push made by host dispatch just
+/// before invoking a callable appends to the *current* frame's chain; the
+/// invoked frame copies that extended chain at entry (it inherits the
+/// enclosing receivers), and the matching pop removes it once the call returns.
+/// Because the chain lives on the frame, it travels with a parked continuation
+/// and cannot leak past the frame or across a `run` boundary.
+threadlocal var active_chain: ?*std.ArrayList(Value) = null;
+
+/// Push `v` as an enclosing implicit receiver for the about-to-be-invoked
+/// callable. Appends to the current frame's chain; the invoked frame inherits
+/// it at entry. A no-op (silently dropped) when no frame is active.
+pub fn pushEnclosing(v: *const Value) void {
+    const chain = active_chain orelse return;
+    chain.append(chainAllocator(), v.*) catch {};
+}
+
+/// Pop the most recent `pushEnclosing`. A no-op when no frame is active or the
+/// chain is empty.
+pub fn popEnclosing() void {
+    const chain = active_chain orelse return;
+    if (chain.items.len > 0) _ = chain.pop();
+}
+
+/// The innermost enclosing `this`, or `null` when the chain is empty.
+pub fn enclosingThisLast() ?Value {
+    const chain = active_chain orelse return null;
+    if (chain.items.len == 0) return null;
+    return chain.items[chain.items.len - 1];
+}
+
+/// The enclosing-`this` chain, innermost first. Caller owns the returned slice.
+pub fn enclosingThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
+    const chain = active_chain orelse return allocator.alloc(Value, 0);
+    var out = try allocator.alloc(Value, chain.items.len);
+    var i: usize = 0;
+    while (i < chain.items.len) : (i += 1) {
+        out[i] = chain.items[chain.items.len - 1 - i];
+    }
+    return out;
+}
+
+/// Backing allocator for a frame's `enclosing_this` chain. The chain is
+/// frame-scoped (created and torn down with the frame, or copied verbatim into
+/// a `FrameSnapshot` on suspend), so it is backed by the same per-call
+/// allocator the frame's regs/params/captures use.
+fn chainAllocator() Allocator {
+    return std.heap.page_allocator;
+}
+
 fn maxEvalDepth() usize {
     if (eval_depth_cap != 0) return eval_depth_cap;
     // `procEnvGetVar` reads the whole environment block into a scratch
@@ -201,6 +257,13 @@ pub const FrameSnapshot = struct {
     regs: []Value,
     params: []Value,
     captures: []Value,
+    /// The frame's enclosing-`this` chain (innermost last) at the suspension
+    /// point. Restored verbatim on resume so implicit-receiver resolution
+    /// (bare member / `this@Outer`) inside a receiver-lambda / `with` /
+    /// member-extension body sees the same receivers after the park that it saw
+    /// before: the chain travels with the parked continuation instead of being
+    /// recovered from process-global state the resuming thread happens to hold.
+    enclosing_this: []Value,
     try_stack: []TryFrame,
     is_lambda: bool,
     /// Register the resumed value is written into before execution
@@ -235,6 +298,19 @@ const Frame = struct {
     regs: std.ArrayList(Value),
     params: std.ArrayList(Value),
     captures: std.ArrayList(Value),
+    /// The enclosing-`this` chain this frame runs with, innermost last. Seeded
+    /// at frame entry from the caller's active chain (so the frame inherits the
+    /// enclosing implicit receivers a `with`/member-extension/receiver-lambda
+    /// dispatch pushed) and extended by this frame's own pushes for the
+    /// duration of a sub-call. Backed by `page_allocator` so any push site
+    /// (`execInst` here or host dispatch through `pushAccessEnclosing`) appends
+    /// through one allocator. Snapshotted into `FrameSnapshot.enclosing_this`
+    /// on suspend and restored verbatim on resume.
+    enclosing_this: std.ArrayList(Value),
+    /// The `active_chain` pointer to restore when this frame exits, so a frame
+    /// running under a caller frame returns enclosing-`this` resolution to the
+    /// caller's chain rather than leaving a dangling pointer.
+    prev_chain: ?*std.ArrayList(Value),
     /// The owning module handle when this frame runs in a per-method
     /// *sub-module* (anonymous object / local class / nested
     /// `private`/member class — each lowered into its own `Module`).
@@ -262,15 +338,43 @@ const Frame = struct {
             .regs = regs,
             .params = params,
             .captures = captures,
+            .enclosing_this = .empty,
+            .prev_chain = null,
             .module_arc = null,
             .allocator = allocator,
         };
+    }
+
+    /// Seed this frame's enclosing-`this` chain from the caller's active chain
+    /// and make it the active chain for the frame's lifetime. The seed copies
+    /// the caller's chain verbatim: the new frame inherits the enclosing
+    /// implicit receivers visible at the call site (e.g. a `with(x){...}` body
+    /// resolving a member of `x` or a `this@Outer`).
+    fn activateChain(self: *Frame) Allocator.Error!void {
+        if (active_chain) |caller| {
+            try self.enclosing_this.appendSlice(chainAllocator(), caller.items);
+        }
+        self.prev_chain = active_chain;
+        active_chain = &self.enclosing_this;
+    }
+
+    /// Seed this frame's chain from a saved snapshot slice (resume path) and
+    /// make it active.
+    fn activateChainFrom(self: *Frame, saved: []const Value) Allocator.Error!void {
+        try self.enclosing_this.appendSlice(chainAllocator(), saved);
+        self.prev_chain = active_chain;
+        active_chain = &self.enclosing_this;
+    }
+
+    fn deactivateChain(self: *Frame) void {
+        active_chain = self.prev_chain;
     }
 
     fn deinit(self: *Frame) void {
         self.regs.deinit(self.allocator);
         self.params.deinit(self.allocator);
         self.captures.deinit(self.allocator);
+        self.enclosing_this.deinit(chainAllocator());
     }
 
     fn read(self: *const Frame, r: Reg) Value {
@@ -364,6 +468,8 @@ pub fn evalWithCapturesIn(
     var frame = try Frame.newWithCaptures(allocator, module, func, args, captures);
     defer frame.deinit();
     frame.module_arc = owning;
+    try frame.activateChain();
+    defer frame.deactivateChain();
     const cur = func.entry;
     var result = try runFrame(allocator, module, &frame, &try_stack, cur, 0, host);
     // A labeled return whose target is this function exits it as a
@@ -420,6 +526,10 @@ pub fn resumeContinuation(
         var frame = try Frame.newWithCaptures(allocator, m, func, params, caps);
         defer frame.deinit();
         frame.module_arc = snap_module;
+        // Restore the frame's enclosing-`this` chain verbatim so implicit
+        // receivers resolved before the park resolve identically after it.
+        try frame.activateChainFrom(snap.enclosing_this);
+        defer frame.deactivateChain();
         frame.regs.clearRetainingCapacity();
         try frame.regs.appendSlice(allocator, snap.regs);
         // Kotlin `Continuation.resumeWith(Result.failure(e))` means
@@ -594,6 +704,7 @@ fn runFrameInner(
                             .regs = try allocator.dupe(Value, frame.regs.items),
                             .params = try allocator.dupe(Value, frame.params.items),
                             .captures = try allocator.dupe(Value, frame.captures.items),
+                            .enclosing_this = try allocator.dupe(Value, frame.enclosing_this.items),
                             .try_stack = try allocator.dupe(TryFrame, try_stack.items),
                             .is_lambda = frame.func.is_lambda,
                             .resume_reg = resume_reg,
@@ -2584,14 +2695,10 @@ pub const Host = struct {
         call_func_named: ?*const fn (ctx: *anyopaque, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
         call_func_typed: ?*const fn (ctx: *anyopaque, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult = null,
         call_named_overload: ?*const fn (ctx: *anyopaque, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult = null,
-        enclosing_this: ?*const fn (ctx: *anyopaque) ?Value = null,
-        enclosing_this_chain: ?*const fn (ctx: *anyopaque, allocator: Allocator) Allocator.Error![]Value = null,
         callable_receiver_shape: ?*const fn (ctx: *anyopaque, v: *const Value) ?ReceiverShape = null,
         closure_needs_this_capture: ?*const fn (ctx: *anyopaque, v: *const Value) bool = null,
         override_closure_this: ?*const fn (ctx: *anyopaque, v: *const Value, new_this: *const Value) void = null,
         call_member_only: ?*const fn (ctx: *anyopaque, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult = null,
-        push_access_enclosing: ?*const fn (ctx: *anyopaque, v: *const Value) void = null,
-        pop_access_enclosing: ?*const fn (ctx: *anyopaque) void = null,
         push_inner_outer_hint: ?*const fn (ctx: *anyopaque, v: *const Value) void = null,
         pop_inner_outer_hint: ?*const fn (ctx: *anyopaque) void = null,
         is_shadowing_capture: ?*const fn (ctx: *anyopaque, name: []const u8) bool = null,
@@ -2783,18 +2890,13 @@ pub const Host = struct {
     }
 
     pub fn enclosingThis(self: Host) ?Value {
-        if (self.vtable.enclosing_this) |f| return f(self.ctx);
-        return null;
+        _ = self;
+        return enclosingThisLast();
     }
 
     pub fn enclosingThisChain(self: Host, allocator: Allocator) Allocator.Error![]Value {
-        if (self.vtable.enclosing_this_chain) |f| return f(self.ctx, allocator);
-        if (self.enclosingThis()) |v| {
-            const out = try allocator.alloc(Value, 1);
-            out[0] = v;
-            return out;
-        }
-        return allocator.alloc(Value, 0);
+        _ = self;
+        return enclosingThisChainAlloc(allocator);
     }
 
     pub fn callableReceiverShape(self: Host, v: *const Value) ?ReceiverShape {
@@ -2817,11 +2919,13 @@ pub const Host = struct {
     }
 
     pub fn pushAccessEnclosing(self: Host, v: *const Value) void {
-        if (self.vtable.push_access_enclosing) |f| f(self.ctx, v);
+        _ = self;
+        pushEnclosing(v);
     }
 
     pub fn popAccessEnclosing(self: Host) void {
-        if (self.vtable.pop_access_enclosing) |f| f(self.ctx);
+        _ = self;
+        popEnclosing();
     }
 
     pub fn pushInnerOuterHint(self: Host, v: *const Value) void {
