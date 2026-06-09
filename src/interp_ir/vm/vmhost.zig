@@ -1,14 +1,17 @@
-//! The per-evaluation `VmHost` — the `ir.eval.Host` implementation the
-//! IR evaluator dispatches non-trivial operations through, plus the
-//! `VmIntrinsicHost` adapter the stdlib reaches back through to invoke
-//! lambdas and the rest of the runtime.
+//! The per-evaluation `VmHost` — the host type the IR evaluator
+//! dispatches non-trivial operations through, plus the `VmIntrinsicHost`
+//! adapter the stdlib reaches back through to invoke lambdas and the rest
+//! of the runtime.
 //!
-//! In Rust these were inherent `impl VmHost` blocks split across the
-//! `host_*.rs` files plus the `impl Host for VmHost` glue in
-//! `host_impl.rs`. Here the per-operation methods are FREE FUNCTIONS
-//! over `*VmHost` living in the sibling files, and this file owns the
-//! struct definitions plus the `{ctx, vtable}` wiring that turns them
-//! into an `ir.eval.Host` / `runtime.IntrinsicHost`.
+//! The IR evaluator (`ir.eval`) is generic over its host type
+//! (`comptime H`); `interp_ir` supplies `H = VmHost` at every
+//! `ir.eval.evalWith(VmHost, ...)` call site, so `host.callValue(...)` and
+//! the rest resolve as direct comptime-duck-typed method calls with no
+//! `{ctx, vtable}` indirection. The per-operation methods are FREE
+//! FUNCTIONS over `*VmHost` living in the sibling `host_*.zig` files; this
+//! file owns the struct definitions and aliases each free function as a
+//! `VmHost` method decl. `VmIntrinsicHost` still uses the
+//! `runtime.IntrinsicHost` `{ctx, vtable}` pair, which is a separate seam.
 
 const std = @import("std");
 
@@ -36,7 +39,6 @@ const Module = ir.Module;
 const FuncId = ir.FuncId;
 const ClassId = ir.ClassId;
 const TypeRef = ir.TypeRef;
-const Host = ir.eval.Host;
 const EvalResult = ir.eval.EvalResult;
 /// The stdlib `IntrinsicHost` callbacks carry `runtime.EvalResult`
 /// (`Value` / `RuntimeError`), distinct from the IR evaluator's
@@ -174,10 +176,46 @@ pub const VmHost = struct {
         };
     }
 
-    /// Build an `ir.eval.Host` `{ctx, vtable}` pair bound to this host.
-    pub fn hostInterface(self: *VmHost) Host {
-        return .{ .ctx = self, .vtable = &host_vtable };
-    }
+    // The IR evaluator is generic over its host type (`comptime H`) and
+    // invokes these as plain methods (`host.callValue(...)`). Each is the
+    // free function over `*VmHost` living in a sibling file; aliasing them
+    // here as struct decls makes method-call syntax resolve directly, with
+    // no `{ctx, vtable}` indirection. `interp_ir` supplies `H = VmHost` at
+    // every `ir.eval.evalWith(VmHost, ...)` call site.
+    pub const callValue = host_call_value.callValue;
+    pub const callValueNamed = host_call_value.callValueNamed;
+    pub const callValueWithThis = host_call_value.callValueWithThis;
+    pub const callMember = host_call_member.callMember;
+    pub const callMemberNamed = host_call_member.callMemberNamed;
+    pub const callMemberOnly = host_call_member.callMemberOnly;
+    pub const hostHasMember = host_call_member.hostHasMember;
+    pub const memberRef = host_call_member.memberRef;
+    pub const callSuper = host_call_member.callSuper;
+    pub const qualifiedThis = host_call_member.qualifiedThis;
+    pub const newInstance = host_instances.newInstance;
+    pub const newInstanceNamed = host_instances.newInstanceNamed;
+    pub const buildObject = host_instances.buildObject;
+    pub const pushInnerOuterHint = host_instances.pushInnerOuterHint;
+    pub const popInnerOuterHint = host_instances.popInnerOuterHint;
+    pub const getField = host_fields.getField;
+    pub const setField = host_fields.setField;
+    pub const instanceOf = host_classes.instanceOf;
+    pub const isConcreteCastTarget = host_classes.isConcreteCastTarget;
+    pub const registerClass = host_classes.registerClass;
+    pub const registerClassCaptured = host_classes.registerClassCaptured;
+    pub const lookupGlobal = host_globals.lookupGlobal;
+    pub const lookupGlobalThrowing = host_globals.lookupGlobalThrowing;
+    pub const storeGlobal = host_globals.storeGlobal;
+    pub const isShadowingCapture = host_globals.isShadowingCapture;
+    pub const buildClosure = host_call_value.buildClosure;
+    pub const buildAstLambdaWithFlagFuncid = host_call_value.buildAstLambdaWithFlagFuncid;
+    pub const callableReceiverShape = host_call_value.callableReceiverShape;
+    pub const closureNeedsThisCapture = host_call_value.closureNeedsThisCapture;
+    pub const overrideClosureThis = host_call_value.overrideClosureThis;
+    pub const callFunc = host_call_func.callFunc;
+    pub const callFuncNamed = host_call_func.callFuncNamed;
+    pub const callFuncTyped = host_call_func.callFuncTyped;
+    pub const callNamedOverload = host_call_func.callNamedOverload;
 };
 
 /// Stdlib `CallCtx` host adapter for native Vm dispatch. HOF bindings
@@ -221,159 +259,6 @@ pub const VmIntrinsicHost = struct {
     pub fn intrinsicHost(self: *VmIntrinsicHost) IntrinsicHost {
         return .{ .ctx = self, .vtable = &intrinsic_vtable };
     }
-};
-
-// -------------------------------------------------------------------------
-// `ir.eval.Host` vtable wiring.
-//
-// Each slot casts the opaque ctx back to `*VmHost` and forwards to the
-// matching free function in a sibling file (mirroring `host_impl.rs`'s
-// `impl Host for VmHost`). The sibling functions are stubs for now;
-// filling them in does not touch this wiring.
-// -------------------------------------------------------------------------
-
-fn hp(ctx: *anyopaque) *VmHost {
-    return @ptrCast(@alignCast(ctx));
-}
-
-fn vtCallValue(ctx: *anyopaque, a: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
-    return host_call_value.callValue(hp(ctx), a, callee, args);
-}
-fn vtCallValueNamed(ctx: *anyopaque, a: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return host_call_value.callValueNamed(hp(ctx), a, callee, args, arg_names);
-}
-fn vtCallValueWithThis(ctx: *anyopaque, a: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return host_call_value.callValueWithThis(hp(ctx), a, callee, this_value, args, arg_names);
-}
-fn vtCallMember(ctx: *anyopaque, a: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
-    return host_call_member.callMember(hp(ctx), a, receiver, name, args);
-}
-fn vtCallMemberNamed(ctx: *anyopaque, a: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return host_call_member.callMemberNamed(hp(ctx), a, receiver, name, args, arg_names);
-}
-fn vtCallMemberOnly(ctx: *anyopaque, a: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return host_call_member.callMemberOnly(hp(ctx), a, receiver, name, args, arg_names);
-}
-fn vtHostHasMember(ctx: *anyopaque, receiver: *const Value, name: []const u8) bool {
-    return host_call_member.hostHasMember(hp(ctx), receiver, name);
-}
-fn vtMemberRef(ctx: *anyopaque, a: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return host_call_member.memberRef(hp(ctx), a, receiver, name);
-}
-fn vtNewInstance(ctx: *anyopaque, a: Allocator, class: ClassId, args: []const Value) Allocator.Error!EvalResult {
-    return host_instances.newInstance(hp(ctx), a, class, args);
-}
-fn vtNewInstanceNamed(ctx: *anyopaque, a: Allocator, class: ClassId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return host_instances.newInstanceNamed(hp(ctx), a, class, args, arg_names);
-}
-fn vtGetField(ctx: *anyopaque, a: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return host_fields.getField(hp(ctx), a, receiver, name);
-}
-fn vtSetField(ctx: *anyopaque, a: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {
-    return host_fields.setField(hp(ctx), a, receiver, name, value);
-}
-fn vtInstanceOf(ctx: *anyopaque, value: *const Value, ty: TypeRef) bool {
-    return host_classes.instanceOf(hp(ctx), value, ty);
-}
-fn vtIsConcreteCastTarget(ctx: *anyopaque, name: []const u8) bool {
-    return host_classes.isConcreteCastTarget(hp(ctx), name);
-}
-fn vtLookupGlobal(ctx: *anyopaque, name: []const u8) ?Value {
-    return host_globals.lookupGlobal(hp(ctx), name);
-}
-fn vtLookupGlobalThrowing(ctx: *anyopaque, a: Allocator, name: []const u8) Allocator.Error!MaybeValueResult {
-    return host_globals.lookupGlobalThrowing(hp(ctx), a, name);
-}
-fn vtStoreGlobal(ctx: *anyopaque, a: Allocator, name: []const u8, value: Value) Allocator.Error!UnitResult {
-    return host_globals.storeGlobal(hp(ctx), a, name, value);
-}
-fn vtRegisterClass(ctx: *anyopaque, a: Allocator, class: *const ast.Class) Allocator.Error!UnitResult {
-    return host_classes.registerClass(hp(ctx), a, class);
-}
-fn vtRegisterClassCaptured(ctx: *anyopaque, a: Allocator, class: *const ast.Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult {
-    return host_classes.registerClassCaptured(hp(ctx), a, class, captured_names, captures);
-}
-fn vtBuildObject(ctx: *anyopaque, a: Allocator, expr: *const ast.Expr, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult {
-    return host_instances.buildObject(hp(ctx), a, expr, captured_names, captures);
-}
-fn vtCallSuper(ctx: *anyopaque, a: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return host_call_member.callSuper(hp(ctx), a, receiver, owner_class, qualifier, name, args, arg_names);
-}
-fn vtQualifiedThis(ctx: *anyopaque, a: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {
-    return host_call_member.qualifiedThis(hp(ctx), a, receiver, qualifier);
-}
-fn vtBuildClosure(ctx: *anyopaque, a: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {
-    return host_call_value.buildClosure(hp(ctx), a, module, body_func, captures);
-}
-fn vtBuildAstLambdaWithFlagFuncid(ctx: *anyopaque, a: Allocator, params: []const []const u8, body: *const ast.Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
-    return host_call_value.buildAstLambdaWithFlagFuncid(hp(ctx), a, params, body, captured_names, captures, absorb_return, body_func);
-}
-fn vtCallFunc(ctx: *anyopaque, a: Allocator, module: *const Module, func: FuncId, args: []const Value) Allocator.Error!EvalResult {
-    return host_call_func.callFunc(hp(ctx), a, module, func, args);
-}
-fn vtCallFuncNamed(ctx: *anyopaque, a: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return host_call_func.callFuncNamed(hp(ctx), a, module, func, args, arg_names);
-}
-fn vtCallFuncTyped(ctx: *anyopaque, a: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
-    return host_call_func.callFuncTyped(hp(ctx), a, module, func, args, arg_names, type_args, exact);
-}
-fn vtCallNamedOverload(ctx: *anyopaque, a: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
-    return host_call_func.callNamedOverload(hp(ctx), a, module, name, args, arg_names);
-}
-fn vtCallableReceiverShape(ctx: *anyopaque, v: *const Value) ?ReceiverShape {
-    return host_call_value.callableReceiverShape(hp(ctx), v);
-}
-fn vtClosureNeedsThisCapture(ctx: *anyopaque, v: *const Value) bool {
-    return host_call_value.closureNeedsThisCapture(hp(ctx), v);
-}
-fn vtOverrideClosureThis(ctx: *anyopaque, v: *const Value, new_this: *const Value) void {
-    host_call_value.overrideClosureThis(hp(ctx), v, new_this);
-}
-fn vtPushInnerOuterHint(ctx: *anyopaque, v: *const Value) void {
-    host_instances.pushInnerOuterHint(hp(ctx), v);
-}
-fn vtPopInnerOuterHint(ctx: *anyopaque) void {
-    host_instances.popInnerOuterHint(hp(ctx));
-}
-fn vtIsShadowingCapture(ctx: *anyopaque, name: []const u8) bool {
-    return host_globals.isShadowingCapture(hp(ctx), name);
-}
-
-const host_vtable: Host.VTable = .{
-    .call_value = vtCallValue,
-    .call_value_named = vtCallValueNamed,
-    .call_value_with_this = vtCallValueWithThis,
-    .call_member = vtCallMember,
-    .call_member_named = vtCallMemberNamed,
-    .call_member_only = vtCallMemberOnly,
-    .host_has_member = vtHostHasMember,
-    .member_ref = vtMemberRef,
-    .new_instance = vtNewInstance,
-    .new_instance_named = vtNewInstanceNamed,
-    .get_field = vtGetField,
-    .set_field = vtSetField,
-    .instance_of = vtInstanceOf,
-    .is_concrete_cast_target = vtIsConcreteCastTarget,
-    .lookup_global = vtLookupGlobal,
-    .lookup_global_throwing = vtLookupGlobalThrowing,
-    .store_global = vtStoreGlobal,
-    .register_class = vtRegisterClass,
-    .register_class_captured = vtRegisterClassCaptured,
-    .build_object = vtBuildObject,
-    .call_super = vtCallSuper,
-    .qualified_this = vtQualifiedThis,
-    .build_closure = vtBuildClosure,
-    .build_ast_lambda_with_flag_funcid = vtBuildAstLambdaWithFlagFuncid,
-    .call_func = vtCallFunc,
-    .call_func_named = vtCallFuncNamed,
-    .call_func_typed = vtCallFuncTyped,
-    .call_named_overload = vtCallNamedOverload,
-    .callable_receiver_shape = vtCallableReceiverShape,
-    .closure_needs_this_capture = vtClosureNeedsThisCapture,
-    .override_closure_this = vtOverrideClosureThis,
-    .push_inner_outer_hint = vtPushInnerOuterHint,
-    .pop_inner_outer_hint = vtPopInnerOuterHint,
-    .is_shadowing_capture = vtIsShadowingCapture,
 };
 
 // -------------------------------------------------------------------------

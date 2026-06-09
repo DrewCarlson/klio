@@ -2,10 +2,8 @@
 //! lambdas, intrinsics, bound methods), lambda construction, and the
 //! capture-read / receiver-shape helpers the IR evaluator consults.
 //!
-//! Free functions over `*VmHost`, wired into the `ir.eval.Host` vtable
-//! by `vmhost.zig`. Bodies are filled in as the Vm's native execution
-//! paths grow; until then they report `Unsupported`, mirroring the
-//! Rust `NullHost` defaults.
+//! Free functions over `*VmHost`, aliased as `VmHost` methods by
+//! `vmhost.zig` and invoked directly by the generic IR evaluator.
 
 const std = @import("std");
 
@@ -394,8 +392,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             defer g.deinit();
             try capture_values.appendSlice(allocator, g.get().*);
         }
-        var iface = self.hostInterface();
-        return ir.eval.evalWithCaptures(allocator, module, func, call_args, capture_values, &iface);
+        return ir.eval.evalWithCaptures(VmHost, allocator, module, func, call_args, capture_values, self);
     }
     const msg = try std.fmt.allocPrint(allocator, "Vm::call_value on `{s}`", .{callee.typeFqn()});
     return .{ .err = .{ .Unimplemented = msg } };
@@ -716,8 +713,7 @@ fn padArgsWithDefaults(
                 return .{ .err = .{ .Type = msg } };
             }
             const dfunc = &module.funcs.items[fid.int()];
-            var iface = self.hostInterface();
-            const r = try ir.eval.evalWithCaptures(allocator, module, dfunc, args_copy, captures, &iface);
+            const r = try ir.eval.evalWithCaptures(VmHost, allocator, module, dfunc, args_copy, captures, self);
             switch (r) {
                 .ok => |v| try call_args.append(allocator, v),
                 .err => |e| {

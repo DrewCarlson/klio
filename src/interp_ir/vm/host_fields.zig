@@ -2,8 +2,8 @@
 //! receiver — stored fields, custom getters/setters, extension
 //! properties, and the inner-class outer-chain fallbacks.
 //!
-//! Free functions over `*VmHost`, wired into the `ir.eval.Host` vtable
-//! by `vmhost.zig`. Mirrors the ordered field-resolution dispatch chain
+//! Free functions over `*VmHost`, aliased as `VmHost` methods by
+//! `vmhost.zig` and invoked directly by the generic IR evaluator. Mirrors the ordered field-resolution dispatch chain
 //! of `host_fields.rs` (get/set/member-ref).
 
 const std = @import("std");
@@ -170,10 +170,9 @@ fn evalGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value)
     var args: std.ArrayList(Value) = .empty;
     defer args.deinit(allocator);
     try args.append(allocator, receiver);
-    var host_iface = self.hostInterface();
     var args_owned: std.ArrayList(Value) = .empty;
     try args_owned.appendSlice(allocator, args.items);
-    return ir.eval.evalWith(allocator, mptr, func, args_owned, &host_iface);
+    return ir.eval.evalWith(VmHost, allocator, mptr, func, args_owned, self);
 }
 
 /// `instance_prop_getters.get((class, name))` -> `?FuncId`.
@@ -427,8 +426,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             break :blk g.get().contains(anonKey(cls_name, getter_name));
         };
         if (has_getter) {
-            var host_iface = self.hostInterface();
-            return host_iface.callMember(allocator, receiver, getter_name, &.{});
+            return self.callMember(allocator, receiver, getter_name, &.{});
         }
     }
     // `Thread` handle property reads (`t.name`, `t.isAlive`).
@@ -574,7 +572,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                     defer g.deinit();
                     break :blk g.get().*;
                 };
-                const chain = try self.hostInterface().enclosingThisChain(allocator);
+                const chain = try ir.eval.enclosingThisChainAlloc(allocator);
                 defer allocator.free(chain);
                 for (chain) |o| {
                     if (o == .Instance) {
@@ -756,7 +754,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         if (gg.get().lookup(name)) |v| return ok(v);
     }
     // Stdlib const-style globals through the full global path.
-    if (self.hostInterface().lookupGlobal(name)) |v| return ok(v);
+    if (self.lookupGlobal(name)) |v| return ok(v);
     // Drive a later top-level property's initializer on demand.
     switch (try host_impl.ensureTopLevelInited(self, name)) {
         .ok => |maybe| if (maybe) |v| return ok(v),
@@ -1131,8 +1129,7 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         };
         if (raw) |d| {
             const prop_ref = Value{ .PropertyRef = .{ .name = try StringRef.init(allocator, name) } };
-            var host_iface = self.hostInterface();
-            return try host_iface.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
+            return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
         }
     }
     const recv_fqn = blk: {
@@ -1328,8 +1325,7 @@ fn unwrapDelegate(self: *VmHost, allocator: Allocator, d: ObjRef(runtime.Delegat
     switch (state) {
         .Lazy => |lz| {
             if (lz.cached) |c| return ok(c);
-            var host_iface = self.hostInterface();
-            const result = switch (try host_iface.callValue(allocator, &lz.producer, &.{})) {
+            const result = switch (try self.callValue(allocator, &lz.producer, &.{})) {
                 .ok => |v| v,
                 .err => |e| return errRes(e),
             };
@@ -1556,8 +1552,7 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                 };
                 if (raw) |d| {
                     const prop_ref = Value{ .PropertyRef = .{ .name = try StringRef.init(allocator, real_name) } };
-                    var host_iface = self.hostInterface();
-                    switch (try host_iface.callMember(allocator, &d, "setValue", &.{ receiver.*, prop_ref, value })) {
+                    switch (try self.callMember(allocator, &d, "setValue", &.{ receiver.*, prop_ref, value })) {
                         .ok => return .{ .ok = {} },
                         .err => |e| return .{ .err = e },
                     }
@@ -1707,8 +1702,7 @@ fn evalSetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value,
     var args: std.ArrayList(Value) = .empty;
     try args.append(allocator, receiver);
     try args.append(allocator, value);
-    var host_iface = self.hostInterface();
-    return switch (try ir.eval.evalWith(allocator, mptr, func, args, &host_iface)) {
+    return switch (try ir.eval.evalWith(VmHost, allocator, mptr, func, args, self)) {
         .ok => .{ .ok = {} },
         .err => |e| .{ .err = e },
     };

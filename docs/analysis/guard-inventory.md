@@ -199,7 +199,7 @@ are the seams and the fallbacks that paper over the disagreement.
   `callableReceiverShape` returns `null`, `closureNeedsThisCapture` returns
   `false`, `overrideClosureThis` is a no-op. Consumed by the `CallValue` arm
   (`eval.zig:1160-1172`).
-- **What it does:** vestigial vtable seams for a closure-shape protocol that was
+- **What it does:** vestigial host methods for a closure-shape protocol that was
   never wired; the `CallValue` arm's receiver-lambda handling is effectively dead
   through these and relies on A3/A4 instead.
 - **Class:** A (cleanup).
@@ -377,7 +377,9 @@ or a re-entrant dispatch.
 
 - **Location:** `src/interp_ir/vm/host_instances.zig:62` (TLS), push/pop/read
   `:79-91`, consumed when stamping a new inner instance's `outer` `:1827-1831`;
-  wired into the eval vtable `vmhost.zig:289-290`, `eval.zig:2543-2544,2781-2785`.
+  surfaced to the evaluator as the `pushInnerOuterHint`/`popInnerOuterHint`
+  `VmHost` methods (`host_instances.zig`), which `eval`'s `NewInstance` arm
+  invokes directly (the eval `Host` vtable was removed in R18).
 - **What it does:** a separate TLS carrying the outer receiver for inner-class
   construction — a *fourth* receiver origin alongside the three in §3.5.
 - **Class:** B.

@@ -3,8 +3,8 @@
 //! the `call_named_overload` probe the IR evaluator uses for bare-name
 //! calls.
 //!
-//! Free functions over `*VmHost`, wired into the `ir.eval.Host` vtable
-//! by `vmhost.zig`.
+//! Free functions over `*VmHost`, aliased as `VmHost` methods by
+//! `vmhost.zig` and invoked directly by the generic IR evaluator.
 
 const std = @import("std");
 
@@ -608,8 +608,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
                             const dfunc = funcAt(module, dfid) orelse
                                 return .{ .err = typeErr(allocator, "default-arg FuncId {d} out of range", .{dfid.int()}) };
                             var thunk_args = try argsFromSlice(allocator, args.items);
-                            var iface = self.hostInterface();
-                            const r = try ir.eval.evalWith(allocator, module, dfunc, thunk_args, &iface);
+                            const r = try ir.eval.evalWith(VmHost, allocator, module, dfunc, thunk_args, self);
                             switch (r) {
                                 .ok => |v| try args.append(allocator, v),
                                 .err => |e| return .{ .err = e },
@@ -639,8 +638,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
                     var captures: std.ArrayList(Value) = .empty;
                     if (args.items.len != 0) try captures.append(allocator, args.items[0]);
                     var thunk_args = try argsFromSlice(allocator, args.items);
-                    var iface = self.hostInterface();
-                    const r = try ir.eval.evalWithCaptures(allocator, module, dfunc, thunk_args, captures, &iface);
+                    const r = try ir.eval.evalWithCaptures(VmHost, allocator, module, dfunc, thunk_args, captures, self);
                     _ = &thunk_args;
                     switch (r) {
                         .ok => |v| try args.append(allocator, v),
@@ -658,8 +656,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // deiniting `args`; the outer `defer args.deinit` would then double
     // free. Take ownership of the final list and disarm the defer.
     args = .empty;
-    var iface = self.hostInterface();
-    return ir.eval.evalWith(allocator, module, f, packed_args, &iface);
+    return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
 }
 
 /// Single named-argument call dispatch flow.
@@ -750,8 +747,7 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                     const dfunc = funcAt(module, id) orelse
                         return .{ .err = typeErr(allocator, "default-arg FuncId {d} out of range", .{id.int()}) };
                     var thunk_args = try argsFromSlice(allocator, reordered.items);
-                    var iface = self.hostInterface();
-                    const r = try ir.eval.evalWith(allocator, module, dfunc, thunk_args, &iface);
+                    const r = try ir.eval.evalWith(VmHost, allocator, module, dfunc, thunk_args, self);
                     _ = &thunk_args;
                     switch (r) {
                         .ok => |v| try reordered.append(allocator, v),

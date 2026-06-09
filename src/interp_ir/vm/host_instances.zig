@@ -3,8 +3,8 @@
 //! init, delegation), building anonymous-object instances, and the
 //! inner-class outer-instance hint stack.
 //!
-//! Free functions over `*VmHost`, wired into the `ir.eval.Host` vtable
-//! by `vmhost.zig`.
+//! Free functions over `*VmHost`, aliased as `VmHost` methods by
+//! `vmhost.zig` and invoked directly by the generic IR evaluator.
 
 const std = @import("std");
 
@@ -187,10 +187,9 @@ fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator
     var args_list: std.ArrayList(Value) = .empty;
     errdefer args_list.deinit(self.allocator);
     try args_list.appendSlice(self.allocator, args);
-    var iface = self.hostInterface();
     // Ownership of `args_list` transfers into `evalWith`: the frame adopts
     // it as its `params` backing and frees it on `frame.deinit()`.
-    return ir.eval.evalWith(self.allocator, mg.get(), func, args_list, &iface);
+    return ir.eval.evalWith(VmHost, self.allocator, mg.get(), func, args_list, self);
 }
 
 // -------------------------------------------------------------------------
@@ -1100,9 +1099,8 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
             errdefer items.deinit(allocator);
             var i: i64 = 0;
             while (i < size) : (i += 1) {
-                var iface = self.hostInterface();
                 const idx = Value.newInt(i);
-                switch (try iface.callValue(allocator, &init, &.{idx})) {
+                switch (try self.callValue(allocator, &init, &.{idx})) {
                     .ok => |v| try items.append(allocator, v),
                     .err => |e| return .{ .err = e },
                 }
@@ -1185,8 +1183,7 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
             }
         }
         if (best_fid) |fid| {
-            var iface = self.hostInterface();
-            return iface.callFunc(allocator, m, fid, args);
+            return self.callFunc(allocator, m, fid, args);
         }
     }
     return throwInstantiation(self, allocator, "Cannot create an instance of an interface: {s}", class_name);
@@ -1479,8 +1476,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
                 defer module_ref.deinit();
                 const mg = module_ref.borrow();
                 defer mg.deinit();
-                var iface = self.hostInterface();
-                return iface.callFunc(allocator, mg.get(), fid, effective.items);
+                return self.callFunc(allocator, mg.get(), fid, effective.items);
             }
         }
     }
@@ -1543,8 +1539,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
             defer module_ref.deinit();
             const mg = module_ref.borrow();
             defer mg.deinit();
-            var iface = self.hostInterface();
-            return iface.callFunc(allocator, mg.get(), fid, effective.items);
+            return self.callFunc(allocator, mg.get(), fid, effective.items);
         }
         return .{ .err = try typeErr(allocator, "{s}() expects {d} args, got {d}", .{ class_name, n_primary, effective.items.len }) };
     }
@@ -2018,8 +2013,7 @@ fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u
     };
     if (!has_provide) return v;
     const prop_ref = Value{ .PropertyRef = .{ .name = try ObjRef([]const u8).init(allocator, try allocator.dupe(u8, prop_name)) } };
-    var iface = self.hostInterface();
-    switch (try iface.callMember(allocator, &v, "provideDelegate", &.{ inst_value.*, prop_ref })) {
+    switch (try self.callMember(allocator, &v, "provideDelegate", &.{ inst_value.*, prop_ref })) {
         .ok => |rep| return rep,
         .err => return v,
     }
@@ -2426,9 +2420,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             var all: std.ArrayList(Value) = .empty;
             try all.append(allocator, inst_value);
             try all.appendSlice(allocator, cls_args);
-            var iface = self.hostInterface();
             const module_ref = self.module.clone();
-            const r = try ir.eval.evalWith(allocator, module_ref.borrow().get(), &func, all, &iface);
+            const r = try ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), &func, all, self);
             module_ref.deinit();
             switch (r) {
                 .ok => |v| {
@@ -2477,8 +2470,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         }
         var all: std.ArrayList(Value) = .empty;
         try all.append(allocator, inst_value);
-        var iface = self.hostInterface();
-        const r = try ir.eval.evalWithCaptures(allocator, sub_mod, &func, all, cap_vec, &iface);
+        const r = try ir.eval.evalWithCaptures(VmHost, allocator, sub_mod, &func, all, cap_vec, self);
         mg.deinit();
         self.globals.deinit();
         self.globals = prev;
