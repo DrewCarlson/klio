@@ -67,6 +67,7 @@ Run any program with:
 | `typealias.kt`                | `typealias`.                                                |
 | `captured_var_carrier.kt`     | A captured `var` mutated inside a lambda round-trips identically whether the closure is called directly, passed to a stdlib HOF (`forEach`/`fold`), spliced through an `inline` HOF, or captured across a `launch`/`suspend`. |
 | `receiver_across_suspend.kt`  | The enclosing-`this` (implicit receiver) chain survives a coroutine park: a member-extension body suspends at a `delay`, then after resume resolves a bare member of an *enclosing* receiver reachable only through the implicit-receiver chain. Interleaved `async` Owners each resolve their own enclosing receiver (innermost wins). |
+| `receiver_bound_suspend_value_call.kt` | A `suspend Receiver.() -> Unit` value invoked with a bound receiver (`b.block()`, where `block` is a fun-typed parameter) parks at a `delay` inside its body and resumes — single park, multiple parks across one body, and two such calls interleaving under `async` each against their own receiver. |
 
 ## Properties and delegation
 

@@ -431,22 +431,68 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 }
                 break :blk null;
             };
-            if (info.n_params >= 1 and args.len == info.n_params + 1 and this_idx != null) {
-                const idx = this_idx.?;
+            if (this_idx) |idx| {
+                // Two receiver-lambda shapes reach here, both dispatched on
+                // the MAIN evaluator path (`call_value`) so a suspension
+                // inside a `suspend` body snapshots frames and parks:
+                //   * explicit-receiver call (`block(receiver, p)` for a
+                //     `R.(P) -> T`): arg0 is the receiver and overrides
+                //     `this`, the body's value params follow.
+                //   * receiver-bound call (`recv.block()` where `block` is a
+                //     `suspend R.() -> Unit` param/property): the receiver
+                //     arrives via `this_value`, the body's value params are
+                //     `args` unchanged.
+                // The intrinsic-host invoke below does neither, which would
+                // both strand a captured receiver-lambda's bare-member
+                // resolution and flatten an `EvalError.Suspended` into a
+                // "suspended outside a driver" runtime error.
+                const explicit_receiver = info.n_params >= 1 and args.len == info.n_params + 1;
+                const receiver: Value = if (explicit_receiver) args[0] else this_value.*;
+                const body_args: []const Value = if (explicit_receiver) args[1..] else args;
+
+                // Bind the receiver into a fresh captures cell's `this` slot
+                // (the evaluator reads the closure value's captures, not the
+                // side-table). Snapshot the prior `this` to keep it reachable
+                // as an enclosing receiver for the body's bare-member /
+                // member-extension resolution.
                 var new_caps: std.ArrayList(Value) = .empty;
                 {
                     const g = captures.borrow();
                     defer g.deinit();
                     try new_caps.appendSlice(allocator, g.get().*);
                 }
+                const prior_this: ?Value = if (idx < new_caps.items.len) new_caps.items[idx] else null;
                 if (idx >= new_caps.items.len) {
                     try new_caps.appendNTimes(allocator, Value.Null, idx + 1 - new_caps.items.len);
                 }
-                new_caps.items[idx] = this_value.*;
+                new_caps.items[idx] = receiver;
                 const slice = try new_caps.toOwnedSlice(allocator);
                 const caps_ref = try ValueSlice.init(allocator, slice);
                 const bound = Value{ .IrClosure = .{ .id = id, .captures = caps_ref } };
-                return callValue(self, allocator, &bound, args);
+
+                // Keep the displaced prior `this` reachable as an outer
+                // implicit receiver, and push the new receiver so a body
+                // calling a member-extension declared on its class sees the
+                // owner as visible — mirroring `invoke_callable_with_this`.
+                const pushed_outer = po: {
+                    const pt = prior_this orelse break :po false;
+                    if (pt == .Null or pt == .Unit) break :po false;
+                    if (pt == .Instance and receiver == .Instance) {
+                        break :po !ObjRef(InstanceData).ptrEq(pt.Instance, receiver.Instance);
+                    }
+                    break :po true;
+                };
+                if (pushed_outer) {
+                    if (prior_this) |p| host_call_member.pushAccessEnclosing(self, &p);
+                }
+                const pushed_receiver = receiver == .Instance;
+                if (pushed_receiver) {
+                    host_call_member.pushAccessEnclosing(self, &receiver);
+                }
+                const r = try callValue(self, allocator, &bound, body_args);
+                if (pushed_receiver) host_call_member.popAccessEnclosing(self);
+                if (pushed_outer) host_call_member.popAccessEnclosing(self);
+                return r;
             }
         }
     }
@@ -612,8 +658,18 @@ fn runtimeErrToEval(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalR
             };
             return .{ .err = .{ .Suspended = st } };
         },
+        // Map each error kind back to its `EvalError` counterpart, keeping
+        // the carried message as the same string (the inverse of
+        // `runtimeErrorFromEval`). Formatting the whole `RuntimeError` with
+        // `{any}` would print its `[]const u8` payload as a raw byte array
+        // and re-wrap an already-rendered message inside a second `.Type`.
+        .Unbound => |s| return .{ .err = .{ .Unbound = s } },
+        .Type => |s| return .{ .err = .{ .Type = s } },
+        .Arity => |s| return .{ .err = .{ .Arity = s } },
+        .Unimplemented => |s| return .{ .err = .{ .Unimplemented = s } },
+        .LabeledReturn => |lr| return .{ .err = .{ .LabeledReturn = .{ .label = lr.label, .value = lr.value } } },
         else => {
-            const msg = try std.fmt.allocPrint(allocator, "{any}", .{e});
+            const msg = try std.fmt.allocPrint(allocator, "{s}", .{@tagName(e)});
             return .{ .err = .{ .Type = msg } };
         },
     }

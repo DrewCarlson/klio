@@ -309,3 +309,91 @@ test "enclosing_this_chain_survives_suspend" {
         "H:owner=A|helper=H:owner=A\nH:owner=B|helper=H:owner=B\nH:owner=seq|helper=H:owner=seq\n",
     );
 }
+
+// A `suspend Receiver.() -> Unit` value invoked with a bound receiver
+// (`b.block()`, where `block` is a fun-typed parameter) must park at a
+// `delay` inside its body and resume. The receiver-bound value-call runs
+// on the main evaluator path so the suspension snapshots frames up the
+// call chain instead of being flattened to a "suspended outside a driver"
+// runtime error. A bare `n` inside the body resolves to the bound `Bar`
+// receiver both before and after the park.
+test "receiver_bound_suspend_value_call_parks" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\class Bar(val n: Int)
+        \\suspend fun runOn(b: Bar, block: suspend Bar.() -> Unit) { b.block() }
+        \\fun main() = runBlocking {
+        \\    val acc = StringBuilder()
+        \\    runOn(Bar(7)) {
+        \\        acc.append("a$n")
+        \\        delay(5)
+        \\        acc.append("|b$n")
+        \\    }
+        \\    println(acc.toString())
+        \\}
+        \\
+    ;
+    try assertKlio("receiver_bound_suspend_value_call", src, "a7|b7\n");
+}
+
+// The same shape parking multiple times across one body: the continuation
+// re-enters the closure body at each suspension point and threads the bound
+// receiver `this` through every resume.
+test "receiver_bound_suspend_value_call_multi_park" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\class Bar(val n: Int)
+        \\suspend fun runOn(b: Bar, block: suspend Bar.() -> Unit) { b.block() }
+        \\fun main() = runBlocking {
+        \\    val acc = StringBuilder()
+        \\    runOn(Bar(7)) {
+        \\        acc.append("a$n")
+        \\        delay(5)
+        \\        acc.append("|b$n")
+        \\        delay(3)
+        \\        acc.append("|c$n")
+        \\    }
+        \\    println(acc.toString())
+        \\}
+        \\
+    ;
+    try assertKlio("receiver_bound_suspend_value_call_multi", src, "a7|b7|c7\n");
+}
+
+// Two receiver-bound suspend value-calls interleave under `async`: each
+// parks and resumes against its OWN bound receiver, and the awaited results
+// preserve per-coroutine receiver identity across the parks.
+test "receiver_bound_suspend_value_call_interleaved_async" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\class Bar(val n: Int)
+        \\suspend fun runOn(b: Bar, block: suspend Bar.() -> String): String = b.block()
+        \\fun main() = runBlocking {
+        \\    val a = async {
+        \\        runOn(Bar(1)) {
+        \\            val before = "a$n"
+        \\            delay(10)
+        \\            "$before|b$n"
+        \\        }
+        \\    }
+        \\    val b = async {
+        \\        runOn(Bar(2)) {
+        \\            val before = "a$n"
+        \\            delay(5)
+        \\            "$before|b$n"
+        \\        }
+        \\    }
+        \\    println(a.await())
+        \\    println(b.await())
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "receiver_bound_suspend_value_call_interleaved",
+        src,
+        "a1|b1\na2|b2\n",
+    );
+}
