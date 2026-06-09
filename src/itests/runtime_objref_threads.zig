@@ -1,7 +1,6 @@
-//! Real-OS-thread stress + ordering tests for `ObjRef`'s publish protocol
-//! (port of the Rust suite). Exercises the
-//! actual `std`-backed adaptive cell across genuine threads through the
-//! public `runtime` module API.
+//! Real-OS-thread stress + ordering tests for `ObjRef` (port of the Rust
+//! suite). Exercises the actual `std`-backed reader/writer cell across
+//! genuine threads through the public `runtime` module API.
 //!
 //! `ObjRef` does its own ref-counted heap allocation/free, so these use the
 //! leak-checking testing allocator directly (no pipeline arena involved):
@@ -52,17 +51,14 @@ const PushWorker = struct {
     }
 };
 
-// After `publish()`, N threads hammer the same shared `ObjRef` with
-// interleaved `borrowMut().append(..)` and `borrow()` reads. The lock must
-// serialize every access: the final length equals the exact total of pushes
-// and every element is one we pushed (no corruption, no lost write).
+// N threads hammer the same shared `ObjRef` with interleaved
+// `borrowMut().append(..)` and `borrow()` reads. The lock must serialize
+// every access: the final length equals the exact total of pushes and
+// every element is one we pushed (no corruption, no lost write).
 test "shared objref concurrent push is consistent" {
     const allocator = std.testing.allocator;
     const obj = try ObjRef(IntList).init(allocator, .{});
     defer obj.deinit();
-    // Publish before the handle escapes to any other thread.
-    obj.publish();
-    try std.testing.expect(obj.isShared());
 
     var handles: [THREADS]std.Thread = undefined;
     var t: usize = 0;
@@ -105,9 +101,8 @@ const HandoffWriter = struct {
             var i: i32 = 0;
             while (i < 64) : (i += 1) g.get().items.append(self.allocator, i) catch unreachable;
         }
-        obj.publish();
         self.slot.* = obj;
-        // Release store hands the published handle to the reader.
+        // Release store hands the handle to the reader.
         self.ready.store(true, .release);
     }
 };
@@ -123,17 +118,17 @@ const HandoffReader = struct {
         defer g.deinit();
         std.debug.assert(g.get().items.items.len == 64);
         for (g.get().items.items, 0..) |v, i| {
-            // Never a partial pre-publish write.
+            // Never a partial write.
             std.debug.assert(v == @as(i32, @intCast(i)));
         }
     }
 };
 
-// Publish-then-handoff ordering: the writing thread mutates the value,
-// `publish()`es, then hands the handle to a reader thread. The reader (which
-// only sees the handle *after* publish) must observe the fully-written
-// value, never a partial state.
-test "publish then handoff orders the write" {
+// Handoff ordering: the writing thread mutates the value, then hands the
+// handle to a reader thread. The reader (which only sees the handle after
+// the release store) must observe the fully-written value, never a
+// partial state.
+test "handoff orders the write across threads" {
     const allocator = std.testing.allocator;
     const ROUNDS: usize = 200;
 
@@ -183,7 +178,6 @@ test "shared objref read modify counter" {
     const allocator = std.testing.allocator;
     const obj = try ObjRef(i64).init(allocator, 0);
     defer obj.deinit();
-    obj.publish();
 
     var applied = std.atomic.Value(usize).init(0);
 

@@ -134,20 +134,6 @@ pub const Env = struct {
     }
 };
 
-/// Publish every `ObjRef` reachable from an environment (its bound
-/// values and the whole parent chain). Used to make the program's
-/// globals sound to observe from a freshly spawned OS thread.
-pub fn publishEnvDeep(allocator: std.mem.Allocator, env: ObjRef(Env)) void {
-    const gc_traverse = @import("gc_traverse.zig");
-    var seen = std.AutoHashMap(usize, void).init(allocator);
-    defer seen.deinit();
-    env.publish();
-    _ = seen.getOrPut(env.identity()) catch {};
-    const g = env.borrow();
-    defer g.deinit();
-    gc_traverse.publishEnv(g.get(), &seen);
-}
-
 // -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------

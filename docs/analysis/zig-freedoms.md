@@ -67,6 +67,12 @@ rewrite.
 
 #### 2A.1 The adaptive UNSHARED→SHARED cell taxes 1,178 single-thread borrow sites
 
+> **Resolved by R15.** The adaptive split is gone: `borrow`/`borrowMut` now
+> always take the per-cell reader/writer spin-lock. The `state` byte, the
+> non-atomic `flag`, and the load-plus-branch on every borrow were deleted.
+> A/B benchmark showed e2e geomean −0.08% (perf-neutral). The analysis below
+> is retained for context.
+
 `ControlBlock(T)` (`src/runtime/objcell.zig:95-106`) carries `refcount`
 (`atomic(usize)`), `state` (`atomic(u8)`), `flag` (`isize`), a `SpinRwLock`,
 `data`, and an `allocator`. Every `tryBorrow`/`tryBorrowMut`
@@ -88,6 +94,9 @@ Soundness note (do NOT regress): the transition is never itself concurrent.
 torn-`flag` race. The protocol is correct; only its shape is vestigial.
 
 #### 2A.2 `ObjGuard`/`ObjGuardMut` carry a runtime `shared: bool` branched at every release
+
+> **Resolved by R15.** The guard `shared: bool` and both `deinit` branches are
+> gone; each guard unconditionally releases its reader/writer lock.
 
 Each guard stores `shared: bool` captured at borrow time
 (`src/runtime/objcell.zig:269`, `:296`) and `deinit` branches on it
@@ -113,6 +122,12 @@ AI-tell scaffolding CLAUDE.md warns against). The `synchronized` enter/exit case
 at `src/interp_ir/interp_ir.zig:135-146`, so the fence calls are genuinely dead.
 
 #### 2A.4 `publishDeep`/`publishEnvDeep` walk the entire reachable graph on every spawn
+
+> **Resolved by R15.** With the cell's lock unconditional there is no SHARED
+> transition to flip, so the publish walk has no purpose. `gc_traverse.zig`
+> (the whole publish walk), `value.publishDeep`, `env.publishEnvDeep`, the
+> per-spawn publish prelude in `startWorker`, and the `publish()`/`isShared()`
+> API were all deleted. Spawning a worker no longer walks the reachable graph.
 
 Before each `startWorker`, the code walks the escaping block value, the whole
 globals `Env` chain, every class, and every `class_default_outer` entry, calling
@@ -615,7 +630,7 @@ These are isolated, mechanically verifiable, and cannot regress the suite.
 
 | # | Item | Impact | Risk | Effort | Deps |
 |---|------|--------|------|--------|------|
-| R15 | **Collapse the adaptive cell to an unconditional spin-rwlock** (delete `flag`, `state`, the publish bit, guard `bool`, and most of `gc_traverse.zig`'s publish walk; 2A.1, 2A.2, 2A.4). One uncontended `cmpxchg` replaces load+branch+flag-arithmetic. **Must** be benchmarked A/B against keeping `flag` before committing — the single-thread path is the entire e2e corpus. | high | medium | L | R3 (fence gone) |
+| R15 | **DONE.** Collapsed the adaptive cell to an unconditional reader/writer spin-lock: deleted `flag`, `state`, `UNSHARED`/`SHARED`, the `publish()`/`isShared()` protocol, the guard `shared: bool`, and the whole `gc_traverse.zig` publish walk (file deleted) plus its callers (`value.publishDeep`, `env.publishEnvDeep`, the `startWorker` publish prelude, the `SharedOutput`/`SharedClosures`/`registerSlotOwner` publishes). `borrow`/`borrowMut` now always take the lock — one uncontended `cmpxchg` replaces the `state.load(.acquire)` + branch + non-atomic `flag` arithmetic, and the guard `deinit` loses its mode branch. Re-entrancy: KLIO single-thread code already copies out of a borrow before running any user code, so no overlapping *conflicting* borrow on one cell exists (it would have panicked the `flag` already) — verified by the 83/83 e2e corpus running byte-identical with zero deadlocks. A/B (interleaved median of 3 alternating rounds, ReleaseFast, pinned core): e2e **geomean −0.08%** (neutral), borrow-heavy `object_fields` −5.4%, `map_ops` −7.2%, `fib_recursive` −9.0%; worst single program `behavior_tree` +4.2% (low-iter noise, swings ±4% between rounds). The `DriverWakeup`-style publish race (commit that landed it) is now structurally impossible: there is no publish step to skip. 2A.1/2A.2/2A.4 retired. | high | medium | L | R3 (fence gone) |
 | R16 | **Make `ObjRef.deinit` skip atomic/destroy/T.deinit under the arena**; make `Vm.deinit` a near no-op (drop only real OS thread handles + scheduler) (2C.3, 2A.6, 2C.6 fall out). Gate behind a `reclaim=false` host flag so the leak-checking unit-test config keeps the full path. The gate **must** cover the real-thread objcell stress tests (`src/runtime/objcell.zig:485-634`) and `src/itests/runtime_objref_threads.zig`, not just the e2e corpus — those run on `testing.allocator` and depend on the full refcount/destroy path to catch UAF; wiring the gate to their allocator would mask use-after-free. | high | medium | L | R15 |
 | R17 | **Convert build-time-immutable `ClassDef` fields to arena slices** (`parent`, `interfaces`, `enum_entries`, `nested_classes`, `supertype_delegates`, `delegate_forwarders`); keep cells only for `companion`/`object_singleton`/parent-during-link (2A.7). Biggest dispatch-path borrow-branch reducer; requires reworking the two-phase linker to backpatch. Validate no path mutates these post-link first. | high | high | XL | R15 |
 | R18 | **Make the IR evaluator generic over the host type** (`comptime H`), deleting the ~40-slot vtable + ~160 lines of trampolines (2D.3). Keep `NullHost` as a second instantiation. | high | medium | XL | R7-R9 (fewer slots first) |
@@ -624,9 +639,10 @@ These are isolated, mechanically verifiable, and cannot regress the suite.
 
 **Recommended execution order:** R1-R5 (a day of safe cleanup) → R6 (safest
 large win, validates the bench harness) → R7-R10 → R13 (the one confirmed
-correctness bug) + R12 (cheap invariant guard) → R11 → then the gated XL items
-R15/R16, with R17/R18/R20 only after the benchmark and corpus gates are proven
-stable on the smaller changes.
+correctness bug) + R12 (cheap invariant guard) → R11 → **R15 (done — the
+adaptive cell is now an unconditional reader/writer lock)** → R16, with
+R17/R18/R20 only after the benchmark and corpus gates are proven stable on the
+smaller changes.
 
 ---
 
@@ -635,31 +651,30 @@ stable on the smaller changes.
 These are correct and necessary. Removing or weakening them reintroduces the
 exact races/UAFs Rust's type system used to forbid.
 
-1. **The publish protocol's happens-before edges.** `ObjRef.publish()`'s release
-   store (`src/runtime/objcell.zig:232-234`) paired with the acquire load in
-   every `borrow`/`borrowMut` (`:198`, `:215`), and the per-cell `SpinRwLock`,
-   are what make the thread/coroutine model sound. R15 may *collapse the cell to
-   an unconditional rwlock* (which preserves the ordering), but never *weaken the
-   release/acquire ordering or drop the per-block publish for a still-adaptive
-   cell*.
+1. **The per-cell `SpinRwLock`'s acquire/release ordering** (`src/runtime/objcell.zig`,
+   `SpinRwLock`). Since R15 every `borrow`/`borrowMut` takes this lock; its
+   acquire on lock and release on unlock are the happens-before edges that make
+   the thread/coroutine model sound (the old `publish()` release-store + acquire
+   load, now removed, is subsumed by the lock taken on the very first
+   cross-thread borrow). Real OS threads concurrently borrow the shared
+   class/prog/anon-methods cells (`startWorker`,
+   `src/interp_ir/vm/intrinsic_host.zig`); the lock is the discipline for those
+   borrows. Do not weaken the acquire/release ordering or special-case the
+   uncontended path back into a non-atomic flag — the single-thread fast path is
+   already an uncontended `cmpxchg`, measured perf-neutral.
 
-2. **The SHARED `SpinRwLock` itself** (`src/runtime/objcell.zig:49-89`). Real OS
-   threads concurrently borrow shared class/prog/anon-methods cells
-   (`startWorker`, `src/interp_ir/vm/intrinsic_host.zig:850-861`). The lock is
-   the discipline for those borrows.
-
-3. **`spawnSeed`'s per-handle `.clone()`** (`src/interp_ir/vm/intrinsic_host.zig:870-890`)
+2. **`spawnSeed`'s per-handle `.clone()`** (`src/interp_ir/vm/intrinsic_host.zig:870-890`)
    and `WorkerArgs`/`SendableVmSeed` ownership transfer. This is the ONE
    genuinely-escaping case — the child `Vm` outlives the call frame on another
    thread, so these clones are real ownership, not the removable transient-host
    clones of R6.
 
-4. **`DriverWakeup`** as the cross-thread resume mailbox
+3. **`DriverWakeup`** as the cross-thread resume mailbox
    (`src/interp_ir/vm/coroutines.zig:53-134`). It is the one sound worker→driver
    primitive; only the never-freed registry *around* it and the busy-poll are
    over-built (2B.5). Keep the mailbox.
 
-5. **The hand-rolled spin locks are NOT a Rust-ism to "fix" with
+4. **The hand-rolled spin locks are NOT a Rust-ism to "fix" with
    `std.Thread.Mutex`.** Verified against the local toolchain
    (`/config/.local/zig-0.16.0`): Zig 0.16 has **no**
    `std.Thread.Mutex`/`RwLock`/`Condition`/`Futex`/`Semaphore` (each grep of
@@ -674,25 +689,25 @@ exact races/UAFs Rust's type system used to forbid.
    thread-safe options in this toolchain are `std.heap.smp_allocator` and
    `ArenaAllocator`-over-a-thread-safe-child (see 2C.1, R12).
 
-6. **The error-as-data union shape** (Type/Return/Break/Continue/Suspend ride the
+5. **The error-as-data union shape** (Type/Return/Break/Continue/Suspend ride the
    same channel as real errors). R19 may *unify the two duplicate unions* but must
    NOT convert control-flow signals to a Zig `error{}` set — they carry `Value`
    payloads a `error{}` set cannot.
 
-7. **`*Value` boxes that genuinely break the recursive type**
+6. **`*Value` boxes that genuinely break the recursive type**
    (`BoundMethod.receiver`, `Exception.cause`, `Pair`/`Triple`/`MapEntry`,
    `src/runtime/value.zig:308`, `:319`, `:348-361`). Keep them as pointers. R-style
    coalescing of multi-field boxes into one allocation (2D.9) is fine; **fully
    inlining into the union is not** — it bloats `@sizeOf(Value)`, the one thing the
    box legitimately prevents.
 
-8. **`Vm.deinit`'s teardown of real OS thread join handles + the scheduler/driver**
+7. **`Vm.deinit`'s teardown of real OS thread join handles + the scheduler/driver**
    (`src/interp_ir/vm/run.zig:565-580`, thread join at `:480`). Even under the
    arena (R16), these are genuine OS resources that must be joined/freed; only the
    *value-graph* walk may become a no-op.
 
-9. **The leak-checking unit-test allocator config.** R16's `reclaim=false`
+8. **The leak-checking unit-test allocator config.** R16's `reclaim=false`
    arena fast-path must remain gated so the `testing.allocator`-backed tests
    (including the concurrent objcell stress tests in `src/runtime/objcell.zig`
    that use real threads) keep exercising the full refcount/free path. Those tests
-   are the safety net for the protocol and must keep passing unchanged.
+   are the safety net for the cell and must keep passing unchanged.

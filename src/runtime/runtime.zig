@@ -16,7 +16,6 @@ const env_mod = @import("env.zig");
 const proc_env_mod = @import("proc_env.zig");
 const clock_mod = @import("clock.zig");
 const float_fmt_mod = @import("float_fmt.zig");
-const gc_traverse_mod = @import("gc_traverse.zig");
 const safety_mod = @import("safety.zig");
 
 // objcell
@@ -91,7 +90,6 @@ pub const charUnitsToString = output_mod.charUnitsToString;
 
 // env
 pub const Env = env_mod.Env;
-pub const publishEnvDeep = env_mod.publishEnvDeep;
 
 // proc_env (portable process-environment access)
 pub const procEnvGetVar = proc_env_mod.getVar;
@@ -104,10 +102,6 @@ pub const clockWallTime = clock_mod.wallTime;
 pub const ClockWallTime = clock_mod.WallTime;
 pub const clockMonotonicNanos = clock_mod.monotonicNanos;
 pub const clockSleepMillis = clock_mod.sleepMillis;
-
-// gc_traverse
-pub const publishEnv = gc_traverse_mod.publishEnv;
-pub const publishValue = gc_traverse_mod.publishValue;
 
 // float_fmt
 pub const floatToString = float_fmt_mod.floatToString;
@@ -132,7 +126,6 @@ test {
     _ = proc_env_mod;
     _ = clock_mod;
     _ = float_fmt_mod;
-    _ = gc_traverse_mod;
     _ = safety_mod;
 }
 
@@ -279,138 +272,4 @@ test "enum entries keeps list type fqn for dispatch" {
         .backing = null,
     } };
     try testing.expectEqualStrings("kotlin.collections.List", entries.typeFqn());
-}
-
-test "publish deep nested graph publishes every cell" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // List -> Instance -> field Map -> Cell
-    const cell = try ObjRef(Value).init(a, .{ .Int = 7 });
-    var map_entries = try MapEntries.init(a, .empty);
-    {
-        const g = map_entries.borrowMut();
-        defer g.deinit();
-        try g.get().append(a, .{ .key = .{ .String = try StringRef.init(a, "k") }, .value = .{ .Cell = cell } });
-    }
-    const map = Value{ .Map = .{ .entries = map_entries, .mutable = true } };
-    const cls = try makeClass(a, "Holder", false, false, false);
-    var fields: std.ArrayList(InstanceField) = .empty;
-    try fields.append(a, .{ .name = "m", .value = map });
-    const inst = try ObjRef(InstanceData).init(a, .{
-        .class = cls,
-        .fields = fields,
-        .outer = null,
-        .identity = 1,
-        .native_state = null,
-    });
-    var items = try ValueList.init(a, .empty);
-    {
-        const g = items.borrowMut();
-        defer g.deinit();
-        try g.get().append(a, .{ .Instance = inst });
-    }
-    const root = Value{ .List = .{ .items = items, .mutable = false, .enum_class = null, .backing = null } };
-
-    try testing.expect(!items.isShared());
-    try testing.expect(!inst.isShared());
-    try testing.expect(!map_entries.isShared());
-    try testing.expect(!cell.isShared());
-
-    root.publishDeep(a);
-
-    try testing.expect(items.isShared());
-    try testing.expect(inst.isShared());
-    try testing.expect(map_entries.isShared());
-    try testing.expect(cell.isShared());
-    // The captured_env of the embedded ClassDef is reached too.
-    {
-        const ig = inst.borrow();
-        defer ig.deinit();
-        try testing.expect(ig.get().class.asPtr().captured_env.isShared());
-    }
-}
-
-test "publish deep cyclic graph terminates" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // Instance whose field is a Cell pointing back to the instance.
-    const cls = try makeClass(a, "Node", false, false, false);
-    const inst = try ObjRef(InstanceData).init(a, .{
-        .class = cls,
-        .fields = .empty,
-        .outer = null,
-        .identity = 1,
-        .native_state = null,
-    });
-    const cell = try ObjRef(Value).init(a, .{ .Instance = inst });
-    {
-        const g = inst.borrowMut();
-        defer g.deinit();
-        try g.get().fields.append(a, .{ .name = "self", .value = .{ .Cell = cell } });
-    }
-
-    // Env whose parent chain loops back on itself, reachable from the
-    // instance through its class's captured env.
-    const env_cell = try ObjRef(Env).init(a, Env.init(a));
-    {
-        const g = env_cell.borrowMut();
-        defer g.deinit();
-        g.get().parent = env_cell;
-        try g.get().define("here", .{ .Instance = inst });
-    }
-    {
-        const cg = cls.borrowMut();
-        defer cg.deinit();
-        cg.get().captured_env = env_cell;
-    }
-
-    (Value{ .Instance = inst }).publishDeep(a);
-
-    try testing.expect(inst.isShared());
-    try testing.expect(cell.isShared());
-    try testing.expect(env_cell.isShared());
-}
-
-test "publish deep is idempotent" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const cell = try ObjRef(Value).init(a, .{ .Int = 1 });
-    var items = try ValueList.init(a, .empty);
-    {
-        const g = items.borrowMut();
-        defer g.deinit();
-        try g.get().append(a, .{ .Cell = cell });
-    }
-    const root = Value{ .List = .{ .items = items, .mutable = true, .enum_class = null, .backing = null } };
-
-    root.publishDeep(a);
-    root.publishDeep(a);
-
-    try testing.expect(items.isShared());
-    try testing.expect(cell.isShared());
-}
-
-test "publish deep scalars are noops" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    (Value{ .Int = 42 }).publishDeep(a);
-    {
-        const s = try StringRef.init(a, "hi");
-        (Value{ .String = s }).publishDeep(a);
-    }
-    (Value{ .Null = {} }).publishDeep(a);
-    (Value{ .Unit = {} }).publishDeep(a);
-    {
-        var caps = try ValueSlice.init(a, try a.dupe(Value, &.{ .{ .Int = 1 }, .{ .Bool = true } }));
-        defer caps.deinit();
-        (Value{ .IrClosure = .{ .id = 0, .captures = caps } }).publishDeep(a);
-    }
 }
