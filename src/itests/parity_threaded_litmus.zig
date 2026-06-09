@@ -135,13 +135,13 @@ test "tl_wakeup_hammer" {
     try check("tl_wakeup_hammer");
 }
 
-// Continuously exercise the cross-thread `DriverWakeup` publication seam:
-// a batch of `Dispatchers.Default` jobs route their completion resume
+// Continuously exercise the cross-thread `DriverWakeup` escape seam: a
+// batch of `Dispatchers.Default` jobs route their completion resume
 // through the single driver's wakeup mailbox (the global `SlotOwners`
 // registry escape) while the driver pump drains it concurrently. Looped so
-// a publication regression (the wakeup cell left UNSHARED when it escapes to
-// a worker thread) aborts here instead of flaking through. `tl_wakeup_hammer`
-// itself launches 60 in-flight awaits over 20 rounds per run.
+// a borrow-ordering regression on the wakeup cell as it escapes to a worker
+// thread aborts here instead of flaking through. `tl_wakeup_hammer` itself
+// launches 60 in-flight awaits over 20 rounds per run.
 test "tl_wakeup_hammer repeated stress" {
     var i: usize = 0;
     while (i < 12) : (i += 1) {

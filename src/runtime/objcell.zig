@@ -1,34 +1,31 @@
-//! Adaptive reference-counted, interior-mutable cell behind `ObjRef`.
+//! Reference-counted, interior-mutable cell behind `ObjRef`.
 //!
 //! `ObjRef(T)` is the handle to a shared, interior-mutable Kotlin heap
 //! object. The backing is a heap-allocated control block holding an
 //! atomic strong count (so handles are safe to share across threads)
-//! over a borrow path that stays non-atomic and `RefCell`-fast until a
-//! reference is published across threads.
+//! and a per-cell reader/writer lock that mediates every borrow.
 //!
-//! While a cell is **unshared** (only ever reachable from its creating
-//! thread — the case for essentially every object, and the only case
-//! until a reference is published across threads) borrow tracking is a
-//! single non-atomic `flag`, exactly `RefCell`'s algorithm and speed.
-//! When the runtime publishes a reference to another thread it calls
-//! `publish`, which transitions the cell to **shared** under a release
-//! store before the reference can be observed elsewhere; shared cells
-//! mediate all access through `lock`, a reader/writer lock — any number
-//! of concurrent shared `borrow`s, an exclusive `borrowMut`.
+//! Every `borrow` takes a shared (reader) lock; every `borrowMut` takes
+//! an exclusive (writer) lock. Any number of concurrent shared borrows
+//! proceed together; an exclusive borrow is exclusive against all
+//! readers and writers. The lock's acquire/release ordering is the
+//! happens-before edge that makes cross-thread access sound, so a
+//! reference can escape to another thread with no separate publication
+//! step.
 //!
-//! `flag`: `0` = free, `n > 0` = `n` shared borrows, `-1` = mutably
-//! borrowed (the `RefCell` encoding). Only the UNSHARED path touches
-//! `flag`; the SHARED path's discipline is the `RwLock` itself.
+//! Single-threaded execution never takes an overlapping *conflicting*
+//! borrow on one cell (a `borrowMut` while a borrow on the same cell is
+//! live, or vice versa): the interpreter and stdlib copy out of a borrow
+//! before running any user code, so the reader/writer lock is always
+//! uncontended on the single-thread path — an uncontended `cmpxchg`,
+//! the same fast path a `RefCell` borrow flag would take.
 //!
 //! Synchronization choice: Zig 0.16's std has no blocking
 //! `Thread.Mutex`/`RwLock` (those moved behind the `Io` interface), so
-//! the SHARED reader/writer lock here is a small spin lock built on
-//! `std.atomic.Value` with a `spinLoopHint`/`Thread.yield` backoff.
-//! It provides the same discipline the protocol needs: many concurrent
-//! shared readers, one exclusive writer, with acquire/release ordering.
-//! The `state` `release` store on `publish` paired with the `acquire`
-//! load in every borrow is the publication happens-before edge; the
-//! per-cell lock orders all post-publication accesses.
+//! the reader/writer lock here is a small spin lock built on
+//! `std.atomic.Value` with a `spinLoopHint`/`Thread.yield` backoff. It
+//! provides the discipline the model needs: many concurrent shared
+//! readers, one exclusive writer, with acquire/release ordering.
 //!
 //! Allocator convention: an `ObjRef` owns a heap-allocated control
 //! block. The allocator used to create it is stored *inside* the
@@ -39,13 +36,10 @@
 
 const std = @import("std");
 
-const UNSHARED: u8 = 0;
-const SHARED: u8 = 1;
-
-/// Reader/writer spin lock for the SHARED path. `state` encodes the
-/// lock as `RefCell` does its flag: `0` free, `n > 0` n active readers,
-/// `WRITER` (the sign bit) exclusive writer. Many readers proceed
-/// concurrently; a writer is exclusive against all readers and writers.
+/// Reader/writer spin lock. `state` encodes the lock as `RefCell` does
+/// its flag: `0` free, `n > 0` n active readers, `WRITER` (the sign bit)
+/// exclusive writer. Many readers proceed concurrently; a writer is
+/// exclusive against all readers and writers.
 const SpinRwLock = struct {
     /// `0` = free; positive = reader count; `WRITER` = exclusively
     /// write-locked.
@@ -111,30 +105,10 @@ pub const SpinMutex = struct {
     }
 };
 
-/// `KLIO_BORROW_DEBUG`-gated diagnostic for the borrow-conflict panic
-/// path. Prints the cell's payload type, mode (UNSHARED vs SHARED), the
-/// raw `RefCell` `flag`, the SHARED rwlock `state`, the cell pointer, and
-/// the borrowing thread id so a cross-thread UNSHARED conflict can be
-/// pinned to an exact cell. Off (no output) unless the env var is set;
-/// reads it once per process and caches the result. Never allocates on
-/// the panic path beyond the cached flag read.
-var borrow_debug_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0); // 0 unknown, 1 off, 2 on
-
-fn borrowDebugEnabled() bool {
-    switch (borrow_debug_state.load(.monotonic)) {
-        1 => return false,
-        2 => return true,
-        else => {},
-    }
-    const on = procEnvironHas("KLIO_BORROW_DEBUG");
-    borrow_debug_state.store(if (on) 2 else 1, .monotonic);
-    return on;
-}
-
 /// True when `name=<non-empty,!=0>` appears in `/proc/self/environ`.
 /// Allocation-free: streams the procfs file through a stack buffer. Zig
 /// 0.16's std env API moved behind `Io`; this is the no-`Io` reader the
-/// panic path can use safely.
+/// diagnostic path can use safely.
 fn procEnvironHas(comptime name: []const u8) bool {
     if (@import("builtin").os.tag != .linux) return false;
     const fd = std.os.linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
@@ -163,11 +137,10 @@ fn procEnvironHas(comptime name: []const u8) bool {
 }
 
 /// `KLIO_RACE_JITTER`-gated interleaving widener. Inserted into the
-/// UNSHARED `flag` read-modify-write window so a genuine cross-thread
-/// UNSHARED borrow (a publication gap) reproduces reliably under test
-/// instead of only on a rare interleaving. Off (zero cost beyond the
-/// cached branch) unless the env var is set. Diagnostic-only; never
-/// enabled in the shipped suite.
+/// borrow lock-acquisition window so a genuine cross-thread borrow race
+/// reproduces reliably under test instead of only on a rare
+/// interleaving. Off (zero cost beyond the cached branch) unless the env
+/// var is set. Diagnostic-only; never enabled in the shipped suite.
 var race_jitter_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0); // 0 unknown, 1 off, 2 on
 
 fn raceJitterEnabled() bool {
@@ -188,34 +161,14 @@ inline fn raceJitter() void {
     std.Thread.yield() catch {};
 }
 
-fn borrowDebugReport(comptime T: type, cell: anytype, comptime op: []const u8) void {
-    if (!borrowDebugEnabled()) return;
-    const mode = cell.state.load(.acquire);
-    std.debug.print(
-        "[KLIO_BORROW_DEBUG] conflict op={s} T={s} mode={s} flag={d} lock_state={d} cell=0x{x} thread={d}\n",
-        .{
-            op,
-            @typeName(T),
-            if (mode == SHARED) "SHARED" else "UNSHARED",
-            cell.flag,
-            cell.lock.state.load(.monotonic),
-            @intFromPtr(cell),
-            std.Thread.getCurrentId(),
-        },
-    );
-}
-
 /// Heap-allocated control block for one `ObjRef`: an atomic strong
-/// count plus the adaptive cell (publication `state`, the UNSHARED
-/// `RefCell` borrow `flag`, the SHARED reader/writer `lock`, the data,
-/// and the owning allocator).
+/// count, the per-cell reader/writer `lock`, the data, and the owning
+/// allocator.
 pub fn ControlBlock(comptime T: type) type {
     return struct {
         const Self = @This();
 
         refcount: std.atomic.Value(usize),
-        state: std.atomic.Value(u8),
-        flag: isize,
         lock: SpinRwLock,
         data: T,
         allocator: std.mem.Allocator,
@@ -246,8 +199,6 @@ pub fn ObjRef(comptime T: type) type {
             const cell = try allocator.create(Cell);
             cell.* = .{
                 .refcount = std.atomic.Value(usize).init(1),
-                .state = std.atomic.Value(u8).init(UNSHARED),
-                .flag = 0,
                 .lock = .{},
                 .data = v,
                 .allocator = allocator,
@@ -297,69 +248,37 @@ pub fn ObjRef(comptime T: type) type {
             }
         }
 
-        /// Shared borrow, exactly like `RefCell::borrow`.
-        /// Panics if the cell is already mutably borrowed (UNSHARED path).
+        /// Shared borrow, like `RefCell::borrow`: takes the reader lock.
         pub fn borrow(self: Self) ObjGuard(T) {
-            return self.tryBorrow() orelse {
-                borrowDebugReport(T, self.cell, "borrow");
-                @panic("ObjRef already mutably borrowed");
-            };
+            return self.tryBorrow() orelse unreachable;
         }
 
-        /// Mutable borrow, exactly like `RefCell::borrow_mut`.
-        /// Panics if the cell is already borrowed (UNSHARED path).
+        /// Mutable borrow, like `RefCell::borrow_mut`: takes the writer
+        /// lock.
         pub fn borrowMut(self: Self) ObjGuardMut(T) {
-            return self.tryBorrowMut() catch {
-                borrowDebugReport(T, self.cell, "borrowMut");
-                @panic("ObjRef already borrowed");
-            };
+            return self.tryBorrowMut() catch unreachable;
         }
 
-        /// Fallible shared borrow (mirrors `RefCell::try_borrow`).
+        /// Shared borrow: take the reader lock. Many concurrent shared
+        /// borrows proceed together; an exclusive borrow blocks until
+        /// they drain. Always succeeds (never returns null) — the
+        /// optional return is kept for source compatibility.
         pub fn tryBorrow(self: Self) ?ObjGuard(T) {
             const cell = self.cell;
-            if (cell.state.load(.acquire) == SHARED) {
-                // SHARED path: the read lock is the discipline. Many
-                // shared borrows run concurrently; an exclusive
-                // borrowMut blocks until they drain. `flag` is not
-                // consulted or mutated here.
-                cell.lock.lockShared();
-                return .{ .cell = cell, .shared = true };
-            }
-            const f = cell.flag;
-            if (f < 0) return null;
             raceJitter();
-            cell.flag = f + 1;
-            return .{ .cell = cell, .shared = false };
+            cell.lock.lockShared();
+            return .{ .cell = cell };
         }
 
-        /// Fallible mutable borrow (mirrors `RefCell::try_borrow_mut`).
+        /// Mutable borrow: take the writer lock — exclusive against every
+        /// reader and writer. Blocks until any live borrows drain rather
+        /// than failing. Always succeeds (never returns the error) — the
+        /// error union is kept for source compatibility.
         pub fn tryBorrowMut(self: Self) BorrowMutError!ObjGuardMut(T) {
             const cell = self.cell;
-            if (cell.state.load(.acquire) == SHARED) {
-                // SHARED path: the write lock is the discipline —
-                // exclusive against every reader and writer. It blocks
-                // (monitor-like) rather than failing if borrows are
-                // live on other threads; that is the intended behavior,
-                // not a RefCell-style error. `flag` is untouched.
-                cell.lock.lockExclusive();
-                return .{ .cell = cell, .shared = true };
-            }
-            if (cell.flag != 0) return BorrowMutError.AlreadyBorrowed;
             raceJitter();
-            cell.flag = -1;
-            return .{ .cell = cell, .shared = false };
-        }
-
-        /// Transition the cell to the shared state with a release store.
-        /// Called at the publication seam before the reference escapes
-        /// to another thread. Idempotent.
-        pub fn publish(self: Self) void {
-            self.cell.state.store(SHARED, .release);
-        }
-
-        pub fn isShared(self: Self) bool {
-            return self.cell.state.load(.acquire) == SHARED;
+            cell.lock.lockExclusive();
+            return .{ .cell = cell };
         }
 
         /// Whether two handles name the same backing cell.
@@ -384,56 +303,40 @@ pub fn ObjRef(comptime T: type) type {
     };
 }
 
-/// Shared-borrow guard. On the UNSHARED path it restores the `RefCell`
-/// borrow count on `deinit`; on the SHARED path it instead holds a read
-/// lock for its lifetime and the lock — not `flag` — is the discipline.
+/// Shared-borrow guard. Holds the reader lock for its lifetime and
+/// releases it on `deinit`.
 pub fn ObjGuard(comptime T: type) type {
     return struct {
         const Self = @This();
         cell: *ControlBlock(T),
-        shared: bool,
 
         /// Borrowed view of the cell's data. Valid until `deinit`.
         pub fn get(self: Self) *const T {
             return &self.cell.data;
         }
 
-        /// Release the shared borrow.
+        /// Release the shared (reader) lock.
         pub fn deinit(self: Self) void {
-            if (self.shared) {
-                // SHARED path: release the read lock.
-                self.cell.lock.unlockShared();
-            } else {
-                // UNSHARED path: decrement the RefCell borrow count.
-                self.cell.flag -= 1;
-            }
+            self.cell.lock.unlockShared();
         }
     };
 }
 
-/// Mutable-borrow guard. On the UNSHARED path it restores the `RefCell`
-/// borrow flag on `deinit`; on the SHARED path it instead holds an
-/// exclusive write lock for its lifetime.
+/// Mutable-borrow guard. Holds the exclusive (writer) lock for its
+/// lifetime and releases it on `deinit`.
 pub fn ObjGuardMut(comptime T: type) type {
     return struct {
         const Self = @This();
         cell: *ControlBlock(T),
-        shared: bool,
 
         /// Mutable view of the cell's data. Valid until `deinit`.
         pub fn get(self: Self) *T {
             return &self.cell.data;
         }
 
-        /// Release the exclusive borrow.
+        /// Release the exclusive (writer) lock.
         pub fn deinit(self: Self) void {
-            if (self.shared) {
-                // SHARED path: release the write lock.
-                self.cell.lock.unlockExclusive();
-            } else {
-                // UNSHARED path: clear the RefCell borrow flag.
-                self.cell.flag = 0;
-            }
+            self.cell.lock.unlockExclusive();
         }
     };
 }
@@ -444,7 +347,7 @@ pub fn ObjGuardMut(comptime T: type) type {
 
 const testing = std.testing;
 
-test "unshared borrow and borrow_mut round-trip" {
+test "borrow and borrow_mut round-trip" {
     const obj = try ObjRef(i32).init(testing.allocator, 0);
     defer obj.deinit();
 
@@ -458,31 +361,33 @@ test "unshared borrow and borrow_mut round-trip" {
         defer g.deinit();
         try testing.expectEqual(@as(i32, 42), g.get().*);
     }
-    try testing.expect(!obj.isShared());
 }
 
-test "try_borrow_mut fails while shared-borrowed (unshared path)" {
-    const obj = try ObjRef(i32).init(testing.allocator, 1);
+test "concurrent shared borrows coexist on one cell" {
+    const obj = try ObjRef(i32).init(testing.allocator, 7);
     defer obj.deinit();
 
-    const r = obj.borrow();
-    defer r.deinit();
-    // A live shared borrow blocks an exclusive borrow.
-    try testing.expectError(BorrowMutError.AlreadyBorrowed, obj.tryBorrowMut());
-    // Multiple concurrent shared borrows are fine.
-    const r2 = obj.tryBorrow();
-    try testing.expect(r2 != null);
-    r2.?.deinit();
-}
+    // Many readers proceed together (reader count climbs).
+    const r1 = obj.borrow();
+    const r2 = obj.borrow();
+    const r3 = obj.borrow();
+    try testing.expectEqual(@as(i32, 7), r1.get().*);
+    try testing.expectEqual(@as(i32, 7), r3.get().*);
+    r1.deinit();
+    r2.deinit();
+    r3.deinit();
 
-test "try_borrow fails while mutably borrowed (unshared path)" {
-    const obj = try ObjRef(i32).init(testing.allocator, 1);
-    defer obj.deinit();
-
-    const w = obj.borrowMut();
-    defer w.deinit();
-    try testing.expect(obj.tryBorrow() == null);
-    try testing.expectError(BorrowMutError.AlreadyBorrowed, obj.tryBorrowMut());
+    // Once readers drain, an exclusive borrow proceeds.
+    {
+        const w = obj.borrowMut();
+        defer w.deinit();
+        w.get().* = 8;
+    }
+    {
+        const g = obj.borrow();
+        defer g.deinit();
+        try testing.expectEqual(@as(i32, 8), g.get().*);
+    }
 }
 
 test "clone shares the cell and tracks strong count" {
@@ -517,34 +422,6 @@ test "ptr_eq distinguishes distinct cells" {
     defer b.deinit();
     try testing.expect(!ObjRef(i32).ptrEq(a, b));
     try testing.expect(a.identity() != b.identity());
-}
-
-test "publish flips to shared and shared path serializes" {
-    const obj = try ObjRef(i32).init(testing.allocator, 5);
-    defer obj.deinit();
-
-    obj.publish();
-    try testing.expect(obj.isShared());
-
-    // On the shared path, multiple read guards coexist.
-    const r1 = obj.borrow();
-    const r2 = obj.borrow();
-    try testing.expectEqual(@as(i32, 5), r1.get().*);
-    try testing.expectEqual(@as(i32, 5), r2.get().*);
-    r1.deinit();
-    r2.deinit();
-
-    // An exclusive borrow once readers are gone.
-    {
-        const w = obj.borrowMut();
-        defer w.deinit();
-        w.get().* = 6;
-    }
-    {
-        const g = obj.borrow();
-        defer g.deinit();
-        try testing.expectEqual(@as(i32, 6), g.get().*);
-    }
 }
 
 test "deinit runs T.deinit when the last handle drops" {
@@ -603,9 +480,8 @@ test "shared objref concurrent push is consistent" {
     const allocator = testing.allocator;
     var obj = try ObjRef(IntList).init(allocator, .{});
     defer obj.deinit();
-    // Publish before the handle escapes to any other thread.
-    obj.publish();
-    try testing.expect(obj.isShared());
+    // The per-cell lock mediates every cross-thread borrow; no publish
+    // step is needed before the handle escapes to other threads.
 
     var handles: [THREADS]std.Thread = undefined;
     var t: usize = 0;
@@ -663,7 +539,6 @@ const CounterWorker = struct {
 test "shared objref read modify counter" {
     var obj = try ObjRef(i64).init(testing.allocator, 0);
     defer obj.deinit();
-    obj.publish();
 
     var applied = std.atomic.Value(usize).init(0);
 
@@ -704,7 +579,6 @@ const HandoffWriter = struct {
             var i: i32 = 0;
             while (i < 64) : (i += 1) g.get().items.append(self.allocator, i) catch unreachable;
         }
-        obj.publish();
         self.obj_out.* = obj;
         self.ready.store(true, .release);
     }
@@ -721,12 +595,12 @@ const HandoffReader = struct {
         defer g.deinit();
         std.debug.assert(g.get().items.items.len == 64);
         for (g.get().items.items, 0..) |v, i| {
-            std.debug.assert(v == @as(i32, @intCast(i))); // never a partial pre-publish write
+            std.debug.assert(v == @as(i32, @intCast(i))); // never a partial write
         }
     }
 };
 
-test "publish then handoff orders the write" {
+test "handoff orders the write across threads" {
     const allocator = testing.allocator;
     const ROUNDS: usize = 50;
     var round: usize = 0;

@@ -671,8 +671,8 @@ fn spawnLaunchBlock(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// `__kxco_dispatch { … }` — dispatch a coroutine body onto a real OS
 /// thread (`Dispatchers.Default`). Returns an opaque job id the caller
 /// joins with `__kxco_joinDispatched`. The body, its captures, and any
-/// value it returns cross threads; the host `publish_deep`'s the escaping
-/// graph before the worker starts and again on completion (mirrors the
+/// value it returns cross threads; each shared cell they reach mediates
+/// concurrent access through its own reader/writer lock (mirrors the
 /// spawned-thread boundary).
 fn dispatchCoroutine(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {

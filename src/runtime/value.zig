@@ -3,8 +3,8 @@
 //! `RuntimeError` data type.
 //!
 //! Reference handles: Rust `Arc<T>` / `ObjRef<T>` both map to
-//! `ObjRef(T)` (the refcounted, interior-mutable, cross-thread-publishable
-//! cell). Rust `Box<Value>` maps to `*Value`. Shared-immutable AST nodes
+//! `ObjRef(T)` (the refcounted, interior-mutable, lock-mediated cell).
+//! Rust `Box<Value>` maps to `*Value`. Shared-immutable AST nodes
 //! (`Arc<klio_ast::Function>` etc.) map to `*const ast.X` pointers, owned
 //! by the parse/lower arena.
 
@@ -899,28 +899,6 @@ pub const Value = union(enum) {
             .StringBuilder => |s| s.identity(),
             else => null,
         };
-    }
-
-    /// Publish every `ObjRef` reachable from this value so the whole
-    /// graph is sound to observe from another OS thread. The soundness
-    /// primitive a value graph must pass through before it can cross a
-    /// thread boundary: `publish()` establishes the happens-before that
-    /// `ObjRef`'s adaptive cell relies on.
-    ///
-    /// Cycle-safe. Kotlin object graphs, `Env` parent chains, `Cell`
-    /// self-references, and `ClassDef` parent/enclosing links are all
-    /// cyclic; recursion is guarded by a visited set keyed on each
-    /// cell's address-stable identity. `publish()` itself is idempotent,
-    /// so revisiting a cell is harmless — the visited check exists purely
-    /// to guarantee termination.
-    ///
-    /// Over-approximates by design: when in doubt a reachable cell is
-    /// published. It never under-publishes.
-    pub fn publishDeep(self: *const Value, allocator: std.mem.Allocator) void {
-        const gc_traverse = @import("gc_traverse.zig");
-        var seen = std.AutoHashMap(usize, void).init(allocator);
-        defer seen.deinit();
-        gc_traverse.publishValue(self, &seen);
     }
 
     /// Render this value the way Kotlin's `toString` / string templates do,

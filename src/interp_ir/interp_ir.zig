@@ -196,20 +196,17 @@ pub const SpinMutex = runtime.SpinMutex;
 /// write through this so concurrent `println` is serialized; on
 /// completion the recorded calls replay into the caller's real sink.
 ///
-/// A thin handle over `ObjRef(RecordingSink)` — the same adaptive shared
-/// cell `ThreadTable` is built on. The cell is `publish`ed at `new` so
-/// every access takes the SHARED reader/writer lock's exclusive
-/// `borrowMut`, serializing concurrent writes exactly as the prior
-/// hand-rolled mutex did.
+/// A thin handle over `ObjRef(RecordingSink)` — the same shared cell
+/// `ThreadTable` is built on. Every access takes the cell's reader/writer
+/// lock's exclusive `borrowMut`, serializing concurrent writes exactly as
+/// the prior hand-rolled mutex did.
 pub const SharedOutput = struct {
     obj: ObjRef(runtime.RecordingSink),
 
     pub fn new(allocator: Allocator) Allocator.Error!SharedOutput {
         const obj = try ObjRef(runtime.RecordingSink).init(allocator, runtime.RecordingSink.init(allocator));
-        // Published immediately: this sink is shared across every thread
-        // of the program from creation, so all writes serialize through
-        // the cell's exclusive lock.
-        obj.publish();
+        // Shared across every thread of the program from creation; all
+        // writes serialize through the cell's exclusive lock.
         return .{ .obj = obj };
     }
 
@@ -267,10 +264,8 @@ pub const SharedClosures = struct {
 
     pub fn new(allocator: Allocator) Allocator.Error!SharedClosures {
         const obj = try ObjRef(std.ArrayList(ClosureInfo)).init(allocator, .empty);
-        // Published immediately: the side-table is shared across every
-        // thread from creation, so `get`/`push` go through the cell's
-        // reader/writer lock.
-        obj.publish();
+        // The side-table is shared across every thread from creation, so
+        // `get`/`push` go through the cell's reader/writer lock.
         return .{ .obj = obj };
     }
 

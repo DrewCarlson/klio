@@ -700,79 +700,22 @@ fn workerEntry(wargs: WorkerArgs) void {
         return;
     };
     // Worker result publication: happens-before to the joining parent is
-    // carried by publishDeep's release stores plus the parent's join().
+    // carried by each cell's reader/writer lock plus the parent's join().
     switch (r) {
-        .ok => |v| {
-            v.publishDeep(args.seed.allocator);
-            publishThreadResult(args.threads, args.id, .{ .ok = {} });
-        },
+        .ok => publishThreadResult(args.threads, args.id, .{ .ok = {} }),
         .err => |e| switch (e) {
-            .Return => |v| {
-                v.publishDeep(args.seed.allocator);
-                publishThreadResult(args.threads, args.id, .{ .ok = {} });
-            },
+            .Return => publishThreadResult(args.threads, args.id, .{ .ok = {} }),
             else => publishThreadResult(args.threads, args.id, .{ .err = e }),
         },
     }
 }
 
-/// Publish the escaping graph then spawn a worker thread for `block`.
+/// Spawn a worker thread for `block`. Every cell the child reaches
+/// mediates access through its own reader/writer lock, so concurrent
+/// borrows from the worker and the parent are ordered by that lock; the
+/// `Thread.spawn`/`join` below carry the bracketing happens-before. No
+/// separate graph publication is needed.
 fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!HostResultU64 {
-    // Publish the escaping block and every shared root the child can
-    // reach so observing them from the new thread is sound.
-    block.publishDeep(self.allocator);
-    runtime.publishEnvDeep(self.allocator, self.globals);
-    {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        var it = cg.get().valueIterator();
-        while (it.next()) |def| {
-            (Value{ .Class = def.clone() }).publishDeep(self.allocator);
-        }
-    }
-    {
-        const og = self.class_default_outer.borrow();
-        defer og.deinit();
-        var it = og.get().valueIterator();
-        while (it.next()) |v| v.publishDeep(self.allocator);
-    }
-    // Transition the shared container cells the child reads to the SHARED
-    // (rwlock) discipline so concurrent borrows from the worker don't race
-    // the parent's `RefCell`-style flag. Mirrors Rust's `Arc<...>` roots:
-    // `classes`, `anon_methods`, `class_default_outer`, plus the
-    // build-time-immutable `prog` image and its `installed_bindings`
-    // overlay every dispatch path borrows.
-    self.classes.publish();
-    self.anon_methods.publish();
-    self.class_default_outer.publish();
-    // The build-time-immutable IR image. Every worker `borrow()`s it on
-    // each call/dispatch (the closure body func, nested closure bodies,
-    // every member resolution), so multiple running workers borrow this
-    // one cell concurrently. While it stays UNSHARED those borrows race
-    // its non-atomic `RefCell` `flag` (a torn increment reads back as a
-    // phantom mutable borrow and panics). Publish it so those concurrent
-    // read borrows go through the SHARED reader/writer lock. It is never
-    // mutated after build, so concurrent shared borrows are correct.
-    self.module.publish();
-    // The monotonic id source: the parent `borrowMut`s it below to mint
-    // this worker's id while an already-running worker may `borrowMut` it
-    // to mint an instance id. Publish so those concurrent borrows take the
-    // SHARED write lock instead of racing the UNSHARED flag.
-    self.instance_id_counter.publish();
-    // The worker writes its result into `threads` (borrowMut via
-    // publishThreadResult) while the parent borrows it in joinSpawned/
-    // joinAllThreads. Publish it so those concurrent borrows go through the
-    // SHARED rwlock instead of the non-atomic UNSHARED flag (data race).
-    self.threads.publish();
-    self.prog.publish();
-    {
-        const pg = self.prog.borrow();
-        defer pg.deinit();
-        pg.get().installed_bindings.publish();
-    }
-    // The publish() release stores above pair with Thread.spawn's ordering
-    // (below) to make the published roots visible on the worker.
-
     const id = blk: {
         const g = self.instance_id_counter.borrowMut();
         defer g.deinit();

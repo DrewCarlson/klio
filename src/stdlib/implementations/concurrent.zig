@@ -162,7 +162,7 @@ pub fn concurrent_thread(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // (the body runs concurrently regardless); a later `.start()` is
     // a no-op. Defaulting to start=true matches the common case.
     // Thread start: happens-before is carried by Thread.spawn inside
-    // spawnOsThread, paired with publish()'s release store on the seed.
+    // spawnOsThread plus each shared cell's reader/writer lock.
     const spawned = try ctx.host.spawnOsThread(&body, ctx.out);
     const id: u64 = switch (spawned) {
         .ok => |v| v,
