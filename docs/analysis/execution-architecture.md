@@ -247,13 +247,17 @@ is keyed by bare simple name and tie-broken by order:
   (`host_call_func.resolvedNativeForm`). The form is fixed at link time
   independent of load order, so it no longer depends on how a symbol was loaded.
 
-**Aggravating factors.** Lowering forks FQN resolution on `isLambdaBody()`
-(`src/ir/lower/expr.zig:867`, also `1058`, `2897`, `2956`), so the same dotted
-path lowers to a `LoadGlobal`-of-FQN at top level but a member/`this` walk inside
-a lambda — and pack code is heavily consumed through builder lambdas. Span-keyed
-FQN overrides fire only for files WITH a package header (`build.zig:264-283`), so
-packaged pack decls and package-less user scripts take structurally different
-mangling/retain branches in the same build.
+**Aggravating factors.** Lowering used to fork FQN resolution on
+`isLambdaBody()` (the four `expr.zig` dotted-head sites), so the same dotted path
+lowered to a `LoadGlobal`-of-FQN at top level but a member/`this` walk inside a
+lambda — and pack code is heavily consumed through builder lambdas. **Resolved
+(item 10):** the lambda axis is gone; package-head vs receiver-member is now the
+one predicate `headIsPackage` (real package root or a declared FQN-prefix package
+via `Module.packageHeadDeclared`), so a dotted head resolves identically whether
+or not it is lexically inside a lambda. Span-keyed FQN overrides still fire only
+for files WITH a package header (`build.zig:264-283`), so packaged pack decls and
+package-less user scripts take structurally different mangling/retain branches in
+the same build.
 
 **One instance of this class is fixed and regression-protected — not live.**
 `plans/KTOR-UPSTREAM.md:232-246` documents what it calls "the load-order bug":
@@ -587,17 +591,28 @@ header set) — provably independent of pack load order:
    probe's pick on every dispatch and reports 0 divergences over the green corpus
    — the executable proof the link form is a faithful, behavior-preserving
    replacement.
-6. **Remove `isLambdaBody()` as a resolution axis** (`expr.zig:867`, also
-   `1058`, `2897`, `2956`). Package-head vs receiver-member would instead be
-   decided by resolving the head against the caller's imports/package and the
-   lexical capture set — one predicate, no lambda special case. **This is a broad
-   behavioral change, not a medium-risk local edit:** `isLambdaBody` currently
-   forces a dotted head inside a lambda to a member/`this` walk rather than a
-   `LoadGlobal`-of-FQN, and pack/DSL code is consumed almost entirely *through*
-   builder lambdas (this is the same consumption surface as Class C's own
-   evidence). Flipping it changes how every dotted path inside every builder/DSL
-   lambda lowers, and must be gated behind a builder-DSL-heavy differential pass
-   (kotlinx/ktor builder itests) being green, not characterized as medium risk.
+6. **Remove `isLambdaBody()` as a resolution axis. DONE (item 10).** The four
+   `(isPkgRoot(head) or !b.isLambdaBody())` gates in `expr.zig` are replaced by
+   one principled predicate, `headIsPackage(b, head)`: a dotted head is a
+   package-qualified global (flatten to `LoadGlobal`-of-FQN) when it is a real
+   package root (`isPkgRoot`) or names a package the program contributes a
+   top-level symbol to (`Module.packageHeadDeclared` — `head.<rest>` is a
+   declared FQN prefix over the complete phase-1 header set); otherwise it is a
+   member of an implicit receiver and walks `this`. A captured/local name or an
+   enclosing-class member shadows a package head (the sites already filter those
+   with `resolve`/`knowsOuter`/`hasEnclosingMember`/`classId` guards). The answer
+   is independent of lambda nesting AND of declaration order / load mode, so the
+   same dotted head inside a builder/DSL lambda lowers identically to the same
+   head at top level — which also fixes the latent Class-C bug where
+   `isLambdaBody` *blocked* a legitimately package-qualified head from flattening
+   inside a builder lambda. The inline splice binds the inline body's receiver as
+   a scope local named `"this"` already, so inline-body dotted heads resolve
+   through the same predicate without a lambda axis (no extra frame-receiver slot
+   was required at the splice). Gated behind the builder-DSL differential pass:
+   `examples/dsl_dotted_head.kt` + `coroutine_smoke/cs8_dotted_in_builder.kt`
+   byte-identical across EmbeddedOnly / SourcePacks / CompiledPacks, the
+   extension/dsl/suspend/inner-class/functional/lambda itests unmodified, and
+   `KLIO_RESOLVE_AUDIT`/`KLIO_LINK_AUDIT` = 0 over the corpus.
 
 ### 4.5 Cleanup (supporting)
 
@@ -727,7 +742,7 @@ refactors, then the structural unifications in dependency order.
 | 7 | PARTIAL — single implicit-receiver resolution choke point (`implicitThisValue` + `implicitReceiverChain` in `ir/eval.zig`) now feeds all three `*OrGlobal` handlers (`CallMemberOrGlobal`/`LoadFromThisOrGlobal`/`StoreToThisOrGlobal`), so the bare-name member-vs-global precedence is derived in one place instead of three. Registry func-kind landed: `Func.kind` (`FuncKind.member_extension`) is the authoritative member-extension predicate, set at the member-extension lowering site (`decl.zig`); the five `member_ext_owner_class` dispatch sites route through `isMemberExt`/`memberExtVisible` (the owner-class gate is preserved exactly — the kind selects which funcs are gated, the side table supplies the owner). The four "Or" *instructions* are NOT collapsed to a single `CallUnresolved`: they encode three distinct operations (read / write / call) plus the explicit-receiver `CallMemberOrValue`, and the "Or" itself is the "couldn't classify member-vs-global statically" signal item 8's FQN static resolution removes — collapsing now would re-encode the read/write/call distinction without removing the runtime decision. Deferred to item 8. (A/B) | A/B | high | medium | L |
 | 8 | PARTIAL (steps 1-4, fallback retained) — per-decl `package` tag on `Func`/`Class` (set at flatten/lowering, `""` = no package), the two-phase header registration made explicit (phase-1 reserves every class + func HEADER with FQN/package/receiver, phase-2 lowers bodies against the complete set), and the package/FQN symbol index (`Module.resolveBareCallIndexed`, keyed on caller package → file imports → built-in stdlib) as the PRIMARY bare-call path: where it resolves a unique non-extension target, lowering binds that target by exact `FuncId` (FQN-exact at the VM); otherwise it defers to the order-based heuristic, which is RETAINED unchanged. `KLIO_RESOLVE_AUDIT` is a permanent env-gated detector that compares the index pick to the heuristic pick on every bare call — proven 0 divergences over all 82 examples + the differential corpus, i.e. the index is a faithful superset. DEFERRED (the tightening prerequisite): the index does NOT yet error on ambiguity, and `isShippedFqn`/prefix-ladder/suffix-scan are NOT removed — that hardening is gated on the §4.4-item-3 uniqueness proof and is items 9/10's scope. | C | high | high | XL |
 | 9 | DONE — one executable form per symbol resolved at link time (`ProgramImage.linkResolvedForms` → the `resolved_native` table keyed by `FuncId`, populated once after the module + `installed_bindings` exist); the per-call FQN short-circuit in `callFunc` and `callValue` is deleted, both now consulting the resolved form by `FuncId` (`host_call_func.resolvedNativeForm`). Pack-vs-source identity is settled at link time, load-order-independent. `KLIO_LINK_AUDIT` is a permanent env-gated detector proving the link form equals the deleted per-call probe's pick (0 divergences over the full suite + 82 examples + the differential corpus). (§4.4) | C | high | high | XL |
-| 10 | Remove `isLambdaBody()` resolution axis; inline splice sets frame receiver slot (§4.4/§4.2) — gate behind builder-DSL differential pass | C/B | medium | high | M |
+| 10 | DONE — removed `isLambdaBody()` as a resolution axis at the four `expr.zig` dotted-head sites; package-head vs receiver-member is now the one predicate `headIsPackage` (real package root or `Module.packageHeadDeclared` FQN-prefix), shadowed by captured/local/enclosing-member names — order- and load-mode-independent, no lambda special case. The inline splice already binds the inline receiver as a `"this"` scope local, so no extra frame-receiver slot was needed. Gated green behind the builder-DSL differential (`examples/dsl_dotted_head.kt` + `coroutine_smoke/cs8_dotted_in_builder.kt`, byte-identical across all three pack modes); both audits 0. (§4.4/§4.2) | C/B | medium | high | M |
 | 11 | DONE — deleted `Value.Lambda` (vestigial Env-based closure the live IR VM never produced; `AstLambda` already built `IrClosure`). Removed the variant, its one GC-test constructor, and every Value-context `.Lambda =>` arm; `IrClosure` is now the single closure value form and `func.capture_order` (via `ClosureInfo.captures`) is the sole capture-metadata authority. | cleanup | medium | medium | M |
 | 12 | `KLIO_TRACE_PATH` structured trace + `scripts/assert_single_path.py` (§5.5) | detect | medium | low | M |
 
