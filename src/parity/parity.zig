@@ -1235,29 +1235,40 @@ fn packRoundtrip(arena: Allocator, sources: []const PackSource) Allocator.Error!
 /// canonical loader behind `runWithKtc` / `runWithPacks`: each runner is this
 /// plus the shared build + `Vm.run` tail. ASTs and bindings live in `arena`.
 pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) Allocator.Error!SResult(LoadedProgram) {
+    return loadProgramFiles(arena, io, &.{file}, mode);
+}
+
+/// Multi-file variant of `loadProgram`: every path in `files` is a user
+/// source file, assembled (in order, after packs + stdlib) into one
+/// program — the in-process mirror of `klio run a.kt b.kt`.
+pub fn loadProgramFiles(arena: Allocator, io: Io, files: []const []const u8, mode: LoadMode) Allocator.Error!SResult(LoadedProgram) {
     // The SourceMap is borrowed by the parsed ASTs (and returned to the
     // caller for diagnostic rendering) for the arena's lifetime; it is
     // never deinit'd so spans stay valid through build + run.
     const map = try arena.create(SourceMap);
     map.* = SourceMap.init(arena);
 
-    const user_src = readFileOpt(arena, io, file) orelse {
-        return .{ .err = try std.fmt.allocPrint(arena, "read {s}", .{file}) };
-    };
-    const user_ast = switch (try parsePackFile(arena, map, file, user_src)) {
-        .err => |e| return .{ .err = e },
-        .ok => |a| a,
-    };
+    var user_asts: std.ArrayList(KotlinFile) = .empty;
+    defer user_asts.deinit(arena);
+    for (files) |file| {
+        const user_src = readFileOpt(arena, io, file) orelse {
+            return .{ .err = try std.fmt.allocPrint(arena, "read {s}", .{file}) };
+        };
+        const user_ast = switch (try parsePackFile(arena, map, file, user_src)) {
+            .err => |e| return .{ .err = e },
+            .ok => |a| a,
+        };
+        try user_asts.append(arena, user_ast);
+    }
 
     var asts: std.ArrayList(KotlinFile) = .empty;
     defer asts.deinit(arena);
     var bindings: ?HostBindings = null;
 
     if (mode == .EmbeddedOnly) {
-        var user_only = [_]KotlinFile{user_ast};
-        const stdlib_asts = try embeddedStdlibSources(arena, io, &user_only, map);
+        const stdlib_asts = try embeddedStdlibSources(arena, io, user_asts.items, map);
         try asts.appendSlice(arena, stdlib_asts);
-        try asts.append(arena, user_ast);
+        try asts.appendSlice(arena, user_asts.items);
         return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = null, .map = map } };
     }
 
@@ -1265,7 +1276,9 @@ pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) A
     const pack_dirs = try kotlinxPackDirs(arena);
 
     var user_import_prefixes = std.StringHashMap(void).init(arena);
-    try collectImportPrefixes(arena, &user_ast, &user_import_prefixes);
+    for (user_asts.items) |*ua| {
+        try collectImportPrefixes(arena, ua, &user_import_prefixes);
+    }
     var imports_coroutines = false;
     {
         var it = user_import_prefixes.keyIterator();
@@ -1316,13 +1329,13 @@ pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) A
     var probe: std.ArrayList(KotlinFile) = .empty;
     defer probe.deinit(arena);
     try probe.appendSlice(arena, asts.items);
-    try probe.append(arena, user_ast);
+    try probe.appendSlice(arena, user_asts.items);
     const stdlib_asts = try embeddedStdlibSources(arena, io, probe.items, map);
     for (stdlib_asts) |a| {
         try registerAstPackage(arena, &a);
         try asts.append(arena, a);
     }
-    try asts.append(arena, user_ast);
+    try asts.appendSlice(arena, user_asts.items);
 
     var b = try HostBindings.withStdlibDefaults(arena);
     {
@@ -1346,6 +1359,11 @@ pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) A
 /// captured stdout (ok) or an error message (err), owned by `allocator`. The
 /// single tail shared by all three load configurations.
 pub fn runInMode(allocator: Allocator, io: Io, file: []const u8, mode: LoadMode) Allocator.Error!SResult([]u8) {
+    return runFilesInMode(allocator, io, &.{file}, mode);
+}
+
+/// Multi-file `runInMode`.
+pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, mode: LoadMode) Allocator.Error!SResult([]u8) {
     // In-process run path shared by e2e / itests / differential / fuzzer:
     // cap RSS and arm the opt-in deadline so a runaway program can't OOM or
     // hang the harness process. Call-once.
@@ -1369,7 +1387,7 @@ pub fn runInMode(allocator: Allocator, io: Io, file: []const u8, mode: LoadMode)
     // on this thread before assembling the next program.
     interp_ir.resetReceiverThreadLocals();
 
-    const loaded = switch (try loadProgram(arena, io, file, mode)) {
+    const loaded = switch (try loadProgramFiles(arena, io, files, mode)) {
         .err => |e| return .{ .err = try allocator.dupe(u8, e) },
         .ok => |p| p,
     };
@@ -1740,6 +1758,12 @@ pub fn runWithPacks(allocator: Allocator, io: Io, file: []const u8) Allocator.Er
     // `runInMode` runs `main` on a 64 MiB worker stack (the Zig equivalent of
     // the Rust harness's `stacker::grow`), so deep recursion has headroom.
     return runInMode(allocator, io, file, .SourcePacks);
+}
+
+/// Multi-file variant of `runWithPacks` — the in-process mirror of
+/// `klio run a.kt b.kt`, for itests exercising cross-package shapes.
+pub fn runFilesWithPacks(allocator: Allocator, io: Io, files: []const []const u8) Allocator.Error!SResult([]u8) {
+    return runFilesInMode(allocator, io, files, .SourcePacks);
 }
 
 // ---------------------- staging helpers ----------------------

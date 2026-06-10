@@ -60,6 +60,7 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .diagnostics = root.DiagnosticSink.init(),
         .frames = frames,
         .fns = std.StringHashMap(std.ArrayList(root.FnSig)).init(allocator),
+        .file_packages = std.AutoHashMap(u32, []const u8).init(allocator),
         .extensions = std.StringHashMap(std.ArrayList(root.ExtensionSig)).init(allocator),
         .extension_properties = std.StringHashMap(std.ArrayList(root.ExtensionPropSig)).init(allocator),
         .classes = std.StringHashMap(root.ClassInfo).init(allocator),

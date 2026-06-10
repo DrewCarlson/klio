@@ -2398,3 +2398,69 @@ test "suspend_call_inside_anon_fun_marked_suspend" {
     defer c.deinit();
     try testing.expect(c.hasCode(codes.TYPE_SUSPEND_CALL_FROM_NON_SUSPEND));
 }
+
+// ---------------------------------------------------------------------------
+// Module-level (multi-file) checks: conflicting overloads are per package.
+// ---------------------------------------------------------------------------
+
+/// Re-home every span a test function carries onto `fid` so the checker's
+/// per-file package map (and cross-file visibility checks) see the decl in
+/// the right file.
+fn rehomeFn(f: *Function, fid: FileId) void {
+    f.span.file = fid;
+    f.name.span.file = fid;
+}
+
+fn pkgFile(b: *Builder, pkg_name: ?[]const u8, decls: []const Decl, fid: FileId) KotlinFile {
+    var f = b.file(decls);
+    f.span.file = fid;
+    if (pkg_name) |pn| {
+        const idents = b.arena.allocator().alloc(Ident, 1) catch unreachable;
+        idents[0] = b.ident(pn);
+        f.package = .{ .path = idents, .span = f.span };
+    }
+    return f;
+}
+
+fn checkModule(gpa: std.mem.Allocator, files: []const KotlinFile) Checked {
+    const arena = gpa.create(std.heap.ArenaAllocator) catch unreachable;
+    arena.* = std.heap.ArenaAllocator.init(gpa);
+    const a = arena.allocator();
+    var res = resolver.resolveModule(a, files) catch unreachable;
+    const tc = check.typecheckModule(a, files, &res) catch unreachable;
+    return .{ .arena = arena, .res = res, .tc = tc };
+}
+
+test "module: cross-package same-signature functions are not conflicting overloads" {
+    // liba.kt: package liba; fun f(x: Int): Int = x
+    // libb.kt: package libb; fun f(x: Int): Int = x
+    // kotlinc compiles this module clean — the conflicting-overloads
+    // domain is one package, so no T0094.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var fa = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
+    rehomeFn(&fa, FileId.from(1));
+    var fb = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
+    rehomeFn(&fb, FileId.from(2));
+    const file_a = pkgFile(&b, "liba", &.{.{ .Function = fa }}, FileId.from(1));
+    const file_b = pkgFile(&b, "libb", &.{.{ .Function = fb }}, FileId.from(2));
+    var c = checkModule(testing.allocator, &.{ file_a, file_b });
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 0), c.countCode(codes.TYPE_CONFLICTING_OVERLOADS));
+}
+
+test "module: same-package same-signature functions across files still conflict" {
+    // a.kt + b.kt both `package liba` declaring `fun f(x: Int): Int` —
+    // one package, identical signatures: kotlinc rejects, T0094 fires.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var fa = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
+    rehomeFn(&fa, FileId.from(1));
+    var fb = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
+    rehomeFn(&fb, FileId.from(2));
+    const file_a = pkgFile(&b, "liba", &.{.{ .Function = fa }}, FileId.from(1));
+    const file_b = pkgFile(&b, "liba", &.{.{ .Function = fb }}, FileId.from(2));
+    var c = checkModule(testing.allocator, &.{ file_a, file_b });
+    defer c.deinit();
+    try testing.expect(c.countCode(codes.TYPE_CONFLICTING_OVERLOADS) >= 1);
+}

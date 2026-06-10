@@ -553,6 +553,65 @@ fn primitiveClassDef(allocator: Allocator, name: []const u8) Allocator.Error!Obj
 /// probe chain (cached global, delegate auto-resolve, user class/function,
 /// stdlib FQN probes, synthetic class names, typealias follow); splitting
 /// it would fragment the fallthrough.
+/// The runtime value of one exact top-level function: a closure over its
+/// lowered body, or — for a bodyless decl whose single executable form
+/// was settled at link time — that native binding. Null when the func id
+/// is unknown or carries neither form.
+fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    const func = idGet(m.funcs.items, fid.int()) orelse return null;
+    if (func.blocks.len != 0) {
+        const caps = ObjRef(std.ArrayList(Value)).init(allocator, .empty) catch return null;
+        const id = self.closures.push(.{
+            .body_func = fid,
+            .n_params = func.params.len,
+            .capture_names = &.{},
+            .captures = caps,
+        }) catch return null;
+        const empty = ValueSlice.init(allocator, &.{}) catch return null;
+        return .{ .IrClosure = .{ .id = id, .captures = empty } };
+    }
+    const linked: ?StdlibFn = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().resolvedNativeForm(fid);
+    };
+    if (linked) |func_native| {
+        return .{ .Intrinsic = .{ .fqn = func.fqn, .func = func_native } };
+    }
+    return null;
+}
+
+/// Resolve a lowering-bound global reference by exact identity: the
+/// symbol index already picked the declaration, so no name-keyed
+/// re-resolution can swap in a same-simple-name twin. Returns null when
+/// the id carries no runtime value (the caller falls back to the
+/// name-keyed path).
+pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, class: ?ir.ClassId) ?Value {
+    if (func) |fid| {
+        if (funcValueById(self, allocator, fid)) |v| return v;
+    }
+    if (class) |cid| {
+        const fqn: ?[]const u8 = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const m = mg.get();
+            if (cid.int() >= m.classes.items.len) break :blk null;
+            break :blk m.classes.items[cid.int()].fqn;
+        };
+        if (fqn) |f| {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            if (cg.get().get(f)) |def| {
+                return .{ .Class = def.clone() };
+            }
+        }
+    }
+    return null;
+}
+
 pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
     const allocator = self.allocator;
 
@@ -649,12 +708,28 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
     // closure value so `val f = ::name; f(args)` routes through call_value.
     // A bare (unqualified, receiverless) reference must never resolve to
     // an extension function (a synthetic `this` first param) — prefer a
-    // non-extension same-named sibling, otherwise fall through.
+    // non-extension same-named sibling, otherwise fall through. A dotted
+    // name is an exact-FQN reference (the lowerer's index-resolved
+    // emission); it binds that one declaration or nothing.
     {
         const mg = self.module.borrow();
         defer mg.deinit();
         const m = mg.get();
-        const chosen: ?FuncId = if (m.funcId(name)) |fid| pick: {
+        // A dotted name is an exact-FQN reference, but it must still
+        // never bind an extension form: a top-level extension twin
+        // shares the receiverless FQN string (`build` puts no receiver
+        // segment in `Func.fqn`), and a value reference cannot supply
+        // its receiver — so the non-extension declaration under the FQN
+        // is the only candidate.
+        const by_fqn: ?FuncId = if (std.mem.indexOfScalar(u8, name, '.') != null) pick: {
+            for (m.funcs.items) |f| {
+                if (!std.mem.eql(u8, f.fqn, name)) continue;
+                if (isExtFid(f.id, m)) continue;
+                break :pick f.id;
+            }
+            break :pick null;
+        } else null;
+        const chosen: ?FuncId = by_fqn orelse if (m.funcId(name)) |fid| pick: {
             if (isExtFid(fid, m)) {
                 for (m.funcsBySimpleName(name)) |c| {
                     if (!isExtFid(c, m)) {
@@ -669,52 +744,30 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
             }
         } else null;
         if (chosen) |fid| {
-            if (idGet(m.funcs.items, fid.int())) |func| {
-                if (func.blocks.len != 0) {
-                    const n_params = func.params.len;
-                    const caps = ObjRef(std.ArrayList(Value)).init(allocator, .empty) catch return null;
-                    const id = self.closures.push(.{
-                        .body_func = fid,
-                        .n_params = n_params,
-                        .capture_names = &.{},
-                        .captures = caps,
-                    }) catch return null;
-                    const empty = ValueSlice.init(allocator, &.{}) catch return null;
-                    return .{ .IrClosure = .{ .id = id, .captures = empty } };
-                }
-            }
+            if (funcValueById(self, allocator, fid)) |v| return v;
         }
     }
 
-    // Probe stdlib by FQN for known package surfaces. A bare reference can
-    // only bind a *top-level* function — probe the top-level packages
-    // (`math`, `comparisons`, `io`) before the receiver-extension packages
-    // so `min`/`max` resolve to `kotlin.math.min` rather than a collection
-    // extension of the same name.
+    // Stdlib resolution: an exact-FQN reference (the lowerer emits dotted
+    // names fully qualified) resolves directly; a bare simple name
+    // resolves through the link-settled name → FQN maps — the
+    // default-import map over the implicit stdlib surface, then the
+    // pack-binding bare aliases. One deterministic edge per name, built
+    // once by `linkResolvedForms`, replacing the per-call prefix-probe
+    // ladder and the hash-order suffix scan.
     {
-        // Each probe owns a stable, heap-allocated FQN slice.
-        const prefixes = [_]?[]const u8{
-            null,
-            "kotlin",
-            "kotlin.math",
-            "kotlin.comparisons",
-            "kotlin.io",
-            "kotlin.collections",
-            "kotlin.text",
-            "kotlin.ranges",
-            "kotlin.concurrent",
-            "kotlin.coroutines",
-            "kotlin.coroutines.intrinsics",
-            "kotlin.internal",
+        const mapped: ?[]const u8 = if (lookupIntrinsic(self, name) != null)
+            name
+        else blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().defaultImportGlobal(name) orelse pg.get().packBareAlias(name);
         };
-        for (prefixes) |pre| {
-            const fqn = if (pre) |p|
-                (std.fmt.allocPrint(allocator, "{s}.{s}", .{ p, name }) catch return null)
-            else
-                (allocator.dupe(u8, name) catch return null);
-            if (lookupIntrinsic(self, fqn)) |func| {
+        if (mapped) |m| {
+            if (lookupIntrinsic(self, m)) |func| {
+                const fqn = allocator.dupe(u8, m) catch return null;
                 if (trace.enabled(name)) {
-                    trace.emit("ladder=global_prefix name={s} fqn={s}", .{ name, fqn });
+                    trace.emit("map=global_fqn name={s} fqn={s}", .{ name, fqn });
                 }
                 const tail = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
                 if (looksConst(tail)) {
@@ -722,29 +775,6 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
                     if (r == .ok) return r.ok;
                 }
                 return .{ .Intrinsic = .{ .fqn = fqn, .func = func } };
-            }
-            allocator.free(fqn);
-        }
-    }
-
-    // Loaded packs register their FQNs in `installed_bindings`. For a
-    // bare-name reference, scan the overlay for a key that ends with
-    // `.{name}`. Runs after `direct_probes` so a top-level `kotlin.*`
-    // function wins over a same-named receiver-extension.
-    {
-        const suffix = std.fmt.allocPrint(allocator, ".{s}", .{name}) catch return null;
-        defer allocator.free(suffix);
-        const pg = self.prog.borrow();
-        defer pg.deinit();
-        const bg = pg.get().installed_bindings.borrow();
-        defer bg.deinit();
-        var it = bg.get().table.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.endsWith(u8, entry.key_ptr.*, suffix)) {
-                if (trace.enabled(name)) {
-                    trace.emit("ladder=global_suffix name={s} fqn={s}", .{ name, entry.key_ptr.* });
-                }
-                return .{ .Intrinsic = .{ .fqn = entry.key_ptr.*, .func = entry.value_ptr.* } };
             }
         }
     }

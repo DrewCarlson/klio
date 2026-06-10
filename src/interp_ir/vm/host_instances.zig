@@ -112,34 +112,44 @@ fn concreteSibling(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
     return null;
 }
 
-fn secondaryCtors(self: *VmHost, name: []const u8) []const root.build.SecondaryCtorEntry {
-    const g = self.prog.borrow();
-    defer g.deinit();
-    return g.get().secondary_ctors.get(name) orelse &.{};
+/// Class-keyed side tables hold one entry under the class's simple name
+/// and (when it differs) one under its FQN. A caller that knows the
+/// resolved FQN resolves through it exclusively — the simple-name entry
+/// may belong to a same-simple-name class from another package — while a
+/// simple-name-only caller (synthesized classes) keeps the legacy view.
+fn sideTableKey(fqn: ?[]const u8, name: []const u8) []const u8 {
+    const f = fqn orelse return name;
+    return if (f.len != 0) f else name;
 }
 
-fn parentCtorArgThunks(self: *VmHost, name: []const u8) ?[]const FuncId {
+fn secondaryCtors(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const root.build.SecondaryCtorEntry {
     const g = self.prog.borrow();
     defer g.deinit();
-    return g.get().parent_ctor_args.get(name);
+    return g.get().secondary_ctors.get(sideTableKey(fqn, name)) orelse &.{};
 }
 
-fn primaryDefaultThunks(self: *VmHost, name: []const u8) ?[]const ?FuncId {
+fn parentCtorArgThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const FuncId {
     const g = self.prog.borrow();
     defer g.deinit();
-    return g.get().primary_ctor_default_thunks.get(name);
+    return g.get().parent_ctor_args.get(sideTableKey(fqn, name));
 }
 
-fn classDelegateThunks(self: *VmHost, name: []const u8) []const root.build.StrFunc {
+fn primaryDefaultThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const ?FuncId {
     const g = self.prog.borrow();
     defer g.deinit();
-    return g.get().class_delegates.get(name) orelse &.{};
+    return g.get().primary_ctor_default_thunks.get(sideTableKey(fqn, name));
 }
 
-fn bodyPropInit(self: *VmHost, class_name: []const u8, prop_name: []const u8) ?FuncId {
+fn classDelegateThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const root.build.StrFunc {
     const g = self.prog.borrow();
     defer g.deinit();
-    return g.get().body_prop_inits.get(.{ .a = class_name, .b = prop_name });
+    return g.get().class_delegates.get(sideTableKey(fqn, name)) orelse &.{};
+}
+
+fn bodyPropInit(self: *VmHost, class_fqn: ?[]const u8, class_name: []const u8, prop_name: []const u8) ?FuncId {
+    const g = self.prog.borrow();
+    defer g.deinit();
+    return g.get().body_prop_inits.get(.{ .a = sideTableKey(class_fqn, class_name), .b = prop_name });
 }
 
 fn nextInstanceId(self: *VmHost) u64 {
@@ -277,11 +287,14 @@ fn pathConstDefault(self: *VmHost, e: *const ast.Expr) Allocator.Error!?Value {
 }
 
 /// Pack trailing positional args into the primary ctor's `vararg` slot.
-fn packPrimaryCtorVarargs(self: *VmHost, class_name: []const u8, args: []Value) Allocator.Error![]Value {
+/// `class_fqn`, when known, keys the module class exactly so a
+/// same-simple-name class from another package cannot supply the params.
+fn packPrimaryCtorVarargs(self: *VmHost, class_fqn: ?[]const u8, class_name: []const u8, args: []Value) Allocator.Error![]Value {
     const mg = self.module.borrow();
     defer mg.deinit();
     const m = mg.get();
-    const cid = m.classId(class_name) orelse return args;
+    const by_fqn: ?ir.ClassId = if (class_fqn) |fq| m.classIdByFqn(fq) else null;
+    const cid = by_fqn orelse m.classId(class_name) orelse return args;
     if (cid.int() >= m.classes.items.len) return args;
     const ir_cls = &m.classes.items[cid.int()];
     const params = ir_cls.primary_params;
@@ -544,14 +557,14 @@ fn bindThrowableArgs(self: *VmHost, inst: ObjRef(InstanceData), args: []const Va
 const UnitOrErr = union(enum) { ok: void, err: EvalError };
 
 /// Dispatch the parent's matching secondary-ctor chain on the same leaf.
-fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_name: []const u8, args: []const Value) Allocator.Error!UnitOrErr {
+fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, class_name: []const u8, args: []const Value) Allocator.Error!UnitOrErr {
     if (isBuiltinThrowableName(class_name)) {
         if (leaf.* == .Instance) {
             try bindThrowableArgs(self, leaf.Instance, args, true);
         }
         return .{ .ok = {} };
     }
-    const entries = secondaryCtors(self, class_name);
+    const entries = secondaryCtors(self, class_fqn, class_name);
     var chosen: ?root.build.SecondaryCtorEntry = null;
     for (entries) |e| {
         if (e.param_count == args.len) {
@@ -576,7 +589,7 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_name: []const u8, 
         }
     }
     if (entry.is_this) {
-        switch (try runSuperCtorChain(self, leaf, class_name, next_args.items)) {
+        switch (try runSuperCtorChain(self, leaf, class_fqn, class_name, next_args.items)) {
             .ok => {},
             .err => |e| return .{ .err = e },
         }
@@ -584,18 +597,20 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_name: []const u8, 
         // The `super(...)` target is the parent of the class whose ctor
         // we're currently running.
         var parent_name: ?[]const u8 = null;
-        if (classDefByName(self, class_name)) |def| {
+        var parent_fqn: ?[]const u8 = null;
+        if (classDefByName(self, sideTableKey(class_fqn, class_name))) |def| {
             const dg = def.borrow();
             if (dg.get().parent) |parent| {
                 const pcg = parent.borrow();
                 parent_name = pcg.get().name;
+                parent_fqn = pcg.get().fqn;
                 pcg.deinit();
             }
             dg.deinit();
             def.deinit();
         }
         if (parent_name) |p| {
-            switch (try runSuperCtorChain(self, leaf, p, next_args.items)) {
+            switch (try runSuperCtorChain(self, leaf, parent_fqn, p, next_args.items)) {
                 .ok => {},
                 .err => |e| return .{ .err = e },
             }
@@ -620,7 +635,57 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_name: []const u8, 
     return .{ .ok = {} };
 }
 
-const ChainEntry = struct { name: []const u8, args: []Value };
+const ChainEntry = struct { name: []const u8, fqn: ?[]const u8 = null, args: []Value };
+
+/// Whether a chain entry denotes the same class as (`fqn`, `name`):
+/// resolved-FQN identity when both sides carry one, written-name
+/// equality otherwise.
+fn chainEntryIs(entry: *const ChainEntry, fqn: ?[]const u8, name: []const u8) bool {
+    if (entry.fqn) |ef| {
+        if (fqn) |f| return std.mem.eql(u8, ef, f);
+    }
+    return std.mem.eql(u8, entry.name, name);
+}
+
+/// Resolve a supertype written as a simple name from `child_fqn`'s
+/// perspective: the child's own package first (Kotlin scoping), then the
+/// program-wide simple-name view — so a same-simple-name class from
+/// another package cannot become the parent.
+fn classDefForSuper(self: *VmHost, child_fqn: []const u8, child_name: []const u8, sup_name: []const u8) ?ObjRef(ClassDef) {
+    const pkg = ir.packageOfFqn(child_fqn, child_name);
+    if (pkg.len != 0) {
+        const qualified = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ pkg, sup_name }) catch
+            return classDefByName(self, sup_name);
+        defer self.allocator.free(qualified);
+        if (classDefByName(self, qualified)) |d| return d;
+    }
+    return classDefByName(self, sup_name);
+}
+
+const SuperRef = struct { name: []const u8, fqn: ?[]const u8 };
+
+/// First supertype of `def` that is not a known interface — the parent
+/// the ctor chain delegates to. Resolution is package-aware via
+/// `classDefForSuper`; a name with no runtime def (a builtin Throwable
+/// parent) is returned with a null fqn, preserving the written name.
+fn firstNonInterfaceSuper(self: *VmHost, def: ObjRef(ClassDef)) ?SuperRef {
+    const dg = def.borrow();
+    defer dg.deinit();
+    const child_fqn = dg.get().fqn;
+    const child_name = dg.get().name;
+    for (dg.get().supertype_names) |n| {
+        const sd = classDefForSuper(self, child_fqn, child_name, n);
+        if (sd) |s| {
+            const is_iface = classDefIsInterface(s);
+            const sfqn = classDefFqn(s);
+            s.deinit();
+            if (is_iface) continue;
+            return .{ .name = n, .fqn = sfqn };
+        }
+        return .{ .name = n, .fqn = null };
+    }
+    return null;
+}
 
 /// Run the class's `init { … }` blocks whose source position equals
 /// `before_prop_idx`. Each block takes `this` plus the class's args.
@@ -637,14 +702,15 @@ fn runInitBlocksAt(
         defer g.deinit();
         break :blk g.get().name;
     };
+    const cls_fqn = classDefFqn(cls);
     const fids: []const FuncId = blk: {
         const g = self.prog.borrow();
         defer g.deinit();
-        break :blk g.get().init_blocks.get(cls_name) orelse return .{ .ok = {} };
+        break :blk g.get().init_blocks.get(sideTableKey(cls_fqn, cls_name)) orelse return .{ .ok = {} };
     };
     var cls_args: []const Value = fallback_args;
-    for (chain) |c| {
-        if (std.mem.eql(u8, c.name, cls_name)) {
+    for (chain) |*c| {
+        if (chainEntryIs(c, cls_fqn, cls_name)) {
             cls_args = c.args;
             break;
         }
@@ -734,6 +800,11 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
         }
         break :blk m.classes.items[class.int()].name;
     };
+    const class_fqn = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().classes.items[class.int()].fqn;
+    };
     // Primary param names, off the IR class.
     var primary_names: std.ArrayList([]const u8) = .empty;
     defer primary_names.deinit(allocator);
@@ -750,7 +821,9 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
     for (arg_names) |n| {
         if (n) |nm| try supplied_names.append(allocator, nm);
     }
-    const class_def = classDefByName(self, class_name);
+    // FQN first: named-argument construction must read the params of the
+    // exact class the ClassId resolved, not a simple-name twin.
+    const class_def = classDefByName(self, class_fqn) orelse classDefByName(self, class_name);
     defer if (class_def) |d| d.deinit();
 
     // Prefer the primary signature when every supplied name names a
@@ -847,7 +920,7 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
     }
 
     // A named arg names a secondary-constructor parameter.
-    const entries = secondaryCtors(self, class_name);
+    const entries = secondaryCtors(self, class_fqn, class_name);
     var chosen: ?root.build.SecondaryCtorEntry = null;
     for (entries) |e| {
         if (e.param_count < args.len) continue;
@@ -979,7 +1052,12 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
         }
     }
 
-    var class_def = classDefByName(self, ir_name) orelse {
+    // The lowering-resolved ClassId carries the exact identity; resolve
+    // the runtime ClassDef by FQN (the table's authoritative key) so a
+    // same-simple-name class from another package can never swap in. The
+    // simple-name view remains the fallback for synthesized classes that
+    // only register under their simple name.
+    var class_def = classDefByName(self, ir_fqn) orelse classDefByName(self, ir_name) orelse {
         return .{ .err = .{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::new_instance: no runtime ClassDef registered for `{s}`", .{ir_name}) } };
     };
     defer class_def.deinit();
@@ -1041,7 +1119,7 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
 
     // Secondary-ctor dispatch.
     const zero_primary_secondary = n_primary_initial == 0 and blk: {
-        for (secondaryCtors(self, class_name)) |e| {
+        for (secondaryCtors(self, classDefFqn(class_def), class_name)) |e| {
             if (e.param_count == args.len) break :blk true;
         }
         break :blk false;
@@ -1063,6 +1141,12 @@ fn classDefName(d: ObjRef(ClassDef)) []const u8 {
     const g = d.borrow();
     defer g.deinit();
     return g.get().name;
+}
+
+fn classDefFqn(d: ObjRef(ClassDef)) []const u8 {
+    const g = d.borrow();
+    defer g.deinit();
+    return g.get().fqn;
 }
 
 fn classDefIsAbstract(d: ObjRef(ClassDef)) bool {
@@ -1235,7 +1319,7 @@ fn funcParamHasDefault(self: *VmHost, fid: FuncId, idx: usize) bool {
 /// the primary-ctor path.
 fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), args: []const Value, outer_hint: ?*const Value) Allocator.Error!?EvalResult {
     const class_name = classDefName(class_def);
-    const entries = secondaryCtors(self, class_name);
+    const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
     var chosen: ?root.build.SecondaryCtorEntry = null;
     for (entries) |e| {
         if (e.param_count == args.len) {
@@ -1396,7 +1480,7 @@ fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, class_de
             pg.deinit();
             g.deinit();
         }
-        switch (try runSuperCtorChain(self, &leaf, pname, target_args)) {
+        switch (try runSuperCtorChain(self, &leaf, classDefFqn(pdef), pname, target_args)) {
             .ok => {},
             .err => |e| return .{ .err = e },
         }
@@ -1453,7 +1537,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
     // Pack trailing positional args into the primary ctor's vararg slot.
     {
         const owned = try allocator.dupe(Value, effective.items);
-        const packed_args = try packPrimaryCtorVarargs(self, class_name, owned);
+        const packed_args = try packPrimaryCtorVarargs(self, classDefFqn(class_def), class_name, owned);
         effective.clearRetainingCapacity();
         try effective.appendSlice(allocator, packed_args);
         allocator.free(packed_args);
@@ -1505,7 +1589,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
 
     // Fill omitted trailing params from default thunks.
     if (effective.items.len < n_primary) {
-        const default_thunks = primaryDefaultThunks(self, class_name);
+        const default_thunks = primaryDefaultThunks(self, classDefFqn(class_def), class_name);
         var idx = effective.items.len;
         while (idx < n_primary) : (idx += 1) {
             var dflt_expr: ?*const ast.Expr = null;
@@ -1744,9 +1828,13 @@ fn selectInnerOuter(self: *VmHost, allocator: Allocator, class_def: ObjRef(Class
 
 fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, args: []const Value, outer_hint: ?*const Value) Allocator.Error!EvalResult {
     const class_name = classDefName(class_def);
+    const class_fqn = classDefFqn(class_def);
     const identity = nextInstanceId(self);
 
-    // Build the parent ctor-arg chain top-down.
+    // Build the parent ctor-arg chain top-down. Each entry carries the
+    // resolved FQN alongside the written name, so every per-class side
+    // table (ctor args, init blocks, body-prop inits) is read for the
+    // exact class, never a same-simple-name twin.
     var chain: std.ArrayList(ChainEntry) = .empty;
     defer {
         for (chain.items) |c| allocator.free(c.args);
@@ -1754,9 +1842,10 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
     }
     {
         const owned = try allocator.dupe(Value, args);
-        try chain.append(allocator, .{ .name = ir_name, .args = owned });
+        try chain.append(allocator, .{ .name = ir_name, .fqn = class_fqn, .args = owned });
     }
     var cur_class = ir_name;
+    var cur_fqn: ?[]const u8 = class_fqn;
     var cur_args: []const Value = args;
 
     var throwable_message: ?Value = null;
@@ -1764,25 +1853,10 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
 
     // Direct-parent Throwable message/cause recovery.
     {
-        const cur_def = classDefByName(self, cur_class);
-        defer if (cur_def) |d| d.deinit();
-        var parent_name: ?[]const u8 = null;
-        if (cur_def) |d| {
-            const dg = d.borrow();
-            defer dg.deinit();
-            for (dg.get().supertype_names) |n| {
-                const sd = classDefByName(self, n);
-                const is_iface = if (sd) |s| classDefIsInterface(s) else false;
-                if (sd) |s| s.deinit();
-                if (!is_iface) {
-                    parent_name = n;
-                    break;
-                }
-            }
-        }
-        if (parent_name) |pname| {
-            if (isThrowableDirectName(pname)) {
-                if (parentCtorArgThunks(self, cur_class)) |thunks| {
+        const parent_ref = firstNonInterfaceSuper(self, class_def);
+        if (parent_ref) |pref| {
+            if (isThrowableDirectName(pref.name)) {
+                if (parentCtorArgThunks(self, cur_fqn, cur_class)) |thunks| {
                     for (thunks, 0..) |fid, idx| {
                         const fr = try funcAt(self, fid, "parent ctor arg");
                         switch (fr) {
@@ -1803,24 +1877,15 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
     }
 
     // Walk the parent ctor chain.
-    while (parentCtorArgThunks(self, cur_class)) |thunks| {
-        const cur_def = classDefByName(self, cur_class);
-        var parent_name: ?[]const u8 = null;
+    while (parentCtorArgThunks(self, cur_fqn, cur_class)) |thunks| {
+        const cur_def = classDefByName(self, sideTableKey(cur_fqn, cur_class));
+        var parent_ref: ?SuperRef = null;
         if (cur_def) |d| {
-            const dg = d.borrow();
-            for (dg.get().supertype_names) |n| {
-                const sd = classDefByName(self, n);
-                const is_iface = if (sd) |s| classDefIsInterface(s) else false;
-                if (sd) |s| s.deinit();
-                if (!is_iface) {
-                    parent_name = n;
-                    break;
-                }
-            }
-            dg.deinit();
+            parent_ref = firstNonInterfaceSuper(self, d);
             d.deinit();
         }
-        const pname = parent_name orelse break;
+        const pref = parent_ref orelse break;
+        const pname = pref.name;
 
         // Evaluate this level's super-args.
         var parent_args: std.ArrayList(Value) = .empty;
@@ -1853,7 +1918,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             parent_args.deinit(allocator);
             break;
         }
-        const parent_def = classDefByName(self, pname);
+        const parent_def = classDefByName(self, sideTableKey(pref.fqn, pname));
         const parent_is_iface = if (parent_def) |d| classDefIsInterface(d) else true;
         if (parent_def) |d| d.deinit();
         if (parent_def == null or parent_is_iface) {
@@ -1861,9 +1926,10 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             break;
         }
         // Pack the delegation args for the parent's vararg primary param.
-        const packed_parent = try packPrimaryCtorVarargs(self, pname, try parent_args.toOwnedSlice(allocator));
-        try chain.append(allocator, .{ .name = pname, .args = try allocator.dupe(Value, packed_parent) });
+        const packed_parent = try packPrimaryCtorVarargs(self, pref.fqn, pname, try parent_args.toOwnedSlice(allocator));
+        try chain.append(allocator, .{ .name = pname, .fqn = pref.fqn, .args = try allocator.dupe(Value, packed_parent) });
         cur_class = pname;
+        cur_fqn = pref.fqn;
         cur_args = packed_parent;
     }
 
@@ -1876,7 +1942,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             ci -= 1;
             const cls_name = chain.items[ci].name;
             const cls_args = chain.items[ci].args;
-            var cls_def = classDefByName(self, cls_name);
+            var cls_def = classDefByName(self, sideTableKey(chain.items[ci].fqn, cls_name));
             var use_def = false;
             if (cls_def) |d| {
                 if (classDefIsInterface(d)) {
@@ -1998,7 +2064,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
 
     // Evaluate class-delegation expressions.
     {
-        const delegates = classDelegateThunks(self, class_name);
+        const delegates = classDelegateThunks(self, class_fqn, class_name);
         for (delegates) |sf| {
             const fr = try funcAt(self, sf.func, "class delegate");
             switch (fr) {
@@ -2051,14 +2117,15 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             ci -= 1;
             const cls = chain_classes.items[ci];
             const cls_name = classDefName(cls);
+            const cls_fqn = classDefFqn(cls);
             const body_len = blk: {
                 const g = cls.borrow();
                 defer g.deinit();
                 break :blk g.get().body_properties.len;
             };
             const cls_args: []const Value = blk: {
-                for (chain.items) |c| {
-                    if (std.mem.eql(u8, c.name, cls_name)) break :blk c.args;
+                for (chain.items) |*c| {
+                    if (chainEntryIs(c, cls_fqn, cls_name)) break :blk c.args;
                 }
                 break :blk args;
             };
@@ -2073,7 +2140,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                     defer g.deinit();
                     break :blk g.get().body_properties[prop_idx].name;
                 };
-                if (bodyPropInit(self, cls_name, prop_name)) |fid| {
+                if (bodyPropInit(self, cls_fqn, cls_name, prop_name)) |fid| {
                     const fr = try funcAt(self, fid, "body prop init");
                     switch (fr) {
                         .err => |e| return .{ .err = e },
@@ -2587,6 +2654,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             defer cg.deinit();
             break :blk cg.get().name;
         };
+        const cls_fqn = classDefFqn(cls);
         const cls_args: []Value = super_args_by_class.get(cls_name) orelse &.{};
         const props = blk: {
             const cg = cls.borrow();
@@ -2598,7 +2666,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 .ok => {},
                 .err => |e| return .{ .err = e },
             }
-            const fid = bodyPropInit(self, cls_name, p.name) orelse continue;
+            const fid = bodyPropInit(self, cls_fqn, cls_name, p.name) orelse continue;
             const mg = self.module.borrow();
             const m = mg.get();
             if (@intFromEnum(fid) >= m.funcs.items.len) {

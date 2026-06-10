@@ -185,28 +185,44 @@ pub fn resolve(allocator: std.mem.Allocator, file: *const KotlinFile) !Resolutio
     };
 }
 
-/// Resolve a multi-file module. Every file's top-level declarations
-/// share a module-level scope, but each file applies its own imports
-/// only inside its own decls (file-local import scoping). Use-spans
-/// across files remain distinguishable through the `FileId` carried on
-/// each Span.
+/// Resolve a multi-file module. Top-level declarations are package-
+/// qualified: files sharing a `package` header declare into one
+/// package scope, so a redeclaration is only flagged within a package
+/// — two packages may each declare `class Config` without conflict.
+/// Cross-package references stay resolvable through a tolerant shared
+/// module scope (the resolver has no import-graph typing yet), and
+/// each file applies its own imports only inside its own decls
+/// (file-local import scoping). Use-spans across files remain
+/// distinguishable through the `FileId` carried on each Span.
 pub fn resolveModule(allocator: std.mem.Allocator, files: []const KotlinFile) !Resolution {
     var r = try Resolver.init(allocator);
     const builtins = ScopeId.from(0);
     const module_scope = try r.pushScope(builtins, .File);
-    // Phase 1: forward-declare every file's top-level decls into the
-    // shared module scope so cross-file references resolve.
+    var pkg_scopes = std.StringHashMap(ScopeId).init(allocator);
+    defer pkg_scopes.deinit();
+    // Phase 1: forward-declare every file's top-level decls into its
+    // package's scope (redeclaration detection is per package), then
+    // mirror the binding into the shared module scope without
+    // diagnostics so cross-file, cross-package references resolve.
     for (files) |*file| {
         try r.setFilePackage(file);
+        const pkg_scope = blk: {
+            const gop = try pkg_scopes.getOrPut(r.file_package orelse "");
+            if (!gop.found_existing) gop.value_ptr.* = try r.pushScope(module_scope, .File);
+            break :blk gop.value_ptr.*;
+        };
         for (file.decls) |*decl| {
-            try r.declareTopLevel(module_scope, decl);
+            try r.declareTopLevel(pkg_scope, decl);
+            try r.mirrorModuleBinding(module_scope, pkg_scope, decl);
         }
     }
     // Phase 2: per-file pass that applies that file's imports inside
-    // a fresh child of the module scope, then resolves decl bodies.
+    // a fresh child of the file's package scope, then resolves decl
+    // bodies (lookup walks file → package → module → builtins).
     for (files) |*file| {
         try r.setFilePackage(file);
-        const file_scope = try r.pushScope(module_scope, .File);
+        const pkg_scope = pkg_scopes.get(r.file_package orelse "").?;
+        const file_scope = try r.pushScope(pkg_scope, .File);
         for (file.imports) |*imp| {
             try r.checkImport(imp);
             try r.bindImportLeaf(file_scope, imp);
@@ -480,6 +496,30 @@ const Resolver = struct {
             return;
         }
         _ = try self.declare(scope, name, kind, sp, false);
+    }
+
+    /// Mirror a top-level binding from its package scope into the
+    /// shared module scope, diagnostics-free: the module scope is the
+    /// tolerant cross-package fallback, never a redeclaration domain.
+    /// First binding wins so the fallback is declaration-order stable.
+    fn mirrorModuleBinding(self: *Resolver, module_scope: ScopeId, pkg_scope: ScopeId, decl: *const Decl) !void {
+        switch (decl.*) {
+            .Property => |p| {
+                if (p.receiver_type != null) return;
+            },
+            else => {},
+        }
+        const name: []const u8 = switch (decl.*) {
+            .Function => |f| f.name.name,
+            .Property => |p| p.name.name,
+            .Class => |c| c.name.name,
+            .Object => |o| o.name.name,
+            .TypeAlias => |a| a.name.name,
+        };
+        if (self.scopes.items[module_scope.int()].bindings.get(name) != null) return;
+        if (self.scopes.items[pkg_scope.int()].bindings.get(name)) |id| {
+            try self.scopes.items[module_scope.int()].bindings.put(name, id);
+        }
     }
 
     fn declare(
@@ -1353,6 +1393,85 @@ test "duplicate top level emits r0004" {
     var cs = try codes(a, &r);
     defer cs.deinit(a);
     try testing.expect(hasCode(cs.items, "R0004"));
+}
+
+test "module: cross-package same simple names are not redeclarations" {
+    const a = testing.allocator;
+    // package liba: class Config; fun setup() {}
+    // package appb: class Config; fun setup() {}
+    var lib_setup = emptyFn("setup");
+    lib_setup.body = .{ .Block = .{ .stmts = &.{}, .span = ts() } };
+    var app_setup = emptyFn("setup");
+    app_setup.body = .{ .Block = .{ .stmts = &.{}, .span = ts() } };
+    var lib_decls = [_]Decl{ .{ .Class = mkClass("Config", &.{}) }, .{ .Function = lib_setup } };
+    var app_decls = [_]Decl{ .{ .Class = mkClass("Config", &.{}) }, .{ .Function = app_setup } };
+    var lib_pkg = [_]ast.Ident{ident("liba")};
+    var app_pkg = [_]ast.Ident{ident("appb")};
+    const files = [_]KotlinFile{
+        .{ .package = .{ .path = &lib_pkg, .span = ts() }, .imports = &.{}, .decls = &lib_decls, .span = ts() },
+        .{ .package = .{ .path = &app_pkg, .span = ts() }, .imports = &.{}, .decls = &app_decls, .span = ts() },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolveModule(arena.allocator(), &files);
+    var cs = try codes(a, &r);
+    defer cs.deinit(a);
+    try testing.expect(!hasCode(cs.items, "R0004"));
+}
+
+test "module: same-package duplicate across files is a redeclaration" {
+    const a = testing.allocator;
+    // Two files, both `package shared`, both declaring `fun foo()`.
+    var foo1 = emptyFn("foo");
+    foo1.body = .{ .Block = .{ .stmts = &.{}, .span = ts() } };
+    var foo2 = emptyFn("foo");
+    foo2.body = .{ .Block = .{ .stmts = &.{}, .span = ts() } };
+    var decls1 = [_]Decl{.{ .Function = foo1 }};
+    var decls2 = [_]Decl{.{ .Function = foo2 }};
+    var pkg1 = [_]ast.Ident{ident("shared")};
+    var pkg2 = [_]ast.Ident{ident("shared")};
+    const files = [_]KotlinFile{
+        .{ .package = .{ .path = &pkg1, .span = ts() }, .imports = &.{}, .decls = &decls1, .span = ts() },
+        .{ .package = .{ .path = &pkg2, .span = ts() }, .imports = &.{}, .decls = &decls2, .span = ts() },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolveModule(arena.allocator(), &files);
+    var cs = try codes(a, &r);
+    defer cs.deinit(a);
+    try testing.expect(hasCode(cs.items, "R0004"));
+}
+
+test "module: cross-package reference resolves through the module scope" {
+    const a = testing.allocator;
+    // package liba: fun helper() {}
+    // (no package): fun main() { helper() }
+    var helper = emptyFn("helper");
+    helper.body = .{ .Block = .{ .stmts = &.{}, .span = ts() } };
+    var lib_decls = [_]Decl{.{ .Function = helper }};
+    var lib_pkg = [_]ast.Ident{ident("liba")};
+
+    var helper_callee = pathExpr("helper");
+    defer a.free(helper_callee.Path.segments);
+    const call = callExpr(&helper_callee, &.{});
+    var stmts = [_]Stmt{.{ .Expr = call }};
+    var main_fn = emptyFn("main");
+    main_fn.body = .{ .Block = .{ .stmts = &stmts, .span = ts() } };
+    var main_decls = [_]Decl{.{ .Function = main_fn }};
+
+    const files = [_]KotlinFile{
+        .{ .package = .{ .path = &lib_pkg, .span = ts() }, .imports = &.{}, .decls = &lib_decls, .span = ts() },
+        .{ .package = null, .imports = &.{}, .decls = &main_decls, .span = ts() },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var r = try resolveModule(arena.allocator(), &files);
+    var cs = try codes(a, &r);
+    defer cs.deinit(a);
+    try testing.expect(!hasCode(cs.items, "R0001"));
 }
 
 test "shadowing in inner scope emits r0002" {

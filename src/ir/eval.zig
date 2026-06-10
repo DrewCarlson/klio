@@ -1653,8 +1653,14 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .LoadGlobal => |lg| {
             const name_str = constStr(frame.module, lg.name) orelse
                 return errResult(.{ .Type = "LoadGlobal: name not a string const" });
-            const lg_r = host.lookupGlobalThrowing(allocator, name_str);
-            const found = switch (try lg_r) {
+            // A lowering-resolved identity binds that exact declaration;
+            // the name string is only the unresolved-shape fallback.
+            const by_id: ?Value = if (lg.func != null or lg.class != null)
+                host.lookupGlobalById(allocator, lg.func, lg.class)
+            else
+                null;
+            const lg_r: MaybeValueResult = if (by_id != null) .{ .ok = by_id } else try host.lookupGlobalThrowing(allocator, name_str);
+            const found = switch (lg_r) {
                 .ok => |maybe| maybe,
                 .err => |e| return errResult(e),
             };
@@ -1937,7 +1943,13 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         if (overload) |v| {
             result = v;
         } else {
-            const global = switch (try host.lookupGlobalThrowing(allocator, name_str)) {
+            // A lowering-resolved constructor class binds exactly; the
+            // simple-name lookup remains the unresolved fallback.
+            const by_id: ?Value = if (cmg.class) |_|
+                host.lookupGlobalById(allocator, null, cmg.class)
+            else
+                null;
+            const global = if (by_id != null) by_id else switch (try host.lookupGlobalThrowing(allocator, name_str)) {
                 .ok => |maybe| maybe,
                 .err => |e| return errResult(e),
             };
@@ -2815,6 +2827,11 @@ pub const NullHost = struct {
     pub fn lookupGlobalThrowing(self: *NullHost, allocator: Allocator, name: []const u8) Allocator.Error!MaybeValueResult {
         _ = allocator;
         return .{ .ok = self.lookupGlobal(name) };
+    }
+
+    pub fn lookupGlobalById(self: *NullHost, allocator: Allocator, func: ?FuncId, class: ?ClassId) ?Value {
+        _ = .{ self, allocator, func, class };
+        return null;
     }
 
     pub fn storeGlobal(self: *NullHost, allocator: Allocator, name: []const u8, value: Value) Allocator.Error!UnitResult {

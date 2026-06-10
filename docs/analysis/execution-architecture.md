@@ -223,26 +223,32 @@ another; load *order* of pack source files is resolution-significant.
 from declaration **order** and **FQN-mangling**, because every downstream table
 is keyed by bare simple name and tie-broken by order:
 
-- **`Module.funcId`** returns `first_user orelse first_body orelse first`, where
-  `first_user` is the first candidate whose FQN is NOT `isShippedFqn`
-  (`src/ir/ir.zig:787-801`, `isShippedFqn` at `ir.zig:936`). Any pack outside
-  `kotlin.`/`kotlinx.`/`java.` counts as "user", so a pack's same-named function
-  — concatenated first — wins over the user's.
-- **`Module.classId`** returns the FIRST `class_index` entry matching the simple
-  name (`src/ir/ir.zig:748-753`); same-simple-name/different-FQN classes are
-  stored distinctly but the FQN distinction is unreachable from a bare
-  reference. The resolver's `module_scope` is one flat last-write-wins table
-  keyed by bare name (`src/resolver/resolver.zig:208-233`, `resolver.zig:443-506`);
-  `file_package` is tracked only for import validation, never to namespace
-  bindings.
+- **`Module.funcId`** returns `first_user orelse first_body orelse first`,
+  ranked over the per-decl `Func.package` (`isShippedFqn` is deleted). It is
+  no longer a resolution input: the symbol index
+  (`resolveBareCallIndexed`/`resolveBareRefIndexed`) is the primary path and
+  `funcId` only breaks the shapes the index defers on (extensions, overload
+  sets), order-stably.
+- **`Module.classId`** (first `class_index` entry by simple name) remains only
+  as the legacy fallback: bare construction/reference sites resolve through
+  `classIdIndexed` (caller package + imports) and carry the resolved
+  `ClassId` to the runtime, whose class registry is FQN-keyed (the
+  simple-name view is a first-wins, user-over-shipped alias for callers with
+  no resolved identity). The resolver declares per-package scopes —
+  redeclaration is detected per package and the module scope is a
+  diagnostics-free first-wins mirror for cross-package reads
+  (`resolver.zig` `resolveModule`/`mirrorModuleBinding`).
 - **Inline-fn table** is a process-global `StringHashMap` keyed by bare simple
   name, merged across packs + user (`src/ir/lower/inline_state.zig:31`,
   `inline_state.zig:72-93`, `inline_state.zig:284-302`); a pack `inline fun foo`
   and a user `inline fun foo` share one bucket, tie-broken by shape/order.
-- **VM global lookup** hard-codes a `kotlin.*` prefix-probe ladder, then a
-  **suffix scan** of `installed_bindings` matching any FQN ending in `.{name}`,
-  returning the first hash-map hit (`src/interp_ir/vm/host_globals.zig:431-486`)
-  — iteration-order nondeterministic.
+- **VM global lookup. RESOLVED (item 8 steps 2+3).** The `kotlin.*`
+  prefix-probe ladder and the `installed_bindings` suffix scan are deleted;
+  a bare name resolves through link-settled name→FQN maps
+  (`default_import_globals`, first-package-wins; `pack_bare_aliases`,
+  receiver-qualified keys excluded, lexicographic tie-break) and an
+  index-resolved reference bypasses names entirely (`lookupGlobalById` on
+  the emitted `FuncId`/`ClassId`).
 - **Two executable forms. RESOLVED (item 9).** `callFunc`/`callValue` used to
   short-circuit any FQN matching an `installed_bindings` entry to
   `dispatchIntrinsic` (a native binding) instead of the lowered body, deciding the
@@ -687,17 +693,25 @@ header set) — provably independent of pack load order:
    heuristic's cross-package pick) and 12 `CompletableDeferred` shape
    corrections (exact-arity overload over the default-param sibling, with
    runtime type dispatch unchanged since non-exact calls re-resolve through
-   `pickOverload`). Still live as resolution inputs (items 8b/8c scope):
-   `isShippedFqn` in `funcId`'s tie-break and the flat
-   `module_scope`/`classId`-by-simple-name lookups.
-4. **Lowering emits FQN-qualified `Call`/`LoadGlobal`.** The VM does exact
-   `funcIdByFqn` (`ir.zig:822`) / `installed_bindings.resolve(fqn)` lookups with
-   NO prefix-probe ladder and NO suffix scan (`host_globals.zig:431-486`). Fold
-   inline-fn resolution into the same entry point so there is one selection
-   algorithm, not a parallel simple-name inline table. **Inventory landed:**
-   the three runtime ladders — the `lookupGlobal` prefix probe and suffix scan
-   (`host_globals.zig`) and the `callFunc` bodyless ladder
-   (`host_call_func.zig`) — emit `KLIO_TRACE_RESOLVE`-gated
+   `pickOverload`). Items 8b/8c are landed: `isShippedFqn` is deleted
+   (`funcId` ranks by `Func.package`), the resolver declares per-package
+   scopes (redeclaration is per package; the module scope is a
+   diagnostics-free first-wins mirror), and the runtime class registry is
+   FQN-keyed — the simple-name views that remain are order-stable
+   fallbacks behind identity-carrying emission, not resolution inputs.
+4. **Lowering emits identity-carrying `Call`/`LoadGlobal`. LANDED** (except
+   the inline-fn fold, deferred as 8d). A unique index pick emits
+   `LoadGlobal` carrying the exact `FuncId`/`ClassId` (`lookupGlobalById`
+   binds it directly — no name round-trip, so extension twins sharing a
+   receiverless FQN string and dotless root-package FQNs bind exactly);
+   the three runtime ladders are DELETED — the `lookupGlobal` prefix probe
+   and suffix scan replaced by the link-time
+   `default_import_globals`/`pack_bare_aliases` maps, the `callFunc`
+   bodyless ladder by link-settled `resolved_redirect`/`resolved_native`
+   (`KLIO_LINK_AUDIT` re-derives the deleted algorithms independently).
+   Fold inline-fn resolution into the same entry point so there is one
+   selection algorithm, not a parallel simple-name inline table (8d).
+   The pre-deletion inventory was `KLIO_TRACE_RESOLVE`-gated
    `ladder=<which> name=<simple> fqn=<resolved>` lines, so a corpus sweep
    enumerates exactly which (program, name, fqn) still reach them. Current
    sweep over all 85 examples: 18 distinct prefix-ladder names (constants and
@@ -871,7 +885,7 @@ refactors, then the structural unifications in dependency order.
 | 5 | `VmIntrinsicHost` becomes thin adapter delegating to eval.Host (§4.1) | A | high | medium | L |
 | 6 | DONE (receiver chain + close-out) — enclosing-`this` chain is now a `Frame` field (`enclosing_this`), snapshotted into `FrameSnapshot` on suspend and restored on resume; the `outer_this` thread-local + `outerThisStack` + its `resetReceiverTls` are deleted and `enclosingThis`/`enclosingThisChain`/`pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain. Close-out landed: `inner_outer_hint` TLS replaced by an explicit `outer_hint` param (sourced via `callerThisValue` — param or capture) with class-keyed outer selection in `materializeInstance`, plus a lambda-side `this` capture for bare inner-class construction keyed on the new `ir.Class.is_inner` (fixes `with(other){Inner()}` incl. shadowing subjects, lambda-escaping inners, user-HOF lambdas, two-level nesting), `member_only_probe`/`cc_explicit_read` are now params, the dead duplicate `ctor_guard` is collapsed onto `host_instances.ctorGuardContains` (activating the deferred-`object` gate), and `host_call_member`'s re-entrancy flags are defer-cleared + run-boundary-asserted. Remaining §4.2 line item: fold the frame's own `this` into the carrier (see §4.2 consumer inventory). (§4.2) | B | high | high | XL |
 | 7 | PARTIAL — single implicit-receiver resolution choke point (`implicitThisValue` + `implicitReceiverChain` in `ir/eval.zig`) now feeds all three `*OrGlobal` handlers (`CallMemberOrGlobal`/`LoadFromThisOrGlobal`/`StoreToThisOrGlobal`), so the bare-name member-vs-global precedence is derived in one place instead of three. Registry func-kind landed: `Func.kind` (`FuncKind.member_extension`) is the authoritative member-extension predicate, set at the member-extension lowering site (`decl.zig`); the five `member_ext_owner_class` dispatch sites route through `isMemberExt`/`memberExtVisible` (the owner-class gate is preserved exactly — the kind selects which funcs are gated, the side table supplies the owner). The four "Or" *instructions* are NOT collapsed to a single `CallUnresolved`: they encode three distinct operations (read / write / call) plus the explicit-receiver `CallMemberOrValue`, and the "Or" itself is the "couldn't classify member-vs-global statically" signal item 8's FQN static resolution removes — collapsing now would re-encode the read/write/call distinction without removing the runtime decision. Deferred to item 8. (A/B) | A/B | high | medium | L |
-| 8 | PARTIAL (steps 1-4 + tightening landed, ladders retained) — per-decl `package` tag on `Func`/`Class`, explicit two-phase header registration, and the package/FQN symbol index (`Module.resolveBareCallIndexed`) as the PRIMARY bare-call path, now hardened: reason-tagged deferrals (`ResolveDeferReason`, 13 classified shapes), order-independent forward references (phase-1 stubs rank by declared arity `decl_user_arity`, full-granularity declared types `decl_user_sig` rendered by the same `loweredTypeRef` body params use, and AST-derived `low_priority`; default-param shapes defer from stub and body gates alike), a six-tier preference order matching kotlinc's probed scoping (named import → own package → wildcard import → default-import package → shipped → other; a named import outranks even a same-file declaration; same-leaf named imports are ALL kept in `registry.import_aliases` so a second import of one leaf is a classified tie, not a shadow; wildcard imports per file in `registry.import_wildcards`, default imports mirroring `stdlib.IMPLICITLY_IMPORTED_PACKAGES` under a lockstep test), and ambiguity as a DEFAULT-ON lowering diagnostic scoped to what kotlinc rejects: a CALLED, non-extension bare call whose in-scope identical-FULL-signature candidates carry no defaults/varargs records `Module.resolve_diags`, surfaced by `klio run`/parity with `file:line` — same-FQN duplicates as "conflicting overloads … identical signatures declared at a.kt:2 and a.kt:3 — rename or remove one of the declarations", cross-package ties as "ambiguous reference … qualify the call or import one explicitly" (exact-wording + both-orders coverage in `itests/resolve_ambiguity.zig`); NOT diagnosed (heuristic-deferred): default/vararg-exercised, extension-form, and never-called identical pairs. Type-distinguishable sets — anything not provably identical at full granularity, incl. generic-argument-only and function-shape-only differences — stay runtime-resolved (`type_overload`), cast picks reclassify (`cast_disambiguated`), out-of-scope identical sets (`unimported_set`) keep the lenient pick. `KLIO_RESOLVE_AUDIT` emits a machine-readable per-call readout incl. a divergence grade (`tier_correction` / `shape_correction` / `receiver_pref`); `KLIO_RESOLVE_STRICT` (in the test cache key) hard-fails any ungraded divergence. Sweep readout (85 examples + coroutine fixtures): 0 failures, 0 ungraded divergences; 300 `checkIndexOverflow` tier corrections + 12 `CompletableDeferred` shape corrections. The three runtime ladders emit `KLIO_TRACE_RESOLVE` `ladder=` inventory lines (sweep: 18 prefix names, 1 suffix name, 0 bodyless hits). DEFERRED: dropping `isShippedFqn`/`classId`-by-simple-name as resolution inputs and deleting the prefix-ladder/suffix-scan/bodyless ladders (items 8b/8c), folding the inline-fn table into the index (8d). | C | high | high | XL |
+| 8 | PARTIAL (steps 1-4 + tightening + the steps-2/3 ladder deletion landed; only 8d remains) — per-decl `package` tag on `Func`/`Class`, explicit two-phase header registration, and the package/FQN symbol index (`Module.resolveBareCallIndexed`) as the PRIMARY bare-call path, now hardened: reason-tagged deferrals (`ResolveDeferReason`, 13 classified shapes), order-independent forward references (phase-1 stubs rank by declared arity `decl_user_arity`, full-granularity declared types `decl_user_sig` rendered by the same `loweredTypeRef` body params use, and AST-derived `low_priority`; default-param shapes defer from stub and body gates alike), a six-tier preference order matching kotlinc's probed scoping (named import → own package → wildcard import → default-import package → shipped → other; a named import outranks even a same-file declaration; same-leaf named imports are ALL kept in `registry.import_aliases` so a second import of one leaf is a classified tie, not a shadow; wildcard imports per file in `registry.import_wildcards`, default imports mirroring `stdlib.IMPLICITLY_IMPORTED_PACKAGES` under a lockstep test), and ambiguity as a DEFAULT-ON lowering diagnostic scoped to what kotlinc rejects: a CALLED, non-extension bare call whose in-scope identical-FULL-signature candidates carry no defaults/varargs records `Module.resolve_diags`, surfaced by `klio run`/parity with `file:line` — same-FQN duplicates as "conflicting overloads … identical signatures declared at a.kt:2 and a.kt:3 — rename or remove one of the declarations", cross-package ties as "ambiguous reference … qualify the call or import one explicitly" (exact-wording + both-orders coverage in `itests/resolve_ambiguity.zig`); NOT diagnosed (heuristic-deferred): default/vararg-exercised, extension-form, and never-called identical pairs. Type-distinguishable sets — anything not provably identical at full granularity, incl. generic-argument-only and function-shape-only differences — stay runtime-resolved (`type_overload`), cast picks reclassify (`cast_disambiguated`). Out-of-scope sets are now an error matching kotlinc: a bare call whose every candidate lives in a package the caller neither declares, imports, nor sees by default or via the shipped surface (tier 5, index-verdict shapes only — `resolved`/`unimported_set`/`type_overload`) records an "unresolved reference … add `import pkg.f` or qualify the call" lowering diagnostic; loose-shape deferrals (arity/default/vararg) stay with the heuristic since the runtime may still dispatch a member. Every lowering entry point now seeds the caller package (`ir.build.setLowerSelfPackage` read by every `FuncBuilder`; class bodies get the file's true package via the `decl_pkg` span map — a companion's class-qualified FQN is not a package). `KLIO_RESOLVE_AUDIT` emits a machine-readable per-call readout incl. a divergence grade (`tier_correction` / `shape_correction` / `receiver_pref`); `KLIO_RESOLVE_STRICT` (in the test cache key) hard-fails any ungraded divergence. Sweep readout (85 examples + coroutine fixtures): 0 failures, 0 ungraded divergences; 300 `checkIndexOverflow` tier corrections + 12 `CompletableDeferred` shape corrections. Steps 2+3 (items 8b/8c) are landed: `isShippedFqn` is deleted (`funcId` ranks by `Func.package` and is only the order-based fallback behind the index); the `lookupGlobal` prefix ladder and `installed_bindings` suffix scan are replaced by link-time name→FQN maps (`ProgramImage.default_import_globals` / `pack_bare_aliases` / `any_member_globals`, first-package-wins rank + lexicographic pack tie-break, both unit-pinned incl. the StringBuilder production collision); the `callFunc` bodyless ladder is replaced by link-settled `resolved_redirect`/`resolved_native` (`KLIO_LINK_AUDIT` re-derives the DELETED ladder's algorithm — old prefix order `deleted_bodyless_prefixes`, per-call sibling scan — independently of the new tables, so a divergence is detectable). Resolved identity is carried end-to-end: value-position bare refs AND `::name`/`::Ctor` callable references resolve through the index and emit `LoadGlobal` with the exact `FuncId`/`ClassId` (`refAudit` instruments both arms); the runtime class registry is FQN-keyed with a user-over-shipped first-wins simple-name alias view, `NewInstance`/named-arg/copy/secondary-ctor/parent-chain materialization resolve by FQN (side tables dual-keyed), and the per-class side tables are read through the resolved identity. Cross-phase consistency: typeck's T0094 conflicting-overloads check is per-package (`file_packages` on the Checker), matching the resolver's per-package scopes; expect-fn default parameter values transplant onto the superseding `actual` before the expect drops (Kotlin: defaults live on the expect only). DEFERRED: folding the inline-fn table into the index (8d). | C | high | high | XL |
 | 9 | DONE — one executable form per symbol resolved at link time (`ProgramImage.linkResolvedForms` → the `resolved_native` table keyed by `FuncId`, populated once after the module + `installed_bindings` exist); the per-call FQN short-circuit in `callFunc` and `callValue` is deleted, both now consulting the resolved form by `FuncId` (`host_call_func.resolvedNativeForm`). Pack-vs-source identity is settled at link time, load-order-independent. `KLIO_LINK_AUDIT` is a permanent env-gated detector proving the link form equals the deleted per-call probe's pick (0 divergences over the full suite + 82 examples + the differential corpus). (§4.4) | C | high | high | XL |
 | 10 | DONE — removed `isLambdaBody()` as a resolution axis at the four `expr.zig` dotted-head sites; package-head vs receiver-member is now the one predicate `headIsPackage` (real package root or `Module.packageHeadDeclared` FQN-prefix), shadowed by captured/local/enclosing-member names — order- and load-mode-independent, no lambda special case. The inline splice already binds the inline receiver as a `"this"` scope local, so no extra frame-receiver slot was needed. Gated green behind the builder-DSL differential (`examples/dsl_dotted_head.kt` + `coroutine_smoke/cs8_dotted_in_builder.kt`, byte-identical across all three pack modes); both audits 0. (§4.4/§4.2) | C/B | medium | high | M |
 | 11 | DONE — deleted `Value.Lambda` (vestigial Env-based closure the live IR VM never produced; `AstLambda` already built `IrClosure`). Removed the variant, its one GC-test constructor, and every Value-context `.Lambda =>` arm; `IrClosure` is now the single closure value form and `func.capture_order` (via `ClosureInfo.captures`) is the sole capture-metadata authority. | cleanup | medium | medium | M |

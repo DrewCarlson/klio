@@ -113,6 +113,7 @@ pub const lowerClass = decl.lowerClass;
 pub const lowerClassWithFile = decl.lowerClassWithFile;
 pub const lowerClassWithExtras = decl.lowerClassWithExtras;
 pub const lowerClassWithExtrasFqn = decl.lowerClassWithExtrasFqn;
+pub const lowerClassWithExtrasFqnPkg = decl.lowerClassWithExtrasFqnPkg;
 pub const lowerFunction = decl.lowerFunction;
 pub const lowerFunctionWithFile = decl.lowerFunctionWithFile;
 pub const lowerFunctionBodyInto = decl.lowerFunctionBodyInto;

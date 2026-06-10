@@ -91,6 +91,7 @@ pub const lowerClass = mod.lowerClass;
 pub const lowerClassWithFile = mod.lowerClassWithFile;
 pub const lowerClassWithExtras = mod.lowerClassWithExtras;
 pub const lowerClassWithExtrasFqn = mod.lowerClassWithExtrasFqn;
+pub const lowerClassWithExtrasFqnPkg = mod.lowerClassWithExtrasFqnPkg;
 pub const lowerFunction = mod.lowerFunction;
 pub const lowerFunctionWithFile = mod.lowerFunctionWithFile;
 pub const lowerFunctionBodyInto = mod.lowerFunctionBodyInto;

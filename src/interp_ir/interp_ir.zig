@@ -104,10 +104,69 @@ pub const ProgramImage = struct {
     /// dispatch paths consult this directly instead of re-deciding the
     /// form per call against `installed_bindings`.
     resolved_native: std.AutoHashMap(u32, StdlibFn),
+    /// Link-settled redirect for bodyless top-level decls (`expect` /
+    /// header-only): the same-simple-name body-bearing siblings in
+    /// declaration order. Dispatch picks the first sibling whose arity
+    /// fits the call; replaces the per-call `funcsBySimpleName` scan.
+    resolved_redirect: std.AutoHashMap(u32, []FuncId),
+    /// Deterministic bare-name → FQN map over the stdlib packages a
+    /// bare reference may bind into implicitly. Built once at link time
+    /// from the embedded intrinsic registry plus the installed pack
+    /// overlay; the first package in `bare_probe_packages` order wins a
+    /// cross-package collision. Replaces the per-call prefix-probe
+    /// ladder in `lookupGlobal`. Keys and values are subslices of the
+    /// registry / overlay FQNs, which outlive this image.
+    default_import_globals: std.StringHashMap([]const u8),
+    /// Bare-name → FQN aliases for *package-level* installed pack
+    /// bindings (`runBlocking` → `kotlinx.coroutines.runBlocking`).
+    /// Receiver-qualified bindings (`kotlinx.coroutines.Job.join`) are
+    /// member forms a bare name can never mean and are excluded. The
+    /// lexicographically smallest FQN wins a collision, so the answer
+    /// is independent of hash iteration order. Replaces the suffix scan
+    /// over `installed_bindings`.
+    pack_bare_aliases: std.StringHashMap([]const u8),
+    /// Bare-name → FQN map over the builtin member-extension surfaces
+    /// (`kotlin.io`, `kotlin.AutoCloseable`, `kotlin.Any`) the member
+    /// dispatcher probes for an instance receiver with no user
+    /// extension. Same construction as `default_import_globals`.
+    any_member_globals: std.StringHashMap([]const u8),
     /// Whether `linkResolvedForms` has run for the current
     /// `installed_bindings` snapshot.
     resolved_linked: bool,
     allocator: Allocator,
+
+    /// Packages a bare global name may bind into implicitly, in
+    /// preference order — the prefix order of the deleted `lookupGlobal`
+    /// ladder (top-level packages before the receiver-extension ones so
+    /// `min` resolves to `kotlin.math.min`). The deleted `callFunc`
+    /// bodyless ladder probed a DIFFERENT order (io before math, text
+    /// before collections, ranges before comparisons); the two were
+    /// deliberately unified onto this one. `KLIO_LINK_AUDIT` re-derives
+    /// the old `callFunc` order independently
+    /// (`host_call_func.deleted_bodyless_prefixes`), so a name whose
+    /// pick would differ between the two orders is flagged instead of
+    /// silently absorbed.
+    pub const bare_probe_packages = [_][]const u8{
+        "kotlin",
+        "kotlin.math",
+        "kotlin.comparisons",
+        "kotlin.io",
+        "kotlin.collections",
+        "kotlin.text",
+        "kotlin.ranges",
+        "kotlin.concurrent",
+        "kotlin.coroutines",
+        "kotlin.coroutines.intrinsics",
+        "kotlin.internal",
+    };
+
+    /// Builtin receiver surfaces probed for a member call on an
+    /// instance with no user extension, in the dispatcher's order.
+    pub const any_member_prefixes = [_][]const u8{
+        "kotlin.io",
+        "kotlin.AutoCloseable",
+        "kotlin.Any",
+    };
 
     pub fn init(allocator: Allocator) Allocator.Error!ProgramImage {
         return .{
@@ -126,6 +185,10 @@ pub const ProgramImage = struct {
             .func_defaults = std.AutoHashMap(u32, []?FuncId).init(allocator),
             .installed_bindings = try ObjRef(HostBindings).init(allocator, HostBindings.init(allocator)),
             .resolved_native = std.AutoHashMap(u32, StdlibFn).init(allocator),
+            .resolved_redirect = std.AutoHashMap(u32, []FuncId).init(allocator),
+            .default_import_globals = std.StringHashMap([]const u8).init(allocator),
+            .pack_bare_aliases = std.StringHashMap([]const u8).init(allocator),
+            .any_member_globals = std.StringHashMap([]const u8).init(allocator),
             .resolved_linked = false,
             .allocator = allocator,
         };
@@ -147,6 +210,17 @@ pub const ProgramImage = struct {
         self.func_defaults.deinit();
         self.installed_bindings.deinit();
         self.resolved_native.deinit();
+        self.clearResolvedRedirects();
+        self.resolved_redirect.deinit();
+        self.default_import_globals.deinit();
+        self.pack_bare_aliases.deinit();
+        self.any_member_globals.deinit();
+    }
+
+    fn clearResolvedRedirects(self: *ProgramImage) void {
+        var it = self.resolved_redirect.valueIterator();
+        while (it.next()) |sibs| self.allocator.free(sibs.*);
+        self.resolved_redirect.clearRetainingCapacity();
     }
 
     /// Resolve each symbol's single executable form ONCE: for every
@@ -165,9 +239,33 @@ pub const ProgramImage = struct {
     /// rebuilds the table.
     pub fn linkResolvedForms(self: *ProgramImage, module: *const Module) Allocator.Error!void {
         self.resolved_native.clearRetainingCapacity();
+        self.clearResolvedRedirects();
+        self.default_import_globals.clearRetainingCapacity();
+        self.pack_bare_aliases.clearRetainingCapacity();
+        self.any_member_globals.clearRetainingCapacity();
         const bg = self.installed_bindings.borrow();
         defer bg.deinit();
         const bindings = bg.get();
+
+        // Bare-name maps: one deterministic name → FQN edge per simple
+        // name, settled here instead of probed per call. Sources are the
+        // embedded intrinsic registry and the installed overlay; ties
+        // across packages resolve by `bare_probe_packages` order, and a
+        // same-package tie cannot occur (FQNs are unique per table).
+        {
+            var fqn_it = stdlib.implementations.allFqns();
+            while (fqn_it.next()) |fqn| {
+                try noteMapped(&self.default_import_globals, &bare_probe_packages, fqn);
+                try noteMapped(&self.any_member_globals, &any_member_prefixes, fqn);
+            }
+            var key_it = bindings.table.keyIterator();
+            while (key_it.next()) |k| {
+                try noteMapped(&self.default_import_globals, &bare_probe_packages, k.*);
+                try noteMapped(&self.any_member_globals, &any_member_prefixes, k.*);
+                try notePackAlias(&self.pack_bare_aliases, k.*);
+            }
+        }
+
         if (!bindings.isEmpty()) {
             for (module.funcs.items) |*f| {
                 if (bindings.resolve(f.fqn)) |intrinsic| {
@@ -175,7 +273,130 @@ pub const ProgramImage = struct {
                 }
             }
         }
+
+        // Bodyless decls (`expect` / header-only): settle the executable
+        // form in the dispatcher's order — an overlay binding under the
+        // declared FQN dispatches directly (recorded above); otherwise a
+        // same-simple-name body sibling redirect (declaration order;
+        // arity picks among them at the call), falling back to the
+        // exact-FQN embedded native, else the bare-name map's native.
+        for (module.funcs.items) |*f| {
+            if (f.blocks.len != 0) continue;
+            if (self.resolved_native.contains(f.id.int())) continue;
+            var sibs: std.ArrayList(FuncId) = .empty;
+            errdefer sibs.deinit(self.allocator);
+            for (module.funcsBySimpleName(f.name)) |cand| {
+                if (cand.int() == f.id.int()) continue;
+                if (cand.int() >= module.funcs.items.len) continue;
+                if (module.funcs.items[cand.int()].blocks.len == 0) continue;
+                try sibs.append(self.allocator, cand);
+            }
+            if (sibs.items.len != 0) {
+                try self.resolved_redirect.put(f.id.int(), try sibs.toOwnedSlice(self.allocator));
+            }
+            if (self.bodylessNativeForm(bindings, f.fqn, f.name)) |intrinsic| {
+                try self.resolved_native.put(f.id.int(), intrinsic);
+            }
+        }
         self.resolved_linked = true;
+    }
+
+    /// The native form a bodyless decl's per-call ladder would have
+    /// found: the declared FQN against the overlay then the embedded
+    /// registry, then the bare-name map's FQN against both.
+    fn bodylessNativeForm(self: *const ProgramImage, bindings: *const HostBindings, fqn: []const u8, name: []const u8) ?StdlibFn {
+        if (bindings.resolve(fqn)) |i| return i;
+        if (stdlib.implementation(fqn)) |i| return i;
+        if (self.default_import_globals.get(name)) |mapped| {
+            if (bindings.resolve(mapped)) |i| return i;
+            if (stdlib.implementation(mapped)) |i| return i;
+        }
+        return null;
+    }
+
+    /// Record `fqn`'s simple name into `map` when its package is one of
+    /// `packages`, keeping the entry whose package ranks earliest.
+    fn noteMapped(map: *std.StringHashMap([]const u8), packages: []const []const u8, fqn: []const u8) Allocator.Error!void {
+        const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return;
+        const pkg = fqn[0..dot];
+        const name = fqn[dot + 1 ..];
+        if (name.len == 0) return;
+        const rank = pkgRank(packages, pkg) orelse return;
+        const gop = try map.getOrPut(name);
+        if (gop.found_existing) {
+            const cur_dot = std.mem.lastIndexOfScalar(u8, gop.value_ptr.*, '.').?;
+            const cur_rank = pkgRank(packages, gop.value_ptr.*[0..cur_dot]).?;
+            if (rank >= cur_rank) return;
+        }
+        gop.value_ptr.* = fqn;
+    }
+
+    fn pkgRank(packages: []const []const u8, pkg: []const u8) ?usize {
+        for (packages, 0..) |p, i| {
+            if (std.mem.eql(u8, p, pkg)) return i;
+        }
+        return null;
+    }
+
+    /// Record a package-level installed binding's bare-name alias. A
+    /// binding whose parent segment starts with an uppercase letter is a
+    /// receiver-qualified member form (`...Job.join`) a bare name can
+    /// never mean; it is excluded. The lexicographically smallest FQN
+    /// wins a collision so the alias is hash-order independent.
+    fn notePackAlias(map: *std.StringHashMap([]const u8), fqn: []const u8) Allocator.Error!void {
+        const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return;
+        const pkg = fqn[0..dot];
+        const name = fqn[dot + 1 ..];
+        if (name.len == 0 or pkg.len == 0) return;
+        const parent_start = if (std.mem.lastIndexOfScalar(u8, pkg, '.')) |d| d + 1 else 0;
+        const parent = pkg[parent_start..];
+        if (parent.len == 0 or std.ascii.isUpper(parent[0])) return;
+        const gop = try map.getOrPut(name);
+        if (gop.found_existing) {
+            if (std.mem.order(u8, fqn, gop.value_ptr.*) != .lt) return;
+        }
+        gop.value_ptr.* = fqn;
+    }
+
+    /// The deterministic FQN a bare global name maps to under the
+    /// implicit stdlib surface, or null when the name is not part of it.
+    pub fn defaultImportGlobal(self: *const ProgramImage, name: []const u8) ?[]const u8 {
+        return self.default_import_globals.get(name);
+    }
+
+    /// The pack-installed package-level binding a bare name aliases.
+    pub fn packBareAlias(self: *const ProgramImage, name: []const u8) ?[]const u8 {
+        return self.pack_bare_aliases.get(name);
+    }
+
+    /// The builtin member-extension FQN a member name maps to on the
+    /// `kotlin.io` / `kotlin.AutoCloseable` / `kotlin.Any` surfaces.
+    pub fn anyMemberGlobal(self: *const ProgramImage, name: []const u8) ?[]const u8 {
+        return self.any_member_globals.get(name);
+    }
+
+    /// The link-settled body siblings of a bodyless decl, declaration
+    /// order, or an empty slice.
+    pub fn resolvedRedirects(self: *const ProgramImage, func: FuncId) []const FuncId {
+        return self.resolved_redirect.get(func.int()) orelse &.{};
+    }
+
+    /// The body sibling a call with `argc` args dispatches to for a
+    /// bodyless decl: the first link-settled redirect whose user arity
+    /// matches exactly or whose last param is a vararg. This is the
+    /// dispatch seam `callFunc` consults — kept here so the pick is unit
+    /// testable against synthetic modules.
+    pub fn resolvedRedirectTarget(self: *const ProgramImage, module: *const Module, func: FuncId, argc: usize) ?FuncId {
+        for (self.resolvedRedirects(func)) |cand| {
+            if (cand.int() >= module.funcs.items.len) continue;
+            const g = &module.funcs.items[cand.int()];
+            const has_this = g.params.len != 0 and std.mem.eql(u8, g.params[0].name, "this");
+            const user = if (has_this) g.params.len - 1 else g.params.len;
+            const last_vararg = g.params.len != 0 and g.params[g.params.len - 1].is_vararg;
+            if (user != argc and !last_vararg) continue;
+            return cand;
+        }
+        return null;
     }
 
     /// The link-time-resolved native form for `func`, or `null` when the
@@ -699,9 +920,30 @@ fn linkTestNativeFn(ctx: *runtime.CallCtx) std.mem.Allocator.Error!runtime.EvalR
 }
 
 fn pushLinkTestFunc(m: *Module, a: Allocator, name: []const u8, fqn: []const u8) Allocator.Error!FuncId {
+    return pushLinkTestFuncOpts(m, a, name, fqn, false);
+}
+
+fn pushLinkTestFuncParams(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, n_params: usize, last_vararg: bool) Allocator.Error!FuncId {
+    const id = try pushLinkTestFuncOpts(m, a, name, fqn, false);
+    const params = try a.alloc(ir.Param, n_params);
+    for (params, 0..) |*pp, i| {
+        pp.* = .{
+            .name = "p",
+            .ty = .{ .name = "Int", .nullable = false, .args = &.{} },
+            .default = null,
+            .is_vararg = last_vararg and i == n_params - 1,
+        };
+    }
+    m.funcs.items[id.int()].params = params;
+    return id;
+}
+
+fn pushLinkTestFuncOpts(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, bodyless: bool) Allocator.Error!FuncId {
     const id = FuncId.from(@intCast(m.funcs.items.len));
-    const blocks = try a.alloc(ir.Block, 1);
-    blocks[0] = .{ .id = ir.BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
+    const blocks = try a.alloc(ir.Block, if (bodyless) 0 else 1);
+    if (!bodyless) {
+        blocks[0] = .{ .id = ir.BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
+    }
     try m.funcs.append(a, .{
         .id = id,
         .name = name,
@@ -714,6 +956,7 @@ fn pushLinkTestFunc(m: *Module, a: Allocator, name: []const u8, fqn: []const u8)
         .entry = ir.BlockId.from(0),
         .is_suspend = false,
     });
+    try m.func_index.append(a, .{ .name = name, .id = id });
     return id;
 }
 
@@ -761,6 +1004,142 @@ test "linkResolvedForms binds one form per symbol from the installed overlay" {
     }
     try prog.linkResolvedForms(&m);
     try testing.expect(prog.resolvedNativeForm(shimmed) == null);
+}
+
+test "linkResolvedForms settles bodyless decls: sibling redirect, FQN native, map native" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| a.free(f.blocks);
+        m.deinit(a);
+    }
+    // expect→actual shape: bodyless decl with a body-bearing sibling.
+    const expect_fn = try pushLinkTestFuncOpts(&m, a, "ping", "app.ping", true);
+    const actual_fn = try pushLinkTestFunc(&m, a, "ping", "app.ping.impl");
+    // Bodyless decl whose declared FQN is an embedded intrinsic.
+    const abs_decl = try pushLinkTestFuncOpts(&m, a, "abs", "kotlin.math.abs", true);
+    // Bodyless decl whose declared FQN is unknown, but whose simple name
+    // maps into the implicit stdlib surface.
+    const sqrt_decl = try pushLinkTestFuncOpts(&m, a, "sqrt", "mylib.sqrt", true);
+    // Body-bearing func: the embedded registry must NOT shadow its body.
+    const body_abs = try pushLinkTestFunc(&m, a, "abs", "kotlin.math.abs");
+    try m.rebuildFuncNameIndex(a);
+
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+    try prog.linkResolvedForms(&m);
+
+    // Sibling redirect recorded in declaration order; no native form.
+    const redirects = prog.resolvedRedirects(expect_fn);
+    try testing.expect(redirects.len >= 1);
+    try testing.expectEqual(actual_fn.int(), redirects[0].int());
+    try testing.expect(prog.resolvedNativeForm(actual_fn) == null);
+    // The dispatch seam picks that sibling for a fitting call and
+    // declines a non-fitting one (zero-param sibling, one-arg call).
+    try testing.expectEqual(actual_fn.int(), prog.resolvedRedirectTarget(&m, expect_fn, 0).?.int());
+    try testing.expect(prog.resolvedRedirectTarget(&m, expect_fn, 1) == null);
+
+    // Exact-FQN embedded native bound for the bodyless decl only.
+    try testing.expect(prog.resolvedNativeForm(abs_decl) != null);
+    try testing.expect(prog.resolvedNativeForm(body_abs) == null);
+
+    // Map-resolved native: `sqrt` maps to kotlin.math.sqrt.
+    try testing.expect(prog.resolvedNativeForm(sqrt_decl) != null);
+    try testing.expectEqualStrings("kotlin.math.sqrt", prog.defaultImportGlobal("sqrt").?);
+}
+
+test "bodyless redirect dispatch picks by exact arity, then vararg" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| {
+            a.free(f.blocks);
+            if (f.params.len != 0) a.free(f.params);
+        }
+        m.deinit(a);
+    }
+    const stub = try pushLinkTestFuncOpts(&m, a, "pick", "app.pick", true);
+    const two = try pushLinkTestFuncParams(&m, a, "pick", "app.pick.two", 2, false);
+    const vararg = try pushLinkTestFuncParams(&m, a, "pick", "app.pick.va", 1, true);
+    try m.rebuildFuncNameIndex(a);
+
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+    try prog.linkResolvedForms(&m);
+
+    // Exact arity wins; a non-matching count falls to the vararg form;
+    // the vararg form also absorbs zero extra args.
+    try testing.expectEqual(two.int(), prog.resolvedRedirectTarget(&m, stub, 2).?.int());
+    try testing.expectEqual(vararg.int(), prog.resolvedRedirectTarget(&m, stub, 3).?.int());
+    try testing.expectEqual(vararg.int(), prog.resolvedRedirectTarget(&m, stub, 0).?.int());
+    // A body-bearing func never redirects.
+    try testing.expect(prog.resolvedRedirectTarget(&m, two, 2) == null);
+}
+
+test "link-time bare-name maps are deterministic and package-ranked" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+    {
+        const bg = prog.installed_bindings.borrowMut();
+        defer bg.deinit();
+        // Package-level pack binding: bare-aliasable.
+        try bg.get().register("kotlinx.coroutines.runBlocking", linkTestNativeFn);
+        // Receiver-qualified member binding: never bare-aliasable.
+        try bg.get().register("kotlinx.coroutines.Job.join", linkTestNativeFn);
+        // Same leaf from two packages: smallest FQN wins, hash-order free.
+        try bg.get().register("kotlinx.serialization.encode", linkTestNativeFn);
+        try bg.get().register("kotlinx.io.encode", linkTestNativeFn);
+    }
+    try prog.linkResolvedForms(&m);
+
+    try testing.expectEqualStrings("kotlinx.coroutines.runBlocking", prog.packBareAlias("runBlocking").?);
+    try testing.expect(prog.packBareAlias("join") == null);
+    try testing.expectEqualStrings("kotlinx.io.encode", prog.packBareAlias("encode").?);
+
+    // Default-import map: the embedded registry feeds it (`min` maps to
+    // kotlin.math.min; no other bare-mappable `min` exists today) and the
+    // implicit surface always carries the array builders. Unconditional:
+    // a dropped key must fail, not pass silently.
+    try testing.expectEqualStrings("kotlin.math.min", prog.defaultImportGlobal("min").?);
+    try testing.expectEqualStrings("kotlin.intArrayOf", prog.defaultImportGlobal("intArrayOf").?);
+
+    // Member-surface map: `kotlin.io.println` is the one real any-member
+    // edge, and no source registers a `kotlin.AutoCloseable.*` /
+    // `kotlin.Any.*` FQN today — `use` must stay absent.
+    try testing.expectEqualStrings("kotlin.io.println", prog.anyMemberGlobal("println").?);
+    try testing.expect(prog.anyMemberGlobal("use") == null);
+}
+
+test "link-time bare-name maps rank a cross-package collision first-package-wins" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+    {
+        const bg = prog.installed_bindings.borrowMut();
+        defer bg.deinit();
+        // Same simple name registered under two `bare_probe_packages`
+        // members: the earlier-ranked package must win regardless of
+        // registration or hash order (kotlin.math ranks above kotlin.io).
+        try bg.get().register("kotlin.io.zzzCollide", linkTestNativeFn);
+        try bg.get().register("kotlin.math.zzzCollide", linkTestNativeFn);
+        // Any-member surface collision: kotlin.AutoCloseable ranks above
+        // kotlin.Any.
+        try bg.get().register("kotlin.Any.zzzUse", linkTestNativeFn);
+        try bg.get().register("kotlin.AutoCloseable.zzzUse", linkTestNativeFn);
+    }
+    try prog.linkResolvedForms(&m);
+    try testing.expectEqualStrings("kotlin.math.zzzCollide", prog.defaultImportGlobal("zzzCollide").?);
+    try testing.expectEqualStrings("kotlin.AutoCloseable.zzzUse", prog.anyMemberGlobal("zzzUse").?);
+    // Production pin for the one real cross-package collision in the
+    // embedded registry: StringBuilder is registered under both `kotlin`
+    // and `kotlin.text`, and `kotlin` ranks first. A rank-order
+    // regression flips this pick.
+    try testing.expectEqualStrings("kotlin.StringBuilder", prog.defaultImportGlobal("StringBuilder").?);
 }
 
 test "shared closures push is append-stable" {

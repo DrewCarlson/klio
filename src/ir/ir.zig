@@ -319,8 +319,11 @@ pub const Inst = union(enum) {
     /// Resolve a bare global identifier through the Host. Used when
     /// Path lowering cannot bind the name to a local register —
     /// covers top-level stdlib calls (`println`, `listOf`) and any
-    /// other module-scoped reference.
-    LoadGlobal: struct { dst: Reg, name: ConstId },
+    /// other module-scoped reference. When the lowerer's symbol index
+    /// resolved the reference to a unique declaration, `func` / `class`
+    /// carry that exact identity and the host binds it directly — the
+    /// name string remains for traces and as the unresolved fallback.
+    LoadGlobal: struct { dst: Reg, name: ConstId, func: ?FuncId = null, class: ?ClassId = null },
     /// Bare-name read inside a lambda body that doesn't resolve as a
     /// local / capture / own member. If `this_idx`'s captured value
     /// is an instance with a field/method named `name`, read it;
@@ -351,6 +354,10 @@ pub const Inst = union(enum) {
         args: Reg,
         n_args: u8,
         arg_names: []?ConstId,
+        /// The scope-resolved class when the bare name is a constructor
+        /// call the index bound; the global leg constructs exactly this
+        /// class instead of re-resolving the simple name.
+        class: ?ClassId = null,
     },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host.store_global` so a
@@ -771,6 +778,16 @@ pub const Module = struct {
         span: Span,
         span_a: ?Span = null,
         span_b: ?Span = null,
+        kind: Kind = .ambiguous,
+
+        pub const Kind = enum {
+            /// Two in-scope candidates nothing can tell apart.
+            ambiguous,
+            /// Every candidate lives in a package the caller neither
+            /// declares, imports, nor sees by default. Kotlin does not
+            /// resolve such a reference at all.
+            unresolved,
+        };
 
         /// Render the diagnostic with the call site (and declaration
         /// sites) located as `path:line` through `map`. Two identical
@@ -778,10 +795,25 @@ pub const Module = struct {
         /// can separate two declarations sharing one FQN, so the fix is
         /// declaration-side. Distinct FQNs are a cross-package tie the
         /// caller resolves by qualifying the call or importing one
-        /// candidate explicitly.
+        /// candidate explicitly. An `unresolved` reference names the
+        /// out-of-scope candidates and how to bring one into scope.
         pub fn render(self: ResolveDiag, allocator: Allocator, map: *const span.SourceMap) Allocator.Error![]u8 {
             const call_loc = try locOf(allocator, map, self.span);
             defer allocator.free(call_loc);
+            if (self.kind == .unresolved) {
+                if (self.fqn_b.len != 0 and !std.mem.eql(u8, self.fqn_a, self.fqn_b)) {
+                    return std.fmt.allocPrint(
+                        allocator,
+                        "{s}: error: unresolved reference `{s}`: candidates `{s}` and `{s}` exist but neither package is imported here — add an import for one or qualify the call",
+                        .{ call_loc, self.name, self.fqn_a, self.fqn_b },
+                    );
+                }
+                return std.fmt.allocPrint(
+                    allocator,
+                    "{s}: error: unresolved reference `{s}`: `{s}` is declared in package `{s}`, which is not imported here — add `import {s}` or qualify the call",
+                    .{ call_loc, self.name, self.fqn_a, packageOfFqn(self.fqn_a, self.name), self.fqn_a },
+                );
+            }
             if (std.mem.eql(u8, self.fqn_a, self.fqn_b) and self.span_a != null and self.span_b != null) {
                 const loc_a = try locOf(allocator, map, self.span_a.?);
                 defer allocator.free(loc_a);
@@ -863,6 +895,28 @@ pub const Module = struct {
         return null;
     }
 
+    /// Resolve a class by simple name from the caller's scope, ranking
+    /// same-simple-name classes from different packages under the bare-
+    /// call tier order over `Class.package` (named import, own package,
+    /// wildcard import, default import, shipped, other). Declaration
+    /// order breaks a same-tier tie, so a single-candidate lookup
+    /// matches `classId` exactly while a cross-package collision binds
+    /// the class the caller can actually see.
+    pub fn classIdIndexed(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId) ?ClassId {
+        var best: ?ClassId = null;
+        var best_tier: u8 = 255;
+        for (self.class_index.items) |entry| {
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            const c = idGet(Class, self.classes.items, entry.id.int()) orelse continue;
+            const t = self.scopeTier(c.fqn, c.package, name, caller_pkg, caller_file);
+            if (t < best_tier) {
+                best_tier = t;
+                best = entry.id;
+            }
+        }
+        return best;
+    }
+
     /// Rebuild `func_name_index` from the declaration-order
     /// `func_index`. The IR build pipelines call this whenever
     /// they're done extending `func_index`, and deserialized modules
@@ -903,7 +957,7 @@ pub const Module = struct {
             if (idGet(Func, self.funcs.items, id.int())) |f| {
                 if (first_body == null and f.blocks.len != 0) first_body = id;
                 if (first_user != null) continue;
-                if (!isShippedFqn(f.fqn)) first_user = id;
+                if (!isShippedPackage(f.package)) first_user = id;
             }
         }
         // Prefer body over bodyless: a same-name `expect` (bodyless)
@@ -920,10 +974,22 @@ pub const Module = struct {
             if (first == null) first = entry.id;
             if (first_user != null) continue;
             if (idGet(Func, self.funcs.items, entry.id.int())) |f| {
-                if (!isShippedFqn(f.fqn)) first_user = entry.id;
+                if (!isShippedPackage(f.package)) first_user = entry.id;
             }
         }
         return first_user orelse first;
+    }
+
+    /// Whether any top-level function with this simple name exists.
+    /// Pure existence — no order-based pick — for callers that only
+    /// gate on the name being callable.
+    pub fn hasFuncNamed(self: *const Module, name: []const u8) bool {
+        if (self.funcsBySimpleName(name).len != 0) return true;
+        // Same stale-name-index fallback `funcId` keeps.
+        for (self.func_index.items) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return true;
+        }
+        return false;
     }
 
     /// Look up a top-level function by fully-qualified name (matches
@@ -1020,6 +1086,10 @@ pub const Module = struct {
     /// real ambiguity; below it Kotlin would not resolve the call at all
     /// and klio's lenient pick stays heuristic.
     pub const last_in_scope_tier: u8 = 3;
+    /// The tier of a candidate in a package the caller neither
+    /// declares, imports, nor sees by default or via the shipped
+    /// surface — Kotlin does not resolve such a reference at all.
+    pub const other_package_tier: u8 = 5;
 
     /// Bare-call preference tier of a candidate func, ranked low-to-high
     /// urgency: 0 = file-named-import, 1 = own package, 2 = file-
@@ -1034,13 +1104,21 @@ pub const Module = struct {
     /// tier 0; a wildcard import of the candidate's package matches
     /// tier 2.
     fn bareCallTier(self: *const Module, f: *const Func, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
+        return self.scopeTier(f.fqn, f.package, name, caller_pkg, caller_file);
+    }
+
+    /// The scope tier of one declared symbol (function or class) at a
+    /// reference site, over its FQN and declaring package. Shared by
+    /// `bareCallTier` and `classIdIndexed` so both kinds rank under the
+    /// same Kotlin scoping order.
+    fn scopeTier(self: *const Module, fqn: []const u8, pkg: []const u8, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
         for (self.importAliasPathsIn(caller_file, name)) |p| {
-            if (std.mem.eql(u8, p.fqn, f.fqn)) return 0;
+            if (std.mem.eql(u8, p.fqn, fqn)) return 0;
         }
-        if (std.mem.eql(u8, f.package, caller_pkg)) return 1;
-        if (self.importWildcardIn(caller_file, f.package)) return 2;
-        if (isDefaultImportPackage(f.package)) return 3;
-        if (isShippedFqn(f.fqn)) return 4;
+        if (std.mem.eql(u8, pkg, caller_pkg)) return 1;
+        if (self.importWildcardIn(caller_file, pkg)) return 2;
+        if (isDefaultImportPackage(pkg)) return 3;
+        if (isShippedPackage(pkg)) return 4;
         return 5;
     }
 
@@ -1440,6 +1518,48 @@ pub const Module = struct {
         return .{ .outcome = .{ .deferred = reason }, .tier = best_tier, .tier_count = 0 };
     }
 
+    /// Value-position bare-reference resolution: resolve `name` (a bare
+    /// identifier read, not a call) to a unique `FuncId` under the same
+    /// scope tiers as `resolveBareCallIndexed`, with no arity filter — a
+    /// reference denotes the declaration itself, so a vararg or
+    /// defaulted signature is as referenceable as any other. Extension
+    /// forms never resolve (a bare read cannot supply the receiver),
+    /// intrinsic-owned names defer to the lowerer's intrinsic routing,
+    /// and the winning tier must hold exactly one candidate. A phase-1
+    /// header stub resolves too: its FQN is final and phase-2 fills the
+    /// same slot, so the answer is declaration-order independent.
+    pub fn resolveBareRefIndexed(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?FuncId {
+        if (intrinsicOwnsBareName(name)) return null;
+        const cands = self.funcsBySimpleName(name);
+        if (cands.len == 0) return null;
+        var best_tier: u8 = 255;
+        for (cands) |id| {
+            const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
+            if (funcHasImplicitThis(f)) continue;
+            if (f.blocks.len == 0 and self.stubDeclArity(id) == null) continue;
+            const t = self.bareCallTier(f, name, caller_pkg, caller_file);
+            if (t < best_tier) best_tier = t;
+        }
+        if (best_tier == 255) return null;
+        var chosen: ?FuncId = null;
+        var count: usize = 0;
+        for (cands) |id| {
+            const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
+            if (funcHasImplicitThis(f)) continue;
+            if (f.blocks.len == 0 and self.stubDeclArity(id) == null) continue;
+            if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
+            if (chosen == null) chosen = id;
+            count += 1;
+        }
+        if (count == 1) return chosen;
+        return null;
+    }
+
     /// Register a class declaration and return its id. If the name
     /// was previously `reserveClass`d, the reserved slot/id is reused
     /// so forward references that resolved to that id stay valid.
@@ -1456,8 +1576,11 @@ pub const Module = struct {
             // (identical FQN), overwrites in place so forward
             // references keep their id. A different fully-qualified
             // name sharing the simple name is a genuinely distinct
-            // class from another package: give it its own ClassId.
-            if (is_stub or std.mem.eql(u8, existing.fqn, class.fqn) or std.mem.eql(u8, class.fqn, class.name)) {
+            // class from another package: give it its own ClassId —
+            // including a root-package class arriving after a packaged
+            // twin filled the slot (its FQN is its simple name, which
+            // must not alias it onto the other package's class).
+            if (is_stub or std.mem.eql(u8, existing.fqn, class.fqn)) {
                 class.id = id;
                 self.classes.items[id.int()] = class;
                 return id;
@@ -1568,13 +1691,25 @@ pub fn packageOfFqn(fqn: []const u8, simple: []const u8) []const u8 {
     return "";
 }
 
-fn isShippedFqn(fqn: []const u8) bool {
-    return std.mem.startsWith(u8, fqn, "kotlin.") or
-        std.mem.startsWith(u8, fqn, "kotlinx.") or
-        std.mem.startsWith(u8, fqn, "java.") or
-        std.mem.eql(u8, fqn, "kotlin") or
-        std.mem.eql(u8, fqn, "kotlinx") or
-        std.mem.eql(u8, fqn, "java");
+/// Whether `pkg` names a package the runtime ships (the embedded stdlib,
+/// the kotlinx packs, java interop): its head segment is `kotlin`,
+/// `kotlinx`, or `java`. Classifies a declaration by its declaring
+/// package — the same field the scope tiers rank on — so user-package
+/// candidates outrank shipped ones in the order-based fallbacks.
+fn isShippedPackage(pkg: []const u8) bool {
+    return pkgHeadIs(pkg, "kotlin") or pkgHeadIs(pkg, "kotlinx") or pkgHeadIs(pkg, "java");
+}
+
+/// Whether an FQN's head segment marks a shipped declaration (stdlib,
+/// kotlinx pack, java interop). The runtime class registry's simple-name
+/// view ranks a user class above a shipped one for the same simple name.
+pub fn shippedFqnHead(fqn: []const u8) bool {
+    return isShippedPackage(fqn);
+}
+
+fn pkgHeadIs(pkg: []const u8, head: []const u8) bool {
+    if (!std.mem.startsWith(u8, pkg, head)) return false;
+    return pkg.len == head.len or pkg[head.len] == '.';
 }
 
 /// Index into a slice by a `u32` id, returning a pointer or `null`
@@ -2350,4 +2485,132 @@ test "packageHeadDeclared distinguishes a package head from a member head" {
     // is never a package head.
     try testing.expect(!m.packageHeadDeclared("inner"));
     try testing.expect(!m.packageHeadDeclared(""));
+}
+
+test "funcId ranks a user declaration above a shipped same-name" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Shipped decl concatenates first (packs precede user sources).
+    _ = try pushTestFunc(&m, a, "shuffle", "kotlin.collections.shuffle", "kotlin.collections", 1);
+    const user = try pushTestFunc(&m, a, "shuffle", "shuffle", "", 1);
+    try m.rebuildFuncNameIndex(a);
+    try testing.expectEqual(user.int(), m.funcId("shuffle").?.int());
+
+    // The package classification is a head-segment match, not a raw
+    // prefix: a user package starting with `kotlinx2` is not shipped.
+    var m2 = Module.default(a);
+    defer freeTestModule(&m2, a);
+    _ = try pushTestFunc(&m2, a, "go", "kotlinx.coroutines.go", "kotlinx.coroutines", 0);
+    const user2 = try pushTestFunc(&m2, a, "go", "kotlinx2.go", "kotlinx2", 0);
+    try m2.rebuildFuncNameIndex(a);
+    try testing.expectEqual(user2.int(), m2.funcId("go").?.int());
+}
+
+test "funcId prefers a body sibling over a bodyless shipped pair" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Both shipped: the bodyless `expect` must not hide the body sibling.
+    _ = try pushTestFuncOpts(&m, a, "now", "kotlin.time.now", "kotlin.time", 0, .{ .stub = true });
+    const actual = try pushTestFunc(&m, a, "now", "kotlin.time.now.actual", "kotlin.time", 0);
+    try m.rebuildFuncNameIndex(a);
+    try testing.expectEqual(actual.int(), m.funcId("now").?.int());
+}
+
+test "hasFuncNamed is pure existence over both index forms" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    _ = try pushTestFunc(&m, a, "f", "pkg.f", "pkg", 0);
+    // Name index not rebuilt yet: the func_index walk still answers.
+    try testing.expect(m.hasFuncNamed("f"));
+    try testing.expect(!m.hasFuncNamed("g"));
+    try m.rebuildFuncNameIndex(a);
+    try testing.expect(m.hasFuncNamed("f"));
+    try testing.expect(!m.hasFuncNamed("g"));
+}
+
+fn pushTestClass(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, package: []const u8) !ClassId {
+    return m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = name,
+        .fqn = fqn,
+        .package = package,
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+}
+
+test "classIdIndexed prefers the caller's own package on a collision" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const lib = try pushTestClass(&m, a, "Config", "lib.Config", "lib");
+    const app = try pushTestClass(&m, a, "Config", "app.Config", "app");
+    // Flat lookup returns the first declaration regardless of caller.
+    try testing.expectEqual(lib.int(), m.classId("Config").?.int());
+    // The indexed lookup binds the class the caller's package declares.
+    try testing.expectEqual(app.int(), m.classIdIndexed("Config", "app", FileId.from(0)).?.int());
+    try testing.expectEqual(lib.int(), m.classIdIndexed("Config", "lib", FileId.from(0)).?.int());
+    // A caller in neither package keeps the declaration-order pick.
+    try testing.expectEqual(lib.int(), m.classIdIndexed("Config", "other", FileId.from(0)).?.int());
+    try testing.expect(m.classIdIndexed("Missing", "app", FileId.from(0)) == null);
+}
+
+test "bare-ref index resolves a unique candidate with no arity filter" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Vararg and defaulted shapes the CALL index defers on still
+    // resolve as references.
+    const f = try pushTestFuncOpts(&m, a, "fmt", "app.fmt", "app", 2, .{ .last_vararg = true });
+    try m.rebuildFuncNameIndex(a);
+    try testing.expectEqual(f.int(), m.resolveBareRefIndexed("fmt", "app", FileId.from(0)).?.int());
+    // Cross-package: the caller's own package wins over another package.
+    const own = try pushTestFunc(&m, a, "pick", "app.pick", "app", 0);
+    _ = try pushTestFunc(&m, a, "pick", "lib.pick", "lib", 0);
+    try m.rebuildFuncNameIndex(a);
+    try testing.expectEqual(own.int(), m.resolveBareRefIndexed("pick", "app", FileId.from(0)).?.int());
+}
+
+test "bare-ref index defers ambiguity, extensions, and unknown names" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Two same-tier candidates: ambiguous, defer.
+    _ = try pushTestFunc(&m, a, "h", "app.h", "app", 0);
+    _ = try pushTestFunc(&m, a, "h", "app.util.h", "app", 1);
+    // A single extension-form candidate: never a bare reference.
+    _ = try pushTestFuncOpts(&m, a, "ext", "app.ext", "app", 1, .{ .extension = true });
+    try m.rebuildFuncNameIndex(a);
+    try testing.expect(m.resolveBareRefIndexed("h", "app", FileId.from(0)) == null);
+    try testing.expect(m.resolveBareRefIndexed("ext", "app", FileId.from(0)) == null);
+    try testing.expect(m.resolveBareRefIndexed("missing", "app", FileId.from(0)) == null);
+    try testing.expect(m.resolveBareRefIndexed("compareValues", "app", FileId.from(0)) == null);
+}
+
+test "classIdIndexed ranks a named import above the own package" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    _ = try pushTestClass(&m, a, "Config", "app.Config", "app");
+    const imported = try pushTestClass(&m, a, "Config", "lib.Config", "lib");
+    var paths: std.ArrayList(ModuleRegistry.ImportPath) = .empty;
+    const segs = try a.alloc([]const u8, 2);
+    segs[0] = "lib";
+    segs[1] = "Config";
+    try paths.append(a, .{ .fqn = try a.dupe(u8, "lib.Config"), .segs = segs });
+    var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    try inner.put("Config", paths);
+    try m.registry.import_aliases.put(FileId.from(0), inner);
+    try testing.expectEqual(imported.int(), m.classIdIndexed("Config", "app", FileId.from(0)).?.int());
+    // A file without the import resolves the own-package class.
+    try testing.expectEqual(
+        m.classIdByFqn("app.Config").?.int(),
+        m.classIdIndexed("Config", "app", FileId.from(1)).?.int(),
+    );
 }

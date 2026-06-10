@@ -500,36 +500,38 @@ keyed by **bare simple name** and tie-broken by **declaration order**; packs are
 the only thing that both add same-simple-name competitors from other packages and
 get a fixed insertion position.
 
-### C1 — `funcId` `first_user orelse first_body orelse first` tie-break
+### C1 — `funcId` `first_user orelse first_body orelse first` tie-break — REMOVED as a resolution input (item 8 steps 2+3)
 
-- **Location:** `src/ir/ir.zig:779-802` (and the legacy twin `funcIdLegacy`
-  `:804-816`), keyed on `isShippedFqn` (`:936-943`).
-- **What it does:** resolves a bare function name by declaration order, preferring
-  the first non-shipped FQN. A pack outside `kotlin.`/`kotlinx.`/`java.` counts as
-  "user" and, concatenated first, wins over the user's same-named function.
-- **Class:** C (the core order-sensitive resolver).
-- **Deletable?** Deletable as resolution policy — replaced by the
-  (package+imports)→FQN index (§4.4). `isShippedFqn` is dropped only after the
-  uniqueness proof (§4.4-item-3); do **not** tighten early or currently-passing
-  programs become ambiguity errors (the §4.4 caution).
-- **Removes via:** §6 item **8**.
-- **Removal test:** differential harness over every `examples/*.kt` byte-identical
-  across modes *and* each bare call proven to resolve to a unique FQN target before
-  `isShippedFqn` is removed.
-
-### C2 — `classId` first-by-simple-name
-
-- **Location:** `src/ir/ir.zig:748-753`.
-- **What it does:** returns the FIRST `class_index` entry matching a simple name;
-  same-simple-name/different-FQN classes are stored distinctly (`addClass`
-  `:842-867`) but unreachable from a bare reference.
+- **Status:** `isShippedFqn` is deleted; `funcId` ranks over the per-decl
+  `Func.package` and survives only as the order-stable FALLBACK for shapes
+  the symbol index defers on (extensions, overload sets). Resolution policy
+  is the (package+imports)→FQN index (`resolveBareCallIndexed` /
+  `resolveBareRefIndexed`), with a unique pick emitted as an exact
+  `FuncId` on the instruction (`LoadGlobal.func`, `Call.func`) — no
+  simple-name re-resolution at runtime. Out-of-scope (tier-5) index
+  verdicts are now an unresolved-reference lowering error matching kotlinc.
+- **Was at:** `src/ir/ir.zig` (`funcId`/`funcIdLegacy`, `isShippedFqn`).
 - **Class:** C.
-- **Deletable?** Deletable as the *bare-name* path — superseded by FQN-keyed
-  resolution (`classIdByFqn` already exists, `:879-889`). The simple-name `classId`
-  stays only as a last-resort until §4.4 uniqueness holds.
-- **Removes via:** §6 item **8**.
-- **Removal test:** `nested_name_collision.kt` (must move into `itests_files` via the
-  differential harness, §5.1) + differential green.
+- **Verified by:** `KLIO_RESOLVE_AUDIT`/`KLIO_RESOLVE_STRICT` sweeps (0
+  unexplained divergences), both-orders cross-package itests in
+  `itests/resolve_ambiguity.zig`, and the differential harness.
+
+### C2 — `classId` first-by-simple-name — SUPERSEDED as a resolution input (item 8 steps 2+3)
+
+- **Status:** bare construction and `::Ctor` reference sites resolve through
+  `classIdIndexed` (caller package + imports) and carry the resolved
+  `ClassId` end-to-end: `NewInstance` materializes by the IR class FQN
+  against the FQN-keyed runtime class registry (authoritative FQN entries;
+  first-wins user-over-shipped simple-name aliases), `addClass` no longer
+  collapses a root-package class onto a packaged twin's slot, and the
+  per-class side tables (ctor args, init blocks, secondary ctors, defaults,
+  body-prop inits, delegates) are dual-keyed by FQN and read through the
+  resolved identity. The simple-name `classId` remains only as the legacy
+  fallback for synthesized shapes with no resolved id.
+- **Class:** C.
+- **Verified by:** both-orders cross-package class itests in
+  `itests/resolve_ambiguity.zig` (ctor, `::Ctor`, `copy`, named-arg,
+  data-class arity) + `itest-parity_inner_classes` green.
 
 ### C3 — Nested-type collision mangling (`Outer$Name`)
 
@@ -550,31 +552,33 @@ get a fixed insertion position.
   `Holder.Application.who()=="nested"`) passes **unmodified** under the differential
   harness — the §2 root-cause-only requirement.
 
-### C4 — VM bare-global `kotlin.*` prefix-probe ladder
+### C4 — VM bare-global `kotlin.*` prefix-probe ladder — REMOVED (item 8 steps 2+3)
 
-- **Location:** `src/interp_ir/vm/host_globals.zig:436-467`: a fixed list of
-  `kotlin.*` prefixes probed in order to resolve a bare name to an intrinsic.
-- **What it does:** hard-codes resolution order for stdlib top-level functions/
-  consts (`min`→`kotlin.math.min`) — order-sensitive, package-agnostic.
+- **Status:** REMOVED. The per-call prefix probe is replaced by the
+  link-settled `ProgramImage.default_import_globals` map (one name→FQN edge,
+  first package in `bare_probe_packages` order wins a cross-package
+  collision — rank semantics unit-pinned, including the `StringBuilder`
+  production collision and a synthetic two-package collision that fails on
+  rank inversion).
+- **Was at:** `src/interp_ir/vm/host_globals.zig` (the prefix list in
+  `lookupGlobal`).
 - **Class:** C.
-- **Deletable?** Deletable. §4.4-item-4: exact `funcIdByFqn`/`installed_bindings.resolve(fqn)`
-  with NO prefix ladder once lowering emits FQN-qualified loads.
-- **Removes via:** §6 item **8**.
-- **Removal test:** differential identical; `parity_strings_numbers`/
-  `parity_ranges_arrays` green with FQN-qualified `LoadGlobal`.
+- **Verified by:** the map unit tests in `interp_ir.zig` + differential
+  byte-identical across modes.
 
-### C5 — VM bare-global `installed_bindings` suffix scan
+### C5 — VM bare-global `installed_bindings` suffix scan — REMOVED (item 8 steps 2+3)
 
-- **Location:** `src/interp_ir/vm/host_globals.zig:469-486`: scan every
-  `installed_bindings` key for one ending in `.{name}`, returning the first
-  hash-map hit (iteration-order nondeterministic).
-- **What it does:** resolves a bare name against any pack binding whose FQN ends in
-  the name — the most order/iteration-sensitive resolver in the tree (§2 Class C).
+- **Status:** REMOVED. The hash-order `endsWith` scan is replaced by the
+  link-settled `ProgramImage.pack_bare_aliases` map: package-level binding
+  keys only (receiver-qualified member keys like
+  `kotlinx.coroutines.Job.join` are excluded — a bare name can never mean
+  one), lexicographically smallest FQN wins a collision, so the alias is
+  hash-order independent. Both properties are unit-pinned.
+- **Was at:** `src/interp_ir/vm/host_globals.zig` (the `installed_bindings`
+  suffix scan in `lookupGlobal`).
 - **Class:** C.
-- **Deletable?** Deletable (same as C4).
-- **Removes via:** §6 item **8**.
-- **Removal test:** differential `SourcePacks` vs `CompiledPacks` byte-identical (a
-  HashMap-iteration-order divergence would show here first).
+- **Verified by:** the alias unit tests in `interp_ir.zig` + differential
+  `SourcePacks` vs `CompiledPacks` byte-identical.
 
 ### C6 — `callFunc` pack-binding FQN short-circuit — REMOVED (item 9)
 

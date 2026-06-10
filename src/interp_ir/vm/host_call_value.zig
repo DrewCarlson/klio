@@ -137,9 +137,18 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             defer g.deinit();
             break :blk g.get().name;
         };
+        const cls_fqn = blk: {
+            const g = cls.borrow();
+            defer g.deinit();
+            break :blk g.get().fqn;
+        };
+        // The bound ClassDef carries the resolved FQN; the module class
+        // resolves by it, so `(::Ctor)(args)` constructs the referenced
+        // class even when another package declares the same simple name.
         const class_id: ?ir.ClassId = blk: {
             const mg = self.module.borrow();
             defer mg.deinit();
+            if (mg.get().classIdByFqn(cls_fqn)) |cid| break :blk cid;
             for (mg.get().class_index.items) |entry| {
                 if (std.mem.eql(u8, entry.name, cls_name)) break :blk entry.id;
             }
@@ -208,7 +217,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             {
                 const mg = self.module.borrow();
                 defer mg.deinit();
-                if (mg.get().funcId(name) != null) break :blk true;
+                if (mg.get().hasFuncNamed(name)) break :blk true;
             }
             if (host_globals.lookupGlobal(self, name)) |g| {
                 break :blk (g == .Function or g == .IrClosure);
@@ -272,7 +281,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // binding instead of running the shim placeholder body. The form
         // was settled once by `linkResolvedForms`; this consults it by
         // `FuncId` with no per-call FQN probe.
-        host_call_func.linkAuditCheck(self, func.id, func.fqn);
+        host_call_func.linkAuditCheck(self, module, func.id, func, args);
         if (host_call_func.resolvedNativeForm(self, func.id)) |intrinsic| {
             return dispatchIntrinsic(self, func.fqn, intrinsic, args);
         }

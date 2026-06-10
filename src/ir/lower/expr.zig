@@ -416,11 +416,34 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .PropertyRef => |pr| {
             // `::greet` — a registered top-level fn loads the function value;
             // a tracked local / top-level prop keeps the unbound PropertyRef;
-            // an untracked own-receiver member binds a MemberRef.
+            // an untracked own-receiver member binds a MemberRef. The symbol
+            // index resolves the name from this file's package and imports,
+            // and a unique pick is carried as an exact identity — a class
+            // first (`::Ctor`; the runtime gives a class value precedence
+            // over a same-named function), then a non-extension function —
+            // so a same-simple-name declaration from another package cannot
+            // swap in at runtime. Deferred shapes (overload sets, extension
+            // forms) keep the name-keyed emission.
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = pr.name.name });
             const is_tracked = b.resolve(pr.name.name) != null or isTopLevelProp(pr.name.name);
-            if (b.module.funcId(pr.name.name) != null or b.module.classId(pr.name.name) != null) {
+            const class_pick: ?ir.ClassId = b.module.classIdIndexed(pr.name.name, b.self_package, pr.name.span.file);
+            const ref_pick: ?FuncId = if (class_pick != null)
+                null
+            else
+                b.module.resolveBareRefIndexed(pr.name.name, b.self_package, pr.name.span.file);
+            refAudit(b, pr.name.name, ref_pick);
+            if (class_pick) |cid| {
+                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cid } });
+            } else if (ref_pick) |fid| {
+                const n = blk: {
+                    if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                        break :blk try b.module.internConst(b.allocator, .{ .String = f.fqn });
+                    }
+                    break :blk nm;
+                };
+                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
+            } else if (b.module.funcId(pr.name.name) != null or b.module.classId(pr.name.name) != null) {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             } else if (!is_tracked) {
                 if (try resolveThisReg(b)) |this_reg| {
@@ -854,6 +877,26 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             return dst;
+        }
+        // Value-position bare reference to a top-level function, in a
+        // context no receiver can shadow (no reachable `this`, no
+        // enclosing member, no owner-class getter qualification): the
+        // symbol index resolves it from the caller's scope and a unique
+        // pick loads by exact FQN, so a same-simple-name function from
+        // another package cannot swap in at runtime.
+        if (b.resolve("this") == null and !b.isLambdaBody() and b.ownerClass() == null and
+            !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and !isTopLevelProp(name0))
+        {
+            const ref_pick = b.module.resolveBareRefIndexed(name0, b.self_package, segments[0].span.file);
+            refAudit(b, name0, ref_pick);
+            if (ref_pick) |fid| {
+                if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                    const dst = b.allocReg();
+                    const n = try b.module.internConst(b.allocator, .{ .String = f.fqn });
+                    try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
+                    return dst;
+                }
+            }
         }
         if (b.resolve("this")) |this_reg| {
             // A bare name resolving to a known top-level fn is a
@@ -1739,9 +1782,28 @@ fn lowerCallWithWritebackPath(
     var run_regs: std.ArrayList(Reg) = .empty;
     defer run_regs.deinit(b.allocator);
     const segments = callee.Path.segments;
+    // Bind the callee through the symbol index where it resolves
+    // uniquely (caller package + imports over the complete header set);
+    // the order-based `funcId` pick remains the fallback for the shapes
+    // the index defers on (extensions, overload sets).
+    var bound_id: ?FuncId = null;
     if (segments.len == 1) {
+        const ires = b.module.resolveBareCallIndexed(
+            segments[0].name,
+            b.self_package,
+            segments[0].span.file,
+            args.len,
+            lastArgIsLambda(args),
+        );
+        bound_id = if (b.module.funcId(segments[0].name)) |heur|
+            preferredBareTarget(b, heur, ires.pick())
+        else
+            ires.pick();
+        if (bound_id) |bid| {
+            _ = try recordOutOfScopeCall(b, segments[0].name, segments[0].span, bid, ires);
+        }
         var needs_this = false;
-        if (b.module.funcId(segments[0].name)) |fid| {
+        if (bound_id) |fid| {
             if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
                 needs_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
             }
@@ -1767,7 +1829,7 @@ fn lowerCallWithWritebackPath(
 
     const dst = b.allocReg();
     if (segments.len == 1) {
-        if (b.module.funcId(segments[0].name)) |func_id| {
+        if (bound_id) |func_id| {
             const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
             try b.push(.{ .Call = .{
                 .dst = dst,
@@ -1998,9 +2060,11 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (try lowerPathCall(b, expr, shadowed_by_class)) |r| return r;
     }
 
-    // Path-callee with a registered class name.
+    // Path-callee with a registered class name. The indexed lookup binds
+    // the class visible from the caller's package and imports, so a
+    // cross-package simple-name collision constructs the right class.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
-        if (b.module.classId(callee.Path.segments[0].name)) |class_id| {
+        if (b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file)) |class_id| {
             const run = try lowerArgRun(b, args);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const dst = b.allocReg();
@@ -2033,6 +2097,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .args = run[0],
                     .n_args = run[1],
                     .arg_names = arg_names,
+                    .class = class_id,
                 } });
             }
             return dst;
@@ -2493,6 +2558,10 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
             // which stays with the heuristic — receiver-based resolution
             // is the heuristic's domain and the index never models it.
             const final_id = preferredBareTarget(b, func_id, index_pick);
+            // A target in a package the caller cannot see is an
+            // unresolved reference (kotlinc rejects the call); the
+            // diagnostic fails the program before it runs.
+            _ = try recordOutOfScopeCall(b, name0, segments[0].span, final_id, index_res);
             return try emitBareFuncCall(b, expr, final_id, was_cast);
         }
     }
@@ -2536,6 +2605,51 @@ fn recordAmbiguousCall(b: *FuncBuilder, name: []const u8, call_span: ir.Span, re
         .span_a = span_a,
         .span_b = span_b,
     });
+}
+
+/// Kotlin does not resolve an unqualified call whose every candidate
+/// lives in a package the caller neither declares, imports, nor sees by
+/// default (kotlinc: "unresolved reference"). When the bound target is a
+/// plain top-level function in such a package, record the unresolved
+/// diagnostic — naming the candidates and how to import them — and tell
+/// the caller to suppress the bind. Receiver-bound extensions are the
+/// heuristic's domain and never classify as out of scope here. The
+/// corpus sweep (examples + coroutine fixtures + the lowered stdlib and
+/// pack sources, KLIO_RESOLVE_AUDIT) resolves zero calls at this tier,
+/// so the error only fires on programs kotlinc already rejects.
+fn recordOutOfScopeCall(
+    b: *FuncBuilder,
+    name: []const u8,
+    call_span: ir.Span,
+    final_id: FuncId,
+    index_res: ir.Module.BareCallResolution,
+) Allocator.Error!bool {
+    const file = call_span.file;
+    // Only the index's own out-of-scope verdicts count: a unique
+    // exact-arity match, or a tier-5 candidate set (identical or
+    // type-distinct). Loose-shape deferrals (arity/default/vararg/
+    // bodyless) stay with the heuristic — those binds are provisional
+    // and the runtime may still dispatch a member or re-pick an
+    // overload (`list.apply { add(x) }` must not error because a
+    // user file declares a top-level `add`).
+    const precise = switch (index_res.outcome) {
+        .resolved => true,
+        .deferred => |r| r == .unimported_set or r == .type_overload,
+    };
+    if (!precise) return false;
+    if (!isNonExt(b, final_id)) return false;
+    const tier = b.module.bareCallTierOf(final_id, name, b.self_package, file) orelse return false;
+    if (tier != ir.Module.other_package_tier) return false;
+    const fqn_a = if (index_res.first) |f| fqnOf(b, f) else fqnOf(b, final_id);
+    const fqn_b = if (index_res.second) |s2| fqnOf(b, s2) else "";
+    try b.module.resolve_diags.append(b.allocator, .{
+        .name = name,
+        .fqn_a = fqn_a,
+        .fqn_b = fqn_b,
+        .span = call_span,
+        .kind = .unresolved,
+    });
+    return true;
 }
 
 /// How a bare-call index/heuristic divergence is explained. Anything
@@ -2717,6 +2831,23 @@ fn resolveStrictOn() bool {
         }
     }
     return resolve_strict_enabled;
+}
+
+/// Audit one value-position bare reference: the index's pick against
+/// the order-based `funcId` pick the runtime's bare-name closure path
+/// binds. A divergence where both resolve is the index correcting (or,
+/// unexplained, mis-binding) the reference target; the corpus sweep
+/// proves zero unexplained before the FQN emission is trusted.
+fn refAudit(b: *FuncBuilder, name: []const u8, index_pick: ?FuncId) void {
+    if (!resolveAuditOn()) return;
+    const heur = b.module.funcId(name);
+    const divergent = index_pick != null and heur != null and index_pick.?.int() != heur.?.int();
+    const idx_fqn: []const u8 = if (index_pick) |i| fqnOf(b, i) else "-";
+    const heur_fqn: []const u8 = if (heur) |h| fqnOf(b, h) else "-";
+    std.debug.print(
+        "[KLIO_RESOLVE_AUDIT] ref name={s} pkg={s} index_fqn={s} heur_fqn={s} divergent={d}\n",
+        .{ name, b.self_package, idx_fqn, heur_fqn, @intFromBool(divergent) },
+    );
 }
 
 fn resolveAuditLog(b: *FuncBuilder, name: []const u8, heuristic: ?FuncId, index: FuncId) void {

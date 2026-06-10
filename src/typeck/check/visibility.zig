@@ -607,6 +607,11 @@ pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
                 if (a.params.len != b.params.len) {
                     continue;
                 }
+                // Two packages may each declare the same signature —
+                // kotlinc's conflicting-overloads domain is one package.
+                if (!sameDeclPackage(self, a.decl_span, b.decl_span)) {
+                    continue;
+                }
                 const n = a.params.len;
                 const a_ge_b = try helpers.atLeastAsApplicable(self.allocator, a, b, n, &self.classes);
                 const b_ge_a = try helpers.atLeastAsApplicable(self.allocator, b, a, n, &self.classes);
@@ -646,6 +651,17 @@ pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
         _ = d.withCode(codes.TYPE_CONFLICTING_OVERLOADS);
         try self.diagnostics.emit(self.allocator, d);
     }
+}
+
+/// Whether two declaration sites live in the same package, judged by
+/// their files' package headers (the multi-file entry point records one
+/// package per FileId; a missing entry is the root package).
+fn sameDeclPackage(self: *Checker, a: ?Span, b: ?Span) bool {
+    const sa = a orelse return true;
+    const sb = b orelse return true;
+    const pa = self.file_packages.get(sa.file.int()) orelse "";
+    const pb = self.file_packages.get(sb.file.int()) orelse "";
+    return std.mem.eql(u8, pa, pb);
 }
 
 fn countTrue(flags: []const bool) usize {

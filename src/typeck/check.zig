@@ -194,7 +194,28 @@ pub fn typecheckModule(
     resolution: *const Resolution,
 ) Allocator.Error!TypeCheck {
     const merged = try mergeModuleFiles(allocator, files);
-    return typecheck(allocator, &merged, resolution);
+    const user_contracts = try scanUserInlineContracts(allocator, &merged);
+    cfa.analyses.contracts.setUserInlineContracts(user_contracts);
+    var tc = try Checker.new(allocator, resolution);
+    for (files) |*f| {
+        const pkg = f.package orelse continue;
+        var dotted: std.ArrayList(u8) = .empty;
+        for (pkg.path, 0..) |id, i| {
+            if (i != 0) try dotted.append(allocator, '.');
+            try dotted.appendSlice(allocator, id.name);
+        }
+        try tc.file_packages.put(f.span.file.int(), try dotted.toOwnedSlice(allocator));
+    }
+    try tc.run(&merged);
+    try annotations.applySuppressAnnotations(allocator, &merged, &tc.diagnostics);
+    cfa.analyses.contracts.setUserInlineContracts(
+        cfa.analyses.contracts.UserInlineContracts.init(allocator),
+    );
+    return .{
+        .types = tc.types,
+        .diagnostics = tc.diagnostics,
+        .cfgs = tc.cfgs,
+    };
 }
 
 fn mergeModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocator.Error!KotlinFile {
@@ -564,6 +585,11 @@ pub const Checker = struct {
     /// Top-level user functions keyed by simple name. A name maps to a list
     /// of signatures so positional overloads can be picked at call sites.
     fns: std.StringHashMap(std.ArrayList(FnSig)),
+    /// Declaring package per source file (FileId.int() -> dotted package),
+    /// populated by the multi-file entry point. Two same-name signatures
+    /// from different packages are not an overload pair (kotlinc's
+    /// conflicting-overloads check is per package).
+    file_packages: std.AutoHashMap(u32, []const u8),
     /// User-declared extension functions keyed by the receiver type's simple
     /// name.
     extensions: std.StringHashMap(std.ArrayList(ExtensionSig)),
