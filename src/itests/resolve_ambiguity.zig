@@ -24,6 +24,13 @@ const RunResult = union(enum) {
 };
 
 fn runKlio(name: []const u8, src: []const u8) !RunResult {
+    return runKlioFiles(name, &.{src});
+}
+
+/// Write each source as `{name}_{i}.kt` and run them as one program, in
+/// order — the in-process mirror of `klio run a.kt b.kt`, for the
+/// cross-package shapes that need one package header per file.
+fn runKlioFiles(name: []const u8, srcs: []const []const u8) !RunResult {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
 
@@ -32,13 +39,45 @@ fn runKlio(name: []const u8, src: []const u8) !RunResult {
     const io = threaded.io();
 
     std.Io.Dir.cwd().createDirPath(io, TMP_DIR) catch {};
-    const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (srcs, 0..) |src, i| {
+        const path = if (srcs.len == 1)
+            try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name })
+        else
+            try std.fmt.allocPrint(a, "{s}/{s}_{d}.kt", .{ TMP_DIR, name, i });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+        try paths.append(a, path);
+    }
 
-    return switch (try parity.runWithPacks(a, io, path)) {
+    return switch (try parity.runFilesWithPacks(a, io, paths.items)) {
         .ok => |got| .{ .ok = got },
         .err => |m| .{ .err = m },
     };
+}
+
+fn expectFilesOutput(name: []const u8, srcs: []const []const u8, expected: []const u8) !void {
+    switch (try runKlioFiles(name, srcs)) {
+        .ok => |got| try std.testing.expectEqualStrings(expected, got),
+        .err => |m| {
+            std.debug.print("klio run failed for `{s}`: {s}\n", .{ name, m });
+            return error.KlioRunFailed;
+        },
+    }
+}
+
+fn expectFilesErrContains(name: []const u8, srcs: []const []const u8, needle: []const u8) !void {
+    switch (try runKlioFiles(name, srcs)) {
+        .ok => |got| {
+            std.debug.print("expected a lowering diagnostic for `{s}`, program ran: {s}\n", .{ name, got });
+            return error.ExpectedResolutionDiagnostic;
+        },
+        .err => |m| {
+            if (std.mem.indexOf(u8, m, needle) == null) {
+                std.debug.print("diagnostic for `{s}` missing `{s}`:\n{s}\n", .{ name, needle, m });
+                return error.WrongDiagnostic;
+            }
+        },
+    }
 }
 
 fn expectOutput(name: []const u8, src: []const u8, expected: []const u8) !void {
@@ -199,6 +238,48 @@ test "a cast-disambiguated overload call keeps resolving" {
     try expectOutput("cast_pick_ok", src, "int\n");
 }
 
+test "expect/actual top-level pair binds the actual body" {
+    // The build drops a top-level `expect` superseded by its `actual`,
+    // so the call set holds exactly one candidate and the symbol index
+    // resolves it (an expect/actual pair must never report as
+    // conflicting overloads). kotlinc cannot compile this standalone
+    // (multiplatform-only), so it lives here rather than in examples/.
+    const src =
+        \\expect fun platformName(): String
+        \\actual fun platformName(): String = "klio"
+        \\expect fun greet(who: String): String
+        \\actual fun greet(who: String): String = "hello, " + who
+        \\expect val answer: Int
+        \\actual val answer: Int = 42
+        \\fun main() {
+        \\    println(platformName())
+        \\    println(greet("expect/actual"))
+        \\    println(answer)
+        \\}
+        \\
+    ;
+    try expectOutput("expect_actual_toplevel", src, "klio\nhello, expect/actual\n42\n");
+}
+
+test "an expect decl over an embedded intrinsic is dropped at build and the call binds the intrinsic" {
+    // What this pins: the BUILD-side drop (`retainDecl` removes an
+    // `expect` whose `kotlin.{name}` FQN is an embedded intrinsic) plus
+    // the link-settled bare-name map edge for `intArrayOf`. The decl
+    // does NOT survive to the VM, so the bodyless redirect / native-form
+    // machinery is never consulted here — that seam is pinned by the
+    // `resolvedRedirectTarget` unit tests in `interp_ir.zig`.
+    const src =
+        \\expect fun intArrayOf(vararg elements: Int): IntArray
+        \\fun main() {
+        \\    val xs = intArrayOf(3, 1, 2)
+        \\    println(xs.size)
+        \\    println(xs[0] + xs[2])
+        \\}
+        \\
+    ;
+    try expectOutput("expect_native_backed", src, "3\n5\n");
+}
+
 test "default-param twins resolve the same in either declaration order" {
     // A candidate with a default parameter is deferred by the stub gate
     // AND the body gate, so the verdict cannot flip on whether the
@@ -219,4 +300,150 @@ test "default-param twins resolve the same in either declaration order" {
     ;
     try expectOutput("default_twins_decls_first", decls_first, "3\n");
     try expectOutput("default_twins_decls_last", decls_last, "3\n");
+}
+
+test "expect-fn default parameter values transfer to the superseding actual" {
+    // Kotlin: defaults are declared on the `expect` only; the `actual`
+    // inherits them. The build transplants the expect's defaults onto
+    // the retained actual before the expect is dropped.
+    const src =
+        \\expect fun greet(who: String = "world"): String
+        \\actual fun greet(who: String): String = "hello, " + who
+        \\expect fun twice(x: Int = 21): Int
+        \\actual fun twice(x: Int): Int = x * 2
+        \\fun main() {
+        \\    println(greet())
+        \\    println(greet("kotlin"))
+        \\    println(twice())
+        \\}
+        \\
+    ;
+    try expectOutput("expect_defaults", src, "hello, world\nhello, kotlin\n42\n");
+}
+
+test "a bare value reference never binds the extension twin, in either order" {
+    // `fun String.deco` and `fun deco` share the receiverless FQN string;
+    // the reference must bind the plain form regardless of declaration
+    // order (the resolved FuncId is carried on the LoadGlobal).
+    const ext_first =
+        \\package app
+        \\fun String.deco(): String = "ext:" + this
+        \\fun deco(): String = "plain"
+        \\fun main() {
+        \\    val g = ::deco
+        \\    println(g())
+        \\}
+        \\
+    ;
+    const plain_first =
+        \\package app
+        \\fun deco(): String = "plain"
+        \\fun String.deco(): String = "ext:" + this
+        \\fun main() {
+        \\    val g = ::deco
+        \\    println(g())
+        \\}
+        \\
+    ;
+    try expectOutput("ext_twin_ref_a", ext_first, "plain\n");
+    try expectOutput("ext_twin_ref_b", plain_first, "plain\n");
+}
+
+const xpkg_lib =
+    \\package liba
+    \\fun tag(): String = "liba"
+    \\
+;
+const xpkg_main =
+    \\fun tag(): String = "app"
+    \\fun main() {
+    \\    println(tag())
+    \\    val f = ::tag
+    \\    println(f())
+    \\    println(run(::tag))
+    \\}
+    \\
+;
+
+test "::name binds from the caller's scope, not declaration order" {
+    // kotlinc: app / app / app in both file orders.
+    try expectFilesOutput("xpkg_ref_lib_first", &.{ xpkg_lib, xpkg_main }, "app\napp\napp\n");
+    try expectFilesOutput("xpkg_ref_main_first", &.{ xpkg_main, xpkg_lib }, "app\napp\napp\n");
+}
+
+const xcls_lib =
+    \\package libc
+    \\class Box(val v: Int) { fun tag(): String = "libc:" + v }
+    \\
+;
+const xcls_main =
+    \\class Box(val v: Int) { fun tag(): String = "root:" + v }
+    \\fun main() {
+    \\    println(Box(1).tag())
+    \\    val f = ::Box
+    \\    println(f(2).tag())
+    \\    println(listOf(3).map(::Box).map { it.tag() })
+    \\}
+    \\
+;
+
+test "cross-package class collision constructs the caller's class in either order" {
+    // kotlinc: root:* for all three forms regardless of file order.
+    const want = "root:1\nroot:2\n[root:3]\n";
+    try expectFilesOutput("xpkg_cls_main_first", &.{ xcls_main, xcls_lib }, want);
+    try expectFilesOutput("xpkg_cls_lib_first", &.{ xcls_lib, xcls_main }, want);
+}
+
+test "cross-package data-class twins keep their own arity and copy() in either order" {
+    const root_p =
+        \\data class P(val x: Int, val y: Int)
+        \\fun main() {
+        \\    println(P(1, 2))
+        \\    println(P(3, 4).copy(y = 9))
+        \\    println(libd.mk())
+        \\}
+        \\
+    ;
+    const libd_p =
+        \\package libd
+        \\data class P(val x: Int)
+        \\fun mk(): P = P(7).copy(x = 8)
+        \\
+    ;
+    const want = "P(x=1, y=2)\nP(x=3, y=9)\nP(x=8)\n";
+    try expectFilesOutput("xpkg_data_main_first", &.{ root_p, libd_p }, want);
+    try expectFilesOutput("xpkg_data_libd_first", &.{ libd_p, root_p }, want);
+}
+
+test "a cross-package bare call without an import is an unresolved reference" {
+    // kotlinc rejects this shape outright; the diagnostic names the
+    // candidates and how to import one. Both file orders.
+    const liba =
+        \\package liba
+        \\fun f(): String = "liba.f"
+        \\
+    ;
+    const libb =
+        \\package libb
+        \\fun f(): String = "libb.f"
+        \\
+    ;
+    const caller =
+        \\package app
+        \\fun main() { println(f()) }
+        \\
+    ;
+    try expectFilesErrContains("xpkg_unresolved_ab", &.{ liba, libb, caller }, "unresolved reference `f`");
+    try expectFilesErrContains("xpkg_unresolved_ba", &.{ libb, liba, caller }, "unresolved reference `f`");
+    // A single out-of-scope candidate is unresolved too, and the
+    // diagnostic says how to import it.
+    try expectFilesErrContains("xpkg_unresolved_one", &.{ liba, caller }, "add `import liba.f`");
+    // An explicit import resolves the same call.
+    const caller_imp =
+        \\package app
+        \\import liba.f
+        \\fun main() { println(f()) }
+        \\
+    ;
+    try expectFilesOutput("xpkg_imported_ok", &.{ liba, libb, caller_imp }, "liba.f\n");
 }

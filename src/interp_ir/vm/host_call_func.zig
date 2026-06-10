@@ -216,30 +216,120 @@ pub fn resolvedNativeForm(self: *VmHost, func: FuncId) ?StdlibFn {
     return g.get().resolvedNativeForm(func);
 }
 
-/// Opt-in audit (`KLIO_LINK_AUDIT`): assert the link-time resolved form for
-/// `func` equals what the deleted per-call short-circuit would have picked
-/// (`installed_bindings.resolve(fqn)`). Used to prove the link table is a
-/// faithful, behavior-preserving replacement before the short-circuit is
-/// removed. Logs every divergence; a clean corpus run proves zero.
-pub fn linkAuditCheck(self: *VmHost, func: FuncId, fqn: []const u8) void {
-    if (!linkAuditOn()) return;
-    const per_call: ?StdlibFn = blk: {
+/// The prefix sequence the DELETED `callFunc` bodyless ladder probed, in
+/// its exact order. This list intentionally differs from
+/// `ProgramImage.bare_probe_packages` (the deleted `lookupGlobal` ladder's
+/// order, which the link-time map unified onto): io/math, text/collections
+/// and ranges/comparisons are transposed between the two. The audit
+/// re-derives THIS order independently so a future binding registered
+/// under two of the transposed packages — where the unified map's pick
+/// would diverge from the deleted dispatch — is flagged, not silently
+/// absorbed.
+const deleted_bodyless_prefixes = [_][]const u8{
+    "kotlin.",
+    "kotlin.io.",
+    "kotlin.math.",
+    "kotlin.text.",
+    "kotlin.collections.",
+    "kotlin.ranges.",
+    "kotlin.comparisons.",
+    "kotlin.concurrent.",
+    "kotlin.coroutines.",
+    "kotlin.coroutines.intrinsics.",
+    "kotlin.internal.",
+};
+
+/// Overlay-then-embedded probe for one FQN — the deleted ladder's
+/// `lookupIntrinsic` rung, re-derived here so the audit never consults
+/// the link-built tables it is checking.
+fn auditIntrinsicProbe(self: *VmHost, fqn: []const u8) ?StdlibFn {
+    {
         const g = self.prog.borrow();
         defer g.deinit();
         const bg = g.get().installed_bindings.borrow();
         defer bg.deinit();
-        break :blk bg.get().resolve(fqn);
+        if (bg.get().resolve(fqn)) |i| return i;
+    }
+    return stdlib.implementation(fqn);
+}
+
+/// Opt-in audit (`KLIO_LINK_AUDIT`): re-derive what the DELETED per-call
+/// dispatch would have done for `func` and assert the link-settled tables
+/// agree. For a body-bearing func that is the
+/// `installed_bindings.resolve(fqn)` short-circuit. For a bodyless decl
+/// the deleted ladder ran, in order: the per-call same-simple-name
+/// body-sibling scan (first arity-fitting candidate), the declared FQN
+/// against the overlay then the embedded registry, then the
+/// `deleted_bodyless_prefixes` probes — re-computed here from the raw
+/// sources (never from `resolved_redirect` / `default_import_globals`,
+/// which are the tables under audit), so a divergence between the deleted
+/// algorithm and the link-time replacement is detectable. Logs every
+/// divergence; a clean corpus run proves zero.
+pub fn linkAuditCheck(self: *VmHost, module: *const Module, func: FuncId, f: *const ir.Func, args_in: []const Value) void {
+    if (!linkAuditOn()) return;
+    if (f.blocks.len != 0) {
+        const per_call: ?StdlibFn = blk: {
+            const g = self.prog.borrow();
+            defer g.deinit();
+            const bg = g.get().installed_bindings.borrow();
+            defer bg.deinit();
+            break :blk bg.get().resolve(f.fqn);
+        };
+        const linked = resolvedNativeForm(self, func);
+        if (per_call != linked) {
+            std.debug.print(
+                "[KLIO_LINK_AUDIT] divergence: fid={d} fqn={s} per_call={s} linked={s}\n",
+                .{ func.int(), f.fqn, if (per_call != null) "native" else "body", if (linked != null) "native" else "body" },
+            );
+        }
+        return;
+    }
+
+    // Deleted rung 1: per-call sibling scan, first body-bearing
+    // arity-fitting same-simple-name candidate.
+    const per_call_sibling: ?FuncId = blk: {
+        for (module.funcsBySimpleName(f.name)) |cand| {
+            if (cand.int() == func.int()) continue;
+            const g = funcAt(module, cand) orelse continue;
+            if (g.blocks.len == 0) continue;
+            const g_user = if (paramIsThis(g.params)) g.params.len - 1 else g.params.len;
+            if (g_user != args_in.len and !lastIsVararg(g.params)) continue;
+            break :blk cand;
+        }
+        break :blk null;
     };
-    const linked = resolvedNativeForm(self, func);
-    if (per_call != linked) {
+    // The replacement's pick: exactly what dispatch consults.
+    const linked_sibling: ?FuncId = blk: {
+        const g = self.prog.borrow();
+        defer g.deinit();
+        break :blk g.get().resolvedRedirectTarget(module, func, args_in.len);
+    };
+    if ((per_call_sibling == null) != (linked_sibling == null) or
+        (per_call_sibling != null and per_call_sibling.?.int() != linked_sibling.?.int()))
+    {
+        std.debug.print(
+            "[KLIO_LINK_AUDIT] divergence: fid={d} fqn={s} sibling per_call={?} linked={?}\n",
+            .{ func.int(), f.fqn, per_call_sibling, linked_sibling },
+        );
+    }
+    if (per_call_sibling != null) return;
+
+    // Deleted rungs 2+3: declared FQN, then the old prefix sequence.
+    const per_call_native: ?StdlibFn = blk: {
+        if (auditIntrinsicProbe(self, f.fqn)) |i| break :blk i;
+        var buf: [128]u8 = undefined;
+        for (deleted_bodyless_prefixes) |pfx| {
+            if (pfx.len + f.name.len > buf.len) continue;
+            const probe = std.fmt.bufPrint(&buf, "{s}{s}", .{ pfx, f.name }) catch continue;
+            if (auditIntrinsicProbe(self, probe)) |i| break :blk i;
+        }
+        break :blk null;
+    };
+    const linked_native = resolvedNativeForm(self, func);
+    if (per_call_native != linked_native) {
         std.debug.print(
             "[KLIO_LINK_AUDIT] divergence: fid={d} fqn={s} per_call={s} linked={s}\n",
-            .{
-                func.int(),
-                fqn,
-                if (per_call != null) "native" else "body",
-                if (linked != null) "native" else "body",
-            },
+            .{ func.int(), f.fqn, if (per_call_native != null) "native" else "body", if (linked_native != null) "native" else "body" },
         );
     }
 }
@@ -509,13 +599,36 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         trace.emit("call_func {s} fid={d} fqn={s} argc={d}", .{ f.name, func.int(), f.fqn, args_in.len });
     }
 
+    linkAuditCheck(self, module, func, f, args_in);
+
+    // Bodyless `expect` / header-only decl: the link step settled its
+    // body siblings (declaration order); the first whose arity fits the
+    // call runs. Settled once by `linkResolvedForms` — no per-call
+    // `funcsBySimpleName` scan.
+    if (f.blocks.len == 0) {
+        const target: ?FuncId = blk: {
+            const g = self.prog.borrow();
+            defer g.deinit();
+            break :blk g.get().resolvedRedirectTarget(module, func, args_in.len);
+        };
+        if (target) |cand| {
+            if (trace.enabled(f.name)) {
+                const g = funcAt(module, cand);
+                trace.emit("map=bodyless_sibling name={s} fqn={s}", .{ f.name, if (g) |gg| gg.fqn else "?" });
+            }
+            return callFunc(self, allocator, module, cand, args_in);
+        }
+    }
+
     // One executable form per symbol: a top-level function whose single
     // form was resolved to a native binding at link time dispatches that
     // binding instead of running its lowered shim body. The form was
     // settled once by `linkResolvedForms`; this consults it by `FuncId`
     // with no per-call FQN probe.
-    linkAuditCheck(self, func, f.fqn);
     if (resolvedNativeForm(self, func)) |intrinsic| {
+        if (f.blocks.len == 0 and trace.enabled(f.name)) {
+            trace.emit("map=bodyless_native name={s} fqn={s}", .{ f.name, f.fqn });
+        }
         return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
     }
 
@@ -540,57 +653,6 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         if (mismatch) {
             if (lookupIntrinsic(self, f.fqn)) |intrinsic| {
                 return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
-            }
-        }
-    }
-
-    // Bodyless `expect` decl: redirect to a same-name same-arity sibling
-    // with a body, or fall through to the intrinsic table.
-    if (f.blocks.len == 0) {
-        const want = args_in.len;
-        const cands = module.funcsBySimpleName(f.name);
-        for (cands) |cand| {
-            if (cand.int() == func.int()) continue;
-            const g = funcAt(module, cand) orelse continue;
-            if (g.blocks.len == 0) continue;
-            const g_params = g.params.len;
-            const g_user_params = if (paramIsThis(g.params)) g_params - 1 else g_params;
-            if (g_user_params != want and !lastIsVararg(g.params)) continue;
-            if (trace.enabled(f.name)) {
-                trace.emit("ladder=bodyless_sibling name={s} fqn={s}", .{ f.name, g.fqn });
-            }
-            return callFunc(self, allocator, module, cand, args_in);
-        }
-        // No same-name body sibling — try the declared FQN first, then
-        // probe the common stdlib packages by simple name.
-        if (lookupIntrinsic(self, f.fqn)) |intrinsic| {
-            if (trace.enabled(f.name)) {
-                trace.emit("ladder=bodyless_fqn name={s} fqn={s}", .{ f.name, f.fqn });
-            }
-            return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
-        }
-        const simple = f.name;
-        const prefixes = [_][]const u8{
-            "kotlin.",
-            "kotlin.io.",
-            "kotlin.math.",
-            "kotlin.text.",
-            "kotlin.collections.",
-            "kotlin.ranges.",
-            "kotlin.comparisons.",
-            "kotlin.concurrent.",
-            "kotlin.coroutines.",
-            "kotlin.coroutines.intrinsics.",
-            "kotlin.internal.",
-        };
-        for (prefixes) |pfx| {
-            const probe = std.fmt.allocPrint(allocator, "{s}{s}", .{ pfx, simple }) catch continue;
-            defer allocator.free(probe);
-            if (lookupIntrinsic(self, probe)) |intrinsic| {
-                if (trace.enabled(simple)) {
-                    trace.emit("ladder=bodyless_prefix name={s} fqn={s}", .{ simple, probe });
-                }
-                return dispatchIntrinsic(self, allocator, probe, intrinsic, args_in);
             }
         }
     }

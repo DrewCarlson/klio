@@ -244,7 +244,9 @@ pub fn buildModule(allocator: Allocator, file: *const KotlinFile) Allocator.Erro
     defer fqn.deinit();
     var func_fqn = SpanStrMap.init(allocator);
     defer func_fqn.deinit();
-    return buildModuleWithOverrides(allocator, file, &fqn, &func_fqn);
+    var decl_pkg = SpanStrMap.init(allocator);
+    defer decl_pkg.deinit();
+    return buildModuleWithOverrides(allocator, file, &fqn, &func_fqn, &decl_pkg);
 }
 
 /// Drive `buildModule` against multiple parsed files. All declarations
@@ -260,13 +262,19 @@ pub fn buildModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocat
     defer fqn_overrides.deinit();
     var func_fqn_overrides = SpanStrMap.init(allocator);
     defer func_fqn_overrides.deinit();
+    var decl_pkg = SpanStrMap.init(allocator);
+    defer decl_pkg.deinit();
 
     for (files) |*f| {
         const prefix = try packagePrefix(allocator, f.package);
         for (f.decls) |*d| {
             try collectClassFqns(allocator, d, prefix, &fqn_overrides);
+            try collectDeclPkgs(allocator, d, prefix, &decl_pkg);
             if (d.* == .Function and prefix.len != 0) {
                 try func_fqn_overrides.put(d.Function.span, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix, d.Function.name.name }));
+            }
+            if (d.* == .Property and prefix.len != 0) {
+                try func_fqn_overrides.put(d.Property.span, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix, d.Property.name.name }));
             }
         }
         try decls.appendSlice(allocator, f.decls);
@@ -279,7 +287,7 @@ pub fn buildModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocat
         .decls = try decls.toOwnedSlice(allocator),
         .span = Span.init(span.FileId.from(0), 0, 0),
     };
-    return buildModuleWithOverrides(allocator, &combined, &fqn_overrides, &func_fqn_overrides);
+    return buildModuleWithOverrides(allocator, &combined, &fqn_overrides, &func_fqn_overrides, &decl_pkg);
 }
 
 fn packagePrefix(allocator: Allocator, pkg: ?ast.PackageHeader) Allocator.Error![]const u8 {
@@ -313,6 +321,38 @@ fn collectClassFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: 
     if (d.* == .Object and pkg.len != 0) {
         try out.put(d.Object.span, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, d.Object.name.name }));
     }
+}
+
+/// Record the DECLARING package of every decl — including members of
+/// classes and objects at any nesting depth, whose lifted top-level
+/// forms keep their source spans. A nested class's FQN override is
+/// class-qualified (`pkg.Outer.Inner`), so the package cannot be
+/// recovered from it; this map carries the file's package directly.
+fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *SpanStrMap) Allocator.Error!void {
+    if (pkg.len == 0) return;
+    switch (d.*) {
+        .Class => |*c| {
+            try out.put(c.span, pkg);
+            for (c.members) |*m| try collectDeclPkgs(allocator, m, pkg, out);
+        },
+        .Object => |*o| {
+            try out.put(o.span, pkg);
+            for (o.members) |*m| try collectDeclPkgs(allocator, m, pkg, out);
+        },
+        .Function => |*f| try out.put(f.span, pkg),
+        .Property => |*p| try out.put(p.span, pkg),
+        else => {},
+    }
+}
+
+/// Package of one top-level decl in the combined multi-file program.
+/// Used to seed `setLowerSelfPackage` around accessor/thunk lowering
+/// that runs outside the class/function body drivers, so the symbol
+/// index keys those bodies on their declaring package too.
+fn declPackage(a: Allocator, decl_pkg: *const SpanStrMap, overrides: *const SpanStrMap, decl_span: Span, package_prefix: []const u8, simple: []const u8) Allocator.Error![]const u8 {
+    if (decl_pkg.get(decl_span)) |p| return p;
+    const fqn = try resolveFqn(a, overrides, decl_span, package_prefix, simple);
+    return packageOfFqn(fqn, simple);
 }
 
 /// Resolve a declaration's FQN: the per-span override if present, else
@@ -405,6 +445,7 @@ fn buildModuleWithOverrides(
     file: *const KotlinFile,
     fqn_overrides: *const SpanStrMap,
     func_fqn_overrides: *const SpanStrMap,
+    decl_pkg: *const SpanStrMap,
 ) Allocator.Error!BuiltModule {
     const module_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
     // The ObjRef holds the only handle during the build and nothing else
@@ -588,6 +629,36 @@ fn buildModuleWithOverrides(
         }
     }
 
+    // Kotlin declares default parameter values on the `expect` fn ONLY —
+    // the `actual` may not re-declare them and inherits them instead. The
+    // retain pass below drops the superseded expect wholesale, so first
+    // transplant its parameter defaults onto the matching actual (same
+    // name, user arity, and receiver shape); an actual that re-declares a
+    // default keeps its own.
+    for (all_decls.items) |*d| {
+        if (d.* != .Function) continue;
+        const ef = &d.Function;
+        if (!ef.is_expect) continue;
+        var any_default = false;
+        for (ef.params) |*pp| {
+            if (pp.default != null) any_default = true;
+        }
+        if (!any_default) continue;
+        for (all_decls.items) |*cand| {
+            if (cand.* != .Function) continue;
+            const af = &cand.Function;
+            if (!af.is_actual) continue;
+            if (!std.mem.eql(u8, af.name.name, ef.name.name)) continue;
+            if (af.params.len != ef.params.len) continue;
+            if ((af.receiver_type == null) != (ef.receiver_type == null)) continue;
+            if (af.receiver_type != null and
+                !std.mem.eql(u8, af.receiver_type.?.name.name, ef.receiver_type.?.name.name)) continue;
+            for (af.params, ef.params) |*ap, *ep| {
+                if (ap.default == null) ap.default = ep.default;
+            }
+        }
+    }
+
     // Drop superseded `expect` decls + the upstream stubs klio overrides.
     var decls_list: std.ArrayList(Decl) = .empty;
     for (all_decls.items) |*d| {
@@ -757,7 +828,8 @@ fn buildModuleWithOverrides(
             const c = &d.Class;
             const extras: *const StringSet = nested_outer_members.getPtr(c.name.name) orelse &empty_set;
             const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
-            _ = try ir.lower.lowerClassWithExtrasFqn(module, c, &file_classes, extras, cfqn);
+            const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+            _ = try ir.lower.lowerClassWithExtrasFqnPkg(module, c, &file_classes, extras, cfqn, cls_pkg);
         }
     }
 
@@ -792,7 +864,7 @@ fn buildModuleWithOverrides(
                 .id = id,
                 .name = f.name.name,
                 .fqn = fqn,
-                .package = packageOfFqn(fqn, f.name.name),
+                .package = decl_pkg.get(f.span) orelse packageOfFqn(fqn, f.name.name),
                 .params = stub_params,
                 .return_ty = ir.build.typeUnit(),
                 .n_locals = 0,
@@ -873,6 +945,8 @@ fn buildModuleWithOverrides(
                 if (p.default != null) any_default = true;
             }
             if (any_default) {
+                const thunk_pkg = ir.lower.decl.setLowerSelfPackage(module.funcs.items[id.int()].package);
+                defer _ = ir.lower.decl.setLowerSelfPackage(thunk_pkg);
                 const lowered_names = module.funcs.items[id.int()].params;
                 const offset = if (lowered_names.len > f.params.len) lowered_names.len - f.params.len else 0;
                 var name_refs: std.ArrayList([]const u8) = .empty;
@@ -907,6 +981,9 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
+        const body_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+        const prev_body_pkg = ir.lower.decl.setLowerSelfPackage(body_pkg);
+        defer _ = ir.lower.decl.setLowerSelfPackage(prev_body_pkg);
         var own_members = StringSet.init(a);
         defer own_members.deinit();
         for (c.primary_params) |*p| {
@@ -939,8 +1016,14 @@ fn buildModuleWithOverrides(
                 }
             }
             try primary_ctor_default_thunks.put(c.name.name, slots);
+            const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+            if (!std.mem.eql(u8, cfqn, c.name.name)) {
+                try primary_ctor_default_thunks.put(cfqn, slots);
+            }
         }
 
+        const body_prop_cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        const body_prop_dual = !std.mem.eql(u8, body_prop_cfqn, c.name.name);
         for (c.members) |*m| {
             if (m.* != .Property) continue;
             const p = &m.Property;
@@ -948,11 +1031,13 @@ fn buildModuleWithOverrides(
                 const nm = try std.fmt.allocPrint(a, "__init_prop_{s}_{s}", .{ c.name.name, p.name.name });
                 const fid = try ir.lower.lowerAccessorExprWithExpected(module, c.name.name, &own_members, prop_init_params.items, init, nm, p.ty);
                 try body_prop_inits.put(.{ .a = c.name.name, .b = p.name.name }, fid);
+                if (body_prop_dual) try body_prop_inits.put(.{ .a = body_prop_cfqn, .b = p.name.name }, fid);
             } else if (p.delegate) |*delegate| {
                 try delegated_body_props.put(.{ .a = c.name.name, .b = p.name.name }, {});
                 const nm = try std.fmt.allocPrint(a, "__delegate_prop_{s}_{s}", .{ c.name.name, p.name.name });
                 const fid = try ir.lower.lowerAccessorExpr(module, c.name.name, &own_members, prop_init_params.items, delegate, nm);
                 try body_prop_inits.put(.{ .a = c.name.name, .b = p.name.name }, fid);
+                if (body_prop_dual) try body_prop_inits.put(.{ .a = body_prop_cfqn, .b = p.name.name }, fid);
             }
             if (p.getter) |*getter| {
                 const nm = try std.fmt.allocPrint(a, "__get_{s}_{s}", .{ c.name.name, p.name.name });
@@ -990,9 +1075,19 @@ fn buildModuleWithOverrides(
         }
     }
 
-    // Synthesise a runtime ClassDef for every class in the file.
+    // Synthesise a runtime ClassDef for every class in the file. The
+    // table is FQN-keyed: every class registers under its fully-qualified
+    // name (which IS the simple name for a root-package class), and those
+    // entries are authoritative — they are written first and a simple-name
+    // alias can never displace one. The simple-name view exists only for
+    // callers that hold no resolved identity; where two packages declare
+    // the same simple name the first declaration claims the alias, so the
+    // view is declaration-order deterministic, and every identity-carrying
+    // path (NewInstance ClassId, `::Ctor`, copy) resolves by FQN instead.
     const globals_for_capture = try ObjRef(Env).init(a, Env.init(a));
     var classes = ClassTable.init(a);
+    var simple_aliases: std.ArrayList(struct { name: []const u8, def: ObjRef(ClassDef) }) = .empty;
+    defer simple_aliases.deinit(a);
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1001,9 +1096,43 @@ fn buildModuleWithOverrides(
         const def_fqn = fqn_g.get().fqn;
         fqn_g.deinit();
         if (def_fqn.len != 0 and !std.mem.eql(u8, def_fqn, c.name.name)) {
-            try classes.put(def_fqn, def.clone());
+            try simple_aliases.append(a, .{ .name = c.name.name, .def = def.clone() });
+            try classes.put(def_fqn, def);
+        } else {
+            try classes.put(c.name.name, def);
         }
-        try classes.put(c.name.name, def);
+    }
+    for (simple_aliases.items) |alias| {
+        const gop = try classes.getOrPut(alias.name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = alias.def;
+            continue;
+        }
+        // An authoritative entry (a root-package class whose FQN is the
+        // key) is never displaced. Among aliases, a user-package class
+        // outranks a shipped one — decl concatenation puts shipped
+        // sources first, so this preserves the binding user programs
+        // always had — and equally-ranked aliases keep the first
+        // declaration.
+        const existing_fqn = blk: {
+            const g = gop.value_ptr.borrow();
+            defer g.deinit();
+            break :blk g.get().fqn;
+        };
+        const alias_fqn = blk: {
+            const g = alias.def.borrow();
+            defer g.deinit();
+            break :blk g.get().fqn;
+        };
+        const existing_authoritative = std.mem.eql(u8, existing_fqn, alias.name);
+        if (!existing_authoritative and
+            ir.shippedFqnHead(existing_fqn) and !ir.shippedFqnHead(alias_fqn))
+        {
+            gop.value_ptr.deinit();
+            gop.value_ptr.* = alias.def;
+        } else {
+            alias.def.deinit();
+        }
     }
 
     // Populate enum entries + per-entry overrides + ctor-arg thunks.
@@ -1015,7 +1144,11 @@ fn buildModuleWithOverrides(
         if (d.* != .Class) continue;
         const c = &d.Class;
         if (!c.is_enum) continue;
-        const class_def = classes.get(c.name.name) orelse continue;
+        const enum_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+        const prev_enum_pkg = ir.lower.decl.setLowerSelfPackage(enum_pkg);
+        defer _ = ir.lower.decl.setLowerSelfPackage(prev_enum_pkg);
+        const enum_key = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        const class_def = classes.get(enum_key) orelse classes.get(c.name.name) orelse continue;
         var entries: std.ArrayList(ClassDef.EnumEntry) = .empty;
         for (c.enum_entries, 0..) |*entry, ordinal| {
             const id = next_id;
@@ -1075,10 +1208,23 @@ fn buildModuleWithOverrides(
             const def = def_ptr.*;
             const dg = def.borrow();
             const supertype_names = dg.get().supertype_names;
+            const def_pkg = packageOfFqn(dg.get().fqn, dg.get().name);
             dg.deinit();
             var ifaces: std.ArrayList(ObjRef(ClassDef)) = .empty;
             for (supertype_names) |sup_name| {
-                const sup_def = classes.get(sup_name) orelse continue;
+                // A supertype name is written as a simple name in source;
+                // resolve it Kotlin-style — the subclass's own package
+                // before the cross-package simple-name view — so a
+                // same-simple-name class from another package cannot
+                // become the parent.
+                const sup_def = blk: {
+                    if (def_pkg.len != 0) {
+                        const qualified = try std.fmt.allocPrint(a, "{s}.{s}", .{ def_pkg, sup_name });
+                        defer a.free(qualified);
+                        if (classes.get(qualified)) |sd| break :blk sd;
+                    }
+                    break :blk classes.get(sup_name) orelse continue;
+                };
                 if (def.cell == sup_def.cell) continue;
                 const sg = sup_def.borrow();
                 const sup_is_interface = sg.get().is_interface;
@@ -1121,11 +1267,16 @@ fn buildModuleWithOverrides(
         defer own.deinit();
         try collectCompanionOwnMembers(c, &own);
         var fids = try a.alloc(FuncId, parent_args.len);
+        const pca_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+        const prev_pca_pkg = ir.lower.decl.setLowerSelfPackage(pca_pkg);
+        defer _ = ir.lower.decl.setLowerSelfPackage(prev_pca_pkg);
         for (parent_args, 0..) |*e, idx| {
             const nm = try std.fmt.allocPrint(a, "__parent_ctor_arg_{s}_{d}", .{ c.name.name, idx });
             fids[idx] = try ir.lower.lowerExprAsParamThunkScoped(module, param_refs.items, e, nm, c.name.name, &own);
         }
         try parent_ctor_args.put(c.name.name, fids);
+        const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        if (!std.mem.eql(u8, cfqn, c.name.name)) try parent_ctor_args.put(cfqn, fids);
     }
 
     // Init blocks as 1-arg thunks taking `this` plus ctor params.
@@ -1156,11 +1307,16 @@ fn buildModuleWithOverrides(
         try local_params.append(a, "this");
         for (c.primary_params) |*p| try local_params.append(a, p.name.name);
         var fids = try a.alloc(FuncId, c.init_blocks.len);
+        const ib_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+        const prev_ib_pkg = ir.lower.decl.setLowerSelfPackage(ib_pkg);
+        defer _ = ir.lower.decl.setLowerSelfPackage(prev_ib_pkg);
         for (c.init_blocks, 0..) |*blk, idx| {
             const nm = try std.fmt.allocPrint(a, "__init_block_{s}_{d}", .{ c.name.name, idx });
             fids[idx] = try ir.lower.lowerAccessorBlock(module, c.name.name, &own_members, local_params.items, blk, nm);
         }
         try init_blocks.put(c.name.name, fids);
+        const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        if (!std.mem.eql(u8, cfqn, c.name.name)) try init_blocks.put(cfqn, fids);
     }
 
     // Per-class delegation expressions.
@@ -1173,6 +1329,9 @@ fn buildModuleWithOverrides(
         defer param_refs.deinit(a);
         for (c.primary_params) |*p| try param_refs.append(a, p.name.name);
         var entries: std.ArrayList(StrFunc) = .empty;
+        const cd_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+        const prev_cd_pkg = ir.lower.decl.setLowerSelfPackage(cd_pkg);
+        defer _ = ir.lower.decl.setLowerSelfPackage(prev_cd_pkg);
         for (c.supertype_delegates, 0..) |delegate_opt, sup_idx| {
             if (delegate_opt) |delegate_expr| {
                 const sup_name = if (sup_idx < c.supertypes.len) c.supertypes[sup_idx].name.name else "";
@@ -1182,7 +1341,10 @@ fn buildModuleWithOverrides(
             }
         }
         if (entries.items.len != 0) {
-            try class_delegates.put(c.name.name, try entries.toOwnedSlice(a));
+            const owned = try entries.toOwnedSlice(a);
+            try class_delegates.put(c.name.name, owned);
+            const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+            if (!std.mem.eql(u8, cfqn, c.name.name)) try class_delegates.put(cfqn, owned);
         } else {
             entries.deinit(a);
         }
@@ -1194,6 +1356,9 @@ fn buildModuleWithOverrides(
         if (d.* != .Class) continue;
         const c = &d.Class;
         if (c.secondary_ctors.len == 0) continue;
+        const sc_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+        const prev_sc_pkg = ir.lower.decl.setLowerSelfPackage(sc_pkg);
+        defer _ = ir.lower.decl.setLowerSelfPackage(prev_sc_pkg);
         var own_members = StringSet.init(a);
         defer own_members.deinit();
         for (c.primary_params) |*p| {
@@ -1272,6 +1437,8 @@ fn buildModuleWithOverrides(
             };
         }
         try secondary_ctors.put(c.name.name, entries);
+        const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        if (!std.mem.eql(u8, cfqn, c.name.name)) try secondary_ctors.put(cfqn, entries);
     }
 
     // Top-level property initialisers — const first, then the rest.
@@ -1281,6 +1448,9 @@ fn buildModuleWithOverrides(
         if (d.* != .Property) continue;
         const p = &d.Property;
         if (p.receiver_type != null or !p.is_const) continue;
+        const tp_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
+        const prev_tp_pkg = ir.lower.decl.setLowerSelfPackage(tp_pkg);
+        defer _ = ir.lower.decl.setLowerSelfPackage(prev_tp_pkg);
         if (p.init) |*init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, init, nm);
@@ -1291,6 +1461,9 @@ fn buildModuleWithOverrides(
         if (d.* != .Property) continue;
         const p = &d.Property;
         if (p.receiver_type != null or p.is_const) continue;
+        const tp_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
+        const prev_tp_pkg = ir.lower.decl.setLowerSelfPackage(tp_pkg);
+        defer _ = ir.lower.decl.setLowerSelfPackage(prev_tp_pkg);
         if (p.init) |*init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, init, nm);
@@ -1326,6 +1499,9 @@ fn buildModuleWithOverrides(
     }
     for (ext_prop_decls.items) |p| {
         const recv = p.receiver_type orelse continue;
+        const ep_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
+        const prev_ep_pkg = ir.lower.decl.setLowerSelfPackage(ep_pkg);
+        defer _ = ir.lower.decl.setLowerSelfPackage(prev_ep_pkg);
         if (p.getter) |*getter| {
             var empty_members = StringSet.init(a);
             defer empty_members.deinit();

@@ -88,11 +88,29 @@ pub fn lowerClassWithExtrasFqn(
     extra_members: *const StringSet,
     class_fqn: []const u8,
 ) Allocator.Error!ClassId {
+    return lowerClassWithExtrasFqnPkg(module, c, file_classes, extra_members, class_fqn, ir.packageOfFqn(class_fqn, c.name.name));
+}
+
+/// Like [`lowerClassWithExtrasFqn`] but with the class's DECLARING
+/// package supplied explicitly. A nested/companion class's FQN is
+/// class-qualified (`pkg.Outer.Inner`), so deriving the package from it
+/// would hand the symbol index a phantom package; the build driver knows
+/// the file's package and passes it here.
+pub fn lowerClassWithExtrasFqnPkg(
+    module: *Module,
+    c: *const ast.Class,
+    file_classes: *const FileClasses,
+    extra_members: *const StringSet,
+    class_fqn: []const u8,
+    class_pkg: []const u8,
+) Allocator.Error!ClassId {
     lower_class_fqn = class_fqn;
-    const prev_pkg = setLowerSelfPackage(ir.packageOfFqn(class_fqn, c.name.name));
+    lower_class_pkg = class_pkg;
+    const prev_pkg = setLowerSelfPackage(class_pkg);
     const id = try lowerClassWithExtras(module, c, file_classes, extra_members);
     _ = setLowerSelfPackage(prev_pkg);
     lower_class_fqn = null;
+    lower_class_pkg = null;
     return id;
 }
 
@@ -102,20 +120,13 @@ pub fn lowerClassWithExtrasFqn(
 /// (and their other callers/tests) unchanged.
 var lower_class_fqn: ?[]const u8 = null;
 
-/// Declaring package of the function/class whose body is being lowered.
-/// Seeded by the build driver per top-level decl (and per class while
-/// its methods lower) so a `FuncBuilder` can key the symbol index on the
-/// caller's package. `""` is the no-package case.
-threadlocal var lower_self_package: []const u8 = "";
+/// Declaring package matching `lower_class_fqn`, supplied by the build
+/// driver (null falls back to deriving it from the FQN).
+var lower_class_pkg: ?[]const u8 = null;
 
-/// Set the caller package read into the next `FuncBuilder`. Returns the
-/// previous value so a nested lowering (a class method, a local fn) can
-/// restore the enclosing package on exit.
-pub fn setLowerSelfPackage(pkg: []const u8) []const u8 {
-    const prev = lower_self_package;
-    lower_self_package = pkg;
-    return prev;
-}
+/// The caller-package seed lives next to `FuncBuilder` (every builder
+/// reads it on init); re-exported here for the build drivers.
+pub const setLowerSelfPackage = build.setLowerSelfPackage;
 
 /// Names captured by the anonymous object whose method is being lowered
 /// (`object : Flow { collect(c) { c.block() } }` where `block` is an
@@ -318,7 +329,7 @@ pub fn lowerClassWithExtras(
         .id = ClassId.from(0),
         .name = c.name.name,
         .fqn = class_fqn,
-        .package = ir.packageOfFqn(class_fqn, c.name.name),
+        .package = lower_class_pkg orelse ir.packageOfFqn(class_fqn, c.name.name),
         .primary_params = try primary_params.toOwnedSlice(a),
         .methods = &.{},
         .init_block = null,
@@ -385,8 +396,14 @@ pub fn lowerClassWithExtras(
     }
     var supertypes: std.ArrayList(ClassId) = .empty;
     errdefer supertypes.deinit(a);
+    // A supertype reference resolves from the declaring class's own
+    // scope (its package + its file's imports), so a cross-package
+    // simple-name collision binds the supertype this class can see.
+    const class_pkg = lower_class_pkg orelse ir.packageOfFqn(class_fqn, c.name.name);
     for (c.supertypes) |*t| {
-        if (module.classId(t.name.name)) |cid| try supertypes.append(a, cid);
+        if (module.classIdIndexed(t.name.name, class_pkg, t.name.span.file)) |cid| {
+            try supertypes.append(a, cid);
+        }
     }
     // Patch the registered class with its now-known method list and
     // resolved supertypes.
@@ -736,7 +753,6 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
     const a = module.registry.allocator;
     var b = try FuncBuilder.init(a, module);
     defer b.deinit();
-    b.self_package = lower_self_package;
 
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(a);

@@ -1558,11 +1558,42 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         if (try sequenceMember(self, allocator, receiver, name, args)) |r| return r;
     }
 
-    // Inner-class construction: `outer.Inner(args)`.
+    // Inner-class construction: `outer.Inner(args)`. The inner class's
+    // registered FQN is `{outer fqn}.{name}`, so the receiver's own class
+    // (then its parents) resolves the exact nested class; the bare
+    // simple-name view is only the fallback for synthesized shapes.
     if (receiver.* == .Instance) {
         const def_opt = blk: {
             const cg = self.classes.borrow();
             defer cg.deinit();
+            var outer_cls: ?ObjRef(ClassDef) = blk2: {
+                const g = receiver.Instance.borrow();
+                defer g.deinit();
+                break :blk2 g.get().class.clone();
+            };
+            var hops: usize = 0;
+            while (outer_cls) |oc| : (hops += 1) {
+                if (hops > 64) {
+                    oc.deinit();
+                    break;
+                }
+                const og = oc.borrow();
+                const outer_fqn = og.get().fqn;
+                const qualified = std.fmt.allocPrint(allocator, "{s}.{s}", .{ outer_fqn, name }) catch {
+                    og.deinit();
+                    oc.deinit();
+                    break;
+                };
+                defer allocator.free(qualified);
+                const next: ?ObjRef(ClassDef) = if (og.get().parent) |p| p.clone() else null;
+                og.deinit();
+                oc.deinit();
+                if (cg.get().get(qualified)) |d| {
+                    if (next) |n| n.deinit();
+                    break :blk d.clone();
+                }
+                outer_cls = next;
+            }
             if (cg.get().get(name)) |d| break :blk d.clone();
             break :blk null;
         };
@@ -1570,9 +1601,16 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
             defer def.deinit();
             const dg = def.borrow();
             const is_inner = dg.get().is_inner;
+            const def_fqn = dg.get().fqn;
             dg.deinit();
             if (is_inner) {
-                if (self.module.borrow().get().classId(name)) |class_id| {
+                // The runtime ClassDef carries the FQN, so resolve the
+                // module class by it; a same-simple-name class from
+                // another package cannot swap in.
+                const mg2 = self.module.borrow();
+                const cid_opt = mg2.get().classIdByFqn(def_fqn) orelse mg2.get().classId(name);
+                mg2.deinit();
+                if (cid_opt) |class_id| {
                     const r = try newInstanceById(self, allocator, class_id, args, receiver);
                     if (r == .ok and r.ok == .Instance) {
                         const ig = r.ok.Instance.borrowMut();
@@ -2195,12 +2233,15 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         break :blk false;
     };
     if (!has_recv_ext) {
-        const any_probes = [_][]const u8{
-            try std.fmt.allocPrint(allocator, "kotlin.io.{s}", .{name}),
-            try std.fmt.allocPrint(allocator, "kotlin.AutoCloseable.{s}", .{name}),
-            try std.fmt.allocPrint(allocator, "kotlin.Any.{s}", .{name}),
+        // Link-settled name → FQN map over the builtin kotlin.io /
+        // AutoCloseable / Any member surfaces; replaces the per-call
+        // probe loop with one deterministic edge per name.
+        const mapped: ?[]const u8 = blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().anyMemberGlobal(name);
         };
-        for (any_probes) |p| {
+        if (mapped) |p| {
             if (lookupIntrinsic(self, p)) |func| {
                 const all_args = try prependReceiver(allocator, receiver, args);
                 return try dispatchIntrinsic(self, allocator, p, func, all_args);
@@ -2658,7 +2699,7 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
     const pname = pg.get().*;
     pg.deinit();
     if (std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) {
-        const has_fn = self.module.borrow().get().funcId(pname) != null;
+        const has_fn = self.module.borrow().get().hasFuncNamed(pname);
         const callable = lookupGlobalValue(self, pname);
         const is_callable_global = callable != null and switch (callable.?) {
             .Function, .IrClosure => true,
@@ -3231,11 +3272,13 @@ fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
     }
     if (is_data and !has_user_override and std.mem.eql(u8, name, "copy")) {
         var class_name2: []const u8 = undefined;
+        var class_fqn2: []const u8 = undefined;
         var n_params: usize = undefined;
         {
             const g = inst.borrow();
             const cg = g.get().class.borrow();
             class_name2 = cg.get().name;
+            class_fqn2 = cg.get().fqn;
             n_params = cg.get().primary_params.len;
             cg.deinit();
             g.deinit();
@@ -3254,7 +3297,13 @@ fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
             }
             cg.deinit();
             g.deinit();
-            if (self.module.borrow().get().classId(class_name2)) |cid| {
+            // The receiver's ClassDef carries the FQN: copy() rebuilds
+            // the SAME class, never a same-simple-name one from another
+            // package.
+            const mg2 = self.module.borrow();
+            const cid_opt = mg2.get().classIdByFqn(class_fqn2) orelse mg2.get().classId(class_name2);
+            mg2.deinit();
+            if (cid_opt) |cid| {
                 return try newInstanceById(self, allocator, cid, new_args.items, null);
             }
         }
@@ -4278,12 +4327,14 @@ fn copyNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, args: 
     var is_data = false;
     var n_params: usize = 0;
     var class_name: []const u8 = undefined;
+    var class_fqn: []const u8 = undefined;
     {
         const g = inst.borrow();
         const cg = g.get().class.borrow();
         is_data = cg.get().is_data;
         n_params = cg.get().primary_params.len;
         class_name = cg.get().name;
+        class_fqn = cg.get().fqn;
         cg.deinit();
         g.deinit();
     }
@@ -4324,7 +4375,11 @@ fn copyNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, args: 
         cg.deinit();
         g.deinit();
     }
-    if (self.module.borrow().get().classId(class_name)) |cid| {
+    // Same FQN-keyed rebuild as the positional `copy` path.
+    const mg2 = self.module.borrow();
+    const cid_opt = mg2.get().classIdByFqn(class_fqn) orelse mg2.get().classId(class_name);
+    mg2.deinit();
+    if (cid_opt) |cid| {
         return try newInstanceById(self, allocator, cid, new_args.items, null);
     }
     return null;

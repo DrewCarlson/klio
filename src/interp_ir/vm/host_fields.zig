@@ -707,7 +707,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         {
             const g = self.module.borrow();
             defer g.deinit();
-            if (g.get().funcId(name) != null) break :blk true;
+            if (g.get().hasFuncNamed(name)) break :blk true;
         }
         const gg = self.globals.borrow();
         defer gg.deinit();

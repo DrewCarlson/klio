@@ -432,13 +432,18 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
     if (callable.* == .Class) {
         const def = callable.Class;
         var name: []const u8 = undefined;
+        var fqn: []const u8 = undefined;
         {
             const dg = def.borrow();
             defer dg.deinit();
             name = dg.get().name;
+            fqn = dg.get().fqn;
         }
+        // The bound ClassDef carries the FQN; resolve the module class
+        // by it so `::Ctor` of a same-simple-name class from another
+        // package constructs the referenced class.
         const module_g = self.module.borrow();
-        const class_id_opt = module_g.get().classId(name);
+        const class_id_opt = module_g.get().classIdByFqn(fqn) orelse module_g.get().classId(name);
         module_g.deinit();
         if (class_id_opt) |class_id| {
             const r = try construct(self, class_id, args, out);

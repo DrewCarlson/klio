@@ -55,6 +55,22 @@ pub const InlineLambdaRet = struct {
 /// appends to. Carries a simple scope stack so the lowering pass
 /// can resolve `Path { name }` reads against function parameters
 /// and locally introduced bindings.
+/// Declaring package of the decl whose body/initializer/thunk is being
+/// lowered. Seeded by the build driver per top-level decl (functions,
+/// classes — including accessors, init blocks and ctor thunks — and
+/// top-level properties) and read by every `FuncBuilder` on init, so the
+/// symbol index always keys on the caller's package. `""` is the
+/// no-package case.
+threadlocal var lower_self_package: []const u8 = "";
+
+/// Install the caller package for subsequently-created builders. Returns
+/// the previous value so a nested lowering restores it on exit.
+pub fn setLowerSelfPackage(pkg: []const u8) []const u8 {
+    const prev = lower_self_package;
+    lower_self_package = pkg;
+    return prev;
+}
+
 pub const FuncBuilder = struct {
     allocator: Allocator,
     module: *Module,
@@ -198,6 +214,7 @@ pub const FuncBuilder = struct {
         var self = FuncBuilder{
             .allocator = allocator,
             .module = module,
+            .self_package = lower_self_package,
             .cur = BlockId.from(0),
             .next_reg = 0,
             .outer_names = StringSet.init(allocator),
