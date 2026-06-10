@@ -556,11 +556,17 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
             const g_params = g.params.len;
             const g_user_params = if (paramIsThis(g.params)) g_params - 1 else g_params;
             if (g_user_params != want and !lastIsVararg(g.params)) continue;
+            if (trace.enabled(f.name)) {
+                trace.emit("ladder=bodyless_sibling name={s} fqn={s}", .{ f.name, g.fqn });
+            }
             return callFunc(self, allocator, module, cand, args_in);
         }
         // No same-name body sibling — try the declared FQN first, then
         // probe the common stdlib packages by simple name.
         if (lookupIntrinsic(self, f.fqn)) |intrinsic| {
+            if (trace.enabled(f.name)) {
+                trace.emit("ladder=bodyless_fqn name={s} fqn={s}", .{ f.name, f.fqn });
+            }
             return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
         }
         const simple = f.name;
@@ -581,6 +587,9 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
             const probe = std.fmt.allocPrint(allocator, "{s}{s}", .{ pfx, simple }) catch continue;
             defer allocator.free(probe);
             if (lookupIntrinsic(self, probe)) |intrinsic| {
+                if (trace.enabled(simple)) {
+                    trace.emit("ladder=bodyless_prefix name={s} fqn={s}", .{ simple, probe });
+                }
                 return dispatchIntrinsic(self, allocator, probe, intrinsic, args_in);
             }
         }

@@ -696,15 +696,53 @@ fn buildModuleWithOverrides(
         ir.lower.setTopLevelPropNames(top_props);
     }
 
-    // Non-wildcard imports keyed by declaring file then bound leaf name.
+    // Non-wildcard imports keyed by declaring file then bound leaf name;
+    // wildcard imports keyed by declaring file as dotted package paths.
     for (file.imports) |*imp| {
-        if (imp.wildcard or imp.path.len == 0) continue;
-        var segs: std.ArrayList([]const u8) = .empty;
-        for (imp.path) |id| try segs.append(a, id.name);
+        if (imp.path.len == 0) continue;
+        if (imp.wildcard) {
+            // `import pkg.*`: record the package per file so the symbol
+            // index can rank wildcard-imported candidates above the
+            // implicitly-imported built-ins.
+            var dotted: std.ArrayList(u8) = .empty;
+            defer dotted.deinit(a);
+            for (imp.path, 0..) |id, i| {
+                if (i != 0) try dotted.append(a, '.');
+                try dotted.appendSlice(a, id.name);
+            }
+            const wgop = try module.registry.import_wildcards.getOrPut(imp.span.file);
+            if (!wgop.found_existing) wgop.value_ptr.* = .empty;
+            try wgop.value_ptr.append(a, try a.dupe(u8, dotted.items));
+            continue;
+        }
+        var dotted: std.ArrayList(u8) = .empty;
+        defer dotted.deinit(a);
+        const segs = try a.alloc([]const u8, imp.path.len);
+        for (imp.path, 0..) |id, i| {
+            segs[i] = id.name;
+            if (i != 0) try dotted.append(a, '.');
+            try dotted.appendSlice(a, id.name);
+        }
         const leaf = if (imp.alias) |al| al.name else imp.path[imp.path.len - 1].name;
         const fgop = try module.registry.import_aliases.getOrPut(imp.span.file);
-        if (!fgop.found_existing) fgop.value_ptr.* = std.StringHashMap(std.ArrayList([]const u8)).init(a);
-        try fgop.value_ptr.put(leaf, segs);
+        if (!fgop.found_existing) fgop.value_ptr.* = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+        const lgop = try fgop.value_ptr.getOrPut(leaf);
+        if (!lgop.found_existing) lgop.value_ptr.* = .empty;
+        // Kotlin keeps every same-leaf import in scope (the second one
+        // is an ambiguity at the use site, not a shadow), so the leaf
+        // maps to ALL its import paths; only an exact repeat collapses.
+        var already = false;
+        for (lgop.value_ptr.items) |p| {
+            if (std.mem.eql(u8, p.fqn, dotted.items)) {
+                already = true;
+                break;
+            }
+        }
+        if (already) {
+            a.free(segs);
+        } else {
+            try lgop.value_ptr.append(a, .{ .fqn = try a.dupe(u8, dotted.items), .segs = segs });
+        }
     }
 
     // Pre-register every class name so `classId` resolves order-independently.
@@ -766,7 +804,7 @@ fn buildModuleWithOverrides(
                 .is_inline = f.is_inline,
                 .capture_order = &.{},
                 .implicit_label = null,
-                .low_priority = false,
+                .low_priority = ir.lower.decl.isLowPriorityOverload(f),
             });
             try module.func_index.append(a, .{ .name = f.name.name, .id = id });
             const gop = try module.func_name_index.getOrPut(f.name.name);
@@ -782,6 +820,19 @@ fn buildModuleWithOverrides(
                 }
                 try module.decl_user_arity.put(id.int(), .{ .required = required, .total = @intCast(f.params.len), .trailing_vararg = has_vararg });
             }
+            {
+                // Declared parameter types at full structural
+                // granularity, rendered by the SAME lowering body params
+                // use (`loweredTypeRef`), so the symbol index proves or
+                // refutes signature identity identically for a forward
+                // reference and for its later-lowered body.
+                const sig = try a.alloc(ir.TypeRef, f.params.len);
+                for (f.params, 0..) |*p, i| {
+                    sig[i] = try ir.lower.decl.loweredTypeRef(a, &p.ty, true);
+                }
+                try module.decl_user_sig.put(id.int(), sig);
+            }
+            try module.decl_span.put(id.int(), f.span);
             try stub_ids.append(a, id);
         }
     }
@@ -1762,6 +1813,18 @@ const testing = std.testing;
 test {
     testing.refAllDecls(@This());
     _ = lift;
+}
+
+test "symbol-index default-import list matches the stdlib's canonical one" {
+    // `ir` cannot depend on `stdlib`, so the index carries a mirror of
+    // `IMPLICITLY_IMPORTED_PACKAGES`; this pins the two in lockstep.
+    try testing.expectEqual(
+        stdlib.IMPLICITLY_IMPORTED_PACKAGES.len,
+        ir.Module.default_import_packages.len,
+    );
+    for (stdlib.IMPLICITLY_IMPORTED_PACKAGES, ir.Module.default_import_packages) |a, b| {
+        try testing.expectEqualStrings(a, b);
+    }
 }
 
 test "build_module produces an owned empty module shell" {

@@ -218,7 +218,7 @@ pub fn runModuleFiles(
     all_asts.appendSlice(gpa, loaded.asts) catch return 1;
     all_asts.appendSlice(gpa, asts.items) catch return 1;
 
-    return runBuilt(gpa, all_asts.items, loaded.bindings, "runtime error: no main function in module");
+    return runBuilt(gpa, all_asts.items, loaded.bindings, &map, "runtime error: no main function in module");
 }
 
 /// `klio run` over a single source file through `interp_ir`'s Vm.
@@ -258,15 +258,17 @@ pub fn runFileIrVm(
     all_asts.appendSlice(gpa, loaded.asts) catch return 1;
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
 
-    return runBuilt(gpa, all_asts.items, loaded.bindings, "error: no main function found");
+    return runBuilt(gpa, all_asts.items, loaded.bindings, &map, "error: no main function found");
 }
 
 /// Shared tail of the two `run*` paths: build the module, materialize a
-/// Vm, register installed bindings, and run `main`.
+/// Vm, register installed bindings, and run `main`. `map` locates
+/// lowering diagnostics (file:line) in the parsed sources.
 fn runBuilt(
     gpa: std.mem.Allocator,
     all_asts: []const KotlinFile,
     bindings: HostBindings,
+    map: *const SourceMap,
     no_main_msg: []const u8,
 ) u8 {
     // The whole `klio` process runs on one process-lifetime arena
@@ -279,6 +281,21 @@ fn runBuilt(
     defer runtime.setReclaim(prev_reclaim);
 
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch return 1;
+    // Lowering-time resolution diagnostics (ambiguous bare calls) fail
+    // the program before it runs.
+    {
+        const mg = built.module.borrow();
+        defer mg.deinit();
+        const rdiags = mg.get().resolve_diags.items;
+        if (rdiags.len != 0) {
+            for (rdiags) |d| {
+                const msg = d.render(gpa, map) catch return 1;
+                defer gpa.free(msg);
+                io.printStderr(gpa, "{s}\n", .{msg});
+            }
+            return 1;
+        }
+    }
     const main_id = built.main;
     const fb = Vm.fromBuilt(gpa, &built) catch return 1;
     var vm = fb.vm;

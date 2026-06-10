@@ -448,6 +448,68 @@ pub fn loweredTypeName(allocator: Allocator, ty: *const ast.TypeRef) Allocator.E
     return ty.name.name;
 }
 
+/// Lowered structural form of a declared type: the head keeps
+/// `loweredTypeName`'s rendering (so runtime overload matching, which
+/// reads only the head name and nullability, is unchanged) while `args`
+/// carries the full recursive shape — generic type arguments, and for a
+/// function type its receiver, parameter, and return types. Source
+/// facts with no head-name slot are encoded as synthetic marker args
+/// (`#suspend` for a suspend function type, `#non-null` for `T & Any`,
+/// `#qual:a.b.C` for a qualified path, `*` for a star projection, an
+/// `in#`/`out#` head prefix for a variance projection) so two parameter
+/// lists prove identical only when the declared types really are. With
+/// `own_names` every string is duped into `allocator` so the result can
+/// be deep-freed (the phase-1 declared-signature record); body params
+/// borrow the AST names like the rest of the lowered IR.
+pub fn loweredTypeRef(allocator: Allocator, ty: *const ast.TypeRef, own_names: bool) Allocator.Error!ir.TypeRef {
+    var args: std.ArrayList(ir.TypeRef) = .empty;
+    errdefer args.deinit(allocator);
+    var head: []const u8 = undefined;
+    if (ty.function) |ft| {
+        head = try std.fmt.allocPrint(allocator, "Function{d}", .{ft.params.len});
+        if (ft.is_suspend) try args.append(allocator, try markerRef(allocator, "#suspend", own_names));
+        if (ft.receiver) |*recv| try args.append(allocator, try loweredTypeRef(allocator, recv, own_names));
+        for (ft.params) |*p| try args.append(allocator, try loweredTypeRef(allocator, p, own_names));
+        try args.append(allocator, try loweredTypeRef(allocator, &ft.ret, own_names));
+    } else {
+        head = if (own_names) try allocator.dupe(u8, ty.name.name) else ty.name.name;
+        for (ty.type_args) |*ta| try args.append(allocator, try loweredTypeArg(allocator, ta, own_names));
+    }
+    if (ty.definitely_non_null) try args.append(allocator, try markerRef(allocator, "#non-null", own_names));
+    if (ty.qualified_path) |qp| {
+        try args.append(allocator, .{
+            .name = try std.fmt.allocPrint(allocator, "#qual:{s}", .{qp}),
+            .nullable = false,
+            .args = &.{},
+        });
+    }
+    return .{ .name = head, .nullable = ty.nullable, .args = try args.toOwnedSlice(allocator) };
+}
+
+fn loweredTypeArg(allocator: Allocator, ta: *const ast.TypeArg, own_names: bool) Allocator.Error!ir.TypeRef {
+    if (ta.is_star) return markerRef(allocator, "*", own_names);
+    var lowered = try loweredTypeRef(allocator, &ta.ty, own_names);
+    const prefix: ?[]const u8 = switch (ta.variance) {
+        .Invariant => null,
+        .In => "in#",
+        .Out => "out#",
+    };
+    if (prefix) |p| {
+        const combined = try std.fmt.allocPrint(allocator, "{s}{s}", .{ p, lowered.name });
+        if (own_names) allocator.free(lowered.name);
+        lowered.name = combined;
+    }
+    return lowered;
+}
+
+fn markerRef(allocator: Allocator, name: []const u8, own_names: bool) Allocator.Error!ir.TypeRef {
+    return .{
+        .name = if (own_names) try allocator.dupe(u8, name) else name,
+        .nullable = false,
+        .args = &.{},
+    };
+}
+
 /// Collect an extension receiver's own + inherited member names, walking
 /// supertypes reachable through the file's class registry.
 fn collectRecvMembers(
@@ -786,13 +848,13 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
         });
     }
     for (f.params) |*p| {
+        // The full structural type (generic args, function-type shapes)
+        // rides on the param so the symbol index can prove or refute
+        // signature identity between overloads; runtime overload
+        // matching keeps reading only the head name + nullability.
         try params.append(a, .{
             .name = p.name.name,
-            .ty = .{
-                .name = try loweredTypeName(a, &p.ty),
-                .nullable = p.ty.nullable,
-                .args = &.{},
-            },
+            .ty = try loweredTypeRef(a, &p.ty, false),
             .default = null,
             .is_property = false,
             .is_vararg = p.is_vararg,
@@ -824,8 +886,11 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
 /// (kotlin-internal) or `@Deprecated(level = DeprecationLevel.ERROR)`.
 /// kotlinx.coroutines uses these on the receiver-less `async`/`launch`
 /// guard stubs that exist only to produce a compile error and otherwise
-/// just `throw`; klio must never bind one over a real overload.
-fn isLowPriorityOverload(f: *const ast.Function) bool {
+/// just `throw`; klio must never bind one over a real overload. Public
+/// so phase-1 header registration can mark stubs before their bodies
+/// are lowered, keeping the symbol index's low-priority filter
+/// order-independent over forward references.
+pub fn isLowPriorityOverload(f: *const ast.Function) bool {
     for (f.annotations) |*ann| {
         const leaf: []const u8 = if (ann.path.len != 0) ann.path[ann.path.len - 1].name else "";
         if (std.mem.eql(u8, leaf, "LowPriorityInOverloadResolution")) {

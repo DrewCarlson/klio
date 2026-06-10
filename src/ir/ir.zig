@@ -731,6 +731,26 @@ pub const Module = struct {
     /// user parameters' `(required, total, trailing_vararg)`.
     /// Lowering-only; not serialized.
     decl_user_arity: std.AutoHashMap(u32, DeclArity),
+    /// Per top-level `FuncId` (keyed by `FuncId.int()`): the declared
+    /// user parameters' full structural types — generic arguments and
+    /// function-type shapes included — recorded at phase-1 header
+    /// registration through the same lowering body params use. Lets the
+    /// symbol index prove signature identity for forward references
+    /// whose bodies (and thus lowered params) do not exist yet. Names
+    /// and arg slices are owned by the module allocator. Lowering-only;
+    /// not serialized.
+    decl_user_sig: std.AutoHashMap(u32, []TypeRef),
+    /// Per top-level `FuncId` (keyed by `FuncId.int()`): the function
+    /// declaration's source span, recorded at phase-1 header
+    /// registration so resolution diagnostics can point at the
+    /// conflicting declarations. Lowering-only; not serialized.
+    decl_span: std.AutoHashMap(u32, Span),
+    /// Lowering-time resolution diagnostics: ambiguous bare calls the
+    /// symbol index refused to pick among. Recorded during lowering and
+    /// surfaced by the build driver before the program runs. The name
+    /// and FQN slices borrow from the module's own funcs/AST and share
+    /// its lifetime.
+    resolve_diags: std.ArrayList(ResolveDiag) = .empty,
 
     /// `(required, total, trailing_vararg)` for a top-level function's
     /// declared user parameters.
@@ -740,12 +760,64 @@ pub const Module = struct {
         trailing_vararg: bool,
     };
 
+    /// One ambiguous bare-call diagnostic: the call-site name and span
+    /// plus the first two identical-signature candidates' FQNs and
+    /// declaration spans (a span is null when the candidate carries no
+    /// phase-1 record).
+    pub const ResolveDiag = struct {
+        name: []const u8,
+        fqn_a: []const u8,
+        fqn_b: []const u8,
+        span: Span,
+        span_a: ?Span = null,
+        span_b: ?Span = null,
+
+        /// Render the diagnostic with the call site (and declaration
+        /// sites) located as `path:line` through `map`. Two identical
+        /// FQNs are conflicting overloads — no qualification or import
+        /// can separate two declarations sharing one FQN, so the fix is
+        /// declaration-side. Distinct FQNs are a cross-package tie the
+        /// caller resolves by qualifying the call or importing one
+        /// candidate explicitly.
+        pub fn render(self: ResolveDiag, allocator: Allocator, map: *const span.SourceMap) Allocator.Error![]u8 {
+            const call_loc = try locOf(allocator, map, self.span);
+            defer allocator.free(call_loc);
+            if (std.mem.eql(u8, self.fqn_a, self.fqn_b) and self.span_a != null and self.span_b != null) {
+                const loc_a = try locOf(allocator, map, self.span_a.?);
+                defer allocator.free(loc_a);
+                const loc_b = try locOf(allocator, map, self.span_b.?);
+                defer allocator.free(loc_b);
+                return std.fmt.allocPrint(
+                    allocator,
+                    "{s}: error: conflicting overloads of `{s}`: identical signatures declared at {s} and {s} — rename or remove one of the declarations",
+                    .{ call_loc, self.name, loc_a, loc_b },
+                );
+            }
+            return std.fmt.allocPrint(
+                allocator,
+                "{s}: error: ambiguous reference `{s}`: candidates `{s}`, `{s}` — qualify the call or import one explicitly",
+                .{ call_loc, self.name, self.fqn_a, self.fqn_b },
+            );
+        }
+
+        fn locOf(allocator: Allocator, map: *const span.SourceMap, s: Span) Allocator.Error![]u8 {
+            if (s.file.int() >= map.files.items.len) {
+                return std.fmt.allocPrint(allocator, "?:{d}", .{s.start});
+            }
+            const sf = map.get(s.file);
+            const lc = sf.lineCol(s.start);
+            return std.fmt.allocPrint(allocator, "{s}:{d}", .{ sf.path, lc.line });
+        }
+    };
+
     pub fn init(allocator: Allocator) Module {
         return .{
             .func_name_index = std.StringHashMap(std.ArrayList(FuncId)).init(allocator),
             .registry = ModuleRegistry.init(allocator),
             .decl_user_params = std.AutoHashMap(u32, u32).init(allocator),
             .decl_user_arity = std.AutoHashMap(u32, DeclArity).init(allocator),
+            .decl_user_sig = std.AutoHashMap(u32, []TypeRef).init(allocator),
+            .decl_span = std.AutoHashMap(u32, Span).init(allocator),
         };
     }
 
@@ -771,6 +843,16 @@ pub const Module = struct {
         self.registry.deinit();
         self.decl_user_params.deinit();
         self.decl_user_arity.deinit();
+        {
+            var sig_it = self.decl_user_sig.valueIterator();
+            while (sig_it.next()) |sig| {
+                for (sig.*) |*ty| ty.deinit(allocator);
+                allocator.free(sig.*);
+            }
+            self.decl_user_sig.deinit();
+        }
+        self.decl_span.deinit();
+        self.resolve_diags.deinit(allocator);
     }
 
     /// Look up a class by simple name.
@@ -875,50 +957,91 @@ pub const Module = struct {
         return false;
     }
 
-    /// The full segment path of a non-wildcard import whose leaf is
-    /// `name`, as seen from source file `file`. A named import is
-    /// file-scoped, so only imports declared in `file` are consulted.
+    /// The full segment path of the first non-wildcard import whose
+    /// leaf is `name`, as seen from source file `file`. A named import
+    /// is file-scoped, so only imports declared in `file` are consulted.
     pub fn importAliasIn(self: *const Module, file: FileId, name: []const u8) ?[]const []const u8 {
-        if (self.registry.import_aliases.get(file)) |m| {
-            if (m.get(name)) |segs| return segs.items;
-        }
-        return null;
+        const paths = self.importAliasPathsIn(file, name);
+        if (paths.len == 0) return null;
+        return paths[0].segs;
     }
 
-    /// Bare-call preference tier of a candidate func, ranked low-to-high
-    /// urgency: 0 = own package, 1 = file-named-import, 2 = built-in
-    /// stdlib, 3 = any other package. `caller_pkg` is the caller's
-    /// declaring package (`""` for a user script). A non-wildcard import
-    /// of `name` in `caller_file` whose full path equals the candidate's
-    /// FQN matches tier 1.
-    fn bareCallTier(self: *const Module, f: *const Func, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
-        if (std.mem.eql(u8, f.package, caller_pkg)) return 0;
-        if (self.importAliasIn(caller_file, name)) |segs| {
-            if (segs.len >= 1) {
-                // Reconstruct the import's dotted path and compare to the
-                // candidate's FQN.
-                var matches = true;
-                var idx: usize = 0;
-                var rest: []const u8 = f.fqn;
-                while (idx < segs.len) : (idx += 1) {
-                    if (!std.mem.startsWith(u8, rest, segs[idx])) {
-                        matches = false;
-                        break;
-                    }
-                    rest = rest[segs[idx].len..];
-                    if (idx + 1 < segs.len) {
-                        if (rest.len == 0 or rest[0] != '.') {
-                            matches = false;
-                            break;
-                        }
-                        rest = rest[1..];
-                    }
-                }
-                if (matches and rest.len == 0) return 1;
+    /// Every non-wildcard import in `file` whose bound leaf is `name`,
+    /// in declaration order. More than one entry means the file imports
+    /// the same leaf from several paths — Kotlin keeps every such
+    /// import in scope, so an identical-signature pair behind two
+    /// same-leaf imports is an ambiguity, never a shadow.
+    pub fn importAliasPathsIn(self: *const Module, file: FileId, name: []const u8) []const ModuleRegistry.ImportPath {
+        if (self.registry.import_aliases.get(file)) |m| {
+            if (m.get(name)) |paths| return paths.items;
+        }
+        return &.{};
+    }
+
+    /// Whether source file `file` declares `import <pkg>.*`. A wildcard
+    /// import is file-scoped like a named one.
+    pub fn importWildcardIn(self: *const Module, file: FileId, pkg: []const u8) bool {
+        if (pkg.len == 0) return false;
+        if (self.registry.import_wildcards.get(file)) |list| {
+            for (list.items) |path| {
+                if (std.mem.eql(u8, path, pkg)) return true;
             }
         }
-        if (isShippedFqn(f.fqn)) return 2;
-        return 3;
+        return false;
+    }
+
+    /// Packages whose top-level entities are implicitly visible in every
+    /// Kotlin source file. Mirrors the canonical
+    /// `stdlib.IMPLICITLY_IMPORTED_PACKAGES` (the `ir` module cannot
+    /// depend on `stdlib`); an interp-side test keeps the two in
+    /// lockstep.
+    pub const default_import_packages = [_][]const u8{
+        "kotlin",
+        "kotlin.annotation",
+        "kotlin.collections",
+        "kotlin.comparisons",
+        "kotlin.io",
+        "kotlin.ranges",
+        "kotlin.sequences",
+        "kotlin.text",
+        "kotlin.math",
+    };
+
+    fn isDefaultImportPackage(pkg: []const u8) bool {
+        for (default_import_packages) |p| {
+            if (std.mem.eql(u8, p, pkg)) return true;
+        }
+        return false;
+    }
+
+    /// The lowest tier whose candidates are visible to the caller under
+    /// Kotlin scoping (named import / own package / wildcard import /
+    /// default import). An identical-signature tie above this line is a
+    /// real ambiguity; below it Kotlin would not resolve the call at all
+    /// and klio's lenient pick stays heuristic.
+    pub const last_in_scope_tier: u8 = 3;
+
+    /// Bare-call preference tier of a candidate func, ranked low-to-high
+    /// urgency: 0 = file-named-import, 1 = own package, 2 = file-
+    /// wildcard-import package, 3 = default-import package, 4 = built-in
+    /// stdlib, 5 = any other package. This is Kotlin's resolution order
+    /// for an unqualified top-level callable: the file's explicit
+    /// imports outrank even a same-file declaration, then the declaring
+    /// package's own scope, then star imports, then the implicitly
+    /// imported packages. `caller_pkg` is the caller's declaring package
+    /// (`""` for a user script). A non-wildcard import of `name` in
+    /// `caller_file` whose full path equals the candidate's FQN matches
+    /// tier 0; a wildcard import of the candidate's package matches
+    /// tier 2.
+    fn bareCallTier(self: *const Module, f: *const Func, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
+        for (self.importAliasPathsIn(caller_file, name)) |p| {
+            if (std.mem.eql(u8, p.fqn, f.fqn)) return 0;
+        }
+        if (std.mem.eql(u8, f.package, caller_pkg)) return 1;
+        if (self.importWildcardIn(caller_file, f.package)) return 2;
+        if (isDefaultImportPackage(f.package)) return 3;
+        if (isShippedFqn(f.fqn)) return 4;
+        return 5;
     }
 
     /// Number of *user* parameters a func declares (excluding a leading
@@ -949,23 +1072,216 @@ pub const Module = struct {
             std.mem.eql(u8, name, "compareValuesBy");
     }
 
+    /// Why the symbol index declined to resolve a bare call. Every
+    /// deferral carries one of these so an audit sweep can prove that
+    /// the heuristic fallback only ever handles classified structural
+    /// shapes, never an unclassified pick.
+    pub const ResolveDeferReason = enum {
+        /// No top-level function with this simple name exists.
+        no_candidates,
+        /// Every candidate takes an implicit receiver `this` (instance
+        /// method, top-level or member extension); receiver-based
+        /// resolution is the heuristic's domain.
+        extension_form,
+        /// The lowerer always routes this bare name to an intrinsic; the
+        /// index defers so it never binds the body the lowerer skips.
+        intrinsic_owned,
+        /// More than one exact match in a winning tier the caller can
+        /// SEE (named import, own package, wildcard import, or default
+        /// import), every match with the SAME full parameter type
+        /// signature — generic arguments and function-type shapes
+        /// included — so nothing can tell them apart, at lowering or at
+        /// runtime. Kotlin rejects such a set as conflicting overloads.
+        ambiguous_tier,
+        /// More than one exact match in the winning tier, but the
+        /// matches differ in parameter types: an overload set the
+        /// runtime resolves by argument type.
+        type_overload,
+        /// More than one identical exact match, but every match lives in
+        /// a package the caller neither declares, imports, nor sees by
+        /// default — Kotlin would not resolve the call at all, so klio's
+        /// lenient cross-package pick stays with the heuristic.
+        unimported_set,
+        /// The winning tier has candidates, but none matches the call's
+        /// arity exactly.
+        arity_mismatch,
+        /// Every near match declares a default parameter — a
+        /// `required..total` acceptance range the index does not rank.
+        /// Stubs and bodies defer this shape alike, so the verdict never
+        /// depends on whether a candidate's body has been lowered yet.
+        default_param_shape,
+        /// Only header stubs / bodyless decls with no declared-arity
+        /// record were available.
+        bodyless_only,
+        /// The only exact matches are low-priority overloads.
+        low_priority_only,
+        /// The only near matches take a trailing vararg.
+        vararg_only,
+        /// The call's trailing lambda spans a default-parameter gap, a
+        /// shape the index does not model.
+        trailing_lambda_shape,
+        /// Same-tier same-arity overload set disambiguated by an `as`
+        /// cast at the call site. Assigned by the lowerer (which sees
+        /// the cast), never produced by the index itself.
+        cast_disambiguated,
+    };
+
+    /// Result of `resolveBareCallIndexed`: either a unique `FuncId` or a
+    /// reason-tagged deferral to the heuristic, plus the winning tier and
+    /// its exact-match count for the resolve audit's readout.
+    pub const BareCallResolution = struct {
+        pub const Outcome = union(enum) {
+            resolved: FuncId,
+            deferred: ResolveDeferReason,
+        };
+        outcome: Outcome,
+        /// Winning preference tier (0..5), or 255 when no candidate
+        /// established one.
+        tier: u8 = 255,
+        /// Exact-arity matches counted within the winning tier.
+        tier_count: usize = 0,
+        /// First two exact matches in the winning tier; both set when
+        /// the outcome is `ambiguous_tier`.
+        first: ?FuncId = null,
+        second: ?FuncId = null,
+
+        /// The resolved id, or null on any deferral.
+        pub fn pick(self: BareCallResolution) ?FuncId {
+            return switch (self.outcome) {
+                .resolved => |id| id,
+                .deferred => null,
+            };
+        }
+
+        fn deferred(reason: ResolveDeferReason) BareCallResolution {
+            return .{ .outcome = .{ .deferred = reason } };
+        }
+    };
+
+    /// Whether a phase-1 header stub's *declared* user arity exactly
+    /// matches the call: no defaults (`required == total`), no trailing
+    /// vararg, and exactly `want` parameters. Stubs carry no lowered
+    /// params, so this is the order-independent arity source for ranking
+    /// forward references; defaults/vararg/trailing-lambda shapes on a
+    /// stub stay deferred to the heuristic.
+    fn stubDeclArity(self: *const Module, id: FuncId) ?DeclArity {
+        return self.decl_user_arity.get(id.int());
+    }
+
+    /// Preference tier of one specific candidate at a call site. The
+    /// resolve audit uses this to grade a heuristic pick against the
+    /// index's: a divergence where the index pick ranks strictly better
+    /// is a package-preference correction, not a mis-bind.
+    pub fn bareCallTierOf(self: *const Module, id: FuncId, name: []const u8, caller_pkg: []const u8, caller_file: FileId) ?u8 {
+        const f = idGet(Func, self.funcs.items, id.int()) orelse return null;
+        return self.bareCallTier(f, name, caller_pkg, caller_file);
+    }
+
+    /// A candidate's user-parameter type signature: lowered params for
+    /// a body-bearing func, the phase-1 declared record for a header
+    /// stub. Both render through `lower.decl.loweredTypeRef`, so a stub
+    /// and its later-lowered body expose identical structures. `null`
+    /// when the signature is unknowable (a bodyless func with no
+    /// declared record), which forfeits any identity proof.
+    const SigView = union(enum) {
+        body: *const Func,
+        decl: []const TypeRef,
+
+        fn len(self: SigView) usize {
+            return switch (self) {
+                .body => |f| funcUserArity(f),
+                .decl => |s| s.len,
+            };
+        }
+
+        fn at(self: SigView, i: usize) TypeRef {
+            return switch (self) {
+                .body => |f| blk: {
+                    const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
+                    break :blk f.params[off + i].ty;
+                },
+                .decl => |s| s[i],
+            };
+        }
+    };
+
+    fn sigViewOf(self: *const Module, id: FuncId, f: *const Func) ?SigView {
+        if (f.blocks.len != 0) return .{ .body = f };
+        if (self.decl_user_sig.get(id.int())) |sig| return .{ .decl = sig };
+        return null;
+    }
+
+    /// Whether two candidates declare the same user parameter type
+    /// signature (leading synthesized `this` excluded), compared over
+    /// the FULL declared structure: head name, nullability, and the
+    /// recursive argument shapes — generic arguments, and a function
+    /// type's suspend marker, receiver, parameter, and return types.
+    /// Only a set equal at this granularity is a true duplicate that
+    /// Kotlin rejects as conflicting overloads; any structural
+    /// difference leaves a type-dispatched overload set.
+    fn sameUserSig(a: SigView, b: SigView) bool {
+        if (a.len() != b.len()) return false;
+        var i: usize = 0;
+        while (i < a.len()) : (i += 1) {
+            if (!a.at(i).eql(b.at(i))) return false;
+        }
+        return true;
+    }
+
+    /// Whether any user parameter (leading synthesized `this` excluded)
+    /// declares a default value.
+    fn anyUserParamDefault(f: *const Func) bool {
+        const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
+        for (f.params[off..]) |p| {
+            if (p.has_default) return true;
+        }
+        return false;
+    }
+
+    /// Whether the call's trailing lambda can bind `f`'s last (function-
+    /// typed) parameter with every gap parameter defaulted — the shape
+    /// the heuristic's trailing-lambda rung accepts and the index defers.
+    fn tlShapeMatches(f: *const Func, want: usize) bool {
+        const up = funcUserArity(f);
+        const last_is_fn = f.params.len != 0 and
+            std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
+        if (f.blocks.len == 0 or !last_is_fn or up < want or want < 1) return false;
+        const this_off: usize = if (funcHasImplicitThis(f)) 1 else 0;
+        const lead = want - 1;
+        const last_user = up - 1;
+        var i = lead;
+        while (i < last_user) : (i += 1) {
+            if (this_off + i >= f.params.len or !f.params[this_off + i].has_default) return false;
+        }
+        return true;
+    }
+
     /// Principled bare-call resolution: resolve `name` (called with
     /// `want_arity` user args, `last_arg_lambda` set when a trailing
     /// lambda is supplied) to a UNIQUE `FuncId` as a function of the
     /// caller's package + imports + the complete header set, independent
-    /// of declaration order.
+    /// of declaration order. Phase-1 header stubs (forward references,
+    /// `expect` decls) rank by their recorded declared arity, so the
+    /// answer does not depend on whether a candidate's body has been
+    /// lowered yet.
     ///
-    /// Preference order — own package, then file-named imports, then
-    /// built-in stdlib — picks the highest non-empty tier; within that
-    /// tier the candidate is returned only when exactly one body-bearing
-    /// non-extension func matches the requested arity. Extension funcs
-    /// (a leading synthesized `this`) are never index-resolved: a bare
-    /// call to one needs a receiver the index does not model, so it is
-    /// left to the order-based heuristic. A name the index cannot resolve
-    /// to a single non-extension target returns `null`, deferring to the
-    /// heuristic fallback. The index never selects a *different* target
-    /// than the heuristic for a name it resolves: it is a faithful
-    /// superset gated by uniqueness, proven by the resolve audit.
+    /// Preference order — file-named imports, then the caller's own
+    /// package, then wildcard imports, then the default-import packages,
+    /// then built-in stdlib (Kotlin's scoping order) — picks the highest
+    /// non-empty tier; within that tier the candidate is returned only
+    /// when exactly one non-extension func matches the requested arity
+    /// exactly with no default parameters. Extension funcs (a leading
+    /// synthesized `this`) are never index-resolved: a bare call to one
+    /// needs a receiver the index does not model, so it is left to the
+    /// order-based heuristic. A name the index cannot resolve to a
+    /// single non-extension target defers with a reason classifying
+    /// why. Where the index and the heuristic both resolve, they agree
+    /// — except when the heuristic's declaration-order pick sits in a
+    /// strictly worse preference tier or matches the call less exactly
+    /// (a vararg/default/arity-mismatched fallback where the index found
+    /// an exact overload); the resolve audit grades every divergence as
+    /// one of those corrections, a receiver-preference the heuristic
+    /// retains, or a bug.
     pub fn resolveBareCallIndexed(
         self: *const Module,
         name: []const u8,
@@ -973,42 +1289,155 @@ pub const Module = struct {
         caller_file: FileId,
         want_arity: usize,
         last_arg_lambda: bool,
-    ) ?FuncId {
-        _ = last_arg_lambda;
-        if (intrinsicOwnsBareName(name)) return null;
+    ) BareCallResolution {
+        if (intrinsicOwnsBareName(name)) return BareCallResolution.deferred(.intrinsic_owned);
         const cands = self.funcsBySimpleName(name);
-        if (cands.len == 0) return null;
+        if (cands.len == 0) return BareCallResolution.deferred(.no_candidates);
 
-        // Highest-priority tier among the *non-extension* body-bearing
-        // candidates.
+        // Highest-priority tier among the non-extension candidates:
+        // body-bearing funcs, plus header stubs with a declared-arity
+        // record (rankable without a lowered body).
         var best_tier: u8 = 255;
+        var all_ext = true;
         for (cands) |id| {
             const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
-            if (f.blocks.len == 0) continue;
             if (funcHasImplicitThis(f)) continue;
+            all_ext = false;
+            if (f.blocks.len == 0 and self.stubDeclArity(id) == null) continue;
             const t = self.bareCallTier(f, name, caller_pkg, caller_file);
             if (t < best_tier) best_tier = t;
         }
-        if (best_tier == 255) return null;
+        if (best_tier == 255) {
+            return BareCallResolution.deferred(if (all_ext) .extension_form else .bodyless_only);
+        }
 
         // Within the best tier, look for a unique exact-arity,
-        // non-low-priority, non-extension candidate.
+        // non-low-priority, non-extension candidate. Track the closest
+        // miss so a zero-match tier defers with the blocking shape.
         var chosen: ?FuncId = null;
+        var second: ?FuncId = null;
         var count: usize = 0;
+        // Whether every exact match is body-bearing with the same user
+        // parameter type signature as the first one. Distinguishes a
+        // true ambiguity from a type-dispatched overload set.
+        var sigs_identical = true;
+        var saw_tl = false;
+        var saw_arity = false;
+        var saw_default = false;
+        var saw_vararg = false;
+        var saw_low = false;
+        var saw_bodyless = false;
         for (cands) |id| {
             const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
-            if (f.blocks.len == 0) continue;
-            if (f.low_priority) continue;
             if (funcHasImplicitThis(f)) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
-            const last_not_vararg = f.params.len == 0 or !f.params[f.params.len - 1].is_vararg;
-            if (!last_not_vararg) continue;
-            if (funcUserArity(f) != want_arity) continue;
-            chosen = id;
+            const is_stub = f.blocks.len == 0;
+            // The stub and body gates must accept the SAME candidate
+            // shapes (exact arity, no defaults, no trailing vararg) so
+            // the resolution — and the ambiguity verdict — never
+            // depends on whether a candidate's body lowered before the
+            // call site.
+            if (is_stub) {
+                const da = self.stubDeclArity(id) orelse {
+                    saw_bodyless = true;
+                    continue;
+                };
+                if (f.low_priority) {
+                    saw_low = true;
+                    continue;
+                }
+                if (da.trailing_vararg) {
+                    saw_vararg = true;
+                    continue;
+                }
+                if (da.total != want_arity) {
+                    saw_arity = true;
+                    continue;
+                }
+                if (da.required != da.total) {
+                    saw_default = true;
+                    continue;
+                }
+            } else {
+                if (f.low_priority) {
+                    saw_low = true;
+                    continue;
+                }
+                if (f.params.len != 0 and f.params[f.params.len - 1].is_vararg) {
+                    saw_vararg = true;
+                    continue;
+                }
+                if (funcUserArity(f) != want_arity) {
+                    if (last_arg_lambda and tlShapeMatches(f, want_arity)) {
+                        saw_tl = true;
+                    } else {
+                        saw_arity = true;
+                    }
+                    continue;
+                }
+                if (anyUserParamDefault(f)) {
+                    saw_default = true;
+                    continue;
+                }
+            }
+            if (chosen) |first_id| {
+                if (second == null) second = id;
+                // Identity is proven over lowered params for bodies and
+                // the phase-1 declared record for stubs; a candidate
+                // with neither forfeits the proof.
+                if (sigs_identical) {
+                    const first_f = idGet(Func, self.funcs.items, first_id.int());
+                    const first_view: ?SigView = if (first_f) |ff| self.sigViewOf(first_id, ff) else null;
+                    const this_view = self.sigViewOf(id, f);
+                    if (first_view == null or this_view == null or
+                        !sameUserSig(first_view.?, this_view.?))
+                    {
+                        sigs_identical = false;
+                    }
+                }
+            } else {
+                chosen = id;
+            }
             count += 1;
         }
-        if (count == 1) return chosen;
-        return null;
+        if (count == 1) {
+            return .{
+                .outcome = .{ .resolved = chosen.? },
+                .tier = best_tier,
+                .tier_count = count,
+                .first = chosen,
+            };
+        }
+        if (count > 1) {
+            const reason: ResolveDeferReason = if (!sigs_identical)
+                .type_overload
+            else if (best_tier <= last_in_scope_tier)
+                .ambiguous_tier
+            else
+                .unimported_set;
+            return .{
+                .outcome = .{ .deferred = reason },
+                .tier = best_tier,
+                .tier_count = count,
+                .first = chosen,
+                .second = second,
+            };
+        }
+        const reason: ResolveDeferReason = if (saw_tl)
+            .trailing_lambda_shape
+        else if (saw_default)
+            .default_param_shape
+        else if (saw_arity)
+            .arity_mismatch
+        else if (saw_vararg)
+            .vararg_only
+        else if (saw_low)
+            .low_priority_only
+        else if (saw_bodyless)
+            .bodyless_only
+        else
+            .arity_mismatch;
+        return .{ .outcome = .{ .deferred = reason }, .tier = best_tier, .tier_count = 0 };
     }
 
     /// Register a class declaration and return its id. If the name
@@ -1200,10 +1629,17 @@ pub const ModuleRegistry = struct {
     /// `typealias Name = Target` → `Name` ↦ `Target`'s simple head
     /// name.
     type_aliases: std.StringHashMap([]const u8),
-    /// Per-file (`FileId`) non-wildcard import leaf → the import's full
-    /// segment path. Keyed by file because a Kotlin named import is
-    /// file-scoped.
-    import_aliases: std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList([]const u8))),
+    /// Per-file (`FileId`) non-wildcard import leaf → every import in
+    /// the file bound to that leaf, in declaration order. Keyed by file
+    /// because a Kotlin named import is file-scoped; a list because
+    /// Kotlin keeps every same-leaf import in scope (a second import of
+    /// the same leaf is an ambiguity at the use site, not a shadow).
+    import_aliases: std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))),
+    /// Per-file (`FileId`) wildcard-import package paths (dotted,
+    /// owned). A `import pkg.*` makes every `pkg` declaration visible
+    /// to the file, outranking the implicitly-imported built-ins in
+    /// bare-call preference.
+    import_wildcards: std.AutoHashMap(FileId, std.ArrayList([]const u8)),
     /// Nested-object simple-name aliases, keyed by enclosing class
     /// name.
     nested_object_aliases: std.StringHashMap(std.StringHashMap([]const u8)),
@@ -1212,6 +1648,14 @@ pub const ModuleRegistry = struct {
     class_const_inits: StrPairMap(Const),
 
     allocator: Allocator,
+
+    /// One non-wildcard import: its full dotted path (owned by the
+    /// registry allocator) and the same path as segments (an owned
+    /// slice of name slices borrowed from the AST).
+    pub const ImportPath = struct {
+        fqn: []const u8,
+        segs: []const []const u8,
+    };
 
     pub fn init(allocator: Allocator) ModuleRegistry {
         return .{
@@ -1225,7 +1669,8 @@ pub const ModuleRegistry = struct {
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
             .abstract_member_defaults = StrPairMap(std.ArrayList(?FuncId)).init(allocator),
             .type_aliases = std.StringHashMap([]const u8).init(allocator),
-            .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList([]const u8))).init(allocator),
+            .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))).init(allocator),
+            .import_wildcards = std.AutoHashMap(FileId, std.ArrayList([]const u8)).init(allocator),
             .nested_object_aliases = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
             .allocator = allocator,
@@ -1265,10 +1710,24 @@ pub const ModuleRegistry = struct {
             var it = self.import_aliases.valueIterator();
             while (it.next()) |inner| {
                 var inner_it = inner.valueIterator();
-                while (inner_it.next()) |segs| segs.deinit(a);
+                while (inner_it.next()) |paths| {
+                    for (paths.items) |p| {
+                        a.free(p.fqn);
+                        a.free(p.segs);
+                    }
+                    paths.deinit(a);
+                }
                 inner.deinit();
             }
             self.import_aliases.deinit();
+        }
+        {
+            var it = self.import_wildcards.valueIterator();
+            while (it.next()) |list| {
+                for (list.items) |path| a.free(path);
+                list.deinit(a);
+            }
+            self.import_wildcards.deinit();
         }
         {
             var it = self.nested_object_aliases.valueIterator();
@@ -1409,15 +1868,47 @@ test "packageOfFqn strips the trailing simple name" {
     try testing.expectEqualStrings("pkg", packageOfFqn("pkg.Outer$Name", "Name"));
 }
 
-/// Push a body-bearing top-level func with the given simple name, FQN,
-/// package, and user-parameter count, returning its id. Used by the
-/// symbol-index tests.
-fn pushTestFunc(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, package: []const u8, user_params: usize) !FuncId {
+/// Options for the symbol-index test func pusher.
+const TestFuncOpts = struct {
+    /// `null` = body-bearing; otherwise a header stub with no blocks.
+    stub: bool = false,
+    low_priority: bool = false,
+    /// Mark the last parameter `vararg`.
+    last_vararg: bool = false,
+    /// Give every parameter but the last a default, and type the last
+    /// parameter `Function0` (the trailing-lambda gap shape).
+    fn_tail_with_defaults: bool = false,
+    /// First parameter is a synthesized receiver `this`.
+    extension: bool = false,
+    /// Type name for every user parameter (default `Int`).
+    param_ty: []const u8 = "Int",
+};
+
+/// Push a top-level func with the given simple name, FQN, package, and
+/// user-parameter count, returning its id. Used by the symbol-index tests.
+fn pushTestFuncOpts(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, package: []const u8, user_params: usize, opts: TestFuncOpts) !FuncId {
     const id = FuncId.from(@intCast(m.funcs.items.len));
-    const params = try a.alloc(Param, user_params);
-    for (params) |*p| p.* = .{ .name = "x", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null };
-    const blocks = try a.alloc(Block, 1);
-    blocks[0] = .{ .id = BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
+    const n_params = user_params + @as(usize, if (opts.extension) 1 else 0);
+    const params = try a.alloc(Param, n_params);
+    for (params, 0..) |*p, i| {
+        p.* = .{ .name = "x", .ty = .{ .name = opts.param_ty, .nullable = false, .args = &.{} }, .default = null };
+        if (opts.extension and i == 0) {
+            p.name = "this";
+            p.ty.name = "String";
+        }
+        if (opts.fn_tail_with_defaults) {
+            if (i + 1 == n_params) {
+                p.ty.name = "Function0";
+            } else if (!(opts.extension and i == 0)) {
+                p.has_default = true;
+            }
+        }
+        if (opts.last_vararg and i + 1 == n_params) p.is_vararg = true;
+    }
+    const blocks = try a.alloc(Block, if (opts.stub) 0 else 1);
+    if (!opts.stub) {
+        blocks[0] = .{ .id = BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
+    }
     try m.funcs.append(a, .{
         .id = id,
         .name = name,
@@ -1429,21 +1920,35 @@ fn pushTestFunc(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, pac
         .blocks = blocks,
         .entry = BlockId.from(0),
         .is_suspend = false,
+        .low_priority = opts.low_priority,
     });
     try m.func_index.append(a, .{ .name = name, .id = id });
     return id;
 }
 
+fn pushTestFunc(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, package: []const u8, user_params: usize) !FuncId {
+    return pushTestFuncOpts(m, a, name, fqn, package, user_params, .{});
+}
+
+fn deferReasonOf(res: Module.BareCallResolution) ?Module.ResolveDeferReason {
+    return switch (res.outcome) {
+        .resolved => null,
+        .deferred => |r| r,
+    };
+}
+
+fn freeTestModule(m: *Module, a: Allocator) void {
+    for (m.funcs.items) |f| {
+        a.free(f.params);
+        a.free(f.blocks);
+    }
+    m.deinit(a);
+}
+
 test "symbol index prefers the caller's own package" {
     const a = testing.allocator;
     var m = Module.default(a);
-    defer {
-        for (m.funcs.items) |f| {
-            a.free(f.params);
-            a.free(f.blocks);
-        }
-        m.deinit(a);
-    }
+    defer freeTestModule(&m, a);
     // Two same-name, same-arity funcs in different packages.
     const own = try pushTestFunc(&m, a, "greet", "app.greet", "app", 0);
     _ = try pushTestFunc(&m, a, "greet", "lib.greet", "lib", 0);
@@ -1451,65 +1956,373 @@ test "symbol index prefers the caller's own package" {
 
     // A caller in package `app` resolves its own `greet`, not lib's.
     const got = m.resolveBareCallIndexed("greet", "app", FileId.from(0), 0, false);
-    try testing.expect(got != null);
-    try testing.expectEqual(own.int(), got.?.int());
+    try testing.expect(got.outcome == .resolved);
+    try testing.expectEqual(own.int(), got.outcome.resolved.int());
+    try testing.expectEqual(@as(u8, 1), got.tier);
+    try testing.expectEqual(@as(usize, 1), got.tier_count);
+}
+
+test "symbol index ranks a named import above the caller's own package" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Kotlin's scoping: an explicit `import lib.greet` outranks even a
+    // declaration in the caller's own package (and file).
+    _ = try pushTestFunc(&m, a, "greet", "app.greet", "app", 0);
+    const imported = try pushTestFunc(&m, a, "greet", "lib.greet", "lib", 0);
+    var paths: std.ArrayList(ModuleRegistry.ImportPath) = .empty;
+    const segs = try a.alloc([]const u8, 2);
+    segs[0] = "lib";
+    segs[1] = "greet";
+    try paths.append(a, .{ .fqn = try a.dupe(u8, "lib.greet"), .segs = segs });
+    var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    try inner.put("greet", paths);
+    try m.registry.import_aliases.put(FileId.from(0), inner);
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("greet", "app", FileId.from(0), 0, false);
+    try testing.expect(got.outcome == .resolved);
+    try testing.expectEqual(imported.int(), got.outcome.resolved.int());
+    try testing.expectEqual(@as(u8, 0), got.tier);
+
+    // From a file without the import the own-package declaration wins.
+    const got2 = m.resolveBareCallIndexed("greet", "app", FileId.from(1), 0, false);
+    try testing.expect(got2.outcome == .resolved);
+    try testing.expectEqual(@as(u8, 1), got2.tier);
 }
 
 test "symbol index defers when the preferred tier is ambiguous" {
     const a = testing.allocator;
     var m = Module.default(a);
-    defer {
-        for (m.funcs.items) |f| {
-            a.free(f.params);
-            a.free(f.blocks);
-        }
-        m.deinit(a);
-    }
-    // Two same-name same-arity funcs in two non-caller packages: neither
-    // is in the caller's package or imports, so they share the lowest
-    // (other) tier and the index must defer rather than pick one.
+    defer freeTestModule(&m, a);
+    // Two same-name, same-arity, same-signature funcs in the CALLER's
+    // package: in scope and indistinguishable, the index must defer as
+    // ambiguous rather than pick one.
+    const p_id = try pushTestFunc(&m, a, "h", "user.h", "user", 1);
+    const q_id = try pushTestFunc(&m, a, "h", "user.x.h", "user", 1);
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("h", "user", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.ambiguous_tier, deferReasonOf(got).?);
+    try testing.expectEqual(@as(usize, 2), got.tier_count);
+    try testing.expectEqual(p_id.int(), got.first.?.int());
+    try testing.expectEqual(q_id.int(), got.second.?.int());
+}
+
+test "symbol index classifies an out-of-scope identical set as unimported" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Two identical funcs in two packages the caller neither declares
+    // nor imports: Kotlin would resolve neither, so klio's lenient
+    // cross-package pick stays with the heuristic instead of erroring.
     _ = try pushTestFunc(&m, a, "h", "p.h", "p", 1);
     _ = try pushTestFunc(&m, a, "h", "q.h", "q", 1);
     try m.rebuildFuncNameIndex(a);
 
     const got = m.resolveBareCallIndexed("h", "user", FileId.from(0), 1, false);
-    try testing.expect(got == null);
+    try testing.expectEqual(Module.ResolveDeferReason.unimported_set, deferReasonOf(got).?);
+}
+
+test "symbol index ranks a default-import package above other built-ins" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // `kotlin.collections` is implicitly imported in every file; a
+    // same-name sibling in a non-default kotlinx package is not in
+    // scope, so the default-import candidate resolves uniquely.
+    const dflt = try pushTestFunc(&m, a, "chk", "kotlin.collections.chk", "kotlin.collections", 1);
+    _ = try pushTestFunc(&m, a, "chk", "kotlinx.other.chk", "kotlinx.other", 1);
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("chk", "user", FileId.from(0), 1, false);
+    try testing.expect(got.outcome == .resolved);
+    try testing.expectEqual(dflt.int(), got.outcome.resolved.int());
+    try testing.expectEqual(@as(u8, 3), got.tier);
+}
+
+test "symbol index prefers a wildcard-imported package over other packages" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Same name/arity in two non-caller packages; the caller's file
+    // wildcard-imports one of them, which disambiguates (real Kotlin
+    // scoping: explicit imports outrank everything but the own package).
+    const imported = try pushTestFunc(&m, a, "sync", "locks.sync", "locks", 1);
+    _ = try pushTestFunc(&m, a, "sync", "other.sync", "other", 1);
+    var wl: std.ArrayList([]const u8) = .empty;
+    try wl.append(a, try a.dupe(u8, "locks"));
+    try m.registry.import_wildcards.put(FileId.from(0), wl);
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("sync", "user", FileId.from(0), 1, false);
+    try testing.expect(got.outcome == .resolved);
+    try testing.expectEqual(imported.int(), got.outcome.resolved.int());
+    try testing.expectEqual(@as(u8, 2), got.tier);
+
+    // From a different file (no wildcard import) neither candidate is in
+    // scope; the identical tie defers to the lenient heuristic.
+    const got2 = m.resolveBareCallIndexed("sync", "user", FileId.from(1), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.unimported_set, deferReasonOf(got2).?);
+}
+
+test "symbol index classifies a type-distinguishable overload set" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Same package, same arity, DIFFERENT parameter types: runtime
+    // argument types pick the overload, so this is never an ambiguity.
+    _ = try pushTestFuncOpts(&m, a, "f", "app.f", "app", 1, .{ .param_ty = "Int" });
+    _ = try pushTestFuncOpts(&m, a, "f", "app.f", "app", 1, .{ .param_ty = "String" });
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("f", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.type_overload, deferReasonOf(got).?);
+    try testing.expectEqual(@as(usize, 2), got.tier_count);
+}
+
+/// Record a declared-signature entry (all params `ty_name`, non-null,
+/// no generic args) for a stub, mirroring phase-1 header registration.
+fn putTestDeclSig(m: *Module, a: Allocator, id: FuncId, ty_name: []const u8, n: usize) !void {
+    const sig = try a.alloc(TypeRef, n);
+    for (sig) |*ty| ty.* = .{ .name = try a.dupe(u8, ty_name), .nullable = false, .args = &.{} };
+    try m.decl_user_sig.put(id.int(), sig);
+}
+
+test "symbol index proves stub signatures through the declared record" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // One lowered body plus one forward-referenced stub of the same
+    // name/arity. With a matching declared signature recorded at phase 1
+    // the set is provably identical (ambiguous); without any record the
+    // proof is forfeited (type overload).
+    _ = try pushTestFunc(&m, a, "g", "app.g", "app", 1);
+    const stub = try pushTestFuncOpts(&m, a, "g", "app.g2.g", "app", 0, .{ .stub = true });
+    try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .trailing_vararg = false });
+    try m.rebuildFuncNameIndex(a);
+
+    const unproven = m.resolveBareCallIndexed("g", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.type_overload, deferReasonOf(unproven).?);
+
+    try putTestDeclSig(&m, a, stub, "Int", 1);
+    const proven = m.resolveBareCallIndexed("g", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.ambiguous_tier, deferReasonOf(proven).?);
+}
+
+test "symbol index distinguishes overloads by generic arguments" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Two same-package stubs whose declared params differ only in the
+    // generic argument (`List<Int>` vs `List<String>`): a legal Kotlin
+    // overload set the runtime dispatches by argument type, never an
+    // ambiguity. Rewriting the second record to `List<Int>` makes the
+    // pair a true duplicate and the verdict flips to ambiguous.
+    const s1 = try pushTestFuncOpts(&m, a, "pick", "app.pick", "app", 0, .{ .stub = true });
+    try m.decl_user_arity.put(s1.int(), .{ .required = 1, .total = 1, .trailing_vararg = false });
+    {
+        const sig = try a.alloc(TypeRef, 1);
+        const args = try a.alloc(TypeRef, 1);
+        args[0] = .{ .name = try a.dupe(u8, "Int"), .nullable = false, .args = &.{} };
+        sig[0] = .{ .name = try a.dupe(u8, "List"), .nullable = false, .args = args };
+        try m.decl_user_sig.put(s1.int(), sig);
+    }
+    const s2 = try pushTestFuncOpts(&m, a, "pick", "app.pick", "app", 0, .{ .stub = true });
+    try m.decl_user_arity.put(s2.int(), .{ .required = 1, .total = 1, .trailing_vararg = false });
+    {
+        const sig = try a.alloc(TypeRef, 1);
+        const args = try a.alloc(TypeRef, 1);
+        args[0] = .{ .name = try a.dupe(u8, "String"), .nullable = false, .args = &.{} };
+        sig[0] = .{ .name = try a.dupe(u8, "List"), .nullable = false, .args = args };
+        try m.decl_user_sig.put(s2.int(), sig);
+    }
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("pick", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.type_overload, deferReasonOf(got).?);
+
+    // Make the second stub's declared type IDENTICAL (`List<Int>`):
+    // now nothing distinguishes the pair and it is a real ambiguity.
+    {
+        const old = m.decl_user_sig.fetchRemove(s2.int()).?;
+        for (old.value) |*ty| ty.deinit(a);
+        a.free(old.value);
+        const fresh = try a.alloc(TypeRef, 1);
+        const args = try a.alloc(TypeRef, 1);
+        args[0] = .{ .name = try a.dupe(u8, "Int"), .nullable = false, .args = &.{} };
+        fresh[0] = .{ .name = try a.dupe(u8, "List"), .nullable = false, .args = args };
+        try m.decl_user_sig.put(s2.int(), fresh);
+    }
+    const got2 = m.resolveBareCallIndexed("pick", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.ambiguous_tier, deferReasonOf(got2).?);
+}
+
+test "symbol index distinguishes a stub overload by its declared types" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Body takes Int, forward-referenced stub declares String: a
+    // type-dispatched overload set even though one body is unlowered.
+    _ = try pushTestFunc(&m, a, "h2", "app.h2", "app", 1);
+    const stub = try pushTestFuncOpts(&m, a, "h2", "app.x.h2", "app", 0, .{ .stub = true });
+    try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .trailing_vararg = false });
+    try putTestDeclSig(&m, a, stub, "String", 1);
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("h2", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.type_overload, deferReasonOf(got).?);
 }
 
 test "symbol index never resolves an extension form" {
     const a = testing.allocator;
     var m = Module.default(a);
-    defer {
-        for (m.funcs.items) |f| {
-            a.free(f.params);
-            a.free(f.blocks);
-        }
-        m.deinit(a);
-    }
+    defer freeTestModule(&m, a);
     // One candidate, an extension (leading `this` param): the index does
     // not model receiver resolution, so it defers to the heuristic.
-    const id = FuncId.from(@intCast(m.funcs.items.len));
-    const params = try a.alloc(Param, 1);
-    params[0] = .{ .name = "this", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
-    const blocks = try a.alloc(Block, 1);
-    blocks[0] = .{ .id = BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
-    try m.funcs.append(a, .{
-        .id = id,
-        .name = "ext",
-        .fqn = "app.ext",
-        .package = "app",
-        .params = params,
-        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
-        .n_locals = 0,
-        .blocks = blocks,
-        .entry = BlockId.from(0),
-        .is_suspend = false,
-    });
-    try m.func_index.append(a, .{ .name = "ext", .id = id });
+    _ = try pushTestFuncOpts(&m, a, "ext", "app.ext", "app", 0, .{ .extension = true });
     try m.rebuildFuncNameIndex(a);
 
     const got = m.resolveBareCallIndexed("ext", "app", FileId.from(0), 0, false);
-    try testing.expect(got == null);
+    try testing.expectEqual(Module.ResolveDeferReason.extension_form, deferReasonOf(got).?);
+}
+
+test "symbol index defers an unknown name as no_candidates" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("nope", "app", FileId.from(0), 0, false);
+    try testing.expectEqual(Module.ResolveDeferReason.no_candidates, deferReasonOf(got).?);
+}
+
+test "symbol index defers an intrinsic-owned name" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Even with a matching lowered body present, the lowerer routes
+    // `compareValues` to the intrinsic; the index must agree.
+    _ = try pushTestFunc(&m, a, "compareValues", "kotlin.comparisons.compareValues", "kotlin.comparisons", 2);
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("compareValues", "app", FileId.from(0), 2, false);
+    try testing.expectEqual(Module.ResolveDeferReason.intrinsic_owned, deferReasonOf(got).?);
+}
+
+test "symbol index defers an arity mismatch in the winning tier" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    _ = try pushTestFunc(&m, a, "f", "app.f", "app", 2);
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("f", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.arity_mismatch, deferReasonOf(got).?);
+    try testing.expectEqual(@as(u8, 1), got.tier);
+}
+
+test "symbol index defers a bodyless decl with no declared-arity record" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // A bodyless func without a `decl_user_arity` entry cannot be ranked.
+    _ = try pushTestFuncOpts(&m, a, "g", "app.g", "app", 0, .{ .stub = true });
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("g", "app", FileId.from(0), 0, false);
+    try testing.expectEqual(Module.ResolveDeferReason.bodyless_only, deferReasonOf(got).?);
+}
+
+test "symbol index defers when only a low-priority overload matches" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    _ = try pushTestFuncOpts(&m, a, "lp", "app.lp", "app", 1, .{ .low_priority = true });
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("lp", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.low_priority_only, deferReasonOf(got).?);
+}
+
+test "symbol index defers a trailing-vararg candidate" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    _ = try pushTestFuncOpts(&m, a, "va", "app.va", "app", 1, .{ .last_vararg = true });
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("va", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.vararg_only, deferReasonOf(got).?);
+}
+
+test "symbol index defers a default-gap trailing-lambda shape" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // `fun tl(x: Int = 0, body: () -> Unit)` called as `tl { ... }`:
+    // one supplied arg (the lambda), the gap param defaulted — the
+    // heuristic's trailing-lambda rung handles this, the index defers.
+    _ = try pushTestFuncOpts(&m, a, "tl", "app.tl", "app", 2, .{ .fn_tail_with_defaults = true });
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("tl", "app", FileId.from(0), 1, true);
+    try testing.expectEqual(Module.ResolveDeferReason.trailing_lambda_shape, deferReasonOf(got).?);
+
+    // Without the trailing lambda the same call is a plain arity miss.
+    const got2 = m.resolveBareCallIndexed("tl", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.arity_mismatch, deferReasonOf(got2).?);
+}
+
+test "symbol index ranks a forward-referenced stub by declared arity" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // An own-package phase-1 stub (body not lowered yet) with a recorded
+    // exact declared arity resolves, independent of lowering order.
+    const stub = try pushTestFuncOpts(&m, a, "fwd", "app.fwd", "app", 0, .{ .stub = true });
+    try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .trailing_vararg = false });
+    _ = try pushTestFunc(&m, a, "fwd", "lib.fwd", "lib", 1);
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("fwd", "app", FileId.from(0), 1, false);
+    try testing.expect(got.outcome == .resolved);
+    try testing.expectEqual(stub.int(), got.outcome.resolved.int());
+    try testing.expectEqual(@as(u8, 1), got.tier);
+}
+
+test "symbol index defers a stub whose declared arity has defaults or varargs" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // required < total (a default param): only an exact no-default
+    // declared arity is rankable without the lowered body.
+    const dflt = try pushTestFuncOpts(&m, a, "d", "app.d", "app", 0, .{ .stub = true });
+    try m.decl_user_arity.put(dflt.int(), .{ .required = 1, .total = 2, .trailing_vararg = false });
+    const va = try pushTestFuncOpts(&m, a, "v", "app.v", "app", 0, .{ .stub = true });
+    try m.decl_user_arity.put(va.int(), .{ .required = 0, .total = 1, .trailing_vararg = true });
+    try m.rebuildFuncNameIndex(a);
+
+    const got_d = m.resolveBareCallIndexed("d", "app", FileId.from(0), 2, false);
+    try testing.expectEqual(Module.ResolveDeferReason.default_param_shape, deferReasonOf(got_d).?);
+    const got_v = m.resolveBareCallIndexed("v", "app", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.vararg_only, deferReasonOf(got_v).?);
+}
+
+test "symbol index defers a default-bearing body exactly like its stub" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // `fun d(x: Int, y: Int = 0)` as a lowered BODY: a full-arity call
+    // must defer the same way the phase-1 stub gate defers
+    // `required != total`, so the verdict cannot flip with declaration
+    // order once the body lowers.
+    const body = try pushTestFuncOpts(&m, a, "d", "app.d", "app", 2, .{});
+    m.funcs.items[body.int()].params[1].has_default = true;
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("d", "app", FileId.from(0), 2, false);
+    try testing.expectEqual(Module.ResolveDeferReason.default_param_shape, deferReasonOf(got).?);
 }
 
 test "packageHeadDeclared distinguishes a package head from a member head" {
