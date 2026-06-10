@@ -187,6 +187,7 @@ fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator
     var args_list: std.ArrayList(Value) = .empty;
     errdefer args_list.deinit(self.allocator);
     try args_list.appendSlice(self.allocator, args);
+    vmhost.emitPath(self.allocator, "ctor_thunk", func.fqn, func.id, null, args);
     // Ownership of `args_list` transfers into `evalWith`: the frame adopts
     // it as its `params` backing and frees it on `frame.deinit()`.
     return ir.eval.evalWith(VmHost, self.allocator, mg.get(), func, args_list, self);
@@ -344,7 +345,8 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
     return stdlib.implementation(fqn);
 }
 
-fn dispatchIntrinsic(self: *VmHost, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+    vmhost.emitPath(self.allocator, "intrinsic_instances", fqn, null, null, args);
     var ih = VmIntrinsicHost{
         .module = self.module.clone(),
         .closures = self.closures.clone(),
@@ -713,7 +715,7 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
                 const first_is_array = args.len > 0 and args[0] == .Array and !std.mem.eql(u8, f, "kotlin.String");
                 if (!first_is_array) {
                     if (lookupIntrinsic(self, f)) |intrinsic| {
-                        return dispatchIntrinsic(self, intrinsic, args);
+                        return dispatchIntrinsic(self, f, intrinsic, args);
                     }
                 }
             }
@@ -971,7 +973,7 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     // Builtin Throwable hierarchy: host-backed via the intrinsic.
     if (root.isBuiltinThrowableFqn(ir_fqn)) {
         if (lookupIntrinsic(self, ir_fqn)) |intrinsic| {
-            return dispatchIntrinsic(self, intrinsic, args);
+            return dispatchIntrinsic(self, ir_fqn, intrinsic, args);
         }
     }
     // Builtin tuple classes (`kotlin.Pair` / `kotlin.Triple`) have a
@@ -981,7 +983,7 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     // Instance (which would print as `Pair(first=…, second=…)`).
     if (std.mem.eql(u8, ir_fqn, "kotlin.Pair") or std.mem.eql(u8, ir_fqn, "kotlin.Triple")) {
         if (lookupIntrinsic(self, ir_fqn)) |intrinsic| {
-            return dispatchIntrinsic(self, intrinsic, args);
+            return dispatchIntrinsic(self, ir_fqn, intrinsic, args);
         }
     }
 
@@ -2409,6 +2411,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             try all.append(allocator, inst_value);
             try all.appendSlice(allocator, cls_args);
             const module_ref = self.module.clone();
+            vmhost.emitPath(allocator, "object_build", func.fqn, fid, &inst_value, cls_args);
             const r = try ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), &func, all, self);
             module_ref.deinit();
             switch (r) {
@@ -2458,6 +2461,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         }
         var all: std.ArrayList(Value) = .empty;
         try all.append(allocator, inst_value);
+        vmhost.emitPath(allocator, "object_build", func.fqn, cpi.func, &inst_value, &.{});
         const r = try ir.eval.evalWithCaptures(VmHost, allocator, sub_mod, &func, all, cap_vec, self);
         mg.deinit();
         self.globals.deinit();

@@ -100,7 +100,8 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// side-channel so HOF bindings can call back into IR-lowered lambdas.
 /// Maps a thrown / control-flow `RuntimeError` onto the matching
 /// `EvalError`, preserving the thrown `Value` for try/catch matching.
-fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, func: StdlibFn, args: []const Value) Allocator.Error!union(enum) { ok: Value, err: EvalError } {
+fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!union(enum) { ok: Value, err: EvalError } {
+    vmhost.emitPath(allocator, "intrinsic_globals", fqn, null, null, args);
     var intrinsic = VmIntrinsicHost{
         .module = self.module.clone(),
         .closures = self.closures.clone(),
@@ -464,7 +465,7 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
             if (lookupIntrinsic(self, fqn)) |func| {
                 const tail = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
                 if (looksConst(tail)) {
-                    const r = dispatchIntrinsic(self, allocator, func, &.{}) catch return null;
+                    const r = dispatchIntrinsic(self, allocator, fqn, func, &.{}) catch return null;
                     if (r == .ok) return r.ok;
                 }
                 return .{ .Intrinsic = .{ .fqn = fqn, .func = func } };

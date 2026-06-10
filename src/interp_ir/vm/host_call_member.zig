@@ -234,7 +234,8 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// Build a `VmIntrinsicHost` bound to this host's shared handles, run the
 /// intrinsic, and map any `RuntimeError` into the IR evaluator's
 /// `EvalError`. Mirrors `dispatch_intrinsic`.
-fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+    vmhost.emitPath(allocator, "intrinsic_call_member", fqn, null, null, args);
     var intrinsic = makeIntrinsicHost(self);
     defer deinitIntrinsicHost(&intrinsic);
     var ihost = intrinsic.intrinsicHost();
@@ -1477,7 +1478,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     if (receiver.* == .Intrinsic) {
         const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ receiver.Intrinsic.fqn, name });
         if (lookupIntrinsic(self, probe)) |func| {
-            return dispatchIntrinsic(self, allocator, func, args);
+            return dispatchIntrinsic(self, allocator, probe, func, args);
         }
     }
     if (receiver.* == .Class) {
@@ -1487,9 +1488,9 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const cfqn = cg.get().fqn;
         cg.deinit();
         const probe_simple = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
-        if (lookupIntrinsic(self, probe_simple)) |func| return dispatchIntrinsic(self, allocator, func, args);
+        if (lookupIntrinsic(self, probe_simple)) |func| return dispatchIntrinsic(self, allocator, probe_simple, func, args);
         const probe_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
-        if (lookupIntrinsic(self, probe_fqn)) |func| return dispatchIntrinsic(self, allocator, func, args);
+        if (lookupIntrinsic(self, probe_fqn)) |func| return dispatchIntrinsic(self, allocator, probe_fqn, func, args);
     }
 
     // `List.optimizeReadOnlyList()` — no-op.
@@ -1956,17 +1957,19 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
                 .err => |e| return .{ .err = e },
             };
             const new_args = try prependReceiver(allocator, &map_val, args);
-            return dispatchIntrinsic(self, allocator, f, new_args);
+            return dispatchIntrinsic(self, allocator, probe, f, new_args);
         }
     }
 
     // Iterable fallback.
     if (receiver.* == .Instance and !iterable_fallback_active and hostHasMember(self, receiver, "iterator")) {
         const p1 = try std.fmt.allocPrint(allocator, "kotlin.collections.Iterable.{s}", .{name});
+        var matched: []const u8 = p1;
         var intrinsic = lookupIntrinsic(self, p1);
         if (intrinsic == null) {
             const p2 = try std.fmt.allocPrint(allocator, "kotlin.collections.List.{s}", .{name});
             intrinsic = lookupIntrinsic(self, p2);
+            matched = p2;
         }
         if (intrinsic) |f| {
             iterable_fallback_active = true;
@@ -1977,7 +1980,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
                 .err => |e| return .{ .err = e },
             };
             const new_args = try prependReceiver(allocator, &dv, args);
-            return dispatchIntrinsic(self, allocator, f, new_args);
+            return dispatchIntrinsic(self, allocator, matched, f, new_args);
         }
     }
 
@@ -2117,7 +2120,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         };
         if (installed) |func| {
             const all_args = try prependReceiver(allocator, receiver, args);
-            return try dispatchIntrinsic(self, allocator, func, all_args);
+            return try dispatchIntrinsic(self, allocator, p, func, all_args);
         }
     }
 
@@ -2130,7 +2133,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         for (synth) |p| {
             if (lookupIntrinsic(self, p)) |func| {
                 const all_args = try prependReceiver(allocator, receiver, args);
-                return try dispatchIntrinsic(self, allocator, func, all_args);
+                return try dispatchIntrinsic(self, allocator, p, func, all_args);
             }
         }
     }
@@ -2168,7 +2171,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         for (any_probes) |p| {
             if (lookupIntrinsic(self, p)) |func| {
                 const all_args = try prependReceiver(allocator, receiver, args);
-                return try dispatchIntrinsic(self, allocator, func, all_args);
+                return try dispatchIntrinsic(self, allocator, p, func, all_args);
             }
         }
     }
@@ -3411,6 +3414,7 @@ fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Value,
     }
     var packed_list = try argsListFromSlice(allocator, packed_args);
     _ = &packed_list;
+    vmhost.emitPath(allocator, "member_anon", f.fqn, f.id, receiver, args);
     return ir.eval.evalWithCapturesIn(VmHost, allocator, module_rc, module_rc, &f, packed_list, cap_vec, self);
 }
 
@@ -3433,6 +3437,7 @@ fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Modul
             var captures: std.ArrayList(Value) = .empty;
             if (call_args.items.len != 0) try captures.append(allocator, call_args.items[0]);
             const cur = try argsListFromSlice(allocator, call_args.items);
+            vmhost.emitPath(allocator, "member_default_thunk", dfunc.fqn, df, null, provided);
             const r = try ir.eval.evalWithCaptures(VmHost, allocator, module, &dfunc, cur, captures, self);
             switch (r) {
                 .ok => |v| try call_args.append(allocator, v),
@@ -3546,6 +3551,7 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                         checkFuncInRange(self, "irMethodWalk", f.id);
                         checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
                     }
+                    vmhost.emitPath(allocator, "member_ir_walk", f.fqn, f.id, receiver, args);
                     const r = try ir.eval.evalWith(VmHost, allocator, mod, &f, packed_list, self);
                     mg.deinit();
                     return r;
@@ -3672,7 +3678,7 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     if (stdlib.isArrayBuilder(name) and !hostHasMember(self, receiver, name)) {
         const probe = try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name});
         if (lookupIntrinsic(self, probe)) |func| {
-            return try dispatchIntrinsic(self, allocator, func, args);
+            return try dispatchIntrinsic(self, allocator, probe, func, args);
         }
     }
 
@@ -3680,7 +3686,7 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
         for (probes.items) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
                 const all_args = try prependReceiver(allocator, receiver, args);
-                return try dispatchIntrinsic(self, allocator, func, all_args);
+                return try dispatchIntrinsic(self, allocator, probe, func, all_args);
             }
         }
     }
@@ -4343,7 +4349,7 @@ fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
         if (lookupIntrinsic(self, probe)) |func| {
             const all_args = try prependReceiver(allocator, receiver, reordered.items);
-            return try dispatchIntrinsic(self, allocator, func, all_args);
+            return try dispatchIntrinsic(self, allocator, probe, func, all_args);
         }
         break;
     }
@@ -4560,6 +4566,18 @@ fn ownerHasSupertype(self: *VmHost, class_name: []const u8, q: []const u8) bool 
     return false;
 }
 
+/// `[PATH]` record for a super-qualified dispatch, labelled with the
+/// resolved static target class (`super(Base)`) rather than the runtime
+/// receiver — super dispatch is static, so keying on the runtime class
+/// would collide with the virtual call's key while legitimately selecting
+/// a different declaration.
+fn emitSuperPath(allocator: Allocator, decl_fqn: []const u8, fid: FuncId, target_class: []const u8, args: []const Value) void {
+    if (!trace.pathEnabled()) return;
+    const label = std.fmt.allocPrint(allocator, "super({s})", .{target_class}) catch return;
+    defer allocator.free(label);
+    vmhost.emitPathLabeled(allocator, "member_super", decl_fqn, fid, label, args);
+}
+
 pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     _ = arg_names;
     // Find the parent class of owner_class — `super.method()` walks one
@@ -4614,6 +4632,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                 try all.appendSlice(allocator, args);
                 const module_ref = self.module.clone();
                 defer module_ref.deinit();
+                emitSuperPath(allocator, func.fqn, fid, cname, args);
                 return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), &func, all, self);
             }
             mg.deinit();
@@ -4639,6 +4658,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                     try all.append(allocator, receiver.*);
                     const module_ref = self.module.clone();
                     defer module_ref.deinit();
+                    emitSuperPath(allocator, func.fqn, fid, cname, args);
                     return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), &func, all, self);
                 }
                 mg.deinit();

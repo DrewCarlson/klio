@@ -172,6 +172,7 @@ fn evalGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value)
     try args.append(allocator, receiver);
     var args_owned: std.ArrayList(Value) = .empty;
     try args_owned.appendSlice(allocator, args.items);
+    vmhost.emitPath(allocator, "getter", func.fqn, fid, &receiver, &.{});
     return ir.eval.evalWith(VmHost, allocator, mptr, func, args_owned, self);
 }
 
@@ -196,7 +197,8 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// Invoke a resolved stdlib intrinsic with `args`, mapping a thrown /
 /// non-local-return / suspend `RuntimeError` to the matching
 /// `EvalError`.
-fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+    vmhost.emitPath(allocator, "intrinsic_fields", fqn, null, null, args);
     var ih = VmIntrinsicHost{
         .module = self.module,
         .closures = self.closures,
@@ -643,7 +645,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         for (probes) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
                 const args = [_]Value{receiver.*};
-                return dispatchIntrinsic(self, allocator, func, &args);
+                return dispatchIntrinsic(self, allocator, probe, func, &args);
             }
         }
     }
@@ -1678,6 +1680,7 @@ fn evalSetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value,
     var args: std.ArrayList(Value) = .empty;
     try args.append(allocator, receiver);
     try args.append(allocator, value);
+    vmhost.emitPath(allocator, "setter", func.fqn, fid, &receiver, &.{value});
     return switch (try ir.eval.evalWith(VmHost, allocator, mptr, func, args, self)) {
         .ok => .{ .ok = {} },
         .err => |e| .{ .err = e },

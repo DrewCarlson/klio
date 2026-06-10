@@ -13,7 +13,8 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 
-const VmHost = @import("vmhost.zig").VmHost;
+const vmhost = @import("vmhost.zig");
+const VmHost = vmhost.VmHost;
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -113,6 +114,7 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
     defer module_ref.deinit();
     const mg = module_ref.borrow();
     defer mg.deinit();
+    vmhost.emitPath(self.allocator, "top_level_init", func.fqn, fid, null, &.{});
     const r = try ir.eval.evalWith(VmHost, self.allocator, mg.get(), func, .empty, self);
     switch (r) {
         .ok => |v| {

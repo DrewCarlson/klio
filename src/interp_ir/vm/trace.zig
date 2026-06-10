@@ -10,6 +10,11 @@
 //! opt-in and never panic, so the default build stays green; they exist to
 //! surface latent dispatch bugs for triage (see execution-architecture §5.3).
 //!
+//! Set `KLIO_TRACE_PATH=1` to emit one structured `[PATH]` record per
+//! terminal dispatch (the chosen declaration plus which dispatch entry ran
+//! it), consumed by `scripts/assert_single_path.py` to assert each call
+//! shape resolves to exactly one declaration and one dispatch path.
+//!
 //! Zero cost when unset: the filter is parsed once and cached, and every
 //! trace point is guarded by `enabled`.
 
@@ -114,9 +119,14 @@ pub fn maybeDumpChain(allocator: std.mem.Allocator, chain: []const Value) void {
     std.debug.print("]\n", .{});
 }
 
-/// A short receiver-kind label for a dispatch trace (the runtime value's
-/// class name for an instance, or a coarse variant tag otherwise). The
-/// instance and class cases allocate; release with `freeLabel`.
+/// A short receiver-kind label for a dispatch trace: the runtime value's
+/// class name for an instance, the variant tag for the callable kinds (all
+/// of which dispatch identically but read differently in a trace), and the
+/// simple name of `typeFqn` otherwise. `typeFqn` is the axis member
+/// dispatch actually probes (`{type_fqn}.{name}`), so the label carries
+/// every distinction dispatch can act on — `MutableList` vs `List`,
+/// `IntRange` vs `IntProgression`, `IntArray` vs `Array`. The instance and
+/// class cases allocate; release with `freeLabel`.
 pub fn recvLabel(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error![]const u8 {
     return switch (v) {
         .Instance => |i| blk: {
@@ -131,11 +141,12 @@ pub fn recvLabel(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error
             defer cg.deinit();
             break :blk try std.fmt.allocPrint(allocator, "Class({s})", .{cg.get().name});
         },
-        .String => "String",
-        .Array => "Array",
         .Null => "Null",
-        .Unit => "Unit",
-        else => @tagName(v),
+        .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => @tagName(v),
+        else => blk: {
+            const fqn = v.typeFqn();
+            break :blk if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
+        },
     };
 }
 
@@ -194,9 +205,71 @@ pub fn invariant(comptime detail_fmt: []const u8, args: anytype) void {
     std.debug.print("[INVARIANT] " ++ detail_fmt ++ "\n", args);
 }
 
+// -------------------------------------------------------------------------
+// Structured dispatch-path records (KLIO_TRACE_PATH, default OFF).
+//
+// One `[PATH]` line per terminal dispatch — the site where a chosen
+// declaration's body (or native form) actually executes. The records let a
+// harness assert that every call shape resolves to one declaration and is
+// handled by one dispatch entry, across calls and across runs.
+// -------------------------------------------------------------------------
+
+var path_inited = std.atomic.Value(bool).init(false);
+var path_done = std.atomic.Value(bool).init(false);
+var path_on: bool = false;
+
+fn ensurePath() void {
+    if (path_done.load(.acquire)) return;
+    if (path_inited.swap(true, .acquire)) {
+        while (!path_done.load(.acquire)) std.atomic.spinLoopHint();
+        return;
+    }
+    var pbuf: [64]u8 = undefined;
+    if (readEnv("KLIO_TRACE_PATH", &pbuf)) |v| {
+        path_on = v.len != 0 and !std.mem.eql(u8, v, "0");
+    } else path_on = false;
+    path_done.store(true, .release);
+}
+
+/// True when structured dispatch-path records should be emitted. Callers
+/// guard all record-building work behind this so it is free when unset.
+pub fn pathEnabled() bool {
+    ensurePath();
+    return path_on;
+}
+
+/// Emit one structured dispatch-path record. Format (stable, one line,
+/// key=value space-separated for scripted parsing):
+///   `[PATH] fn=<simple> recv=<label> argc=<n> args=<tags> decl=<fqn>#<fid> path=<tag>`
+/// Callers gate with `pathEnabled`.
+pub fn path(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print("[PATH] " ++ fmt ++ "\n", args);
+}
+
 const testing = std.testing;
 test {
     testing.refAllDecls(@This());
+}
+
+test "pathEnabled is total" {
+    // Cannot reliably control the env in-process across runs; ensure the
+    // gate parses whatever is set and the call is total.
+    _ = pathEnabled();
+}
+
+test "path gate parse semantics" {
+    // The gate treats an empty value and a literal "0" as off, anything
+    // else as on — mirror of the invariants gate. Exercised directly on
+    // the parse expression since the env itself is process-global.
+    const parse = struct {
+        fn on(v: []const u8) bool {
+            return v.len != 0 and !std.mem.eql(u8, v, "0");
+        }
+    };
+    try testing.expect(!parse.on(""));
+    try testing.expect(!parse.on("0"));
+    try testing.expect(parse.on("1"));
+    try testing.expect(parse.on("yes"));
 }
 
 test "enabled is false when unset" {

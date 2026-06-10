@@ -46,7 +46,7 @@ fn unsupported(name: []const u8) EvalResult {
 /// Single callable-value dispatch over the value variants.
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     if (callee.* == .Intrinsic) {
-        return dispatchIntrinsic(self, callee.Intrinsic.func, args);
+        return dispatchIntrinsic(self, callee.Intrinsic.fqn, callee.Intrinsic.func, args);
     }
     // `instance()` — bound-member-reference invocation
     // (`recv::method`, `String::plus`) wins over `operator fun
@@ -274,7 +274,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // `FuncId` with no per-call FQN probe.
         host_call_func.linkAuditCheck(self, func.id, func.fqn);
         if (host_call_func.resolvedNativeForm(self, func.id)) |intrinsic| {
-            return dispatchIntrinsic(self, intrinsic, args);
+            return dispatchIntrinsic(self, func.fqn, intrinsic, args);
         }
         // Value-style invocation of a receiver lambda
         // (`block.invoke(receiver, p)` / `block(receiver, p)` for a
@@ -392,6 +392,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             defer g.deinit();
             try capture_values.appendSlice(allocator, g.get().*);
         }
+        vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
         return ir.eval.evalWithCaptures(VmHost, allocator, module, func, call_args, capture_values, self);
     }
     const msg = try std.fmt.allocPrint(allocator, "Vm::call_value on `{s}`", .{callee.typeFqn()});
@@ -615,7 +616,8 @@ fn intrinsicHostDeinit(h: *VmIntrinsicHost) void {
 
 /// Invoke a Rust-native stdlib intrinsic, mapping its `RuntimeError`
 /// control-flow signals back into the IR evaluator's `EvalError`.
-fn dispatchIntrinsic(self: *VmHost, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+    vmhost.emitPath(self.allocator, "intrinsic_call_value", fqn, null, null, args);
     var intrinsic = makeIntrinsicHost(self);
     defer intrinsicHostDeinit(&intrinsic);
     var ctx = CallCtx{
@@ -713,6 +715,7 @@ fn padArgsWithDefaults(
                 return .{ .err = .{ .Type = msg } };
             }
             const dfunc = &module.funcs.items[fid.int()];
+            vmhost.emitPath(allocator, "default_thunk", dfunc.fqn, fid, null, provided);
             const r = try ir.eval.evalWithCaptures(VmHost, allocator, module, dfunc, args_copy, captures, self);
             switch (r) {
                 .ok => |v| try call_args.append(allocator, v),
