@@ -17,6 +17,7 @@ const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
 const host_impl = @import("host_impl.zig");
+const host_globals = @import("host_globals.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -204,6 +205,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .instance_id_counter = self.instance_id_counter,
         .out_sink = self.out_sink,
         .threads = self.threads,
+        .object_states = self.object_states,
         .allocator = allocator,
     };
     var ctx = CallCtx{
@@ -370,28 +372,15 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 break :blk g.get().registry.companion_singletons.get(cls_name);
             };
             if (comp_name) |cn| {
-                const gg = self.globals.borrow();
-                defer gg.deinit();
-                if (gg.get().lookup(cn)) |s| return ok(s);
+                switch (try host_globals.ensureObjectSingleton(self, cn)) {
+                    .ok => |maybe| if (maybe) |s| return ok(s),
+                    .err => |e| return errRes(e),
+                }
             }
             if (is_object) {
-                {
-                    const gg = self.globals.borrow();
-                    defer gg.deinit();
-                    if (gg.get().lookup(cls_name)) |s| return ok(s);
-                }
-                const cid = blk: {
-                    const g = self.module.borrow();
-                    defer g.deinit();
-                    for (g.get().class_index.items) |e| {
-                        if (std.mem.eql(u8, e.name, cls_name)) break :blk e.id;
-                    }
-                    break :blk null;
-                };
-                if (cid) |c| {
-                    const mptr: *const Module = self.module.asPtr();
-                    _ = mptr;
-                    return @import("host_instances.zig").newInstance(self, allocator, c, &.{}, null);
+                switch (try host_globals.ensureObjectSingleton(self, cls_name)) {
+                    .ok => |maybe| if (maybe) |s| return ok(s),
+                    .err => |e| return errRes(e),
                 }
             }
         }
@@ -695,10 +684,9 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 break :blk g.get().registry.companion_singletons.get(cname);
             };
             if (comp_name) |cn| {
-                const singleton: ?Value = blk: {
-                    const gg = self.globals.borrow();
-                    defer gg.deinit();
-                    break :blk gg.get().lookup(cn);
+                const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+                    .ok => |maybe| maybe,
+                    .err => |e| return errRes(e),
                 };
                 if (singleton) |s| {
                     if (s == .Instance) {
@@ -810,10 +798,9 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             break :blk g.get().registry.companion_singletons.get(cls_name);
         };
         if (comp_name) |cn| {
-            const comp: ?Value = blk: {
-                const gg = self.globals.borrow();
-                defer gg.deinit();
-                break :blk gg.get().lookup(cn);
+            const comp: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+                .ok => |maybe| maybe,
+                .err => |e| return errRes(e),
             };
             if (comp) |c| {
                 const same = c == .Instance and ObjRef(InstanceData).ptrEq(c.Instance, receiver.Instance);
@@ -851,14 +838,14 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
         const suffix = try std.fmt.allocPrint(allocator, "$Companion${s}", .{name});
         defer allocator.free(suffix);
         if (std.mem.endsWith(u8, cn, suffix)) {
-            const gg = self.globals.borrow();
-            defer gg.deinit();
-            if (gg.get().lookup(cn)) |s| return ok(s);
+            switch (try host_globals.ensureObjectSingleton(self, cn)) {
+                .ok => |maybe| if (maybe) |s| return ok(s),
+                .err => |e| return errRes(e),
+            }
         }
-        const singleton: ?Value = blk: {
-            const gg = self.globals.borrow();
-            defer gg.deinit();
-            break :blk gg.get().lookup(cn);
+        const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+            .ok => |maybe| maybe,
+            .err => |e| return errRes(e),
         };
         if (singleton) |s| {
             if (s == .Instance) {
@@ -886,22 +873,29 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
         }
     }
     // A nested object lifted as `Outer$Name`: resolve the mangled
-    // singleton (then class) for a qualified `Outer.Name` access.
+    // singleton (then class) for a qualified `Outer.Name` access. First
+    // access constructs the singleton through the gate.
     const mangled = try std.fmt.allocPrint(allocator, "{s}${s}", .{ cls_name, name });
     defer allocator.free(mangled);
-    {
-        const gg = self.globals.borrow();
-        defer gg.deinit();
-        if (gg.get().lookup(mangled)) |v| {
+    switch (try host_globals.ensureObjectSingleton(self, mangled)) {
+        .ok => |maybe| if (maybe) |v| {
             if (v == .Instance) return ok(v);
-        }
+        },
+        .err => |e| return errRes(e),
     }
     {
         const cg = self.classes.borrow();
         defer cg.deinit();
         if (cg.get().get(mangled)) |def| return ok(.{ .Class = def });
     }
-    // Nested singleton object published as a global wins over the class.
+    // Nested singleton object (lifted under its simple name) wins over
+    // the class.
+    switch (try host_globals.ensureObjectSingleton(self, name)) {
+        .ok => |maybe| if (maybe) |v| {
+            if (v == .Instance) return ok(v);
+        },
+        .err => |e| return errRes(e),
+    }
     {
         const gg = self.globals.borrow();
         defer gg.deinit();
@@ -949,10 +943,14 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     if (std.mem.eql(u8, name, "isInterface")) return ok(.{ .Bool = cd.is_interface });
     if (std.mem.eql(u8, name, "isFun")) return ok(.{ .Bool = cd.is_fun_interface });
     if (std.mem.eql(u8, name, "objectInstance")) {
+        // Reading `objectInstance` initializes the object, matching the
+        // JVM (the read reaches the INSTANCE static field through class
+        // initialization).
         if (cd.is_object) {
-            const gg = self.globals.borrow();
-            defer gg.deinit();
-            if (gg.get().lookup(cd.name)) |v| return ok(v);
+            switch (try host_globals.ensureObjectSingleton(self, cd.name)) {
+                .ok => |maybe| if (maybe) |v| return ok(v),
+                .err => |e| return errRes(e),
+            }
         }
         return ok(.Null);
     }
@@ -1374,10 +1372,12 @@ fn companionParentWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(Instanc
             break :blk g.get().registry.companion_singletons.get(cname);
         };
         if (comp_name) |cn| {
-            const singleton: ?Value = blk: {
-                const gg = self.globals.borrow();
-                defer gg.deinit();
-                break :blk gg.get().lookup(cn);
+            const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+                .ok => |maybe| maybe,
+                .err => |e| {
+                    cg.deinit();
+                    return .{ .err = e };
+                },
             };
             if (singleton) |s| {
                 if (s == .Instance) {
@@ -1473,10 +1473,9 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             break :blk g.get().registry.companion_singletons.get(cls_name);
         };
         if (comp_name) |cn| {
-            const singleton: ?Value = blk: {
-                const gg = self.globals.borrow();
-                defer gg.deinit();
-                break :blk gg.get().lookup(cn);
+            const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+                .ok => |maybe| maybe,
+                .err => |e| return .{ .err = e },
             };
             if (singleton) |s| {
                 if (s == .Instance) return setField(self, allocator, &s, name, value);
@@ -1648,10 +1647,12 @@ fn setCompanionParentWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(Inst
             break :blk g.get().registry.companion_singletons.get(cname);
         };
         if (comp_name) |cn| {
-            const singleton: ?Value = blk: {
-                const gg = self.globals.borrow();
-                defer gg.deinit();
-                break :blk gg.get().lookup(cn);
+            const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+                .ok => |maybe| maybe,
+                .err => |e| {
+                    cg.deinit();
+                    return .{ .err = e };
+                },
             };
             if (singleton) |s| {
                 if (s == .Instance) {

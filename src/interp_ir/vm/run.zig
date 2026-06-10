@@ -1,8 +1,10 @@
 //! The `Vm` run loop and constructors.
 //!
 //! Establishes a `Vm` around a lowered IR module, runs the startup
-//! pipeline (object singletons, top-level property initialisers,
-//! enum-entry ctor args), and drives `main` through the IR evaluator.
+//! pipeline (top-level property initialisers, enum-entry ctor args), and
+//! drives `main` through the IR evaluator. `object` / companion
+//! singletons are not part of startup: they initialize lazily at first
+//! access through `host_globals.ensureObjectSingleton`.
 //! Inherent methods over `*Vm`, exported under `Vm.*` aliases by the
 //! module root.
 
@@ -66,6 +68,7 @@ pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
         .prog = try ObjRef(ProgramImage).init(allocator, try ProgramImage.init(allocator)),
         .out_sink = try SharedOutput.new(allocator),
         .threads = try root.ThreadTable.init(allocator, std.AutoHashMap(u64, root.ThreadEntry).init(allocator)),
+        .object_states = try root.ObjectStates.init(allocator, std.StringHashMap(root.ObjectInitState).init(allocator)),
         .allocator = allocator,
     };
 }
@@ -221,6 +224,7 @@ fn sharedHandles(self: *Vm) vmhost.SharedHandles {
         .closures = self.closures,
         .out_sink = self.out_sink,
         .threads = self.threads,
+        .object_states = self.object_states,
         .allocator = self.allocator,
     };
 }
@@ -258,6 +262,7 @@ pub fn vmSpawnChild(self: *Vm) SendableVmSeed {
         .closures = self.closures.clone(),
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
+        .object_states = self.object_states.clone(),
         .allocator = self.allocator,
     };
 }
@@ -327,64 +332,25 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
         }
     }
 
-    // Allocate every `object Foo { … }` singleton FIRST, so a top-level
-    // property initialiser that captures the object observes the same
-    // instance the main body will (preserving `===` identity across init
-    // contexts). Non-companion objects first, then synth companions: a
-    // companion's `val` initializer may reference a top-level singleton.
-    {
-        var object_names: std.ArrayList([]const u8) = .empty;
-        defer object_names.deinit(self.allocator);
-        for (module.registry.object_names.items) |n| try object_names.append(self.allocator, n);
-        // Stable sort: preserve source order within each rank, matching
-        // Rust's `sort_by_key`.
-        std.sort.insertion([]const u8, object_names.items, {}, lessByCompanionRank);
-        for (object_names.items) |obj_name| {
-            // Skip an object/companion already initialized on demand.
-            {
-                const gg = self.globals.borrow();
-                const existing = gg.get().lookup(obj_name);
-                gg.deinit();
-                if (existing) |ev| {
-                    if (ev == .Instance) continue;
-                }
-            }
-            const class_id = module.classId(obj_name) orelse continue;
-            const inst = blk: {
-                var host = vmMakeHost(self, sink);
-                switch (try host.newInstance(self.allocator, class_id, &.{}, null)) {
-                    .ok => |v| break :blk v,
-                    // Defer an object whose eager initializer throws — it is
-                    // initialized on first access in `lookupGlobal` instead.
-                    .err => continue,
-                }
-            };
-            if (inst == .Instance) {
-                if (std.mem.indexOf(u8, obj_name, "$Companion$")) |sep| {
-                    const outer_name = obj_name[0..sep];
-                    const outer_def: ?runtime.ObjRef(runtime.ClassDef) = blk: {
-                        const cg = self.classes.borrow();
-                        defer cg.deinit();
-                        if (cg.get().get(outer_name)) |d| break :blk d.clone();
-                        break :blk null;
-                    };
-                    if (outer_def) |od| {
-                        const ig = inst.Instance.borrowMut();
-                        ig.get().outer = .{ .Class = od };
-                        ig.deinit();
-                    }
-                }
-            }
-            const g = self.globals.borrowMut();
-            g.get().define(obj_name, inst) catch {};
-            g.deinit();
-        }
-    }
+    // `object Foo { … }` singletons and companions are NOT constructed
+    // here: Kotlin initializes an object lazily at its first access (and a
+    // companion additionally at the first instantiation of its owning
+    // class), and a never-referenced object never initializes. The
+    // first-access gate lives in `host_globals.ensureObjectSingleton`;
+    // every read path for a singleton routes through it.
 
     // Run top-level property initialisers before main so global reads
-    // against the env see the initial values.
+    // against the env see the initial values. A property already defined
+    // (its initializer was driven on demand by an earlier initialiser via
+    // `ensureTopLevelInited`) is not re-run: the initializer executes once.
     for (self.top_level_props.items) |nf| {
         if (nf.func.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
+        {
+            const g = self.globals.borrow();
+            const exists = g.get().lookup(nf.name) != null;
+            g.deinit();
+            if (exists) continue;
+        }
         const init_func = &module.funcs.items[nf.func.int()];
         var host = vmMakeHost(self, sink);
         const r = try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host);
@@ -536,15 +502,6 @@ fn vmEvalMessage(allocator: Allocator, e: RuntimeError) []const u8 {
     };
 }
 
-/// Sort key for object-singleton initialisation order: non-companion
-/// objects (`false`) precede synth companion objects (`true`), matching
-/// Rust's `sort_by_key(|n| n.contains("$Companion$"))`.
-fn lessByCompanionRank(_: void, a: []const u8, b: []const u8) bool {
-    const ra = std.mem.indexOf(u8, a, "$Companion$") != null;
-    const rb = std.mem.indexOf(u8, b, "$Companion$") != null;
-    return @intFromBool(ra) < @intFromBool(rb);
-}
-
 /// Format an `EvalError` into a `VmError`, mirroring the Rust
 /// `From<EvalError> for VmError` conversion (a thrown exception renders
 /// its fqn + message).
@@ -604,6 +561,7 @@ pub fn vmDeinit(self: *Vm) void {
         self.prog.deinit();
         self.out_sink.deinit();
         self.threads.deinit();
+        self.object_states.deinit();
     }
     // The receiver/coroutine thread-locals are balanced within a run; assert
     // they are empty at the boundary and clear them so leaked-across-runs

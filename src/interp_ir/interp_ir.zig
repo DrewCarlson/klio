@@ -312,6 +312,31 @@ pub const ThreadResult = union(enum) {
 
 pub const ThreadTable = ObjRef(std.AutoHashMap(u64, ThreadEntry));
 
+/// First-access initialization state for one `object` / companion
+/// singleton, keyed by its lifted global name in `ObjectStates`. A name
+/// with no entry is either not yet initialized or already published in
+/// `globals`; the gate in `host_globals.ensureObjectSingleton` checks
+/// `globals` first, so the table only carries the transient and terminal
+/// non-published states.
+pub const ObjectInitState = union(enum) {
+    /// Construction is running on `thread`. `instance` is set as soon as
+    /// the instance shell is materialized, so re-entrant access from the
+    /// constructing thread (an object referencing itself during its own
+    /// init) observes the partially-initialized singleton, matching
+    /// Kotlin. Any other thread waits for the entry to resolve.
+    InProgress: struct { thread: std.Thread.Id, instance: ?Value },
+    /// The first construction threw. The initializer is never retried;
+    /// every later access throws `FileFailedToInitializeException`
+    /// without the original cause, matching kotlinc.
+    Failed,
+};
+
+/// Shared lazy-`object` init table: one entry per singleton whose
+/// construction is in flight or has failed. Shared by handle with every
+/// OS thread, like `ThreadTable`; the cell's writer lock serializes the
+/// claim that makes first-access construction once-only across threads.
+pub const ObjectStates = ObjRef(std.StringHashMap(ObjectInitState));
+
 /// Vm-level errors. Carried as data, mirroring Rust's `VmError`.
 pub const VmError = union(enum) {
     /// main function not found in module
@@ -373,6 +398,8 @@ pub const Vm = struct {
     out_sink: SharedOutput,
     /// Host-side registry of live spawned-thread join handles.
     threads: ThreadTable,
+    /// Lazy `object` / companion first-access init states.
+    object_states: ObjectStates,
     allocator: Allocator,
 
     pub const new = run_mod.vmNew;
@@ -400,6 +427,7 @@ pub const SendableVmSeed = struct {
     closures: SharedClosures,
     out_sink: SharedOutput,
     threads: ThreadTable,
+    object_states: ObjectStates,
     allocator: Allocator,
 
     /// Materialize a child `Vm` on the current (new) OS thread.
@@ -417,6 +445,7 @@ pub const SendableVmSeed = struct {
             .prog = self.prog,
             .out_sink = self.out_sink,
             .threads = self.threads,
+            .object_states = self.object_states,
             .allocator = self.allocator,
         };
     }

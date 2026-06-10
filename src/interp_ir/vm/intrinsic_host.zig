@@ -124,6 +124,7 @@ fn spawnSeed(self: *VmIntrinsicHost) SendableVmSeed {
         .closures = self.closures.clone(),
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
+        .object_states = self.object_states.clone(),
         .allocator = self.allocator,
     };
 }
@@ -586,6 +587,13 @@ pub fn lookupGlobal(self: *VmIntrinsicHost, name: []const u8) ?Value {
         const g = self.globals.borrow();
         defer g.deinit();
         if (g.get().lookup(name)) |v| return v;
+    }
+    // A pack native's first reference to an `object` / companion drives
+    // the same lazy first-access gate the evaluator uses.
+    {
+        const state = vmhost.SharedHandles.fromIntrinsic(self);
+        var host = VmHost.borrowed(state, state.globals, self.out_sink.output());
+        if (vmhost.host_globals.objectSingletonQuiet(&host, name)) |v| return v;
     }
     const cg = self.classes.borrow();
     defer cg.deinit();

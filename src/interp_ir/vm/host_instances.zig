@@ -15,6 +15,7 @@ const stdlib = @import("stdlib");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
+const host_globals = @import("host_globals.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -52,11 +53,10 @@ fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloca
 }
 
 // -------------------------------------------------------------------------
-// Per-thread constructor-shell recursion guard. In Rust this was a single
-// thread-local on the `EXEC` struct read through `with_ctor_guard` by both
-// secondary-ctor shell construction (here) and the deferred-`object`
-// on-access drive in `host_globals.zig`; `ctorGuardContains` is `pub` so
-// both readers consult the one stack the shell construction pushes onto.
+// Per-thread constructor-shell recursion guard for secondary-ctor shell
+// construction. Lazy `object` re-entrancy is handled separately by the
+// shared object-init state table in `host_globals.zig`; this stack only
+// breaks same-class shell recursion during secondary-ctor dispatch.
 // -------------------------------------------------------------------------
 
 threadlocal var ctor_guard: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -341,6 +341,7 @@ fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []con
         .instance_id_counter = self.instance_id_counter.clone(),
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
+        .object_states = self.object_states.clone(),
         .allocator = self.allocator,
     };
     defer {
@@ -354,6 +355,7 @@ fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []con
         ih.instance_id_counter.deinit();
         ih.out_sink.deinit();
         ih.threads.deinit();
+        ih.object_states.deinit();
     }
     var ctx = CallCtx{
         .args = args,
@@ -1004,6 +1006,38 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
 
     const class_name = classDefName(class_def);
     const n_primary_initial = classDefPrimaryParamCount(class_def);
+
+    // Kotlin initializes a class's companion at the first instantiation of
+    // the class (when not already initialized by direct access), the
+    // class's own companion before its ancestors' — kotlinc order. An init
+    // failure aborts the instantiation at this access site.
+    {
+        var cur: ?ObjRef(ClassDef) = class_def.clone();
+        while (cur) |c| {
+            const cname = classDefName(c);
+            const comp_name: ?[]const u8 = blk: {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                break :blk mg.get().registry.companion_singletons.get(cname);
+            };
+            if (comp_name) |cn| {
+                switch (try host_globals.ensureObjectSingleton(self, cn)) {
+                    .ok => {},
+                    .err => |e| {
+                        c.deinit();
+                        return .{ .err = e };
+                    },
+                }
+            }
+            const next: ?ObjRef(ClassDef) = blk: {
+                const g = c.borrow();
+                defer g.deinit();
+                break :blk if (g.get().parent) |pp| pp.clone() else null;
+            };
+            c.deinit();
+            cur = next;
+        }
+    }
 
     // Secondary-ctor dispatch.
     const zero_primary_secondary = n_primary_initial == 0 and blk: {
@@ -1946,11 +1980,20 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         }
     }
 
-    // Publish object / companion singletons before init runs.
+    // Make an object / companion singleton shell visible before its init
+    // runs. A gate-driven construction records the in-flight instance in
+    // the shared object-init table, so re-entrant reads from the
+    // constructing thread (the object referencing itself during its own
+    // init) observe it while other threads keep waiting — the singleton
+    // only publishes into `globals` after construction completes. A
+    // construction NOT driven through the gate (a runtime-registered
+    // local object) publishes directly, as before.
     if (classDefIsObject(class_def)) {
-        const g = self.globals.borrowMut();
-        g.get().define(class_name, inst_value) catch {};
-        g.deinit();
+        if (!host_globals.noteObjectInFlight(self, class_name, inst_value)) {
+            const g = self.globals.borrowMut();
+            g.get().define(class_name, inst_value) catch {};
+            g.deinit();
+        }
     }
 
     // Evaluate class-delegation expressions.
@@ -2326,6 +2369,28 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             else => {},
         }
     }
+    // Lower the object literal's own `init { … }` blocks as 0-arg method
+    // thunks over `this`, recording each block's position as the number of
+    // properties declared before it so the run below interleaves blocks
+    // and property initializers in declaration order.
+    const InitThunk = struct { module: ObjRef(Module), func: FuncId, prop_pos: usize };
+    var init_thunks: std.ArrayList(InitThunk) = .empty;
+    for (obj.init_blocks, 0..) |*blk, idx| {
+        const member_pos = if (idx < obj.init_block_positions.len) obj.init_block_positions[idx] else members.len;
+        const upto = @min(member_pos, members.len);
+        var prop_pos: usize = 0;
+        for (members[0..upto]) |*m| {
+            if (m.* == .Property) prop_pos += 1;
+        }
+        const thunk_name: ast.Ident = .{
+            .name = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx}),
+            .span = blk.span,
+        };
+        const thunk = synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
+        const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+        const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
+        try init_thunks.append(allocator, .{ .module = sub_ref, .func = func.id, .prop_pos = prop_pos });
+    }
     ir.lower.setLowerAnonCaptures(null);
 
     // Body-property defs from the object's own properties.
@@ -2498,7 +2563,21 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             cur = next;
         }
     }
-    // Bottom-up so a parent's field exists before a nearer ancestor.
+    // Bottom-up so a parent's field exists before a nearer ancestor. Each
+    // parent's `init { … }` blocks run interleaved with its body-property
+    // initializers in declaration order, exactly as in a named
+    // construction (`runInitBlocksAt`).
+    var super_chain_entries: std.ArrayList(ChainEntry) = .empty;
+    defer super_chain_entries.deinit(allocator);
+    for (parent_chain.items) |c| {
+        const cg = c.borrow();
+        const cname = cg.get().name;
+        cg.deinit();
+        try super_chain_entries.append(allocator, .{
+            .name = cname,
+            .args = super_args_by_class.get(cname) orelse &.{},
+        });
+    }
     var ci: usize = parent_chain.items.len;
     while (ci > 0) {
         ci -= 1;
@@ -2514,7 +2593,11 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             defer cg.deinit();
             break :blk try allocator.dupe(PropertyDef, cg.get().body_properties);
         };
-        for (props) |p| {
+        for (props, 0..) |p, pi| {
+            switch (try runInitBlocksAt(self, cls, pi, &inst_value, super_chain_entries.items, cls_args)) {
+                .ok => {},
+                .err => |e| return .{ .err = e },
+            }
             const fid = bodyPropInit(self, cls_name, p.name) orelse continue;
             const mg = self.module.borrow();
             const m = mg.get();
@@ -2547,53 +2630,100 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 .err => |e| return .{ .err = e },
             }
         }
+        switch (try runInitBlocksAt(self, cls, props.len, &inst_value, super_chain_entries.items, cls_args)) {
+            .ok => {},
+            .err => |e| return .{ .err = e },
+        }
     }
 
-    // Run the anon object's own complex property inits.
-    for (complex_prop_inits.items) |cpi| {
-        const mref = cpi.module;
-        const i = @intFromEnum(cpi.func);
-        const mg = mref.borrow();
-        const sub_mod = mg.get();
-        if (i >= sub_mod.funcs.items.len) {
-            mg.deinit();
-            continue;
-        }
-        const func = sub_mod.funcs.items[i];
-        const prev = self.globals.clone();
-        if (capture_pairs.len != 0) {
-            const scoped = try ObjRef(Env).init(allocator, Env.withParent(allocator, self.globals.clone()));
-            const sg = scoped.borrowMut();
-            for (capture_pairs) |nv| sg.get().define(nv.name, nv.value) catch {};
-            sg.deinit();
-            self.globals = scoped;
-        }
-        var cap_vec: std.ArrayList(Value) = .empty;
-        for (func.capture_order) |cn| {
-            if (std.mem.eql(u8, cn, "this")) {
-                try cap_vec.append(allocator, inst_value);
-            } else {
-                try cap_vec.append(allocator, findCapture(capture_pairs, cn) orelse .Null);
+    // Run the anon object's own `init { … }` blocks and complex property
+    // inits interleaved in declaration order: blocks positioned before a
+    // property run before that property's initializer.
+    var next_init: usize = 0;
+    var prop_idx: usize = 0;
+    for (members) |*m| {
+        if (m.* != .Property) continue;
+        while (next_init < init_thunks.items.len and init_thunks.items[next_init].prop_pos <= prop_idx) : (next_init += 1) {
+            const it = init_thunks.items[next_init];
+            switch (try runAnonThunk(self, allocator, it.module, it.func, &inst_value, capture_pairs)) {
+                .ok => {},
+                .err => |e| return .{ .err = e },
             }
         }
-        var all: std.ArrayList(Value) = .empty;
-        try all.append(allocator, inst_value);
-        vmhost.emitPath(allocator, "object_build", func.fqn, cpi.func, &inst_value, &.{});
-        const r = try ir.eval.evalWithCaptures(VmHost, allocator, sub_mod, &func, all, cap_vec, self);
-        mg.deinit();
-        self.globals.deinit();
-        self.globals = prev;
-        switch (r) {
+        prop_idx += 1;
+        const pname = m.Property.name.name;
+        const cpi: ?ComplexInit = blk: {
+            for (complex_prop_inits.items) |c| {
+                if (std.mem.eql(u8, c.name, pname)) break :blk c;
+            }
+            break :blk null;
+        };
+        const c = cpi orelse continue;
+        switch (try runAnonThunk(self, allocator, c.module, c.func, &inst_value, capture_pairs)) {
             .ok => |v| {
                 const ig = inst.borrowMut();
                 defer ig.deinit();
-                try ig.get().define(allocator, cpi.name, v);
+                try ig.get().define(allocator, c.name, v);
             },
+            .err => |e| return .{ .err = e },
+        }
+    }
+    while (next_init < init_thunks.items.len) : (next_init += 1) {
+        const it = init_thunks.items[next_init];
+        switch (try runAnonThunk(self, allocator, it.module, it.func, &inst_value, capture_pairs)) {
+            .ok => {},
             .err => |e| return .{ .err = e },
         }
     }
 
     return .{ .ok = inst_value };
+}
+
+/// Run one lowered anon-object thunk (a complex property initializer or
+/// an `init` block) against the instance under construction: captures
+/// resolve through `capture_pairs` (with `this` bound to the instance)
+/// and the enclosing scope's names are layered over globals for the
+/// call's duration.
+fn runAnonThunk(
+    self: *VmHost,
+    allocator: Allocator,
+    mref: ObjRef(Module),
+    fid: FuncId,
+    inst_value: *const Value,
+    capture_pairs: []const NameValue,
+) Allocator.Error!EvalResult {
+    const i = @intFromEnum(fid);
+    const mg = mref.borrow();
+    const sub_mod = mg.get();
+    if (i >= sub_mod.funcs.items.len) {
+        mg.deinit();
+        return .{ .ok = .Unit };
+    }
+    const func = sub_mod.funcs.items[i];
+    const prev = self.globals.clone();
+    if (capture_pairs.len != 0) {
+        const scoped = try ObjRef(Env).init(allocator, Env.withParent(allocator, self.globals.clone()));
+        const sg = scoped.borrowMut();
+        for (capture_pairs) |nv| sg.get().define(nv.name, nv.value) catch {};
+        sg.deinit();
+        self.globals = scoped;
+    }
+    var cap_vec: std.ArrayList(Value) = .empty;
+    for (func.capture_order) |cn| {
+        if (std.mem.eql(u8, cn, "this")) {
+            try cap_vec.append(allocator, inst_value.*);
+        } else {
+            try cap_vec.append(allocator, findCapture(capture_pairs, cn) orelse .Null);
+        }
+    }
+    var all: std.ArrayList(Value) = .empty;
+    try all.append(allocator, inst_value.*);
+    vmhost.emitPath(allocator, "object_build", func.fqn, fid, inst_value, &.{});
+    const r = try ir.eval.evalWithCaptures(VmHost, allocator, sub_mod, &func, all, cap_vec, self);
+    mg.deinit();
+    self.globals.deinit();
+    self.globals = prev;
+    return r;
 }
 
 /// Evaluate a supertype ctor-arg expression to a value: literals, then a

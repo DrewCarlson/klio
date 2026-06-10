@@ -54,7 +54,7 @@ const itests_files = [_][]const u8{
     "parity_generics_advanced", "parity_inheritance_dispatch", "parity_inner_classes",
     "parity_interfaces_visibility", "parity_iterables_special", "parity_kotlinx_io_read",
     "parity_lambdas_and_dispatch", "parity_maps_intensive", "parity_named_args_defaults",
-    "parity_nullability_deep", "parity_operator_edge_cases", "parity_properties_accessors",
+    "parity_nullability_deep", "parity_object_init", "parity_operator_edge_cases", "parity_properties_accessors",
     "parity_ranges_arrays", "parity_sealed_when_patterns", "parity_string_processing",
     "parity_strings_numbers", "parity_suspend_shapes", "parity_threaded_litmus",
     "parity_type_system_shapes", "parity_visibility_modifiers", "parser_corpus",

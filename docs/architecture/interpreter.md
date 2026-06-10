@@ -59,6 +59,31 @@ sentinel.
 state (for example `kotlinx.io.Buffer` stashes a byte
 `std.ArrayList(u8)` there).
 
+## Object and companion initialization
+
+`object` singletons and companions initialize lazily, matching
+kotlinc: construction happens at the first access (bare-name read,
+qualified member access, `::class.objectInstance`, a pack native's
+lookup), and a companion additionally initializes at the first
+instantiation of its owning class — the class's own companion before
+its ancestors'. A never-referenced object never runs its
+initializers. Property initializers and `init` blocks run interleaved
+in declaration order, for object declarations and object expressions
+alike.
+
+Initialization is once-only across threads: a shared per-program
+state table (`Vm.object_states`) serializes the first-access claim.
+The claiming thread constructs and publishes into globals only after
+construction completes; other threads racing the same name wait, and
+the constructing thread's own re-entrant reads observe the in-flight
+instance (an object may reference itself during its own init). A
+throw during initialization propagates to the access site wrapped in
+`FileFailedToInitializeException` (an `Error`, not an `Exception`)
+with the user throwable as its cause; the initializer is never
+retried — every later access throws the same wrapper without the
+cause. Top-level property initializers stay eager (file order at
+program start), matching kotlinc's main-file semantics.
+
 ## Dispatch and intrinsics
 
 Stdlib and pack functionality is host-bound. The Vm does not special

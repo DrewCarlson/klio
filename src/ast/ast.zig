@@ -781,6 +781,14 @@ pub const Expr = union(enum) {
         supertype_args: []?[]Expr,
         supertype_delegates: []?Expr,
         members: []Decl,
+        /// `init { … }` blocks in declaration order, run at construction
+        /// interleaved with the property initializers — same semantics as
+        /// `Class.init_blocks`.
+        init_blocks: []Block,
+        /// Position of each entry in `init_blocks` relative to `members`,
+        /// with the same before/after ordering contract as
+        /// `Class.init_block_positions`.
+        init_block_positions: []usize,
         span: Span,
     },
 

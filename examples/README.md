@@ -39,6 +39,7 @@ Run any program with:
 | `enums.kt`, `enum_companion.kt`, `enum_entries_interface.kt` | Enum entries, ctor args, per-entry overrides, `entries`/`values()`, enum companions. |
 | `sealed_when.kt`, `sealed_when_exhaustive.kt` | Sealed hierarchies with exhaustive `when`.  |
 | `data_object.kt`           | `data object`.                                                 |
+| `object_lazy_init.kt`      | Lazy first-access `object`/companion initialization: unused objects never initialize, init/property interleaving, companion init at first instantiation, anon-object init blocks, init-failure wrapping (`FileFailedToInitializeException`) without retry. |
 | `value_class.kt`           | Inline `value class`.                                           |
 | `annotation_class.kt`      | `annotation class` declarations.                               |
 | `plain_class_tostring.kt`  | Default and overridden `toString`.                             |

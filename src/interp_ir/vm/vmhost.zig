@@ -55,6 +55,7 @@ const ClassTable = root.ClassTable;
 const OuterTable = root.OuterTable;
 const SharedClosures = root.SharedClosures;
 const ThreadTable = root.ThreadTable;
+const ObjectStates = root.ObjectStates;
 
 // Sibling impl files. Each holds the free functions over `*VmHost` /
 // `*VmIntrinsicHost` that fill in one slice of host behaviour.
@@ -145,7 +146,6 @@ fn pathSimpleName(fqn: []const u8) []const u8 {
 /// empty at a run boundary, then clear them. Run between programs so leaked
 /// state is a loud failure rather than silently threaded into the next run.
 pub fn resetReceiverThreadLocals() void {
-    host_globals.resetReceiverTls();
     host_instances.resetReceiverTls();
     host_call_member.resetReceiverTls();
     host_fields.resetReceiverTls();
@@ -170,6 +170,7 @@ pub const SharedHandles = struct {
     closures: SharedClosures,
     out_sink: SharedOutput,
     threads: ThreadTable,
+    object_states: ObjectStates,
     allocator: Allocator,
 
     /// Borrow the shared handles a live `VmHost` holds, without cloning.
@@ -185,6 +186,7 @@ pub const SharedHandles = struct {
             .closures = host.closures,
             .out_sink = host.out_sink,
             .threads = host.threads,
+            .object_states = host.object_states,
             .allocator = host.allocator,
         };
     }
@@ -202,6 +204,7 @@ pub const SharedHandles = struct {
             .closures = host.closures,
             .out_sink = host.out_sink,
             .threads = host.threads,
+            .object_states = host.object_states,
             .allocator = host.allocator,
         };
     }
@@ -223,6 +226,7 @@ pub const VmHost = struct {
     closures: SharedClosures,
     out_sink: SharedOutput,
     threads: ThreadTable,
+    object_states: ObjectStates,
     allocator: Allocator,
 
     /// Build a transient `VmHost` that BORROWS another host/Vm's shared
@@ -244,6 +248,7 @@ pub const VmHost = struct {
             .closures = state.closures,
             .out_sink = state.out_sink,
             .threads = state.threads,
+            .object_states = state.object_states,
             .allocator = state.allocator,
         };
     }
@@ -302,6 +307,7 @@ pub const VmIntrinsicHost = struct {
     instance_id_counter: ObjRef(std.atomic.Value(u64)),
     out_sink: SharedOutput,
     threads: ThreadTable,
+    object_states: ObjectStates,
     allocator: Allocator,
 
     /// Build a transient `VmIntrinsicHost` that BORROWS another host's shared
@@ -320,6 +326,7 @@ pub const VmIntrinsicHost = struct {
             .instance_id_counter = state.instance_id_counter,
             .out_sink = state.out_sink,
             .threads = state.threads,
+            .object_states = state.object_states,
             .allocator = state.allocator,
         };
     }
