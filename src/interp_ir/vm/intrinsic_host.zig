@@ -270,6 +270,7 @@ pub fn evalClosureRaw(
 
     const state = vmhost.SharedHandles.fromIntrinsic(self);
     var host = VmHost.borrowed(state, state.globals, out);
+    vmhost.emitPath(self.allocator, "coroutine_closure", func.fqn, info.body_func, this_value, args);
     return ir.eval.evalWithCaptures(VmHost, self.allocator, module, func, args_owned, caps_owned, &host);
 }
 
@@ -420,6 +421,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         // site with no name-seeded scratch env or capture read-back.
         const state = vmhost.SharedHandles.fromIntrinsic(self);
         var host = VmHost.borrowed(state, state.globals, out);
+        vmhost.emitPath(self.allocator, "hof_invoke", func.fqn, info.body_func, null, args);
         const result = try ir.eval.evalWithCaptures(VmHost, self.allocator, module, func, call_args, caps_owned, &host);
         return flattenEval(result);
     }
@@ -451,6 +453,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
             .host = child.intrinsicHost(),
             .allocator = self.allocator,
         };
+        vmhost.emitPath(self.allocator, "intrinsic_hof", callable.Intrinsic.fqn, null, null, args);
         return callable.Intrinsic.func(&ctx);
     }
 

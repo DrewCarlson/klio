@@ -70,6 +70,77 @@ pub const intrinsic_host = @import("intrinsic_host.zig");
 pub const coroutines = @import("coroutines.zig");
 pub const trace = @import("trace.zig");
 
+/// Emit one structured `[PATH]` dispatch record (`KLIO_TRACE_PATH`) for a
+/// terminal dispatch site: `path_tag` identifies the site, `decl_fqn`/`fid`
+/// the chosen declaration (`fid` null for a native intrinsic form),
+/// `receiver` the dispatch receiver (null for receiverless entries), and
+/// `args` the call arguments. Free when the gate is off: the first check
+/// returns before any label or tag work.
+pub fn emitPath(
+    allocator: Allocator,
+    path_tag: []const u8,
+    decl_fqn: []const u8,
+    fid: ?FuncId,
+    receiver: ?*const Value,
+    args: []const Value,
+) void {
+    if (!trace.pathEnabled()) return;
+    const recv_label: []const u8 = if (receiver) |r|
+        trace.recvLabel(allocator, r.*) catch return
+    else
+        "none";
+    defer if (receiver) |r| trace.freeLabel(allocator, r.*, recv_label);
+    emitPathLabeled(allocator, path_tag, decl_fqn, fid, recv_label, args);
+}
+
+/// `emitPath` with a caller-supplied receiver label. Super-qualified
+/// dispatch uses this to label the record with the resolved static target
+/// class (`super(Base)`) rather than the runtime receiver: `super.f()` is
+/// static dispatch, so keying it on the runtime class would collide with
+/// the virtual `recv.f()` key while legitimately choosing a different
+/// declaration.
+pub fn emitPathLabeled(
+    allocator: Allocator,
+    path_tag: []const u8,
+    decl_fqn: []const u8,
+    fid: ?FuncId,
+    recv_label: []const u8,
+    args: []const Value,
+) void {
+    if (!trace.pathEnabled()) return;
+    // Coarse arg-shape tags via `trace.recvLabel`: the runtime-type label
+    // per argument — the same axis member dispatch probes — with an
+    // instance reporting its runtime class name. Comma-joined; `-` for a
+    // zero-arg call so the record stays one space-separated token list.
+    var tags: std.ArrayList(u8) = .empty;
+    defer tags.deinit(allocator);
+    if (args.len == 0) {
+        tags.appendSlice(allocator, "-") catch return;
+    }
+    for (args, 0..) |a, i| {
+        if (i != 0) tags.append(allocator, ',') catch return;
+        const label = trace.recvLabel(allocator, a) catch return;
+        defer trace.freeLabel(allocator, a, label);
+        tags.appendSlice(allocator, label) catch return;
+    }
+    const fn_name = pathSimpleName(decl_fqn);
+    if (fid) |f| {
+        trace.path("fn={s} recv={s} argc={d} args={s} decl={s}#{d} path={s}", .{
+            fn_name, recv_label, args.len, tags.items, decl_fqn, f.int(), path_tag,
+        });
+    } else {
+        trace.path("fn={s} recv={s} argc={d} args={s} decl={s} path={s}", .{
+            fn_name, recv_label, args.len, tags.items, decl_fqn, path_tag,
+        });
+    }
+}
+
+/// Simple-name tail of a possibly-qualified name (`a.b.C` -> `C`).
+fn pathSimpleName(fqn: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| return fqn[i + 1 ..];
+    return fqn;
+}
+
 /// Assert (Debug) that the process-wide receiver/coroutine thread-locals are
 /// empty at a run boundary, then clear them. Run between programs so leaked
 /// state is a loud failure rather than silently threaded into the next run.

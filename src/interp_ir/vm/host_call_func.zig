@@ -134,7 +134,8 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// Build a `VmIntrinsicHost` mirroring `dispatch_intrinsic`'s, drive the
 /// intrinsic through a `CallCtx`, and convert any `RuntimeError` back into
 /// the IR evaluator's `EvalError` data path.
-fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
+    vmhost.emitPath(allocator, "intrinsic_call_func", fqn, null, null, args);
     var intrinsic = VmIntrinsicHost{
         .module = self.module.clone(),
         .closures = self.closures.clone(),
@@ -513,7 +514,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // with no per-call FQN probe.
     linkAuditCheck(self, func, f.fqn);
     if (resolvedNativeForm(self, func)) |intrinsic| {
-        return dispatchIntrinsic(self, allocator, intrinsic, args_in);
+        return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
     }
 
     // Mis-bound type-specialized overload fallback. A bare call is lowered
@@ -536,7 +537,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         }
         if (mismatch) {
             if (lookupIntrinsic(self, f.fqn)) |intrinsic| {
-                return dispatchIntrinsic(self, allocator, intrinsic, args_in);
+                return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
             }
         }
     }
@@ -558,7 +559,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         // No same-name body sibling — try the declared FQN first, then
         // probe the common stdlib packages by simple name.
         if (lookupIntrinsic(self, f.fqn)) |intrinsic| {
-            return dispatchIntrinsic(self, allocator, intrinsic, args_in);
+            return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
         }
         const simple = f.name;
         const prefixes = [_][]const u8{
@@ -578,7 +579,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
             const probe = std.fmt.allocPrint(allocator, "{s}{s}", .{ pfx, simple }) catch continue;
             defer allocator.free(probe);
             if (lookupIntrinsic(self, probe)) |intrinsic| {
-                return dispatchIntrinsic(self, allocator, intrinsic, args_in);
+                return dispatchIntrinsic(self, allocator, probe, intrinsic, args_in);
             }
         }
     }
@@ -608,6 +609,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
                             const dfunc = funcAt(module, dfid) orelse
                                 return .{ .err = typeErr(allocator, "default-arg FuncId {d} out of range", .{dfid.int()}) };
                             var thunk_args = try argsFromSlice(allocator, args.items);
+                            vmhost.emitPath(allocator, "call_func_default_thunk", dfunc.fqn, dfid, null, args.items);
                             const r = try ir.eval.evalWith(VmHost, allocator, module, dfunc, thunk_args, self);
                             switch (r) {
                                 .ok => |v| try args.append(allocator, v),
@@ -638,6 +640,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
                     var captures: std.ArrayList(Value) = .empty;
                     if (args.items.len != 0) try captures.append(allocator, args.items[0]);
                     var thunk_args = try argsFromSlice(allocator, args.items);
+                    vmhost.emitPath(allocator, "call_func_default_thunk", dfunc.fqn, dfid, null, args.items);
                     const r = try ir.eval.evalWithCaptures(VmHost, allocator, module, dfunc, thunk_args, captures, self);
                     _ = &thunk_args;
                     switch (r) {
@@ -656,6 +659,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // deiniting `args`; the outer `defer args.deinit` would then double
     // free. Take ownership of the final list and disarm the defer.
     args = .empty;
+    vmhost.emitPath(allocator, "call_func", f.fqn, func, null, args_in);
     return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
 }
 
@@ -747,6 +751,7 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                     const dfunc = funcAt(module, id) orelse
                         return .{ .err = typeErr(allocator, "default-arg FuncId {d} out of range", .{id.int()}) };
                     var thunk_args = try argsFromSlice(allocator, reordered.items);
+                    vmhost.emitPath(allocator, "call_func_named_thunk", dfunc.fqn, id, null, reordered.items);
                     const r = try ir.eval.evalWith(VmHost, allocator, module, dfunc, thunk_args, self);
                     _ = &thunk_args;
                     switch (r) {

@@ -714,10 +714,14 @@ stale Rust-path `corpus_check.py`) that runs a program with `KLIO_TRACE_PATH=1`
 and asserts each `(fn, receiver_type)` pair maps to exactly one `path_tag` and
 one `chosen_decl` — turning "one execution path" into an executable check.
 
-> Note: `scripts/klio-parity-sweep.sh`, `klio-smoke.sh`, `klio-guard.sh`, and
-> `corpus_check.py` still reference Rust/cargo paths (`target/release/klio`,
-> `cargo build -p klio-parity`, `crates/klio-parity/tests/corpus`) and are stale
-> post-port. Any new script should target `zig-out/bin/klio` and
+> Note: `scripts/assert_single_path.py` is the live replacement: it targets
+> `zig-out/bin/klio`, runs the examples + coroutine-smoke corpus under
+> `KLIO_TRACE_PATH=1`, and asserts decl determinism, single-path grouping, and
+> cross-run record stability. `corpus_check.py` remains usable only in
+> `--no-rust` mode; `scripts/klio-parity-sweep.sh`, `klio-smoke.sh`, and
+> `klio-guard.sh` still reference Rust/cargo paths (`target/release/klio`,
+> `cargo build -p klio-parity`, `crates/klio-parity/tests/corpus`) and are
+> stale post-port. Any new script should target `zig-out/bin/klio` and
 > `tests/corpus/expected/`.
 
 ---
@@ -744,7 +748,7 @@ refactors, then the structural unifications in dependency order.
 | 9 | DONE — one executable form per symbol resolved at link time (`ProgramImage.linkResolvedForms` → the `resolved_native` table keyed by `FuncId`, populated once after the module + `installed_bindings` exist); the per-call FQN short-circuit in `callFunc` and `callValue` is deleted, both now consulting the resolved form by `FuncId` (`host_call_func.resolvedNativeForm`). Pack-vs-source identity is settled at link time, load-order-independent. `KLIO_LINK_AUDIT` is a permanent env-gated detector proving the link form equals the deleted per-call probe's pick (0 divergences over the full suite + 82 examples + the differential corpus). (§4.4) | C | high | high | XL |
 | 10 | DONE — removed `isLambdaBody()` as a resolution axis at the four `expr.zig` dotted-head sites; package-head vs receiver-member is now the one predicate `headIsPackage` (real package root or `Module.packageHeadDeclared` FQN-prefix), shadowed by captured/local/enclosing-member names — order- and load-mode-independent, no lambda special case. The inline splice already binds the inline receiver as a `"this"` scope local, so no extra frame-receiver slot was needed. Gated green behind the builder-DSL differential (`examples/dsl_dotted_head.kt` + `coroutine_smoke/cs8_dotted_in_builder.kt`, byte-identical across all three pack modes); both audits 0. (§4.4/§4.2) | C/B | medium | high | M |
 | 11 | DONE — deleted `Value.Lambda` (vestigial Env-based closure the live IR VM never produced; `AstLambda` already built `IrClosure`). Removed the variant, its one GC-test constructor, and every Value-context `.Lambda =>` arm; `IrClosure` is now the single closure value form and `func.capture_order` (via `ClosureInfo.captures`) is the sole capture-metadata authority. | cleanup | medium | medium | M |
-| 12 | `KLIO_TRACE_PATH` structured trace + `scripts/assert_single_path.py` (§5.5) | detect | medium | low | M |
+| 12 | DONE — `KLIO_TRACE_PATH=1` emits one structured `[PATH]` record per terminal dispatch through the tracer (`fn`/`recv`/`argc`/`args`/`decl`/`path`), instrumented at every terminal site: `callFunc` body + default thunks, `callValue` closure body + default thunk, `irMethodWalk`, `invokeAnonMethod`, `callSuper` (labelled `super(Target)` — super dispatch is static, so keying on the runtime receiver would collide with the virtual call's key), getter/setter, ctor/init thunks, anon-object build, top-level prop init, the closure trio (`call_value_closure`/`hof_invoke`/`coroutine_closure`), and every native `dispatchIntrinsic` terminal (each now carries the resolved FQN). Value labels report the `typeFqn` simple name — the axis member dispatch probes — so `MutableList`/`List` and `IntRange`/`IntProgression` stay distinct. `scripts/assert_single_path.py` (§5.5) asserts, per program with `--rerun`: (1) one declaration per call shape, (2) one dispatch-path group per target, (3) identical record sets across runs; green over all examples + coroutine-smoke. Two corrections to this row's original spec proved necessary: the chosen-decl assertion keys on `(fn, recv, argc, arg-tags)` rather than `(fn, recv)` because Kotlin overloads legitimately map one `(fn, recv)` to several declarations; and the three behaviorally-unified-but-structurally-distinct closure execution sites form one `closure_body` group (with anonymous bodies identified by declaration, and named function-reference wrappers joining the direct-call group), since a literal one-tag assertion is false by design until the closure sites are structurally merged. | detect | medium | low | M |
 
 **Critical path.** 0a–0c and 1–3 are detection scaffolding that should land
 first — they make every later refactor verifiable and convert the three
