@@ -25,6 +25,7 @@ test {
     _ = @import("parity_maps_intensive.zig");
     _ = @import("parity_named_args_defaults.zig");
     _ = @import("parity_nullability_deep.zig");
+    _ = @import("parity_object_init.zig");
     _ = @import("parity_operator_edge_cases.zig");
     _ = @import("parity_properties_accessors.zig");
     _ = @import("parity_ranges_arrays.zig");

@@ -2677,6 +2677,7 @@ fn walkExprForOptIn(
         },
         .ObjectExpr => |oe| {
             for (oe.members) |*m| try walkDeclForOptIn(self, m, markers, required, scope, out);
+            for (oe.init_blocks) |*ib| try walkBlockForOptIn(self, ib, markers, required, scope, out);
             for (oe.supertype_args) |maybe_args| {
                 if (maybe_args) |args| {
                     for (args) |*a| try walkExprForOptIn(self, a, markers, required, scope, out);
@@ -3008,6 +3009,7 @@ fn walkExprForDeprecation(
         },
         .ObjectExpr => |oe| {
             for (oe.members) |*m| try walkDeclForDeprecation(self, m, info, out);
+            for (oe.init_blocks) |*ib| try walkBlockForDeprecation(self, ib, info, out);
             for (oe.supertype_args) |maybe_args| {
                 if (maybe_args) |args| {
                     for (args) |*a| try walkExprForDeprecation(self, a, info, out);

@@ -1,0 +1,16 @@
+main: start
+settings: level
+settings: init level=3
+settings: label
+main: settings -> ready/3
+main: settings again -> 3
+engine: companion prop
+engine: companion init
+engine: instance init
+main: engine built true power=90
+anon: first
+anon: init first=1
+anon: second
+main: anon sum=3
+main: broken -> [FileFailedToInitializeException/IllegalStateException, FileFailedToInitializeException/none]
+main: end

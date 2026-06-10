@@ -276,7 +276,13 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
             const fqn = g.get().*;
             const tail = lastSegment(fqn);
             if (std.mem.eql(u8, tail, ty.name)) return true;
-            if (matchesAny(ty.name, &.{ "Throwable", "Exception", "Any" })) return true;
+            if (matchesAny(ty.name, &.{ "Throwable", "Any" })) return true;
+            // `Error`-side throwables are not `Exception`s: kotlinc
+            // matches `catch (e: Error)` and not `catch (e: Exception)`
+            // for AssertionError / FileFailedToInitializeException and
+            // kin.
+            if (std.mem.eql(u8, ty.name, "Exception")) return !isErrorSideThrowable(tail);
+            if (std.mem.eql(u8, ty.name, "Error")) return isErrorSideThrowable(tail);
             return builtinExceptionParentMatch(tail, ty.name);
         },
         else => {},
@@ -390,6 +396,17 @@ fn interfaceChainMatches(self: *VmHost, cdef: *const ClassDef, name: []const u8)
         }
     }
     return false;
+}
+
+/// Throwables on the `kotlin.Error` side of the hierarchy (everything
+/// else thrown as a `Value.Exception` descends from `kotlin.Exception`).
+fn isErrorSideThrowable(tail: []const u8) bool {
+    const error_side = [_][]const u8{
+        "Error",                           "AssertionError",
+        "NotImplementedError",             "OutOfMemoryError",
+        "StackOverflowError",              "FileFailedToInitializeException",
+    };
+    return containsStr(&error_side, tail);
 }
 
 /// Best-effort builtin-Throwable parent walk used for `Value.Exception`

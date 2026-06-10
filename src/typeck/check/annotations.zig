@@ -450,6 +450,9 @@ pub fn walkExprForOptIn(
             for (oe.members) |*m| {
                 try walkDeclForOptIn(allocator, m, markers, required, scope, out);
             }
+            for (oe.init_blocks) |*ib| {
+                try walkBlockForOptIn(allocator, ib, markers, required, scope, out);
+            }
             for (oe.supertype_args) |maybe_args| {
                 if (maybe_args) |args| {
                     for (args) |*a| {
@@ -1007,6 +1010,9 @@ pub fn walkExprForDeprecation(
         .ObjectExpr => |oe| {
             for (oe.members) |*m| {
                 try walkDeclForDeprecation(allocator, m, info, out);
+            }
+            for (oe.init_blocks) |*ib| {
+                try walkBlockForDeprecation(allocator, ib, info, out);
             }
             for (oe.supertype_args) |maybe_args| {
                 if (maybe_args) |args| {

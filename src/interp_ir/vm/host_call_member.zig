@@ -14,6 +14,7 @@ const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 
 const vmhost = @import("vmhost.zig");
+const host_globals = @import("host_globals.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const trace = @import("trace.zig");
@@ -266,11 +267,13 @@ fn makeIntrinsicHost(self: *VmHost) VmIntrinsicHost {
         .instance_id_counter = self.instance_id_counter.clone(),
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
+        .object_states = self.object_states.clone(),
         .allocator = self.allocator,
     };
 }
 
 fn deinitIntrinsicHost(h: *VmIntrinsicHost) void {
+    h.object_states.deinit();
     h.module.deinit();
     h.closures.deinit();
     h.globals.deinit();
@@ -2464,20 +2467,13 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
     if (comp_name) |cn| {
-        var singleton = lookupGlobalValue(self, cn);
-        // On-demand companion init.
-        if (!(singleton != null and singleton.? == .Instance)) {
-            const cid_opt = self.module.borrow().get().classId(cn);
-            if (cid_opt) |cid| {
-                const r = try newInstanceById(self, allocator, cid, &.{}, null);
-                if (r == .ok and r.ok == .Instance) {
-                    const g = self.globals.borrowMut();
-                    g.get().define(cn, r.ok) catch {};
-                    g.deinit();
-                    singleton = r.ok;
-                }
-            }
-        }
+        // First access through a companion member constructs the
+        // companion (once, thread-safe); a miss probe for a non-member
+        // (an enum entry, a nested class) leaves it uninitialized.
+        const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+            .ok => |maybe| maybe,
+            .err => |e| return .{ .err = e },
+        };
         if (singleton) |s| {
             if (s == .Instance) {
                 const no_such = try std.fmt.allocPrint(allocator, "`{s}` on", .{name});
@@ -4129,7 +4125,11 @@ fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const V
         break :blk null;
     };
     if (comp_name) |cn| {
-        if (lookupGlobalValue(self, cn)) |s| {
+        const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+            .ok => |maybe| maybe,
+            .err => |e| return .{ .err = e },
+        };
+        if (singleton) |s| {
             if (s == .Instance) {
                 const r = try callMemberRec(self, allocator, &s, name, args);
                 if (r == .ok) return r;
@@ -4163,7 +4163,11 @@ fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: *con
             break :blk mg.get().registry.companion_singletons.get(cname);
         };
         if (comp_name) |cn| {
-            if (lookupGlobalValue(self, cn)) |s| {
+            const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+                .ok => |maybe| maybe,
+                .err => |e| return .{ .err = e },
+            };
+            if (singleton) |s| {
                 if (s == .Instance) {
                     const sg = s.Instance.borrow();
                     const sid = sg.get().identity;

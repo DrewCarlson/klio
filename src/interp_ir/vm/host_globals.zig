@@ -1,12 +1,13 @@
 //! `VmHost` global resolution: reading and writing top-level names,
-//! the throwing variant used during top-level init, on-demand lazy
-//! `object` initialization, and the shadowing-capture check.
+//! the throwing variant used during top-level init, the lazy
+//! first-access `object` / companion initialization gate, and the
+//! shadowing-capture check.
 //!
 //! Free functions over `*VmHost`, aliased as `VmHost` methods by
 //! `vmhost.zig` and invoked directly by the generic IR evaluator.
 //! The name-resolution probe chain in `lookupGlobal`
-//! mirrors the Rust `lookup_global`: cached global, deferred-`object`
-//! init, top-level-property init, delegate auto-resolve, user
+//! mirrors the Rust `lookup_global`: cached global, first-access
+//! `object` init, top-level-property init, delegate auto-resolve, user
 //! class/function, stdlib FQN probes, the loaded-pack overlay, the
 //! synthetic `Thread`/`Delegates` surfaces, primitive type names and
 //! their companion constants, package-qualified bare refs, and
@@ -45,28 +46,312 @@ const UnitResult = ir.eval.UnitResult;
 const SuspendState = ir.eval.SuspendState;
 
 // -------------------------------------------------------------------------
-// Thread-local re-entrancy state. Mirrors the `lib.rs` thread-locals the
-// Rust `lookup_global` reads: the active-constructor guard stack (a
-// deferred `object` is only driven on-access when its own ctor is not
-// already running — the one stack secondary-ctor shell construction in
-// `host_instances.zig` pushes onto, read here through
-// `host_instances.ctorGuardContains`) and the in-top-level-init flag (a
-// forward reference during startup re-drives the real initializer rather
-// than observing the `Null` placeholder).
+// Lazy `object` / companion first-access initialization.
+//
+// Kotlin initializes an `object` singleton at its first access — never at
+// program start, exactly once across all threads — and a companion
+// additionally at the first instantiation of its owning class. The gate
+// below owns that contract: every singleton read path (bare-name
+// `LoadGlobal`, companion forwarding on a class receiver, qualified
+// nested-object access, `::class.objectInstance`, pack natives) routes
+// through `ensureObjectSingleton` instead of reading `globals` directly.
+//
+// State lives in the shared `object_states` table (one cell per program,
+// shared by handle with every OS thread). The cell's writer lock
+// serializes the first-access claim: the claiming thread constructs, any
+// other thread that races the same name waits for the entry to resolve,
+// and the constructing thread's own re-entrant reads observe the
+// in-flight instance (an object referencing itself during its own init).
+// The singleton publishes into `globals` only after construction
+// completes, so no other thread can observe a partially-initialized
+// instance. A construction failure is terminal: the initializer is never
+// retried, and every access after the first failure throws
+// `FileFailedToInitializeException` without the original cause, matching
+// kotlinc.
 // -------------------------------------------------------------------------
 
-threadlocal var top_level_init_depth: usize = 0;
+const ObjectInitState = root.ObjectInitState;
 
-/// Assert (Debug) the top-level-init depth is clear at a run boundary and
-/// reset it so leaked-across-runs state is a loud failure.
-pub fn resetReceiverTls() void {
-    std.debug.assert(top_level_init_depth == 0);
-    top_level_init_depth = 0;
+/// Wrapper thrown when an `object` / companion initializer fails, named
+/// after the kotlinc-native exception so `e::class.simpleName` and catch
+/// matching agree with the reference. It is an `Error`-side throwable:
+/// `catch (e: Throwable)` and `catch (e: Error)` match it,
+/// `catch (e: Exception)` does not.
+pub const FILE_INIT_FAILED_FQN = "kotlin.native.internal.FileFailedToInitializeException";
+const FILE_INIT_FAILED_MSG = "There was an error during file or class initialization";
+
+fn fileInitFailedThrow(allocator: Allocator, cause: ?Value) Allocator.Error!EvalError {
+    const fqn = try StringRef.init(allocator, FILE_INIT_FAILED_FQN);
+    const msg = try StringRef.init(allocator, FILE_INIT_FAILED_MSG);
+    const cause_ptr: ?*Value = if (cause) |c| blk: {
+        const p = try allocator.create(Value);
+        p.* = c;
+        break :blk p;
+    } else null;
+    return .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = cause_ptr } } };
 }
 
-/// True while a top-level property initializer is running on this thread.
-fn inTopLevelInit() bool {
-    return top_level_init_depth > 0;
+/// What the claim step decided for one gate pass.
+const ClaimOutcome = union(enum) {
+    /// This thread inserted the in-progress entry and must construct.
+    construct,
+    /// Construction is already running on this thread; the in-flight
+    /// instance (if the shell exists yet) is the singleton.
+    reentrant: ?Value,
+    /// Another thread is constructing — wait and re-check.
+    wait,
+    /// A previous construction failed; throw without retrying.
+    failed,
+};
+
+fn claimObjectInit(self: *VmHost, key: []const u8) ClaimOutcome {
+    const tid = std.Thread.getCurrentId();
+    const g = self.object_states.borrowMut();
+    defer g.deinit();
+    if (g.get().getPtr(key)) |entry| {
+        switch (entry.*) {
+            .InProgress => |ip| {
+                if (ip.thread == tid) return .{ .reentrant = ip.instance };
+                return .wait;
+            },
+            .Failed => return .failed,
+        }
+    }
+    g.get().put(key, .{ .InProgress = .{ .thread = tid, .instance = null } }) catch return .wait;
+    return .construct;
+}
+
+/// Record the just-materialized instance shell for an in-flight `object`
+/// construction owned by the current thread, so re-entrant reads during
+/// the rest of construction (delegates, body properties, init blocks)
+/// observe the singleton. Returns false when no in-flight entry exists —
+/// the construction was not driven through the gate (a runtime-registered
+/// local object), and the caller publishes directly instead.
+pub fn noteObjectInFlight(self: *VmHost, name: []const u8, instance: Value) bool {
+    const tid = std.Thread.getCurrentId();
+    const g = self.object_states.borrowMut();
+    defer g.deinit();
+    if (g.get().getPtr(name)) |entry| {
+        if (entry.* == .InProgress and entry.InProgress.thread == tid) {
+            entry.InProgress.instance = instance;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Resolve a registered `object` / companion singleton by its lifted
+/// global name, constructing it on first access. `.ok = null` when `name`
+/// is not a registered object (or is mid-construction on this thread with
+/// no shell yet); `.err` carries an init failure to the access site.
+pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Error!MaybeValueResult {
+    const allocator = self.allocator;
+    // Fast path: already published (construction completed).
+    {
+        const g = self.globals.borrow();
+        defer g.deinit();
+        if (g.get().lookup(raw_name)) |v| {
+            if (v == .Instance) return .{ .ok = v };
+        }
+    }
+    // Canonicalize to the run-stable program-image key: callers may pass
+    // a transient slice (a formatted `Outer$Nested` qualifier), and the
+    // claim entry / `globals` binding outlive the call.
+    const name = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().object_names.getKey(raw_name) orelse return .{ .ok = null };
+    };
+    while (true) {
+        {
+            const g = self.globals.borrow();
+            defer g.deinit();
+            if (g.get().lookup(name)) |v| {
+                if (v == .Instance) return .{ .ok = v };
+            }
+        }
+        switch (claimObjectInit(self, name)) {
+            .construct => {},
+            .reentrant => |inst| return .{ .ok = inst },
+            .failed => return .{ .err = try fileInitFailedThrow(allocator, null) },
+            .wait => {
+                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
+                continue;
+            },
+        }
+        // Re-check `globals` after winning the claim: a finishing
+        // constructor publishes and then clears its entry, so a thread
+        // whose pre-claim globals check raced ahead of the publish could
+        // otherwise construct a second instance. The claim's writer-lock
+        // acquire orders after the finisher's clear, which is sequenced
+        // after its publish, so the singleton is visible here.
+        {
+            const published: ?Value = blk: {
+                const g = self.globals.borrow();
+                defer g.deinit();
+                break :blk g.get().lookup(name);
+            };
+            if (published) |v| {
+                if (v == .Instance) {
+                    clearObjectState(self, name);
+                    return .{ .ok = v };
+                }
+            }
+        }
+        break;
+    }
+
+    // This thread owns the claim. Any exit that does not publish must
+    // resolve the entry, or racing threads would wait forever.
+    const class_id_opt: ?ir.ClassId = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().classId(name);
+    };
+    const class_id = class_id_opt orelse {
+        clearObjectState(self, name);
+        return .{ .ok = null };
+    };
+
+    const r = self.newInstance(allocator, class_id, &.{}, null) catch |e| {
+        clearObjectState(self, name);
+        return e;
+    };
+    switch (r) {
+        .ok => |inst| {
+            if (inst != .Instance) {
+                clearObjectState(self, name);
+                return .{ .ok = inst };
+            }
+            // A companion's enclosing class is its `outer`, so
+            // `this`-relative resolution inside companion members sees
+            // the owning class's statics.
+            if (std.mem.indexOf(u8, name, "$Companion$")) |sep| {
+                const outer_name = name[0..sep];
+                const outer_def: ?ObjRef(ClassDef) = blk: {
+                    const cg = self.classes.borrow();
+                    defer cg.deinit();
+                    if (cg.get().get(outer_name)) |c| break :blk c.clone();
+                    break :blk null;
+                };
+                if (outer_def) |od| {
+                    const ig = inst.Instance.borrowMut();
+                    defer ig.deinit();
+                    ig.get().outer = .{ .Class = od };
+                }
+            }
+            // Publish, then resolve the claim. Publish-before-clear so a
+            // waiter that re-checks `globals` after the entry vanishes
+            // always finds the singleton.
+            {
+                const g = self.globals.borrowMut();
+                defer g.deinit();
+                g.get().define(name, inst) catch {};
+            }
+            clearObjectState(self, name);
+            return .{ .ok = inst };
+        },
+        .err => |e| {
+            markObjectFailed(self, name);
+            // First access surfaces the failure wrapped with the original
+            // throwable as its cause; non-throw eval errors (an unresolved
+            // call inside init) propagate as-is.
+            switch (e) {
+                .Throw => |cause| return .{ .err = try fileInitFailedThrow(allocator, cause) },
+                else => return .{ .err = e },
+            }
+        },
+    }
+}
+
+/// Non-throwing gate for resolution chains that cannot carry an error
+/// (`lookupGlobal`, pack-native lookups). An init failure resolves to
+/// null here; the throwing read paths surface it.
+pub fn objectSingletonQuiet(self: *VmHost, name: []const u8) ?Value {
+    const r = ensureObjectSingleton(self, name) catch return null;
+    return switch (r) {
+        .ok => |v| v,
+        .err => null,
+    };
+}
+
+/// Whether the (possibly not-yet-initialized) singleton class
+/// `class_name` declares member function `name`, transitively over its
+/// supertypes. Drives the companion-forwarding call paths: a first access
+/// only constructs the companion when the member genuinely lives on it,
+/// so a miss probe (an enum entry, a nested class) does not initialize.
+pub fn objectClassDeclaresMethod(self: *VmHost, class_name: []const u8, name: []const u8) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    if (mg.get().registry.hierarchy_methods.get(class_name)) |methods| {
+        if (methods.contains(name)) return true;
+    }
+    return false;
+}
+
+/// Whether the (possibly not-yet-initialized) singleton class
+/// `class_name` declares property `name`: body properties / primary
+/// params along the runtime parent chain, a custom getter, or a
+/// companion-scoped extension property.
+pub fn objectClassDeclaresProp(self: *VmHost, class_name: []const u8, name: []const u8) bool {
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (pg.get().instance_prop_getters.get(.{ .a = class_name, .b = name }) != null) return true;
+        if (pg.get().extension_props.get(.{ .a = class_name, .b = name }) != null) return true;
+    }
+    var cur: ?ObjRef(ClassDef) = blk: {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(class_name)) |d| break :blk d.clone();
+        break :blk null;
+    };
+    var depth: usize = 0;
+    while (cur) |c| {
+        defer c.deinit();
+        if (depth > 64) break;
+        depth += 1;
+        const g = c.borrow();
+        defer g.deinit();
+        for (g.get().body_properties) |bp| {
+            if (std.mem.eql(u8, bp.name, name)) return true;
+        }
+        for (g.get().primary_params) |pp| {
+            if (pp.property != null and std.mem.eql(u8, pp.name, name)) return true;
+        }
+        cur = if (g.get().parent) |pp| pp.clone() else null;
+    }
+    return false;
+}
+
+/// Companion read gate for the speculative member-probe paths: resolve
+/// the singleton when already initialized; construct it on first access
+/// only when its class declares `name` (as a property or function).
+pub fn objectSingletonForMember(self: *VmHost, name: []const u8, member: []const u8) Allocator.Error!MaybeValueResult {
+    {
+        const g = self.globals.borrow();
+        defer g.deinit();
+        if (g.get().lookup(name)) |v| {
+            if (v == .Instance) return .{ .ok = v };
+        }
+    }
+    if (objectClassDeclaresProp(self, name, member) or objectClassDeclaresMethod(self, name, member)) {
+        return ensureObjectSingleton(self, name);
+    }
+    return .{ .ok = null };
+}
+
+fn clearObjectState(self: *VmHost, name: []const u8) void {
+    const g = self.object_states.borrowMut();
+    defer g.deinit();
+    _ = g.get().remove(name);
+}
+
+fn markObjectFailed(self: *VmHost, name: []const u8) void {
+    const g = self.object_states.borrowMut();
+    defer g.deinit();
+    g.get().put(name, .Failed) catch {};
 }
 
 // -------------------------------------------------------------------------
@@ -104,6 +389,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .instance_id_counter = self.instance_id_counter.clone(),
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
+        .object_states = self.object_states.clone(),
         .allocator = self.allocator,
     };
     defer {
@@ -117,6 +403,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         intrinsic.instance_id_counter.deinit();
         intrinsic.out_sink.deinit();
         intrinsic.threads.deinit();
+        intrinsic.object_states.deinit();
     }
     var ctx = CallCtx{
         .args = args,
@@ -267,57 +554,28 @@ fn primitiveClassDef(allocator: Allocator, name: []const u8) Allocator.Error!Obj
 /// it would fragment the fallthrough.
 pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
     const allocator = self.allocator;
+
     const cached: ?Value = blk: {
         const g = self.globals.borrow();
         defer g.deinit();
         break :blk g.get().lookup(name);
     };
 
-    // On-demand init of a deferred `object`: its eager startup init threw
-    // (a missing dependency it is never expected to need unless used), so
-    // it was skipped. Initialize it now, on first access, matching
-    // Kotlin's lazy `object` initialization.
-    if (cached == null and progHasObjectName(self, name) and !host_instances.ctorGuardContains(name)) {
-        const class_id_opt: ?ir.ClassId = blk_cid: {
-            const mg = self.module.borrow();
-            defer mg.deinit();
-            break :blk_cid mg.get().classId(name);
-        };
-        if (class_id_opt) |class_id| {
-            const r = self.newInstance(allocator, class_id, &.{}, null) catch return null;
-            if (r == .ok and r.ok == .Instance) {
-                const inst = r.ok;
-                if (std.mem.indexOf(u8, name, "$Companion$")) |sep| {
-                    const outer_name = name[0..sep];
-                    const outer_def: ?ObjRef(ClassDef) = blk2: {
-                        const cg = self.classes.borrow();
-                        defer cg.deinit();
-                        if (cg.get().get(outer_name)) |c| break :blk2 c.clone();
-                        break :blk2 null;
-                    };
-                    if (outer_def) |od| {
-                        const ig = inst.Instance.borrowMut();
-                        defer ig.deinit();
-                        ig.get().outer = .{ .Class = od };
-                    }
-                }
-                {
-                    const g = self.globals.borrowMut();
-                    defer g.deinit();
-                    g.get().define(name, inst) catch return null;
-                }
-                return inst;
-            }
-        }
+    // First access to an `object` / companion singleton constructs it —
+    // once, thread-safe — through the shared gate. A non-Instance cached
+    // value still drives the gate: a user object outranks a same-named
+    // implicit stdlib alias pre-defined in globals (`object E` vs
+    // `kotlin.math.E`). Errors cannot surface through this non-throwing
+    // chain (a failed init resolves to null and falls through);
+    // `lookupGlobalThrowing` drives the gate on the throwing read path
+    // and propagates the failure to the access site.
+    if ((cached == null or cached.? != .Instance) and progHasObjectName(self, name)) {
+        if (objectSingletonQuiet(self, name)) |v| return v;
     }
 
     // Top-level property whose own initializer has not produced its value
-    // yet. A deferred prop (`cached == null`) is re-driven on first
-    // access; a forward reference during startup (`Null` placeholder,
-    // still inside top-level init) is driven so the real value is seen.
-    if (progHasTopLevelPropInit(self, name) and
-        (cached == null or (inTopLevelInit() and cached != null and cached.? == .Null)))
-    {
+    // yet: a deferred prop (`cached == null`) is driven on first access.
+    if (cached == null and progHasTopLevelPropInit(self, name)) {
         const r = host_impl.ensureTopLevelInited(self, name) catch return null;
         if (r == .ok) {
             if (r.ok) |v| {
@@ -636,6 +894,18 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name: []const u
         defer g.deinit();
         break :blk g.get().lookup(name);
     };
+
+    // First access to an `object` / companion singleton: construct it and
+    // PROPAGATE an init failure to the access site (the non-throwing
+    // `lookupGlobal` below would swallow it). A non-Instance cached value
+    // still drives the gate — a user object outranks a same-named
+    // implicit stdlib alias pre-defined in globals.
+    if ((raw == null or raw.? != .Instance) and progHasObjectName(self, name)) {
+        switch (try ensureObjectSingleton(self, name)) {
+            .ok => |maybe| if (maybe) |v| return .{ .ok = v },
+            .err => |e| return .{ .err = e },
+        }
+    }
     if (raw) |rv| {
         if (rv == .Delegate) {
             const is_uninit_notnull = blk2: {
@@ -740,10 +1010,7 @@ test "is_primitive_type_name matches the builtin set only" {
     try testing.expect(!isPrimitiveTypeName("List"));
 }
 
-test "ctor guard and top-level-init flag default empty" {
-    try testing.expect(!inTopLevelInit());
-    // The deferred-`object` gate reads the one shared constructor-shell
-    // guard owned by `host_instances`.
+test "ctor guard defaults empty" {
     try testing.expect(!host_instances.ctorGuardContains("Foo"));
 }
 
@@ -822,4 +1089,78 @@ test "is_shadowing_capture is false at the top level" {
     // The Vm's global env is the root scope (no parent), so a capture can
     // never shadow it.
     try testing.expect(!isShadowingCapture(&fx.host, "anything"));
+}
+
+test "object init gate: claim is once per thread, re-entrant, clearable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try HostFixture.init(a);
+
+    // First claim wins construction; a re-entrant claim on the same
+    // thread observes the in-flight state instead of re-constructing.
+    try testing.expect(claimObjectInit(&fx.host, "O") == .construct);
+    {
+        const second = claimObjectInit(&fx.host, "O");
+        try testing.expect(second == .reentrant);
+        try testing.expect(second.reentrant == null);
+    }
+
+    // Recording the in-flight shell makes re-entrant access observe it.
+    try testing.expect(noteObjectInFlight(&fx.host, "O", .{ .Int = 7 }));
+    {
+        const third = claimObjectInit(&fx.host, "O");
+        try testing.expect(third == .reentrant);
+        try testing.expect(third.reentrant != null);
+        try testing.expect(third.reentrant.?.Int == 7);
+    }
+
+    // Clearing resolves the entry; the next claim constructs again.
+    clearObjectState(&fx.host, "O");
+    try testing.expect(claimObjectInit(&fx.host, "O") == .construct);
+    clearObjectState(&fx.host, "O");
+
+    // An in-flight note with no entry reports not-gate-driven.
+    try testing.expect(!noteObjectInFlight(&fx.host, "P", .{ .Int = 1 }));
+}
+
+test "object init gate: failed state throws the no-cause wrapper" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try HostFixture.init(a);
+
+    // Register the name as an object so the gate consults the state table.
+    {
+        const pg = fx.host.prog.borrowMut();
+        defer pg.deinit();
+        try pg.get().object_names.put("O", {});
+    }
+    markObjectFailed(&fx.host, "O");
+    try testing.expect(claimObjectInit(&fx.host, "O") == .failed);
+
+    const r = try ensureObjectSingleton(&fx.host, "O");
+    try testing.expect(r == .err);
+    try testing.expect(r.err == .Throw);
+    const exc = r.err.Throw;
+    try testing.expect(exc == .Exception);
+    const fg = exc.Exception.fqn.borrow();
+    defer fg.deinit();
+    try testing.expectEqualStrings(FILE_INIT_FAILED_FQN, fg.get().*);
+    try testing.expect(exc.Exception.cause == null);
+}
+
+test "object init gate: unknown names resolve to null without state" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try HostFixture.init(a);
+
+    const r = try ensureObjectSingleton(&fx.host, "NotAnObject");
+    try testing.expect(r == .ok);
+    try testing.expect(r.ok == null);
+    // No state entry is left behind for a non-object name.
+    const g = fx.host.object_states.borrow();
+    defer g.deinit();
+    try testing.expect(g.get().count() == 0);
 }

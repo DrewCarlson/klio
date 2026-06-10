@@ -880,6 +880,9 @@ const Resolver = struct {
                 for (oe.members) |*m| {
                     try self.resolveMemberDecl(body_scope, m);
                 }
+                for (oe.init_blocks) |*b| {
+                    try self.resolveBlock(body_scope, b, false);
+                }
             },
         }
     }
@@ -1702,6 +1705,8 @@ test "object literal member forward reference resolves" {
         .supertype_args = &super_args,
         .supertype_delegates = &super_delegates,
         .members = &obj_members,
+        .init_blocks = &.{},
+        .init_block_positions = &.{},
         .span = ts(),
     } };
     var g_prop = emptyProp(false, "g");

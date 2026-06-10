@@ -166,6 +166,8 @@ pub fn parsePrimary(p: *Parser) ?Expr {
                     .supertype_args = st.args,
                     .supertype_delegates = st.delegates,
                     .members = body.members,
+                    .init_blocks = body.init_blocks,
+                    .init_block_positions = body.init_block_positions,
                     .span = kw_tok.span.join(end),
                 } };
             },
