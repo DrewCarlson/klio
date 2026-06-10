@@ -1,7 +1,7 @@
 //! `VmHost` instance construction: allocating a `Value.Instance` for a
 //! `ClassId` (running primary/secondary ctors, init blocks, body-property
-//! init, delegation), building anonymous-object instances, and the
-//! inner-class outer-instance hint stack.
+//! init, delegation), building anonymous-object instances, and selecting
+//! the outer instance an inner-class instance captures.
 //!
 //! Free functions over `*VmHost`, aliased as `VmHost` methods by
 //! `vmhost.zig` and invoked directly by the generic IR evaluator.
@@ -52,26 +52,24 @@ fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloca
 }
 
 // -------------------------------------------------------------------------
-// Per-thread constructor-shell recursion guard and inner-class outer
-// hint stack. In Rust these were thread-locals on the `EXEC` struct read
-// through `with_ctor_guard` / `with_inner_outer_hint`. The inner-outer
-// hint's push/pop are wired into the host vtable through this file.
+// Per-thread constructor-shell recursion guard. In Rust this was a single
+// thread-local on the `EXEC` struct read through `with_ctor_guard` by both
+// secondary-ctor shell construction (here) and the deferred-`object`
+// on-access drive in `host_globals.zig`; `ctorGuardContains` is `pub` so
+// both readers consult the one stack the shell construction pushes onto.
 // -------------------------------------------------------------------------
 
 threadlocal var ctor_guard: std.ArrayListUnmanaged([]const u8) = .empty;
-threadlocal var inner_outer_hint: std.ArrayListUnmanaged(Value) = .empty;
 
-/// Assert (Debug) the constructor-shell guard and inner-class outer hint are
-/// clear at a run boundary and reset them so leaked-across-runs state is a
-/// loud failure.
+/// Assert (Debug) the constructor-shell guard is clear at a run boundary
+/// and reset it so leaked-across-runs state is a loud failure.
 pub fn resetReceiverTls() void {
     std.debug.assert(ctor_guard.items.len == 0);
-    std.debug.assert(inner_outer_hint.items.len == 0);
     ctor_guard.clearRetainingCapacity();
-    inner_outer_hint.clearRetainingCapacity();
 }
 
-fn ctorGuardContains(name: []const u8) bool {
+/// True while `name`'s constructor shell is being built on this thread.
+pub fn ctorGuardContains(name: []const u8) bool {
     for (ctor_guard.items) |n| {
         if (std.mem.eql(u8, n, name)) return true;
     }
@@ -84,21 +82,6 @@ fn ctorGuardPush(name: []const u8) void {
 
 fn ctorGuardPop() void {
     _ = ctor_guard.pop();
-}
-
-pub fn pushInnerOuterHint(self: *VmHost, v: *const Value) void {
-    _ = self;
-    inner_outer_hint.append(std.heap.page_allocator, v.*) catch {};
-}
-
-pub fn popInnerOuterHint(self: *VmHost) void {
-    _ = self;
-    _ = inner_outer_hint.pop();
-}
-
-fn innerOuterHintLast() ?Value {
-    if (inner_outer_hint.items.len == 0) return null;
-    return inner_outer_hint.items[inner_outer_hint.items.len - 1];
 }
 
 // -------------------------------------------------------------------------
@@ -700,7 +683,14 @@ fn runInitBlocksAt(
 // `new_instance_named`
 // -------------------------------------------------------------------------
 
-pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+/// `outer_hint` is the constructing frame's own `this` (when it is an
+/// instance), threaded through the whole construction path down to
+/// `materializeInstance` so an inner-class instance can capture it as its
+/// `outer`. A call argument scoped to one construction dispatch: it cannot
+/// leak across a coroutine park (no valid Kotlin suspension point exists
+/// inside ctor/init/default-param evaluation), and nested shell
+/// constructions see the same hint the entry call received.
+pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, args: []const Value, arg_names: []const ?[]const u8, outer_hint: ?*const Value) Allocator.Error!EvalResult {
     // Intrinsic-backed classes route through the host ctor.
     {
         const mg = self.module.borrow();
@@ -730,7 +720,7 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
         }
     }
     if (!any_named) {
-        return newInstance(self, allocator, class, args);
+        return newInstance(self, allocator, class, args, outer_hint);
     }
 
     const class_name = blk: {
@@ -850,7 +840,7 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
                 }
                 try final_args.append(allocator, resolved);
             }
-            return newInstance(self, allocator, class, final_args.items);
+            return newInstance(self, allocator, class, final_args.items, outer_hint);
         }
     }
 
@@ -929,9 +919,9 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
             }
             try full.append(allocator, .Null);
         }
-        return newInstance(self, allocator, class, full.items);
+        return newInstance(self, allocator, class, full.items, outer_hint);
     }
-    return newInstance(self, allocator, class, args);
+    return newInstance(self, allocator, class, args, outer_hint);
 }
 
 fn isIntrinsicClass(fqn: []const u8) bool {
@@ -956,7 +946,7 @@ fn isIntrinsicClass(fqn: []const u8) bool {
 // `new_instance`
 // -------------------------------------------------------------------------
 
-pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []const Value) Allocator.Error!EvalResult {
+pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []const Value, outer_hint: ?*const Value) Allocator.Error!EvalResult {
     // IR class name / fqn (off the frozen module).
     var ir_name: []const u8 = undefined;
     var ir_fqn: []const u8 = undefined;
@@ -1024,13 +1014,13 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     };
     const shell_guarded = ctorGuardContains(class_name);
     if (!shell_guarded and (args.len != n_primary_initial or zero_primary_secondary)) {
-        if (try dispatchSecondaryCtor(self, allocator, class, class_def, args)) |res| {
+        if (try dispatchSecondaryCtor(self, allocator, class, class_def, args, outer_hint)) |res| {
             return res;
         }
     }
 
     // Primary-ctor path.
-    return primaryCtorPath(self, allocator, class_def, ir_name, args);
+    return primaryCtorPath(self, allocator, class_def, ir_name, args, outer_hint);
 }
 
 // --- ClassDef accessors (each takes a borrowed handle) ---
@@ -1209,7 +1199,7 @@ fn funcParamHasDefault(self: *VmHost, fid: FuncId, idx: usize) bool {
 
 /// Returns the constructed instance value, or `null` to fall through to
 /// the primary-ctor path.
-fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), args: []const Value) Allocator.Error!?EvalResult {
+fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), args: []const Value, outer_hint: ?*const Value) Allocator.Error!?EvalResult {
     const class_name = classDefName(class_def);
     const entries = secondaryCtors(self, class_name);
     var chosen: ?root.build.SecondaryCtorEntry = null;
@@ -1288,19 +1278,19 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
 
     var inst_v: Value = undefined;
     if (entry.is_super) {
-        switch (try superDelegation(self, allocator, class, class_def, target_args.items)) {
+        switch (try superDelegation(self, allocator, class, class_def, target_args.items, outer_hint)) {
             .ok => |v| inst_v = v,
             .err => |e| return EvalResult{ .err = e },
         }
     } else if (entry.is_this) {
-        switch (try newInstance(self, allocator, class, target_args.items)) {
+        switch (try newInstance(self, allocator, class, target_args.items, outer_hint)) {
             .ok => |v| inst_v = v,
             .err => |e| return EvalResult{ .err = e },
         }
     } else {
         // Implicit `super()`.
         ctorGuardPush(class_name);
-        const shell = try newInstance(self, allocator, class, &.{});
+        const shell = try newInstance(self, allocator, class, &.{}, outer_hint);
         ctorGuardPop();
         switch (shell) {
             .ok => |v| inst_v = v,
@@ -1331,7 +1321,7 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
 /// The `: super(...)` arm. Returns the constructed leaf instance, or an
 /// error (including `Unimplemented` when no parent class def exists for a
 /// non-Throwable parent).
-fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), target_args: []const Value) Allocator.Error!EvalResult {
+fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), target_args: []const Value, outer_hint: ?*const Value) Allocator.Error!EvalResult {
     const class_name = classDefName(class_def);
     // Resolve the parent def: prefer the resolved `parent`, else the
     // first supertype name.
@@ -1351,7 +1341,7 @@ fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, class_de
     if (parent_def) |pdef| {
         const pname = classDefName(pdef);
         ctorGuardPush(class_name);
-        const leaf_res = try newInstance(self, allocator, class, &.{});
+        const leaf_res = try newInstance(self, allocator, class, &.{}, outer_hint);
         ctorGuardPop();
         const leaf = switch (leaf_res) {
             .ok => |v| v,
@@ -1390,7 +1380,7 @@ fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, class_de
     if (!is_throwable_name) {
         return .{ .err = .{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::new_instance: secondary ctor super-delegation for `{s}` (no parent class def)", .{class_name}) } };
     }
-    const leaf_res = try newInstance(self, allocator, class, &.{});
+    const leaf_res = try newInstance(self, allocator, class, &.{}, outer_hint);
     const leaf = switch (leaf_res) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
@@ -1418,7 +1408,7 @@ fn isBuiltinThrowableNameNoCancel(name: []const u8) bool {
     return false;
 }
 
-fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, args_in: []const Value) Allocator.Error!EvalResult {
+fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, args_in: []const Value, outer_hint: ?*const Value) Allocator.Error!EvalResult {
     const class_name = classDefName(class_def);
     const n_primary = classDefPrimaryParamCount(class_def);
 
@@ -1542,7 +1532,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
         return .{ .err = try typeErr(allocator, "{s}() expects {d} args, got {d}", .{ class_name, n_primary, effective.items.len }) };
     }
 
-    return materializeInstance(self, allocator, class_def, ir_name, effective.items);
+    return materializeInstance(self, allocator, class_def, ir_name, effective.items, outer_hint);
 }
 
 /// Among same-named factory overloads pick the best fit. `clean_only`
@@ -1591,7 +1581,134 @@ fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args
     return best_fid;
 }
 
-fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, args: []const Value) Allocator.Error!EvalResult {
+/// The lexically enclosing class name for an inner/nested class: the
+/// build registry's `enclosing_class` map (filled when nested classes are
+/// lifted to the top level), falling back to the runtime def's resolved
+/// enclosing-class handle.
+fn enclosingClassNameOf(self: *VmHost, class_def: ObjRef(ClassDef), ir_name: []const u8) ?[]const u8 {
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const reg = &mg.get().registry;
+        if (reg.enclosing_class.get(ir_name)) |n| return n;
+        const def_name = classDefName(class_def);
+        if (!std.mem.eql(u8, def_name, ir_name)) {
+            if (reg.enclosing_class.get(def_name)) |n| return n;
+        }
+    }
+    const g = class_def.borrow();
+    defer g.deinit();
+    const eg = g.get().enclosing_class.borrow();
+    defer eg.deinit();
+    if (eg.get().*) |e| {
+        const ng = e.borrow();
+        defer ng.deinit();
+        return ng.get().name;
+    }
+    return null;
+}
+
+/// True when `v` is an `Instance` whose class is `want` or a subtype of it
+/// (simple name or FQN, walking the resolved parent chain).
+fn instanceOfClassName(v: *const Value, want: []const u8) bool {
+    if (v.* != .Instance) return false;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    var cur: ?ObjRef(ClassDef) = g.get().class.clone();
+    while (cur) |c| {
+        const cg = c.borrow();
+        const matched = std.mem.eql(u8, cg.get().name, want) or std.mem.eql(u8, cg.get().fqn, want);
+        const next: ?ObjRef(ClassDef) = if (cg.get().parent) |p| p.clone() else null;
+        cg.deinit();
+        c.deinit();
+        if (matched) {
+            if (next) |n| n.deinit();
+            return true;
+        }
+        cur = next;
+    }
+    return false;
+}
+
+/// The `outer` link of an `Instance` value, `null` otherwise.
+fn instanceOuterOf(v: *const Value) ?Value {
+    if (v.* != .Instance) return null;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    return g.get().outer;
+}
+
+/// First instance of `want` reachable through `v`'s `outer` links,
+/// excluding `v` itself. The walk is Kotlin's class-nesting rule: inside a
+/// member of `Inner`, `this@Outer` is in scope as the receiver reachable
+/// through the dispatch receiver's captured outer.
+fn outerWalkMatch(v: *const Value, want: []const u8) ?Value {
+    var cur = instanceOuterOf(v);
+    while (cur) |c| {
+        if (instanceOfClassName(&c, want)) return c;
+        cur = instanceOuterOf(&c);
+    }
+    return null;
+}
+
+/// Pick the outer instance a freshly-materialized inner-class instance
+/// captures, keyed on the inner class's lexically enclosing class. The
+/// receivers in scope at the construction site are, innermost first: the
+/// constructing frame's own `this` (the hint) with its class-nesting tower
+/// (`this`, `this.outer`, …), then the enclosing-receiver chain, where each
+/// dispatch-receiver entry carries its own tower but a `with`/`run` subject
+/// contributes only itself. The first receiver that is an instance of the
+/// enclosing class (or a subtype) supplies the outer:
+///
+/// 1. the hint itself — the bare `Inner()`-inside-a-member case, and the
+///    receiver-lambda case where the subject is of the enclosing class
+///    (`with(other) { Inner() }` constructs `other.Inner()`);
+/// 2. the hint's outer walk — a member of `Inner` constructing a sibling
+///    `Inner()` reaches `this@Outer` through its own outer link, never
+///    through an unrelated receiver inherited from a caller frame. Skipped
+///    when the hint IS the innermost receiver-lambda subject: a displaced
+///    `with(x) { … }` subject brings only itself into scope, and the
+///    lambda's lexical tower continues on the chain (the displaced `this`);
+/// 3. the chain, innermost first, each entry checked directly and — for
+///    non-subject entries — through its outer walk;
+/// 4. else the explicit hint as given (no class data, or no candidate of
+///    the enclosing class — matches the pre-class-keyed behavior).
+fn selectInnerOuter(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, outer_hint: ?*const Value) Allocator.Error!?Value {
+    const want = enclosingClassNameOf(self, class_def, ir_name) orelse {
+        if (outer_hint) |h| return h.*;
+        return null;
+    };
+    if (outer_hint) |h| {
+        if (instanceOfClassName(h, want)) return h.*;
+    }
+    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+    defer allocator.free(entries);
+    const hint_is_subject = blk: {
+        const h = outer_hint orelse break :blk false;
+        if (h.* != .Instance) break :blk false;
+        for (entries) |*e| {
+            if (!e.is_subject) continue;
+            break :blk e.v == .Instance and
+                ObjRef(InstanceData).ptrEq(h.Instance, e.v.Instance);
+        }
+        break :blk false;
+    };
+    if (!hint_is_subject) {
+        if (outer_hint) |h| {
+            if (outerWalkMatch(h, want)) |m| return m;
+        }
+    }
+    for (entries) |*e| {
+        if (instanceOfClassName(&e.v, want)) return e.v;
+        if (!e.is_subject) {
+            if (outerWalkMatch(&e.v, want)) |m| return m;
+        }
+    }
+    if (outer_hint) |h| return h.*;
+    return null;
+}
+
+fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, args: []const Value, outer_hint: ?*const Value) Allocator.Error!EvalResult {
     const class_name = classDefName(class_def);
     const identity = nextInstanceId(self);
 
@@ -1813,7 +1930,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             }
         }
     }
-    // Inner-class outer hint.
+    // Inner-class outer selection.
     if (classDefIsInner(class_def)) {
         const has_outer = blk: {
             const g = inst.borrow();
@@ -1821,9 +1938,9 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             break :blk g.get().outer != null;
         };
         if (!has_outer) {
-            if (innerOuterHintLast()) |hint| {
+            if (try selectInnerOuter(self, allocator, class_def, ir_name, outer_hint)) |outer_v| {
                 const g = inst.borrowMut();
-                g.get().outer = hint;
+                g.get().outer = outer_v;
                 g.deinit();
             }
         }

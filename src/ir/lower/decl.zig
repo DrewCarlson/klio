@@ -324,6 +324,7 @@ pub fn lowerClassWithExtras(
         .init_block = null,
         .companion = null,
         .supertypes = &.{},
+        .is_inner = c.is_inner,
     });
     // Collect this class's own member names so method-body lowering can
     // tell `someMember()` (this.someMember) apart from `topLevelFn()`

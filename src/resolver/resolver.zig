@@ -531,7 +531,7 @@ const Resolver = struct {
             .Function => |*f| try self.resolveFunction(scope, f),
             .Property => |*p| try self.resolveProperty(scope, p, is_top_level),
             .Class => |*c| try self.resolveClassBody(scope, c.primary_params, c.init_blocks, c.members),
-            .Object => |*o| try self.resolveClassBody(scope, &.{}, &.{}, o.members),
+            .Object => |*o| try self.resolveClassBody(scope, &.{}, o.init_blocks, o.members),
             .TypeAlias => {
                 // The aliased type is resolved by the type checker; no
                 // name-use sites inside a typealias target need symbol

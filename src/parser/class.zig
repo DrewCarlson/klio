@@ -405,6 +405,8 @@ pub fn parseObject(
         .supertypes = sup.types,
         .supertype_args = sup.args,
         .members = cb.members,
+        .init_blocks = cb.init_blocks,
+        .init_block_positions = cb.init_block_positions,
         .is_data = is_data,
         .is_expect = is_expect,
         .is_actual = is_actual,

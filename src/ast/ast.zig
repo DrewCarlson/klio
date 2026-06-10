@@ -424,6 +424,13 @@ pub const ObjectDecl = struct {
     name: Ident,
     supertypes: []TypeRef,
     members: []Decl,
+    /// `init { … }` blocks in declaration order, run when the singleton is
+    /// constructed — same semantics as `Class.init_blocks`.
+    init_blocks: []Block,
+    /// Position of each entry in `init_blocks` relative to `members`, with
+    /// the same before/after ordering contract as
+    /// `Class.init_block_positions`.
+    init_block_positions: []usize,
     /// Constructor arguments for each declared supertype (`object O :
     /// Foo(arg1, arg2)`). Slot per supertype; `None` when no `(args)` was
     /// written (interface or default-ctor base).

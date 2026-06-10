@@ -170,7 +170,7 @@ fn flattenEval(r: EvalResult) RuntimeEvalResult {
 /// from stdlib higher-order ops like `map`/`fold`.
 pub fn construct(self: *VmIntrinsicHost, class_id: ClassId, args: []const Value, out: Output) Allocator.Error!RawResult {
     var host = vmHost(self, out);
-    return host.newInstance(self.allocator, class_id, args);
+    return host.newInstance(self.allocator, class_id, args, null);
 }
 
 /// Evaluate an `IrClosure` and return the *raw* `EvalError` so the
@@ -539,7 +539,7 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
             // sees that owner as visible.
             const pushed_receiver = this_value.* == .Instance;
             if (pushed_receiver) {
-                host_call_member.pushOuterThis(self.allocator, this_value);
+                host_call_member.pushOuterSubject(self.allocator, this_value);
             }
 
             const result = try invokeCallable(self, callable, all.items, out);

@@ -656,6 +656,10 @@ pub const Class = struct {
     init_block: ?FuncId,
     companion: ?ClassId,
     supertypes: []ClassId,
+    /// `inner class` — instances capture an enclosing-class instance.
+    /// Construction-site lowering consults this so a lambda building a
+    /// bare `Inner()` captures the enclosing `this` it depends on.
+    is_inner: bool = false,
 };
 
 /// `class_index` / `func_index` entry: simple name → id.
@@ -1062,8 +1066,11 @@ pub const Module = struct {
     /// Pre-register a class name so `classId` resolves it before its
     /// body is lowered. Makes cross-class references order-independent.
     /// The placeholder is overwritten by the real definition when
-    /// `addClass` runs for the same name.
-    pub fn reserveClass(self: *Module, allocator: Allocator, name: []const u8) Allocator.Error!ClassId {
+    /// `addClass` runs for the same name. `is_inner` is stamped on the
+    /// stub so construction-site lowering reads the right value for a
+    /// class whose body has not been lowered yet — the lambda capture
+    /// rule for a bare `Inner()` must not depend on declaration order.
+    pub fn reserveClass(self: *Module, allocator: Allocator, name: []const u8, is_inner: bool) Allocator.Error!ClassId {
         if (self.classIndexEntryByName(name)) |id| return id;
         const id = ClassId.from(@intCast(self.classes.items.len));
         try self.class_index.append(allocator, .{ .name = name, .id = id });
@@ -1076,6 +1083,7 @@ pub const Module = struct {
             .init_block = null,
             .companion = null,
             .supertypes = &.{},
+            .is_inner = is_inner,
         });
         return id;
     }

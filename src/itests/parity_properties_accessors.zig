@@ -178,3 +178,28 @@ test "property_with_secondary_setter_logic" {
     ;
     try assertKlio("temp_prop", src, "100.0 212.0\n");
 }
+
+// An `object` whose init block references the singleton by its own name
+// (and through a bare member call) must observe the instance being
+// constructed — published before init runs — rather than re-driving its
+// own constructor. Also pins that a top-level `object`'s init blocks run
+// at all.
+test "object_self_reference_during_init" {
+    const src =
+        \\
+        \\object Registry {
+        \\    val items = mutableListOf<String>()
+        \\    init {
+        \\        Registry.items.add("a")
+        \\        register("b")
+        \\    }
+        \\    fun register(s: String) { items.add(s) }
+        \\}
+        \\fun main() {
+        \\    println(Registry.items)
+        \\    println(Registry.items.size)
+        \\}
+        \\
+    ;
+    try assertKlio("object_self_ref_init", src, "[a, b]\n2\n");
+}

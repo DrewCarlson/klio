@@ -2005,6 +2005,17 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const dst = b.allocReg();
             if (shadowed_by_class) {
+                // A bare `Inner()` uses the enclosing `this` as the new
+                // instance's outer. Inside a lambda body that `this` is
+                // only reachable through the closure's capture set, so
+                // record the capture (kotlinc does the same: the inner
+                // ctor's outer argument forces a `this$0` capture).
+                if (class_id.int() < b.module.classes.items.len and
+                    b.module.classes.items[class_id.int()].is_inner and
+                    b.resolve("this") == null and b.isLambdaBody())
+                {
+                    _ = try b.recordCapture("this");
+                }
                 try b.push(.{ .NewInstance = .{
                     .dst = dst,
                     .class = class_id,

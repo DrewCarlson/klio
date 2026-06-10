@@ -56,11 +56,6 @@ inline fn errRes(e: EvalError) EvalResult {
 // enclosing machinery push onto them, matching Rust's default state.
 // -------------------------------------------------------------------------
 
-/// Set while reading the real `coroutineContext` field for an explicit
-/// `recv.coroutineContext` so the suspend-implicit redirect is skipped
-/// for that one read.
-threadlocal var cc_explicit_read: bool = false;
-
 /// `(instance id, field name)` pairs currently being resolved through
 /// the `get_field` heuristic fallbacks. Bounds the recursion to the
 /// distinct instances on the stack.
@@ -74,10 +69,8 @@ threadlocal var field_outer_active: bool = false;
 /// loud failure.
 pub fn resetReceiverTls() void {
     std.debug.assert(field_resolve_stack.items.len == 0);
-    std.debug.assert(!cc_explicit_read);
     std.debug.assert(!field_outer_active);
     field_resolve_stack.clearRetainingCapacity();
-    cc_explicit_read = false;
     field_outer_active = false;
 }
 
@@ -110,6 +103,7 @@ fn withFieldResolvePair(
     id: usize,
     name: []const u8,
     receiver: *const Value,
+    suppress_cc_redirect: bool,
 ) Allocator.Error!?EvalResult {
     for (field_resolve_stack.items) |k| {
         if (k.id == id and std.mem.eql(u8, k.name, name)) return null;
@@ -118,7 +112,7 @@ fn withFieldResolvePair(
     // capacity-retaining at run boundaries; a per-run-arena backing would
     // leave the retained capacity dangling once that arena is torn down).
     field_resolve_stack.append(std.heap.page_allocator, .{ .id = id, .name = name }) catch {};
-    const r = try getField(self, allocator, receiver, name);
+    const r = try getFieldInner(self, allocator, receiver, name, suppress_cc_redirect);
     var i: usize = field_resolve_stack.items.len;
     while (i > 0) {
         i -= 1;
@@ -237,6 +231,16 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
 // -------------------------------------------------------------------------
 
 pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+    return getFieldInner(self, allocator, receiver, name, false);
+}
+
+/// `suppress_cc_redirect` skips the suspend-implicit `coroutineContext`
+/// redirect for this one resolution (an explicit `recv.coroutineContext`
+/// read, lowered to the `$coroutineContext$explicit` sentinel). A
+/// parameter scoped to the resolution, threaded through the fallback
+/// ladder's own recursion, so it cannot leak into a dispatched getter
+/// body or across a re-entrant dispatch.
+fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool) Allocator.Error!EvalResult {
     // Reflective reads on a *bound* member reference (`this::name`):
     // `.name`/`.simpleName` yield the referenced member's name, and
     // `.isInitialized` answers the lateinit probe against the captured
@@ -308,10 +312,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     // Explicit `recv.coroutineContext` (lowered to this sentinel):
     // bypass the bare-`coroutineContext` redirect for this one read.
     if (std.mem.eql(u8, name, "$coroutineContext$explicit")) {
-        cc_explicit_read = true;
-        const r = getField(self, allocator, receiver, "coroutineContext");
-        cc_explicit_read = false;
-        return r;
+        return getFieldInner(self, allocator, receiver, "coroutineContext", true);
     }
     // Scope-qualified property read (`$sgetter$<owner>\u{1f}<name>`):
     // invoke the lexically enclosing owner's own custom getter.
@@ -329,12 +330,12 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                     return evalGetter(self, allocator, fid, receiver.*);
                 }
             }
-            return getField(self, allocator, receiver, prop);
+            return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect);
         }
     }
     // Suspend-implicit `coroutineContext` intrinsic: redirect a bare
     // read to the active coroutine scope's context.
-    if (std.mem.eql(u8, name, "coroutineContext") and !cc_explicit_read) {
+    if (std.mem.eql(u8, name, "coroutineContext") and !suppress_cc_redirect) {
         if (activeCoroScope()) |scope| {
             const same = scope == .Instance and receiver.* == .Instance and
                 ObjRef(InstanceData).ptrEq(scope.Instance, receiver.Instance);
@@ -345,7 +346,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                 recv_owns_context = g.get().get("coroutineContext") != null;
             }
             if (!same and !recv_owns_context) {
-                return getField(self, allocator, &scope, "coroutineContext");
+                return getFieldInner(self, allocator, &scope, "coroutineContext", suppress_cc_redirect);
             }
         }
     }
@@ -390,7 +391,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                 if (cid) |c| {
                     const mptr: *const Module = self.module.asPtr();
                     _ = mptr;
-                    return @import("host_instances.zig").newInstance(self, allocator, c, &.{});
+                    return @import("host_instances.zig").newInstance(self, allocator, c, &.{}, null);
                 }
             }
         }
@@ -661,7 +662,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             }
         }
         for (delegates.items) |d| {
-            switch (try getField(self, allocator, &d, name)) {
+            switch (try getFieldInner(self, allocator, &d, name, suppress_cc_redirect)) {
                 .ok => |v| if (v != .Unit) return ok(v),
                 .err => {},
             }
@@ -701,7 +702,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                 };
                 if (singleton) |s| {
                     if (s == .Instance) {
-                        switch (try getField(self, allocator, &s, name)) {
+                        switch (try getFieldInner(self, allocator, &s, name, suppress_cc_redirect)) {
                             .ok => |v| if (v != .Unit) return ok(v),
                             .err => {},
                         }
@@ -733,7 +734,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                 (outer == .Instance and receiver.* == .Instance and ObjRef(InstanceData).ptrEq(outer.Instance, receiver.Instance));
             if (!skip) {
                 const oid: usize = if (outer == .Instance) outer.Instance.identity() else 0;
-                if (try withFieldResolvePair(self, allocator, oid, name, &outer)) |r| {
+                if (try withFieldResolvePair(self, allocator, oid, name, &outer, suppress_cc_redirect)) |r| {
                     if (r == .ok) {
                         switch (r.ok) {
                             .Unit, .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => {},
@@ -765,7 +766,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         const same = outer == .Instance and receiver.* == .Instance and ObjRef(InstanceData).ptrEq(outer.Instance, receiver.Instance);
         if (!same and outer != .Null and outer != .Unit) {
             const oid: usize = if (outer == .Instance) outer.Instance.identity() else 0;
-            if (try withFieldResolvePair(self, allocator, oid, name, &outer)) |r| {
+            if (try withFieldResolvePair(self, allocator, oid, name, &outer, suppress_cc_redirect)) |r| {
                 if (r == .ok and r.ok != .Unit) return r;
             }
         }
@@ -785,7 +786,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         };
         while (cur) |o| {
             if (o == .Null or o == .Unit) break;
-            switch (try getField(self, allocator, &o, name)) {
+            switch (try getFieldInner(self, allocator, &o, name, suppress_cc_redirect)) {
                 .ok => |v| if (v != .Unit) return ok(v),
                 .err => {},
             }
@@ -817,7 +818,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             if (comp) |c| {
                 const same = c == .Instance and ObjRef(InstanceData).ptrEq(c.Instance, receiver.Instance);
                 if (!same) {
-                    switch (try getField(self, allocator, &c, name)) {
+                    switch (try getFieldInner(self, allocator, &c, name, suppress_cc_redirect)) {
                         .ok => |v| return ok(v),
                         .err => {},
                     }
@@ -1416,7 +1417,7 @@ fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Instance
                     if (g.get().get(name)) |v| return ok(v);
                 }
                 const oid = outer_inst.identity();
-                if (try withFieldResolvePair(self, allocator, oid, name, &o)) |r| {
+                if (try withFieldResolvePair(self, allocator, oid, name, &o, false)) |r| {
                     if (r == .ok and r.ok != .Unit) return r;
                 }
                 cur_outer = blk: {

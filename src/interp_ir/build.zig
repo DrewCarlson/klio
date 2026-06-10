@@ -709,7 +709,7 @@ fn buildModuleWithOverrides(
 
     // Pre-register every class name so `classId` resolves order-independently.
     for (decls) |*d| {
-        if (d.* == .Class) _ = try module.reserveClass(a, d.Class.name.name);
+        if (d.* == .Class) _ = try module.reserveClass(a, d.Class.name.name, d.Class.is_inner);
     }
     // Lower each class.
     var empty_set = StringSet.init(a);

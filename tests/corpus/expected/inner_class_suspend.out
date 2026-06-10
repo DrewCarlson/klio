@@ -1,0 +1,10 @@
+outer=sync
+outer=sync+w
+outer=sync
+outer=sync
+outer=sync,outer=sync
+outer=sib
+outer=sib
+later=sib
+outer=A
+outer=B+x

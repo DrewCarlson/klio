@@ -146,7 +146,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             break :blk null;
         };
         if (class_id) |cid| {
-            return host_instances.newInstance(self, allocator, cid, args);
+            return host_instances.newInstance(self, allocator, cid, args, null);
         }
         // Direct allocation for classes that aren't in the IR
         // module index. The runtime ClassDef carries enough to
@@ -347,7 +347,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             }
             const pushed_receiver = args[0] == .Instance;
             if (pushed_receiver) {
-                host_call_member.pushAccessEnclosing(self, &args[0]);
+                host_call_member.pushAccessEnclosingSubject(self, &args[0]);
             }
             const r = try callValue(self, allocator, &bound, rest);
             if (pushed_receiver) host_call_member.popAccessEnclosing(self);
@@ -483,7 +483,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 }
                 const pushed_receiver = receiver == .Instance;
                 if (pushed_receiver) {
-                    host_call_member.pushAccessEnclosing(self, &receiver);
+                    host_call_member.pushAccessEnclosingSubject(self, &receiver);
                 }
                 const r = try callValue(self, allocator, &bound, body_args);
                 if (pushed_receiver) host_call_member.popAccessEnclosing(self);

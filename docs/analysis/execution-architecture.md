@@ -172,16 +172,22 @@ and `callerThisValue` additionally drops any receiver that is not `.Instance`
 (`eval.zig:1858`), so primitive/`String` receivers in `with`/`apply` cannot
 thread through this path at all.
 
-**Companion thread-locals, same anti-pattern, none snapshotted.**
-`member_only_probe`, `map_fallback_active`, `iterable_fallback_active`
-(`host_call_member.zig:54-60`); `cc_explicit_read`, `field_resolve_stack`,
-`field_outer_active` (`src/interp_ir/vm/host_fields.zig:62-70`); `ctor_guard`
-(defined twice — `host_globals.zig` and `host_instances.zig:61`), `inner_outer_hint`
-(`host_instances.zig:62`); `coro_stack`, `active_scope_stack`, `persisted_parked`
-(`src/interp_ir/vm/coroutines.zig:514-527`); `coroutine_time_mode_tls`
-(`src/interp_ir/interp_ir.zig:322`). Each is transient resolution state kept in
-TLS, leakable across a suspend or a re-entrant dispatch, and never reset between
-runs in a multi-program test binary.
+**Companion thread-locals, same anti-pattern — now mostly resolved.**
+`member_only_probe`, `cc_explicit_read`, and `inner_outer_hint` are converted
+to explicit parameters (`member_only` on `callMemberInner`/
+`callMemberNamedInner`, `suppress_cc_redirect` on `getFieldInner`,
+`outer_hint` on the `newInstanceNamed` → `materializeInstance` construction
+path), and the dead duplicate `ctor_guard` in `host_globals.zig` is collapsed
+onto `host_instances.ctorGuardContains`. What remains in TLS is genuine
+re-entrancy / driver state: `map_fallback_active`, `iterable_fallback_active`,
+`call_outer_active` (`host_call_member.zig`, now `defer`-cleared and asserted
+clear at run boundaries via `host_call_member.resetReceiverTls`);
+`field_resolve_stack`, `field_outer_active` (`src/interp_ir/vm/host_fields.zig`);
+the one `ctor_guard` (`host_instances.zig`); `coro_stack`,
+`active_scope_stack`, `persisted_parked` (`src/interp_ir/vm/coroutines.zig`);
+`coroutine_time_mode_tls` (`src/interp_ir/interp_ir.zig`). Every TLS-holding
+VM module is wired into the run-boundary assert
+(`vmhost.resetReceiverThreadLocals`).
 
 **Inline variant.** An `inline fun` with a receiver binds the receiver as a
 lowering-time scope local named `"this"` in the caller's builder
@@ -372,9 +378,10 @@ fallback, stdlib member dispatch, delegate forwarding, companion forwarding,
 function-typed property invocation, extension-fn fallback — in fixed order, each
 `if (try X) |r| return r`. `callMemberNamed` (`:4021`), `callMemberOnly`
 (`:4053`), and `userMethodNamed` (`:4177`) re-enter subsets with different
-ordering/visibility flags. The `member_only_probe` thread-local
-(`host_call_member.zig:54`) is a hidden state channel captured-and-cleared at the
-top. `irMethodWalk` resolves the receiver class by two different keys — FQN
+ordering/visibility flags. The member-only restriction is an explicit
+`member_only` parameter on `callMemberInner`/`callMemberNamedInner` (the old
+`member_only_probe` thread-local channel is gone). `irMethodWalk` resolves the
+receiver class by two different keys — FQN
 (`host_call_member.zig:3369`) then a simple-name scan (`:3373-3380`) — which is
 what makes pack-mangled classes layout-sensitive. `extensionFnFallback`
 (`:3692-3711`) admits any func whose first param is named `"this"` and whose
@@ -392,9 +399,12 @@ At any dispatch, the receiver is sourced from up to three unsynchronized places:
 3. the thread-local `outer_this` stack (`enclosingThisChain`,
    `host_call_member.zig:875-891`),
 
-plus a separate `inner_outer_hint` thread-local for inner-class outer receivers
-(`host_instances.zig:61-91`, `host_instances.zig:1827`). There is no assertion
-that these agree.
+The fourth origin — the `inner_outer_hint` thread-local for inner-class outer
+receivers — is gone: the outer is an explicit `outer_hint` parameter on the
+construction path, and `selectInnerOuter` picks it by the inner class's
+lexically enclosing class (`registry.enclosing_class`) over the hint's
+class-nesting tower (its `outer` links) and the subject-tagged frame chain.
+There is still no assertion that the remaining origins agree.
 
 ### 3.6 Closure execution call-site count
 
@@ -466,21 +476,89 @@ class.
   and `outerThisStack` are deleted, and `enclosingThis`/`enclosingThisChain`/
   `pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain
   via a thread-local `active_chain` pointer that only ever points at a live
-  frame's field. Still pending: folding the frame's own `this` and the
-  inner-class outer receiver (`inner_outer_hint`) into the same carrier.
-- Set the frame receiver slot at call entry on every dispatch path (method walk,
-  extension call, closure invoke, inline splice). `frameThisParam`/
-  `callerThisValue`/`execCallMemberOrGlobal` read one field instead of recovering
-  it by name+type matching. Drop the `== .Instance` restriction so
-  primitive/`String` receivers thread identically.
-- Eliminate the `outer_this` and `inner_outer_hint` thread-locals and their two
-  push helpers. The inline splice sets the frame receiver slot for the spliced
-  region instead of binding a scope local named `"this"`, so inline-body member
-  resolution uses the identical path as a normal method body.
-- Convert the transient boolean guards (`member_only_probe`,
-  `*_fallback_active`, `field_outer_active`, `cc_explicit_read`) into explicit
-  parameters on the relevant resolver functions so they cannot leak across a
-  suspend or a re-entrant dispatch. Collapse the duplicate `ctor_guard`.
+  frame's field.
+- **Inner-class outer receiver: DONE (item-6 close-out).** The
+  `inner_outer_hint` thread-local and its push/pop helpers are deleted. The
+  outer is an explicit `outer_hint: ?*const Value` parameter on
+  `newInstanceNamed`, threaded through `newInstance` →
+  `dispatchSecondaryCtor`/`superDelegation` (nested shell constructions see
+  the same hint) → `primaryCtorPath` → `materializeInstance`, where
+  `selectInnerOuter` picks the outer by the inner class's lexically
+  enclosing class (`registry.enclosing_class` /
+  `ClassDef.enclosing_class`), walking the receivers in scope at the
+  construction site innermost-first the way kotlinc resolves the inner
+  constructor's dispatch receiver: the hint itself; the hint's
+  class-nesting tower (`outer` links — a member of `Inner` constructing a
+  sibling `Inner()` reaches `this@Outer` through its own outer link, never
+  through a receiver inherited from a caller frame), skipped when the hint
+  is the innermost receiver-lambda subject (a displaced `with(x)` slot —
+  the subject brings only itself into scope); then the enclosing-receiver
+  chain, each entry direct plus — for non-subject entries — its own tower.
+  Chain entries carry the subject/receiver distinction from the push site
+  (`ir.eval.EnclosingEntry.is_subject`; the three receiver-lambda dispatch
+  sites push the subject tagged, the displaced prior `this` plain). On the
+  build side, a lambda body lowering a bare `Inner()` to `NewInstance` now
+  records a `this` capture (kotlinc's `this$0`: the inner construction is
+  a *use* of the enclosing instance), `ir.Class` carries `is_inner` to key
+  that decision — stamped on the `reserveClass` stub too, so a
+  forward-referenced sibling inner class lowers identically in either
+  declaration order — and the `NewInstance` arm sources the hint via
+  `callerThisValue` (param or capture). Together these fixed
+  `with(other) { Inner().show() }` inside an Outer member — including the
+  shadowing case where the unrelated subject declares a same-named
+  property (the stamped `outer` resolves through `instanceField`'s early
+  outer-instance walk, ahead of the dynamic chain-top rescue) — plus inner
+  instances escaping HOF lambdas, user-HOF lambdas, two-level `inner`
+  nesting, sibling construction under a polluted caller chain, and
+  later-declared siblings built from lambdas. Pinned by the
+  `inner_class_constructed_inside_with_lambda` /
+  `inner_class_in_with_lambda_ignores_shadowing_subject` /
+  `inner_class_constructed_inside_user_hof_lambda` /
+  `inner_class_two_level_nesting` /
+  `inner_class_escapes_lambda_with_outer` /
+  `sibling_inner_construction_ignores_caller_receivers` /
+  `later_declared_sibling_inner_class_from_lambda` /
+  `with_subject_of_enclosing_class_supplies_outer` /
+  `with_subject_outer_links_not_in_scope` /
+  `with_unrelated_subject_in_inner_member_reaches_outer` itests
+  (sibling/`with`-subject expectations confirmed against kotlinc-native
+  2.3.10), the suspend pins in `parity_suspend_shapes` (including
+  `sibling_inner_constructed_after_park`), and
+  `examples/inner_class_suspend.kt`.
+- **Guards → params: DONE (item-6 close-out) for the deletable set.**
+  `member_only_probe` is the `member_only` parameter of
+  `callMemberInner`/`callMemberNamedInner` (public surface forwards
+  `false`, `callMemberOnly` passes `true`); `cc_explicit_read` is the
+  `suppress_cc_redirect` parameter of `getFieldInner`. The duplicate
+  `ctor_guard` is collapsed: the `host_globals.zig` copy had no writer (its
+  deferred-`object` gate read was always false), and `lookupGlobal` now
+  consults the one real guard via `host_instances.ctorGuardContains`. The
+  load-bearing re-entrancy flags stay as TLS
+  (`map/iterable_fallback_active`, `call_outer_active`,
+  `field_outer_active`, `field_resolve_stack`) but are `defer`-cleared and
+  covered by run-boundary asserts (`host_call_member.resetReceiverTls` is
+  wired into `vmhost.resetReceiverThreadLocals`); their full TLS→param
+  conversion rides the §4.3 single-resolver work.
+- **Remaining §4.2 line item — fold the frame's own `this` into the
+  carrier.** The frame's own receiver is still a param/capture recovered by
+  name (`frameThisParam`, `callerThisValue` with its `.Instance`-only gate,
+  `implicitThisValue`), not `enclosing_this[0]`. Folding it changes the
+  depth assumptions of every chain consumer:
+  `implicitReceiverChain` (eval's choke point would double-count), the
+  getField enclosing-receiver rescue (chain-top-only read in
+  `host_fields.zig`), `enclosingOwnerSet`/`enclosingChainClassOrder`
+  (member-ext visibility), `checkReceiverChain` (the KLIO_TRACE_INVARIANTS
+  interior-hole rule), and the B13 `.Instance`-only gate. Set the frame
+  receiver slot at call entry on every dispatch path; drop the
+  `== .Instance` restriction so primitive/`String` receivers thread
+  identically; the inline splice sets the slot for the spliced region
+  instead of binding a scope local named `"this"`. Known residual until
+  then: the dynamic chain-top rescue in `getField` can still resolve a
+  bare name inside an inner-class member body against an unrelated
+  enclosing receiver when neither the instance, its captured outer
+  chain, nor any earlier ladder step owns the name — a leniency over
+  kotlinc (which rejects such programs at compile time), not a wrong
+  value for valid programs.
 
 ### 4.3 One name-resolution function (→ Class A/B dispatch order)
 
@@ -742,7 +820,7 @@ refactors, then the structural unifications in dependency order.
 | 4a | Precise captured-`var` carrier FIRST: `StoreCapture` instr OR precise boxing (replace syntactic `computeBoxedVars`), proven green with closures itests + §5.1 (§4.1) | A | high | medium | L |
 | 4b | DONE — stop swapping `self.globals`, deleted `StoreGlobal`-for-capture + `scoped_env` + the now-dead `WritebackCaptures`/`readLambdaCapture` capture-sync; the HOF invoke path runs over the real top-level env and captured-`var` writes round-trip through the shared `Cell`. Required extending 4a's boxing to function/lambda *parameters* a nested closure writes (the captured-param gap, e.g. `toMap(destination){ consumeEach { destination += it } }`). (§4.1) | A | high | high | L |
 | 5 | `VmIntrinsicHost` becomes thin adapter delegating to eval.Host (§4.1) | A | high | medium | L |
-| 6 | DONE (receiver chain) — enclosing-`this` chain is now a `Frame` field (`enclosing_this`), snapshotted into `FrameSnapshot` on suspend and restored on resume; the `outer_this` thread-local + `outerThisStack` + its `resetReceiverTls` are deleted and `enclosingThis`/`enclosingThisChain`/`pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain. `inner_outer_hint` and the remaining guards-as-params are not yet folded in. (§4.2) | B | high | high | XL |
+| 6 | DONE (receiver chain + close-out) — enclosing-`this` chain is now a `Frame` field (`enclosing_this`), snapshotted into `FrameSnapshot` on suspend and restored on resume; the `outer_this` thread-local + `outerThisStack` + its `resetReceiverTls` are deleted and `enclosingThis`/`enclosingThisChain`/`pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain. Close-out landed: `inner_outer_hint` TLS replaced by an explicit `outer_hint` param (sourced via `callerThisValue` — param or capture) with class-keyed outer selection in `materializeInstance`, plus a lambda-side `this` capture for bare inner-class construction keyed on the new `ir.Class.is_inner` (fixes `with(other){Inner()}` incl. shadowing subjects, lambda-escaping inners, user-HOF lambdas, two-level nesting), `member_only_probe`/`cc_explicit_read` are now params, the dead duplicate `ctor_guard` is collapsed onto `host_instances.ctorGuardContains` (activating the deferred-`object` gate), and `host_call_member`'s re-entrancy flags are defer-cleared + run-boundary-asserted. Remaining §4.2 line item: fold the frame's own `this` into the carrier (see §4.2 consumer inventory). (§4.2) | B | high | high | XL |
 | 7 | PARTIAL — single implicit-receiver resolution choke point (`implicitThisValue` + `implicitReceiverChain` in `ir/eval.zig`) now feeds all three `*OrGlobal` handlers (`CallMemberOrGlobal`/`LoadFromThisOrGlobal`/`StoreToThisOrGlobal`), so the bare-name member-vs-global precedence is derived in one place instead of three. Registry func-kind landed: `Func.kind` (`FuncKind.member_extension`) is the authoritative member-extension predicate, set at the member-extension lowering site (`decl.zig`); the five `member_ext_owner_class` dispatch sites route through `isMemberExt`/`memberExtVisible` (the owner-class gate is preserved exactly — the kind selects which funcs are gated, the side table supplies the owner). The four "Or" *instructions* are NOT collapsed to a single `CallUnresolved`: they encode three distinct operations (read / write / call) plus the explicit-receiver `CallMemberOrValue`, and the "Or" itself is the "couldn't classify member-vs-global statically" signal item 8's FQN static resolution removes — collapsing now would re-encode the read/write/call distinction without removing the runtime decision. Deferred to item 8. (A/B) | A/B | high | medium | L |
 | 8 | PARTIAL (steps 1-4, fallback retained) — per-decl `package` tag on `Func`/`Class` (set at flatten/lowering, `""` = no package), the two-phase header registration made explicit (phase-1 reserves every class + func HEADER with FQN/package/receiver, phase-2 lowers bodies against the complete set), and the package/FQN symbol index (`Module.resolveBareCallIndexed`, keyed on caller package → file imports → built-in stdlib) as the PRIMARY bare-call path: where it resolves a unique non-extension target, lowering binds that target by exact `FuncId` (FQN-exact at the VM); otherwise it defers to the order-based heuristic, which is RETAINED unchanged. `KLIO_RESOLVE_AUDIT` is a permanent env-gated detector that compares the index pick to the heuristic pick on every bare call — proven 0 divergences over all 82 examples + the differential corpus, i.e. the index is a faithful superset. DEFERRED (the tightening prerequisite): the index does NOT yet error on ambiguity, and `isShippedFqn`/prefix-ladder/suffix-scan are NOT removed — that hardening is gated on the §4.4-item-3 uniqueness proof and is items 9/10's scope. | C | high | high | XL |
 | 9 | DONE — one executable form per symbol resolved at link time (`ProgramImage.linkResolvedForms` → the `resolved_native` table keyed by `FuncId`, populated once after the module + `installed_bindings` exist); the per-call FQN short-circuit in `callFunc` and `callValue` is deleted, both now consulting the resolved form by `FuncId` (`host_call_func.resolvedNativeForm`). Pack-vs-source identity is settled at link time, load-order-independent. `KLIO_LINK_AUDIT` is a permanent env-gated detector proving the link form equals the deleted per-call probe's pick (0 divergences over the full suite + 82 examples + the differential corpus). (§4.4) | C | high | high | XL |
