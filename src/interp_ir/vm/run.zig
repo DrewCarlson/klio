@@ -352,7 +352,7 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
             const class_id = module.classId(obj_name) orelse continue;
             const inst = blk: {
                 var host = vmMakeHost(self, sink);
-                switch (try host.newInstance(self.allocator, class_id, &.{})) {
+                switch (try host.newInstance(self.allocator, class_id, &.{}, null)) {
                     .ok => |v| break :blk v,
                     // Defer an object whose eager initializer throws — it is
                     // initialized on first access in `lookupGlobal` instead.

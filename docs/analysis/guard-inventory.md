@@ -31,16 +31,17 @@ called out explicitly.
 | Class | Guards catalogued | Deletable (point-fix) | Keep (load-bearing) | Needs-verification | Removed |
 | --- | --- | --- | --- | --- | --- |
 | A — closure execution / lambda variable access | 9 | 7 | 1 | 1 | 3 (A1, A2 via 4b; A5 via item 9) |
-| B — receiver/`this` across suspend/inline | 14 | 11 | 1 | 2 | 1 (B1 via item 6; B2–B5 relocated onto the frame chain) |
+| B — receiver/`this` across suspend/inline | 14 | 8 | 1 | 2 | 4 (B1 via item 6; B2–B5 relocated onto the frame chain; B6, B7, B10 via the item-6 close-out) |
 | C — pack-vs-direct resolution | 12 | 10 | 1 | 1 | 1 (C6 via item 9) |
-| Other-correctness / re-entrancy | 7 | 1 | 6 | 0 | 0 |
-| **Total** | **42** | **29** | **9** | **4** | **4** |
+| Other-correctness / re-entrancy | 7 | 0 | 6 | 0 | 1 (O3's duplicate copy collapsed; the guard itself stays) |
+| **Total** | **42** | **25** | **9** | **4** | **9** |
 
 (A guard counted "needs-verification" is also counted in exactly one of
 deletable/keep per its best-current assessment; the four NV rows are A4, B9,
 B13, C12. A1 and A2 are now REMOVED via §6 item 4b; A5 (a Class-C
 two-executable-forms guard catalogued under Class A) and C6 are now REMOVED via
-§6 item 9 — see their entries.)
+§6 item 9; B6, B7, B10 and O3's duplicate copy are now REMOVED via the item-6
+receiver-context close-out — see their entries.)
 
 The **keep list** (load-bearing branches that are NOT point-fixes and must not be
 deleted) is consolidated at the bottom.
@@ -311,35 +312,32 @@ or a re-entrant dispatch.
 - **Removal test:** `parity_functional_patterns` (`with`/`apply`/`run` with member
   calls) + fuzzer green.
 
-### B6 — `member_only_probe` thread-local
+### B6 — `member_only_probe` thread-local — REMOVED (item-6 close-out)
 
-- **Location:** `src/interp_ir/vm/host_call_member.zig:54` (TLS),
-  captured-and-cleared at `:1303-1304`, set/restored in `callMemberOnly`
-  `:4054-4057`, consumed by `irMethodWalk`/`extensionFnFallback`
-  (`:1490,1663,1704`).
-- **What it does:** a hidden boolean channel implementing Kotlin's
-  member-vs-extension precedence (member-only resolution defers a SAM-lambda
-  member to an extension). Leakable across a re-entrant dispatch / suspend like
-  any TLS.
-- **Class:** B (TLS anti-pattern) / A-B dispatch order.
-- **Deletable?** Deletable as a *thread-local* — becomes an explicit parameter on
-  the resolver (§4.2 "guards become params", §4.3 one resolver).
-- **Removes via:** §6 item **7** (single resolver) + **6**.
-- **Removal test:** `parity_extension_resolution` green with `member_only` passed as
-  a function arg; single-path tracer shows deterministic member-vs-ext choice.
+- **Status:** REMOVED. `member_only` is now an explicit parameter:
+  `callMemberOnly` calls `callMemberNamedInner(..., member_only = true)`,
+  which forwards it to `callMemberInner`; the public `callMember`/
+  `callMemberNamed` host surface forwards `false`. The flag is scoped to one
+  resolution by construction — it can no longer be stolen by a re-entrant
+  `callMember` inside `copyNamed`/`stdlibNamedDispatch`/`userMethodNamed`
+  (the old TLS was consumed-and-cleared by whichever dispatch read it
+  first). `irMethodWalk`/`samInstanceDispatch`/`extensionFnFallback` already
+  took it as a parameter.
+- **Removal test (passing):** `parity_extension_resolution` (17 tests) green
+  with `member_only` passed as a function arg; full suite + differential +
+  single-path oracle green.
 
-### B7 — `cc_explicit_read` thread-local (coroutineContext redirect)
+### B7 — `cc_explicit_read` thread-local (coroutineContext redirect) — REMOVED (item-6 close-out)
 
-- **Location:** `src/interp_ir/vm/host_fields.zig:62` (TLS), set/cleared
-  `:296-299`, consumed `:322`.
-- **What it does:** suppresses the suspend-implicit `coroutineContext` redirect for
-  one explicit `recv.coroutineContext` read. Transient resolution state in TLS.
-- **Class:** B.
-- **Deletable?** Deletable as a TLS — pass an explicit-read flag down the field-read
-  call, or lower the explicit form to a distinct instruction that needs no flag.
-- **Removes via:** §6 item **6** (guards → params).
-- **Removal test:** `parity_coroutines_realistic` / `parity_suspend_shapes` green
-  with the flag threaded as a parameter.
+- **Status:** REMOVED. The flag is now a `suppress_cc_redirect: bool`
+  parameter on `getFieldInner` (the public `getField` forwards `false`); the
+  `$coroutineContext$explicit` sentinel arm calls the inner fn with `true`,
+  and the flag is threaded through the fallback ladder's own recursion
+  (including `withFieldResolvePair`) so the dynamic extent of one explicit
+  read matches the old TLS window without being able to leak into a
+  dispatched getter body.
+- **Removal test (passing):** `parity_coroutines_realistic` /
+  `parity_suspend_shapes` green with the flag threaded as a parameter.
 
 ### B8 — `field_resolve_stack` re-entrancy bound
 
@@ -373,21 +371,57 @@ or a re-entrant dispatch.
   green after removal; if they loop, it is a keep (loop-prevention) reclassified
   toward C-style guards.
 
-### B10 — `inner_outer_hint` thread-local
+### B10 — `inner_outer_hint` thread-local — REMOVED (item-6 close-out)
 
-- **Location:** `src/interp_ir/vm/host_instances.zig:62` (TLS), push/pop/read
-  `:79-91`, consumed when stamping a new inner instance's `outer` `:1827-1831`;
-  surfaced to the evaluator as the `pushInnerOuterHint`/`popInnerOuterHint`
-  `VmHost` methods (`host_instances.zig`), which `eval`'s `NewInstance` arm
-  invokes directly (the eval `Host` vtable was removed in R18).
-- **What it does:** a separate TLS carrying the outer receiver for inner-class
-  construction — a *fourth* receiver origin alongside the three in §3.5.
-- **Class:** B.
-- **Deletable?** Deletable. Folds into the one `ReceiverContext` (§4.2 "Eliminate
-  the `outer_this` and `inner_outer_hint` thread-locals").
-- **Removes via:** §6 item **6**.
-- **Removal test:** `parity_inner_classes` (`inner_class_captures_outer_this`,
-  already in tree) green with the hint sourced from the frame receiver context.
+- **Status:** REMOVED, and its replacement also fixed a live bug. The hint is
+  now an `outer_hint: ?*const Value` parameter on `newInstanceNamed`,
+  threaded through `newInstance` → `dispatchSecondaryCtor`/`superDelegation`
+  (the same hint flows through nested shell constructions) →
+  `primaryCtorPath` → `materializeInstance`; the `NewInstance` arm passes
+  the frame's own `this` directly and the push/pop helpers, the `VmHost`
+  aliases, and the NullHost stubs are deleted. `selectInnerOuter`
+  (`host_instances.zig`) picks the outer by the inner class's lexically
+  enclosing class (`registry.enclosing_class`), walking the receivers in
+  scope at the construction site innermost-first the way kotlinc resolves
+  the inner constructor's dispatch receiver: the hint itself, then the
+  hint's class-nesting tower (`hint.outer`, `hint.outer.outer`, … — a
+  member of `Inner` constructing a sibling `Inner()` reaches `this@Outer`
+  through its own outer link, never through a receiver inherited from a
+  caller frame), then the enclosing-receiver chain innermost-first where
+  each dispatch-receiver entry carries its own tower but a `with`/`run`
+  subject contributes only itself. Chain entries are tagged at the push
+  site (`ir.eval.EnclosingEntry.is_subject`; the three receiver-lambda
+  dispatch sites push the subject via `pushEnclosingSubject`/
+  `pushOuterSubject`/`pushAccessEnclosingSubject` and the displaced prior
+  `this` as a plain receiver), and the hint's tower walk is skipped when
+  the hint IS the innermost subject (a displaced receiver-lambda `this`
+  slot — its outers are not in scope; the lambda's lexical tower continues
+  with the displaced entry on the chain). On the build side a lambda body
+  lowering a bare `Inner()` to `NewInstance` records a `this` capture
+  (kotlinc's `this$0`), keyed on `ir.Class.is_inner` — stamped both by
+  `lowerClassWithExtras` and on the `reserveClass` stub so the rule is
+  declaration-order independent — and the `NewInstance` arm sources the
+  hint via `callerThisValue` (param or capture). This fixed
+  `with(other) { Inner().show() }` inside an Outer member (previously
+  ``Vm::get_field `tag` on `<instance>``: no lambda-side construction path
+  stamped `outer`, and the getField rescue consults only the chain top),
+  the same-named-subject shadowing variants, inner instances escaping HOF
+  lambdas, user-HOF lambdas, two-level `inner` nesting, sibling `Inner()`
+  construction from a member of Inner under a polluted caller chain, and
+  forward-referenced sibling inner classes constructed from lambdas.
+- **Removal test (passing):** `parity_inner_classes`
+  (`inner_class_captures_outer_this`, `inner_class_constructed_inside_with_lambda`,
+  `inner_class_constructed_inside_map_lambda`, `inner_class_escapes_lambda_with_outer`,
+  `sibling_inner_construction_ignores_caller_receivers`,
+  `later_declared_sibling_inner_class_from_lambda`,
+  `with_subject_of_enclosing_class_supplies_outer`,
+  `with_subject_outer_links_not_in_scope`,
+  `with_unrelated_subject_in_inner_member_reaches_outer`)
+  plus the suspend pins `inner_class_constructed_after_park` /
+  `inner_class_in_receiver_lambda_after_park` /
+  `sibling_inner_constructed_after_park` and `examples/inner_class_suspend.kt`.
+  The sibling/`with`-subject expectations are confirmed against
+  kotlinc-native 2.3.10 (the suspend variants via their sync shapes).
 
 ### B11 — Inline-receiver bound as a scope local `"this"`
 
@@ -692,7 +726,14 @@ catalogued so nobody mistakes them for Class-A/B/C point-fixes; most are **keep*
 - **Deletable?** **Keep** the protection, but the TLS *mechanism* is deletable —
   pass the in-progress flag as a parameter of the drain call (§4.2 "guards become
   params"). Standalone deletion would infinitely recurse on a user Map/Iterable.
-- **Removes via:** §6 item **6** (TLS→param), not a resolution-class fix.
+- **Hardened (item-6 close-out):** the set/clear windows are now
+  `defer`-cleared blocks (a Zig error from the drain can no longer leak the
+  flag), and `host_call_member.resetReceiverTls` Debug-asserts both flags
+  false at every run boundary (wired into
+  `vmhost.resetReceiverThreadLocals`) — previously the only TLS-holding VM
+  module with no run-boundary assert.
+- **Removes via:** §6 item **7** (the full TLS→param conversion rides the
+  single-resolver work), not a resolution-class fix.
 - **Removal test:** `parity_collections_intensive`/`parity_maps_intensive` with a
   user-defined `Map`/`Iterable`; must stay green (a regression would hang).
 
@@ -702,23 +743,30 @@ catalogued so nobody mistakes them for Class-A/B/C point-fixes; most are **keep*
 - **What it does:** re-entrancy flag so a companion whose `outer` is its class (whose
   member lookup forwards back to the companion) cannot loop.
 - **Class:** other-correctness.
-- **Deletable?** **Keep** (loop prevention); TLS→param under §6 item 6.
+- **Deletable?** **Keep** (loop prevention); TLS→param under §6 item 7.
+  Now asserted false at run boundaries via `host_call_member.resetReceiverTls`
+  (item-6 close-out).
 - **Removal test:** companion-outer cyclic fixtures in `parity_inner_classes` stay
   green.
 
-### O3 — `ctor_guard` (defined twice)
+### O3 — `ctor_guard` (was defined twice) — duplication REMOVED (item-6 close-out)
 
-- **Location:** `src/interp_ir/vm/host_globals.zig:54` AND
-  `src/interp_ir/vm/host_instances.zig:61` — two independent TLS stacks of the same
-  name; consumed `host_instances.zig:1020` (`shell_guarded`) and
-  `host_globals.zig:63-68`.
+- **Status:** collapsed to ONE guard. The `host_globals.zig` copy had **no
+  writer anywhere** (the shell pushes wrote `host_instances.zig`'s distinct
+  threadlocal), so the deferred-`object` gate read in `lookupGlobal` was
+  provably always false — a silently broken port of Rust's single shared
+  `EXEC` thread-local. `host_instances.ctorGuardContains` is now `pub` and
+  `host_globals.lookupGlobal` consults it, restoring the intended
+  cross-file semantics; the dead copy, its reset lines, and its private
+  `contains` are deleted.
+- **Location:** `src/interp_ir/vm/host_instances.zig` (the one guard:
+  push/pop around secondary-ctor shell construction, read as
+  `shell_guarded` and by `host_globals.lookupGlobal`).
 - **What it does:** a deferred `object` is only driven on-access when its own ctor is
-  not already running; the instances copy guards secondary-ctor dispatch.
-- **Class:** other-correctness — but the **duplication** is a defect (§4.2 "Collapse
-  the duplicate `ctor_guard`").
-- **Deletable?** **Keep** the guard; **delete the duplication** (collapse to one).
-- **Removes via:** §6 item **6**.
-- **Removal test:** `parity_properties_accessors` (object init order) green with one
+  not already running; the same stack guards secondary-ctor shell dispatch.
+- **Class:** other-correctness. The guard itself stays.
+- **Removal test (passing):** `parity_properties_accessors` (object init
+  order, incl. `object_self_reference_during_init`) green with one
   `ctor_guard`.
 
 ### O4 — `top_level_init_depth`
@@ -801,8 +849,8 @@ registry-kind) rather than deleting the behavior.
    to relocate, but the re-entrancy protection it provides is mandatory (infinite
    recursion otherwise).
 3. **`call_outer_active` (O2)** — companion/outer cycle loop-prevention.
-4. **`ctor_guard` (O3)** — object/secondary-ctor init guard; *collapse the duplicate*
-   but keep the guard.
+4. **`ctor_guard` (O3)** — object/secondary-ctor init guard; the duplicate is now
+   collapsed (item-6 close-out), keep the one guard.
 5. **`top_level_init_depth` (O4)** — forward-reference init-order semantics.
 6. **Coroutine driver TLS (O5)** — genuine suspend/resume machinery; own-on-driver +
    reset-assert, do not delete.

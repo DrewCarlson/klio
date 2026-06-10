@@ -310,6 +310,99 @@ test "enclosing_this_chain_survives_suspend" {
     );
 }
 
+// A bare `Inner()` constructed strictly *after* a `delay` park inside a
+// suspend member of the enclosing class must capture the right outer for
+// each interleaved coroutine: the frame's `this` param is snapshotted with
+// the continuation, and outer selection reads it on resume.
+test "inner_class_constructed_after_park" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\class Outer(val tag: String) {
+        \\    inner class Inner {
+        \\        fun show(): String = "outer=" + tag
+        \\    }
+        \\    suspend fun build(): String {
+        \\        delay(5)
+        \\        return Inner().show()
+        \\    }
+        \\}
+        \\fun main() = runBlocking {
+        \\    val a = async { Outer("A").build() }
+        \\    val b = async { Outer("B").build() }
+        \\    println(a.await())
+        \\    println(b.await())
+        \\    println(Outer("seq").build())
+        \\}
+        \\
+    ;
+    try assertKlio("inner_after_park", src, "outer=A\nouter=B\nouter=seq\n");
+}
+
+// The receiver-lambda variant: after the park, `with(h) { Inner() }` runs
+// in a lambda whose innermost receiver is the unrelated Helper. Outer
+// selection must key on Inner's enclosing class through the restored
+// implicit-receiver chain, while `hid` still resolves on the with-subject.
+test "inner_class_in_receiver_lambda_after_park" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\class Helper(val hid: String)
+        \\class Outer(val tag: String) {
+        \\    inner class Inner {
+        \\        fun show(): String = "outer=" + tag
+        \\    }
+        \\    suspend fun buildVia(h: Helper): String {
+        \\        delay(5)
+        \\        return with(h) { Inner().show() + "+" + hid }
+        \\    }
+        \\}
+        \\fun main() = runBlocking {
+        \\    val a = async { Outer("A").buildVia(Helper("x")) }
+        \\    val b = async { Outer("B").buildVia(Helper("y")) }
+        \\    println(a.await())
+        \\    println(b.await())
+        \\}
+        \\
+    ;
+    try assertKlio("inner_with_after_park", src, "outer=A+x\nouter=B+y\n");
+}
+
+// A member of Inner constructing a sibling `Inner()` strictly after a park:
+// the outer must come through the dispatch receiver's own outer link for
+// each interleaved coroutine, even when one coroutine's restored chain
+// carries an unrelated `with(w)` subject of the same Outer class from its
+// caller. The frame's `this` param travels with the continuation; the
+// `with(w)` receiver in `drive` is not in scope inside `sibling()`.
+test "sibling_inner_constructed_after_park" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\class Outer(val tag: String) {
+        \\    inner class Inner {
+        \\        suspend fun sibling(): Inner {
+        \\            delay(5)
+        \\            return Inner()
+        \\        }
+        \\        fun show(): String = "outer=" + tag
+        \\    }
+        \\    fun mk(): Inner = Inner()
+        \\}
+        \\class Driver(val w: Outer, val inner: Outer.Inner) {
+        \\    suspend fun drive(): Outer.Inner = with(w) { inner.sibling() }
+        \\}
+        \\fun main() = runBlocking {
+        \\    val d = Driver(Outer("W"), Outer("A").mk())
+        \\    val a = async { d.drive() }
+        \\    val b = async { Outer("B").mk().sibling() }
+        \\    println(a.await().show())
+        \\    println(b.await().show())
+        \\}
+        \\
+    ;
+    try assertKlio("inner_sibling_after_park", src, "outer=A\nouter=B\n");
+}
+
 // A `suspend Receiver.() -> Unit` value invoked with a bound receiver
 // (`b.block()`, where `block` is a fun-typed parameter) must park at a
 // `delay` inside its body and resume. The receiver-bound value-call runs

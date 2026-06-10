@@ -20,6 +20,7 @@ const stdlib = @import("stdlib");
 
 const vmhost = @import("vmhost.zig");
 const host_impl = @import("host_impl.zig");
+const host_instances = @import("host_instances.zig");
 
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -47,35 +48,25 @@ const SuspendState = ir.eval.SuspendState;
 // Thread-local re-entrancy state. Mirrors the `lib.rs` thread-locals the
 // Rust `lookup_global` reads: the active-constructor guard stack (a
 // deferred `object` is only driven on-access when its own ctor is not
-// already running) and the in-top-level-init flag (a forward reference
-// during startup re-drives the real initializer rather than observing the
-// `Null` placeholder).
+// already running — the one stack secondary-ctor shell construction in
+// `host_instances.zig` pushes onto, read here through
+// `host_instances.ctorGuardContains`) and the in-top-level-init flag (a
+// forward reference during startup re-drives the real initializer rather
+// than observing the `Null` placeholder).
 // -------------------------------------------------------------------------
 
-threadlocal var ctor_guard: std.ArrayListUnmanaged([]const u8) = .empty;
 threadlocal var top_level_init_depth: usize = 0;
 
-/// Assert (Debug) the constructor-shell guard and top-level-init depth are
-/// clear at a run boundary and reset them so leaked-across-runs state is a
-/// loud failure.
+/// Assert (Debug) the top-level-init depth is clear at a run boundary and
+/// reset it so leaked-across-runs state is a loud failure.
 pub fn resetReceiverTls() void {
-    std.debug.assert(ctor_guard.items.len == 0);
     std.debug.assert(top_level_init_depth == 0);
-    ctor_guard.clearRetainingCapacity();
     top_level_init_depth = 0;
 }
 
 /// True while a top-level property initializer is running on this thread.
 fn inTopLevelInit() bool {
     return top_level_init_depth > 0;
-}
-
-/// True when `name` is on the active-constructor guard stack.
-fn ctorGuardContains(name: []const u8) bool {
-    for (ctor_guard.items) |n| {
-        if (std.mem.eql(u8, n, name)) return true;
-    }
-    return false;
 }
 
 // -------------------------------------------------------------------------
@@ -286,14 +277,14 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
     // (a missing dependency it is never expected to need unless used), so
     // it was skipped. Initialize it now, on first access, matching
     // Kotlin's lazy `object` initialization.
-    if (cached == null and progHasObjectName(self, name) and !ctorGuardContains(name)) {
+    if (cached == null and progHasObjectName(self, name) and !host_instances.ctorGuardContains(name)) {
         const class_id_opt: ?ir.ClassId = blk_cid: {
             const mg = self.module.borrow();
             defer mg.deinit();
             break :blk_cid mg.get().classId(name);
         };
         if (class_id_opt) |class_id| {
-            const r = self.newInstance(allocator, class_id, &.{}) catch return null;
+            const r = self.newInstance(allocator, class_id, &.{}, null) catch return null;
             if (r == .ok and r.ok == .Instance) {
                 const inst = r.ok;
                 if (std.mem.indexOf(u8, name, "$Companion$")) |sep| {
@@ -751,7 +742,9 @@ test "is_primitive_type_name matches the builtin set only" {
 
 test "ctor guard and top-level-init flag default empty" {
     try testing.expect(!inTopLevelInit());
-    try testing.expect(!ctorGuardContains("Foo"));
+    // The deferred-`object` gate reads the one shared constructor-shell
+    // guard owned by `host_instances`.
+    try testing.expect(!host_instances.ctorGuardContains("Foo"));
 }
 
 const root = @import("../interp_ir.zig");

@@ -147,6 +147,7 @@ fn pathSimpleName(fqn: []const u8) []const u8 {
 pub fn resetReceiverThreadLocals() void {
     host_globals.resetReceiverTls();
     host_instances.resetReceiverTls();
+    host_call_member.resetReceiverTls();
     host_fields.resetReceiverTls();
     host_impl.resetReceiverTls();
     coroutines.resetReceiverTls();
@@ -266,8 +267,6 @@ pub const VmHost = struct {
     pub const newInstance = host_instances.newInstance;
     pub const newInstanceNamed = host_instances.newInstanceNamed;
     pub const buildObject = host_instances.buildObject;
-    pub const pushInnerOuterHint = host_instances.pushInnerOuterHint;
-    pub const popInnerOuterHint = host_instances.popInnerOuterHint;
     pub const getField = host_fields.getField;
     pub const setField = host_fields.setField;
     pub const instanceOf = host_classes.instanceOf;

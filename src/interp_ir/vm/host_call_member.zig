@@ -47,18 +47,22 @@ const EvalError = ir.eval.EvalError;
 // member-dispatch reads/writes are kept here.
 // -------------------------------------------------------------------------
 
-/// When set, `callMember` resolves only a real member of the receiver
-/// (the instance / IR-class / anon-object method walk) and reports
-/// not-found instead of falling back to a top-level extension, a SAM
-/// dispatch, or a global. Captured-and-cleared at the top of
-/// `callMember` so it never leaks into a dispatched member's body.
-threadlocal var member_only_probe: bool = false;
-
 /// Guards `materializeUserMap` re-entry while the Map fallback runs.
 threadlocal var map_fallback_active: bool = false;
 
 /// Guards `drainIterableToList` re-entry while the Iterable fallback runs.
 threadlocal var iterable_fallback_active: bool = false;
+
+/// Assert (Debug) the member-dispatch re-entrancy flags are clear at a run
+/// boundary and reset them so leaked-across-runs state is a loud failure.
+pub fn resetReceiverTls() void {
+    std.debug.assert(!map_fallback_active);
+    std.debug.assert(!iterable_fallback_active);
+    std.debug.assert(!call_outer_active);
+    map_fallback_active = false;
+    iterable_fallback_active = false;
+    call_outer_active = false;
+}
 
 fn unsupported(name: []const u8) EvalResult {
     return .{ .err = .{ .Unsupported = name } };
@@ -200,8 +204,8 @@ fn callValueWithThisRec(self: *VmHost, allocator: Allocator, callee: *const Valu
     return self.callValueWithThis(allocator, callee, this_value, args, &.{});
 }
 
-fn newInstanceById(self: *VmHost, allocator: Allocator, class: ir.ClassId, args: []const Value) Allocator.Error!EvalResult {
-    return self.newInstance(allocator, class, args);
+fn newInstanceById(self: *VmHost, allocator: Allocator, class: ir.ClassId, args: []const Value, outer_hint: ?*const Value) Allocator.Error!EvalResult {
+    return self.newInstance(allocator, class, args, outer_hint);
 }
 
 fn getFieldRec(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
@@ -1003,6 +1007,13 @@ pub fn pushAccessEnclosing(self: *VmHost, v: *const Value) void {
     ir.eval.pushEnclosing(v);
 }
 
+/// `pushAccessEnclosing` for a receiver-lambda subject; see
+/// `pushOuterSubject`.
+pub fn pushAccessEnclosingSubject(self: *VmHost, v: *const Value) void {
+    _ = self;
+    ir.eval.pushEnclosingSubject(v);
+}
+
 pub fn popAccessEnclosing(self: *VmHost) void {
     _ = self;
     ir.eval.popEnclosing();
@@ -1015,6 +1026,15 @@ pub fn popAccessEnclosing(self: *VmHost) void {
 pub fn pushOuterThis(allocator: Allocator, v: *const Value) void {
     _ = allocator;
     ir.eval.pushEnclosing(v);
+}
+
+/// Push a receiver-lambda subject (`with(x) { … }`'s `x`). Tagged so
+/// inner-class outer selection knows the subject's own `outer` links are not
+/// receivers in scope inside the lambda body; bare-name resolution treats it
+/// like any other enclosing receiver.
+pub fn pushOuterSubject(allocator: Allocator, v: *const Value) void {
+    _ = allocator;
+    ir.eval.pushEnclosingSubject(v);
 }
 
 pub fn popOuterThis() void {
@@ -1425,10 +1445,15 @@ fn prependReceiver(allocator: Allocator, receiver: *const Value, args: []const V
 // -------------------------------------------------------------------------
 
 pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
-    // Member-only probe applies to *this* resolution only.
-    const member_only = member_only_probe;
-    member_only_probe = false;
+    return callMemberInner(self, allocator, receiver, name, args, false);
+}
 
+/// `member_only` restricts the resolution to a real member of the receiver
+/// (the instance / IR-class / anon-object method walk), reporting
+/// not-found instead of falling back to a top-level extension, a SAM
+/// dispatch, or a global. A parameter scoped to this one resolution, so it
+/// cannot leak into a dispatched member's body or a re-entrant dispatch.
+fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, member_only: bool) Allocator.Error!EvalResult {
     // Built-in delegate protocol.
     if (receiver.* == .Delegate) {
         if (try delegateMember(self, allocator, receiver.Delegate, name, args)) |r| return r;
@@ -1545,7 +1570,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             dg.deinit();
             if (is_inner) {
                 if (self.module.borrow().get().classId(name)) |class_id| {
-                    const r = try newInstanceById(self, allocator, class_id, args);
+                    const r = try newInstanceById(self, allocator, class_id, args, receiver);
                     if (r == .ok and r.ok == .Instance) {
                         const ig = r.ok.Instance.borrowMut();
                         ig.get().outer = .{ .Instance = receiver.Instance.clone() };
@@ -1583,7 +1608,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         if (class_id == null) class_id = mod.classId(name);
         mg.deinit();
         if (class_id) |cid| {
-            return newInstanceById(self, allocator, cid, args);
+            return newInstanceById(self, allocator, cid, args, null);
         }
     }
 
@@ -1856,7 +1881,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             dg.deinit();
             if (self.module.borrow().get().classId(dn)) |cid| {
                 const ctor_args = [_]Value{receiver.*};
-                return newInstanceById(self, allocator, cid, &ctor_args);
+                return newInstanceById(self, allocator, cid, &ctor_args, null);
             }
         }
     }
@@ -1949,9 +1974,11 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     {
         const probe = try std.fmt.allocPrint(allocator, "kotlin.collections.Map.{s}", .{name});
         if (lookupIntrinsic(self, probe)) |f| {
-            map_fallback_active = true;
-            const built = try materializeUserMap(self, allocator, receiver);
-            map_fallback_active = false;
+            const built = blk: {
+                map_fallback_active = true;
+                defer map_fallback_active = false;
+                break :blk try materializeUserMap(self, allocator, receiver);
+            };
             const map_val = switch (built) {
                 .ok => |v| v,
                 .err => |e| return .{ .err = e },
@@ -1972,9 +1999,11 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             matched = p2;
         }
         if (intrinsic) |f| {
-            iterable_fallback_active = true;
-            const drained = try drainIterableToList(self, allocator, receiver);
-            iterable_fallback_active = false;
+            const drained = blk: {
+                iterable_fallback_active = true;
+                defer iterable_fallback_active = false;
+                break :blk try drainIterableToList(self, allocator, receiver);
+            };
             const dv = switch (drained) {
                 .ok => |v| v,
                 .err => |e| return .{ .err = e },
@@ -2440,7 +2469,7 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         if (!(singleton != null and singleton.? == .Instance)) {
             const cid_opt = self.module.borrow().get().classId(cn);
             if (cid_opt) |cid| {
-                const r = try newInstanceById(self, allocator, cid, &.{});
+                const r = try newInstanceById(self, allocator, cid, &.{}, null);
                 if (r == .ok and r.ok == .Instance) {
                     const g = self.globals.borrowMut();
                     g.get().define(cn, r.ok) catch {};
@@ -3230,7 +3259,7 @@ fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
             cg.deinit();
             g.deinit();
             if (self.module.borrow().get().classId(class_name2)) |cid| {
-                return try newInstanceById(self, allocator, cid, new_args.items);
+                return try newInstanceById(self, allocator, cid, new_args.items, null);
             }
         }
     }
@@ -4201,6 +4230,10 @@ fn outerChainFallback(self: *VmHost, allocator: Allocator, receiver: *const Valu
 // -------------------------------------------------------------------------
 
 pub fn callMemberNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false);
+}
+
+fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, member_only: bool) Allocator.Error!EvalResult {
     var any_named = false;
     for (arg_names) |n| {
         if (n != null) any_named = true;
@@ -4222,7 +4255,7 @@ pub fn callMemberNamed(self: *VmHost, allocator: Allocator, receiver: *const Val
     }
 
     // Positional dispatch first.
-    const primary = try callMember(self, allocator, receiver, name, args);
+    const primary = try callMemberInner(self, allocator, receiver, name, args, member_only);
     if (!(primary == .err and primary.err == .Unimplemented)) return primary;
 
     // Class-hierarchy method walk for a class-qualified lowered name.
@@ -4233,11 +4266,7 @@ pub fn callMemberNamed(self: *VmHost, allocator: Allocator, receiver: *const Val
 }
 
 pub fn callMemberOnly(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    const prev = member_only_probe;
-    member_only_probe = true;
-    const r = callMemberNamed(self, allocator, receiver, name, args, arg_names);
-    member_only_probe = prev;
-    return r;
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true);
 }
 
 fn copyNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!?EvalResult {
@@ -4292,7 +4321,7 @@ fn copyNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, args: 
         g.deinit();
     }
     if (self.module.borrow().get().classId(class_name)) |cid| {
-        return try newInstanceById(self, allocator, cid, new_args.items);
+        return try newInstanceById(self, allocator, cid, new_args.items, null);
     }
     return null;
 }

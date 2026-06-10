@@ -132,6 +132,21 @@ threadlocal var eval_depth: usize = 0;
 /// first `runFrame` reads the env once and caches the result.
 threadlocal var eval_depth_cap: usize = 0;
 
+/// One implicit receiver on the enclosing-`this` chain.
+///
+/// `is_subject` records how the value entered scope, because the two ways
+/// bring different receivers with them. A dispatch receiver or a displaced
+/// lexical `this` carries its whole class-nesting tower: inside a member of
+/// `Inner`, `this@Outer` is in scope precisely because it is reachable
+/// through `this@Inner`'s `outer` link. A `with`/`run`/`apply` subject
+/// brings only itself — `with(x) { … }` never puts `x`'s enclosing
+/// instances in scope. Inner-class outer selection consults the flag;
+/// bare-name resolution ignores it.
+pub const EnclosingEntry = struct {
+    v: Value,
+    is_subject: bool,
+};
+
 /// The enclosing-`this` chain of the *currently executing* frame.
 ///
 /// This is NOT receiver state of its own: it always points at a live `Frame`'s
@@ -145,18 +160,25 @@ threadlocal var eval_depth_cap: usize = 0;
 /// enclosing receivers), and the matching pop removes it once the call returns.
 /// Because the chain lives on the frame, it travels with a parked continuation
 /// and cannot leak past the frame or across a `run` boundary.
-threadlocal var active_chain: ?*std.ArrayList(Value) = null;
+threadlocal var active_chain: ?*std.ArrayList(EnclosingEntry) = null;
 
 /// Push `v` as an enclosing implicit receiver for the about-to-be-invoked
 /// callable. Appends to the current frame's chain; the invoked frame inherits
 /// it at entry. A no-op (silently dropped) when no frame is active.
 pub fn pushEnclosing(v: *const Value) void {
     const chain = active_chain orelse return;
-    chain.append(chainAllocator(), v.*) catch {};
+    chain.append(chainAllocator(), .{ .v = v.*, .is_subject = false }) catch {};
 }
 
-/// Pop the most recent `pushEnclosing`. A no-op when no frame is active or the
-/// chain is empty.
+/// Push a receiver-lambda subject (`with(x) { … }`'s `x`). The subject is a
+/// receiver inside the lambda body, but its `outer` links are not.
+pub fn pushEnclosingSubject(v: *const Value) void {
+    const chain = active_chain orelse return;
+    chain.append(chainAllocator(), .{ .v = v.*, .is_subject = true }) catch {};
+}
+
+/// Pop the most recent `pushEnclosing`/`pushEnclosingSubject`. A no-op when no
+/// frame is active or the chain is empty.
 pub fn popEnclosing() void {
     const chain = active_chain orelse return;
     if (chain.items.len > 0) _ = chain.pop();
@@ -166,13 +188,25 @@ pub fn popEnclosing() void {
 pub fn enclosingThisLast() ?Value {
     const chain = active_chain orelse return null;
     if (chain.items.len == 0) return null;
-    return chain.items[chain.items.len - 1];
+    return chain.items[chain.items.len - 1].v;
 }
 
 /// The enclosing-`this` chain, innermost first. Caller owns the returned slice.
 pub fn enclosingThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
     const chain = active_chain orelse return allocator.alloc(Value, 0);
     var out = try allocator.alloc(Value, chain.items.len);
+    var i: usize = 0;
+    while (i < chain.items.len) : (i += 1) {
+        out[i] = chain.items[chain.items.len - 1 - i].v;
+    }
+    return out;
+}
+
+/// The enclosing-`this` chain with subject tags, innermost first. Caller owns
+/// the returned slice.
+pub fn enclosingEntriesAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry {
+    const chain = active_chain orelse return allocator.alloc(EnclosingEntry, 0);
+    var out = try allocator.alloc(EnclosingEntry, chain.items.len);
     var i: usize = 0;
     while (i < chain.items.len) : (i += 1) {
         out[i] = chain.items[chain.items.len - 1 - i];
@@ -263,7 +297,7 @@ pub const FrameSnapshot = struct {
     /// member-extension body sees the same receivers after the park that it saw
     /// before: the chain travels with the parked continuation instead of being
     /// recovered from process-global state the resuming thread happens to hold.
-    enclosing_this: []Value,
+    enclosing_this: []EnclosingEntry,
     try_stack: []TryFrame,
     is_lambda: bool,
     /// Register the resumed value is written into before execution
@@ -306,11 +340,11 @@ const Frame = struct {
     /// (`execInst` here or host dispatch through `pushAccessEnclosing`) appends
     /// through one allocator. Snapshotted into `FrameSnapshot.enclosing_this`
     /// on suspend and restored verbatim on resume.
-    enclosing_this: std.ArrayList(Value),
+    enclosing_this: std.ArrayList(EnclosingEntry),
     /// The `active_chain` pointer to restore when this frame exits, so a frame
     /// running under a caller frame returns enclosing-`this` resolution to the
     /// caller's chain rather than leaving a dangling pointer.
-    prev_chain: ?*std.ArrayList(Value),
+    prev_chain: ?*std.ArrayList(EnclosingEntry),
     /// The owning module handle when this frame runs in a per-method
     /// *sub-module* (anonymous object / local class / nested
     /// `private`/member class — each lowered into its own `Module`).
@@ -360,7 +394,7 @@ const Frame = struct {
 
     /// Seed this frame's chain from a saved snapshot slice (resume path) and
     /// make it active.
-    fn activateChainFrom(self: *Frame, saved: []const Value) Allocator.Error!void {
+    fn activateChainFrom(self: *Frame, saved: []const EnclosingEntry) Allocator.Error!void {
         try self.enclosing_this.appendSlice(chainAllocator(), saved);
         self.prev_chain = active_chain;
         active_chain = &self.enclosing_this;
@@ -710,7 +744,7 @@ fn runFrameInner(
                             .regs = try allocator.dupe(Value, frame.regs.items),
                             .params = try allocator.dupe(Value, frame.params.items),
                             .captures = try allocator.dupe(Value, frame.captures.items),
-                            .enclosing_this = try allocator.dupe(Value, frame.enclosing_this.items),
+                            .enclosing_this = try allocator.dupe(EnclosingEntry, frame.enclosing_this.items),
                             .try_stack = try allocator.dupe(TryFrame, try_stack.items),
                             .is_lambda = frame.func.is_lambda,
                             .resume_reg = resume_reg,
@@ -1505,15 +1539,15 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const names = try resolveArgNames(allocator, frame.module, ni.arg_names);
             defer allocator.free(names);
             // A bare `Inner(args)` inside a member of the enclosing
-            // class is `this@Outer.Inner(args)`.
-            var outer_hint: ?Value = null;
-            if (frameThisParam(frame)) |i| {
-                if (frame.params.items[i] == .Instance) outer_hint = frame.params.items[i];
-            }
-            if (outer_hint) |*h| host.pushInnerOuterHint(h);
-            const result_r = host.newInstanceNamed(allocator, ni.class, arg_values, names);
-            if (outer_hint != null) host.popInnerOuterHint();
-            const result = switch (try result_r) {
+            // class is `this@Outer.Inner(args)`: pass the frame's own
+            // `this` — a method's `this` param or a lambda's `this`
+            // capture — as the outer hint for the construction dispatch.
+            // The host's outer selection is class-keyed, so a receiver
+            // lambda whose `this` slot was overridden with an unrelated
+            // subject falls through to the enclosing-receiver chain.
+            var outer_hint: ?Value = callerThisValue(frame);
+            const hint_ptr: ?*const Value = if (outer_hint) |*h| h else null;
+            const result = switch (try host.newInstanceNamed(allocator, ni.class, arg_values, names, hint_ptr)) {
                 .ok => |v| v,
                 .err => |e| return errResult(e),
             };
@@ -2715,8 +2749,8 @@ pub const NullHost = struct {
         return errResult(.{ .Unsupported = "Host.new_instance" });
     }
 
-    pub fn newInstanceNamed(self: *NullHost, allocator: Allocator, class: ClassId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-        _ = arg_names;
+    pub fn newInstanceNamed(self: *NullHost, allocator: Allocator, class: ClassId, args: []const Value, arg_names: []const ?[]const u8, outer_hint: ?*const Value) Allocator.Error!EvalResult {
+        _ = .{ arg_names, outer_hint };
         return self.newInstance(allocator, class, args);
     }
 
@@ -2888,14 +2922,6 @@ pub const NullHost = struct {
         return self.callMemberNamed(allocator, receiver, name, args, arg_names);
     }
 
-    pub fn pushInnerOuterHint(self: *NullHost, v: *const Value) void {
-        _ = .{ self, v };
-    }
-
-    pub fn popInnerOuterHint(self: *NullHost) void {
-        _ = self;
-    }
-
     pub fn isShadowingCapture(self: *NullHost, name: []const u8) bool {
         _ = .{ self, name };
         return false;
@@ -2998,6 +3024,57 @@ test "eval_branch" {
     const v = try eval(testing.allocator, &m, &func, .empty);
     try testing.expect(v == .ok);
     try testing.expect(v.ok == .Int and v.ok.Int == 1);
+}
+
+test "enclosing chain tags subjects and projects innermost-first" {
+    var chain: std.ArrayList(EnclosingEntry) = .empty;
+    defer chain.deinit(chainAllocator());
+    const prev = active_chain;
+    active_chain = &chain;
+    defer active_chain = prev;
+
+    const receiver = Value{ .Int = 1 };
+    const subject = Value{ .Int = 2 };
+    pushEnclosing(&receiver);
+    pushEnclosingSubject(&subject);
+
+    // Value projection: innermost first, tags invisible.
+    const vals = try enclosingThisChainAlloc(testing.allocator);
+    defer testing.allocator.free(vals);
+    try testing.expectEqual(@as(usize, 2), vals.len);
+    try testing.expect(vals[0] == .Int and vals[0].Int == 2);
+    try testing.expect(vals[1] == .Int and vals[1].Int == 1);
+    try testing.expect(enclosingThisLast().? == .Int and enclosingThisLast().?.Int == 2);
+
+    // Tagged projection: same order, push-site tags preserved.
+    const entries = try enclosingEntriesAlloc(testing.allocator);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expect(entries[0].is_subject and entries[0].v.Int == 2);
+    try testing.expect(!entries[1].is_subject and entries[1].v.Int == 1);
+
+    popEnclosing();
+    const rest = try enclosingEntriesAlloc(testing.allocator);
+    defer testing.allocator.free(rest);
+    try testing.expectEqual(@as(usize, 1), rest.len);
+    try testing.expect(!rest[0].is_subject and rest[0].v.Int == 1);
+    popEnclosing();
+    try testing.expectEqual(@as(usize, 0), chain.items.len);
+}
+
+test "enclosing chain pushes are dropped with no active frame" {
+    const prev = active_chain;
+    active_chain = null;
+    defer active_chain = prev;
+
+    const v = Value{ .Int = 7 };
+    pushEnclosing(&v);
+    pushEnclosingSubject(&v);
+    popEnclosing();
+    try testing.expect(enclosingThisLast() == null);
+    const entries = try enclosingEntriesAlloc(testing.allocator);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 0), entries.len);
 }
 
 test {
