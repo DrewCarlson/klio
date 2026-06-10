@@ -7,6 +7,7 @@ Exit 0 iff every example's Zig stdout matches the Rust reference (or, with
 --no-rust, iff every example exits 0).
 """
 import argparse
+import concurrent.futures
 import glob
 import os
 import subprocess
@@ -34,6 +35,7 @@ def main():
     ap.add_argument("--rust", default=os.path.join(ROOT, "target/release/klio"))
     ap.add_argument("--no-rust", action="store_true", help="just check Zig exits 0")
     ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--jobs", type=int, default=min(24, os.cpu_count() or 1))
     ap.add_argument("--list-fail", action="store_true")
     ap.add_argument("pattern", nargs="?", default="examples/*.kt")
     args = ap.parse_args()
@@ -43,8 +45,7 @@ def main():
         print("no files matched", args.pattern, file=sys.stderr)
         return 2
 
-    passed, failed = 0, []
-    for f in files:
+    def check(f):
         rel = os.path.relpath(f, ROOT)
         zrc, zout = run(args.zig, f, args.timeout)
         if args.no_rust:
@@ -54,10 +55,15 @@ def main():
             rrc, rout = run(args.rust, f, args.timeout)
             ok = zrc == 0 and rrc == 0 and zout == rout
             detail = f"zig rc={zrc} rust rc={rrc} stdout {'==' if zout == rout else '!='}"
-        if ok:
-            passed += 1
-        else:
-            failed.append((rel, detail, zout if args.no_rust else (zout, rout)))
+        return rel, ok, detail, zout if args.no_rust else (zout, rout)
+
+    passed, failed = 0, []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        for rel, ok, detail, out in pool.map(check, files):
+            if ok:
+                passed += 1
+            else:
+                failed.append((rel, detail, out))
 
     print(f"\nCORPUS: {passed}/{len(files)} passed, {len(failed)} failed")
     if args.list_fail:

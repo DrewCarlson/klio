@@ -39,6 +39,7 @@ Default corpus: examples/*.kt + tests/fixtures/coroutine_smoke/*.kt.
 Exit 0 iff every program passes all three assertions (and exits 0 itself).
 """
 import argparse
+import concurrent.futures
 import glob
 import os
 import re
@@ -183,6 +184,7 @@ def main():
     ap.add_argument("--rerun", type=int, default=2,
                     help="runs per program; record sets must match")
     ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--jobs", type=int, default=min(24, os.cpu_count() or 1))
     ap.add_argument("--list-fail", action="store_true")
     ap.add_argument("patterns", nargs="*",
                     default=["examples/*.kt", "tests/fixtures/coroutine_smoke/*.kt"])
@@ -195,16 +197,20 @@ def main():
         print("no files matched", args.patterns, file=sys.stderr)
         return 2
 
-    passed, failed = 0, []
-    for f in files:
+    def check(f):
         rel = os.path.relpath(f, ROOT)
         violations, n = check_file(args.bin, f, args.rerun, args.timeout)
-        if not violations:
-            passed += 1
-            print(f"  ok   {rel} ({n} records)")
-        else:
-            failed.append((rel, violations))
-            print(f"  FAIL {rel}: {violations[0]}")
+        return rel, violations, n
+
+    passed, failed = 0, []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        for rel, violations, n in pool.map(check, files):
+            if not violations:
+                passed += 1
+                print(f"  ok   {rel} ({n} records)")
+            else:
+                failed.append((rel, violations))
+                print(f"  FAIL {rel}: {violations[0]}")
 
     print(f"\nSINGLE-PATH: {passed}/{len(files)} passed, {len(failed)} failed "
           f"(rerun={args.rerun})")
