@@ -2341,16 +2341,17 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
         return dst;
     }
 
-    // FQN-precedence: an explicit import routes a collision call.
+    // FQN-precedence: a UNIQUE explicit import routes a collision call.
+    // Two same-leaf imports are no shadow — Kotlin keeps both in scope —
+    // so a collision among the imports themselves falls through to the
+    // symbol index, which classifies the tie (ambiguous when the
+    // signatures are identical, type-dispatched otherwise).
     const collision = b.module.funcsBySimpleName(name0).len > 1;
     var imported_func_id: ?FuncId = null;
     if (collision) {
-        if (b.module.importAliasIn(segments[0].span.file, name0)) |segs| {
-            if (segs.len >= 2) {
-                const fqn = try joinStrs(b.allocator, segs);
-                defer b.allocator.free(fqn);
-                imported_func_id = b.module.funcIdByFqn(fqn);
-            }
+        const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
+        if (alias_paths.len == 1 and alias_paths[0].segs.len >= 2) {
+            imported_func_id = b.module.funcIdByFqn(alias_paths[0].fqn);
         }
     }
     if (imported_func_id) |func_id| {
@@ -2362,13 +2363,29 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
                 break :blk false;
             };
             if (!needs_this) {
+                // Import-routed binds run the index + audit too, so the
+                // detector keeps one line per bare call and a unique
+                // index pick (the exact-arity overload behind the
+                // imported FQN) is preferred over the first FQN match.
+                const ires = b.module.resolveBareCallIndexed(
+                    name0,
+                    b.self_package,
+                    segments[0].span.file,
+                    args.len,
+                    lastArgIsLambda(args),
+                );
+                resolveAudit(b, name0, segments[0].span.file, args.len, lastArgIsLambda(args), func_id, ires, shadowed_by_class, false);
+                if (indexDeferReason(ires) == .ambiguous_tier) {
+                    try recordAmbiguousCall(b, name0, segments[0].span, ires);
+                }
+                const bind_id = ires.pick() orelse func_id;
                 const run = try lowerArgRun(b, args);
                 const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
                 const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
                 const dst = b.allocReg();
                 try b.push(.{ .Call = .{
                     .dst = dst,
-                    .func = func_id,
+                    .func = bind_id,
                     .args = run[0],
                     .n_args = run[1],
                     .arg_names = arg_names,
@@ -2438,44 +2455,238 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     // a different target than the heuristic for a name it resolves; the
     // KLIO_RESOLVE_AUDIT detector below proves zero divergence over the
     // green corpus.
-    const index_pick = b.module.resolveBareCallIndexed(
+    var index_res = b.module.resolveBareCallIndexed(
         name0,
         b.self_package,
         segments[0].span.file,
         want,
         last_arg_lambda,
     );
-    resolveAudit(b, name0, bare_func_id, index_pick);
+    // A same-tier same-arity overload set the call site disambiguates
+    // with an `as` cast is not an ambiguity: the cast already picked the
+    // target. Reclassify so the strict gate and the ambiguity diagnostic
+    // never fire on a cast-resolved call.
+    if (cast_pick != null) {
+        const r = indexDeferReason(index_res);
+        if (r == .ambiguous_tier or r == .type_overload) {
+            index_res.outcome = .{ .deferred = .cast_disambiguated };
+        }
+    }
+    const index_pick = index_res.pick();
+    resolveAudit(b, name0, segments[0].span.file, want, last_arg_lambda, bare_func_id, index_res, shadowed_by_class, prefer_member);
 
     if (bare_func_id) |func_id| {
         if (!shadowed_by_class) {
+            // The call binds a bare top-level function. If the index saw
+            // two same-tier same-arity candidates with identical
+            // parameter signatures, the reference is ambiguous — nothing
+            // at lowering or at runtime can tell them apart. Record a
+            // lowering diagnostic for the build driver to surface.
+            // (Type-distinguishable overload sets classify as
+            // `type_overload`, cast-picked ones as `cast_disambiguated`;
+            // neither reaches here.)
+            if (indexDeferReason(index_res) == .ambiguous_tier) {
+                try recordAmbiguousCall(b, name0, segments[0].span, index_res);
+            }
             // Prefer the index's unique FQN-qualified target when it
-            // resolves; it equals the heuristic pick on the green corpus,
-            // so this routes the same call through the exact-FQN binding
-            // instead of the order-sensitive path.
-            const final_id = index_pick orelse func_id;
+            // resolves, except for a receiver-matched extension pick,
+            // which stays with the heuristic — receiver-based resolution
+            // is the heuristic's domain and the index never models it.
+            const final_id = preferredBareTarget(b, func_id, index_pick);
             return try emitBareFuncCall(b, expr, final_id, was_cast);
         }
     }
     return null;
 }
 
-/// Opt-in consistency detector for the symbol index (`KLIO_RESOLVE_AUDIT`).
-/// For every bare call it compares the index's resolved FQN against the
-/// order-based heuristic's pick and logs any divergence. A non-zero count
-/// means the index is not yet a faithful superset of the heuristic on the
-/// audited program — the index must equal the heuristic (or defer) for
-/// every currently-green program.
-fn resolveAudit(b: *FuncBuilder, name: []const u8, heuristic: ?FuncId, index: ?FuncId) void {
-    if (!resolveAuditOn()) return;
-    // The index only commits when it resolves a UNIQUE target; a `null`
-    // index pick means "defer to the heuristic" and is never a divergence.
-    const idx = index orelse return;
-    const heur = heuristic orelse {
-        resolveAuditLog(b, name, null, idx);
-        return;
+fn indexDeferReason(res: ir.Module.BareCallResolution) ?ir.Module.ResolveDeferReason {
+    return switch (res.outcome) {
+        .resolved => null,
+        .deferred => |r| r,
     };
-    if (idx.int() != heur.int()) resolveAuditLog(b, name, heur, idx);
+}
+
+/// The target a bare call binds when both the heuristic and the index
+/// produced one: the index's exact-FQN pick wins, EXCEPT when the
+/// heuristic chose an extension (implicit `this`) and the index a plain
+/// top-level sibling. The index never models receivers, so an extension
+/// the receiver ladder matched must not be overridden by its
+/// non-extension namesake (Kotlin resolves the in-scope receiver's
+/// extension over the top-level function).
+fn preferredBareTarget(b: *FuncBuilder, heuristic: FuncId, index_pick: ?FuncId) FuncId {
+    const idx = index_pick orelse return heuristic;
+    if (!isNonExt(b, heuristic) and isNonExt(b, idx)) return heuristic;
+    return idx;
+}
+
+/// Record an ambiguous bare call into the module's lowering diagnostics.
+/// The build driver reports these before the program runs. Each
+/// candidate carries its declaration span (from the phase-1 header
+/// record) so a true duplicate's report can point at both declarations.
+fn recordAmbiguousCall(b: *FuncBuilder, name: []const u8, call_span: ir.Span, res: ir.Module.BareCallResolution) Allocator.Error!void {
+    const fqn_a = if (res.first) |f| fqnOf(b, f) else "?";
+    const fqn_b = if (res.second) |s| fqnOf(b, s) else "?";
+    const span_a: ?ir.Span = if (res.first) |f| b.module.decl_span.get(f.int()) else null;
+    const span_b: ?ir.Span = if (res.second) |s| b.module.decl_span.get(s.int()) else null;
+    try b.module.resolve_diags.append(b.allocator, .{
+        .name = name,
+        .fqn_a = fqn_a,
+        .fqn_b = fqn_b,
+        .span = call_span,
+        .span_a = span_a,
+        .span_b = span_b,
+    });
+}
+
+/// How a bare-call index/heuristic divergence is explained. Anything
+/// but `unexplained` is a classified structural shape, not a mis-bind.
+const DivergenceGrade = enum {
+    /// The index pick ranks in a strictly better preference tier: the
+    /// heuristic's declaration-order pick missed a named-import /
+    /// own-package candidate whose body lowers later. Binding takes the
+    /// index pick.
+    tier_correction,
+    /// Same tier, but the heuristic fell back to a candidate that does
+    /// not match the call exactly (trailing vararg, default parameters,
+    /// arity mismatch, or an unrankable stub) while the index resolved
+    /// an exact overload. Binding takes the index pick.
+    shape_correction,
+    /// The heuristic bound a receiver-matched extension; the index — by
+    /// contract blind to receivers — resolved the plain top-level
+    /// namesake. Binding keeps the heuristic's extension (Kotlin
+    /// resolves the in-scope receiver's extension over the top-level
+    /// function).
+    receiver_pref,
+    /// No classified shape explains the divergence: an interpreter bug,
+    /// never a program property.
+    unexplained,
+};
+
+/// Opt-in consistency detector for the symbol index (`KLIO_RESOLVE_AUDIT`).
+/// Emits one machine-readable line per bare call — name, caller package,
+/// file, requested arity, index outcome + deferral reason, winning tier
+/// and its candidate count, the heuristic's pick, the emitted call
+/// shape, and (for a divergence) its grade — plus a `divergence:` line
+/// whenever the index and the heuristic resolve the same call to
+/// different targets without a classified explanation
+/// (`DivergenceGrade`). A non-zero unexplained divergence count means
+/// the index mis-binds on the audited program.
+///
+/// `KLIO_RESOLVE_STRICT` (independent of the audit) turns an
+/// unexplained divergence into a hard failure: the index and the
+/// heuristic binding different same-tier same-shape targets for one
+/// bare call is an interpreter bug, never a program property.
+fn resolveAudit(
+    b: *FuncBuilder,
+    name: []const u8,
+    file: ir.FileId,
+    want: usize,
+    last_arg_lambda: bool,
+    heuristic: ?FuncId,
+    index_res: ir.Module.BareCallResolution,
+    shadowed_by_class: bool,
+    prefer_member: bool,
+) void {
+    const audit_on = resolveAuditOn();
+    const strict_on = resolveStrictOn();
+    if (!audit_on and !strict_on) return;
+
+    const final: ?FuncId = if (heuristic) |h|
+        preferredBareTarget(b, h, index_res.pick())
+    else
+        index_res.pick();
+    const shape: []const u8 = if (heuristic == null and prefer_member)
+        "member_pref"
+    else if (heuristic == null)
+        "fallthrough"
+    else if (shadowed_by_class)
+        "shadowed_class"
+    else if (final != null and !isNonExt(b, final.?))
+        "ext_bound"
+    else
+        "bound";
+
+    // A divergence is the index and the heuristic resolving the SAME
+    // call to DIFFERENT targets. Each one is graded: a tier or shape
+    // correction (the index fixing the heuristic's declaration-order /
+    // fallback-shape blind spots, binding the index pick), a receiver
+    // preference (the heuristic's extension pick retained), or
+    // unexplained — an interpreter bug. The index resolving where the
+    // heuristic declined is none of these: the binding is gated on the
+    // heuristic, so the pick is discarded (the readout records it as
+    // `shape=fallthrough outcome=resolved`).
+    const divergent = switch (index_res.outcome) {
+        .deferred => false,
+        .resolved => |idx| if (heuristic) |heur| idx.int() != heur.int() else false,
+    };
+    const grade: ?DivergenceGrade = if (!divergent) null else blk: {
+        const heur_id = heuristic.?;
+        const idx_id = index_res.pick().?;
+        if (!isNonExt(b, heur_id) and isNonExt(b, idx_id)) break :blk .receiver_pref;
+        const heur_tier = b.module.bareCallTierOf(heur_id, name, b.self_package, file) orelse 255;
+        if (index_res.tier < heur_tier) break :blk .tier_correction;
+        if (heurPickInexact(b, heur_id, want)) break :blk .shape_correction;
+        break :blk .unexplained;
+    };
+    const explained = grade != null and grade.? != .unexplained;
+
+    if (audit_on) {
+        const outcome: []const u8 = switch (index_res.outcome) {
+            .resolved => "resolved",
+            .deferred => "deferred",
+        };
+        const reason: []const u8 = switch (index_res.outcome) {
+            .resolved => "-",
+            .deferred => |r| @tagName(r),
+        };
+        const idx_fqn: []const u8 = switch (index_res.outcome) {
+            .resolved => |id| fqnOf(b, id),
+            .deferred => "-",
+        };
+        const heur_fqn: []const u8 = if (heuristic) |h| fqnOf(b, h) else "-";
+        const grade_tag: []const u8 = if (grade) |g| @tagName(g) else "-";
+        std.debug.print(
+            "[KLIO_RESOLVE_AUDIT] call name={s} pkg={s} file={d} arity={d} tl={d} outcome={s} reason={s} index_fqn={s} tier={d} tier_count={d} heur_fqn={s} shape={s} divergent={d} correction={d} grade={s}\n",
+            .{
+                name,                    b.self_package,                file.int(),
+                want,                    @intFromBool(last_arg_lambda), outcome,
+                reason,                  idx_fqn,                       index_res.tier,
+                index_res.tier_count,    heur_fqn,                      shape,
+                @intFromBool(divergent), @intFromBool(explained),       grade_tag,
+            },
+        );
+        if (divergent and !explained) resolveAuditLog(b, name, heuristic, index_res.pick().?);
+    }
+
+    if (strict_on and divergent and !explained) {
+        const heur_id = heuristic.?;
+        const heur_tier = b.module.bareCallTierOf(heur_id, name, b.self_package, file) orelse 255;
+        std.debug.panic(
+            "KLIO_RESOLVE_STRICT: unexplained bare-call divergence on '{s}' (pkg='{s}' file={d} arity={d}): heuristic={s} (tier {d}) index={s} (tier {d})",
+            .{ name, b.self_package, file.int(), want, fqnOf(b, heur_id), heur_tier, fqnOf(b, index_res.pick().?), index_res.tier },
+        );
+    }
+}
+
+/// Whether the heuristic's pick matches the call less exactly than any
+/// index pick can: an unrankable stub, a trailing vararg, a default
+/// parameter, or a declared arity differing from the call's. The index
+/// only ever resolves an exact-arity no-default no-vararg candidate, so
+/// a same-tier divergence onto such a heuristic pick is the index
+/// correcting a fallback shape, not a mis-bind.
+fn heurPickInexact(b: *FuncBuilder, fid: FuncId, want: usize) bool {
+    const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return true;
+    if (f.blocks.len == 0) {
+        const da = b.module.decl_user_arity.get(fid.int()) orelse return true;
+        return da.trailing_vararg or da.required != da.total or da.total != want;
+    }
+    if (f.params.len != 0 and f.params[f.params.len - 1].is_vararg) return true;
+    if (userParams(f) != want) return true;
+    const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    for (f.params[off..]) |p| {
+        if (p.has_default) return true;
+    }
+    return false;
 }
 
 var resolve_audit_checked: bool = false;
@@ -2491,6 +2702,21 @@ fn resolveAuditOn() bool {
         }
     }
     return resolve_audit_enabled;
+}
+
+var resolve_strict_checked: bool = false;
+var resolve_strict_enabled: bool = false;
+
+fn resolveStrictOn() bool {
+    if (!resolve_strict_checked) {
+        resolve_strict_checked = true;
+        const a = std.heap.page_allocator;
+        if (runtime.procEnvGetVar(a, "KLIO_RESOLVE_STRICT") catch null) |v| {
+            defer a.free(v);
+            resolve_strict_enabled = v.len != 0 and !std.mem.eql(u8, v, "0");
+        }
+    }
+    return resolve_strict_enabled;
 }
 
 fn resolveAuditLog(b: *FuncBuilder, name: []const u8, heuristic: ?FuncId, index: FuncId) void {
@@ -3293,26 +3519,6 @@ fn joinSegments(allocator: Allocator, segments: []const ast.Ident) Allocator.Err
         }
         @memcpy(out[off .. off + s.name.len], s.name);
         off += s.name.len;
-    }
-    return out;
-}
-
-/// Join string slices with `.`. The caller owns the returned slice.
-fn joinStrs(allocator: Allocator, strs: []const []const u8) Allocator.Error![]u8 {
-    var total: usize = 0;
-    for (strs, 0..) |s, i| {
-        total += s.len;
-        if (i != 0) total += 1;
-    }
-    var out = try allocator.alloc(u8, total);
-    var off: usize = 0;
-    for (strs, 0..) |s, i| {
-        if (i != 0) {
-            out[off] = '.';
-            off += 1;
-        }
-        @memcpy(out[off .. off + s.len], s);
-        off += s.len;
     }
     return out;
 }

@@ -624,37 +624,86 @@ header set) — provably independent of pack load order:
    and emits every func stub (FQN + package + receiver `this`) — the complete
    phase-1 header set — before any body lowers in phase 2.
 3. **Build one symbol index** mapping (caller-package + caller-imports) → FQN →
-   `FuncId`/`ClassId`. Bare calls prefer: own package, then imported names, then
-   built-in stdlib. **DONE (item 8, PRIMARY path, fallback retained).**
+   `FuncId`/`ClassId`. Bare calls follow Kotlin's scoping order: named imports,
+   then the caller's own package, then star imports, then the default imports,
+   then built-in stdlib. **DONE (item 8, PRIMARY path; hardened, fallback
+   retained for classified shapes).**
    `Module.resolveBareCallIndexed(name, caller_pkg, caller_file, arity, …)`
-   (`ir.zig`) ranks each non-extension body-bearing candidate by tier (0 own
-   package, 1 file-named import, 2 built-in stdlib, 3 other), commits the unique
-   exact-arity candidate in the best non-empty tier, and returns `null`
-   otherwise. Lowering (`lower/expr.zig lowerPathCall`) prefers the index target
-   when it resolves and otherwise keeps the order-based heuristic pick. **The
-   tightening is NOT done and is explicitly out of scope here:** the index never
-   errors on ambiguity, extension-form / intrinsic-owned bare names defer, and
-   `isShippedFqn` + the flat `module_scope`/`classId`-by-simple-name remain
-   live resolution inputs. **Tightening prerequisite:** "simple-name fallback
-   only when exactly one candidate exists" would HARDEN resolution into an
-   "ambiguous reference" error in cases the current order-based
-   `first_user`/`first_body` tie-break (`ir.zig:787-801`) silently resolves —
-   the `isShippedFqn` logic exists precisely because user simple names collide
-   with embedded-stdlib same-names. Do NOT tighten to "exactly one candidate"
-   until the differential harness (§5.1) is green across every `examples/*.kt`
-   *and* it is proven that each green program's bare calls resolve to a unique
-   `(package + imports) → FQN` target; otherwise currently-passing programs turn
-   into ambiguity failures. Drop `isShippedFqn` and the flat
-   `module_scope`/`classId`-by-simple-name as resolution inputs only once that
-   uniqueness holds. The `KLIO_RESOLVE_AUDIT` detector (`lower/expr.zig`) logs
-   every index-vs-heuristic divergence and reports 0 over the green corpus — it
-   is the executable evidence the index is a faithful superset, and the readout
-   the uniqueness proof will build on.
+   (`ir.zig`) ranks each non-extension candidate by tier (0 file-named import
+   — kotlinc-probed: an explicit import outranks even a same-file declaration
+   — 1 own package, 2 file-wildcard import, 3 default-import package — the
+   spec's implicitly imported set, mirrored from
+   `stdlib.IMPLICITLY_IMPORTED_PACKAGES` with a lockstep test — 4 built-in
+   stdlib, 5 other), commits the unique exact-arity no-default no-vararg
+   candidate in the best non-empty tier, and otherwise returns a reason-tagged
+   deferral (`ResolveDeferReason`: no_candidates / extension_form /
+   intrinsic_owned / ambiguous_tier / type_overload / unimported_set /
+   arity_mismatch / default_param_shape / bodyless_only / low_priority_only /
+   vararg_only / trailing_lambda_shape / cast_disambiguated). Forward
+   references rank order-independently: phase-1 header stubs carry their
+   declared arity (`decl_user_arity`), declared parameter types at FULL
+   structural granularity (`decl_user_sig`, rendered by the same
+   `loweredTypeRef` body params use — generic arguments, function-type
+   receiver/parameter/return shapes, suspend and `T & Any` markers), and
+   AST-derived `low_priority`, so the index's answer does not depend on
+   whether a candidate's body has been lowered yet; default-parameter shapes
+   defer identically from the stub AND the body gate for the same reason. A
+   file's same-leaf named imports are ALL kept (`registry.import_aliases`
+   maps leaf → import-path list): a second `import pkg2.f` after
+   `import pkg1.f` is a tie the index classifies, not a shadow. Lowering
+   (`lower/expr.zig lowerPathCall`) prefers the index target when it
+   resolves — except a receiver-matched extension pick, which stays with the
+   heuristic (the index never models receivers) — and otherwise keeps the
+   order-based heuristic pick for the classified deferral shapes.
+   **Ambiguity is a lowering diagnostic (default-on), scoped precisely:** it
+   fires only for a CALLED, non-extension bare call whose in-scope (tier ≤ 3)
+   same-arity candidates carry no defaults or varargs and prove identical at
+   full signature granularity — the sets kotlinc itself rejects. Two
+   identical FQNs render as
+   "`file.kt:4: error: conflicting overloads of `f`: identical signatures
+   declared at file.kt:2 and file.kt:3 — rename or remove one of the
+   declarations`" (qualifying cannot separate one FQN); distinct FQNs render
+   as "`file.kt:4: error: ambiguous reference `f`: candidates `a.f`, `b.f` —
+   qualify the call or import one explicitly`". Surfaced by the run pipeline
+   (`commands.zig runBuilt`, `parity.zig runInMode`) with `file:line` from the
+   `SourceMap`. NOT diagnosed (deferred to the heuristic, kotlinc-stricter
+   shapes): identical pairs exercised through default parameters or varargs,
+   extension-form candidates, and pairs that are never called.
+   Type-distinguishable overload sets (`type_overload` — anything not
+   provably identical at full granularity) stay runtime-resolved, cast-picked
+   sets reclassify as `cast_disambiguated`, and identical sets visible only
+   outside Kotlin scoping (`unimported_set`) keep klio's lenient pick. The
+   `KLIO_RESOLVE_AUDIT` detector emits one machine-readable line per bare call
+   (outcome + reason + tier + counts + heuristic pick + emitted shape +
+   divergence grade) and flags divergences; every index/heuristic divergence
+   is graded (`tier_correction` — index pick in a strictly better tier;
+   `shape_correction` — same tier, heuristic fell back to a
+   vararg/default/arity-mismatched candidate where the index found an exact
+   overload; `receiver_pref` — heuristic's extension pick retained) and
+   `KLIO_RESOLVE_STRICT` turns an unexplained divergence into a hard failure.
+   Strict+audit sweep over all 85 examples + the coroutine fixtures: 0
+   failures, 0 unexplained divergences; the graded divergences are 300
+   `checkIndexOverflow` tier corrections (own-package target over the
+   heuristic's cross-package pick) and 12 `CompletableDeferred` shape
+   corrections (exact-arity overload over the default-param sibling, with
+   runtime type dispatch unchanged since non-exact calls re-resolve through
+   `pickOverload`). Still live as resolution inputs (items 8b/8c scope):
+   `isShippedFqn` in `funcId`'s tie-break and the flat
+   `module_scope`/`classId`-by-simple-name lookups.
 4. **Lowering emits FQN-qualified `Call`/`LoadGlobal`.** The VM does exact
    `funcIdByFqn` (`ir.zig:822`) / `installed_bindings.resolve(fqn)` lookups with
    NO prefix-probe ladder and NO suffix scan (`host_globals.zig:431-486`). Fold
    inline-fn resolution into the same entry point so there is one selection
-   algorithm, not a parallel simple-name inline table.
+   algorithm, not a parallel simple-name inline table. **Inventory landed:**
+   the three runtime ladders — the `lookupGlobal` prefix probe and suffix scan
+   (`host_globals.zig`) and the `callFunc` bodyless ladder
+   (`host_call_func.zig`) — emit `KLIO_TRACE_RESOLVE`-gated
+   `ladder=<which> name=<simple> fqn=<resolved>` lines, so a corpus sweep
+   enumerates exactly which (program, name, fqn) still reach them. Current
+   sweep over all 85 examples: 18 distinct prefix-ladder names (constants and
+   `*ArrayOf` builders dominate), exactly one suffix-scan name
+   (`runBlocking` via the pack overlay), zero bodyless-ladder hits — the
+   removal worklist for this item.
 5. **One executable form per symbol. DONE (item 9).** Pack-vs-source identity is
    resolved once at link time: `ProgramImage.linkResolvedForms` (`interp_ir.zig`)
    runs after the two-phase build and the `installed_bindings` overlay exist, and
@@ -822,7 +871,7 @@ refactors, then the structural unifications in dependency order.
 | 5 | `VmIntrinsicHost` becomes thin adapter delegating to eval.Host (§4.1) | A | high | medium | L |
 | 6 | DONE (receiver chain + close-out) — enclosing-`this` chain is now a `Frame` field (`enclosing_this`), snapshotted into `FrameSnapshot` on suspend and restored on resume; the `outer_this` thread-local + `outerThisStack` + its `resetReceiverTls` are deleted and `enclosingThis`/`enclosingThisChain`/`pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain. Close-out landed: `inner_outer_hint` TLS replaced by an explicit `outer_hint` param (sourced via `callerThisValue` — param or capture) with class-keyed outer selection in `materializeInstance`, plus a lambda-side `this` capture for bare inner-class construction keyed on the new `ir.Class.is_inner` (fixes `with(other){Inner()}` incl. shadowing subjects, lambda-escaping inners, user-HOF lambdas, two-level nesting), `member_only_probe`/`cc_explicit_read` are now params, the dead duplicate `ctor_guard` is collapsed onto `host_instances.ctorGuardContains` (activating the deferred-`object` gate), and `host_call_member`'s re-entrancy flags are defer-cleared + run-boundary-asserted. Remaining §4.2 line item: fold the frame's own `this` into the carrier (see §4.2 consumer inventory). (§4.2) | B | high | high | XL |
 | 7 | PARTIAL — single implicit-receiver resolution choke point (`implicitThisValue` + `implicitReceiverChain` in `ir/eval.zig`) now feeds all three `*OrGlobal` handlers (`CallMemberOrGlobal`/`LoadFromThisOrGlobal`/`StoreToThisOrGlobal`), so the bare-name member-vs-global precedence is derived in one place instead of three. Registry func-kind landed: `Func.kind` (`FuncKind.member_extension`) is the authoritative member-extension predicate, set at the member-extension lowering site (`decl.zig`); the five `member_ext_owner_class` dispatch sites route through `isMemberExt`/`memberExtVisible` (the owner-class gate is preserved exactly — the kind selects which funcs are gated, the side table supplies the owner). The four "Or" *instructions* are NOT collapsed to a single `CallUnresolved`: they encode three distinct operations (read / write / call) plus the explicit-receiver `CallMemberOrValue`, and the "Or" itself is the "couldn't classify member-vs-global statically" signal item 8's FQN static resolution removes — collapsing now would re-encode the read/write/call distinction without removing the runtime decision. Deferred to item 8. (A/B) | A/B | high | medium | L |
-| 8 | PARTIAL (steps 1-4, fallback retained) — per-decl `package` tag on `Func`/`Class` (set at flatten/lowering, `""` = no package), the two-phase header registration made explicit (phase-1 reserves every class + func HEADER with FQN/package/receiver, phase-2 lowers bodies against the complete set), and the package/FQN symbol index (`Module.resolveBareCallIndexed`, keyed on caller package → file imports → built-in stdlib) as the PRIMARY bare-call path: where it resolves a unique non-extension target, lowering binds that target by exact `FuncId` (FQN-exact at the VM); otherwise it defers to the order-based heuristic, which is RETAINED unchanged. `KLIO_RESOLVE_AUDIT` is a permanent env-gated detector that compares the index pick to the heuristic pick on every bare call — proven 0 divergences over all 82 examples + the differential corpus, i.e. the index is a faithful superset. DEFERRED (the tightening prerequisite): the index does NOT yet error on ambiguity, and `isShippedFqn`/prefix-ladder/suffix-scan are NOT removed — that hardening is gated on the §4.4-item-3 uniqueness proof and is items 9/10's scope. | C | high | high | XL |
+| 8 | PARTIAL (steps 1-4 + tightening landed, ladders retained) — per-decl `package` tag on `Func`/`Class`, explicit two-phase header registration, and the package/FQN symbol index (`Module.resolveBareCallIndexed`) as the PRIMARY bare-call path, now hardened: reason-tagged deferrals (`ResolveDeferReason`, 13 classified shapes), order-independent forward references (phase-1 stubs rank by declared arity `decl_user_arity`, full-granularity declared types `decl_user_sig` rendered by the same `loweredTypeRef` body params use, and AST-derived `low_priority`; default-param shapes defer from stub and body gates alike), a six-tier preference order matching kotlinc's probed scoping (named import → own package → wildcard import → default-import package → shipped → other; a named import outranks even a same-file declaration; same-leaf named imports are ALL kept in `registry.import_aliases` so a second import of one leaf is a classified tie, not a shadow; wildcard imports per file in `registry.import_wildcards`, default imports mirroring `stdlib.IMPLICITLY_IMPORTED_PACKAGES` under a lockstep test), and ambiguity as a DEFAULT-ON lowering diagnostic scoped to what kotlinc rejects: a CALLED, non-extension bare call whose in-scope identical-FULL-signature candidates carry no defaults/varargs records `Module.resolve_diags`, surfaced by `klio run`/parity with `file:line` — same-FQN duplicates as "conflicting overloads … identical signatures declared at a.kt:2 and a.kt:3 — rename or remove one of the declarations", cross-package ties as "ambiguous reference … qualify the call or import one explicitly" (exact-wording + both-orders coverage in `itests/resolve_ambiguity.zig`); NOT diagnosed (heuristic-deferred): default/vararg-exercised, extension-form, and never-called identical pairs. Type-distinguishable sets — anything not provably identical at full granularity, incl. generic-argument-only and function-shape-only differences — stay runtime-resolved (`type_overload`), cast picks reclassify (`cast_disambiguated`), out-of-scope identical sets (`unimported_set`) keep the lenient pick. `KLIO_RESOLVE_AUDIT` emits a machine-readable per-call readout incl. a divergence grade (`tier_correction` / `shape_correction` / `receiver_pref`); `KLIO_RESOLVE_STRICT` (in the test cache key) hard-fails any ungraded divergence. Sweep readout (85 examples + coroutine fixtures): 0 failures, 0 ungraded divergences; 300 `checkIndexOverflow` tier corrections + 12 `CompletableDeferred` shape corrections. The three runtime ladders emit `KLIO_TRACE_RESOLVE` `ladder=` inventory lines (sweep: 18 prefix names, 1 suffix name, 0 bodyless hits). DEFERRED: dropping `isShippedFqn`/`classId`-by-simple-name as resolution inputs and deleting the prefix-ladder/suffix-scan/bodyless ladders (items 8b/8c), folding the inline-fn table into the index (8d). | C | high | high | XL |
 | 9 | DONE — one executable form per symbol resolved at link time (`ProgramImage.linkResolvedForms` → the `resolved_native` table keyed by `FuncId`, populated once after the module + `installed_bindings` exist); the per-call FQN short-circuit in `callFunc` and `callValue` is deleted, both now consulting the resolved form by `FuncId` (`host_call_func.resolvedNativeForm`). Pack-vs-source identity is settled at link time, load-order-independent. `KLIO_LINK_AUDIT` is a permanent env-gated detector proving the link form equals the deleted per-call probe's pick (0 divergences over the full suite + 82 examples + the differential corpus). (§4.4) | C | high | high | XL |
 | 10 | DONE — removed `isLambdaBody()` as a resolution axis at the four `expr.zig` dotted-head sites; package-head vs receiver-member is now the one predicate `headIsPackage` (real package root or `Module.packageHeadDeclared` FQN-prefix), shadowed by captured/local/enclosing-member names — order- and load-mode-independent, no lambda special case. The inline splice already binds the inline receiver as a `"this"` scope local, so no extra frame-receiver slot was needed. Gated green behind the builder-DSL differential (`examples/dsl_dotted_head.kt` + `coroutine_smoke/cs8_dotted_in_builder.kt`, byte-identical across all three pack modes); both audits 0. (§4.4/§4.2) | C/B | medium | high | M |
 | 11 | DONE — deleted `Value.Lambda` (vestigial Env-based closure the live IR VM never produced; `AstLambda` already built `IrClosure`). Removed the variant, its one GC-test constructor, and every Value-context `.Lambda =>` arm; `IrClosure` is now the single closure value form and `func.capture_order` (via `ClosureInfo.captures`) is the sole capture-metadata authority. | cleanup | medium | medium | M |

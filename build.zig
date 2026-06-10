@@ -99,6 +99,7 @@ const itests_files = [_]Itest{
     .{ .name = "parity_threaded_litmus", .dirs = &.{"tests/fixtures/threaded_litmus"} },
     .{ .name = "parity_type_system_shapes" },
     .{ .name = "parity_visibility_modifiers" },
+    .{ .name = "resolve_ambiguity" },
     .{ .name = "parser_corpus", .parity_data = false },
     .{ .name = "runtime_objref_threads", .parity_data = false },
     .{ .name = "typeck_negative", .parity_data = false, .dirs = &.{"tests/fixtures/typeck_negative"} },
@@ -143,6 +144,7 @@ const interp_env_keys = [_][]const u8{
     "KLIO_TRACE_HTTP",
     "KLIO_LINK_AUDIT",
     "KLIO_RESOLVE_AUDIT",
+    "KLIO_RESOLVE_STRICT",
     "KLIO_STDLIB_PACK",
     "KLIO_PACK_DIAG",
 };

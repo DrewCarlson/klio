@@ -22,6 +22,7 @@ const stdlib = @import("stdlib");
 const vmhost = @import("vmhost.zig");
 const host_impl = @import("host_impl.zig");
 const host_instances = @import("host_instances.zig");
+const trace = @import("trace.zig");
 
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -712,6 +713,9 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
             else
                 (allocator.dupe(u8, name) catch return null);
             if (lookupIntrinsic(self, fqn)) |func| {
+                if (trace.enabled(name)) {
+                    trace.emit("ladder=global_prefix name={s} fqn={s}", .{ name, fqn });
+                }
                 const tail = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
                 if (looksConst(tail)) {
                     const r = dispatchIntrinsic(self, allocator, fqn, func, &.{}) catch return null;
@@ -737,6 +741,9 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
         var it = bg.get().table.iterator();
         while (it.next()) |entry| {
             if (std.mem.endsWith(u8, entry.key_ptr.*, suffix)) {
+                if (trace.enabled(name)) {
+                    trace.emit("ladder=global_suffix name={s} fqn={s}", .{ name, entry.key_ptr.* });
+                }
                 return .{ .Intrinsic = .{ .fqn = entry.key_ptr.*, .func = entry.value_ptr.* } };
             }
         }

@@ -1131,11 +1131,13 @@ pub const LoadMode = enum {
 
 /// A program assembled for one `LoadMode`: the full AST set in build order
 /// (deps first, user last), the host bindings to install (none for
-/// `EmbeddedOnly`), and whether a `main` declaration is present. The ASTs and
-/// bindings are allocated into the caller-provided arena.
+/// `EmbeddedOnly`), and the source map the ASTs were parsed against (for
+/// locating lowering diagnostics). Everything is allocated into the
+/// caller-provided arena.
 pub const LoadedProgram = struct {
     asts: []KotlinFile,
     bindings: ?HostBindings,
+    map: *const SourceMap,
 };
 
 /// One in-repo kotlinx pack source file: path (for spans / pack rel_path) and
@@ -1233,14 +1235,16 @@ fn packRoundtrip(arena: Allocator, sources: []const PackSource) Allocator.Error!
 /// canonical loader behind `runWithKtc` / `runWithPacks`: each runner is this
 /// plus the shared build + `Vm.run` tail. ASTs and bindings live in `arena`.
 pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) Allocator.Error!SResult(LoadedProgram) {
-    var map = SourceMap.init(arena);
-    // The SourceMap is borrowed by the parsed ASTs for the arena's lifetime;
-    // it is not deinit'd here so spans stay valid through build + run.
+    // The SourceMap is borrowed by the parsed ASTs (and returned to the
+    // caller for diagnostic rendering) for the arena's lifetime; it is
+    // never deinit'd so spans stay valid through build + run.
+    const map = try arena.create(SourceMap);
+    map.* = SourceMap.init(arena);
 
     const user_src = readFileOpt(arena, io, file) orelse {
         return .{ .err = try std.fmt.allocPrint(arena, "read {s}", .{file}) };
     };
-    const user_ast = switch (try parsePackFile(arena, &map, file, user_src)) {
+    const user_ast = switch (try parsePackFile(arena, map, file, user_src)) {
         .err => |e| return .{ .err = e },
         .ok => |a| a,
     };
@@ -1251,10 +1255,10 @@ pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) A
 
     if (mode == .EmbeddedOnly) {
         var user_only = [_]KotlinFile{user_ast};
-        const stdlib_asts = try embeddedStdlibSources(arena, io, &user_only, &map);
+        const stdlib_asts = try embeddedStdlibSources(arena, io, &user_only, map);
         try asts.appendSlice(arena, stdlib_asts);
         try asts.append(arena, user_ast);
-        return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = null } };
+        return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = null, .map = map } };
     }
 
     // SourcePacks / CompiledPacks: fold in the in-repo kotlinx packs.
@@ -1284,7 +1288,7 @@ pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) A
     switch (mode) {
         .SourcePacks => {
             for (pack_sources) |s| {
-                const file_ast = switch (try parsePackFile(arena, &map, s.path, s.text)) {
+                const file_ast = switch (try parsePackFile(arena, map, s.path, s.text)) {
                     .err => |e| return .{ .err = e },
                     .ok => |a| a,
                 };
@@ -1298,7 +1302,7 @@ pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) A
                 .ok => |d| d,
             };
             for (decoded) |sf| {
-                const file_ast = switch (try parsePackFile(arena, &map, sf.rel_path, sf.bytes)) {
+                const file_ast = switch (try parsePackFile(arena, map, sf.rel_path, sf.bytes)) {
                     .err => |e| return .{ .err = e },
                     .ok => |a| a,
                 };
@@ -1313,7 +1317,7 @@ pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) A
     defer probe.deinit(arena);
     try probe.appendSlice(arena, asts.items);
     try probe.append(arena, user_ast);
-    const stdlib_asts = try embeddedStdlibSources(arena, io, probe.items, &map);
+    const stdlib_asts = try embeddedStdlibSources(arena, io, probe.items, map);
     for (stdlib_asts) |a| {
         try registerAstPackage(arena, &a);
         try asts.append(arena, a);
@@ -1335,7 +1339,7 @@ pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) A
     }
     bindings = b;
 
-    return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = bindings } };
+    return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = bindings, .map = map } };
 }
 
 /// Assemble `file` under `mode`, build the module, and run `main`, returning
@@ -1372,6 +1376,19 @@ pub fn runInMode(allocator: Allocator, io: Io, file: []const u8, mode: LoadMode)
 
     interp_ir.setCoroutineTimeMode(.Virtual);
     var built = try interp_ir.build.buildModuleFiles(arena, loaded.asts);
+    // Lowering-time resolution diagnostics (ambiguous bare calls) fail
+    // the program before it runs, mirroring the `klio run` pipeline.
+    const amb_msg: ?[]u8 = blk: {
+        const mg = built.module.borrow();
+        defer mg.deinit();
+        const rdiags = mg.get().resolve_diags.items;
+        if (rdiags.len == 0) break :blk null;
+        break :blk try rdiags[0].render(allocator, loaded.map);
+    };
+    if (amb_msg) |msg| {
+        built.deinit();
+        return .{ .err = msg };
+    }
     const main_id = built.main orelse {
         built.deinit();
         return .{ .err = try allocator.dupe(u8, "no main function in module") };
