@@ -72,6 +72,7 @@ const itests_files = [_]Itest{
     .{ .name = "parity_collections_intensive" },
     .{ .name = "parity_conformance", .dirs = &.{"tests/fixtures/conformance"} },
     .{ .name = "parity_coroutine_smoke", .dirs = &.{"tests/fixtures/coroutine_smoke"} },
+    .{ .name = "parity_corpus_pinned", .dirs = &.{"tests/fixtures/parity_corpus"} },
     .{ .name = "parity_coroutines_realistic" },
     .{ .name = "parity_data_class_features" },
     .{ .name = "parity_dsl_operators" },

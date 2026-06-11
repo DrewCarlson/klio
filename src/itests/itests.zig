@@ -9,6 +9,7 @@ test {
     _ = @import("parity_collections_intensive.zig");
     _ = @import("parity_conformance.zig");
     _ = @import("parity_coroutine_smoke.zig");
+    _ = @import("parity_corpus_pinned.zig");
     _ = @import("parity_coroutines_realistic.zig");
     _ = @import("parity_data_class_features.zig");
     _ = @import("parity_dsl_operators.zig");

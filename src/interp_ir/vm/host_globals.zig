@@ -602,10 +602,38 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
             break :blk m.classes.items[cid.int()].fqn;
         };
         if (fqn) |f| {
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            if (cg.get().get(f)) |def| {
-                return .{ .Class = def.clone() };
+            const found: ?ObjRef(ClassDef) = blk: {
+                const cg = self.classes.borrow();
+                defer cg.deinit();
+                if (cg.get().get(f)) |def| break :blk def.clone();
+                break :blk null;
+            };
+            if (found) |def| {
+                // An `object` in value position is its singleton, not
+                // the bare class value (matching the name-keyed read).
+                // Only an already-published singleton resolves here;
+                // first-access construction stays with the name-keyed
+                // throwing path, which drives the init gate exactly once
+                // and surfaces an init failure with its cause.
+                const obj_name: ?[]const u8 = blk: {
+                    const dg = def.borrow();
+                    defer dg.deinit();
+                    if (dg.get().is_object) break :blk dg.get().name;
+                    break :blk null;
+                };
+                if (obj_name) |n| {
+                    const published: ?Value = blk: {
+                        const gg = self.globals.borrow();
+                        defer gg.deinit();
+                        break :blk gg.get().lookup(n);
+                    };
+                    def.deinit();
+                    if (published) |v| {
+                        if (v == .Instance) return v;
+                    }
+                    return null;
+                }
+                return .{ .Class = def };
             }
         }
     }

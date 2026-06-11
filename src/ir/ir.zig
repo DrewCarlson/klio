@@ -1384,9 +1384,15 @@ pub const Module = struct {
         // record (rankable without a lowered body).
         var best_tier: u8 = 255;
         var all_ext = true;
+        var ext_in_scope = false;
         for (cands) |id| {
             const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
-            if (funcHasImplicitThis(f)) continue;
+            if (funcHasImplicitThis(f)) {
+                if (self.bareCallTier(f, name, caller_pkg, caller_file) < other_package_tier) {
+                    ext_in_scope = true;
+                }
+                continue;
+            }
             all_ext = false;
             if (f.blocks.len == 0 and self.stubDeclArity(id) == null) continue;
             const t = self.bareCallTier(f, name, caller_pkg, caller_file);
@@ -1394,6 +1400,16 @@ pub const Module = struct {
         }
         if (best_tier == 255) {
             return BareCallResolution.deferred(if (all_ext) .extension_form else .bodyless_only);
+        }
+        // Every rankable non-extension candidate lives in a package the
+        // caller cannot see, while an in-scope extension (or member) form
+        // exists. Kotlin resolves the call against an implicit receiver's
+        // extension long before it would even consider the invisible
+        // package, so receiver-based resolution — the heuristic's
+        // domain — decides; binding (or rejecting) the invisible
+        // function here would be wrong on both counts.
+        if (best_tier == other_package_tier and ext_in_scope) {
+            return BareCallResolution.deferred(.extension_form);
         }
 
         // Within the best tier, look for a unique exact-arity,
@@ -2183,6 +2199,33 @@ test "symbol index ranks a named import above the caller's own package" {
     const got2 = m.resolveBareCallIndexed("greet", "app", FileId.from(1), 0, false);
     try testing.expect(got2.outcome == .resolved);
     try testing.expectEqual(@as(u8, 1), got2.tier);
+}
+
+test "symbol index defers an out-of-scope pick when an in-scope extension exists" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // The only non-extension candidate lives in a package the caller
+    // (kotlin.text) cannot see; a same-package extension also exists.
+    // The call may bind the extension via an implicit receiver, so the
+    // index must defer to the receiver-aware heuristic instead of
+    // resolving (and later rejecting) the invisible function.
+    _ = try pushTestFunc(&m, a, "firstOrNull", "firstOrNull", "", 1);
+    _ = try pushTestFuncOpts(&m, a, "firstOrNull", "kotlin.text.firstOrNull", "kotlin.text", 1, .{ .extension = true });
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("firstOrNull", "kotlin.text", FileId.from(0), 1, false);
+    try testing.expectEqual(Module.ResolveDeferReason.extension_form, deferReasonOf(got).?);
+
+    // Without the extension, the invisible candidate still resolves (the
+    // out-of-scope diagnostic is the lowering's call), tier 5.
+    var m2 = Module.default(a);
+    defer freeTestModule(&m2, a);
+    _ = try pushTestFunc(&m2, a, "firstOrNull", "firstOrNull", "", 1);
+    try m2.rebuildFuncNameIndex(a);
+    const got2 = m2.resolveBareCallIndexed("firstOrNull", "kotlin.text", FileId.from(0), 1, false);
+    try testing.expect(got2.outcome == .resolved);
+    try testing.expectEqual(Module.other_package_tier, got2.tier);
 }
 
 test "symbol index defers when the preferred tier is ambiguous" {

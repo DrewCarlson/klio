@@ -2979,7 +2979,12 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
     // Bound method reference: forward the call.
     const r = try callMemberRec(self, allocator, &recv_capt, n, args);
     if ((std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) and r == .err and r.err == .Unimplemented) {
-        if (lookupGlobalValue(self, n)) |callable| {
+        // The receiver's class declares no such member: the reference
+        // names a top-level function (a `::fn` lowered as a member ref
+        // before the function's header was registered). Resolve it
+        // through the full global probe chain — the raw env holds no
+        // top-level functions.
+        if (host_globals.lookupGlobal(self, n)) |callable| {
             switch (callable) {
                 .Function, .IrClosure => return try callValueRec(self, allocator, &callable, args),
                 else => {},
