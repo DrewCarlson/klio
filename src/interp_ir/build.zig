@@ -1406,7 +1406,7 @@ fn buildModuleWithOverrides(
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_ib_pkg);
         for (c.init_blocks, 0..) |*blk, idx| {
             const nm = try std.fmt.allocPrint(a, "__init_block_{s}_{d}", .{ c.name.name, idx });
-            fids[idx] = try ir.lower.lowerAccessorBlock(module, c.name.name, &own_members, local_params.items, blk, nm);
+            fids[idx] = try ir.lower.lowerInitBlockWithParams(module, c.name.name, &own_members, local_params.items, blk, nm);
         }
         try init_blocks.put(c.name.name, fids);
         const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
@@ -1651,14 +1651,33 @@ fn buildModuleWithOverrides(
     // thunks onto overriding members lacking their own thunk.
     try propagateInheritedDefaults(a, module, &func_defaults);
 
-    // typealias Name = Target → Name ↦ Target's simple head name.
+    // typealias Name = Target → Name ↦ Target's simple head name. A
+    // function-type target (`typealias CompletionHandler = (Throwable?) ->
+    // Unit`) maps to its `Function{N}` tag so applicability checks
+    // recognise an aliased parameter as function-typed.
     for (decls) |*d| {
         if (d.* != .TypeAlias) continue;
         const ta = &d.TypeAlias;
+        if (ta.target.function) |ft| {
+            const arity = ft.params.len + @as(usize, if (ft.receiver != null) 1 else 0);
+            const tag = try std.fmt.allocPrint(a, "Function{d}", .{arity});
+            try module.registry.type_aliases.put(ta.name.name, tag);
+            continue;
+        }
         const full = ta.target.name.name;
         const target = if (std.mem.lastIndexOfScalar(u8, full, '.')) |dot| full[dot + 1 ..] else full;
         if (target.len != 0 and !std.mem.eql(u8, target, ta.name.name)) {
             try module.registry.type_aliases.put(ta.name.name, target);
+        }
+    }
+    // Rewrite function-type alias names in lowered param types so every
+    // applicability/score consumer sees the `Function{N}` tag — a param
+    // declared `handler: CompletionHandler` is function-typed for
+    // trailing-lambda alignment and overload scoring.
+    for (module.funcs.items) |*f| {
+        for (f.params) |*p| {
+            const resolved = module.registry.type_aliases.get(p.ty.name) orelse continue;
+            if (std.mem.startsWith(u8, resolved, "Function")) p.ty.name = resolved;
         }
     }
 

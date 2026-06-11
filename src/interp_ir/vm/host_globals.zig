@@ -1006,6 +1006,28 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name: []const u
         }
     }
 
+    // Suspend-implicit `coroutineContext` intrinsic reached as a plain
+    // global read (a top-level suspend body has no receiver to probe):
+    // the active coroutine scope's context, or — from the root driver,
+    // e.g. `suspend fun main` — the empty context. Only when no user
+    // global shadows the name.
+    if (raw == null and
+        (std.mem.eql(u8, name, "coroutineContext") or
+            std.mem.eql(u8, name, "kotlin.coroutines.coroutineContext")) and
+        lookupGlobal(self, name) == null)
+    {
+        if (vmhost.coroutines.activeCoroScope()) |scope| {
+            switch (try vmhost.host_fields.getField(self, allocator, &scope, "coroutineContext")) {
+                .ok => |v| return .{ .ok = v },
+                .err => {},
+            }
+        }
+        switch (try ensureObjectSingleton(self, "EmptyCoroutineContext")) {
+            .ok => |maybe| if (maybe) |v| return .{ .ok = v },
+            .err => |e| return .{ .err = e },
+        }
+    }
+
     return .{ .ok = lookupGlobal(self, name) };
 }
 

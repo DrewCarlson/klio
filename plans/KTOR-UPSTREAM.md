@@ -912,3 +912,66 @@ write side remains gated on coroutine-suspension fidelity (not on the cores'
 critical path under the synchronous-execution hypothesis). The shim stays in
 place so client/server keep working until each layer's upstream replacement is
 validated.
+
+## Zig-tree status: shim client green and gated; upstream GET reaches the engine
+
+The shim `client` feature performs a real GET end to end (status 200 +
+body, single send), and `client-serialization` deserializes a typed
+`body<T>()` — both gated forever by the `ktor_client_get` itest, which
+builds + installs the packs into a scratch HOME, owns a localhost HTTP
+server in-process, and drives the installed `klio` binary as a child.
+Two transport bugs found and fixed on the way: a stale installed
+`io.ktor` pack (feature gating from an old manifest loaded the upstream
+client files alongside the shim — rebuilding/reinstalling restored the
+gate) and the engine's `makeSockaddrIn` writing the IPv4 octets
+byte-swapped (`readInt(.big)` into `addr` — connect went to 1.0.0.127).
+
+Under `client-upstream`, `HttpClient(KlioClient).get(url)` now drives
+the full upstream composition through the engine — `__kktor_request`
+issues the real HTTP request and the response flows back through
+`HttpClientCall` / `DefaultHttpResponse` / the receive bridge — after a
+stack of root-caused interpreter fixes, each pinned by a kotlinc-parity
+fixture in `tests/fixtures/parity_corpus`:
+
+- operator dispatch (`config += this`) is receiver-PROVEN, so a `val`
+  declaring only `plusAssign` no longer binds `String?.plus`
+  (`compound_assign_val_plus_assign.kt`);
+- a `(T) -> Unit` lambda invoked receiver-style (`client.apply(it)`)
+  fills its positional param with the receiver
+  (`apply_fills_positional_param.kt`);
+- a lone member overload declines on over-supply, so stdlib
+  `buildString { }` resolves inside a class declaring a zero-arg
+  `buildString()` (`member_shadowed_buildstring.kt`);
+- a function-typed member param rejects a definitely-non-callable
+  argument, so `url(urlString)` reaches the String extension past the
+  member `url(block)` (`fn_param_member_vs_string_extension.kt`);
+- init-block thunks record their bound params and the companion walk
+  covers the full supertype graph, so a bare private-companion call in
+  a base-class init block resolves through an interface-first subtype
+  (`init_block_companion_call.kt`); `StringValuesImpl.tableSizeFor` and
+  `caseInsensitiveHashCode` run;
+- named-arg dispatch checks param names, members outrank extensions,
+  and `typealias CompletionHandler = (Throwable?) -> Unit` params are
+  recognized as function-typed — with non-Function-subtype instances
+  (JobNode) still disproving the member
+  (`iface_default_named_overload_typealias.kt`);
+- a bare call whose own member is a non-callable property falls through
+  to the same-named top-level fn (`bare_call_prop_vs_toplevel_fn.kt`),
+  fixing `HttpStatusCode.Companion`'s `allStatusCodes = allStatusCodes()`;
+- bare `coroutineContext` with no driver scope reads the empty context
+  (kotlinc: a suspend body always has one), so `Pipeline.execute` runs
+  from `suspend fun main`;
+- the lenient extension pass honors a definite receiver disproof, so
+  `Pipeline.execute` never binds on a coroutine/class receiver;
+- `HttpRequestRetry.kt` is consumed (HttpSend reads its
+  `MaxRetriesPerRequestAttributeKey`).
+
+**Remaining `client-upstream` blocker:** one logical GET issues 8 sends
+and ends in `ClassCastException: cast to HttpClientCall failed`. The
+proximate signals: an empty-payload `Unimplemented` error escaping the
+plugin-hook lambdas (`HttpRedirect.handleCall` and siblings) is treated
+as a dispatch miss somewhere up the chain, re-driving the send; and one
+`on(Send)` handler invocation loses its `Sender` receiver (`unresolved
+global proceed`, 1 of 9 dispatches). Root-causing that swallow is the
+next step; the stage-3 swap (point `client` at upstream, delete
+`shim/client/*`) stays parked until the upstream path single-sends.

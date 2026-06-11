@@ -123,3 +123,60 @@ test "exception_hierarchy_multilevel" {
         \\
     );
 }
+
+test "compound_assign_val_plus_assign" {
+    try check("compound_assign_val_plus_assign",
+        \\[base, user, tail]
+        \\false
+        \\
+    );
+}
+
+test "apply_fills_positional_param" {
+    try check("apply_fills_positional_param",
+        \\direct
+        \\direct
+        \\install data on s1
+        \\
+    );
+}
+
+test "member_shadowed_buildstring" {
+    try check("member_shadowed_buildstring",
+        \\member:auth(example.com)
+        \\auth(example.com)
+        \\
+    );
+}
+
+test "fn_param_member_vs_string_extension" {
+    try check("fn_param_member_vs_string_extension",
+        \\http://a/
+        \\http://b/
+        \\
+    );
+}
+
+test "init_block_companion_call" {
+    try check("init_block_companion_call",
+        \\10
+        \\1
+        \\
+    );
+}
+
+test "iface_default_named_overload_typealias" {
+    try check("iface_default_named_overload_typealias",
+        \\handler go
+        \\r=1
+        \\
+    );
+}
+
+test "bare_call_prop_vs_toplevel_fn" {
+    try check("bare_call_prop_vs_toplevel_fn",
+        \\[1, 2, 3]
+        \\3
+        \\
+    );
+}

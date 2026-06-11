@@ -150,6 +150,10 @@ pub fn lowerExprAsParamThunkScoped(
 }
 
 /// Lower an init-style block with arbitrary bound parameter names.
+/// Records the bound params (incl. `this`) like the accessor-expression
+/// form, so the eval `this`-parameter fallback recovers the receiver — a
+/// bare companion-method call inside an init block resolves against the
+/// constructed instance's chain.
 pub fn lowerInitBlockWithParams(
     module: *Module,
     owner_class: []const u8,
@@ -162,11 +166,13 @@ pub fn lowerInitBlockWithParams(
     var b = try FuncBuilder.init(allocator, module);
     defer b.deinit();
     b.setOwnerClass(owner_class);
+    b.setRecvTy(owner_class);
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
     try bindParams(&b, params);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
-    const func = try b.finish(name, name, build.typeUnit());
+    var func = try b.finish(name, name, build.typeUnit());
+    func.params = try accessorParams(allocator, params);
     return pushFunc(module, func);
 }
 
