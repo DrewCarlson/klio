@@ -178,8 +178,10 @@ test "local_class_suspend_method_resumes_in_its_module" {
 // `async(CoroutineContext)` overload, not re-select the `Job` overload
 // (the runtime value is still a `Job`) and recurse forever. Here the
 // receiver-lambda `ic.invoke(next, r)` calls a suspend method whose body
-// is `async(coroutineContext + Job()) { … }.await()`, exercising the
-// delegation through the real coroutines library.
+// is `async(coroutineContext + Job()) { … }.await()` inside a
+// `coroutineScope` (the lexical `CoroutineScope` receiver `async`
+// requires — kotlinc rejects a bare `async` in a plain suspend method),
+// exercising the delegation through the real coroutines library.
 test "async_job_overload_delegates_without_recursing" {
     const src =
         \\
@@ -189,7 +191,7 @@ test "async_job_overload_delegates_without_recursing" {
         \\class Base : Snd {
         \\    override suspend fun execute(r: String): String {
         \\        val ctx = coroutineContext + Job()
-        \\        return async(ctx) { "E($r)" }.await()
+        \\        return coroutineScope { async(ctx) { "E($r)" }.await() }
         \\    }
         \\}
         \\class Inter(val ic: suspend Snd.(String) -> String, val next: Snd) : Snd {

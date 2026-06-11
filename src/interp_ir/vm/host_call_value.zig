@@ -402,7 +402,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             try capture_values.appendSlice(allocator, g.get().*);
         }
         vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
-        return ir.eval.evalWithCaptures(VmHost, allocator, module, func, call_args, capture_values, self);
+        return ir.eval.evalWithCapturesChained(VmHost, allocator, module, null, func, call_args, capture_values, info.chain, self);
     }
     const msg = try std.fmt.allocPrint(allocator, "Vm::call_value on `{s}`", .{callee.typeFqn()});
     return .{ .err = .{ .Unimplemented = msg } };
@@ -490,7 +490,10 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 if (pushed_outer) {
                     if (prior_this) |p| host_call_member.pushAccessEnclosing(self, &p);
                 }
-                const pushed_receiver = receiver == .Instance;
+                // A null subject is pushed too: it is a real receiver
+                // candidate for nullable-receiver extensions
+                // (`fun Thing?.show()` inside `with(t)` where `t == null`).
+                const pushed_receiver = receiver == .Instance or receiver == .Null;
                 if (pushed_receiver) {
                     host_call_member.pushAccessEnclosingSubject(self, &receiver);
                 }
@@ -499,6 +502,32 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 if (pushed_outer) host_call_member.popAccessEnclosing(self);
                 return r;
             }
+            // No `this` capture: the receiver binds as the leading
+            // declared `this` param when the body has one (a local
+            // extension function lowered as a closure); otherwise the
+            // body takes no receiver. Either way the call runs on the
+            // MAIN evaluator path (the intrinsic invoke below flattens a
+            // suspension into a hard error), with the receiver reachable
+            // as the innermost subject for dispatch-time resolution.
+            const takes_this_param = blk: {
+                const module_g = self.module.borrow();
+                defer module_g.deinit();
+                const m = module_g.get();
+                if (info.body_func.int() >= m.funcs.items.len) break :blk false;
+                const fp = m.funcs.items[info.body_func.int()].params;
+                break :blk fp.len != 0 and std.mem.eql(u8, fp[0].name, "this");
+            };
+            var all_args: std.ArrayList(Value) = .empty;
+            defer all_args.deinit(allocator);
+            if (takes_this_param) try all_args.append(allocator, this_value.*);
+            try all_args.appendSlice(allocator, args);
+            const pushed_receiver = this_value.* == .Instance or this_value.* == .Null;
+            if (pushed_receiver) {
+                host_call_member.pushAccessEnclosingSubject(self, this_value);
+            }
+            const r = try callValue(self, allocator, callee, all_args.items);
+            if (pushed_receiver) host_call_member.popAccessEnclosing(self);
+            return r;
         }
     }
     var sink = self.out_sink.clone();
@@ -535,6 +564,7 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
         .n_params = n_params,
         .capture_names = capture_names,
         .captures = cell,
+        .chain = try ir.eval.captureChainAlloc(allocator),
     });
     const caps_ref = try ValueSlice.init(allocator, try allocator.dupe(Value, captures));
     return .{ .ok = .{ .IrClosure = .{ .id = id, .captures = caps_ref } } };
@@ -555,6 +585,7 @@ pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, params:
         .n_params = params.len,
         .capture_names = try allocator.dupe([]const u8, captured_names),
         .captures = cell,
+        .chain = try ir.eval.captureChainAlloc(allocator),
     });
     const caps_ref = try ValueSlice.init(allocator, try allocator.dupe(Value, captures));
     return .{ .ok = .{ .IrClosure = .{ .id = id, .captures = caps_ref } } };

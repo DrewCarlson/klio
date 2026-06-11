@@ -324,18 +324,24 @@ pub const Inst = union(enum) {
     /// carry that exact identity and the host binds it directly — the
     /// name string remains for traces and as the unresolved fallback.
     LoadGlobal: struct { dst: Reg, name: ConstId, func: ?FuncId = null, class: ?ClassId = null },
-    /// Bare-name read inside a lambda body that doesn't resolve as a
-    /// local / capture / own member. If `this_idx`'s captured value
-    /// is an instance with a field/method named `name`, read it;
-    /// otherwise fall back to LoadGlobal(name).
+    /// Bare-name read in a receiver context that doesn't resolve as a
+    /// local / capture / own member. The runtime searches the implicit
+    /// receivers (the captured `this` at `this_idx`, the enclosing-`this`
+    /// chain, and each dispatch receiver's class-nesting tower) innermost
+    /// first for a field/member named `name`; otherwise it falls back to
+    /// the global. When the lowerer's symbol index resolved the global
+    /// fallback to a unique declaration, `func` / `class` carry that
+    /// exact identity so the global arm binds directly.
     LoadFromThisOrGlobal: struct {
         dst: Reg,
         this_idx: u16,
         name: ConstId,
+        func: ?FuncId = null,
+        class: ?ClassId = null,
     },
-    /// Symmetric write counterpart of `LoadFromThisOrGlobal`. If
-    /// `this_idx`'s captured value is an instance with a member named
-    /// `name`, `SetField` it; otherwise fall back to
+    /// Symmetric write counterpart of `LoadFromThisOrGlobal`: the
+    /// innermost implicit receiver with a member named `name` takes the
+    /// write (`SetField`); when no receiver owns it, fall back to
     /// `StoreGlobal(name)`.
     StoreToThisOrGlobal: struct {
         this_idx: u16,
@@ -358,6 +364,11 @@ pub const Inst = union(enum) {
         /// call the index bound; the global leg constructs exactly this
         /// class instead of re-resolving the simple name.
         class: ?ClassId = null,
+        /// The lowering-resolved top-level function when the bare call
+        /// would have bound statically but a runtime receiver member can
+        /// shadow it; the global leg calls exactly this declaration
+        /// instead of re-resolving the simple name.
+        func: ?FuncId = null,
     },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host.store_global` so a
@@ -1749,6 +1760,12 @@ pub const ModuleRegistry = struct {
     /// reified-call dispatch to bind `T` → `Value.Class(arg)` as a
     /// global for the call's lifetime.
     func_type_params: std.AutoHashMap(FuncId, std.ArrayList([]const u8)),
+    /// Declared upper bounds of a function's type parameters (`<T : Number>`
+    /// inline bounds plus `where` clauses), one entry per (param, bound)
+    /// pair. The strict extension-receiver prover consults these: a
+    /// bounded type-parameter receiver is proven only when the actual
+    /// receiver satisfies every bound; an unbounded one accepts anything.
+    func_type_param_bounds: std.AutoHashMap(FuncId, []const TypeParamBound),
     /// Top-level property names declared with `by <delegate>`.
     /// Reads/writes route through the stored delegate's `getValue` /
     /// `setValue` methods.
@@ -1757,6 +1774,12 @@ pub const ModuleRegistry = struct {
     /// declares or inherits (transitively over supertypes). Lets the
     /// lowerer honor Kotlin's separate function/property namespaces.
     hierarchy_methods: std.StringHashMap(std.StringHashMap(void)),
+    /// Every member name (function, property, primary-ctor property,
+    /// companion member) declared by ANY class in the program. A bare
+    /// name in a receiver context can only be shadowed by a runtime
+    /// receiver when some class declares a member of that name, so
+    /// lowering keeps the static classification for everything else.
+    class_member_names: std.StringHashMap(void),
     /// Class simple name → its transitive supertype simple names,
     /// nearest first (each direct supertype followed by its own chain).
     /// Recorded from the AST hierarchy before body lowering, so a
@@ -1809,13 +1832,20 @@ pub const ModuleRegistry = struct {
         segs: []const []const u8,
     };
 
+    pub const TypeParamBound = struct {
+        param: []const u8,
+        bound: []const u8,
+    };
+
     pub fn init(allocator: Allocator) ModuleRegistry {
         return .{
             .companion_singletons = std.StringHashMap([]const u8).init(allocator),
             .enclosing_class = std.StringHashMap([]const u8).init(allocator),
             .func_type_params = std.AutoHashMap(FuncId, std.ArrayList([]const u8)).init(allocator),
+            .func_type_param_bounds = std.AutoHashMap(FuncId, []const TypeParamBound).init(allocator),
             .top_level_delegated_props = std.StringHashMap(void).init(allocator),
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
+            .class_member_names = std.StringHashMap(void).init(allocator),
             .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
             .delegated_body_props = StrPairSet.init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
@@ -1840,12 +1870,18 @@ pub const ModuleRegistry = struct {
             while (it.next()) |list| list.deinit(a);
             self.func_type_params.deinit();
         }
+        {
+            var it = self.func_type_param_bounds.valueIterator();
+            while (it.next()) |list| a.free(list.*);
+            self.func_type_param_bounds.deinit();
+        }
         self.top_level_delegated_props.deinit();
         {
             var it = self.hierarchy_methods.valueIterator();
             while (it.next()) |inner| inner.deinit();
             self.hierarchy_methods.deinit();
         }
+        self.class_member_names.deinit();
         {
             var it = self.class_super_names.valueIterator();
             while (it.next()) |names| a.free(names.*);

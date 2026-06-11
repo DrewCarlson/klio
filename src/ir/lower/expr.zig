@@ -94,7 +94,7 @@ const lowerStmt = stmt_mod.lowerStmt;
 /// level / in a non-receiver context.
 fn resolveThisRegKind(b: *FuncBuilder, in_lambda_body: bool, bind_local: bool) Allocator.Error!?Reg {
     if (b.resolve("this")) |r| return r;
-    if (b.knowsOuter("this") or (in_lambda_body and b.isLambdaBody())) {
+    if (b.knowsOuter("this") or (in_lambda_body and b.capturesThisSlot())) {
         const idx = try b.recordCapture("this");
         const dst = b.allocReg();
         try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
@@ -840,22 +840,47 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
         }
-        // A bare name that is a known class is a class reference.
+        // A bare name that is a known class is a class reference. In a
+        // receiver context a runtime receiver member shadows the
+        // classifier (kotlinc: a property named like a class wins in
+        // expression position), so the read decides at runtime with the
+        // index-resolved class riding as the exact global arm; the
+        // companion sentinel passes a member value through unchanged.
         if (b.module.classId(name0) != null) {
-            const cls = b.allocReg();
             const n = try b.module.internConst(b.allocator, .{ .String = name0 });
-            try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = n } });
+            const cls = b.allocReg();
+            if (inReceiverContext(b)) {
+                const this_idx = try b.recordCapture("this");
+                orEmitAudit(b, "class_name_value", "LoadFromThisOrGlobal", name0);
+                try b.push(.{ .LoadFromThisOrGlobal = .{
+                    .dst = cls,
+                    .this_idx = this_idx,
+                    .name = n,
+                    .class = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file),
+                } });
+            } else {
+                orEmitAudit(b, "class_name_value", "LoadGlobal", name0);
+                try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = n } });
+            }
             const dst = b.allocReg();
             const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
             try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = sentinel } });
             return dst;
         }
-        // A bare builtin type name used as a qualifier.
+        // A bare builtin type name used as a qualifier. Outside any
+        // receiver context no member can shadow it, so the read is a
+        // static global.
         if (isBuiltinTypeName(name0)) {
-            const this_idx = try b.recordCapture("this");
-            const dst = b.allocReg();
             const name = try b.module.internConst(b.allocator, .{ .String = name0 });
-            try b.push(.{ .LoadFromThisOrGlobal = .{ .dst = dst, .this_idx = this_idx, .name = name } });
+            const dst = b.allocReg();
+            if (inReceiverContext(b)) {
+                const this_idx = try b.recordCapture("this");
+                orEmitAudit(b, "builtin_type_name", "LoadFromThisOrGlobal", name0);
+                try b.push(.{ .LoadFromThisOrGlobal = .{ .dst = dst, .this_idx = this_idx, .name = name } });
+            } else {
+                orEmitAudit(b, "builtin_type_name", "LoadGlobal", name0);
+                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = name } });
+            }
             return dst;
         }
         // An imported member of a (possibly named) companion object →
@@ -871,8 +896,16 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 return lowerExpr(b, &qualified);
             }
         }
-        // A bare reference to a known top-level property is a global read.
-        if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0)) {
+        // A bare reference to a known top-level property is a global read
+        // — unless a runtime implicit receiver could shadow it: kotlinc
+        // resolves implicit-receiver members ahead of package-scope
+        // properties, so where some class declares a member of this name
+        // and a receiver is (or may be bound) in scope, the read decides
+        // at runtime instead.
+        if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
+            !(inReceiverContext(b) and b.module.registry.class_member_names.contains(name0)))
+        {
+            orEmitAudit(b, "top_level_prop", "LoadGlobal", name0);
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
@@ -884,7 +917,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // symbol index resolves it from the caller's scope and a unique
         // pick loads by exact FQN, so a same-simple-name function from
         // another package cannot swap in at runtime.
-        if (b.resolve("this") == null and !b.isLambdaBody() and b.ownerClass() == null and
+        if (!inReceiverContext(b) and
             !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and !isTopLevelProp(name0))
         {
             const ref_pick = b.module.resolveBareRefIndexed(name0, b.self_package, segments[0].span.file);
@@ -901,7 +934,12 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (b.resolve("this")) |this_reg| {
             // A bare name resolving to a known top-level fn is a
             // value-position function reference; skip the GetField shortcut.
-            const is_known_global = b.module.funcId(name0) != null;
+            // A known top-level *property* skips it too: the shortcut's
+            // lenient field resolution would adopt outer-chain members a
+            // plain extension receiver does not lexically see — the
+            // runtime walk below resolves member-vs-global with the right
+            // receiver scope.
+            const is_known_global = b.module.funcId(name0) != null or isTopLevelProp(name0);
             if (!is_known_global) {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -909,10 +947,30 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 return dst;
             }
         }
+        // Outside any receiver context no member can shadow the name, so
+        // the read is a static global (kotlinc rejects resolving it
+        // against a caller's receiver).
+        if (!inReceiverContext(b)) {
+            orEmitAudit(b, "bare_name_fallthrough", "LoadGlobal", name0);
+            const dst = b.allocReg();
+            const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
+            return dst;
+        }
         const this_idx = try b.recordCapture("this");
         const dst = b.allocReg();
         const name = try sgetterName(b, name0);
-        try b.push(.{ .LoadFromThisOrGlobal = .{ .dst = dst, .this_idx = this_idx, .name = name } });
+        // The index's unique pick rides as the exact global arm; the
+        // runtime member probe still runs first, and a runtime-scoped
+        // shadowing capture re-routes to the name lookup.
+        const ref_pick = b.module.resolveBareRefIndexed(name0, b.self_package, segments[0].span.file);
+        orEmitAudit(b, "bare_name_fallthrough", "LoadFromThisOrGlobal", name0);
+        try b.push(.{ .LoadFromThisOrGlobal = .{
+            .dst = dst,
+            .this_idx = this_idx,
+            .name = name,
+            .func = ref_pick,
+        } });
         return dst;
     }
 
@@ -939,12 +997,32 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     var cur: Reg = undefined;
     if (b.resolve(first.name)) |r| {
         cur = r;
-    } else {
+    } else if (inReceiverContext(b)) {
         // Unresolved head: route through `this` / the enclosing receiver.
+        // A head naming a known class carries the index-resolved class as
+        // the exact global arm (a runtime receiver member still shadows
+        // it, innermost first).
         const this_idx = try b.recordCapture("this");
         const dst = b.allocReg();
         const n = try b.module.internConst(b.allocator, .{ .String = first.name });
-        try b.push(.{ .LoadFromThisOrGlobal = .{ .dst = dst, .this_idx = this_idx, .name = n } });
+        orEmitAudit(b, "multi_seg_head", "LoadFromThisOrGlobal", first.name);
+        try b.push(.{ .LoadFromThisOrGlobal = .{
+            .dst = dst,
+            .this_idx = this_idx,
+            .name = n,
+            .class = b.module.classIdIndexed(first.name, b.self_package, first.span.file),
+        } });
+        cur = dst;
+    } else {
+        // No receiver context: the head is a static global.
+        const dst = b.allocReg();
+        const n = try b.module.internConst(b.allocator, .{ .String = first.name });
+        orEmitAudit(b, "multi_seg_head", "LoadGlobal", first.name);
+        try b.push(.{ .LoadGlobal = .{
+            .dst = dst,
+            .name = n,
+            .class = b.module.classIdIndexed(first.name, b.self_package, first.span.file),
+        } });
         cur = dst;
     }
     for (segments[1..]) |seg| {
@@ -1022,6 +1100,16 @@ fn lowerStringTemplate(b: *FuncBuilder, parts: []const ast.StringPart) Allocator
 }
 
 fn lowerShortInterp(b: *FuncBuilder, ident: ast.Ident) Allocator.Error!Reg {
+    // `$this` denotes the receiver itself — `this` is a keyword, never a
+    // member or global name — so it lowers exactly like a bare `this`
+    // expression: the bound `this`, or the captured slot in a lambda body.
+    if (std.mem.eql(u8, ident.name, "this")) {
+        if (b.resolve("this")) |r| return r;
+        const idx = try b.recordCapture("this");
+        const dst = b.allocReg();
+        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+        return dst;
+    }
     if (b.resolve(ident.name)) |r| return r;
     if (b.knowsOuter(ident.name)) {
         const idx = try b.recordCapture(ident.name);
@@ -1043,10 +1131,16 @@ fn lowerShortInterp(b: *FuncBuilder, ident: ast.Ident) Allocator.Error!Reg {
         try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = n } });
         return dst;
     }
-    const this_idx = try b.recordCapture("this");
-    const dst = b.allocReg();
     const n = try b.module.internConst(b.allocator, .{ .String = ident.name });
-    try b.push(.{ .LoadFromThisOrGlobal = .{ .dst = dst, .this_idx = this_idx, .name = n } });
+    const dst = b.allocReg();
+    if (inReceiverContext(b)) {
+        const this_idx = try b.recordCapture("this");
+        orEmitAudit(b, "short_interp", "LoadFromThisOrGlobal", ident.name);
+        try b.push(.{ .LoadFromThisOrGlobal = .{ .dst = dst, .this_idx = this_idx, .name = n } });
+    } else {
+        orEmitAudit(b, "short_interp", "LoadGlobal", ident.name);
+        try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
+    }
     return dst;
 }
 
@@ -2053,7 +2147,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 // ctor's outer argument forces a `this$0` capture).
                 if (class_id.int() < b.module.classes.items.len and
                     b.module.classes.items[class_id.int()].is_inner and
-                    b.resolve("this") == null and b.isLambdaBody())
+                    b.resolve("this") == null and b.capturesThisSlot())
                 {
                     _ = try b.recordCapture("this");
                 }
@@ -2067,6 +2161,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             } else {
                 const this_idx = try b.recordCapture("this");
                 const nmc = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
+                orEmitAudit(b, "class_or_factory_call", "CallMemberOrGlobal", callee.Path.segments[0].name);
                 try b.push(.{ .CallMemberOrGlobal = .{
                     .dst = dst,
                     .this_idx = this_idx,
@@ -2380,7 +2475,7 @@ fn lowerValueInvocation(
 
     // A bare call to a receiver-lambda param reached as a capture.
     if (b.isReceiverLambdaParam(name0) and b.resolve(name0) == null and b.knowsOuter(name0)) {
-        const this_reg: ?Reg = if (b.knowsOuter("this") or b.isLambdaBody())
+        const this_reg: ?Reg = if (b.knowsOuter("this") or b.capturesThisSlot())
             try resolveCapture(b, "this")
         else
             b.resolve("this");
@@ -2568,7 +2663,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
         b.module.funcId(name0) != null;
     if (shadowed_by_local) {
         const callee_r = try resolveCapture(b, name0);
-        const this_reg: ?Reg = if (b.knowsOuter("this") or b.isLambdaBody())
+        const this_reg: ?Reg = if (b.knowsOuter("this") or b.capturesThisSlot())
             try resolveCapture(b, "this")
         else
             b.resolve("this");
@@ -3014,6 +3109,45 @@ fn heurPickInexact(b: *FuncBuilder, fid: FuncId, want: usize) bool {
     return false;
 }
 
+/// True when a bare name in this builder's context can be shadowed by a
+/// runtime implicit receiver: lambda bodies (the bound receiver is only
+/// known at invoke time), method / extension / ctor-thunk bodies (`this`
+/// in scope). In every other context — a plain top-level function body —
+/// no implicit receiver exists, so member-vs-global is statically
+/// decidable: kotlinc rejects resolving a bare name against a *caller's*
+/// receiver (dynamic scope), so those sites emit the static global form.
+fn inReceiverContext(b: *const FuncBuilder) bool {
+    return b.capturesThisSlot() or b.resolve("this") != null or b.ownerClass() != null or
+        b.isParamThunk() or b.recvTy() != null;
+}
+
+var or_audit_checked: bool = false;
+var or_audit_enabled: bool = false;
+
+/// Compile-side half of the `KLIO_OR_AUDIT` detector (the runtime half
+/// lives in `ir/eval.zig`): logs every member-vs-global emission decision
+/// so a corpus sweep can join emit context against the runtime arm that
+/// actually won.
+fn orAuditOn() bool {
+    if (!or_audit_checked) {
+        or_audit_checked = true;
+        const a = std.heap.page_allocator;
+        if (runtime.procEnvGetVar(a, "KLIO_OR_AUDIT") catch null) |v| {
+            defer a.free(v);
+            or_audit_enabled = v.len != 0 and !std.mem.eql(u8, v, "0");
+        }
+    }
+    return or_audit_enabled;
+}
+
+pub fn orEmitAudit(b: *const FuncBuilder, site: []const u8, inst: []const u8, name: []const u8) void {
+    if (!orAuditOn()) return;
+    std.debug.print(
+        "[KLIO_OR_AUDIT] emit site={s} inst={s} name={s} recvctx={d} pkg={s}\n",
+        .{ site, inst, name, @intFromBool(inReceiverContext(b)), b.self_package },
+    );
+}
+
 var resolve_audit_checked: bool = false;
 var resolve_audit_enabled: bool = false;
 
@@ -3261,6 +3395,37 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         b.switchTo(dead);
         return b.emitConst(.Unit);
     }
+    // kotlinc resolves a bare call scope-by-scope, innermost receiver
+    // first: a member function — or an invoke-convention member property
+    // — of a runtime implicit receiver outranks the package-scope
+    // function. Where some class declares a member of this name and a
+    // receiver is (or may be bound) in scope, the call decides at
+    // runtime, carrying the lowering-resolved FuncId as the exact global
+    // arm. Cast-disambiguated and type-argumented calls keep the static
+    // form (their resolution is already exact).
+    {
+        const name0 = callee.Path.segments[0].name;
+        if (inReceiverContext(b) and !was_cast and ast_type_args.len == 0 and
+            b.module.registry.class_member_names.contains(name0))
+        {
+            const this_idx = try b.recordCapture("this");
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+            const dst = b.allocReg();
+            orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
+            try b.push(.{ .CallMemberOrGlobal = .{
+                .dst = dst,
+                .this_idx = this_idx,
+                .name = nm,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+                .func = func_id,
+            } });
+            return dst;
+        }
+    }
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
@@ -3328,8 +3493,9 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
         const uarg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nmc = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
         const dst = b.allocReg();
-        if (b.isLambdaBody()) {
+        if (b.capturesThisSlot()) {
             const this_idx = try b.recordCapture("this");
+            orEmitAudit(b, "ext_bare_call_lambda", "CallMemberOrGlobal", callee.Path.segments[0].name);
             try b.push(.{ .CallMemberOrGlobal = .{
                 .dst = dst,
                 .this_idx = this_idx,
@@ -3473,11 +3639,33 @@ fn lowerUnresolvedBareCall(
             return dst;
         }
     }
+    // Outside any receiver context no member can serve the call (kotlinc
+    // rejects resolving a bare call against a caller's receiver), and
+    // `funcId == null` here means the overload tier has no candidates
+    // either — the callee is a static global value.
+    if (!inReceiverContext(b)) {
+        orEmitAudit(b, "unresolved_bare_call", "LoadGlobal", name0);
+        const callee_r = b.allocReg();
+        const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+        try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
+        const run = try lowerArgRun(b, args);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const dst = b.allocReg();
+        try b.push(.{ .CallValue = .{
+            .dst = dst,
+            .callee = callee_r,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+        } });
+        return dst;
+    }
     const this_idx = try b.recordCapture("this");
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+    orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);
     try b.push(.{ .CallMemberOrGlobal = .{
         .dst = dst,
         .this_idx = this_idx,
@@ -3672,6 +3860,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
         const dst = b.allocReg();
+        orEmitAudit(b, "member_or_local_callable", "CallMemberOrValue", name.name);
         try b.push(.{ .CallMemberOrValue = .{
             .dst = dst,
             .receiver = recv,
@@ -3973,7 +4162,7 @@ test "lowers unary negation" {
     try testing.expectEqual(UnOp.Neg, func.blocks[0].insts[1].UnOp.op);
 }
 
-test "path falls back to load global when unbound" {
+test "unbound path in a plain body is a static global read" {
     var m = Module.default(testing.allocator);
     defer m.deinit(testing.allocator);
     var b = try FuncBuilder.init(testing.allocator, &m);
@@ -3984,6 +4173,25 @@ test "path falls back to load global when unbound" {
     b.terminate(.{ .Return = r });
     const func = try b.finish("f", "f", build.typeUnit());
     defer freeFunc(func);
+    // No receiver context: nothing can shadow the global, so the read
+    // is statically classified.
+    try testing.expect(func.blocks[0].insts[0] == .LoadGlobal);
+}
+
+test "unbound path in a lambda body resolves member-vs-global at runtime" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    b.setOuterNames(StringSet.init(testing.allocator));
+    var seg = [_]ast.Ident{.{ .name = "println", .span = dummySpan() }};
+    const e = Expr{ .Path = .{ .segments = &seg, .span = dummySpan() } };
+    const r = try lowerExpr(&b, &e);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "f", build.typeUnit());
+    defer freeFunc(func);
+    // The lambda's bound receiver is unknowable statically; the Or form
+    // keeps the runtime member arm.
     try testing.expect(func.blocks[0].insts[0] == .LoadFromThisOrGlobal);
 }
 

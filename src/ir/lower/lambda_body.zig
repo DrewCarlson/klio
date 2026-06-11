@@ -63,7 +63,7 @@ pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
     // lambda can capture the enclosing receiver: forward `this`
     // through this builder's own capture slot rather than collapsing
     // it to `Unit`.
-    if (std.mem.eql(u8, name, "this") and b.isLambdaBody()) {
+    if (std.mem.eql(u8, name, "this") and b.capturesThisSlot()) {
         const idx = try b.recordCapture("this");
         const dst = b.allocReg();
         try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });

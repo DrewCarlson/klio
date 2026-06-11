@@ -18,6 +18,7 @@ const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
 const host_impl = @import("host_impl.zig");
 const host_globals = @import("host_globals.zig");
+const host_call_member = @import("host_call_member.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -105,6 +106,7 @@ fn withFieldResolvePair(
     name: []const u8,
     receiver: *const Value,
     suppress_cc_redirect: bool,
+    member_probe: bool,
 ) Allocator.Error!?EvalResult {
     for (field_resolve_stack.items) |k| {
         if (k.id == id and std.mem.eql(u8, k.name, name)) return null;
@@ -113,7 +115,7 @@ fn withFieldResolvePair(
     // capacity-retaining at run boundaries; a per-run-arena backing would
     // leave the retained capacity dangling once that arena is torn down).
     field_resolve_stack.append(std.heap.page_allocator, .{ .id = id, .name = name }) catch {};
-    const r = try getFieldInner(self, allocator, receiver, name, suppress_cc_redirect);
+    const r = try getFieldInner(self, allocator, receiver, name, suppress_cc_redirect, member_probe);
     var i: usize = field_resolve_stack.items.len;
     while (i > 0) {
         i -= 1;
@@ -233,7 +235,19 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
 // -------------------------------------------------------------------------
 
 pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return getFieldInner(self, allocator, receiver, name, false);
+    return getFieldInner(self, allocator, receiver, name, false, false);
+}
+
+/// Per-candidate probe for the bare-name resolver's innermost-first walk:
+/// resolves only what the receiver itself owns — instance fields,
+/// declared properties and their getters, applicable extension
+/// properties, builtin member properties. Every global / outer-receiver /
+/// companion adoption tail is disabled, so a candidate cannot "resolve" a
+/// name it does not own and shadow a real member of a receiver further
+/// out; the walk's own terminal arm decides the global fallback, and
+/// companions ride the walk as their own candidates.
+pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+    return getFieldInner(self, allocator, receiver, name, false, true);
 }
 
 /// `suppress_cc_redirect` skips the suspend-implicit `coroutineContext`
@@ -242,7 +256,11 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
 /// parameter scoped to the resolution, threaded through the fallback
 /// ladder's own recursion, so it cannot leak into a dispatched getter
 /// body or across a re-entrant dispatch.
-fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool) Allocator.Error!EvalResult {
+/// `member_probe` restricts resolution to what the receiver itself owns
+/// (see `getMemberField`); the adoption tails — globals, enclosing
+/// receivers, outer chain, companions — are skipped so the bare-name
+/// walk's candidate order decides precedence.
+fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool) Allocator.Error!EvalResult {
     // Reflective reads on a *bound* member reference (`this::name`):
     // `.name`/`.simpleName` yield the referenced member's name, and
     // `.isInitialized` answers the lateinit probe against the captured
@@ -314,7 +332,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // Explicit `recv.coroutineContext` (lowered to this sentinel):
     // bypass the bare-`coroutineContext` redirect for this one read.
     if (std.mem.eql(u8, name, "$coroutineContext$explicit")) {
-        return getFieldInner(self, allocator, receiver, "coroutineContext", true);
+        return getFieldInner(self, allocator, receiver, "coroutineContext", true, member_probe);
     }
     // Scope-qualified property read (`$sgetter$<owner>\u{1f}<name>`):
     // invoke the lexically enclosing owner's own custom getter.
@@ -332,7 +350,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     return evalGetter(self, allocator, fid, receiver.*);
                 }
             }
-            return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect);
+            return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
         }
     }
     // Suspend-implicit `coroutineContext` intrinsic: redirect a bare
@@ -348,7 +366,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 recv_owns_context = g.get().get("coroutineContext") != null;
             }
             if (!same and !recv_owns_context) {
-                return getFieldInner(self, allocator, &scope, "coroutineContext", suppress_cc_redirect);
+                return getFieldInner(self, allocator, &scope, "coroutineContext", suppress_cc_redirect, member_probe);
             }
         }
     }
@@ -542,7 +560,19 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 const msg = try std.fmt.allocPrint(allocator, "extension prop FuncId {d} out of range", .{fid.int()});
                 return errRes(.{ .Type = msg });
             }
-            return evalGetter(self, allocator, fid, receiver.*);
+            // A member-extension property's getter body has its declaring
+            // class's `this` in lexical scope; seed the getter frame with
+            // the owner instance from the enclosing chain.
+            var pushed_owner = false;
+            if (mptr.registry.member_ext_owner_class.get(fid)) |owner| {
+                if (try host_call_member.memberExtOwnerInstance(self, allocator, receiver, owner)) |inst| {
+                    ir.eval.pushEnclosing(&inst);
+                    pushed_owner = true;
+                }
+            }
+            const r = try evalGetter(self, allocator, fid, receiver.*);
+            if (pushed_owner) ir.eval.popEnclosing();
+            return r;
         }
     }
     // Reflection-style accessors on `KClass` / `KProperty` values.
@@ -618,7 +648,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         }
     }
     if (receiver.* == .Instance) {
-        if (try instanceField(self, allocator, receiver, name)) |v| return v;
+        if (try instanceField(self, allocator, receiver, name, member_probe)) |v| return v;
     }
     // Stdlib property read on a built-in type — `"abc".length`, etc.
     const type_fqn = receiver.typeFqn();
@@ -651,7 +681,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             }
         }
         for (delegates.items) |d| {
-            switch (try getFieldInner(self, allocator, &d, name, suppress_cc_redirect)) {
+            switch (try getFieldInner(self, allocator, &d, name, suppress_cc_redirect, member_probe)) {
                 .ok => |v| if (v != .Unit) return ok(v),
                 .err => {},
             }
@@ -668,8 +698,10 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         if (stdlib.primitive_companion_const(simple, name)) |v| return ok(v);
     }
     // Companion fallback for an instance receiver: a companion `val` is
-    // in scope unqualified inside the class's own member bodies.
-    if (receiver.* == .Instance) {
+    // in scope unqualified inside the class's own member bodies. The
+    // member probe skips it — companions ride the bare-name walk as
+    // their own candidates at the owning class's depth.
+    if (!member_probe and receiver.* == .Instance) {
         const is_companion_recv = std.mem.indexOf(u8, className(receiver.Instance), "$Companion$") != null;
         var cur: ?[]const u8 = if (is_companion_recv) null else className(receiver.Instance);
         var seen: std.ArrayList([]const u8) = .empty;
@@ -690,7 +722,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 };
                 if (singleton) |s| {
                     if (s == .Instance) {
-                        switch (try getFieldInner(self, allocator, &s, name, suppress_cc_redirect)) {
+                        switch (try getFieldInner(self, allocator, &s, name, suppress_cc_redirect, member_probe)) {
                             .ok => |v| if (v != .Unit) return ok(v),
                             .err => {},
                         }
@@ -703,7 +735,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // A top-level *function* must not outrank a property of an enclosing
     // implicit receiver. Try the enclosing receiver first when the
     // global is callable, adopting only a non-callable result.
-    const global_is_callable = blk: {
+    const global_is_callable = !member_probe and blk: {
         {
             const g = self.module.borrow();
             defer g.deinit();
@@ -717,51 +749,62 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         };
     };
     if (global_is_callable) {
-        if (outerThisLast(self)) |outer| {
+        const chain = try ir.eval.enclosingThisChainAlloc(allocator);
+        defer allocator.free(chain);
+        for (chain) |outer| {
             const skip = outer == .Null or outer == .Unit or
                 (outer == .Instance and receiver.* == .Instance and ObjRef(InstanceData).ptrEq(outer.Instance, receiver.Instance));
-            if (!skip) {
-                const oid: usize = if (outer == .Instance) outer.Instance.identity() else 0;
-                if (try withFieldResolvePair(self, allocator, oid, name, &outer, suppress_cc_redirect)) |r| {
-                    if (r == .ok) {
-                        switch (r.ok) {
-                            .Unit, .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => {},
-                            else => return r,
-                        }
+            if (skip) continue;
+            const oid: usize = if (outer == .Instance) outer.Instance.identity() else 0;
+            if (try withFieldResolvePair(self, allocator, oid, name, &outer, suppress_cc_redirect, false)) |r| {
+                if (r == .ok) {
+                    switch (r.ok) {
+                        .Unit, .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => {},
+                        else => return r,
                     }
                 }
             }
         }
     }
     // Bare top-level `const val` / `val` referenced inside an extension
-    // body — resolve as a global before failing.
-    {
-        const gg = self.globals.borrow();
-        defer gg.deinit();
-        if (gg.get().lookup(name)) |v| return ok(v);
-    }
-    // Stdlib const-style globals through the full global path.
-    if (self.lookupGlobal(name)) |v| return ok(v);
-    // Drive a later top-level property's initializer on demand.
-    switch (try host_impl.ensureTopLevelInited(self, name)) {
-        .ok => |maybe| if (maybe) |v| return ok(v),
-        .err => |e| return errRes(e),
+    // body — resolve as a global before failing. The member probe never
+    // adopts a global: the walk's own terminal arm decides that tier.
+    if (!member_probe) {
+        {
+            const gg = self.globals.borrow();
+            defer gg.deinit();
+            if (gg.get().lookup(name)) |v| return ok(v);
+        }
+        // Stdlib const-style globals through the full global path.
+        if (self.lookupGlobal(name)) |v| return ok(v);
+        // Drive a later top-level property's initializer on demand.
+        switch (try host_impl.ensureTopLevelInited(self, name)) {
+            .ok => |maybe| if (maybe) |v| return ok(v),
+            .err => |e| return errRes(e),
+        }
     }
     // Enclosing-receiver fallback: a bare member property read inside a
     // member-extension / receiver-lambda body may name a member of the
-    // lexically enclosing class instance.
-    if (outerThisLast(self)) |outer| {
-        const same = outer == .Instance and receiver.* == .Instance and ObjRef(InstanceData).ptrEq(outer.Instance, receiver.Instance);
-        if (!same and outer != .Null and outer != .Unit) {
+    // lexically enclosing class instance. The member probe skips it —
+    // enclosing receivers are the walk's own candidates.
+    if (!member_probe) {
+        // The chain holds the lexical receivers innermost-first (an
+        // extension receiver sits inside its member-extension owner), so
+        // every entry is a candidate, not just the innermost.
+        const chain = try ir.eval.enclosingThisChainAlloc(allocator);
+        defer allocator.free(chain);
+        for (chain) |outer| {
+            const same = outer == .Instance and receiver.* == .Instance and ObjRef(InstanceData).ptrEq(outer.Instance, receiver.Instance);
+            if (same or outer == .Null or outer == .Unit) continue;
             const oid: usize = if (outer == .Instance) outer.Instance.identity() else 0;
-            if (try withFieldResolvePair(self, allocator, oid, name, &outer, suppress_cc_redirect)) |r| {
+            if (try withFieldResolvePair(self, allocator, oid, name, &outer, suppress_cc_redirect, false)) |r| {
                 if (r == .ok and r.ok != .Unit) return r;
             }
         }
     }
     // Inner-class outer-chain fallback: walk the receiver's captured
     // `outer` link for a field of an enclosing-class instance.
-    if (!field_outer_active) {
+    if (!member_probe and !field_outer_active) {
         field_outer_active = true;
         defer field_outer_active = false;
         var cur: ?Value = switch (receiver.*) {
@@ -774,7 +817,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         };
         while (cur) |o| {
             if (o == .Null or o == .Unit) break;
-            switch (try getFieldInner(self, allocator, &o, name, suppress_cc_redirect)) {
+            switch (try getFieldInner(self, allocator, &o, name, suppress_cc_redirect, member_probe)) {
                 .ok => |v| if (v != .Unit) return ok(v),
                 .err => {},
             }
@@ -789,8 +832,9 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         }
     }
     // Bare member of the enclosing class's companion accessed from inside
-    // an instance method.
-    if (receiver.* == .Instance) {
+    // an instance method. Skipped by the member probe (companions are
+    // candidates).
+    if (!member_probe and receiver.* == .Instance) {
         const cls_name = className(receiver.Instance);
         const comp_name: ?[]const u8 = blk: {
             const g = self.module.borrow();
@@ -805,7 +849,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (comp) |c| {
                 const same = c == .Instance and ObjRef(InstanceData).ptrEq(c.Instance, receiver.Instance);
                 if (!same) {
-                    switch (try getFieldInner(self, allocator, &c, name, suppress_cc_redirect)) {
+                    switch (try getFieldInner(self, allocator, &c, name, suppress_cc_redirect, member_probe)) {
                         .ok => |v| return ok(v),
                         .err => {},
                     }
@@ -1096,7 +1140,7 @@ fn resolveExtensionProp(
 /// custom getter (with override rules), raw slot (lateinit / built-in
 /// delegate auto-unwrap), companion/parent walk, outer-chain, enum
 /// entries, nested classes, globals.
-fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
+fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, member_probe: bool) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     const class_name = className(inst);
     // Delegated body property: route through the delegate's `getValue`.
@@ -1181,10 +1225,13 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         return ok(v);
     }
     // Companion / parent / interface chain walk for a companion-owned
-    // field.
-    if (try companionParentWalk(self, allocator, inst, name)) |v| return v;
-    // Outer-instance chain fallback.
-    if (try outerInstanceChain(self, allocator, inst, name)) |v| return v;
+    // field. The member probe resolves companions and outer instances as
+    // the bare-name walk's own candidates instead.
+    if (!member_probe) {
+        if (try companionParentWalk(self, allocator, inst, name)) |v| return v;
+        // Outer-instance chain fallback.
+        if (try outerInstanceChain(self, allocator, inst, name)) |v| return v;
+    }
     // Enum entry bare-name access.
     {
         const g = inst.borrow();
@@ -1214,13 +1261,13 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         g.deinit();
     }
     // Nested-class fallback.
-    {
+    if (!member_probe) {
         const cg = self.classes.borrow();
         defer cg.deinit();
         if (cg.get().get(name)) |def| return ok(.{ .Class = def });
     }
     // Top-level global / module-scoped fallback.
-    {
+    if (!member_probe) {
         const gg = self.globals.borrow();
         defer gg.deinit();
         if (gg.get().lookup(name)) |v| return ok(v);
@@ -1417,7 +1464,7 @@ fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Instance
                     if (g.get().get(name)) |v| return ok(v);
                 }
                 const oid = outer_inst.identity();
-                if (try withFieldResolvePair(self, allocator, oid, name, &o, false)) |r| {
+                if (try withFieldResolvePair(self, allocator, oid, name, &o, false, false)) |r| {
                     if (r == .ok and r.ok != .Unit) return r;
                 }
                 cur_outer = blk: {
@@ -1501,7 +1548,19 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                 const msg = try std.fmt.allocPrint(allocator, "ext setter FuncId {d} out of range", .{f.int()});
                 return .{ .err = .{ .Type = msg } };
             }
-            switch (try evalSetter(self, allocator, f, receiver.*, value)) {
+            // A member-extension property's setter body has its declaring
+            // class's `this` in lexical scope; seed the setter frame with
+            // the owner instance from the enclosing chain.
+            var pushed_owner = false;
+            if (mptr.registry.member_ext_owner_class.get(f)) |owner| {
+                if (try host_call_member.memberExtOwnerInstance(self, allocator, receiver, owner)) |inst| {
+                    ir.eval.pushEnclosing(&inst);
+                    pushed_owner = true;
+                }
+            }
+            const r = try evalSetter(self, allocator, f, receiver.*, value);
+            if (pushed_owner) ir.eval.popEnclosing();
+            switch (r) {
                 .ok => return .{ .ok = {} },
                 .err => |e| return .{ .err = e },
             }

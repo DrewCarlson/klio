@@ -1805,7 +1805,7 @@ fn selectInnerOuter(self: *VmHost, allocator: Allocator, class_def: ObjRef(Class
         const h = outer_hint orelse break :blk false;
         if (h.* != .Instance) break :blk false;
         for (entries) |*e| {
-            if (!e.is_subject) continue;
+            if (!e.isSubject()) continue;
             break :blk e.v == .Instance and
                 ObjRef(InstanceData).ptrEq(h.Instance, e.v.Instance);
         }
@@ -1818,7 +1818,7 @@ fn selectInnerOuter(self: *VmHost, allocator: Allocator, class_def: ObjRef(Class
     }
     for (entries) |*e| {
         if (instanceOfClassName(&e.v, want)) return e.v;
-        if (!e.is_subject) {
+        if (!e.isSubject()) {
             if (outerWalkMatch(&e.v, want)) |m| return m;
         }
     }

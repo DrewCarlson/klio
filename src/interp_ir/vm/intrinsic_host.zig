@@ -272,7 +272,7 @@ pub fn evalClosureRaw(
     const state = vmhost.SharedHandles.fromIntrinsic(self);
     var host = VmHost.borrowed(state, state.globals, out);
     vmhost.emitPath(self.allocator, "coroutine_closure", func.fqn, info.body_func, this_value, args);
-    return ir.eval.evalWithCaptures(VmHost, self.allocator, module, func, args_owned, caps_owned, &host);
+    return ir.eval.evalWithCapturesChained(VmHost, self.allocator, module, null, func, args_owned, caps_owned, info.chain, &host);
 }
 
 /// Resume a parked activation with `value`, raw `EvalError` out.
@@ -423,7 +423,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         const state = vmhost.SharedHandles.fromIntrinsic(self);
         var host = VmHost.borrowed(state, state.globals, out);
         vmhost.emitPath(self.allocator, "hof_invoke", func.fqn, info.body_func, null, args);
-        const result = try ir.eval.evalWithCaptures(VmHost, self.allocator, module, func, call_args, caps_owned, &host);
+        const result = try ir.eval.evalWithCapturesChained(VmHost, self.allocator, module, null, func, call_args, caps_owned, info.chain, &host);
         return flattenEval(result);
     }
 
@@ -543,7 +543,9 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
             // receiver for the duration of the lambda call: a `with(a) { … }`
             // body that calls a member-extension declared on `a`'s class then
             // sees that owner as visible.
-            const pushed_receiver = this_value.* == .Instance;
+            // A null subject is a real receiver candidate for
+            // nullable-receiver extensions.
+            const pushed_receiver = this_value.* == .Instance or this_value.* == .Null;
             if (pushed_receiver) {
                 host_call_member.pushOuterSubject(self.allocator, this_value);
             }

@@ -571,7 +571,7 @@ fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg) Al
                     .field = field,
                     .value = combined,
                 } });
-            } else if (b.isLambdaBody()) {
+            } else if (b.capturesThisSlot()) {
                 // Unqualified write inside a lambda body whose
                 // name is not a local/param/captured-outer/
                 // own-member. By Kotlin scoping it is either a
@@ -585,6 +585,7 @@ fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg) Al
                 // receiver's member when present, else globals.
                 const this_idx = try b.recordCapture("this");
                 const name_c = try b.module.internConst(b.allocator, .{ .String = seg });
+                expr_mod.orEmitAudit(b, "bare_name_assign", "StoreToThisOrGlobal", seg);
                 try b.push(.{ .StoreToThisOrGlobal = .{
                     .this_idx = this_idx,
                     .name = name_c,

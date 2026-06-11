@@ -50,6 +50,42 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     }
 }
 
+/// Run an embedded program expected to FAIL with an unresolved-reference
+/// error naming `unresolved`. Pins kotlinc-rejected shapes (the interpreter
+/// surfaces them as runtime resolution errors).
+fn assertKlioUnresolved(name: []const u8, src: []const u8, unresolved: []const u8) !void {
+    _ = file_arena.reset(.retain_capacity);
+    const a = file_arena.allocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, TMP_DIR) catch |e| {
+        std.debug.print("lambdas_and_dispatch {s}: mkdir failed {s}\n", .{ name, @errorName(e) });
+        return error.KlioRunFailed;
+    };
+    const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
+    cwd.writeFile(io, .{ .sub_path = path, .data = src }) catch |e| {
+        std.debug.print("lambdas_and_dispatch {s}: write failed {s}\n", .{ name, @errorName(e) });
+        return error.KlioRunFailed;
+    };
+
+    const res = try parity.runWithPacks(a, io, path);
+    switch (res) {
+        .ok => |got| {
+            std.debug.print("lambdas_and_dispatch {s}: expected unresolved `{s}`, program ran: {s}\n", .{ name, unresolved, got });
+            return error.KlioRunFailed;
+        },
+        .err => |m| {
+            if (std.mem.indexOf(u8, m, "unresolved") == null or std.mem.indexOf(u8, m, unresolved) == null) {
+                std.debug.print("lambdas_and_dispatch {s}: expected unresolved `{s}`, got error: {s}\n", .{ name, unresolved, m });
+                return error.KlioRunFailed;
+            }
+        },
+    }
+}
+
 test "function_reference_to_extension" {
     const src =
         \\
@@ -347,4 +383,483 @@ test "receiver_typed_lambda_bare_invocation_field_read" {
         \\
     ;
     try assertKlio("receiver_lambda_field", src, "p\n");
+}
+
+test "bare_write_reaches_outer_receiver_member" {
+    // kotlinc-pinned (tests/fixtures/parity_corpus/bare_write_outer_receiver_member.kt):
+    // a bare-name write inside a nested receiver lambda resolves against
+    // the implicit receivers innermost-first, like the read side.
+    const src =
+        \\
+        \\class Outer { var label: String = "init" }
+        \\class Gadget { var size: Int = 0 }
+        \\fun main() {
+        \\    val o = Outer()
+        \\    with(o) {
+        \\        with(Gadget()) {
+        \\            label = "from-inner"
+        \\            size = 7
+        \\            println(size)
+        \\        }
+        \\    }
+        \\    println(o.label)
+        \\}
+        \\
+    ;
+    try assertKlio("bare_write_outer_receiver", src, "7\nfrom-inner\n");
+}
+
+test "bare_write_member_beats_same_named_global" {
+    // kotlinc-pinned: an enclosing receiver's member outranks a top-level
+    // `var` of the same name for a bare-name write.
+    const src =
+        \\
+        \\class Outer { var label: String = "init" }
+        \\class Gadget { var size: Int = 0 }
+        \\var label: String = "global"
+        \\fun main() {
+        \\    val o = Outer()
+        \\    with(o) {
+        \\        with(Gadget()) {
+        \\            label = "written"
+        \\        }
+        \\    }
+        \\    println(o.label)
+        \\    println(label)
+        \\}
+        \\
+    ;
+    try assertKlio("bare_write_member_over_global", src, "written\nglobal\n");
+}
+
+test "extension_on_inner_receiver_beats_outer_member" {
+    // kotlinc-pinned: implicit-receiver call resolution is per-receiver,
+    // innermost-first — an extension applicable to the inner receiver
+    // outranks a member of the outer receiver.
+    const src =
+        \\
+        \\class Outer { fun describe(): String = "outer-member" }
+        \\class Inner
+        \\fun Inner.describe(): String = "inner-extension"
+        \\fun main() {
+        \\    with(Outer()) {
+        \\        with(Inner()) {
+        \\            println(describe())
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    try assertKlio("inner_ext_over_outer_member", src, "inner-extension\n");
+}
+
+test "bare_write_in_inner_class_lambda_reaches_outer_property" {
+    // kotlinc-pinned: a dispatch receiver brings its class-nesting tower
+    // into scope for writes — a lambda in an inner-class method writing a
+    // bare name mutates `this@Owner`'s property.
+    const src =
+        \\
+        \\class Owner {
+        \\    var status: String = "init"
+        \\    inner class Pocket {
+        \\        fun update() {
+        \\            listOf(1).forEach { status = "from-lambda" }
+        \\        }
+        \\    }
+        \\}
+        \\fun main() {
+        \\    val o = Owner()
+        \\    o.Pocket().update()
+        \\    println(o.status)
+        \\}
+        \\
+    ;
+    try assertKlio("inner_class_lambda_outer_write", src, "from-lambda\n");
+}
+
+test "top_level_fn_cannot_see_callers_receiver" {
+    // kotlinc rejects resolving a bare name in a top-level function body
+    // against a *caller's* `with` receiver (dynamic scope). The lowering
+    // classifies the no-receiver-context call as a static global, so the
+    // program fails with an unresolved reference instead of leaking the
+    // caller's receiver.
+    const src =
+        \\
+        \\class Box { fun payload(): String = "hidden" }
+        \\fun leak(): String = payload()
+        \\fun main() {
+        \\    with(Box()) {
+        \\        println(leak())
+        \\    }
+        \\}
+        \\
+    ;
+    try assertKlioUnresolved("dynamic_scope_call_rejected", src, "payload");
+}
+
+test "closure_in_no_receiver_scope_writes_top_level" {
+    // kotlinc: a lambda created in `main` (no receivers in scope) resolves
+    // a bare write lexically — the top-level `var`, never the member of
+    // the method it is dynamically invoked from.
+    const src =
+        \\
+        \\class Host {
+        \\    var label: String = "host-init"
+        \\    fun act(f: () -> Unit) { f() }
+        \\}
+        \\var label: String = "global"
+        \\fun main() {
+        \\    val h = Host()
+        \\    val f = { label = "written" }
+        \\    h.act(f)
+        \\    println(h.label)
+        \\    println(label)
+        \\}
+        \\
+    ;
+    try assertKlio("closure_lexical_write", src, "host-init\nwritten\n");
+}
+
+test "closure_in_no_receiver_scope_reads_top_level" {
+    const src =
+        \\
+        \\class Host {
+        \\    val label: String = "host-member"
+        \\    fun act(f: () -> String): String = f()
+        \\}
+        \\val label: String = "global"
+        \\fun main() {
+        \\    val f = { label }
+        \\    println(Host().act(f))
+        \\}
+        \\
+    ;
+    try assertKlio("closure_lexical_read", src, "global\n");
+}
+
+test "closure_captures_creation_receivers_lexically" {
+    // The lambda is created inside `with(W())` and invoked later from a
+    // scope with different (or no) receivers: kotlinc resolves `tag`
+    // against the creation-time receiver, not the invocation context.
+    const src =
+        \\
+        \\val tag = "global"
+        \\class W { val tag = "w-member" }
+        \\var f: (() -> String)? = null
+        \\fun main() {
+        \\    with(W()) { f = { tag } }
+        \\    println(f!!())
+        \\}
+        \\
+    ;
+    try assertKlio("closure_creation_chain", src, "w-member\n");
+}
+
+test "closure_creation_scope_beats_invocation_scope" {
+    const src =
+        \\
+        \\class A { val mark = "a-member" }
+        \\class B { val mark = "b-member" }
+        \\fun main() {
+        \\    var g: (() -> String)? = null
+        \\    with(A()) { g = { mark } }
+        \\    with(B()) { println(g!!()) }
+        \\}
+        \\
+    ;
+    try assertKlio("closure_creation_vs_invocation", src, "a-member\n");
+}
+
+test "anon_fun_resolves_enclosing_receivers" {
+    // An anonymous-function body resolves bare names against the
+    // lexically enclosing receivers exactly like a lambda body.
+    const src =
+        \\
+        \\class Box {
+        \\    fun payload(): String = "member-fn"
+        \\    val tag = "member-prop"
+        \\}
+        \\fun main() {
+        \\    with(Box()) {
+        \\        val f = fun(): String { return payload() }
+        \\        println(f())
+        \\        val g = fun(): String { return tag }
+        \\        println(g())
+        \\    }
+        \\}
+        \\
+    ;
+    try assertKlio("anon_fun_receiver_scope", src, "member-fn\nmember-prop\n");
+}
+
+test "anon_fun_bare_write_reaches_receiver_member" {
+    const src =
+        \\
+        \\class Box { var label = "init" }
+        \\var label = "global"
+        \\fun main() {
+        \\    with(Box()) {
+        \\        val w = fun() { label = "set-by-anon" }
+        \\        w()
+        \\        println(label)
+        \\    }
+        \\    println(label)
+        \\}
+        \\
+    ;
+    try assertKlio("anon_fun_receiver_write", src, "set-by-anon\nglobal\n");
+}
+
+test "function_shape_ext_requires_function_receiver" {
+    // `(() -> Int).describe()` is not applicable to a plain instance, so
+    // the outer receiver's member binds.
+    const src =
+        \\
+        \\class Outer { fun describe(): String = "outer-member" }
+        \\class Inner
+        \\fun (() -> Int).describe(): String = "fn-ext"
+        \\fun main() {
+        \\    with(Outer()) { with(Inner()) { println(describe()) } }
+        \\}
+        \\
+    ;
+    try assertKlio("fn_shape_ext_proof", src, "outer-member\n");
+}
+
+test "bounded_type_param_ext_requires_bound" {
+    // `<T : Number> T.halve()` is not applicable to a String receiver
+    // (outer member wins) but is to an Int receiver (innermost ext wins).
+    const src =
+        \\
+        \\class Outer { fun halve(): String = "outer-member" }
+        \\fun <T : Number> T.halve(): String = "number-ext"
+        \\fun main() {
+        \\    with(Outer()) { with("str") { println(halve()) } }
+        \\    with(Outer()) { with(42) { println(halve()) } }
+        \\}
+        \\
+    ;
+    try assertKlio("bounded_generic_ext_proof", src, "outer-member\nnumber-ext\n");
+}
+
+test "generic_elem_ext_proof_both_ways" {
+    // `List<String>.render()` is disproven on a list of Ints (outer
+    // member binds) and proven on a list of Strings (innermost ext binds).
+    const src =
+        \\
+        \\class Outer { fun render(): String = "outer-member" }
+        \\fun List<String>.render(): String = "string-list-ext"
+        \\fun main() {
+        \\    with(Outer()) { with(listOf(1, 2)) { println(render()) } }
+        \\    with(Outer()) { with(listOf("a", "b")) { println(render()) } }
+        \\}
+        \\
+    ;
+    try assertKlio("generic_elem_ext_proof", src, "outer-member\nstring-list-ext\n");
+}
+
+test "typealias_ext_receiver_expands" {
+    const src =
+        \\
+        \\typealias Rows = List<Int>
+        \\fun Rows.total(): String = "rows-ext"
+        \\class Outer { fun total(): String = "outer-member" }
+        \\fun main() {
+        \\    with(Outer()) { with(listOf(1, 2)) { println(total()) } }
+        \\}
+        \\
+    ;
+    try assertKlio("typealias_ext_receiver", src, "rows-ext\n");
+}
+
+test "nullable_ext_receiver_accepts_null_subject" {
+    const src =
+        \\
+        \\class Outer { fun show(): String = "outer-member" }
+        \\class Thing
+        \\fun Thing?.show(): String = if (this == null) "ext-null" else "ext-thing"
+        \\fun main() {
+        \\    val t: Thing? = null
+        \\    with(Outer()) { with(t) { println(show()) } }
+        \\}
+        \\
+    ;
+    try assertKlio("nullable_ext_null_subject", src, "ext-null\n");
+}
+
+test "outer_member_read_beats_top_level_when_inner_misses" {
+    // The innermost receiver does not own `z`; the outer receiver's
+    // member outranks the top-level binding — a candidate probe must not
+    // adopt a global.
+    const src =
+        \\
+        \\class A
+        \\class B { val z: String = "b-member" }
+        \\val z: String = "global"
+        \\fun main() {
+        \\    with(B()) { with(A()) { println(z) } }
+        \\}
+        \\
+    ;
+    try assertKlio("outer_member_over_global_read", src, "b-member\n");
+}
+
+test "companion_property_rides_implicit_chain" {
+    // A companion `val` is an implicit receiver at its class's own depth:
+    // it outranks the top-level binding inside the class's members, but
+    // an instance member and a with-subject member outrank it.
+    const src =
+        \\
+        \\val tag: String = "global"
+        \\class Other
+        \\class Host {
+        \\    companion object { val tag: String = "companion" }
+        \\    fun test(): String = with(Other()) { tag }
+        \\}
+        \\class Host2 {
+        \\    val tag = "instance"
+        \\    companion object { val tag2 = "companion" }
+        \\    fun test(): String = tag
+        \\}
+        \\class WithSubject { val mark = "subject-member" }
+        \\class Host3 {
+        \\    companion object { val mark = "companion" }
+        \\    fun test(): String = with(WithSubject()) { mark }
+        \\}
+        \\fun main() {
+        \\    println(Host().test())
+        \\    println(Host2().test())
+        \\    println(Host3().test())
+        \\}
+        \\
+    ;
+    try assertKlio("companion_implicit_chain", src, "companion\ninstance\nsubject-member\n");
+}
+
+test "outer_class_companion_visible_in_inner_class" {
+    const src =
+        \\
+        \\class Outer {
+        \\    companion object { val mark = "outer-companion" }
+        \\    inner class In { fun f(): String = mark }
+        \\}
+        \\fun main() { println(Outer().In().f()) }
+        \\
+    ;
+    try assertKlio("inner_sees_outer_companion", src, "outer-companion\n");
+}
+
+test "companion_var_takes_bare_write" {
+    const src =
+        \\
+        \\class Host {
+        \\    companion object { var count = 0 }
+        \\    fun bump() { count = 5 }
+        \\}
+        \\fun main() {
+        \\    val h = Host()
+        \\    h.bump()
+        \\    println(Host.count)
+        \\}
+        \\
+    ;
+    try assertKlio("companion_var_write", src, "5\n");
+}
+
+test "bare_write_skips_method_named_like_var" {
+    // An assignment LHS resolves only to properties: a member *function*
+    // of the written name never captures the write, at any receiver
+    // depth, and compound assignment reads and writes the same binding.
+    const src =
+        \\
+        \\class Holder { fun label(): String = "fn" }
+        \\class OuterFn { fun tag(): String = "fn" }
+        \\class Inner
+        \\class Counter { fun count(): Int = 99 }
+        \\var label: String = "global"
+        \\var tag = "global"
+        \\var count = 10
+        \\fun main() {
+        \\    with(Holder()) { label = "written" }
+        \\    println(label)
+        \\    with(OuterFn()) { with(Inner()) { tag = "written" } }
+        \\    println(tag)
+        \\    with(Counter()) { count += 5 }
+        \\    println(count)
+        \\}
+        \\
+    ;
+    try assertKlio("write_skips_methods", src, "written\nwritten\n15\n");
+}
+
+test "member_prop_invoke_shadows_top_level_fn" {
+    // kotlinc resolves a bare call scope-by-scope: the receiver's member
+    // property + invoke convention outranks the top-level function.
+    const src =
+        \\
+        \\class Host { val handler: () -> String = { "host-property" } }
+        \\fun handler(): String = "global-fn"
+        \\fun main() {
+        \\    with(Host()) { println(handler()) }
+        \\}
+        \\
+    ;
+    try assertKlio("member_prop_invoke_shadows", src, "host-property\n");
+}
+
+test "member_fn_shadows_top_level_fn" {
+    const src =
+        \\
+        \\class Host { fun handler(): String = "member-fn" }
+        \\fun handler(): String = "global-fn"
+        \\fun main() { with(Host()) { println(handler()) } }
+        \\
+    ;
+    try assertKlio("member_fn_shadows", src, "member-fn\n");
+}
+
+test "inapplicable_member_falls_to_top_level_fn" {
+    // The member takes an argument the call does not supply, so it is
+    // not a candidate; the top-level function binds.
+    const src =
+        \\
+        \\class Host { fun handler(x: Int): String = "member-$x" }
+        \\fun handler(): String = "global-fn"
+        \\fun main() { with(Host()) { println(handler()) } }
+        \\
+    ;
+    try assertKlio("inapplicable_member_falls", src, "global-fn\n");
+}
+
+test "ext_receiver_brings_no_outer_tower" {
+    // A top-level extension on an inner class sees only the extension
+    // receiver — not the receiver's enclosing-instance tower (kotlinc:
+    // `status` is the top-level var, not `Owner.status`).
+    const src =
+        \\
+        \\class Owner {
+        \\    var status: String = "owner-value"
+        \\    inner class Pocket { var p: Int = 0 }
+        \\}
+        \\var status: String = "global"
+        \\fun Owner.Pocket.poke(): String = status
+        \\fun main() {
+        \\    val o = Owner()
+        \\    println(o.Pocket().poke())
+        \\}
+        \\
+    ;
+    try assertKlio("ext_receiver_no_tower", src, "global\n");
+}
+
+test "unit_valued_member_read_is_a_hit" {
+    const src =
+        \\
+        \\class A { var u: Unit = Unit }
+        \\fun main() {
+        \\    with(A()) { println(u) }
+        \\}
+        \\
+    ;
+    try assertKlio("unit_member_read", src, "kotlin.Unit\n");
 }
