@@ -1724,7 +1724,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .AstLambda => |al| {
             const cap_values = try readRegSlice(allocator, frame, al.captures);
             defer allocator.free(cap_values);
-            switch (try host.buildAstLambdaWithFlagFuncid(allocator, al.params, &al.body_ast, al.captured_names, cap_values, al.absorb_return, al.body_func)) {
+            switch (try host.buildAstLambdaWithFlagFuncid(allocator, frame.module, al.params, &al.body_ast, al.captured_names, cap_values, al.absorb_return, al.body_func)) {
                 .ok => |v| try frame.write(al.dst, v),
                 .err => |e| return errResult(e),
             }
@@ -3127,8 +3127,8 @@ pub const NullHost = struct {
         return self.buildAstLambda(allocator, params, body, captured_names, captures);
     }
 
-    pub fn buildAstLambdaWithFlagFuncid(self: *NullHost, allocator: Allocator, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
-        _ = body_func;
+    pub fn buildAstLambdaWithFlagFuncid(self: *NullHost, allocator: Allocator, module: *const Module, params: []const []const u8, body: *const @import("ast").Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
+        _ = .{ module, body_func };
         return self.buildAstLambdaWithFlag(allocator, params, body, captured_names, captures, absorb_return);
     }
 
