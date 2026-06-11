@@ -255,13 +255,13 @@ pub const ProgramImage = struct {
         {
             var fqn_it = stdlib.implementations.allFqns();
             while (fqn_it.next()) |fqn| {
-                try noteMapped(&self.default_import_globals, &bare_probe_packages, fqn);
-                try noteMapped(&self.any_member_globals, &any_member_prefixes, fqn);
+                try stdlib.noteBareNameMapping(&self.default_import_globals, &bare_probe_packages, fqn);
+                try stdlib.noteBareNameMapping(&self.any_member_globals, &any_member_prefixes, fqn);
             }
             var key_it = bindings.table.keyIterator();
             while (key_it.next()) |k| {
-                try noteMapped(&self.default_import_globals, &bare_probe_packages, k.*);
-                try noteMapped(&self.any_member_globals, &any_member_prefixes, k.*);
+                try stdlib.noteBareNameMapping(&self.default_import_globals, &bare_probe_packages, k.*);
+                try stdlib.noteBareNameMapping(&self.any_member_globals, &any_member_prefixes, k.*);
                 try notePackAlias(&self.pack_bare_aliases, k.*);
             }
         }
@@ -310,30 +310,6 @@ pub const ProgramImage = struct {
         if (self.default_import_globals.get(name)) |mapped| {
             if (bindings.resolve(mapped)) |i| return i;
             if (stdlib.implementation(mapped)) |i| return i;
-        }
-        return null;
-    }
-
-    /// Record `fqn`'s simple name into `map` when its package is one of
-    /// `packages`, keeping the entry whose package ranks earliest.
-    fn noteMapped(map: *std.StringHashMap([]const u8), packages: []const []const u8, fqn: []const u8) Allocator.Error!void {
-        const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return;
-        const pkg = fqn[0..dot];
-        const name = fqn[dot + 1 ..];
-        if (name.len == 0) return;
-        const rank = pkgRank(packages, pkg) orelse return;
-        const gop = try map.getOrPut(name);
-        if (gop.found_existing) {
-            const cur_dot = std.mem.lastIndexOfScalar(u8, gop.value_ptr.*, '.').?;
-            const cur_rank = pkgRank(packages, gop.value_ptr.*[0..cur_dot]).?;
-            if (rank >= cur_rank) return;
-        }
-        gop.value_ptr.* = fqn;
-    }
-
-    fn pkgRank(packages: []const []const u8, pkg: []const u8) ?usize {
-        for (packages, 0..) |p, i| {
-            if (std.mem.eql(u8, p, pkg)) return i;
         }
         return null;
     }

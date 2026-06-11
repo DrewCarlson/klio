@@ -70,6 +70,7 @@ pub const exprSpan = helpers.exprSpan;
 // Inline-state registries (thread-local equivalents installed by the
 // build driver before body lowering).
 pub const setInlineFnAsts = inline_state.setInlineFnAsts;
+pub const registerInlineFnId = inline_state.registerInlineFnId;
 pub const setShadowedInlineNames = inline_state.setShadowedInlineNames;
 pub const setTopLevelPropNames = inline_state.setTopLevelPropNames;
 

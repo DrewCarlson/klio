@@ -173,6 +173,40 @@ pub fn isImplicitlyImportedPackage(package_path: []const u8) bool {
     return false;
 }
 
+/// Record `fqn`'s simple name into `map` when its declaring package is
+/// one of `packages` (exact match), keeping the mapping whose package
+/// ranks earliest in the list. This is the single bare-name → FQN map
+/// constructor: the link-time `default_import_globals` /
+/// `any_member_globals` maps and the lowerer's inline-shadow name set
+/// all derive their name domain from this one rule, so the
+/// "which bare names does the shipped surface own" answer has exactly
+/// one source of truth.
+pub fn noteBareNameMapping(
+    map: *std.StringHashMap([]const u8),
+    packages: []const []const u8,
+    fqn: []const u8,
+) std.mem.Allocator.Error!void {
+    const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return;
+    const pkg = fqn[0..dot];
+    const name = fqn[dot + 1 ..];
+    if (name.len == 0) return;
+    const rank = bareNamePkgRank(packages, pkg) orelse return;
+    const gop = try map.getOrPut(name);
+    if (gop.found_existing) {
+        const cur_dot = std.mem.lastIndexOfScalar(u8, gop.value_ptr.*, '.').?;
+        const cur_rank = bareNamePkgRank(packages, gop.value_ptr.*[0..cur_dot]).?;
+        if (rank >= cur_rank) return;
+    }
+    gop.value_ptr.* = fqn;
+}
+
+fn bareNamePkgRank(packages: []const []const u8, pkg: []const u8) ?usize {
+    for (packages, 0..) |p, i| {
+        if (std.mem.eql(u8, p, pkg)) return i;
+    }
+    return null;
+}
+
 /// Curated stdlib sources that PARSE but are not yet *consumed*. The loaders
 /// skip these by `rel_path` suffix. Empty today.
 pub const CONSUMPTION_DEFERRED_SOURCES = [_][]const u8{};
@@ -551,6 +585,42 @@ test "implicitly imported packages match spec list" {
     try testing.expect(isImplicitlyImportedPackage("kotlin.math"));
     try testing.expect(!isImplicitlyImportedPackage("kotlin.reflect"));
     try testing.expect(!isImplicitlyImportedPackage("kotlin.math.foo"));
+}
+
+test "noteBareNameMapping keeps the earliest-ranked package and ignores the rest" {
+    var map = std.StringHashMap([]const u8).init(testing.allocator);
+    defer map.deinit();
+    const pkgs = [_][]const u8{ "kotlin", "kotlin.math" };
+    try noteBareNameMapping(&map, &pkgs, "kotlin.math.abs");
+    try testing.expectEqualStrings("kotlin.math.abs", map.get("abs").?);
+    // An earlier-ranked package takes the name over a later one.
+    try noteBareNameMapping(&map, &pkgs, "kotlin.abs");
+    try testing.expectEqualStrings("kotlin.abs", map.get("abs").?);
+    // A later-ranked arrival never displaces the earlier rank.
+    try noteBareNameMapping(&map, &pkgs, "kotlin.math.abs");
+    try testing.expectEqualStrings("kotlin.abs", map.get("abs").?);
+    // Packages outside the list, and dotless names, are ignored.
+    try noteBareNameMapping(&map, &pkgs, "other.pkg.abs");
+    try testing.expectEqualStrings("kotlin.abs", map.get("abs").?);
+    try noteBareNameMapping(&map, &pkgs, "abs");
+    try testing.expectEqual(@as(usize, 1), map.count());
+}
+
+test "the inline shadow set's name domain comes from the shared constructor" {
+    // The lowerer derives `shadowed_inline_names` from
+    // `noteBareNameMapping` over `IMPLICITLY_IMPORTED_PACKAGES`; pin two
+    // production-load-bearing members of that domain and one
+    // non-implicit exclusion.
+    var map = std.StringHashMap([]const u8).init(testing.allocator);
+    defer map.deinit();
+    var it = implementations.allFqns();
+    while (it.next()) |fqn| {
+        try noteBareNameMapping(&map, &IMPLICITLY_IMPORTED_PACKAGES, fqn);
+    }
+    try testing.expect(map.contains("synchronized"));
+    try testing.expect(map.contains("arrayOf"));
+    // kotlin.concurrent is not implicitly imported.
+    try testing.expect(!map.contains("thread"));
 }
 
 test "is known package covers coroutines" {

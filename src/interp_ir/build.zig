@@ -379,6 +379,23 @@ fn collectHierarchyMethodNames(start: []const u8, by_name: *const FileClasses, o
     for (c.supertypes) |*st| try collectHierarchyMethodNames(st.name.name, by_name, out, seen);
 }
 
+/// Collect a class's transitive supertype simple names, nearest first:
+/// each direct supertype, then that supertype's own chain. A supertype
+/// whose declaration is not in `by_name` (a pack-internal or built-in
+/// base) still records its name — its own ancestors are simply
+/// unknowable from here.
+fn collectHierarchySuperNames(a: Allocator, c: *const ast.Class, by_name: *const FileClasses, out: *std.ArrayList([]const u8), seen: *StringSet) Allocator.Error!void {
+    for (c.supertypes) |*st| {
+        const nm = st.name.name;
+        const gop = try seen.getOrPut(nm);
+        if (gop.found_existing) continue;
+        try out.append(a, nm);
+        if (by_name.get(nm)) |parent| {
+            try collectHierarchySuperNames(a, parent, by_name, out, seen);
+        }
+    }
+}
+
 fn collectHierarchyMemberNames(start: []const u8, by_name: *const FileClasses, out: *StringSet, seen: *StringSet) Allocator.Error!void {
     const gop = try seen.getOrPut(start);
     if (gop.found_existing) return;
@@ -703,6 +720,20 @@ fn buildModuleWithOverrides(
             try module.registry.hierarchy_methods.put(cname.*, methods);
         }
     }
+    // Per-class transitive supertype-name chain, nearest first, so body
+    // lowering can rank extension receivers against the enclosing class
+    // before the IR-side supertype slots are filled.
+    {
+        var it = file_classes.iterator();
+        while (it.next()) |e| {
+            var chain: std.ArrayList([]const u8) = .empty;
+            var seen = StringSet.init(a);
+            defer seen.deinit();
+            try seen.put(e.key_ptr.*, {});
+            try collectHierarchySuperNames(a, e.value_ptr.*, &file_classes, &chain, &seen);
+            try module.registry.class_super_names.put(e.key_ptr.*, try chain.toOwnedSlice(a));
+        }
+    }
     // `nested_object_aliases` is needed by the lowerer; install on registry.
     {
         var it = nested_object_aliases.iterator();
@@ -741,18 +772,20 @@ fn buildModuleWithOverrides(
         inline_fns.deinit();
         ir.lower.setInlineFnAsts(frozen);
 
-        // Default-import host bindings shadow same-simple-name inline fns.
-        var shadowed = StringSet.init(tl);
+        // Default-import host bindings shadow same-simple-name inline
+        // fns. The name domain comes from the same constructor the
+        // link-time bare-name maps use (`stdlib.noteBareNameMapping`),
+        // restricted to the implicitly imported packages, so the
+        // "default-import owns this bare name" answer has one source.
+        var owned = std.StringHashMap([]const u8).init(a);
+        defer owned.deinit();
         var fqn_it = stdlib.implementations.allFqns();
         while (fqn_it.next()) |fqn| {
-            if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
-                const scope = fqn[0..dot];
-                const simple = fqn[dot + 1 ..];
-                if (stdlib.isImplicitlyImportedPackage(scope)) {
-                    try shadowed.put(simple, {});
-                }
-            }
+            try stdlib.noteBareNameMapping(&owned, &stdlib.IMPLICITLY_IMPORTED_PACKAGES, fqn);
         }
+        var shadowed = StringSet.init(tl);
+        var owned_it = owned.keyIterator();
+        while (owned_it.next()) |k| try shadowed.put(k.*, {});
         ir.lower.setShadowedInlineNames(shadowed);
     }
 
@@ -885,12 +918,13 @@ fn buildModuleWithOverrides(
             if (f.is_tailrec) try module.tailrec_fn_names.append(a, f.name.name);
             try module.decl_user_params.put(id.int(), @intCast(f.params.len));
             {
-                const has_vararg = f.params.len != 0 and f.params[f.params.len - 1].is_vararg;
+                var has_vararg = false;
                 var required: u32 = 0;
                 for (f.params) |*p| {
+                    if (p.is_vararg) has_vararg = true;
                     if (p.default == null and !p.is_vararg) required += 1;
                 }
-                try module.decl_user_arity.put(id.int(), .{ .required = required, .total = @intCast(f.params.len), .trailing_vararg = has_vararg });
+                try module.decl_user_arity.put(id.int(), .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg });
             }
             {
                 // Declared parameter types at full structural
@@ -905,6 +939,12 @@ fn buildModuleWithOverrides(
                 try module.decl_user_sig.put(id.int(), sig);
             }
             try module.decl_span.put(id.int(), f.span);
+            // Key the inline-fn AST by the header stub's FuncId, so a
+            // bare call the symbol index resolves to this declaration
+            // splices exactly this declaration.
+            if (f.is_inline and f.body != null) {
+                try ir.lower.registerInlineFnId(id.int(), f);
+            }
             try stub_ids.append(a, id);
         }
     }

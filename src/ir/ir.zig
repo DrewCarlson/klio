@@ -735,7 +735,7 @@ pub const Module = struct {
     /// Lowering-only; not serialized into packs.
     decl_user_params: std.AutoHashMap(u32, u32),
     /// Per top-level `FuncId` (keyed by `FuncId.int()`): the declared
-    /// user parameters' `(required, total, trailing_vararg)`.
+    /// user parameters' `(required, total, has_vararg)`.
     /// Lowering-only; not serialized.
     decl_user_arity: std.AutoHashMap(u32, DeclArity),
     /// Per top-level `FuncId` (keyed by `FuncId.int()`): the declared
@@ -759,12 +759,15 @@ pub const Module = struct {
     /// its lifetime.
     resolve_diags: std.ArrayList(ResolveDiag) = .empty,
 
-    /// `(required, total, trailing_vararg)` for a top-level function's
-    /// declared user parameters.
+    /// `(required, total, has_vararg)` for a top-level function's
+    /// declared user parameters. `has_vararg` is true for a `vararg`
+    /// parameter at ANY position — Kotlin allows a vararg before a
+    /// trailing function parameter, and such a candidate matches a call
+    /// just as inexactly as a trailing one.
     pub const DeclArity = struct {
         required: u32,
         total: u32,
-        trailing_vararg: bool,
+        has_vararg: bool,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -919,8 +922,9 @@ pub const Module = struct {
 
     /// Rebuild `func_name_index` from the declaration-order
     /// `func_index`. The IR build pipelines call this whenever
-    /// they're done extending `func_index`, and deserialized modules
-    /// call it lazily on first `funcId` lookup.
+    /// they're done extending `func_index`; incremental writers pair
+    /// every `func_index` append with a name-index push, so the name
+    /// index is authoritative at all times.
     pub fn rebuildFuncNameIndex(self: *Module, allocator: Allocator) Allocator.Error!void {
         var it = self.func_name_index.valueIterator();
         while (it.next()) |list| list.deinit(allocator);
@@ -941,14 +945,14 @@ pub const Module = struct {
         return &.{};
     }
 
+    /// First-wins order-based pick for a simple name, over the name
+    /// index — the single authority: every build pipeline pairs each
+    /// `func_index` append with a name-index push (member extensions
+    /// via `funcNameIndexPush`, header stubs in the phase-1 loop) and
+    /// rebuilds after batch mutation, and the pack format never
+    /// serializes a `Module`, so no stale-index module exists.
     pub fn funcId(self: *const Module, name: []const u8) ?FuncId {
         const candidates = self.funcsBySimpleName(name);
-        if (candidates.len == 0) {
-            // Fallback for callers that mutate `func_index` directly
-            // without rebuilding the name-index — preserve the old
-            // O(n) walk so the answer stays correct in that path.
-            return self.funcIdLegacy(name);
-        }
         var first: ?FuncId = null;
         var first_user: ?FuncId = null;
         var first_body: ?FuncId = null;
@@ -966,30 +970,12 @@ pub const Module = struct {
         return first_user orelse first_body orelse first;
     }
 
-    fn funcIdLegacy(self: *const Module, name: []const u8) ?FuncId {
-        var first: ?FuncId = null;
-        var first_user: ?FuncId = null;
-        for (self.func_index.items) |entry| {
-            if (!std.mem.eql(u8, entry.name, name)) continue;
-            if (first == null) first = entry.id;
-            if (first_user != null) continue;
-            if (idGet(Func, self.funcs.items, entry.id.int())) |f| {
-                if (!isShippedPackage(f.package)) first_user = entry.id;
-            }
-        }
-        return first_user orelse first;
-    }
-
     /// Whether any top-level function with this simple name exists.
     /// Pure existence — no order-based pick — for callers that only
-    /// gate on the name being callable.
+    /// gate on the name being callable. Answers over the name index,
+    /// the single authority (see `funcId`).
     pub fn hasFuncNamed(self: *const Module, name: []const u8) bool {
-        if (self.funcsBySimpleName(name).len != 0) return true;
-        // Same stale-name-index fallback `funcId` keeps.
-        for (self.func_index.items) |entry| {
-            if (std.mem.eql(u8, entry.name, name)) return true;
-        }
-        return false;
+        return self.funcsBySimpleName(name).len != 0;
     }
 
     /// Look up a top-level function by fully-qualified name (matches
@@ -1237,11 +1223,11 @@ pub const Module = struct {
     };
 
     /// Whether a phase-1 header stub's *declared* user arity exactly
-    /// matches the call: no defaults (`required == total`), no trailing
-    /// vararg, and exactly `want` parameters. Stubs carry no lowered
-    /// params, so this is the order-independent arity source for ranking
-    /// forward references; defaults/vararg/trailing-lambda shapes on a
-    /// stub stay deferred to the heuristic.
+    /// matches the call: no defaults (`required == total`), no vararg at
+    /// any position, and exactly `want` parameters. Stubs carry no
+    /// lowered params, so this is the order-independent arity source for
+    /// ranking forward references; defaults/vararg/trailing-lambda
+    /// shapes on a stub stay deferred to the heuristic.
     fn stubDeclArity(self: *const Module, id: FuncId) ?DeclArity {
         return self.decl_user_arity.get(id.int());
     }
@@ -1304,6 +1290,16 @@ pub const Module = struct {
             if (!a.at(i).eql(b.at(i))) return false;
         }
         return true;
+    }
+
+    /// Whether any parameter is declared `vararg`, at any position —
+    /// the body-side mirror of `DeclArity.has_vararg`, so the stub and
+    /// body gates skip the same candidate shapes.
+    fn anyParamVararg(f: *const Func) bool {
+        for (f.params) |p| {
+            if (p.is_vararg) return true;
+        }
+        return false;
     }
 
     /// Whether any user parameter (leading synthesized `this` excluded)
@@ -1411,10 +1407,10 @@ pub const Module = struct {
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
             const is_stub = f.blocks.len == 0;
             // The stub and body gates must accept the SAME candidate
-            // shapes (exact arity, no defaults, no trailing vararg) so
-            // the resolution — and the ambiguity verdict — never
-            // depends on whether a candidate's body lowered before the
-            // call site.
+            // shapes (exact arity, no defaults, no vararg at any
+            // position) so the resolution — and the ambiguity verdict —
+            // never depends on whether a candidate's body lowered
+            // before the call site.
             if (is_stub) {
                 const da = self.stubDeclArity(id) orelse {
                     saw_bodyless = true;
@@ -1424,7 +1420,7 @@ pub const Module = struct {
                     saw_low = true;
                     continue;
                 }
-                if (da.trailing_vararg) {
+                if (da.has_vararg) {
                     saw_vararg = true;
                     continue;
                 }
@@ -1441,7 +1437,7 @@ pub const Module = struct {
                     saw_low = true;
                     continue;
                 }
-                if (f.params.len != 0 and f.params[f.params.len - 1].is_vararg) {
+                if (anyParamVararg(f)) {
                     saw_vararg = true;
                     continue;
                 }
@@ -1615,6 +1611,20 @@ pub const Module = struct {
         return found;
     }
 
+    /// Whether class `sub` is `super_name` itself, or transitively
+    /// extends / implements it, judged over the simple-name hierarchy
+    /// recorded at build time (`registry.class_super_names`). Receiver
+    /// applicability for extension narrowing: an extension declared on
+    /// a base class accepts a subclass receiver.
+    pub fn classIsOrExtends(self: *const Module, sub: []const u8, super_name: []const u8) bool {
+        if (std.mem.eql(u8, sub, super_name)) return true;
+        const supers = self.registry.class_super_names.get(sub) orelse return false;
+        for (supers) |s| {
+            if (std.mem.eql(u8, s, super_name)) return true;
+        }
+        return false;
+    }
+
     /// Pre-register a class name so `classId` resolves it before its
     /// body is lowered. Makes cross-class references order-independent.
     /// The placeholder is overwritten by the real definition when
@@ -1747,6 +1757,13 @@ pub const ModuleRegistry = struct {
     /// declares or inherits (transitively over supertypes). Lets the
     /// lowerer honor Kotlin's separate function/property namespaces.
     hierarchy_methods: std.StringHashMap(std.StringHashMap(void)),
+    /// Class simple name → its transitive supertype simple names,
+    /// nearest first (each direct supertype followed by its own chain).
+    /// Recorded from the AST hierarchy before body lowering, so a
+    /// method body can rank extension receivers against the enclosing
+    /// class — including extensions declared on a base class — while
+    /// the IR-side `Class.supertypes` slots are still being filled.
+    class_super_names: std.StringHashMap([]const []const u8),
     /// Body-property `(class, prop)` pairs declared with `by`.
     delegated_body_props: StrPairSet,
     /// `FuncId` → declaring-class simple name for *member extension
@@ -1799,6 +1816,7 @@ pub const ModuleRegistry = struct {
             .func_type_params = std.AutoHashMap(FuncId, std.ArrayList([]const u8)).init(allocator),
             .top_level_delegated_props = std.StringHashMap(void).init(allocator),
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
+            .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
             .delegated_body_props = StrPairSet.init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
@@ -1827,6 +1845,11 @@ pub const ModuleRegistry = struct {
             var it = self.hierarchy_methods.valueIterator();
             while (it.next()) |inner| inner.deinit();
             self.hierarchy_methods.deinit();
+        }
+        {
+            var it = self.class_super_names.valueIterator();
+            while (it.next()) |names| a.free(names.*);
+            self.class_super_names.deinit();
         }
         self.delegated_body_props.deinit();
         self.member_ext_owner_class.deinit();
@@ -2234,7 +2257,7 @@ test "symbol index proves stub signatures through the declared record" {
     // proof is forfeited (type overload).
     _ = try pushTestFunc(&m, a, "g", "app.g", "app", 1);
     const stub = try pushTestFuncOpts(&m, a, "g", "app.g2.g", "app", 0, .{ .stub = true });
-    try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .trailing_vararg = false });
+    try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .has_vararg = false });
     try m.rebuildFuncNameIndex(a);
 
     const unproven = m.resolveBareCallIndexed("g", "app", FileId.from(0), 1, false);
@@ -2255,7 +2278,7 @@ test "symbol index distinguishes overloads by generic arguments" {
     // ambiguity. Rewriting the second record to `List<Int>` makes the
     // pair a true duplicate and the verdict flips to ambiguous.
     const s1 = try pushTestFuncOpts(&m, a, "pick", "app.pick", "app", 0, .{ .stub = true });
-    try m.decl_user_arity.put(s1.int(), .{ .required = 1, .total = 1, .trailing_vararg = false });
+    try m.decl_user_arity.put(s1.int(), .{ .required = 1, .total = 1, .has_vararg = false });
     {
         const sig = try a.alloc(TypeRef, 1);
         const args = try a.alloc(TypeRef, 1);
@@ -2264,7 +2287,7 @@ test "symbol index distinguishes overloads by generic arguments" {
         try m.decl_user_sig.put(s1.int(), sig);
     }
     const s2 = try pushTestFuncOpts(&m, a, "pick", "app.pick", "app", 0, .{ .stub = true });
-    try m.decl_user_arity.put(s2.int(), .{ .required = 1, .total = 1, .trailing_vararg = false });
+    try m.decl_user_arity.put(s2.int(), .{ .required = 1, .total = 1, .has_vararg = false });
     {
         const sig = try a.alloc(TypeRef, 1);
         const args = try a.alloc(TypeRef, 1);
@@ -2301,7 +2324,7 @@ test "symbol index distinguishes a stub overload by its declared types" {
     // type-dispatched overload set even though one body is unlowered.
     _ = try pushTestFunc(&m, a, "h2", "app.h2", "app", 1);
     const stub = try pushTestFuncOpts(&m, a, "h2", "app.x.h2", "app", 0, .{ .stub = true });
-    try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .trailing_vararg = false });
+    try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .has_vararg = false });
     try putTestDeclSig(&m, a, stub, "String", 1);
     try m.rebuildFuncNameIndex(a);
 
@@ -2416,7 +2439,7 @@ test "symbol index ranks a forward-referenced stub by declared arity" {
     // An own-package phase-1 stub (body not lowered yet) with a recorded
     // exact declared arity resolves, independent of lowering order.
     const stub = try pushTestFuncOpts(&m, a, "fwd", "app.fwd", "app", 0, .{ .stub = true });
-    try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .trailing_vararg = false });
+    try m.decl_user_arity.put(stub.int(), .{ .required = 1, .total = 1, .has_vararg = false });
     _ = try pushTestFunc(&m, a, "fwd", "lib.fwd", "lib", 1);
     try m.rebuildFuncNameIndex(a);
 
@@ -2433,9 +2456,9 @@ test "symbol index defers a stub whose declared arity has defaults or varargs" {
     // required < total (a default param): only an exact no-default
     // declared arity is rankable without the lowered body.
     const dflt = try pushTestFuncOpts(&m, a, "d", "app.d", "app", 0, .{ .stub = true });
-    try m.decl_user_arity.put(dflt.int(), .{ .required = 1, .total = 2, .trailing_vararg = false });
+    try m.decl_user_arity.put(dflt.int(), .{ .required = 1, .total = 2, .has_vararg = false });
     const va = try pushTestFuncOpts(&m, a, "v", "app.v", "app", 0, .{ .stub = true });
-    try m.decl_user_arity.put(va.int(), .{ .required = 0, .total = 1, .trailing_vararg = true });
+    try m.decl_user_arity.put(va.int(), .{ .required = 0, .total = 1, .has_vararg = true });
     try m.rebuildFuncNameIndex(a);
 
     const got_d = m.resolveBareCallIndexed("d", "app", FileId.from(0), 2, false);
@@ -2518,14 +2541,11 @@ test "funcId prefers a body sibling over a bodyless shipped pair" {
     try testing.expectEqual(actual.int(), m.funcId("now").?.int());
 }
 
-test "hasFuncNamed is pure existence over both index forms" {
+test "hasFuncNamed answers over the name index" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
     _ = try pushTestFunc(&m, a, "f", "pkg.f", "pkg", 0);
-    // Name index not rebuilt yet: the func_index walk still answers.
-    try testing.expect(m.hasFuncNamed("f"));
-    try testing.expect(!m.hasFuncNamed("g"));
     try m.rebuildFuncNameIndex(a);
     try testing.expect(m.hasFuncNamed("f"));
     try testing.expect(!m.hasFuncNamed("g"));

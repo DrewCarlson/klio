@@ -329,30 +329,40 @@ fn unifyTypeParam(
 pub fn tryInlineCallWithTypeArgs(
     b: *FuncBuilder,
     fname: []const u8,
+    target: ?*const ast.Function,
     args: []const Expr,
     arg_names: []const ?[]const u8,
     this_arg: ?*const Expr,
     type_args: []const TypeRef,
     expected: ?*const TypeRef,
 ) Allocator.Error!?Reg {
-    // Resolve the inline overload matching this call's shape (so an
-    // overloaded inline fn binds the function-param form for a trailing
-    // lambda); conservative — falls back to the first overload otherwise.
-    const last_is_lambda = args.len > 0 and switch (args[args.len - 1]) {
-        .Lambda, .AnonFun => true,
-        else => false,
-    };
-    const call_shape = CallShape{ .want = args.len, .last_is_lambda = last_is_lambda };
-    const recv_ty = try inferReceiverType(b, this_arg);
-    // A present `this_arg` means a qualified member call (`recv.f(...)`); the
-    // inline target must be a receiver extension, never a same-named top-level
-    // build-only overload.
-    const f = inline_state.inlineFnAstForRecvExt(
-        fname,
-        call_shape,
-        recv_ty,
-        this_arg != null,
-    ) orelse return null;
+    // A bare call arrives with its `target` already resolved (the
+    // symbol index's pick, or the narrowing fallback for the shapes the
+    // index defers on) so the splice expands exactly the declaration
+    // the call binds. A member call (`recv.f(...)`, `this_arg` set)
+    // resolves here by receiver/shape narrowing: the inline target must
+    // be a receiver extension, never a same-named top-level overload.
+    var f: *const ast.Function = undefined;
+    if (target) |t| {
+        f = t;
+    } else {
+        const last_is_lambda = args.len > 0 and switch (args[args.len - 1]) {
+            .Lambda, .AnonFun => true,
+            else => false,
+        };
+        const call_shape = CallShape{ .want = args.len, .last_is_lambda = last_is_lambda };
+        const recv_ty = try inferReceiverType(b, this_arg);
+        const recv_chain: ?[]const []const u8 = if (recv_ty) |r|
+            try expr_lower.recvChainOf(b, r)
+        else
+            null;
+        f = inline_state.inlineFnAstForRecvExt(
+            fname,
+            call_shape,
+            recv_chain,
+            this_arg != null,
+        ) orelse return null;
+    }
     if (b.inlineInProgress(fname)) {
         return null;
     }
