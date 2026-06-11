@@ -115,7 +115,15 @@ pub fn runCheck(
     // `gpa` here is the process-lifetime arena (`main.zig`), so the resolver
     // and type checker allocate their whole workspace from it and free
     // nothing — the arena reclaims everything at process exit.
-    const r = resolver.resolveModule(gpa, combined.items) catch return 2;
+    var native_fqns: std.ArrayList([]const u8) = .empty;
+    defer native_fqns.deinit(gpa);
+    {
+        var it = loaded.bindings.table.keyIterator();
+        while (it.next()) |k| {
+            native_fqns.append(gpa, k.*) catch return 2;
+        }
+    }
+    const r = resolver.resolveModuleWithNatives(gpa, combined.items, native_fqns.items) catch return 2;
     for (r.diagnostics.diags()) |d| {
         if (user_file_ids.contains(d.primary.span.file.int())) {
             all.emit(gpa, d) catch return 2;

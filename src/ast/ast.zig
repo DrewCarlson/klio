@@ -687,6 +687,12 @@ pub const Expr = union(enum) {
         params: []Ident,
         body: Block,
         span: Span,
+        /// True when the single `it` parameter was injected by the parser
+        /// for a zero-`->` lambda. The literal's real arity then comes
+        /// from the expected type: `{ x() }` is `() -> R` in a value
+        /// position but `(T) -> R` when passed where one parameter is
+        /// expected.
+        implicit_it: bool = false,
     },
     /// `this` or `this@Label`. `qualifier` is `Some(name)` for the labeled
     /// form, used inside an inner class to refer to the enclosing

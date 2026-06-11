@@ -97,6 +97,7 @@ pub fn typecheck(
     const user_contracts = try scanUserInlineContracts(allocator, file);
     cfa.analyses.contracts.setUserInlineContracts(user_contracts);
     var tc = try Checker.new(allocator, resolution);
+    defer destroyQueryScratch(allocator, tc.query_scratch);
     try tc.run(file);
     try annotations.applySuppressAnnotations(allocator, file, &tc.diagnostics);
     cfa.analyses.contracts.setUserInlineContracts(
@@ -197,6 +198,7 @@ pub fn typecheckModule(
     const user_contracts = try scanUserInlineContracts(allocator, &merged);
     cfa.analyses.contracts.setUserInlineContracts(user_contracts);
     var tc = try Checker.new(allocator, resolution);
+    defer destroyQueryScratch(allocator, tc.query_scratch);
     for (files) |*f| {
         const pkg = f.package orelse continue;
         var dotted: std.ArrayList(u8) = .empty;
@@ -216,6 +218,15 @@ pub fn typecheckModule(
         .diagnostics = tc.diagnostics,
         .cfgs = tc.cfgs,
     };
+}
+
+/// Return the checker's per-query scratch pages to the OS once the checker
+/// is done. The arena's backing is the page allocator, not the driver's
+/// phase arena, so this teardown is required even under the
+/// driver-owned-arena model.
+fn destroyQueryScratch(allocator: Allocator, scratch: *std.heap.ArenaAllocator) void {
+    scratch.deinit();
+    allocator.destroy(scratch);
 }
 
 fn mergeModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocator.Error!KotlinFile {
@@ -493,6 +504,10 @@ pub const ClassInfo = struct {
     /// Member name -> type. Covers primary-param properties, body
     /// properties, and methods (as `Type.Function`).
     members: std.StringHashMap(Type),
+    /// Member method name -> every declared overload's signature. The
+    /// `members` map collapses overloads to one entry; call-site overload
+    /// selection reads this instead.
+    member_methods: std.StringHashMap(std.ArrayList(FnSig)),
     /// Member name -> mutable? (only for properties).
     member_mutable: std.StringHashMap(bool),
     /// Constructor parameter list (primary). Used to type-check `Box(...)`.
@@ -536,6 +551,7 @@ pub const ClassInfo = struct {
     pub fn init(allocator: Allocator) ClassInfo {
         return .{
             .members = std.StringHashMap(Type).init(allocator),
+            .member_methods = std.StringHashMap(std.ArrayList(FnSig)).init(allocator),
             .member_mutable = std.StringHashMap(bool).init(allocator),
             .member_flags = std.StringHashMap(MemberFlags).init(allocator),
             .member_sigs = std.StringHashMap(MemberSig).init(allocator),
@@ -569,10 +585,36 @@ pub const TypeAliasInfo = struct {
     name_span: Span,
 };
 
+/// Memoized per-function reachability solves, keyed by function span.
+/// Each entry's `reachable` slice is owned by the checker's allocator and
+/// replaced when its epoch falls behind `nothing_epoch`.
+pub const ReachCache = std.AutoHashMap(Span, ReachEntry);
+
+pub const ReachEntry = struct {
+    epoch: u64,
+    reachable: []bool,
+};
+
 pub const Checker = struct {
     allocator: Allocator,
     resolution: *const Resolution,
     types: std.AutoHashMap(Span, Type),
+    /// Spans whose recorded type is `Nothing`, maintained alongside `types`.
+    /// The reachability queries only need to know where control diverges,
+    /// so they consult this small set instead of walking the full map.
+    nothing_spans: std.AutoHashMap(Span, void),
+    /// Candidate `Nothing` spans bucketed by the function context
+    /// (`cfg_fn_stack` top) active when they were recorded. The
+    /// reachability queries over a function's CFG read just its bucket,
+    /// filtered through `nothing_spans` for current membership.
+    nothing_by_fn: std.AutoHashMap(Span, std.AutoHashMap(Span, void)),
+    /// Bumped whenever `nothing_spans` changes. Reachability over a lowered
+    /// CFG depends only on the CFG and this set, so the per-statement
+    /// unreachable-code query caches its last solve against this epoch.
+    nothing_epoch: u64,
+    /// Cached reachability solve for the W0002 per-statement query: valid
+    /// while the queried function and `nothing_epoch` both match.
+    reach_cache: ReachCache,
     /// User-class name attached to an expression by span — populated for
     /// path / `this` / constructor-call sites whose static type is a
     /// user-declared class.
@@ -647,6 +689,18 @@ pub const Checker = struct {
     inference_session: ?InferenceSession,
     /// Set while typing a call whose callee is annotated `@BuilderInference`.
     builder_inference_active: bool,
+    /// Number of lambda bodies currently being checked. Inside a lambda a
+    /// bare call may target a member of a receiver the checker cannot see
+    /// (user DSL builders), so resolution against same-named top-level
+    /// functions stays tolerant when no candidate's arity admits the call.
+    lambda_depth: usize,
+    /// Retained arena for per-query CFG-analysis scratch (smart-cast / VIA /
+    /// reachability solves). Reset at the start of each query via
+    /// `narrowing.queryScratch`; torn down by the typecheck entry points once
+    /// the checker is done. Backed by the page allocator so its pages are
+    /// genuinely returned between queries even when the driver hands the
+    /// checker a phase arena.
+    query_scratch: *std.heap.ArenaAllocator,
 
     pub const new = phases.new;
     pub const run = phases.run;

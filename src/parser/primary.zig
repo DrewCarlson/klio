@@ -310,8 +310,12 @@ pub fn parseStringTemplate(p: *Parser) ?Expr {
             },
             .ShortInterp => |name| {
                 const tok = support.bump(p);
+                // Own the name in the AST allocator for the same reason as
+                // StringText below: the token's buffer is freed with the
+                // token stream, which can happen before resolution.
+                const owned_name = p.allocator.dupe(u8, name) catch @panic("OOM in primary");
                 parts.append(p.allocator, StringPart{ .ShortInterp = Ident{
-                    .name = name,
+                    .name = owned_name,
                     .span = tok.span,
                 } }) catch @panic("OOM in primary");
             },
