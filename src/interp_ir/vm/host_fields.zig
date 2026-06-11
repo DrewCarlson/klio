@@ -499,7 +499,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if (receiver.* == .IrClosure) {
         const id = receiver.IrClosure.id;
         if (self.closures.get(@intCast(id))) |info| {
-            const mptr: *const Module = self.module.asPtr();
+            const mptr: *const Module = info.module orelse self.module.asPtr();
             if (info.body_func.int() < mptr.funcs.items.len) {
                 const f = &mptr.funcs.items[info.body_func.int()];
                 if (std.mem.eql(u8, name, "name")) {
@@ -1260,8 +1260,27 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         cg.deinit();
         g.deinit();
     }
-    // Nested-class fallback.
+    // Nested-class fallback. An `object` declaration referenced by bare
+    // name in value position is its singleton instance, never the bare
+    // class value (kotlinc: `val c = EmptyCoroutineContext` binds the
+    // object). First access constructs it through the shared gate.
     if (!member_probe) {
+        const is_object = blk: {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            const def = cg.get().get(name) orelse break :blk false;
+            const dg = def.borrow();
+            defer dg.deinit();
+            break :blk dg.get().is_object;
+        };
+        if (is_object) {
+            switch (try host_globals.ensureObjectSingleton(self, name)) {
+                .ok => |maybe| if (maybe) |v| {
+                    if (v == .Instance) return ok(v);
+                },
+                .err => |e| return errRes(e),
+            }
+        }
         const cg = self.classes.borrow();
         defer cg.deinit();
         if (cg.get().get(name)) |def| return ok(.{ .Class = def });

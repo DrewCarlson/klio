@@ -375,13 +375,10 @@ test "suspend_inline_ext_twins_bind_by_enclosing_class_receiver" {
     // splice (its continuation capture is only correct inlined), and
     // the splice must still pick the enclosing class's extension, not
     // the first-declared one (kotlinc: got:A / got:B). The completion
-    // is a named Continuation class rather than an object expression:
-    // an anonymous object's `override val context =
-    // EmptyCoroutineContext` initializer evaluates to null under this
-    // harness's load modes — a pre-existing anon-object property-init
-    // bug (present at revisions before this test existed, independent
-    // of inline resolution) that would mask the receiver binding
-    // pinned here.
+    // is an anonymous object whose `override val context =
+    // EmptyCoroutineContext` initializer must bind the singleton —
+    // also pinning anon-object property inits that read a global
+    // object by bare name.
     const src =
         \\import kotlin.coroutines.*
         \\
@@ -395,11 +392,12 @@ test "suspend_inline_ext_twins_bind_by_enclosing_class_receiver" {
         \\suspend inline fun A.label(f: () -> Unit) { tag = "A"; f() }
         \\suspend inline fun B.label(f: () -> Unit) { tag = "B"; f() }
         \\
-        \\class Done : Continuation<Unit> {
-        \\    override val context: CoroutineContext get() = EmptyCoroutineContext
-        \\    override fun resumeWith(result: Result<Unit>) {}
+        \\fun run(block: suspend () -> Unit) {
+        \\    block.startCoroutine(object : Continuation<Unit> {
+        \\        override val context = EmptyCoroutineContext
+        \\        override fun resumeWith(result: Result<Unit>) {}
+        \\    })
         \\}
-        \\fun run(block: suspend () -> Unit) { block.startCoroutine(Done()) }
         \\fun main() {
         \\    run { A().m(); B().m() }
         \\}

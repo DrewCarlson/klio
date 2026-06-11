@@ -269,7 +269,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         };
         const module_ref = self.module.clone();
         defer module_ref.deinit();
-        const module = module_ref.asPtr();
+        // A closure created inside a sub-module-lowered body resolves its
+        // `FuncId` against that sub-module, never the main func table.
+        const module = info.module orelse module_ref.asPtr();
         if (info.body_func.int() >= module.funcs.items.len) {
             const msg = try std.fmt.allocPrint(allocator, "closure body FuncId {d} out of range", .{info.body_func.int()});
             return .{ .err = .{ .Type = msg } };
@@ -280,10 +282,13 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // (e.g. a closure-of `kotlinx.datetime.__kxdt_*`), dispatch that
         // binding instead of running the shim placeholder body. The form
         // was settled once by `linkResolvedForms`; this consults it by
-        // `FuncId` with no per-call FQN probe.
-        host_call_func.linkAuditCheck(self, module, func.id, func, args);
-        if (host_call_func.resolvedNativeForm(self, func.id)) |intrinsic| {
-            return dispatchIntrinsic(self, func.fqn, intrinsic, args);
+        // `FuncId` with no per-call FQN probe. Link tables are keyed by
+        // main-module ids, so sub-module closures never consult them.
+        if (info.module == null) {
+            host_call_func.linkAuditCheck(self, module, func.id, func, args);
+            if (host_call_func.resolvedNativeForm(self, func.id)) |intrinsic| {
+                return dispatchIntrinsic(self, func.fqn, intrinsic, args);
+            }
         }
         // Value-style invocation of a receiver lambda
         // (`block.invoke(receiver, p)` / `block(receiver, p)` for a
@@ -367,8 +372,10 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // registered default-arg thunks (an implicit-`it` lambda
         // invoked with zero args still gets its slot as Null).
         // Pack trailing vararg args into an Array when the
-        // target's last param is marked vararg.
+        // target's last param is marked vararg. The defaults table is
+        // keyed by main-module ids, so sub-module closures skip it.
         const defaults: ?[]?FuncId = blk: {
+            if (info.module != null) break :blk null;
             const pg = self.prog.borrow();
             defer pg.deinit();
             break :blk pg.get().func_defaults.get(info.body_func.int());
@@ -402,7 +409,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             try capture_values.appendSlice(allocator, g.get().*);
         }
         vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
-        return ir.eval.evalWithCapturesChained(VmHost, allocator, module, null, func, call_args, capture_values, info.chain, self);
+        return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, self);
     }
     const msg = try std.fmt.allocPrint(allocator, "Vm::call_value on `{s}`", .{callee.typeFqn()});
     return .{ .err = .{ .Unimplemented = msg } };
@@ -512,7 +519,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
             const takes_this_param = blk: {
                 const module_g = self.module.borrow();
                 defer module_g.deinit();
-                const m = module_g.get();
+                const m = info.module orelse module_g.get();
                 if (info.body_func.int() >= m.funcs.items.len) break :blk false;
                 const fp = m.funcs.items[info.body_func.int()].params;
                 break :blk fp.len != 0 and std.mem.eql(u8, fp[0].name, "this");
@@ -561,6 +568,7 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
     const cell = try ObjRef(std.ArrayList(Value)).init(allocator, cell_list);
     const id = try self.closures.push(.{
         .body_func = body_func,
+        .module = if (module == self.module.asPtr()) null else module,
         .n_params = n_params,
         .capture_names = capture_names,
         .captures = cell,
@@ -570,7 +578,7 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
     return .{ .ok = .{ .IrClosure = .{ .id = id, .captures = caps_ref } } };
 }
 
-pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, params: []const []const u8, body: *const ast.Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
+pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, module: *const Module, params: []const []const u8, body: *const ast.Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
     _ = body;
     _ = absorb_return;
     const fid = body_func orelse return .{ .err = .{ .Unimplemented = "Vm: lambda lower did not provide body_func" } };
@@ -582,6 +590,7 @@ pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, params:
     const cell = try ObjRef(std.ArrayList(Value)).init(allocator, cell_list);
     const id = try self.closures.push(.{
         .body_func = fid,
+        .module = if (module == self.module.asPtr()) null else module,
         .n_params = params.len,
         .capture_names = try allocator.dupe([]const u8, captured_names),
         .captures = cell,

@@ -2297,6 +2297,24 @@ fn findCapture(pairs: []const NameValue, name: []const u8) ?Value {
     return null;
 }
 
+/// Is `expr` a bare one-segment name the captured scope can resolve
+/// directly — a captured local, or a field of the captured enclosing
+/// `this`? Exactly these are filled without a thunk at instance build;
+/// every other expression evaluates through a lowered thunk.
+fn bareCaptureResolvable(expr: *const ast.Expr, pairs: []const NameValue) bool {
+    if (expr.* != .Path or expr.Path.segments.len != 1) return false;
+    const nm = expr.Path.segments[0].name;
+    if (findCapture(pairs, nm) != null) return true;
+    if (findCapture(pairs, "this")) |tv| {
+        if (tv == .Instance) {
+            const ig = tv.Instance.borrow();
+            defer ig.deinit();
+            if (ig.get().get(nm) != null) return true;
+        }
+    }
+    return false;
+}
+
 /// Synthesize a body-less 0-arg getter/init thunk `Function` from an
 /// accessor or expression body so it can be lowered as an anon method.
 fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef, is_override: bool) ast.Function {
@@ -2421,9 +2439,15 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                     tbl.deinit();
                 }
                 const init_expr = if (p.init) |*e| e else continue;
-                const is_bare_path = init_expr.* == .Path and init_expr.Path.segments.len == 1;
                 const is_lit = (try simpleLiteral(allocator, init_expr)) != null;
-                if (is_lit or is_bare_path) continue;
+                if (is_lit) continue;
+                // A bare one-segment name resolvable from the captured
+                // scope is filled directly at field init below. Any other
+                // bare name (a top-level property, an object singleton, a
+                // class reference) must evaluate through a lowered thunk
+                // like every other initializer — the capture pairs alone
+                // cannot resolve it.
+                if (bareCaptureResolvable(init_expr, capture_pairs)) continue;
                 const thunk_name: ast.Ident = .{
                     .name = try std.fmt.allocPrint(allocator, "$init${s}", .{p.name.name}),
                     .span = p.name.span,
@@ -2457,6 +2481,41 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
         const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
         try init_thunks.append(allocator, .{ .module = sub_ref, .func = func.id, .prop_pos = prop_pos });
+    }
+    // Lower a thunk for every supertype ctor arg the captured scope
+    // cannot resolve directly (anything beyond a literal or a captured
+    // name): `object : Base(g + 1)` evaluates `g + 1` for real. The
+    // thunks run against the *enclosing* `this` — a super arg is
+    // evaluated before the object exists and never sees its members, so
+    // they lower with no own-member set.
+    const SuperArgThunk = struct { module: ObjRef(Module), func: FuncId };
+    var super_arg_thunks = try allocator.alloc([]?SuperArgThunk, supertypes.len);
+    {
+        var no_members = StringSet.init(allocator);
+        defer no_members.deinit();
+        for (supertypes, 0..) |_, si| {
+            const arg_exprs: []const ast.Expr = blk: {
+                if (si < supertype_args.len) {
+                    if (supertype_args[si]) |ae| break :blk ae;
+                }
+                break :blk &.{};
+            };
+            const slots = try allocator.alloc(?SuperArgThunk, arg_exprs.len);
+            super_arg_thunks[si] = slots;
+            for (arg_exprs, 0..) |*ae, ai| {
+                slots[ai] = null;
+                if ((try simpleLiteral(allocator, ae)) != null) continue;
+                if (bareCaptureResolvable(ae, capture_pairs)) continue;
+                const thunk_name: ast.Ident = .{
+                    .name = try std.fmt.allocPrint(allocator, "$superarg${d}${d}", .{ si, ai }),
+                    .span = obj.span,
+                };
+                const thunk = synthThunk(thunk_name, .{ .Expr = ae.* }, null, false);
+                const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &no_members);
+                slots[ai] = .{ .module = sub_ref, .func = func.id };
+            }
+        }
     }
     ir.lower.setLowerAnonCaptures(null);
 
@@ -2562,13 +2621,25 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     }
 
     // Populate parent primary-param fields from supertype ctor args, and
-    // stash each supertype's evaluated ctor args.
+    // stash each supertype's evaluated ctor args. A pre-lowered thunk
+    // evaluates the arg in the enclosing scope (`this` is the captured
+    // enclosing receiver, or Null at top level); the direct path covers
+    // literals and captured names.
     var super_args_by_class = std.StringHashMap([]Value).init(allocator);
     for (supertypes, 0..) |*sup, idx| {
         const arg_exprs = if (idx < supertype_args.len) (supertype_args[idx] orelse continue) else continue;
         var vals = try allocator.alloc(Value, arg_exprs.len);
         for (arg_exprs, 0..) |*ae, ai| {
-            vals[ai] = try evalSuperArg(self, allocator, ae, capture_pairs);
+            if (idx < super_arg_thunks.len and ai < super_arg_thunks[idx].len and super_arg_thunks[idx][ai] != null) {
+                const th = super_arg_thunks[idx][ai].?;
+                const outer_this: Value = findCapture(capture_pairs, "this") orelse .Null;
+                switch (try runAnonThunk(self, allocator, th.module, th.func, &outer_this, capture_pairs)) {
+                    .ok => |v| vals[ai] = v,
+                    .err => |e| return .{ .err = e },
+                }
+            } else {
+                vals[ai] = try evalSuperArg(self, allocator, ae, capture_pairs);
+            }
         }
         const parent_def = classDefByName(self, sup.name.name);
         if (parent_def) |pdef| {
@@ -2747,11 +2818,12 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     return .{ .ok = inst_value };
 }
 
-/// Run one lowered anon-object thunk (a complex property initializer or
-/// an `init` block) against the instance under construction: captures
-/// resolve through `capture_pairs` (with `this` bound to the instance)
-/// and the enclosing scope's names are layered over globals for the
-/// call's duration.
+/// Run one lowered anon-object thunk: captures resolve through
+/// `capture_pairs`, the enclosing scope's names are layered over globals
+/// for the call's duration, and `inst_value` binds as `this` — the
+/// instance under construction for property-init / `init`-block thunks,
+/// the captured enclosing receiver (or Null) for supertype-ctor-arg
+/// thunks, which run before the instance exists.
 fn runAnonThunk(
     self: *VmHost,
     allocator: Allocator,

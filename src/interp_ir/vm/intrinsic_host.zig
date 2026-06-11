@@ -203,7 +203,7 @@ pub fn evalClosureRaw(
 
     const module_g = self.module.borrow();
     defer module_g.deinit();
-    const module = module_g.get();
+    const module = info.module orelse module_g.get();
     if (info.body_func.int() >= module.funcs.items.len) {
         const msg = try std.fmt.allocPrint(
             self.allocator,
@@ -272,7 +272,7 @@ pub fn evalClosureRaw(
     const state = vmhost.SharedHandles.fromIntrinsic(self);
     var host = VmHost.borrowed(state, state.globals, out);
     vmhost.emitPath(self.allocator, "coroutine_closure", func.fqn, info.body_func, this_value, args);
-    return ir.eval.evalWithCapturesChained(VmHost, self.allocator, module, null, func, args_owned, caps_owned, info.chain, &host);
+    return ir.eval.evalWithCapturesChained(VmHost, self.allocator, module, info.module, func, args_owned, caps_owned, info.chain, &host);
 }
 
 /// Resume a parked activation with `value`, raw `EvalError` out.
@@ -385,7 +385,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         };
         const module_g = self.module.borrow();
         defer module_g.deinit();
-        const module = module_g.get();
+        const module = info.module orelse module_g.get();
         if (info.body_func.int() >= module.funcs.items.len) {
             const msg = try std.fmt.allocPrint(
                 self.allocator,
@@ -423,7 +423,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         const state = vmhost.SharedHandles.fromIntrinsic(self);
         var host = VmHost.borrowed(state, state.globals, out);
         vmhost.emitPath(self.allocator, "hof_invoke", func.fqn, info.body_func, null, args);
-        const result = try ir.eval.evalWithCapturesChained(VmHost, self.allocator, module, null, func, call_args, caps_owned, info.chain, &host);
+        const result = try ir.eval.evalWithCapturesChained(VmHost, self.allocator, module, info.module, func, call_args, caps_owned, info.chain, &host);
         return flattenEval(result);
     }
 

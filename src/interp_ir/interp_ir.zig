@@ -444,6 +444,15 @@ pub const SharedOutput = struct {
 /// One element of the lambda/closure side-table.
 pub const ClosureInfo = struct {
     body_func: FuncId,
+    /// The module `body_func` indexes when the closure was created inside
+    /// a body lowered into a per-method *sub-module* (an anonymous-object
+    /// method, property-init thunk, or `init` block). Null means the main
+    /// program module. Every invocation site resolves the body against
+    /// this module — sub-module `FuncId`s start at 0 and must never be
+    /// read through the main module's func table. The pointed-to module
+    /// stays live for the whole run (its owning `ObjRef` is held by the
+    /// anon-method table or the run arena).
+    module: ?*const ir.Module = null,
     n_params: usize,
     /// Capture names, in the same order as the runtime captures vec.
     capture_names: [][]const u8,

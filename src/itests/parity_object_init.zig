@@ -429,3 +429,130 @@ test "forward_referenced_top_level_prop_initializes_once" {
     ;
     try assertKlio("forward_ref_once", src, "a-init\nb-init\nmain 11 10\n");
 }
+
+/// Run `src` under both in-process load modes (`EmbeddedOnly` and
+/// `SourcePacks`) and assert stdout equals `expected` in each. Pins
+/// behavior the two stdlib assemblies must agree on.
+fn assertKlioBothModes(name: []const u8, src: []const u8, expected: []const u8) !void {
+    const modes = [_]parity.LoadMode{ .EmbeddedOnly, .SourcePacks };
+    for (modes) |mode| {
+        _ = file_arena.reset(.retain_capacity);
+        const a = file_arena.allocator();
+
+        var threaded: std.Io.Threaded = .init(a, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        std.Io.Dir.cwd().createDirPath(io, TMP_DIR) catch {};
+        const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+
+        const res = try parity.runInMode(a, io, path, mode);
+        switch (res) {
+            .ok => |got| std.testing.expectEqualStrings(expected, got) catch |e| {
+                std.debug.print("mode {s}: output mismatch for `{s}`\n", .{ @tagName(mode), name });
+                return e;
+            },
+            .err => |m| {
+                std.debug.print("mode {s}: klio run failed for `{s}`: {s}\n", .{ @tagName(mode), name, m });
+                return error.KlioRunFailed;
+            },
+        }
+    }
+}
+
+// An anonymous object's property initializer that calls an inline
+// stdlib HOF (`run`): the lambda is a closure created inside the
+// runtime-lowered init thunk's sub-module, so its body must resolve
+// against that sub-module, never the main func table (kotlinc:
+// "anon: first" then "1").
+test "anon_object_prop_init_through_inline_hof" {
+    const src =
+        \\fun main() {
+        \\    val probe = object {
+        \\        val first = run { println("anon: first"); 1 }
+        \\    }
+        \\    println(probe.first)
+        \\}
+        \\
+    ;
+    try assertKlioBothModes("anon_prop_init_inline_hof", src, "anon: first\n1\n");
+}
+
+// An anonymous Continuation whose overridden `context` property is
+// initialized from the `EmptyCoroutineContext` singleton by bare name:
+// the initializer must bind the object singleton, not null and not the
+// bare class value (kotlinc: "hi").
+test "anon_continuation_context_initializer_binds_singleton" {
+    const src =
+        \\import kotlin.coroutines.*
+        \\
+        \\fun runIt(block: suspend () -> Unit) {
+        \\    block.startCoroutine(object : Continuation<Unit> {
+        \\        override val context = EmptyCoroutineContext
+        \\        override fun resumeWith(result: Result<Unit>) {}
+        \\    })
+        \\}
+        \\fun main() {
+        \\    runIt { println("hi") }
+        \\}
+        \\
+    ;
+    try assertKlioBothModes("anon_continuation_ctx_init", src, "hi\n");
+}
+
+// Anonymous-object property initializers reading enclosing-scope names
+// by bare identifier: a top-level `val`, a user `object` singleton (the
+// value is the singleton — its `toString` override dispatches), and a
+// stdlib singleton, alongside a call and a constructor (kotlinc:
+// 7 / 9 / true / MyObj! / EmptyCoroutineContext).
+test "anon_object_prop_init_reads_globals_and_singletons" {
+    const src =
+        \\import kotlin.coroutines.*
+        \\object MyObj { override fun toString() = "MyObj!" }
+        \\val g = 7
+        \\fun f() = 9
+        \\class C
+        \\fun main() {
+        \\    val a = object {
+        \\        val fromGlobal = g
+        \\        val fromFun = f()
+        \\        val fromCtor = C()
+        \\        val fromObj = MyObj
+        \\        val fromStdlibObj = EmptyCoroutineContext
+        \\    }
+        \\    println(a.fromGlobal)
+        \\    println(a.fromFun)
+        \\    println(a.fromCtor != null)
+        \\    println(a.fromObj)
+        \\    println(a.fromStdlibObj)
+        \\}
+        \\
+    ;
+    try assertKlioBothModes(
+        "anon_prop_init_globals_singletons",
+        src,
+        "7\n9\ntrue\nMyObj!\nEmptyCoroutineContext\n",
+    );
+}
+
+// Supertype constructor args of an object expression evaluate for real
+// in the enclosing scope: a top-level `val` by bare name, a compound
+// expression over it, and a captured local (kotlinc: 5 / 6 / 4).
+test "anon_object_super_ctor_args_evaluate_in_enclosing_scope" {
+    const src =
+        \\val g = 5
+        \\open class Base(val n: Int)
+        \\fun main() {
+        \\    val a = object : Base(g) {}
+        \\    println(a.n)
+        \\    val b = object : Base(g + 1) {}
+        \\    println(b.n)
+        \\    val lc = 3
+        \\    val c = object : Base(lc + 1) {}
+        \\    println(c.n)
+        \\}
+        \\
+    ;
+    try assertKlioBothModes("anon_super_ctor_args", src, "5\n6\n4\n");
+}

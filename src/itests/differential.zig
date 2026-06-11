@@ -12,7 +12,7 @@
 //!     source) AND `CompiledPacks` (packs round-tripped through a compiled
 //!     `.klio-pack` image), and the two outputs must match byte-for-byte.
 //!
-//! The corpus is `examples/*.kt` (pure stdlib) plus the kotlinx-using
+//! The corpus is every `examples/*.kt` (pure stdlib) plus the kotlinx-using
 //! `tests/fixtures/coroutine_smoke/*.kt` so at least one pack-using program is
 //! exercised across ≥2 modes.
 

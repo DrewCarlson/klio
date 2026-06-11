@@ -3018,7 +3018,7 @@ fn kfunctionReflection(self: *VmHost, allocator: Allocator, receiver: *const Val
     const info = self.closures.get(@intCast(receiver.IrClosure.id)) orelse return null;
     const mg = self.module.borrow();
     defer mg.deinit();
-    const mod = mg.get();
+    const mod = info.module orelse mg.get();
     if (@intFromEnum(info.body_func) >= mod.funcs.items.len) return null;
     const f = mod.funcs.items[@intFromEnum(info.body_func)];
     if (std.mem.eql(u8, name, "name")) {
