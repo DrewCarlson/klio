@@ -177,6 +177,7 @@ pub const FuncBuilder = struct {
     /// exiting.
     finally_stack: std.ArrayList(ast.Block) = .empty,
     is_lambda_body: bool,
+    is_anon_fn_body: bool,
     is_named_local_fn: bool,
     is_inline: bool,
     /// True while lowering a default-argument thunk. A default
@@ -232,6 +233,7 @@ pub const FuncBuilder = struct {
             .receiver_lambda_params = StringSet.init(allocator),
             .generic_typed_params = StringSet.init(allocator),
             .is_lambda_body = false,
+            .is_anon_fn_body = false,
             .is_named_local_fn = false,
             .is_inline = false,
             .is_param_thunk = false,
@@ -439,6 +441,22 @@ pub const FuncBuilder = struct {
     pub fn setOuterNamesWithoutLambda(self: *FuncBuilder, names: StringSet) void {
         self.outer_names.deinit();
         self.outer_names = names;
+        // The one body shape lowered this way is an anonymous-function
+        // expression (`fun(...) { ... }`). It is not a lambda for
+        // return/label semantics (`return` is local), but its bare names
+        // resolve against the enclosing receivers exactly like a lambda's,
+        // and its implicit `this` arrives through the capture slot.
+        self.is_anon_fn_body = true;
+    }
+    pub fn isAnonFnBody(self: *const FuncBuilder) bool {
+        return self.is_anon_fn_body;
+    }
+    /// A body whose implicit `this` arrives through the closure capture
+    /// slot rather than a bound parameter, and whose bare names resolve
+    /// against the receivers in scope at its creation site: lambda bodies,
+    /// named local fns, and anonymous-function bodies.
+    pub fn capturesThisSlot(self: *const FuncBuilder) bool {
+        return self.is_lambda_body or self.is_anon_fn_body;
     }
     pub fn setInline(self: *FuncBuilder, inline_: bool) void {
         self.is_inline = inline_;

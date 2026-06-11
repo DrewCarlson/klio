@@ -590,7 +590,9 @@ pub fn lowerFunctionBody(
             while (it.next()) |k| try members.put(k.*, {});
         }
         const implicit = [_][]const u8{"this"};
-        return lowerFunctionBodyWithImplicitOwner(module, f, &implicit, null, &members);
+        var func = try lowerFunctionBodyWithImplicitOwner(module, f, &implicit, null, &members);
+        func.kind = .top_level_extension;
+        return func;
     } else {
         return lowerFunctionBodyWithImplicitOwner(module, f, &.{}, null, null);
     }
@@ -720,6 +722,7 @@ pub fn lowerMethodWithPrivate(
     const id = FuncId.from(@intCast(module.funcs.items.len));
     var placed = func;
     placed.id = id;
+    placed.kind = .instance_method;
     try module.funcs.append(a, placed);
     try recordMethodParamDefaults(module, f, id, owner_class, own_members);
     return placed;
@@ -885,11 +888,11 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
     // order.
     if (f.receiver_type) |*rt| {
         if (func.params.len != 0 and std.mem.eql(u8, func.params[0].name, "this")) {
-            func.params[0].ty = .{
-                .name = try loweredTypeName(a, rt),
-                .nullable = rt.nullable,
-                .args = &.{},
-            };
+            // Full structural type — head name AND generic arguments — so
+            // the strict extension-receiver prover can refute a
+            // `List<String>` receiver on a list of Ints instead of
+            // proving on the bare head.
+            func.params[0].ty = try loweredTypeRef(a, rt, false);
         }
     }
     func.is_suspend = f.is_suspend;

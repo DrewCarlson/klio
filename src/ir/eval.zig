@@ -134,17 +134,26 @@ threadlocal var eval_depth_cap: usize = 0;
 
 /// One implicit receiver on the enclosing-`this` chain.
 ///
-/// `is_subject` records how the value entered scope, because the two ways
-/// bring different receivers with them. A dispatch receiver or a displaced
-/// lexical `this` carries its whole class-nesting tower: inside a member of
-/// `Inner`, `this@Outer` is in scope precisely because it is reachable
-/// through `this@Inner`'s `outer` link. A `with`/`run`/`apply` subject
-/// brings only itself — `with(x) { … }` never puts `x`'s enclosing
-/// instances in scope. Inner-class outer selection consults the flag;
-/// bare-name resolution ignores it.
+/// `kind` records how the value entered scope, because the three ways
+/// carry different scope rights. A dispatch receiver or a displaced
+/// lexical `this` (`receiver`) carries its whole class-nesting tower:
+/// inside a member of `Inner`, `this@Outer` is in scope precisely because
+/// it is reachable through `this@Inner`'s `outer` link. A
+/// `with`/`run`/`apply` subject (`subject`) brings only itself —
+/// `with(x) { … }` never puts `x`'s enclosing instances in scope. An
+/// `access` entry exists only for the duration of one host dispatch (the
+/// member-extension visibility filter consults it); it is never part of
+/// any frame's lexical receiver scope, so it neither transfers into a
+/// callee frame nor survives into a closure's creation-chain snapshot.
 pub const EnclosingEntry = struct {
     v: Value,
-    is_subject: bool,
+    kind: Kind = .receiver,
+
+    pub const Kind = enum { receiver, subject, access };
+
+    pub fn isSubject(self: EnclosingEntry) bool {
+        return self.kind == .subject;
+    }
 };
 
 /// The enclosing-`this` chain of the *currently executing* frame.
@@ -154,27 +163,49 @@ pub const EnclosingEntry = struct {
 /// frame). On frame entry it is repointed at the new frame's chain and restored
 /// to the caller's chain on exit, so the chain a frame reads is its own
 /// frame-scoped data, snapshotted into `FrameSnapshot.enclosing_this` on
-/// suspend and restored verbatim on resume. A push made by host dispatch just
-/// before invoking a callable appends to the *current* frame's chain; the
-/// invoked frame copies that extended chain at entry (it inherits the
-/// enclosing receivers), and the matching pop removes it once the call returns.
-/// Because the chain lives on the frame, it travels with a parked continuation
-/// and cannot leak past the frame or across a `run` boundary.
+/// suspend and restored verbatim on resume.
+///
+/// Kotlin receiver scope is LEXICAL, so a frame's chain is seeded from
+/// what the code it runs could lexically see — a closure body's chain
+/// comes from the closure's creation-time snapshot, a member/extension
+/// body's receiver tower comes from its dispatch — never inherited
+/// wholesale from the dynamic caller. The only entries that cross a frame
+/// boundary at entry are the ones the dispatch just pushed for this very
+/// call (a bound receiver-lambda subject, a displaced `this`, a
+/// member-extension owner): the in-flight suffix beyond the caller's
+/// `active_chain_base`, minus `access` entries. Because the chain lives on
+/// the frame, it travels with a parked continuation and cannot leak past
+/// the frame or across a `run` boundary.
 threadlocal var active_chain: ?*std.ArrayList(EnclosingEntry) = null;
 
+/// Length of the active chain's seeded (frame-entry) prefix. Entries at
+/// `>= active_chain_base` are in-flight pushes made by the currently
+/// executing frame around a dispatch; only those transfer into the next
+/// frame entered.
+threadlocal var active_chain_base: usize = 0;
+
 /// Push `v` as an enclosing implicit receiver for the about-to-be-invoked
-/// callable. Appends to the current frame's chain; the invoked frame inherits
-/// it at entry. A no-op (silently dropped) when no frame is active.
+/// callable. Appends to the current frame's chain; the invoked frame picks
+/// it up at entry. A no-op (silently dropped) when no frame is active.
 pub fn pushEnclosing(v: *const Value) void {
     const chain = active_chain orelse return;
-    chain.append(chainAllocator(), .{ .v = v.*, .is_subject = false }) catch {};
+    chain.append(chainAllocator(), .{ .v = v.*, .kind = .receiver }) catch {};
 }
 
 /// Push a receiver-lambda subject (`with(x) { … }`'s `x`). The subject is a
 /// receiver inside the lambda body, but its `outer` links are not.
 pub fn pushEnclosingSubject(v: *const Value) void {
     const chain = active_chain orelse return;
-    chain.append(chainAllocator(), .{ .v = v.*, .is_subject = true }) catch {};
+    chain.append(chainAllocator(), .{ .v = v.*, .kind = .subject }) catch {};
+}
+
+/// Push `v` for dispatch-time visibility only (the member-extension
+/// visibility filter and field-resolution fallbacks consult the chain
+/// while resolving one call). The entry never becomes part of a callee
+/// frame's lexical receiver scope.
+pub fn pushEnclosingAccess(v: *const Value) void {
+    const chain = active_chain orelse return;
+    chain.append(chainAllocator(), .{ .v = v.*, .kind = .access }) catch {};
 }
 
 /// Pop the most recent `pushEnclosing`/`pushEnclosingSubject`. A no-op when no
@@ -212,6 +243,24 @@ pub fn enclosingEntriesAlloc(allocator: Allocator) Allocator.Error![]EnclosingEn
         out[i] = chain.items[chain.items.len - 1 - i];
     }
     return out;
+}
+
+/// Snapshot the receiver chain a closure created *right here* lexically
+/// sees (storage order, innermost last). Kotlin closures resolve bare
+/// names against the receivers in scope at their creation site, so the
+/// snapshot is taken once at `Lambda`/`AstLambda` execution and seeds the
+/// body frame's chain at every later invocation — wherever (and on
+/// whichever thread) that happens. `access` entries are dispatch-transient
+/// and excluded. Caller owns the returned slice.
+pub fn captureChainAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry {
+    const chain = active_chain orelse return allocator.alloc(EnclosingEntry, 0);
+    var out: std.ArrayList(EnclosingEntry) = .empty;
+    errdefer out.deinit(allocator);
+    for (chain.items) |e| {
+        if (e.kind == .access) continue;
+        try out.append(allocator, e);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Backing allocator for a frame's `enclosing_this` chain. The chain is
@@ -333,18 +382,22 @@ const Frame = struct {
     params: std.ArrayList(Value),
     captures: std.ArrayList(Value),
     /// The enclosing-`this` chain this frame runs with, innermost last. Seeded
-    /// at frame entry from the caller's active chain (so the frame inherits the
-    /// enclosing implicit receivers a `with`/member-extension/receiver-lambda
-    /// dispatch pushed) and extended by this frame's own pushes for the
-    /// duration of a sub-call. Backed by `page_allocator` so any push site
-    /// (`execInst` here or host dispatch through `pushAccessEnclosing`) appends
-    /// through one allocator. Snapshotted into `FrameSnapshot.enclosing_this`
-    /// on suspend and restored verbatim on resume.
+    /// at frame entry from the frame's *lexical* receivers — a closure body's
+    /// creation-time snapshot plus whatever the dispatch just pushed for this
+    /// call (subject / displaced `this` / member-extension owner) — and
+    /// extended by this frame's own pushes for the duration of a sub-call.
+    /// Backed by `page_allocator` so any push site (`execInst` here or host
+    /// dispatch through `pushAccessEnclosing`) appends through one allocator.
+    /// Snapshotted into `FrameSnapshot.enclosing_this` on suspend and restored
+    /// verbatim on resume.
     enclosing_this: std.ArrayList(EnclosingEntry),
     /// The `active_chain` pointer to restore when this frame exits, so a frame
     /// running under a caller frame returns enclosing-`this` resolution to the
     /// caller's chain rather than leaving a dangling pointer.
     prev_chain: ?*std.ArrayList(EnclosingEntry),
+    /// The caller's `active_chain_base`, restored on exit alongside
+    /// `prev_chain`.
+    prev_chain_base: usize,
     /// The owning module handle when this frame runs in a per-method
     /// *sub-module* (anonymous object / local class / nested
     /// `private`/member class — each lowered into its own `Module`).
@@ -374,34 +427,62 @@ const Frame = struct {
             .captures = captures,
             .enclosing_this = .empty,
             .prev_chain = null,
+            .prev_chain_base = 0,
             .module_arc = null,
             .allocator = allocator,
         };
     }
 
-    /// Seed this frame's enclosing-`this` chain from the caller's active chain
-    /// and make it the active chain for the frame's lifetime. The seed copies
-    /// the caller's chain verbatim: the new frame inherits the enclosing
-    /// implicit receivers visible at the call site (e.g. a `with(x){...}` body
-    /// resolving a member of `x` or a `this@Outer`).
-    fn activateChain(self: *Frame) Allocator.Error!void {
-        if (active_chain) |caller| {
-            try self.enclosing_this.appendSlice(chainAllocator(), caller.items);
+    /// Seed this frame's enclosing-`this` chain and make it the active chain
+    /// for the frame's lifetime. Kotlin receiver scope is lexical, so the
+    /// seed is NOT the caller's chain: it is `seed` (a closure body's
+    /// creation-time snapshot; empty for everything else) followed by the
+    /// caller's in-flight pushes — the entries the dispatch placed for this
+    /// very call (a receiver-lambda subject, a displaced `this`, a
+    /// member-extension owner). `access` entries are dispatch-transient and
+    /// never cross the frame boundary.
+    fn activateChain(self: *Frame, seed: []const EnclosingEntry) Allocator.Error!void {
+        for (seed) |e| {
+            if (e.kind == .access) continue;
+            try self.enclosing_this.append(chainAllocator(), e);
         }
-        self.prev_chain = active_chain;
-        active_chain = &self.enclosing_this;
+        if (active_chain) |caller| {
+            for (caller.items[@min(active_chain_base, caller.items.len)..]) |e| {
+                if (e.kind == .access) continue;
+                try self.enclosing_this.append(chainAllocator(), e);
+            }
+        }
+        // A method / extension body's own receiver is the innermost
+        // lexical receiver of everything written inside it — seed it onto
+        // the frame's chain so a closure created in the body snapshots it
+        // (and so dispatch-time visibility filters see it without a
+        // per-site push). It is part of the seeded base, never an
+        // in-flight push, so it does not leak into callees.
+        if (ownReceiverEntry(self.func, self.params.items)) |own| {
+            const items = self.enclosing_this.items;
+            const dup = items.len > 0 and sameReceiver(items[items.len - 1].v, own.v);
+            if (!dup) try self.enclosing_this.append(chainAllocator(), own);
+        }
+        self.activateAs();
     }
 
     /// Seed this frame's chain from a saved snapshot slice (resume path) and
     /// make it active.
     fn activateChainFrom(self: *Frame, saved: []const EnclosingEntry) Allocator.Error!void {
         try self.enclosing_this.appendSlice(chainAllocator(), saved);
+        self.activateAs();
+    }
+
+    fn activateAs(self: *Frame) void {
         self.prev_chain = active_chain;
+        self.prev_chain_base = active_chain_base;
         active_chain = &self.enclosing_this;
+        active_chain_base = self.enclosing_this.items.len;
     }
 
     fn deactivateChain(self: *Frame) void {
         active_chain = self.prev_chain;
+        active_chain_base = self.prev_chain_base;
     }
 
     fn deinit(self: *Frame) void {
@@ -499,13 +580,33 @@ pub fn evalWithCapturesIn(
     captures: std.ArrayList(Value),
     host: *H,
 ) Allocator.Error!EvalResult {
+    return evalWithCapturesChained(H, allocator, module, owning, func, args, captures, &.{}, host);
+}
+
+/// Like `evalWithCapturesIn` but additionally seeds the frame's
+/// enclosing-`this` chain with `chain_seed` (storage order, innermost
+/// last). This is the closure-invocation entry: the seed is the closure's
+/// creation-time receiver snapshot, so the body resolves bare names
+/// against the receivers it lexically closed over, not whatever the
+/// dynamic caller happens to have in scope.
+pub fn evalWithCapturesChained(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    owning: ?*const Module,
+    func: *const Func,
+    args: std.ArrayList(Value),
+    captures: std.ArrayList(Value),
+    chain_seed: []const EnclosingEntry,
+    host: *H,
+) Allocator.Error!EvalResult {
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
     const func_name = func.name;
     var frame = try Frame.newWithCaptures(allocator, module, func, args, captures);
     defer frame.deinit();
     frame.module_arc = owning;
-    try frame.activateChain();
+    try frame.activateChain(chain_seed);
     defer frame.deactivateChain();
     const cur = func.entry;
     var result = try runFrame(H, allocator, module, &frame, &try_stack, cur, 0, host);
@@ -1128,7 +1229,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // visibility filter accepts the member-ext owner.
             var pushed_enclosing = false;
             if (frame.params.items.len > 0 and frame.params.items[0] == .Instance) {
-                pushEnclosing(&frame.params.items[0]);
+                pushEnclosingAccess(&frame.params.items[0]);
                 pushed_enclosing = true;
             }
             const extension_result = try host.callMember(allocator, &v, method, &.{});
@@ -1278,7 +1379,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 const pi = frame.params.items[0].Instance;
                 const same = recv == .Instance and ObjRef(InstanceData).ptrEq(pi, recv.Instance);
                 if (!same) {
-                    pushEnclosing(&frame.params.items[0]);
+                    pushEnclosingAccess(&frame.params.items[0]);
                     pushed_enclosing = true;
                 }
             }
@@ -1327,7 +1428,16 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                         const same = arg_values.len > 0 and arg_values[0] == .Instance and
                             ObjRef(InstanceData).ptrEq(p.Instance, arg_values[0].Instance);
                         if (!same) {
-                            pushEnclosing(&frame.params.items[ct_idx]);
+                            // A member-extension's body has its declaring
+                            // class's `this` in lexical scope (the
+                            // dispatch receiver); a plain extension's body
+                            // does not — the push is then dispatch
+                            // visibility only.
+                            if (callee_fn.?.kind == .member_extension) {
+                                pushEnclosing(&frame.params.items[ct_idx]);
+                            } else {
+                                pushEnclosingAccess(&frame.params.items[ct_idx]);
+                            }
                             pushed_enclosing = true;
                         }
                     }
@@ -1373,17 +1483,13 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     host.overrideClosureThis(&callee_v, &ct);
                 }
             }
-            // Receiver-lambda fallback for bare names lowered as
-            // LoadGlobal.
-            var pushed_caller_this = false;
-            if (callee_v == .IrClosure) {
-                if (caller_this) |ct| {
-                    pushEnclosing(&ct);
-                    pushed_caller_this = true;
-                }
-            }
+            // No caller-`this` push here: a closure's body resolves bare
+            // names against its creation-time receiver chain (lexical
+            // scope); a receiver-typed lambda gets its subject through the
+            // receiver-split / `this`-capture binding above. Pushing the
+            // dynamic caller's `this` would hand the body a receiver it
+            // never lexically saw.
             const result = host.callValueNamed(allocator, &callee_v, arg_values_list.items, names_list.items);
-            if (pushed_caller_this) popEnclosing();
             switch (try result) {
                 .ok => |rv| try frame.write(cv.dst, rv),
                 .err => |e| return errResult(e),
@@ -1458,14 +1564,17 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             defer allocator.free(arg_values);
             const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
             defer allocator.free(names);
-            // Keep the caller's instance `this` reachable as the
-            // enclosing receiver while a `recv.member(...)` call runs.
+            // Keep the caller's instance `this` reachable while the
+            // `recv.member(...)` dispatch resolves (the member-extension
+            // visibility filter consults the chain); the callee's own
+            // lexical scope is its dispatch receiver, so the entry is
+            // access-only.
             var pushed_enclosing = false;
             if (frame.params.items.len > 0 and frame.params.items[0] == .Instance) {
                 const pi = frame.params.items[0].Instance;
                 const same = recv == .Instance and ObjRef(InstanceData).ptrEq(pi, recv.Instance);
                 if (!same) {
-                    pushEnclosing(&frame.params.items[0]);
+                    pushEnclosingAccess(&frame.params.items[0]);
                     pushed_enclosing = true;
                 }
             }
@@ -1485,11 +1594,13 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const name_str = constStr(frame.module, cmv.name) orelse
                 return errResult(.{ .Type = "CallMemberOrValue: name not a string const" });
             if (host.hostHasMember(&recv, name_str)) {
+                orAudit("CallMemberOrValue", name_str, "member", 0, &recv);
                 switch (try host.callMemberNamed(allocator, &recv, name_str, user_args, names)) {
                     .ok => |rv| try frame.write(cmv.dst, rv),
                     .err => |e| return errResult(e),
                 }
             } else {
+                orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
                 const fb = frame.read(cmv.fallback);
                 switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
                     .ok => |rv| try frame.write(cmv.dst, rv),
@@ -1519,6 +1630,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 else => false,
             };
             if (invocable) {
+                if (orAuditOn()) {
+                    const name_str = constStr(frame.module, cvm.name) orelse "?";
+                    orAudit("CallValueOrMember", name_str, "value", -1, null);
+                }
                 switch (try host.callValueNamed(allocator, &callee_v, arg_values, names)) {
                     .ok => |rv| try frame.write(cvm.dst, rv),
                     .err => |e| return errResult(e),
@@ -1527,6 +1642,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 const recv = frame.read(cvm.this_recv);
                 const name_str = constStr(frame.module, cvm.name) orelse
                     return errResult(.{ .Type = "CallValueOrMember: name not a string const" });
+                orAudit("CallValueOrMember", name_str, "member", 0, &recv);
                 switch (try host.callMemberNamed(allocator, &recv, name_str, arg_values, names)) {
                     .ok => |rv| try frame.write(cvm.dst, rv),
                     .err => |e| return errResult(e),
@@ -1642,14 +1758,30 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const name_str = constStr(frame.module, stg.name) orelse
                 return errResult(.{ .Type = "StoreToThisOrGlobal: name not a string const" });
             const v = frame.read(stg.value);
-            const this_val = implicitThisValue(frame, stg.this_idx, false);
-            const route_to_member = this_val == .Instance and host.hostHasMember(&this_val, name_str);
-            if (route_to_member) {
-                switch (try host.setField(allocator, &this_val, name_str, v)) {
-                    .ok => {},
-                    .err => |e| return errResult(e),
+            // Kotlin scoping for a bare-name write mirrors the read side:
+            // the innermost implicit receiver owning a *property* of this
+            // name takes the write; only when no receiver owns one does
+            // the write land on the top-level binding (pinned by the
+            // `bare_write_*` kotlinc parity fixtures). An assignment LHS
+            // can only resolve to a property or variable — a member
+            // *function* of the name never captures the write.
+            var routed = false;
+            {
+                const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, false, host, name_str);
+                defer allocator.free(cands);
+                for (cands) |c| {
+                    if (c.v != .Instance or !host.hostHasProperty(&c.v, name_str)) continue;
+                    orAudit("StoreToThisOrGlobal", name_str, "member", c.depth, &c.v);
+                    switch (try host.setField(allocator, &c.v, name_str, v)) {
+                        .ok => {},
+                        .err => |e| return errResult(e),
+                    }
+                    routed = true;
+                    break;
                 }
-            } else {
+            }
+            if (!routed) {
+                orAudit("StoreToThisOrGlobal", name_str, "global", -1, null);
                 switch (try host.storeGlobal(allocator, name_str, v)) {
                     .ok => {},
                     .err => |e| return errResult(e),
@@ -1670,30 +1802,16 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 .ok => |maybe| maybe,
                 .err => |e| return errResult(e),
             };
+            // No receiver probe here: a `LoadGlobal` is emitted only where
+            // no implicit receiver can shadow the name, and kotlinc
+            // rejects resolving it against a *caller's* receiver (dynamic
+            // scope), so a miss is a hard unresolved reference.
             var v: Value = undefined;
             if (found) |fv| {
                 v = fv;
             } else {
-                // Receiver-lambda fallback.
-                var resolved: ?Value = null;
-                const chain = try enclosingThisChainAlloc(allocator);
-                defer allocator.free(chain);
-                for (chain) |outer| {
-                    if (outer == .Null or outer == .Unit) continue;
-                    switch (try host.getField(allocator, &outer, name_str)) {
-                        .ok => |gv| if (gv != .Unit) {
-                            resolved = gv;
-                            break;
-                        },
-                        .err => {},
-                    }
-                }
-                if (resolved) |rv| {
-                    v = rv;
-                } else {
-                    const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                    return errResult(.{ .Unbound = msg });
-                }
+                const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
+                return errResult(.{ .Unbound = msg });
             }
             try frame.write(lg.dst, v);
         },
@@ -1704,15 +1822,25 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .LoadFromThisOrGlobal => |lt| {
             const name_str = constStr(frame.module, lt.name) orelse
                 return errResult(.{ .Type = "LoadFromThisOrGlobal: name not a string const" });
-            const this_val = implicitThisValue(frame, lt.this_idx, false);
             var resolved: ?Value = null;
             {
-                const chain = try implicitReceiverChain(allocator, this_val);
-                defer allocator.free(chain);
-                for (chain) |recv| {
-                    if (recv == .Null or recv == .Unit) continue;
-                    switch (try host.getField(allocator, &recv, name_str)) {
-                        .ok => |v| if (v != .Unit) {
+                // `consult_param = true`: in a method / extension body the
+                // implicit receiver is the frame's `this` *parameter*, not
+                // a capture slot.
+                const cands = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str));
+                defer allocator.free(cands);
+                // Per-candidate probes are member-only (`getMemberField`):
+                // a candidate must not "resolve" a global or an outer
+                // receiver's member and shadow a receiver further out —
+                // the walk's own order decides precedence, and the global
+                // tiers below decide the fallback. A probe hit is a hit
+                // even when the member's value IS `Unit` (`var u: Unit`):
+                // the strict probe reports misses as errors, never as a
+                // spurious `Unit`.
+                for (cands) |c| {
+                    switch (try host.getMemberField(allocator, &c.v, name_str)) {
+                        .ok => |v| {
+                            orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);
                             resolved = v;
                             break;
                         },
@@ -1724,13 +1852,27 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // the getter reads above; the global fallback uses the bare
             // name.
             const bare_name = stripScopeGetter(name_str);
+            // A lowering-resolved identity binds that exact declaration;
+            // the name string remains the unresolved-shape fallback. A
+            // runtime-scoped shadowing capture (a closed-over callable
+            // materialized as a scoped-global layer) outranks the static
+            // pick, mirroring the call form's shadow gate.
+            const by_id: ?Value = if (resolved == null and (lt.func != null or lt.class != null) and
+                !host.isShadowingCapture(bare_name))
+                host.lookupGlobalById(allocator, lt.func, lt.class)
+            else
+                null;
             var v: Value = undefined;
             if (resolved) |rv| {
                 v = rv;
+            } else if (by_id) |gv| {
+                orAudit("LoadFromThisOrGlobal", bare_name, "global_id", -1, null);
+                v = gv;
             } else {
                 switch (try host.lookupGlobalThrowing(allocator, bare_name)) {
                     .ok => |maybe| {
                         if (maybe) |gv| {
+                            orAudit("LoadFromThisOrGlobal", bare_name, "global", -1, null);
                             v = gv;
                         } else {
                             const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
@@ -1798,9 +1940,13 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
     return ok(.Unit);
 }
 
-/// `name(args)` where `name` resolves to an in-scope value that also
-/// names a member function of the enclosing class. Mirrors the Rust
-/// `Inst::CallMemberOrGlobal` arm.
+/// `name(args)` where lowering could not classify the bare callee as
+/// member-vs-global. Mirrors Kotlin's call resolution for an implicit
+/// receiver: each candidate receiver is searched innermost-first, members
+/// and applicable extensions per receiver (pinned by the
+/// `inner_ext_over_outer_member` kotlinc parity fixture), then the
+/// top-level tiers — runtime overload selection, the lowering-resolved
+/// constructor class, the global by name — and only then an error.
 fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!EvalResult {
     const name_str = constStr(frame.module, cmg.name) orelse
         return errResult(.{ .Type = "CallMemberOrGlobal: name not a string const" });
@@ -1823,16 +1969,15 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     const shadow_capture = host.isShadowingCapture(name_str) and
         ((this_val == .Null or this_val == .Unit) or !host.hostHasMember(&this_val, name_str));
 
-    // Implicit-receiver search, Kotlin order: a *member* of the lambda's
-    // own `this` or of any lexically enclosing `this@…` outranks a
-    // same-named top-level extension.
     if (!is_ctor_name and !shadow_capture) {
-        const chain = try implicitReceiverChain(allocator, this_val);
-        defer allocator.free(chain);
-        for (chain) |recv| {
-            if (recv == .Null or recv == .Unit) continue;
-            switch (try host.callMemberOnly(allocator, &recv, name_str, arg_values, names)) {
+        const cands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str);
+        defer allocator.free(cands);
+        // Strict pass: members and receiver-compatible extensions of each
+        // candidate, innermost first — the kotlinc candidate order.
+        for (cands) |c| {
+            switch (try host.callMemberStrictExt(allocator, &c.v, name_str, arg_values, names)) {
                 .ok => |v| {
+                    orAudit("CallMemberOrGlobal", name_str, "member", c.depth, &c.v);
                     resolved = v;
                     break;
                 },
@@ -1845,82 +1990,14 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 },
             }
         }
-    }
-    if (resolved == null and !is_ctor_name and !shadow_capture and this_val != .Null and this_val != .Unit) {
-        switch (try host.callMemberNamed(allocator, &this_val, name_str, arg_values, names)) {
-            .ok => |v| resolved = v,
-            .err => |e| switch (e) {
-                .Suspended => return errResult(e),
-                .Unimplemented => {},
-                else => if (first_real_err == null) {
-                    first_real_err = e;
-                },
-            },
-        }
-    }
-    // Enclosing-receiver fallback.
-    if (resolved == null and !shadow_capture) {
-        if (enclosingThisLast()) |outer| {
-            if (outer != .Null and outer != .Unit) {
-                switch (try host.callMemberNamed(allocator, &outer, name_str, arg_values, names)) {
-                    .ok => |v| resolved = v,
-                    .err => |e| switch (e) {
-                        .Suspended => return errResult(e),
-                        .Unimplemented => {},
-                        else => if (first_real_err == null) {
-                            first_real_err = e;
-                        },
-                    },
-                }
-            }
-        }
-    }
-    // Inner-class outer-chain fallback.
-    if (resolved == null and !shadow_capture) {
-        var cur: ?Value = instanceOuter(&this_val);
-        while (cur) |o| {
-            if (o == .Null or o == .Unit) break;
-            switch (try host.callMemberNamed(allocator, &o, name_str, arg_values, names)) {
-                .ok => |v| {
-                    resolved = v;
-                    break;
-                },
-                .err => |e| switch (e) {
-                    .Suspended => return errResult(e),
-                    .Unimplemented => {},
-                    else => if (first_real_err == null) {
-                        first_real_err = e;
-                    },
-                },
-            }
-            cur = instanceOuter(&o);
-        }
-    }
-    // The receiver carries this member but none of the probes above
-    // bound it.
-    if (resolved == null and !is_ctor_name and this_val != .Null and this_val != .Unit and
-        host.hostHasMember(&this_val, name_str))
-    {
-        switch (try host.callMemberNamed(allocator, &this_val, name_str, arg_values, names)) {
-            .ok => |v| resolved = v,
-            .err => |e| switch (e) {
-                .Suspended => return errResult(e),
-                .Unimplemented => {},
-                else => if (first_real_err == null) {
-                    first_real_err = e;
-                },
-            },
-        }
-    }
-    // Lexically-enclosing receivers as extension candidates.
-    if (resolved == null and !is_ctor_name and !shadow_capture) {
-        const chain = try implicitReceiverChain(allocator, this_val);
-        defer allocator.free(chain);
-        if (chain.len > 1) {
-            for (chain[1..]) |recv| {
-                if (recv == .Null or recv == .Unit) continue;
-                switch (try host.callMemberNamed(allocator, &recv, name_str, arg_values, names)) {
+        // Lenient pass: receivers whose runtime type cannot prove the
+        // extension-receiver match. Runs only after every receiver missed
+        // strictly, so an unprovable pick never outranks a real member.
+        if (resolved == null) {
+            for (cands) |c| {
+                switch (try host.callMemberNamed(allocator, &c.v, name_str, arg_values, names)) {
                     .ok => |v| {
+                        orAudit("CallMemberOrGlobal", name_str, "member_lenient", c.depth, &c.v);
                         resolved = v;
                         break;
                     },
@@ -1947,12 +2024,17 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             .err => |e| return errResult(e),
         };
         if (overload) |v| {
+            orAudit("CallMemberOrGlobal", name_str, "overload", -1, null);
             result = v;
         } else {
-            // A lowering-resolved constructor class binds exactly; the
-            // simple-name lookup remains the unresolved fallback.
-            const by_id: ?Value = if (cmg.class) |_|
-                host.lookupGlobalById(allocator, null, cmg.class)
+            // A lowering-resolved identity (constructor class or
+            // shadowable top-level function) binds exactly; the
+            // simple-name lookup remains the unresolved fallback. A
+            // runtime-scoped shadowing capture outranks the static pick,
+            // as on the load form.
+            const by_id: ?Value = if ((cmg.class != null or cmg.func != null) and
+                !host.isShadowingCapture(name_str))
+                host.lookupGlobalById(allocator, cmg.func, cmg.class)
             else
                 null;
             const global = if (by_id != null) by_id else switch (try host.lookupGlobalThrowing(allocator, name_str)) {
@@ -1960,53 +2042,39 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 .err => |e| return errResult(e),
             };
             if (global) |callee| {
+                orAudit("CallMemberOrGlobal", name_str, if (by_id != null) "global_id" else "global", -1, null);
                 switch (try host.callValueNamed(allocator, &callee, arg_values, names)) {
                     .ok => |v| result = v,
                     .err => |e| return errResult(e),
                 }
             } else {
-                // Last resort: dispatch the bare call on the frame's
-                // bound `this` param, or the lexically enclosing
-                // receiver.
-                var own_this: ?Value = null;
-                if (frameThisParam(frame)) |i| {
-                    if (i < frame.params.items.len and frame.params.items[i] == .Instance) {
-                        own_this = frame.params.items[i];
-                    }
-                }
-                if (own_this == null) {
-                    const ec = try enclosingThisChainAlloc(allocator);
-                    defer allocator.free(ec);
-                    for (ec) |v| {
-                        if (v == .Instance and host.hostHasMember(&v, name_str)) {
-                            own_this = v;
-                            break;
-                        }
-                    }
-                }
-                if (own_this != null and own_this.? == .Instance) {
-                    const t = own_this.?;
-                    switch (try host.callMemberNamed(allocator, &t, name_str, arg_values, names)) {
-                        .ok => |v| result = v,
-                        .err => |e| switch (e) {
-                            .Suspended => return errResult(e),
-                            else => {
-                                if (first_real_err) |fre| return errResult(fre);
-                                const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                                return errResult(.{ .Unbound = msg });
-                            },
-                        },
-                    }
-                } else {
-                    if (first_real_err) |fre| return errResult(fre);
-                    const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                    return errResult(.{ .Unbound = msg });
-                }
+                if (first_real_err) |fre| return errResult(fre);
+                const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
+                return errResult(.{ .Unbound = msg });
             }
         }
     }
     try frame.write(cmg.dst, result);
     return ok(.Unit);
+}
+
+/// The enclosing-chain entry a method / extension frame contributes for
+/// its own bound receiver: a dispatch receiver carries its class-nesting
+/// tower and companion (`receiver`); an extension receiver brings only
+/// itself (`subject`). `null` for plain functions, lambdas (their
+/// receiver scope is the creation-time chain), and unbound frames.
+fn ownReceiverEntry(func: *const Func, params: []const Value) ?EnclosingEntry {
+    const kind: EnclosingEntry.Kind = switch (func.kind) {
+        .instance_method => .receiver,
+        .top_level_extension, .member_extension => .subject,
+        .plain => return null,
+    };
+    if (func.is_lambda) return null;
+    if (func.params.len == 0 or !std.mem.eql(u8, func.params[0].name, "this")) return null;
+    if (params.len == 0) return null;
+    const v = params[0];
+    if (v == .Null or v == .Unit) return null;
+    return .{ .v = v, .kind = kind };
 }
 
 /// The captured/parameter outer link of an `Instance` value.
@@ -2051,13 +2119,18 @@ fn callerThisValue(frame: *const Frame) ?Value {
 // Implicit-receiver resolution choke point.
 //
 // The `*OrGlobal` instructions (`LoadFromThisOrGlobal`, `StoreToThisOrGlobal`,
-// `CallMemberOrGlobal`) all resolve a bare name against an *implicit*
-// receiver — the lambda/method's own `this` plus any lexically-enclosing
-// `this@…` — before falling back to a top-level global. The front step
-// (recover the implicit `this`) and the traversal order (own `this`, then
-// the enclosing-`this` chain) are identical across the three; these helpers
-// are the single place that derives them so the read / write / call arms
-// share one resolution path instead of re-deriving it three ways.
+// `CallMemberOrGlobal`) all resolve a bare name against the *implicit*
+// receivers in scope — the lambda/method's own `this`, each
+// lexically-enclosing `this@…`, and (for dispatch receivers) the class-nesting
+// tower of `outer` links — before falling back to a top-level global. The
+// candidate list and its order are derived in exactly one place
+// (`implicitCandidatesAlloc`); the three handlers differ only in their
+// terminal operation (field read / member write / member call) and in the
+// call form's shadow/constructor gates. Kotlin's precedence, pinned by the
+// kotlinc parity fixtures (`receiver_lambda_*`, `bare_write_*`,
+// `inner_ext_over_outer_member`): candidates are searched innermost-first,
+// and *all* of a receiver's candidates — members first, then applicable
+// extensions — outrank any candidate of the next receiver out.
 // -------------------------------------------------------------------------
 
 /// Recover the implicit receiver for an `*OrGlobal` instruction:
@@ -2078,17 +2151,149 @@ fn implicitThisValue(frame: *const Frame, this_idx: usize, consult_param: bool) 
     return this_val;
 }
 
-/// The ordered implicit-receiver chain a bare name is resolved against:
-/// the frame's own implicit `this` (when present) followed by each
-/// lexically-enclosing `this@…`. Caller frees the returned slice.
-fn implicitReceiverChain(allocator: Allocator, this_val: Value) Allocator.Error![]Value {
-    var chain: std.ArrayList(Value) = .empty;
-    errdefer chain.deinit(allocator);
-    if (this_val != .Null and this_val != .Unit) try chain.append(allocator, this_val);
-    const ec = try enclosingThisChainAlloc(allocator);
-    defer allocator.free(ec);
-    try chain.appendSlice(allocator, ec);
-    return chain.toOwnedSlice(allocator);
+/// One candidate receiver for a bare-name `*OrGlobal` resolution. `depth`
+/// is the candidate's position in the search order (0 = the frame's own
+/// implicit `this`), recorded for the KLIO_OR_AUDIT readout.
+const ImplicitCandidate = struct {
+    v: Value,
+    depth: u16,
+};
+
+/// The ordered implicit-receiver candidates a bare name is resolved
+/// against, innermost first: the frame's own implicit `this` (when
+/// present), then each lexically-enclosing `this@…`. A receiver that
+/// entered scope by dispatch (a method receiver or a displaced lexical
+/// `this`) is followed by its class's companion object (when that
+/// companion owns a member of the searched name — Kotlin puts the
+/// companion in scope at the class's own depth, below the instance
+/// receiver) and by its class-nesting tower of `outer` links — inside a
+/// member of `Inner`, `this@Outer` is in scope through `this@Inner` —
+/// while a `with`/`run`/`apply` subject brings only itself
+/// (`with(x) { … }` never puts `x`'s enclosing instances or companion in
+/// scope). Caller frees the returned slice.
+fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const Frame, this_idx: usize, consult_param: bool, host: *H, bare_name: []const u8) Allocator.Error![]ImplicitCandidate {
+    var out: std.ArrayList(ImplicitCandidate) = .empty;
+    errdefer out.deinit(allocator);
+    const this_val = implicitThisValue(frame, this_idx, consult_param);
+    const entries = try enclosingEntriesAlloc(allocator);
+    defer allocator.free(entries);
+    var depth: u16 = 0;
+    if (this_val != .Null and this_val != .Unit) {
+        // When the frame's own `this` is also the innermost chain entry
+        // (a seeded method/extension receiver, or a receiver-split
+        // subject), the entry's own run covers it with the right kind.
+        const dup = entries.len > 0 and sameReceiver(entries[0].v, this_val);
+        if (!dup) {
+            // The frame's own `this` brings its class-nesting tower (and
+            // companion) only when it is a *dispatch* receiver. An
+            // extension receiver is subject-like — `fun Owner.Inner.f()`
+            // does not put `Inner`'s enclosing `Owner` instance or
+            // companion in scope.
+            const own_is_subject = switch (frame.func.kind) {
+                .top_level_extension, .member_extension => true,
+                else => false,
+            };
+            try appendCandidateRun(H, allocator, &out, this_val, own_is_subject, &depth, host, bare_name);
+        }
+    }
+    for (entries) |e| try appendCandidateRun(H, allocator, &out, e.v, e.isSubject(), &depth, host, bare_name);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Append `v` and, unless it entered scope as a `with`/`run` subject, its
+/// class's member-owning companion and its class-nesting tower (`outer`
+/// links, each with its own companion). Consecutive duplicates collapse:
+/// a receiver-split invoke records the receiver both in the capture slot
+/// and as the innermost chain entry.
+fn appendCandidateRun(
+    comptime H: type,
+    allocator: Allocator,
+    out: *std.ArrayList(ImplicitCandidate),
+    v: Value,
+    is_subject: bool,
+    depth: *u16,
+    host: *H,
+    bare_name: []const u8,
+) Allocator.Error!void {
+    if (v == .Unit) return;
+    // A null `with`/`run` subject is a real receiver candidate — a
+    // nullable-receiver extension applies to it — but a null dispatch
+    // receiver just means "nothing bound".
+    if (v == .Null and !is_subject) return;
+    if (v == .Null) {
+        try out.append(allocator, .{ .v = v, .depth = depth.* });
+        depth.* +|= 1;
+        return;
+    }
+    if (out.items.len == 0 or !sameReceiver(out.items[out.items.len - 1].v, v)) {
+        try out.append(allocator, .{ .v = v, .depth = depth.* });
+    }
+    depth.* +|= 1;
+    if (is_subject) return;
+    try appendCompanionCandidate(H, allocator, out, &v, depth, host, bare_name);
+    var cur: ?Value = instanceOuter(&v);
+    while (cur) |o| {
+        if (o == .Null or o == .Unit) break;
+        try out.append(allocator, .{ .v = o, .depth = depth.* });
+        depth.* +|= 1;
+        try appendCompanionCandidate(H, allocator, out, &o, depth, host, bare_name);
+        cur = instanceOuter(&o);
+    }
+}
+
+/// Append the companion-object singleton of `v`'s class as a candidate at
+/// the class's own depth, when that companion owns a member named
+/// `bare_name`.
+fn appendCompanionCandidate(
+    comptime H: type,
+    allocator: Allocator,
+    out: *std.ArrayList(ImplicitCandidate),
+    v: *const Value,
+    depth: *u16,
+    host: *H,
+    bare_name: []const u8,
+) Allocator.Error!void {
+    const comp = (try host.companionWithMember(allocator, v, bare_name)) orelse return;
+    if (sameReceiver(comp, v.*)) return;
+    try out.append(allocator, .{ .v = comp, .depth = depth.* });
+    depth.* +|= 1;
+}
+
+/// Two receiver values denote the same instance.
+fn sameReceiver(a: Value, b: Value) bool {
+    if (a == .Instance and b == .Instance) return ObjRef(InstanceData).ptrEq(a.Instance, b.Instance);
+    return false;
+}
+
+var or_audit_checked: bool = false;
+var or_audit_enabled: bool = false;
+
+/// Opt-in arm-audit detector for the `*OrGlobal` instructions
+/// (`KLIO_OR_AUDIT`, same pattern as `KLIO_RESOLVE_AUDIT` /
+/// `KLIO_LINK_AUDIT`): every execution logs which arm bound the name —
+/// `member@<depth>` (with the winning receiver's type), `overload`,
+/// `global_id` (the lowering-resolved identity), `global` (name lookup),
+/// or the store/global-fallback variants — so a corpus sweep proves which
+/// runtime arms are live before an emit site is statically classified.
+fn orAuditOn() bool {
+    if (!or_audit_checked) {
+        or_audit_checked = true;
+        const a = std.heap.page_allocator;
+        if (runtime.procEnvGetVar(a, "KLIO_OR_AUDIT") catch null) |v| {
+            defer a.free(v);
+            or_audit_enabled = v.len != 0 and !std.mem.eql(u8, v, "0");
+        }
+    }
+    return or_audit_enabled;
+}
+
+fn orAudit(inst_tag: []const u8, name: []const u8, arm: []const u8, depth: i32, recv: ?*const Value) void {
+    if (!orAuditOn()) return;
+    const recv_tag: []const u8 = if (recv) |r| r.typeFqn() else "-";
+    std.debug.print(
+        "[KLIO_OR_AUDIT] run inst={s} name={s} arm={s} depth={d} recv={s}\n",
+        .{ inst_tag, name, arm, depth, recv_tag },
+    );
 }
 
 fn stripScopeGetter(name: []const u8) []const u8 {
@@ -2757,9 +2962,23 @@ pub const NullHost = struct {
         return self.callMember(allocator, receiver, name, args);
     }
 
+    pub fn callMemberStrictExt(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+        return self.callMemberNamed(allocator, receiver, name, args, arg_names);
+    }
+
     pub fn hostHasMember(self: *NullHost, receiver: *const Value, name: []const u8) bool {
         _ = .{ self, receiver, name };
         return false;
+    }
+
+    pub fn hostHasProperty(self: *NullHost, receiver: *const Value, name: []const u8) bool {
+        _ = .{ self, receiver, name };
+        return false;
+    }
+
+    pub fn companionWithMember(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?Value {
+        _ = .{ self, allocator, receiver, name };
+        return null;
     }
 
     pub fn newInstance(self: *NullHost, allocator: Allocator, class: ClassId, args: []const Value) Allocator.Error!EvalResult {
@@ -2770,6 +2989,19 @@ pub const NullHost = struct {
     pub fn newInstanceNamed(self: *NullHost, allocator: Allocator, class: ClassId, args: []const Value, arg_names: []const ?[]const u8, outer_hint: ?*const Value) Allocator.Error!EvalResult {
         _ = .{ arg_names, outer_hint };
         return self.newInstance(allocator, class, args);
+    }
+
+    pub fn getMemberField(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+        _ = self;
+        // Strict probe contract: a miss is an error, never a spurious
+        // `Null`/`Unit` value, so the walk's candidate order stays honest.
+        if (receiver.* == .Instance) {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            if (g.get().get(name)) |v| return ok(v);
+        }
+        const msg = try std.fmt.allocPrint(allocator, "no member `{s}`", .{name});
+        return errResult(.{ .Unimplemented = msg });
     }
 
     pub fn getField(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
@@ -2941,10 +3173,6 @@ pub const NullHost = struct {
         _ = .{ self, v, new_this };
     }
 
-    pub fn callMemberOnly(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-        return self.callMemberNamed(allocator, receiver, name, args, arg_names);
-    }
-
     pub fn isShadowingCapture(self: *NullHost, name: []const u8) bool {
         _ = .{ self, name };
         return false;
@@ -3073,14 +3301,14 @@ test "enclosing chain tags subjects and projects innermost-first" {
     const entries = try enclosingEntriesAlloc(testing.allocator);
     defer testing.allocator.free(entries);
     try testing.expectEqual(@as(usize, 2), entries.len);
-    try testing.expect(entries[0].is_subject and entries[0].v.Int == 2);
-    try testing.expect(!entries[1].is_subject and entries[1].v.Int == 1);
+    try testing.expect(entries[0].isSubject() and entries[0].v.Int == 2);
+    try testing.expect(!entries[1].isSubject() and entries[1].v.Int == 1);
 
     popEnclosing();
     const rest = try enclosingEntriesAlloc(testing.allocator);
     defer testing.allocator.free(rest);
     try testing.expectEqual(@as(usize, 1), rest.len);
-    try testing.expect(!rest[0].is_subject and rest[0].v.Int == 1);
+    try testing.expect(!rest[0].isSubject() and rest[0].v.Int == 1);
     popEnclosing();
     try testing.expectEqual(@as(usize, 0), chain.items.len);
 }

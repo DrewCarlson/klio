@@ -369,6 +369,25 @@ const packageOfFqn = ir.packageOfFqn;
 // AST-walk helpers (member-name collection across the class hierarchy).
 // -------------------------------------------------------------------------
 
+/// Record every member name a class/object declares — functions,
+/// properties, primary-ctor properties — recursing into nested classes
+/// and objects (companions included) so the flat program-wide
+/// member-name universe is complete.
+fn collectClassMemberNamesInto(out: *StringSet, primary_params: []const ast.ClassParam, members: []const ast.Decl) Allocator.Error!void {
+    for (primary_params) |*p| {
+        if (p.property != null) try out.put(p.name.name, {});
+    }
+    for (members) |*m| {
+        switch (m.*) {
+            .Function => |*f| try out.put(f.name.name, {}),
+            .Property => |*p| try out.put(p.name.name, {}),
+            .Class => |*c| try collectClassMemberNamesInto(out, c.primary_params, c.members),
+            .Object => |*o| try collectClassMemberNamesInto(out, &.{}, o.members),
+            else => {},
+        }
+    }
+}
+
 fn collectHierarchyMethodNames(start: []const u8, by_name: *const FileClasses, out: *StringSet, seen: *StringSet) Allocator.Error!void {
     const gop = try seen.getOrPut(start);
     if (gop.found_existing) return;
@@ -720,6 +739,18 @@ fn buildModuleWithOverrides(
             try module.registry.hierarchy_methods.put(cname.*, methods);
         }
     }
+    // Program-wide member-name universe: every name some class declares
+    // as a member (function, property, primary-ctor property, companion /
+    // nested-object member). A bare name in a receiver context is only
+    // shadowable at runtime when it appears here, so lowering keeps the
+    // static classification for every other name.
+    for (decls) |*d| {
+        if (d.* == .Class) {
+            try collectClassMemberNamesInto(&module.registry.class_member_names, d.Class.primary_params, d.Class.members);
+        } else if (d.* == .Object) {
+            try collectClassMemberNamesInto(&module.registry.class_member_names, &.{}, d.Object.members);
+        }
+    }
     // Per-class transitive supertype-name chain, nearest first, so body
     // lowering can rank extension receivers against the enclosing class
     // before the IR-side supertype slots are filled.
@@ -978,6 +1009,22 @@ fn buildModuleWithOverrides(
                 var names: std.ArrayList([]const u8) = .empty;
                 for (f.type_params) |*tp| try names.append(a, tp.name.name);
                 try func_type_params.put(id.int(), try names.toOwnedSlice(a));
+                // Declared upper bounds (`<T : Number>` and `where` clauses)
+                // for the strict extension-receiver prover.
+                var bounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
+                for (f.type_params) |*tp| {
+                    if (tp.upper_bound) |*ub| {
+                        try bounds.append(a, .{ .param = tp.name.name, .bound = ub.name.name });
+                    }
+                }
+                for (f.where_bounds) |*wb| {
+                    try bounds.append(a, .{ .param = wb.name.name, .bound = wb.bound.name.name });
+                }
+                if (bounds.items.len != 0) {
+                    try module.registry.func_type_param_bounds.put(id, try bounds.toOwnedSlice(a));
+                } else {
+                    bounds.deinit(a);
+                }
             }
 
             var any_default = false;
@@ -1519,25 +1566,27 @@ fn buildModuleWithOverrides(
     // Top-level + companion/object extension properties.
     var extension_props = PairFuncMap.init(a);
     var extension_prop_setters = PairFuncMap.init(a);
-    var ext_prop_decls: std.ArrayList(*const ast.Property) = .empty;
+    const ExtPropDecl = struct { p: *const ast.Property, owner: ?[]const u8 };
+    var ext_prop_decls: std.ArrayList(ExtPropDecl) = .empty;
     defer ext_prop_decls.deinit(a);
     for (decls) |*d| {
         switch (d.*) {
-            .Property => |*p| if (p.receiver_type != null) try ext_prop_decls.append(a, p),
+            .Property => |*p| if (p.receiver_type != null) try ext_prop_decls.append(a, .{ .p = p, .owner = null }),
             .Class => |*c| {
                 for (c.members) |*m| {
-                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, &m.Property);
+                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, .{ .p = &m.Property, .owner = c.name.name });
                 }
             },
             .Object => |*o| {
                 for (o.members) |*m| {
-                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, &m.Property);
+                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, .{ .p = &m.Property, .owner = o.name.name });
                 }
             },
             else => {},
         }
     }
-    for (ext_prop_decls.items) |p| {
+    for (ext_prop_decls.items) |epd| {
+        const p = epd.p;
         const recv = p.receiver_type orelse continue;
         const ep_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
         const prev_ep_pkg = ir.lower.decl.setLowerSelfPackage(ep_pkg);
@@ -1551,6 +1600,12 @@ fn buildModuleWithOverrides(
                 .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv.name.name, &empty_members, &.{"this"}, &blk, nm),
             };
             try extension_props.put(.{ .a = recv.name.name, .b = p.name.name }, fid);
+            // A member-extension property's accessor body has its
+            // declaring class's `this` in lexical scope; tag the owner so
+            // dispatch seeds the accessor frame with the owner instance.
+            if (epd.owner) |owner| {
+                try module.registry.member_ext_owner_class.put(fid, owner);
+            }
         }
         if (p.setter) |*setter| {
             const setter_param_name = if (setter.params.len != 0) setter.params[0].name else "value";
@@ -1568,6 +1623,9 @@ fn buildModuleWithOverrides(
                 .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv.name.name, &recv_members, &.{ "this", setter_param_name }, &blk, nm),
             };
             try extension_prop_setters.put(.{ .a = recv.name.name, .b = p.name.name }, fid);
+            if (epd.owner) |owner| {
+                try module.registry.member_ext_owner_class.put(fid, owner);
+            }
         }
     }
 

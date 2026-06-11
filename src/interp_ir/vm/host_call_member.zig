@@ -833,6 +833,226 @@ fn extReceiverSpecificity(self: *VmHost, receiver: *const Value, ty_name: []cons
     return -1;
 }
 
+/// Strict extension-receiver proof for the bare-name resolver's
+/// innermost-first walk: does the candidate's declared receiver type
+/// *provably* accept this runtime receiver? Unlike the lenient
+/// `receiverImplementsType`, nothing is assumed:
+///   * a function-shape receiver (`(() -> R).f()`) proves only against an
+///     actual function value (with the arity checked where the value
+///     carries one);
+///   * a declared type parameter proves unconditionally only when
+///     unbounded; a bounded one (`<T : Number>`) requires the receiver to
+///     satisfy every declared bound;
+///   * a typealias receiver is expanded through the registry before the
+///     head check;
+///   * generic arguments participate where the runtime value carries
+///     element knowledge (`List<String>.f()` on a list of Ints is
+///     disproven; on a list of Strings proven); where it cannot (empty
+///     containers, erased user generics) the candidate is NOT proven and
+///     falls to the resolver's ordered lenient pass.
+fn strictReceiverProven(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, ty: *const TypeRef) Allocator.Error!bool {
+    // A null receiver (a `with(t)` subject whose value is null) is
+    // provably accepted only by a nullable receiver type.
+    if (receiver.* == .Null) return ty.nullable;
+    return strictReceiverProvenName(self, allocator, receiver, fid, ty.name, ty.args, 0);
+}
+
+fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, ty_name: []const u8, ty_args: []const TypeRef, fuel: u8) Allocator.Error!bool {
+    if (fuel > 8) return false;
+    var pn = simpleName(ty_name);
+    pn = std.mem.trimEnd(u8, pn, "?");
+    if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
+    // Function-shape receivers prove only against function values.
+    if (std.mem.startsWith(u8, pn, "Function")) {
+        return receiverIsFunctionShaped(self, receiver, pn);
+    }
+    // Declared type parameter of this candidate: unbounded accepts
+    // anything; bounded requires the receiver to satisfy every bound.
+    if (typeParamOf(self, fid, pn)) {
+        const bounds: []const ir.ModuleRegistry.TypeParamBound = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().registry.func_type_param_bounds.get(fid) orelse &.{};
+        };
+        for (bounds) |b| {
+            if (!std.mem.eql(u8, b.param, pn)) continue;
+            if (!try strictReceiverProvenName(self, allocator, receiver, fid, b.bound, &.{}, fuel + 1)) return false;
+        }
+        return true;
+    }
+    // A short all-uppercase head that is not a registered type parameter
+    // is still a type parameter in shapes the registry does not record
+    // (class-level generics, member extensions); no bound is knowable, so
+    // it proves like an unbounded one.
+    if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) return true;
+    // Typealias expansion (the registry stores the target's simple head
+    // name; its generic arguments are not recorded, so the expansion
+    // proves on the head alone).
+    {
+        const target: ?[]const u8 = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().registry.type_aliases.get(pn);
+        };
+        if (target) |t| {
+            if (!std.mem.eql(u8, t, pn)) {
+                return strictReceiverProvenName(self, allocator, receiver, fid, t, &.{}, fuel + 1);
+            }
+        }
+    }
+    if (!receiverImplementsHead(self, receiver, pn)) return false;
+    if (ty_args.len == 0) return true;
+    return elementsProveArgs(self, allocator, receiver, fid, pn, ty_args, fuel);
+}
+
+/// Can the candidate take `want` positional args (receiver included)?
+/// Exact arity fits; extra declared params must each carry a default or
+/// be a vararg; extra args only fit a trailing vararg.
+fn extArityApplicable(self: *VmHost, f: *const Func, want: usize) bool {
+    if (f.params.len == want) return true;
+    if (f.params.len < want) {
+        return f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
+    }
+    const defaults = funcDefaults(self, f);
+    var k: usize = want;
+    while (k < f.params.len) : (k += 1) {
+        if (!(f.params[k].is_vararg or paramHasDefault(defaults, k))) return false;
+    }
+    return true;
+}
+
+/// Is the receiver an actual function value of the declared shape?
+/// `pn` is `"Function"` or `"FunctionN"`; the arity is checked where the
+/// value carries one (an AST function's params, an IR closure's declared
+/// param count) and accepted otherwise (intrinsics, bound methods).
+fn receiverIsFunctionShaped(self: *VmHost, receiver: *const Value, pn: []const u8) bool {
+    switch (receiver.*) {
+        .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => {},
+        else => return false,
+    }
+    const digits = pn["Function".len..];
+    if (digits.len == 0) return true;
+    const n = std.fmt.parseInt(usize, digits, 10) catch return true;
+    // A parameterless lambda lowers with the synthetic implicit `it`
+    // slot, so a stored arity of 1 also proves `Function0`.
+    return switch (receiver.*) {
+        .Function => |f| f.decl.params.len == n or (n == 0 and f.decl.params.len == 1),
+        .IrClosure => |c| blk: {
+            const info = self.closures.get(@intCast(c.id)) orelse break :blk true;
+            break :blk info.n_params == n or (n == 0 and info.n_params == 1);
+        },
+        else => true,
+    };
+}
+
+/// Is `pn` a declared type parameter of `fid`?
+fn typeParamOf(self: *VmHost, fid: FuncId, pn: []const u8) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const tps = mg.get().registry.func_type_params.get(fid) orelse return false;
+    for (tps.items) |tp| {
+        if (std.mem.eql(u8, tp, pn)) return true;
+    }
+    return false;
+}
+
+/// Generic-argument proof over the receiver's actual elements. Only
+/// builtin containers carry element knowledge; everything else (and an
+/// empty container) is unprovable and reports false so the candidate
+/// falls to the lenient pass.
+fn elementsProveArgs(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, pn: []const u8, ty_args: []const TypeRef, fuel: u8) Allocator.Error!bool {
+    if (std.mem.eql(u8, pn, "Map") or std.mem.eql(u8, pn, "MutableMap")) {
+        if (receiver.* != .Map or ty_args.len < 2) return false;
+        const g = receiver.Map.entries.borrow();
+        defer g.deinit();
+        const entries = g.get().items;
+        if (entries.len == 0) return false;
+        for (entries) |*e| {
+            if (!try elementSatisfies(self, allocator, &e.key, fid, &ty_args[0], fuel)) return false;
+            if (!try elementSatisfies(self, allocator, &e.value, fid, &ty_args[1], fuel)) return false;
+        }
+        return true;
+    }
+    const items: ?runtime.ValueList = switch (receiver.*) {
+        .List => |l| if (isListHead(pn)) l.items else null,
+        .Set => |st| if (isSetHead(pn)) st.items else null,
+        .Array => |arr| if (std.mem.eql(u8, pn, "Array")) arr.items else null,
+        else => null,
+    };
+    const list = items orelse return false;
+    if (ty_args.len < 1) return false;
+    const g = list.borrow();
+    defer g.deinit();
+    const elems = g.get().items;
+    if (elems.len == 0) return false;
+    for (elems) |*e| {
+        if (!try elementSatisfies(self, allocator, e, fid, &ty_args[0], fuel)) return false;
+    }
+    return true;
+}
+
+fn isListHead(pn: []const u8) bool {
+    return std.mem.eql(u8, pn, "List") or std.mem.eql(u8, pn, "MutableList") or
+        std.mem.eql(u8, pn, "Collection") or std.mem.eql(u8, pn, "MutableCollection") or
+        std.mem.eql(u8, pn, "Iterable") or std.mem.eql(u8, pn, "MutableIterable");
+}
+
+fn isSetHead(pn: []const u8) bool {
+    return std.mem.eql(u8, pn, "Set") or std.mem.eql(u8, pn, "MutableSet") or
+        std.mem.eql(u8, pn, "Collection") or std.mem.eql(u8, pn, "MutableCollection") or
+        std.mem.eql(u8, pn, "Iterable") or std.mem.eql(u8, pn, "MutableIterable");
+}
+
+/// One element against one declared generic argument. A star projection
+/// or type-parameter argument accepts anything; a nullable argument
+/// accepts `null`.
+fn elementSatisfies(self: *VmHost, allocator: Allocator, elem: *const Value, fid: FuncId, arg: *const TypeRef, fuel: u8) Allocator.Error!bool {
+    if (std.mem.eql(u8, arg.name, "*")) return true;
+    var head = arg.name;
+    if (std.mem.startsWith(u8, head, "in#")) head = head["in#".len..];
+    if (std.mem.startsWith(u8, head, "out#")) head = head["out#".len..];
+    if (arg.nullable and elem.* == .Null) return true;
+    if (elem.* == .Null) return false;
+    return strictReceiverProvenName(self, allocator, elem, fid, head, arg.args, fuel + 1);
+}
+
+/// Head-name check against the receiver's actual runtime type: the user
+/// class hierarchy for an `Instance`, the runtime type-name sets
+/// otherwise. No generosity for generics or function shapes — callers
+/// handle those.
+fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const u8) bool {
+    switch (receiver.*) {
+        .Instance => |inst| {
+            const a = self.allocator;
+            var queue: std.ArrayList([]const u8) = .empty;
+            defer queue.deinit(a);
+            var seen: std.StringHashMap(void) = .init(a);
+            defer seen.deinit();
+            {
+                const g = inst.borrow();
+                const cg = g.get().class.borrow();
+                queue.append(a, cg.get().name) catch {};
+                cg.deinit();
+                g.deinit();
+            }
+            while (queue.pop()) |c| {
+                if (seen.contains(c)) continue;
+                seen.put(c, {}) catch {};
+                if (std.mem.eql(u8, simpleName(c), pn)) return true;
+                const cg = self.classes.borrow();
+                if (cg.get().get(c)) |d| {
+                    const dg = d.borrow();
+                    for (dg.get().supertype_names) |sup| queue.append(a, sup) catch {};
+                    dg.deinit();
+                }
+                cg.deinit();
+            }
+            return false;
+        },
+        else => return receiver.isRuntimeType(pn),
+    }
+}
+
 /// Does the receiver's actual runtime type satisfy `ty_name`?
 fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []const u8) bool {
     var pn = simpleName(ty_name);
@@ -938,6 +1158,124 @@ pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bo
         cg.deinit();
     }
     return false;
+}
+
+/// Does the receiver's class hierarchy declare a *property* (primary-ctor
+/// property or body property) named `name`? The bare-name write resolver
+/// gates on this rather than `hostHasMember`: a Kotlin assignment LHS can
+/// only resolve to a property or variable, never to a function, so a
+/// method of this name must not capture the write.
+pub fn hostHasProperty(self: *VmHost, receiver: *const Value, name: []const u8) bool {
+    const inst = switch (receiver.*) {
+        .Instance => |inst| inst,
+        else => return false,
+    };
+    const a = self.allocator;
+    var cls_name: []const u8 = undefined;
+    {
+        const g = inst.borrow();
+        const cg = g.get().class.borrow();
+        cls_name = cg.get().name;
+        cg.deinit();
+        g.deinit();
+    }
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(a);
+    var seen: std.StringHashMap(void) = .init(a);
+    defer seen.deinit();
+    queue.append(a, cls_name) catch return false;
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cur = queue.items[head];
+        if (seen.contains(cur)) continue;
+        seen.put(cur, {}) catch {};
+        const cg = self.classes.borrow();
+        if (cg.get().get(cur)) |def| {
+            const dg = def.borrow();
+            const d = dg.get();
+            for (d.primary_params) |p| {
+                if (std.mem.eql(u8, p.name, name)) {
+                    dg.deinit();
+                    cg.deinit();
+                    return true;
+                }
+            }
+            for (d.body_properties) |p| {
+                if (std.mem.eql(u8, p.name, name)) {
+                    dg.deinit();
+                    cg.deinit();
+                    return true;
+                }
+            }
+            for (d.supertype_names) |sn| queue.append(a, sn) catch {};
+            dg.deinit();
+        }
+        cg.deinit();
+    }
+    return false;
+}
+
+/// The companion-object singleton serving as an implicit receiver at this
+/// instance's class depth, when the class (or a supertype) declares a
+/// companion that owns a member named `name`. Kotlin puts a class's
+/// companion in scope inside the class's own members — below the instance
+/// receiver, above the next receiver out — so the bare-name resolver adds
+/// it as a candidate right after the dispatch receiver. The singleton is
+/// only materialised when its class really owns the member, so candidate
+/// enumeration for unrelated names stays side-effect free.
+pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?Value {
+    const inst = switch (receiver.*) {
+        .Instance => |inst| inst,
+        else => return null,
+    };
+    var cls_name: []const u8 = undefined;
+    {
+        const g = inst.borrow();
+        const cg = g.get().class.borrow();
+        cls_name = cg.get().name;
+        cg.deinit();
+        g.deinit();
+    }
+    if (std.mem.indexOf(u8, cls_name, "$Companion$") != null) return null;
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(allocator);
+    var cur: ?[]const u8 = cls_name;
+    while (cur) |cname| {
+        cur = null;
+        var already = false;
+        for (seen.items) |sname| {
+            if (std.mem.eql(u8, sname, cname)) {
+                already = true;
+                break;
+            }
+        }
+        if (already) break;
+        try seen.append(allocator, cname);
+        const comp_name: ?[]const u8 = blk: {
+            const g = self.module.borrow();
+            defer g.deinit();
+            break :blk g.get().registry.companion_singletons.get(cname);
+        };
+        if (comp_name) |cn| {
+            const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+                .ok => |maybe| maybe,
+                .err => return null,
+            };
+            if (singleton) |sv| {
+                if (sv == .Instance) return sv;
+            }
+        }
+        cur = blk: {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            const def = cg.get().get(cname) orelse break :blk null;
+            const dg = def.borrow();
+            defer dg.deinit();
+            const supers = dg.get().supertype_names;
+            break :blk if (supers.len != 0) supers[0] else null;
+        };
+    }
+    return null;
 }
 
 // -------------------------------------------------------------------------
@@ -1451,12 +1789,15 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     return callMemberInner(self, allocator, receiver, name, args, false);
 }
 
-/// `member_only` restricts the resolution to a real member of the receiver
-/// (the instance / IR-class / anon-object method walk), reporting
-/// not-found instead of falling back to a top-level extension, a SAM
-/// dispatch, or a global. A parameter scoped to this one resolution, so it
-/// cannot leak into a dispatched member's body or a re-entrant dispatch.
-fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, member_only: bool) Allocator.Error!EvalResult {
+/// `strict_ext` restricts the extension fallback to candidates whose
+/// declared receiver type provably accepts this receiver. The bare-name
+/// resolver's innermost-first candidate walk uses it so an extension that
+/// is not applicable to an inner receiver cannot pre-empt a real member
+/// of an outer one (kotlinc: a receiver-incompatible extension is not a
+/// candidate at that receiver at all); the unproven-compatibility pick
+/// stays available as the resolver's later lenient pass and as the
+/// explicit-dispatch default.
+fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool) Allocator.Error!EvalResult {
     // Built-in delegate protocol.
     if (receiver.* == .Delegate) {
         if (try delegateMember(self, allocator, receiver.Delegate, name, args)) |r| return r;
@@ -1679,7 +2020,7 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 
     // SAM-instance dispatch via `__sam_target__`.
     if (receiver.* == .Instance) {
-        if (try samInstanceDispatch(self, allocator, receiver, name, args, member_only)) |r| return r;
+        if (try samInstanceDispatch(self, allocator, receiver, name, args)) |r| return r;
     }
 
     // Bound method/property-reference dispatch.
@@ -1852,7 +2193,7 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 
     // IR class + supertype method walk.
     if (receiver.* == .Instance) {
-        if (try irMethodWalk(self, allocator, receiver, name, args, member_only)) |r| return r;
+        if (try irMethodWalk(self, allocator, receiver, name, args)) |r| return r;
     }
 
     // Generic Any.toString / equals / hashCode fallback for Instances.
@@ -1893,7 +2234,7 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     }
 
     // Extension-fn fallback.
-    if (try extensionFnFallback(self, allocator, receiver, name, args, member_only)) |r| return r;
+    if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext)) |r| return r;
 
     // Class-delegation forwarding (swallow all errors).
     if (receiver.* == .Instance) {
@@ -2566,7 +2907,7 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
     return null;
 }
 
-fn samInstanceDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, member_only: bool) Allocator.Error!?EvalResult {
+fn samInstanceDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     const target = blk: {
         const g = inst.borrow();
@@ -2574,9 +2915,6 @@ fn samInstanceDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
         break :blk g.get().get("__sam_target__");
     };
     if (target) |t| {
-        if (member_only) {
-            return try unimplemented(allocator, "Vm::call_member `{s}` (member-only: SAM dispatch is not a member)", .{name});
-        }
         var cls_name: []const u8 = undefined;
         {
             const g = inst.borrow();
@@ -3527,7 +3865,7 @@ fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Modul
     return .{ .ok = try call_args.toOwnedSlice(allocator) };
 }
 
-fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, member_only: bool) Allocator.Error!?EvalResult {
+fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     var class_name: []const u8 = undefined;
     var recv_fqn: []const u8 = undefined;
@@ -3580,26 +3918,6 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                     }
                 }
                 if (pickMethodOverload(self, candidates.items, args)) |f| {
-                    // Member-only SAM-lambda deferral.
-                    if (member_only) {
-                        const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-                        var sam_lambda = false;
-                        var i: usize = 0;
-                        while (i < args.len and i + skip < f.params.len) : (i += 1) {
-                            const a = args[i];
-                            const callable = switch (a) {
-                                .IrClosure, .Function, .BoundMethod => true,
-                                else => false,
-                            };
-                            const pn = f.params[i + skip].ty.name;
-                            const fn_ty = std.mem.startsWith(u8, pn, "Function") or (pn.len <= 2 and allUppercase(pn));
-                            if (callable and !fn_ty) sam_lambda = true;
-                        }
-                        if (sam_lambda) {
-                            mg.deinit();
-                            return try unimplemented(allocator, "Vm::call_member `{s}` (member-only: SAM-lambda member deferred to extension)", .{name});
-                        }
-                    }
                     var all = try prependReceiver(allocator, receiver, args);
                     // Pad defaults.
                     const defaults = blk: {
@@ -3903,7 +4221,7 @@ fn delegateForward(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 
 const Candidate = struct { fid: FuncId, func: Func };
 
-fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, member_only: bool) Allocator.Error!?EvalResult {
+fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool) Allocator.Error!?EvalResult {
     const want = args.len + 1;
     var visible_owners = try enclosingOwnerSet(self, allocator);
     defer visible_owners.deinit();
@@ -3922,18 +4240,45 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
     }
 
-    // Receiver-type filter.
-    var any_compat = false;
-    for (candidates.items) |c| {
-        if (receiverCompatibleWithParam(receiver, &c.func.params[0].ty)) any_compat = true;
-    }
-    if (any_compat) {
+    // Receiver-type filter. The strict probe (the bare-name resolver's
+    // innermost-first walk) demands a *proven* receiver match — the
+    // declared receiver type (or a generic / `Any` / function-shape
+    // receiver, which accepts anything) must hold for this receiver's
+    // class hierarchy — so an inapplicable extension cannot bind at an
+    // inner receiver and pre-empt a real member of an outer one. The
+    // lenient form keeps the score-anyway pick for receivers whose
+    // runtime type cannot prove the match.
+    if (strict_ext) {
         var filtered: std.ArrayList(Candidate) = .empty;
         for (candidates.items) |c| {
-            if (receiverCompatibleWithParam(receiver, &c.func.params[0].ty)) filtered.append(allocator, c) catch {};
+            // A low-priority candidate (`@LowPriorityInOverloadResolution`
+            // / deprecated-ERROR guard stub) is never a strict pick: it
+            // only applies when no ordinary candidate does, which the
+            // resolver's later tiers decide.
+            if (c.func.low_priority) continue;
+            // Both the receiver AND the value-argument arity must
+            // provably fit — an extension whose extra params carry no
+            // defaults is not applicable to this call.
+            if (!try strictReceiverProven(self, allocator, receiver, c.fid, &c.func.params[0].ty)) continue;
+            if (!extArityApplicable(self, &c.func, want)) continue;
+            filtered.append(allocator, c) catch {};
         }
         candidates.deinit(allocator);
         candidates = filtered;
+        if (candidates.items.len == 0) return null;
+    } else {
+        var any_compat = false;
+        for (candidates.items) |c| {
+            if (receiverCompatibleWithParam(receiver, &c.func.params[0].ty)) any_compat = true;
+        }
+        if (any_compat) {
+            var filtered: std.ArrayList(Candidate) = .empty;
+            for (candidates.items) |c| {
+                if (receiverCompatibleWithParam(receiver, &c.func.params[0].ty)) filtered.append(allocator, c) catch {};
+            }
+            candidates.deinit(allocator);
+            candidates = filtered;
+        }
     }
 
     // Unique-exact-arity pick.
@@ -3959,10 +4304,6 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     }
 
     if (chosen == null) return null;
-
-    if (member_only) {
-        return try unimplemented(allocator, "Vm::call_member `{s}` (member-only probe)", .{name});
-    }
 
     // Defer to a function-typed enclosing property when the chosen
     // member-extension's receiver doesn't accept the actual receiver.
@@ -3994,11 +4335,60 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         const all = try prependReceiver(allocator, receiver, args);
         const mg = self.module.borrow();
         const mod = mg.get();
+        // A member-extension's body has its declaring class's `this` in
+        // lexical scope (the dispatch receiver that made it visible
+        // here). Seed the callee frame with that owner instance: push it
+        // as a transferable enclosing receiver for the duration of the
+        // call.
+        var pushed_owner = false;
+        if (mod.registry.member_ext_owner_class.get(c.fid)) |owner| {
+            if (try memberExtOwnerInstance(self, allocator, receiver, owner)) |inst| {
+                ir.eval.pushEnclosing(&inst);
+                pushed_owner = true;
+            }
+        }
         const r = try callFuncRec(self, allocator, mod, c.fid, all);
+        if (pushed_owner) ir.eval.popEnclosing();
         mg.deinit();
         return r;
     }
     return null;
+}
+
+/// The instance serving as a member-extension's dispatch receiver: the
+/// innermost enclosing receiver (including access entries pushed for this
+/// dispatch) whose class hierarchy carries `owner`, else the explicit
+/// receiver itself when it does.
+pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *const Value, owner: []const u8) Allocator.Error!?Value {
+    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+    defer allocator.free(entries);
+    for (entries) |e| {
+        if (e.v != .Instance) continue;
+        if (receiverImplementsType(self, &e.v, owner)) return e.v;
+        // The owner may sit on the entry's class-nesting tower.
+        if (!e.isSubject()) {
+            var cur: ?Value = instanceOuterLink(&e.v);
+            while (cur) |o| {
+                if (o != .Instance) break;
+                if (receiverImplementsType(self, &o, owner)) return o;
+                cur = instanceOuterLink(&o);
+            }
+        }
+    }
+    if (receiver.* == .Instance and receiverImplementsType(self, receiver, owner)) return receiver.*;
+    return null;
+}
+
+/// The captured/constructed `outer` link of an `Instance` value.
+fn instanceOuterLink(v: *const Value) ?Value {
+    return switch (v.*) {
+        .Instance => |i| blk: {
+            const g = i.borrow();
+            defer g.deinit();
+            break :blk g.get().outer;
+        },
+        else => null,
+    };
 }
 
 /// Kotlin-faithful most-specific extension-overload selection.
@@ -4286,7 +4676,17 @@ pub fn callMemberNamed(self: *VmHost, allocator: Allocator, receiver: *const Val
     return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false);
 }
 
-fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, member_only: bool) Allocator.Error!EvalResult {
+/// Per-receiver probe for the bare-name resolver's innermost-first
+/// candidate walk: members and *receiver-compatible* extensions of this
+/// one receiver. The unproven-compatibility extension pick reports a
+/// clean miss here so it cannot pre-empt a real member of an outer
+/// receiver; the resolver retries leniently (`callMemberNamed`) only
+/// after every receiver missed strictly.
+pub fn callMemberStrictExt(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true);
+}
+
+fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, strict_ext: bool) Allocator.Error!EvalResult {
     var any_named = false;
     for (arg_names) |n| {
         if (n != null) any_named = true;
@@ -4308,7 +4708,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     }
 
     // Positional dispatch first.
-    const primary = try callMemberInner(self, allocator, receiver, name, args, member_only);
+    const primary = try callMemberInner(self, allocator, receiver, name, args, strict_ext);
     if (!(primary == .err and primary.err == .Unimplemented)) return primary;
 
     // Class-hierarchy method walk for a class-qualified lowered name.
@@ -4316,10 +4716,6 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         if (try instanceMethodWalkNamed(self, allocator, receiver, name, args, null)) |r| return r;
     }
     return primary;
-}
-
-pub fn callMemberOnly(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true);
 }
 
 fn copyNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!?EvalResult {
@@ -4488,6 +4884,41 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
     return if (chosen) |c| c.fid else null;
 }
 
+/// Applicability for the class-hierarchy walk's name match: positional
+/// fit (via `pickMethodOverload`'s single-candidate rules) or Kotlin's
+/// trailing-lambda alignment — the trailing callable binds to the LAST
+/// function-typed parameter with every skipped middle parameter
+/// defaulted.
+fn memberApplicableForWalk(self: *VmHost, f: *const Func, args: []const Value) bool {
+    {
+        const one = [_]Func{f.*};
+        if (pickMethodOverload(self, &one, args) != null) return true;
+    }
+    if (args.len == 0) return false;
+    const last_arg = args[args.len - 1];
+    const trailing_callable = switch (last_arg) {
+        .IrClosure, .Function, .BoundMethod, .BoundUserMethod, .Intrinsic => true,
+        else => false,
+    };
+    if (!trailing_callable) return false;
+    const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    const effective = f.params[skip..];
+    if (args.len > effective.len or effective.len == 0) return false;
+    const last_ty = effective[effective.len - 1].ty.name;
+    const last_is_fn = std.mem.startsWith(u8, last_ty, "Function") or
+        (last_ty.len > 0 and last_ty.len <= 2 and allUppercase(last_ty));
+    if (!last_is_fn) return false;
+    // Leading args fill the leading params; the middle params between the
+    // last positional arg and the trailing-lambda slot must be defaulted
+    // (or varargs).
+    const defaults = funcDefaults(self, f);
+    var k: usize = args.len - 1;
+    while (k + 1 < effective.len) : (k += 1) {
+        if (!(effective[k].is_vararg or paramHasDefault(defaults, skip + k))) return false;
+    }
+    return true;
+}
+
 fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: ?[]const ?[]const u8) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     var start: []const u8 = undefined;
@@ -4517,8 +4948,15 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                     for (c.methods) |fid| {
                         if (funcAt(mod, fid)) |f| {
                             if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, simpleName(f.name), name)) {
-                                method_fid = fid;
-                                break;
+                                // A name match alone is not a candidate:
+                                // the member must be *applicable* to the
+                                // supplied args (an unsupplied param needs
+                                // a default or vararg slot), or Kotlin
+                                // resolution moves on to the next tier.
+                                if (memberApplicableForWalk(self, &f, args)) {
+                                    method_fid = fid;
+                                    break;
+                                }
                             }
                         }
                     }

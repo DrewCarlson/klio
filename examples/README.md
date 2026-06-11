@@ -60,6 +60,8 @@ Run any program with:
 | `extension_functions.kt`, `extension_property.kt`, `extension_nullable_receiver.kt` | Extensions, incl. nullable receivers. |
 | `infix_calls.kt`              | `infix` functions.                                          |
 | `scoping_fns_top_level.kt`    | `let` / `also` / `apply` / `run` / `with` / `takeIf`.       |
+| `receiver_member_precedence.kt` | Implicit-receiver precedence for bare reads, writes, and calls: innermost receiver first, member over extension within one receiver, receiver member over top-level binding, inner-class nesting tower. |
+| `lexical_receiver_scope.kt`   | Lexical (creation-site) receiver scope for closures and anonymous functions: a no-receiver lambda writes the top-level var from inside a member dispatch; a `with`-created lambda keeps its receiver wherever it is invoked. |
 | `operator_overload_arith.kt`  | Operator overloading.                                       |
 | `tailrec.kt`                  | Direct and mutual tail-call optimization.                   |
 | `sam_conversion.kt`           | SAM conversion.                                             |

@@ -61,7 +61,7 @@ public fun <R, T> (suspend R.() -> T).createCoroutineUnintercepted(
     completion: Continuation<T>
 ): Continuation<Unit> {
     val block = this
-    return KlioStartContinuation(completion) { block(receiver) }
+    return KlioStartContinuation(completion) { receiver.block() }
 }
 
 public fun <T> (suspend () -> T).startCoroutineUninterceptedOrReturn(
@@ -76,7 +76,7 @@ public fun <R, T> (suspend R.() -> T).startCoroutineUninterceptedOrReturn(
     completion: Continuation<T>
 ): Any? {
     val block = this
-    return startBlock(completion) { block(receiver) }
+    return startBlock(completion) { receiver.block() }
 }
 
 // Receiver lambda with one value parameter — the shape of a ktor

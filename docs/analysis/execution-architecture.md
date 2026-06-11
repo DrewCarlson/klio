@@ -173,11 +173,14 @@ and `callerThisValue` additionally drops any receiver that is not `.Instance`
 thread through this path at all.
 
 **Companion thread-locals, same anti-pattern — now mostly resolved.**
-`member_only_probe`, `cc_explicit_read`, and `inner_outer_hint` are converted
-to explicit parameters (`member_only` on `callMemberInner`/
-`callMemberNamedInner`, `suppress_cc_redirect` on `getFieldInner`,
-`outer_hint` on the `newInstanceNamed` → `materializeInstance` construction
-path), and the dead duplicate `ctor_guard` in `host_globals.zig` is collapsed
+`member_only_probe` (with the whole member-only probe mode) is deleted —
+the §4.3 resolver's innermost-first candidate walk replaced its only use;
+the cascade's one flag is now the `strict_ext` parameter on
+`callMemberInner`/`callMemberNamedInner`. `cc_explicit_read` and
+`inner_outer_hint` are explicit parameters (`suppress_cc_redirect` on
+`getFieldInner`, `outer_hint` on the `newInstanceNamed` →
+`materializeInstance` construction path), and the dead duplicate
+`ctor_guard` in `host_globals.zig` is collapsed
 onto `host_instances.ctorGuardContains`. What remains in TLS is genuine
 re-entrancy / driver state: `map_fallback_active`, `iterable_fallback_active`,
 `call_outer_active` (`host_call_member.zig`, now `defer`-cleared and asserted
@@ -382,11 +385,15 @@ protocols, data-class auto members, anon-object dispatch (`anonMethodDispatch`),
 IR class+supertype walk (`irMethodWalk`, `host_call_member.zig:3339-3448`), Any
 fallback, stdlib member dispatch, delegate forwarding, companion forwarding,
 function-typed property invocation, extension-fn fallback — in fixed order, each
-`if (try X) |r| return r`. `callMemberNamed` (`:4021`), `callMemberOnly`
-(`:4053`), and `userMethodNamed` (`:4177`) re-enter subsets with different
-ordering/visibility flags. The member-only restriction is an explicit
-`member_only` parameter on `callMemberInner`/`callMemberNamedInner` (the old
-`member_only_probe` thread-local channel is gone). `irMethodWalk` resolves the
+`if (try X) |r| return r`. `callMemberNamed` and `callMemberStrictExt`
+re-enter the cascade with one flag: `strict_ext` (threaded through
+`callMemberInner` to `extensionFnFallback`) demands a proven
+receiver-type match for extension candidates — the bare-name resolver's
+per-receiver probe uses it so an inapplicable extension cannot bind at an
+inner receiver. The old member-only restriction (`callMemberOnly`,
+`member_only` parameter, SAM-lambda deferral) is deleted: its only caller
+was the resolver's former member-only pre-pass, which the innermost-first
+candidate walk replaced. `irMethodWalk` resolves the
 receiver class by two different keys — FQN
 (`host_call_member.zig:3369`) then a simple-name scan (`:3373-3380`) — which is
 what makes pack-mangled classes layout-sensitive. `extensionFnFallback`
@@ -410,7 +417,12 @@ receivers — is gone: the outer is an explicit `outer_hint` parameter on the
 construction path, and `selectInnerOuter` picks it by the inner class's
 lexically enclosing class (`registry.enclosing_class`) over the hint's
 class-nesting tower (its `outer` links) and the subject-tagged frame chain.
-There is still no assertion that the remaining origins agree.
+For the bare-name `*OrGlobal` family the three origins are consumed through
+one producer (`implicitCandidatesAlloc`, `src/ir/eval.zig`): capture slot →
+`this` param (call form) → frame chain entries → non-subject towers, in that
+order, so the read/write/call arms cannot disagree on receiver precedence.
+There is still no assertion that the origins agree for the *other* dispatch
+shapes (explicit `CallMember`, host-internal rescues).
 
 ### 3.6 Closure execution call-site count
 
@@ -472,17 +484,26 @@ class.
 
 ### 4.2 One receiver context, threaded on the Frame (→ Class B)
 
-- **Receiver chain: DONE (item 6).** The enclosing-`this@` chain is now an
-  `enclosing_this` field of `Frame` (seeded at frame entry from the caller's
-  active chain so the frame inherits the enclosing implicit receivers a
-  `with`/member-extension/receiver-lambda dispatch pushed) and of
+- **Receiver chain: DONE (item 6; seeding made lexical with item 7).** The
+  enclosing-`this@` chain is an `enclosing_this` field of `Frame` and of
   `FrameSnapshot`. It is duped on suspend and restored verbatim in
   `resumeContinuation`, so the chain travels with the parked continuation by
-  construction; the suspend-`this` bug disappears. The `outer_this` thread-local
-  and `outerThisStack` are deleted, and `enclosingThis`/`enclosingThisChain`/
-  `pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain
-  via a thread-local `active_chain` pointer that only ever points at a live
-  frame's field.
+  construction; the suspend-`this` bug disappears. The `outer_this`
+  thread-local and `outerThisStack` are deleted, and `enclosingThis`/
+  `enclosingThisChain`/`pushAccessEnclosing`/`popAccessEnclosing` read/write
+  the current frame's chain via a thread-local `active_chain` pointer that
+  only ever points at a live frame's field. Frame-entry seeding is LEXICAL,
+  not inherited from the dynamic caller: a closure body's chain is the
+  closure's creation-time snapshot (`ClosureInfo.chain`, taken by
+  `captureChainAlloc` at `Lambda`/`AstLambda` execution), a method /
+  extension body's chain starts from its own dispatch receiver
+  (`ownReceiverEntry`: a dispatch receiver enters as `.receiver` with its
+  nesting tower and companion; an extension receiver as `.subject`, itself
+  only), and the only caller entries that cross the frame boundary are the
+  in-flight pushes the dispatch made for this very call (a bound
+  receiver-lambda subject, a displaced `this`, a member-extension owner) —
+  tracked past `active_chain_base`, with `.access` entries (dispatch-time
+  visibility for the extension-owner filters) never transferring.
 - **Inner-class outer receiver: DONE (item-6 close-out).** The
   `inner_outer_hint` thread-local and its push/pop helpers are deleted. The
   outer is an explicit `outer_hint: ?*const Value` parameter on
@@ -532,25 +553,34 @@ class.
   `sibling_inner_constructed_after_park`), and
   `examples/inner_class_suspend.kt`.
 - **Guards → params: DONE (item-6 close-out) for the deletable set.**
-  `member_only_probe` is the `member_only` parameter of
-  `callMemberInner`/`callMemberNamedInner` (public surface forwards
-  `false`, `callMemberOnly` passes `true`); `cc_explicit_read` is the
-  `suppress_cc_redirect` parameter of `getFieldInner`. The duplicate
-  `ctor_guard` is collapsed: the `host_globals.zig` copy had no writer (its
-  deferred-`object` gate read was always false), and `lookupGlobal` now
-  consults the one real guard via `host_instances.ctorGuardContains`. The
-  load-bearing re-entrancy flags stay as TLS
-  (`map/iterable_fallback_active`, `call_outer_active`,
-  `field_outer_active`, `field_resolve_stack`) but are `defer`-cleared and
-  covered by run-boundary asserts (`host_call_member.resetReceiverTls` is
-  wired into `vmhost.resetReceiverThreadLocals`); their full TLS→param
-  conversion rides the §4.3 single-resolver work.
+  `member_only_probe` and its `member_only` parameter successor are gone
+  entirely (item 7): the resolver's innermost-first candidate walk replaced
+  the member-only pre-pass, so `callMemberOnly` and the SAM-lambda deferral
+  were deleted with their only caller; the one remaining cascade flag is
+  the `strict_ext` parameter (proven-receiver extension filter).
+  `cc_explicit_read` is the `suppress_cc_redirect` parameter of
+  `getFieldInner`. The duplicate `ctor_guard` is collapsed: the
+  `host_globals.zig` copy had no writer (its deferred-`object` gate read
+  was always false), and `lookupGlobal` now consults the one real guard via
+  `host_instances.ctorGuardContains`. The load-bearing re-entrancy flags
+  stay as TLS (`map/iterable_fallback_active`, `call_outer_active`,
+  `field_outer_active`, `field_resolve_stack`), `defer`-cleared and covered
+  by run-boundary asserts (`host_call_member.resetReceiverTls` is wired
+  into `vmhost.resetReceiverThreadLocals`). Re-checked at the §4.3 close:
+  none is a resolver-order flag, so the single resolver does not retire
+  them — each breaks a recursion that crosses the eval boundary (the
+  Map/Iterable materialization, the outer-chain walk, and the field
+  rescue all re-enter host dispatch through `ir.eval` frames), which a
+  parameter cannot follow. They stay TLS with this as the documented
+  reason.
 - **Remaining §4.2 line item — fold the frame's own `this` into the
   carrier.** The frame's own receiver is still a param/capture recovered by
   name (`frameThisParam`, `callerThisValue` with its `.Instance`-only gate,
   `implicitThisValue`), not `enclosing_this[0]`. Folding it changes the
   depth assumptions of every chain consumer:
-  `implicitReceiverChain` (eval's choke point would double-count), the
+  `implicitCandidatesAlloc` (eval's choke point already collapses the
+  consecutive duplicate a receiver-split records, but the depth-0 slot
+  would shift), the
   getField enclosing-receiver rescue (chain-top-only read in
   `host_fields.zig`), `enclosingOwnerSet`/`enclosingChainClassOrder`
   (member-ext visibility), `checkReceiverChain` (the KLIO_TRACE_INVARIANTS
@@ -569,16 +599,15 @@ class.
 ### 4.3 One name-resolution function (→ Class A/B dispatch order)
 
 Define ONE resolver `resolve(frame_receiver_ctx, name, args) -> ResolvedTarget`
-used by both `execCallMemberOrGlobal` and `callMember`'s implicit-receiver
-handling, so bare `name()` and `this.name()` traverse identical precedence.
-Reduce the three "Or" instructions to a single `CallUnresolved` whose runtime
-arm calls this resolver; keep `Call`/`CallValue`/`CallMember`/`CallSuper` as the
-only statically-classified shapes. Split pure builtin-protocol dispatch
-(List/Map/Sequence/Range/Iterator, keyed on receiver type) from user-class
-resolution (instance/supertype/anon/extension walk), and drive user resolution
-through this one resolver. Mark every func with an explicit kind in the registry at build time
-(`instance-method` / `member-extension` / `top-level-extension`) so the
-extension scorer selects candidates by kind, not by `param[0] == "this"`.
+behind the runtime member-vs-global decision, so the bare-name read, write,
+and call forms traverse identical receiver precedence. Statically classify
+every emit site whose context proves no implicit receiver can shadow the
+name; keep the "Or" forms only where the receiver is genuinely unknowable at
+lower time (lambda bodies, method bodies — `ir.TypeRef` erases `R.()->T`
+receivers and lambda lowering receives no receiver type). Mark every func
+with an explicit kind in the registry at build time (`instance-method` /
+`member-extension` / `top-level-extension`) so the extension scorer selects
+candidates by kind, not by `param[0] == "this"`.
 
 **Landed (item 7, member-extension kind).** `Func.kind: FuncKind` now carries
 `member_extension` as a first-class category (`src/ir/ir.zig`), set at the
@@ -589,12 +618,84 @@ are equivalent predicates over the same set. The five member-extension dispatch
 sites in `host_call_member.zig` route through `isMemberExt(mod, fid)` (kind is
 authoritative) and `memberExtVisible(mod, fid, &visible_owners)` (the owner-class
 gate). The side table is kept as the owner-class data source (per the caution
-below — the kind is additive, the gate is preserved exactly). The single
-implicit-receiver resolution choke point (`implicitThisValue` +
-`implicitReceiverChain` in `ir/eval.zig`) feeds the three `*OrGlobal` handlers;
-the four "Or" *instructions* are kept (item 8 closed without absorbing the
-collapse — the receiver-dependent residue still needs the runtime decision;
-see §6 rows 7–8).
+below — the kind is additive, the gate is preserved exactly).
+
+**Landed (item 7, one resolver + lexical receiver scope + static
+classification — CLOSED).** Kotlin receiver scope is lexical, and the runtime
+now enforces that structurally: frames stop inheriting the dynamic caller's
+chain. A closure snapshots its creation-time receiver chain
+(`ClosureInfo.chain` via `captureChainAlloc`) and every later invocation —
+any frame, coroutine resume, worker thread — seeds the body frame from that
+snapshot (`evalWithCapturesChained`); a method / extension body seeds from
+its own dispatch (`ownReceiverEntry`: dispatch receivers as `.receiver` with
+nesting tower + companion, extension receivers as `.subject`, themselves
+only); the only caller entries that transfer are the in-flight pushes the
+dispatch made for this call (receiver-lambda subject — including a null
+subject, which only a nullable-receiver extension proves against — displaced
+`this`, member-extension owner), while `.access` pushes serve dispatch-time
+visibility filters and never enter a callee's scope. A lambda created in a
+no-receiver scope therefore writes the top-level `var` even when invoked
+inside a member dispatch, and a `with`-created lambda keeps its receiver
+wherever it runs — both kotlinc-pinned
+(`closure_lexical_receiver_scope` / `anon_fun_receiver_scope` fixtures and
+the `parity_lambdas_and_dispatch` itests).
+
+The three `*OrGlobal` handlers share one candidate producer
+(`implicitCandidatesAlloc`, `src/ir/eval.zig`): the frame's own implicit
+`this` (or the seeded chain entry it dedups into), each enclosing receiver
+innermost-first; dispatch receivers bring their class-nesting tower and —
+when it owns a member of the searched name — the class's companion-object
+singleton at the class's own depth (`companionWithMember`); subjects bring
+only themselves. One precedence policy, kotlinc-pinned: candidates
+innermost-first; within one receiver, members before applicable extensions;
+receiver candidates before the top-level tiers (runtime overload pick →
+lowering-resolved identity → global by name → error). The handlers differ
+only in terminal op, and each terminal op is now per-candidate honest:
+reads probe `getMemberField` (a strict `getField` whose global / enclosing
+/ outer-chain / companion adoption tails are disabled, so an inner receiver
+cannot "resolve" a top-level binding and shadow an outer receiver's real
+member; a `Unit`-valued member is a hit); writes gate on `hostHasProperty`
+(an assignment LHS resolves only to properties — a member *function* of the
+written name never swallows a write) and `setField`; calls probe
+`callMemberStrictExt` first and retry leniently only after every receiver
+missed. The strict extension gate (`strictReceiverProven`,
+`host_call_member.zig`) PROVES the declared receiver: a function-shape
+receiver only against an actual function value (arity-checked, with the
+synthetic implicit-`it` slot tolerated for `Function0`), a bounded type
+parameter only when the receiver satisfies every declared bound
+(`registry.func_type_param_bounds`), a typealias after registry expansion,
+generic arguments against the elements the runtime value actually carries
+(a `List<String>` extension is disproven on a list of Ints, proven on a
+list of Strings, unprovable — and deferred to the lenient pass — on an
+empty one), and low-priority guard stubs never strictly bind; the strict
+pick must also be arity-applicable (`extArityApplicable`).
+
+Statically classified emit sites (`inReceiverContext`,
+`src/ir/lower/expr.zig` — anonymous-function bodies count as receiver
+contexts exactly like lambda bodies, carried on a dedicated
+`is_anon_fn_body` bit): in a context with no implicit receiver, bare reads,
+short interpolations, multi-segment heads, class/builtin-type-name values,
+and unresolved bare calls emit `LoadGlobal`/`CallValue`/`StoreGlobal`
+directly, so a top-level function resolving a bare name against a *caller's*
+receiver is an unresolved-reference error exactly as kotlinc rejects it. In
+receiver contexts a bare name is statically bound only when no runtime
+receiver can shadow it: the program-wide member-name universe
+(`registry.class_member_names`) gates both known top-level property reads
+and known top-level function calls — where some class declares a member of
+the name, the read stays `LoadFromThisOrGlobal` and the call becomes
+`CallMemberOrGlobal`, each carrying the index's resolved identity for the
+global arm (`.func`/`.class`, bound via `lookupGlobalById` behind an
+`isShadowingCapture` gate), so a member function or an invoke-convention
+member property of a runtime receiver outranks the package-scope function
+exactly as kotlinc resolves it. The "Or" forms are NOT merged into one
+`CallUnresolved`: the read/write/call payloads are real instruction data the
+evaluator needs regardless, and a merge re-encodes them as a mode tag while
+removing no runtime decision. `CallMemberOrValue` / `CallValueOrMember` stay
+out of the resolver deliberately — their question is
+member-vs-local-callable on an explicit receiver, the same runtime-typed
+dispatch as `CallMember` itself. The Or family is observable end-to-end via
+`KLIO_OR_AUDIT` (emit-site context lines at lowering + arm-won lines at
+runtime).
 
 **Caution — the taxonomy must distinguish member-extension from plain
 instance-method, not collapse "is in `class.methods`" ⇒ "not an extension".**
@@ -923,7 +1024,7 @@ refactors, then the structural unifications in dependency order.
 | 4b | DONE — stop swapping `self.globals`, deleted `StoreGlobal`-for-capture + `scoped_env` + the now-dead `WritebackCaptures`/`readLambdaCapture` capture-sync; the HOF invoke path runs over the real top-level env and captured-`var` writes round-trip through the shared `Cell`. Required extending 4a's boxing to function/lambda *parameters* a nested closure writes (the captured-param gap, e.g. `toMap(destination){ consumeEach { destination += it } }`). (§4.1) | A | high | high | L |
 | 5 | `VmIntrinsicHost` becomes thin adapter delegating to eval.Host (§4.1) | A | high | medium | L |
 | 6 | DONE (receiver chain + close-out) — enclosing-`this` chain is now a `Frame` field (`enclosing_this`), snapshotted into `FrameSnapshot` on suspend and restored on resume; the `outer_this` thread-local + `outerThisStack` + its `resetReceiverTls` are deleted and `enclosingThis`/`enclosingThisChain`/`pushAccessEnclosing`/`popAccessEnclosing` read/write the current frame's chain. Close-out landed: `inner_outer_hint` TLS replaced by an explicit `outer_hint` param (sourced via `callerThisValue` — param or capture) with class-keyed outer selection in `materializeInstance`, plus a lambda-side `this` capture for bare inner-class construction keyed on the new `ir.Class.is_inner` (fixes `with(other){Inner()}` incl. shadowing subjects, lambda-escaping inners, user-HOF lambdas, two-level nesting), `member_only_probe`/`cc_explicit_read` are now params, the dead duplicate `ctor_guard` is collapsed onto `host_instances.ctorGuardContains` (activating the deferred-`object` gate), and `host_call_member`'s re-entrancy flags are defer-cleared + run-boundary-asserted. Remaining §4.2 line item: fold the frame's own `this` into the carrier (see §4.2 consumer inventory). (§4.2) | B | high | high | XL |
-| 7 | PARTIAL — single implicit-receiver resolution choke point (`implicitThisValue` + `implicitReceiverChain` in `ir/eval.zig`) now feeds all three `*OrGlobal` handlers (`CallMemberOrGlobal`/`LoadFromThisOrGlobal`/`StoreToThisOrGlobal`), so the bare-name member-vs-global precedence is derived in one place instead of three. Registry func-kind landed: `Func.kind` (`FuncKind.member_extension`) is the authoritative member-extension predicate, set at the member-extension lowering site (`decl.zig`); the five `member_ext_owner_class` dispatch sites route through `isMemberExt`/`memberExtVisible` (the owner-class gate is preserved exactly — the kind selects which funcs are gated, the side table supplies the owner). The four "Or" *instructions* are NOT collapsed to a single `CallUnresolved`: they encode three distinct operations (read / write / call) plus the explicit-receiver `CallMemberOrValue`, and the "Or" itself is the "couldn't classify member-vs-global statically" signal item 8's FQN static resolution removes — collapsing now would re-encode the read/write/call distinction without removing the runtime decision. Item 8 closed WITHOUT absorbing the collapse: its receiver-dependent residue (bare calls in class-method bodies, dynamic lambda receivers) still needs the runtime decision, so the collapse rides this row's single-resolver work. (A/B) | A/B | high | medium | L |
+| 7 | DONE (one resolver + LEXICAL receiver scope + static classification + exact global arm) — frames stop inheriting the dynamic caller's chain: closures snapshot their creation-time receiver chain (`ClosureInfo.chain` via `captureChainAlloc`, seeded at every invocation through `evalWithCapturesChained` — across coroutine resume and worker threads), method/extension frames seed from their own dispatch (`ownReceiverEntry`: dispatch receivers as `.receiver` with tower+companion, extension receivers as `.subject`), and only the dispatch's in-flight pushes (subject — incl. a null subject for nullable-receiver extensions — displaced `this`, member-extension owner) cross the frame boundary, `.access` entries never. The three `*OrGlobal` handlers resolve through ONE candidate producer (`implicitCandidatesAlloc` in `ir/eval.zig`: own implicit `this` → enclosing receivers innermost-first → dispatch-receiver class-nesting towers and member-owning companions at the class's own depth via `companionWithMember`, `EnclosingEntry.kind`-aware) and one precedence policy (per-receiver members-then-PROVEN-extensions, kotlinc-pinned by the `bare_write_*`/`inner_ext_over_outer_member`/`innermost_member_*`/`closure_lexical_receiver_scope`/`ext_receiver_strict_proof`/`companion_implicit_receiver`/`member_shadows_top_level_call` parity fixtures + itests), differing only in terminal op (read `getMemberField` — a strict member-only probe with every global/enclosing/outer-chain/companion adoption tail disabled / write `hostHasProperty`+`setField` — an assignment LHS never resolves to a member function / call `callMemberStrictExt` then lenient retry). The strict extension prover (`strictReceiverProven`) demands the declared receiver: function-shape receivers only against actual function values (arity-checked), bounded type params only when every bound holds (`registry.func_type_param_bounds`), typealiases registry-expanded, generic args checked against actual elements (unprovable → lenient pass), low-priority stubs never strict, and the pick must be arity-applicable (`extArityApplicable`). Real semantic fixes landed with kotlinc oracle evidence: bare writes now reach outer receivers and inner-class nesting towers (was: silent global write); an extension applicable to an inner receiver outranks an outer receiver's member; the call form's seven ad-hoc tiers are gone (strict receiver-proven extension pass first via `callMemberStrictExt`/`receiverImplementsType`, lenient unproven-type pass only after every receiver missed — fixes the kotlinx `SafeCollector`/`Flow.collect` wrong-receiver recursion class); `callMemberOnly` and the `member_only` threading (SAM-lambda deferral) are deleted with their only caller. Statically classified (`inReceiverContext` gate, `ir/lower/expr.zig`): no-receiver-context bare reads / short interps / multi-seg heads / class- and builtin-type-name values / unresolved bare calls emit `LoadGlobal`/`CallValue`/`StoreGlobal`, and `LoadGlobal`'s receiver-probe fallback arm is deleted (KLIO_OR_AUDIT sweep over examples+fixtures: 0 hits) — a top-level fn resolving a bare name against a caller's `with` receiver is now rejected like kotlinc; receiver-context class-name values flipped the other way (static `LoadGlobal` → runtime Or + exact `ClassId`) because a receiver member shadows a classifier in expression position (kotlinc-probed). Exact global arm: `LoadFromThisOrGlobal` carries `func`/`class` (index pick; `isShadowingCapture`-gated `lookupGlobalById`), and `CallMemberOrGlobal` carries `class` AND `func` — a bare call (or known top-level property read) in a receiver context stays statically bound only when no program class declares a member of the name (`registry.class_member_names`); where one does, the call/read decides at runtime with the index pick riding as the exact global arm, so a member function or invoke-convention member property of a runtime receiver outranks the package-scope declaration exactly as kotlinc resolves it (anonymous-function bodies count as receiver contexts via the dedicated `is_anon_fn_body` bit). The four "Or" instructions are deliberately NOT merged into one `CallUnresolved`: read/write/call payloads are real instruction data and a merge removes no runtime decision; they remain only where the receiver is statically unknowable (lambda/method bodies — `ir.TypeRef` erases `R.()->T`; removable if lambda receiver typing ever lands). `CallMemberOrValue`/`CallValueOrMember` stay runtime-typed dispatch, same status as `CallMember`. Detector: `KLIO_OR_AUDIT` logs every emit decision (site + receiver-context) and every runtime arm won (member@depth / overload / global_id / global); sweep readout (examples + coroutine_smoke + parity_corpus, 444 programs): `*OrGlobal` arms = 461 member (348 call / 73 read / 40 write), 384 global-by-name, 572 global-by-id, 42 overload, 8 lenient-pass (all kotlinx coroutine-internal `dispatch` member-extensions whose erased receiver the prover cannot model — the lenient tier's designed residue), 0 fallback-arm; RESOLVE/LINK audit = 0 ungraded divergences (342 graded: 300 tier + 12 shape + 30 receiver-pref), 0 link divergences, 0 invariant hits. (A/B) | A/B | high | high | XL |
 | 8 | DONE (steps 1-4 + tightening + the steps-2/3 ladder deletion + the 8d inline fold landed) — per-decl `package` tag on `Func`/`Class`, explicit two-phase header registration, and the package/FQN symbol index (`Module.resolveBareCallIndexed`) as the PRIMARY bare-call path, now hardened: reason-tagged deferrals (`ResolveDeferReason`, 13 classified shapes), order-independent forward references (phase-1 stubs rank by declared arity `decl_user_arity`, full-granularity declared types `decl_user_sig` rendered by the same `loweredTypeRef` body params use, and AST-derived `low_priority`; default-param shapes defer from stub and body gates alike), a six-tier preference order matching kotlinc's probed scoping (named import → own package → wildcard import → default-import package → shipped → other; a named import outranks even a same-file declaration; same-leaf named imports are ALL kept in `registry.import_aliases` so a second import of one leaf is a classified tie, not a shadow; wildcard imports per file in `registry.import_wildcards`, default imports mirroring `stdlib.IMPLICITLY_IMPORTED_PACKAGES` under a lockstep test), and ambiguity as a DEFAULT-ON lowering diagnostic scoped to what kotlinc rejects: a CALLED, non-extension bare call whose in-scope identical-FULL-signature candidates carry no defaults/varargs records `Module.resolve_diags`, surfaced by `klio run`/parity with `file:line` — same-FQN duplicates as "conflicting overloads … identical signatures declared at a.kt:2 and a.kt:3 — rename or remove one of the declarations", cross-package ties as "ambiguous reference … qualify the call or import one explicitly" (exact-wording + both-orders coverage in `itests/resolve_ambiguity.zig`); NOT diagnosed (heuristic-deferred): default/vararg-exercised, extension-form, and never-called identical pairs. Type-distinguishable sets — anything not provably identical at full granularity, incl. generic-argument-only and function-shape-only differences — stay runtime-resolved (`type_overload`), cast picks reclassify (`cast_disambiguated`). Out-of-scope sets are now an error matching kotlinc: a bare call whose every candidate lives in a package the caller neither declares, imports, nor sees by default or via the shipped surface (tier 5, index-verdict shapes only — `resolved`/`unimported_set`/`type_overload`) records an "unresolved reference … add `import pkg.f` or qualify the call" lowering diagnostic; loose-shape deferrals (arity/default/vararg) stay with the heuristic since the runtime may still dispatch a member. Every lowering entry point now seeds the caller package (`ir.build.setLowerSelfPackage` read by every `FuncBuilder`; class bodies get the file's true package via the `decl_pkg` span map — a companion's class-qualified FQN is not a package). `KLIO_RESOLVE_AUDIT` emits a machine-readable per-call readout incl. a divergence grade (`tier_correction` / `shape_correction` / `receiver_pref`); `KLIO_RESOLVE_STRICT` (in the test cache key) hard-fails any ungraded divergence. Sweep readout (85 examples + coroutine fixtures): 0 failures, 0 ungraded divergences; 300 `checkIndexOverflow` tier corrections + 12 `CompletableDeferred` shape corrections. Steps 2+3 (items 8b/8c) are landed: `isShippedFqn` is deleted (`funcId` ranks by `Func.package` and is only the order-based fallback behind the index); the `lookupGlobal` prefix ladder and `installed_bindings` suffix scan are replaced by link-time name→FQN maps (`ProgramImage.default_import_globals` / `pack_bare_aliases` / `any_member_globals`, first-package-wins rank + lexicographic pack tie-break, both unit-pinned incl. the StringBuilder production collision); the `callFunc` bodyless ladder is replaced by link-settled `resolved_redirect`/`resolved_native` (`KLIO_LINK_AUDIT` re-derives the DELETED ladder's algorithm — old prefix order `deleted_bodyless_prefixes`, per-call sibling scan — independently of the new tables, so a divergence is detectable). Resolved identity is carried end-to-end: value-position bare refs AND `::name`/`::Ctor` callable references resolve through the index and emit `LoadGlobal` with the exact `FuncId`/`ClassId` (`refAudit` instruments both arms); the runtime class registry is FQN-keyed with a user-over-shipped first-wins simple-name alias view, `NewInstance`/named-arg/copy/secondary-ctor/parent-chain materialization resolve by FQN (side tables dual-keyed), and the per-class side tables are read through the resolved identity. Cross-phase consistency: typeck's T0094 conflicting-overloads check is per-package (`file_packages` on the Checker), matching the resolver's per-package scopes; expect-fn default parameter values transplant onto the superseding `actual` before the expect drops (Kotlin: defaults live on the expect only). Close-out (8d + heuristic survey): the parallel simple-name inline table is folded into the index — top-level inline ASTs register under their phase-1 stub `FuncId`s, bare-call inline pre-emption resolves through `resolveBareCallIndexed` first and splices exactly the resolved declaration (non-inline winner = no splice; receiver-matched extension keeps the narrowing pick), the index's shape gates skip a vararg candidate at ANY parameter position (stub + body gates alike), the shape/receiver narrowing survives only as the tie-break for index-deferred shapes — receiver-aware in class methods: the enclosing class (falling back from the enclosing extension receiver) matches candidate receivers through the transitive supertype chain (`registry.class_super_names`/`Module.classIsOrExtends`), nearest first, with the same subtype-aware receiver veto in the splice gate — and `shadowed_inline_names` derives from the same `stdlib.noteBareNameMapping` constructor as the link-time bare-name maps; KLIO_RESOLVE_AUDIT `inline` records gate the fold, graded as shape corrections (vararg-at-any-position/default/arity fallbacks) or tier corrections (index pick in a strictly better scope tier, e.g. a named import over a same-package reified inline namesake — pinned strict-mode-on in `itests/resolve_ambiguity.zig`) (corpus+fixtures: 517,022 records, 0 unexplained, 48 graded shape corrections at one root site — kotlinx `Migration.kt`'s deprecated `combineLatest` bodies, where the inline-only table mis-spliced the reified vararg `combine`; the index pick is the kotlinc binding, pinned fold-sensitively by the equal-arity vararg-vs-exact itest, which fails under a name-first mutation). Heuristic-rung survey (audit `rung=` field, corpus+fixtures sweep): every rung of the order-based ladder is a live final binder for a classified deferral shape and is KEPT with reason — `ext_arity` 97,289 + `recv_rebind` 49,462 + `ext_arity_tl` 111 (extension forms; receiver dispatch is item 7's domain), `non_ext_arity` 19,451 + `non_ext_arity_tl` 12 (type_overload / default-param sets the runtime re-picks), `cast` 48 (cast_disambiguated), `decl_arity_*` 45,792 (forward-referenced stubs with non-exact shapes), `imported` 87 (unique-import fast path); DELETED: the stale-name-index rungs `funcIdLegacy` and the `hasFuncNamed` `func_index` walk, proven unreachable (every `func_index` append is paired with a name-index push; the pack format never serializes a `Module`; instrumented sweep = 0 `legacy_*` hits) — the name index is the single resolution authority. NOT absorbed (decided from the re-sequencing experiment): bare calls inside class-method bodies still lower before the phase-1 stubs and stay runtime-resolved (`CallMemberOrGlobal`) — they are receiver-dependent by classification: re-sequencing the build (stubs before class bodies) exposed them to the type-blind heuristic ladder, which statically bound `CoroutineScope.async` with a wrong-typed `this` inside `Snd.execute` (infinite resume loop, `parity_suspend_shapes`) and mis-bound bare `coroutineContext` reads; binding them statically requires the receiver-aware single resolver, which is row 7's open work — the four "Or" instructions row 7 deferred to this item therefore remain, encoding exactly this receiver-dependent residue. Gates at close: zig build test 143/143, corpus 85/85, differential 93 programs/all modes, assert_single_path 93/93 --rerun 2, KLIO_RESOLVE_AUDIT+STRICT+LINK_AUDIT sweep 0 unexplained (312 graded call corrections: 300 tier + 12 shape). | C | high | high | XL |
 | 9 | DONE — one executable form per symbol resolved at link time (`ProgramImage.linkResolvedForms` → the `resolved_native` table keyed by `FuncId`, populated once after the module + `installed_bindings` exist); the per-call FQN short-circuit in `callFunc` and `callValue` is deleted, both now consulting the resolved form by `FuncId` (`host_call_func.resolvedNativeForm`). Pack-vs-source identity is settled at link time, load-order-independent. `KLIO_LINK_AUDIT` is a permanent env-gated detector proving the link form equals the deleted per-call probe's pick (0 divergences over the full suite + 82 examples + the differential corpus). (§4.4) | C | high | high | XL |
 | 10 | DONE — removed `isLambdaBody()` as a resolution axis at the four `expr.zig` dotted-head sites; package-head vs receiver-member is now the one predicate `headIsPackage` (real package root or `Module.packageHeadDeclared` FQN-prefix), shadowed by captured/local/enclosing-member names — order- and load-mode-independent, no lambda special case. The inline splice already binds the inline receiver as a `"this"` scope local, so no extra frame-receiver slot was needed. Gated green behind the builder-DSL differential (`examples/dsl_dotted_head.kt` + `coroutine_smoke/cs8_dotted_in_builder.kt`, byte-identical across all three pack modes); both audits 0. (§4.4/§4.2) | C/B | medium | high | M |

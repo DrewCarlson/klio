@@ -450,6 +450,13 @@ pub const ClosureInfo = struct {
     /// Live capture values. Stored behind a shared interior-mutable
     /// handle so the lambda body's `StoreGlobal` writes propagate.
     captures: ObjRef(std.ArrayList(Value)),
+    /// The enclosing-receiver chain at the closure's creation site
+    /// (storage order, innermost last). Kotlin receiver scope is lexical:
+    /// the body resolves bare names against the receivers in scope where
+    /// the lambda literal was written, so every invocation — from any
+    /// frame, coroutine resume, or worker thread — seeds the body frame's
+    /// chain from this snapshot rather than the dynamic caller's chain.
+    chain: []const ir.eval.EnclosingEntry = &.{},
 };
 
 /// Lambda/closure side-table shared across every OS thread of one
