@@ -688,6 +688,22 @@ driver-owned arena and exposes no container teardown; `Resolution.deinit`,
 the resolver's child string arena are gone, and the move dance with them)**.
 **All roadmap items are now landed.**
 
+One deliberate carve-out from the R20 contract: the type checker's
+flow-sensitive queries (smart-cast / VIA / reachability in
+`src/typeck/check/narrowing.zig`) run a dataflow solve per query, once per
+name read or statement. That working set is mid-phase scratch whose volume
+dwarfs the phase result — on the driver arena, where `free` is a no-op, a
+whole-module `klio check` accreted gigabytes. The `Checker` therefore owns
+one retained `ArenaAllocator` backed by the page allocator
+(`Checker.query_scratch`): each query resets it with capacity retained, and
+the `typecheck`/`typecheckModule` entry points tear it down
+(`destroyQueryScratch`) once the checker is done. Anything escaping a query
+is cloned onto the phase allocator first. Alongside it, the per-statement
+reachability solve is memoized per function (`Checker.reach_cache`, keyed
+by function span and invalidated by `nothing_epoch` whenever the set of
+`Nothing`-typed spans changes), and the solve consumes the per-function
+`nothing_by_fn` bucket instead of a snapshot of the whole `types` map.
+
 ---
 
 ## 4. Do NOT touch — load-bearing clones / ownership that prevent real UAF or races

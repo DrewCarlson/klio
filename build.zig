@@ -103,6 +103,7 @@ const itests_files = [_]Itest{
     .{ .name = "parser_corpus", .parity_data = false },
     .{ .name = "runtime_objref_threads", .parity_data = false },
     .{ .name = "typeck_negative", .parity_data = false, .dirs = &.{"tests/fixtures/typeck_negative"} },
+    .{ .name = "check_examples", .dirs = &.{"examples"} },
     .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" } },
     .{ .name = "fuzz_closures_suspend", .fuzz_env = true },
 };

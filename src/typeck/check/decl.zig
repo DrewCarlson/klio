@@ -426,6 +426,11 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
         switch (m.*) {
             .Function => |*f| {
                 const sig = try signatureOf(self, f);
+                {
+                    const gop = try info.member_methods.getOrPut(f.name.name);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try gop.value_ptr.append(self.allocator, sig);
+                }
                 const param_types = try self.allocator.alloc(Type, sig.params.len);
                 for (sig.params, 0..) |*p, i| param_types[i] = try p.clone(self.allocator);
                 try info.member_sigs.put(f.name.name, .{ .Function = .{
@@ -865,16 +870,20 @@ fn checkFunctionBody(self: *Checker, f: *const Function, body: *const FunctionBo
             // Block-body functions with a declared non-`Unit` / non-`Nothing`
             // return require every path to terminate. Defer to the CFG.
             const normal_exit_reachable = blk: {
-                var type_map = cfa.analyses.reachable.TypeMap.init(self.allocator);
-                defer type_map.deinit();
-                var it = self.types.iterator();
-                while (it.next()) |entry| {
-                    const sp = entry.key_ptr.*;
-                    try type_map.put(.{ .start = sp.start, .end = sp.end }, entry.value_ptr.*);
+                const scratch = narrowing.queryScratch(self);
+                // Reachability only consults divergent (`Nothing`-typed)
+                // spans in this function's CFG, so feed it the function's
+                // bucket rather than a snapshot of the whole types map.
+                var type_map = cfa.analyses.reachable.TypeMap.init(scratch);
+                if (self.nothing_by_fn.getPtr(f.span)) |bucket| {
+                    var it = bucket.keyIterator();
+                    while (it.next()) |sp| {
+                        if (!self.nothing_spans.contains(sp.*)) continue;
+                        try type_map.put(.{ .start = sp.start, .end = sp.end }, .Nothing);
+                    }
                 }
                 const cfg = self.cfgs.getPtr(f.span) orelse break :blk true;
-                var r = try cfa.analyses.reachable.analyseWithTypes(self.allocator, cfg, &type_map);
-                defer r.deinit(self.allocator);
+                const r = try cfa.analyses.reachable.analyseWithTypes(scratch, cfg, &type_map);
                 if (cfg.exits.items.len == 0) break :blk true;
                 for (cfg.exits.items) |e| {
                     if (r.isReachable(e)) break :blk true;

@@ -764,7 +764,9 @@ pub fn parseTrailingLambda(p: *Parser) ?Expr {
     // Same shape; if no `->` is present, default to a single `it` param.
     const lbrace = support.bump(p);
     var header = parseLambdaHeader(p);
+    var implicit_it = false;
     if (header.params.len == 0) {
+        implicit_it = true;
         header.params = singleIdent(p, .{
             .name = "it",
             .span = lbrace.span,
@@ -799,7 +801,7 @@ pub fn parseTrailingLambda(p: *Parser) ?Expr {
         .stmts = stmts.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
         .span = sp,
     };
-    return Expr{ .Lambda = .{ .params = header.params, .body = body, .span = sp } };
+    return Expr{ .Lambda = .{ .params = header.params, .body = body, .span = sp, .implicit_it = implicit_it } };
 }
 
 /// Does the `{ … }` at the cursor have a `params ->` header?

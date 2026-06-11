@@ -73,10 +73,27 @@ pub fn checkCall(
                 var it = self.extensions.valueIterator();
                 outer: while (it.next()) |list| {
                     for (list.items) |e| {
-                        if (std.mem.eql(u8, e.name, name)) {
-                            ext_sig = e.sig;
-                            break :outer;
-                        }
+                        if (!std.mem.eql(u8, e.name, name)) continue;
+                        // Only commit to the extension when its arity
+                        // admits the call; otherwise the bare name likely
+                        // targets a member of the enclosing builder's
+                        // receiver, which dispatch resolves at runtime.
+                        const min = sigMinArity(&e.sig);
+                        const fits_arity = if (sigVarargIdx(&e.sig) != null)
+                            args.len >= min
+                        else
+                            args.len >= min and args.len <= e.sig.params.len;
+                        if (!fits_arity) continue;
+                        // The builder shape is a receiver lambda: the
+                        // candidate must actually take a function in the
+                        // trailing position.
+                        const lam_slot = if (e.sig.params.len == 0)
+                            continue
+                        else
+                            @min(args.len - 1, e.sig.params.len - 1);
+                        if (e.sig.params[lam_slot].nonNull().* != .Function) continue;
+                        ext_sig = e.sig;
+                        break :outer;
                     }
                 }
                 if (ext_sig) |sig| {
@@ -91,6 +108,33 @@ pub fn checkCall(
             }
         }
         if (self.fns.get(name)) |sigs_list| {
+            // Inside a lambda body, a bare call may target a member of the
+            // lambda's eventual receiver (user DSL builders) that happens
+            // to share its name with a top-level function. When no
+            // top-level candidate's arity admits the call, defer to the
+            // interpreter's receiver-aware dispatch instead of forcing an
+            // arity error against the wrong declaration.
+            if (self.lambda_depth > 0) {
+                var any_arity_fits = false;
+                for (sigs_list.items) |*s| {
+                    const min = sigMinArity(s);
+                    const fits_arity = if (sigVarargIdx(s) != null)
+                        args.len >= min
+                    else
+                        args.len >= min and args.len <= s.params.len;
+                    if (fits_arity) {
+                        any_arity_fits = true;
+                        break;
+                    }
+                }
+                if (!any_arity_fits) {
+                    for (args) |*arg| {
+                        var t = try expr_mod.checkExpr(self, arg, null);
+                        t.deinit(self.allocator);
+                    }
+                    return .Unresolved;
+                }
+            }
             if (self.fn_visibility.get(name)) |entries| {
                 for (entries.items) |vf| {
                     try visibility.checkTopLevelVisibility(self, name, vf.visibility, vf.file, callee_span);
@@ -268,27 +312,28 @@ pub fn checkCall(
             if (try visibility.lookupMemberVisibility(self, cn, mname) != null) {
                 try visibility.checkMemberVisibility(self, cn, mname, cn, m.name.span);
             }
-            if (try expr_mod.lookupExtension(self, cn, mname, args)) |ext| {
-                const sig = ext.sig;
-                if (sig.params.len == 0) {
-                    for (args) |*a| {
-                        var t = try expr_mod.checkExpr(self, a, null);
-                        t.deinit(self.allocator);
-                    }
-                } else {
-                    var t = try checkOverloadedCall(self,
-                        &[_]FnSig{sig},
-                        args,
-                        arg_names,
-                        type_args,
-                        call_span,
-                    );
-                    t.deinit(self.allocator);
-                }
-                if (ext.return_class) |rcn| {
+            var cands: std.ArrayList(expr_mod.ExtensionCandidate) = .empty;
+            defer cands.deinit(self.allocator);
+            try expr_mod.lookupExtensionCandidates(self, cn, mname, args.len, &cands);
+            if (cands.items.len != 0) {
+                // Run full overload selection over every reachable
+                // extension with this name, so `sb.append("x")` picks
+                // `append(String)` over an arity-matching sibling.
+                var sigs_buf: std.ArrayList(FnSig) = .empty;
+                defer sigs_buf.deinit(self.allocator);
+                for (cands.items) |c| try sigs_buf.append(self.allocator, c.sig);
+                const ret = try checkOverloadedCall(
+                    self,
+                    sigs_buf.items,
+                    args,
+                    arg_names,
+                    type_args,
+                    call_span,
+                );
+                if (cands.items[0].return_class) |rcn| {
                     try self.expr_class.put(call_span, rcn);
                 }
-                return try sig.return_ty.clone(self.allocator);
+                return ret;
             }
         }
     }
@@ -575,43 +620,88 @@ pub fn checkOverloadedCall(
     }
     // Pre-type each argument once; selection consults these types, and
     // assignability checks against the chosen signature reuse them without
-    // re-evaluating.
+    // re-evaluating. Lambda and anonymous-function arguments are deferred:
+    // their shape (arity, suspend, return type) comes from the chosen
+    // parameter, so typing them without that hint would invent a synthetic
+    // `it` parameter and poison both selection and inference. They stay
+    // `Unresolved` (which fits every candidate) until a signature is chosen.
     var arg_tys: std.ArrayList(Type) = .empty;
     defer {
         for (arg_tys.items) |*t| t.deinit(self.allocator);
         arg_tys.deinit(self.allocator);
     }
     for (args) |*a| {
-        try arg_tys.append(self.allocator, try expr_mod.checkExpr(self, a, null));
+        switch (a.*) {
+            .Lambda, .AnonFun => try arg_tys.append(self.allocator, .Unresolved),
+            else => try arg_tys.append(self.allocator, try expr_mod.checkExpr(self, a, null)),
+        }
     }
     var chosen: ?*const FnSig = null;
+    var uncertain_pick = false;
     var arity_match: ?*const FnSig = null;
     var fitting: std.ArrayList(*const FnSig) = .empty;
     defer fitting.deinit(self.allocator);
     for (filtered.items) |s| {
-        var min: usize = 0;
-        for (s.has_default) |h| {
-            if (!h) min += 1;
-        }
+        const va_idx = sigVarargIdx(s);
+        const min = sigMinArity(s);
         const max = s.params.len;
-        if (args.len < min or args.len > max) {
+        const arity_ok = if (va_idx != null)
+            args.len >= min
+        else
+            args.len >= min and args.len <= max;
+        if (!arity_ok) {
             continue;
         }
         if (arity_match == null) {
             arity_match = s;
         }
         var fits = true;
-        const n = @min(arg_tys.items.len, s.params.len);
         var k: usize = 0;
-        while (k < n) : (k += 1) {
-            if (!arg_tys.items[k].isSubtypeOf(s.params[k])) {
+        while (k < arg_tys.items.len) : (k += 1) {
+            // Past a vararg parameter every additional positional arg
+            // lands on the vararg slot, whose declared type is the
+            // element type.
+            const slot = if (va_idx != null and k >= va_idx.?) va_idx.? else k;
+            if (slot >= s.params.len) break;
+            if (k < args.len and args[k] == .Spread) {
+                // A spread's element-type check runs against the chosen
+                // signature later; for selection a spread only requires a
+                // vararg slot.
+                if (va_idx == null or slot != va_idx.?) {
+                    fits = false;
+                    break;
+                }
+                continue;
+            }
+            if (k < args.len and (args[k] == .Lambda or args[k] == .AnonFun)) {
+                // A deferred lambda's type is `Unresolved`, which would fit
+                // anything; the literal itself can only land on a
+                // function-shaped (or unknown) parameter.
+                const pslot = s.params[slot].nonNull().*;
+                if (pslot != .Function and pslot != .Unresolved and pslot != .TypeParam) {
+                    fits = false;
+                    break;
+                }
+                continue;
+            }
+            if (!arg_tys.items[k].isSubtypeOf(s.params[slot])) {
                 fits = false;
                 break;
             }
         }
         if (fits) try fitting.append(self.allocator, s);
     }
-    if (fitting.items.len != 0) {
+    // When candidates differ only in a function-typed parameter the
+    // deferred trailing lambda lands on, the lambda's actual return type
+    // is the selection signal (`sumOf` overloads differ solely in the
+    // selector's return). Resolve that before the MSC procedure, which
+    // has no visibility into the deferred body.
+    if (chosen == null and fitting.items.len > 1) {
+        if (try lambdaReturnTiebreak(self, fitting.items, args)) |s| {
+            chosen = s;
+        }
+    }
+    if (chosen == null and fitting.items.len != 0) {
         // Full MSC pairwise forwarding test, with the integer-widening rule
         // folded into the constraint comparison. Falls back to the
         // widen-only tiebreaker when MSC reports an ambiguity, so untyped
@@ -621,36 +711,9 @@ pub fn checkOverloadedCall(
             .ok => |best| chosen = best,
             .ambiguous => |frontier| {
                 defer self.allocator.free(frontier);
-                var names: std.ArrayList([]u8) = .empty;
-                defer {
-                    for (names.items) |nm| self.allocator.free(nm);
-                    names.deinit(self.allocator);
-                }
-                for (frontier) |s| {
-                    const params_str = try helpers.describeParams(self.allocator, s.params);
-                    defer self.allocator.free(params_str);
-                    try names.append(self.allocator, try std.fmt.allocPrint(self.allocator, "({s})", .{params_str}));
-                }
-                const joined = try joinStrings(self.allocator, names.items, ", ");
-                defer self.allocator.free(joined);
-                const msg = try std.fmt.allocPrint(
-                    self.allocator,
-                    "Overload resolution ambiguity between candidates: {s}",
-                    .{joined},
-                );
-                var d = Diagnostic.err(msg, call_span);
-                _ = d.withCode(codes.TYPE_OVERLOAD_RESOLUTION_AMBIGUITY);
-                try self.diagnostics.emit(self.allocator, d);
-                var best: *const FnSig = frontier[0];
-                var best_score = helpers.widenScore(frontier[0].params);
-                for (frontier[1..]) |s| {
-                    const sc = helpers.widenScore(s.params);
-                    if (sc < best_score) {
-                        best_score = sc;
-                        best = s;
-                    }
-                }
-                chosen = best;
+                const res = try resolveAmbiguousFrontier(self, frontier, args, arg_tys.items, call_span);
+                chosen = res.sig;
+                uncertain_pick = !res.certain;
             },
         }
     }
@@ -664,12 +727,11 @@ pub fn checkOverloadedCall(
             arities.deinit(self.allocator);
         }
         for (filtered.items) |s| {
-            var min: usize = 0;
-            for (s.has_default) |h| {
-                if (!h) min += 1;
-            }
+            const min = sigMinArity(s);
             const max = s.params.len;
-            if (min == max) {
+            if (sigVarargIdx(s) != null) {
+                try arities.append(self.allocator, try std.fmt.allocPrint(self.allocator, "{d}+", .{min}));
+            } else if (min == max) {
                 try arities.append(self.allocator, try std.fmt.allocPrint(self.allocator, "{d}", .{min}));
             } else {
                 try arities.append(self.allocator, try std.fmt.allocPrint(self.allocator, "{d}..{d}", .{ min, max }));
@@ -685,19 +747,47 @@ pub fn checkOverloadedCall(
         var d = Diagnostic.err(msg, call_span);
         _ = d.withCode(codes.TYPE_NONE_APPLICABLE);
         try self.diagnostics.emit(self.allocator, d);
+        // No signature to hint with; still walk deferred lambda bodies so
+        // their own diagnostics surface.
+        for (args) |*a| {
+            if (a.* != .Lambda and a.* != .AnonFun) continue;
+            var t = try expr_mod.checkExpr(self, a, null);
+            t.deinit(self.allocator);
+        }
         return .Unresolved;
     }
     const sig = chosen orelse arity_match.?;
     if (has_type_args) {
         try decl_mod.checkTypeArgBounds(self, sig, type_args);
     }
-    try enforceSuspendColoring(self, sig.is_suspend, "function", call_span);
-    var min: usize = 0;
-    for (sig.has_default) |h| {
-        if (!h) min += 1;
+    // Type the deferred lambda arguments against the chosen signature's
+    // parameter types so the bodies are checked exactly once, with the
+    // declared shape as the expected type.
+    {
+        const t_idx = trailingLambdaParamIdx(sig, args);
+        for (args, 0..) |*a, i| {
+            if (a.* != .Lambda and a.* != .AnonFun) continue;
+            const pidx = if (i + 1 == args.len) (t_idx orelse i) else i;
+            const hint: ?*const Type = if (pidx < sig.params.len) &sig.params[pidx] else null;
+            const t = try expr_mod.checkExpr(self, a, hint);
+            if (i < arg_tys.items.len) {
+                arg_tys.items[i].deinit(self.allocator);
+                arg_tys.items[i] = t;
+            } else {
+                var owned = t;
+                owned.deinit(self.allocator);
+            }
+        }
     }
+    try enforceSuspendColoring(self, sig.is_suspend, "function", call_span);
+    const sig_va_idx = sigVarargIdx(sig);
+    const min = sigMinArity(sig);
     const max = sig.params.len;
-    if (args.len < min or args.len > max) {
+    const sig_arity_ok = if (sig_va_idx != null)
+        args.len >= min
+    else
+        args.len >= min and args.len <= max;
+    if (!sig_arity_ok) {
         const msg = try std.fmt.allocPrint(
             self.allocator,
             "Wrong number of arguments: expected {d}..{d}, got {d}",
@@ -707,16 +797,270 @@ pub fn checkOverloadedCall(
         _ = d.withCode(codes.TYPE_ARGUMENT_COUNT);
         try self.diagnostics.emit(self.allocator, d);
     } else {
-        const n = @min(@min(args.len, sig.params.len), arg_tys.items.len);
+        const n = @min(args.len, arg_tys.items.len);
         var k: usize = 0;
         while (k < n) : (k += 1) {
-            try checkAssignable(self, &arg_tys.items[k], &sig.params[k], args[k].span());
+            if (args[k] == .Spread) continue;
+            const slot = if (sig_va_idx != null and k >= sig_va_idx.?) sig_va_idx.? else k;
+            if (slot >= sig.params.len) break;
+            try checkAssignable(self, &arg_tys.items[k], &sig.params[slot], args[k].span());
         }
     }
     if (has_type_args) {
+        if (uncertain_pick) return .Unresolved;
         return sig.return_ty.clone(self.allocator);
     }
-    return inferCallReturnWithArgs(self, sig, arg_tys.items, args, call_span);
+    var ret = try inferCallReturnWithArgs(self, sig, arg_tys.items, args, call_span);
+    if (uncertain_pick) {
+        ret.deinit(self.allocator);
+        return .Unresolved;
+    }
+    return ret;
+}
+
+/// True when every parameter type of `sig` resolved to a concrete type.
+fn sigParamsResolved(sig: *const FnSig) bool {
+    for (sig.params) |*p| {
+        if (p.nonNull().* == .Unresolved) return false;
+    }
+    return true;
+}
+
+/// Class name identifying `arg_tys[i]` / `args[i]` when one is known:
+/// the recorded `expr_class`, or the builtin class of a primitive type.
+fn argClassName(self: *Checker, args: []const Expr, arg_tys: []const Type, i: usize) ?[]const u8 {
+    if (i < args.len) {
+        if (self.expr_class.get(args[i].span())) |cn| return cn;
+    }
+    if (i >= arg_tys.len) return null;
+    return switch (arg_tys[i].nonNull().*) {
+        .String => "String",
+        .Int => "Int",
+        .Long => "Long",
+        .Boolean => "Boolean",
+        .Char => "Char",
+        .Double => "Double",
+        .Float => "Float",
+        .Byte => "Byte",
+        .Short => "Short",
+        .Generic => |g| g.name,
+        else => null,
+    };
+}
+
+/// Name-level subtype walk over the collected class table.
+fn classIsSubtypeOf(self: *Checker, sub: []const u8, sup: []const u8) bool {
+    if (std.mem.eql(u8, sub, sup)) return true;
+    const info = self.classes.get(sub) orelse return false;
+    var steps: usize = 0;
+    for (info.supertypes.items) |s| {
+        if (steps > 64) break;
+        steps += 1;
+        if (classIsSubtypeOf(self, s, sup)) return true;
+    }
+    return false;
+}
+
+/// True when every parameter of `sig` carries selection signal: either a
+/// resolved type or (for user-class params typed `Unresolved`) a recorded
+/// class name in `param_class_names`.
+fn sigParamsKnown(sig: *const FnSig) bool {
+    for (sig.params, 0..) |*p, i| {
+        if (p.nonNull().* != .Unresolved) continue;
+        const cn = if (i < sig.param_class_names.len) sig.param_class_names[i] else null;
+        if (cn == null) return false;
+    }
+    return true;
+}
+
+fn paramClassName(sig: *const FnSig, i: usize) ?[]const u8 {
+    if (i >= sig.param_class_names.len) return null;
+    return sig.param_class_names[i];
+}
+
+fn paramListsEqual(a: *const FnSig, b: *const FnSig) bool {
+    if (a.params.len != b.params.len) return false;
+    for (a.params, b.params, 0..) |pa, pb, i| {
+        if (!pa.eql(pb)) return false;
+        const ca = paramClassName(a, i);
+        const cb = paramClassName(b, i);
+        if ((ca == null) != (cb == null)) return false;
+        if (ca != null and !std.mem.eql(u8, ca.?, cb.?)) return false;
+    }
+    return true;
+}
+
+/// Type the deferred trailing lambda once, with its expected shape taken
+/// from the first candidate but the return left open, then pick the
+/// candidate whose function-typed parameter returns what the body
+/// actually returned. `null` when the tiebreak doesn't apply.
+fn lambdaReturnTiebreak(
+    self: *Checker,
+    pool: []const *const FnSig,
+    args: []const Expr,
+) Allocator.Error!?*const FnSig {
+    if (args.len == 0) return null;
+    if (args[args.len - 1] != .Lambda and args[args.len - 1] != .AnonFun) return null;
+    const li = args.len - 1;
+    const slot = trailingLambdaParamIdx(pool[0], args) orelse li;
+    if (slot >= pool[0].params.len) return null;
+    if (pool[0].params[slot].nonNull().* != .Function) return null;
+    // Candidates must agree on everything except the lambda parameter's
+    // return type, otherwise the body's return says nothing.
+    for (pool[1..]) |s| {
+        if (s.params.len != pool[0].params.len) return null;
+        for (s.params, pool[0].params, 0..) |pa, pb, i| {
+            if (i == slot) continue;
+            if (!pa.eql(pb)) return null;
+        }
+    }
+    // Open the expected return so the body's own type comes through.
+    const first_fn = pool[0].params[slot].nonNull().Function;
+    var open_params = try self.allocator.alloc(Type, first_fn.params.len);
+    defer self.allocator.free(open_params);
+    for (first_fn.params, 0..) |*pt, i| open_params[i] = pt.*;
+    var open_ret: Type = .Unresolved;
+    const expected = Type{ .Function = .{
+        .params = open_params,
+        .return_type = &open_ret,
+        .is_suspend = first_fn.is_suspend,
+    } };
+    var lam_ty = try expr_mod.checkExpr(self, &args[li], &expected);
+    defer lam_ty.deinit(self.allocator);
+    if (lam_ty != .Function) return null;
+    const actual_ret = lam_ty.Function.return_type;
+    if (actual_ret.* == .Unresolved) return null;
+    for (pool) |s| {
+        if (slot >= s.params.len) continue;
+        const p = s.params[slot].nonNull().*;
+        if (p != .Function) continue;
+        if (p.Function.return_type.eql(actual_ret.*)) return s;
+    }
+    return null;
+}
+
+const AmbResolution = struct {
+    sig: *const FnSig,
+    /// False when the tie was broken by guesswork (widen-score over
+    /// under-typed candidates): the pick still drives argument checks,
+    /// but its return type carries no signal.
+    certain: bool,
+};
+
+/// Disambiguate an MSC tie. The frontier routinely contains signatures
+/// whose parameter types didn't resolve (stdlib shims) or that duplicate
+/// each other across stdlib source sets; reporting T0091 there says
+/// nothing about the program. Order of preference:
+/// 1. a single fully-typed candidate,
+/// 2. all candidates identical -> first,
+/// 3. a deferred trailing lambda's actual return type selects between
+///    function-typed parameters (`sumOf` picks the `(T) -> Int` overload
+///    when the selector returns `Int`),
+/// 4. genuine ambiguity (all types known, candidates differ) -> T0091,
+/// 5. widen-score tiebreak (uncertain).
+fn resolveAmbiguousFrontier(
+    self: *Checker,
+    frontier: []const *const FnSig,
+    args: []const Expr,
+    arg_tys: []const Type,
+    call_span: Span,
+) Allocator.Error!AmbResolution {
+    // Tier 1: candidates whose parameter types fully resolved.
+    var resolved: std.ArrayList(*const FnSig) = .empty;
+    defer resolved.deinit(self.allocator);
+    for (frontier) |s| {
+        if (sigParamsResolved(s)) try resolved.append(self.allocator, s);
+    }
+    if (resolved.items.len == 1) return .{ .sig = resolved.items[0], .certain = true };
+    // Tier 2: resolved types or class-name-annotated `Unresolved` slots.
+    var known: std.ArrayList(*const FnSig) = .empty;
+    defer known.deinit(self.allocator);
+    for (frontier) |s| {
+        if (sigParamsKnown(s)) try known.append(self.allocator, s);
+    }
+    if (known.items.len == 1) return .{ .sig = known.items[0], .certain = true };
+    const pool: []const *const FnSig = if (known.items.len != 0) known.items else frontier;
+    // Tier 3: class-name compatibility — drop candidates whose
+    // class-named parameter cannot accept the argument's known class
+    // (`Base64.decode(CharSequence, …)` wins over the `ByteArray`
+    // overload for a `String` argument).
+    {
+        var compatible: std.ArrayList(*const FnSig) = .empty;
+        defer compatible.deinit(self.allocator);
+        for (pool) |s| {
+            var ok = true;
+            for (s.params, 0..) |*p, i| {
+                if (i >= arg_tys.len) break;
+                if (p.nonNull().* != .Unresolved) continue;
+                const pc = paramClassName(s, i) orelse continue;
+                const ac = argClassName(self, args, arg_tys, i) orelse continue;
+                if (!classIsSubtypeOf(self, ac, pc)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) try compatible.append(self.allocator, s);
+        }
+        if (compatible.items.len == 1) return .{ .sig = compatible.items[0], .certain = true };
+    }
+    var all_same = true;
+    for (pool[1..]) |s| {
+        if (!paramListsEqual(pool[0], s)) {
+            all_same = false;
+            break;
+        }
+    }
+    if (all_same) return .{ .sig = pool[0], .certain = true };
+    // Deferred-lambda return tiebreak (also run pre-MSC; kept here for
+    // frontiers MSC produced from other selection paths).
+    if (try lambdaReturnTiebreak(self, pool, args)) |s| {
+        return .{ .sig = s, .certain = true };
+    }
+    var args_known = true;
+    for (arg_tys, 0..) |*t, i| {
+        const nn = t.nonNull().*;
+        if (nn == .Unresolved or nn == .TypeParam) {
+            // A tolerantly-typed user-class value (constructor calls type
+            // as `Unresolved`) still identifies itself via `expr_class`.
+            if (i < args.len and self.expr_class.get(args[i].span()) != null) continue;
+            args_known = false;
+            break;
+        }
+    }
+    var diagnosed = false;
+    if (args_known and known.items.len == frontier.len) {
+        diagnosed = true;
+        var names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (names.items) |nm| self.allocator.free(nm);
+            names.deinit(self.allocator);
+        }
+        for (frontier) |s| {
+            const params_str = try helpers.describeParams(self.allocator, s.params);
+            defer self.allocator.free(params_str);
+            try names.append(self.allocator, try std.fmt.allocPrint(self.allocator, "({s})", .{params_str}));
+        }
+        const joined = try joinStrings(self.allocator, names.items, ", ");
+        defer self.allocator.free(joined);
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "Overload resolution ambiguity between candidates: {s}",
+            .{joined},
+        );
+        var d = Diagnostic.err(msg, call_span);
+        _ = d.withCode(codes.TYPE_OVERLOAD_RESOLUTION_AMBIGUITY);
+        try self.diagnostics.emit(self.allocator, d);
+    }
+    var best: *const FnSig = pool[0];
+    var best_score = helpers.widenScore(pool[0].params);
+    for (pool[1..]) |s| {
+        const sc = helpers.widenScore(s.params);
+        if (sc < best_score) {
+            best_score = sc;
+            best = s;
+        }
+    }
+    return .{ .sig = best, .certain = diagnosed };
 }
 
 fn joinStrings(allocator: Allocator, parts: []const []const u8, sep: []const u8) Allocator.Error![]u8 {
@@ -927,14 +1271,28 @@ pub fn trailingLambdaParamIdx(sig: *const FnSig, args: []const Expr) ?usize {
     return null;
 }
 
-pub fn checkArityAndArgs(self: *Checker, sig: *const FnSig, args: []const Expr, call_span: Span) Allocator.Error!void {
-    var vararg_idx: ?usize = null;
+/// Index of the signature's `vararg` parameter, if any.
+fn sigVarargIdx(sig: *const FnSig) ?usize {
     for (sig.is_vararg, 0..) |v, i| {
-        if (v) {
-            vararg_idx = i;
-            break;
-        }
+        if (v) return i;
     }
+    return null;
+}
+
+/// Minimum positional arity of a signature: parameters that are neither
+/// defaulted nor `vararg` (a vararg accepts zero arguments).
+fn sigMinArity(sig: *const FnSig) usize {
+    var min: usize = 0;
+    const n = @min(sig.has_default.len, sig.is_vararg.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (!sig.has_default[i] and !sig.is_vararg[i]) min += 1;
+    }
+    return min;
+}
+
+pub fn checkArityAndArgs(self: *Checker, sig: *const FnSig, args: []const Expr, call_span: Span) Allocator.Error!void {
+    const vararg_idx = sigVarargIdx(sig);
     const trailing_lambda_idx = trailingLambdaParamIdx(sig, args);
     // Spread arguments must land on a vararg parameter regardless of arity.
     // Emit T0047 up front so the diagnostic still fires when a mis-spread
@@ -951,14 +1309,7 @@ pub fn checkArityAndArgs(self: *Checker, sig: *const FnSig, args: []const Expr, 
             }
         }
     }
-    var min_args: usize = 0;
-    {
-        const n = @min(sig.has_default.len, sig.is_vararg.len);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (!sig.has_default[i] and !sig.is_vararg[i]) min_args += 1;
-        }
-    }
+    const min_args = sigMinArity(sig);
     const max_args = sig.params.len;
     const arity_ok = if (vararg_idx != null)
         args.len >= min_args
@@ -1065,27 +1416,34 @@ pub fn checkUserOperatorKeyword(
     var stack: std.ArrayList([]const u8) = .empty;
     defer stack.deinit(self.allocator);
     try stack.append(self.allocator, class_name);
+    // The `operator` modifier is inherited: an override may omit it when
+    // any declaration of the member up the supertype chain carries it, so
+    // the whole chain is consulted before warning.
+    var found_name: ?[]const u8 = null;
     while (stack.pop()) |name| {
         if ((try visited.getOrPut(name)).found_existing) {
             continue;
         }
         const info = self.classes.get(name) orelse continue;
         if (info.member_flags.get(op_name)) |flags| {
-            if (!flags.is_operator) {
-                const msg = try std.fmt.allocPrint(
-                    self.allocator,
-                    "`{s}.{s}` is used as an operator-convention function but is missing the `operator` modifier",
-                    .{ name, op_name },
-                );
-                var d = Diagnostic.warning(msg, sp);
-                _ = d.withCode(codes.TYPE_OPERATOR_KEYWORD_MISSING);
-                try self.diagnostics.emit(self.allocator, d);
+            if (flags.is_operator) {
+                return;
             }
-            return;
+            if (found_name == null) found_name = name;
         }
         for (info.supertypes.items) |s| {
             try stack.append(self.allocator, s);
         }
+    }
+    if (found_name) |name| {
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "`{s}.{s}` is used as an operator-convention function but is missing the `operator` modifier",
+            .{ name, op_name },
+        );
+        var d = Diagnostic.warning(msg, sp);
+        _ = d.withCode(codes.TYPE_OPERATOR_KEYWORD_MISSING);
+        try self.diagnostics.emit(self.allocator, d);
     }
 }
 
@@ -1609,6 +1967,16 @@ pub fn checkLambda(
     body: *const Block,
     expected: ?*const Type,
 ) Allocator.Error!Type {
+    return checkLambdaShaped(self, params, body, expected, false);
+}
+
+pub fn checkLambdaShaped(
+    self: *Checker,
+    params: []const Ident,
+    body: *const Block,
+    expected: ?*const Type,
+    implicit_it: bool,
+) Allocator.Error!Type {
     // Pull param types from expected function type, if it's one.
     var param_tys: std.ArrayList(Type) = .empty;
     defer {
@@ -1638,21 +2006,29 @@ pub fn checkLambda(
     try narrowing.pushFrame(self);
     // A lambda assigned to a `suspend (…) -> R` slot becomes a suspending
     // lambda. A lambda passed to an `inline` function is inlined into the
-    // caller, so it also inherits the enclosing suspending bit.
+    // caller, so it also inherits the enclosing suspending bit. When the
+    // expected callable shape is unknown (native entry points like
+    // `runBlocking` expose no signature), the literal may well be bound to
+    // a `suspend` parameter, so its body is checked suspend-permissively.
     const enclosing_suspend = lastBool(self.suspend_context_stack);
-    try self.suspend_context_stack.append(self.allocator, is_suspend or enclosing_suspend);
-    // Pick zero vs one phantom `it` based on the expected callable shape. The
-    // parser preemptively pushes a synthetic `it` for any zero-`->` lambda
-    // body, so when the expected callable is zero-arity we strip that
-    // synthetic param.
+    const unknown_shape = expected == null or expected.?.nonNull().* != .Function;
+    try self.suspend_context_stack.append(self.allocator, is_suspend or enclosing_suspend or unknown_shape);
+    self.lambda_depth += 1;
+    defer self.lambda_depth -= 1;
+    // Pick zero vs one phantom `it` based on the expected callable shape.
+    // The parser preemptively pushes a synthetic `it` for any zero-`->`
+    // trailing lambda, so the literal's real arity comes from the expected
+    // type: one param (bound as `it`) when the expected callable takes one,
+    // zero otherwise. Without an expected function type a zero-`->` lambda
+    // is `() -> R`, as in Kotlin.
     const expected_arity: ?usize = if (expected) |exp| switch (exp.nonNull().*) {
         .Function => |f| f.params.len,
         else => null,
     } else null;
-    const synthetic_it = params.len == 1 and std.mem.eql(u8, params[0].name, "it") and
-        (expected_arity != null and expected_arity.? == 0);
+    const synthetic_it = params.len == 1 and implicit_it and
+        !(expected_arity != null and expected_arity.? >= 1);
     const effective_empty = params.len == 0 or synthetic_it;
-    const bind_it = effective_empty and !(expected_arity != null and expected_arity.? == 0);
+    const bind_it = effective_empty and expected_arity != null and expected_arity.? >= 1;
     if (bind_it) {
         const it_ty = if (param_tys.items.len > 0) try param_tys.items[0].clone(self.allocator) else Type.Unresolved;
         try narrowing.currentFrame(self).bindings.put("it", .{
@@ -1690,9 +2066,7 @@ pub fn checkLambda(
         params_out.deinit(self.allocator);
     }
     if (effective_empty) {
-        if (expected_arity != null and expected_arity.? == 0) {
-            // empty params
-        } else {
+        if (bind_it) {
             const first = if (param_tys.items.len > 0) try param_tys.items[0].clone(self.allocator) else Type.Unresolved;
             try params_out.append(self.allocator, first);
         }

@@ -422,6 +422,24 @@ pub const Lowering = struct {
         return reg;
     }
 
+    /// Queryable position of a jump statement (`return`/`break`/
+    /// `continue`/`throw`): the end of the block it terminates. The
+    /// statement executes there; only its `Nothing` value lives in the
+    /// dead continuation block.
+    fn jumpStmtPos(self: *Lowering, cur: BlockId) NodePos {
+        return .{ .block = cur, .node_idx = self.b.currentNodeCount(cur).? };
+    }
+
+    /// Emit the jump statement's `Nothing`-value eval into the dead
+    /// continuation block, but pin the span's queryable position to the
+    /// block the statement actually executes in, so reachability queries
+    /// on the statement's own span don't see the dead block.
+    fn emitJumpEval(self: *Lowering, dead: BlockId, sp: Span, stmt_at: NodePos) Allocator.Error!Reg {
+        const reg = try self.emitEval(dead, sp);
+        try self.span_to_pos.put(.{ .start = sp.start, .end = sp.end }, stmt_at);
+        return reg;
+    }
+
     fn emitEval(self: *Lowering, cur: BlockId, sp: Span) Allocator.Error!Reg {
         const a = self.allocator;
         const reg = self.b.newReg();
@@ -610,27 +628,31 @@ pub const Lowering = struct {
                 if (r) |reg| {
                     self.labelSetResult(if (e.label) |*l| l else null, reg);
                 }
+                const stmt_at = self.jumpStmtPos(cur.*);
                 try self.b.setTerminator(a, cur.*, .{ .Goto = target });
                 cur.* = try self.freshDeadBlock();
-                return try self.emitEval(cur.*, e.span);
+                return try self.emitJumpEval(cur.*, e.span, stmt_at);
             },
             .Break => |e| {
                 const target = self.breakTarget(if (e.label) |*l| l else null);
+                const stmt_at = self.jumpStmtPos(cur.*);
                 try self.b.setTerminator(a, cur.*, .{ .Goto = target });
                 cur.* = try self.freshDeadBlock();
-                return try self.emitEval(cur.*, e.span);
+                return try self.emitJumpEval(cur.*, e.span, stmt_at);
             },
             .Continue => |e| {
                 const target = self.continueTarget(if (e.label) |*l| l else null);
+                const stmt_at = self.jumpStmtPos(cur.*);
                 try self.b.setTerminator(a, cur.*, .{ .Goto = target });
                 cur.* = try self.freshDeadBlock();
-                return try self.emitEval(cur.*, e.span);
+                return try self.emitJumpEval(cur.*, e.span, stmt_at);
             },
             .Throw => |e| {
                 const r = try self.lowerExpr(e.value, cur);
+                const stmt_at = self.jumpStmtPos(cur.*);
                 try self.routeThrow(cur.*, r);
                 cur.* = try self.freshDeadBlock();
-                return try self.emitEval(cur.*, e.span);
+                return try self.emitJumpEval(cur.*, e.span, stmt_at);
             },
 
             .Labeled => |e| {

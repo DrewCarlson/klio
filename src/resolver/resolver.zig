@@ -98,6 +98,13 @@ pub const ScopeKind = enum {
     /// enclosing scope are *not* an R0001 error — they may be inherited
     /// from a supertype or resolved against `this` at runtime.
     ClassBody,
+    /// A scope that may carry an implicit receiver the resolver cannot
+    /// see lexically: a lambda body (`buildList { add(1) }`,
+    /// `"hi".apply { length }`), an extension function or extension
+    /// property accessor body (`fun Box.show() = n`). Bare names that
+    /// don't resolve lexically defer to the type checker's member
+    /// resolution instead of R0001, like `ClassBody`.
+    ImplicitReceiver,
 };
 
 /// Lexical scope tree. Each scope has a parent (except the file scope), a
@@ -136,6 +143,15 @@ pub const Resolution = struct {
         return null;
     }
 };
+
+/// Package roots a fully-qualified reference can start with. The
+/// interpreter resolves such paths against its native symbol tables, so
+/// the resolver treats `<root>.x.y` as qualified rather than as a use of
+/// a lexical binding named `<root>`.
+fn isPackageRoot(name: []const u8) bool {
+    return std.mem.eql(u8, name, "kotlin") or std.mem.eql(u8, name, "kotlinx") or
+        std.mem.eql(u8, name, "java");
+}
 
 const BUILTINS = [_][]const u8{
     "println",
@@ -195,8 +211,27 @@ pub fn resolve(allocator: std.mem.Allocator, file: *const KotlinFile) !Resolutio
 /// (file-local import scoping). Use-spans across files remain
 /// distinguishable through the `FileId` carried on each Span.
 pub fn resolveModule(allocator: std.mem.Allocator, files: []const KotlinFile) !Resolution {
+    return resolveModuleWithNatives(allocator, files, &.{});
+}
+
+/// `resolveModule` plus a set of natively-implemented symbols (installed
+/// pack bindings, e.g. `kotlinx.coroutines.runBlocking`). Each FQN's leaf
+/// name is bound in the builtins scope so a bare use of a native pack
+/// entry point resolves instead of false-positiving R0001.
+pub fn resolveModuleWithNatives(
+    allocator: std.mem.Allocator,
+    files: []const KotlinFile,
+    native_fqns: []const []const u8,
+) !Resolution {
     var r = try Resolver.init(allocator);
     const builtins = ScopeId.from(0);
+    for (native_fqns) |fqn| {
+        const leaf = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
+        if (leaf.len == 0) continue;
+        if (r.scopes.items[builtins.int()].bindings.contains(leaf)) continue;
+        const sym = try r.addSymbol(leaf, .Builtin, null);
+        try r.scopes.items[builtins.int()].bindings.put(leaf, sym);
+    }
     const module_scope = try r.pushScope(builtins, .File);
     var pkg_scopes = std.StringHashMap(ScopeId).init(allocator);
     defer pkg_scopes.deinit();
@@ -628,7 +663,8 @@ const Resolver = struct {
     }
 
     fn resolveFunction(self: *Resolver, parent: ScopeId, f: *const Function) ResolveError!void {
-        const fn_scope = try self.pushScope(parent, .Function);
+        const kind: ScopeKind = if (f.receiver_type != null) .ImplicitReceiver else .Function;
+        const fn_scope = try self.pushScope(parent, kind);
         for (f.params) |*p| {
             try self.resolveParam(fn_scope, p);
         }
@@ -657,15 +693,15 @@ const Resolver = struct {
             try self.resolveExpr(scope, p_init);
         }
         if (p.getter) |*getter| {
-            try self.resolveAccessor(scope, getter);
+            try self.resolveAccessor(scope, getter, p.receiver_type != null);
         }
         if (p.setter) |*setter| {
-            try self.resolveAccessor(scope, setter);
+            try self.resolveAccessor(scope, setter, p.receiver_type != null);
         }
     }
 
-    fn resolveAccessor(self: *Resolver, parent: ScopeId, acc: *const ast.Accessor) ResolveError!void {
-        const scope = try self.pushScope(parent, .Function);
+    fn resolveAccessor(self: *Resolver, parent: ScopeId, acc: *const ast.Accessor, has_receiver: bool) ResolveError!void {
+        const scope = try self.pushScope(parent, if (has_receiver) ScopeKind.ImplicitReceiver else .Function);
         for (acc.params) |p| {
             _ = try self.declare(scope, p.name, .Parameter, p.span, true);
         }
@@ -690,6 +726,15 @@ const Resolver = struct {
                 .Decl => |d| switch (d) {
                     .Function => |f| {
                         _ = try self.declare(scope, f.name.name, .LocalFunction, f.name.span, true);
+                    },
+                    // Local classes and objects are declarations too:
+                    // `class Scaled(...)` inside a function body binds
+                    // `Scaled` for the rest of the block.
+                    .Class => |c| {
+                        _ = try self.declare(scope, c.name.name, .Class, c.name.span, true);
+                    },
+                    .Object => |o| {
+                        _ = try self.declare(scope, o.name.name, .Class, o.name.span, true);
                     },
                     else => {},
                 },
@@ -760,6 +805,15 @@ const Resolver = struct {
             .Path => |p| {
                 if (p.segments.len > 0) {
                     const first = p.segments[0];
+                    // A path headed by a package root (`kotlin.math.abs`,
+                    // `kotlinx.coroutines.delay`) is a fully-qualified
+                    // reference, not a use of a lexical binding named
+                    // `kotlin` — unless something local shadows the name.
+                    // A dotted head also reaches here as a single-segment
+                    // receiver (`kotlin` in `kotlin.math.sin(0.0)`).
+                    if (isPackageRoot(first.name) and self.lookup(scope, first.name) == null) {
+                        return;
+                    }
                     try self.resolveNameUse(scope, first.name, first.span);
                 }
             },
@@ -839,7 +893,7 @@ const Resolver = struct {
                 }
             },
             .Lambda => |lam| {
-                const lam_scope = try self.pushScope(scope, .Block);
+                const lam_scope = try self.pushScope(scope, .ImplicitReceiver);
                 for (lam.params) |p| {
                     const sym = try self.addSymbol(p.name, .Parameter, p.span);
                     try self.scopes.items[lam_scope.int()].bindings.put(p.name, sym);
@@ -854,16 +908,24 @@ const Resolver = struct {
                 if (w.subject) |s| {
                     try self.resolveExpr(scope, s);
                 }
+                // `when (val v = subject)` binds `v` for the patterns and
+                // branch bodies.
+                var branch_scope = scope;
+                if (w.subject_binding) |b| {
+                    branch_scope = try self.pushScope(scope, .Block);
+                    const sym = try self.addSymbol(b.name.name, .LocalProperty, b.name.span);
+                    try self.scopes.items[branch_scope.int()].bindings.put(b.name.name, sym);
+                }
                 for (w.branches) |b| {
                     for (b.patterns) |*p| {
                         switch (p.kind) {
                             .Value, .InRange, .NotInRange => |*e| {
-                                try self.resolveExpr(scope, e);
+                                try self.resolveExpr(branch_scope, e);
                             },
                             .IsType, .NotIsType, .Else => {},
                         }
                     }
-                    try self.resolveExpr(scope, &b.body);
+                    try self.resolveExpr(branch_scope, &b.body);
                 }
             },
             .IsCheck => |ic| try self.resolveExpr(scope, ic.expr),
@@ -972,7 +1034,7 @@ const Resolver = struct {
             if (!n) {
                 const msg = try std.fmt.allocPrint(
                     self.strs(),
-                    "Unnecessary safe call on a non-null receiver of type `{s}`",
+                    "Unnecessary safe call on the non-null receiver `{s}`",
                     .{name},
                 );
                 var d = Diagnostic.fromFactory(&factories.UNNECESSARY_SAFE_CALL, op_span);
@@ -1007,7 +1069,7 @@ const Resolver = struct {
         var scope = start;
         while (true) {
             const s = &self.scopes.items[scope.int()];
-            if (s.kind == .ClassBody) return true;
+            if (s.kind == .ClassBody or s.kind == .ImplicitReceiver) return true;
             if (s.parent) |p| {
                 scope = p;
             } else {

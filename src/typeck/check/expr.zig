@@ -70,6 +70,24 @@ fn recordType(self: *Checker, sp: Span, ty: *const Type) Allocator.Error!void {
     const gop = try self.types.getOrPut(sp);
     if (gop.found_existing) gop.value_ptr.deinit(self.allocator);
     gop.value_ptr.* = owned;
+    if (owned == .Nothing) {
+        const ng = try self.nothing_spans.getOrPut(sp);
+        if (!ng.found_existing) self.nothing_epoch += 1;
+        // Record the span under the active function context as well; a
+        // span can be re-typed under a different context than the one
+        // that first saw it, so membership is per (function, span).
+        if (self.cfg_fn_stack.items.len != 0) {
+            const fn_span = self.cfg_fn_stack.items[self.cfg_fn_stack.items.len - 1];
+            const bucket = try self.nothing_by_fn.getOrPut(fn_span);
+            if (!bucket.found_existing) {
+                bucket.value_ptr.* = std.AutoHashMap(Span, void).init(self.allocator);
+            }
+            const bg = try bucket.value_ptr.getOrPut(sp);
+            if (!bg.found_existing) self.nothing_epoch += 1;
+        }
+    } else if (gop.found_existing) {
+        if (self.nothing_spans.remove(sp)) self.nothing_epoch += 1;
+    }
 }
 
 // ---- statements & blocks --------------------------------------------
@@ -284,7 +302,13 @@ pub fn checkAssign(self: *Checker, target: *const Expr, op: AssignOp, value: *co
             }
             var got = try self.checkExpr(value, &want);
             defer got.deinit(a);
-            try expr_calls.checkAssignable(self, &got, &want, value.span());
+            // A compound assignment that resolves to a `*Assign` operator
+            // checks the value against the operator's parameter
+            // (`list += 100` feeds `plusAssign(element)`), not against the
+            // receiver type itself.
+            if (!compound_with_assign) {
+                try expr_calls.checkAssignable(self, &got, &want, value.span());
+            }
             // killDataFlow lives in the CFG: Node::KillDataFlow at every loop
             // head invalidates narrowings on reassigned places.
             return;
@@ -357,10 +381,18 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             if (p.segments.len == 1) {
                 const name = p.segments[0].name;
                 try visibility.enforceDslScopeForMember(self, name, sp);
-                if (try narrowing.cfgNarrowedClassAt(self, name, sp)) |cn| {
+                // One dataflow solve serves the class/type narrowings and
+                // the GADT substitution at this read.
+                var facts = try narrowing.cfgSmartFactsAt(self, name, sp, true);
+                defer {
+                    var git = facts.gadt.valueIterator();
+                    while (git.next()) |gt| gt.deinit(a);
+                    facts.gadt.deinit();
+                }
+                if (facts.narrowed_class) |cn| {
                     try self.expr_class.put(sp, cn);
                 }
-                if (try narrowing.lookupNarrowedAt(self, name, sp)) |narrowed| {
+                if (facts.narrowed) |narrowed| {
                     return narrowed;
                 }
                 if (narrowing.lookup(self, name)) |b| {
@@ -389,18 +421,12 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                     // fold the implied type-parameter substitution into the
                     // declared type. Outside any branch the substitution is
                     // empty and `ty` is returned unchanged.
-                    var gadt = try narrowing.cfgGadtSubstAt(self, sp);
-                    defer {
-                        var git = gadt.valueIterator();
-                        while (git.next()) |gt| gt.deinit(a);
-                        gadt.deinit();
-                    }
-                    if (gadt.count() == 0) {
+                    if (facts.gadt.count() == 0) {
                         return ty;
                     }
                     var owned = ty;
                     defer owned.deinit(a);
-                    return substituteTypeParams(a, &owned, &gadt);
+                    return substituteTypeParams(a, &owned, &facts.gadt);
                 }
                 if (self.fns.get(name)) |sigs| {
                     // Function reference (not a call) — pick the first declared
@@ -432,10 +458,12 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             const sp = m.span;
             if (try dotPathKey(a, expr)) |key| {
                 defer a.free(key);
-                if (try narrowing.cfgNarrowedClassAt(self, key, sp)) |cn| {
+                var facts = try narrowing.cfgSmartFactsAt(self, key, sp, false);
+                defer facts.gadt.deinit();
+                if (facts.narrowed_class) |cn| {
                     try self.expr_class.put(sp, cn);
                 }
-                if (try narrowing.lookupNarrowedAt(self, key, sp)) |narrowed| {
+                if (facts.narrowed) |narrowed| {
                     var rt = try self.checkExpr(m.receiver, null);
                     rt.deinit(a);
                     return narrowed;
@@ -791,7 +819,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             }
             return acc;
         },
-        .Lambda => |l| return expr_calls.checkLambda(self, l.params, &l.body, expected),
+        .Lambda => |l| return expr_calls.checkLambdaShaped(self, l.params, &l.body, expected, l.implicit_it),
         .This => |t| {
             const target: ?[]const u8 = if (t.qualifier) |q|
                 q.name
@@ -1318,17 +1346,80 @@ pub fn lookupExtension(
         const list = self.extensions.get(key) orelse continue;
         for (list.items) |*ext| {
             if (!std.mem.eql(u8, ext.name, name)) continue;
-            var min: usize = 0;
-            for (ext.sig.has_default) |h| {
-                if (!h) min += 1;
-            }
-            const max = ext.sig.params.len;
-            if (args.len < min or args.len > max) continue;
+            if (!extensionArityFits(&ext.sig, args.len)) continue;
             return .{ .sig = ext.sig, .return_class = ext.return_class };
         }
     }
     return null;
 }
+
+fn extensionArityFits(sig: *const root.FnSig, n_args: usize) bool {
+    var min: usize = 0;
+    var has_vararg = false;
+    for (sig.has_default, 0..) |h, i| {
+        const va = i < sig.is_vararg.len and sig.is_vararg[i];
+        if (va) has_vararg = true;
+        if (!h and !va) min += 1;
+    }
+    if (has_vararg) return n_args >= min;
+    return n_args >= min and n_args <= sig.params.len;
+}
+
+/// Every extension named `name` reachable from `recv_class` (its class,
+/// supertype chain, then `Any`) whose arity admits `n_args`, in
+/// most-specific-receiver-first order. The caller runs full overload
+/// selection over the returned signatures.
+pub fn lookupExtensionCandidates(
+    self: *const Checker,
+    recv_class: []const u8,
+    name: []const u8,
+    n_args: usize,
+    out: *std.ArrayList(ExtensionCandidate),
+) Allocator.Error!void {
+    const a = self.allocator;
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(a);
+    try keys.append(a, recv_class);
+    var seen = std.StringHashMap(void).init(a);
+    defer seen.deinit();
+    try seen.put(recv_class, {});
+    var frontier: std.ArrayList([]const u8) = .empty;
+    defer frontier.deinit(a);
+    try frontier.append(a, recv_class);
+    var steps: usize = 0;
+    while (frontier.pop()) |c| {
+        if (steps > 64) break;
+        steps += 1;
+        const info = self.classes.get(c) orelse continue;
+        for (info.supertypes.items) |s| {
+            if (!(try seen.getOrPut(s)).found_existing) {
+                try keys.append(a, s);
+                try frontier.append(a, s);
+            }
+        }
+    }
+    try keys.append(a, "Any");
+    // Member methods declared on the receiver's class chain come first:
+    // Kotlin gives members precedence over extensions.
+    for (keys.items) |key| {
+        const info = self.classes.get(key) orelse continue;
+        const sigs = info.member_methods.get(name) orelse continue;
+        for (sigs.items) |sig| {
+            if (!extensionArityFits(&sig, n_args)) continue;
+            try out.append(a, .{ .sig = sig, .return_class = null });
+        }
+    }
+    for (keys.items) |key| {
+        const list = self.extensions.get(key) orelse continue;
+        for (list.items) |*ext| {
+            if (!std.mem.eql(u8, ext.name, name)) continue;
+            if (!extensionArityFits(&ext.sig, n_args)) continue;
+            try out.append(a, .{ .sig = ext.sig, .return_class = ext.return_class });
+        }
+    }
+}
+
+pub const ExtensionCandidate = struct { sig: root.FnSig, return_class: ?[]const u8 };
 
 test {
     std.testing.refAllDecls(@This());

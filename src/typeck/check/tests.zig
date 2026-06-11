@@ -2026,6 +2026,71 @@ test "unreachable_after_throw" {
     try testing.expect(c.hasCode(codes.WARN_UNREACHABLE_CODE));
 }
 
+test "unreachable_after_nothing_typed_call" {
+    // fun boom(): Nothing { throw RuntimeException("x") }
+    // fun main() { boom(); println("dead") }
+    // The reachability query consumes the maintained per-function set of
+    // Nothing-typed spans: code after a call typed `Nothing` is dead.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const boom = b.funBlock("boom", &.{}, b.ty("Nothing"), &.{
+        b.exprStmt(b.throwExpr(b.call(b.path("RuntimeException"), &.{b.str("x")}))),
+    });
+    const main = b.funBlock("main", &.{}, null, &.{
+        b.exprStmt(b.call(b.path("boom"), &.{})),
+        b.exprStmt(b.call(b.path("println"), &.{b.str("dead")})),
+    });
+    const f = b.file(&.{ .{ .Function = boom }, .{ .Function = main } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasCode(codes.WARN_UNREACHABLE_CODE));
+}
+
+test "unreachable_memo_does_not_leak_across_functions" {
+    // fun boom(): Nothing { throw RuntimeException("x") }
+    // fun dead() { boom(); println("dead") }
+    // fun alive() { println("ok"); println("still ok") }
+    // The memoized per-function reachability solve must not let `dead`'s
+    // divergence mark statements in `alive` unreachable, and `alive`'s
+    // clean solve must not mask the warning in `dead`.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const boom = b.funBlock("boom", &.{}, b.ty("Nothing"), &.{
+        b.exprStmt(b.throwExpr(b.call(b.path("RuntimeException"), &.{b.str("x")}))),
+    });
+    const dead = b.funBlock("dead", &.{}, null, &.{
+        b.exprStmt(b.call(b.path("boom"), &.{})),
+        b.exprStmt(b.call(b.path("println"), &.{b.str("dead")})),
+    });
+    const alive = b.funBlock("alive", &.{}, null, &.{
+        b.exprStmt(b.call(b.path("println"), &.{b.str("ok")})),
+        b.exprStmt(b.call(b.path("println"), &.{b.str("still ok")})),
+    });
+    const f = b.file(&.{ .{ .Function = boom }, .{ .Function = dead }, .{ .Function = alive } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 1), c.countCode(codes.WARN_UNREACHABLE_CODE));
+}
+
+test "unreachable_warns_in_each_diverging_function" {
+    // Two functions that each diverge mid-body: the per-function memo must
+    // recompute when the Nothing-span set grows, warning in both.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const f1 = b.funBlock("f1", &.{}, null, &.{
+        b.exprStmt(b.returnExpr(null)),
+        b.exprStmt(b.call(b.path("println"), &.{b.str("dead1")})),
+    });
+    const f2 = b.funBlock("f2", &.{}, null, &.{
+        b.exprStmt(b.returnExpr(null)),
+        b.exprStmt(b.call(b.path("println"), &.{b.str("dead2")})),
+    });
+    const f = b.file(&.{ .{ .Function = f1 }, .{ .Function = f2 } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 2), c.countCode(codes.WARN_UNREACHABLE_CODE));
+}
+
 test "senseless_comparison_nonnull_eq_null" {
     // fun main() { val x: Int = 5; if (x == null) { println("nope") } }
     var b = Builder.init(testing.allocator);

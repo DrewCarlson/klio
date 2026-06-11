@@ -113,7 +113,11 @@ pub fn analyseWithTypes(
         }
         if (block_diverges) continue;
         switch (block.term) {
-            .Throw, .Return, .Unreachable => {},
+            .Return, .Unreachable => {},
+            // A throw's recorded successors are exactly the exceptional
+            // edges the lowering routed to enclosing catch / finally
+            // blocks; control genuinely flows there. Without a handler
+            // the successor list is empty.
             else => {
                 for (block.succs.items) |e| {
                     try stack.append(allocator, e.block);

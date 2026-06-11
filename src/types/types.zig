@@ -380,7 +380,12 @@ pub const Type = union(enum) {
                     const ok = switch (variance) {
                         .Out => l.ty.isSubtypeOf(r.ty),
                         .In => r.ty.isSubtypeOf(l.ty),
-                        .Invariant => l.ty.eql(r.ty),
+                        // Type parameters and unresolved slots stay
+                        // permissive wildcards inside type-argument lists,
+                        // matching the top-level rule above.
+                        .Invariant => l.ty.eql(r.ty) or
+                            l.ty == .TypeParam or r.ty == .TypeParam or
+                            l.ty == .Unresolved or r.ty == .Unresolved,
                     };
                     if (!ok) return false;
                 }

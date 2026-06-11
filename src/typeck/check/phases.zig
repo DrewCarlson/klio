@@ -51,10 +51,16 @@ const codes = root.codes;
 pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!Checker {
     var frames: std.ArrayList(Frame) = .empty;
     try frames.append(allocator, Frame.init(allocator));
+    const query_scratch = try allocator.create(std.heap.ArenaAllocator);
+    query_scratch.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     return .{
         .allocator = allocator,
         .resolution = resolution,
         .types = std.AutoHashMap(root.Span, root.Type).init(allocator),
+        .nothing_spans = std.AutoHashMap(root.Span, void).init(allocator),
+        .nothing_by_fn = std.AutoHashMap(root.Span, std.AutoHashMap(root.Span, void)).init(allocator),
+        .nothing_epoch = 0,
+        .reach_cache = root.ReachCache.init(allocator),
         .expr_class = std.AutoHashMap(root.Span, []const u8).init(allocator),
         .list_elem = std.AutoHashMap(root.Span, root.Type).init(allocator),
         .diagnostics = root.DiagnosticSink.init(),
@@ -87,6 +93,8 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .cfg_fn_stack = .empty,
         .inference_session = null,
         .builder_inference_active = false,
+        .lambda_depth = 0,
+        .query_scratch = query_scratch,
     };
 }
 
@@ -1659,6 +1667,21 @@ pub fn checkDeprecatedReferences(self: *Checker, file: *const KotlinFile) Alloca
     defer info.deinit();
     try collectDeprecationInfo(a, file.decls, &info);
     if (info.count() == 0) return;
+    // The tracker is keyed by bare name, with no overload resolution: if a
+    // non-deprecated declaration shares the name (`append` has one
+    // deprecated overload among many live ones), a use site cannot be
+    // attributed to the deprecated one, so the name is dropped rather than
+    // flagging every call.
+    var clean = std.StringHashMap(void).init(a);
+    defer clean.deinit();
+    try collectNonDeprecatedNames(a, file.decls, &clean);
+    {
+        var it = clean.keyIterator();
+        while (it.next()) |name| {
+            _ = info.remove(name.*);
+        }
+    }
+    if (info.count() == 0) return;
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(a);
     for (file.decls) |*d| {
@@ -2835,6 +2858,32 @@ fn collectDeprecationInfo(allocator: Allocator, decls: []const Decl, out: *std.S
             },
             .TypeAlias => |*a| {
                 if (try parseDeprecation(allocator, a.annotations)) |info| try out.put(a.name.name, info);
+            },
+        }
+    }
+}
+
+/// Names declared at least once *without* `@Deprecated`, mirroring
+/// `collectDeprecationInfo`'s walk.
+fn collectNonDeprecatedNames(allocator: Allocator, decls: []const Decl, out: *std.StringHashMap(void)) Allocator.Error!void {
+    for (decls) |*d| {
+        switch (d.*) {
+            .Function => |*f| {
+                if (try parseDeprecation(allocator, f.annotations) == null) try out.put(f.name.name, {});
+            },
+            .Property => |*p| {
+                if (try parseDeprecation(allocator, p.annotations) == null) try out.put(p.name.name, {});
+            },
+            .Class => |*c| {
+                if (try parseDeprecation(allocator, c.annotations) == null) try out.put(c.name.name, {});
+            },
+            .Object => |*o| {
+                for (o.members) |*m| {
+                    try collectNonDeprecatedNames(allocator, m[0..1], out);
+                }
+            },
+            .TypeAlias => |*a| {
+                if (try parseDeprecation(allocator, a.annotations) == null) try out.put(a.name.name, {});
             },
         }
     }
