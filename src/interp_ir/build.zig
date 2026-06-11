@@ -328,8 +328,10 @@ fn collectClassFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: 
 /// forms keep their source spans. A nested class's FQN override is
 /// class-qualified (`pkg.Outer.Inner`), so the package cannot be
 /// recovered from it; this map carries the file's package directly.
+/// The no-package case records `""` for the same reason: a nested
+/// decl's class-qualified override (`Outer.Inner`) would otherwise be
+/// misread as a package prefix.
 fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *SpanStrMap) Allocator.Error!void {
-    if (pkg.len == 0) return;
     switch (d.*) {
         .Class => |*c| {
             try out.put(c.span, pkg);
@@ -493,6 +495,8 @@ fn buildModuleWithOverrides(
     const package_prefix = try packagePrefix(a, file.package);
 
     var object_names: std.ArrayList([]const u8) = .empty;
+    var object_spans: std.ArrayList(Span) = .empty;
+    defer object_spans.deinit(a);
     var companion_singletons = std.StringHashMap([]const u8).init(a);
     var nested_outer_members = lift.OuterMembers.init(a);
     var enclosing_class = lift.EnclosingMap.init(a);
@@ -573,6 +577,7 @@ fn buildModuleWithOverrides(
         .allocator = a,
         .out_decls = &all_decls,
         .object_names = &object_names,
+        .object_spans = &object_spans,
         .companion_singletons = &companion_singletons,
         .nested_outer_members = &nested_outer_members,
         .enclosing_class = &enclosing_class,
@@ -597,6 +602,7 @@ fn buildModuleWithOverrides(
                     const fqn = fqn_overrides.get(o.span) orelse "";
                     const mangled = try replaceDotWithDollar(a, fqn);
                     try object_names.append(a, mangled);
+                    try object_spans.append(a, o.span);
                     var synth = try lift.synthesizeClassFromObject(a, o);
                     synth.name = .{ .name = mangled, .span = o.name.span };
                     try all_decls.append(a, .{ .Class = synth });
@@ -614,6 +620,7 @@ fn buildModuleWithOverrides(
                     continue;
                 }
                 try object_names.append(a, o.name.name);
+                try object_spans.append(a, o.span);
                 const synth = try lift.synthesizeClassFromObject(a, o);
                 try lift.liftClassRecursive(&lift_ctx, &synth, &.{});
                 try all_decls.append(a, .{ .Class = synth });
@@ -1178,7 +1185,7 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
-        const def = try buildClassDef(a, c, fqn_overrides, package_prefix, &object_names, globals_for_capture);
+        const def = try buildClassDef(a, c, fqn_overrides, package_prefix, &object_spans, globals_for_capture);
         const fqn_g = def.borrow();
         const def_fqn = fqn_g.get().fqn;
         fqn_g.deinit();
@@ -1803,7 +1810,7 @@ fn buildClassDef(
     c: *const ast.Class,
     fqn_overrides: *const SpanStrMap,
     package_prefix: []const u8,
-    object_names: *const std.ArrayList([]const u8),
+    object_spans: *const std.ArrayList(Span),
     globals_for_capture: ObjRef(Env),
 ) Allocator.Error!ObjRef(ClassDef) {
     var primary_params = try a.alloc(ClassParamDef, c.primary_params.len);
@@ -1833,9 +1840,11 @@ fn buildClassDef(
         });
     }
 
+    // Matched by declaration span, never by simple name: a same-named
+    // `object` from another package must not mark this class an object.
     var is_object = false;
-    for (object_names.items) |n| {
-        if (std.mem.eql(u8, n, c.name.name)) {
+    for (object_spans.items) |s| {
+        if (std.meta.eql(s, c.span)) {
             is_object = true;
             break;
         }

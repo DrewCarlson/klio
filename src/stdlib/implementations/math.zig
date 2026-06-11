@@ -109,6 +109,17 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
             @max(x, y);
         return ok(.{ .Double = r });
     }
+    // Unsigned pairs compare by unsigned magnitude and keep their kind,
+    // widening to the larger when the kinds differ.
+    if (unsigned_as_u64(first) != null or unsigned_as_u64(second) != null) {
+        const x = unsigned_as_u64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
+        const y = unsigned_as_u64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
+        const r: u64 = if (want_min) @min(x, y) else @max(x, y);
+        if (first.* == .ULong or second.* == .ULong) return ok(.{ .ULong = r });
+        if (first.* == .UInt or second.* == .UInt) return ok(.{ .UInt = @intCast(r) });
+        if (first.* == .UShort or second.* == .UShort) return ok(.{ .UShort = @intCast(r) });
+        return ok(.{ .UByte = @intCast(r) });
+    }
     const x = numeric_as_i64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
     const y = numeric_as_i64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
     const r: i64 = if (want_min) @min(x, y) else @max(x, y);
@@ -118,6 +129,17 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
     }
     // Kotlin Int min/max keeps an Int result.
     return ok(.{ .Int = @truncate(r) });
+}
+
+/// Unsigned operand widened to `u64` (UByte/UShort/UInt/ULong only).
+fn unsigned_as_u64(v: *const Value) ?u64 {
+    return switch (v.*) {
+        .UByte => |x| @as(u64, x),
+        .UShort => |x| @as(u64, x),
+        .UInt => |x| @as(u64, x),
+        .ULong => |x| x,
+        else => null,
+    };
 }
 
 pub fn math_min(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -1012,6 +1034,39 @@ test "min and max widen and propagate NaN" {
     var c5 = makeCtx(&.{ .{ .Char = 'b' }, .{ .Char = 'a' } }, &h, &cap);
     const r5 = try math_min(&c5);
     try testing.expectEqual(@as(u16, 'a'), r5.ok.Char);
+}
+
+test "min and max compare unsigned operands by magnitude" {
+    var h = NoopHost.init(testing.allocator);
+    defer h.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+
+    var c1 = makeCtx(&.{ .{ .UInt = 1 }, .{ .UInt = 5 } }, &h, &cap);
+    const r1 = try math_max(&c1);
+    try testing.expect(r1.ok == .UInt);
+    try testing.expectEqual(@as(u32, 5), r1.ok.UInt);
+
+    var c2 = makeCtx(&.{ .{ .UInt = 1 }, .{ .UInt = 5 } }, &h, &cap);
+    const r2 = try math_min(&c2);
+    try testing.expectEqual(@as(u32, 1), r2.ok.UInt);
+
+    // A high-bit ULong is large, not negative.
+    var c3 = makeCtx(&.{ .{ .ULong = 0xFFFF_FFFF_FFFF_FFFF }, .{ .ULong = 3 } }, &h, &cap);
+    const r3 = try math_max(&c3);
+    try testing.expect(r3.ok == .ULong);
+    try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), r3.ok.ULong);
+
+    // Mixed unsigned kinds widen to the larger kind.
+    var c4 = makeCtx(&.{ .{ .UInt = 7 }, .{ .ULong = 2 } }, &h, &cap);
+    const r4 = try math_min(&c4);
+    try testing.expect(r4.ok == .ULong);
+    try testing.expectEqual(@as(u64, 2), r4.ok.ULong);
+
+    var c5 = makeCtx(&.{ .{ .UByte = 9 }, .{ .UByte = 4 } }, &h, &cap);
+    const r5 = try math_max(&c5);
+    try testing.expect(r5.ok == .UByte);
+    try testing.expectEqual(@as(u8, 9), r5.ok.UByte);
 }
 
 test "pow for double and float" {

@@ -1,0 +1,125 @@
+//! Pinned parity-corpus fixtures. Each test runs one real
+//! `tests/fixtures/parity_corpus/*.kt` program through the in-process
+//! pipeline and asserts kotlinc's output (kotlinc-jvm 2.3.21), so the
+//! fixtures gate under `zig build test` — the kotlinc-backed corpus
+//! sweep (`klio-parity --sweep corpus`) needs a kotlinc install and runs
+//! out-of-band.
+
+const std = @import("std");
+const parity = @import("parity");
+
+const CORPUS_DIR = "tests/fixtures/parity_corpus";
+
+// One arena shared by every pipeline run in this file. The pipeline
+// installs process-global tables backed by the build allocator; a fresh
+// per-test arena would free that memory out from under the still-live
+// globals. Mirrors the e2e harness.
+var shared_arena: ?std.heap.ArenaAllocator = null;
+
+fn arenaAllocator() std.mem.Allocator {
+    if (shared_arena) |*a| {
+        _ = a.reset(.retain_capacity);
+    } else {
+        shared_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    }
+    return shared_arena.?.allocator();
+}
+
+/// Run `tests/fixtures/parity_corpus/<stem>.kt` and assert its stdout.
+fn check(stem: []const u8, expected: []const u8) !void {
+    const a = arenaAllocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const file = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ CORPUS_DIR, stem });
+    const res = try parity.runWithPacks(a, io, file);
+    switch (res) {
+        .ok => |got| try std.testing.expectEqualStrings(expected, got),
+        .err => |m| {
+            std.debug.print("parity corpus {s}: klio error: {s}\n", .{ stem, m });
+            return error.KlioRunFailed;
+        },
+    }
+}
+
+test "annotated_expression_body" {
+    try check("annotated_expression_body",
+        \\neg
+        \\zero
+        \\pos
+        \\1
+        \\null
+        \\
+    );
+}
+
+test "elvis_line_continuation" {
+    try check("elvis_line_continuation",
+        \\7
+        \\-1
+        \\anonymous
+        \\
+    );
+}
+
+test "companion_init_reads_top_const" {
+    try check("companion_init_reads_top_const",
+        \\200
+        \\101
+        \\100
+        \\
+    );
+}
+
+test "method_fn_ref_default_param" {
+    try check("method_fn_ref_default_param",
+        \\ANN!
+        \\<ann>
+        \\<ann>
+        \\[ann]
+        \\
+    );
+}
+
+test "nested_enum_in_class" {
+    try check("nested_enum_in_class",
+        \\RED
+        \\GREEN
+        \\YELLOW
+        \\RED
+        \\GREEN
+        \\
+    );
+}
+
+test "unsigned_compare" {
+    try check("unsigned_compare",
+        \\true
+        \\true
+        \\false
+        \\false
+        \\5
+        \\1
+        \\3
+        \\true
+        \\10
+        \\3
+        \\[1, 1, 3, 4, 5]
+        \\4
+        \\
+    );
+}
+
+test "exception_hierarchy_multilevel" {
+    try check("exception_hierarchy_multilevel",
+        \\notfound app=true rt=true th=true
+        \\timeout app=true rt=true th=true
+        \\other app=false rt=true th=true
+        \\caught-as-AppError msg=boom
+        \\not here
+        \\timeout
+        \\wrapped-msg
+        \\
+    );
+}

@@ -536,6 +536,12 @@ fn pushField(g: *InstanceData, allocator: Allocator, key: []const u8, v: Value) 
 /// Bind the conventional `(message[, cause])` super-args onto a leaf
 /// Throwable instance.
 fn bindThrowableArgs(self: *VmHost, inst: ObjRef(InstanceData), args: []const Value, only_when_unset: bool) Allocator.Error!void {
+    // The unset probe runs before the exclusive borrow below: the
+    // instance lock is not reentrant, so a read taken under the held
+    // write borrow deadlocks the constructing thread against itself.
+    const skip_single = only_when_unset and args.len == 1 and
+        hasNonNullField(inst, if (args[0] == .Instance) "cause" else "message");
+    if (skip_single) return;
     const g = inst.borrowMut();
     defer g.deinit();
     const i = g.get();
@@ -543,7 +549,6 @@ fn bindThrowableArgs(self: *VmHost, inst: ObjRef(InstanceData), args: []const Va
         const only = args[0];
         const is_cause = only == .Instance;
         const key: []const u8 = if (is_cause) "cause" else "message";
-        if (only_when_unset and hasNonNullField(inst, key)) return;
         retainField(i, self.allocator, key);
         try pushField(i, self.allocator, key, only);
     } else if (args.len >= 2) {
@@ -572,7 +577,48 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
             break;
         }
     }
-    const entry = chosen orelse return .{ .ok = {} };
+    const entry = chosen orelse {
+        // No secondary ctor takes this shape: the class delegates through
+        // its PRIMARY ctor (`open class A(msg: String) : B(msg)`). Bind
+        // its property params onto the leaf where the leaf does not
+        // already carry them (child overrides win), evaluate the
+        // supertype-call args against the primary params, and continue
+        // the chain with the parent.
+        const def = classDefByName(self, sideTableKey(class_fqn, class_name)) orelse return .{ .ok = {} };
+        defer def.deinit();
+        if (leaf.* == .Instance) {
+            const dg = def.borrow();
+            const pp = dg.get().primary_params;
+            var k: usize = 0;
+            while (k < pp.len and k < args.len) : (k += 1) {
+                if (pp[k].property == null) continue;
+                if (hasNonNullField(leaf.Instance, pp[k].name)) continue;
+                const g = leaf.Instance.borrowMut();
+                retainField(g.get(), self.allocator, pp[k].name);
+                try pushField(g.get(), self.allocator, pp[k].name, args[k]);
+                g.deinit();
+            }
+            dg.deinit();
+        }
+        const thunks = parentCtorArgThunks(self, class_fqn, class_name) orelse return .{ .ok = {} };
+        var parent_args: std.ArrayList(Value) = .empty;
+        defer parent_args.deinit(self.allocator);
+        for (thunks) |fid| {
+            const fr = try funcAt(self, fid, "parent ctor arg");
+            switch (fr) {
+                .err => |e| return .{ .err = e },
+                .ok => |func| {
+                    switch (try evalThunk(self, func, args)) {
+                        .ok => |v| try parent_args.append(self.allocator, v),
+                        .err => |e| return .{ .err = e },
+                    }
+                },
+            }
+        }
+        const pref = firstNonInterfaceSuper(self, def) orelse return .{ .ok = {} };
+        if (std.mem.eql(u8, pref.name, class_name)) return .{ .ok = {} };
+        return try runSuperCtorChain(self, leaf, pref.fqn, pref.name, parent_args.items);
+    };
 
     var next_args: std.ArrayList(Value) = .empty;
     defer next_args.deinit(self.allocator);

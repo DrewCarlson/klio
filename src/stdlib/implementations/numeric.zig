@@ -985,6 +985,18 @@ fn numExtreme(allocator: Allocator, args: []const Value, want_min: bool, what: [
             @max(x, y);
         return .{ .ok = .{ .Double = r } };
     }
+    // Unsigned pairs (`maxOf(1u, 5u)`, `minOf(10uL, 3uL)`): compare by
+    // unsigned magnitude and keep the operands' kind, widening to the
+    // larger when they differ.
+    if (unsignedAsU64(first) != null or unsignedAsU64(second) != null) {
+        const x = unsignedAsU64(first) orelse return .{ .err = try typeErr(allocator, "{s}: non-numeric arg", .{what}) };
+        const y = unsignedAsU64(second) orelse return .{ .err = try typeErr(allocator, "{s}: non-numeric arg", .{what}) };
+        const r = if (want_min) @min(x, y) else @max(x, y);
+        if (first == .ULong or second == .ULong) return .{ .ok = .{ .ULong = r } };
+        if (first == .UInt or second == .UInt) return .{ .ok = .{ .UInt = @intCast(r) } };
+        if (first == .UShort or second == .UShort) return .{ .ok = .{ .UShort = @intCast(r) } };
+        return .{ .ok = .{ .UByte = @intCast(r) } };
+    }
     const x = numericAsI64(first) orelse return .{ .err = try typeErr(allocator, "{s}: non-numeric arg", .{what}) };
     const y = numericAsI64(second) orelse return .{ .err = try typeErr(allocator, "{s}: non-numeric arg", .{what}) };
     const r = if (want_min) @min(x, y) else @max(x, y);
@@ -992,6 +1004,17 @@ fn numExtreme(allocator: Allocator, args: []const Value, want_min: bool, what: [
         return .{ .ok = .{ .Long = r } };
     }
     return .{ .ok = Value.newInt(r) };
+}
+
+/// Unsigned operand widened to `u64` (UByte/UShort/UInt/ULong only).
+fn unsignedAsU64(v: Value) ?u64 {
+    return switch (v) {
+        .UByte => |x| @as(u64, x),
+        .UShort => |x| @as(u64, x),
+        .UInt => |x| @as(u64, x),
+        .ULong => |x| x,
+        else => null,
+    };
 }
 
 /// Mirror of `math::numeric_as_i64` (Int/Long/Short/Byte only).

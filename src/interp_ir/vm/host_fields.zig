@@ -932,6 +932,50 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
         defer cg.deinit();
         if (cg.get().get(mangled)) |def| return ok(.{ .Class = def });
     }
+    // A nested class registered under its enclosing-qualified FQN
+    // (`Outer.Nested`): the exact declaration resolves before any
+    // simple-name fallback below can adopt an unrelated namesake from
+    // another package.
+    {
+        const cls_fqn = blk: {
+            const g = receiver.Class.borrow();
+            defer g.deinit();
+            break :blk g.get().fqn;
+        };
+        if (cls_fqn.len != 0) {
+            const nested_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name });
+            defer allocator.free(nested_fqn);
+            const nested: ?ObjRef(ClassDef) = blk: {
+                const cg = self.classes.borrow();
+                defer cg.deinit();
+                if (cg.get().get(nested_fqn)) |def| break :blk def.clone();
+                break :blk null;
+            };
+            if (nested) |def| {
+                const obj_name: ?[]const u8 = blk: {
+                    const dg = def.borrow();
+                    defer dg.deinit();
+                    if (dg.get().is_object) break :blk dg.get().name;
+                    break :blk null;
+                };
+                if (obj_name) |n| {
+                    switch (try host_globals.ensureObjectSingleton(self, n)) {
+                        .ok => |maybe| if (maybe) |v| {
+                            if (v == .Instance) {
+                                def.deinit();
+                                return ok(v);
+                            }
+                        },
+                        .err => |e| {
+                            def.deinit();
+                            return errRes(e);
+                        },
+                    }
+                }
+                return ok(.{ .Class = def });
+            }
+        }
+    }
     // Nested singleton object (lifted under its simple name) wins over
     // the class.
     switch (try host_globals.ensureObjectSingleton(self, name)) {

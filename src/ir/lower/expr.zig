@@ -137,7 +137,18 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (!aliased and b.resolve(n) == null and !b.knowsOuter(n) and b.module.classId(n) != null) {
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = n });
-            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
+            // The index-resolved class rides as the exact identity so a
+            // same-simple-name class/object from an invisible package
+            // cannot swap in at runtime (a nested `State` inside the
+            // caller's class must not resolve to another package's
+            // file-private `object State`). A same-named top-level
+            // property keeps the name-keyed read — the property wins in
+            // value position.
+            const cls_pick: ?ir.ClassId = if (isTopLevelProp(n))
+                null
+            else
+                b.module.classIdIndexed(n, b.self_package, segments[0].span.file);
+            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cls_pick } });
             return dst;
         }
     }
@@ -2787,7 +2798,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
             if (bare_func_id != null) rung = .non_ext_arity_tl;
         }
         if (bare_func_id == null and !name_is_alias) {
-            bare_func_id = try fallbackByDeclArity(b, cands, name0, want, &rung);
+            bare_func_id = try fallbackByDeclArity(b, cands, name0, want, segments[0].span.file, &rung);
         }
     }
 
@@ -3307,7 +3318,7 @@ fn declArity(b: *FuncBuilder, fid: FuncId) ?u32 {
     return b.module.decl_user_params.get(fid.int());
 }
 
-fn fallbackByDeclArity(b: *FuncBuilder, cands: []const FuncId, name0: []const u8, want: usize, rung: *HeurRung) Allocator.Error!?FuncId {
+fn fallbackByDeclArity(b: *FuncBuilder, cands: []const FuncId, name0: []const u8, want: usize, file: ir.FileId, rung: *HeurRung) Allocator.Error!?FuncId {
     const fallback = b.module.funcId(name0);
     const want_u32: u32 = @intCast(want);
     const fallback_fits = blk: {
@@ -3316,6 +3327,26 @@ fn fallbackByDeclArity(b: *FuncBuilder, cands: []const FuncId, name0: []const u8
         }
         break :blk true;
     };
+    // A fallback in a package the caller cannot see never outranks an
+    // in-scope extension candidate of matching declared arity: Kotlin
+    // does not resolve the invisible function at all, while the
+    // extension may bind through an implicit receiver (the stdlib's own
+    // `firstOrNull(predicate)` inside `CharSequence.find` must not bind
+    // a user file's root-package `firstOrNull`).
+    if (fallback) |fid| {
+        const tier = b.module.bareCallTierOf(fid, name0, b.self_package, file) orelse 255;
+        if (tier == ir.Module.other_package_tier) {
+            for (cands) |cid| {
+                if (isNonExt(b, cid)) continue;
+                if (declArity(b, cid) != want_u32) continue;
+                const ct = b.module.bareCallTierOf(cid, name0, b.self_package, file) orelse continue;
+                if (ct < ir.Module.other_package_tier) {
+                    rung.* = .decl_arity_ext;
+                    return cid;
+                }
+            }
+        }
+    }
     if (fallback_fits) {
         if (fallback != null) rung.* = .decl_arity_order;
         return fallback;

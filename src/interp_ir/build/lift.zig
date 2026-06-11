@@ -211,6 +211,11 @@ pub const LiftCtx = struct {
     allocator: Allocator,
     out_decls: *std.ArrayList(Decl),
     object_names: *std.ArrayList([]const u8),
+    /// Declaration spans appended in lockstep with `object_names`: the
+    /// identity of each lifted `object` decl. `buildClassDef` matches a
+    /// class's span against these — never the simple name, which a
+    /// same-named class from another package can collide with.
+    object_spans: *std.ArrayList(Span),
     companion_singletons: *std.StringHashMap([]const u8),
     nested_outer_members: *OuterMembers,
     enclosing_class: *EnclosingMap,
@@ -243,6 +248,7 @@ pub fn liftClassRecursive(
             }
             const is_private = is_private0 or collides;
             try ctx.object_names.append(a, lifted_name);
+            try ctx.object_spans.append(a, co.span);
             try ctx.enclosing_class.put(lifted_name, c.name.name);
             var extras = StringSet.init(a);
             try collectEnclosingMemberNames(c, &extras);
@@ -289,6 +295,7 @@ pub fn liftClassRecursive(
                 }
                 try ctx.nested_outer_members.put(comp_name, extras);
                 try ctx.object_names.append(a, comp_name);
+                try ctx.object_spans.append(a, nested.span);
                 try ctx.enclosing_class.put(comp_name, c.name.name);
                 const next_chain = try appendChain(a, enclosing_chain, c);
                 defer a.free(next_chain);
