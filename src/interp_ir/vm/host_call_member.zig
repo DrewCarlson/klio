@@ -325,6 +325,32 @@ fn isFunctionTypeRef(ty: *const TypeRef) bool {
         std.mem.indexOf(u8, ty.name, "->") != null;
 }
 
+/// `ty`'s name with `typealias` indirection resolved (bounded hops), so a
+/// param declared as `handler: CompletionHandler` (an alias for a function
+/// type) is recognised as function-typed by applicability checks.
+fn resolveAliasName(self: *VmHost, name: []const u8) []const u8 {
+    var cur = name;
+    var hops: usize = 0;
+    while (hops < 4) : (hops += 1) {
+        const next = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().registry.type_aliases.get(simpleName(cur));
+        } orelse return cur;
+        if (std.mem.eql(u8, next, cur)) return cur;
+        cur = next;
+    }
+    return cur;
+}
+
+/// `isFunctionTypeRef` with typealias indirection resolved.
+fn isFunctionTypeRefResolved(self: *VmHost, ty: *const TypeRef) bool {
+    if (isFunctionTypeRef(ty)) return true;
+    const resolved = resolveAliasName(self, ty.name);
+    return std.mem.startsWith(u8, simpleName(resolved), "Function") or
+        std.mem.indexOf(u8, resolved, "->") != null;
+}
+
 /// Pack trailing positional args into a single `Value::Array` when the
 /// target's last param is `vararg`. `args` is consumed and freed.
 fn packVarargArgs(self: *VmHost, allocator: Allocator, func: *const Func, args: []Value) Allocator.Error![]Value {
@@ -1237,11 +1263,18 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
         g.deinit();
     }
     if (std.mem.indexOf(u8, cls_name, "$Companion$") != null) return null;
+    // Walk the full supertype graph (not just the first supertype): a
+    // class may list an interface before its superclass
+    // (`HeadersImpl : Headers, StringValuesImpl(...)`), and the companion
+    // holding `name` can sit on any ancestor — class or interface.
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(allocator);
     var seen: std.ArrayList([]const u8) = .empty;
     defer seen.deinit(allocator);
-    var cur: ?[]const u8 = cls_name;
-    while (cur) |cname| {
-        cur = null;
+    try queue.append(allocator, cls_name);
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cname = queue.items[head];
         var already = false;
         for (seen.items) |sname| {
             if (std.mem.eql(u8, sname, cname)) {
@@ -1249,7 +1282,7 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
                 break;
             }
         }
-        if (already) break;
+        if (already) continue;
         try seen.append(allocator, cname);
         const comp_name: ?[]const u8 = blk: {
             const g = self.module.borrow();
@@ -1265,15 +1298,15 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
                 if (sv == .Instance) return sv;
             }
         }
-        cur = blk: {
+        {
             const cg = self.classes.borrow();
             defer cg.deinit();
-            const def = cg.get().get(cname) orelse break :blk null;
-            const dg = def.borrow();
-            defer dg.deinit();
-            const supers = dg.get().supertype_names;
-            break :blk if (supers.len != 0) supers[0] else null;
-        };
+            if (cg.get().get(cname)) |def| {
+                const dg = def.borrow();
+                defer dg.deinit();
+                for (dg.get().supertype_names) |sn| try queue.append(allocator, sn);
+            }
+        }
     }
     return null;
 }
@@ -1538,12 +1571,93 @@ fn paramHasDefault(defaults: ?[]const ?FuncId, idx: usize) bool {
 /// Conservative type-incompatibility check for a single instance arg
 /// against a user-class parameter. Returns `true` only when we can
 /// prove the argument's class is not the parameter type nor any of its
-/// supertypes; primitives, builtins, function types, and generics are
-/// never adjudicated here (they are scored elsewhere).
+/// supertypes; primitives, builtins, and generics are never adjudicated
+/// here (they are scored elsewhere). A function-typed parameter is
+/// definite against a plain data value: kotlinc drops such a candidate
+/// (String is no Function subtype), so a member `url(block: (T) -> Unit)`
+/// can't pre-empt the same-named `url(urlString: String)` extension.
+/// Whether an instance can stand in for a function-typed parameter:
+/// it carries a SAM-conversion target, or its supertype closure names a
+/// `Function*` type (kotlinc: assignability needs the type relation — a
+/// class merely declaring an `invoke` member is not a Function subtype).
+fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
+    {
+        const g = v.Instance.borrow();
+        defer g.deinit();
+        if (g.get().get("__sam_target__") != null) return true;
+    }
+    var start: []const u8 = undefined;
+    {
+        const g = v.Instance.borrow();
+        const cg = g.get().class.borrow();
+        start = cg.get().name;
+        cg.deinit();
+        g.deinit();
+    }
+    const a = self.allocator;
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(a);
+    var seen: std.StringHashMap(void) = .init(a);
+    defer seen.deinit();
+    queue.append(a, start) catch return false;
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cur = queue.items[head];
+        if (seen.contains(cur)) continue;
+        seen.put(cur, {}) catch {};
+        if (std.mem.startsWith(u8, simpleName(cur), "Function")) return true;
+        const cg = self.classes.borrow();
+        if (cg.get().get(cur)) |d| {
+            const dg = d.borrow();
+            for (dg.get().supertype_names) |sn| queue.append(a, sn) catch {};
+            dg.deinit();
+        }
+        cg.deinit();
+    }
+    return false;
+}
+
+/// Definite receiver disproof for the lenient extension pass: an
+/// instance whose known hierarchy excludes the declared receiver class
+/// (`argDefinitelyNotParamType`), or a class value against a concrete
+/// receiver class — a `KClass` is never an instance of `Pipeline`, so
+/// `Pipeline.execute` is not a candidate at that receiver (kotlinc drops
+/// it outright).
+fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver: *const Value) bool {
+    if (argDefinitelyNotParamType(self, param_ty, receiver)) return true;
+    if (receiver.* == .Class) {
+        const pn = param_ty.name;
+        if (param_ty.nullable) return false;
+        if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return false;
+        if (std.mem.startsWith(u8, pn, "Function")) return true;
+        if (pn.len <= 2 and allUppercase(pn)) return false;
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        return cg.get().get(simpleName(pn)) != null;
+    }
+    return false;
+}
+
 fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
     const pn = param_ty.name;
+    // A qualified reference (`Owner.Pocket`) names a lifted nested/inner
+    // class whose registered name the supertype walk cannot relate;
+    // decline to adjudicate.
+    if (std.mem.indexOfScalar(u8, pn, '.') != null) return false;
+
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit") or param_ty.nullable) return false;
-    if (std.mem.startsWith(u8, pn, "Function") or (pn.len <= 2 and allUppercase(pn))) return false;
+    if (pn.len <= 2 and allUppercase(pn)) return false;
+    if (std.mem.startsWith(u8, pn, "Function")) {
+        // Callables and Null stay non-definite; a plain data value is
+        // definite, and so is an instance with no `invoke` surface (a
+        // `JobNode` is not a `CompletionHandler` — kotlinc drops the
+        // member and binds the JobNode-typed extension).
+        return switch (arg.*) {
+            .String, .Bool, .Char, .Byte, .Short, .Int, .Long, .Float, .Double, .UByte, .UShort, .UInt, .ULong => true,
+            .Instance => !instanceHasInvokeSurface(self, arg),
+            else => false,
+        };
+    }
     // Only adjudicate when the parameter names a known user class.
     {
         const cg = self.classes.borrow();
@@ -1580,6 +1694,11 @@ fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *cons
     while (head < queue.items.len) : (head += 1) {
         const cur = queue.items[head];
         if (std.mem.eql(u8, cur, pn)) return false; // arg IS-A param type.
+        // A lifted nested/inner class is registered under `Outer$Name`;
+        // a type reference written `Outer.Name` collapses to `Name`, so
+        // match the mangled tail too.
+        if (cur.len > pn.len and cur[cur.len - pn.len - 1] == '$' and
+            std.mem.endsWith(u8, cur, pn)) return false;
         if (seen.contains(cur)) continue;
         seen.put(cur, {}) catch {};
         const cg = self.classes.borrow();
@@ -1610,6 +1729,15 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         const f = candidates[0];
         const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         const effective = f.params[skip..];
+        // Over-supply with no vararg tail can't bind: decline so an
+        // applicable top-level/extension overload wins — e.g. the stdlib
+        // `buildString { … }` inside an extension on a class that declares
+        // its own zero-arg `buildString()` member (`URLBuilder.authority`).
+        if (args.len > effective.len and
+            (effective.len == 0 or !effective[effective.len - 1].is_vararg))
+        {
+            return null;
+        }
         if (args.len < effective.len) {
             const defaults = funcDefaults(self, &f);
             var k: usize = args.len;
@@ -1640,7 +1768,7 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         // trailing lambda to the LAST function-typed param, with the
         // intermediate gap defaulted.
         if (args.len < effective.len and args.len > 0 and
-            effective.len > 0 and isFunctionTypeRef(&effective[effective.len - 1].ty) and
+            effective.len > 0 and isFunctionTypeRefResolved(self, &effective[effective.len - 1].ty) and
             isCallable(&args[args.len - 1]))
         {
             const lead = args.len - 1;
@@ -4272,21 +4400,42 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         candidates = filtered;
         if (candidates.items.len == 0) return null;
     } else {
+        // Lenient pass: keep candidates whose receiver match cannot be
+        // proven (erased generics) — but a definite DISPROOF still drops
+        // the candidate: when the declared receiver heads a known class
+        // and the runtime receiver's full hierarchy excludes it, kotlinc
+        // never considers the extension (`Pipeline.execute` is not a
+        // candidate on a coroutine receiver).
         var any_compat = false;
         for (candidates.items) |c| {
-            if (receiverCompatibleWithParam(receiver, &c.func.params[0].ty)) any_compat = true;
+            if (receiverCompatibleWithParam(receiver, &c.func.params[0].ty) and
+                !receiverDefinitelyNotParam(self, &c.func.params[0].ty, receiver)) any_compat = true;
         }
         if (any_compat) {
             var filtered: std.ArrayList(Candidate) = .empty;
             for (candidates.items) |c| {
-                if (receiverCompatibleWithParam(receiver, &c.func.params[0].ty)) filtered.append(allocator, c) catch {};
+                if (receiverCompatibleWithParam(receiver, &c.func.params[0].ty) and
+                    !receiverDefinitelyNotParam(self, &c.func.params[0].ty, receiver)) filtered.append(allocator, c) catch {};
             }
             candidates.deinit(allocator);
             candidates = filtered;
+        } else {
+            // Every candidate is either incompatible or definitely
+            // disproven: nothing to pick leniently.
+            var any_undisproven = false;
+            for (candidates.items) |c| {
+                if (!receiverDefinitelyNotParam(self, &c.func.params[0].ty, receiver)) any_undisproven = true;
+            }
+            if (!any_undisproven) return null;
         }
     }
 
-    // Unique-exact-arity pick.
+    // Unique-exact-arity pick — only when every supplied argument can
+    // bind its parameter. An arity-exact candidate whose param types the
+    // args definitely don't satisfy is inapplicable (kotlinc drops it),
+    // so a defaulted-arity sibling can win on type fit instead:
+    // `fetch("url")` must reach `fetch(urlString, block = {})`, not the
+    // arity-exact `fetch(block: () -> Unit)`.
     var unique_exact: ?Candidate = null;
     {
         var count: usize = 0;
@@ -4297,6 +4446,16 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             }
         }
         if (count != 1) unique_exact = null;
+        if (unique_exact) |c| {
+            for (args, 0..) |*a, i| {
+                if (c.func.params.len > i + 1 and
+                    overloadScoreArg(self, &c.func.params[i + 1].ty, a) == null)
+                {
+                    unique_exact = null;
+                    break;
+                }
+            }
+        }
     }
 
     var chosen: ?Candidate = null;
@@ -4586,20 +4745,27 @@ fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const V
 fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     var recv_id: u64 = undefined;
-    var cur: ?[]const u8 = undefined;
+    var start: []const u8 = undefined;
     {
         const g = inst.borrow();
         const cg = g.get().class.borrow();
         recv_id = g.get().identity;
-        cur = cg.get().name;
+        start = cg.get().name;
         cg.deinit();
         g.deinit();
     }
+    // Walk the full supertype graph (not just the first supertype): a
+    // class may list an interface ahead of the superclass whose companion
+    // declares `name`.
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
     defer seen.deinit();
-    while (cur) |cname| {
-        cur = null;
-        if (seen.contains(cname)) break;
+    try queue.append(allocator, start);
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cname = queue.items[head];
+        if (seen.contains(cname)) continue;
         try seen.put(cname, {});
         const comp_name = blk: {
             const mg = self.module.borrow();
@@ -4626,7 +4792,7 @@ fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: *con
         const cg = self.classes.borrow();
         if (cg.get().get(cname)) |d| {
             const dg = d.borrow();
-            if (dg.get().supertype_names.len != 0) cur = dg.get().supertype_names[0];
+            for (dg.get().supertype_names) |sn| queue.append(allocator, sn) catch {};
             dg.deinit();
         }
         cg.deinit();
@@ -4846,6 +5012,12 @@ fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
 }
 
 fn userMethodNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!?EvalResult {
+    // An applicable member of the receiver's own class outranks every
+    // extension (kotlinc: members win) — `buffer.write(bytes, startIndex =
+    // …)` binds the `ByteArray` member, not the `ByteString` extension.
+    if (receiver.* == .Instance) {
+        if (try instanceMethodWalkNamed(self, allocator, receiver, name, args, arg_names)) |r| return r;
+    }
     if (resolveExtOverloadLocal(self, allocator, name, receiver, args, arg_names)) |fid| {
         const all = try prependReceiver(allocator, receiver, args);
         var names = try allocator.alloc(?[]const u8, arg_names.len + 1);
@@ -4857,16 +5029,12 @@ fn userMethodNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         mg.deinit();
         return r;
     }
-    if (receiver.* == .Instance) {
-        return try instanceMethodWalkNamed(self, allocator, receiver, name, args, arg_names);
-    }
     return null;
 }
 
 /// Resolve the user extension/top-level fn an unqualified `recv.name(args)`
 /// would dispatch to (same candidate selection as `extensionFnFallback`).
 fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8, receiver: *const Value, args: []const Value, arg_names: []const ?[]const u8) ?FuncId {
-    _ = arg_names;
     const want = args.len + 1;
     var visible_owners = enclosingOwnerSet(self, allocator) catch return null;
     defer visible_owners.deinit();
@@ -4880,6 +5048,26 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
             if (!memberExtVisible(mod, fid, &visible_owners)) continue;
+            // Every supplied argument name must name one of the candidate's
+            // params (kotlinc: a candidate without the named param is not
+            // applicable) — `invokeOnCompletion(onCancelling = true) { }`
+            // must not bind an extension that has no `onCancelling`.
+            var names_fit = true;
+            for (arg_names) |maybe_n| {
+                const n = maybe_n orelse continue;
+                var found = false;
+                for (f.params) |*p| {
+                    if (std.mem.eql(u8, p.name, n)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    names_fit = false;
+                    break;
+                }
+            }
+            if (!names_fit) continue;
             candidates.append(allocator, .{ .fid = fid, .func = f }) catch {};
         }
     }
@@ -4909,8 +5097,9 @@ fn memberApplicableForWalk(self: *VmHost, f: *const Func, args: []const Value) b
     const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     const effective = f.params[skip..];
     if (args.len > effective.len or effective.len == 0) return false;
-    const last_ty = effective[effective.len - 1].ty.name;
+    const last_ty = resolveAliasName(self, effective[effective.len - 1].ty.name);
     const last_is_fn = std.mem.startsWith(u8, last_ty, "Function") or
+        std.mem.indexOf(u8, last_ty, "->") != null or
         (last_ty.len > 0 and last_ty.len <= 2 and allUppercase(last_ty));
     if (!last_is_fn) return false;
     // Leading args fill the leading params; the middle params between the

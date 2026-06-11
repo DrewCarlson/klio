@@ -344,10 +344,12 @@ fn resolveIp4(host: []const u8, port: u16) TransportError!linux.sockaddr.in {
 }
 
 fn makeSockaddrIn(octets: [4]u8, port: u16) linux.sockaddr.in {
+    // `addr` holds the four octets in network order in memory; a bit-cast
+    // preserves that layout regardless of host endianness.
     return .{
         .family = linux.AF.INET,
         .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.readInt(u32, &octets, .big),
+        .addr = @bitCast(octets),
     };
 }
 

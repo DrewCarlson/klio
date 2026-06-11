@@ -354,19 +354,34 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         }
     }
     // Suspend-implicit `coroutineContext` intrinsic: redirect a bare
-    // read to the active coroutine scope's context.
+    // read to the active coroutine scope's context. With no scope on the
+    // driver stack (a suspend body reached straight from the root, e.g.
+    // `suspend fun main`), the ambient context is the empty context —
+    // Kotlin's suspend functions always have one — so a receiver that
+    // doesn't own the property reads `EmptyCoroutineContext` instead of
+    // erroring on a missing member.
     if (std.mem.eql(u8, name, "coroutineContext") and !suppress_cc_redirect) {
+        var recv_stores_context = false;
+        if (receiver.* == .Instance) {
+            const g = receiver.Instance.borrow();
+            recv_stores_context = g.get().get("coroutineContext") != null;
+            g.deinit();
+        }
         if (activeCoroScope()) |scope| {
             const same = scope == .Instance and receiver.* == .Instance and
                 ObjRef(InstanceData).ptrEq(scope.Instance, receiver.Instance);
-            var recv_owns_context = false;
-            if (receiver.* == .Instance) {
-                const g = receiver.Instance.borrow();
-                defer g.deinit();
-                recv_owns_context = g.get().get("coroutineContext") != null;
-            }
-            if (!same and !recv_owns_context) {
+            if (!same and !recv_stores_context) {
                 return getFieldInner(self, allocator, &scope, "coroutineContext", suppress_cc_redirect, member_probe);
+            }
+        } else if (!recv_stores_context and receiver.* == .Instance and
+            !vmhost.host_call_member.hostHasProperty(self, receiver, "coroutineContext"))
+        {
+            // No driver scope and no own property anywhere on the class
+            // chain: the ambient suspend context is the empty context
+            // (a suspend body always has one).
+            switch (try host_globals.ensureObjectSingleton(self, "EmptyCoroutineContext")) {
+                .ok => |maybe| if (maybe) |v| return ok(v),
+                .err => |e| return errRes(e),
             }
         }
     }

@@ -59,6 +59,8 @@ const Itest = struct {
     dirs: []const []const u8 = &.{},
     /// Honors the fuzzer / kotlinc-oracle environment at runtime.
     fuzz_env: bool = false,
+    /// Spawns the installed `zig-out/bin/klio` binary as a child process.
+    needs_exe: bool = false,
 };
 
 const itests_files = [_]Itest{
@@ -107,6 +109,14 @@ const itests_files = [_]Itest{
     .{ .name = "check_examples", .dirs = &.{"examples"} },
     .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" } },
     .{ .name = "fuzz_closures_suspend", .fuzz_env = true },
+    // End-to-end ktor gate: child `klio` + in-test HTTP server + installed packs.
+    .{ .name = "ktor_client_get", .parity_data = false, .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-io",
+        "kotlin-klio/klio-kotlinx-serialization",
+        "kotlin-klio/klio-ktor-client",
+    } },
 };
 
 /// Read by every parity-pipeline run: the stdlib pack is built at runtime from
@@ -251,6 +261,8 @@ pub fn build(b: *std.Build) void {
                 run_t.setCwd(b.path("."));
                 keyOnEnv(b, run_t, &interp_env_keys);
                 if (spec.fuzz_env) keyOnEnv(b, run_t, &fuzz_env_keys);
+                // Child-spawning tests need the `klio` binary installed first.
+                if (spec.needs_exe) run_t.step.dependOn(b.getInstallStep());
                 if (spec.parity_data) {
                     declareDataDirs(b, run_t, &data_memo, &stdlib_data_dirs);
                     declareDataDirs(b, run_t, &data_memo, &kotlinx_pack_dirs);

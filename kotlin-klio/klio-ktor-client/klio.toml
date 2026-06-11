@@ -206,6 +206,8 @@ include = [
     "io/ktor/client/plugins/SaveBody.kt",
     "io/ktor/client/plugins/DefaultTransform.kt",
     "io/ktor/client/plugins/HttpSend.kt",
+    # `HttpSend` reads `MaxRetriesPerRequestAttributeKey`, declared here.
+    "io/ktor/client/plugins/HttpRequestRetry.kt",
     "io/ktor/client/plugins/HttpCallValidator.kt",
     "io/ktor/client/plugins/HttpRedirect.kt",
     "io/ktor/client/plugins/HttpPlainText.kt",

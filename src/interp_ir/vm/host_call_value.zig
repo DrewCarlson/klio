@@ -460,7 +460,21 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 // "suspended outside a driver" runtime error.
                 const explicit_receiver = info.n_params >= 1 and args.len == info.n_params + 1;
                 const receiver: Value = if (explicit_receiver) args[0] else this_value.*;
-                const body_args: []const Value = if (explicit_receiver) args[1..] else args;
+                var body_args: []const Value = if (explicit_receiver) args[1..] else args;
+                // Receiver-bound call of a closure that declares one more
+                // positional param than the call supplies: the callee is a
+                // plain `(T, …) -> R` lambda used where a `T.(…) -> R` is
+                // expected (kotlinc: the receiver IS the underlying
+                // function's first param), so the receiver is delivered
+                // positionally too — `client.apply(it)` over a stored
+                // `(HttpClient) -> Unit` must fill `it`'s param, not pad
+                // it with Null.
+                if (!explicit_receiver and args.len + 1 == info.n_params) {
+                    const with_recv = try allocator.alloc(Value, args.len + 1);
+                    with_recv[0] = receiver;
+                    @memcpy(with_recv[1..], args);
+                    body_args = with_recv;
+                }
 
                 // Bind the receiver into a fresh captures cell's `this` slot
                 // (the evaluator reads the closure value's captures, not the
@@ -524,9 +538,14 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 const fp = m.funcs.items[info.body_func.int()].params;
                 break :blk fp.len != 0 and std.mem.eql(u8, fp[0].name, "this");
             };
+            // A plain `(T, …) -> R` lambda used where a `T.(…) -> R` is
+            // expected declares one more positional param than the call
+            // supplies; the receiver fills it (kotlinc: the receiver IS
+            // the underlying function's first param).
+            const recv_fills_param = !takes_this_param and args.len + 1 == info.n_params;
             var all_args: std.ArrayList(Value) = .empty;
             defer all_args.deinit(allocator);
-            if (takes_this_param) try all_args.append(allocator, this_value.*);
+            if (takes_this_param or recv_fills_param) try all_args.append(allocator, this_value.*);
             try all_args.appendSlice(allocator, args);
             const pushed_receiver = this_value.* == .Instance or this_value.* == .Null;
             if (pushed_receiver) {

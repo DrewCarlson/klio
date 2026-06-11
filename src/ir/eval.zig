@@ -1313,8 +1313,14 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             }
             if (operatorMethod(bo.op)) |method| {
                 if (l == .Instance or r == .Instance) {
+                    // Strict extension dispatch: an operator extension whose
+                    // declared receiver doesn't accept `l` is not a candidate
+                    // (kotlinc drops it), so `Unimplemented` surfaces and the
+                    // `<op>Assign` fallback below can fire — `config += other`
+                    // on a type declaring only `plusAssign` must not bind a
+                    // receiver-incompatible `plus` like `String?.plus(Any?)`.
                     var result: Value = undefined;
-                    switch (try host.callMember(allocator, &l, method, &.{r})) {
+                    switch (try host.callMemberStrictExt(allocator, &l, method, &.{r}, &.{null})) {
                         .ok => |v| result = v,
                         .err => |e| switch (e) {
                             // `a OP= b` lowers to `a = a.OP(b)`, but the

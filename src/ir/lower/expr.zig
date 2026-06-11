@@ -3616,6 +3616,24 @@ fn lowerImplicitThisCall(
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+    // When a same-named top-level function exists, the own member may be a
+    // non-callable *property* (`val allStatusCodes = allStatusCodes()`),
+    // which kotlinc skips for a call — emit the OrGlobal form so member
+    // dispatch still wins when callable but a miss falls through to the
+    // function instead of erroring.
+    if (b.module.funcsBySimpleName(name0).len != 0) {
+        const this_idx = try b.recordCapture("this");
+        orEmitAudit(b, "implicit_this_call_global_fallback", "CallMemberOrGlobal", name0);
+        try b.push(.{ .CallMemberOrGlobal = .{
+            .dst = dst,
+            .this_idx = this_idx,
+            .name = nm,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+        } });
+        return dst;
+    }
     try b.push(.{ .CallMember = .{
         .dst = dst,
         .receiver = this_reg,
