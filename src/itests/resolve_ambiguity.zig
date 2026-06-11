@@ -225,6 +225,60 @@ test "different arities of the same name keep resolving" {
     try expectOutput("arity_overloads_ok", src, "19\n");
 }
 
+test "exact-arity overload outranks a reified vararg inline sibling" {
+    // Kotlin specificity: the fixed-arity declaration wins over the
+    // vararg one. The inline-fn fold must not pre-empt this — the
+    // simple-name inline table only ever holds the inline overloads
+    // (the kotlinx `Migration.kt` `combineLatest` mis-bind). The second
+    // call is the fold-sensitive pin: its arity equals the inline
+    // vararg sibling's parameter count, so a name-first pick splices
+    // the reified body with `xs` bound to the scalar `5` and crashes on
+    // `xs.size`; only the index-first pick — with the vararg shape
+    // skipped at ANY parameter position, not just the last — binds the
+    // exact `(Int, transform)` overload kotlinc binds. The first call's
+    // 3-scalar shape never splices under either picker (the vararg body
+    // cannot bind two extra positionals) and pins the plain-ladder
+    // binding instead.
+    const src =
+        \\inline fun <reified T> pick(vararg xs: T, transform: (Int) -> Int): String = "vararg " + transform(xs.size)
+        \\fun pick(a: Int, b: Int, c: Int): String = "exact " + (a + b + c)
+        \\fun pick(a: Int, transform: (Int) -> Int): String = "exact " + transform(a)
+        \\fun main() {
+        \\    println(pick(1, 2, 3))
+        \\    println(pick(5) { it * 10 })
+        \\}
+        \\
+    ;
+    try expectOutput("inline_vararg_vs_exact", src, "exact 6\nexact 50\n");
+}
+
+test "a named import outranks a same-package reified inline namesake, and strict mode accepts it" {
+    // kotlinc: the file's explicit `import lib2.greet` outranks the
+    // caller's own-package declaration, so the non-inline import wins
+    // and prints "lib-noninline". The index resolves it at the named-
+    // import tier and the non-inline winner suppresses the splice; the
+    // resolve audit must grade the simple-name table's reified pick as
+    // a TIER correction — a program property, not a divergence — so
+    // KLIO_RESOLVE_STRICT (forced on here) accepts the program instead
+    // of panicking on valid Kotlin.
+    const ir = @import("ir");
+    ir.lower.expr.setResolveStrictForTest(true);
+    defer ir.lower.expr.resetResolveStrictForTest();
+    const lib2 =
+        \\package lib2
+        \\fun greet(): String = "lib-noninline"
+        \\
+    ;
+    const app =
+        \\package app
+        \\import lib2.greet
+        \\inline fun <reified T> greet(): String = "app-inline"
+        \\fun main() { println(greet()) }
+        \\
+    ;
+    try expectFilesOutput("named_import_vs_inline_strict", &.{ app, lib2 }, "lib-noninline\n");
+}
+
 test "a cast-disambiguated overload call keeps resolving" {
     const src =
         \\fun show(x: Int): String = "int"

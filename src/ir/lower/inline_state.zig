@@ -37,6 +37,16 @@ threadlocal var inline_fn_asts: ?std.StringHashMap([]const *const ast.Function) 
 /// the call falls through to the normal call path.
 threadlocal var shadowed_inline_names: ?StringSet = null;
 
+/// `inline fun` ASTs keyed by the phase-1 header stub's `FuncId`, so a
+/// bare call the symbol index resolves to a unique top-level target can
+/// splice exactly that declaration — no simple-name re-resolution. The
+/// build driver registers each top-level inline fn as it emits the
+/// fn's header stub; class/object member inline fns carry no stub and
+/// stay reachable only through the simple-name candidate table (the
+/// index never resolves them, so a member splice always goes through
+/// the receiver/shape narrowing).
+threadlocal var inline_fn_ids: ?std.AutoHashMap(u32, *const ast.Function) = null;
+
 /// Hard ceiling on combined inline nesting (fn-body + lambda-arg
 /// splices) so transitive expansion cannot recurse without bound; past
 /// it, callers fall back to a normal call.
@@ -69,9 +79,56 @@ pub fn isTopLevelProp(name: []const u8) bool {
 /// simple name maps to all its inline overloads (declaration order) so a
 /// call site can disambiguate a function-param overload from a
 /// value-param one by the trailing-arg shape. Takes ownership of `m`.
+/// Also drops the previous build's `FuncId`-keyed entries; the driver
+/// re-registers them while emitting the new build's header stubs.
 pub fn setInlineFnAsts(m: std.StringHashMap([]const *const ast.Function)) void {
     if (inline_fn_asts) |*old| old.deinit();
     inline_fn_asts = m;
+    if (inline_fn_ids) |*old| old.deinit();
+    inline_fn_ids = null;
+}
+
+/// Record one top-level `inline fun`'s AST under its phase-1 header
+/// stub `FuncId`. Called by the build driver inside the stub loop, so
+/// every id the symbol index can resolve has its AST on file before
+/// phase-2 body lowering starts (class-method bodies lower earlier, but
+/// the index sees no top-level candidates there and always defers). The
+/// map container outlives the build arena (same process-lifetime
+/// backing as the other tables here); the AST pointers share the build
+/// arena's lifetime exactly like `inline_fn_asts`.
+pub fn registerInlineFnId(id: u32, f: *const ast.Function) std.mem.Allocator.Error!void {
+    if (inline_fn_ids == null) {
+        inline_fn_ids = std.AutoHashMap(u32, *const ast.Function).init(std.heap.page_allocator);
+    }
+    try inline_fn_ids.?.put(id, f);
+}
+
+/// The inline-fn AST registered under a resolved top-level `FuncId`, or
+/// null when the id's target is not an inline fn (or carries no stub —
+/// a member fn the index never resolves).
+pub fn inlineAstById(id: u32) ?*const ast.Function {
+    if (inline_fn_ids) |*m| return m.get(id);
+    return null;
+}
+
+/// The phase-1 stub `FuncId` under which `f` was registered, or null
+/// for a member inline fn (no stub, never index-resolved). The reverse
+/// of `inlineAstById`; lets the resolve audit rank a simple-name pick
+/// in the same scope tiers the index ranks its candidates in.
+pub fn inlineIdByAst(f: *const ast.Function) ?u32 {
+    if (inline_fn_ids) |*m| {
+        var it = m.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* == f) return e.key_ptr.*;
+        }
+    }
+    return null;
+}
+
+/// Whether a default-imported host binding owns this simple name (see
+/// `shadowed_inline_names`); such a name never splices.
+pub fn isShadowedInlineName(name: []const u8) bool {
+    return isShadowed(name);
 }
 
 /// Install the set of simple names owned by default-imported host
@@ -97,14 +154,17 @@ pub fn inlineFnAst(name: []const u8) ?*const ast.Function {
 }
 
 /// Like [`inlineFnAstFor`] but, when several overloads share the name,
-/// prefer the one whose extension `receiver_type` matches `recv_ty` (the
-/// statically-inferred receiver type of the member call).
+/// prefer the one whose extension `receiver_type` matches the call's
+/// receiver. `recv_chain` carries the statically-known receiver type
+/// followed by its transitive supertypes, most-derived first, so an
+/// extension declared on a base class still matches a subclass
+/// receiver — and a subclass's own extension outranks the base one.
 pub fn inlineFnAstForRecv(
     name: []const u8,
     call: ?CallShape,
-    recv_ty: ?[]const u8,
+    recv_chain: ?[]const []const u8,
 ) ?*const ast.Function {
-    return inlineFnAstForRecvExt(name, call, recv_ty, false);
+    return inlineFnAstForRecvExt(name, call, recv_chain, false);
 }
 
 /// As [`inlineFnAstForRecv`], with `require_receiver`: when the call is a
@@ -114,7 +174,7 @@ pub fn inlineFnAstForRecv(
 pub fn inlineFnAstForRecvExt(
     name: []const u8,
     call: ?CallShape,
-    recv_ty: ?[]const u8,
+    recv_chain: ?[]const []const u8,
     require_receiver: bool,
 ) ?*const ast.Function {
     if (isShadowed(name)) return null;
@@ -139,6 +199,23 @@ pub fn inlineFnAstForRecvExt(
             has_toplevel = true;
         }
     }
+
+    // The effective receiver type: the most-derived chain entry that
+    // any candidate declares as its receiver. A subclass extension
+    // outranks a base-class one for a subclass receiver; when nothing
+    // matches, the head keeps the narrowing's mismatch fallback intact.
+    const recv_ty: ?[]const u8 = blk: {
+        const chain = recv_chain orelse break :blk null;
+        if (chain.len == 0) break :blk null;
+        for (chain) |rn| {
+            for (cands) |f| {
+                if (f.receiver_type) |rt| {
+                    if (std.mem.eql(u8, rt.name.name, rn)) break :blk rn;
+                }
+            }
+        }
+        break :blk chain[0];
+    };
 
     // Count the narrowed candidate subset per the rules above.
     var matched: usize = 0;
@@ -318,6 +395,10 @@ pub fn resetForTest() void {
         m.deinit();
         inline_fn_asts = null;
     }
+    if (inline_fn_ids) |*m| {
+        m.deinit();
+        inline_fn_ids = null;
+    }
     if (shadowed_inline_names) |*s| {
         s.deinit();
         shadowed_inline_names = null;
@@ -354,6 +435,20 @@ test "shadowed name suppresses inline lookup" {
     try shadowed.put("synchronized", {});
     setShadowedInlineNames(shadowed);
     try testing.expect(inlineFnAst("synchronized") == null);
+    try testing.expect(isShadowedInlineName("synchronized"));
+    try testing.expect(!isShadowedInlineName("other"));
+}
+
+test "inline fn ids register, look up, and reset with the table" {
+    defer resetForTest();
+    var f: ast.Function = undefined;
+    try registerInlineFnId(7, &f);
+    try testing.expect(inlineAstById(7) == @as(?*const ast.Function, &f));
+    try testing.expect(inlineAstById(8) == null);
+    // Installing the next build's simple-name table drops the previous
+    // build's FuncId entries.
+    setInlineFnAsts(std.StringHashMap([]const *const ast.Function).init(testing.allocator));
+    try testing.expect(inlineAstById(7) == null);
 }
 
 test "inline expand depth guard caps at max" {

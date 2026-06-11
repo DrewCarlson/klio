@@ -332,3 +332,122 @@ test "member_extension_unary_operator_on_primitive" {
     ;
     try assertKlio("member_ext_unary_primitive", src, "1,2,3\n");
 }
+
+test "bare_ext_inline_call_in_class_method_binds_enclosing_class_receiver" {
+    // Same-name inline extensions on two unrelated receivers, bare-
+    // called (with a non-local return forcing the splice) from each
+    // class's methods: the enclosing class is the implicit receiver, so
+    // A's method splices `A.label` and B's splices `B.label` (kotlinc:
+    // got:A / got:B) — never the first-declared candidate. Both
+    // declaration orders pin order-independence.
+    const a_first =
+        \\var tag = ""
+        \\class A {
+        \\    fun m() { label { println("got:" + tag); return } }
+        \\}
+        \\class B {
+        \\    fun m() { label { println("got:" + tag); return } }
+        \\}
+        \\inline fun A.label(f: () -> Unit) { tag = "A"; f() }
+        \\inline fun B.label(f: () -> Unit) { tag = "B"; f() }
+        \\fun main() { A().m(); B().m() }
+        \\
+    ;
+    const b_first =
+        \\var tag = ""
+        \\class A {
+        \\    fun m() { label { println("got:" + tag); return } }
+        \\}
+        \\class B {
+        \\    fun m() { label { println("got:" + tag); return } }
+        \\}
+        \\inline fun B.label(f: () -> Unit) { tag = "B"; f() }
+        \\inline fun A.label(f: () -> Unit) { tag = "A"; f() }
+        \\fun main() { A().m(); B().m() }
+        \\
+    ;
+    try assertKlio("ext_inline_class_recv_a_first", a_first, "got:A\ngot:B\n");
+    try assertKlio("ext_inline_class_recv_b_first", b_first, "got:A\ngot:B\n");
+}
+
+test "suspend_inline_ext_twins_bind_by_enclosing_class_receiver" {
+    // The suspend-inline variant: a `suspend inline` extension must
+    // splice (its continuation capture is only correct inlined), and
+    // the splice must still pick the enclosing class's extension, not
+    // the first-declared one (kotlinc: got:A / got:B). The completion
+    // is a named Continuation class rather than an object expression:
+    // an anonymous object's `override val context =
+    // EmptyCoroutineContext` initializer evaluates to null under this
+    // harness's load modes — a pre-existing anon-object property-init
+    // bug (present at revisions before this test existed, independent
+    // of inline resolution) that would mask the receiver binding
+    // pinned here.
+    const src =
+        \\import kotlin.coroutines.*
+        \\
+        \\var tag = ""
+        \\class A {
+        \\    suspend fun m() { label { println("got:" + tag) } }
+        \\}
+        \\class B {
+        \\    suspend fun m() { label { println("got:" + tag) } }
+        \\}
+        \\suspend inline fun A.label(f: () -> Unit) { tag = "A"; f() }
+        \\suspend inline fun B.label(f: () -> Unit) { tag = "B"; f() }
+        \\
+        \\class Done : Continuation<Unit> {
+        \\    override val context: CoroutineContext get() = EmptyCoroutineContext
+        \\    override fun resumeWith(result: Result<Unit>) {}
+        \\}
+        \\fun run(block: suspend () -> Unit) { block.startCoroutine(Done()) }
+        \\fun main() {
+        \\    run { A().m(); B().m() }
+        \\}
+        \\
+    ;
+    try assertKlio("suspend_inline_ext_class_recv", src, "got:A\ngot:B\n");
+}
+
+test "base_class_extension_accepts_subclass_method_receiver" {
+    // The receiver match walks the supertype chain: `B : A()` accepts
+    // `A.label` for B's methods (kotlinc: got:A) — including when an
+    // unrelated receiver's extension is declared first (kotlinc still
+    // got:A) — and B's own extension outranks the base one when both
+    // exist (kotlinc: got:B).
+    const base_only =
+        \\var tag = ""
+        \\open class A
+        \\class B : A() {
+        \\    fun m() { label { println("got:" + tag); return } }
+        \\}
+        \\inline fun A.label(f: () -> Unit) { tag = "A"; f() }
+        \\fun main() { B().m() }
+        \\
+    ;
+    const unrelated_first =
+        \\var tag = ""
+        \\open class A
+        \\class C
+        \\class B : A() {
+        \\    fun m() { label { println("got:" + tag); return } }
+        \\}
+        \\inline fun C.label(f: () -> Unit) { tag = "C"; f() }
+        \\inline fun A.label(f: () -> Unit) { tag = "A"; f() }
+        \\fun main() { B().m() }
+        \\
+    ;
+    const derived_wins =
+        \\var tag = ""
+        \\open class A
+        \\class B : A() {
+        \\    fun m() { label { println("got:" + tag); return } }
+        \\}
+        \\inline fun A.label(f: () -> Unit) { tag = "A"; f() }
+        \\inline fun B.label(f: () -> Unit) { tag = "B"; f() }
+        \\fun main() { B().m() }
+        \\
+    ;
+    try assertKlio("ext_inline_super_recv", base_only, "got:A\n");
+    try assertKlio("ext_inline_super_recv_unrelated_first", unrelated_first, "got:A\n");
+    try assertKlio("ext_inline_super_recv_derived_wins", derived_wins, "got:B\n");
+}

@@ -1582,6 +1582,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             } else if (cast.safe) {
                 try frame.write(cast.dst, .Null);
             } else {
+                // A failed cast raises without passing through the
+                // `Throw` terminator, so trace it here too or
+                // KLIO_THROW_TRACE never sees ClassCastExceptions.
+                if (envVarSet("KLIO_THROW_TRACE")) {
+                    std.debug.print("[throw-trace] from fn {s} (fqn={s}): ClassCastException cast to {s} (value tag {s})\n", .{ frame.func.name, frame.func.fqn, cast.ty.name, @tagName(v) });
+                }
                 const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
                 const exc = Value{ .Exception = .{
                     .fqn = try StringRef.init(allocator, "kotlin.ClassCastException"),

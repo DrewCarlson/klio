@@ -1605,7 +1605,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const receiver = callee.Member.receiver;
             const expected = b.peekExpected();
             const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-            if (try tryInlineCallWithTypeArgs(b, mname, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
+            if (try tryInlineCallWithTypeArgs(b, mname, null, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
                 return r;
             }
             // Splice bailed: fall back to a plain member dispatch.
@@ -1946,34 +1946,11 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             .want = args.len,
             .last_is_lambda = lastArgIsLambdaOrAnon(args),
         };
-        if (inlineFnAstForRecv(nm, inline_call_shape, b.recvTy())) |f| {
-            const has_reified = anyReified(f.type_params);
-            const want = args.len;
-            const trailing_lambda = lastArgIsLambdaOrAnon(args);
-            const inline_takes_fn = f.params.len != 0 and f.params[f.params.len - 1].ty.function != null;
-            const drops_trailing_lambda = trailing_lambda and want >= 2;
-            const a_func_fits = aFuncFits(b, nm, want);
-            const shadowed_by_member = drops_trailing_lambda and inline_takes_fn and
-                !a_func_fits and b.resolve(nm) == null and b.hasOwnMember(nm);
-            const recv_mismatch = blk: {
-                if (f.receiver_type) |rt| {
-                    const rn = rt.name.name;
-                    const positive = if (b.recvTy()) |cur|
-                        (!std.mem.eql(u8, cur, rn) and !eqOptStr(b.ownerClass(), rn))
-                    else
-                        false;
-                    const member_wins = b.hasEnclosingMember(nm) and
-                        (if (b.ownerClass()) |oc| !std.mem.eql(u8, oc, rn) else false);
-                    break :blk positive or member_wins;
-                }
-                break :blk false;
-            };
-            const needs_inline = !recv_mismatch and
-                (f.is_suspend or argLambdaHasNonlocalReturn(args) or has_reified or shadowed_by_member);
-            const expected = b.peekExpected();
-            const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-            if (needs_inline) {
-                if (try tryInlineCallWithTypeArgs(b, nm, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
+        if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
+            if (bareInlineNeedsSplice(b, nm, f, args)) {
+                const expected = b.peekExpected();
+                const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+                if (try tryInlineCallWithTypeArgs(b, nm, f, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
                     return r;
                 }
             }
@@ -2174,9 +2151,222 @@ fn aFuncFits(b: *FuncBuilder, nm: []const u8, want: usize) bool {
     return false;
 }
 
-fn eqOptStr(a: ?[]const u8, b: []const u8) bool {
-    if (a) |x| return std.mem.eql(u8, x, b);
+/// The receiver type a bare extension call inside this builder's body
+/// narrows against — the enclosing extension's declared receiver, or
+/// inside a class method (no extension receiver) the enclosing class
+/// itself, since `this` is the implicit receiver Kotlin resolves the
+/// call's extension on — followed by its transitive supertype names,
+/// most-derived first. Null when no receiver is in scope.
+fn narrowingRecvChain(b: *FuncBuilder) Allocator.Error!?[]const []const u8 {
+    const cur = b.recvTy() orelse b.ownerClass() orelse return null;
+    return try recvChainOf(b, cur);
+}
+
+/// `cur` followed by its transitive supertype simple names (nearest
+/// first), from the hierarchy recorded at build time. A type with no
+/// recorded hierarchy (a built-in, a generic parameter) yields just
+/// itself.
+pub fn recvChainOf(b: *FuncBuilder, cur: []const u8) Allocator.Error![]const []const u8 {
+    const supers: []const []const u8 =
+        b.module.registry.class_super_names.get(cur) orelse &.{};
+    const chain = try b.allocator.alloc([]const u8, supers.len + 1);
+    chain[0] = cur;
+    @memcpy(chain[1..], supers);
+    return chain;
+}
+
+/// The inline-fn declaration a bare call may splice, resolved through
+/// the symbol index FIRST: a unique top-level winner decides — an
+/// inline winner splices its registered AST, a non-inline winner
+/// suppresses the splice so the normal call path binds it. The
+/// shape/receiver narrowing over the simple-name candidate table
+/// survives only as the tie-break for the shapes the index defers on
+/// (extension forms, overload sets, default/vararg/trailing-lambda
+/// shapes, and bodies lowered before the phase-1 headers exist — class
+/// method bodies). Default-import-owned names never splice. The
+/// KLIO_RESOLVE_AUDIT `inline` records compare this pick against the
+/// simple-name narrowing's per call, a permanent regression detector
+/// for the fold (zero unexplained divergences over the corpus).
+fn inlineTargetForBareCall(
+    b: *FuncBuilder,
+    seg: *const ast.Ident,
+    args: []const Expr,
+    shape: CallShape,
+) Allocator.Error!?*const ast.Function {
+    const nm = seg.name;
+    if (inline_state.isShadowedInlineName(nm)) return null;
+    const narrowed = inlineFnAstForRecv(nm, shape, try narrowingRecvChain(b));
+    const ires = b.module.resolveBareCallIndexed(
+        nm,
+        b.self_package,
+        seg.span.file,
+        args.len,
+        shape.last_is_lambda,
+    );
+    const pick: ?*const ast.Function = switch (ires.outcome) {
+        .resolved => |fid| blk: {
+            // Receiver preference, mirroring `preferredBareTarget`: an
+            // extension the receiver narrowing matched (and that the
+            // splice gate accepts) outranks the index's receiverless
+            // namesake — Kotlin resolves the in-scope receiver's
+            // extension over the top-level function, and the index
+            // never models receivers.
+            if (narrowed) |nf| {
+                if (nf.receiver_type != null and bareInlineNeedsSplice(b, nm, nf, args)) {
+                    break :blk nf;
+                }
+            }
+            break :blk inline_state.inlineAstById(fid.int());
+        },
+        .deferred => narrowed,
+    };
+    inlineResolveAudit(b, nm, seg.span.file, narrowed, pick, args, shape.last_is_lambda, ires);
+    return pick;
+}
+
+/// Whether a bare call to inline fn `f` must be spliced at the call
+/// site rather than dispatched: a `suspend inline` builder (its
+/// `suspendCoroutineUninterceptedOrReturn` must capture the caller's
+/// continuation), a lambda argument performing a non-local return, a
+/// reified type parameter, or a member shadowing the trailing-lambda
+/// shape. A receiver mismatch vetoes the splice (the call belongs to a
+/// different receiver's overload). The receiver judged is the
+/// innermost one in scope — the enclosing extension's declared
+/// receiver, or inside a class method the enclosing class itself — and
+/// matching is subtype-aware: an extension declared on a base class
+/// accepts a subclass receiver.
+fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function, args: []const Expr) bool {
+    const has_reified = anyReified(f.type_params);
+    const want = args.len;
+    const trailing_lambda = lastArgIsLambdaOrAnon(args);
+    const inline_takes_fn = f.params.len != 0 and f.params[f.params.len - 1].ty.function != null;
+    const drops_trailing_lambda = trailing_lambda and want >= 2;
+    const a_func_fits = aFuncFits(b, nm, want);
+    const shadowed_by_member = drops_trailing_lambda and inline_takes_fn and
+        !a_func_fits and b.resolve(nm) == null and b.hasOwnMember(nm);
+    const recv_mismatch = blk: {
+        if (f.receiver_type) |rt| {
+            const rn = rt.name.name;
+            const owner_accepts = if (b.ownerClass()) |oc| b.module.classIsOrExtends(oc, rn) else false;
+            const positive = if (b.recvTy() orelse b.ownerClass()) |cur|
+                (!b.module.classIsOrExtends(cur, rn) and !owner_accepts)
+            else
+                false;
+            const member_wins = b.hasEnclosingMember(nm) and
+                (if (b.ownerClass()) |oc| !std.mem.eql(u8, oc, rn) else false);
+            break :blk positive or member_wins;
+        }
+        break :blk false;
+    };
+    return !recv_mismatch and
+        (f.is_suspend or argLambdaHasNonlocalReturn(args) or has_reified or shadowed_by_member);
+}
+
+/// Audit one inline-target resolution (the `inline` records of
+/// KLIO_RESOLVE_AUDIT): the simple-name narrowing's pick against the
+/// index-first pick, compared on the splice that would actually occur —
+/// a candidate failing the needs-splice gate never splices, so a
+/// difference confined to non-splicing picks is not a divergence.
+/// Divergences are graded like the bare-call audit's: the index
+/// resolving an exact-arity overload where the simple-name table —
+/// which only ever holds the inline overloads — fell back to a
+/// vararg/default/arity-mismatched candidate is a `shape_correction`
+/// (the pick takes the index's exact target), and the index resolving
+/// in a strictly better scope tier than the simple-name pick ranks in
+/// is a `tier_correction` (Kotlin's scope order — a named import
+/// outranks even a same-package inline declaration — is a program
+/// property the simple-name table cannot see). Anything else is
+/// unexplained: an interpreter bug. KLIO_RESOLVE_STRICT turns an
+/// unexplained divergence into a hard failure.
+fn inlineResolveAudit(
+    b: *FuncBuilder,
+    nm: []const u8,
+    file: ir.FileId,
+    narrowed: ?*const ast.Function,
+    pick: ?*const ast.Function,
+    args: []const Expr,
+    last_is_lambda: bool,
+    ires: ir.Module.BareCallResolution,
+) void {
+    const audit_on = resolveAuditOn();
+    const strict_on = resolveStrictOn();
+    if (!audit_on and !strict_on) return;
+    const old_eff: ?*const ast.Function = if (narrowed) |f|
+        (if (bareInlineNeedsSplice(b, nm, f, args)) f else null)
+    else
+        null;
+    const new_eff: ?*const ast.Function = if (pick) |f|
+        (if (bareInlineNeedsSplice(b, nm, f, args)) f else null)
+    else
+        null;
+    const divergent = old_eff != new_eff;
+    const tier_corrected = divergent and ires.pick() != null and old_eff != null and blk: {
+        const old_id = inline_state.inlineIdByAst(old_eff.?) orelse break :blk false;
+        const old_tier = b.module.bareCallTierOf(FuncId.from(old_id), nm, b.self_package, file) orelse break :blk false;
+        break :blk ires.tier < old_tier;
+    };
+    const explained = divergent and ires.pick() != null and
+        (old_eff == null or tier_corrected or astPickInexact(old_eff.?, args.len, last_is_lambda));
+    if (audit_on) {
+        const outcome: []const u8 = switch (ires.outcome) {
+            .resolved => "resolved",
+            .deferred => "deferred",
+        };
+        const reason: []const u8 = switch (ires.outcome) {
+            .resolved => "-",
+            .deferred => |r| @tagName(r),
+        };
+        const old_np: usize = if (narrowed) |f| f.params.len else 0;
+        const new_np: usize = if (pick) |f| f.params.len else 0;
+        std.debug.print(
+            "[KLIO_RESOLVE_AUDIT] inline name={s} pkg={s} arity={d} outcome={s} reason={s} old={s}/{d} new={s}/{d} splice_old={d} splice_new={d} divergent={d} correction={d}\n",
+            .{
+                nm,                            b.self_package,                args.len,
+                outcome,                       reason,                        inlineCandLabel(narrowed),
+                old_np,                        inlineCandLabel(pick),         new_np,
+                @intFromBool(old_eff != null), @intFromBool(new_eff != null), @intFromBool(divergent),
+                @intFromBool(explained),
+            },
+        );
+    }
+    if (strict_on and divergent and !explained) {
+        std.debug.panic(
+            "KLIO_RESOLVE_STRICT: unexplained inline-target divergence on '{s}' (pkg='{s}' arity={d}): simple-name pick {s} vs index pick {s}",
+            .{ nm, b.self_package, args.len, inlineCandLabel(old_eff), inlineCandLabel(new_eff) },
+        );
+    }
+}
+
+/// Whether an inline candidate matches the call less exactly than any
+/// index pick can: a vararg at any position, a default parameter, or a
+/// declared arity differing from the call's (a trailing-lambda gap the
+/// candidate's fn-typed last parameter absorbs is exact enough). The
+/// AST-side mirror of `heurPickInexact`.
+fn astPickInexact(f: *const ast.Function, want: usize, last_is_lambda: bool) bool {
+    for (f.params) |p| {
+        if (p.is_vararg) return true;
+    }
+    if (f.params.len != want) {
+        const tl_fits = last_is_lambda and f.params.len != 0 and
+            f.params[f.params.len - 1].ty.function != null and want >= 1 and
+            f.params.len > want;
+        if (!tl_fits) return true;
+    }
+    for (f.params) |p| {
+        if (p.default != null) return true;
+    }
     return false;
+}
+
+/// Audit label classifying an inline candidate's declaration shape
+/// (overloads share the simple name; receiver-ness, suspend-ness, and
+/// the printed parameter count identify the declaration).
+fn inlineCandLabel(f: ?*const ast.Function) []const u8 {
+    const fp = f orelse return "-";
+    if (fp.receiver_type != null) {
+        return if (fp.is_suspend) "ext+suspend" else "ext";
+    }
+    return if (fp.is_suspend) "plain+suspend" else "plain";
 }
 
 /// A single-name callee bound as a local / parameter / receiver-lambda-param.
@@ -2346,7 +2536,7 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
         if (!std.mem.eql(u8, entry.name, name)) continue;
         if (b.module.decl_user_arity.get(entry.id.int())) |arity| {
             const n: u32 = @intCast(nargs);
-            if (n >= arity.required and (arity.trailing_vararg or n <= arity.total)) {
+            if (n >= arity.required and (arity.has_vararg or n <= arity.total)) {
                 any_factory_applicable = true;
                 break;
             }
@@ -2439,7 +2629,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
                     args.len,
                     lastArgIsLambda(args),
                 );
-                resolveAudit(b, name0, segments[0].span.file, args.len, lastArgIsLambda(args), func_id, ires, shadowed_by_class, false);
+                resolveAudit(b, name0, segments[0].span.file, args.len, lastArgIsLambda(args), func_id, .imported, ires, shadowed_by_class, false);
                 if (indexDeferReason(ires) == .ambiguous_tier) {
                     try recordAmbiguousCall(b, name0, segments[0].span, ires);
                 }
@@ -2481,14 +2671,28 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     const cast_pick: ?FuncId = if (intrinsic_owns_all) null else try overloadPickByCast(b, cands, args, want);
 
     var bare_func_id: ?FuncId = null;
+    var rung: HeurRung = .none;
     if (!(intrinsic_owns_all or (prefer_member and cast_pick == null))) {
         bare_func_id = cast_pick;
-        if (bare_func_id == null) bare_func_id = findCand(b, cands, want, .non_ext_arity);
-        if (bare_func_id == null) bare_func_id = findCand(b, cands, want, .ext_arity);
-        if (bare_func_id == null and last_arg_lambda) bare_func_id = findCand(b, cands, want, .ext_arity_tl);
-        if (bare_func_id == null and last_arg_lambda) bare_func_id = findCand(b, cands, want, .non_ext_arity_tl);
+        if (bare_func_id != null) rung = .cast;
+        if (bare_func_id == null) {
+            bare_func_id = findCand(b, cands, want, .non_ext_arity);
+            if (bare_func_id != null) rung = .non_ext_arity;
+        }
+        if (bare_func_id == null) {
+            bare_func_id = findCand(b, cands, want, .ext_arity);
+            if (bare_func_id != null) rung = .ext_arity;
+        }
+        if (bare_func_id == null and last_arg_lambda) {
+            bare_func_id = findCand(b, cands, want, .ext_arity_tl);
+            if (bare_func_id != null) rung = .ext_arity_tl;
+        }
+        if (bare_func_id == null and last_arg_lambda) {
+            bare_func_id = findCand(b, cands, want, .non_ext_arity_tl);
+            if (bare_func_id != null) rung = .non_ext_arity_tl;
+        }
         if (bare_func_id == null and !name_is_alias) {
-            bare_func_id = try fallbackByDeclArity(b, cands, name0, want);
+            bare_func_id = try fallbackByDeclArity(b, cands, name0, want, &rung);
         }
     }
 
@@ -2505,7 +2709,10 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
                         break;
                     }
                 }
-                if (found) |fnd| bare_func_id = fnd;
+                if (found) |fnd| {
+                    bare_func_id = fnd;
+                    rung = .recv_rebind;
+                }
             }
         }
     }
@@ -2538,7 +2745,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
         }
     }
     const index_pick = index_res.pick();
-    resolveAudit(b, name0, segments[0].span.file, want, last_arg_lambda, bare_func_id, index_res, shadowed_by_class, prefer_member);
+    resolveAudit(b, name0, segments[0].span.file, want, last_arg_lambda, bare_func_id, rung, index_res, shadowed_by_class, prefer_member);
 
     if (bare_func_id) |func_id| {
         if (!shadowed_by_class) {
@@ -2697,6 +2904,7 @@ fn resolveAudit(
     want: usize,
     last_arg_lambda: bool,
     heuristic: ?FuncId,
+    rung: HeurRung,
     index_res: ir.Module.BareCallResolution,
     shadowed_by_class: bool,
     prefer_member: bool,
@@ -2760,13 +2968,14 @@ fn resolveAudit(
         const heur_fqn: []const u8 = if (heuristic) |h| fqnOf(b, h) else "-";
         const grade_tag: []const u8 = if (grade) |g| @tagName(g) else "-";
         std.debug.print(
-            "[KLIO_RESOLVE_AUDIT] call name={s} pkg={s} file={d} arity={d} tl={d} outcome={s} reason={s} index_fqn={s} tier={d} tier_count={d} heur_fqn={s} shape={s} divergent={d} correction={d} grade={s}\n",
+            "[KLIO_RESOLVE_AUDIT] call name={s} pkg={s} file={d} arity={d} tl={d} outcome={s} reason={s} index_fqn={s} tier={d} tier_count={d} heur_fqn={s} rung={s} shape={s} divergent={d} correction={d} grade={s}\n",
             .{
                 name,                    b.self_package,                file.int(),
                 want,                    @intFromBool(last_arg_lambda), outcome,
                 reason,                  idx_fqn,                       index_res.tier,
-                index_res.tier_count,    heur_fqn,                      shape,
-                @intFromBool(divergent), @intFromBool(explained),       grade_tag,
+                index_res.tier_count,    heur_fqn,                      @tagName(rung),
+                shape,                   @intFromBool(divergent),       @intFromBool(explained),
+                grade_tag,
             },
         );
         if (divergent and !explained) resolveAuditLog(b, name, heuristic, index_res.pick().?);
@@ -2783,18 +2992,20 @@ fn resolveAudit(
 }
 
 /// Whether the heuristic's pick matches the call less exactly than any
-/// index pick can: an unrankable stub, a trailing vararg, a default
-/// parameter, or a declared arity differing from the call's. The index
-/// only ever resolves an exact-arity no-default no-vararg candidate, so
-/// a same-tier divergence onto such a heuristic pick is the index
-/// correcting a fallback shape, not a mis-bind.
+/// index pick can: an unrankable stub, a vararg at any position, a
+/// default parameter, or a declared arity differing from the call's.
+/// The index only ever resolves an exact-arity no-default no-vararg
+/// candidate, so a same-tier divergence onto such a heuristic pick is
+/// the index correcting a fallback shape, not a mis-bind.
 fn heurPickInexact(b: *FuncBuilder, fid: FuncId, want: usize) bool {
     const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return true;
     if (f.blocks.len == 0) {
         const da = b.module.decl_user_arity.get(fid.int()) orelse return true;
-        return da.trailing_vararg or da.required != da.total or da.total != want;
+        return da.has_vararg or da.required != da.total or da.total != want;
     }
-    if (f.params.len != 0 and f.params[f.params.len - 1].is_vararg) return true;
+    for (f.params) |p| {
+        if (p.is_vararg) return true;
+    }
     if (userParams(f) != want) return true;
     const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     for (f.params[off..]) |p| {
@@ -2820,6 +3031,24 @@ fn resolveAuditOn() bool {
 
 var resolve_strict_checked: bool = false;
 var resolve_strict_enabled: bool = false;
+
+/// Test hook: force KLIO_RESOLVE_STRICT on for the current process,
+/// bypassing the once-per-process environment read, so an in-process
+/// integration test can pin strict mode's verdict on a specific
+/// program.
+pub fn setResolveStrictForTest(on: bool) void {
+    resolve_strict_checked = true;
+    resolve_strict_enabled = on;
+}
+
+/// Test hook: undo `setResolveStrictForTest` — the next strict-mode
+/// read consults the environment again, so a forced setting never
+/// leaks past the test that installed it (including under a
+/// KLIO_RESOLVE_STRICT=1 suite run).
+pub fn resetResolveStrictForTest() void {
+    resolve_strict_checked = false;
+    resolve_strict_enabled = false;
+}
 
 fn resolveStrictOn() bool {
     if (!resolve_strict_checked) {
@@ -2869,6 +3098,24 @@ fn matchesRecv(b: *FuncBuilder, fid: FuncId, recv: []const u8) bool {
 }
 
 const CandKind = enum { non_ext_arity, ext_arity, ext_arity_tl, non_ext_arity_tl };
+
+/// Which rung of the order-based bare-call heuristic produced the pick.
+/// Carried into the resolve audit so a corpus sweep counts per-rung
+/// reachability — the survey evidence behind keeping (or deleting) each
+/// rung of the fallback ladder.
+const HeurRung = enum {
+    none,
+    imported,
+    cast,
+    non_ext_arity,
+    ext_arity,
+    ext_arity_tl,
+    non_ext_arity_tl,
+    decl_arity_order,
+    decl_arity_non_ext,
+    decl_arity_ext,
+    recv_rebind,
+};
 
 fn findCand(b: *FuncBuilder, cands: []const FuncId, want: usize, kind: CandKind) ?FuncId {
     for (cands) |fid| {
@@ -2926,7 +3173,7 @@ fn declArity(b: *FuncBuilder, fid: FuncId) ?u32 {
     return b.module.decl_user_params.get(fid.int());
 }
 
-fn fallbackByDeclArity(b: *FuncBuilder, cands: []const FuncId, name0: []const u8, want: usize) Allocator.Error!?FuncId {
+fn fallbackByDeclArity(b: *FuncBuilder, cands: []const FuncId, name0: []const u8, want: usize, rung: *HeurRung) Allocator.Error!?FuncId {
     const fallback = b.module.funcId(name0);
     const want_u32: u32 = @intCast(want);
     const fallback_fits = blk: {
@@ -2935,14 +3182,24 @@ fn fallbackByDeclArity(b: *FuncBuilder, cands: []const FuncId, name0: []const u8
         }
         break :blk true;
     };
-    if (fallback_fits) return fallback;
+    if (fallback_fits) {
+        if (fallback != null) rung.* = .decl_arity_order;
+        return fallback;
+    }
     // Prefer a candidate whose declared arity fits.
     for (cands) |fid| {
-        if (isNonExt(b, fid) and declArity(b, fid) == want_u32) return fid;
+        if (isNonExt(b, fid) and declArity(b, fid) == want_u32) {
+            rung.* = .decl_arity_non_ext;
+            return fid;
+        }
     }
     for (cands) |fid| {
-        if (!isNonExt(b, fid) and declArity(b, fid) == want_u32) return fid;
+        if (!isNonExt(b, fid) and declArity(b, fid) == want_u32) {
+            rung.* = .decl_arity_ext;
+            return fid;
+        }
     }
+    if (fallback != null) rung.* = .decl_arity_order;
     return fallback;
 }
 

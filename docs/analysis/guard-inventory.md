@@ -510,6 +510,12 @@ get a fixed insertion position.
   `FuncId` on the instruction (`LoadGlobal.func`, `Call.func`) — no
   simple-name re-resolution at runtime. Out-of-scope (tier-5) index
   verdicts are now an unresolved-reference lowering error matching kotlinc.
+  The stale-name-index rungs are deleted (item 8 close-out): `funcIdLegacy`
+  and the `hasFuncNamed` `func_index` walk were proven unreachable — every
+  build pipeline pairs each `func_index` append with a name-index push and
+  the pack format never serializes a `Module`, and the instrumented sweep
+  (`legacy_funcid`/`legacy_hasfunc` audit lines) logged 0 hits over the
+  corpus + fixtures — so the name index is the single authority.
 - **Was at:** `src/ir/ir.zig` (`funcId`/`funcIdLegacy`, `isShippedFqn`).
 - **Class:** C.
 - **Verified by:** `KLIO_RESOLVE_AUDIT`/`KLIO_RESOLVE_STRICT` sweeps (0
@@ -691,25 +697,57 @@ get a fixed insertion position.
   `parity_lambdas_and_dispatch` itests and `KLIO_RESOLVE_AUDIT`/`KLIO_LINK_AUDIT` =
   0 over the corpus.
 
-### C12 — Inline-fn table keyed by bare simple name
+### C12 — Inline-fn table keyed by bare simple name — FOLDED into the symbol index (item 8d)
 
-- **Location:** `src/ir/lower/inline_state.zig:31` (`inline_fn_asts` StringHashMap),
-  `:38` (`shadowed_inline_names`), candidate lookup `:90-99`.
-- **What it does:** a process-global inline-fn table keyed by bare simple name,
-  merged across packs + user; a pack `inline fun foo` and a user `inline fun foo`
-  share one bucket, tie-broken by shape/order (§2 Class C). `shadowed_inline_names`
-  is itself a point-fix preventing inline expansion from shadowing default-import
-  resolution.
-- **Class:** C.
-- **Deletable?** **Needs-verification.** The simple-name keying is a Class-C guard
-  that should fold into the §4.4 FQN index (§4.4-item-4 "Fold inline-fn resolution
-  into the same entry point"). But these are *also* build-scoped thread-locals
-  (a B-style anti-pattern) and the suspend-inline machinery has real constraints
-  (`inline_state.zig:25-30`); verify the FQN-keyed inline resolution preserves
-  suspend-inline correctness before deleting `shadowed_inline_names`.
-- **Removes via:** §6 item **8** (+ **7** for one resolver).
-- **Removal test:** differential over a program with same-simple-name `inline fun`s
-  in two packages; `parity_advanced_idioms` (inline idioms) green.
+- **Status:** bare-call inline resolution is index-first. The build driver
+  registers every top-level `inline fun`'s AST under its phase-1 header
+  stub's `FuncId` (`inline_state.registerInlineFnId`, called from the stub
+  loop), and `inlineTargetForBareCall` (`src/ir/lower/expr.zig`) resolves the
+  bare name through `resolveBareCallIndexed` FIRST: an inline winner splices
+  exactly the resolved declaration (`tryInlineCallWithTypeArgs` now takes the
+  resolved target), a non-inline winner suppresses the splice so the normal
+  call path binds it, and a receiver-matched extension pick keeps the
+  narrowing's choice (mirroring `preferredBareTarget`). The simple-name
+  shape/receiver narrowing (`inlineFnAstFor*`) survives only as the
+  tie-break for shapes the index defers on: extension forms, overload sets,
+  default/vararg/trailing-lambda shapes, class/object member inline fns (no
+  stub, never index-resolved), and class-method bodies lowered before the
+  phase-1 headers exist. `shadowed_inline_names` no longer has its own
+  construction: its name domain comes from `stdlib.noteBareNameMapping` —
+  the same constructor behind the link-time `default_import_globals` /
+  `any_member_globals` maps — over `IMPLICITLY_IMPORTED_PACKAGES`.
+- **Location:** `src/ir/lower/inline_state.zig` (`inline_fn_asts` simple-name
+  candidates, `inline_fn_ids` FuncId-keyed ASTs, `shadowed_inline_names`),
+  `src/ir/lower/expr.zig` (`inlineTargetForBareCall`).
+- **Class:** C (resolved).
+- **Verified by:** the KLIO_RESOLVE_AUDIT `inline` records — one line per
+  bare inline-candidate call comparing the old simple-name-first pick to the
+  index-first pick on the splice that would actually occur, each divergence
+  graded as a shape correction (the simple-name pick matches less exactly:
+  vararg at ANY parameter position, a default, an arity mismatch) or a tier
+  correction (the index pick ranks in a strictly better scope tier — e.g. a
+  named import outranking a same-package reified inline namesake, a program
+  property pinned strict-mode-on in `itests/resolve_ambiguity.zig`). Corpus +
+  fixture sweep: 517,022 records, 0 unexplained divergences; 48 graded shape
+  corrections, all at one root site (the four deprecated `combineLatest`
+  bodies in kotlinx-coroutines `Migration.kt`, where the simple-name table —
+  which only ever holds the inline overloads — spliced the reified vararg
+  `combine` for calls whose exact-arity match is the non-inline
+  `combine(flow, flow2, transform)`; the index pick is the kotlinc-correct
+  binding, pinned fold-sensitively by the equal-arity vararg-vs-exact test
+  in `itests/resolve_ambiguity.zig`, which fails under a name-first
+  mutation). The surviving narrowing is receiver-aware in class methods:
+  the enclosing class (falling back from the enclosing extension's
+  receiver) matches candidate receivers through the transitive supertype
+  chain (`registry.class_super_names` / `Module.classIsOrExtends`),
+  nearest first, with the same subtype-aware receiver veto in the splice
+  gate — `A.label`/`B.label` twins splice per enclosing class in either
+  declaration order, a base-class extension accepts a subclass method's
+  receiver, and the subclass's own extension outranks the base one
+  (`itests/parity_extension_resolution.zig`). `KLIO_RESOLVE_STRICT`
+  hard-fails an unexplained inline divergence. Differential (93 programs,
+  all modes), `parity_advanced_idioms`, `parity_suspend_shapes`, coroutine
+  smoke green.
 
 ---
 
