@@ -10,7 +10,7 @@ jobs:
   build-and-test:
     name: zig build + test
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       # The kotlin-klio/*/upstream vendor trees (kotlinx + ktor sources the
       # interpreter consumes at runtime) are submodules; without them every
@@ -52,9 +52,11 @@ jobs:
       # (build artifacts plus the test run-step result manifests, so unchanged
       # test steps are cache hits in CI exactly as they are locally). Keyed
       # per-commit with prefix restore so every run starts from the nearest
-      # prior cache and saves its own.
-      - name: cache zig build + test state
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      # prior cache. Restore and save are split so the save runs even when
+      # the job fails or times out -- a partial compile still banks progress
+      # for the next run instead of restarting cold forever.
+      - name: restore zig build + test state
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cache/zig
@@ -66,10 +68,20 @@ jobs:
       - name: zig build
         run: zig build
 
-      # -j2: the test graph compiles a second (ReleaseSafe) module universe for
-      # the program-running harness binaries; those optimizing compiles peak at
-      # several GB each, and four concurrent jobs can exhaust the 16GB runner
-      # (the kernel OOM-kills whichever steps are resident). Two jobs keeps the
-      # peak inside the runner; with a warm cache the serialization is moot.
+      # -j3: the test graph compiles a second (ReleaseSafe) module universe for
+      # the program-running harness binaries; those optimizing compiles and the
+      # heaviest harness steps peak at several GB each, and four concurrent
+      # jobs can exhaust the 16GB runner. Three keeps the peak bounded without
+      # throttling the cold compile the way -j2 did; with a warm cache the
+      # limit is moot.
       - name: zig build test
-        run: zig build test -j2 --summary all
+        run: zig build test -j3 --summary all
+
+      - name: save zig build + test state
+        if: always()
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-0.16.0-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
