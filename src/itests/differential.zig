@@ -155,3 +155,80 @@ test "examples + coroutine smoke are byte-identical across load modes" {
         return error.PackVsDirectDivergence;
     }
 }
+
+// Order-independence gate for the once-per-process stdlib base: the corpus
+// runs twice in one process — forward, then reversed — and every
+// (program, mode) outcome must be byte-identical between the passes. A
+// mutation leaking from one program's run into the shared base would make
+// an output depend on which programs ran before it.
+test "corpus outputs are independent of program order" {
+    var list_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer list_arena.deinit();
+    const la = list_arena.allocator();
+    var threaded: std.Io.Threaded = .init(la, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var corpus: std.ArrayList([]u8) = .empty;
+    defer corpus.deinit(la);
+    const examples = parity.collectKt(la, io, EXAMPLES) catch |e| {
+        std.debug.print("differential order: collectKt(examples) failed ({s})\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    try corpus.appendSlice(la, examples);
+    const smoke = parity.collectKt(la, io, SMOKE_DIR) catch &.{};
+    try corpus.appendSlice(la, smoke);
+    if (corpus.items.len == 0) return error.SkipZigTest;
+
+    const Key = struct { file: []const u8, mode: parity.LoadMode };
+    var recorded: std.ArrayList(struct { key: Key, kind: u8, text: []u8 }) = .empty;
+    defer recorded.deinit(la);
+
+    var run_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer run_arena.deinit();
+
+    // Forward pass: record every outcome (output or error text).
+    for (corpus.items) |file| {
+        _ = run_arena.reset(.retain_capacity);
+        const ra = run_arena.allocator();
+        const src = std.Io.Dir.cwd().readFileAlloc(io, file, ra, .unlimited) catch continue;
+        for (applicableModes(src)) |mode| {
+            const outcome = try runOne(ra, io, file, mode);
+            const kind: u8 = if (outcome == .out) 0 else 1;
+            const text = switch (outcome) {
+                .out => |o| o,
+                .err => |e| e,
+            };
+            try recorded.append(la, .{
+                .key = .{ .file = file, .mode = mode },
+                .kind = kind,
+                .text = try la.dupe(u8, text),
+            });
+        }
+    }
+
+    // Reverse pass: byte-compare against the forward pass.
+    var failures: usize = 0;
+    var idx: usize = recorded.items.len;
+    while (idx > 0) {
+        idx -= 1;
+        const rec = recorded.items[idx];
+        _ = run_arena.reset(.retain_capacity);
+        const ra = run_arena.allocator();
+        const outcome = try runOne(ra, io, rec.key.file, rec.key.mode);
+        const kind: u8 = if (outcome == .out) 0 else 1;
+        const text = switch (outcome) {
+            .out => |o| o,
+            .err => |e| e,
+        };
+        if (kind != rec.kind or !std.mem.eql(u8, text, rec.text)) {
+            failures += 1;
+            std.debug.print(
+                "differential ORDER DIVERGENCE {s} [{s}]:\n  forward: {s}\n  reverse: {s}\n",
+                .{ rec.key.file, @tagName(rec.key.mode), rec.text, text },
+            );
+        }
+    }
+    std.debug.print("differential order: {d} (program, mode) outcomes re-checked in reverse\n", .{recorded.items.len});
+    if (failures != 0) return error.OrderDependentOutput;
+}

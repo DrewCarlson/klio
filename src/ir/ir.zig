@@ -914,6 +914,53 @@ pub const Module = struct {
         self.resolve_diags.deinit(allocator);
     }
 
+    /// Clone this module so the copy can be EXTENDED (funcs/classes/consts
+    /// appended, new registry keys added) without touching the original.
+    /// Container spines are copied onto `a`; leaf data (instruction slices,
+    /// strings, param slices, registry values) is shared with the original,
+    /// which must outlive the clone and stay immutable. Built for the
+    /// once-per-process stdlib base: the base module is lowered once and
+    /// each program extends an arena-backed clone. Clones are arena-owned;
+    /// never call `deinit` on one outside an arena teardown.
+    pub fn cloneForExtend(self: *const Module, a: Allocator) Allocator.Error!Module {
+        var out = Module.init(a);
+        try out.funcs.appendSlice(a, self.funcs.items);
+        try out.classes.appendSlice(a, self.classes.items);
+        try out.consts.appendSlice(a, self.consts.items);
+        try out.top_level.appendSlice(a, self.top_level.items);
+        try out.class_index.appendSlice(a, self.class_index.items);
+        try out.func_index.appendSlice(a, self.func_index.items);
+        {
+            var it = self.func_name_index.iterator();
+            while (it.next()) |e| {
+                var list: std.ArrayList(FuncId) = .empty;
+                try list.appendSlice(a, e.value_ptr.items);
+                try out.func_name_index.put(e.key_ptr.*, list);
+            }
+        }
+        out.package = self.package;
+        try out.tailrec_fn_names.appendSlice(a, self.tailrec_fn_names.items);
+        out.registry = try self.registry.cloneForExtend(a);
+        {
+            var it = self.decl_user_params.iterator();
+            while (it.next()) |e| try out.decl_user_params.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.decl_user_arity.iterator();
+            while (it.next()) |e| try out.decl_user_arity.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.decl_user_sig.iterator();
+            while (it.next()) |e| try out.decl_user_sig.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.decl_span.iterator();
+            while (it.next()) |e| try out.decl_span.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        try out.resolve_diags.appendSlice(a, self.resolve_diags.items);
+        return out;
+    }
+
     /// Look up a class by simple name.
     pub fn classId(self: *const Module, name: []const u8) ?ClassId {
         for (self.class_index.items) |entry| {
@@ -1966,6 +2013,103 @@ pub const ModuleRegistry = struct {
         }
         self.mangled_nested.deinit();
         self.class_const_inits.deinit();
+    }
+
+    /// Clone for extension (see `Module.cloneForExtend`). Outer container
+    /// spines are copied onto `a`; inner containers and value slices are
+    /// SHARED with the original by value-copy. That is sound because the
+    /// extending build only ever inserts NEW keys (new files, new classes,
+    /// new FuncIds — cross-boundary name collisions fall back to a full
+    /// rebuild) and replaces whole entries; it never appends into an inner
+    /// container reached through an existing key.
+    pub fn cloneForExtend(self: *const ModuleRegistry, a: Allocator) Allocator.Error!ModuleRegistry {
+        var out = ModuleRegistry.init(a);
+        try out.object_names.appendSlice(a, self.object_names.items);
+        {
+            var it = self.companion_singletons.iterator();
+            while (it.next()) |e| try out.companion_singletons.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.enclosing_class.iterator();
+            while (it.next()) |e| try out.enclosing_class.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.func_type_params.iterator();
+            while (it.next()) |e| {
+                var list: std.ArrayList([]const u8) = .empty;
+                try list.appendSlice(a, e.value_ptr.items);
+                try out.func_type_params.put(e.key_ptr.*, list);
+            }
+        }
+        {
+            var it = self.func_type_param_bounds.iterator();
+            while (it.next()) |e| try out.func_type_param_bounds.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.top_level_delegated_props.keyIterator();
+            while (it.next()) |k| try out.top_level_delegated_props.put(k.*, {});
+        }
+        {
+            var it = self.hierarchy_methods.iterator();
+            while (it.next()) |e| try out.hierarchy_methods.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.class_member_names.keyIterator();
+            while (it.next()) |k| try out.class_member_names.put(k.*, {});
+        }
+        {
+            var it = self.class_super_names.iterator();
+            while (it.next()) |e| try out.class_super_names.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.delegated_body_props.keyIterator();
+            while (it.next()) |k| try out.delegated_body_props.put(k.*, {});
+        }
+        {
+            var it = self.member_ext_owner_class.iterator();
+            while (it.next()) |e| try out.member_ext_owner_class.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.local_fn_defaults.iterator();
+            while (it.next()) |e| {
+                var list: std.ArrayList(?FuncId) = .empty;
+                try list.appendSlice(a, e.value_ptr.items);
+                try out.local_fn_defaults.put(e.key_ptr.*, list);
+            }
+        }
+        {
+            var it = self.abstract_member_defaults.iterator();
+            while (it.next()) |e| {
+                var list: std.ArrayList(?FuncId) = .empty;
+                try list.appendSlice(a, e.value_ptr.items);
+                try out.abstract_member_defaults.put(e.key_ptr.*, list);
+            }
+        }
+        {
+            var it = self.type_aliases.iterator();
+            while (it.next()) |e| try out.type_aliases.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.import_aliases.iterator();
+            while (it.next()) |e| try out.import_aliases.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.import_wildcards.iterator();
+            while (it.next()) |e| try out.import_wildcards.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.nested_object_aliases.iterator();
+            while (it.next()) |e| try out.nested_object_aliases.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.mangled_nested.iterator();
+            while (it.next()) |e| try out.mangled_nested.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.class_const_inits.iterator();
+            while (it.next()) |e| try out.class_const_inits.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        return out;
     }
 };
 

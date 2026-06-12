@@ -14,7 +14,11 @@
 
 const std = @import("std");
 
-const KLIO_BIN = "zig-out/bin/klio";
+/// The `klio` binary to spawn: `KLIO_ITEST_BIN` when set (the build run
+/// step points it at the harness-optimized install), else the Debug install.
+fn klioBin(env: *const std.process.Environ.Map) []const u8 {
+    return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
+}
 
 fn envWithHome(allocator: std.mem.Allocator, io: std.Io, home: []const u8) !std.process.Environ.Map {
     var map = std.process.Environ.Map.init(allocator);
@@ -57,14 +61,14 @@ fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Envi
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, home) catch {};
     {
-        const r = try runKlio(allocator, io, env, &.{ KLIO_BIN, "pack", "build", "kotlin-klio/klio-kotlinx-serialization" });
+        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "build", "kotlin-klio/klio-kotlinx-serialization" });
         if (!r.ok) {
             std.debug.print("json_reified_inline: pack build failed:\n{s}\n", .{r.stderr});
             return error.PackBuildFailed;
         }
     }
     {
-        const r = try runKlio(allocator, io, env, &.{ KLIO_BIN, "pack", "install", "target/packs/kotlinx.serialization.klio-pack" });
+        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "install", "target/packs/kotlinx.serialization.klio-pack" });
         if (!r.ok) {
             std.debug.print("json_reified_inline: pack install failed:\n{s}\n", .{r.stderr});
             return error.PackInstallFailed;
@@ -96,7 +100,7 @@ fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
     const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
     try cwd.writeFile(io, .{ .sub_path = path, .data = src });
 
-    const r = try runKlio(a, io, &env, &.{ KLIO_BIN, "run", "--feature", "kotlinx.serialization/json", path });
+    const r = try runKlio(a, io, &env, &.{ klioBin(&env), "run", "--feature", "kotlinx.serialization/json", path });
     if (!r.ok) {
         std.debug.print("json_reified_inline {s}: klio run failed:\nstdout:\n{s}\nstderr:\n{s}\n", .{ name, r.stdout, r.stderr });
         return error.KlioRunFailed;

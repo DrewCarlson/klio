@@ -14,7 +14,11 @@
 
 const std = @import("std");
 
-const KLIO_BIN = "zig-out/bin/klio";
+/// The `klio` binary to spawn: `KLIO_ITEST_BIN` when set (the build run
+/// step points it at the harness-optimized install), else the Debug install.
+fn klioBin(env: *const std.process.Environ.Map) []const u8 {
+    return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
+}
 
 fn envWithHome(allocator: std.mem.Allocator, io: std.Io, home: []const u8) !std.process.Environ.Map {
     var map = std.process.Environ.Map.init(allocator);
@@ -69,14 +73,14 @@ fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Envi
         "target/packs/io.ktor.klio-pack",
     };
     for (pack_dirs) |d| {
-        const r = try runKlio(allocator, io, env, &.{ KLIO_BIN, "pack", "build", d });
+        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "build", d });
         if (!r.ok) {
             std.debug.print("ktor_channel_async: pack build {s} failed:\n{s}\n", .{ d, r.stderr });
             return error.PackBuildFailed;
         }
     }
     for (pack_files) |f| {
-        const r = try runKlio(allocator, io, env, &.{ KLIO_BIN, "pack", "install", f });
+        const r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "install", f });
         if (!r.ok) {
             std.debug.print("ktor_channel_async: pack install {s} failed:\n{s}\n", .{ f, r.stderr });
             return error.PackInstallFailed;
@@ -108,7 +112,7 @@ fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
     const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
     try cwd.writeFile(io, .{ .sub_path = path, .data = src });
 
-    const r = try runKlio(a, io, &env, &.{ KLIO_BIN, "run", path });
+    const r = try runKlio(a, io, &env, &.{ klioBin(&env), "run", path });
     if (!r.ok) {
         std.debug.print("ktor_channel_async {s}: klio run failed:\nstdout:\n{s}\nstderr:\n{s}\n", .{ name, r.stdout, r.stderr });
         return error.KlioRunFailed;

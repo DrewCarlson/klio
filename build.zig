@@ -59,13 +59,21 @@ const Itest = struct {
     dirs: []const []const u8 = &.{},
     /// Honors the fuzzer / kotlinc-oracle environment at runtime.
     fuzz_env: bool = false,
-    /// Spawns the installed `zig-out/bin/klio` binary as a child process.
+    /// Spawns a `klio` binary as a child process. The run step installs the
+    /// harness-optimized `zig-out/bin/klio-harness` and points the test at it
+    /// via `KLIO_ITEST_BIN`.
     needs_exe: bool = false,
+    /// Spends its runtime interpreting Kotlin programs (in-process through
+    /// the parity pipeline, or via a spawned `klio` child), so the binary
+    /// compiles with the harness optimize mode. Unit-style suites that lean
+    /// on Debug `testing.allocator` leak/UAF fidelity set this false and
+    /// stay on the default optimize mode.
+    interprets: bool = true,
 };
 
 const itests_files = [_]Itest{
-    .{ .name = "cfa_builder", .parity_data = false },
-    .{ .name = "cfa_smartcast", .parity_data = false },
+    .{ .name = "cfa_builder", .parity_data = false, .interprets = false },
+    .{ .name = "cfa_smartcast", .parity_data = false, .interprets = false },
     .{ .name = "parity_advanced_idioms" },
     .{ .name = "parity_array_bulk_ops" },
     .{ .name = "parity_atomicfu_arrays" },
@@ -98,14 +106,15 @@ const itests_files = [_]Itest{
     .{ .name = "parity_sealed_when_patterns" },
     .{ .name = "parity_string_processing" },
     .{ .name = "parity_strings_numbers" },
+    .{ .name = "parity_stdlib_isolation" },
     .{ .name = "parity_suspend_shapes" },
     .{ .name = "parity_threaded_litmus", .dirs = &.{"tests/fixtures/threaded_litmus"} },
     .{ .name = "parity_type_system_shapes" },
     .{ .name = "parity_visibility_modifiers" },
     .{ .name = "resolve_ambiguity" },
-    .{ .name = "parser_corpus", .parity_data = false },
-    .{ .name = "runtime_objref_threads", .parity_data = false },
-    .{ .name = "typeck_negative", .parity_data = false, .dirs = &.{"tests/fixtures/typeck_negative"} },
+    .{ .name = "parser_corpus", .parity_data = false, .interprets = false },
+    .{ .name = "runtime_objref_threads", .parity_data = false, .interprets = false },
+    .{ .name = "typeck_negative", .parity_data = false, .interprets = false, .dirs = &.{"tests/fixtures/typeck_negative"} },
     .{ .name = "check_examples", .dirs = &.{"examples"} },
     .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" } },
     .{ .name = "fuzz_closures_suspend", .fuzz_env = true },
@@ -199,6 +208,18 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Program-running harness binaries (parity itests, e2e, bench, the
+    // fuzzer and the differential) spend their time interpreting Kotlin;
+    // a Debug interpreter pays ~5x on every program's embedded-stdlib
+    // assembly. They compile ReleaseSafe — bounds/overflow/unreachable
+    // checks stay on — while the per-module unit tests keep the default
+    // optimize mode so `testing.allocator` leak/UAF detection keeps full
+    // Debug fidelity.
+    const harness_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "harness-optimize",
+        "Optimize mode for the program-running test harnesses (default ReleaseSafe)",
+    ) orelse .ReleaseSafe;
 
     // Memoized configure-phase directory walks for declareDataDirs.
     var data_memo = std.StringHashMap([]const []const u8).init(b.allocator);
@@ -229,6 +250,35 @@ pub fn build(b: *std.Build) void {
     pack_mod.link_libc = true;
     pack_mod.linkLibrary(zstd);
 
+    // Second per-(module, optimize) universe for the harness binaries.
+    // Zig modules are keyed by (root source, optimize), so the harness
+    // graph is a separate compilation of the same sources; it shares the
+    // global cache and only rebuilds when sources change. When the two
+    // modes coincide the Debug universe is reused as-is.
+    var harness_mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
+    defer harness_mods.deinit();
+    if (harness_optimize == optimize) {
+        var it = mods.iterator();
+        while (it.next()) |e| harness_mods.put(e.key_ptr.*, e.value_ptr.*) catch @panic("oom");
+    } else {
+        for (mod_list) |m| {
+            const mod = b.createModule(.{
+                .root_source_file = b.path(b.fmt("src/{s}/{s}.zig", .{ m.name, m.name })),
+                .target = target,
+                .optimize = harness_optimize,
+            });
+            harness_mods.put(m.name, mod) catch @panic("oom");
+        }
+        for (mod_list) |m| {
+            const mod = harness_mods.get(m.name).?;
+            for (m.deps) |d| mod.addImport(d, harness_mods.get(d).?);
+        }
+        const zstd_harness = buildZstd(b, target, harness_optimize);
+        const pack_harness = harness_mods.get("pack").?;
+        pack_harness.link_libc = true;
+        pack_harness.linkLibrary(zstd_harness);
+    }
+
     // Install the compiled static library to zig-out/lib/libzstd.a so
     // per-module verification (scripts/zigcheck.py) can link the extern
     // ZSTD_* symbols without re-running the whole build graph.
@@ -249,6 +299,23 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // Harness-optimized `klio` for the child-spawning itests: each spawned
+    // program pays the embedded-stdlib assembly, so those tests point at
+    // this binary (via KLIO_ITEST_BIN) instead of the Debug install.
+    const harness_exe = b.addExecutable(.{
+        .name = "klio-harness",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = harness_optimize,
+            .imports = &.{
+                .{ .name = "cli", .module = harness_mods.get("cli").? },
+            },
+        }),
+    });
+    const harness_exe_step = b.step("klio-harness", "Build+install the harness-optimized klio binary");
+    harness_exe_step.dependOn(&b.addInstallArtifact(harness_exe, .{}).step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
@@ -263,20 +330,27 @@ pub fn build(b: *std.Build) void {
             // One test binary per integration-test file (process isolation).
             const imports = b.allocator.alloc(std.Build.Module.Import, m.deps.len) catch @panic("oom");
             for (m.deps, 0..) |d, i| imports[i] = .{ .name = d, .module = mods.get(d).? };
+            const harness_imports = b.allocator.alloc(std.Build.Module.Import, m.deps.len) catch @panic("oom");
+            for (m.deps, 0..) |d, i| harness_imports[i] = .{ .name = d, .module = harness_mods.get(d).? };
             for (itests_files) |spec| {
                 const tmod = b.createModule(.{
                     .root_source_file = b.path(b.fmt("src/itests/{s}.zig", .{spec.name})),
                     .target = target,
-                    .optimize = optimize,
-                    .imports = imports,
+                    .optimize = if (spec.interprets) harness_optimize else optimize,
+                    .imports = if (spec.interprets) harness_imports else imports,
                 });
                 const tbin = b.addTest(.{ .root_module = tmod });
                 const run_t = b.addRunArtifact(tbin);
                 run_t.setCwd(b.path("."));
                 keyOnEnv(b, run_t, &interp_env_keys);
                 if (spec.fuzz_env) keyOnEnv(b, run_t, &fuzz_env_keys);
-                // Child-spawning tests need the `klio` binary installed first.
-                if (spec.needs_exe) run_t.step.dependOn(b.getInstallStep());
+                // Child-spawning tests run programs through the
+                // harness-optimized `klio` installed alongside the suite.
+                if (spec.needs_exe) {
+                    const hinst = b.addInstallArtifact(harness_exe, .{});
+                    run_t.step.dependOn(&hinst.step);
+                    run_t.setEnvironmentVariable("KLIO_ITEST_BIN", "zig-out/bin/klio-harness");
+                }
                 if (spec.parity_data) {
                     declareDataDirs(b, run_t, &data_memo, &stdlib_data_dirs);
                     declareDataDirs(b, run_t, &data_memo, &kotlinx_pack_dirs);
@@ -299,7 +373,12 @@ pub fn build(b: *std.Build) void {
             }
             continue;
         }
-        const t = b.addTest(.{ .root_module = mods.get(m.name).? });
+        // e2e and bench module tests run whole programs through the
+        // interpreter; they ride the harness universe. Every other module
+        // test stays on the default optimize mode for leak/UAF fidelity.
+        const runs_programs = std.mem.eql(u8, m.name, "e2e") or std.mem.eql(u8, m.name, "bench");
+        const test_mods = if (runs_programs) &harness_mods else &mods;
+        const t = b.addTest(.{ .root_module = test_mods.get(m.name).? });
         const run_t = b.addRunArtifact(t);
         keyOnEnv(b, run_t, &interp_env_keys);
         // Module tests that read repo data by relative path at runtime: pin
