@@ -100,6 +100,21 @@ assumptions across every consumer; the consumer inventory lives in
 breaks a recursion that crosses the host→eval→host boundary, which a
 parameter cannot follow. Tracked in `guard-inventory.md` (keep rows).
 
+### 12. Dispatchers.Default/IO run inline on the calling pump
+
+Measured during the thread-safety audit: `launch`/`async`/`withContext`
+under `Dispatchers.Default`/`IO` execute inline — same thread name, serial
+wall-time for sleeping bodies, and a spin-wait handoff between two Default
+launches deadlocks. The `__kxco_dispatch` host hook and the wakeup mailbox
+exist, but the coroutine start path never routes through them, and a
+continuation parked on a foreign pump cannot be resumed (cross-OS-thread
+channel suspension fails with nondeterministic internal errors).
+`kotlin.concurrent.thread` is the only genuine parallelism today. Fix
+direction: dispatcher-aware coroutine start through `__kxco_dispatch`,
+cross-pump resume via the wakeup mailbox/slot machinery, and Default-
+dispatch parallelism litmus tests. `docs/architecture/concurrency.md`
+records the user-facing truth.
+
 ## Tooling
 
 ### 10. `klio run` resolves the kotlin/ stdlib checkout relative to the working directory
