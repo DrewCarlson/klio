@@ -645,17 +645,17 @@ interpreter fixes got there, each with a kotlinc-parity corpus test:
   `is`-checks resolve, and the hierarchy is correct. Covered by
   `self_named_nested_supertype.kt`.
 
-## Channel streaming subsystem — read side consumed
+## Channel streaming subsystem — read side and async write side consumed
 
 The **read side** of the `io.ktor.utils.io` channel layer is consumed from
 upstream and wired into the pack: the fully-buffered, non-suspending
 `SourceByteReadChannel`, the `ByteReadChannel(bytes/text/source)` factories, and
 the read operations (`readRemaining`/`readByteArray`/…) — the shape a response
-body is drained with. Verified by `ktor_channel_read_from_upstream`
-(`ByteReadChannel("hello world").readRemaining().readByteArray()` round-trips
-to the original text/bytes). The async `ByteChannel` *write* side is deferred
-(see below). Getting here surfaced and fixed three general interpreter bugs,
-each with a kotlinc-parity corpus test:
+body is drained with (`ByteReadChannel("hello world").readRemaining()
+.readByteArray()` round-trips to the original text/bytes). The async
+`ByteChannel` **write side** is also consumed (see the write-side section
+below). Getting the read side in surfaced and fixed three general interpreter
+bugs, each with a kotlinc-parity corpus test:
 
 - **Landed — a member function's function-reference default parameter (`::fn`)
   now calls the referenced function.** A method's default-arg thunk is lowered
@@ -683,13 +683,60 @@ each with a kotlinc-parity corpus test:
   `(String)`) won and bound the `ByteArray` to the wrong parameter. The
   diversion now scores arity-applicable factories by argument type. Covered by
   `interface_factory_overload_by_argtype.kt` (kotlinc byte-parity).
-- **Deferred — the async `ByteChannel` *write* side** blocks on coroutine
-  suspension: a write→`flushAndClose`→`readRemaining` round trip reads a
-  `kotlinx.coroutines.internal.Symbol` from `_closedCause` because
-  `awaitContent()` suspends through `suspendCancellableCoroutine` + the `Slot`
-  state machine, which klio's cooperative driver mishandles. The read side
-  (above) avoids this; the write side needs coroutine-suspension fidelity and
-  its locks/`DEVELOPMENT_MODE` actuals.
+## Channel async write side — consumed
+
+The async `ByteChannel` write side runs on real upstream code: `ByteChannel.kt`
+(the `Slot` suspension state machine), `BufferedByteWriteChannel.kt`,
+`ByteWriteChannelOperations.kt`, `core/Strings.kt` (`Sink.writeText` /
+`String.toByteArray(charset)` / `Source.readText`), and the
+`locks/Synchronized.kt` expects, with two klio actuals under `shim/core`:
+`io.ktor.utils.io.locks` (uncontended no-op locks, mirroring the atomicfu
+locks shim) and `DEVELOPMENT_MODE = false`. Gated by the `ktor_channel_async`
+itest (child `klio` + installed packs): a buffered
+write→`flushAndClose`→`readRemaining` round trip with the closed-state
+getters, a reader genuinely parked on `awaitContent`
+(`suspendCancellableCoroutine` + `Slot.Read`) resumed by a later writer's
+flush, and a writer parked on `flush` past `CHANNEL_MAX_SIZE` (`Slot.Write`)
+resumed by the reader draining the flush buffer.
+
+The recorded blocker ("reads a `kotlinx.coroutines.internal.Symbol` from
+`_closedCause`") was NOT a parking-fidelity failure — the cooperative driver's
+`suspendCancellableCoroutine` handling was sound. It root-caused to two
+general interpreter bugs, each fixed with a kotlinc-parity fixture:
+
+- **A companion-declared member extension imported and called on an instance
+  lost its extension receiver.** `_closedCause.value?.wrapCause()` (the
+  `CloseToken.Companion.wrapCause` shape) dispatched through the
+  companion-forward tier with the companion as receiver and no extension
+  argument, so the body read the wrong instance's state. A member extension
+  whose owner class is an `object`/companion singleton is now visible at any
+  call site (the dispatch receiver is the always-materializable singleton)
+  and the singleton serves as its owner instance
+  (`companion_member_extension_import.kt`).
+- **A reified type parameter could not be inferred from a constructor-reference
+  argument, and nested reified inline calls could not chain.**
+  `sleepWhile(Slot::Read)` must solve `TaskType = Slot.Read` from the
+  functional parameter's return type (the lowered reference IS the class
+  value, so the splice binds it directly), and `trySuspend<TaskType>` /
+  `resumeSlot<TaskType>` inside the spliced body must reuse the enclosing
+  splice's resolved class instead of a global lookup of the parameter name
+  (the new `FuncBuilder.reified_type_binds` chain)
+  (`reified_ctor_ref_inference.kt`).
+
+The manual-continuation slot protocol itself (park through
+`suspendCancellableCoroutine`, hand-resume from a sibling coroutine,
+immediate-resume race check, no-park fast path) is pinned
+kotlinc+kotlinx-coroutines byte-parity by
+`manual_continuation_slot_park_and_resume` in `parity_suspend_shapes`.
+
+Multi-thread contention on one channel (real `Dispatchers.Default` writers
+racing readers) is untested; the locks actual is a no-op on the grounds that
+channel operations serialize on the cooperative pump.
+
+**Option opened:** with the async write side live, the client engine could
+stream response bodies through a real `ByteChannel` (writer job feeding the
+response channel) instead of the buffered read-side `ByteReadChannel` it
+builds today. Not wired — the buffered path stays the shipping path.
 
 ## Cores consumption — staged plan
 
@@ -1051,11 +1098,13 @@ was a general interpreter correctness issue ktor merely surfaced:
   `internal var counter` each, cross-package imported reads and writes,
   kotlinc-verified).
 
-Known deferred items:
-
-- The async `ByteChannel` write side still needs coroutine-suspension
-  fidelity; nothing in the GET path requires it (responses are buffered
-  read-side channels).
+The async `ByteChannel` write side is CONSUMED (see the write-side
+section): write→`flushAndClose`→`readRemaining` round-trips, and both
+parked directions (reader on `awaitContent`, writer on `flush` past
+`CHANNEL_MAX_SIZE`) park and resume through the upstream `Slot` protocol,
+gated by the `ktor_channel_async` itest. The GET path still uses buffered
+read-side channels; streaming response bodies through a real `ByteChannel`
+is now an available option, not yet wired.
 
 Next: **server core** (`Application`/`ApplicationCall`/routing/
 `respondText` on upstream; klio engine actual over `__kktor_serve`;

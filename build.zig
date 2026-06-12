@@ -117,6 +117,14 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-ktor-client",
     } },
+    // Async ByteChannel gate: upstream channel write side (Slot suspension
+    // protocol) through child `klio` + installed packs.
+    .{ .name = "ktor_channel_async", .parity_data = false, .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-io",
+        "kotlin-klio/klio-ktor-client",
+    } },
     // Reified inline Json extension shapes through the installed pack
     // (kotlinc-verified expected output; the in-process parity harness
     // does not fold in the serialization pack).

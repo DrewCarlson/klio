@@ -23,23 +23,27 @@ include = [
     "io/ktor/utils/io/Annotations.kt",
     "io/ktor/utils/io/Deprecation.kt",
     "io/ktor/utils/io/core/Buffer.kt",
+    "io/ktor/utils/io/core/Strings.kt",
     "io/ktor/utils/io/core/ByteReadPacket.kt",
     "io/ktor/utils/io/core/BytePacketBuilder.kt",
     "io/ktor/utils/io/core/Builder.kt",
-    # Channel interface types (referenced by the `OutgoingContent` body layer)
-    # and the read side of the channel layer: the fully-buffered, non-suspending
+    # Channel layer: the read side (the fully-buffered, non-suspending
     # `SourceByteReadChannel`, the `ByteReadChannel(bytes/text/source)`
-    # factories, and the read operations (`readRemaining`/`readByteArray`/…) —
-    # the shape a response body is drained with. The async `ByteChannel` write
-    # side (which needs coroutine-suspension fidelity) is a later lift; its
-    # references in the read operations sit in unused function bodies.
+    # factories, the read operations — the shape a response body is drained
+    # with) and the async write side (the `ByteChannel` Slot state machine +
+    # the write operations). klio supplies the `locks` and `DEVELOPMENT_MODE`
+    # actuals under `shim/core`.
     "io/ktor/utils/io/ByteReadChannel.kt",
     "io/ktor/utils/io/ByteWriteChannel.kt",
+    "io/ktor/utils/io/BufferedByteWriteChannel.kt",
+    "io/ktor/utils/io/ByteChannel.kt",
     "io/ktor/utils/io/Exceptions.kt",
     "io/ktor/utils/io/CloseToken.kt",
     "io/ktor/utils/io/SourceByteReadChannel.kt",
     "io/ktor/utils/io/ByteChannelCtor.kt",
     "io/ktor/utils/io/ByteReadChannelOperations.kt",
+    "io/ktor/utils/io/ByteWriteChannelOperations.kt",
+    "io/ktor/utils/io/locks/Synchronized.kt",
 ]
 
 # Upstream `io.ktor.util` string helpers (escapeHTML / quote /
