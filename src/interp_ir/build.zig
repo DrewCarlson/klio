@@ -840,6 +840,13 @@ fn buildModuleWithOverrides(
     var pending_object_aliases: std.ArrayList(PendingAlias) = .empty;
     defer pending_object_aliases.deinit(a);
 
+    // Primary-constructor parameter lists of superseded `expect` classes
+    // that carry defaults, keyed by class simple name. Kotlin declares
+    // defaults on the `expect` only; the dropped expect's defaults
+    // transplant onto the matching actual after the collection loop.
+    var expect_class_ctor_params = std.StringHashMap([]const ast.ClassParam).init(a);
+    defer expect_class_ctor_params.deinit();
+
     for (file.decls) |*d| {
         switch (d.*) {
             .Object => |*o| {
@@ -874,7 +881,16 @@ fn buildModuleWithOverrides(
                 try all_decls.append(a, .{ .Class = synth });
             },
             .Class => |*c| {
-                if (c.is_expect and actual_class_names.contains(c.name.name)) continue;
+                if (c.is_expect and actual_class_names.contains(c.name.name)) {
+                    var any_ctor_default = false;
+                    for (c.primary_params) |*pp| {
+                        if (pp.default != null) any_ctor_default = true;
+                    }
+                    if (any_ctor_default) {
+                        try expect_class_ctor_params.put(c.name.name, c.primary_params);
+                    }
+                    continue;
+                }
                 try lift.liftClassRecursive(&lift_ctx, c, &.{});
                 try all_decls.append(a, d.*);
             },
@@ -969,6 +985,26 @@ fn buildModuleWithOverrides(
             if (af.receiver_type != null and
                 !std.mem.eql(u8, af.receiver_type.?.name.name, ef.receiver_type.?.name.name)) continue;
             for (af.params, ef.params) |*ap, *ep| {
+                if (ap.default == null) ap.default = ep.default;
+            }
+        }
+    }
+
+    // The same inheritance applies to an `expect class`'s primary
+    // constructor: the superseded expect was dropped during collection
+    // (recording its parameter list when it carried defaults), so
+    // transplant those defaults onto the matching `actual class` here
+    // (e.g. ktor's `expect class ConcurrentMap(initialCapacity: Int =
+    // INITIAL_CAPACITY)` makes the no-arg `ConcurrentMap()` shape
+    // construct through the actual).
+    if (expect_class_ctor_params.count() != 0) {
+        for (all_decls.items) |*d| {
+            if (d.* != .Class) continue;
+            const ac = &d.Class;
+            if (!ac.is_actual) continue;
+            const eparams = expect_class_ctor_params.get(ac.name.name) orelse continue;
+            if (ac.primary_params.len != eparams.len) continue;
+            for (ac.primary_params, eparams) |*ap, *ep| {
                 if (ap.default == null) ap.default = ep.default;
             }
         }

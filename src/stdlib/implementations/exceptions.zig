@@ -168,8 +168,8 @@ pub fn throwable_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
 }
 
-/// `Throwable.addSuppressed(other)` — klio is single-threaded and does not
-/// surface suppressed-exception chains in diagnostics, so this records
+/// `Throwable.addSuppressed(other)` — klio does not surface
+/// suppressed-exception chains in diagnostics, so this records
 /// nothing. Accepts any throwable-shaped receiver.
 pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     _ = ctx;

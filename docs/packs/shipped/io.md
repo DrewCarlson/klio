@@ -54,5 +54,6 @@ Top-level:
 ## Out of scope (for now)
 
 - `Source` / `Sink` interfaces.
-- Async pipelining (klio is single-threaded).
+- Async pipelining (kotlinx-io's own async surface is not shipped;
+  klio's ktor pack covers the async channel shapes).
 - Codec support beyond `String` (UTF-8) and big-endian primitives.

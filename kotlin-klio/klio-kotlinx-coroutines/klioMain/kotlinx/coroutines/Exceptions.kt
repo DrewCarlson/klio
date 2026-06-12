@@ -1,5 +1,5 @@
 // Bespoke klio platform layer: cancellation exception hierarchy.
-// Single-threaded model — no stack-trace recovery flag.
+// klio has no stack-trace recovery machinery, so no recovery flag.
 
 package kotlinx.coroutines
 

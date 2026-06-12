@@ -1,12 +1,18 @@
 //! Native bindings for `kotlinx.atomicfu`.
 //!
-//! klio runs single-threaded, so the "atomic" operations are
-//! trivially atomic: every binding mutates the instance's `value`
-//! field directly. The pack consumes upstream atomicfu commonMain
-//! `expect` declarations plus klio `actual`s (under `klioMain/`)
-//! that declare the class shapes; these bindings shadow the actual
-//! method bodies at dispatch time via the `installed_bindings`
-//! table on the interpreter.
+//! klio runs real worker threads (`kotlin.concurrent.thread`,
+//! `Dispatchers.Default`/`IO`), so every read-modify-write here —
+//! `compareAndSet`, `getAndSet`, the increment/add family — executes
+//! under a single exclusive borrow of the receiver's cell: the
+//! read, the compute, and the write-back happen while the cell's
+//! writer lock is held, so concurrent workers observe each operation
+//! atomically. The `kotlinx.atomicfu.locks` lock classes are backed
+//! by the same per-object reentrant monitor as `kotlin.synchronized`.
+//! The pack consumes upstream atomicfu commonMain `expect`
+//! declarations plus klio `actual`s (under `klioMain/`) that declare
+//! the class shapes; these bindings shadow the actual method bodies
+//! at dispatch time via the `installed_bindings` table on the
+//! interpreter.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -58,6 +64,23 @@ pub fn hostBindings(allocator: std.mem.Allocator) std.mem.Allocator.Error!HostBi
         .{ "kotlinx.atomicfu.AtomicBoolean.getAndSet", atomicBoolGetAndSet },
         .{ "kotlinx.atomicfu.AtomicRef.compareAndSet", atomicRefCas },
         .{ "kotlinx.atomicfu.AtomicRef.getAndSet", atomicRefGetAndSet },
+        // `kotlinx.atomicfu.locks`: the lock classes are real locks backed
+        // by the same per-object reentrant monitor as `kotlin.synchronized`
+        // (keyed on the receiver's identity), so a lock held on one worker
+        // thread excludes every other worker.
+        .{ "kotlinx.atomicfu.locks.ReentrantLock.lock", stdlib.implementations.concurrent_lock_enter },
+        .{ "kotlinx.atomicfu.locks.ReentrantLock.tryLock", stdlib.implementations.concurrent_lock_try_enter },
+        .{ "kotlinx.atomicfu.locks.ReentrantLock.unlock", stdlib.implementations.concurrent_lock_exit },
+        .{ "kotlinx.atomicfu.locks.SynchronousMutex.lock", stdlib.implementations.concurrent_lock_enter },
+        .{ "kotlinx.atomicfu.locks.SynchronousMutex.tryLock", stdlib.implementations.concurrent_lock_try_enter },
+        .{ "kotlinx.atomicfu.locks.SynchronousMutex.unlock", stdlib.implementations.concurrent_lock_exit },
+        // The pack's top-level `synchronized(lock, block)` shares the
+        // bare name `synchronized` with the stdlib host binding, and a
+        // bare call in a program that loads this pack can resolve to the
+        // pack's lifted declaration instead of the default import. Bind
+        // the pack fqn to the same monitor so both routes hold real
+        // exclusion.
+        .{ "kotlinx.atomicfu.locks.synchronized", stdlib.implementations.concurrent_synchronized },
     };
     for (bindings) |entry| {
         try b.register(entry[0], entry[1]);
@@ -95,44 +118,6 @@ const BoolResult = union(enum) {
     err: RuntimeError,
 };
 
-fn intField(inst: InstanceRef) IntResult {
-    const g = inst.borrow();
-    defer g.deinit();
-    if (g.get().get("value")) |v| {
-        switch (v) {
-            .Int => |i| return .{ .val = @as(i64, i) },
-            .Long => |l| return .{ .val = l },
-            else => {},
-        }
-    }
-    return .{ .err = .{ .Type = "AtomicInt: receiver missing `value: Int`" } };
-}
-
-fn longField(inst: InstanceRef) IntResult {
-    const g = inst.borrow();
-    defer g.deinit();
-    if (g.get().get("value")) |v| {
-        switch (v) {
-            .Long => |l| return .{ .val = l },
-            .Int => |i| return .{ .val = @as(i64, i) },
-            else => {},
-        }
-    }
-    return .{ .err = .{ .Type = "AtomicLong: receiver missing `value: Long`" } };
-}
-
-fn boolField(inst: InstanceRef) BoolResult {
-    const g = inst.borrow();
-    defer g.deinit();
-    if (g.get().get("value")) |v| {
-        switch (v) {
-            .Bool => |b| return .{ .val = b },
-            else => {},
-        }
-    }
-    return .{ .err = .{ .Type = "AtomicBoolean: receiver missing `value: Boolean`" } };
-}
-
 fn argInt(ctx: *const CallCtx, idx: usize) std.mem.Allocator.Error!IntResult {
     if (idx < ctx.args.len) {
         switch (ctx.args[idx]) {
@@ -154,24 +139,6 @@ fn argBool(ctx: *const CallCtx, idx: usize) std.mem.Allocator.Error!BoolResult {
     }
     const msg = try std.fmt.allocPrint(ctx.allocator, "kotlinx.atomicfu: argument {d} must be Boolean", .{idx});
     return .{ .err = .{ .Type = msg } };
-}
-
-fn storeInt(allocator: std.mem.Allocator, inst: InstanceRef, v: i64) std.mem.Allocator.Error!void {
-    const g = inst.borrowMut();
-    defer g.deinit();
-    try g.get().define(allocator, "value", Value.newInt(v));
-}
-
-fn storeLong(allocator: std.mem.Allocator, inst: InstanceRef, v: i64) std.mem.Allocator.Error!void {
-    const g = inst.borrowMut();
-    defer g.deinit();
-    try g.get().define(allocator, "value", .{ .Long = v });
-}
-
-fn storeBool(allocator: std.mem.Allocator, inst: InstanceRef, v: bool) std.mem.Allocator.Error!void {
-    const g = inst.borrowMut();
-    defer g.deinit();
-    try g.get().define(allocator, "value", .{ .Bool = v });
 }
 
 // ---------- AtomicInt ----------
@@ -389,23 +356,50 @@ fn atomicIntMinusAssign(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .val => |v| v,
         .err => |e| return .{ .err = e },
     };
-    const cur = switch (intField(inst)) {
-        .val => |v| v,
-        .err => |e| return .{ .err = e },
+    const step = struct {
+        fn run(d: i64, cur: i64) IntStep {
+            return .{ .next = cur -% d, .out = .Unit };
+        }
+    }.run;
+    return switch (try withIntFieldMut(ctx.allocator, inst, i64, delta, step)) {
+        .val => |v| ok(v),
+        .err => |e| .{ .err = e },
     };
-    try storeInt(ctx.allocator, inst, cur -% delta);
-    return ok(.Unit);
 }
 
 // ---------- AtomicLong ----------
 
+/// `withIntFieldMut` for `AtomicLong`: run `f` under a single exclusive
+/// borrow of the receiver so the read-modify-write is observed
+/// atomically by concurrent workers, storing the result back as `Long`.
+fn withLongFieldMut(
+    allocator: std.mem.Allocator,
+    inst: InstanceRef,
+    comptime ctxType: type,
+    fctx: ctxType,
+    f: *const fn (ctxType, i64) IntStep,
+) std.mem.Allocator.Error!StepResult {
+    const g = inst.borrowMut();
+    defer g.deinit();
+    const guard = g.get();
+    var cur: i64 = undefined;
+    if (guard.get("value")) |v| {
+        switch (v) {
+            .Long => |l| cur = l,
+            .Int => |i| cur = @as(i64, i),
+            else => return .{ .err = .{ .Type = "AtomicLong: receiver missing `value: Long`" } },
+        }
+    } else {
+        return .{ .err = .{ .Type = "AtomicLong: receiver missing `value: Long`" } };
+    }
+    const step = f(fctx, cur);
+    try guard.define(allocator, "value", .{ .Long = step.next });
+    return .{ .val = step.out };
+}
+
 fn atomicLongCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const inst = switch (receiverInstance(ctx)) {
         .inst => |i| i,
-        .err => |e| return .{ .err = e },
-    };
-    const cur = switch (longField(inst)) {
-        .val => |v| v,
         .err => |e| return .{ .err = e },
     };
     const expected = switch (try argInt(ctx, 1)) {
@@ -416,12 +410,21 @@ fn atomicLongCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .val => |v| v,
         .err => |e| return .{ .err = e },
     };
-    if (cur == expected) {
-        try storeLong(ctx.allocator, inst, update);
-        return ok(.{ .Bool = true });
-    } else {
-        return ok(.{ .Bool = false });
-    }
+    const Cap = struct { expected: i64, update: i64 };
+    const cap = Cap{ .expected = expected, .update = update };
+    const step = struct {
+        fn run(c: Cap, cur: i64) IntStep {
+            if (cur == c.expected) {
+                return .{ .next = c.update, .out = .{ .Bool = true } };
+            } else {
+                return .{ .next = cur, .out = .{ .Bool = false } };
+            }
+        }
+    }.run;
+    return switch (try withLongFieldMut(ctx.allocator, inst, Cap, cap, step)) {
+        .val => |v| ok(v),
+        .err => |e| .{ .err = e },
+    };
 }
 
 fn atomicLongGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -429,16 +432,19 @@ fn atomicLongGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .inst => |i| i,
         .err => |e| return .{ .err = e },
     };
-    const prev = switch (longField(inst)) {
-        .val => |v| v,
-        .err => |e| return .{ .err = e },
-    };
     const next = switch (try argInt(ctx, 1)) {
         .val => |v| v,
         .err => |e| return .{ .err = e },
     };
-    try storeLong(ctx.allocator, inst, next);
-    return ok(.{ .Long = prev });
+    const step = struct {
+        fn run(n: i64, cur: i64) IntStep {
+            return .{ .next = n, .out = .{ .Long = cur } };
+        }
+    }.run;
+    return switch (try withLongFieldMut(ctx.allocator, inst, i64, next, step)) {
+        .val => |v| ok(v),
+        .err => |e| .{ .err = e },
+    };
 }
 
 fn atomicLongGetAndIncrement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -446,12 +452,15 @@ fn atomicLongGetAndIncrement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .inst => |i| i,
         .err => |e| return .{ .err = e },
     };
-    const prev = switch (longField(inst)) {
-        .val => |v| v,
-        .err => |e| return .{ .err = e },
+    const step = struct {
+        fn run(_: void, cur: i64) IntStep {
+            return .{ .next = cur +% 1, .out = .{ .Long = cur } };
+        }
+    }.run;
+    return switch (try withLongFieldMut(ctx.allocator, inst, void, {}, step)) {
+        .val => |v| ok(v),
+        .err => |e| .{ .err = e },
     };
-    try storeLong(ctx.allocator, inst, prev +% 1);
-    return ok(.{ .Long = prev });
 }
 
 fn atomicLongGetAndDecrement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -459,12 +468,15 @@ fn atomicLongGetAndDecrement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .inst => |i| i,
         .err => |e| return .{ .err = e },
     };
-    const prev = switch (longField(inst)) {
-        .val => |v| v,
-        .err => |e| return .{ .err = e },
+    const step = struct {
+        fn run(_: void, cur: i64) IntStep {
+            return .{ .next = cur -% 1, .out = .{ .Long = cur } };
+        }
+    }.run;
+    return switch (try withLongFieldMut(ctx.allocator, inst, void, {}, step)) {
+        .val => |v| ok(v),
+        .err => |e| .{ .err = e },
     };
-    try storeLong(ctx.allocator, inst, prev -% 1);
-    return ok(.{ .Long = prev });
 }
 
 fn atomicLongIncrementAndGet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -472,13 +484,16 @@ fn atomicLongIncrementAndGet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .inst => |i| i,
         .err => |e| return .{ .err = e },
     };
-    const cur = switch (longField(inst)) {
-        .val => |v| v,
-        .err => |e| return .{ .err = e },
+    const step = struct {
+        fn run(_: void, cur: i64) IntStep {
+            const n = cur +% 1;
+            return .{ .next = n, .out = .{ .Long = n } };
+        }
+    }.run;
+    return switch (try withLongFieldMut(ctx.allocator, inst, void, {}, step)) {
+        .val => |v| ok(v),
+        .err => |e| .{ .err = e },
     };
-    const next = cur +% 1;
-    try storeLong(ctx.allocator, inst, next);
-    return ok(.{ .Long = next });
 }
 
 fn atomicLongDecrementAndGet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -486,13 +501,16 @@ fn atomicLongDecrementAndGet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .inst => |i| i,
         .err => |e| return .{ .err = e },
     };
-    const cur = switch (longField(inst)) {
-        .val => |v| v,
-        .err => |e| return .{ .err = e },
+    const step = struct {
+        fn run(_: void, cur: i64) IntStep {
+            const n = cur -% 1;
+            return .{ .next = n, .out = .{ .Long = n } };
+        }
+    }.run;
+    return switch (try withLongFieldMut(ctx.allocator, inst, void, {}, step)) {
+        .val => |v| ok(v),
+        .err => |e| .{ .err = e },
     };
-    const next = cur -% 1;
-    try storeLong(ctx.allocator, inst, next);
-    return ok(.{ .Long = next });
 }
 
 fn atomicLongGetAndAdd(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -500,16 +518,19 @@ fn atomicLongGetAndAdd(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .inst => |i| i,
         .err => |e| return .{ .err = e },
     };
-    const prev = switch (longField(inst)) {
-        .val => |v| v,
-        .err => |e| return .{ .err = e },
-    };
     const delta = switch (try argInt(ctx, 1)) {
         .val => |v| v,
         .err => |e| return .{ .err = e },
     };
-    try storeLong(ctx.allocator, inst, prev +% delta);
-    return ok(.{ .Long = prev });
+    const step = struct {
+        fn run(d: i64, cur: i64) IntStep {
+            return .{ .next = cur +% d, .out = .{ .Long = cur } };
+        }
+    }.run;
+    return switch (try withLongFieldMut(ctx.allocator, inst, i64, delta, step)) {
+        .val => |v| ok(v),
+        .err => |e| .{ .err = e },
+    };
 }
 
 fn atomicLongAddAndGet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -521,13 +542,16 @@ fn atomicLongAddAndGet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .val => |v| v,
         .err => |e| return .{ .err = e },
     };
-    const cur = switch (longField(inst)) {
-        .val => |v| v,
-        .err => |e| return .{ .err = e },
+    const step = struct {
+        fn run(d: i64, cur: i64) IntStep {
+            const n = cur +% d;
+            return .{ .next = n, .out = .{ .Long = n } };
+        }
+    }.run;
+    return switch (try withLongFieldMut(ctx.allocator, inst, i64, delta, step)) {
+        .val => |v| ok(v),
+        .err => |e| .{ .err = e },
     };
-    const next = cur +% delta;
-    try storeLong(ctx.allocator, inst, next);
-    return ok(.{ .Long = next });
 }
 
 fn atomicLongPlusAssign(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -547,12 +571,15 @@ fn atomicLongMinusAssign(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .val => |v| v,
         .err => |e| return .{ .err = e },
     };
-    const cur = switch (longField(inst)) {
-        .val => |v| v,
-        .err => |e| return .{ .err = e },
+    const step = struct {
+        fn run(d: i64, cur: i64) IntStep {
+            return .{ .next = cur -% d, .out = .Unit };
+        }
+    }.run;
+    return switch (try withLongFieldMut(ctx.allocator, inst, i64, delta, step)) {
+        .val => |v| ok(v),
+        .err => |e| .{ .err = e },
     };
-    try storeLong(ctx.allocator, inst, cur -% delta);
-    return ok(.Unit);
 }
 
 // ---------- AtomicBoolean ----------
@@ -560,10 +587,6 @@ fn atomicLongMinusAssign(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 fn atomicBoolCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const inst = switch (receiverInstance(ctx)) {
         .inst => |i| i,
-        .err => |e| return .{ .err = e },
-    };
-    const cur = switch (boolField(inst)) {
-        .val => |v| v,
         .err => |e| return .{ .err = e },
     };
     const expected = switch (try argBool(ctx, 1)) {
@@ -574,12 +597,20 @@ fn atomicBoolCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .val => |v| v,
         .err => |e| return .{ .err = e },
     };
+    // Compare and swap under one exclusive borrow so two racing workers
+    // cannot both observe the expected value and both report success.
+    const g = inst.borrowMut();
+    defer g.deinit();
+    const guard = g.get();
+    const cur: bool = if (guard.get("value")) |v| switch (v) {
+        .Bool => |b| b,
+        else => return typeErr("AtomicBoolean: receiver missing `value: Boolean`"),
+    } else return typeErr("AtomicBoolean: receiver missing `value: Boolean`");
     if (cur == expected) {
-        try storeBool(ctx.allocator, inst, update);
+        try guard.define(ctx.allocator, "value", .{ .Bool = update });
         return ok(.{ .Bool = true });
-    } else {
-        return ok(.{ .Bool = false });
     }
+    return ok(.{ .Bool = false });
 }
 
 fn atomicBoolGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -587,15 +618,18 @@ fn atomicBoolGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .inst => |i| i,
         .err => |e| return .{ .err = e },
     };
-    const prev = switch (boolField(inst)) {
-        .val => |v| v,
-        .err => |e| return .{ .err = e },
-    };
     const next = switch (try argBool(ctx, 1)) {
         .val => |v| v,
         .err => |e| return .{ .err = e },
     };
-    try storeBool(ctx.allocator, inst, next);
+    const g = inst.borrowMut();
+    defer g.deinit();
+    const guard = g.get();
+    const prev: bool = if (guard.get("value")) |v| switch (v) {
+        .Bool => |b| b,
+        else => return typeErr("AtomicBoolean: receiver missing `value: Boolean`"),
+    } else return typeErr("AtomicBoolean: receiver missing `value: Boolean`");
+    try guard.define(ctx.allocator, "value", .{ .Bool = next });
     return ok(.{ .Bool = prev });
 }
 
@@ -606,11 +640,6 @@ fn atomicRefCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .inst => |i| i,
         .err => |e| return .{ .err = e },
     };
-    const cur = blk: {
-        const g = inst.borrow();
-        defer g.deinit();
-        break :blk g.get().get("value") orelse Value.Null;
-    };
     const expected = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
     const update = if (ctx.args.len > 2) ctx.args[2] else Value.Null;
     // atomicfu `compareAndSet` is a CAS: it compares by *referential
@@ -619,15 +648,19 @@ fn atomicRefCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // coroutine algorithms swap on sentinel-object identity (e.g.
     // `_closeCause.compareAndSet(NO_CLOSE_CAUSE, cause)`); structural
     // equality mis-CASes distinct-but-equal objects and corrupts
-    // that state.
+    // that state. The compare and the swap run under one exclusive
+    // borrow so the read cannot interleave with another worker's
+    // write (`LockFreeLinkedList` and the channel state machines rely
+    // on this for their helping protocols).
+    const g = inst.borrowMut();
+    defer g.deinit();
+    const guard = g.get();
+    const cur = guard.get("value") orelse Value.Null;
     if (Value.referenceEq(&cur, &expected)) {
-        const g = inst.borrowMut();
-        defer g.deinit();
-        try g.get().define(ctx.allocator, "value", update);
+        try guard.define(ctx.allocator, "value", update);
         return ok(.{ .Bool = true });
-    } else {
-        return ok(.{ .Bool = false });
     }
+    return ok(.{ .Bool = false });
 }
 
 fn atomicRefGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -635,17 +668,12 @@ fn atomicRefGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .inst => |i| i,
         .err => |e| return .{ .err = e },
     };
-    const prev = blk: {
-        const g = inst.borrow();
-        defer g.deinit();
-        break :blk g.get().get("value") orelse Value.Null;
-    };
     const next = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
-    {
-        const g = inst.borrowMut();
-        defer g.deinit();
-        try g.get().define(ctx.allocator, "value", next);
-    }
+    const g = inst.borrowMut();
+    defer g.deinit();
+    const guard = g.get();
+    const prev = guard.get("value") orelse Value.Null;
+    try guard.define(ctx.allocator, "value", next);
     return ok(prev);
 }
 
@@ -731,10 +759,15 @@ fn fieldInt(inst: InstanceRef) i64 {
 test "host bindings registers every atomicfu symbol" {
     var b = try hostBindings(testing.allocator);
     defer b.deinit();
-    try testing.expectEqual(@as(usize, 24), b.len());
+    try testing.expectEqual(@as(usize, 31), b.len());
     try testing.expect(b.resolve("kotlinx.atomicfu.AtomicInt.compareAndSet") != null);
     try testing.expect(b.resolve("kotlinx.atomicfu.AtomicRef.getAndSet") != null);
     try testing.expect(b.resolve("kotlinx.atomicfu.AtomicBoolean.getAndSet") != null);
+    try testing.expect(b.resolve("kotlinx.atomicfu.locks.ReentrantLock.lock") != null);
+    try testing.expect(b.resolve("kotlinx.atomicfu.locks.ReentrantLock.tryLock") != null);
+    try testing.expect(b.resolve("kotlinx.atomicfu.locks.ReentrantLock.unlock") != null);
+    try testing.expect(b.resolve("kotlinx.atomicfu.locks.SynchronousMutex.lock") != null);
+    try testing.expect(b.resolve("kotlinx.atomicfu.locks.synchronized") != null);
 }
 
 test "AtomicInt compareAndSet succeeds and fails" {
@@ -908,6 +941,85 @@ test "AtomicRef compareAndSet by identity and getAndSet" {
     const gs = try atomicRefGetAndSet(&gs_ctx);
     try testing.expect(gs.ok == .Instance);
     try testing.expect(InstanceRef.ptrEq(gs.ok.Instance, sentinel));
+}
+
+const StressLongWorker = struct {
+    inst: InstanceRef,
+    iters: usize,
+
+    fn run(self: StressLongWorker) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var h = runtime.NoopHost.init(a);
+        var cap = runtime.CaptureOutput.init(a);
+        var args = [_]Value{.{ .Instance = self.inst }};
+        var i: usize = 0;
+        while (i < self.iters) : (i += 1) {
+            var ctx = makeCtx(a, &args, &h, &cap);
+            const r = atomicLongIncrementAndGet(&ctx) catch unreachable;
+            std.debug.assert(r == .ok);
+        }
+    }
+};
+
+test "AtomicLong increment loses no update across real threads" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const THREADS: usize = 8;
+    const ITERS: usize = 2000;
+    const inst = try makeInstance(a, "AtomicLong", .{ .Long = 0 });
+
+    var threads: [THREADS]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, StressLongWorker.run, .{
+            StressLongWorker{ .inst = inst, .iters = ITERS },
+        });
+    }
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(i64, THREADS * ITERS), fieldInt(inst));
+}
+
+const StressBoolCasWorker = struct {
+    inst: InstanceRef,
+    wins: *std.atomic.Value(usize),
+
+    fn run(self: StressBoolCasWorker) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var h = runtime.NoopHost.init(a);
+        var cap = runtime.CaptureOutput.init(a);
+        var args = [_]Value{ .{ .Instance = self.inst }, .{ .Bool = false }, .{ .Bool = true } };
+        var ctx = makeCtx(a, &args, &h, &cap);
+        const r = atomicBoolCas(&ctx) catch unreachable;
+        if (r == .ok and r.ok.Bool) {
+            _ = self.wins.fetchAdd(1, .monotonic);
+        }
+    }
+};
+
+test "AtomicBoolean compareAndSet has exactly one winner per round" {
+    const ROUNDS: usize = 100;
+    const THREADS: usize = 4;
+    var round: usize = 0;
+    while (round < ROUNDS) : (round += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const inst = try makeInstance(a, "AtomicBoolean", .{ .Bool = false });
+        var wins = std.atomic.Value(usize).init(0);
+
+        var threads: [THREADS]std.Thread = undefined;
+        for (&threads) |*t| {
+            t.* = try std.Thread.spawn(.{}, StressBoolCasWorker.run, .{
+                StressBoolCasWorker{ .inst = inst, .wins = &wins },
+            });
+        }
+        for (threads) |t| t.join();
+        try testing.expectEqual(@as(usize, 1), wins.load(.monotonic));
+    }
 }
 
 test "missing receiver and bad args yield Type errors" {

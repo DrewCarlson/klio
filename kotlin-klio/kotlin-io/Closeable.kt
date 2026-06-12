@@ -2,9 +2,9 @@
 //
 // The upstream commonMain declaration is `public expect inline fun`
 // with a per-platform body — JVM has the suppressed-exception path,
-// Native has a simple try/finally. klio is single-threaded with a
-// straight finally semantics, so we ship the common-shape body
-// directly here.
+// Native has a simple try/finally. klio does not surface
+// suppressed-exception chains, so it ships the Native-shaped
+// try/finally body directly here.
 
 package kotlin
 

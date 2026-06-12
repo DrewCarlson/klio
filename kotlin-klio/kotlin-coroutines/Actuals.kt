@@ -15,9 +15,11 @@
 //    Result to the parked activation) are bound natively in
 //    klio-stdlib and bridge onto the interpreter's frame-snapshot
 //    suspension engine.
-//  - SafeContinuation is the upstream JVM state machine ported to a
-//    single-threaded plain field (klio is GIL-serialized, so the
-//    lock-free CAS loop collapses to a straight-line `when`).
+//  - SafeContinuation is the upstream JVM state machine with the
+//    lock-free CAS loop replaced by monitor-guarded transitions
+//    (`kotlin.synchronized` on the instance), so a resume arriving
+//    from a worker thread races safely against the suspending
+//    caller's `getOrThrow`.
 
 package kotlin.coroutines
 
@@ -75,7 +77,17 @@ internal class KlioContinuation<T>(
     }
 }
 
-// --- SafeContinuation (upstream JVM logic, single-threaded) --------
+// --- SafeContinuation (upstream JVM logic) -------------------------
+//
+// The JVM actual runs its UNDECIDED/SUSPENDED/RESUMED transitions
+// through an atomic CAS because a continuation captured inside a
+// `suspendCoroutine` block can be resumed from another thread (a
+// `Dispatchers.Default` worker) while the suspending caller races
+// through `getOrThrow`. klio's workers are real OS threads, so the
+// transitions here hold the instance's monitor (`kotlin.synchronized`,
+// the host's per-object reentrant lock): each state step is observed
+// atomically, and the delegate resume runs outside the monitor exactly
+// like the upstream post-CAS resume.
 
 private enum class KlioCoState { UNDECIDED, RESUMED }
 
@@ -93,27 +105,36 @@ internal class SafeContinuation<in T> @PublishedApi internal constructor(
     private var result: Any? = initialResult
 
     public override fun resumeWith(result: Result<T>) {
-        val cur = this.result
-        when {
-            cur === KlioCoState.UNDECIDED -> {
-                this.result = result
+        val resumeDelegate = kotlin.synchronized(this) {
+            val cur = this.result
+            when {
+                cur === KlioCoState.UNDECIDED -> {
+                    this.result = result
+                    false
+                }
+                cur === COROUTINE_SUSPENDED -> {
+                    this.result = KlioCoState.RESUMED
+                    true
+                }
+                else -> throw IllegalStateException("Already resumed")
             }
-            cur === COROUTINE_SUSPENDED -> {
-                this.result = KlioCoState.RESUMED
-                delegate.resumeWith(result)
-            }
-            else -> throw IllegalStateException("Already resumed")
+        }
+        if (resumeDelegate) {
+            delegate.resumeWith(result)
         }
     }
 
     @PublishedApi
     internal fun getOrThrow(): Any? {
-        val cur = this.result
-        if (cur === KlioCoState.UNDECIDED) {
-            this.result = COROUTINE_SUSPENDED
-            return COROUTINE_SUSPENDED
+        val cur = kotlin.synchronized(this) {
+            val seen = this.result
+            if (seen === KlioCoState.UNDECIDED) {
+                this.result = COROUTINE_SUSPENDED
+            }
+            seen
         }
         return when {
+            cur === KlioCoState.UNDECIDED -> COROUTINE_SUSPENDED
             cur === KlioCoState.RESUMED -> COROUTINE_SUSPENDED
             cur is Result<*> -> cur.getOrThrow()
             else -> cur

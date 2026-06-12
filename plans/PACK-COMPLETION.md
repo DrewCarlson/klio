@@ -84,8 +84,9 @@ companion collided with the actual's; now skipped, and
 `LocalDate.parse` / `fromEpochDays` work. Also added **LocalTime /
 LocalDateTime parse companions** (riding the same fix) and the
 **`kotlinx.atomicfu.locks`** package (ReentrantLock / SynchronizedObject
-/ synchronized / SynchronousMutex — trivial uncontended shims, no host
-bindings, since the runtime is single-threaded).
+/ synchronized / SynchronousMutex — since upgraded to real locks
+host-bound to the per-object reentrant monitor behind
+`kotlin.synchronized`, as the runtime runs real worker threads).
 
 Still open (needs careful design, not a quick patch):
 - **bare 0-arg `println()` inside a receiver lambda prints the receiver**

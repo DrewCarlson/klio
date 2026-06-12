@@ -6,9 +6,10 @@
 // with the `Removed` sentinel on `_next`, and `correctPrev` runs
 // the helping protocol when an observer encounters a half-completed
 // remove. klio's atomicfu CAS is observed atomically under
-// contention (see the kotlinx-atomicfu Rust-side single-borrow
-// RMW), so the algorithm is sound across real `Dispatchers.Default`
-// worker threads.
+// contention (the host binding compares and swaps under one
+// exclusive borrow of the receiver's cell; see
+// `src/kotlinx_atomicfu`), so the algorithm is sound across real
+// `Dispatchers.Default` worker threads.
 
 package kotlinx.coroutines.internal
 

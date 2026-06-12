@@ -729,9 +729,19 @@ immediate-resume race check, no-park fast path) is pinned
 kotlinc+kotlinx-coroutines byte-parity by
 `manual_continuation_slot_park_and_resume` in `parity_suspend_shapes`.
 
-Multi-thread contention on one channel (real `Dispatchers.Default` writers
-racing readers) is untested; the locks actual is a no-op on the grounds that
-channel operations serialize on the cooperative pump.
+The `io.ktor.utils.io.locks` actual is a real lock (host-bound to the same
+per-object reentrant monitor as `kotlin.synchronized`), so the
+`flushBufferMutex` sections in `ByteChannel` hold genuine exclusion across
+OS threads, and the channel's atomicfu `Slot` CAS runs under the receiver
+cell's writer lock; the `concurrency_stress` itest gates the lock actuals
+under real-thread contention and the channel's flush/read interleavings on
+the pump. True cross-OS-thread channel suspension (a `kotlin.concurrent.thread`
+writer resuming a reader parked on another thread's pump) is still blocked:
+the suspension engine cannot yet resume a continuation parked on a foreign
+pump (a worker-thread `runBlocking` writer racing a driver `readRemaining`
+fails with nondeterministic internal type errors), and `Dispatchers.Default`
+currently executes bodies on the calling pump rather than routing through
+`__kxco_dispatch`.
 
 **Option opened:** with the async write side live, the client engine could
 stream response bodies through a real `ByteChannel` (writer job feeding the

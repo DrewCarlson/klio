@@ -134,6 +134,16 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-ktor-client",
     } },
+    // Threaded stress gate for the pack concurrency primitives
+    // (ConcurrentMap/Attributes computeIfAbsent once-only, the ktor locks
+    // actuals, ByteChannel written from a Default worker) through child
+    // `klio` + installed packs, with KLIO_RACE_JITTER widening the windows.
+    .{ .name = "concurrency_stress", .parity_data = false, .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-io",
+        "kotlin-klio/klio-ktor-client",
+    } },
     // Reified inline Json extension shapes through the installed pack
     // (kotlinc-verified expected output; the in-process parity harness
     // does not fold in the serialization pack).

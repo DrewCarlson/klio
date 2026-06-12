@@ -25,7 +25,7 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done
 - [x] `kotlinx.io` — Buffer.size as property; Source/Sink interfaces; base64/hex codecs; protobuf-varint read/write.
 - [x] `kotlinx.coroutines` — cooperative scheduler, cancellation tokens, Job.cancel observable, CancellationException, ensureActive, withContext/coroutineScope/supervisorScope, Channel.tryReceive/size/isClosedForSend. Continuation-state-machine interleaving across launched tasks remains gated on the IR cutover (#28).
 - [x] `kotlinx.datetime` — DateTimePeriod + plusPeriod/minusPeriod; DateTimeUnit object + TimeBased/DateBased + plusUnit/plusDateUnit/minusUnit/minusDateUnit; Int/Long Duration extension properties.
-- [x] `kotlinx.atomicfu` — full surface. (Fence semantics are intentionally no-ops since klio is single-threaded; documented in pack docs.)
+- [x] `kotlinx.atomicfu` — full surface. (Fence semantics are intentionally no-ops: every atomic operation is already sequentially consistent through the receiver cell's lock; documented in pack docs.)
 
 ## ktor-client
 

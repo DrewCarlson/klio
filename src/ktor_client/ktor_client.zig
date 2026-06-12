@@ -5,8 +5,8 @@
 //! helpers `__kktor_request` / `__kktor_get` / `__kktor_post` are
 //! bound here against a small blocking HTTP/1.1 transport built on the
 //! platform sockets, keeping the dependency footprint modest and
-//! avoiding pulling a full async runtime into klio's single-threaded
-//! interpreter.
+//! avoiding pulling a full async runtime into the interpreter: each
+//! request blocks the calling thread for its duration.
 //!
 //! Each request returns a flat `Array<String>` shaped like
 //! `[statusCode, body, contentType, headerKey, headerVal, ...]` so
@@ -47,6 +47,19 @@ pub fn hostBindings(allocator: Allocator) Allocator.Error!HostBindings {
     // Platform clock for `io.ktor.util.date` (the posix actual reads it
     // via cinterop; klio supplies the wall-clock epoch millis).
     try b.register("io.ktor.util.date.getTimeMillis", get_time_millis);
+    // `io.ktor.utils.io.locks.ReentrantLock`: real locks over the same
+    // per-object reentrant monitor as `kotlin.synchronized`, keyed on
+    // the receiver's identity. A `ByteChannel` can be written from a
+    // `Dispatchers.Default` worker while another coroutine reads, so
+    // the lock actual must hold real exclusion across threads.
+    try b.register("io.ktor.utils.io.locks.ReentrantLock.lock", stdlib.implementations.concurrent_lock_enter);
+    try b.register("io.ktor.utils.io.locks.ReentrantLock.tryLock", stdlib.implementations.concurrent_lock_try_enter);
+    try b.register("io.ktor.utils.io.locks.ReentrantLock.unlock", stdlib.implementations.concurrent_lock_exit);
+    // The locks actual's top-level `synchronized(lock, block)` shares the
+    // bare name with the stdlib host binding; bind the pack fqn so a call
+    // that resolves to the pack's lifted declaration (instead of the
+    // default import) still holds the real monitor.
+    try b.register("io.ktor.utils.io.locks.synchronized", stdlib.implementations.concurrent_synchronized);
     return b;
 }
 
@@ -217,8 +230,8 @@ fn httpRequest(allocator: Allocator, in: RequestInputs) TransportError![][]const
     defer _ = linux.close(fd);
     applyTimeout(fd, in.timeout_ms);
 
-    // The interpreter is single-threaded; `GET`/`HEAD`/`DELETE` and any
-    // empty-body method skip sending a request body.
+    // `GET`/`HEAD`/`DELETE` and any empty-body method skip sending a
+    // request body.
     const send_body = !(std.mem.eql(u8, in.method, "GET") or
         std.mem.eql(u8, in.method, "HEAD") or
         std.mem.eql(u8, in.method, "DELETE") or
@@ -708,10 +721,10 @@ fn write_response(allocator: Allocator, fd: i32, status: i64, content_type: []co
 /// `__kktor_serve(port, dispatch)`: bind `127.0.0.1:port` and serve
 /// forever. Each request is handed to `dispatch` — a Kotlin lambda
 /// `(Array<String>) -> Array<String>` taking `[method, path, body]` and
-/// returning `[status, contentType, body]` — run on this thread. The
-/// interpreter is single-threaded, so connections are handled
-/// sequentially, which is sufficient for the blocking `start(wait=true)`
-/// model.
+/// returning `[status, contentType, body]` — run on this thread.
+/// Connections are accepted and handled sequentially on the serving
+/// thread (the dispatch lambda must run on the Vm that owns it), which
+/// is sufficient for the blocking `start(wait=true)` model.
 fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const port: u16 = blk: {
@@ -867,6 +880,9 @@ test "host bindings register the engine surface" {
     try testing.expect(b.resolve("io.ktor.client.engine.__kktor_setHeader") != null);
     try testing.expect(b.resolve("io.ktor.server.engine.__kktor_serve") != null);
     try testing.expect(b.resolve("io.ktor.util.date.getTimeMillis") != null);
+    try testing.expect(b.resolve("io.ktor.utils.io.locks.ReentrantLock.lock") != null);
+    try testing.expect(b.resolve("io.ktor.utils.io.locks.ReentrantLock.tryLock") != null);
+    try testing.expect(b.resolve("io.ktor.utils.io.locks.ReentrantLock.unlock") != null);
     try testing.expect(b.resolve("io.ktor.client.engine.__nope") == null);
 }
 

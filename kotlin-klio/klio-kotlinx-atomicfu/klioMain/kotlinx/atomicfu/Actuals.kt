@@ -2,10 +2,12 @@
 //
 // The upstream commonMain (consumed from the in-pack submodule)
 // declares the public `expect` surface. This file supplies the
-// matching klio `actual`s. The bodies are thin Kotlin; the Rust
-// host bindings in this crate (src/lib.rs) shadow every atomic
-// operation at dispatch time, so the field-mutating bodies here
-// are only a fallback that is never taken when the pack is loaded.
+// matching klio `actual`s. The bodies are thin Kotlin; the host
+// bindings in `src/kotlinx_atomicfu` shadow every atomic operation
+// at dispatch time with a read-modify-write that holds the
+// receiver's cell lock (atomic across worker threads), so the
+// field-mutating bodies here are only a fallback that is never
+// taken when the pack is loaded.
 
 package kotlinx.atomicfu
 

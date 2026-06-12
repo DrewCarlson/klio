@@ -309,3 +309,15 @@ test "reified_ctor_ref_inference" {
         \\
     );
 }
+
+test "copy_into_named_args" {
+    try check("copy_into_named_args",
+        \\0,0,8,7,0,0
+        \\0,0,8,7,0,0
+        \\0,0,9,8,7,6
+        \\0,0,8,7,0,0
+        \\0,4,5,6,0
+        \\null,b,c,null
+        \\
+    );
+}

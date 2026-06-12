@@ -1,8 +1,8 @@
-// Real CPU-parallel async. Two `async(Dispatchers.Default)` each run
-// a deterministic heavy sum on a real worker thread; their results
-// cross threads back to the awaiter. The total must be exact
-// regardless of interleaving — proves correctness across dispatched
-// threads (wall-clock speedup is verified manually in the gate).
+// Dispatched async exactness. Two `async(Dispatchers.Default)` each
+// run a deterministic heavy sum and the awaited total must be exact
+// regardless of interleaving. (Dispatcher bodies currently execute on
+// the calling pump, so this pins the dispatch/await plumbing, not
+// OS-thread parallelism.)
 //> 999999000000
 import kotlinx.coroutines.*
 

@@ -63,6 +63,74 @@ fn monitorFor(key: usize) std.mem.Allocator.Error!*Monitor {
     return gop.value_ptr.*;
 }
 
+/// Acquire (reentrant) the monitor for `key`: block until the monitor
+/// is free or already owned by the calling thread, then take/deepen
+/// ownership. The enter ordering is carried by the monitor's own
+/// `SpinMutex` acquire.
+pub fn monitorEnter(key: usize) std.mem.Allocator.Error!void {
+    const mon = try monitorFor(key);
+    const me = std.Thread.getCurrentId();
+    while (true) {
+        mon.mutex.lock();
+        if (mon.state.owner) |o| {
+            if (o == me) {
+                mon.state.depth += 1;
+                mon.mutex.unlock();
+                return;
+            }
+            // Held by another thread: release the guard and yield, then
+            // retry the acquire.
+            mon.mutex.unlock();
+            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
+        } else {
+            mon.state.owner = me;
+            mon.state.depth = 1;
+            mon.mutex.unlock();
+            return;
+        }
+    }
+}
+
+/// Non-blocking monitor acquire for `key`. Returns true when the
+/// calling thread now owns the monitor (a fresh take or a reentrant
+/// deepen), false when another thread holds it.
+pub fn monitorTryEnter(key: usize) std.mem.Allocator.Error!bool {
+    const mon = try monitorFor(key);
+    const me = std.Thread.getCurrentId();
+    mon.mutex.lock();
+    defer mon.mutex.unlock();
+    if (mon.state.owner) |o| {
+        if (o == me) {
+            mon.state.depth += 1;
+            return true;
+        }
+        return false;
+    }
+    mon.state.owner = me;
+    mon.state.depth = 1;
+    return true;
+}
+
+/// Release one level of the monitor for `key`; clear ownership when
+/// fully released so a waiter can acquire. Returns false when the
+/// calling thread does not own the monitor (the caller decides whether
+/// that is an error — JVM monitors throw IllegalMonitorStateException).
+/// The exit ordering is carried by the monitor's `SpinMutex` release.
+pub fn monitorExit(key: usize) std.mem.Allocator.Error!bool {
+    const mon = try monitorFor(key);
+    const me = std.Thread.getCurrentId();
+    mon.mutex.lock();
+    defer mon.mutex.unlock();
+    const owner = mon.state.owner orelse return false;
+    if (owner != me) return false;
+    mon.state.depth -= 1;
+    if (mon.state.depth == 0) {
+        mon.state.owner = null;
+    }
+    return true;
+}
+
 /// `synchronized(lock) { body }` / `synchronized(lock, { body })`.
 ///
 /// A real reentrant monitor keyed by the `lock` argument's object
@@ -79,49 +147,46 @@ pub fn concurrent_synchronized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
     else
         return .{ .err = .{ .Arity = "synchronized expects (lock, block)" } };
     const key = lock.lockIdentity() orelse 0;
-    const mon = try monitorFor(key);
-    const me = std.Thread.getCurrentId();
-
-    // Acquire (reentrant): block until the monitor is free or already
-    // owned by this thread, then take/deepen ownership.
-    while (true) {
-        mon.mutex.lock();
-        if (mon.state.owner) |o| {
-            if (o == me) {
-                mon.state.depth += 1;
-                mon.mutex.unlock();
-                break;
-            }
-            // Held by another thread: release the guard and yield, then
-            // retry the acquire.
-            mon.mutex.unlock();
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
-        } else {
-            mon.state.owner = me;
-            mon.state.depth = 1;
-            mon.mutex.unlock();
-            break;
-        }
-    }
-    // Monitor enter: ordering carried by the SpinMutex acquire above.
-
+    try monitorEnter(key);
     const result = ctx.host.invokeCallable(&block, &.{}, ctx.out);
-
-    // Monitor exit: ordering carried by the SpinMutex release below.
-    // Release one level; clear ownership when fully released so a
-    // waiter can acquire.
-    {
-        mon.mutex.lock();
-        defer mon.mutex.unlock();
-        if (mon.state.depth > 0) {
-            mon.state.depth -= 1;
-        }
-        if (mon.state.depth == 0) {
-            mon.state.owner = null;
-        }
-    }
+    _ = try monitorExit(key);
     return result;
+}
+
+/// Monitor key for a lock-object receiver: its object identity, or the
+/// shared sentinel `0` for identity-less values (mirrors
+/// `concurrent_synchronized`).
+fn receiverLockKey(ctx: *const CallCtx) usize {
+    if (ctx.args.len > 0) {
+        if (ctx.args[0].lockIdentity()) |k| return k;
+    }
+    return 0;
+}
+
+/// `ReentrantLock.lock()` (and the other bare lock-class acquires the
+/// packs bind: `kotlinx.atomicfu.locks`, `io.ktor.utils.io.locks`).
+/// Blocks until the receiver's monitor is owned; reentrant.
+pub fn concurrent_lock_enter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    try monitorEnter(receiverLockKey(ctx));
+    return .{ .ok = .Unit };
+}
+
+/// `ReentrantLock.tryLock()` — non-blocking acquire of the receiver's
+/// monitor; reports whether the calling thread now owns it.
+pub fn concurrent_lock_try_enter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const got = try monitorTryEnter(receiverLockKey(ctx));
+    return .{ .ok = .{ .Bool = got } };
+}
+
+/// `ReentrantLock.unlock()` — release one level of the receiver's
+/// monitor. Unlocking a monitor the calling thread does not own is an
+/// error (the JVM throws IllegalMonitorStateException here).
+pub fn concurrent_lock_exit(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const released = try monitorExit(receiverLockKey(ctx));
+    if (!released) {
+        return .{ .err = .{ .Type = "unlock() called by a thread that does not hold the lock" } };
+    }
+    return .{ .ok = .Unit };
 }
 
 /// Whether a value is something we can invoke as a thread body.
@@ -261,6 +326,107 @@ test "distinct value locks map to the sentinel monitor" {
     try testing.expectEqual(m0, m0_again);
     const m1 = try monitorFor(1);
     try testing.expect(m0 != m1);
+}
+
+test "monitor enter is reentrant and exit releases by depth" {
+    const key: usize = 0xC0FFEE;
+    try monitorEnter(key);
+    try monitorEnter(key); // reentrant deepen, no self-deadlock
+    try testing.expect(try monitorTryEnter(key)); // reentrant try also succeeds
+    try testing.expect(try monitorExit(key));
+    try testing.expect(try monitorExit(key));
+    try testing.expect(try monitorExit(key));
+    // Fully released: exit without ownership reports failure.
+    try testing.expect(!(try monitorExit(key)));
+}
+
+const MonitorWorker = struct {
+    key: usize,
+    counter: *i64,
+    iters: usize,
+
+    fn run(self: MonitorWorker) void {
+        var i: usize = 0;
+        while (i < self.iters) : (i += 1) {
+            monitorEnter(self.key) catch unreachable;
+            // Unsynchronized read-modify-write; only the monitor makes
+            // it exact across the workers.
+            self.counter.* += 1;
+            _ = monitorExit(self.key) catch unreachable;
+        }
+    }
+};
+
+test "monitor excludes across real threads" {
+    const key: usize = 0xBEEF01;
+    const THREADS: usize = 8;
+    const ITERS: usize = 2000;
+    var counter: i64 = 0;
+    var threads: [THREADS]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, MonitorWorker.run, .{
+            MonitorWorker{ .key = key, .counter = &counter, .iters = ITERS },
+        });
+    }
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(i64, THREADS * ITERS), counter);
+}
+
+const TryEnterHolder = struct {
+    key: usize,
+    held: *std.atomic.Value(bool),
+    release: *std.atomic.Value(bool),
+
+    fn run(self: TryEnterHolder) void {
+        monitorEnter(self.key) catch unreachable;
+        self.held.store(true, .release);
+        while (!self.release.load(.acquire)) {
+            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
+        }
+        _ = monitorExit(self.key) catch unreachable;
+    }
+};
+
+test "tryEnter fails while another thread holds the monitor" {
+    const key: usize = 0xBEEF02;
+    var held = std.atomic.Value(bool).init(false);
+    var release = std.atomic.Value(bool).init(false);
+    const holder = try std.Thread.spawn(.{}, TryEnterHolder.run, .{
+        TryEnterHolder{ .key = key, .held = &held, .release = &release },
+    });
+    while (!held.load(.acquire)) {
+        std.atomic.spinLoopHint();
+        std.Thread.yield() catch {};
+    }
+    try testing.expect(!(try monitorTryEnter(key)));
+    release.store(true, .release);
+    holder.join();
+    // Released by the holder: this thread can now take and release it.
+    try testing.expect(try monitorTryEnter(key));
+    try testing.expect(try monitorExit(key));
+}
+
+test "lock bindings acquire and release through the receiver identity" {
+    var h = runtime.NoopHost.init(testing.allocator);
+    defer h.deinit();
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    // Identity-less receiver falls back to the shared sentinel key; the
+    // enter/exit pairing must still balance.
+    var args = [_]Value{.{ .Int = 1 }};
+    var ctx = makeCtx(h.host(), cap.output(), &args);
+    const l = try concurrent_lock_enter(&ctx);
+    try testing.expect(l == .ok and l.ok == .Unit);
+    const t = try concurrent_lock_try_enter(&ctx);
+    try testing.expect(t == .ok and t.ok.Bool == true);
+    const rel_a = try concurrent_lock_exit(&ctx);
+    try testing.expect(rel_a == .ok);
+    const rel_b = try concurrent_lock_exit(&ctx);
+    try testing.expect(rel_b == .ok);
+    // Over-unlock is the JVM's IllegalMonitorStateException shape.
+    const rel_c = try concurrent_lock_exit(&ctx);
+    try testing.expect(rel_c == .err and rel_c.err == .Type);
 }
 
 test "Thread.sleep accepts integer types and returns Unit" {

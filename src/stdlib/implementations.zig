@@ -38,6 +38,9 @@ pub const compare_values = collections.compare_values;
 pub const materialise_sequence = collections.materialise_sequence;
 pub const primitive_companion_const = collections.primitive_companion_const;
 pub const concurrent_synchronized = concurrent.concurrent_synchronized;
+pub const concurrent_lock_enter = concurrent.concurrent_lock_enter;
+pub const concurrent_lock_try_enter = concurrent.concurrent_lock_try_enter;
+pub const concurrent_lock_exit = concurrent.concurrent_lock_exit;
 
 /// One registered intrinsic: a fully qualified Kotlin name and the host
 /// function that implements it.
@@ -1193,6 +1196,23 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.synchronized", .names = &.{"lock", "block"} },
     .{ .fqn = "kotlin.concurrent.thread", .names = &.{"start", "isDaemon", "contextClassLoader", "name", "priority", "block"} },
     .{ .fqn = "kotlin.concurrent.Thread.sleep", .names = &.{"millis"} },
+    // `copyInto(destination, destinationOffset, startIndex, endIndex)` —
+    // kotlinx-io's `Segment.writeTo` calls it with named arguments, so a
+    // missing entry here silently dropped the named offsets and copied
+    // nothing (zeroed bytes on the buffer compact path).
+    .{ .fqn = "kotlin.Array.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.IntArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.LongArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.DoubleArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.FloatArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.ShortArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.ByteArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.CharArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.BooleanArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.UIntArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.ULongArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.UShortArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
+    .{ .fqn = "kotlin.UByteArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
 };
 
 /// Hashed lookup map built from `TABLE`, the single source of truth. The
