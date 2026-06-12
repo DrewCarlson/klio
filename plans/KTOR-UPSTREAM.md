@@ -751,7 +751,8 @@ validated, then the corresponding shim file is deleted):
    into the `client-upstream` *feature* (a parallel staging feature that won't
    collide with the live shim `client` feature), then once `HttpClient` works
    there, point `client` at it and delete `shim/client/*` in one step.
-   *In progress, consumed into `client-upstream`:*
+   *DONE — `client` is the upstream feature and `shim/client` is deleted
+   (see Status). Staging history:*
    - `HttpRequest.kt` (the real `HttpRequestBuilder` — url: URLBuilder,
      headers: HeadersBuilder, body: OutgoingContent — plus the immutable
      `HttpRequestData`/`HttpResponseData`) + `RequestBody.kt` — builds a
@@ -903,75 +904,117 @@ with a kotlinc-parity corpus test.
 
 ## Status
 
-The protocol foundation, the full URL layer, `Attributes`, the **Pipeline
-runtime**, the **body content layer**, and the **channel read side** consume
-real upstream and execute. The remaining work is the staged **cores**
-consumption above, which is what removes the simplified `Application` /
-`ApplicationCall` / `HttpClient` shim redeclarations. The async `ByteChannel`
-write side remains gated on coroutine-suspension fidelity (not on the cores'
-critical path under the synchronous-execution hypothesis). The shim stays in
-place so client/server keep working until each layer's upstream replacement is
-validated.
+The client swap is COMPLETE: the `client` feature IS the upstream
+ktor-client-core commonMain (request/statement/call layers, the plugin API,
+all default plugins, `HttpClient` + `HttpClientConfig`), and `shim/client/*`
+is deleted. klio supplies exactly two platform pieces under
+`shim/client-upstream`: the `KlioClientEngine` actual over the host
+`__kktor_request` transport, and the engine-less `HttpClient()` actual bound
+to it (each upstream platform's actual resolves a default engine its own
+way — JVM via ServiceLoader, native via the `engines` loader list; klio
+ships one engine, so its actual binds `KlioClient` directly). Both
+`HttpClient()` and `HttpClient(KlioClient) { followRedirects = ... }`
+construct and a GET single-sends end to end (status `200 OK` + body),
+asserted by the `ktor_client_get` itest whose in-process server counts
+requests (the send-count oracle).
 
-## Zig-tree status: shim client green and gated; upstream GET reaches the engine
+`client-serialization` composes with the upstream client: klio's
+`ContentNegotiation` plugin is built on the real plugin API
+(`createClientPlugin` + `transformRequestBody`/`transformResponseBody`, the
+same hooks `HttpPlainText` uses). The response hook decodes a `body<T>()`
+request the default transformers don't cover via the kotlinx-serialization
+bridge (`Json.decodeToClass(text, requestedType.type)`); the request hook
+serializes a non-primitive `setBody(value)` to a JSON `TextContent` via
+`Json.encodeValue`. `install(ContentNegotiation) { json() }` +
+`resp.body<User>()` round-trips a typed GET (itest-gated).
 
-The shim `client` feature performs a real GET end to end (status 200 +
-body, single send), and `client-serialization` deserializes a typed
-`body<T>()` — both gated forever by the `ktor_client_get` itest, which
-builds + installs the packs into a scratch HOME, owns a localhost HTTP
-server in-process, and drives the installed `klio` binary as a child.
-Two transport bugs found and fixed on the way: a stale installed
-`io.ktor` pack (feature gating from an old manifest loaded the upstream
-client files alongside the shim — rebuilding/reinstalling restored the
-gate) and the engine's `makeSockaddrIn` writing the IPv4 octets
-byte-swapped (`readInt(.big)` into `addr` — connect went to 1.0.0.127).
+Getting the upstream path to single-send root-caused a stack of general
+interpreter bugs, each pinned (parity fixtures in
+`tests/fixtures/parity_corpus`, or the itest):
 
-Under `client-upstream`, `HttpClient(KlioClient).get(url)` now drives
-the full upstream composition through the engine — `__kktor_request`
-issues the real HTTP request and the response flows back through
-`HttpClientCall` / `DefaultHttpResponse` / the receive bridge — after a
-stack of root-caused interpreter fixes, each pinned by a kotlinc-parity
-fixture in `tests/fixtures/parity_corpus`:
+- **The error-discipline hole**: a real failure escaping an executed
+  candidate body surfaced as `Unimplemented` — indistinguishable from a
+  dispatch miss — so fallback chains swallowed it and re-ran candidates
+  (one logical GET issued 8 sends: each enclosing dispatch tier doubled
+  the send chain). `evalWithCapturesChained` / `resumeContinuation` now
+  re-tag an `Unimplemented` escaping a body as `CalleeFailed`
+  (EvalError + RuntimeError variants), which every dispatch walk
+  propagates immediately; `Unimplemented` remains strictly the
+  pre-commit probe-miss sentinel. Load-time top-level-val deferral
+  treats `CalleeFailed` like the missing-symbol cases it already defers.
+- **File-private top-level properties are now file-scoped.** Fifteen
+  upstream plugin files each declare `private val LOGGER` (SaveBody's
+  `by lazy`); klio's flat globals collapsed them into one slot, crossing
+  a delegated property with plain instances (`getValue` dispatched on a
+  logger). The build driver mangles a private top-level property whose
+  simple name another file also declares to a per-file name; bare
+  reads/writes rewrite through the reference's span file
+  (`file_private_props/` two-file fixture).
+- **A captured local extension function called bare from a nested lambda
+  prepends the call-site receiver** (the `on(Send) { handleCall(...) }`
+  shape lost its `Sender`, shifting every parameter by one — this was
+  the "1 of 9 proceeds loses its receiver" signal). Local-ext-fn names
+  now travel the lambda capture boundary like receiver-lambda params
+  (`local_ext_fn_capture_receiver.kt`).
+- **An explicit `name = null` named argument binds null** — the
+  named-arg reorder popped trailing Nulls, so `cleanup(cause = null)`
+  lost its argument and `when (cause) { null -> ... }` took the wrong
+  arm, masking a join-forever path (`named_arg_explicit_null.kt`).
+- **Comma-separated `when` conditions short-circuit** left to right at
+  the first match (kotlinc order). The eager or-chain evaluated every
+  condition, so `Source::class, Input::class ->` (DefaultTransform)
+  failed on the unconsumed `Input` and silently skipped the matched
+  branch — bodyAsText then saw an untransformed channel
+  (`when_comma_conditions_lazy.kt`).
+- **A primitive/String member param declines a callable argument**, so
+  `logger.trace { ... }` drops the anon-object member `trace(String)`
+  and binds the inline `Logger.trace(() -> String)` extension; the
+  anon-object method walk applies the same param-type disproof
+  (`member_lambda_param_vs_inline_ext.kt`).
+- **Inline-overload receiver narrowing types a plain local** from its
+  annotation or recorded initializer call, so `val resp =
+  client.get(url); resp.body<User>()` splices the `HttpResponse.body`
+  overload, not `HttpClientCall.body`.
+- **An explicit-receiver receiver-lambda call with no `this` capture
+  splits arg0 off as the receiver** (the plugin-API hook invoke shape
+  `handler(Context(), a, b, c)`); previously the context bound the
+  first value param and shifted everything.
+- **A typealiased param type adjudicates under its expansion** in the
+  member disproof (the coroutines file-private `typealias Node =
+  LockFreeLinkedListNode` must not be confused with another pack's
+  same-simple-name class).
+- **`Json.ext(...)`-style extension calls through a companioned class
+  name construct the companion**: a user extension whose declared
+  receiver matches the class (or an ancestor) now drives the companion
+  singleton gate, so `Json.encodeValue(x)` binds `fun Json.encodeValue`.
+- Diagnostics name themselves: a `call_member`/`get_field`/`set_field`
+  miss on an instance prints the class fqn instead of `<instance>`, and
+  the `[PATH]` class label prints the fqn. The klio `KtorSimpleLogger`
+  actual defaults to INFO (matching upstream's unset `KTOR_LOG_LEVEL`),
+  and the charset actual gained the `decode(Source)` overload
+  `bodyAsText` drains through.
 
-- operator dispatch (`config += this`) is receiver-PROVEN, so a `val`
-  declaring only `plusAssign` no longer binds `String?.plus`
-  (`compound_assign_val_plus_assign.kt`);
-- a `(T) -> Unit` lambda invoked receiver-style (`client.apply(it)`)
-  fills its positional param with the receiver
-  (`apply_fills_positional_param.kt`);
-- a lone member overload declines on over-supply, so stdlib
-  `buildString { }` resolves inside a class declaring a zero-arg
-  `buildString()` (`member_shadowed_buildstring.kt`);
-- a function-typed member param rejects a definitely-non-callable
-  argument, so `url(urlString)` reaches the String extension past the
-  member `url(block)` (`fn_param_member_vs_string_extension.kt`);
-- init-block thunks record their bound params and the companion walk
-  covers the full supertype graph, so a bare private-companion call in
-  a base-class init block resolves through an interface-first subtype
-  (`init_block_companion_call.kt`); `StringValuesImpl.tableSizeFor` and
-  `caseInsensitiveHashCode` run;
-- named-arg dispatch checks param names, members outrank extensions,
-  and `typealias CompletionHandler = (Throwable?) -> Unit` params are
-  recognized as function-typed — with non-Function-subtype instances
-  (JobNode) still disproving the member
-  (`iface_default_named_overload_typealias.kt`);
-- a bare call whose own member is a non-callable property falls through
-  to the same-named top-level fn (`bare_call_prop_vs_toplevel_fn.kt`),
-  fixing `HttpStatusCode.Companion`'s `allStatusCodes = allStatusCodes()`;
-- bare `coroutineContext` with no driver scope reads the empty context
-  (kotlinc: a suspend body always has one), so `Pipeline.execute` runs
-  from `suspend fun main`;
-- the lenient extension pass honors a definite receiver disproof, so
-  `Pipeline.execute` never binds on a coroutine/class receiver;
-- `HttpRequestRetry.kt` is consumed (HttpSend reads its
-  `MaxRetriesPerRequestAttributeKey`).
+Known deferred items:
 
-**Remaining `client-upstream` blocker:** one logical GET issues 8 sends
-and ends in `ClassCastException: cast to HttpClientCall failed`. The
-proximate signals: an empty-payload `Unimplemented` error escaping the
-plugin-hook lambdas (`HttpRedirect.handleCall` and siblings) is treated
-as a dispatch miss somewhere up the chain, re-driving the send; and one
-`on(Send)` handler invocation loses its `Sender` receiver (`unresolved
-global proceed`, 1 of 9 dispatches). Root-causing that swallow is the
-next step; the stage-3 swap (point `client` at upstream, delete
-`shim/client/*`) stays parked until the upstream path single-sends.
+- The async `ByteChannel` write side still needs coroutine-suspension
+  fidelity; nothing in the GET path requires it (responses are buffered
+  read-side channels).
+- The upstream nonJvm `Loader.kt` + posix `HttpClient.kt` pair is NOT
+  consumed: `Loader.kt`'s private nested `engines.Node` class lifts
+  under its bare name and collides with the coroutines pack's
+  file-private `typealias Node`, mis-typing the LockFreeLinkedList
+  member walk (and `as Node` casts). The klio engine-less actual makes
+  the loader unnecessary; if it is ever consumed, private nested
+  classes need the same scope-true mangling file-private properties got.
+- A reified inline extension called through a companioned class name
+  inside a lambda with no expected type (`Json.encodeToString(x)` in a
+  hook body) does not inline-splice and needs the runtime companion
+  path; the shim avoids the shape via the non-reified bridges.
+- `internal` top-level properties of the same simple name in different
+  packages still share one global slot (the LOGGER fix covers `private`
+  only); package-scoped resolution is a follow-up.
+
+Next: **server core** (`Application`/`ApplicationCall`/routing/
+`respondText` on upstream; klio engine actual over `__kktor_serve`;
+delete `shim/server/*`), then `server-serialization` on the same
+ContentNegotiation pattern.

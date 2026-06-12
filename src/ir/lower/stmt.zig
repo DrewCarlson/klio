@@ -141,6 +141,14 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             try b.markAnyTyped(p.name.name);
         }
     }
+    // Record the local's declared type (or its initializer expression when
+    // un-annotated) so inline-overload receiver narrowing can type a plain
+    // local receiver (`val resp = client.get(url); resp.body<T>()`).
+    if (p.ty) |ty| {
+        try b.setLocalDeclType(p.name.name, ty.name.name);
+    } else if (p.init) |*e| {
+        if (e.* == .Call) try b.setLocalInitExpr(p.name.name, e);
+    }
     if (b.isBoxed(p.name.name)) {
         // Captured `var` — box into a shared cell so writes
         // from a nested closure / coroutine are visible
@@ -208,6 +216,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             .{ .class = o, .members = try b.enclosingMembersForChild() }
         else
             null;
+        const inherited_lef = try b.localExtFnNames();
         const lowered = try lowerLambdaBodyCapturingKindWith(
             b.module,
             param_idents,
@@ -218,6 +227,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             tailrec_self,
             true,
             inherited_rlp,
+            inherited_lef,
             enclosing_owner,
         );
         const body_func = lowered.func;
@@ -593,8 +603,10 @@ fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg) Al
                 } });
             } else {
                 // Top-level binding: route through StoreGlobal so
-                // the tree-walker setter / delegate fires.
-                const n = try b.module.internConst(b.allocator, .{ .String = seg });
+                // the tree-walker setter / delegate fires. A renamed
+                // file-private property writes its per-file global.
+                const target_name = expr_mod.filePrivatePropRename(b, seg, p.segments[0].span.file.int()) orelse seg;
+                const n = try b.module.internConst(b.allocator, .{ .String = target_name });
                 try b.push(.{ .StoreGlobal = .{ .name = n, .value = combined } });
             }
         },

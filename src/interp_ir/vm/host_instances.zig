@@ -391,6 +391,7 @@ fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []con
             .Type => |m| .{ .err = .{ .Type = m } },
             .Arity => |m| .{ .err = .{ .Arity = m } },
             .Unimplemented => |m| .{ .err = .{ .Unimplemented = m } },
+            .CalleeFailed => |m| .{ .err = .{ .CalleeFailed = m } },
             else => .{ .err = try typeErr(self.allocator, "{s}", .{@tagName(e)}) },
         },
     };

@@ -446,6 +446,7 @@ fn runtimeErrorMessage(allocator: Allocator, e: RuntimeError) []const u8 {
         .Type => |s| s,
         .Arity => |s| s,
         .Unimplemented => |s| s,
+        .CalleeFailed => |s| s,
         .NoMain => "no main function",
         else => std.fmt.allocPrint(allocator, "{any}", .{e}) catch "runtime error",
     };

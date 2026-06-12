@@ -98,8 +98,16 @@ pub const EvalError = union(enum) {
     Arity: []const u8,
     /// Unbound identifier reachable through the IR.
     Unbound: []const u8,
-    /// Operation not yet implemented on this value.
+    /// Operation not yet implemented on this value. Doubles as the
+    /// dispatch-miss sentinel: a candidate probe that does not apply
+    /// reports `Unimplemented` and the resolver walks on.
     Unimplemented: []const u8,
+    /// A function body was entered and its execution failed to resolve an
+    /// operation (an `Unimplemented` escaping the body's own frame).
+    /// Distinct from `Unimplemented` so no dispatch fallback ever treats
+    /// a candidate that ran — possibly with side effects — as a candidate
+    /// that did not apply; this error always propagates.
+    CalleeFailed: []const u8,
     /// A suspension point fired (`delay` / `yield` / `suspendCoroutine`).
     /// Each `evalWithCaptures` frame on the unwind path pushes its
     /// `FrameSnapshot` onto `state.frames` (innermost last) and
@@ -625,6 +633,12 @@ pub fn evalWithCapturesChained(
     if (result == .ok) {
         coerceIntToLongTy(func.return_ty, &result.ok);
     }
+    // The body ran: an `Unimplemented` escaping it is a real failure of
+    // an executed statement, not a dispatch miss. Re-tag it so no
+    // enclosing candidate walk retries (and re-executes) this body.
+    if (result == .err and result.err == .Unimplemented) {
+        result = errResult(.{ .CalleeFailed = result.err.Unimplemented });
+    }
     return result;
 }
 
@@ -719,6 +733,9 @@ pub fn resumeContinuation(
                     }
                     pending_throw_from_inner = exc;
                 },
+                // A resumed frame ran; its unresolved-operation failure is
+                // real, never a dispatch miss (see `CalleeFailed`).
+                .Unimplemented => |msg| return errResult(.{ .CalleeFailed = msg }),
                 else => return errResult(e),
             },
         }
@@ -1988,7 +2005,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     break;
                 },
                 .err => |e| switch (e) {
-                    .Suspended => return errResult(e),
+                    .Suspended, .CalleeFailed => return errResult(e),
                     .Unimplemented => {},
                     else => if (first_real_err == null) {
                         first_real_err = e;
@@ -2008,7 +2025,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                         break;
                     },
                     .err => |e| switch (e) {
-                        .Suspended => return errResult(e),
+                        .Suspended, .CalleeFailed => return errResult(e),
                         .Unimplemented => {},
                         else => if (first_real_err == null) {
                             first_real_err = e;

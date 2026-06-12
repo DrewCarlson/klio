@@ -71,6 +71,33 @@ pub fn setLowerSelfPackage(pkg: []const u8) []const u8 {
     return prev;
 }
 
+/// File-private top-level property renames: span FileId -> (simple name ->
+/// mangled global name). Kotlin scopes a `private` top-level property to
+/// its declaring file, but the lowered globals table is flat, so the build
+/// driver mangles a private property whose simple name another file also
+/// declares and bare references resolve through the reference's own span
+/// file (an inline-spliced body keeps its declaring file's spans, so a
+/// splice still reads the right file's property).
+pub const FilePrivateRenames = std.AutoHashMap(u32, std.StringHashMap([]const u8));
+
+threadlocal var lower_file_private_renames: ?*const FilePrivateRenames = null;
+
+/// Install the per-file private-property rename table for the duration of
+/// a lowering pass. Returns the previous value for restoration.
+pub fn setLowerFilePrivateRenames(m: ?*const FilePrivateRenames) ?*const FilePrivateRenames {
+    const prev = lower_file_private_renames;
+    lower_file_private_renames = m;
+    return prev;
+}
+
+/// The mangled global name for `name` referenced from `file`, when that
+/// file declares it as a renamed file-private top-level property.
+pub fn filePrivateRename(name: []const u8, file: u32) ?[]const u8 {
+    const m = lower_file_private_renames orelse return null;
+    const inner = m.get(file) orelse return null;
+    return inner.get(name);
+}
+
 pub const FuncBuilder = struct {
     allocator: Allocator,
     module: *Module,
@@ -160,6 +187,13 @@ pub const FuncBuilder = struct {
     /// Subset of `local_fns` declared as extensions (`fun R.f(...)`);
     /// a bare call must prepend the implicit receiver as `this`.
     local_ext_fns: StringSet,
+    /// Declared type annotation per local (`val resp: HttpResponse`),
+    /// used by inline-overload receiver narrowing.
+    local_decl_types: std.StringHashMap([]const u8),
+    /// Recorded initializer expression per un-annotated local, so the
+    /// narrowing can infer a type from the init call's return type. The
+    /// AST outlives the lowering pass.
+    local_init_exprs: std.StringHashMap(*const ast.Expr),
     /// Params whose declared type is a receiver-typed function
     /// (`block: T.() -> R`). A bare call `block(...)` on one of these
     /// must dispatch with the enclosing `this` as the implicit
@@ -229,6 +263,8 @@ pub const FuncBuilder = struct {
             .private_method_fids = StringFuncIdMap.init(allocator),
             .param_names = StringSet.init(allocator),
             .local_fns = StringSet.init(allocator),
+            .local_decl_types = std.StringHashMap([]const u8).init(allocator),
+            .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
             .local_ext_fns = StringSet.init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
             .generic_typed_params = StringSet.init(allocator),
@@ -270,6 +306,8 @@ pub const FuncBuilder = struct {
         self.private_method_fids.deinit();
         self.param_names.deinit();
         self.local_fns.deinit();
+        self.local_decl_types.deinit();
+        self.local_init_exprs.deinit();
         self.local_ext_fns.deinit();
         self.receiver_lambda_params.deinit();
         self.generic_typed_params.deinit();
@@ -633,6 +671,23 @@ pub const FuncBuilder = struct {
     pub fn tailrecSelf(self: *const FuncBuilder) ?[]const u8 {
         return self.tailrec_self;
     }
+    /// Record a local's declared type / initializer for inline-overload
+    /// receiver narrowing.
+    pub fn setLocalDeclType(self: *FuncBuilder, name: []const u8, ty: []const u8) Allocator.Error!void {
+        try self.local_decl_types.put(name, ty);
+        _ = self.local_init_exprs.remove(name);
+    }
+    pub fn setLocalInitExpr(self: *FuncBuilder, name: []const u8, e: *const ast.Expr) Allocator.Error!void {
+        try self.local_init_exprs.put(name, e);
+        _ = self.local_decl_types.remove(name);
+    }
+    pub fn localDeclType(self: *const FuncBuilder, name: []const u8) ?[]const u8 {
+        return self.local_decl_types.get(name);
+    }
+    pub fn localInitExpr(self: *const FuncBuilder, name: []const u8) ?*const ast.Expr {
+        return self.local_init_exprs.get(name);
+    }
+
     pub fn markLocalFn(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.local_fns.put(name, {});
     }
@@ -664,6 +719,19 @@ pub const FuncBuilder = struct {
     }
     pub fn unmarkReceiverLambdaParam(self: *FuncBuilder, name: []const u8) void {
         _ = self.receiver_lambda_params.remove(name);
+    }
+    /// The local-extension-function names this builder knows. The caller
+    /// owns the returned set.
+    pub fn localExtFnNames(self: *const FuncBuilder) Allocator.Error!StringSet {
+        return cloneStringSet(self.allocator, &self.local_ext_fns);
+    }
+    /// Seed this builder's local-extension-function set from an enclosing
+    /// scope's, so a captured local ext fn called bare in a nested lambda
+    /// still gets the enclosing receiver prepended. Copies the names; the
+    /// caller keeps ownership of `names`.
+    pub fn inheritLocalExtFns(self: *FuncBuilder, names: *const StringSet) Allocator.Error!void {
+        var it = names.keyIterator();
+        while (it.next()) |k| try self.local_ext_fns.put(k.*, {});
     }
     pub fn markGenericTypedParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.generic_typed_params.put(name, {});

@@ -753,10 +753,35 @@ fn writeBackLvalue(b: *FuncBuilder, target: *const Expr, val: Reg) Allocator.Err
     }
 }
 
+/// The mangled per-file global for a bare `name` referenced from the file
+/// `file`, or null when the reference is not a read of a renamed
+/// file-private top-level property. Locals, lambda/anon-object captures,
+/// and own class members shadow the property (Kotlin scope order), so the
+/// rename only applies when none of them bind the name.
+pub fn filePrivatePropRename(b: *FuncBuilder, name: []const u8, file: u32) ?[]const u8 {
+    const renamed = build.filePrivateRename(name, file) orelse return null;
+    if (b.resolve(name) != null) return null;
+    if (b.knowsOuter(name)) return null;
+    if (decl_mod.isLowerAnonCapture(name)) return null;
+    if (b.hasOwnMember(name)) return null;
+    return renamed;
+}
+
 /// `Path` lowering — the full bare-name resolution ladder.
 fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const segments = expr.Path.segments;
     const span0 = expr.Path.span;
+
+    // File-private top-level property rename: a bare reference from the
+    // declaring file resolves to the per-file mangled global. Locals,
+    // captures, and own members keep shadowing it (Kotlin scope order).
+    if (filePrivatePropRename(b, segments[0].name, segments[0].span.file.int())) |renamed| {
+        const new_segs = try b.allocator.dupe(ast.Ident, segments);
+        defer b.allocator.free(new_segs);
+        new_segs[0] = .{ .name = renamed, .span = segments[0].span };
+        const rewritten = Expr{ .Path = .{ .segments = new_segs, .span = span0 } };
+        return lowerExpr(b, &rewritten);
+    }
 
     // `const val name = <literal>` inline.
     if (segments.len == 1 and b.ownerClass() != null and b.resolve(segments[0].name) == null) {
@@ -1400,6 +1425,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     defer outer_boxed.deinit();
     const enclosing_owner = try enclosingOwnerFor(b);
 
+    const inherited_lef = try b.localExtFnNames();
     const lowered = try lowerLambdaBodyCapturing(
         b.module,
         lam.params,
@@ -1407,6 +1433,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         outer_names,
         &outer_boxed,
         inherited_rlp,
+        inherited_lef,
         enclosing_owner,
     );
     const body_func = lowered.func;
@@ -1466,6 +1493,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     defer outer_boxed.deinit();
     const enclosing_owner = try enclosingOwnerFor(b);
 
+    const inherited_lef = try b.localExtFnNames();
     const lowered = try lowerLambdaBodyCapturingKind(
         b.module,
         param_idents,
@@ -1475,6 +1503,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         &outer_boxed,
         null,
         inherited_rlp,
+        inherited_lef,
         enclosing_owner,
     );
     const captured_names = lowered.captures;
@@ -2501,6 +2530,37 @@ fn lowerValueInvocation(
                 .receiver = tr,
                 .args = run[0],
                 .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+    }
+
+    // A bare call to a local *extension* function reached as a capture:
+    // prepend the enclosing receiver as the closure's leading `this`
+    // param, mirroring the declaring-scope arm below (`handleCall(...)`
+    // inside an `on(Send) { ... }` lambda binds the Sender receiver).
+    if (b.isLocalExtFn(name0) and b.resolve(name0) == null and b.knowsOuter(name0)) {
+        const this_reg: ?Reg = if (b.knowsOuter("this") or b.capturesThisSlot())
+            try resolveCapture(b, "this")
+        else
+            b.resolve("this");
+        if (this_reg) |tr| {
+            const callee_r = try resolveCapture(b, name0);
+            const recv = b.allocReg();
+            try b.push(.{ .Move = .{ .dst = recv, .src = tr } });
+            const vals = try b.allocator.alloc(Reg, args.len + 1);
+            defer b.allocator.free(vals);
+            vals[0] = recv;
+            for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
+            const args_start = try packContiguous(b, vals);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            try b.push(.{ .CallValue = .{
+                .dst = dst,
+                .callee = callee_r,
+                .args = args_start,
+                .n_args = @intCast(vals.len),
                 .arg_names = arg_names,
             } });
             return dst;

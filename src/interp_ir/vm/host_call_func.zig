@@ -196,6 +196,7 @@ fn runtimeErrorToEval(allocator: Allocator, e: RuntimeError) EvalError {
         .Type => |s| .{ .Type = s },
         .Arity => |s| .{ .Arity = s },
         .Unimplemented => |s| .{ .Unimplemented = s },
+        .CalleeFailed => |s| .{ .CalleeFailed = s },
         else => typeErr(allocator, "{s}", .{@tagName(e)}),
     };
 }
@@ -813,7 +814,6 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
             const defaults = funcDefaults(self, func);
             var reordered: std.ArrayList(Value) = .empty;
             defer reordered.deinit(allocator);
-            var truncated = false;
             for (slots, 0..) |slot, i| {
                 if (slot) |v| {
                     try reordered.append(allocator, v);
@@ -834,14 +834,10 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                 } else {
                     // No value and no default: a trailing omitted param.
                     // Hand the prefix to call_func, whose own padding
-                    // finishes the job.
-                    truncated = true;
+                    // finishes the job. An explicitly supplied trailing
+                    // `null` stays in place — `f(cause = null)` must bind
+                    // Null, not re-default or pad as Unit.
                     break;
-                }
-            }
-            if (!truncated) {
-                while (reordered.items.len != 0 and reordered.items[reordered.items.len - 1] == .Null) {
-                    _ = reordered.pop();
                 }
             }
             return callFunc(self, allocator, module, func, reordered.items);

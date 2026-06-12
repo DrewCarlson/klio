@@ -158,14 +158,12 @@ include = [
     "io/ktor/http/URLBuilderPosix.kt",
 ]
 
-# Client-core foundation (cores stage 1 — engine boundary). These are the
-# client-core types with no `shim/client` equivalent, so they sit in core
-# without colliding: `EmptyContent` (request-body default), the engine config
-# base, and the engine-capability interface (`HttpClientEngineCapability`'s
-# eager `DEFAULT_CAPABILITIES` references the not-yet-consumed timeout plugin;
-# klio defers a missing-symbol top-level-val init to on-access). Client types
-# that DO shadow the shim (`HttpRequestBuilder`/`HttpResponse`/`HttpClient`)
-# wait for the stage-3 feature swap.
+# Upstream ktor-client-core commonMain. The engine layer (`EmptyContent`,
+# the engine config base, the capability interface) is ungated core
+# (`HttpClientEngineCapability`'s eager `DEFAULT_CAPABILITIES` references
+# the timeout plugin; klio defers a missing-symbol top-level-val init to
+# on-access). The client itself (request/statement/call layers, default
+# plugins, `HttpClient`) is gated under the `client` feature.
 [[source]]
 root = "upstream/ktor-client/ktor-client-core/common/src"
 include = [
@@ -176,10 +174,8 @@ include = [
     "io/ktor/client/engine/HttpClientEngineBase.kt",
     "io/ktor/client/engine/HttpClientEngineFactory.kt",
     "io/ktor/client/engine/Utils.kt",
-    # Upstream client core (request/statement/call layers). These shadow
-    # `shim/client` declarations, so they are gated under the `client-upstream`
-    # feature (the stage-3 swap that replaces `shim/client`) rather than core —
-    # otherwise they collide with the shim under `--feature client`.
+    # Upstream client core (request/statement/call layers + the default
+    # plugins + HttpClient itself), gated under the `client` feature.
     "io/ktor/client/content/ObservableContent.kt",
     "io/ktor/client/request/RequestBody.kt",
     "io/ktor/client/request/HttpRequest.kt",
@@ -247,13 +243,14 @@ id = "kotlinx.io"
 # enabled, so a plain client/server program needs no serializer.
 [features]
 default = []
-# ktor-client-core: HttpClient + request/response builder DSL.
-client = { sources = ["shim/client"] }
-# Staged upstream client-core consumption (stage 3 — see plans/KTOR-UPSTREAM).
-# Gates the real upstream client files that shadow `shim/client`; building up
-# here in parallel keeps the shim `client` feature working until the swap is
-# complete (then `client` points here and `shim/client` is deleted).
-client-upstream = { sources = [
+# ktor-client-core: the real upstream client (HttpClient + plugins +
+# request/response pipelines), consumed verbatim from commonMain. klio
+# supplies the platform pieces under `shim/client-upstream`: the
+# `KlioClientEngine` actual over the host `__kktor_request` transport and
+# the engine-less `HttpClient()` actual bound to it (each platform's
+# actual resolves a default engine its own way; klio ships one engine).
+# Both `HttpClient()` and `HttpClient(KlioClient)` construct.
+client = { sources = [
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/utils/ClientEvents.kt",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/content/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/request/",
@@ -267,8 +264,9 @@ client-upstream = { sources = [
 # ktor-server-core: embeddedServer + routing + respondText.
 server = { sources = ["shim/server"] }
 # ktor-client-content-negotiation + ktor-serialization-kotlinx-json:
-# typed body<T>() / setBody<T>() and ContentNegotiation { json() }. Pulls
-# the serialization pack's `json` feature (its core alone has no Json).
+# `install(ContentNegotiation) { json() }` backed by kotlinx-serialization,
+# so the upstream `body<T>()` / `setBody(value)` round-trip typed JSON.
+# Pulls the serialization pack's `json` feature (its core alone has no Json).
 client-serialization = { sources = ["shim/client-serialization"], deps = ["kotlinx.serialization/json"], requires = ["client"] }
 # ktor-server-content-negotiation + ktor-serialization-kotlinx-json:
 # typed respond<T>() / receive<T>() and ContentNegotiation { json() }.
