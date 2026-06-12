@@ -10,7 +10,7 @@ jobs:
   build-and-test:
     name: zig build + test
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       # The kotlin-klio/*/upstream vendor trees (kotlinx + ktor sources the
       # interpreter consumes at runtime) are submodules; without them every
@@ -61,21 +61,22 @@ jobs:
           path: |
             ~/.cache/zig
             .zig-cache
-          key: zig-0.16.0-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
+          key: zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
           restore-keys: |
-            zig-0.16.0-${{ hashFiles('build.zig.zon') }}-
+            zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-
 
       - name: zig build
         run: zig build
 
-      # -j3: the test graph compiles a second (ReleaseSafe) module universe for
-      # the program-running harness binaries; those optimizing compiles and the
-      # heaviest harness steps peak at several GB each, and four concurrent
-      # jobs can exhaust the 16GB runner. Three keeps the peak bounded without
-      # throttling the cold compile the way -j2 did; with a warm cache the
-      # limit is moot.
+      # -Dharness-optimize=Debug: locally the program-running harness binaries
+      # compile a second ReleaseSafe module universe so interpreted test
+      # programs run ~5x faster across thousands of iterations. CI runs each
+      # step once, so the slower Debug interpreter costs a couple of minutes
+      # while the second universe's optimizing compiles cost tens of minutes
+      # on a 4-vCPU runner. One universe here; the ReleaseSafe configuration
+      # runs in the harness-release workflow (manual / nightly).
       - name: zig build test
-        run: zig build test -j3 --summary all
+        run: zig build test -Dharness-optimize=Debug --summary all
 
       - name: save zig build + test state
         if: always()
@@ -84,4 +85,4 @@ jobs:
           path: |
             ~/.cache/zig
             .zig-cache
-          key: zig-0.16.0-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
+          key: zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
