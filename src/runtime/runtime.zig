@@ -17,6 +17,7 @@ const proc_env_mod = @import("proc_env.zig");
 const clock_mod = @import("clock.zig");
 const float_fmt_mod = @import("float_fmt.zig");
 const safety_mod = @import("safety.zig");
+const threads_mod = @import("threads.zig");
 
 // objcell
 pub const ObjRef = objcell.ObjRef;
@@ -109,6 +110,18 @@ pub const clockSleepMillis = clock_mod.sleepMillis;
 pub const floatToString = float_fmt_mod.floatToString;
 pub const doubleToString = float_fmt_mod.doubleToString;
 
+// threads (cross-thread name overrides + run-boundary sweep hooks)
+pub const setThreadName = threads_mod.setThreadName;
+pub const clearThreadName = threads_mod.clearThreadName;
+pub const threadName = threads_mod.threadName;
+pub const registerRunBoundaryHook = threads_mod.registerRunBoundaryHook;
+pub const runBoundarySweep = threads_mod.runBoundarySweep;
+pub const setThreadAbandonable = threads_mod.setThreadAbandonable;
+pub const isThreadAbandonable = threads_mod.isThreadAbandonable;
+pub const requestAbandon = threads_mod.requestAbandon;
+pub const clearAbandon = threads_mod.clearAbandon;
+pub const shouldAbandon = threads_mod.shouldAbandon;
+
 // safety (host-protection backstops)
 pub const startMemoryWatchdog = safety_mod.startMemoryWatchdog;
 pub const startRunDeadline = safety_mod.startRunDeadline;
@@ -129,6 +142,7 @@ test {
     _ = clock_mod;
     _ = float_fmt_mod;
     _ = safety_mod;
+    _ = threads_mod;
 }
 
 // -------------------------------------------------------------------------

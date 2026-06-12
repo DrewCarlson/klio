@@ -16,6 +16,7 @@ const runtime = @import("runtime");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
+const scheduler = @import("scheduler.zig");
 const host_call_member = @import("host_call_member.zig");
 const trace = @import("trace.zig");
 const VmHost = vmhost.VmHost;
@@ -315,12 +316,18 @@ pub fn coroutineDisarmSlot(self: *VmIntrinsicHost) void {
     coroutines.coroutineDisarmSlot(self);
 }
 
-pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value) void {
-    coroutines.coroutineResumeSlotValue(self, slot, value);
+pub fn coroutinePushScope(self: *VmIntrinsicHost, scope: *const Value) void {
+    _ = self;
+    coroutines.coroutinePushScope(scope);
 }
 
-pub fn coroutineCancelTimedParksWith(self: *VmIntrinsicHost, cause: ?Value) void {
-    coroutines.coroutineCancelTimedParksWith(self, cause) catch {};
+pub fn coroutinePopScope(self: *VmIntrinsicHost) void {
+    _ = self;
+    coroutines.coroutinePopScope();
+}
+
+pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value) void {
+    coroutines.coroutineResumeSlotValue(self, slot, value);
 }
 
 pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) void {
@@ -773,11 +780,29 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!Host
 }
 
 /// Spawn `block` on a real OS thread, returning an opaque thread id.
-/// `Dispatchers.Default` / `Dispatchers.IO` and `kotlin.concurrent.thread`
-/// share this one path: one OS thread per call.
+/// `kotlin.concurrent.thread` — one OS thread per call, joined through
+/// the thread table.
 pub fn spawnOsThread(self: *VmIntrinsicHost, block: *const Value, out: Output) Allocator.Error!HostResultU64 {
     _ = out;
     return startWorker(self, block);
+}
+
+/// Post a dispatcher runnable onto the shared worker pool —
+/// `Dispatchers.Default` (`io_kind == false`, the CPU-bounded view) and
+/// `Dispatchers.IO` (`io_kind == true`, the elastic view) share the same
+/// pool threads. The block, its captures, and any value it produces cross
+/// threads; each shared cell they reach mediates concurrent access through
+/// its own reader/writer lock (the spawned-thread boundary contract).
+pub fn coroutineDispatchPooled(self: *VmIntrinsicHost, block: *const Value, io_kind: bool, out: Output) Allocator.Error!?RuntimeError {
+    _ = out;
+    try scheduler.post(.{
+        .seed = spawnSeed(self),
+        .block = block.*,
+        .time_mode = root.coroutineTimeMode(),
+        .reclaim = runtime.reclaimEnabled(),
+        .kind = if (io_kind) .io else .default,
+    });
+    return null;
 }
 
 /// Join the OS thread previously returned by `spawnOsThread`,

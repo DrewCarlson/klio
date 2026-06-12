@@ -21,7 +21,12 @@ import kotlin.coroutines.__klio_co_runRoot
 // block's value is the result.
 public fun <T> suspendCoroutineUninterceptedOrReturn(block: (Continuation<T>) -> Any?): T {
     val slot = __klio_co_newSlot()
-    val cont = KlioContinuation<T>(slot, EmptyCoroutineContext)
+    // The continuation carries the suspending coroutine's real context
+    // (the suspend-implicit `coroutineContext`, resolved by the host to
+    // the active coroutine), not an empty one: cancellable suspensions
+    // read `context[Job]` to install their parent-cancellation handle,
+    // which is how `Job.cancel` preempts a parked `delay`/`join`.
+    val cont = KlioContinuation<T>(slot, coroutineContext)
     // Arm the slot before running the block: a suspension inside it
     // (e.g. a `delay` within `withTimeout`) is then bound to this
     // continuation's slot, so a cancellation can resume it early by
@@ -110,7 +115,23 @@ internal fun <T> startBlock(completion: Continuation<T>, body: () -> T): Any? {
     // propagates so the caller can wrap it; a real suspension parks
     // cooperatively inside `body()` and the eventual resume routes
     // through the continuation klio captured at the suspension point.
-    return body()
+    //
+    // The block belongs to `completion`'s coroutine (a `ScopeCoroutine`
+    // / `TimeoutCoroutine`): making it the active scope lets the
+    // suspend-implicit `coroutineContext` inside resolve to that
+    // coroutine's context, so a cancellable suspension installs its
+    // parent-cancellation handle on the right Job — `withTimeout`'s
+    // expiry preempts the block's `delay` through exactly that handle.
+    // A suspension unwinding out of `body()` skips the `finally` (the
+    // activation is parked, not failed); the pop then runs when the
+    // resumed body finally completes, and the driving pump truncates
+    // any push left by an activation abandoned mid-park.
+    __klio_co_pushScope(completion)
+    try {
+        return body()
+    } finally {
+        __klio_co_popScope()
+    }
 }
 
 @PublishedApi

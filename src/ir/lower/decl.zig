@@ -822,6 +822,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
     }
     if (f.is_tailrec) {
         b.setTailrecSelf(f.name.name);
+        b.setTailrecSelfHasThis(names.items.len != 0 and std.mem.eql(u8, names.items[0], "this"));
     }
     b.setInline(f.is_inline);
     // The declared return type is the expected type for both an
@@ -916,9 +917,13 @@ pub fn isLowPriorityOverload(f: *const ast.Function) bool {
             return true;
         }
         if (std.mem.eql(u8, leaf, "Deprecated")) {
-            // `@Deprecated(..., level = DeprecationLevel.ERROR)`.
+            // `@Deprecated(..., level = DeprecationLevel.ERROR)` and
+            // `level = DeprecationLevel.HIDDEN`: neither is a source-level
+            // candidate in kotlinc (ERROR rejects the call, HIDDEN hides
+            // the declaration entirely — it exists only for binary
+            // compatibility), so both rank as guard stubs.
             for (ann.args) |*arg| {
-                if (exprMentionsError(arg)) return true;
+                if (exprMentionsErrorOrHidden(arg)) return true;
             }
         }
     }
@@ -926,37 +931,38 @@ pub fn isLowPriorityOverload(f: *const ast.Function) bool {
 }
 
 /// Mirror of the Rust `format!("{e:?}").contains("ERROR")` probe used to
-/// detect `@Deprecated(level = DeprecationLevel.ERROR)`: walk the
-/// argument expression looking for an identifier / string literal that
-/// contains `ERROR`.
-fn exprMentionsError(e: *const ast.Expr) bool {
+/// detect `@Deprecated(level = DeprecationLevel.ERROR)`, extended to
+/// `DeprecationLevel.HIDDEN` (not a source-level candidate either): walk
+/// the argument expression looking for an identifier / string literal
+/// that contains either level name.
+fn exprMentionsErrorOrHidden(e: *const ast.Expr) bool {
     switch (e.*) {
         .Path => |p| {
             for (p.segments) |seg| {
-                if (std.mem.indexOf(u8, seg.name, "ERROR") != null) return true;
+                if (std.mem.indexOf(u8, seg.name, "ERROR") != null or std.mem.indexOf(u8, seg.name, "HIDDEN") != null) return true;
             }
         },
         .Member => |m| {
-            if (std.mem.indexOf(u8, m.name.name, "ERROR") != null) return true;
-            return exprMentionsError(m.receiver);
+            if (std.mem.indexOf(u8, m.name.name, "ERROR") != null or std.mem.indexOf(u8, m.name.name, "HIDDEN") != null) return true;
+            return exprMentionsErrorOrHidden(m.receiver);
         },
         .MemberRef => |m| {
-            if (std.mem.indexOf(u8, m.name.name, "ERROR") != null) return true;
-            return exprMentionsError(m.receiver);
+            if (std.mem.indexOf(u8, m.name.name, "ERROR") != null or std.mem.indexOf(u8, m.name.name, "HIDDEN") != null) return true;
+            return exprMentionsErrorOrHidden(m.receiver);
         },
         .Call => |c| {
-            if (exprMentionsError(c.callee)) return true;
-            for (c.args) |*arg| if (exprMentionsError(arg)) return true;
+            if (exprMentionsErrorOrHidden(c.callee)) return true;
+            for (c.args) |*arg| if (exprMentionsErrorOrHidden(arg)) return true;
         },
         .Binary => |bin| {
-            return exprMentionsError(bin.lhs) or exprMentionsError(bin.rhs);
+            return exprMentionsErrorOrHidden(bin.lhs) or exprMentionsErrorOrHidden(bin.rhs);
         },
-        .Unary => |u| return exprMentionsError(u.expr),
-        .Postfix => |u| return exprMentionsError(u.expr),
-        .As => |u| return exprMentionsError(u.expr),
-        .IsCheck => |u| return exprMentionsError(u.expr),
-        .Spread => |u| return exprMentionsError(u.expr),
-        .Labeled => |u| return exprMentionsError(u.expr),
+        .Unary => |u| return exprMentionsErrorOrHidden(u.expr),
+        .Postfix => |u| return exprMentionsErrorOrHidden(u.expr),
+        .As => |u| return exprMentionsErrorOrHidden(u.expr),
+        .IsCheck => |u| return exprMentionsErrorOrHidden(u.expr),
+        .Spread => |u| return exprMentionsErrorOrHidden(u.expr),
+        .Labeled => |u| return exprMentionsErrorOrHidden(u.expr),
         else => {},
     }
     return false;

@@ -63,10 +63,18 @@ pub const IntrinsicHost = struct {
         coroutine_launch: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_arm_slot: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
         coroutine_disarm_slot: ?*const fn (ctx: *anyopaque) void = null,
+        /// Push / pop the active coroutine scope around an undispatched
+        /// block run inline in the caller's activation
+        /// (`startCoroutineUninterceptedOrReturn`). `null` => no-op.
+        coroutine_push_scope: ?*const fn (ctx: *anyopaque, scope: *const Value) void = null,
+        coroutine_pop_scope: ?*const fn (ctx: *anyopaque) void = null,
         coroutine_resume_slot_value: ?*const fn (ctx: *anyopaque, slot: i64, value: Value) void = null,
-        coroutine_cancel_timed_parks_with: ?*const fn (ctx: *anyopaque, cause: ?Value) void = null,
         coroutine_drain_to_idle: ?*const fn (ctx: *anyopaque, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_resume_external: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) void = null,
+        /// Post a dispatcher runnable onto the shared worker pool
+        /// (`Dispatchers.Default` / `Dispatchers.IO`). `null` => default
+        /// (run the block inline on the calling thread).
+        coroutine_dispatch_pooled: ?*const fn (ctx: *anyopaque, block: *const Value, io: bool, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         spawn_os_thread: ?*const fn (ctx: *anyopaque, block: *const Value, out: Output) std.mem.Allocator.Error!HostResultU64 = null,
         join_os_thread: ?*const fn (ctx: *anyopaque, id: u64) std.mem.Allocator.Error!?RuntimeError = null,
         os_thread_alive: ?*const fn (ctx: *anyopaque, id: u64) bool = null,
@@ -127,16 +135,16 @@ pub const IntrinsicHost = struct {
         if (self.vtable.coroutine_disarm_slot) |f| f(self.ctx);
     }
 
+    pub fn coroutinePushScope(self: IntrinsicHost, scope: *const Value) void {
+        if (self.vtable.coroutine_push_scope) |f| f(self.ctx, scope);
+    }
+
+    pub fn coroutinePopScope(self: IntrinsicHost) void {
+        if (self.vtable.coroutine_pop_scope) |f| f(self.ctx);
+    }
+
     pub fn coroutineResumeSlotValue(self: IntrinsicHost, slot: i64, value: Value) void {
         if (self.vtable.coroutine_resume_slot_value) |f| f(self.ctx, slot, value);
-    }
-
-    pub fn coroutineCancelTimedParks(self: IntrinsicHost) void {
-        self.coroutineCancelTimedParksWith(null);
-    }
-
-    pub fn coroutineCancelTimedParksWith(self: IntrinsicHost, cause: ?Value) void {
-        if (self.vtable.coroutine_cancel_timed_parks_with) |f| f(self.ctx, cause);
     }
 
     pub fn coroutineDrainToIdle(self: IntrinsicHost, out: Output) !?RuntimeError {
@@ -150,6 +158,15 @@ pub const IntrinsicHost = struct {
         } else {
             self.coroutineResumeSlotValue(slot, value);
         }
+    }
+
+    pub fn coroutineDispatchPooled(self: IntrinsicHost, block: *const Value, io_kind: bool, out: Output) !?RuntimeError {
+        if (self.vtable.coroutine_dispatch_pooled) |f| return f(self.ctx, block, io_kind, out);
+        const r = try self.invokeCallable(block, &.{}, out);
+        return switch (r) {
+            .ok => null,
+            .err => |e| e,
+        };
     }
 
     pub fn spawnOsThread(self: IntrinsicHost, block: *const Value, out: Output) !HostResultU64 {

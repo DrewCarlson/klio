@@ -40,6 +40,7 @@ fn sleepMillis(millis: u64) void {
     runtime.clockSleepMillis(@intCast(@min(millis, @as(u64, std.math.maxInt(i64)))));
 }
 
+
 /// Cross-thread wakeup primitive shared between a `runBlocking` driver
 /// and any worker threads it has dispatched via `__kxco_dispatch`
 /// (real-thread `Dispatchers.Default`). Workers post resume entries
@@ -53,6 +54,12 @@ fn sleepMillis(millis: u64) void {
 pub const DriverWakeup = struct {
     mailbox: SpinMutex = .{},
     mailbox_entries: std.ArrayList(MailboxEntry) = .empty,
+    /// Set under the mailbox lock by the owning driver's exit protocol.
+    /// A closed mailbox rejects posts, so a racing resumer falls through
+    /// to the persisted-continuation registry the driver populated
+    /// strictly before closing — no resume can land in a mailbox nobody
+    /// will ever drain again.
+    mailbox_closed: bool = false,
     pending_workers: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     owned_slots: SpinMutex = .{},
     owned_slot_set: std.ArrayList(i64) = .empty,
@@ -73,17 +80,33 @@ pub const DriverWakeup = struct {
         self.owned_slot_set.deinit(self.allocator);
     }
 
-    /// Post a `(slot, value)` resume entry and wake the driver.
-    pub fn postResume(self: *DriverWakeup, slot: i64, value: Value) Allocator.Error!void {
+    /// Post a `(slot, value)` resume entry and wake the driver. Returns
+    /// `false` when the mailbox is already closed (the driver exited);
+    /// the caller must route the resume through the persisted registry.
+    pub fn postResume(self: *DriverWakeup, slot: i64, value: Value) Allocator.Error!bool {
         self.mailbox.lock();
         defer self.mailbox.unlock();
+        if (self.mailbox_closed) return false;
         try self.mailbox_entries.append(self.allocator, .{ .slot = slot, .value = value });
+        return true;
     }
 
     /// Take everything queued in the mailbox.
     pub fn drainMailbox(self: *DriverWakeup, allocator: Allocator) Allocator.Error![]MailboxEntry {
         self.mailbox.lock();
         defer self.mailbox.unlock();
+        const out = try self.mailbox_entries.toOwnedSlice(allocator);
+        self.mailbox_entries = .empty;
+        return out;
+    }
+
+    /// Close the mailbox and take whatever raced in. Part of the driver
+    /// exit protocol: persist parked continuations first, then close, so
+    /// every later resume routes to the persisted registry.
+    pub fn closeAndDrain(self: *DriverWakeup, allocator: Allocator) Allocator.Error![]MailboxEntry {
+        self.mailbox.lock();
+        defer self.mailbox.unlock();
+        self.mailbox_closed = true;
         const out = try self.mailbox_entries.toOwnedSlice(allocator);
         self.mailbox_entries = .empty;
         return out;
@@ -148,6 +171,14 @@ pub const DriverWakeup = struct {
 const SlotOwners = struct {
     var mutex: SpinMutex = .{};
     var map: ?std.AutoHashMap(i64, ObjRef(DriverWakeup)) = null;
+    /// Resumes that arrived before their slot had an owner. A waiter
+    /// publishes itself to a rendezvous registry (a channel waiter
+    /// queue, a completion handler) before arming its slot; a resume
+    /// landing in that gap finds no owner and no persisted state and
+    /// must not be dropped — it parks here, and `registerSlotOwner`
+    /// re-checks under the same mutex, so exactly one of the two sides
+    /// always sees the other.
+    var pending: ?std.AutoHashMap(i64, Value) = null;
 
     /// Allocator backing the process-global registry spine.
     fn allocator() Allocator {
@@ -162,10 +193,28 @@ const SlotOwners = struct {
         return &map.?;
     }
 
+    /// Stash an undeliverable resume for `slot`, unless an owner has
+    /// appeared — the registration check and the stash are one atomic
+    /// section against `registerSlotOwner`. Returns whether the value
+    /// was stashed (`false` ⇒ the caller must retry the owner route).
+    fn stashPendingIfUnowned(slot: i64, value: Value) Allocator.Error!bool {
+        mutex.lock();
+        defer mutex.unlock();
+        if (map) |*m| {
+            if (m.contains(slot)) return false;
+        }
+        if (pending == null) {
+            pending = std.AutoHashMap(i64, Value).init(allocator());
+        }
+        try pending.?.put(slot, value);
+        return true;
+    }
+
     /// Drop every entry and free the map's spine. Run at the run
     /// boundary once all workers have joined, so a slot left registered
     /// by an error/abort/cancel path (whose `DriverWakeup` cell is
     /// arena-backed) cannot survive into the next run's reset arena.
+    /// Pending resumes are arena-keyed Values and sweep with it.
     fn drainAll() void {
         mutex.lock();
         defer mutex.unlock();
@@ -174,6 +223,10 @@ const SlotOwners = struct {
             while (it.next()) |w| w.deinit();
             m.deinit();
             map = null;
+        }
+        if (pending) |*p| {
+            p.deinit();
+            pending = null;
         }
     }
 };
@@ -188,6 +241,67 @@ const SlotOwners = struct {
 /// must not tear down the registry the live driver is still routing through.
 pub fn drainSlotOwners() void {
     SlotOwners.drainAll();
+}
+
+/// Process-global slot → persisted `SuspendState` registry. A coroutine
+/// that parks indefinitely inside a driven root outlives the driver that
+/// started it (the `startCoroutine` boundary, and every dispatcher pool
+/// task whose body suspends awaiting an external event). The state is
+/// keyed by its rendezvous slot here so a later `Continuation.resume`
+/// from ANY thread — the runBlocking driver, another pool worker, a
+/// `kotlin.concurrent.thread` body — can claim it (single winner via
+/// `fetchRemove` under the mutex) and drive it to completion on the
+/// resuming thread. This is what lets a coroutine hop between OS threads:
+/// it parks on worker A, A's pump exits and persists it, and the resume
+/// dispatched to worker B claims and continues it there.
+///
+/// The map spine is `page_allocator`-backed; the `SuspendState` payloads
+/// reach into the run's value graph, so the registry is swept at the run
+/// boundary (`drainPersistedParked` from `joinAllThreads`) exactly like
+/// `SlotOwners`.
+const PersistedParked = struct {
+    var mutex: SpinMutex = .{};
+    var map: ?std.AutoHashMap(i64, SuspendState) = null;
+
+    fn allocator() Allocator {
+        return std.heap.page_allocator;
+    }
+
+    fn put(slot: i64, state: SuspendState) Allocator.Error!void {
+        mutex.lock();
+        defer mutex.unlock();
+        if (map == null) {
+            map = std.AutoHashMap(i64, SuspendState).init(allocator());
+        }
+        try map.?.put(slot, state);
+    }
+
+    /// Claim the persisted state for `slot`. Single winner.
+    fn take(slot: i64) ?SuspendState {
+        mutex.lock();
+        defer mutex.unlock();
+        if (map) |*m| {
+            if (m.fetchRemove(slot)) |kv| return kv.value;
+        }
+        return null;
+    }
+
+    fn drainAll() void {
+        mutex.lock();
+        defer mutex.unlock();
+        if (map) |*m| {
+            m.deinit();
+            map = null;
+        }
+    }
+};
+
+/// Empty the persisted-continuation registry at the run boundary (after
+/// every worker has joined). A state left behind belongs to a coroutine
+/// whose resume never came; its frames are arena-backed and must not
+/// survive into the next run's reset arena.
+pub fn drainPersistedParked() void {
+    PersistedParked.drainAll();
 }
 
 /// Register `slot` → `wakeup` so a worker thread's completion resume
@@ -205,12 +319,29 @@ pub fn registerSlotOwner(slot: i64, wakeup: *const ObjRef(DriverWakeup)) Allocat
         defer w.deinit();
         try w.get().addOwnedSlot(slot);
     }
-    SlotOwners.mutex.lock();
-    defer SlotOwners.mutex.unlock();
-    const m = try SlotOwners.ensure();
-    const gop = try m.getOrPut(slot);
-    if (gop.found_existing) gop.value_ptr.deinit();
-    gop.value_ptr.* = wakeup.clone();
+    const pending_resume: ?Value = blk: {
+        SlotOwners.mutex.lock();
+        defer SlotOwners.mutex.unlock();
+        const m = try SlotOwners.ensure();
+        const gop = try m.getOrPut(slot);
+        if (gop.found_existing) gop.value_ptr.deinit();
+        gop.value_ptr.* = wakeup.clone();
+        // A resume for this slot may already have arrived and parked in
+        // the pending stash (the resumer ran in the publish-before-arm
+        // gap). Claim it under the same lock that just made the owner
+        // visible, so the resumer's miss and this claim cannot cross.
+        if (SlotOwners.pending) |*p| {
+            if (p.fetchRemove(slot)) |kv| break :blk kv.value;
+        }
+        break :blk null;
+    };
+    if (pending_resume) |v| {
+        // Deliver through the owner's own mailbox: the pump drains it on
+        // its next idle round, after the activation has actually parked.
+        const w = wakeup.borrowMut();
+        defer w.deinit();
+        _ = try w.get().postResume(slot, v);
+    }
 }
 
 /// The driver that owns `slot`, if any. The returned handle is an
@@ -442,32 +573,6 @@ pub const CooperativeInterceptor = struct {
         return null;
     }
 
-    /// Wake every parked activation whose wake-at is a finite
-    /// virtual-time deadline (i.e. parked on a `delay`/`withTimeout`).
-    /// Each is removed from `parked` ordering by being marked ready now,
-    /// its resume value is set to the supplied `failure` (a
-    /// `Value.Result { ok = false, … }` that the resume path in
-    /// `ir.eval` routes as a throw at the suspension point), and the
-    /// token is queued ready. Indefinite parks (`wake_at` ==
-    /// `INDEFINITE`) such as join/await/channel-receive are not touched.
-    pub fn cancelTimedParks(self: *CooperativeInterceptor, failure: Value) Allocator.Error!void {
-        var due: std.ArrayList(u64) = .empty;
-        defer due.deinit(self.allocator);
-        var it = self.parked.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.wake_at != INDEFINITE) {
-                try due.append(self.allocator, e.key_ptr.*);
-            }
-        }
-        for (due.items) |tok| {
-            if (self.parked.getPtr(tok)) |entry| {
-                entry.wake_at = 0;
-            }
-            try self.token_resume_value.put(tok, failure);
-            try self.ready.append(self.allocator, tok);
-        }
-    }
-
     /// Seam: nothing ready — advance the clock to the soonest timer and
     /// arm every activation due then. Under `Virtual` the clock jumps
     /// instantly; under `Wall` the thread sleeps until the real
@@ -490,26 +595,45 @@ pub const CooperativeInterceptor = struct {
             .Wall => {
                 const wait = @max(t - self.nowMillis(), 0);
                 if (wait > 0) {
-                    const wait_ms: u64 = @intCast(wait);
-                    sleepMillis(wait_ms);
+                    // Sleep toward the deadline one millisecond at a
+                    // time: the pump must keep draining its cross-thread
+                    // mailbox between slices (a resume can preempt the
+                    // timer — a cancellation arriving from another pump
+                    // must not wait out a parked `delay`) and must keep
+                    // observing run-boundary abandonment. Returning
+                    // `true` reports the pending timer as progress; the
+                    // pump comes back next round.
+                    sleepMillis(@min(@as(u64, @intCast(wait)), 1));
+                    if (self.nowMillis() < t) return true;
                 }
             },
         }
         const now = self.nowMillis();
-        var due: std.ArrayList(u64) = .empty;
+        const Due = struct {
+            tok: u64,
+            wake_at: i64,
+            fn lessThan(_: void, x: @This(), y: @This()) bool {
+                if (x.wake_at != y.wake_at) return x.wake_at < y.wake_at;
+                return x.tok < y.tok;
+            }
+        };
+        var due: std.ArrayList(Due) = .empty;
         defer due.deinit(self.allocator);
         {
             var it = self.parked.iterator();
             while (it.next()) |e| {
                 const w = e.value_ptr.wake_at;
                 if (w != INDEFINITE and w <= now) {
-                    try due.append(self.allocator, e.key_ptr.*);
+                    try due.append(self.allocator, .{ .tok = e.key_ptr.*, .wake_at = w });
                 }
             }
         }
-        std.mem.sort(u64, due.items, {}, std.sort.asc(u64));
-        for (due.items) |tok| {
-            try self.ready.append(self.allocator, tok);
+        // Fire in DEADLINE order (token order breaks ties): when a slow
+        // round leaves several timers due at once, the earliest deadline
+        // resumes first, exactly as an event loop would have fired them.
+        std.mem.sort(Due, due.items, {}, Due.lessThan);
+        for (due.items) |d| {
+            try self.ready.append(self.allocator, d.tok);
         }
         return due.items.len != 0;
     }
@@ -557,21 +681,15 @@ threadlocal var coro_stack: std.ArrayList(CooperativeInterceptor) = .empty;
 /// `ACTIVE_CORO_SCOPE`). Page-allocator backed for the same reason.
 threadlocal var active_scope_stack: std.ArrayList(Value) = .empty;
 
-/// Coroutines that parked indefinitely inside a driven root and are
-/// awaiting an external `Continuation.resume`. Keyed by rendezvous slot;
-/// the resume drives the saved state to completion. Program/thread
-/// lifetime — the held continuation outlives the driver that started it
-/// (the Rust `PERSISTED_PARKED`).
-threadlocal var persisted_parked: ?std.AutoHashMap(i64, SuspendState) = null;
-
 fn coroStackAllocator() Allocator {
     return std.heap.page_allocator;
 }
 
 /// Assert (Debug) the coroutine interceptor and active-scope stacks are empty
 /// at a run boundary and clear them so leaked-across-runs coroutine context is
-/// a loud failure. `persisted_parked` is intentionally NOT reset here: it holds
-/// continuations that outlive the driver that started them.
+/// a loud failure. The persisted-continuation registry is NOT reset here: it
+/// is process-global, holds continuations that outlive the driver that
+/// started them, and is swept once per run by `drainPersistedParked`.
 pub fn resetReceiverTls() void {
     std.debug.assert(coro_stack.items.len == 0);
     std.debug.assert(active_scope_stack.items.len == 0);
@@ -670,11 +788,18 @@ pub fn driveRunBlocking(self: *VmIntrinsicHost, block: *const Value, scope: *con
 /// `driveRunBlocking` with control over whether a coroutine that parks
 /// indefinitely (awaiting an external resume) is preserved into
 /// program-lifetime storage on driver exit (`persist = true`, the
-/// `startCoroutine` boundary) or simply abandoned (`persist = false`,
-/// `runBlocking`). One tightly-coupled coroutine state machine.
+/// `startCoroutine` boundary and every dispatcher pool task) or simply
+/// abandoned (`persist = false`, `runBlocking`). One tightly-coupled
+/// coroutine state machine.
 pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output, persist: bool) Allocator.Error!RuntimeEvalResult {
     const a = self.allocator;
     try coroPush(a);
+    // An undispatched block's scope push (`coroutinePushScope`) pops when
+    // its activation completes; an activation abandoned with this pump
+    // never completes, so the pump truncates the stack back to its entry
+    // depth on every exit path.
+    const scope_depth = active_scope_stack.items.len;
+    defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
     const guard = ActiveScopeGuard.enter(scope);
     defer guard.leave();
 
@@ -686,34 +811,118 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
         .err => |e| switch (e) {
             .Suspended => |st| root_token = try park(a, st),
             else => {
-                if (coroPop()) |w| {
-                    var ww = w;
-                    ww.deinit();
-                }
+                // Error exit runs the same exit protocol as quiescence:
+                // persist (in persist mode), close the mailbox, release
+                // the slot-owner entries. A bare pop would leave stale
+                // owner registrations pointing at an open mailbox nobody
+                // drains — a silently lost resume for every sibling.
+                try pumpExit(self, out, persist);
                 return .{ .err = mapDriverErr(a, e) };
             },
         },
     }
 
+    if (try pumpLoop(self, scope, out, persist, &root_token, &root_value)) |err_result| {
+        return err_result;
+    }
+    try pumpExit(self, out, persist);
+    return .{ .ok = root_value orelse Value.Unit };
+}
+
+/// Resume a persisted continuation claimed from `PersistedParked` and
+/// drive it (and anything it launches) to quiescence on the calling
+/// thread, under a fresh pump. This is the cross-pump resume engine: a
+/// coroutine that parked on one OS thread continues here, on whichever
+/// thread its resume arrived (for dispatcher coroutines that is a pool
+/// worker, because the resume itself travels as a dispatched runnable).
+/// A new indefinite park is re-persisted, so a coroutine can hop pumps
+/// any number of times.
+pub fn driveResumed(self: *VmIntrinsicHost, state_in: SuspendState, value: Value, out: Output) Allocator.Error!void {
+    const a = self.allocator;
+    try coroPush(a);
+    const scope_depth = active_scope_stack.items.len;
+    defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
+    var root_value: ?Value = null;
+    var root_token: ?u64 = null;
+    var state = state_in;
+    switch (try intrinsic_host.resumeRaw(self, &state, value, out)) {
+        .ok => |v| root_value = v,
+        .err => |e| switch (e) {
+            .Suspended => |st| root_token = try park(a, st),
+            else => {
+                // The resumed coroutine's terminal outcome is delivered
+                // through its completion continuation inside the frames;
+                // an error escaping raw has no awaiting caller on this
+                // thread. The pump still exits through the protocol so
+                // its slot registrations and mailbox close cleanly.
+                try pumpExit(self, out, true);
+                return;
+            },
+        },
+    }
+    const scope = activeCoroScope() orelse Value.Unit;
+    if (try pumpLoop(self, &scope, out, true, &root_token, &root_value)) |_| {
+        return;
+    }
+    try pumpExit(self, out, true);
+}
+
+/// The shared driver pump: start queued launches, resume ready
+/// coroutines, advance timers, drain the cross-thread mailbox, and — for
+/// a blocking root — wait while the root is alive or dispatched pool
+/// work that can still resume one of this driver's coroutines is in
+/// flight. Returns a non-null error result when the pump failed (the
+/// interceptor has been popped); null on quiescence (the interceptor is
+/// still pushed and `pumpExit` must run).
+fn pumpLoop(
+    self: *VmIntrinsicHost,
+    scope: *const Value,
+    out: Output,
+    persist: bool,
+    root_token: *?u64,
+    root_value: *?Value,
+) Allocator.Error!?RuntimeEvalResult {
+    const a = self.allocator;
+    var idle_rounds: usize = 0;
     while (true) {
-        // 1. Start any queued child launches.
+        // 0. Daemon abandonment: a pool task's pump still running at the
+        //    run boundary stops pumping and exits through the protocol.
+        if (runtime.shouldAbandon()) {
+            try pumpExit(self, out, persist);
+            return .{ .err = .{ .Type = "daemon task abandoned at run boundary" } };
+        }
+
+        // 0b. A blocking root returns the moment its root coroutine has
+        //     completed: for `runBlocking` that is the job-tree
+        //     completion. Anything still queued or parked on this pump
+        //     is outside its job tree (an orphaned daemon launch, a
+        //     cancelled child's stale timer) and dies with the pump,
+        //     exactly as upstream `runBlocking` returns without it.
+        if (!persist and root_token.* == null) break;
+
+        // 1. Start any queued child launches. A started launch may
+        //    enqueue more (a `delay` schedules its timer through a
+        //    spawned block), so a round that started anything loops back
+        //    to drain again BEFORE the clock may advance: a timer must
+        //    be parked, with its deadline measured from the current
+        //    time, before `advanceTime` picks the next wakeup.
         const launched = try (coroTop().?).drainLaunched(a);
         defer a.free(launched);
-        const progressed = launched.len != 0;
         for (launched) |child| {
             switch (try intrinsic_host.evalClosureRaw(self, &child, &.{}, scope, out)) {
                 .ok => {},
                 .err => |e| switch (e) {
                     .Suspended => |st| _ = try park(a, st),
                     else => {
-                        if (coroPop()) |w| {
-                            var ww = w;
-                            ww.deinit();
-                        }
+                        try pumpExit(self, out, persist);
                         return .{ .err = mapDriverErr(a, e) };
                     },
                 },
             }
+        }
+        if (launched.len != 0) {
+            idle_rounds = 0;
+            continue;
         }
 
         // 2. Resume a ready coroutine, if any.
@@ -723,16 +932,16 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
                 const resume_with = (coroTop().?).takeResumeValue(tok) orelse Value.Unit;
                 switch (try intrinsic_host.resumeRaw(self, &entry.state, resume_with, out)) {
                     .ok => |v| {
-                        if (root_token != null and root_token.? == tok) {
-                            root_value = v;
-                            root_token = null;
+                        if (root_token.* != null and root_token.*.? == tok) {
+                            root_value.* = v;
+                            root_token.* = null;
                         }
                     },
                     .err => |e| switch (e) {
                         .Suspended => |st2| {
                             const new_tok = try park(a, st2);
-                            if (root_token != null and root_token.? == tok) {
-                                root_token = new_tok;
+                            if (root_token.* != null and root_token.*.? == tok) {
+                                root_token.* = new_tok;
                             }
                         },
                         // A launched child observing a CancellationException
@@ -740,21 +949,15 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
                         // swallowed, matching a real Kotlin runtime; the root
                         // keeps its throw semantics.
                         .Throw => |v| {
-                            if ((root_token == null or root_token.? != tok) and root.isCancellationException(&v)) {
+                            if ((root_token.* == null or root_token.*.? != tok) and root.isCancellationException(&v)) {
                                 // swallow
                             } else {
-                                if (coroPop()) |w| {
-                                    var ww = w;
-                                    ww.deinit();
-                                }
+                                try pumpExit(self, out, persist);
                                 return .{ .err = mapDriverErr(a, e) };
                             }
                         },
                         else => {
-                            if (coroPop()) |w| {
-                                var ww = w;
-                                ww.deinit();
-                            }
+                            try pumpExit(self, out, persist);
                             return .{ .err = mapDriverErr(a, e) };
                         },
                     },
@@ -776,7 +979,10 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
             w.deinit();
         }
         const had_resume = try drainWakeupInto(a, &wakeup, coroTop().?);
-        if (had_resume) continue;
+        if (had_resume) {
+            idle_rounds = 0;
+            continue;
+        }
         var pending: usize = 0;
         {
             const w = wakeup.borrowMut();
@@ -789,35 +995,101 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
             continue;
         }
 
-        // 4. Nothing ready, no timers: done (or deadlocked on an
-        //    indefinitely-parked coroutine with no resumer).
-        if (!progressed) break;
-    }
+        // 3c. A blocking root must not return while its root coroutine is
+        //     still parked. For `runBlocking` the root parks until its
+        //     coroutine's job completes, and the job machinery — not a
+        //     host-side count — decides when that is: children on this
+        //     pump, children dispatched to pool workers, and children
+        //     resumed from explicit threads all complete the job (or are
+        //     not part of it, like `GlobalScope` daemons) exactly as
+        //     upstream structured concurrency defines. The completion
+        //     resume arrives locally or through the mailbox above.
+        if (!persist and root_token.* != null) {
+            idle_rounds += 1;
+            if (idle_rounds == 3000) diagStalledPump(coroTop().?, root_token.*);
+            sleepMillis(1);
+            continue;
+        }
 
+        // 4. Nothing queued, nothing ready, no timers: done (or
+        //    deadlocked on an indefinitely-parked coroutine with no
+        //    resumer).
+        break;
+    }
+    return null;
+}
+
+/// Driver exit protocol. Ordering closes the persist/post race with a
+/// resumer on another thread:
+///   1. persist every indefinitely-parked continuation (persist mode) —
+///      a racing resumer that misses the mailbox finds the state here;
+///   2. close the mailbox and take whatever raced in before the close —
+///      any later `postResume` is rejected and reroutes itself;
+///   3. release this driver's global slot-owner entries;
+///   4. re-route the raced-in entries through the persisted registry.
+fn pumpExit(self: *VmIntrinsicHost, out: Output, persist: bool) Allocator.Error!void {
+    const a = self.allocator;
     if (persist) {
-        // A coroutine that parked indefinitely is alive, waiting on a
-        // continuation held outside this driver. Preserve it so a later
-        // external resume can drive it to completion.
         const saved = try (coroTop().?).drainIndefiniteParked(a);
         defer a.free(saved);
-        if (saved.len != 0) {
-            const m = try persistedParkedMap();
-            for (saved) |s| try m.put(s.slot, s.state);
-        }
+        for (saved) |s| try PersistedParked.put(s.slot, s.state);
     }
-
-    // Release any global slot-owner entries still pointing at this driver's
-    // wakeup so cross-thread routing doesn't leak.
+    var leftovers: []DriverWakeup.MailboxEntry = &.{};
     if (coroPop()) |w| {
         var ww = w;
         {
             const g = ww.borrowMut();
+            leftovers = g.get().closeAndDrain(a) catch &.{};
             g.get().releaseOwnedSlots();
             g.deinit();
         }
         ww.deinit();
     }
-    return .{ .ok = root_value orelse Value.Unit };
+    defer if (leftovers.len != 0) a.free(leftovers);
+    for (leftovers) |entry| {
+        if (PersistedParked.take(entry.slot)) |st| {
+            try driveResumed(self, st, entry.value, out);
+        }
+        // No persisted state: the waiter was abandoned with its driver
+        // (a runBlocking exit) — the entry has nowhere to land.
+    }
+}
+
+var pump_diag_state: u8 = 0;
+
+pub fn pumpDiagEnabled() bool {
+    if (pump_diag_state == 0) {
+        const v = runtime.procEnvGetVar(std.heap.page_allocator, "KLIO_PUMP_DIAG") catch null;
+        pump_diag_state = if (v != null) 2 else 1;
+    }
+    return pump_diag_state == 2;
+}
+
+/// One-shot stderr dump of a blocking pump that has idled for several
+/// seconds with its root still parked - the shape of a lost resume.
+/// Gated on `KLIO_PUMP_DIAG`; a diagnosis aid, never load-bearing.
+fn diagStalledPump(top: *CooperativeInterceptor, root_tok: ?u64) void {
+    if (!pumpDiagEnabled()) return;
+    std.debug.print("[PUMP] stalled root_tok={?d} parked={d} ready={d} launched={d}\n", .{
+        root_tok, top.parked.count(), top.ready.items.len, top.launched.items.len,
+    });
+    var it = top.slot_to_token.iterator();
+    while (it.next()) |e| {
+        std.debug.print("[PUMP] slot={d} -> tok={d}\n", .{ e.key_ptr.*, e.value_ptr.* });
+    }
+    SlotOwners.mutex.lock();
+    if (SlotOwners.map) |*m| {
+        std.debug.print("[PUMP] slot_owners={d}\n", .{m.count()});
+    }
+    if (SlotOwners.pending) |*p| {
+        std.debug.print("[PUMP] pending_resumes={d}\n", .{p.count()});
+    }
+    SlotOwners.mutex.unlock();
+    PersistedParked.mutex.lock();
+    if (PersistedParked.map) |*m| {
+        std.debug.print("[PUMP] persisted={d}\n", .{m.count()});
+    }
+    PersistedParked.mutex.unlock();
 }
 
 /// Drain everything the worker-thread mailbox posted into the interceptor
@@ -833,14 +1105,6 @@ fn drainWakeupInto(allocator: Allocator, wakeup: *const ObjRef(DriverWakeup), to
         _ = try top.resumeSlotValue(entry.slot, entry.value);
     }
     return drained.len != 0;
-}
-
-/// The persisted-parked map, created on first use.
-fn persistedParkedMap() Allocator.Error!*std.AutoHashMap(i64, SuspendState) {
-    if (persisted_parked == null) {
-        persisted_parked = std.AutoHashMap(i64, SuspendState).init(coroStackAllocator());
-    }
-    return &persisted_parked.?;
 }
 
 // -------------------------------------------------------------------------
@@ -906,30 +1170,37 @@ pub fn coroutineDisarmSlot(self: *VmIntrinsicHost) void {
     if (coroTop()) |top| top.clearPendingSlot();
 }
 
-pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value) void {
-    _ = self;
-    var i: usize = coro_stack.items.len;
-    while (i > 0) {
-        i -= 1;
-        if (coro_stack.items[i].resumeSlotValue(slot, value) catch false) break;
+/// Push the active coroutine scope for an undispatched block running
+/// inline in the caller's activation (`startCoroutineUninterceptedOrReturn`
+/// over a `ScopeCoroutine` / `TimeoutCoroutine`). The suspend-implicit
+/// `coroutineContext` then resolves to the block's own coroutine, so a
+/// cancellable suspension inside it installs its parent-cancellation
+/// handle on the right Job. Balanced by `coroutinePopScope` from the
+/// Kotlin side (the pop is skipped over a suspension unwind and runs
+/// when the resumed body finally completes).
+pub fn coroutinePushScope(scope: *const Value) void {
+    active_scope_stack.append(coroStackAllocator(), scope.*) catch {};
+}
+
+pub fn coroutinePopScope() void {
+    if (active_scope_stack.items.len != 0) {
+        _ = active_scope_stack.pop();
     }
 }
 
-pub fn coroutineCancelTimedParksWith(self: *VmIntrinsicHost, cause: ?Value) Allocator.Error!void {
-    const a = self.allocator;
-    const exc = cause orelse Value{ .Exception = .{
-        .fqn = try runtime.StringRef.init(a, "kotlin.coroutines.cancellation.CancellationException"),
-        .message = try runtime.StringRef.init(a, "StandaloneCoroutine was cancelled"),
-        .cause = null,
-    } };
-    const payload = try Value.box(a, exc);
-    const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
-    if (coroTop()) |top| try top.cancelTimedParks(failure);
+pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value) void {
+    // Same routing as `coroutineResumeExternal`: the waiter may be parked
+    // on this thread's pump, on a live pump on another OS thread (a
+    // channel receiver parked in the runBlocking driver while a
+    // dispatcher worker sends), or persisted after its pump exited. The
+    // shared output sink carries any inline drive's writes.
+    coroutineResumeExternal(self, slot, value, self.out_sink.output()) catch {};
 }
 
 pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!void {
-    // A live cooperative driver still holding this slot? Enqueue there —
-    // its drive loop runs the activation.
+    if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} tid={d}\n", .{ slot, std.Thread.getCurrentId() });
+    // A live cooperative driver on THIS thread still holding the slot?
+    // Enqueue there — its drive loop runs the activation.
     {
         var i: usize = coro_stack.items.len;
         while (i > 0) {
@@ -937,24 +1208,46 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
             if (coro_stack.items[i].resumeSlotValue(slot, value) catch false) return;
         }
     }
-    // Cross-thread: the slot is owned by a driver on another OS thread
-    // (e.g. a `Dispatchers.Default` worker resuming `await` back on the
-    // main `runBlocking` pump). Route through the driver's mailbox.
-    if (lookupSlotOwner(slot)) |w| {
-        var ww = w;
-        defer ww.deinit();
-        const g = ww.borrowMut();
-        defer g.deinit();
-        try g.get().postResume(slot, value);
-        return;
-    }
-    // Otherwise the coroutine parked inside a driven root that already
-    // returned; its state was preserved. Drive it to completion now.
-    if (persisted_parked) |*m| {
-        if (m.fetchRemove(slot)) |kv| {
-            var st = kv.value;
-            _ = try intrinsic_host.resumeRaw(self, &st, value, out);
+    // Cross-thread: the slot is owned by a live driver on another OS
+    // thread (e.g. a `Dispatchers.Default` worker resuming `await` back
+    // on the main `runBlocking` pump). Route through that driver's
+    // mailbox; a rejected post means the driver just exited and persisted
+    // its parked coroutines, so fall through to the persisted registry.
+    // A slot with no owner and no persisted state belongs to a waiter
+    // that has published itself but not yet armed (the registration gap);
+    // the resume parks in the pending stash, which `registerSlotOwner`
+    // claims under the same lock — never dropped.
+    while (true) {
+        if (lookupSlotOwner(slot)) |w| {
+            var ww = w;
+            defer ww.deinit();
+            const posted = blk: {
+                const g = ww.borrowMut();
+                defer g.deinit();
+                break :blk try g.get().postResume(slot, value);
+            };
+            if (posted) return;
+            // Mailbox closed: the owner just exited and persisted its
+            // parked coroutines strictly before closing.
+            if (PersistedParked.take(slot)) |st| {
+                try driveResumed(self, st, value, out);
+            }
+            // No persisted state either: the waiter was abandoned with
+            // its driver (a runBlocking exit) — nowhere to land.
+            return;
         }
+        // The coroutine parked inside a driven root that already
+        // returned; its state was persisted. Claim it (single winner)
+        // and drive it to quiescence on this thread under a fresh pump —
+        // the cross-pump resume that lets a coroutine continue on a
+        // different OS thread.
+        if (PersistedParked.take(slot)) |st| {
+            try driveResumed(self, st, value, out);
+            return;
+        }
+        if (try SlotOwners.stashPendingIfUnowned(slot, value)) return;
+        // An owner registered between the miss and the stash; retry the
+        // owner route.
     }
 }
 
@@ -964,7 +1257,6 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
         const top = coroTop() orelse break;
         const launched = try top.drainLaunched(a);
         defer a.free(launched);
-        const progressed = launched.len != 0;
         const scope = activeCoroScope() orelse Value.Unit;
         for (launched) |child| {
             switch (try intrinsic_host.evalClosureRaw(self, &child, &.{}, &scope, out)) {
@@ -978,6 +1270,9 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
                 },
             }
         }
+        // Re-drain after any start so a freshly scheduled timer parks
+        // before the clock can advance (same ordering as `pumpLoop`).
+        if (launched.len != 0) continue;
         if ((coroTop().?).nextReady()) |tok| {
             if ((coroTop().?).takeParked(tok)) |entry_in| {
                 var entry = entry_in;
@@ -996,7 +1291,7 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
             continue;
         }
         if (try (coroTop().?).advanceTime()) continue;
-        if (!progressed) break;
+        break;
     }
     return null;
 }
@@ -1089,24 +1384,6 @@ test "resume_slot_value queues the waiter and records its resume value" {
     try testing.expect(!try ci.resumeSlot(3));
 }
 
-test "cancel_timed_parks wakes only finite-deadline parks with the failure" {
-    var ci = try CooperativeInterceptor.new(testing.allocator);
-    defer ci.deinit();
-    ci.mode = .Virtual;
-
-    const timed = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = 100 });
-    const indef = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = -1 });
-
-    try ci.cancelTimedParks(.{ .Bool = false });
-    try testing.expectEqual(@as(?u64, timed), ci.nextReady());
-    try testing.expectEqual(@as(?u64, null), ci.nextReady());
-    const v = ci.takeResumeValue(timed);
-    try testing.expect(v != null);
-    try testing.expectEqual(false, v.?.Bool);
-    // The indefinite park is untouched and still parked.
-    try testing.expect(ci.parked.get(indef) != null);
-}
-
 test "launch queue drains FIFO" {
     var ci = try CooperativeInterceptor.new(testing.allocator);
     defer ci.deinit();
@@ -1133,7 +1410,7 @@ test "driver wakeup mailbox round-trips and worker counter tracks pending" {
         try testing.expectEqual(@as(usize, 0), w.get().pending());
         w.get().workerStarted();
         try testing.expectEqual(@as(usize, 1), w.get().pending());
-        try w.get().postResume(9, .{ .Int = 7 });
+        try testing.expect(try w.get().postResume(9, .{ .Int = 7 }));
         const drained = try w.get().drainMailbox(testing.allocator);
         defer testing.allocator.free(drained);
         try testing.expectEqual(@as(usize, 1), drained.len);
@@ -1250,7 +1527,7 @@ fn wakeupRaceWorker(ctx: WakeupRaceCtx) void {
             if (lookupSlotOwner(s)) |w| {
                 var ww = w;
                 const g = ww.borrowMut();
-                g.get().postResume(s, .Unit) catch {};
+                _ = g.get().postResume(s, .Unit) catch false;
                 g.deinit();
                 ww.deinit();
             }

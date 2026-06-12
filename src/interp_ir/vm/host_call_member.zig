@@ -454,6 +454,41 @@ fn allUppercase(s: []const u8) bool {
     return true;
 }
 
+/// Coarse builtin value kinds for definite argument-type disproof.
+/// Numeric widths collapse into one kind: klio's lowered literals may
+/// carry a narrower tag than the declared parameter type.
+const BuiltinKind = enum { numeric, string, boolean, char };
+
+fn builtinParamKind(pn: []const u8) ?BuiltinKind {
+    const eq = std.mem.eql;
+    if (eq(u8, pn, "Int") or eq(u8, pn, "Long") or eq(u8, pn, "Short") or eq(u8, pn, "Byte") or
+        eq(u8, pn, "UInt") or eq(u8, pn, "ULong") or eq(u8, pn, "UShort") or eq(u8, pn, "UByte") or
+        eq(u8, pn, "Double") or eq(u8, pn, "Float") or eq(u8, pn, "Number")) return .numeric;
+    if (eq(u8, pn, "String")) return .string;
+    if (eq(u8, pn, "Boolean")) return .boolean;
+    if (eq(u8, pn, "Char")) return .char;
+    return null;
+}
+
+fn builtinValueKind(v: *const Value) ?BuiltinKind {
+    return switch (v.*) {
+        .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float => .numeric,
+        .String => .string,
+        .Bool => .boolean,
+        .Char => .char,
+        else => null,
+    };
+}
+
+/// `true` when the parameter's declared builtin kind and the argument's
+/// runtime builtin kind are both known and differ — a definite
+/// inapplicability kotlinc would never consider.
+fn builtinKindMismatch(pn: []const u8, arg: *const Value) bool {
+    const pk = builtinParamKind(pn) orelse return false;
+    const vk = builtinValueKind(arg) orelse return false;
+    return pk != vk;
+}
+
 /// Kotlin-faithful `hashCode()` for builtin value types.
 fn kotlinHashCode(v: *const Value) i32 {
     return switch (v.*) {
@@ -930,6 +965,52 @@ fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *cons
     if (!receiverImplementsHead(self, receiver, pn)) return false;
     if (ty_args.len == 0) return true;
     return elementsProveArgs(self, allocator, receiver, fid, pn, ty_args, fuel);
+}
+
+/// Whether an extension whose declared receiver head is `ty` applies to
+/// a receiver whose STATIC (declared) type head is `static_name`. Kotlin
+/// resolves extension calls against the static receiver type, so inside
+/// `fun I.helper()` a bare extension call binds I's extensions even when
+/// the runtime value is a subtype carrying a same-name extension.
+/// `null` ⇒ undecidable statically (unresolvable static class); the
+/// caller falls back to the runtime-type proof.
+fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []const u8, fid: FuncId, ty: *const TypeRef) ?bool {
+    var pn = simpleName(ty.name);
+    pn = std.mem.trimEnd(u8, pn, "?");
+    // Receivers that accept anything statically, mirroring the runtime
+    // prover's universal cases.
+    if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
+    if (typeParamOf(self, fid, pn)) return true;
+    // The short-all-uppercase type-param heuristic only applies to a
+    // head that is NOT a registered class (`W5` is a class, `T`/`TT`
+    // are type params).
+    const head_is_class = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().registry.class_super_names.get(pn) != null or mg.get().classId(pn) != null;
+    };
+    if (!head_is_class and pn.len > 0 and pn.len <= 2 and allUppercase(pn)) return true;
+    {
+        const target: ?[]const u8 = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().registry.type_aliases.get(pn);
+        };
+        if (target) |t| {
+            if (!std.mem.eql(u8, t, pn)) pn = simpleName(t);
+        }
+    }
+    var sn = simpleName(static_name);
+    if (std.mem.indexOfScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
+    sn = std.mem.trimEnd(u8, std.mem.trim(u8, sn, " "), "?");
+    if (std.mem.eql(u8, sn, pn)) return true;
+    _ = allocator;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    if (mg.get().classIsOrExtends(sn, pn)) return true;
+    // The static head is unknown to the recorded hierarchy: undecidable.
+    if (mg.get().registry.class_super_names.get(sn) == null) return null;
+    return false;
 }
 
 /// Can the candidate take `want` positional args (receiver included)?
@@ -1685,6 +1766,13 @@ fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *cons
             else => false,
         };
     }
+    // Builtin value-kind disproof: a String argument can never bind an
+    // Int parameter (kotlinc does not consider the candidate at all, so
+    // the receiver walk must fall through to an outer receiver instead
+    // of executing it). Same-kind pairs stay non-definite — a lowered
+    // literal may carry a narrower tag than the declared type (`f(5)`
+    // binding `f(n: Long)`).
+    if (builtinKindMismatch(pn, arg)) return true;
     // Only adjudicate when the parameter names a known user class.
     {
         const cg = self.classes.borrow();
@@ -1827,6 +1915,10 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
                     } else ok = false;
                 }
                 if (ok) {
+                    // A `@Deprecated(HIDDEN)` / low-priority overload is
+                    // only kotlinc's pick when no ordinary candidate
+                    // applies; rank it strictly below every ordinary one.
+                    if (f.low_priority) total -= 1000;
                     if (check_inv and total == best_score) tied.append(self.allocator, f) catch {};
                     if (total > best_score) {
                         best_score = total;
@@ -1869,6 +1961,10 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         if (!ok) continue;
         // Prefer an exact-arity overload over one relying on defaults.
         if (args.len == effective.len) score += 5;
+        // A `@Deprecated(HIDDEN)` / low-priority overload is only
+        // kotlinc's pick when no ordinary candidate applies; rank it
+        // strictly below every ordinary one.
+        if (f.low_priority) score -= 1000;
         if (check_inv and score == best_score) tied.append(self.allocator, f) catch {};
         if (score > best_score) {
             best_score = score;
@@ -1953,6 +2049,10 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
 /// stays available as the resolver's later lenient pass and as the
 /// explicit-dispatch default.
 fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool) Allocator.Error!EvalResult {
+    return callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, null);
+}
+
+fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8) Allocator.Error!EvalResult {
     // Built-in delegate protocol.
     if (receiver.* == .Delegate) {
         if (try delegateMember(self, allocator, receiver.Delegate, name, args)) |r| return r;
@@ -1980,6 +2080,11 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
             } else if (std.mem.eql(u8, name, "isAlive")) {
                 return .{ .ok = boolVal(vmhost.host_impl.threadAlive(self, id)) };
             } else if (std.mem.eql(u8, name, "name")) {
+                // A dispatcher pool worker reports its registered
+                // upstream-shaped name (`DefaultDispatcher-worker-N`).
+                if (runtime.threadName(allocator, id)) |overridden| {
+                    return .{ .ok = .{ .String = try StringRef.init(allocator, overridden) } };
+                }
                 const s = try std.fmt.allocPrint(allocator, "klio-thread-{d}", .{id});
                 return .{ .ok = .{ .String = try StringRef.init(allocator, s) } };
             } else if (std.mem.eql(u8, name, "start") or std.mem.eql(u8, name, "interrupt")) {
@@ -2389,7 +2494,7 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     }
 
     // Extension-fn fallback.
-    if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext)) |r| return r;
+    if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext, static_recv)) |r| return r;
 
     // Class-delegation forwarding (swallow all errors).
     if (receiver.* == .Instance) {
@@ -4430,7 +4535,17 @@ fn delegateForward(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         const g = inst.borrow();
         defer g.deinit();
         for (g.get().fields.items) |f| {
-            if (std.mem.startsWith(u8, f.name, "__delegate__")) try delegates.append(allocator, f.value);
+            if (!std.mem.startsWith(u8, f.name, "__delegate__")) continue;
+            // Kotlin class delegation forwards only the members the
+            // delegated interface itself declares. An extension function
+            // or an unrelated name must NOT fall through to the delegate:
+            // it would rebind `this` to the delegate object (e.g.
+            // `Continuation.resumeCancellableWithInternal` running against
+            // the wrapped continuation instead of the DispatchedContinuation
+            // wrapper, which silently skipped the dispatcher).
+            const iface = f.name["__delegate__".len..];
+            if (delegatedInterfaceDeclares(self, allocator, inst, iface, name) == false) continue;
+            try delegates.append(allocator, f.value);
         }
     }
     for (delegates.items) |d| {
@@ -4448,9 +4563,75 @@ fn delegateForward(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     return null;
 }
 
+/// Whether the interface a class delegates to (named by the suffix of a
+/// `__delegate__<iface>` field) declares a member `name` anywhere on its
+/// hierarchy. Returns `null` when the interface cannot be resolved (the
+/// caller keeps the legacy forward-anything behavior), `true`/`false`
+/// when membership is decidable.
+pub fn delegatedInterfaceDeclares(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), iface_name_raw: []const u8, name: []const u8) ?bool {
+    // The key carries the source-spelled supertype; strip generic args
+    // (`Continuation<T>` -> `Continuation`).
+    var iface_name = iface_name_raw;
+    if (std.mem.indexOfScalar(u8, iface_name, '<')) |lt| iface_name = iface_name[0..lt];
+    iface_name = std.mem.trim(u8, iface_name, " ");
+    if (std.mem.lastIndexOfScalar(u8, iface_name, '.')) |dot| iface_name = iface_name[dot + 1 ..];
+    if (iface_name.len == 0) return null;
+
+    // Resolve lexically first (the class's captured declaration env), then
+    // via the global class table.
+    // The lowered hierarchy registry covers what `ClassDef.findMethod`
+    // cannot see: abstract interface members have no lowered body, so
+    // they never appear in `methods`, yet Kotlin forwards exactly those
+    // through `by` delegation (`interface Greeter { fun greet(): String }`).
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().registry.hierarchy_methods.get(iface_name)) |methods| {
+            if (methods.contains(name)) return true;
+        }
+    }
+    const iface_def: ?ObjRef(ClassDef) = blk: {
+        {
+            const g = inst.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            const eg = cg.get().captured_env.borrow();
+            defer eg.deinit();
+            if (eg.get().lookup(iface_name)) |v| {
+                if (v == .Class) break :blk v.Class.clone();
+            }
+        }
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(iface_name)) |d| break :blk d.clone();
+        break :blk null;
+    };
+    const def = iface_def orelse return null;
+    defer def.deinit();
+    if (ClassDef.findMethod(def, allocator, name)) |hit| {
+        hit.class.deinit();
+        return true;
+    }
+    if (ClassDef.findBodyProperty(def, allocator, name)) |hit| {
+        hit.class.deinit();
+        return true;
+    }
+
+    // A property may be dispatched through its synthesized accessor name.
+    if (std.mem.startsWith(u8, name, "$get$") or std.mem.startsWith(u8, name, "$set$")) {
+        const prop = name["$get$".len..];
+        if (ClassDef.findBodyProperty(def, allocator, prop)) |hit| {
+            hit.class.deinit();
+            return true;
+        }
+    }
+    return false;
+}
+
 const Candidate = struct { fid: FuncId, func: Func };
 
-fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool) Allocator.Error!?EvalResult {
+fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8) Allocator.Error!?EvalResult {
     const want = args.len + 1;
     var visible_owners = try enclosingOwnerSet(self, allocator);
     defer visible_owners.deinit();
@@ -4487,8 +4668,17 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             if (c.func.low_priority) continue;
             // Both the receiver AND the value-argument arity must
             // provably fit — an extension whose extra params carry no
-            // defaults is not applicable to this call.
-            if (!try strictReceiverProven(self, allocator, receiver, c.fid, &c.func.params[0].ty)) continue;
+            // defaults is not applicable to this call. With a known
+            // STATIC receiver type, applicability is decided against it
+            // (Kotlin extension resolution is static): an extension on a
+            // runtime subtype is not a candidate inside an extension
+            // body whose `this` is declared as the supertype.
+            const recv_fits = if (static_recv) |sname|
+                staticReceiverApplicable(self, allocator, sname, c.fid, &c.func.params[0].ty) orelse
+                    try strictReceiverProven(self, allocator, receiver, c.fid, &c.func.params[0].ty)
+            else
+                try strictReceiverProven(self, allocator, receiver, c.fid, &c.func.params[0].ty);
+            if (!recv_fits) continue;
             if (!extArityApplicable(self, &c.func, want)) continue;
             filtered.append(allocator, c) catch {};
         }
@@ -4496,6 +4686,20 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         candidates = filtered;
         if (candidates.items.len == 0) return null;
     } else {
+        // With a known static receiver type, drop candidates that are
+        // statically inapplicable before any runtime-type ranking: an
+        // extension on a runtime subtype is not a candidate at all when
+        // `this` is declared as the supertype.
+        if (static_recv) |sname| {
+            var filtered: std.ArrayList(Candidate) = .empty;
+            for (candidates.items) |c| {
+                const fits = staticReceiverApplicable(self, allocator, sname, c.fid, &c.func.params[0].ty) orelse true;
+                if (fits) filtered.append(allocator, c) catch {};
+            }
+            candidates.deinit(allocator);
+            candidates = filtered;
+            if (candidates.items.len == 0) return null;
+        }
         // Lenient pass: keep candidates whose receiver match cannot be
         // proven (erased generics) — but a definite DISPROOF still drops
         // the candidate: when the declared receiver heads a known class
@@ -4947,7 +5151,14 @@ fn outerChainFallback(self: *VmHost, allocator: Allocator, receiver: *const Valu
 // -------------------------------------------------------------------------
 
 pub fn callMemberNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false);
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, null);
+}
+
+/// `callMemberNamed` with the receiver's DECLARED type head (a bare call
+/// on the implicit `this` of an extension body). Extension dispatch then
+/// resolves against the static type, as kotlinc does.
+pub fn callMemberNamedStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, static_recv);
 }
 
 /// Per-receiver probe for the bare-name resolver's innermost-first
@@ -4956,11 +5167,19 @@ pub fn callMemberNamed(self: *VmHost, allocator: Allocator, receiver: *const Val
 /// clean miss here so it cannot pre-empt a real member of an outer
 /// receiver; the resolver retries leniently (`callMemberNamed`) only
 /// after every receiver missed strictly.
-pub fn callMemberStrictExt(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true);
+///
+/// `static_recv` is the receiver's DECLARED type head when the caller
+/// knows it (the bare-call resolver inside an extension body, whose
+/// implicit `this` has the extension's declared receiver type). Kotlin
+/// resolves extensions against the static receiver type, so when present
+/// it replaces the runtime-type proof in the extension fallback: inside
+/// `fun I.helper()` a bare `describe()` binds `I.describe` even when the
+/// runtime value is a subtype with its own `describe` extension.
+pub fn callMemberStrictExt(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv);
 }
 
-fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, strict_ext: bool) Allocator.Error!EvalResult {
+fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8) Allocator.Error!EvalResult {
     var any_named = false;
     for (arg_names) |n| {
         if (n != null) any_named = true;
@@ -4982,7 +5201,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     }
 
     // Positional dispatch first.
-    const primary = try callMemberInner(self, allocator, receiver, name, args, strict_ext);
+    const primary = try callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, static_recv);
     if (!(primary == .err and primary.err == .Unimplemented)) return primary;
 
     // Class-hierarchy method walk for a class-qualified lowered name.

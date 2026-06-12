@@ -49,6 +49,17 @@ internal fun __klio_co_park(slot: Long): Result<Any?> = Result.success(null)
 internal fun __klio_co_resume(slot: Long, ok: Boolean, value: Any?) {
 }
 
+// Make `scope` the active coroutine scope for an undispatched block
+// running inline in the caller's activation, so the suspend-implicit
+// `coroutineContext` inside the block resolves to the block's own
+// coroutine (a `ScopeCoroutine` / `TimeoutCoroutine`). Balanced by
+// __klio_co_popScope when the block's activation completes.
+@PublishedApi
+internal fun __klio_co_pushScope(scope: Any?) {}
+
+@PublishedApi
+internal fun __klio_co_popScope() {}
+
 // Drive `block` as a cooperative coroutine root to quiescence (the
 // start-coroutine driver boundary). `block` delivers its own result
 // to the completion continuation, so this returns nothing — a

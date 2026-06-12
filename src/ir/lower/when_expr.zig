@@ -110,8 +110,22 @@ pub fn lowerWhen(
     branches: []const ast.WhenBranch,
     when_span: span.Span,
 ) Allocator.Error!Reg {
+    return lowerWhenWithSubjectReg(b, subject, null, branches, when_span);
+}
+
+/// `lowerWhen` over an already-lowered subject register. The subject-
+/// binding form `when (val v = expr)` lowers `expr` exactly once for the
+/// binding and passes the register here — Kotlin evaluates a `when`
+/// subject once, so a side-effecting subject must not be re-lowered.
+pub fn lowerWhenWithSubjectReg(
+    b: *FuncBuilder,
+    subject: ?*const Expr,
+    pre_lowered: ?Reg,
+    branches: []const ast.WhenBranch,
+    when_span: span.Span,
+) Allocator.Error!Reg {
     _ = when_span;
-    const subject_r: ?Reg = if (subject) |s| try lowerExpr(b, s) else null;
+    const subject_r: ?Reg = if (pre_lowered) |r| r else if (subject) |s| try lowerExpr(b, s) else null;
     const join = try b.allocBlock();
     const result = b.allocReg();
     if (subject_r) |subj| {

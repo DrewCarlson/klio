@@ -4,10 +4,17 @@
 //! comment lines, exactly like the memory-model `conformance` suite.
 //!
 //! Programs assert exact stdout (`RUNNABLE`); the genuinely parallel
-//! ones run on real OS threads via `kotlin.concurrent.thread` (the
-//! `Dispatchers.*` shapes currently execute on the calling pump).
-//! Programs blocked on a missing capability are listed in `PENDING`,
-//! keyed by the blocker, and run by an ignored test until it lands.
+//! ones run on real OS threads — via `kotlin.concurrent.thread` or the
+//! shared dispatcher worker pool behind `Dispatchers.Default`/`IO`
+//! (wall-time overlap, worker thread names, cross-pump park/resume,
+//! `limitedParallelism`, and the elastic IO cap are each pinned by a
+//! fixture). A program expected to FAIL — an uncaught exception crossing
+//! the dispatcher boundary must crash the run, exactly as kotlinc+kotlinx
+//! crash the JVM — pins the failure with a leading `//>! substring`
+//! comment instead: the run must end in an error whose message contains
+//! every such substring. Programs blocked on a missing capability are
+//! listed in `PENDING`, keyed by the blocker, and run by an ignored test
+//! until it lands.
 //! Run with `KLIO_RACE_JITTER=1` to widen borrow interleavings so a
 //! lost-update or double-init race reproduces reliably.
 const std = @import("std");
@@ -23,31 +30,51 @@ const LITMUS_DIR = "tests/fixtures/threaded_litmus";
 // leak-checking test allocator is never used, matching the e2e harness).
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-/// Expected stdout = the leading run of `//> ` comment lines, each
-/// contributing one output line (matching `runWithPacks`'s join convention).
-/// Mirrors the `conformance` harness. Returns owned bytes.
-fn expectedStdout(allocator: std.mem.Allocator, io: std.Io, file: []const u8) ![]u8 {
+const Expectation = struct {
+    /// Exact expected stdout (the `//> ` lines).
+    stdout: []u8,
+    /// Substrings the run's terminal error must contain (the `//>! `
+    /// lines). Non-empty ⇒ the program must FAIL.
+    err_contains: [][]u8,
+};
+
+/// Expected outcome = the leading run of `//> ` comment lines (one
+/// stdout line each, matching `runWithPacks`'s join convention) and/or
+/// `//>! ` lines (error-message substrings; their presence makes the
+/// expectation "the run fails"). Mirrors the `conformance` harness.
+/// Returns owned bytes.
+fn expectedOutcome(allocator: std.mem.Allocator, io: std.Io, file: []const u8) !Expectation {
     const src = try std.Io.Dir.cwd().readFileAlloc(io, file, allocator, .unlimited);
     defer allocator.free(src);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
+    var errs: std.ArrayList([]u8) = .empty;
+    defer errs.deinit(allocator);
     var lines = std.mem.splitScalar(u8, src, '\n');
     while (lines.next()) |line| {
         const t = std.mem.trimStart(u8, line, " \t\r");
-        if (std.mem.startsWith(u8, t, "//>")) {
+        if (std.mem.startsWith(u8, t, "//>!")) {
+            var rest = t[4..];
+            if (rest.len != 0 and rest[0] == ' ') rest = rest[1..];
+            rest = std.mem.trimEnd(u8, rest, "\r");
+            try errs.append(allocator, try allocator.dupe(u8, rest));
+        } else if (std.mem.startsWith(u8, t, "//>")) {
             var rest = t[3..];
             if (rest.len != 0 and rest[0] == ' ') rest = rest[1..];
             // Strip a trailing CR left by the `\n` split on CRLF input.
             rest = std.mem.trimEnd(u8, rest, "\r");
             try out.appendSlice(allocator, rest);
             try out.append(allocator, '\n');
-        } else if (std.mem.startsWith(u8, t, "//") or out.items.len == 0) {
+        } else if (std.mem.startsWith(u8, t, "//") or (out.items.len == 0 and errs.items.len == 0)) {
             // Skip leading comments and blank lead-in.
         } else {
             break;
         }
     }
-    return out.toOwnedSlice(allocator);
+    return .{
+        .stdout = try out.toOwnedSlice(allocator),
+        .err_contains = try errs.toOwnedSlice(allocator),
+    };
 }
 
 fn check(stem: []const u8) !void {
@@ -69,15 +96,35 @@ fn check(stem: []const u8) !void {
         std.debug.print("missing litmus {s}\n", .{file});
         return error.MissingLitmus;
     }
-    const want = try expectedStdout(a, io, file);
-    if (want.len == 0) {
+    const want = try expectedOutcome(a, io, file);
+    if (want.stdout.len == 0 and want.err_contains.len == 0) {
         std.debug.print("no //> expected lines in {s}\n", .{stem});
         return error.NoExpectedLines;
     }
     const res = try parity.runWithPacks(a, io, file);
+    if (want.err_contains.len != 0) {
+        // Failure pin: the run must end in an error carrying every
+        // expected substring (an uncaught exception crossing the
+        // dispatcher boundary crashes the run, as kotlinc+kotlinx do).
+        switch (res) {
+            .ok => |got| {
+                std.debug.print("threaded litmus {s}: expected a failing run, got success with stdout:\n{s}\n", .{ stem, got });
+                return error.ExpectedFailureSucceeded;
+            },
+            .err => |m| {
+                for (want.err_contains) |needle| {
+                    if (std.mem.indexOf(u8, m, needle) == null) {
+                        std.debug.print("threaded litmus {s}: error message missing `{s}`\n got: {s}\n", .{ stem, needle, m });
+                        return error.ErrorMessageMismatch;
+                    }
+                }
+            },
+        }
+        return;
+    }
     switch (res) {
-        .ok => |got| std.testing.expectEqualStrings(want, got) catch |e| {
-            std.debug.print("threaded litmus {s}: stdout mismatch\n got: {s}\nwant: {s}\n", .{ stem, got, want });
+        .ok => |got| std.testing.expectEqualStrings(want.stdout, got) catch |e| {
+            std.debug.print("threaded litmus {s}: stdout mismatch\n got: {s}\nwant: {s}\n", .{ stem, got, want.stdout });
             return e;
         },
         .err => |m| {
@@ -103,6 +150,27 @@ const RUNNABLE = [_][]const u8{
     "tl_atomicfu_ref_cas",
     "tl_atomicfu_lock_mutex",
     "tl_lazy_once",
+    "tl_default_parallel_wall",
+    "tl_dispatch_thread_names",
+    "tl_spin_handoff",
+    "tl_io_elastic",
+    "tl_limited_one",
+    "tl_withcontext_io_from_default",
+    "tl_delay_on_worker",
+    "tl_runblocking_undispatched",
+    "tl_channel_cross_dispatcher",
+    "tl_thread_channel_bridge",
+    "tl_dispatched_failure_join",
+    "tl_dispatched_failure_no_join",
+    "tl_dispatched_failure_caught",
+    "tl_cancel_dispatched_child",
+    "tl_runblocking_on_worker",
+    "tl_thread_resume_child",
+    "tl_daemon_not_awaited",
+    "tl_daemon_queued_dropped",
+    "tl_daemon_infinite_abandoned",
+    "tl_runblocking_worker_visibility",
+    "tl_early_error_with_thread",
 };
 
 /// Guarantees that only become meaningful with real OS-thread spawning.
@@ -155,6 +223,69 @@ test "tl_atomicfu_lock_mutex" {
 }
 test "tl_lazy_once" {
     try check("tl_lazy_once");
+}
+test "tl_default_parallel_wall" {
+    try check("tl_default_parallel_wall");
+}
+test "tl_dispatch_thread_names" {
+    try check("tl_dispatch_thread_names");
+}
+test "tl_spin_handoff" {
+    try check("tl_spin_handoff");
+}
+test "tl_io_elastic" {
+    try check("tl_io_elastic");
+}
+test "tl_limited_one" {
+    try check("tl_limited_one");
+}
+test "tl_withcontext_io_from_default" {
+    try check("tl_withcontext_io_from_default");
+}
+test "tl_delay_on_worker" {
+    try check("tl_delay_on_worker");
+}
+test "tl_runblocking_undispatched" {
+    try check("tl_runblocking_undispatched");
+}
+test "tl_channel_cross_dispatcher" {
+    try check("tl_channel_cross_dispatcher");
+}
+test "tl_thread_channel_bridge" {
+    try check("tl_thread_channel_bridge");
+}
+test "tl_dispatched_failure_join" {
+    try check("tl_dispatched_failure_join");
+}
+test "tl_dispatched_failure_no_join" {
+    try check("tl_dispatched_failure_no_join");
+}
+test "tl_dispatched_failure_caught" {
+    try check("tl_dispatched_failure_caught");
+}
+test "tl_cancel_dispatched_child" {
+    try check("tl_cancel_dispatched_child");
+}
+test "tl_runblocking_on_worker" {
+    try check("tl_runblocking_on_worker");
+}
+test "tl_thread_resume_child" {
+    try check("tl_thread_resume_child");
+}
+test "tl_daemon_not_awaited" {
+    try check("tl_daemon_not_awaited");
+}
+test "tl_daemon_queued_dropped" {
+    try check("tl_daemon_queued_dropped");
+}
+test "tl_daemon_infinite_abandoned" {
+    try check("tl_daemon_infinite_abandoned");
+}
+test "tl_runblocking_worker_visibility" {
+    try check("tl_runblocking_worker_visibility");
+}
+test "tl_early_error_with_thread" {
+    try check("tl_early_error_with_thread");
 }
 
 // Continuously exercise the cross-thread `DriverWakeup` escape seam: a

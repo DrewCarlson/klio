@@ -69,6 +69,7 @@ pub const host_instances = @import("host_instances.zig");
 pub const host_impl = @import("host_impl.zig");
 pub const intrinsic_host = @import("intrinsic_host.zig");
 pub const coroutines = @import("coroutines.zig");
+pub const scheduler = @import("scheduler.zig");
 pub const trace = @import("trace.zig");
 
 /// Emit one structured `[PATH]` dispatch record (`KLIO_TRACE_PATH`) for a
@@ -264,6 +265,7 @@ pub const VmHost = struct {
     pub const callValueWithThis = host_call_value.callValueWithThis;
     pub const callMember = host_call_member.callMember;
     pub const callMemberNamed = host_call_member.callMemberNamed;
+    pub const callMemberNamedStatic = host_call_member.callMemberNamedStatic;
     pub const callMemberStrictExt = host_call_member.callMemberStrictExt;
     pub const hostHasMember = host_call_member.hostHasMember;
     pub const hostHasProperty = host_call_member.hostHasProperty;
@@ -383,17 +385,23 @@ fn ivCoroutineArmSlot(ctx: *anyopaque, slot: i64) void {
 fn ivCoroutineDisarmSlot(ctx: *anyopaque) void {
     intrinsic_host.coroutineDisarmSlot(ip(ctx));
 }
+fn ivCoroutinePushScope(ctx: *anyopaque, scope: *const Value) void {
+    intrinsic_host.coroutinePushScope(ip(ctx), scope);
+}
+fn ivCoroutinePopScope(ctx: *anyopaque) void {
+    intrinsic_host.coroutinePopScope(ip(ctx));
+}
 fn ivCoroutineResumeSlotValue(ctx: *anyopaque, slot: i64, value: Value) void {
     intrinsic_host.coroutineResumeSlotValue(ip(ctx), slot, value);
-}
-fn ivCoroutineCancelTimedParksWith(ctx: *anyopaque, cause: ?Value) void {
-    intrinsic_host.coroutineCancelTimedParksWith(ip(ctx), cause);
 }
 fn ivCoroutineResumeExternal(ctx: *anyopaque, slot: i64, value: Value, out: Output) void {
     intrinsic_host.coroutineResumeExternal(ip(ctx), slot, value, out);
 }
 fn ivCoroutineDrainToIdle(ctx: *anyopaque, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineDrainToIdle(ip(ctx), out);
+}
+fn ivCoroutineDispatchPooled(ctx: *anyopaque, block: *const Value, io_kind: bool, out: Output) Allocator.Error!?RuntimeError {
+    return intrinsic_host.coroutineDispatchPooled(ip(ctx), block, io_kind, out);
 }
 fn ivSpawnOsThread(ctx: *anyopaque, block: *const Value, out: Output) Allocator.Error!HostResultU64 {
     return intrinsic_host.spawnOsThread(ip(ctx), block, out);
@@ -417,9 +425,11 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .coroutine_launch = ivCoroutineLaunch,
     .coroutine_arm_slot = ivCoroutineArmSlot,
     .coroutine_disarm_slot = ivCoroutineDisarmSlot,
+    .coroutine_push_scope = ivCoroutinePushScope,
+    .coroutine_pop_scope = ivCoroutinePopScope,
     .coroutine_resume_slot_value = ivCoroutineResumeSlotValue,
-    .coroutine_cancel_timed_parks_with = ivCoroutineCancelTimedParksWith,
     .coroutine_resume_external = ivCoroutineResumeExternal,
+    .coroutine_dispatch_pooled = ivCoroutineDispatchPooled,
     .coroutine_drain_to_idle = ivCoroutineDrainToIdle,
     .spawn_os_thread = ivSpawnOsThread,
     .join_os_thread = ivJoinOsThread,

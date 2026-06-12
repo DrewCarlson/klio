@@ -264,6 +264,13 @@ pub const Inst = union(enum) {
         args: Reg,
         n_args: u8,
         arg_names: []?ConstId = &.{},
+        /// The receiver's DECLARED type head when lowering knows it (a
+        /// bare call on the implicit `this` of an extension body, whose
+        /// static type is the extension's declared receiver). Kotlin
+        /// resolves extension calls against the static receiver type, so
+        /// dispatch must not bind a runtime subtype's same-name
+        /// extension when this is set.
+        static_recv: ?ConstId = null,
     },
     /// Instantiate a class.
     NewInstance: struct {

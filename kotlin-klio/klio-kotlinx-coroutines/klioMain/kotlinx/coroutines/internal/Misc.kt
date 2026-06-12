@@ -13,9 +13,18 @@ internal actual val platformExceptionHandlers: Collection<CoroutineExceptionHand
 internal actual fun ensurePlatformExceptionHandlerLoaded(callback: CoroutineExceptionHandler) {
 }
 
+// Upstream's JVM final resort hands the exception to the current
+// thread's uncaught-exception handler: the trace prints to stderr and
+// the process continues (a failed `GlobalScope` root coroutine never
+// crashes the program). klio reports the same one-line shape to stderr
+// through the host. Rethrowing here would instead tear down whichever
+// pump happened to be dispatching the completion — a hard crash where
+// upstream prints and moves on.
 internal actual fun propagateExceptionFinalResort(exception: Throwable) {
-    throw exception
+    __kxco_reportUncaught(exception.toString())
 }
+
+internal fun __kxco_reportUncaught(message: String) {}
 
 // The diagnostic context string is non-essential, and stringifying
 // an arbitrary CoroutineContext here (`context.toString()`) is a

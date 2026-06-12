@@ -3,11 +3,12 @@
 klio runs Kotlin concurrency on real OS threads. `Thread.start` /
 `join` spawn and join genuine `std.Thread`s. Coroutines within
 one `runBlocking` interleave cooperatively on their driver
-thread; `Dispatchers.Default` / `IO` currently execute their bodies
-on the calling pump too (the `__kxco_dispatch` worker hook and the
-cross-thread wakeup mailbox exist, but the coroutine start path does
-not route bodies through them yet, so coroutine bodies do not
-overlap across OS threads). `Thread`, `synchronized`, `@Volatile`, and atomics have
+thread; `Dispatchers.Default` / `IO` dispatch their bodies onto a
+shared pool of real worker threads (`DefaultDispatcher-worker-N`),
+so dispatched bodies overlap in wall time across OS threads, and a
+coroutine that parks on one worker resumes wherever its resume
+lands — another worker, the driver, or a `kotlin.concurrent.thread`
+body. `Thread`, `synchronized`, `@Volatile`, and atomics have
 faithful Kotlin semantics; the value model
 (`runtime.Value`, backed by `ObjRef` over an atomically
 reference-counted cell) is safe to share across threads and
@@ -43,15 +44,22 @@ cancellation, `Dispatchers`, `delay`, `Channel`. It is the
 Layer 1.
 
 The seam between them is the interceptor. In `interp_ir` the
-default interceptor is `CooperativeInterceptor`, a per-`runBlocking`
+default interceptor is `CooperativeInterceptor`, a per-pump
 scheduler exposed through a named seam (`interceptSuspend`,
-`drainLaunched`, `nextReady`, `takeParked`, `advanceTime`). It
-is the *only* place coroutine scheduling happens, so it is also the
-only place a cross-thread happens-before edge for coroutine code is
-established. `async`/`await`/`join` park on a host slot and resume
-on completion; `withContext` / `coroutineScope` / `supervisorScope`
-run inline on the current interceptor (no nested driver); `Channel`
-suspends on empty/full and exposes an iterator for `for (v in ch)`.
+`drainLaunched`, `nextReady`, `takeParked`, `advanceTime`). Every
+OS thread that drives coroutines — the `runBlocking` driver and each
+dispatcher pool worker executing a task — owns one pump. Scheduling
+happens only here, so this is also the only place a cross-thread
+happens-before edge for coroutine code is established.
+`async`/`await`/`join` park on a host slot and resume on completion
+(routed across pumps through the slot-owner registry and each
+driver’s wakeup mailbox, or — once a pump has exited — through the
+process-global persisted-continuation registry, which lets a
+coroutine hop between OS threads); `withContext` /
+`coroutineScope` / `supervisorScope` run inline on the current
+interceptor (no nested driver); `Channel` suspends on empty/full,
+rendezvouses across OS threads, and exposes an iterator for
+`for (v in ch)`.
 
 ## One memory model
 
@@ -153,6 +161,75 @@ bodies onto a real worker pool for genuine CPU-bound parallelism.
 The single cooperative driver per `runBlocking` is retained for
 intra-scope coroutine interleaving.
 
+### The dispatcher worker pool
+
+One shared pool (`src/interp_ir/vm/scheduler.zig`) serves both
+dispatchers, mirroring the upstream JVM `CoroutineScheduler` model:
+
+- `Dispatchers.Default` is the CPU-bounded view — at most
+  `max(2, nproc)` of its tasks run concurrently.
+- `Dispatchers.IO` is the elastic view — up to `max(64, nproc)`
+  workers in total — over the *same* threads, so a
+  `withContext(Dispatchers.IO)` hop from a Default coroutine stays
+  inside the pool.
+- Dispatcher tasks are daemons, exactly as upstream JVM dispatcher
+  threads are: they never block the run's end. At the run boundary
+  still-queued tasks are dropped without running, and in-flight
+  tasks are abandoned cooperatively (the evaluator and the host
+  sleep primitives poll an abandon flag on worker threads, so even
+  a non-terminating daemon body stops at its next instruction or
+  sleep slice) before every worker is joined.
+- Workers are spawned on demand against the queue backlog, park by
+  polling when idle, and are named `DefaultDispatcher-worker-N`.
+- Per-view execution is FIFO; both dispatchers report
+  `isDispatchNeeded == true`, and `dispatch` posts the upstream
+  `DispatchedContinuation` runnable verbatim — cancellation, the Job
+  tree, and exception propagation are the consumed upstream common
+  code, untouched by where bodies execute.
+- `limitedParallelism(n)` is the upstream common `LimitedDispatcher`
+  over these views: never more than `n` concurrent, excess queues in
+  FIFO order, threads shared with the underlying pool.
+
+Each dispatched runnable executes on a worker under its own
+cooperative pump (`driveRoot`, persist mode). A body that parks
+indefinitely (join, await, channel) releases its worker: the parked
+`SuspendState` moves to the process-global persisted-continuation
+registry keyed by its rendezvous slot, and the eventual resume —
+itself a dispatched runnable, a mailbox post, or an inline drive —
+claims it (single winner) and continues the coroutine on whatever
+thread the resume arrived on. A `delay` under a dispatcher parks on
+the worker’s own pump and resumes there, never on the runBlocking
+driver. Coroutines launched in `runBlocking`’s scope *without* a
+dispatcher stay on the runBlocking thread (the cooperative
+`KlioDispatcher` is the default interceptor).
+
+`runBlocking` itself is the upstream shape: a `BlockingCoroutine`
+job over the caller's context, the body started as its child, and
+the calling thread pumping until the coroutine's whole job tree
+completes — the root activation parks on a completion slot that the
+job's `invokeOnCompletion` resumes. The Job machinery, not a
+host-side count, decides when blocking ends: children on the local
+pump, children dispatched to pool workers, and children resumed
+from explicit `kotlin.concurrent.thread`s all complete the job
+first, while `GlobalScope` daemons are not part of it and never
+block the return. A failing child cancels the blocking job per
+structured concurrency — parked siblings resume with the
+cancellation at their suspension points, cross-pump through the
+mailbox/persisted routing — and the failure rethrows out of
+`runBlocking` through `onCancelled`, exactly as kotlinc+kotlinx
+propagate it. An uncaught exception in a root coroutine with no
+parent (`GlobalScope.launch { throw … }`) reports through the
+final-resort handler to stderr and the program continues, matching
+the JVM uncaught-handler behavior.
+
+The driver-exit protocol closes the park/resume race: a pump that
+exits first persists its indefinitely-parked continuations, then
+closes its mailbox (taking anything that raced in), then releases
+its slot-owner registrations, and finally re-routes the raced-in
+entries through the persisted registry; a resumer whose mailbox post
+is rejected falls through to the same registry, so no resume can
+land in a mailbox nobody will drain.
+
 This is validated by three gates:
 
 - **Real-thread stress** — `src/itests/runtime_objref_threads.zig`
@@ -163,7 +240,13 @@ This is validated by three gates:
   (programs under `tests/fixtures/threaded_litmus/`) exercises
   real-thread guarantees end to end (mutual exclusion, safe
   publication, no lost update, parallel partition, parallel `async`,
-  `withContext(IO)`, many-dispatch), each asserting exact stdout.
+  `withContext(IO)`, many-dispatch, genuine Default overlap, worker
+  thread names, the spin-wait flag handoff, the elastic IO cap,
+  `limitedParallelism(1)` serialization, delay-resumes-on-worker,
+  undispatched-stays-on-caller, cross-dispatcher channel ping-pong,
+  and the cross-OS-thread channel bridge), each asserting exact
+  stdout and verified against the kotlinc-JVM oracle where plain
+  kotlinx semantics allow.
 - **Single-thread benchmark** — the fixed `bench` corpus, diffable
   against a baseline (`klio-bench --diff`), guards the common path
   against regression; the adaptive cell's UNSHARED fast path keeps
