@@ -551,22 +551,6 @@ pub fn tryInlineCallWithTypeArgs(
     }
     const body = if (f.body) |*body_ref| body_ref else return null;
 
-    // A reified parameter that stays unbound after explicit-argument and
-    // expected-type inference must not be one the body actually reads —
-    // splicing would leave `T::class` / `is T` dangling. Decline the
-    // splice instead; the member-dispatch fallback binds runtime type
-    // arguments. A body that never reads its reified parameters (the
-    // `Json.encodeToString(value)` shape) splices fine without a binding.
-    {
-        const probe = try inferReifiedTypeArgs(b.allocator, f, type_args, expected);
-        defer b.allocator.free(probe);
-        var unbound_reified = false;
-        for (f.type_params, 0..) |tp, i| {
-            if (tp.is_reified and probe[i] == null) unbound_reified = true;
-        }
-        if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) return null;
-    }
-
     var ordered = try b.allocator.alloc(?*const Expr, f.params.len);
     defer b.allocator.free(ordered);
     for (ordered) |*slot| slot.* = null;
@@ -596,6 +580,26 @@ pub fn tryInlineCallWithTypeArgs(
             }
         }
     }
+
+    // A reified parameter that stays unbound after explicit-argument,
+    // expected-type, and callable-reference-argument inference must not
+    // be one the body actually reads — splicing would leave `T::class` /
+    // `is T` dangling. Decline the splice instead; the member-dispatch
+    // fallback binds runtime type arguments. A body that never reads its
+    // reified parameters (the `Json.encodeToString(value)` shape) splices
+    // fine without a binding.
+    {
+        const probe = try inferReifiedTypeArgs(b.allocator, f, type_args, expected);
+        defer b.allocator.free(probe);
+        var unbound_reified = false;
+        for (f.type_params, 0..) |tp, i| {
+            if (!(tp.is_reified and probe[i] == null)) continue;
+            if (callableRefParamFor(f, ordered, tp.name.name) != null) continue;
+            unbound_reified = true;
+        }
+        if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) return null;
+    }
+
     if (!inline_state.inlineExpandEnter()) {
         return null;
     }
@@ -634,9 +638,12 @@ pub fn tryInlineCallWithTypeArgs(
         }
     }
     var lambda_map = std.StringHashMap(*const ast.Expr).init(b.allocator);
+    const arg_regs = try b.allocator.alloc(Reg, f.params.len);
+    defer b.allocator.free(arg_regs);
     for (f.params, 0..) |*p, i| {
         const a = ordered[i].?; // filled above
         const r = try lowerExpr(b, a);
+        arg_regs[i] = r;
         // A lambda argument is spliced inline (its body is expanded at the
         // call site), so it is never a closure value to box — skip boxing
         // it even if a deeper nested lambda mentions the param name.
@@ -743,15 +750,39 @@ pub fn tryInlineCallWithTypeArgs(
     // `val u: User = resp.body()` binds `T = User` with no `<User>`.
     const effective_type_args = try inferReifiedTypeArgs(b.allocator, f, type_args, expected);
     defer b.allocator.free(effective_type_args);
+    const ReifiedRestore = struct { name: []const u8, prev: ?Reg };
+    var reified_restores: std.ArrayList(ReifiedRestore) = .empty;
+    defer reified_restores.deinit(b.allocator);
     for (f.type_params, 0..) |tp, tp_idx| {
         if (!tp.is_reified) continue;
-        const arg = (if (tp_idx < effective_type_args.len) effective_type_args[tp_idx] else null) orelse continue;
-        const cls_reg = b.allocReg();
-        const arg_name = try b.module.internConst(b.allocator, .{ .String = arg.name.name });
-        try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name } });
+        const arg = if (tp_idx < effective_type_args.len) effective_type_args[tp_idx] else null;
+        var cls_reg_opt: ?Reg = null;
+        if (arg) |a| {
+            // A type argument naming an *enclosing splice's* reified
+            // parameter chains lexically: `trySuspend<TaskType>(...)`
+            // inside a spliced `sleepWhile<reified TaskType>` body reuses
+            // the class value the outer splice already resolved.
+            if (b.resolveReifiedType(a.name.name)) |reg| {
+                cls_reg_opt = reg;
+            } else {
+                const cls_reg = b.allocReg();
+                const arg_name = try b.module.internConst(b.allocator, .{ .String = a.name.name });
+                try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name } });
+                cls_reg_opt = cls_reg;
+            }
+        } else if (callableRefParamFor(f, ordered, tp.name.name)) |pi| {
+            // Inferred from a constructor-reference argument
+            // (`sleepWhile(Slot::Read)` solves `TaskType = Slot.Read`
+            // from `createTask: (Continuation<Unit>) -> TaskType`): the
+            // lowered reference IS the class value, so bind it directly.
+            cls_reg_opt = arg_regs[pi];
+        }
+        const cls_reg = cls_reg_opt orelse continue;
         try b.bind(tp.name.name, cls_reg);
         const tp_global = try b.module.internConst(b.allocator, .{ .String = tp.name.name });
         try b.push(.{ .StoreGlobal = .{ .name = tp_global, .value = cls_reg } });
+        const prev = try b.bindReifiedType(tp.name.name, cls_reg);
+        try reified_restores.append(b.allocator, .{ .name = tp.name.name, .prev = prev });
     }
     // Mark body-declared `var`s that a nested closure writes as boxed so
     // their decl emits `MakeCell` and the closure's write lands on the
@@ -787,6 +818,16 @@ pub fn tryInlineCallWithTypeArgs(
     // Remove the boxing marks added for this splice so a same-named caller
     // local keeps its own (un)boxed status.
     for (boxed_here.items) |n| b.unmarkBoxed(n);
+    // Restore enclosing reified-type bindings shadowed by this splice
+    // (reverse order so nested same-named params unwind correctly).
+    {
+        var ri: usize = reified_restores.items.len;
+        while (ri > 0) {
+            ri -= 1;
+            const rr = reified_restores.items[ri];
+            b.restoreReifiedType(rr.name, rr.prev);
+        }
+    }
     b.popInlineReturn();
     b.popInlineLambdaFrame();
     try b.popScope();
@@ -800,6 +841,53 @@ fn paramIndex(f: *const Function, name: []const u8) ?usize {
         if (std.mem.eql(u8, p.name.name, name)) return i;
     }
     return null;
+}
+
+/// Index of a parameter that solves type parameter `tp_name` from a
+/// constructor-reference argument: the parameter's declared type is a
+/// function type whose return is the bare type parameter, and the
+/// argument is a `Type::Nested` constructor reference — whose lowered
+/// value is the referenced class, so the splice can bind the reified
+/// parameter to it directly (`sleepWhile(Slot::Read)` solves
+/// `TaskType = Slot.Read`).
+fn callableRefParamFor(f: *const Function, ordered: []const ?*const Expr, tp_name: []const u8) ?usize {
+    for (f.params, 0..) |*p, i| {
+        const ft = p.ty.function orelse continue;
+        if (ft.ret.function != null or ft.ret.type_args.len != 0) continue;
+        if (!std.mem.eql(u8, ft.ret.name.name, tp_name)) continue;
+        const a = (if (i < ordered.len) ordered[i] else null) orelse continue;
+        if (isTypeConstructorRef(a)) return i;
+    }
+    return null;
+}
+
+/// Whether an expression is a `Type::Nested` constructor reference —
+/// a `MemberRef` whose receiver is a type-name path and whose member
+/// itself names a type (`Slot::Read`). A lowercase member (`obj::method`,
+/// `String::length`) is a bound callable, not a class, so it never
+/// solves a reified parameter here.
+fn isTypeConstructorRef(e: *const Expr) bool {
+    return switch (e.*) {
+        .MemberRef => |mr| nameLooksLikeType(mr.name.name) and isTypeNamePath(mr.receiver),
+        else => false,
+    };
+}
+
+fn isTypeNamePath(e: *const Expr) bool {
+    return switch (e.*) {
+        .Path => |p| blk: {
+            if (p.segments.len == 0) break :blk false;
+            for (p.segments) |s| {
+                if (!nameLooksLikeType(s.name)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn nameLooksLikeType(n: []const u8) bool {
+    return n.len > 0 and n[0] >= 'A' and n[0] <= 'Z';
 }
 
 // -------------------------------------------------------------------------

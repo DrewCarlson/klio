@@ -290,3 +290,22 @@ test "internal_props_cross_package" {
         },
     }
 }
+
+test "companion_member_extension_import" {
+    try check("companion_member_extension_import",
+        \\a=label:none
+        \\aw=null
+        \\b=label:boom
+        \\bw=wrapped:boom
+        \\bx=X:boom
+        \\
+    );
+}
+
+test "reified_ctor_ref_inference" {
+    try check("reified_ctor_ref_inference",
+        \\empty+hit;same:Read(c1)+hit;
+        \\read:Read(c2)+hit;same:Write(c3)+hit;
+        \\
+    );
+}

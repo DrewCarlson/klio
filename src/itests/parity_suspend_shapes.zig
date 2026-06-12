@@ -492,3 +492,83 @@ test "receiver_bound_suspend_value_call_interleaved_async" {
         "a1|b1\na2|b2\n",
     );
 }
+
+test "manual_continuation_slot_park_and_resume" {
+    // The ByteChannel Slot wakeup protocol in miniature: a reader parks
+    // through `suspendCancellableCoroutine` storing its continuation in
+    // a slot, and a sibling coroutine's send/close resumes it by hand —
+    // including the in-block immediate-resume race check and the
+    // data-already-present no-park path. kotlinc+kotlinx-coroutines
+    // byte-parity.
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlin.coroutines.Continuation
+        \\
+        \\class MiniChannel {
+        \\    private var slot: Continuation<Unit>? = null
+        \\    private var data = ""
+        \\    private var closed = false
+        \\
+        \\    suspend fun awaitContent() {
+        \\        while (data.isEmpty() && !closed) {
+        \\            suspendCancellableCoroutine { cont ->
+        \\                slot = cont
+        \\                if (!(data.isEmpty() && !closed)) {
+        \\                    slot = null
+        \\                    cont.resumeWith(Result.success(Unit))
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\
+        \\    fun send(text: String) {
+        \\        data += text
+        \\        val c = slot
+        \\        slot = null
+        \\        c?.resumeWith(Result.success(Unit))
+        \\    }
+        \\
+        \\    fun close() {
+        \\        closed = true
+        \\        val c = slot
+        \\        slot = null
+        \\        c?.resumeWith(Result.success(Unit))
+        \\    }
+        \\
+        \\    fun take(): String {
+        \\        val d = data
+        \\        data = ""
+        \\        return d
+        \\    }
+        \\}
+        \\
+        \\fun main() = runBlocking {
+        \\    val ch = MiniChannel()
+        \\    val reader = launch {
+        \\        println("reader: waiting")
+        \\        ch.awaitContent()
+        \\        println("reader: got=" + ch.take())
+        \\        ch.awaitContent()
+        \\        println("reader: closed=" + ch.take() + ".")
+        \\    }
+        \\    delay(5)
+        \\    println("writer: send")
+        \\    ch.send("ping")
+        \\    delay(5)
+        \\    ch.close()
+        \\    reader.join()
+        \\    val ch2 = MiniChannel()
+        \\    ch2.send("pre")
+        \\    ch2.awaitContent()
+        \\    println("main: got=" + ch2.take())
+        \\    println("done")
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "manual_continuation_slot_park_and_resume",
+        src,
+        "reader: waiting\nwriter: send\nreader: got=ping\nreader: closed=.\nmain: got=pre\ndone\n",
+    );
+}

@@ -4346,10 +4346,23 @@ fn isMemberExt(mod: *const Module, fid: FuncId) bool {
 /// `member_ext_owner_class.get(fid)`-then-`visible_owners.contains(owner)`
 /// behavior exactly: the kind selects the gated funcs, the side table
 /// supplies the owner.
-fn memberExtVisible(mod: *const Module, fid: FuncId, visible_owners: *const std.StringHashMap(void)) bool {
+fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_owners: *const std.StringHashMap(void)) bool {
     if (!isMemberExt(mod, fid)) return true;
     const owner = mod.registry.member_ext_owner_class.get(fid) orelse return true;
-    return visible_owners.contains(owner);
+    if (visible_owners.contains(owner)) return true;
+    // A member extension declared in an `object`/companion is callable
+    // wherever the singleton is importable (`import C.Companion.f`): its
+    // dispatch receiver is the singleton itself, which is always
+    // materializable, so the enclosing-`this` chain need not carry it.
+    return ownerIsObjectSingleton(self, owner);
+}
+
+/// Whether a member-extension owner class is a registered `object` /
+/// companion singleton.
+fn ownerIsObjectSingleton(self: *VmHost, owner: []const u8) bool {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return pg.get().object_names.contains(owner);
 }
 
 /// A visible member-extension on the receiver type declared in the
@@ -4451,7 +4464,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         for (mod.funcsBySimpleName(name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
-            if (!memberExtVisible(mod, fid, &visible_owners)) continue;
+            if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
             try candidates.append(allocator, .{ .fid = fid, .func = f });
         }
     }
@@ -4623,6 +4636,13 @@ pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *co
         }
     }
     if (receiver.* == .Instance and receiverImplementsType(self, receiver, owner)) return receiver.*;
+    // An `object`/companion owner is its own dispatch receiver: the
+    // singleton is materializable from anywhere it can be imported.
+    if (ownerIsObjectSingleton(self, owner)) {
+        if (host_globals.objectSingletonQuiet(self, owner)) |sv| {
+            if (sv == .Instance) return sv;
+        }
+    }
     return null;
 }
 
@@ -5130,7 +5150,7 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
         for (mod.funcsBySimpleName(name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
-            if (!memberExtVisible(mod, fid, &visible_owners)) continue;
+            if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
             // Every supplied argument name must name one of the candidate's
             // params (kotlinc: a candidate without the named param is not
             // applicable) — `invokeOnCompletion(onCancelling = true) { }`
