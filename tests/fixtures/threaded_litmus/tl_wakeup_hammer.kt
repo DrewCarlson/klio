@@ -1,8 +1,9 @@
-// Maximal cross-thread DriverWakeup contention: a large batch of
-// `Dispatchers.Default` jobs all in flight at once, each routing its
-// completion resume through the single driver's wakeup mailbox while the
-// driver pump spins draining it. Repeated so the unpublished-cell race
-// window is hit many times per run.
+// DriverWakeup hammer: a large batch of `Dispatchers.Default` jobs all
+// in flight at once, each routing its completion resume through the
+// driver's wakeup mailbox while the pump drains it. Repeated so a resume
+// ordering regression is hit many times per run. (Dispatcher bodies
+// currently execute on the calling pump, so this pins the mailbox
+// plumbing rather than cross-OS-thread contention.)
 //> 1200
 import kotlinx.coroutines.*
 

@@ -34,22 +34,25 @@ Available:
 | Time         | `delay(ms: Long)` (sleep-backed), `yield()` (no-op)                     |
 | Channel      | `Channel<T>()`, `send`, `trySend`, `receive`, `close`, `isClosedForReceive` |
 
-## Single-threaded semantics
+## Execution semantics
 
-klio runs single-threaded, so:
+klio runs coroutines on a cooperative pump per `runBlocking`:
 
-- `launch` and `async` execute the block to completion on the
-  caller's stack before returning the `Job` / `Deferred`.
-- `delay(millis)` calls `std.Thread.sleep` — wall time passes,
-  no scheduler involvement.
-- `Dispatchers.X` are placeholders for source compatibility; every
-  dispatcher folds into the current thread.
+- `launch` and `async` schedule the block onto the owning pump;
+  bodies interleave cooperatively at suspension points.
+- `Dispatchers.Default` / `IO` currently execute their bodies on the
+  calling pump as well (the `__kxco_dispatch` worker hook exists but
+  the coroutine start path does not route through it yet), so
+  coroutine bodies do not overlap across OS threads.
+- Real OS-thread parallelism is provided by
+  `kotlin.concurrent.thread` (`Thread.start`/`join`), and every
+  shared primitive (`synchronized`, atomicfu, locks, `lazy`) holds
+  real exclusion across those threads.
+- `delay(millis)` parks the coroutine on the pump's virtual clock —
+  sibling coroutines keep running while it waits.
 
-This is sufficient for code that uses coroutines for *structured
-suspension* (e.g. composing async APIs sequentially) but does not
-deliver real concurrency. The full kotlinx.coroutines runtime
-(scheduler, cancellation, structured concurrency, `select`) is not
-yet implemented.
+See `docs/architecture/concurrency.md` for the full model
+(the suspension engine and the cross-thread value rules).
 
 ## Install
 

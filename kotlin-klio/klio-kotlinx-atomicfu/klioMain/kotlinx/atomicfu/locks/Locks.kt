@@ -1,10 +1,17 @@
-// klio single-threaded locks shim for `kotlinx.atomicfu.locks`.
+// klio locks for `kotlinx.atomicfu.locks`.
 //
-// klio's runtime is cooperatively single-threaded, so a lock is
-// uncontended by construction: lock/unlock are no-ops, tryLock always
-// succeeds, and withLock simply runs the action (still through a
-// try/finally so an exception leaves the "lock" released, matching the
-// upstream contract for callers that observe it).
+// klio runs real worker threads, so these are real locks. The lock
+// classes' methods are host-bound (see the pack's native bindings) to
+// the same per-object reentrant monitor that backs
+// `kotlin.synchronized`, keyed on the receiver's identity: `lock()`
+// blocks until the calling thread owns the monitor, re-entry by the
+// owning thread deepens instead of deadlocking, `tryLock()` is a
+// non-blocking acquire, and `unlock()` releases one level (unlocking
+// a lock the thread does not hold is an error). `withLock` /
+// `synchronized` run the action with the monitor held and release it
+// through try/finally even when the action throws. The Kotlin bodies
+// below are placeholders the installed host bindings shadow at
+// dispatch time.
 package kotlinx.atomicfu.locks
 
 public class ReentrantLock {
@@ -26,9 +33,8 @@ public inline fun <T> ReentrantLock.withLock(action: () -> T): T {
 
 public open class SynchronizedObject
 
-public inline fun <T> synchronized(lock: SynchronizedObject, block: () -> T): T {
-    return block()
-}
+public inline fun <T> synchronized(lock: SynchronizedObject, block: () -> T): T =
+    kotlin.synchronized(lock, block)
 
 public class SynchronousMutex {
     public fun tryLock(): Boolean = true

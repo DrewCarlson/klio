@@ -1,10 +1,16 @@
-// klio `actual`s for the `io.ktor.utils.io.locks` expects. klio's
-// cooperative pump serializes channel operations on one OS thread, so a
-// lock is uncontended by construction: lock/unlock are no-ops, tryLock
-// always succeeds, and withLock runs the action through try/finally so
-// an exception leaves the "lock" released (matching the upstream
-// contract for callers that observe it). Mirrors the kotlinx.atomicfu
-// locks shim.
+// klio `actual`s for the `io.ktor.utils.io.locks` expects. klio runs
+// real worker threads (a `ByteChannel` can be written from a
+// `Dispatchers.Default` worker while another coroutine's driver
+// reads), so these are real locks. `synchronized` delegates to
+// `kotlin.synchronized` — the host's per-object reentrant monitor,
+// keyed on the lock's identity — and `ReentrantLock`'s methods are
+// host-bound (see the pack's native bindings) to the same monitor:
+// `lock()` blocks until owned (reentrant), `tryLock()` is a
+// non-blocking acquire, `unlock()` releases one level. `withLock`
+// runs the action with the monitor held and releases it through
+// try/finally so an exception leaves the lock released. The
+// `ReentrantLock` Kotlin bodies are placeholders the installed host
+// bindings shadow at dispatch time.
 
 package io.ktor.utils.io.locks
 
@@ -34,4 +40,5 @@ public actual inline fun <T> ReentrantLock.withLock(block: () -> T): T {
 }
 
 @InternalAPI
-public actual inline fun <T> synchronized(lock: SynchronizedObject, block: () -> T): T = block()
+public actual inline fun <T> synchronized(lock: SynchronizedObject, block: () -> T): T =
+    kotlin.synchronized(lock, block)

@@ -1,11 +1,11 @@
 // klio platform actuals for kotlinx-io commonMain.
 //
 // Every `expect` in the vendored upstream commonMain is satisfied
-// here. klio is a single-threaded cooperative runtime, so the
-// SegmentPool actual performs no pooling or synchronisation — it
-// hands out fresh segments and discards recycled ones, which is
-// behaviourally indistinguishable from upstream's pool for correct
-// programs.
+// here. The SegmentPool actual performs no pooling — it hands out
+// fresh segments and discards recycled ones, so it owns no shared
+// mutable state and needs no synchronisation to satisfy upstream's
+// "thread-safe static singleton" contract; behaviourally it is
+// indistinguishable from upstream's pool for correct programs.
 
 package kotlinx.io
 

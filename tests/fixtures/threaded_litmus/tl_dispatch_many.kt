@@ -1,8 +1,9 @@
-// Real mutual exclusion across dispatched coroutines. 16
+// Mutual exclusion across dispatched coroutines. 16
 // `launch(Dispatchers.Default)` each do 1000 monitor-guarded
-// increments of a shared counter on real worker threads; after
-// joining all, the total must be exactly 16000. A broken monitor or
-// missing publication makes this wrong or flaky.
+// increments of a shared counter; after joining all, the total must
+// be exactly 16000. (Dispatcher bodies currently execute on the
+// calling pump; real OS-thread exclusion is pinned by tl_sync_counter
+// and the tl_atomicfu_* fixtures.)
 //> 16000
 import kotlinx.coroutines.*
 import kotlinx.atomicfu.atomic

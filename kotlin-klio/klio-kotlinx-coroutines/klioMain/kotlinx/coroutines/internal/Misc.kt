@@ -17,10 +17,10 @@ internal actual fun propagateExceptionFinalResort(exception: Throwable) {
     throw exception
 }
 
-// klio is single-threaded; the diagnostic context string is
-// non-essential. Stringifying an arbitrary CoroutineContext here
-// (`context.toString()`) is also a hazard — folding its elements can
-// re-enter coroutine machinery — so keep a fixed message.
+// The diagnostic context string is non-essential, and stringifying
+// an arbitrary CoroutineContext here (`context.toString()`) is a
+// hazard — folding its elements can re-enter coroutine machinery —
+// so keep a fixed message.
 internal actual class DiagnosticCoroutineContextException actual constructor(
     context: CoroutineContext
 ) : RuntimeException("CoroutineContext")

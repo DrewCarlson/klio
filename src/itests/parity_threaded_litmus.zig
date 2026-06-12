@@ -3,11 +3,13 @@
 //! publication, no lost update). Expected stdout is encoded as leading `//> `
 //! comment lines, exactly like the memory-model `conformance` suite.
 //!
-//! Programs whose guarantee already holds under the serialized interpreter (a
-//! `synchronized` block reduces to in-order execution on one thread) assert
-//! exact stdout today (`RUNNABLE`). Programs that genuinely need OS-thread
-//! spawning to be meaningful are listed in `PENDING`, keyed by the blocker,
-//! and run by an ignored test until real thread spawn lands.
+//! Programs assert exact stdout (`RUNNABLE`); the genuinely parallel
+//! ones run on real OS threads via `kotlin.concurrent.thread` (the
+//! `Dispatchers.*` shapes currently execute on the calling pump).
+//! Programs blocked on a missing capability are listed in `PENDING`,
+//! keyed by the blocker, and run by an ignored test until it lands.
+//! Run with `KLIO_RACE_JITTER=1` to widen borrow interleavings so a
+//! lost-update or double-init race reproduces reliably.
 const std = @import("std");
 const parity = @import("parity");
 
@@ -85,7 +87,7 @@ fn check(stem: []const u8) !void {
     }
 }
 
-/// Guarantees that hold under the serialized interpreter today — enforced now.
+/// Guarantees enforced now, on real OS threads.
 const RUNNABLE = [_][]const u8{
     "tl_smoke",
     "tl_thread_join",
@@ -96,6 +98,11 @@ const RUNNABLE = [_][]const u8{
     "tl_dispatch_many",
     "tl_thread_sleep",
     "tl_wakeup_hammer",
+    "tl_atomicfu_long_workers",
+    "tl_atomicfu_cas_once",
+    "tl_atomicfu_ref_cas",
+    "tl_atomicfu_lock_mutex",
+    "tl_lazy_once",
 };
 
 /// Guarantees that only become meaningful with real OS-thread spawning.
@@ -133,6 +140,21 @@ test "tl_thread_sleep" {
 }
 test "tl_wakeup_hammer" {
     try check("tl_wakeup_hammer");
+}
+test "tl_atomicfu_long_workers" {
+    try check("tl_atomicfu_long_workers");
+}
+test "tl_atomicfu_cas_once" {
+    try check("tl_atomicfu_cas_once");
+}
+test "tl_atomicfu_ref_cas" {
+    try check("tl_atomicfu_ref_cas");
+}
+test "tl_atomicfu_lock_mutex" {
+    try check("tl_atomicfu_lock_mutex");
+}
+test "tl_lazy_once" {
+    try check("tl_lazy_once");
 }
 
 // Continuously exercise the cross-thread `DriverWakeup` escape seam: a

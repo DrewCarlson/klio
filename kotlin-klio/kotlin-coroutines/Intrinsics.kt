@@ -39,8 +39,8 @@ public fun <T> suspendCoroutineUninterceptedOrReturn(block: (Continuation<T>) ->
     }
 }
 
-// Single-threaded klio has no interceptor unless one is installed in
-// the continuation's context; mirror the upstream contract.
+// klio installs no implicit interceptor; one applies only when the
+// continuation's context carries it. Mirrors the upstream contract.
 public fun <T> Continuation<T>.intercepted(): Continuation<T> {
     val interceptor = context[ContinuationInterceptor]
     return interceptor?.interceptContinuation(this) ?: this

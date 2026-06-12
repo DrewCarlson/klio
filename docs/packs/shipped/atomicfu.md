@@ -1,9 +1,15 @@
 # kotlinx.atomicfu
 
 The `kotlinx.atomicfu` pack provides atomic reference and primitive
-holders. klio runs single-threaded, so "atomic" operations are
-trivially atomic: each binding mutates the receiver's `value` field
-in place.
+holders. klio runs real worker threads (`kotlin.concurrent.thread`,
+`Dispatchers.Default`/`IO`), so every operation is genuinely atomic:
+each binding performs its read-modify-write under a single exclusive
+borrow of the receiver's cell, so concurrent workers never observe a
+torn or interleaved update. `kotlinx.atomicfu.locks` ships real locks
+backed by the same per-object reentrant monitor as
+`kotlin.synchronized`. Explicit memory fences remain no-ops because
+every atomic operation is already sequentially consistent through the
+cell's lock.
 
 ## Surface
 
@@ -34,7 +40,7 @@ Available types:
 | `AtomicInt`     | `compareAndSet`, `getAndSet`, `getAndIncrement`/`Decrement`, `incrementAndGet`/`Decrement`, `getAndAdd`, `addAndGet`, `plusAssign`/`minusAssign` |
 | `AtomicLong`    | Same as `AtomicInt` over `Long`.                                                          |
 | `AtomicBoolean` | `compareAndSet`, `getAndSet`.                                                              |
-| `AtomicRef<T>`  | `compareAndSet`, `getAndSet`. Equality is structural.                                      |
+| `AtomicRef<T>`  | `compareAndSet`, `getAndSet`. CAS compares by referential identity (`===`), like upstream. |
 
 ## Install
 

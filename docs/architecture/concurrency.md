@@ -1,19 +1,23 @@
 # Concurrency
 
 klio runs Kotlin concurrency on real OS threads. `Thread.start` /
-`join` spawn and join genuine `std.Thread`s, and
-`Dispatchers.Default` / `IO` dispatch coroutine bodies onto a real
-worker pool, so CPU-bound work runs in parallel. Coroutines within
-one `runBlocking` still interleave cooperatively on their driver
-thread. `Thread`, `synchronized`, `@Volatile`, and atomics have
+`join` spawn and join genuine `std.Thread`s. Coroutines within
+one `runBlocking` interleave cooperatively on their driver
+thread; `Dispatchers.Default` / `IO` currently execute their bodies
+on the calling pump too (the `__kxco_dispatch` worker hook and the
+cross-thread wakeup mailbox exist, but the coroutine start path does
+not route bodies through them yet, so coroutine bodies do not
+overlap across OS threads). `Thread`, `synchronized`, `@Volatile`, and atomics have
 faithful Kotlin semantics; the value model
 (`runtime.Value`, backed by `ObjRef` over an atomically
-reference-counted adaptive cell) is safe to share across threads and
-the publication protocol is stress-verified race-free. The adaptive
-cell keeps the single-threaded path at `RefCell` speed: borrow
-tracking is a single non-atomic flag until a reference is published
-across threads, at which point that cell — and only that cell —
-promotes to a reader/writer lock.
+reference-counted cell) is safe to share across threads and
+the publication protocol is stress-verified race-free. Every cell
+carries a per-cell reader/writer spin lock that mediates each
+borrow; on an uncontended cell (the common case) a borrow is a
+single uncontended `cmpxchg`, the same fast path a `RefCell` borrow
+flag would take, and the lock's acquire/release ordering is the
+happens-before edge that lets a reference escape to another thread
+with no separate publication step.
 
 Three ideas structure the design.
 

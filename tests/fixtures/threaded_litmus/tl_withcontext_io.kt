@@ -1,7 +1,7 @@
-// Blocking offload. `withContext(Dispatchers.IO)` runs a blocking
-// loop on a real elastic worker thread and suspends the caller until
-// it completes, returning the value across threads. Result must be
-// exact.
+// Blocking offload shape. `withContext(Dispatchers.IO)` runs a
+// blocking loop and suspends the caller until it completes; the
+// returned value must be exact. (Dispatcher bodies currently execute
+// on the calling pump.)
 //> 500000500000
 import kotlinx.coroutines.*
 
