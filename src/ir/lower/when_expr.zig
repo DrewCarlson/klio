@@ -230,7 +230,7 @@ fn lowerSubjectPatternCond(
                 .dst = dst,
                 .src = subj,
                 .ty = .{
-                    .name = ty.name.name,
+                    .name = expr_lower.loweredTypeName(b, &ty),
                     .nullable = ty.nullable,
                     .args = &.{},
                 },
@@ -243,7 +243,7 @@ fn lowerSubjectPatternCond(
                 .dst = raw,
                 .src = subj,
                 .ty = .{
-                    .name = ty.name.name,
+                    .name = expr_lower.loweredTypeName(b, &ty),
                     .nullable = ty.nullable,
                     .args = &.{},
                 },

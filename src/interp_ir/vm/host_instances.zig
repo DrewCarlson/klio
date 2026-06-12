@@ -2389,10 +2389,16 @@ fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef
     };
 }
 
-pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult {
+pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, captured_names: []const []const u8, captures: []const Value, scope_renames: []const ir.ScopeRename) Allocator.Error!EvalResult {
     if (expr.* != .ObjectExpr) {
         return .{ .err = try typeErr(allocator, "Vm::build_object: not an ObjectExpr AST node", .{}) };
     }
+    // The member bodies below lower into fresh side modules with none of
+    // the build's scope registries; install the lexical site's rename
+    // snapshot so a reference to a mangled private nested class (or a
+    // renamed file-private type) still resolves scope-true.
+    const prev_renames = ir.build.setLowerAnonScopeRenames(scope_renames);
+    defer _ = ir.build.setLowerAnonScopeRenames(prev_renames);
     const obj = expr.ObjectExpr;
     const members = obj.members;
     const supertypes = obj.supertypes;
@@ -2414,7 +2420,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         }
     }
     for (supertypes) |*sup| {
-        const pdef = classDefByName(self, sup.name.name) orelse continue;
+        const sup_name = ir.build.anonScopeRename(sup.name.name) orelse sup.name.name;
+        const pdef = classDefByName(self, sup_name) orelse continue;
         defer pdef.deinit();
         const dg = pdef.borrow();
         defer dg.deinit();
@@ -2584,7 +2591,9 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         });
     }
     var supertype_names = try allocator.alloc([]const u8, supertypes.len);
-    for (supertypes, 0..) |*t, i| supertype_names[i] = t.name.name;
+    for (supertypes, 0..) |*t, i| {
+        supertype_names[i] = ir.build.anonScopeRename(t.name.name) orelse t.name.name;
+    }
 
     // First non-interface supertype as resolved parent class.
     var anon_parent: ?ObjRef(ClassDef) = null;

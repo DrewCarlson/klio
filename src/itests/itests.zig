@@ -11,6 +11,7 @@ test {
     _ = @import("parity_coroutine_smoke.zig");
     _ = @import("parity_corpus_pinned.zig");
     _ = @import("ktor_client_get.zig");
+    _ = @import("json_reified_inline.zig");
     _ = @import("parity_coroutines_realistic.zig");
     _ = @import("parity_data_class_features.zig");
     _ = @import("parity_dsl_operators.zig");

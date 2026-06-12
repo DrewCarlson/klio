@@ -143,6 +143,17 @@ include = [
     "io/ktor/http/content/ByteArrayContent.kt",
 ]
 
+# nonJvm engine loader: the `engines` registry (`append` + iteration) the
+# posix `HttpClient()` actual discovers a default engine through. Gated
+# under the `client` feature (see [features]); klio's engine-less actual
+# binds `KlioClient` directly, so the registry is consumed and usable but
+# not the default-engine mechanism.
+[[source]]
+root = "upstream/ktor-client/ktor-client-core/nonJvm/src"
+include = [
+    "io/ktor/client/engine/Loader.kt",
+]
+
 # Event bus (`io.ktor.events.Events`) — `HttpClient.monitor`. Ungated (core).
 [[source]]
 root = "upstream/ktor-shared/ktor-events/common/src"
@@ -250,6 +261,11 @@ default = []
 # the engine-less `HttpClient()` actual bound to it (each platform's
 # actual resolves a default engine its own way; klio ships one engine).
 # Both `HttpClient()` and `HttpClient(KlioClient)` construct.
+# The nonJvm engine loader (the `engines` registry the posix
+# `HttpClient()` actual discovers a default engine through) is consumed
+# and usable (`engines.append` / iteration), but stays superseded as the
+# default-engine mechanism: klio's actual binds `KlioClient` directly, so
+# the posix `HttpClient.kt` actual is not consumed alongside it.
 client = { sources = [
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/utils/ClientEvents.kt",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/content/",
@@ -259,6 +275,7 @@ client = { sources = [
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/HttpClient.kt",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/HttpClientConfig.kt",
+    "upstream/ktor-client/ktor-client-core/nonJvm/src/io/ktor/client/engine/Loader.kt",
     "shim/client-upstream",
 ] }
 # ktor-server-core: embeddedServer + routing + respondText.

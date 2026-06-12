@@ -1763,7 +1763,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .BuildObject => |bobj| {
             const cap_values = try readRegSlice(allocator, frame, bobj.captures);
             defer allocator.free(cap_values);
-            switch (try host.buildObject(allocator, bobj.ast, bobj.captured_names, cap_values)) {
+            switch (try host.buildObject(allocator, bobj.ast, bobj.captured_names, cap_values, bobj.scope_renames)) {
                 .ok => |v| try frame.write(bobj.dst, v),
                 .err => |e| return errResult(e),
             }
@@ -3110,8 +3110,8 @@ pub const NullHost = struct {
         return self.registerClass(allocator, class);
     }
 
-    pub fn buildObject(self: *NullHost, allocator: Allocator, ast: *const @import("ast").Expr, captured_names: []const []const u8, captures: []const Value) Allocator.Error!EvalResult {
-        _ = .{ self, allocator, ast, captured_names, captures };
+    pub fn buildObject(self: *NullHost, allocator: Allocator, ast: *const @import("ast").Expr, captured_names: []const []const u8, captures: []const Value, scope_renames: []const ir.ScopeRename) Allocator.Error!EvalResult {
+        _ = .{ self, allocator, ast, captured_names, captures, scope_renames };
         return errResult(.{ .Unsupported = "Host.build_object" });
     }
 

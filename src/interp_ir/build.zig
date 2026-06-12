@@ -281,13 +281,17 @@ pub fn buildModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocat
         try imports.appendSlice(allocator, f.imports);
     }
 
-    // Kotlin scopes a `private` top-level property to its declaring file;
-    // the lowered globals table is flat. Mangle each private top-level
-    // property whose simple name another file also declares as a top-level
-    // property, and install the per-file rename table the bare-name
-    // lowering consults through the reference's span file (fifteen ktor
-    // plugin files each declare a file-private `LOGGER`; flattening them
-    // into one slot crossed delegated and plain properties).
+    // Kotlin gives same-named top-level properties distinct storage per
+    // declaration — a `private` one is scoped to its declaring file, and
+    // non-private ones in different packages are distinct declarations —
+    // but the lowered globals table is flat. Rename colliding declarations
+    // (per-file mangle for `private`, the declaring FQN for cross-package
+    // non-private slots) and install the per-file rename table the
+    // bare-name lowering consults through the reference's span file (an
+    // inline-spliced body keeps its declaring file's spans, so a splice
+    // still reads the right file's property). A bare reference resolves
+    // Kotlin's scope order: own-file private > own package > named import
+    // > wildcard import.
     var private_prop_renames = ir.build.FilePrivateRenames.init(allocator);
     defer {
         var it = private_prop_renames.valueIterator();
@@ -312,6 +316,8 @@ pub fn buildModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocat
                 gop.value_ptr.* += 1;
             }
         }
+        // Private decls: per-file mangled slots; bare reads in the
+        // declaring file rewrite to them.
         for (decls.items) |*d| {
             if (d.* != .Property) continue;
             const p = &d.Property;
@@ -326,9 +332,157 @@ pub fn buildModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocat
             try gop.value_ptr.put(p.name.name, mangled);
             p.name = .{ .name = mangled, .span = p.name.span };
         }
+        // Non-private decls of one simple name declared by two or more
+        // packages: each gets its declaring-FQN slot.
+        const FqnCand = struct { pkg: []const u8, fqn: []const u8 };
+        var fqn_renamed = std.StringHashMap(std.ArrayList(FqnCand)).init(allocator);
+        defer {
+            var it = fqn_renamed.valueIterator();
+            while (it.next()) |list| list.deinit(allocator);
+            fqn_renamed.deinit();
+        }
+        for (decls.items) |*d| {
+            if (d.* != .Property) continue;
+            const p = &d.Property;
+            if (p.receiver_type != null) continue;
+            if (p.visibility == .Private or p.is_expect or p.is_actual) continue;
+            const count = name_counts.get(p.name.name) orelse 0;
+            if (count < 2) continue;
+            const pkg = decl_pkg.get(p.span) orelse "";
+            if (pkg.len == 0) continue;
+            // Rename only when another package also declares the name
+            // non-privately: same-package duplicates are a kotlinc
+            // redeclaration error, and a private-only collision is
+            // already file-scoped above.
+            var other_pkg = false;
+            for (decls.items) |*d2| {
+                if (d2.* != .Property) continue;
+                const q = &d2.Property;
+                if (q.receiver_type != null or q.is_expect or q.is_actual) continue;
+                if (q.visibility == .Private) continue;
+                if (!std.mem.eql(u8, q.name.name, p.name.name)) continue;
+                const qpkg = decl_pkg.get(q.span) orelse "";
+                if (!std.mem.eql(u8, qpkg, pkg)) other_pkg = true;
+            }
+            if (!other_pkg) continue;
+            const simple = p.name.name;
+            const fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, simple });
+            const fid = p.span.file.int();
+            const gop = try private_prop_renames.getOrPut(fid);
+            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+            // A file-private decl of the same name in this file wins for
+            // the file's own references; only add when absent.
+            if (gop.value_ptr.get(simple) == null) try gop.value_ptr.put(simple, fqn);
+            const lgop = try fqn_renamed.getOrPut(simple);
+            if (!lgop.found_existing) lgop.value_ptr.* = .empty;
+            try lgop.value_ptr.append(allocator, .{ .pkg = pkg, .fqn = fqn });
+            p.name = .{ .name = fqn, .span = p.name.span };
+        }
+        // Resolve bare references from every other file: own package
+        // first, then a named import of a declaring FQN, then a wildcard
+        // import of a declaring package. A file with no visible
+        // declaration keeps the name-keyed read (Kotlin would reject the
+        // reference outright; klio's lenient pick stays unchanged).
+        if (fqn_renamed.count() != 0) {
+            for (files) |*f| {
+                const fid = f.span.file.int();
+                const fpkg = try packagePrefix(allocator, f.package);
+                var it = fqn_renamed.iterator();
+                while (it.next()) |e| {
+                    const simple = e.key_ptr.*;
+                    {
+                        const fgop = try private_prop_renames.getOrPut(fid);
+                        if (!fgop.found_existing) fgop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+                        if (fgop.value_ptr.get(simple) != null) continue;
+                    }
+                    var pick: ?[]const u8 = null;
+                    for (e.value_ptr.items) |cand| {
+                        if (std.mem.eql(u8, cand.pkg, fpkg)) pick = cand.fqn;
+                    }
+                    if (pick == null) {
+                        for (f.imports) |*imp| {
+                            if (imp.wildcard or imp.path.len == 0) continue;
+                            if (imp.alias != null) continue;
+                            if (!std.mem.eql(u8, imp.path[imp.path.len - 1].name, simple)) continue;
+                            const imp_fqn = try joinIdents(allocator, imp.path, ".");
+                            for (e.value_ptr.items) |cand| {
+                                if (std.mem.eql(u8, cand.fqn, imp_fqn)) pick = cand.fqn;
+                            }
+                        }
+                    }
+                    if (pick == null) {
+                        for (f.imports) |*imp| {
+                            if (!imp.wildcard) continue;
+                            const imp_pkg = try joinIdents(allocator, imp.path, ".");
+                            for (e.value_ptr.items) |cand| {
+                                if (std.mem.eql(u8, cand.pkg, imp_pkg) and pick == null) pick = cand.fqn;
+                            }
+                        }
+                    }
+                    if (pick) |fqn| {
+                        const fgop = try private_prop_renames.getOrPut(fid);
+                        if (!fgop.found_existing) fgop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+                        try fgop.value_ptr.put(simple, fqn);
+                    }
+                }
+            }
+        }
     }
     const prev_renames = ir.build.setLowerFilePrivateRenames(&private_prop_renames);
     defer _ = ir.build.setLowerFilePrivateRenames(prev_renames);
+
+    // Kotlin scopes a file-`private` top-level class or typealias to its
+    // declaring file; the lowered type namespace is flat. Mangle a private
+    // class/typealias whose simple name another file also claims as a type
+    // (class, object, or typealias — the coroutines pack's file-private
+    // `typealias Node` must not capture another file's `Node` class), and
+    // install the per-file rename table; the reference sites (bare heads,
+    // `as`/`is`, supertypes) rewrite through the reference's span file.
+    var file_type_renames = ir.build.FileTypeRenames.init(allocator);
+    defer {
+        var it = file_type_renames.valueIterator();
+        while (it.next()) |inner| inner.deinit();
+        file_type_renames.deinit();
+    }
+    {
+        var name_files = std.StringHashMap(u32).init(allocator);
+        defer name_files.deinit();
+        var name_counts = std.StringHashMap(u32).init(allocator);
+        defer name_counts.deinit();
+        for (decls.items) |*d| {
+            const claim: ?struct { name: []const u8, fid: u32 } = switch (d.*) {
+                .Class => |*c| .{ .name = c.name.name, .fid = c.span.file.int() },
+                .Object => |*o| .{ .name = o.name.name, .fid = o.span.file.int() },
+                .TypeAlias => |*t| .{ .name = t.name.name, .fid = t.span.file.int() },
+                else => null,
+            };
+            const cl = claim orelse continue;
+            const gop = try name_counts.getOrPut(cl.name);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = 1;
+                try name_files.put(cl.name, cl.fid);
+            } else if (name_files.get(cl.name).? != cl.fid) {
+                gop.value_ptr.* += 1;
+            }
+        }
+        for (decls.items) |*d| {
+            const target: ?struct { name: *ast.Ident, vis: ast.Visibility, is_ea: bool, fid: u32 } = switch (d.*) {
+                .Class => |*c| .{ .name = &c.name, .vis = c.visibility, .is_ea = c.is_expect or c.is_actual, .fid = c.span.file.int() },
+                .TypeAlias => |*t| .{ .name = &t.name, .vis = t.visibility, .is_ea = false, .fid = t.span.file.int() },
+                else => null,
+            };
+            const tg = target orelse continue;
+            if (tg.vis != .Private or tg.is_ea) continue;
+            if ((name_counts.get(tg.name.name) orelse 0) < 2) continue;
+            const mangled = try std.fmt.allocPrint(allocator, "{s}$f{d}", .{ tg.name.name, tg.fid });
+            const gop = try file_type_renames.getOrPut(tg.fid);
+            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+            try gop.value_ptr.put(tg.name.name, mangled);
+            tg.name.* = .{ .name = mangled, .span = tg.name.span };
+        }
+    }
+    const prev_ty_renames = ir.build.setLowerFileTypeRenames(&file_type_renames);
+    defer _ = ir.build.setLowerFileTypeRenames(prev_ty_renames);
 
     const combined = KotlinFile{
         .package = null,
@@ -701,6 +855,30 @@ fn buildModuleWithOverrides(
             }
         }
     }
+    // Repoint bare supertype references to a mangled private nested class
+    // from inside its declaring class's subtree: a lifted member whose
+    // enclosing chain reaches the aliasing outer sees the alias, exactly
+    // the scope Kotlin gives the private nested declaration.
+    if (nested_object_aliases.count() != 0) {
+        for (all_decls.items) |*d| {
+            if (d.* != .Class) continue;
+            for (d.Class.supertypes) |*t| {
+                if (t.qualified_path != null) continue;
+                var owner: ?[]const u8 = d.Class.name.name;
+                var hops: usize = 0;
+                while (owner) |o| : (hops += 1) {
+                    if (hops > 32) break;
+                    if (nested_object_aliases.get(o)) |m| {
+                        if (m.get(t.name.name)) |renamed| {
+                            t.name.name = renamed;
+                            break;
+                        }
+                    }
+                    owner = enclosing_class.get(o);
+                }
+            }
+        }
+    }
 
     // Pre-collect actual-name sets to drop superseded `expect` decls.
     var actual_func_names = StringSet.init(a);
@@ -830,6 +1008,26 @@ fn buildModuleWithOverrides(
             while (iit.next()) |ie| try inner.put(ie.key_ptr.*, ie.value_ptr.*);
             try module.registry.nested_object_aliases.put(e.key_ptr.*, inner);
         }
+    }
+    // Mangled nested-class names, for qualified type references
+    // (`x is Outer.Inner` must bind the lifted class, not a
+    // same-simple-name top-level one).
+    {
+        var it = mangled_nested.iterator();
+        while (it.next()) |e| try module.registry.mangled_nested.put(e.key_ptr.*, e.value_ptr.*);
+    }
+    // The enclosing-class chain backs the lowerer's scope-true alias walk
+    // (a private nested class is visible throughout its declaring class's
+    // subtree), and the companion-singleton map backs the companion-
+    // receiver reified-inline splice gate; install both before any body
+    // lowers. The registry materialisation below re-puts the same entries.
+    {
+        var it = enclosing_class.iterator();
+        while (it.next()) |e| try module.registry.enclosing_class.put(e.key_ptr.*, e.value_ptr.*);
+    }
+    {
+        var it = companion_singletons.iterator();
+        while (it.next()) |e| try module.registry.companion_singletons.put(e.key_ptr.*, e.value_ptr.*);
     }
 
     // Make every `inline fun` body available to the lowerer by simple name.
@@ -1936,7 +2134,15 @@ fn buildClassDef(
     for (c.secondary_ctors, 0..) |*sc, i| secondary[i] = sc;
 
     var supertype_names = try a.alloc([]const u8, c.supertypes.len);
-    for (c.supertypes, 0..) |*t, i| supertype_names[i] = t.name.name;
+    for (c.supertypes, 0..) |*t, i| {
+        // A supertype naming a renamed file-private class resolves to the
+        // mangled lift name; the rename is keyed by the reference's own
+        // span file, matching the file scope of the declaration.
+        supertype_names[i] = if (t.qualified_path == null)
+            ir.build.fileTypeRename(t.name.name, t.span.file.int()) orelse t.name.name
+        else
+            t.name.name;
+    }
 
     const fqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
 

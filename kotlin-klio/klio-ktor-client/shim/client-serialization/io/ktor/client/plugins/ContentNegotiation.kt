@@ -2,11 +2,14 @@
 // the real plugin API (`createClientPlugin` + the transform hooks, the same
 // surface HttpPlainText uses). JSON via kotlinx-serialization is the one
 // converter klio ships, so `install(ContentNegotiation) { json() }` wires:
-//  - request: a non-primitive `setBody(value)` serializes to a JSON
-//    `TextContent` (the upstream default transformers keep handling
-//    String/ByteArray/OutgoingContent bodies);
+//  - request: a non-primitive `setBody(value)` serializes through the real
+//    reified `Json.encodeToString` to a JSON `TextContent` (the upstream
+//    default transformers keep handling String/ByteArray/OutgoingContent
+//    bodies);
 //  - response: a `body<T>()` request for a type the default transformers
-//    don't cover decodes the body text into `T` by its runtime class.
+//    don't cover decodes the body text into `T` by its runtime class
+//    (`Json.decodeToClass` — the requested type arrives as a `TypeInfo`,
+//    so the reified decode cannot express it).
 
 package io.ktor.client.plugins.contentnegotiation
 
@@ -19,7 +22,6 @@ import kotlinx.io.Source
 import kotlinx.io.readByteArray
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeToClass
-import kotlinx.serialization.json.encodeValue
 
 public class ContentNegotiationConfig {
     // Registered converter media types, for introspection. JSON is the only
@@ -34,7 +36,7 @@ public val ContentNegotiation: ClientPlugin<ContentNegotiationConfig> = createCl
     transformRequestBody { request, content, bodyType ->
         when (content) {
             is String, is ByteArray, is OutgoingContent -> null
-            else -> TextContent(Json.encodeValue(content), ContentType.Application.Json)
+            else -> TextContent(Json.encodeToString(content), ContentType.Application.Json)
         }
     }
 

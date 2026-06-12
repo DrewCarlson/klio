@@ -3037,9 +3037,9 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         };
         // A user extension whose declared receiver is the class (or an
         // ancestor) also dispatches through the companion value:
-        // `Json.encodeValue(x)` binds `fun Json.encodeValue(...)` with
-        // the companion (`Json.Default`, an instance of `Json`) as its
-        // receiver, so construct the companion for it too.
+        // `Json.encodeToString(x)` binds `fun Json.encodeToString(...)`
+        // with the companion (`Json.Default`, an instance of `Json`) as
+        // its receiver, so construct the companion for it too.
         if (singleton == null and extensionTargetsAny(self, name, probe_classes.items)) {
             singleton = switch (try host_globals.ensureObjectSingleton(self, cn)) {
                 .ok => |maybe| maybe,

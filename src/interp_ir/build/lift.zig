@@ -318,13 +318,26 @@ pub fn liftClassRecursive(
                     try collectEnclosingMemberNames(enclosing_chain[ci], &extras);
                 }
                 const qualified = try std.fmt.allocPrint(a, "{s}.{s}", .{ c.name.name, nested.name.name });
+                // Kotlin scopes a `private` nested class to its declaring
+                // class; the lifted top-level namespace is flat, so a
+                // private nested class always lifts under a scope-keyed
+                // mangled name (the same identity a private nested object
+                // gets) and bare references inside the declaring class's
+                // subtree rewrite through `nested_object_aliases`. A
+                // non-private nested class is mangled only when its bare
+                // name would collide with a top-level type that is also
+                // extended through the qualified form.
+                const is_private = nested.visibility == .Private;
                 const collides = ctx.top_level_type_names.contains(nested.name.name) and
                     ctx.used_qualified_supertypes.contains(qualified);
                 var lifted = nested.*;
-                if (collides) {
+                if (is_private or collides) {
                     const mangled = try std.fmt.allocPrint(a, "{s}${s}", .{ c.name.name, nested.name.name });
                     try ctx.mangled_nested.put(qualified, mangled);
                     lifted.name = .{ .name = mangled, .span = nested.name.span };
+                    if (is_private) {
+                        try putAlias(ctx, c.name.name, nested.name.name, mangled);
+                    }
                 } else {
                     a.free(qualified);
                 }

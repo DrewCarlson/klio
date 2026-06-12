@@ -111,6 +111,11 @@ pub const ConstId = enum(u32) {
     }
 };
 
+/// One scope-true type rename carried by `Inst.BuildObject`: the simple
+/// name a reference uses and the mangled lift name it resolves to in the
+/// object expression's lexical scope.
+pub const ScopeRename = struct { name: []const u8, renamed: []const u8 };
+
 /// One IR instruction. Drives the per-frame evaluator switch.
 pub const Inst = union(enum) {
     /// Materialise a constant into a register.
@@ -394,6 +399,14 @@ pub const Inst = union(enum) {
         ast: *ast.Expr,
         captured_names: [][]const u8,
         captures: []Reg,
+        /// Scope-true type renames visible at the object expression's
+        /// lexical site (mangled private nested classes along the
+        /// enclosing-class chain, renamed file-private types of the
+        /// declaring file), flattened at lowering time. Anon-object
+        /// member bodies lower at runtime into a fresh side module
+        /// with none of the build's scope registries, so the lexical
+        /// renames ride on the instruction.
+        scope_renames: []const ScopeRename = &.{},
     },
     /// Materialise a lambda value capturing the current scope's
     /// registers. The captures are listed as a `[]Reg`; the
@@ -1834,6 +1847,12 @@ pub const ModuleRegistry = struct {
     /// Nested-object simple-name aliases, keyed by enclosing class
     /// name.
     nested_object_aliases: std.StringHashMap(std.StringHashMap([]const u8)),
+    /// Qualified nested-class name (`Outer.Inner`) → mangled lift name,
+    /// for nested classes the lift renamed (private, or colliding with
+    /// a top-level type). A qualified type reference (`x is
+    /// Outer.Inner`, `x as Outer.Inner`) resolves through this so it
+    /// binds the lifted class, never a same-simple-name top-level one.
+    mangled_nested: std.StringHashMap([]const u8),
     /// `(class_name, member_name) → Const` for class / companion
     /// `const val name = <literal>`.
     class_const_inits: StrPairMap(Const),
@@ -1871,6 +1890,7 @@ pub const ModuleRegistry = struct {
             .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))).init(allocator),
             .import_wildcards = std.AutoHashMap(FileId, std.ArrayList([]const u8)).init(allocator),
             .nested_object_aliases = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
+            .mangled_nested = std.StringHashMap([]const u8).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
             .allocator = allocator,
         };
@@ -1944,6 +1964,7 @@ pub const ModuleRegistry = struct {
             while (it.next()) |inner| inner.deinit();
             self.nested_object_aliases.deinit();
         }
+        self.mangled_nested.deinit();
         self.class_const_inits.deinit();
     }
 };

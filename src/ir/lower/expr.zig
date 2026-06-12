@@ -123,17 +123,12 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (expr.* == .Path and expr.Path.segments.len == 1) {
         const segments = expr.Path.segments;
         const n = segments[0].name;
-        // Skip the class-name shortcut when the enclosing class aliases this
-        // name to a (mangled) nested object: a bare `Inner` inside `Outer`
-        // must reach `Outer$Inner` even though a same-named top-level class
-        // owns the bare `class_id`. Falling through to `lowerExpr` applies
-        // the alias rewrite in the `Path` arm.
-        var aliased = false;
-        if (b.ownerClass()) |owner| {
-            if (b.module.registry.nested_object_aliases.get(owner)) |m| {
-                aliased = m.contains(n);
-            }
-        }
+        // Skip the class-name shortcut when the scope renames this name to
+        // a (mangled) nested class/object or a file-private type: a bare
+        // `Inner` inside `Outer` must reach `Outer$Inner` even though a
+        // same-named top-level class owns the bare `class_id`. Falling
+        // through to `lowerExpr` applies the rewrite in the `Path` arm.
+        const aliased = scopeTypeRename(b, n, segments[0].span.file.int()) != null;
         if (!aliased and b.resolve(n) == null and !b.knowsOuter(n) and b.module.classId(n) != null) {
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = n });
@@ -402,7 +397,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             try b.push(.{ .InstanceOf = .{
                 .dst = dst,
                 .src = s,
-                .ty = .{ .name = ck.ty.name.name, .nullable = ck.ty.nullable, .args = &.{} },
+                .ty = .{ .name = loweredTypeName(b, &ck.ty), .nullable = ck.ty.nullable, .args = &.{} },
             } });
             if (ck.negated) {
                 const neg = b.allocReg();
@@ -417,7 +412,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             try b.push(.{ .Cast = .{
                 .dst = dst,
                 .src = s,
-                .ty = .{ .name = cast.ty.name.name, .nullable = cast.ty.nullable, .args = &.{} },
+                .ty = .{ .name = loweredTypeName(b, &cast.ty), .nullable = cast.ty.nullable, .args = &.{} },
                 .safe = cast.safe,
             } });
             return dst;
@@ -502,6 +497,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 .ast = ast_box,
                 .captured_names = captured_names,
                 .captures = captures,
+                .scope_renames = try collectScopeRenames(b, expr.ObjectExpr.span.file.int()),
             } });
             return dst;
         },
@@ -753,6 +749,89 @@ fn writeBackLvalue(b: *FuncBuilder, target: *const Expr, val: Reg) Allocator.Err
     }
 }
 
+/// The mangled lift name a type reference `name` resolves to in the
+/// current scope: a (mangled) nested class/object aliased anywhere along
+/// the enclosing-class chain — Kotlin makes a private nested class
+/// visible throughout its declaring class's subtree, and a lifted
+/// sibling/nested member keeps the outer on its chain — or a renamed
+/// file-private class/typealias declared by the reference's own file.
+/// Returns null when no rename applies.
+pub fn scopeTypeRename(b: *const FuncBuilder, name: []const u8, file: u32) ?[]const u8 {
+    var owner = b.ownerClass();
+    var hops: usize = 0;
+    while (owner) |o| : (hops += 1) {
+        if (hops > 32) break;
+        if (b.module.registry.nested_object_aliases.get(o)) |m| {
+            if (m.get(name)) |renamed| return renamed;
+        }
+        owner = b.module.registry.enclosing_class.get(o);
+    }
+    // An anon-object member body lowering at runtime carries its lexical
+    // site's flattened renames (the side module's registries are empty).
+    if (build.anonScopeRename(name)) |renamed| return renamed;
+    return build.fileTypeRename(name, file);
+}
+
+/// Flatten every scope-true type rename visible at the current lexical
+/// site — the enclosing-class chain's alias maps (nearest scope first),
+/// the anon-scope renames when this site itself sits inside an anon-object
+/// body lowering, and the declaring file's file-private type renames —
+/// into one slice for a `BuildObject` instruction. First entry per name
+/// wins on lookup, so nearer scopes shadow outer ones.
+fn collectScopeRenames(b: *FuncBuilder, file: u32) Allocator.Error![]const ir.ScopeRename {
+    var out: std.ArrayList(ir.ScopeRename) = .empty;
+    var owner = b.ownerClass();
+    var hops: usize = 0;
+    while (owner) |o| : (hops += 1) {
+        if (hops > 32) break;
+        if (b.module.registry.nested_object_aliases.get(o)) |m| {
+            var it = m.iterator();
+            while (it.next()) |e| {
+                try out.append(b.allocator, .{ .name = e.key_ptr.*, .renamed = e.value_ptr.* });
+            }
+        }
+        owner = b.module.registry.enclosing_class.get(o);
+    }
+    for (build.anonScopeRenames()) |r| try out.append(b.allocator, r);
+    if (build.fileTypeRenamesFor(file)) |m| {
+        var it = m.iterator();
+        while (it.next()) |e| {
+            try out.append(b.allocator, .{ .name = e.key_ptr.*, .renamed = e.value_ptr.* });
+        }
+    }
+    return out.toOwnedSlice(b.allocator);
+}
+
+/// Reduce a dotted path to its last two segments (`a.b.C` -> `b.C`);
+/// null when the path has fewer than two.
+fn lastTwoSegments(path: []const u8) ?[]const u8 {
+    var last: ?usize = null;
+    var prev: ?usize = null;
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) {
+        if (path[i] == '.') {
+            prev = last;
+            last = i;
+        }
+    }
+    if (last == null) return null;
+    const start = if (prev) |p| p + 1 else 0;
+    return path[start..];
+}
+
+/// The lowered name for a type position (`as T` / `is T` / catch type):
+/// a qualified nested reference (`Outer.Inner`) whose target the lift
+/// mangled resolves to the mangled lift name, then the scope-true
+/// rename ladder (`scopeTypeRename`), then the bare simple name.
+pub fn loweredTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []const u8 {
+    if (ty.qualified_path) |qp| {
+        if (lastTwoSegments(qp)) |key| {
+            if (b.module.registry.mangled_nested.get(key)) |m| return m;
+        }
+    }
+    return scopeTypeRename(b, ty.name.name, ty.span.file.int()) orelse ty.name.name;
+}
+
 /// The mangled per-file global for a bare `name` referenced from the file
 /// `file`, or null when the reference is not a read of a renamed
 /// file-private top-level property. Locals, lambda/anon-object captures,
@@ -790,12 +869,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return b.emitConst(c);
         }
     }
-    // Nested-object alias rewrite.
-    if (b.ownerClass()) |owner| {
-        var renamed: ?[]const u8 = null;
-        if (b.module.registry.nested_object_aliases.get(owner)) |m| {
-            renamed = m.get(segments[0].name);
-        }
+    // Mangled nested-class/object alias and file-private type rewrite.
+    {
+        const renamed = scopeTypeRename(b, segments[0].name, segments[0].span.file.int());
         if (renamed != null and b.resolve(segments[0].name) == null) {
             const new_segs = try b.allocator.dupe(ast.Ident, segments);
             defer b.allocator.free(new_segs);
@@ -1373,7 +1449,7 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const cur_id = b.cur;
     const catch_handlers = try b.allocator.alloc(CatchHandler, handlers.len);
     for (handlers, catch_handlers) |h, *ch| {
-        ch.* = .{ .type_name = h.c.ty.name.name, .handler = h.blk, .exception_reg = h.exc };
+        ch.* = .{ .type_name = loweredTypeName(b, &h.c.ty), .handler = h.blk, .exception_reg = h.exc };
     }
     b.attachCatches(cur_id, catch_handlers, finally_entry);
     if (t.finally) |blk| try b.pushFinally(blk);
@@ -1724,10 +1800,38 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const ast_type_args = call.type_args;
     const is_infix = call.is_infix;
 
+    // Scope-true callee rewrite: a bare ctor/factory head naming a mangled
+    // nested class (`Node(...)` inside its declaring class's subtree) or a
+    // renamed file-private class/typealias resolves to the mangled lift
+    // name. Locals and own members keep shadowing it (Kotlin scope order).
+    if (callee.* == .Path and callee.Path.segments.len == 1) {
+        const head = callee.Path.segments[0];
+        if (scopeTypeRename(b, head.name, head.span.file.int())) |renamed| {
+            if (b.resolve(head.name) == null and !b.knowsOuter(head.name)) {
+                var new_segs = [_]ast.Ident{.{ .name = renamed, .span = head.span }};
+                var new_callee = Expr{ .Path = .{ .segments = &new_segs, .span = callee.Path.span } };
+                var rewritten = expr.*;
+                rewritten.Call.callee = &new_callee;
+                return lowerCall(b, &rewritten);
+            }
+        }
+    }
+
     // A member call onto an inline `reified` extension (`xs.filterIsInstance<T>()`).
-    if (!is_infix and callee.* == .Member and !callee.Member.safe and
-        (ast_type_args.len != 0 or b.peekExpected() != null))
-    {
+    // Explicit type args or an expected type let the splice bind the
+    // reified parameters. Without either — a lambda body has no expected
+    // type, the `Json.encodeToString(user)` hook shape — a call through a
+    // companioned class name still splices; the splice itself declines
+    // when the body reads a reified parameter it cannot bind, falling
+    // back to runtime dispatch.
+    if (!is_infix and callee.* == .Member and !callee.Member.safe and gate: {
+        if (ast_type_args.len != 0 or b.peekExpected() != null) break :gate true;
+        const recv = callee.Member.receiver;
+        if (recv.* != .Path or recv.Path.segments.len != 1) break :gate false;
+        const n = recv.Path.segments[0].name;
+        if (b.resolve(n) != null or b.knowsOuter(n)) break :gate false;
+        break :gate b.module.registry.companion_singletons.contains(n);
+    }) {
         const mname = callee.Member.name.name;
         const reified_ext = blk: {
             if (inlineFnAst(mname)) |f| {
