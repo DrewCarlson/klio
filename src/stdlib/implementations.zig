@@ -1067,6 +1067,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.coroutines.__klio_co_park", .f = result.coro_park },
     .{ .fqn = "kotlin.coroutines.__klio_co_resume", .f = result.coro_resume },
     .{ .fqn = "kotlin.coroutines.__klio_co_runRoot", .f = result.coro_run_root },
+    .{ .fqn = "kotlin.coroutines.__klio_co_pushScope", .f = result.coro_push_scope },
+    .{ .fqn = "kotlin.coroutines.__klio_co_popScope", .f = result.coro_pop_scope },
     .{ .fqn = "kotlin.text.Regex", .f = regexp.regex_ctor },
     .{ .fqn = "kotlin.text.Regex.pattern", .f = regexp.regex_pattern },
     .{ .fqn = "kotlin.text.Regex.toString", .f = regexp.regex_to_string },

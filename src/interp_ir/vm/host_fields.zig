@@ -222,6 +222,13 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .err => |e| switch (e) {
             .Thrown => |v| errRes(.{ .Throw = v }),
             .Return => |v| errRes(.{ .NonLocalReturn = v }),
+            // Keep each message-carrying kind intact: collapsing to the
+            // tag name buries the real failure text.
+            .Unbound => |s| errRes(.{ .Unbound = s }),
+            .Type => |s| errRes(.{ .Type = s }),
+            .Arity => |s| errRes(.{ .Arity = s }),
+            .Unimplemented => |s| errRes(.{ .Unimplemented = s }),
+            .CalleeFailed => |s| errRes(.{ .CalleeFailed = s }),
             else => blk: {
                 const s = @tagName(e);
                 break :blk errRes(.{ .Type = try allocator.dupe(u8, s) });
@@ -466,6 +473,11 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 return ok(.{ .Bool = host_impl.threadAlive(self, id) });
             }
             if (std.mem.eql(u8, name, "name")) {
+                // A dispatcher pool worker reports its registered
+                // upstream-shaped name (`DefaultDispatcher-worker-N`).
+                if (runtime.threadName(allocator, id)) |overridden| {
+                    return ok(.{ .String = try StringRef.init(allocator, overridden) });
+                }
                 const s = try std.fmt.allocPrint(allocator, "klio-thread-{d}", .{id});
                 return ok(.{ .String = try StringRef.init(allocator, s) });
             }
@@ -684,7 +696,9 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             }
         }
     }
-    // Class-delegation forwarding for property reads.
+    // Class-delegation forwarding for property reads. Forward only the
+    // properties the delegated interface itself declares — Kotlin never
+    // forwards extensions or unrelated names to the delegate.
     if (receiver.* == .Instance) {
         var delegates: std.ArrayList(Value) = .empty;
         defer delegates.deinit(allocator);
@@ -692,7 +706,10 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             const g = receiver.Instance.borrow();
             defer g.deinit();
             for (g.get().fields.items) |f| {
-                if (std.mem.startsWith(u8, f.name, "__delegate__")) try delegates.append(allocator, f.value);
+                if (!std.mem.startsWith(u8, f.name, "__delegate__")) continue;
+                const iface = f.name["__delegate__".len..];
+                if (host_call_member.delegatedInterfaceDeclares(self, allocator, receiver.Instance, iface, name) == false) continue;
+                try delegates.append(allocator, f.value);
             }
         }
         for (delegates.items) |d| {

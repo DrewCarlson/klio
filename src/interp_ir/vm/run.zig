@@ -289,8 +289,23 @@ pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
     return result;
 }
 
-/// Sequential startup pipeline sharing mutable host state.
+/// Sequential startup pipeline sharing mutable host state. Every exit —
+/// including a failing top-level initializer, enum-entry init, or invalid
+/// `main` — routes through `joinAllThreads`: outstanding worker threads
+/// and the dispatcher pool must drain, and the process-global registries
+/// (slot owners, persisted continuations, run-scoped library state) must
+/// sweep, before the Vm and its arena tear down on any path.
 pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
+    const result = try vmRunBody(self, main);
+    // Join every still-running spawned thread before returning so a
+    // program that omits an explicit `join()` does not lose a child's
+    // writes (and the process does not outlive them, racing the next
+    // run's ObjCell borrows). A child that threw surfaces here only if
+    // `main` itself did not already fail.
+    return joinAllThreads(self, result);
+}
+
+fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     const module_ref = self.module.clone();
     defer module_ref.deinit();
     const mg = module_ref.borrow();
@@ -420,16 +435,10 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     const func = &module.funcs.items[main.int()];
     var host = vmMakeHost(self, sink);
     const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, .empty, &host);
-    const result: VmResult = switch (r) {
+    return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = vmErrorFromEval(self.allocator, e) },
     };
-    // Join every still-running spawned thread before returning so a
-    // program that omits an explicit `join()` does not lose a child's
-    // writes (and the process does not outlive them, racing the next
-    // run's ObjCell borrows). A child that threw surfaces here only if
-    // `main` itself did not already fail.
-    return joinAllThreads(self, result);
 }
 
 /// Join every outstanding spawned/dispatched worker thread, mirroring the
@@ -446,46 +455,71 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
 /// it — keeps a stale entry from surviving into the next run's reset arena.
 fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     var out = result;
+    // Once both worker populations have drained, sweep the process-global
+    // registries that key into this run's value graph: the slot-owner and
+    // persisted-continuation maps here, and each library layer's run-scoped
+    // state (e.g. the kxco channel registry) through its registered
+    // run-boundary hook.
+    defer runtime.runBoundarySweep();
+    defer vmhost.coroutines.drainPersistedParked();
     defer vmhost.coroutines.drainSlotOwners();
+    // Two worker populations drain in turn: explicit `kotlin.concurrent`
+    // threads (which may still post dispatcher tasks) first, then the
+    // dispatcher pool (whose tasks may have spawned threads). Loop until
+    // a full pass leaves both empty.
     while (true) {
-        // Take one outstanding handle under the lock, then join it
-        // without holding the lock so the worker's own result
-        // publication (which re-locks the table) cannot deadlock.
-        const id = blk: {
-            const g = self.threads.borrowMut();
-            defer g.deinit();
-            var it = g.get().iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.handle != null) break :blk entry.key_ptr.*;
-            }
-            break :blk null;
-        };
-        const tid = id orelse break;
+        var joined_any = false;
+        while (true) {
+            // Take one outstanding handle under the lock, then join it
+            // without holding the lock so the worker's own result
+            // publication (which re-locks the table) cannot deadlock.
+            const id = blk: {
+                const g = self.threads.borrowMut();
+                defer g.deinit();
+                var it = g.get().iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.handle != null) break :blk entry.key_ptr.*;
+                }
+                break :blk null;
+            };
+            const tid = id orelse break;
+            joined_any = true;
 
-        const handle = blk: {
-            const g = self.threads.borrowMut();
+            const handle = blk: {
+                const g = self.threads.borrowMut();
+                defer g.deinit();
+                if (g.get().getPtr(tid)) |entry| {
+                    const h = entry.handle;
+                    entry.handle = null;
+                    break :blk h;
+                }
+                break :blk null;
+            };
+            if (handle) |h| {
+                // join() establishes happens-before with the worker's writes.
+                h.join();
+            }
+            const g = self.threads.borrow();
             defer g.deinit();
-            if (g.get().getPtr(tid)) |entry| {
-                const h = entry.handle;
-                entry.handle = null;
-                break :blk h;
+            if (out == .ok) {
+                if (g.get().get(tid)) |entry| {
+                    if (entry.result) |res| switch (res) {
+                        .ok => {},
+                        .err => |e| out = .{ .err = .{ .Eval = vmEvalMessage(self.allocator, e) } },
+                    };
+                }
             }
-            break :blk null;
-        };
-        if (handle) |h| {
-            // join() establishes happens-before with the worker's writes.
-            h.join();
         }
-        const g = self.threads.borrow();
-        defer g.deinit();
+        const pool_had_work = vmhost.scheduler.outstandingOther() != 0;
+        vmhost.scheduler.shutdownAndJoin();
         if (out == .ok) {
-            if (g.get().get(tid)) |entry| {
-                if (entry.result) |res| switch (res) {
-                    .ok => {},
-                    .err => |e| out = .{ .err = .{ .Eval = vmEvalMessage(self.allocator, e) } },
-                };
+            if (vmhost.scheduler.takeFirstError()) |e| {
+                out = .{ .err = .{ .Eval = vmEvalMessage(self.allocator, e) } };
             }
+        } else {
+            _ = vmhost.scheduler.takeFirstError();
         }
+        if (!joined_any and !pool_had_work) break;
     }
     return out;
 }

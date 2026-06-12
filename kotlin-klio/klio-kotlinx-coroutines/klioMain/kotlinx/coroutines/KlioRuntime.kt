@@ -17,6 +17,62 @@ import kotlin.coroutines.*
 internal fun __kxco_spawn(block: () -> Unit) {}
 internal fun __kxco_delayMillis(millis: Long) {}
 internal fun __kxco_dispatch(block: () -> Unit): Long = 0L
+internal fun __kxco_newSlot(): Long = 0L
+internal fun __kxco_parkSlot(slot: Long) {}
+internal fun __kxco_resumeSlot(slot: Long) {}
+internal fun __kxco_rbPump(scope: Any?, block: () -> Unit) { block() }
+
+// `runBlocking` — the blocking bridge between regular and suspending
+// code. Mirrors the upstream JVM shape: a `BlockingCoroutine` job over
+// the caller's context, the body started as its child, and the calling
+// thread pumping the cooperative event loop until the coroutine's whole
+// job tree completes. Children attach to the blocking job, a failing
+// child cancels it per structured concurrency, and the final state —
+// value or exception — surfaces here through the upstream completion
+// machinery (`onCompleted` / `onCancelled`).
+public fun <T> runBlocking(
+    context: CoroutineContext = EmptyCoroutineContext,
+    block: suspend CoroutineScope.() -> T
+): T {
+    val newContext = if (context[ContinuationInterceptor] == null)
+        GlobalScope.newCoroutineContext(context + KlioDispatcher)
+    else
+        GlobalScope.newCoroutineContext(context)
+    val coroutine = KlioBlockingCoroutine<T>(newContext)
+    return coroutine.joinBlocking(block)
+}
+
+private class KlioBlockingCoroutine<T>(
+    parentContext: CoroutineContext
+) : AbstractCoroutine<T>(parentContext, true, true) {
+    private var result: Any? = null
+    private var failure: Throwable? = null
+    private var failed = false
+    private var completionSlot: Long = 0L
+
+    override fun onCompleted(value: T) {
+        result = value
+    }
+
+    override fun onCancelled(cause: Throwable, handled: Boolean) {
+        failed = true
+        failure = cause
+    }
+
+    fun joinBlocking(block: suspend CoroutineScope.() -> T): T {
+        __kxco_rbPump(this) {
+            start(CoroutineStart.DEFAULT, this, block)
+            if (!isCompleted) {
+                completionSlot = __kxco_newSlot()
+                invokeOnCompletion { __kxco_resumeSlot(completionSlot) }
+                __kxco_parkSlot(completionSlot)
+            }
+        }
+        if (failed) throw (failure ?: IllegalStateException("runBlocking job failed"))
+        @Suppress("UNCHECKED_CAST")
+        return result as T
+    }
+}
 
 internal object KlioDispatcher : CoroutineDispatcher(), Delay {
     override fun dispatch(context: CoroutineContext, block: Runnable) {
@@ -52,14 +108,49 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
     }
 }
 
-// Real-thread CPU-bound dispatcher. `dispatch` posts each block
-// onto a worker thread via `__kxco_dispatch`; multiple bodies under
+// Real-thread CPU-bound dispatcher. `dispatch` posts each block onto
+// the shared worker pool's Default view (parallelism `max(2, nproc)`)
+// via `__kxco_dispatch`; multiple bodies under
 // `async(Dispatchers.Default) { … }` execute in parallel through
 // the loom-verified value model. Delay scheduling stays on the
 // cooperative virtual clock by routing through `__kxco_spawn`.
 internal object KlioDefaultDispatcher : CoroutineDispatcher(), Delay {
     override fun dispatch(context: CoroutineContext, block: Runnable) {
         __kxco_dispatch { block.run() }
+    }
+
+    override fun scheduleResumeAfterDelay(
+        timeMillis: Long,
+        continuation: CancellableContinuation<Unit>
+    ) {
+        __kxco_spawn {
+            __kxco_delayMillis(timeMillis)
+            continuation.resumeWith(Result.success(Unit))
+        }
+    }
+
+    override fun invokeOnTimeout(
+        timeMillis: Long,
+        block: Runnable,
+        context: CoroutineContext
+    ): DisposableHandle {
+        val gate = TimeoutGate(block)
+        __kxco_spawn {
+            __kxco_delayMillis(timeMillis)
+            gate.fire()
+        }
+        return gate
+    }
+}
+
+// Blocking-work dispatcher: the elastic view over the same worker pool
+// as `KlioDefaultDispatcher` (parallelism `max(64, nproc)`, shared
+// threads). A distinct object from the Default dispatcher so
+// `withContext(Dispatchers.IO)` from a Default coroutine observes a
+// dispatcher change, exactly as upstream.
+internal object KlioIoDispatcher : CoroutineDispatcher(), Delay {
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        __kxco_dispatchIo { block.run() }
     }
 
     override fun scheduleResumeAfterDelay(
@@ -98,7 +189,7 @@ public actual object Dispatchers {
     public actual val Default: CoroutineDispatcher get() = KlioDefaultDispatcher
     public actual val Main: MainCoroutineDispatcher get() = KlioMainDispatcher
     public actual val Unconfined: CoroutineDispatcher get() = KlioDispatcher
-    public val IO: CoroutineDispatcher get() = KlioDefaultDispatcher
+    public val IO: CoroutineDispatcher get() = KlioIoDispatcher
 }
 
 // Carries the timeout `block` and its cancelled state as instance

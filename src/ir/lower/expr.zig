@@ -360,7 +360,10 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.pushScope();
                 const sv = try lowerExpr(b, w.subject.?);
                 try b.bind(w.subject_binding.?.name.name, sv);
-                const r = try lowerWhen(b, w.subject, w.branches, exprSpan(expr));
+                // The subject is evaluated exactly once: the bound register
+                // doubles as the when's subject (re-lowering would re-run a
+                // side-effecting subject like a queue poll).
+                const r = try when_expr.lowerWhenWithSubjectReg(b, w.subject, sv, w.branches, exprSpan(expr));
                 try b.popScope();
                 return r;
             }
@@ -2248,11 +2251,26 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     {
         return b.emitConst(.Unit);
     }
-    // Self-call inside a tailrec fn → TailJump terminator.
+    // Self-call inside a tailrec fn → TailJump terminator. The jump
+    // re-binds the function's parameters in place; an instance/extension
+    // tailrec function carries its receiver as the leading implicit
+    // param, and a bare recursive call keeps the same receiver, so the
+    // arg run must lead with `this` — dropping it would shift every
+    // re-bound parameter by one.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         if (b.tailrecSelf()) |ts| {
             if (std.mem.eql(u8, ts, callee.Path.segments[0].name)) {
-                const run = try lowerArgRun(b, args);
+                const run = if (b.tailrecSelfHasThis()) blk: {
+                    const sp = exprSpan(callee);
+                    const all = try b.allocator.alloc(Expr, args.len + 1);
+                    defer b.allocator.free(all);
+                    const synth_segs = try b.allocator.alloc(ast.Ident, 1);
+                    defer b.allocator.free(synth_segs);
+                    synth_segs[0] = .{ .name = "this", .span = sp };
+                    all[0] = .{ .Path = .{ .segments = synth_segs, .span = sp } };
+                    for (args, 0..) |arg, i| all[i + 1] = arg;
+                    break :blk try lowerArgRun(b, all);
+                } else try lowerArgRun(b, args);
                 b.terminate(.{ .TailJump = .{ .args = run[0], .n_args = run[1] } });
                 const dead = try b.allocBlock();
                 b.switchTo(dead);
@@ -3701,6 +3719,13 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
             } });
             return dst;
         }
+        // Inside an extension body the implicit `this` has the
+        // extension's declared receiver type; record it so dispatch
+        // resolves extensions against the STATIC type, as kotlinc does.
+        const static_recv: ?ConstId = if (b.recvTy()) |rt|
+            try b.module.internConst(b.allocator, .{ .String = rt })
+        else
+            null;
         try b.push(.{ .CallMember = .{
             .dst = dst,
             .receiver = this_reg,
@@ -3708,6 +3733,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
             .args = uargs[0],
             .n_args = uargs[1],
             .arg_names = uarg_names,
+            .static_recv = static_recv,
         } });
         return dst;
     }

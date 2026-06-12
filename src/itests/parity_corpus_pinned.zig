@@ -321,3 +321,11 @@ test "copy_into_named_args" {
         \\
     );
 }
+
+test "tailrec_member_receiver" {
+    try check("tailrec_member_receiver",
+        \\a
+        \\3
+        \\
+    );
+}

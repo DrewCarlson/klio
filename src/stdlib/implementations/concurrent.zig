@@ -259,6 +259,13 @@ pub fn concurrent_thread_sleep(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
     } else return .{ .err = .{ .Type = "Thread.sleep expects a Long or Int millisecond argument" } };
     if (millis > 0) {
         sleepMillis(@intCast(millis));
+        // A daemon pool task asked to abandon itself at the run boundary
+        // wakes from the sliced sleep early and aborts here, before the
+        // body can run any further instruction (the block-level abandon
+        // check in the evaluator only fires at the next block edge).
+        if (runtime.shouldAbandon()) {
+            return .{ .err = .{ .Type = "daemon task abandoned at run boundary" } };
+        }
     }
     return .{ .ok = .Unit };
 }

@@ -239,6 +239,10 @@ pub const FuncBuilder = struct {
     /// function itself. Self-calls are lowered as `Terminator.TailJump`
     /// to keep the stack flat across recursion.
     tailrec_self: ?[]const u8 = null,
+    /// Whether the tailrec function carries an implicit leading `this`
+    /// param (instance method / extension). A bare recursive call keeps
+    /// the same receiver, so the tail jump's arg run must lead with it.
+    tailrec_self_this: bool = false,
     /// Names bound as parameters at the function entry (set by
     /// `bind_params`). Used by call-site lowering to recognise
     /// when an identifier-as-callee is a function-typed param.
@@ -743,6 +747,12 @@ pub const FuncBuilder = struct {
     }
     pub fn tailrecSelf(self: *const FuncBuilder) ?[]const u8 {
         return self.tailrec_self;
+    }
+    pub fn setTailrecSelfHasThis(self: *FuncBuilder, on: bool) void {
+        self.tailrec_self_this = on;
+    }
+    pub fn tailrecSelfHasThis(self: *const FuncBuilder) bool {
+        return self.tailrec_self_this;
     }
     /// Record a local's declared type / initializer for inline-overload
     /// receiver narrowing.

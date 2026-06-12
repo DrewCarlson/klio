@@ -449,3 +449,73 @@ test "base_class_extension_accepts_subclass_method_receiver" {
     try assertKlio("ext_inline_super_recv_unrelated_first", unrelated_first, "got:A\n");
     try assertKlio("ext_inline_super_recv_derived_wins", derived_wins, "got:B\n");
 }
+
+// Extension resolution inside an interface-extension body is STATIC:
+// `this` is declared as the interface, so a bare same-name extension
+// call binds the interface's extension even when the runtime value is a
+// delegating wrapper carrying its own extension. The direct call on the
+// wrapper still binds the wrapper's extension by its static type.
+// kotlinc-verified both directions (the DispatchedContinuation shape).
+test "ext_static_receiver_in_iface_ext_body" {
+    const src =
+        \\interface I5 { fun member(): String }
+        \\class Impl5 : I5 { override fun member() = "impl" }
+        \\class W5(i: I5) : I5 by i
+        \\
+        \\fun I5.describe() = "on-iface"
+        \\fun W5.describe() = "on-wrapper"
+        \\fun I5.helper() = "ext:" + describe()
+        \\
+        \\fun main() {
+        \\    val w = W5(Impl5())
+        \\    println(w.describe())
+        \\    println(w.helper())
+        \\}
+        \\
+    ;
+    try assertKlio("ext_static_recv_iface_body", src, "on-wrapper\next:on-iface\n");
+}
+
+// A receiver-walk PROBE that is inapplicable by parameter type must fall
+// through to the outer receiver — kotlinc resolves `f("x")` to
+// `A.f(String)`; `B.f(Int)` is not a candidate and must not run (its
+// throw is the proof it ran). The ran-and-threw direction is pinned by
+// the sibling test below: an applicable candidate that throws owns its
+// control flow. kotlinc-verified both directions.
+test "bare_call_inapplicable_inner_candidate_falls_through" {
+    const src =
+        \\class A { fun f(s: String) = "outer:" + s }
+        \\class B { fun f(n: Int): String { throw IllegalStateException("inner ran") } }
+        \\
+        \\fun main() {
+        \\    with(A()) {
+        \\        with(B()) {
+        \\            println(f("x"))
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    try assertKlio("bare_call_inapplicable_inner", src, "outer:x\n");
+}
+
+test "bare_call_applicable_inner_candidate_throw_propagates" {
+    const src =
+        \\class C { fun g(): String { throw IllegalStateException("boom1") } }
+        \\class D { fun g() = "outer-d" }
+        \\
+        \\fun main() {
+        \\    try {
+        \\        with(D()) {
+        \\            with(C()) {
+        \\                println(g())
+        \\            }
+        \\        }
+        \\    } catch (e: IllegalStateException) {
+        \\        println("caught " + e.message)
+        \\    }
+        \\}
+        \\
+    ;
+    try assertKlio("bare_call_ran_throw_propagates", src, "caught boom1\n");
+}

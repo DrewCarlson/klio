@@ -100,20 +100,43 @@ assumptions across every consumer; the consumer inventory lives in
 breaks a recursion that crosses the host→eval→host boundary, which a
 parameter cannot follow. Tracked in `guard-inventory.md` (keep rows).
 
-### 12. Dispatchers.Default/IO run inline on the calling pump
+### 12. Active-scope staleness after a resume
 
-Measured during the thread-safety audit: `launch`/`async`/`withContext`
-under `Dispatchers.Default`/`IO` execute inline — same thread name, serial
-wall-time for sleeping bodies, and a spin-wait handoff between two Default
-launches deadlocks. The `__kxco_dispatch` host hook and the wakeup mailbox
-exist, but the coroutine start path never routes through them, and a
-continuation parked on a foreign pump cannot be resumed (cross-OS-thread
-channel suspension fails with nondeterministic internal errors).
-`kotlin.concurrent.thread` is the only genuine parallelism today. Fix
-direction: dispatcher-aware coroutine start through `__kxco_dispatch`,
-cross-pump resume via the wakeup mailbox/slot machinery, and Default-
-dispatch parallelism litmus tests. `docs/architecture/concurrency.md`
-records the user-facing truth.
+The suspend-implicit `coroutineContext` resolves through the threadlocal
+active-scope stack, pushed when a coroutine's block starts (`driveRoot`,
+`__klio_co_runRoot`, `startBlock`'s undispatched push). A suspension that
+resumes later runs under whatever scope the resuming pump has active, so a
+cancellable suspension created after a resume can install its
+parent-cancellation handle on the pump root's Job instead of its own
+coroutine's. Cancellation then over-delivers (preempting via the root)
+rather than under-delivering; the d-probe shapes all pass. The exact fix
+is a per-activation scope carried in the frame snapshot, not a threadlocal.
+
+### 13. Stdlib image bake is shaped by the first program after a cache clear
+
+The CLI's auto-bake on first use keys the image on the stdlib/pack hashes
+plus a load gate, but resolution coverage in practice varies with the
+first program's import surface: a cache primed by a minimal program leaves
+later programs failing with `unresolved global` (`with`,
+`EmptyCoroutineContext`) until the cache is cleared and re-primed. Also a
+`klio pack install` does not invalidate the bake. Reproduced on the
+pre-diff HEAD binary, so it predates the dispatcher work; the in-process
+SourcePacks harnesses are unaffected. Needs a bake whose resolution
+coverage is program-independent (or a cache key that includes the gate
+inputs that actually vary).
+
+### 14. A zero-param receiver lambda binds `it` to its receiver
+
+`recv.block()` on a `R.() -> Unit` lambda whose body references `it`
+resolves `it` to the receiver instead of the enclosing lambda's `it`
+(kotlinc: a receiver lambda declares no `it`; the reference belongs to
+the enclosing scope). Pre-existing (reproduces at the pre-dispatcher
+HEAD with no coroutines: `runWith("R") { println(it) }` inside
+`repeat {}` prints `R`), and now also observable as
+`launch { ch.send(it) }` inside `repeat {}` sending the coroutine
+object. The fix belongs in lambda lowering: a parameterless lambda must
+not synthesize an `it` binding from the invocation receiver/argument
+when the name resolves as a capture.
 
 ## Tooling
 

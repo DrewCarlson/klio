@@ -1,9 +1,8 @@
 // DriverWakeup hammer: a large batch of `Dispatchers.Default` jobs all
-// in flight at once, each routing its completion resume through the
-// driver's wakeup mailbox while the pump drains it. Repeated so a resume
-// ordering regression is hit many times per run. (Dispatcher bodies
-// currently execute on the calling pump, so this pins the mailbox
-// plumbing rather than cross-OS-thread contention.)
+// in flight at once on real pool workers, each routing its completion
+// resume through the driver's wakeup mailbox while the pump drains it.
+// Repeated so a cross-thread resume ordering regression is hit many
+// times per run.
 //> 1200
 import kotlinx.coroutines.*
 

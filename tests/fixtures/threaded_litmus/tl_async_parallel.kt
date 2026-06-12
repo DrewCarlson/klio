@@ -1,8 +1,6 @@
 // Dispatched async exactness. Two `async(Dispatchers.Default)` each
-// run a deterministic heavy sum and the awaited total must be exact
-// regardless of interleaving. (Dispatcher bodies currently execute on
-// the calling pump, so this pins the dispatch/await plumbing, not
-// OS-thread parallelism.)
+// run a deterministic heavy sum on real pool workers and the awaited
+// total must be exact regardless of interleaving.
 //> 999999000000
 import kotlinx.coroutines.*
 

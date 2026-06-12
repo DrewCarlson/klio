@@ -30,26 +30,45 @@ Available:
 | Builders     | `runBlocking` (interpreter intrinsic), `launch`, `async`                |
 | Scope        | `CoroutineScope`, `GlobalScope`, `CoroutineScope(context)`               |
 | Job          | `Job`, `CompletableJob`, `Deferred<T>`                                  |
-| Dispatchers  | `Dispatchers.Default`, `Main`, `IO`, `Unconfined`                       |
-| Time         | `delay(ms: Long)` (sleep-backed), `yield()` (no-op)                     |
+| Dispatchers  | `Dispatchers.Default`, `Main`, `IO`, `Unconfined`, `limitedParallelism(n)` |
+| Time         | `delay(ms: Long)`, `yield()` (cooperative reschedule)                   |
 | Channel      | `Channel<T>()`, `send`, `trySend`, `receive`, `close`, `isClosedForReceive` |
 
 ## Execution semantics
 
-klio runs coroutines on a cooperative pump per `runBlocking`:
+klio runs coroutines on cooperative pumps — one per `runBlocking`
+driver and one per dispatcher worker task:
 
-- `launch` and `async` schedule the block onto the owning pump;
-  bodies interleave cooperatively at suspension points.
-- `Dispatchers.Default` / `IO` currently execute their bodies on the
-  calling pump as well (the `__kxco_dispatch` worker hook exists but
-  the coroutine start path does not route through it yet), so
-  coroutine bodies do not overlap across OS threads.
-- Real OS-thread parallelism is provided by
-  `kotlin.concurrent.thread` (`Thread.start`/`join`), and every
-  shared primitive (`synchronized`, atomicfu, locks, `lazy`) holds
-  real exclusion across those threads.
-- `delay(millis)` parks the coroutine on the pump's virtual clock —
-  sibling coroutines keep running while it waits.
+- `launch` and `async` without a dispatcher schedule the block onto
+  the calling pump; bodies interleave cooperatively at suspension
+  points on the runBlocking thread.
+- `Dispatchers.Default` / `IO` dispatch each body onto a shared pool
+  of real worker threads (`DefaultDispatcher-worker-N`): `Default`
+  is the CPU-bounded view (`max(2, nproc)` concurrent), `IO` the
+  elastic view (`max(64, nproc)`), both over the same threads, so
+  dispatched bodies genuinely overlap across OS threads and
+  `withContext(Dispatchers.IO)` from a Default coroutine stays in
+  the pool. `limitedParallelism(n)` (the upstream common
+  `LimitedDispatcher`) caps a view exactly, FIFO.
+- A dispatched coroutine that parks (join, await, channel) releases
+  its worker and resumes on whatever thread its resume lands on; a
+  `delay` under a dispatcher resumes on a worker, never the
+  runBlocking driver. `runBlocking` blocks its thread until its
+  coroutine's whole job tree completes — children on the local pump,
+  on pool workers, or resumed from explicit threads — exactly as
+  upstream; `GlobalScope` work is a daemon and never blocks it. A
+  failing child cancels the blocking job per structured concurrency
+  and the exception rethrows out of `runBlocking`; `Job.cancel`
+  preempts parked suspensions (`delay`, `join`) cross-pump at their
+  suspension points. Daemon tasks still queued at the run boundary
+  are dropped; in-flight ones are abandoned, so a non-terminating
+  daemon never hangs the program.
+- `kotlin.concurrent.thread` (`Thread.start`/`join`) spawns
+  dedicated OS threads, and every shared primitive (`synchronized`,
+  atomicfu, locks, `lazy`, `Channel`) holds real exclusion /
+  rendezvous across all of these threads.
+- `delay(millis)` parks the coroutine on its pump's clock — sibling
+  coroutines keep running while it waits.
 
 See `docs/architecture/concurrency.md` for the full model
 (the suspension engine and the cross-thread value rules).

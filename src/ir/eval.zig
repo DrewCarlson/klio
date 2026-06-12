@@ -796,6 +796,13 @@ fn runFrameInner(
     var pending_return: ?struct { key: BlockId, val: Value } = null;
     const func: *const Func = frame.func;
     while (true) {
+        // Daemon abandonment: a dispatcher pool task still running at the
+        // run boundary stops at its next block instead of completing (or
+        // looping forever). The unwind bypasses user catch/finally frames
+        // deliberately — the task is being torn down, not failing.
+        if (runtime.shouldAbandon()) {
+            return errResult(.{ .Type = "daemon task abandoned at run boundary" });
+        }
         const block = &func.blocks[cur.int()];
         const insts: []const Inst = block.insts;
         const term = block.terminator;
@@ -1337,7 +1344,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     // on a type declaring only `plusAssign` must not bind a
                     // receiver-incompatible `plus` like `String?.plus(Any?)`.
                     var result: Value = undefined;
-                    switch (try host.callMemberStrictExt(allocator, &l, method, &.{r}, &.{null})) {
+                    switch (try host.callMemberStrictExt(allocator, &l, method, &.{r}, &.{null}, null)) {
                         .ok => |v| result = v,
                         .err => |e| switch (e) {
                             // `a OP= b` lowers to `a = a.OP(b)`, but the
@@ -1601,7 +1608,11 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     pushed_enclosing = true;
                 }
             }
-            const res = host.callMemberNamed(allocator, &recv, name_str, arg_values, names);
+            const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(frame.module, sid) else null;
+            const res = if (static_recv) |sname|
+                host.callMemberNamedStatic(allocator, &recv, name_str, arg_values, names, sname)
+            else
+                host.callMemberNamed(allocator, &recv, name_str, arg_values, names);
             if (pushed_enclosing) popEnclosing();
             switch (try res) {
                 .ok => |rv| try frame.write(cm.dst, rv),
@@ -1995,10 +2006,28 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     if (!is_ctor_name and !shadow_capture) {
         const cands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str);
         defer allocator.free(cands);
+        // Inside an extension body, the implicit `this` has the
+        // extension's DECLARED receiver type, and Kotlin resolves a bare
+        // extension call against that static type — not the runtime
+        // value's type, which may be a subtype carrying its own
+        // same-name extension. Hand the declared head to the strict
+        // probe for exactly that candidate.
+        const static_recv_ty: ?[]const u8 = blk: {
+            switch (frame.func.kind) {
+                .top_level_extension, .member_extension => {},
+                else => break :blk null,
+            }
+            const idx = frameThisParam(frame) orelse break :blk null;
+            break :blk frame.func.params[idx].ty.name;
+        };
         // Strict pass: members and receiver-compatible extensions of each
         // candidate, innermost first — the kotlinc candidate order.
         for (cands) |c| {
-            switch (try host.callMemberStrictExt(allocator, &c.v, name_str, arg_values, names)) {
+            const hint: ?[]const u8 = if (static_recv_ty != null and sameReceiver(c.v, this_val))
+                static_recv_ty
+            else
+                null;
+            switch (try host.callMemberStrictExt(allocator, &c.v, name_str, arg_values, names, hint)) {
                 .ok => |v| {
                     orAudit("CallMemberOrGlobal", name_str, "member", c.depth, &c.v);
                     resolved = v;
@@ -2006,6 +2035,12 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 },
                 .err => |e| switch (e) {
                     .Suspended, .CalleeFailed => return errResult(e),
+                    // Control flow out of a body that RAN: the candidate
+                    // was the real callee (a `synchronized { return x }`
+                    // non-local return, a thrown exception). Walking on
+                    // would re-execute its side effects on an outer
+                    // receiver — same doctrine as `CalleeFailed`.
+                    .Throw, .NonLocalReturn, .LabeledReturn => return errResult(e),
                     .Unimplemented => {},
                     else => if (first_real_err == null) {
                         first_real_err = e;
@@ -2026,6 +2061,9 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     },
                     .err => |e| switch (e) {
                         .Suspended, .CalleeFailed => return errResult(e),
+                        // Same as the strict pass: a body that ran owns
+                        // its control flow; never re-probe.
+                        .Throw, .NonLocalReturn, .LabeledReturn => return errResult(e),
                         .Unimplemented => {},
                         else => if (first_real_err == null) {
                             first_real_err = e;
@@ -2985,7 +3023,13 @@ pub const NullHost = struct {
         return self.callMember(allocator, receiver, name, args);
     }
 
-    pub fn callMemberStrictExt(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+    pub fn callMemberStrictExt(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+        _ = static_recv;
+        return self.callMemberNamed(allocator, receiver, name, args, arg_names);
+    }
+
+    pub fn callMemberNamedStatic(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+        _ = static_recv;
         return self.callMemberNamed(allocator, receiver, name, args, arg_names);
     }
 

@@ -7,6 +7,7 @@
 //! these intrinsics back.
 
 const std = @import("std");
+const threads_mod = @import("threads.zig");
 
 /// Wall-clock time in milliseconds since the Unix epoch.
 pub fn wallMillis() i64 {
@@ -41,12 +42,25 @@ pub fn monotonicNanos() u64 {
 }
 
 /// Sleep for `ms` milliseconds. A non-positive value returns immediately.
+/// On an abandonable thread (a dispatcher pool worker running a daemon
+/// task) the sleep is sliced so a run-boundary abandon request wakes the
+/// task promptly instead of waiting out the full duration.
 pub fn sleepMillis(ms: i64) void {
     if (ms <= 0) return;
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .awake) catch {};
+    if (!threads_mod.isThreadAbandonable()) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .awake) catch {};
+        return;
+    }
+    var remaining = ms;
+    while (remaining > 0) {
+        if (threads_mod.shouldAbandon()) return;
+        const slice = @min(remaining, @as(i64, 2));
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(slice), .awake) catch {};
+        remaining -= slice;
+    }
 }
 
 const testing = std.testing;

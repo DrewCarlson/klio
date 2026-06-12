@@ -747,6 +747,7 @@ fn runtimeErrToEval(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalR
         .Type => |s| return .{ .err = .{ .Type = s } },
         .Arity => |s| return .{ .err = .{ .Arity = s } },
         .Unimplemented => |s| return .{ .err = .{ .Unimplemented = s } },
+        .CalleeFailed => |s| return .{ .err = .{ .CalleeFailed = s } },
         .LabeledReturn => |lr| return .{ .err = .{ .LabeledReturn = .{ .label = lr.label, .value = lr.value } } },
         else => {
             const msg = try std.fmt.allocPrint(allocator, "{s}", .{@tagName(e)});

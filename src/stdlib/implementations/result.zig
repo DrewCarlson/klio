@@ -268,6 +268,23 @@ pub fn coro_disarm_slot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = Value.Unit };
 }
 
+/// `__klio_co_pushScope(scope)` — make `scope` the active coroutine
+/// scope for an undispatched block running inline in the caller's
+/// activation (`startCoroutineUninterceptedOrReturn`), so the
+/// suspend-implicit `coroutineContext` inside the block resolves to the
+/// block's own coroutine. Balanced by `__klio_co_popScope`.
+pub fn coro_push_scope(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const scope: Value = if (ctx.args.len > 0) ctx.args[0] else Value.Unit;
+    ctx.host.coroutinePushScope(&scope);
+    return .{ .ok = Value.Unit };
+}
+
+/// `__klio_co_popScope()` — pop the scope pushed by `__klio_co_pushScope`.
+pub fn coro_pop_scope(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    ctx.host.coroutinePopScope();
+    return .{ .ok = Value.Unit };
+}
+
 /// `__klio_co_resume(slot, ok, value)` — deliver a `Result` to the
 /// activation parked on `slot` and make it ready.
 pub fn coro_resume(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
