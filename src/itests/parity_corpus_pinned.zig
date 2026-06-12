@@ -180,3 +180,62 @@ test "bare_call_prop_vs_toplevel_fn" {
         \\
     );
 }
+
+test "local_ext_fn_capture_receiver" {
+    try check("local_ext_fn_capture_receiver",
+        \\snd:7|false|tail
+        \\
+    );
+}
+
+test "named_arg_explicit_null" {
+    try check("named_arg_explicit_null",
+        \\h null-branch
+        \\h null-branch
+        \\h ise
+        \\h other
+        \\
+    );
+}
+
+test "when_comma_conditions_lazy" {
+    try check("when_comma_conditions_lazy",
+        \\two-or-three
+        \\ab
+        \\two-or-three
+        \\abc
+        \\none
+        \\abcd
+        \\
+    );
+}
+
+test "member_lambda_param_vs_inline_ext" {
+    try check("member_lambda_param_vs_inline_ext",
+        \\[on] lambda message 2
+        \\[on] plain message
+        \\
+    );
+}
+
+test "file_private_top_level_props" {
+    const a = arenaAllocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const res = try parity.runFilesWithPacks(a, io, &.{
+        CORPUS_DIR ++ "/file_private_props/file_a.kt",
+        CORPUS_DIR ++ "/file_private_props/file_b.kt",
+    });
+    switch (res) {
+        .ok => |got| try std.testing.expectEqualStrings(
+            \\logger-a
+            \\logger-b
+            \\
+        , got),
+        .err => |m| {
+            std.debug.print("parity corpus file_private_props: klio error: {s}\n", .{m});
+            return error.KlioRunFailed;
+        },
+    }
+}

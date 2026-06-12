@@ -281,6 +281,55 @@ pub fn buildModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocat
         try imports.appendSlice(allocator, f.imports);
     }
 
+    // Kotlin scopes a `private` top-level property to its declaring file;
+    // the lowered globals table is flat. Mangle each private top-level
+    // property whose simple name another file also declares as a top-level
+    // property, and install the per-file rename table the bare-name
+    // lowering consults through the reference's span file (fifteen ktor
+    // plugin files each declare a file-private `LOGGER`; flattening them
+    // into one slot crossed delegated and plain properties).
+    var private_prop_renames = ir.build.FilePrivateRenames.init(allocator);
+    defer {
+        var it = private_prop_renames.valueIterator();
+        while (it.next()) |inner| inner.deinit();
+        private_prop_renames.deinit();
+    }
+    {
+        var name_files = std.StringHashMap(u32).init(allocator);
+        defer name_files.deinit();
+        var name_counts = std.StringHashMap(u32).init(allocator);
+        defer name_counts.deinit();
+        for (decls.items) |*d| {
+            if (d.* != .Property) continue;
+            const p = &d.Property;
+            if (p.receiver_type != null) continue;
+            const fid = p.span.file.int();
+            const gop = try name_counts.getOrPut(p.name.name);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = 1;
+                try name_files.put(p.name.name, fid);
+            } else if (name_files.get(p.name.name).? != fid) {
+                gop.value_ptr.* += 1;
+            }
+        }
+        for (decls.items) |*d| {
+            if (d.* != .Property) continue;
+            const p = &d.Property;
+            if (p.receiver_type != null) continue;
+            if (p.visibility != .Private or p.is_expect or p.is_actual) continue;
+            const count = name_counts.get(p.name.name) orelse 0;
+            if (count < 2) continue;
+            const fid = p.span.file.int();
+            const mangled = try std.fmt.allocPrint(allocator, "{s}$f{d}", .{ p.name.name, fid });
+            const gop = try private_prop_renames.getOrPut(fid);
+            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+            try gop.value_ptr.put(p.name.name, mangled);
+            p.name = .{ .name = mangled, .span = p.name.span };
+        }
+    }
+    const prev_renames = ir.build.setLowerFilePrivateRenames(&private_prop_renames);
+    defer _ = ir.build.setLowerFilePrivateRenames(prev_renames);
+
     const combined = KotlinFile{
         .package = null,
         .imports = try imports.toOwnedSlice(allocator),

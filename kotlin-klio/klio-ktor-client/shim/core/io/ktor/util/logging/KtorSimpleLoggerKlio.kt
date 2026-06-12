@@ -8,7 +8,7 @@ package io.ktor.util.logging
 @Suppress("FunctionName")
 public actual fun KtorSimpleLogger(name: String): Logger = object : Logger {
 
-    override val level: LogLevel = LogLevel.TRACE
+    override val level: LogLevel = LogLevel.INFO
 
     private fun log(level: LogLevel, message: String) {
         if (level < this.level) return

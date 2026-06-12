@@ -1296,6 +1296,11 @@ pub const RuntimeError = union(enum) {
     Arity: []const u8,
     NoMain,
     Unimplemented: []const u8,
+    /// A function body was entered and failed to resolve an operation.
+    /// Distinct from `Unimplemented` (the dispatch-miss sentinel) so a
+    /// candidate that ran — possibly with side effects — is never retried
+    /// or treated as inapplicable; this error always propagates.
+    CalleeFailed: []const u8,
 
     // Control-flow signals — caught by the appropriate frame.
     Return: Value,

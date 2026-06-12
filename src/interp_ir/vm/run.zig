@@ -362,9 +362,10 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
             },
             // A top-level `val` whose initializer references a not-yet-
             // consumed symbol is deferred to on-access; only a missing-
-            // symbol failure defers.
+            // symbol failure defers. `CalleeFailed` is the body-exit
+            // re-tag of the same missing-symbol condition.
             .err => |e| switch (e) {
-                .Unbound, .Unimplemented => {},
+                .Unbound, .Unimplemented, .CalleeFailed => {},
                 else => return .{ .err = vmErrorFromEval(self.allocator, e) },
             },
         }
@@ -497,6 +498,7 @@ fn vmEvalMessage(allocator: Allocator, e: RuntimeError) []const u8 {
         .Type => |s| s,
         .Arity => |s| s,
         .Unimplemented => |s| s,
+        .CalleeFailed => |s| s,
         .NoMain => "no main function",
         else => std.fmt.allocPrint(allocator, "{any}", .{e}) catch "spawned thread error",
     };
@@ -529,6 +531,7 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
         .Type => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
         .Unbound => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
         .Unimplemented => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
+        .CalleeFailed => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
         .Arity => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "IR eval: {s}", .{s}) catch s },
         .StackOverflow => |s| return .{ .Eval = std.fmt.allocPrint(allocator, "uncaught java.lang.StackOverflowError: {s}", .{s}) catch s },
         else => return .{ .Eval = "IR eval error" },

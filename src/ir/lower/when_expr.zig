@@ -158,12 +158,21 @@ pub fn lowerWhen(
                 continue;
             }
             if (subject_r) |subj| {
-                var regs: std.ArrayList(Reg) = .empty;
-                defer regs.deinit(b.allocator);
-                for (branch.patterns) |*p| {
-                    try regs.append(b.allocator, try lowerSubjectPatternCond(b, p, subj));
+                // Kotlin evaluates a branch's comma-separated conditions
+                // left to right and stops at the first match: each pattern
+                // gets its own block, true jumps straight to the body, so
+                // a later condition (`Source::class, Input::class ->`)
+                // never evaluates once an earlier one matched.
+                var i: usize = 0;
+                while (i < branch.patterns.len) : (i += 1) {
+                    const p = &branch.patterns[i];
+                    const c = try lowerSubjectPatternCond(b, p, subj);
+                    if (i + 1 == branch.patterns.len) break :blk c;
+                    const alt = try b.allocBlock();
+                    b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = alt } });
+                    b.switchTo(alt);
                 }
-                break :blk try orChain(b, regs.items);
+                unreachable;
             } else {
                 var regs: std.ArrayList(Reg) = .empty;
                 defer regs.deinit(b.allocator);

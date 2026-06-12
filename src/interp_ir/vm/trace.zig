@@ -139,7 +139,7 @@ pub fn recvLabel(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error
         .Class => |c| blk: {
             const cg = c.borrow();
             defer cg.deinit();
-            break :blk try std.fmt.allocPrint(allocator, "Class({s})", .{cg.get().name});
+            break :blk try std.fmt.allocPrint(allocator, "Class({s})", .{cg.get().fqn});
         },
         .Null => "Null",
         .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => @tagName(v),

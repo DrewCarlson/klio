@@ -302,6 +302,7 @@ fn mapRuntimeError(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalEr
             ss.* = .{ .token = 0, .frames = .empty, .wake_in_millis = wake, .pending_resume_reg = null };
             break :blk .{ .Suspended = ss };
         },
+        .CalleeFailed => |m| .{ .CalleeFailed = m },
         else => |other| try typeErr(allocator, "{s}", .{@tagName(other)}),
     };
 }
@@ -1638,15 +1639,41 @@ fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver:
     return false;
 }
 
+/// Parameter-type names that can never bind a function-typed argument.
+/// Conservative: only the builtin value types and `String`/`CharSequence`,
+/// so a typealiased function type or user interface is never adjudicated.
+fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
+    const names = [_][]const u8{
+        "String", "CharSequence", "Boolean", "Char",  "Byte",  "Short",
+        "Int",    "Long",         "Float",   "Double", "UByte", "UShort",
+        "UInt",   "ULong",        "Number",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, pn, n)) return true;
+    }
+    return false;
+}
+
 fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
-    const pn = param_ty.name;
+    var pn = param_ty.name;
     // A qualified reference (`Owner.Pocket`) names a lifted nested/inner
     // class whose registered name the supertype walk cannot relate;
     // decline to adjudicate.
     if (std.mem.indexOfScalar(u8, pn, '.') != null) return false;
+    // A typealiased param type adjudicates under its expansion, never the
+    // alias's simple name — another file may register an unrelated class
+    // under that name (the coroutines file-private `typealias Node =
+    // LockFreeLinkedListNode` vs ktor's nested `engines.Node`).
+    pn = resolveAliasName(self, pn);
+    if (std.mem.indexOfScalar(u8, pn, '.') != null) return false;
 
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit") or param_ty.nullable) return false;
     if (pn.len <= 2 and allUppercase(pn)) return false;
+    // A callable argument definitely does not satisfy a primitive/String
+    // parameter: `logger.trace { … }` must drop the member `trace(String)`
+    // so the inline `Logger.trace(message: () -> String)` extension binds
+    // (kotlinc resolves the extension; the member is inapplicable).
+    if (isCallable(arg) and isDefinitelyNonFunctionTypeName(pn)) return true;
     if (std.mem.startsWith(u8, pn, "Function")) {
         // Callables and Null stay non-definite; a plain data value is
         // definite, and so is an instance with no `invoke` surface (a
@@ -2548,6 +2575,13 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         }
     }
 
+    if (receiver.* == .Instance) {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, cg.get().fqn });
+    }
     return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, receiver.typeFqn() });
 }
 
@@ -2922,6 +2956,23 @@ fn isSequenceTerminal(name: []const u8) bool {
     return false;
 }
 
+/// Whether some user extension function named `name` declares a receiver
+/// (`this` param) whose simple type name matches one of `targets`.
+fn extensionTargetsAny(self: *VmHost, name: []const u8, targets: []const []const u8) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    for (mod.funcsBySimpleName(name)) |fid| {
+        const f = funcAt(mod, fid) orelse continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        const recv_simple = simpleName(f.params[0].ty.name);
+        for (targets) |t| {
+            if (std.mem.eql(u8, simpleName(t), recv_simple)) return true;
+        }
+    }
+    return false;
+}
+
 fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const cls = receiver.Class;
     var cls_name: []const u8 = undefined;
@@ -2980,10 +3031,21 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         // First access through a companion member constructs the
         // companion (once, thread-safe); a miss probe for a non-member
         // (an enum entry, a nested class) leaves it uninitialized.
-        const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+        var singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
             .ok => |maybe| maybe,
             .err => |e| return .{ .err = e },
         };
+        // A user extension whose declared receiver is the class (or an
+        // ancestor) also dispatches through the companion value:
+        // `Json.encodeValue(x)` binds `fun Json.encodeValue(...)` with
+        // the companion (`Json.Default`, an instance of `Json`) as its
+        // receiver, so construct the companion for it too.
+        if (singleton == null and extensionTargetsAny(self, name, probe_classes.items)) {
+            singleton = switch (try host_globals.ensureObjectSingleton(self, cn)) {
+                .ok => |maybe| maybe,
+                .err => |e| return .{ .err = e },
+            };
+        }
         if (singleton) |s| {
             if (s == .Instance) {
                 const no_such = try std.fmt.allocPrint(allocator, "`{s}` on", .{name});
@@ -3869,9 +3931,30 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
     }
 
     if (lookupAnonMethod(self, allocator, class_name, arity_name, name)) |hit| {
-        return try invokeAnonMethod(self, allocator, receiver, hit, args, inst);
+        // Param-type disproof, mirroring the named-class member walk: an
+        // anon-object `trace(message: String)` declines a trailing-lambda
+        // call so the inline `Logger.trace(() -> String)` extension binds.
+        if (!anonMethodDisproven(self, hit, args)) {
+            return try invokeAnonMethod(self, allocator, receiver, hit, args, inst);
+        }
     }
     return null;
+}
+
+/// Whether some supplied argument definitely cannot bind the anon method's
+/// corresponding declared parameter (so the candidate must decline and the
+/// dispatch walk continue to extensions).
+fn anonMethodDisproven(self: *VmHost, hit: AnonMethodEntry, args: []const Value) bool {
+    const mg = hit.module.borrow();
+    defer mg.deinit();
+    const f = funcAt(mg.get(), hit.func) orelse return false;
+    const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    const effective = f.params[skip..];
+    var i: usize = 0;
+    while (i < args.len and i < effective.len) : (i += 1) {
+        if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i])) return true;
+    }
+    return false;
 }
 
 const root_mod = @import("../interp_ir.zig");

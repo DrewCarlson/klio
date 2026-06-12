@@ -95,6 +95,7 @@ pub fn lowerLambdaBodyCapturing(
     outer: StringSet,
     outer_boxed: *const StringSet,
     inherited_rlp: StringSet,
+    inherited_lef: StringSet,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
     return lowerLambdaBodyCapturingKind(
@@ -106,6 +107,7 @@ pub fn lowerLambdaBodyCapturing(
         outer_boxed,
         null,
         inherited_rlp,
+        inherited_lef,
         enclosing_owner,
     );
 }
@@ -119,6 +121,7 @@ pub fn lowerLambdaBodyCapturingKind(
     outer_boxed: *const StringSet,
     tailrec_self: ?[]const u8,
     inherited_rlp: StringSet,
+    inherited_lef: StringSet,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
     return lowerLambdaBodyCapturingKindWith(
@@ -131,6 +134,7 @@ pub fn lowerLambdaBodyCapturingKind(
         tailrec_self,
         false,
         inherited_rlp,
+        inherited_lef,
         enclosing_owner,
     );
 }
@@ -147,6 +151,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
     tailrec_self: ?[]const u8,
     is_named_local_fn: bool,
     inherited_rlp: StringSet,
+    inherited_lef: StringSet,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
@@ -174,6 +179,11 @@ pub fn lowerLambdaBodyCapturingKindWith(
     var inherited = inherited_rlp;
     defer inherited.deinit();
     try b.inheritReceiverLambdaParams(&inherited);
+    // Same carrier for local extension functions: a captured local ext fn
+    // called bare in this body must still prepend the enclosing receiver.
+    var inherited_ext = inherited_lef;
+    defer inherited_ext.deinit();
+    try b.inheritLocalExtFns(&inherited_ext);
     if (tailrec_self) |name| {
         b.setTailrecSelf(name);
     }

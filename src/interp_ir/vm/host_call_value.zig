@@ -538,6 +538,19 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 const fp = m.funcs.items[info.body_func.int()].params;
                 break :blk fp.len != 0 and std.mem.eql(u8, fp[0].name, "this");
             };
+            // Explicit-receiver call shape on a body that never captured
+            // `this` (`handler(Context(), a, b, c)` for a
+            // `Context.(A, B, C) -> R` whose body reads no receiver
+            // member): arg0 is the receiver, not a positional param —
+            // split it off and keep it reachable as the innermost subject.
+            if (!takes_this_param and info.n_params >= 1 and args.len == info.n_params + 1) {
+                const recv0 = args[0];
+                const pushed = recv0 == .Instance or recv0 == .Null;
+                if (pushed) host_call_member.pushAccessEnclosingSubject(self, &recv0);
+                const r = try callValue(self, allocator, callee, args[1..]);
+                if (pushed) host_call_member.popAccessEnclosing(self);
+                return r;
+            }
             // A plain `(T, …) -> R` lambda used where a `T.(…) -> R` is
             // expected declares one more positional param than the call
             // supplies; the receiver fills it (kotlinc: the receiver IS

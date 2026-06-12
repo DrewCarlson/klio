@@ -33,6 +33,9 @@ const Server = struct {
     port: u16,
     thread: std.Thread,
     stop: std.atomic.Value(bool),
+    /// Requests served — the send-count oracle (one logical GET must
+    /// issue exactly one request).
+    hits: std.atomic.Value(u32),
 
     fn start(self: *Server) !void {
         const fd_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
@@ -51,6 +54,7 @@ const Server = struct {
         self.fd = fd;
         self.port = std.mem.bigToNative(u16, addr.port);
         self.stop = std.atomic.Value(bool).init(false);
+        self.hits = std.atomic.Value(u32).init(0);
         self.thread = try std.Thread.spawn(.{}, serveLoop, .{self});
     }
 
@@ -78,6 +82,7 @@ const Server = struct {
             if (linux.errno(rc) != .SUCCESS) continue;
             const cfd: i32 = @intCast(rc);
             defer _ = linux.close(cfd);
+            _ = self.hits.fetchAdd(1, .monotonic);
             // Drain the request head (one read is enough for a header-only GET).
             var buf: [8192]u8 = undefined;
             _ = linux.read(cfd, &buf, buf.len);
@@ -210,11 +215,15 @@ fn runProgram(name: []const u8, src: []const u8, feature: []const u8, expected: 
         return error.KlioRunFailed;
     }
     try std.testing.expectEqualStrings(expected, r.stdout);
+    // One logical GET = exactly one request on the wire.
+    try std.testing.expectEqual(@as(u32, 1), server.hits.load(.monotonic));
 }
 
-test "shim client GET single-sends with status and body" {
+test "client GET single-sends with status and body (default engine)" {
     try runProgram("get_plain",
         \\import io.ktor.client.*
+        \\import io.ktor.client.request.*
+        \\import io.ktor.client.statement.*
         \\
         \\suspend fun main() {
         \\    val client = HttpClient()
@@ -225,7 +234,30 @@ test "shim client GET single-sends with status and body" {
         \\}
         \\
     , "io.ktor/client",
-        \\status=200
+        \\status=200 OK
+        \\body={"name":"Ada","age":36,"roles":["ADMIN","USER"]}
+        \\
+    );
+}
+
+test "client GET with explicit engine and followRedirects off" {
+    try runProgram("get_explicit",
+        \\import io.ktor.client.*
+        \\import io.ktor.client.request.*
+        \\import io.ktor.client.statement.*
+        \\
+        \\suspend fun main() {
+        \\    val client = HttpClient(KlioClient) {
+        \\        followRedirects = false
+        \\    }
+        \\    val resp = client.get("http://127.0.0.1:PORT/u")
+        \\    println("status=" + resp.status)
+        \\    println("body=" + resp.bodyAsText())
+        \\    client.close()
+        \\}
+        \\
+    , "io.ktor/client",
+        \\status=200 OK
         \\body={"name":"Ada","age":36,"roles":["ADMIN","USER"]}
         \\
     );
@@ -234,13 +266,19 @@ test "shim client GET single-sends with status and body" {
 test "typed body deserializes through client-serialization" {
     try runProgram("get_typed",
         \\import io.ktor.client.*
+        \\import io.ktor.client.call.*
+        \\import io.ktor.client.plugins.contentnegotiation.*
+        \\import io.ktor.client.request.*
+        \\import io.ktor.serialization.kotlinx.json.*
         \\import kotlinx.serialization.Serializable
         \\
         \\@Serializable
         \\data class User(val name: String, val age: Int, val roles: List<String>)
         \\
         \\suspend fun main() {
-        \\    val client = HttpClient()
+        \\    val client = HttpClient {
+        \\        install(ContentNegotiation) { json() }
+        \\    }
         \\    val resp = client.get("http://127.0.0.1:PORT/u")
         \\    val user = resp.body<User>()
         \\    println("user=" + user)

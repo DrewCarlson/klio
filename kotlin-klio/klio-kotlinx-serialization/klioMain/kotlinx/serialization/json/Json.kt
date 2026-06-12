@@ -42,6 +42,16 @@ public inline fun <reified T> Json.decodeFromString(string: String): T {
     return __klsx_jsonDecode(string, T::class) as T
 }
 
+// klio bridges for callers that resolve the target type at runtime instead
+// of through a reified parameter — ktor's ContentNegotiation receives the
+// requested type as a `TypeInfo` and decodes by its `KClass`; the encoder
+// reflects over the runtime value, so no type token is needed at all.
+public fun Json.decodeToClass(string: String, kClass: KClass<*>): Any? =
+    __klsx_jsonDecode(string, kClass)
+
+public fun Json.encodeValue(value: Any?): String =
+    __klsx_jsonEncode(value, prettyPrint)
+
 public class JsonBuilder internal constructor(from: Json) {
     public var prettyPrint: Boolean = from.prettyPrint
     public var ignoreUnknownKeys: Boolean = from.ignoreUnknownKeys

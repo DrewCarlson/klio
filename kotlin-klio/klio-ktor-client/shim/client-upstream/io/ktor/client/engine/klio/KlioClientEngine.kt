@@ -1,9 +1,7 @@
 // klio's `HttpClientEngine` implementation for the upstream client core (the
 // "custom actual" the architecture calls for). It drives the request through
-// the host `__kktor_request` binding (backed by `ureq` in
-// klio-ktor-client/src/lib.rs) and wraps the response bytes in a buffered,
-// read-side `ByteReadChannel` — the shape `HttpResponse` drains. Gated under
-// the `client-upstream` feature (the stage-3 swap of `shim/client`).
+// the host `__kktor_request` binding and wraps the response bytes in a
+// buffered, read-side `ByteReadChannel` — the shape `HttpResponse` drains.
 
 package io.ktor.client.engine.klio
 
@@ -25,6 +23,7 @@ public object KlioClient : HttpClientEngineFactory<KlioClientEngineConfig> {
     override fun create(block: KlioClientEngineConfig.() -> Unit): HttpClientEngine =
         KlioClientEngine(KlioClientEngineConfig().apply(block))
 }
+
 
 public class KlioClientEngine(
     override val config: KlioClientEngineConfig,

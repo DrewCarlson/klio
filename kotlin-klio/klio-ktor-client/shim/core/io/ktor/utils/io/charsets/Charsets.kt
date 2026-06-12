@@ -48,6 +48,10 @@ public class CharsetDecoder(public val charset: Charset) {
         }
         else -> bytes.decodeToString()
     }
+
+    // Upstream `CharsetDecoder.decode(input: Source, max: Int)` shape used
+    // by `HttpResponse.bodyAsText` (the body arrives as a kotlinx.io Source).
+    public fun decode(input: kotlinx.io.Source): String = decode(input.readByteArray())
 }
 
 public object Charsets {

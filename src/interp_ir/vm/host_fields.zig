@@ -872,10 +872,24 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             }
         }
     }
-    const tf = try allocator.dupe(u8, receiver.typeFqn());
+    const tf = try allocator.dupe(u8, receiverLabel(receiver));
     const msg = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ name, tf });
     allocator.free(tf);
     return errRes(.{ .Unimplemented = msg });
+}
+
+
+/// The receiver's class fqn for diagnostics — an instance names its
+/// declaring class instead of the opaque `<instance>` tag.
+fn receiverLabel(receiver: *const Value) []const u8 {
+    if (receiver.* == .Instance) {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        return cg.get().fqn;
+    }
+    return receiver.typeFqn();
 }
 
 /// Companion forwarding + nested-class/singleton resolution on a
@@ -1748,7 +1762,7 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         }
         return .{ .ok = {} };
     }
-    const tf = try allocator.dupe(u8, receiver.typeFqn());
+    const tf = try allocator.dupe(u8, receiverLabel(receiver));
     const msg = try std.fmt.allocPrint(allocator, "Vm::set_field `{s}` on `{s}`", .{ name, tf });
     allocator.free(tf);
     return .{ .err = .{ .Unimplemented = msg } };

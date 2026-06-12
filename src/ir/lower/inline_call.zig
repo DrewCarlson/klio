@@ -91,6 +91,16 @@ fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocator.Er
             if (tie) return null;
             return best;
         },
+        // A plain local: its declared annotation, or the inferred type of
+        // its recorded initializer (`val resp = client.get(url)` makes
+        // `resp.body<T>()` narrow to the `HttpResponse` overload).
+        .Path => |p| {
+            if (p.segments.len != 1) return null;
+            const name = p.segments[0].name;
+            if (b.localDeclType(name)) |t| return t;
+            if (b.localInitExpr(name)) |e| return inferReceiverType(b, e);
+            return null;
+        },
         else => return null,
     }
 }
