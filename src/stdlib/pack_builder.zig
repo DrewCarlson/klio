@@ -232,9 +232,9 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
 
 /// The local upstream Kotlin checkout's `libraries/stdlib` directory, relative
 /// to the workspace root (the process cwd when the pack is built).
-const UPSTREAM_STDLIB_ROOT = "kotlin/libraries/stdlib";
+pub const UPSTREAM_STDLIB_ROOT = "kotlin/libraries/stdlib";
 /// The `kotlin-klio` directory holding the klio-authored actuals.
-const KLIO_STDLIB_DIR = "kotlin-klio";
+pub const KLIO_STDLIB_DIR = "kotlin-klio";
 
 /// Build a deterministic pack for the in-process Kotlin standard library.
 ///

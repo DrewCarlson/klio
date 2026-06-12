@@ -83,6 +83,16 @@ Two mechanisms keep the suite fast:
   `fast`/`fallback` line per program. The
   `parity_stdlib_isolation` itest and the differential's
   order-independence test gate cross-program contamination.
+- **Baked stdlib image (the CLI's equivalent).** `klio run` serializes
+  the same kind of lowered base to `~/.klio/cache` on first use and
+  loads + extends it on every later run (`src/interp_ir/image.zig`,
+  `src/cli/stdlib_image.zig`). The `stdlib_image` itest gates it: bake
+  → hit → fallback → corrupted image → stale stdlib source, each
+  byte-compared against the legacy whole-program build, plus an
+  in-process bake/load round trip over the lowered tables. The codec
+  itself (memoizing postcard variant) has unit tests in
+  `src/interp_ir/image.zig`. Set `KLIO_STDLIB_IMAGE=0` to disable and
+  `KLIO_TRACE_STDLIB_IMAGE=1` to trace.
 
 ## Before committing
 

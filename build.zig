@@ -40,7 +40,7 @@ const mod_list = [_]Mod{
     // parity pipeline and asserts against tests/corpus/expected/.
     .{ .name = "e2e", .deps = &.{"parity"}, .tested = true },
     // Integration suites ported from crates/*/tests.
-    .{ .name = "itests", .deps = &.{ "parity", "typeck", "resolver", "parser", "lexer", "cfa", "runtime", "ast", "span", "diagnostics", "types", "pack", "ir", "interp_ir" }, .tested = true },
+    .{ .name = "itests", .deps = &.{ "parity", "typeck", "resolver", "parser", "lexer", "cfa", "runtime", "ast", "span", "diagnostics", "types", "pack", "ir", "interp_ir", "stdlib" }, .tested = true },
 };
 
 /// One integration-test file under src/itests/, run as its own test binary so
@@ -140,6 +140,10 @@ const itests_files = [_]Itest{
     .{ .name = "json_reified_inline", .parity_data = false, .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-serialization",
     } },
+    // Baked stdlib image gate: bake -> hit -> fallback -> staleness ->
+    // corruption through a child `klio` against a scratch HOME, plus the
+    // in-process bake/load round trip.
+    .{ .name = "stdlib_image", .needs_exe = true },
 };
 
 /// Read by every parity-pipeline run: the stdlib pack is built at runtime from
@@ -182,6 +186,8 @@ const interp_env_keys = [_][]const u8{
     "KLIO_RESOLVE_STRICT",
     "KLIO_STDLIB_PACK",
     "KLIO_PACK_DIAG",
+    "KLIO_STDLIB_IMAGE",
+    "KLIO_TRACE_STDLIB_IMAGE",
 };
 
 /// Fuzzer sweep size/seed plus the kotlinc-oracle discovery overrides. Note
