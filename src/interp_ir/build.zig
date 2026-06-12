@@ -187,7 +187,12 @@ pub const BuiltModule = struct {
 /// `(class, entry)` → synth class name.
 pub const PairStrMap = std.HashMap(StrPair, []const u8, StrPairContext, std.hash_map.default_max_load_percentage);
 
-/// Build an empty `BuiltModule` shell around `module`.
+/// Build an empty `BuiltModule` shell around `module`. Public for the
+/// image loader, which fills the shell table-by-table from decoded data.
+pub fn emptyBuiltShell(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) BuiltModule {
+    return emptyBuilt(allocator, module, main);
+}
+
 fn emptyBuilt(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) BuiltModule {
     return .{
         .module = module,

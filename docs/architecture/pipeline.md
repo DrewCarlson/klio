@@ -72,6 +72,18 @@ binary by `stdlib_pack` as a byte slice. At startup the loader:
 
 See [Pack Format](../packs/format.md) for the on-disk layout.
 
+To avoid re-lowering the stdlib (and selected packs) on every run, the
+CLI bakes the lowered dependency base — the IR module, its registry
+side tables, the runtime `ClassDef` graph, and the post-lift AST the
+extend path consumes — to a content-addressed image under
+`~/.klio/cache` and extends it with just the user program's
+declarations on later runs (`src/interp_ir/image.zig`,
+`src/cli/stdlib_image.zig`). The image's wire format is the pack
+codec's postcard style plus a shared-graph protocol (slice and AST-node
+define/backref registries) so cross-references like
+`ClassDef.methods[].decl` and inline-function ASTs decode pointing into
+the same decoded tree they did in memory.
+
 ## Diagnostics model
 
 Every front-end pass emits through `diagnostics.DiagnosticSink`,

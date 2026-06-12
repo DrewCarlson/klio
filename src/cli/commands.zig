@@ -44,6 +44,8 @@ const pack_cache = @import("pack_cache.zig");
 const RequestedFeatures = pack_cache.RequestedFeatures;
 const loadInstalledPacks = pack_cache.loadInstalledPacks;
 
+const stdlib_image = @import("stdlib_image.zig");
+
 /// Output format for `klio check`. Mirrors `commands::DiagFormat`.
 pub const DiagFormat = enum {
     Plain,
@@ -198,6 +200,10 @@ pub fn runModuleFiles(
     paths: []const []const u8,
     features: *const RequestedFeatures,
 ) u8 {
+    runtime.startMemoryWatchdog();
+    runtime.startRunDeadline();
+    interp_ir.resetReceiverThreadLocals();
+    if (tryImagePath(gpa, paths, features)) |code| return code;
     var map = SourceMap.init(gpa);
     defer map.deinit();
     var asts: std.ArrayList(KotlinFile) = .empty;
@@ -240,6 +246,7 @@ pub fn runFileIrVm(
     // Catch any receiver/coroutine thread-local state leaked from a prior run
     // on this thread before assembling the next program.
     interp_ir.resetReceiverThreadLocals();
+    if (tryImagePath(gpa, &.{path}, features)) |code| return code;
     var map = SourceMap.init(gpa);
     defer map.deinit();
     const id = load(gpa, &map, path) orelse return 1;
@@ -288,7 +295,41 @@ fn runBuilt(
     runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
 
-    var built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch return 1;
+    const built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch return 1;
+    return runBuiltModule(gpa, built, bindings, map, no_main_msg);
+}
+
+/// Assemble the program against the baked stdlib image when possible.
+/// Returns the process exit code on the fast path, null when the legacy
+/// whole-program path must run instead (cache disabled/missing, parse
+/// errors, base-name collision fallback, unbakeable base).
+fn tryImagePath(
+    gpa: std.mem.Allocator,
+    paths: []const []const u8,
+    features: *const RequestedFeatures,
+) ?u8 {
+    const prev_reclaim = runtime.reclaimEnabled();
+    runtime.setReclaim(false);
+    defer runtime.setReclaim(prev_reclaim);
+    const prepared = stdlib_image.tryPrepare(gpa, paths, features) orelse return null;
+    const msg = if (paths.len == 1) "error: no main function found" else "runtime error: no main function in module";
+    return runBuiltModule(gpa, prepared.built, prepared.bindings, prepared.map, msg);
+}
+
+/// Tail shared by the legacy and image paths: surface lowering-time
+/// resolution diagnostics, materialize a Vm, install bindings, run `main`.
+fn runBuiltModule(
+    gpa: std.mem.Allocator,
+    built_in: interp_ir.build.BuiltModule,
+    bindings: HostBindings,
+    map: *const SourceMap,
+    no_main_msg: []const u8,
+) u8 {
+    const prev_reclaim = runtime.reclaimEnabled();
+    runtime.setReclaim(false);
+    defer runtime.setReclaim(prev_reclaim);
+
+    var built = built_in;
     // Lowering-time resolution diagnostics (ambiguous bare calls) fail
     // the program before it runs.
     {

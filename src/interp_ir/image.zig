@@ -1,0 +1,1794 @@
+//! Baked stdlib image: serialize a lowered `StdlibBase` to bytes and load
+//! it back without re-running the lowering driver.
+//!
+//! The wire format is the pack codec's postcard style (varints,
+//! length-prefixed sequences, in-order struct fields) extended with a
+//! shared-graph protocol so the snapshot's pointer structure survives a
+//! round trip:
+//!
+//! - Every slice is a define/backref: the first encode of a given
+//!   `(address, length)` writes its elements inline and registers it; a
+//!   later encode of the same slice writes a backref. The decoder keeps a
+//!   registry in define order, so a backref resolves to the exact slice
+//!   the first define produced and sharing (lifted classes share member
+//!   slices with their declaring class) is preserved.
+//! - A closed set of AST node types is *watched*: every watched value is
+//!   registered (in traversal order) as it is encoded/decoded, and a
+//!   pointer to a watched node encodes as a reference to that registry.
+//!   This is what lets `Inst.BuildObject.ast`, `ClassDef.methods[].decl`,
+//!   `StdlibBase.inline_ids` and friends point INTO the decoded
+//!   `lifted_decls` tree, interior addresses included, exactly as they do
+//!   in a freshly lowered base.
+//! - `[]const u8` decodes as a borrow of the image buffer, so strings cost
+//!   nothing to materialize. The buffer must outlive the loaded base; the
+//!   CLI keeps it on the same process-lifetime arena as the base itself.
+//!
+//! What is serialized: the SourceMap files, the post-lift AST decls, the
+//! lowered `ir.Module` (registry flattened to index/pair tables), every
+//! `BuiltModule` side table, the runtime `ClassDef` graph (ObjRef edges as
+//! def-table indexes), and the `StdlibBase` gate sets. What is rebuilt at
+//! load: hash-map spines, `func_name_index`, ObjRef cells, and the
+//! run-mutable `ClassDef` cells (companion/object singletons, captured
+//! envs) that `cloneBuiltForRun` resets per run anyway.
+//!
+//! `bake` refuses (returns null) when the base holds anything outside the
+//! serializable build-time surface (e.g. a SAM-converted method value);
+//! callers then simply keep the unbaked path.
+
+const std = @import("std");
+
+const ir = @import("ir");
+const runtime = @import("runtime");
+const ast = @import("ast");
+const span = @import("span");
+
+const build = @import("build.zig");
+
+const Allocator = std.mem.Allocator;
+const SourceMap = span.SourceMap;
+const Span = span.Span;
+const FileId = span.FileId;
+const Module = ir.Module;
+const FuncId = ir.FuncId;
+const ObjRef = runtime.ObjRef;
+const ClassDef = runtime.ClassDef;
+const InstanceData = runtime.InstanceData;
+const Env = runtime.Env;
+const Value = runtime.Value;
+const TypeShape = runtime.TypeShape;
+const StdlibBase = build.StdlibBase;
+const BuiltModule = build.BuiltModule;
+
+/// Bump on ANY change to the encoded layout or to the types it reaches
+/// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
+/// caller rebakes.
+pub const FORMAT_VERSION: u32 = 1;
+
+pub const MAGIC = "KIMG";
+const TRAILER = "GMIK";
+
+// -------------------------------------------------------------------------
+// Watched AST node types: externally referenced by pointer from the IR,
+// the ClassDef graph, or the base's inline-fn registry.
+// -------------------------------------------------------------------------
+
+const watched_types = [_]type{
+    ast.Expr,
+    ast.Block,
+    ast.Function,
+    ast.Class,
+    ast.Property,
+    ast.Accessor,
+    ast.SecondaryCtor,
+};
+
+fn isWatched(comptime T: type) bool {
+    inline for (watched_types) |W| {
+        if (T == W) return true;
+    }
+    return false;
+}
+
+// -------------------------------------------------------------------------
+// Encoder
+// -------------------------------------------------------------------------
+
+const NodeKey = struct { addr: usize, ty: usize };
+const SliceKey = struct { addr: usize, len: usize, ty: usize };
+
+fn typeId(comptime T: type) usize {
+    return @intFromPtr(@typeName(T).ptr);
+}
+
+const Encoder = struct {
+    gpa: Allocator,
+    out: std.ArrayList(u8) = .empty,
+    nodes: std.AutoHashMap(NodeKey, u32),
+    node_count: u32 = 0,
+    slices: std.AutoHashMap(SliceKey, u32),
+    slice_count: u32 = 0,
+
+    fn init(gpa: Allocator) Encoder {
+        return .{
+            .gpa = gpa,
+            .nodes = std.AutoHashMap(NodeKey, u32).init(gpa),
+            .slices = std.AutoHashMap(SliceKey, u32).init(gpa),
+        };
+    }
+
+    fn deinit(self: *Encoder) void {
+        self.out.deinit(self.gpa);
+        self.nodes.deinit();
+        self.slices.deinit();
+    }
+
+    fn byte(self: *Encoder, b: u8) Allocator.Error!void {
+        try self.out.append(self.gpa, b);
+    }
+
+    fn bytes(self: *Encoder, b: []const u8) Allocator.Error!void {
+        try self.out.appendSlice(self.gpa, b);
+    }
+
+    fn varint(self: *Encoder, value: u64) Allocator.Error!void {
+        var v = value;
+        while (true) {
+            const b: u8 = @intCast(v & 0x7f);
+            v >>= 7;
+            if (v == 0) {
+                try self.byte(b);
+                break;
+            }
+            try self.byte(b | 0x80);
+        }
+    }
+};
+
+fn encodeInt(comptime T: type, e: *Encoder, value: T) Allocator.Error!void {
+    const info = @typeInfo(T).int;
+    if (info.bits <= 8) {
+        try e.byte(@bitCast(value));
+        return;
+    }
+    if (info.signedness == .signed) {
+        const wide: i64 = value;
+        const zz: u64 = @bitCast((wide << 1) ^ (wide >> 63));
+        try e.varint(zz);
+    } else {
+        try e.varint(@intCast(value));
+    }
+}
+
+/// Encode one value, traversing by const pointer so registered addresses
+/// are the original object addresses (interior pointers included).
+fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!void {
+    if (comptime isWatched(T)) {
+        const key = NodeKey{ .addr = @intFromPtr(value), .ty = typeId(T) };
+        const gop = try e.nodes.getOrPut(key);
+        if (!gop.found_existing) gop.value_ptr.* = e.node_count;
+        e.node_count += 1;
+    }
+    const info = @typeInfo(T);
+    switch (info) {
+        .bool => try e.byte(if (value.*) 1 else 0),
+        .int => try encodeInt(T, e, value.*),
+        .float => try e.bytes(&std.mem.toBytes(value.*)),
+        .@"enum" => |en| try e.varint(@as(u64, @intCast(@as(en.tag_type, @intFromEnum(value.*))))),
+        .optional => |o| {
+            if (value.*) |*payload| {
+                try e.byte(1);
+                try encodeValue(o.child, e, payload);
+            } else {
+                try e.byte(0);
+            }
+        },
+        .pointer => |p| switch (p.size) {
+            .one => {
+                if (comptime isWatched(p.child)) {
+                    const key = NodeKey{ .addr = @intFromPtr(value.*), .ty = typeId(p.child) };
+                    if (e.nodes.get(key)) |id| {
+                        try e.varint(@as(u64, id) + 1);
+                    } else {
+                        try e.varint(0);
+                        try encodeValue(p.child, e, value.*);
+                    }
+                } else {
+                    try encodeValue(p.child, e, value.*);
+                }
+            },
+            .slice => {
+                const s = value.*;
+                if (s.len == 0) {
+                    // Tag 1: the empty slice — no registry entry.
+                    try e.varint(1);
+                    return;
+                }
+                const key = SliceKey{ .addr = @intFromPtr(s.ptr), .len = s.len, .ty = typeId(p.child) };
+                if (e.slices.get(key)) |id| {
+                    try e.varint(@as(u64, id) + 2);
+                    return;
+                }
+                try e.varint(0);
+                try e.slices.put(key, e.slice_count);
+                e.slice_count += 1;
+                try e.varint(s.len);
+                if (p.child == u8) {
+                    try e.bytes(s);
+                } else {
+                    for (s) |*elem| try encodeValue(p.child, e, elem);
+                }
+            },
+            else => @compileError("unsupported pointer kind in image encode: " ++ @typeName(T)),
+        },
+        .@"struct" => |s| {
+            if (s.layout == .@"packed") {
+                try encodeInt(s.backing_integer.?, e, @bitCast(value.*));
+            } else {
+                inline for (s.fields) |f| {
+                    try encodeValue(f.type, e, &@field(value.*, f.name));
+                }
+            }
+        },
+        .@"union" => |u| {
+            const Tag = std.meta.Tag(T);
+            const tag: Tag = value.*;
+            const tag_int = @intFromEnum(tag);
+            try e.varint(@intCast(tag_int));
+            inline for (u.fields, 0..) |f, idx| {
+                if (idx == tag_int) {
+                    if (f.type != void) {
+                        try encodeValue(f.type, e, &@field(value.*, f.name));
+                    }
+                }
+            }
+        },
+        .void => {},
+        else => @compileError("unsupported type in image encode: " ++ @typeName(T)),
+    }
+}
+
+// -------------------------------------------------------------------------
+// Decoder
+// -------------------------------------------------------------------------
+
+const DecodeError = error{ OutOfMemory, Malformed };
+
+const SliceEntry = struct { addr: usize, len: usize };
+
+const Decoder = struct {
+    a: Allocator,
+    buf: []const u8,
+    pos: usize = 0,
+    nodes: std.ArrayList(usize) = .empty,
+    slices: std.ArrayList(SliceEntry) = .empty,
+
+    fn take(self: *Decoder, n: usize) DecodeError![]const u8 {
+        if (self.pos + n > self.buf.len) return error.Malformed;
+        const out = self.buf[self.pos .. self.pos + n];
+        self.pos += n;
+        return out;
+    }
+
+    fn byte(self: *Decoder) DecodeError!u8 {
+        return (try self.take(1))[0];
+    }
+
+    fn varint(self: *Decoder) DecodeError!u64 {
+        var result: u64 = 0;
+        var shift: u6 = 0;
+        while (true) {
+            const b = try self.byte();
+            result |= @as(u64, b & 0x7f) << shift;
+            if (b & 0x80 == 0) break;
+            if (shift >= 63) return error.Malformed;
+            shift += 7;
+        }
+        return result;
+    }
+};
+
+fn decodeInt(comptime T: type, d: *Decoder) DecodeError!T {
+    const info = @typeInfo(T).int;
+    if (info.bits <= 8) {
+        return @bitCast(try d.byte());
+    }
+    if (info.signedness == .signed) {
+        const zz = try d.varint();
+        const u: u64 = zz;
+        const decoded: i64 = @bitCast((u >> 1) ^ (~(u & 1) +% 1));
+        return std.math.cast(T, decoded) orelse error.Malformed;
+    }
+    const v = try d.varint();
+    return std.math.cast(T, v) orelse error.Malformed;
+}
+
+fn enumFromIntAny(comptime T: type, raw: anytype) DecodeError!T {
+    const en = @typeInfo(T).@"enum";
+    const tag = std.math.cast(en.tag_type, raw) orelse return error.Malformed;
+    if (en.is_exhaustive) {
+        return std.enums.fromInt(T, tag) orelse error.Malformed;
+    }
+    return @enumFromInt(tag);
+}
+
+/// Decode one value in place. Decoding writes through `out` so the final
+/// resting address of every watched node / defined slice is registered,
+/// mirroring the encoder's traversal exactly.
+fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
+    if (comptime isWatched(T)) {
+        try d.nodes.append(d.a, @intFromPtr(out));
+    }
+    const info = @typeInfo(T);
+    switch (info) {
+        .bool => out.* = (try d.byte()) != 0,
+        .int => out.* = try decodeInt(T, d),
+        .float => {
+            const s = try d.take(@sizeOf(T));
+            out.* = std.mem.bytesToValue(T, s);
+        },
+        .@"enum" => out.* = try enumFromIntAny(T, try d.varint()),
+        .optional => |o| {
+            const tag = try d.byte();
+            if (tag == 0) {
+                out.* = null;
+            } else switch (@typeInfo(o.child)) {
+                // Optional pointers/slices pack `null` into the pointer
+                // bits: there is no separate tag to pre-set, so writing an
+                // undefined payload and unwrapping would read undefined.
+                // Decode into a temporary and assign whole. (Pointer
+                // optionals never hold watched VALUES inline -- pointees
+                // are allocated and registered independently -- so the
+                // temporary costs no identity.)
+                .pointer => {
+                    var tmp: o.child = undefined;
+                    try decodeInto(o.child, d, &tmp);
+                    out.* = tmp;
+                },
+                // Non-pointer optionals carry a separate tag; setting a
+                // non-null wrapper gives `&out.*.?` a stable payload
+                // address, which watched-node registration needs (e.g.
+                // `ast.Property.getter: ?Accessor` is referenced by
+                // interior pointer from `ClassDef.body_properties`).
+                else => {
+                    out.* = @as(o.child, undefined);
+                    try decodeInto(o.child, d, &out.*.?);
+                },
+            }
+        },
+        .pointer => |p| switch (p.size) {
+            .one => {
+                const Child = p.child;
+                if (comptime isWatched(Child)) {
+                    const tag = try d.varint();
+                    if (tag == 0) {
+                        const ptr = try d.a.create(Child);
+                        try decodeInto(Child, d, ptr);
+                        out.* = ptr;
+                    } else {
+                        const id: usize = @intCast(tag - 1);
+                        if (id >= d.nodes.items.len) return error.Malformed;
+                        out.* = @ptrFromInt(d.nodes.items[id]);
+                    }
+                } else {
+                    const ptr = try d.a.create(Child);
+                    try decodeInto(Child, d, ptr);
+                    out.* = ptr;
+                }
+            },
+            .slice => {
+                const tag = try d.varint();
+                if (tag == 1) {
+                    out.* = &.{};
+                    return;
+                }
+                if (tag == 0) {
+                    const len: usize = @intCast(try d.varint());
+                    if (p.child == u8 and p.is_const) {
+                        const s = try d.take(len);
+                        try d.slices.append(d.a, .{ .addr = @intFromPtr(s.ptr), .len = len });
+                        out.* = s;
+                    } else {
+                        const arr = try d.a.alloc(p.child, len);
+                        try d.slices.append(d.a, .{ .addr = @intFromPtr(arr.ptr), .len = len });
+                        if (p.child == u8) {
+                            @memcpy(arr, try d.take(len));
+                        } else {
+                            for (arr) |*elem| try decodeInto(p.child, d, elem);
+                        }
+                        out.* = arr;
+                    }
+                    return;
+                }
+                const id: usize = @intCast(tag - 2);
+                if (id >= d.slices.items.len) return error.Malformed;
+                const entry = d.slices.items[id];
+                const many: [*]p.child = @ptrFromInt(entry.addr);
+                out.* = many[0..entry.len];
+            },
+            else => @compileError("unsupported pointer kind in image decode: " ++ @typeName(T)),
+        },
+        .@"struct" => |s| {
+            if (s.layout == .@"packed") {
+                const raw = try decodeInt(s.backing_integer.?, d);
+                out.* = @bitCast(raw);
+            } else {
+                inline for (s.fields) |f| {
+                    try decodeInto(f.type, d, &@field(out.*, f.name));
+                }
+            }
+        },
+        .@"union" => |u| {
+            const tag = try d.varint();
+            var matched = false;
+            inline for (u.fields, 0..) |f, idx| {
+                if (idx == tag) {
+                    matched = true;
+                    if (f.type == void) {
+                        out.* = @unionInit(T, f.name, {});
+                    } else {
+                        out.* = @unionInit(T, f.name, undefined);
+                        try decodeInto(f.type, d, &@field(out.*, f.name));
+                    }
+                }
+            }
+            if (!matched) return error.Malformed;
+        },
+        .void => {},
+        else => @compileError("unsupported type in image decode: " ++ @typeName(T)),
+    }
+}
+
+// -------------------------------------------------------------------------
+// Image schema: the StdlibBase flattened to codec-friendly tables.
+// HashMap/ArrayList/ObjRef spines become index- or pair-keyed slices;
+// everything else is the live type encoded as-is.
+// -------------------------------------------------------------------------
+
+fn KV(comptime K: type, comptime V: type) type {
+    return struct { k: K, v: V };
+}
+
+const StrKV = KV([]const u8, []const u8);
+const PairKey = struct { a: []const u8, b: []const u8 };
+const PairFuncEntry = struct { a: []const u8, b: []const u8, func: FuncId };
+const PairStrEntry = struct { a: []const u8, b: []const u8, v: []const u8 };
+const NameFuncs = struct { name: []const u8, funcs: []const FuncId };
+const NameOptFuncs = struct { name: []const u8, slots: []const ?FuncId };
+
+const FileEntry = struct { path: []const u8, source: []const u8 };
+
+const RegistryImage = struct {
+    object_names: []const []const u8,
+    companion_singletons: []StrKV,
+    enclosing_class: []StrKV,
+    func_type_params: []KV(FuncId, []const []const u8),
+    func_type_param_bounds: []KV(FuncId, []const ir.ModuleRegistry.TypeParamBound),
+    top_level_delegated_props: []const []const u8,
+    hierarchy_methods: []KV([]const u8, []const []const u8),
+    class_member_names: []const []const u8,
+    class_super_names: []KV([]const u8, []const []const u8),
+    delegated_body_props: []PairKey,
+    member_ext_owner_class: []KV(FuncId, []const u8),
+    local_fn_defaults: []KV(FuncId, []const ?FuncId),
+    abstract_member_defaults: []struct { a: []const u8, b: []const u8, slots: []const ?FuncId },
+    type_aliases: []StrKV,
+    import_aliases: []struct {
+        file: FileId,
+        leaves: []struct { leaf: []const u8, paths: []ir.ModuleRegistry.ImportPath },
+    },
+    import_wildcards: []KV(FileId, []const []const u8),
+    nested_object_aliases: []KV([]const u8, []StrKV),
+    mangled_nested: []StrKV,
+    class_const_inits: []struct { a: []const u8, b: []const u8, v: ir.Const },
+};
+
+const ModuleImage = struct {
+    funcs: []ir.Func,
+    classes: []ir.Class,
+    consts: []ir.Const,
+    top_level: []FuncId,
+    class_index: []ir.ClassIndexEntry,
+    func_index: []ir.FuncIndexEntry,
+    package: ?[]const u8,
+    tailrec_fn_names: []const []const u8,
+    registry: RegistryImage,
+    decl_user_params: []KV(u32, u32),
+    decl_user_arity: []KV(u32, Module.DeclArity),
+    decl_user_sig: []KV(u32, []ir.TypeRef),
+    decl_span: []KV(u32, Span),
+};
+
+/// Build-time `Value` reachable from an enum entry or a primitive-zero
+/// slot. Anything outside this set refuses the bake.
+const ValueImage = union(enum) {
+    Unit,
+    Null,
+    Bool: bool,
+    Int: i32,
+    Long: i64,
+    Short: i16,
+    Byte: i8,
+    UInt: u32,
+    ULong: u64,
+    UShort: u16,
+    UByte: u8,
+    Double: f64,
+    Float: f32,
+    Char: u16,
+    Str: []const u8,
+    Instance: InstanceImage,
+};
+
+const InstanceImage = struct {
+    class: u32,
+    fields: []FieldImage,
+    identity: u64,
+};
+
+const FieldImage = struct { name: []const u8, value: ValueImage };
+
+const MethodImage = struct {
+    name: []const u8,
+    decl: *const ast.Function,
+    is_operator: bool,
+    is_open: bool,
+    is_override: bool,
+    is_abstract: bool,
+    delegate_field: ?[]const u8,
+    ir_fn_id: ?u32,
+};
+
+const PropertyImage = struct {
+    name: []const u8,
+    mutable: bool,
+    init: ?*const ast.Expr,
+    getter: ?*const ast.Accessor,
+    setter: ?*const ast.Accessor,
+    delegate: ?*const ast.Expr,
+    is_abstract: bool,
+    is_lateinit: bool,
+    primitive_zero: ?ValueImage,
+};
+
+const ClassParamImage = struct {
+    property: ?bool,
+    name: []const u8,
+    default: ?*const ast.Expr,
+    declared_type: ?[]const u8,
+    declared_shape: ?TypeShape,
+};
+
+const DelegateImage = struct {
+    interface_name: []const u8,
+    interface: ?u32,
+    expr: *const ast.Expr,
+    field_key: []const u8,
+};
+
+const ClassDefImage = struct {
+    name: []const u8,
+    fqn: []const u8,
+    annotation_names: []const []const u8,
+    primary_params: []ClassParamImage,
+    methods: []MethodImage,
+    body_properties: []PropertyImage,
+    init_blocks: []*const ast.Block,
+    init_block_property_positions: []usize,
+    is_data: bool,
+    is_value: bool,
+    is_object: bool,
+    is_enum: bool,
+    is_sealed: bool,
+    supertype_names: []const []const u8,
+    parent: ?u32,
+    interfaces: []u32,
+    is_interface: bool,
+    is_fun_interface: bool,
+    parent_ctor_args: []*const ast.Expr,
+    is_open: bool,
+    is_abstract: bool,
+    is_inner: bool,
+    is_anonymous: bool,
+    secondary_ctors: []*const ast.SecondaryCtor,
+    enum_entries: []struct { name: []const u8, value: ValueImage },
+    enclosing: ?u32,
+    nested_classes: []struct { name: []const u8, idx: u32 },
+    supertype_delegates: []DelegateImage,
+    delegate_forwarders: []MethodImage,
+};
+
+const BuiltImage = struct {
+    body_prop_inits: []PairFuncEntry,
+    instance_prop_getters: []PairFuncEntry,
+    instance_prop_setters: []PairFuncEntry,
+    parent_ctor_args: []NameFuncs,
+    init_blocks: []NameFuncs,
+    top_level_props: []build.NameFunc,
+    extension_props: []PairFuncEntry,
+    extension_prop_setters: []PairFuncEntry,
+    object_names: []const []const u8,
+    companion_singletons: []StrKV,
+    enum_entry_arg_inits: []build.EnumEntryArgInit,
+    secondary_ctors: []struct { name: []const u8, entries: []build.SecondaryCtorEntry },
+    primary_ctor_default_thunks: []NameOptFuncs,
+    class_delegates: []struct { name: []const u8, entries: []build.StrFunc },
+    func_defaults: []KV(u32, []const ?FuncId),
+    enclosing_class: []StrKV,
+    enum_entry_methods: []struct { a: []const u8, b: []const u8, module: ModuleImage, func: FuncId },
+    enum_entry_synth_class: []PairStrEntry,
+    func_type_params: []KV(u32, []const []const u8),
+    top_level_delegated_props: []const []const u8,
+    delegated_body_props: []PairKey,
+    class_defs: []ClassDefImage,
+    class_table: []KV([]const u8, u32),
+};
+
+const ImageRoot = struct {
+    /// SourceMap files in FileId order; the base occupies [0..len).
+    files: []FileEntry,
+    /// Post-lift dependency decls. Encoded first: this walk defines the
+    /// AST node registry every later pointer backrefs into.
+    lifted_decls: []ast.Decl,
+    module: ModuleImage,
+    built: BuiltImage,
+    decl_names: []const []const u8,
+    packages: []const []const u8,
+    param_type_names: []const []const u8,
+    type_names: []const []const u8,
+    inline_ids: []InlineIdImage,
+    enum_id_next: u64,
+    /// CLI replay data: packages registered while loading the dependency
+    /// sources and the host-binding FQNs installed alongside them.
+    known_packages: []const []const u8,
+    binding_fqns: []const []const u8,
+};
+
+const InlineIdImage = struct { id: u32, f: *const ast.Function };
+
+// -------------------------------------------------------------------------
+// Bake: StdlibBase -> bytes
+// -------------------------------------------------------------------------
+
+/// Extra CLI-side state replayed at load time.
+pub const BakeExtras = struct {
+    known_packages: []const []const u8 = &.{},
+    binding_fqns: []const []const u8 = &.{},
+};
+
+/// Serialize `base` (and the SourceMap its spans resolve through) to an
+/// owned byte buffer. Returns null when the base holds state outside the
+/// serializable surface; callers keep the unbaked path. `gpa` is used for
+/// scratch and the returned buffer.
+pub fn bake(
+    gpa: Allocator,
+    base: *const StdlibBase,
+    map: *const SourceMap,
+    extras: BakeExtras,
+) Allocator.Error!?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const root = (try rootFromBase(a, base, map, extras)) orelse return null;
+
+    var e = Encoder.init(gpa);
+    defer e.deinit();
+
+    try e.bytes(MAGIC);
+    try e.bytes(&std.mem.toBytes(std.mem.nativeToLittle(u32, FORMAT_VERSION)));
+    // Payload-length slot, filled below.
+    const len_slot = e.out.items.len;
+    try e.bytes(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    const payload_start = e.out.items.len;
+    try encodeValue(ImageRoot, &e, root);
+    const payload_len: u64 = e.out.items.len - payload_start;
+    @memcpy(e.out.items[len_slot .. len_slot + 8], &std.mem.toBytes(std.mem.nativeToLittle(u64, payload_len)));
+    try e.bytes(TRAILER);
+
+    return try e.out.toOwnedSlice(e.gpa);
+}
+
+fn rootFromBase(
+    a: Allocator,
+    base: *const StdlibBase,
+    map: *const SourceMap,
+    extras: BakeExtras,
+) Allocator.Error!?*ImageRoot {
+    const root = try a.create(ImageRoot);
+
+    // Source files.
+    {
+        const files = try a.alloc(FileEntry, map.files.items.len);
+        for (map.files.items, 0..) |*sf, i| {
+            files[i] = .{ .path = sf.path, .source = sf.source };
+        }
+        root.files = files;
+    }
+
+    root.lifted_decls = @constCast(base.lifted_decls);
+
+    {
+        const mg = base.built.module.borrow();
+        defer mg.deinit();
+        if (!try moduleToImage(a, mg.get(), &root.module)) return null;
+    }
+
+    if (!try builtToImage(a, &base.built, &root.built)) return null;
+
+    root.decl_names = try setToSlice(a, &base.decl_names);
+    root.packages = try setToSlice(a, &base.packages);
+    root.param_type_names = try setToSlice(a, &base.param_type_names);
+    root.type_names = try setToSlice(a, &base.type_names);
+
+    {
+        const ids = try a.alloc(InlineIdImage, base.inline_ids.len);
+        for (base.inline_ids, 0..) |entry, i| {
+            ids[i] = .{ .id = entry.id, .f = entry.f };
+        }
+        root.inline_ids = ids;
+    }
+    root.enum_id_next = base.enum_id_next;
+    root.known_packages = extras.known_packages;
+    root.binding_fqns = extras.binding_fqns;
+    return root;
+}
+
+fn setToSlice(a: Allocator, set: *const std.StringHashMap(void)) Allocator.Error![]const []const u8 {
+    var out = try a.alloc([]const u8, set.count());
+    var it = set.keyIterator();
+    var i: usize = 0;
+    while (it.next()) |k| : (i += 1) out[i] = k.*;
+    return out;
+}
+
+fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Error!bool {
+    if (m.resolve_diags.items.len != 0) return false;
+    out.funcs = m.funcs.items;
+    out.classes = m.classes.items;
+    out.consts = m.consts.items;
+    out.top_level = m.top_level.items;
+    out.class_index = m.class_index.items;
+    out.func_index = m.func_index.items;
+    out.package = m.package;
+    out.tailrec_fn_names = m.tailrec_fn_names.items;
+
+    out.decl_user_params = try autoMapToSlice(u32, u32, a, &m.decl_user_params);
+    out.decl_user_arity = try autoMapToSlice(u32, Module.DeclArity, a, &m.decl_user_arity);
+    out.decl_user_sig = try autoMapToSlice(u32, []ir.TypeRef, a, &m.decl_user_sig);
+    out.decl_span = try autoMapToSlice(u32, Span, a, &m.decl_span);
+
+    const r = &m.registry;
+    out.registry = .{
+        .object_names = r.object_names.items,
+        .companion_singletons = try strMapToSlice([]const u8, a, &r.companion_singletons),
+        .enclosing_class = try strMapToSlice([]const u8, a, &r.enclosing_class),
+        .func_type_params = blk: {
+            var list = try a.alloc(KV(FuncId, []const []const u8), r.func_type_params.count());
+            var it = r.func_type_params.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{ .k = entry.key_ptr.*, .v = entry.value_ptr.items };
+            }
+            break :blk list;
+        },
+        .func_type_param_bounds = try autoMapToSlice(FuncId, []const ir.ModuleRegistry.TypeParamBound, a, &r.func_type_param_bounds),
+        .top_level_delegated_props = try setToSlice(a, &r.top_level_delegated_props),
+        .hierarchy_methods = blk: {
+            var list = try a.alloc(KV([]const u8, []const []const u8), r.hierarchy_methods.count());
+            var it = r.hierarchy_methods.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{ .k = entry.key_ptr.*, .v = try setToSlice(a, entry.value_ptr) };
+            }
+            break :blk list;
+        },
+        .class_member_names = try setToSlice(a, &r.class_member_names),
+        .class_super_names = try strMapToSliceKV([]const []const u8, a, &r.class_super_names),
+        .delegated_body_props = blk: {
+            var list = try a.alloc(PairKey, r.delegated_body_props.count());
+            var it = r.delegated_body_props.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b };
+            }
+            break :blk list;
+        },
+        .member_ext_owner_class = try autoMapToSlice(FuncId, []const u8, a, &r.member_ext_owner_class),
+        .local_fn_defaults = blk: {
+            var list = try a.alloc(KV(FuncId, []const ?FuncId), r.local_fn_defaults.count());
+            var it = r.local_fn_defaults.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{ .k = entry.key_ptr.*, .v = entry.value_ptr.items };
+            }
+            break :blk list;
+        },
+        .abstract_member_defaults = blk: {
+            const E = @TypeOf(out.registry.abstract_member_defaults[0]);
+            var list = try a.alloc(E, r.abstract_member_defaults.count());
+            var it = r.abstract_member_defaults.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b, .slots = entry.value_ptr.items };
+            }
+            break :blk list;
+        },
+        .type_aliases = try strMapToSlice([]const u8, a, &r.type_aliases),
+        .import_aliases = blk: {
+            const E = @TypeOf(out.registry.import_aliases[0]);
+            const L = @TypeOf(out.registry.import_aliases[0].leaves[0]);
+            var list = try a.alloc(E, r.import_aliases.count());
+            var it = r.import_aliases.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                var leaves = try a.alloc(L, entry.value_ptr.count());
+                var lit = entry.value_ptr.iterator();
+                var j: usize = 0;
+                while (lit.next()) |le| : (j += 1) {
+                    leaves[j] = .{ .leaf = le.key_ptr.*, .paths = le.value_ptr.items };
+                }
+                list[i] = .{ .file = entry.key_ptr.*, .leaves = leaves };
+            }
+            break :blk list;
+        },
+        .import_wildcards = blk: {
+            var list = try a.alloc(KV(FileId, []const []const u8), r.import_wildcards.count());
+            var it = r.import_wildcards.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{ .k = entry.key_ptr.*, .v = entry.value_ptr.items };
+            }
+            break :blk list;
+        },
+        .nested_object_aliases = blk: {
+            var list = try a.alloc(KV([]const u8, []StrKV), r.nested_object_aliases.count());
+            var it = r.nested_object_aliases.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{ .k = entry.key_ptr.*, .v = try strMapToSlice([]const u8, a, entry.value_ptr) };
+            }
+            break :blk list;
+        },
+        .mangled_nested = try strMapToSlice([]const u8, a, &r.mangled_nested),
+        .class_const_inits = blk: {
+            const E = @TypeOf(out.registry.class_const_inits[0]);
+            var list = try a.alloc(E, r.class_const_inits.count());
+            var it = r.class_const_inits.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b, .v = entry.value_ptr.* };
+            }
+            break :blk list;
+        },
+    };
+    return true;
+}
+
+fn autoMapToSlice(comptime K: type, comptime V: type, a: Allocator, m: *const std.AutoHashMap(K, V)) Allocator.Error![]KV(K, V) {
+    var out = try a.alloc(KV(K, V), m.count());
+    var it = m.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{ .k = entry.key_ptr.*, .v = entry.value_ptr.* };
+    }
+    return out;
+}
+
+fn strMapToSlice(comptime V: type, a: Allocator, m: *const std.StringHashMap(V)) Allocator.Error![]KV([]const u8, V) {
+    var out = try a.alloc(KV([]const u8, V), m.count());
+    var it = m.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{ .k = entry.key_ptr.*, .v = entry.value_ptr.* };
+    }
+    return out;
+}
+
+const strMapToSliceKV = strMapToSlice;
+
+fn builtToImage(a: Allocator, b: *const BuiltModule, out: *BuiltImage) Allocator.Error!bool {
+    if (b.main != null) return false;
+
+    // The ClassDef graph first: every def reachable from the table gets an
+    // index, so edges and enum-entry instances can refer by index.
+    var def_index = std.AutoHashMap(usize, u32).init(a);
+    var defs: std.ArrayList(ObjRef(ClassDef)) = .empty;
+    {
+        var worklist: std.ArrayList(ObjRef(ClassDef)) = .empty;
+        var it = b.classes.valueIterator();
+        while (it.next()) |def| try worklist.append(a, def.*);
+        var head: usize = 0;
+        while (head < worklist.items.len) : (head += 1) {
+            const def = worklist.items[head];
+            const key = @intFromPtr(def.cell);
+            const gop = try def_index.getOrPut(key);
+            if (gop.found_existing) continue;
+            gop.value_ptr.* = @intCast(defs.items.len);
+            try defs.append(a, def);
+            const g = def.borrow();
+            defer g.deinit();
+            const cd = g.get();
+            if (cd.parent) |p| try worklist.append(a, p);
+            for (cd.interfaces) |iface| try worklist.append(a, iface);
+            for (cd.nested_classes) |nc| try worklist.append(a, nc.class);
+            {
+                const eg = cd.enclosing_class.borrow();
+                const enc = eg.get().*;
+                eg.deinit();
+                if (enc) |ec| try worklist.append(a, ec);
+            }
+            for (cd.supertype_delegates) |sd| {
+                if (sd.interface) |iface| try worklist.append(a, iface);
+            }
+            for (cd.enum_entries) |entry| {
+                if (!try collectValueClasses(a, &worklist, entry.value)) return false;
+            }
+        }
+    }
+
+    const class_defs = try a.alloc(ClassDefImage, defs.items.len);
+    for (defs.items, 0..) |def, i| {
+        if (!try classDefToImage(a, def, &def_index, &class_defs[i])) return false;
+    }
+    out.class_defs = class_defs;
+    {
+        var table = try a.alloc(KV([]const u8, u32), b.classes.count());
+        var it = b.classes.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            table[i] = .{ .k = entry.key_ptr.*, .v = def_index.get(@intFromPtr(entry.value_ptr.cell)).? };
+        }
+        out.class_table = table;
+    }
+
+    out.body_prop_inits = try pairFuncToSlice(a, &b.body_prop_inits);
+    out.instance_prop_getters = try pairFuncToSlice(a, &b.instance_prop_getters);
+    out.instance_prop_setters = try pairFuncToSlice(a, &b.instance_prop_setters);
+    out.parent_ctor_args = try nameFuncsToSlice(a, &b.parent_ctor_args);
+    out.init_blocks = try nameFuncsToSlice(a, &b.init_blocks);
+    out.top_level_props = b.top_level_props.items;
+    out.extension_props = try pairFuncToSlice(a, &b.extension_props);
+    out.extension_prop_setters = try pairFuncToSlice(a, &b.extension_prop_setters);
+    out.object_names = b.object_names.items;
+    out.companion_singletons = try strMapToSlice([]const u8, a, &b.companion_singletons);
+    out.enum_entry_arg_inits = b.enum_entry_arg_inits.items;
+    out.secondary_ctors = blk: {
+        const E = @TypeOf(out.secondary_ctors[0]);
+        var list = try a.alloc(E, b.secondary_ctors.count());
+        var it = b.secondary_ctors.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            list[i] = .{ .name = entry.key_ptr.*, .entries = entry.value_ptr.* };
+        }
+        break :blk list;
+    };
+    out.primary_ctor_default_thunks = blk: {
+        var list = try a.alloc(NameOptFuncs, b.primary_ctor_default_thunks.count());
+        var it = b.primary_ctor_default_thunks.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            list[i] = .{ .name = entry.key_ptr.*, .slots = entry.value_ptr.* };
+        }
+        break :blk list;
+    };
+    out.class_delegates = blk: {
+        const E = @TypeOf(out.class_delegates[0]);
+        var list = try a.alloc(E, b.class_delegates.count());
+        var it = b.class_delegates.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            list[i] = .{ .name = entry.key_ptr.*, .entries = entry.value_ptr.* };
+        }
+        break :blk list;
+    };
+    out.func_defaults = blk: {
+        var list = try a.alloc(KV(u32, []const ?FuncId), b.func_defaults.count());
+        var it = b.func_defaults.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            list[i] = .{ .k = entry.key_ptr.*, .v = entry.value_ptr.* };
+        }
+        break :blk list;
+    };
+    out.enclosing_class = try strMapToSlice([]const u8, a, &b.enclosing_class);
+    out.enum_entry_methods = blk: {
+        const E = @TypeOf(out.enum_entry_methods[0]);
+        var list = try a.alloc(E, b.enum_entry_methods.count());
+        var it = b.enum_entry_methods.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            const mg = entry.value_ptr.module.borrow();
+            defer mg.deinit();
+            list[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b, .module = undefined, .func = entry.value_ptr.func };
+            if (!try moduleToImage(a, mg.get(), &list[i].module)) return false;
+        }
+        break :blk list;
+    };
+    out.enum_entry_synth_class = blk: {
+        var list = try a.alloc(PairStrEntry, b.enum_entry_synth_class.count());
+        var it = b.enum_entry_synth_class.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            list[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b, .v = entry.value_ptr.* };
+        }
+        break :blk list;
+    };
+    out.func_type_params = blk: {
+        var list = try a.alloc(KV(u32, []const []const u8), b.func_type_params.count());
+        var it = b.func_type_params.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            list[i] = .{ .k = entry.key_ptr.*, .v = entry.value_ptr.* };
+        }
+        break :blk list;
+    };
+    out.top_level_delegated_props = try setToSlice(a, &b.top_level_delegated_props);
+    out.delegated_body_props = blk: {
+        var list = try a.alloc(PairKey, b.delegated_body_props.count());
+        var it = b.delegated_body_props.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            list[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b };
+        }
+        break :blk list;
+    };
+    return true;
+}
+
+fn pairFuncToSlice(a: Allocator, m: *const build.PairFuncMap) Allocator.Error![]PairFuncEntry {
+    var out = try a.alloc(PairFuncEntry, m.count());
+    var it = m.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b, .func = entry.value_ptr.* };
+    }
+    return out;
+}
+
+fn nameFuncsToSlice(a: Allocator, m: *const std.StringHashMap([]FuncId)) Allocator.Error![]NameFuncs {
+    var out = try a.alloc(NameFuncs, m.count());
+    var it = m.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{ .name = entry.key_ptr.*, .funcs = entry.value_ptr.* };
+    }
+    return out;
+}
+
+/// Queue the ClassDefs reachable from a build-time enum-entry value, and
+/// verify the value is within the serializable surface.
+fn collectValueClasses(a: Allocator, worklist: *std.ArrayList(ObjRef(ClassDef)), v: Value) Allocator.Error!bool {
+    switch (v) {
+        .Unit, .Null, .Bool, .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Char, .String => return true,
+        .Instance => |inst| {
+            const g = inst.borrow();
+            defer g.deinit();
+            const s = g.get();
+            if (s.outer != null or s.native_state != null) return false;
+            try worklist.append(a, s.class);
+            for (s.fields.items) |f| {
+                if (!try collectValueClasses(a, worklist, f.value)) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn valueToImage(a: Allocator, def_index: *const std.AutoHashMap(usize, u32), v: Value) Allocator.Error!?ValueImage {
+    switch (v) {
+        .Unit => return .Unit,
+        .Null => return .Null,
+        .Bool => |x| return .{ .Bool = x },
+        .Int => |x| return .{ .Int = x },
+        .Long => |x| return .{ .Long = x },
+        .Short => |x| return .{ .Short = x },
+        .Byte => |x| return .{ .Byte = x },
+        .UInt => |x| return .{ .UInt = x },
+        .ULong => |x| return .{ .ULong = x },
+        .UShort => |x| return .{ .UShort = x },
+        .UByte => |x| return .{ .UByte = x },
+        .Double => |x| return .{ .Double = x },
+        .Float => |x| return .{ .Float = x },
+        .Char => |x| return .{ .Char = x },
+        .String => |sref| {
+            const g = sref.borrow();
+            defer g.deinit();
+            return .{ .Str = g.get().* };
+        },
+        .Instance => |inst| {
+            const g = inst.borrow();
+            defer g.deinit();
+            const s = g.get();
+            if (s.outer != null or s.native_state != null) return null;
+            const cls = def_index.get(@intFromPtr(s.class.cell)) orelse return null;
+            const fields = try a.alloc(FieldImage, s.fields.items.len);
+            for (s.fields.items, 0..) |f, i| {
+                const fv = (try valueToImage(a, def_index, f.value)) orelse return null;
+                fields[i] = .{ .name = f.name, .value = fv };
+            }
+            return .{ .Instance = .{ .class = cls, .fields = fields, .identity = s.identity } };
+        },
+        else => return null,
+    }
+}
+
+fn methodToImage(m: *const runtime.MethodDef, out: *MethodImage) bool {
+    if (m.sam_lambda != null) return false;
+    out.* = .{
+        .name = m.name,
+        .decl = m.decl,
+        .is_operator = m.is_operator,
+        .is_open = m.is_open,
+        .is_override = m.is_override,
+        .is_abstract = m.is_abstract,
+        .delegate_field = m.delegate_field,
+        .ir_fn_id = m.ir_fn_id,
+    };
+    return true;
+}
+
+fn classDefToImage(
+    a: Allocator,
+    def: ObjRef(ClassDef),
+    def_index: *const std.AutoHashMap(usize, u32),
+    out: *ClassDefImage,
+) Allocator.Error!bool {
+    const g = def.borrow();
+    defer g.deinit();
+    const cd = g.get();
+
+    const primary = try a.alloc(ClassParamImage, cd.primary_params.len);
+    for (cd.primary_params, 0..) |p, i| {
+        primary[i] = .{
+            .property = p.property,
+            .name = p.name,
+            .default = p.default,
+            .declared_type = p.declared_type,
+            .declared_shape = p.declared_shape,
+        };
+    }
+
+    const methods = try a.alloc(MethodImage, cd.methods.len);
+    for (cd.methods, 0..) |*m, i| {
+        if (!methodToImage(m, &methods[i])) return false;
+    }
+    const forwarders = try a.alloc(MethodImage, cd.delegate_forwarders.len);
+    for (cd.delegate_forwarders, 0..) |*m, i| {
+        if (!methodToImage(m, &forwarders[i])) return false;
+    }
+
+    const props = try a.alloc(PropertyImage, cd.body_properties.len);
+    for (cd.body_properties, 0..) |p, i| {
+        var zero: ?ValueImage = null;
+        if (p.primitive_zero) |z| {
+            zero = (try valueToImage(a, def_index, z)) orelse return false;
+        }
+        props[i] = .{
+            .name = p.name,
+            .mutable = p.mutable,
+            .init = p.init,
+            .getter = p.getter,
+            .setter = p.setter,
+            .delegate = p.delegate,
+            .is_abstract = p.is_abstract,
+            .is_lateinit = p.is_lateinit,
+            .primitive_zero = zero,
+        };
+    }
+
+    const ifaces = try a.alloc(u32, cd.interfaces.len);
+    for (cd.interfaces, 0..) |iface, i| {
+        ifaces[i] = def_index.get(@intFromPtr(iface.cell)) orelse return false;
+    }
+
+    const EntryImage = @TypeOf(out.enum_entries[0]);
+    const entries = try a.alloc(EntryImage, cd.enum_entries.len);
+    for (cd.enum_entries, 0..) |entry, i| {
+        const v = (try valueToImage(a, def_index, entry.value)) orelse return false;
+        entries[i] = .{ .name = entry.name, .value = v };
+    }
+
+    const NestedImage = @TypeOf(out.nested_classes[0]);
+    const nested = try a.alloc(NestedImage, cd.nested_classes.len);
+    for (cd.nested_classes, 0..) |nc, i| {
+        nested[i] = .{ .name = nc.name, .idx = def_index.get(@intFromPtr(nc.class.cell)) orelse return false };
+    }
+
+    const delegates = try a.alloc(DelegateImage, cd.supertype_delegates.len);
+    for (cd.supertype_delegates, 0..) |sd, i| {
+        var iface_idx: ?u32 = null;
+        if (sd.interface) |iface| {
+            iface_idx = def_index.get(@intFromPtr(iface.cell)) orelse return false;
+        }
+        delegates[i] = .{
+            .interface_name = sd.interface_name,
+            .interface = iface_idx,
+            .expr = sd.expr,
+            .field_key = sd.field_key,
+        };
+    }
+
+    var enclosing: ?u32 = null;
+    {
+        const eg = cd.enclosing_class.borrow();
+        const enc = eg.get().*;
+        eg.deinit();
+        if (enc) |ec| {
+            enclosing = def_index.get(@intFromPtr(ec.cell)) orelse return false;
+        }
+    }
+
+    out.* = .{
+        .name = cd.name,
+        .fqn = cd.fqn,
+        .annotation_names = cd.annotation_names,
+        .primary_params = primary,
+        .methods = methods,
+        .body_properties = props,
+        .init_blocks = cd.init_blocks,
+        .init_block_property_positions = @constCast(cd.init_block_property_positions),
+        .is_data = cd.is_data,
+        .is_value = cd.is_value,
+        .is_object = cd.is_object,
+        .is_enum = cd.is_enum,
+        .is_sealed = cd.is_sealed,
+        .supertype_names = cd.supertype_names,
+        .parent = if (cd.parent) |p| (def_index.get(@intFromPtr(p.cell)) orelse return false) else null,
+        .interfaces = ifaces,
+        .is_interface = cd.is_interface,
+        .is_fun_interface = cd.is_fun_interface,
+        .parent_ctor_args = @constCast(cd.parent_ctor_args),
+        .is_open = cd.is_open,
+        .is_abstract = cd.is_abstract,
+        .is_inner = cd.is_inner,
+        .is_anonymous = cd.is_anonymous,
+        .secondary_ctors = @constCast(cd.secondary_ctors),
+        .enum_entries = entries,
+        .enclosing = enclosing,
+        .nested_classes = nested,
+        .supertype_delegates = delegates,
+        .delegate_forwarders = forwarders,
+    };
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Load: bytes -> StdlibBase
+// -------------------------------------------------------------------------
+
+pub const Loaded = struct {
+    base: *StdlibBase,
+    map: *SourceMap,
+    known_packages: []const []const u8,
+    binding_fqns: []const []const u8,
+};
+
+/// Why the most recent `load` on this thread returned null; empty when it
+/// succeeded. Trace/diagnostic only.
+threadlocal var load_failure: []const u8 = "";
+
+pub fn lastLoadFailure() []const u8 {
+    return load_failure;
+}
+
+/// Reconstruct a `StdlibBase` from image bytes. `a` must be a
+/// process-lifetime arena; `bytes` must stay alive as long as the base
+/// (decoded strings borrow from it). Returns null on any format/version
+/// mismatch or malformed input — callers rebake.
+pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
+    load_failure = "";
+    if (bytes.len < MAGIC.len + 4 + 8 + TRAILER.len) {
+        load_failure = "short header";
+        return null;
+    }
+    if (!std.mem.eql(u8, bytes[0..MAGIC.len], MAGIC)) {
+        load_failure = "bad magic";
+        return null;
+    }
+    const version = std.mem.readInt(u32, bytes[MAGIC.len..][0..4], .little);
+    if (version != FORMAT_VERSION) {
+        load_failure = "format version mismatch";
+        return null;
+    }
+    const payload_len = std.mem.readInt(u64, bytes[MAGIC.len + 4 ..][0..8], .little);
+    const payload_start = MAGIC.len + 4 + 8;
+    const expect_total = payload_start + payload_len + TRAILER.len;
+    if (expect_total != bytes.len) {
+        load_failure = "length mismatch";
+        return null;
+    }
+    if (!std.mem.eql(u8, bytes[bytes.len - TRAILER.len ..], TRAILER)) {
+        load_failure = "bad trailer";
+        return null;
+    }
+
+    var d = Decoder{ .a = a, .buf = bytes[payload_start .. payload_start + payload_len] };
+    const root = a.create(ImageRoot) catch return error.OutOfMemory;
+    decodeInto(ImageRoot, &d, root) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Malformed => {
+            load_failure = "malformed payload";
+            return null;
+        },
+    };
+    if (d.pos != d.buf.len) {
+        load_failure = "trailing payload bytes";
+        return null;
+    }
+
+    const loaded = try baseFromRoot(a, root);
+    if (loaded == null) load_failure = "inconsistent tables";
+    return loaded;
+}
+
+fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
+    const map = try a.create(SourceMap);
+    map.* = SourceMap.init(a);
+    for (root.files) |f| {
+        _ = map.add(f.path, f.source) catch return error.OutOfMemory;
+    }
+
+    var module = Module.default(a);
+    try moduleFromImage(a, &root.module, &module);
+    const module_ref = try ObjRef(Module).init(a, module);
+    var built = build.emptyBuiltShell(a, module_ref, null);
+    if (!try builtFromImage(a, &root.built, &built)) return null;
+
+    const base = try a.create(StdlibBase);
+    base.* = .{
+        .built = built,
+        .lifted_decls = root.lifted_decls,
+        .decl_names = try sliceToSet(a, root.decl_names),
+        .packages = try sliceToSet(a, root.packages),
+        .param_type_names = try sliceToSet(a, root.param_type_names),
+        .type_names = try sliceToSet(a, root.type_names),
+        .inline_ids = blk: {
+            const ids = try a.alloc(StdlibBase.InlineId, root.inline_ids.len);
+            for (root.inline_ids, 0..) |entry, i| {
+                ids[i] = .{ .id = entry.id, .f = entry.f };
+            }
+            break :blk ids;
+        },
+        .user_file_start = @intCast(root.files.len),
+        .enum_id_next = root.enum_id_next,
+    };
+
+    return .{
+        .base = base,
+        .map = map,
+        .known_packages = root.known_packages,
+        .binding_fqns = root.binding_fqns,
+    };
+}
+
+fn sliceToSet(a: Allocator, items: []const []const u8) Allocator.Error!std.StringHashMap(void) {
+    var out = std.StringHashMap(void).init(a);
+    try out.ensureTotalCapacity(@intCast(items.len));
+    for (items) |k| try out.put(k, {});
+    return out;
+}
+
+fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocator.Error!void {
+    try out.funcs.appendSlice(a, img.funcs);
+    try out.classes.appendSlice(a, img.classes);
+    try out.consts.appendSlice(a, img.consts);
+    try out.top_level.appendSlice(a, img.top_level);
+    try out.class_index.appendSlice(a, img.class_index);
+    try out.func_index.appendSlice(a, img.func_index);
+    out.package = img.package;
+    try out.tailrec_fn_names.appendSlice(a, img.tailrec_fn_names);
+
+    for (img.decl_user_params) |kv| try out.decl_user_params.put(kv.k, kv.v);
+    for (img.decl_user_arity) |kv| try out.decl_user_arity.put(kv.k, kv.v);
+    for (img.decl_user_sig) |kv| try out.decl_user_sig.put(kv.k, kv.v);
+    for (img.decl_span) |kv| try out.decl_span.put(kv.k, kv.v);
+
+    const r = &out.registry;
+    const ri = &img.registry;
+    try r.object_names.appendSlice(a, ri.object_names);
+    for (ri.companion_singletons) |kv| try r.companion_singletons.put(kv.k, kv.v);
+    for (ri.enclosing_class) |kv| try r.enclosing_class.put(kv.k, kv.v);
+    for (ri.func_type_params) |kv| {
+        var list: std.ArrayList([]const u8) = .empty;
+        try list.appendSlice(a, kv.v);
+        try r.func_type_params.put(kv.k, list);
+    }
+    for (ri.func_type_param_bounds) |kv| try r.func_type_param_bounds.put(kv.k, kv.v);
+    for (ri.top_level_delegated_props) |k| try r.top_level_delegated_props.put(k, {});
+    for (ri.hierarchy_methods) |kv| {
+        try r.hierarchy_methods.put(kv.k, try sliceToSet(a, kv.v));
+    }
+    for (ri.class_member_names) |k| try r.class_member_names.put(k, {});
+    for (ri.class_super_names) |kv| try r.class_super_names.put(kv.k, kv.v);
+    for (ri.delegated_body_props) |p| try r.delegated_body_props.put(.{ .a = p.a, .b = p.b }, {});
+    for (ri.member_ext_owner_class) |kv| try r.member_ext_owner_class.put(kv.k, kv.v);
+    for (ri.local_fn_defaults) |kv| {
+        var list: std.ArrayList(?FuncId) = .empty;
+        try list.appendSlice(a, kv.v);
+        try r.local_fn_defaults.put(kv.k, list);
+    }
+    for (ri.abstract_member_defaults) |entry| {
+        var list: std.ArrayList(?FuncId) = .empty;
+        try list.appendSlice(a, entry.slots);
+        try r.abstract_member_defaults.put(.{ .a = entry.a, .b = entry.b }, list);
+    }
+    for (ri.type_aliases) |kv| try r.type_aliases.put(kv.k, kv.v);
+    for (ri.import_aliases) |entry| {
+        var inner = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+        for (entry.leaves) |le| {
+            var list: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
+            try list.appendSlice(a, le.paths);
+            try inner.put(le.leaf, list);
+        }
+        try r.import_aliases.put(entry.file, inner);
+    }
+    for (ri.import_wildcards) |kv| {
+        var list: std.ArrayList([]const u8) = .empty;
+        try list.appendSlice(a, kv.v);
+        try r.import_wildcards.put(kv.k, list);
+    }
+    for (ri.nested_object_aliases) |kv| {
+        var inner = std.StringHashMap([]const u8).init(a);
+        for (kv.v) |skv| try inner.put(skv.k, skv.v);
+        try r.nested_object_aliases.put(kv.k, inner);
+    }
+    for (ri.mangled_nested) |kv| try r.mangled_nested.put(kv.k, kv.v);
+    for (ri.class_const_inits) |entry| try r.class_const_inits.put(.{ .a = entry.a, .b = entry.b }, entry.v);
+
+    try out.rebuildFuncNameIndex(a);
+}
+
+fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Allocator.Error!bool {
+    // ClassDef graph: shells first, then links — mirrors the two-phase
+    // shape of `cloneClassTableForRun`.
+    const defs = try a.alloc(ObjRef(ClassDef), img.class_defs.len);
+    for (img.class_defs, 0..) |*ci, i| {
+        defs[i] = try ObjRef(ClassDef).init(a, .{
+            .name = ci.name,
+            .fqn = ci.fqn,
+            .annotation_names = ci.annotation_names,
+            .primary_params = blk: {
+                const params = try a.alloc(runtime.ClassParamDef, ci.primary_params.len);
+                for (ci.primary_params, 0..) |p, j| {
+                    params[j] = .{
+                        .property = p.property,
+                        .name = p.name,
+                        .default = p.default,
+                        .declared_type = p.declared_type,
+                        .declared_shape = p.declared_shape,
+                    };
+                }
+                break :blk params;
+            },
+            .methods = try methodsFromImage(a, ci.methods),
+            .body_properties = blk: {
+                const props = try a.alloc(runtime.PropertyDef, ci.body_properties.len);
+                for (ci.body_properties, 0..) |p, j| {
+                    props[j] = .{
+                        .name = p.name,
+                        .mutable = p.mutable,
+                        .init = p.init,
+                        .getter = p.getter,
+                        .setter = p.setter,
+                        .delegate = p.delegate,
+                        .is_abstract = p.is_abstract,
+                        .is_lateinit = p.is_lateinit,
+                        .primitive_zero = if (p.primitive_zero) |z| try scalarFromImage(z) else null,
+                    };
+                }
+                break :blk props;
+            },
+            .init_blocks = ci.init_blocks,
+            .init_block_property_positions = ci.init_block_property_positions,
+            .is_data = ci.is_data,
+            .is_value = ci.is_value,
+            .is_object = ci.is_object,
+            .is_enum = ci.is_enum,
+            .is_sealed = ci.is_sealed,
+            .supertype_names = ci.supertype_names,
+            .parent = null,
+            .interfaces = &.{},
+            .is_interface = ci.is_interface,
+            .is_fun_interface = ci.is_fun_interface,
+            .parent_ctor_args = ci.parent_ctor_args,
+            .is_open = ci.is_open,
+            .is_abstract = ci.is_abstract,
+            .is_inner = ci.is_inner,
+            .is_anonymous = ci.is_anonymous,
+            .secondary_ctors = ci.secondary_ctors,
+            .enum_entries = &.{},
+            .companion = try ObjRef(?ObjRef(InstanceData)).init(a, null),
+            .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(a, null),
+            .nested_classes = &.{},
+            .captured_env = try ObjRef(Env).init(a, Env.init(a)),
+            .supertype_delegates = &.{},
+            .delegate_forwarders = try methodsFromImage(a, ci.delegate_forwarders),
+            .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(a, null),
+        });
+    }
+    // Link pass.
+    for (img.class_defs, 0..) |*ci, i| {
+        const cg = defs[i].borrowMut();
+        defer cg.deinit();
+        const c = cg.get();
+        if (ci.parent) |p| {
+            if (p >= defs.len) return false;
+            c.parent = defs[p].clone();
+        }
+        if (ci.interfaces.len != 0) {
+            const ifaces = try a.alloc(ObjRef(ClassDef), ci.interfaces.len);
+            for (ci.interfaces, 0..) |idx, j| {
+                if (idx >= defs.len) return false;
+                ifaces[j] = defs[idx].clone();
+            }
+            c.interfaces = ifaces;
+        }
+        if (ci.nested_classes.len != 0) {
+            const nested = try a.alloc(ClassDef.NestedClass, ci.nested_classes.len);
+            for (ci.nested_classes, 0..) |nc, j| {
+                if (nc.idx >= defs.len) return false;
+                nested[j] = .{ .name = nc.name, .class = defs[nc.idx].clone() };
+            }
+            c.nested_classes = nested;
+        }
+        if (ci.enclosing) |idx| {
+            if (idx >= defs.len) return false;
+            const eg = c.enclosing_class.borrowMut();
+            eg.get().* = defs[idx].clone();
+            eg.deinit();
+        }
+        if (ci.supertype_delegates.len != 0) {
+            const delegates = try a.alloc(runtime.SupertypeDelegate, ci.supertype_delegates.len);
+            for (ci.supertype_delegates, 0..) |sd, j| {
+                var iface: ?ObjRef(ClassDef) = null;
+                if (sd.interface) |idx| {
+                    if (idx >= defs.len) return false;
+                    iface = defs[idx].clone();
+                }
+                delegates[j] = .{
+                    .interface_name = sd.interface_name,
+                    .interface = iface,
+                    .expr = sd.expr,
+                    .field_key = sd.field_key,
+                };
+            }
+            c.supertype_delegates = delegates;
+        }
+        if (ci.enum_entries.len != 0) {
+            const entries = try a.alloc(ClassDef.EnumEntry, ci.enum_entries.len);
+            for (ci.enum_entries, 0..) |entry, j| {
+                const v = (try valueFromImage(a, defs, entry.value)) orelse return false;
+                entries[j] = .{ .name = entry.name, .value = v };
+            }
+            c.enum_entries = entries;
+        }
+    }
+
+    for (img.class_table) |kv| {
+        if (kv.v >= defs.len) return false;
+        try out.classes.put(kv.k, defs[kv.v].clone());
+    }
+    // The defs slice holds the construction handles; the table's clones
+    // keep the cells alive (the arena owns the memory either way).
+    for (defs) |*def| def.deinit();
+
+    for (img.body_prop_inits) |entry| try out.body_prop_inits.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    for (img.instance_prop_getters) |entry| try out.instance_prop_getters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    for (img.instance_prop_setters) |entry| try out.instance_prop_setters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    for (img.parent_ctor_args) |entry| try out.parent_ctor_args.put(entry.name, @constCast(entry.funcs));
+    for (img.init_blocks) |entry| try out.init_blocks.put(entry.name, @constCast(entry.funcs));
+    try out.top_level_props.appendSlice(a, img.top_level_props);
+    for (img.extension_props) |entry| try out.extension_props.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    for (img.extension_prop_setters) |entry| try out.extension_prop_setters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    try out.object_names.appendSlice(a, img.object_names);
+    for (img.companion_singletons) |kv| try out.companion_singletons.put(kv.k, kv.v);
+    try out.enum_entry_arg_inits.appendSlice(a, img.enum_entry_arg_inits);
+    for (img.secondary_ctors) |entry| try out.secondary_ctors.put(entry.name, entry.entries);
+    for (img.primary_ctor_default_thunks) |entry| try out.primary_ctor_default_thunks.put(entry.name, @constCast(entry.slots));
+    for (img.class_delegates) |entry| try out.class_delegates.put(entry.name, entry.entries);
+    for (img.func_defaults) |kv| try out.func_defaults.put(kv.k, @constCast(kv.v));
+    for (img.enclosing_class) |kv| try out.enclosing_class.put(kv.k, kv.v);
+    for (img.enum_entry_methods) |*entry| {
+        var sub = Module.default(a);
+        try moduleFromImage(a, &entry.module, &sub);
+        const sub_ref = try ObjRef(Module).init(a, sub);
+        try out.enum_entry_methods.put(.{ .a = entry.a, .b = entry.b }, .{ .module = sub_ref, .func = entry.func });
+    }
+    for (img.enum_entry_synth_class) |entry| try out.enum_entry_synth_class.put(.{ .a = entry.a, .b = entry.b }, entry.v);
+    for (img.func_type_params) |kv| try out.func_type_params.put(kv.k, @constCast(kv.v));
+    for (img.top_level_delegated_props) |k| try out.top_level_delegated_props.put(k, {});
+    for (img.delegated_body_props) |p| try out.delegated_body_props.put(.{ .a = p.a, .b = p.b }, {});
+    return true;
+}
+
+fn methodsFromImage(a: Allocator, imgs: []const MethodImage) Allocator.Error![]runtime.MethodDef {
+    const out = try a.alloc(runtime.MethodDef, imgs.len);
+    for (imgs, 0..) |m, i| {
+        out[i] = .{
+            .name = m.name,
+            .decl = m.decl,
+            .is_operator = m.is_operator,
+            .is_open = m.is_open,
+            .is_override = m.is_override,
+            .is_abstract = m.is_abstract,
+            .sam_lambda = null,
+            .delegate_field = m.delegate_field,
+            .ir_fn_id = m.ir_fn_id,
+        };
+    }
+    return out;
+}
+
+fn scalarFromImage(v: ValueImage) Allocator.Error!?Value {
+    return switch (v) {
+        .Unit => Value.Unit,
+        .Null => Value.Null,
+        .Bool => |x| Value{ .Bool = x },
+        .Int => |x| Value{ .Int = x },
+        .Long => |x| Value{ .Long = x },
+        .Short => |x| Value{ .Short = x },
+        .Byte => |x| Value{ .Byte = x },
+        .UInt => |x| Value{ .UInt = x },
+        .ULong => |x| Value{ .ULong = x },
+        .UShort => |x| Value{ .UShort = x },
+        .UByte => |x| Value{ .UByte = x },
+        .Double => |x| Value{ .Double = x },
+        .Float => |x| Value{ .Float = x },
+        .Char => |x| Value{ .Char = x },
+        else => null,
+    };
+}
+
+fn valueFromImage(a: Allocator, defs: []const ObjRef(ClassDef), v: ValueImage) Allocator.Error!?Value {
+    switch (v) {
+        .Str => |s| return Value{ .String = try ObjRef([]const u8).init(a, s) },
+        .Instance => |inst| {
+            if (inst.class >= defs.len) return null;
+            var fields: std.ArrayList(InstanceData.Field) = .empty;
+            try fields.ensureTotalCapacity(a, inst.fields.len);
+            for (inst.fields) |f| {
+                const fv = (try valueFromImage(a, defs, f.value)) orelse return null;
+                try fields.append(a, .{ .name = f.name, .value = fv });
+            }
+            const copy = try ObjRef(InstanceData).init(a, .{
+                .class = defs[inst.class].clone(),
+                .fields = fields,
+                .outer = null,
+                .identity = inst.identity,
+                .native_state = null,
+            });
+            return Value{ .Instance = copy };
+        },
+        else => return scalarFromImage(v),
+    }
+}
+
+// -------------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test {
+    testing.refAllDecls(@This());
+}
+
+const TestNode = struct {
+    name: []const u8,
+    children: []TestNode,
+    tag: TestTag,
+    weight: ?f64,
+};
+
+const TestTag = union(enum) {
+    None,
+    Label: []const u8,
+    Count: u32,
+};
+
+fn encodeOne(comptime T: type, gpa: Allocator, value: *const T) ![]u8 {
+    var e = Encoder.init(gpa);
+    defer e.deinit();
+    try encodeValue(T, &e, value);
+    return e.out.toOwnedSlice(gpa);
+}
+
+fn decodeOne(comptime T: type, a: Allocator, bytes: []const u8) !T {
+    var d = Decoder{ .a = a, .buf = bytes };
+    var out: T = undefined;
+    try decodeInto(T, &d, &out);
+    try testing.expectEqual(bytes.len, d.pos);
+    return out;
+}
+
+test "codec round-trips nested structs, unions, optionals" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var kids = [_]TestNode{
+        .{ .name = "left", .children = &.{}, .tag = .{ .Count = 41 }, .weight = null },
+        .{ .name = "right", .children = &.{}, .tag = .None, .weight = 2.5 },
+    };
+    const root = TestNode{
+        .name = "root",
+        .children = &kids,
+        .tag = .{ .Label = "lbl" },
+        .weight = -1.0,
+    };
+    const bytes = try encodeOne(TestNode, a, &root);
+    const got = try decodeOne(TestNode, a, bytes);
+    try testing.expectEqualStrings("root", got.name);
+    try testing.expectEqual(@as(usize, 2), got.children.len);
+    try testing.expectEqualStrings("left", got.children[0].name);
+    try testing.expectEqual(@as(u32, 41), got.children[0].tag.Count);
+    try testing.expectEqual(@as(?f64, null), got.children[0].weight);
+    try testing.expectEqualStrings("lbl", got.tag.Label);
+    try testing.expectEqual(@as(f64, 2.5), got.children[1].weight.?);
+}
+
+test "codec preserves shared slices as one decoded slice" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Shared = struct { first: []const u32, second: []const u32 };
+    const data = [_]u32{ 7, 8, 9 };
+    const v = Shared{ .first = &data, .second = &data };
+    const bytes = try encodeOne(Shared, a, &v);
+    const got = try decodeOne(Shared, a, bytes);
+    try testing.expectEqualSlices(u32, &data, got.first);
+    try testing.expect(got.first.ptr == got.second.ptr);
+}
+
+test "codec resolves watched AST pointers to the decoded tree" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A decl slice plus an external pointer at one of its interior
+    // functions — the shape ClassDef method decls and inline-fn ids have.
+    const sp = Span.init(FileId.from(0), 0, 0);
+    const fn_decl = ast.Function{
+        .name = .{ .name = "f", .span = sp },
+        .receiver_type = null,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = &.{},
+        .return_type = null,
+        .body = null,
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .is_operator = false,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = sp,
+    };
+    var decls = [_]ast.Decl{.{ .Function = fn_decl }};
+    const Holder = struct { decls: []ast.Decl, ref: *const ast.Function };
+    const v = Holder{ .decls = &decls, .ref = &decls[0].Function };
+    const bytes = try encodeOne(Holder, a, &v);
+    const got = try decodeOne(Holder, a, bytes);
+    try testing.expectEqualStrings("f", got.ref.name.name);
+    // The external pointer aliases the decoded decl, not a copy.
+    try testing.expect(got.ref == &got.decls[0].Function);
+}
+
+test "codec rejects truncated input" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v: []const u8 = "hello";
+    const bytes = try encodeOne([]const u8, a, &v);
+    var d = Decoder{ .a = a, .buf = bytes[0 .. bytes.len - 2] };
+    var out: []const u8 = undefined;
+    try testing.expectError(error.Malformed, decodeInto([]const u8, &d, &out));
+}

@@ -54,6 +54,50 @@ pub const LoadedPacks = struct {
     bindings: HostBindings,
 };
 
+/// What the embedded-stdlib source load saw and did, recorded for the
+/// stdlib-image fast path: the package universe behind the load gate, the
+/// packages it registered, and the host-binding FQNs it installed. All
+/// strings are dupes owned by the loader's allocator.
+pub const EmbeddedReport = struct {
+    /// Package of every parsed curated source (deduplicated).
+    pkgs: std.ArrayList([]const u8) = .empty,
+    any_non_implicit: bool = false,
+    /// The gate the load used (true = the full curated set loaded).
+    gate_full: bool = false,
+    /// Packages registered via `stdlib.registerKnownPackage`.
+    known_packages: std.ArrayList([]const u8) = .empty,
+    /// Host-binding FQNs registered into the installed overlay.
+    binding_fqns: std.ArrayList([]const u8) = .empty,
+};
+
+/// One pack the loader selected, identified for cache keying: its cache
+/// path, the pack's stored content hash, and the resolved active feature
+/// names (sorted). Strings are dupes owned by the loader's allocator.
+pub const SelectedPack = struct {
+    path: []const u8,
+    hash: [pack.format.HASH_LEN]u8,
+    features: []const []const u8,
+};
+
+/// Out-param describing one load for the stdlib-image fast path.
+pub const Selection = struct {
+    packs: std.ArrayList(SelectedPack) = .empty,
+    /// The import-prefix universe at fixpoint end (user imports plus
+    /// imports discovered in loaded pack sources); the embedded-stdlib
+    /// load gate is a function of this set.
+    final_prefixes: std.ArrayList([]const u8) = .empty,
+};
+
+/// Knobs for `loadInstalledPacksOpts`.
+pub const LoadOptions = struct {
+    /// When false, the embedded stdlib sources are skipped entirely (the
+    /// caller supplies their lowered form from a baked image) and only
+    /// cache packs load.
+    include_stdlib: bool = true,
+    embedded_report: ?*EmbeddedReport = null,
+    selection: ?*Selection = null,
+};
+
 /// `Result<PathBuf, String>` carried as data: `ok` is an owned path and
 /// `err` an owned message, both freed by the caller with the allocator
 /// passed to the producing function.
@@ -188,6 +232,7 @@ fn loadEmbeddedStdlibSources(
     source_map: *SourceMap,
     out_asts: *std.ArrayList(KotlinFile),
     out_bindings: *HostBindings,
+    report: ?*EmbeddedReport,
 ) Allocator.Error!void {
     var env = procEnvMap(allocator);
     defer env.deinit();
@@ -280,11 +325,24 @@ fn loadEmbeddedStdlibSources(
     }
     const load_gated = imported_match or !any_non_implicit;
 
+    if (report) |rep| {
+        rep.any_non_implicit = any_non_implicit;
+        rep.gate_full = load_gated;
+        var seen_pkgs = std.StringHashMap(void).init(allocator);
+        defer seen_pkgs.deinit();
+        for (parsed.items) |p| {
+            if (p.pkg.len == 0) continue;
+            const gop = try seen_pkgs.getOrPut(p.pkg);
+            if (!gop.found_existing) try rep.pkgs.append(allocator, try allocator.dupe(u8, p.pkg));
+        }
+    }
+
     for (parsed.items) |p| {
         const is_implicit = p.pkg.len != 0 and stdlib.isImplicitlyImportedPackage(p.pkg);
         if (!is_implicit and !load_gated) continue;
         if (p.pkg.len != 0) {
             stdlib.registerKnownPackage(p.pkg);
+            if (report) |rep| try rep.known_packages.append(allocator, try allocator.dupe(u8, p.pkg));
         }
         try out_asts.append(allocator, p.file);
     }
@@ -308,6 +366,7 @@ fn loadEmbeddedStdlibSources(
     for (platform_fqns) |fqn| {
         if (merged.resolve(fqn)) |f| {
             try out_bindings.register(fqn, f);
+            if (report) |rep| try rep.binding_fqns.append(allocator, try allocator.dupe(u8, fqn));
         }
     }
 }
@@ -315,7 +374,7 @@ fn loadEmbeddedStdlibSources(
 /// True when any prefix in `prefixes` matches `pkg` by the same
 /// bidirectional dotted-prefix rule the Rust loader uses: `imp == pkg`,
 /// `imp` starts with `pkg.`, or `pkg` starts with `imp.`.
-fn importPrefixMatches(
+pub fn importPrefixMatches(
     allocator: Allocator,
     prefixes: *const std.StringHashMap(void),
     pkg: []const u8,
@@ -346,10 +405,13 @@ fn dottedPrefix(allocator: Allocator, s: []const u8, prefix: []const u8) bool {
 const PackCandidate = struct {
     pack: PackReader,
     manifest: schema.PackManifest,
+    /// Cache path of the pack file, for selection identity.
+    path: []u8,
 
     fn deinit(self: *PackCandidate, allocator: Allocator) void {
         self.manifest.deinit(allocator);
         self.pack.deinit();
+        allocator.free(self.path);
     }
 };
 
@@ -374,7 +436,8 @@ fn collectPackCandidates(allocator: Allocator, cache: []const u8) Allocator.Erro
         if (!std.mem.endsWith(u8, entry.name, ".klio-pack")) continue;
         if (std.mem.startsWith(u8, entry.name, "stdlib")) continue;
         const path = try std.fs.path.join(allocator, &.{ cache, entry.name });
-        defer allocator.free(path);
+        var keep_path = false;
+        defer if (!keep_path) allocator.free(path);
         const bytes = std.Io.Dir.cwd().readFileAlloc(fio, path, allocator, .unlimited) catch continue;
         var err: PackError = undefined;
         var reader = (PackReader.fromBytes(allocator, bytes, &err) catch continue) orelse continue;
@@ -395,7 +458,8 @@ fn collectPackCandidates(allocator: Allocator, cache: []const u8) Allocator.Erro
             continue;
         };
         payload.deinit(allocator);
-        try candidates.append(allocator, .{ .pack = reader, .manifest = manifest });
+        keep_path = true;
+        try candidates.append(allocator, .{ .pack = reader, .manifest = manifest, .path = path });
     }
     return candidates.toOwnedSlice(allocator);
 }
@@ -702,7 +766,19 @@ pub fn loadInstalledPacks(
     source_map: *SourceMap,
     requested_features: *const RequestedFeatures,
 ) LoadedPacks {
-    return loadInstalledPacksImpl(gpa, user_asts, source_map, requested_features) catch .{
+    return loadInstalledPacksOpts(gpa, user_asts, source_map, requested_features, .{});
+}
+
+/// `loadInstalledPacks` with the stdlib-image knobs: optionally skip the
+/// embedded stdlib sources and/or record what the load consumed.
+pub fn loadInstalledPacksOpts(
+    gpa: Allocator,
+    user_asts: []const KotlinFile,
+    source_map: *SourceMap,
+    requested_features: *const RequestedFeatures,
+    opts: LoadOptions,
+) LoadedPacks {
+    return loadInstalledPacksImpl(gpa, user_asts, source_map, requested_features, opts) catch .{
         .asts = &.{},
         .bindings = mergedHostBindings(gpa),
     };
@@ -713,6 +789,7 @@ fn loadInstalledPacksImpl(
     user_asts: []const KotlinFile,
     source_map: *SourceMap,
     requested_features: *const RequestedFeatures,
+    opts: LoadOptions,
 ) Allocator.Error!LoadedPacks {
     var out_asts: std.ArrayList(KotlinFile) = .empty;
     errdefer out_asts.deinit(gpa);
@@ -731,7 +808,9 @@ fn loadInstalledPacksImpl(
         .ok => |c| c,
         .err => |e| {
             gpa.free(e);
-            try loadEmbeddedStdlibSources(gpa, &user_import_prefixes, source_map, &out_asts, &out_bindings);
+            if (opts.include_stdlib) {
+                try loadEmbeddedStdlibSources(gpa, &user_import_prefixes, source_map, &out_asts, &out_bindings, opts.embedded_report);
+            }
             return .{ .asts = try out_asts.toOwnedSlice(gpa), .bindings = out_bindings };
         },
     };
@@ -806,6 +885,23 @@ fn loadInstalledPacksImpl(
             var active = try resolveActiveFeatures(gpa, &c.manifest, feature_reqs.getPtr(lib_id));
             defer active.deinit();
 
+            if (opts.selection) |sel| {
+                var feats = try gpa.alloc([]const u8, active.count());
+                var fit = active.keyIterator();
+                var fi: usize = 0;
+                while (fit.next()) |f| : (fi += 1) feats[fi] = try gpa.dupe(u8, f.*);
+                std.mem.sort([]const u8, feats, {}, struct {
+                    fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+                        return std.mem.lessThan(u8, x, y);
+                    }
+                }.lessThan);
+                try sel.packs.append(gpa, .{
+                    .path = try gpa.dupe(u8, c.path),
+                    .hash = c.pack.packHash(),
+                    .features = feats,
+                });
+            }
+
             // An active feature can pull in dependency packs and ask
             // features of them. A dep entry is `lib` or `lib/feat[,feat2]`
             // — the suffix requests features on that dependency.
@@ -857,7 +953,14 @@ fn loadInstalledPacksImpl(
         }
     }
 
-    try loadEmbeddedStdlibSources(gpa, &known_prefixes, source_map, &out_asts, &out_bindings);
+    if (opts.selection) |sel| {
+        var it = known_prefixes.keyIterator();
+        while (it.next()) |k| try sel.final_prefixes.append(gpa, try gpa.dupe(u8, k.*));
+    }
+
+    if (opts.include_stdlib) {
+        try loadEmbeddedStdlibSources(gpa, &known_prefixes, source_map, &out_asts, &out_bindings, opts.embedded_report);
+    }
 
     // Tell the user how to enable any feature their imports need but that
     // wasn't requested. Drop hints for packages something else already

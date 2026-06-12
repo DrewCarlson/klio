@@ -23,6 +23,8 @@ const RequestedFeatures = pack_cache.RequestedFeatures;
 const pack_build = @import("pack_build.zig");
 const PackCmd = pack_build.PackCmd;
 
+const stdlib_image = @import("stdlib_image.zig");
+
 const unimplemented = @import("unimplemented.zig");
 
 const VERSION = "0.1.0";
@@ -37,6 +39,8 @@ const USAGE =
     \\  parse <file>               Parse a source file and print the AST.
     \\  run <file...> [options]    Run one or more `.kt` source files.
     \\  check <file...> [options]  Type-check `.kt` files and emit diagnostics.
+    \\  bake [file...] [options]   Bake the stdlib image cache (`klio run` does
+    \\                             this automatically on first use).
     \\  repl                       Start an interactive REPL.
     \\  pack <subcommand>          Build or inspect a `.klio-pack` artifact.
     \\
@@ -96,6 +100,8 @@ pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
         return commands.runRepl(gpa);
     } else if (std.mem.eql(u8, cmd, "pack")) {
         return runPackCmd(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "bake")) {
+        return runBakeCmd(gpa, rest);
     }
 
     printErr(gpa, "error: unknown command `{s}`\n\n{s}", .{ cmd, USAGE });
@@ -164,6 +170,37 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         return commands.runFileIrVm(gpa, files.items[0], &requested);
     }
     return commands.runModuleFiles(gpa, files.items, &requested);
+}
+
+fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
+    var files: std.ArrayList([]const u8) = .empty;
+    defer files.deinit(gpa);
+    var feature_specs: std.ArrayList([]const u8) = .empty;
+    defer feature_specs.deinit(gpa);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--feature")) {
+            i += 1;
+            if (i >= args.len) {
+                printErr(gpa, "error: --feature requires a `<pack>/<feature>` value\n", .{});
+                return 2;
+            }
+            feature_specs.append(gpa, args[i]) catch return 2;
+        } else if (optionValue(a, "--feature=")) |v| {
+            feature_specs.append(gpa, v) catch return 2;
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            printErr(gpa, "error: unknown option `{s}`\n", .{a});
+            return 2;
+        } else {
+            files.append(gpa, a) catch return 2;
+        }
+    }
+
+    var requested = parseRequestedFeatures(gpa, feature_specs.items);
+    defer deinitRequestedFeatures(&requested);
+    return stdlib_image.runBake(gpa, files.items, &requested);
 }
 
 fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
@@ -334,6 +371,7 @@ test {
     std.testing.refAllDecls(pack_cache);
     std.testing.refAllDecls(pack_build);
     std.testing.refAllDecls(unimplemented);
+    std.testing.refAllDecls(stdlib_image);
     std.testing.refAllDecls(io);
 }
 
