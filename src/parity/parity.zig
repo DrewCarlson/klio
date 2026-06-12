@@ -1050,7 +1050,12 @@ fn embeddedStdlibSources(arena: Allocator, io: Io, existing: []const KotlinFile,
     for (existing) |*f| {
         try collectImportPrefixes(arena, f, &import_prefixes);
     }
+    return embeddedStdlibSourcesPrefixed(arena, io, &import_prefixes, map);
+}
 
+/// `embeddedStdlibSources` over an explicit import-prefix set; the
+/// shared-base loader computes the gate from prefixes alone.
+fn embeddedStdlibSourcesPrefixed(arena: Allocator, io: Io, import_prefixes: *const std.StringHashMap(void), map: *SourceMap) Allocator.Error![]KotlinFile {
     var perr: pack.PackError = undefined;
     var env = try procEnvMap(arena, io);
     defer env.deinit();
@@ -1337,6 +1342,14 @@ pub fn loadProgramFiles(arena: Allocator, io: Io, files: []const []const u8, mod
     }
     try asts.appendSlice(arena, user_asts.items);
 
+    bindings = try packHostBindings(arena);
+
+    return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = bindings, .map = map } };
+}
+
+/// Host bindings installed for the pack load modes: stdlib defaults plus
+/// the kotlinx coroutines/atomicfu overlays.
+fn packHostBindings(arena: Allocator) Allocator.Error!HostBindings {
     var b = try HostBindings.withStdlibDefaults(arena);
     {
         var co = try kotlinx_coroutines.hostBindings(arena);
@@ -1350,9 +1363,381 @@ pub fn loadProgramFiles(arena: Allocator, io: Io, files: []const []const u8, mod
         while (it.next()) |e| try b.register(e.key_ptr.*, e.value_ptr.*);
         af.deinit();
     }
-    bindings = b;
+    return b;
+}
 
-    return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = bindings, .map = map } };
+// ---------------------- once-per-process stdlib base ----------------------
+//
+// Every in-process run used to parse + lower the full embedded stdlib (and
+// the kotlinx packs) from scratch. The harnesses run hundreds of programs
+// per process, so the dependency set is lowered ONCE per (load mode, pack
+// subset, stdlib gate) into an immutable `StdlibBase` on a process-lifetime
+// arena; each program then clones the mutable parts onto its own arena and
+// lowers only its own declarations (`buildModuleFilesExtend`). A program
+// whose top-level names overlap the base's falls back to the original
+// whole-program build, so cross-boundary renames and resolution decisions
+// are never approximated.
+
+const StdlibBase = interp_ir.build.StdlibBase;
+
+/// One published snapshot: the lowered base plus the SourceMap its spans
+/// resolve through. Immutable after publication; read concurrently.
+const BaseEntry = struct {
+    base: *const StdlibBase,
+    map: *const SourceMap,
+};
+
+var base_lock: runtime.SpinMutex = .{};
+var base_arena_state: ?*std.heap.ArenaAllocator = null;
+/// key (mode|mask|gate byte) -> entry, or null when the base for that key
+/// could not be snapshotted (callers then always take the fallback).
+var base_entries: ?std.AutoHashMap(u8, ?*const BaseEntry) = null;
+var stdlib_meta_cache: ?StdlibMeta = null;
+var pack_meta_cache: [3]?PackMeta = .{ null, null, null };
+
+/// Package universe of the embedded stdlib bundle, for the load gate.
+const StdlibMeta = struct {
+    pkgs: []const []const u8,
+    any_non_implicit: bool,
+};
+
+/// One in-repo kotlinx pack's identity + import surface.
+const PackMeta = struct {
+    lib_id: []const u8,
+    import_prefixes: []const []const u8,
+};
+
+fn baseKey(mode: LoadMode, mask: u8, full: bool) u8 {
+    return (@as(u8, @intFromEnum(mode)) << 4) | (mask << 1) | @intFromBool(full);
+}
+
+/// `KLIO_TRACE_STDLIB_BASE=1` prints one fast/fallback line per program.
+/// Read with a raw `read` loop: `/proc/self/environ` stats as 0 bytes, so
+/// the stat-trusting `readFileAlloc` behind `getEnvVar` sees it empty.
+var trace_base_flag: ?bool = null;
+fn traceBaseEnabled() bool {
+    if (trace_base_flag) |v| return v;
+    var enabled = false;
+    if (@import("builtin").os.tag == .linux) blk: {
+        const fd = std.os.linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
+        if (@as(isize, @bitCast(fd)) < 0) break :blk;
+        const ifd: i32 = @intCast(fd);
+        defer _ = std.os.linux.close(ifd);
+        var buf: [16384]u8 = undefined;
+        var len: usize = 0;
+        while (len < buf.len) {
+            const rc = std.os.linux.read(ifd, buf[len..].ptr, buf.len - len);
+            const e = std.os.linux.errno(rc);
+            if (e == .INTR) continue;
+            if (e != .SUCCESS) break;
+            if (rc == 0) break;
+            len += rc;
+        }
+        var it = std.mem.splitScalar(u8, buf[0..len], 0);
+        while (it.next()) |entry| {
+            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+            if (std.mem.eql(u8, entry[0..eq], "KLIO_TRACE_STDLIB_BASE")) {
+                const val = entry[eq + 1 ..];
+                enabled = val.len != 0 and !std.mem.eql(u8, val, "0");
+            }
+        }
+    }
+    trace_base_flag = enabled;
+    return enabled;
+}
+
+fn baseArenaAllocator() Allocator {
+    if (base_arena_state == null) {
+        const holder = std.heap.page_allocator.create(std.heap.ArenaAllocator) catch @panic("oom");
+        holder.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        base_arena_state = holder;
+    }
+    return base_arena_state.?.allocator();
+}
+
+/// Stdlib bundle package metadata, parsed once per process (under the
+/// base lock).
+fn stdlibMeta(io: Io) Allocator.Error!*const StdlibMeta {
+    if (stdlib_meta_cache) |*m| return m;
+    const a = baseArenaAllocator();
+    var pkgs: std.ArrayList([]const u8) = .empty;
+    var seen = std.StringHashMap(void).init(a);
+    var any_non_implicit = false;
+    blk: {
+        var perr: pack.PackError = undefined;
+        var env = try procEnvMap(a, io);
+        defer env.deinit();
+        const bytes = (try stdlib_pack.stdlibPackBytes(a, &env, &perr)) orelse break :blk;
+        var reader = (try pack.PackReader.fromBytes(a, bytes, &perr)) orelse break :blk;
+        defer reader.deinit();
+        const payload = (try reader.readSection(pack.section_names.SOURCES, &perr)) orelse break :blk;
+        const bundle = (try pack.schema.decode(pack.schema.SourceBundle, a, payload.slice(), &perr)) orelse break :blk;
+        var map = SourceMap.init(a);
+        for (bundle.files) |sf| {
+            if (stdlib.isConsumptionDeferredSource(sf.rel_path)) continue;
+            const fid = try map.add(sf.rel_path, sf.bytes);
+            const srcf = map.get(fid).source;
+            var lx = try lexer.Lexer.init(a, fid, srcf);
+            const lexed = try lx.tokenize();
+            if (lexed.diagnostics.hasErrors()) continue;
+            const p = parser.Parser.new(a, fid, srcf, lexed.tokens);
+            const file_ast = p.parseFile();
+            if (p.diagnostics.hasErrors()) continue;
+            const pkg = try packageName(a, &file_ast);
+            if (pkg.len == 0) continue;
+            if (!stdlib.isImplicitlyImportedPackage(pkg)) any_non_implicit = true;
+            const gop = try seen.getOrPut(pkg);
+            if (!gop.found_existing) try pkgs.append(a, pkg);
+        }
+    }
+    stdlib_meta_cache = .{ .pkgs = try pkgs.toOwnedSlice(a), .any_non_implicit = any_non_implicit };
+    return &stdlib_meta_cache.?;
+}
+
+/// Import prefixes + library id of one in-repo kotlinx pack, parsed once
+/// per process (under the base lock).
+fn packMeta(io: Io, idx: usize) Allocator.Error!*const PackMeta {
+    if (pack_meta_cache[idx]) |*m| return m;
+    const a = baseArenaAllocator();
+    const dirs = try kotlinxPackDirs(a);
+    const dir = dirs[idx];
+    const lib_id = (try manifestLibraryId(a, io, dir)) orelse try a.alloc(u8, 0);
+    var prefixes: std.ArrayList([]const u8) = .empty;
+    switch (try collectManifestSources(a, io, dir)) {
+        .err => {},
+        .ok => |sources| {
+            var set = std.StringHashMap(void).init(a);
+            var map = SourceMap.init(a);
+            for (sources) |src_path| {
+                const text = readFileOpt(a, io, src_path) orelse continue;
+                const parsed = switch (try parsePackFile(a, &map, src_path, text)) {
+                    .err => continue,
+                    .ok => |f| f,
+                };
+                try collectImportPrefixes(a, &parsed, &set);
+            }
+            var it = set.keyIterator();
+            while (it.next()) |k| try prefixes.append(a, k.*);
+        },
+    }
+    pack_meta_cache[idx] = .{ .lib_id = lib_id, .import_prefixes = try prefixes.toOwnedSlice(a) };
+    return &pack_meta_cache[idx].?;
+}
+
+/// Which in-repo packs `import_prefixes` pulls in, as a bitmask over
+/// `kotlinxPackDirs` order. Mirrors `collectKotlinxPackSources`' selection
+/// (including coroutines forcing atomicfu).
+fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_coroutines: bool, scratch: Allocator) Allocator.Error!u8 {
+    var mask: u8 = 0;
+    var idx: usize = 0;
+    while (idx < 3) : (idx += 1) {
+        const meta = try packMeta(io, idx);
+        var wanted = false;
+        var it = import_prefixes.keyIterator();
+        while (it.next()) |imp_ptr| {
+            const imp = imp_ptr.*;
+            if (std.mem.eql(u8, imp, meta.lib_id) or
+                startsWithDot(scratch, imp, meta.lib_id) or
+                startsWithDot(scratch, meta.lib_id, imp))
+            {
+                wanted = true;
+                break;
+            }
+        }
+        if (std.mem.eql(u8, meta.lib_id, "kotlinx.atomicfu") and imports_coroutines) wanted = true;
+        if (wanted) mask |= @as(u8, 1) << @intCast(idx);
+    }
+    return mask;
+}
+
+/// Whether the stdlib load gate opens fully for this prefix set (mirrors
+/// `embeddedStdlibSources`' `load_gated`).
+fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask: u8, scratch: Allocator) Allocator.Error!bool {
+    const meta = try stdlibMeta(io);
+    if (!meta.any_non_implicit) return true;
+    var it = import_prefixes.keyIterator();
+    while (it.next()) |imp_ptr| {
+        for (meta.pkgs) |pkg| {
+            if (matchesImportPrefix(scratch, imp_ptr.*, pkg)) return true;
+        }
+    }
+    var idx: usize = 0;
+    while (idx < 3) : (idx += 1) {
+        if (mask & (@as(u8, 1) << @intCast(idx)) == 0) continue;
+        const pmeta = try packMeta(io, idx);
+        for (pmeta.import_prefixes) |imp| {
+            for (meta.pkgs) |pkg| {
+                if (matchesImportPrefix(scratch, imp, pkg)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Get or build the dependency snapshot for (mode, pack mask, gate).
+/// Returns null when that base is not snapshot-safe.
+fn getOrBuildBase(io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+    base_lock.lock();
+    defer base_lock.unlock();
+
+    const a = baseArenaAllocator();
+    if (base_entries == null) base_entries = std.AutoHashMap(u8, ?*const BaseEntry).init(std.heap.page_allocator);
+    const key = baseKey(mode, mask, full);
+    if (base_entries.?.get(key)) |hit| return hit;
+
+    const entry = try buildBaseEntry(a, io, mode, mask, full);
+    try base_entries.?.put(key, entry);
+    return entry;
+}
+
+fn buildBaseEntry(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+    const map = try a.create(SourceMap);
+    map.* = SourceMap.init(a);
+
+    var asts: std.ArrayList(KotlinFile) = .empty;
+    defer asts.deinit(a);
+
+    if (mode != .EmbeddedOnly and mask != 0) {
+        const pack_dirs = try kotlinxPackDirs(a);
+        var sources: std.ArrayList(PackSource) = .empty;
+        defer sources.deinit(a);
+        for (pack_dirs, 0..) |dir, idx| {
+            if (mask & (@as(u8, 1) << @intCast(idx)) == 0) continue;
+            const manifest_sources = switch (try collectManifestSources(a, io, dir)) {
+                .err => return null,
+                .ok => |s| s,
+            };
+            for (manifest_sources) |src_path| {
+                const text = readFileOpt(a, io, src_path) orelse return null;
+                try sources.append(a, .{ .path = src_path, .text = text });
+            }
+        }
+        switch (mode) {
+            .SourcePacks => {
+                for (sources.items) |s| {
+                    const file_ast = switch (try parsePackFile(a, map, s.path, s.text)) {
+                        .err => return null,
+                        .ok => |f| f,
+                    };
+                    try registerAstPackage(a, &file_ast);
+                    try asts.append(a, file_ast);
+                }
+            },
+            .CompiledPacks => {
+                const decoded = switch (try packRoundtrip(a, sources.items)) {
+                    .err => return null,
+                    .ok => |d| d,
+                };
+                for (decoded) |sf| {
+                    const file_ast = switch (try parsePackFile(a, map, sf.rel_path, sf.bytes)) {
+                        .err => return null,
+                        .ok => |f| f,
+                    };
+                    try registerAstPackage(a, &file_ast);
+                    try asts.append(a, file_ast);
+                }
+            },
+            .EmbeddedOnly => unreachable,
+        }
+    }
+
+    // Synthetic prefix set reproducing the gate: the selected stdlib subset
+    // is a pure function of the gate boolean, so the snapshot is identical
+    // for every program that maps to this key.
+    var gate_prefixes = std.StringHashMap(void).init(a);
+    if (full) {
+        const meta = try stdlibMeta(io);
+        for (meta.pkgs) |pkg| try gate_prefixes.put(pkg, {});
+    }
+    const stdlib_asts = try embeddedStdlibSourcesPrefixed(a, io, &gate_prefixes, map);
+    for (stdlib_asts) |s| {
+        if (mode != .EmbeddedOnly) try registerAstPackage(a, &s);
+        try asts.append(a, s);
+    }
+
+    const base = (try interp_ir.build.buildStdlibBase(a, asts.items)) orelse return null;
+    base.user_file_start = @intCast(map.files.items.len);
+
+    const entry = try a.create(BaseEntry);
+    entry.* = .{ .base = base, .map = map };
+    return entry;
+}
+
+/// Program assembled on the fast path: the extended module plus the map
+/// and bindings the shared tail consumes.
+const PreparedProgram = struct {
+    built: interp_ir.build.BuiltModule,
+    map: *const SourceMap,
+    bindings: ?HostBindings,
+};
+
+/// Try to assemble `files` against the shared dependency base. Returns
+/// null when the program must take the whole-program fallback; `.err` when
+/// the program itself is invalid (unreadable/unparseable), matching the
+/// fallback's failure text.
+fn prepareWithBase(arena: Allocator, io: Io, files: []const []const u8, mode: LoadMode) Allocator.Error!?SResult(PreparedProgram) {
+    // First parse on a scratch map: the reuse gate and the base key need
+    // the user program's decls and imports before the base is chosen.
+    var scratch_map = SourceMap.init(arena);
+    var texts = try arena.alloc([]const u8, files.len);
+    var scratch_asts = try arena.alloc(KotlinFile, files.len);
+    for (files, 0..) |file, i| {
+        const text = readFileOpt(arena, io, file) orelse {
+            return .{ .err = try std.fmt.allocPrint(arena, "read {s}", .{file}) };
+        };
+        texts[i] = text;
+        scratch_asts[i] = switch (try parsePackFile(arena, &scratch_map, file, text)) {
+            .err => |e| return .{ .err = e },
+            .ok => |f| f,
+        };
+    }
+
+    var prefixes = std.StringHashMap(void).init(arena);
+    for (scratch_asts) |*f| try collectImportPrefixes(arena, f, &prefixes);
+    var imports_coroutines = false;
+    {
+        var it = prefixes.keyIterator();
+        while (it.next()) |imp_ptr| {
+            const imp = imp_ptr.*;
+            if (std.mem.eql(u8, imp, "kotlinx.coroutines") or
+                std.mem.startsWith(u8, imp, "kotlinx.coroutines."))
+            {
+                imports_coroutines = true;
+                break;
+            }
+        }
+    }
+
+    base_lock.lock();
+    const mask: u8 = if (mode == .EmbeddedOnly) 0 else packMaskFor(io, &prefixes, imports_coroutines, arena) catch |e| {
+        base_lock.unlock();
+        return e;
+    };
+    const full = stdlibGateFull(io, &prefixes, mask, arena) catch |e| {
+        base_lock.unlock();
+        return e;
+    };
+    base_lock.unlock();
+
+    const entry = (try getOrBuildBase(io, mode, mask, full)) orelse return null;
+    if (!interp_ir.build.canExtendBase(entry.base, scratch_asts)) return null;
+
+    // Re-parse the user files onto a map that extends the base's, so user
+    // FileIds continue after the base's and base spans stay resolvable.
+    const map = try arena.create(SourceMap);
+    map.* = SourceMap.init(arena);
+    try map.files.appendSlice(map.arena.allocator(), entry.map.files.items);
+    var user_asts = try arena.alloc(KotlinFile, files.len);
+    for (files, 0..) |file, i| {
+        user_asts[i] = switch (try parsePackFile(arena, map, file, texts[i])) {
+            .err => |e| return .{ .err = e },
+            .ok => |f| f,
+        };
+    }
+
+    const built = try interp_ir.build.buildModuleFilesExtend(arena, entry.base, user_asts);
+    const bindings: ?HostBindings = if (mode == .EmbeddedOnly) null else try packHostBindings(arena);
+    return .{ .ok = .{ .built = built, .map = map, .bindings = bindings } };
 }
 
 /// Assemble `file` under `mode`, build the module, and run `main`, returning
@@ -1387,13 +1772,36 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     // on this thread before assembling the next program.
     interp_ir.resetReceiverThreadLocals();
 
-    const loaded = switch (try loadProgramFiles(arena, io, files, mode)) {
-        .err => |e| return .{ .err = try allocator.dupe(u8, e) },
-        .ok => |p| p,
-    };
-
     interp_ir.setCoroutineTimeMode(.Virtual);
-    var built = try interp_ir.build.buildModuleFiles(arena, loaded.asts);
+
+    // Fast path: extend the once-per-process dependency base with just this
+    // program's decls. Falls back to the whole-program build when the
+    // program redeclares a base name (or the base is not snapshot-safe).
+    var built: interp_ir.build.BuiltModule = undefined;
+    var prog_map: *const SourceMap = undefined;
+    var prog_bindings: ?HostBindings = null;
+    var used_base = false;
+    if (try prepareWithBase(arena, io, files, mode)) |r| switch (r) {
+        .err => |e| return .{ .err = try allocator.dupe(u8, e) },
+        .ok => |p| {
+            built = p.built;
+            prog_map = p.map;
+            prog_bindings = p.bindings;
+            used_base = true;
+        },
+    };
+    if (!used_base) {
+        const loaded = switch (try loadProgramFiles(arena, io, files, mode)) {
+            .err => |e| return .{ .err = try allocator.dupe(u8, e) },
+            .ok => |p| p,
+        };
+        built = try interp_ir.build.buildModuleFiles(arena, loaded.asts);
+        prog_map = loaded.map;
+        prog_bindings = loaded.bindings;
+    }
+    if (traceBaseEnabled()) {
+        printErr("[stdlib-base] {s}: {s}\n", .{ if (used_base) "fast" else "fallback", files[0] });
+    }
     // Lowering-time resolution diagnostics (ambiguous bare calls) fail
     // the program before it runs, mirroring the `klio run` pipeline.
     const amb_msg: ?[]u8 = blk: {
@@ -1401,7 +1809,7 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         defer mg.deinit();
         const rdiags = mg.get().resolve_diags.items;
         if (rdiags.len == 0) break :blk null;
-        break :blk try rdiags[0].render(allocator, loaded.map);
+        break :blk try rdiags[0].render(allocator, prog_map);
     };
     if (amb_msg) |msg| {
         built.deinit();
@@ -1415,7 +1823,7 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     built.deinit();
     var vm = pair.vm;
     defer vm.deinit();
-    if (loaded.bindings) |bindings| try vm.setInstalledBindings(bindings);
+    if (prog_bindings) |bindings| try vm.setInstalledBindings(bindings);
 
     var out = CaptureOutput.init(allocator);
     defer out.deinit();

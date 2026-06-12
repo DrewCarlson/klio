@@ -246,13 +246,25 @@ pub fn buildModule(allocator: Allocator, file: *const KotlinFile) Allocator.Erro
     defer func_fqn.deinit();
     var decl_pkg = SpanStrMap.init(allocator);
     defer decl_pkg.deinit();
-    return buildModuleWithOverrides(allocator, file, &fqn, &func_fqn, &decl_pkg);
+    return buildModuleWithOverrides(allocator, file, &fqn, &func_fqn, &decl_pkg, null, null);
 }
 
 /// Drive `buildModule` against multiple parsed files. All declarations
 /// from every file are concatenated into one synthesised file and
 /// lowered as a single program.
 pub fn buildModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocator.Error!BuiltModule {
+    return buildModuleFilesInner(allocator, files, null, null);
+}
+
+/// Extend an immutable dependency base with `user_files` only: the base's
+/// lowered module/tables are cloned onto `allocator` and just the user
+/// declarations are lifted and lowered on top. Callers must have verified
+/// `canExtendBase` first.
+pub fn buildModuleFilesExtend(allocator: Allocator, base: *const StdlibBase, user_files: []const KotlinFile) Allocator.Error!BuiltModule {
+    return buildModuleFilesInner(allocator, user_files, base, null);
+}
+
+fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
     var decls: std.ArrayList(Decl) = .empty;
     defer decls.deinit(allocator);
     var imports: std.ArrayList(ast.ImportDecl) = .empty;
@@ -490,7 +502,7 @@ pub fn buildModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocat
         .decls = try decls.toOwnedSlice(allocator),
         .span = Span.init(span.FileId.from(0), 0, 0),
     };
-    return buildModuleWithOverrides(allocator, &combined, &fqn_overrides, &func_fqn_overrides, &decl_pkg);
+    return buildModuleWithOverrides(allocator, &combined, &fqn_overrides, &func_fqn_overrides, &decl_pkg, base, out_lifted);
 }
 
 fn packagePrefix(allocator: Allocator, pkg: ?ast.PackageHeader) Allocator.Error![]const u8 {
@@ -687,23 +699,43 @@ fn buildModuleWithOverrides(
     fqn_overrides: *const SpanStrMap,
     func_fqn_overrides: *const SpanStrMap,
     decl_pkg: *const SpanStrMap,
+    base: ?*const StdlibBase,
+    out_lifted: ?*[]Decl,
 ) Allocator.Error!BuiltModule {
-    const module_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+    // Extending build: start from a per-run clone of the base's lowered
+    // module and side tables; `file` then carries ONLY the user decls and
+    // every pass below appends on top of the seeded state.
+    var seed: ?BuiltModule = if (base) |bs| try cloneBuiltForRun(allocator, &bs.built) else null;
+    const module_ref = if (seed) |*s| s.module else try ObjRef(Module).init(allocator, Module.default(allocator));
     // The ObjRef holds the only handle during the build and nothing else
     // borrows it, so a raw pointer into the cell is a stable `*Module` for
     // the lowering driver (mirrors Rust owning `module` then `Arc::new`).
     const module: *Module = &module_ref.cell.data;
     const a = module.registry.allocator;
+    const base_funcs_len = module.funcs.items.len;
 
     const package_prefix = try packagePrefix(a, file.package);
 
-    var object_names: std.ArrayList([]const u8) = .empty;
+    var object_names: std.ArrayList([]const u8) = if (seed) |*s| s.object_names else .empty;
+    const base_object_names_len = object_names.items.len;
     var object_spans: std.ArrayList(Span) = .empty;
     defer object_spans.deinit(a);
-    var companion_singletons = std.StringHashMap([]const u8).init(a);
+    var companion_singletons = if (seed) |*s| s.companion_singletons else std.StringHashMap([]const u8).init(a);
     var nested_outer_members = lift.OuterMembers.init(a);
-    var enclosing_class = lift.EnclosingMap.init(a);
+    var enclosing_class = if (seed) |*s| s.enclosing_class else lift.EnclosingMap.init(a);
     var nested_object_aliases = lift.AliasMap.init(a);
+    if (base != null) {
+        // Seed the lift-time alias/mangle context from the cloned registry
+        // so user classes can extend base nested/mangled shapes. Inner maps
+        // are deep-copied: the lift loop appends into them per class key.
+        var it = module.registry.nested_object_aliases.iterator();
+        while (it.next()) |e| {
+            var inner = std.StringHashMap([]const u8).init(a);
+            var iit = e.value_ptr.iterator();
+            while (iit.next()) |ie| try inner.put(ie.key_ptr.*, ie.value_ptr.*);
+            try nested_object_aliases.put(e.key_ptr.*, inner);
+        }
+    }
 
     // `actual object`/`actual class` names supersede a matching `expect`.
     var actual_object_names = StringSet.init(a);
@@ -759,6 +791,10 @@ fn buildModuleWithOverrides(
     // that would collide.
     var top_level_type_names = StringSet.init(a);
     defer top_level_type_names.deinit();
+    if (base) |bs| {
+        var it = bs.type_names.keyIterator();
+        while (it.next()) |k| try top_level_type_names.put(k.*, {});
+    }
     for (file.decls) |*d| {
         switch (d.*) {
             .Class => |*c| try top_level_type_names.put(c.name.name, {}),
@@ -773,6 +809,10 @@ fn buildModuleWithOverrides(
 
     var mangled_nested = lift.MangledMap.init(a);
     defer mangled_nested.deinit();
+    if (base != null) {
+        var it = module.registry.mangled_nested.iterator();
+        while (it.next()) |e| try mangled_nested.put(e.key_ptr.*, e.value_ptr.*);
+    }
 
     var all_decls: std.ArrayList(Decl) = .empty;
 
@@ -937,10 +977,20 @@ fn buildModuleWithOverrides(
         }
     }
     const decls = decls_list.items;
+    if (out_lifted) |out| out.* = decls;
 
-    // Map every class declaration by simple name.
+    // Map every class declaration by simple name. In an extending build the
+    // base's lifted classes join the universe first: hierarchy walks, init
+    // own-member collection and inline splicing for USER classes reach
+    // through base supertypes, while base decls themselves are never
+    // re-lowered (their lowered forms arrived via the seed clone).
     var file_classes = FileClasses.init(a);
     defer file_classes.deinit();
+    if (base) |bs| {
+        for (bs.lifted_decls) |*d| {
+            if (d.* == .Class) try file_classes.put(d.Class.name.name, &d.Class);
+        }
+    }
     for (decls) |*d| {
         if (d.* == .Class) try file_classes.put(d.Class.name.name, &d.Class);
     }
@@ -962,10 +1012,12 @@ fn buildModuleWithOverrides(
         }
     }
 
-    // Per-class transitive member-function-name set.
+    // Per-class transitive member-function-name set. Seeded base classes
+    // already carry theirs in the cloned registry; only new keys compute.
     {
         var it = file_classes.keyIterator();
         while (it.next()) |cname| {
+            if (module.registry.hierarchy_methods.contains(cname.*)) continue;
             var methods = StringSet.init(a);
             var seen = StringSet.init(a);
             defer seen.deinit();
@@ -991,6 +1043,7 @@ fn buildModuleWithOverrides(
     {
         var it = file_classes.iterator();
         while (it.next()) |e| {
+            if (module.registry.class_super_names.contains(e.key_ptr.*)) continue;
             var chain: std.ArrayList([]const u8) = .empty;
             var seen = StringSet.init(a);
             defer seen.deinit();
@@ -1048,6 +1101,11 @@ fn buildModuleWithOverrides(
     const tl = std.heap.page_allocator;
     {
         var inline_fns = std.StringHashMap(std.ArrayList(*const ast.Function)).init(a);
+        // Base inline fns first, preserving the whole-program declaration
+        // order of each overload list (base decls precede user decls).
+        if (base) |bs| {
+            for (bs.lifted_decls) |*d| try collectInline(a, d, &inline_fns);
+        }
         for (decls) |*d| try collectInline(a, d, &inline_fns);
         var frozen = std.StringHashMap([]const *const ast.Function).init(tl);
         var it = inline_fns.iterator();
@@ -1056,6 +1114,12 @@ fn buildModuleWithOverrides(
         }
         inline_fns.deinit();
         ir.lower.setInlineFnAsts(frozen);
+        // setInlineFnAsts dropped the previous build's FuncId-keyed inline
+        // registrations; replay the base's so user calls the symbol index
+        // resolves to a base inline fn still splice its declaration.
+        if (base) |bs| {
+            for (bs.inline_ids) |entry| try ir.lower.registerInlineFnId(entry.id, entry.f);
+        }
 
         // Default-import host bindings shadow same-simple-name inline
         // fns. The name domain comes from the same constructor the
@@ -1077,6 +1141,13 @@ fn buildModuleWithOverrides(
     // Top-level (file-scope) property names.
     {
         var top_props = StringSet.init(tl);
+        if (base) |bs| {
+            for (bs.lifted_decls) |*d| {
+                if (d.* == .Property and d.Property.receiver_type == null) {
+                    try top_props.put(d.Property.name.name, {});
+                }
+            }
+        }
         for (decls) |*d| {
             if (d.* == .Property and d.Property.receiver_type == null) {
                 try top_props.put(d.Property.name.name, {});
@@ -1238,8 +1309,8 @@ fn buildModuleWithOverrides(
     // reserved slot, resolving bodies and extension-receiver bindings
     // against the now-complete phase-1 header set (above).
     var main_id: ?FuncId = null;
-    var func_defaults = std.AutoHashMap(u32, []?FuncId).init(a);
-    var func_type_params = std.AutoHashMap(u32, [][]const u8).init(a);
+    var func_defaults = if (seed) |*s| s.func_defaults else std.AutoHashMap(u32, []?FuncId).init(a);
+    var func_type_params = if (seed) |*s| s.func_type_params else std.AutoHashMap(u32, [][]const u8).init(a);
     var stub_cursor: usize = 0;
     for (decls) |*d| {
         if (d.* == .Function) {
@@ -1314,11 +1385,11 @@ fn buildModuleWithOverrides(
     }
 
     // Body-property initialisers, getters, setters, ctor defaults.
-    var body_prop_inits = PairFuncMap.init(a);
-    var instance_prop_getters = PairFuncMap.init(a);
-    var instance_prop_setters = PairFuncMap.init(a);
-    var delegated_body_props = StrPairSet.init(a);
-    var primary_ctor_default_thunks = std.StringHashMap([]?FuncId).init(a);
+    var body_prop_inits = if (seed) |*s| s.body_prop_inits else PairFuncMap.init(a);
+    var instance_prop_getters = if (seed) |*s| s.instance_prop_getters else PairFuncMap.init(a);
+    var instance_prop_setters = if (seed) |*s| s.instance_prop_setters else PairFuncMap.init(a);
+    var delegated_body_props = if (seed) |*s| s.delegated_body_props else StrPairSet.init(a);
+    var primary_ctor_default_thunks = if (seed) |*s| s.primary_ctor_default_thunks else std.StringHashMap([]?FuncId).init(a);
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1426,13 +1497,18 @@ fn buildModuleWithOverrides(
     // view is declaration-order deterministic, and every identity-carrying
     // path (NewInstance ClassId, `::Ctor`, copy) resolves by FQN instead.
     const globals_for_capture = try ObjRef(Env).init(a, Env.init(a));
-    var classes = ClassTable.init(a);
+    var classes = if (seed) |*s| s.classes else ClassTable.init(a);
+    // Defs created by THIS build: the parent/interface backpatch below
+    // links only these — seeded base defs arrive fully linked.
+    var new_defs: std.ArrayList(ObjRef(ClassDef)) = .empty;
+    defer new_defs.deinit(a);
     var simple_aliases: std.ArrayList(struct { name: []const u8, def: ObjRef(ClassDef) }) = .empty;
     defer simple_aliases.deinit(a);
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
         const def = try buildClassDef(a, c, fqn_overrides, package_prefix, &object_spans, globals_for_capture);
+        try new_defs.append(a, def);
         const fqn_g = def.borrow();
         const def_fqn = fqn_g.get().fqn;
         fqn_g.deinit();
@@ -1476,11 +1552,13 @@ fn buildModuleWithOverrides(
         }
     }
 
-    // Populate enum entries + per-entry overrides + ctor-arg thunks.
-    var next_id: u64 = 1;
-    var enum_entry_arg_inits: std.ArrayList(EnumEntryArgInit) = .empty;
-    var enum_entry_methods = std.HashMap(StrPair, EnumEntryMethod, StrPairContext, std.hash_map.default_max_load_percentage).init(a);
-    var enum_entry_synth_class = PairStrMap.init(a);
+    // Populate enum entries + per-entry overrides + ctor-arg thunks. An
+    // extending build continues the base's identity sequence so default
+    // toString/hashCode renderings match the whole-program numbering.
+    var next_id: u64 = if (base) |bs| bs.enum_id_next else 1;
+    var enum_entry_arg_inits: std.ArrayList(EnumEntryArgInit) = if (seed) |*s| s.enum_entry_arg_inits else .empty;
+    var enum_entry_methods = if (seed) |*s| s.enum_entry_methods else std.HashMap(StrPair, EnumEntryMethod, StrPairContext, std.hash_map.default_max_load_percentage).init(a);
+    var enum_entry_synth_class = if (seed) |*s| s.enum_entry_synth_class else PairStrMap.init(a);
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1543,10 +1621,10 @@ fn buildModuleWithOverrides(
     // already registered; this is the second linker phase that backpatches
     // each `parent`/`interfaces` slot once. After it returns the fields are
     // immutable for the rest of the process and read lock-free on dispatch.
+    // Only defs created by this build link here; seeded base defs arrived
+    // fully linked from the per-run clone.
     {
-        var vit = classes.valueIterator();
-        while (vit.next()) |def_ptr| {
-            const def = def_ptr.*;
+        for (new_defs.items) |def| {
             const dg = def.borrow();
             const supertype_names = dg.get().supertype_names;
             const def_pkg = packageOfFqn(dg.get().fqn, dg.get().name);
@@ -1589,7 +1667,7 @@ fn buildModuleWithOverrides(
     }
 
     // Parent-ctor argument thunks.
-    var parent_ctor_args = std.StringHashMap([]FuncId).init(a);
+    var parent_ctor_args = if (seed) |*s| s.parent_ctor_args else std.StringHashMap([]FuncId).init(a);
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1621,7 +1699,7 @@ fn buildModuleWithOverrides(
     }
 
     // Init blocks as 1-arg thunks taking `this` plus ctor params.
-    var init_blocks = std.StringHashMap([]FuncId).init(a);
+    var init_blocks = if (seed) |*s| s.init_blocks else std.StringHashMap([]FuncId).init(a);
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1661,7 +1739,7 @@ fn buildModuleWithOverrides(
     }
 
     // Per-class delegation expressions.
-    var class_delegates = std.StringHashMap([]StrFunc).init(a);
+    var class_delegates = if (seed) |*s| s.class_delegates else std.StringHashMap([]StrFunc).init(a);
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1692,7 +1770,7 @@ fn buildModuleWithOverrides(
     }
 
     // Per-class secondary-ctor lowering.
-    var secondary_ctors = std.StringHashMap([]SecondaryCtorEntry).init(a);
+    var secondary_ctors = if (seed) |*s| s.secondary_ctors else std.StringHashMap([]SecondaryCtorEntry).init(a);
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1783,8 +1861,8 @@ fn buildModuleWithOverrides(
     }
 
     // Top-level property initialisers — const first, then the rest.
-    var top_level_props: std.ArrayList(NameFunc) = .empty;
-    var top_level_delegated_props = std.StringHashMap(void).init(a);
+    var top_level_props: std.ArrayList(NameFunc) = if (seed) |*s| s.top_level_props else .empty;
+    var top_level_delegated_props = if (seed) |*s| s.top_level_delegated_props else std.StringHashMap(void).init(a);
     for (decls) |*d| {
         if (d.* != .Property) continue;
         const p = &d.Property;
@@ -1818,8 +1896,8 @@ fn buildModuleWithOverrides(
     }
 
     // Top-level + companion/object extension properties.
-    var extension_props = PairFuncMap.init(a);
-    var extension_prop_setters = PairFuncMap.init(a);
+    var extension_props = if (seed) |*s| s.extension_props else PairFuncMap.init(a);
+    var extension_prop_setters = if (seed) |*s| s.extension_prop_setters else PairFuncMap.init(a);
     const ExtPropDecl = struct { p: *const ast.Property, owner: ?[]const u8 };
     var ext_prop_decls: std.ArrayList(ExtPropDecl) = .empty;
     defer ext_prop_decls.deinit(a);
@@ -1920,8 +1998,12 @@ fn buildModuleWithOverrides(
     // Rewrite function-type alias names in lowered param types so every
     // applicability/score consumer sees the `Function{N}` tag — a param
     // declared `handler: CompletionHandler` is function-typed for
-    // trailing-lambda alignment and overload scoring.
-    for (module.funcs.items) |*f| {
+    // trailing-lambda alignment and overload scoring. In an extending build
+    // only this build's funcs rewrite: base params were settled at base
+    // build time, and their slices are shared with the immutable base (a
+    // user alias that WOULD match a base param type name is screened out by
+    // `canExtendBase`, which falls back to the whole-program build).
+    for (module.funcs.items[base_funcs_len..]) |*f| {
         for (f.params) |*p| {
             const resolved = module.registry.type_aliases.get(p.ty.name) orelse continue;
             if (std.mem.startsWith(u8, resolved, "Function")) p.ty.name = resolved;
@@ -1931,7 +2013,9 @@ fn buildModuleWithOverrides(
     // Materialise the module-scoped registry the Vm reads at dispatch time.
     // Object names, companion singletons, enclosing-class, func type params,
     // delegated props (the lowering-only registry fields stay in place).
-    for (object_names.items) |n| try module.registry.object_names.append(a, n);
+    // Seeded base object names are already in the cloned registry; append
+    // only this build's.
+    for (object_names.items[base_object_names_len..]) |n| try module.registry.object_names.append(a, n);
     {
         var it = companion_singletons.iterator();
         while (it.next()) |e| try module.registry.companion_singletons.put(e.key_ptr.*, e.value_ptr.*);
@@ -2359,6 +2443,394 @@ fn isCollectionFactoryName(n: []const u8) bool {
         if (std.mem.eql(u8, n, k)) return true;
     }
     return false;
+}
+
+// -------------------------------------------------------------------------
+// Once-per-process dependency base: the stdlib (+ pack) files are lowered
+// one time into an immutable snapshot; each program then extends an
+// arena-backed clone with just its own declarations. The snapshot's
+// BuiltModule is NEVER run — every runtime-mutable structure (the Vm's
+// ClassDefs, enum-entry instances, companion/object cells) is deep-cloned
+// per program, so nothing a run mutates is shared across programs.
+// -------------------------------------------------------------------------
+
+/// Immutable lowered snapshot of a program's dependency files. Owned by a
+/// process-lifetime arena managed by the caller; safe to read from many
+/// threads once built.
+pub const StdlibBase = struct {
+    /// The lowered dependency program. Cloned (never consumed) per run.
+    built: BuiltModule,
+    /// Post-lift, post-retain dependency decls: the context universe the
+    /// extending build scans (file_classes, inline fns, top-level prop
+    /// names) without re-lowering.
+    lifted_decls: []const Decl,
+    /// Every top-level simple name the base declares (functions,
+    /// properties, classes, objects, typealiases — raw and post-lift).
+    /// A user program redeclaring any of these falls back to the full
+    /// whole-program build, because cross-boundary renames/mangles and
+    /// resolution could differ from the snapshot's.
+    decl_names: StringSet,
+    /// Packages the base files declare; a user file sharing one falls back
+    /// (pack-private object aliasing scans sibling types per package).
+    packages: StringSet,
+    /// Every lowered base Func param type name. A user function-type
+    /// typealias matching one would rewrite base param types in the
+    /// whole-program build; the extend build falls back instead.
+    param_type_names: StringSet,
+    /// Top-level type simple names (post-lift), seeded into the extending
+    /// build's nested-mangle collision universe.
+    type_names: StringSet,
+    /// (FuncId, AST) pairs replayed into the per-build inline-fn registry
+    /// so user calls resolving to base inline fns still splice.
+    inline_ids: []const InlineId,
+    /// Base SourceMap files occupy ids [0..user_file_start).
+    user_file_start: u32,
+    /// Next enum-entry identity, continuing the base build's sequence so
+    /// default toString/hashCode match the whole-program numbering.
+    enum_id_next: u64,
+
+    pub const InlineId = struct { id: u32, f: *const ast.Function };
+};
+
+/// Build the dependency snapshot from already-parsed base files. The
+/// allocator must be the process-lifetime base arena. Returns null when the
+/// base program is not snapshot-safe (it has resolve diagnostics or a
+/// `main`), in which case callers must use the full per-program build.
+pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocator.Error!?*StdlibBase {
+    var lifted: []Decl = &.{};
+    var built = try buildModuleFilesInner(allocator, files, null, &lifted);
+    {
+        const mg = built.module.borrow();
+        defer mg.deinit();
+        if (mg.get().resolve_diags.items.len != 0 or built.main != null) {
+            built.deinit();
+            return null;
+        }
+    }
+
+    const base = try allocator.create(StdlibBase);
+    base.* = .{
+        .built = built,
+        .lifted_decls = lifted,
+        .decl_names = StringSet.init(allocator),
+        .packages = StringSet.init(allocator),
+        .param_type_names = StringSet.init(allocator),
+        .type_names = StringSet.init(allocator),
+        .inline_ids = &.{},
+        .user_file_start = 0,
+        .enum_id_next = 1,
+    };
+
+    // Name universes for the reuse gate, over raw AND lifted decls (a
+    // lifted/mangled name is a real top-level slot too).
+    for (files) |*f| {
+        if (f.package) |p| {
+            var dotted: std.ArrayList(u8) = .empty;
+            for (p.path, 0..) |id, i| {
+                if (i != 0) try dotted.append(allocator, '.');
+                try dotted.appendSlice(allocator, id.name);
+            }
+            try base.packages.put(try dotted.toOwnedSlice(allocator), {});
+        }
+        for (f.decls) |*d| try noteBaseDeclNames(base, d);
+    }
+    for (base.lifted_decls) |*d| try noteBaseDeclNames(base, d);
+
+    {
+        const mg = base.built.module.borrow();
+        defer mg.deinit();
+        const module = mg.get();
+        var inline_ids: std.ArrayList(StdlibBase.InlineId) = .empty;
+        for (module.funcs.items) |*f| {
+            for (f.params) |*p| try base.param_type_names.put(p.ty.name, {});
+            if (f.is_inline) {
+                if (ir.lower.inline_state.inlineAstById(f.id.int())) |fn_ast| {
+                    try inline_ids.append(allocator, .{ .id = f.id.int(), .f = fn_ast });
+                }
+            }
+        }
+        base.inline_ids = try inline_ids.toOwnedSlice(allocator);
+    }
+
+    // Continue the enum-entry identity sequence after the base's: identities
+    // were assigned 1..N in build order over the base's unique class defs.
+    {
+        var counted = std.AutoHashMap(usize, void).init(allocator);
+        defer counted.deinit();
+        var n: u64 = 0;
+        var it = base.built.classes.valueIterator();
+        while (it.next()) |def| {
+            const gop = try counted.getOrPut(@intFromPtr(def.cell));
+            if (gop.found_existing) continue;
+            const g = def.borrow();
+            n += g.get().enum_entries.len;
+            g.deinit();
+        }
+        base.enum_id_next = 1 + n;
+    }
+
+    return base;
+}
+
+fn noteBaseDeclNames(base: *StdlibBase, d: *const Decl) Allocator.Error!void {
+    switch (d.*) {
+        .Function => |*f| try base.decl_names.put(f.name.name, {}),
+        .Property => |*p| try base.decl_names.put(p.name.name, {}),
+        .Class => |*c| {
+            try base.decl_names.put(c.name.name, {});
+            try base.type_names.put(c.name.name, {});
+        },
+        .Object => |*o| {
+            try base.decl_names.put(o.name.name, {});
+            try base.type_names.put(o.name.name, {});
+        },
+        .TypeAlias => |*t| {
+            try base.decl_names.put(t.name.name, {});
+            try base.type_names.put(t.name.name, {});
+        },
+    }
+}
+
+/// Whether `user_files` can extend `base` without changing any decision the
+/// base build already settled. Conservative: any top-level simple-name
+/// overlap (either namespace), any expect/actual decl, any package overlap,
+/// or a function-type alias matching a base param type forces the full
+/// whole-program build.
+pub fn canExtendBase(base: *const StdlibBase, user_files: []const KotlinFile) bool {
+    for (user_files) |*f| {
+        if (f.package) |p| {
+            var buf: [256]u8 = undefined;
+            var n: usize = 0;
+            for (p.path, 0..) |id, i| {
+                if (i != 0) {
+                    if (n >= buf.len) return false;
+                    buf[n] = '.';
+                    n += 1;
+                }
+                if (n + id.name.len > buf.len) return false;
+                @memcpy(buf[n .. n + id.name.len], id.name);
+                n += id.name.len;
+            }
+            if (base.packages.contains(buf[0..n])) return false;
+        }
+        for (f.decls) |*d| {
+            switch (d.*) {
+                .Function => |*fd| {
+                    if (fd.is_expect or fd.is_actual) return false;
+                    if (base.decl_names.contains(fd.name.name)) return false;
+                },
+                .Property => |*pd| {
+                    if (pd.is_expect or pd.is_actual) return false;
+                    if (base.decl_names.contains(pd.name.name)) return false;
+                },
+                .Class => |*cd| {
+                    if (cd.is_expect or cd.is_actual) return false;
+                    if (base.decl_names.contains(cd.name.name)) return false;
+                },
+                .Object => |*od| {
+                    if (od.is_expect or od.is_actual) return false;
+                    if (base.decl_names.contains(od.name.name)) return false;
+                },
+                .TypeAlias => |*td| {
+                    if (base.decl_names.contains(td.name.name)) return false;
+                    if (td.target.function != null and base.param_type_names.contains(td.name.name)) return false;
+                },
+            }
+        }
+    }
+    return true;
+}
+
+/// Per-run clone of the base's BuiltModule onto `a`. Spines are copied;
+/// lowered leaf data (instructions, strings, thunk-id slices) is shared
+/// with the immutable base. Runtime-mutable graphs (the ClassDef table,
+/// enum-entry instances, companion/object/captured-env cells) are deep
+/// cloned so a run can never write through to the base.
+fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!BuiltModule {
+    const module_clone = blk: {
+        const mg = base.module.borrow();
+        defer mg.deinit();
+        break :blk try mg.get().cloneForExtend(a);
+    };
+    const module_ref = try ObjRef(Module).init(a, module_clone);
+    var out = emptyBuilt(a, module_ref, base.main);
+
+    out.classes.deinit();
+    out.classes = try cloneClassTableForRun(a, &base.classes);
+
+    try copyPairMap(&out.body_prop_inits, &base.body_prop_inits);
+    try copyPairMap(&out.instance_prop_getters, &base.instance_prop_getters);
+    try copyPairMap(&out.instance_prop_setters, &base.instance_prop_setters);
+    try copyStrMap([]FuncId, &out.parent_ctor_args, &base.parent_ctor_args);
+    try copyStrMap([]FuncId, &out.init_blocks, &base.init_blocks);
+    try out.top_level_props.appendSlice(a, base.top_level_props.items);
+    try copyPairMap(&out.extension_props, &base.extension_props);
+    try copyPairMap(&out.extension_prop_setters, &base.extension_prop_setters);
+    try out.object_names.appendSlice(a, base.object_names.items);
+    try copyStrMap([]const u8, &out.companion_singletons, &base.companion_singletons);
+    try out.enum_entry_arg_inits.appendSlice(a, base.enum_entry_arg_inits.items);
+    try copyStrMap([]SecondaryCtorEntry, &out.secondary_ctors, &base.secondary_ctors);
+    try copyStrMap([]?FuncId, &out.primary_ctor_default_thunks, &base.primary_ctor_default_thunks);
+    try copyStrMap([]StrFunc, &out.class_delegates, &base.class_delegates);
+    {
+        var it = base.func_defaults.iterator();
+        while (it.next()) |e| try out.func_defaults.put(e.key_ptr.*, e.value_ptr.*);
+    }
+    try copyStrMap([]const u8, &out.enclosing_class, &base.enclosing_class);
+    {
+        var it = base.enum_entry_methods.iterator();
+        while (it.next()) |e| try out.enum_entry_methods.put(e.key_ptr.*, e.value_ptr.*);
+    }
+    {
+        var it = base.enum_entry_synth_class.iterator();
+        while (it.next()) |e| try out.enum_entry_synth_class.put(e.key_ptr.*, e.value_ptr.*);
+    }
+    {
+        var it = base.func_type_params.iterator();
+        while (it.next()) |e| try out.func_type_params.put(e.key_ptr.*, e.value_ptr.*);
+    }
+    {
+        var it = base.top_level_delegated_props.keyIterator();
+        while (it.next()) |k| try out.top_level_delegated_props.put(k.*, {});
+    }
+    {
+        var it = base.delegated_body_props.keyIterator();
+        while (it.next()) |k| try out.delegated_body_props.put(k.*, {});
+    }
+    return out;
+}
+
+fn copyPairMap(dst: *PairFuncMap, src: *const PairFuncMap) Allocator.Error!void {
+    var it = src.iterator();
+    while (it.next()) |e| try dst.put(e.key_ptr.*, e.value_ptr.*);
+}
+
+fn copyStrMap(comptime V: type, dst: *std.StringHashMap(V), src: *const std.StringHashMap(V)) Allocator.Error!void {
+    var it = src.iterator();
+    while (it.next()) |e| try dst.put(e.key_ptr.*, e.value_ptr.*);
+}
+
+/// Deep-clone the runtime ClassDef graph: a run mutates ClassDefs (startup
+/// patches enum-entry instance fields; companions and object singletons
+/// fill lazily), so per-run defs must be private. Lowered/AST leaf slices
+/// (methods, properties, ctor metadata) stay shared with the base.
+fn cloneClassTableForRun(a: Allocator, src: *const ClassTable) Allocator.Error!ClassTable {
+    var remap = std.AutoHashMap(usize, ObjRef(ClassDef)).init(a);
+    defer remap.deinit();
+
+    // Pass 1: shells for every unique def cell.
+    {
+        var it = src.valueIterator();
+        while (it.next()) |def| {
+            const key = @intFromPtr(def.cell);
+            if (remap.contains(key)) continue;
+            const g = def.borrow();
+            var copy: ClassDef = g.get().*;
+            g.deinit();
+            copy.companion = try ObjRef(?ObjRef(InstanceData)).init(a, null);
+            copy.object_singleton = try ObjRef(?ObjRef(InstanceData)).init(a, null);
+            copy.enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(a, null);
+            copy.captured_env = try ObjRef(Env).init(a, Env.init(a));
+            copy.parent = null;
+            copy.interfaces = &.{};
+            copy.nested_classes = &.{};
+            copy.enum_entries = &.{};
+            try remap.put(key, try ObjRef(ClassDef).init(a, copy));
+        }
+    }
+
+    // Pass 2: re-link the graph through the remap and deep-clone the
+    // runtime-mutable payloads.
+    {
+        var it = src.valueIterator();
+        while (it.next()) |def| {
+            const key = @intFromPtr(def.cell);
+            const cloned = remap.get(key).?;
+            const sg = def.borrow();
+            defer sg.deinit();
+            const s = sg.get();
+            const cg = cloned.borrowMut();
+            defer cg.deinit();
+            const c = cg.get();
+
+            if (s.parent) |p| {
+                if (remap.get(@intFromPtr(p.cell))) |np| c.parent = np.clone();
+            }
+            if (s.interfaces.len != 0) {
+                const ifaces = try a.alloc(ObjRef(ClassDef), s.interfaces.len);
+                for (s.interfaces, 0..) |iface, i| {
+                    ifaces[i] = if (remap.get(@intFromPtr(iface.cell))) |ni| ni.clone() else iface.clone();
+                }
+                c.interfaces = ifaces;
+            }
+            if (s.nested_classes.len != 0) {
+                const nested = try a.alloc(ClassDef.NestedClass, s.nested_classes.len);
+                for (s.nested_classes, 0..) |nc, i| {
+                    nested[i] = .{
+                        .name = nc.name,
+                        .class = if (remap.get(@intFromPtr(nc.class.cell))) |nn| nn.clone() else nc.class.clone(),
+                    };
+                }
+                c.nested_classes = nested;
+            }
+            {
+                const eg = s.enclosing_class.borrow();
+                const enc = eg.get().*;
+                eg.deinit();
+                if (enc) |ec| {
+                    const mapped = if (remap.get(@intFromPtr(ec.cell))) |ne| ne.clone() else ec.clone();
+                    const cgi = c.enclosing_class.borrowMut();
+                    cgi.get().* = mapped;
+                    cgi.deinit();
+                }
+            }
+            if (s.enum_entries.len != 0) {
+                const entries = try a.alloc(ClassDef.EnumEntry, s.enum_entries.len);
+                for (s.enum_entries, 0..) |entry, i| {
+                    entries[i] = .{ .name = entry.name, .value = try cloneBuildValue(a, &remap, entry.value) };
+                }
+                c.enum_entries = entries;
+            }
+        }
+    }
+
+    var out = ClassTable.init(a);
+    var kit = src.iterator();
+    while (kit.next()) |e| {
+        try out.put(e.key_ptr.*, remap.get(@intFromPtr(e.value_ptr.cell)).?.clone());
+    }
+    // Drop the construction handles; the table's clones keep the cells live.
+    var rit = remap.valueIterator();
+    while (rit.next()) |r| r.deinit();
+    return out;
+}
+
+/// Clone a build-time Value reachable from an enum entry. Instances are
+/// deep-cloned (their fields are patched at startup); every other variant
+/// is shared — at build time those are immutable payloads (entry-name
+/// strings, ordinals) the run never writes through.
+fn cloneBuildValue(a: Allocator, remap: *const std.AutoHashMap(usize, ObjRef(ClassDef)), v: Value) Allocator.Error!Value {
+    switch (v) {
+        .Instance => |inst| {
+            const g = inst.borrow();
+            defer g.deinit();
+            const s = g.get();
+            var fields: std.ArrayList(InstanceData.Field) = .empty;
+            for (s.fields.items) |f| {
+                try fields.append(a, .{ .name = f.name, .value = try cloneBuildValue(a, remap, f.value) });
+            }
+            const cls = if (remap.get(@intFromPtr(s.class.cell))) |nc| nc.clone() else s.class.clone();
+            const copy = try ObjRef(InstanceData).init(a, .{
+                .class = cls,
+                .fields = fields,
+                .outer = s.outer,
+                .identity = s.identity,
+                .native_state = s.native_state,
+            });
+            return .{ .Instance = copy };
+        },
+        else => return v,
+    }
 }
 
 // -------------------------------------------------------------------------
