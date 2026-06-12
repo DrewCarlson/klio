@@ -117,6 +117,12 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-ktor-client",
     } },
+    // Reified inline Json extension shapes through the installed pack
+    // (kotlinc-verified expected output; the in-process parity harness
+    // does not fold in the serialization pack).
+    .{ .name = "json_reified_inline", .parity_data = false, .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-serialization",
+    } },
 };
 
 /// Read by every parity-pipeline run: the stdlib pack is built at runtime from

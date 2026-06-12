@@ -32,7 +32,8 @@ public class KlioClientEngine(
     override val supportedCapabilities: Set<HttpClientEngineCapability<*>> = emptySet()
 
     override suspend fun execute(data: HttpRequestData): HttpResponseData {
-        val bodyText = when (val body = data.body) {
+        val body = data.body
+        val bodyText = when (body) {
             is OutgoingContent.ByteArrayContent -> body.bytes().decodeToString()
             else -> ""
         }
@@ -42,6 +43,21 @@ public class KlioClientEngine(
                 flat.add(key)
                 flat.add(value)
             }
+        }
+        // An OutgoingContent carries its own headers and content type
+        // (a serialized `TextContent` body rides its Content-Type here,
+        // not in the request headers); merge them onto the wire the way
+        // the upstream engines do.
+        body.headers.forEach { key, values ->
+            for (value in values) {
+                flat.add(key)
+                flat.add(value)
+            }
+        }
+        val bodyType = body.contentType
+        if (bodyType != null && !data.headers.contains(HttpHeaders.ContentType) && !body.headers.contains(HttpHeaders.ContentType)) {
+            flat.add(HttpHeaders.ContentType)
+            flat.add(bodyType.toString())
         }
         val parts = __kktor_request(
             data.method.value,

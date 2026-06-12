@@ -239,3 +239,54 @@ test "file_private_top_level_props" {
         },
     }
 }
+
+test "file_private_types" {
+    const a = arenaAllocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const res = try parity.runFilesWithPacks(a, io, &.{
+        CORPUS_DIR ++ "/file_private_types/file_a.kt",
+        CORPUS_DIR ++ "/file_private_types/file_b.kt",
+    });
+    switch (res) {
+        .ok => |got| try std.testing.expectEqualStrings(
+            \\yx
+            \\ab
+            \\
+        , got),
+        .err => |m| {
+            std.debug.print("parity corpus file_private_types: klio error: {s}\n", .{m});
+            return error.KlioRunFailed;
+        },
+    }
+}
+
+test "internal_props_cross_package" {
+    const a = arenaAllocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const res = try parity.runFilesWithPacks(a, io, &.{
+        CORPUS_DIR ++ "/internal_props/alpha.kt",
+        CORPUS_DIR ++ "/internal_props/beta.kt",
+        CORPUS_DIR ++ "/internal_props/main.kt",
+    });
+    switch (res) {
+        .ok => |got| try std.testing.expectEqualStrings(
+            \\alpha-state
+            \\beta-state
+            \\1
+            \\101
+            \\2
+            \\102
+            \\501
+            \\3
+            \\
+        , got),
+        .err => |m| {
+            std.debug.print("parity corpus internal_props: klio error: {s}\n", .{m});
+            return error.KlioRunFailed;
+        },
+    }
+}

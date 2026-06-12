@@ -328,6 +328,179 @@ fn unifyTypeParam(
     }
 }
 
+/// Add `ty`'s head name (and its generic arguments', recursively) to `out`.
+fn putTypeRefNames(ty: *const TypeRef, out: *ast_scan.StringSet) Allocator.Error!void {
+    try out.put(ty.name.name, {});
+    for (ty.type_args) |*targ| {
+        if (!targ.is_star) try putTypeRefNames(&targ.ty, out);
+    }
+    if (ty.function) |ft| {
+        if (ft.receiver) |*r| try putTypeRefNames(r, out);
+        for (ft.params) |*p| try putTypeRefNames(p, out);
+        try putTypeRefNames(&ft.ret, out);
+    }
+}
+
+/// Collect the type names a body resolves at runtime — `as T` / `is T`
+/// targets, call-site type arguments, and `when` is-patterns — recursing
+/// the same expression shapes `collectPathIdents` walks. Together the two
+/// scans decide whether a reified inline extension's body ever reads a
+/// reified parameter.
+fn collectRuntimeTypeNames(e: *const Expr, out: *ast_scan.StringSet) Allocator.Error!void {
+    switch (e.*) {
+        .As => |u| {
+            try putTypeRefNames(&u.ty, out);
+            try collectRuntimeTypeNames(u.expr, out);
+        },
+        .IsCheck => |u| {
+            try putTypeRefNames(&u.ty, out);
+            try collectRuntimeTypeNames(u.expr, out);
+        },
+        .Call => |c| {
+            for (c.type_args) |*ta| try putTypeRefNames(ta, out);
+            try collectRuntimeTypeNames(c.callee, out);
+            for (c.args) |*a| try collectRuntimeTypeNames(a, out);
+        },
+        .When => |w| {
+            if (w.subject) |s| try collectRuntimeTypeNames(s, out);
+            for (w.branches) |*br| {
+                for (br.patterns) |*p| switch (p.kind) {
+                    .IsType, .NotIsType => |ty| try putTypeRefNames(&ty, out),
+                    .Value, .InRange, .NotInRange => |*ve| try collectRuntimeTypeNames(ve, out),
+                    .Else => {},
+                };
+                try collectRuntimeTypeNames(&br.body, out);
+            }
+        },
+        .Member => |m| try collectRuntimeTypeNames(m.receiver, out),
+        .MemberRef => |m| try collectRuntimeTypeNames(m.receiver, out),
+        .Index => |idx| {
+            try collectRuntimeTypeNames(idx.receiver, out);
+            for (idx.args) |*a| try collectRuntimeTypeNames(a, out);
+        },
+        .Binary => |bin| {
+            try collectRuntimeTypeNames(bin.lhs, out);
+            try collectRuntimeTypeNames(bin.rhs, out);
+        },
+        .Unary => |u| try collectRuntimeTypeNames(u.expr, out),
+        .Postfix => |u| try collectRuntimeTypeNames(u.expr, out),
+        .Spread => |u| try collectRuntimeTypeNames(u.expr, out),
+        .Throw => |u| try collectRuntimeTypeNames(u.value, out),
+        .Labeled => |u| try collectRuntimeTypeNames(u.expr, out),
+        .If => |f| {
+            try collectRuntimeTypeNames(f.cond, out);
+            try collectRuntimeTypeNames(f.then_branch, out);
+            if (f.else_branch) |els| try collectRuntimeTypeNames(els, out);
+        },
+        .While => |w| {
+            try collectRuntimeTypeNames(w.cond, out);
+            try collectRuntimeTypeNames(w.body, out);
+        },
+        .DoWhile => |w| {
+            if (w.body) |b| try collectRuntimeTypeNames(b, out);
+            try collectRuntimeTypeNames(w.cond, out);
+        },
+        .For => |f| {
+            try collectRuntimeTypeNames(f.iter, out);
+            try collectRuntimeTypeNames(f.body, out);
+        },
+        .Return => |r| {
+            if (r.value) |v| try collectRuntimeTypeNames(v, out);
+        },
+        .Block => |b| {
+            for (b.stmts) |*s| try collectRuntimeTypeNamesStmt(s, out);
+        },
+        .Lambda => |l| {
+            for (l.body.stmts) |*s| try collectRuntimeTypeNamesStmt(s, out);
+        },
+        .AnonFun => |af| {
+            if (af.body) |fb| switch (fb.*) {
+                .Block => |b| {
+                    for (b.stmts) |*s| try collectRuntimeTypeNamesStmt(s, out);
+                },
+                .Expr => |*ex| try collectRuntimeTypeNames(ex, out),
+            };
+        },
+        .Try => |t| {
+            for (t.body.stmts) |*s| try collectRuntimeTypeNamesStmt(s, out);
+            for (t.catches) |*c| {
+                try putTypeRefNames(&c.ty, out);
+                for (c.body.stmts) |*s| try collectRuntimeTypeNamesStmt(s, out);
+            }
+            if (t.finally) |fb| {
+                for (fb.stmts) |*s| try collectRuntimeTypeNamesStmt(s, out);
+            }
+        },
+        .StringTemplate => |st| {
+            for (st.parts) |*p| switch (p.*) {
+                .Interp => |*ex| try collectRuntimeTypeNames(ex, out),
+                else => {},
+            };
+        },
+        else => {},
+    }
+}
+
+fn collectRuntimeTypeNamesStmt(s: *const Stmt, out: *ast_scan.StringSet) Allocator.Error!void {
+    switch (s.*) {
+        .Expr => |*e| try collectRuntimeTypeNames(e, out),
+        .Assign => |a| {
+            try collectRuntimeTypeNames(&a.target, out);
+            try collectRuntimeTypeNames(&a.value, out);
+        },
+        .DestructuringDecl => |d| try collectRuntimeTypeNames(&d.init, out),
+        .Decl => |d| switch (d) {
+            .Property => |p| {
+                if (p.init) |*e| try collectRuntimeTypeNames(e, out);
+                if (p.delegate) |*e| try collectRuntimeTypeNames(e, out);
+            },
+            .Function => |f| {
+                if (f.body) |fb| switch (fb) {
+                    .Block => |b| {
+                        for (b.stmts) |*st2| try collectRuntimeTypeNamesStmt(st2, out);
+                    },
+                    .Expr => |*ex| try collectRuntimeTypeNames(ex, out),
+                };
+            },
+            else => {},
+        },
+    }
+}
+
+/// Whether `f`'s body never references any of its reified type
+/// parameters — neither as a bare name (`T::class` reads through the
+/// `Path` head) nor in a runtime type position (`as T`, `is T`, a
+/// call-site type argument, a `when` is-pattern, a catch type). Such a
+/// body can splice with no binding for the reified parameter, which is
+/// what a call with no explicit type arguments and no expected type
+/// needs (`Json.encodeToString(value)` in a hook lambda).
+pub fn reifiedParamsUnusedInBody(allocator: Allocator, f: *const Function) Allocator.Error!bool {
+    var any_reified = false;
+    for (f.type_params) |tp| {
+        if (tp.is_reified) any_reified = true;
+    }
+    if (!any_reified) return true;
+    const body = if (f.body) |*fb| fb else return false;
+    var used = ast_scan.StringSet.init(allocator);
+    defer used.deinit();
+    switch (body.*) {
+        .Expr => |*e| {
+            try ast_scan.collectPathIdents(e, &used);
+            try collectRuntimeTypeNames(e, &used);
+        },
+        .Block => |*blk| {
+            for (blk.stmts) |*s| {
+                try ast_scan.collectPathIdentsStmt(s, &used);
+                try collectRuntimeTypeNamesStmt(s, &used);
+            }
+        },
+    }
+    for (f.type_params) |tp| {
+        if (tp.is_reified and used.contains(tp.name.name)) return false;
+    }
+    return true;
+}
+
 /// Expand a call to a `suspend inline fun` by splicing its body into
 /// the caller. `type_args` carries the call-site `<T = SomeType>` for
 /// reified type parameters so the splice can bind each reified
@@ -377,6 +550,22 @@ pub fn tryInlineCallWithTypeArgs(
         return null;
     }
     const body = if (f.body) |*body_ref| body_ref else return null;
+
+    // A reified parameter that stays unbound after explicit-argument and
+    // expected-type inference must not be one the body actually reads —
+    // splicing would leave `T::class` / `is T` dangling. Decline the
+    // splice instead; the member-dispatch fallback binds runtime type
+    // arguments. A body that never reads its reified parameters (the
+    // `Json.encodeToString(value)` shape) splices fine without a binding.
+    {
+        const probe = try inferReifiedTypeArgs(b.allocator, f, type_args, expected);
+        defer b.allocator.free(probe);
+        var unbound_reified = false;
+        for (f.type_params, 0..) |tp, i| {
+            if (tp.is_reified and probe[i] == null) unbound_reified = true;
+        }
+        if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) return null;
+    }
 
     var ordered = try b.allocator.alloc(?*const Expr, f.params.len);
     defer b.allocator.free(ordered);

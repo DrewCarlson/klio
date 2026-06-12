@@ -71,18 +71,20 @@ pub fn setLowerSelfPackage(pkg: []const u8) []const u8 {
     return prev;
 }
 
-/// File-private top-level property renames: span FileId -> (simple name ->
-/// mangled global name). Kotlin scopes a `private` top-level property to
-/// its declaring file, but the lowered globals table is flat, so the build
-/// driver mangles a private property whose simple name another file also
-/// declares and bare references resolve through the reference's own span
-/// file (an inline-spliced body keeps its declaring file's spans, so a
-/// splice still reads the right file's property).
+/// Per-file top-level property renames: span FileId -> (simple name ->
+/// renamed global name). Kotlin scopes a `private` top-level property to
+/// its declaring file and gives same-named top-level properties in
+/// different packages distinct storage, but the lowered globals table is
+/// flat, so the build driver renames colliding declarations (per-file
+/// mangle for `private`, declaring-FQN slots across packages) and bare
+/// references resolve through the reference's own span file (an
+/// inline-spliced body keeps its declaring file's spans, so a splice
+/// still reads the right file's property).
 pub const FilePrivateRenames = std.AutoHashMap(u32, std.StringHashMap([]const u8));
 
 threadlocal var lower_file_private_renames: ?*const FilePrivateRenames = null;
 
-/// Install the per-file private-property rename table for the duration of
+/// Install the per-file property rename table for the duration of
 /// a lowering pass. Returns the previous value for restoration.
 pub fn setLowerFilePrivateRenames(m: ?*const FilePrivateRenames) ?*const FilePrivateRenames {
     const prev = lower_file_private_renames;
@@ -90,12 +92,74 @@ pub fn setLowerFilePrivateRenames(m: ?*const FilePrivateRenames) ?*const FilePri
     return prev;
 }
 
-/// The mangled global name for `name` referenced from `file`, when that
-/// file declares it as a renamed file-private top-level property.
+/// The renamed global name for `name` referenced from `file`, when that
+/// file resolves it to a renamed top-level property.
 pub fn filePrivateRename(name: []const u8, file: u32) ?[]const u8 {
     const m = lower_file_private_renames orelse return null;
     const inner = m.get(file) orelse return null;
     return inner.get(name);
+}
+
+/// File-keyed type renames: span FileId -> (simple type name -> mangled
+/// lift name). Kotlin scopes a file-`private` top-level class or
+/// typealias to its declaring file; the build driver mangles one whose
+/// simple name another file also claims as a type, and references —
+/// value-position heads and type positions (`as` / `is` / supertypes) —
+/// rewrite through the reference's own span file.
+pub const FileTypeRenames = std.AutoHashMap(u32, std.StringHashMap([]const u8));
+
+threadlocal var lower_file_type_renames: ?*const FileTypeRenames = null;
+
+/// Install the per-file type rename table for the duration of a lowering
+/// pass. Returns the previous value for restoration.
+pub fn setLowerFileTypeRenames(m: ?*const FileTypeRenames) ?*const FileTypeRenames {
+    const prev = lower_file_type_renames;
+    lower_file_type_renames = m;
+    return prev;
+}
+
+/// The mangled lift name for the type `name` referenced from `file`, when
+/// that file declares it as a renamed file-private class or typealias.
+pub fn fileTypeRename(name: []const u8, file: u32) ?[]const u8 {
+    const m = lower_file_type_renames orelse return null;
+    const inner = m.get(file) orelse return null;
+    return inner.get(name);
+}
+
+/// The whole per-file type rename map for `file`, for callers that
+/// flatten the visible renames (the `BuildObject` scope snapshot).
+pub fn fileTypeRenamesFor(file: u32) ?*const std.StringHashMap([]const u8) {
+    const m = lower_file_type_renames orelse return null;
+    return m.getPtr(file);
+}
+
+/// Scope-true renames carried into a runtime anon-object member-body
+/// lowering: the lexical site's flattened rename snapshot from the
+/// `BuildObject` instruction. Installed around the side-module lowering
+/// and consulted by `scopeTypeRename` after the (empty) chain walk.
+threadlocal var lower_anon_scope_renames: []const ir.ScopeRename = &.{};
+
+/// Install the anon-scope rename snapshot. Returns the previous value
+/// for restoration.
+pub fn setLowerAnonScopeRenames(rs: []const ir.ScopeRename) []const ir.ScopeRename {
+    const prev = lower_anon_scope_renames;
+    lower_anon_scope_renames = rs;
+    return prev;
+}
+
+/// The currently-installed anon-scope rename snapshot (empty outside an
+/// anon-object member-body lowering).
+pub fn anonScopeRenames() []const ir.ScopeRename {
+    return lower_anon_scope_renames;
+}
+
+/// The rename for `name` in the installed anon-scope snapshot; first
+/// entry wins (nearer scopes were flattened first).
+pub fn anonScopeRename(name: []const u8) ?[]const u8 {
+    for (lower_anon_scope_renames) |r| {
+        if (std.mem.eql(u8, r.name, name)) return r.renamed;
+    }
+    return null;
 }
 
 pub const FuncBuilder = struct {

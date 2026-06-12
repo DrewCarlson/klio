@@ -923,10 +923,14 @@ requests (the send-count oracle).
 (`createClientPlugin` + `transformRequestBody`/`transformResponseBody`, the
 same hooks `HttpPlainText` uses). The response hook decodes a `body<T>()`
 request the default transformers don't cover via the kotlinx-serialization
-bridge (`Json.decodeToClass(text, requestedType.type)`); the request hook
-serializes a non-primitive `setBody(value)` to a JSON `TextContent` via
-`Json.encodeValue`. `install(ContentNegotiation) { json() }` +
-`resp.body<User>()` round-trips a typed GET (itest-gated).
+bridge (`Json.decodeToClass(text, requestedType.type)` — the requested type
+arrives as a runtime `TypeInfo`, which a reified parameter cannot express;
+upstream's converter resolves a serializer from the `TypeInfo` the same
+way); the request hook serializes a non-primitive `setBody(value)` to a
+JSON `TextContent` through the real reified `Json.encodeToString` (the
+`encodeValue` bridge is deleted). `install(ContentNegotiation) { json() }`
++ `resp.body<User>()` round-trips a typed GET, and a POST `setBody(User)`
+serializes onto the wire (both itest-gated).
 
 Getting the upstream path to single-send root-caused a stack of general
 interpreter bugs, each pinned (parity fixtures in
@@ -986,7 +990,7 @@ interpreter bugs, each pinned (parity fixtures in
 - **`Json.ext(...)`-style extension calls through a companioned class
   name construct the companion**: a user extension whose declared
   receiver matches the class (or an ancestor) now drives the companion
-  singleton gate, so `Json.encodeValue(x)` binds `fun Json.encodeValue`.
+  singleton gate, so `Json.encodeToString(x)` binds the `Json` extension.
 - Diagnostics name themselves: a `call_member`/`get_field`/`set_field`
   miss on an instance prints the class fqn instead of `<instance>`, and
   the `[PATH]` class label prints the fqn. The klio `KtorSimpleLogger`
@@ -994,25 +998,64 @@ interpreter bugs, each pinned (parity fixtures in
   and the charset actual gained the `decode(Source)` overload
   `bodyAsText` drains through.
 
+The three identity/resolution deferrals from the swap are CLOSED — each
+was a general interpreter correctness issue ktor merely surfaced:
+
+- **Private nested classes and file-private top-level types are
+  scope-true.** The lift now always mangles a `private` nested class to
+  `Outer$Inner` (the identity private nested objects already had), with
+  bare references inside the declaring class's subtree rewriting through
+  the enclosing-class alias chain and qualified `Outer.Inner` type
+  positions resolving through the new `mangled_nested` registry. The
+  build driver gives a file-`private` top-level class/typealias whose
+  simple name another file claims a per-file mangled name, with
+  value-position heads, `as`/`is`/`when`-pattern/catch type positions,
+  and supertypes rewriting through the reference's own span file. A
+  runtime anon-object member-body lowering carries its lexical site's
+  flattened rename snapshot on the `BuildObject` instruction (the side
+  module has none of the build's registries). Pinned by
+  `file_private_types/` (a file-private `typealias Node` over a class
+  in one file vs. an object's private nested `class Node` in another —
+  the exact Loader.kt collision, kotlinc-verified). The upstream nonJvm
+  `Loader.kt` IS now consumed under the `client` feature (its private
+  nested `engines.Node` no longer collides with the coroutines pack's
+  file-private `typealias Node`); the posix `HttpClient.kt` actual stays
+  unconsumed because it is another platform's `actual fun HttpClient` —
+  klio's engine-less actual is klio's platform resolution (one engine,
+  bound directly), and two actuals for one expect is a redeclaration.
+- **A reified inline extension through a companioned class name splices
+  in a lambda with no expected type.** The splice gate now also fires
+  when the call head is a companioned class name (`Json` in
+  `Json.encodeToString(user)` inside a hook body), and the splice
+  declines — falling back to runtime dispatch — only when the body
+  actually reads a reified parameter it cannot bind (a new
+  body scan covers bare `T` reads and runtime type positions: `as`/`is`,
+  call-site type args, `when` patterns, catch types). `encodeToString`
+  never reads `T`, so it splices unbound; `decodeFromString<User>(s)`
+  binds `T` from its explicit type argument. The non-reified
+  `Json.encodeValue` bridge is deleted (ContentNegotiation calls the
+  real reified `encodeToString`); `Json.decodeToClass` stays — the
+  response path receives the requested type as a runtime `TypeInfo`
+  `KClass`, which no reified signature can express (upstream's converter
+  is equally runtime-typed there). Gated by the `json_reified_inline`
+  itest (plain body + hook-lambda shapes, kotlinc+serialization-plugin
+  verified) and the new POST `setBody` wire assertion in
+  `ktor_client_get`.
+- **Top-level property slot identity is FQN-true across packages.**
+  Non-private same-simple-name top-level properties declared by two or
+  more packages each get their declaring-FQN global slot; bare reads,
+  writes, and delegates resolve per referencing file in Kotlin's scope
+  order (own-file private > own package > named import > wildcard
+  import), not by another visibility special case. Pinned by
+  `internal_props/` (two packages, `internal val state` +
+  `internal var counter` each, cross-package imported reads and writes,
+  kotlinc-verified).
+
 Known deferred items:
 
 - The async `ByteChannel` write side still needs coroutine-suspension
   fidelity; nothing in the GET path requires it (responses are buffered
   read-side channels).
-- The upstream nonJvm `Loader.kt` + posix `HttpClient.kt` pair is NOT
-  consumed: `Loader.kt`'s private nested `engines.Node` class lifts
-  under its bare name and collides with the coroutines pack's
-  file-private `typealias Node`, mis-typing the LockFreeLinkedList
-  member walk (and `as Node` casts). The klio engine-less actual makes
-  the loader unnecessary; if it is ever consumed, private nested
-  classes need the same scope-true mangling file-private properties got.
-- A reified inline extension called through a companioned class name
-  inside a lambda with no expected type (`Json.encodeToString(x)` in a
-  hook body) does not inline-splice and needs the runtime companion
-  path; the shim avoids the shape via the non-reified bridges.
-- `internal` top-level properties of the same simple name in different
-  packages still share one global slot (the LOGGER fix covers `private`
-  only); package-scoped resolution is a follow-up.
 
 Next: **server core** (`Application`/`ApplicationCall`/routing/
 `respondText` on upstream; klio engine actual over `__kktor_serve`;

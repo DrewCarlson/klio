@@ -83,14 +83,40 @@ const Server = struct {
             const cfd: i32 = @intCast(rc);
             defer _ = linux.close(cfd);
             _ = self.hits.fetchAdd(1, .monotonic);
-            // Drain the request head (one read is enough for a header-only GET).
+            // Read the request until the head is complete plus, for a
+            // request carrying a Content-Length, the full body — a POST's
+            // payload is echoed back so the serialize-request path is
+            // asserted on the wire.
             var buf: [8192]u8 = undefined;
-            _ = linux.read(cfd, &buf, buf.len);
+            var total: usize = 0;
+            var head_end: ?usize = null;
+            var content_len: usize = 0;
+            while (total < buf.len) {
+                const r = linux.read(cfd, buf[total..].ptr, buf.len - total);
+                if (linux.errno(r) != .SUCCESS or r == 0) break;
+                total += r;
+                if (head_end == null) {
+                    if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |idx| {
+                        head_end = idx + 4;
+                        content_len = parseContentLength(buf[0..idx]);
+                    }
+                }
+                if (head_end) |he| {
+                    if (total >= he + content_len) break;
+                }
+            }
+            const is_post = std.mem.startsWith(u8, buf[0..total], "POST ");
+            const body: []const u8 = blk: {
+                if (is_post) {
+                    if (head_end) |he| break :blk buf[he..@min(total, he + content_len)];
+                }
+                break :blk FIXED_BODY;
+            };
             var resp_buf: [512]u8 = undefined;
             const resp = std.fmt.bufPrint(
                 &resp_buf,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-                .{ FIXED_BODY.len, FIXED_BODY },
+                .{ body.len, body },
             ) catch return;
             var off: usize = 0;
             while (off < resp.len) {
@@ -101,6 +127,18 @@ const Server = struct {
         }
     }
 };
+
+/// `Content-Length` value in a request head, or 0 when absent.
+fn parseContentLength(head: []const u8) usize {
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    while (it.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), "content-length")) continue;
+        const v = std.mem.trim(u8, line[colon + 1 ..], " ");
+        return std.fmt.parseInt(usize, v, 10) catch 0;
+    }
+    return 0;
+}
 
 // -------------------------------------------------------------------------
 // Child-process plumbing.
@@ -289,6 +327,39 @@ test "typed body deserializes through client-serialization" {
     , "io.ktor/client-serialization",
         \\user=User(name=Ada, age=36, roles=[ADMIN, USER])
         \\first=ADMIN
+        \\
+    );
+}
+
+test "POST setBody serializes through ContentNegotiation onto the wire" {
+    try runProgram("post_typed",
+        \\import io.ktor.client.*
+        \\import io.ktor.client.plugins.contentnegotiation.*
+        \\import io.ktor.client.request.*
+        \\import io.ktor.client.statement.*
+        \\import io.ktor.http.*
+        \\import io.ktor.serialization.kotlinx.json.*
+        \\import kotlinx.serialization.Serializable
+        \\
+        \\@Serializable
+        \\data class User(val name: String, val age: Int, val roles: List<String>)
+        \\
+        \\suspend fun main() {
+        \\    val client = HttpClient {
+        \\        install(ContentNegotiation) { json() }
+        \\    }
+        \\    val resp = client.post("http://127.0.0.1:PORT/u") {
+        \\        contentType(ContentType.Application.Json)
+        \\        setBody(User("Bo", 7, listOf("USER")))
+        \\    }
+        \\    println("status=" + resp.status)
+        \\    println("echo=" + resp.bodyAsText())
+        \\    client.close()
+        \\}
+        \\
+    , "io.ktor/client-serialization",
+        \\status=200 OK
+        \\echo={"name":"Bo","age":7,"roles":["USER"]}
         \\
     );
 }
