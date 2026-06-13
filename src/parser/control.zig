@@ -757,7 +757,7 @@ pub fn parseLambdaLiteral(p: *Parser) ?Expr {
         .stmts = stmts.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
         .span = sp,
     };
-    return Expr{ .Lambda = .{ .params = header.params, .body = body, .span = sp } };
+    return Expr{ .Lambda = .{ .params = header.params, .param_tys = header.param_tys, .body = body, .span = sp } };
 }
 
 pub fn parseTrailingLambda(p: *Parser) ?Expr {
@@ -801,7 +801,7 @@ pub fn parseTrailingLambda(p: *Parser) ?Expr {
         .stmts = stmts.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
         .span = sp,
     };
-    return Expr{ .Lambda = .{ .params = header.params, .body = body, .span = sp, .implicit_it = implicit_it } };
+    return Expr{ .Lambda = .{ .params = header.params, .param_tys = header.param_tys, .body = body, .span = sp, .implicit_it = implicit_it } };
 }
 
 /// Does the `{ … }` at the cursor have a `params ->` header?
@@ -836,6 +836,9 @@ pub fn lambdaHasHeader(p: *const Parser) bool {
 
 const LambdaHeader = struct {
     params: []Ident,
+    /// Declared type annotations aligned with `params` (`null` per
+    /// unannotated slot); empty when no header was parsed.
+    param_tys: []?TypeRef = &.{},
     dest_stmts: []Stmt,
 };
 
@@ -844,7 +847,7 @@ const LambdaHeader = struct {
 /// destructuring statements that the caller should prepend to the body
 /// — one `val (a, b, …) = $$dest_<i>` per destructured slot.
 pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
-    const empty = LambdaHeader{ .params = &.{}, .dest_stmts = &.{} };
+    const empty = LambdaHeader{ .params = &.{}, .param_tys = &.{}, .dest_stmts = &.{} };
     const save = p.pos;
     support.skipNl(p);
     // Empty `{ -> ... }` form: arrow at front, no params.
@@ -868,6 +871,7 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
     };
     if (at_param_start) {
         var local: std.ArrayList(Ident) = .empty;
+        var local_tys: std.ArrayList(?TypeRef) = .empty;
         const Pending = struct {
             idx: usize,
             names: []Ident,
@@ -883,11 +887,13 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
                         .span = tok.span,
                     }) catch @panic("OOM in parser");
                     support.skipNl(p);
+                    var pty: ?TypeRef = null;
                     if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
                         _ = support.bump(p);
-                        _ = parseType(p);
+                        pty = parseType(p);
                         support.skipNl(p);
                     }
+                    local_tys.append(p.allocator, pty) catch @panic("OOM in parser");
                 },
                 .LParen => {
                     const lparen = support.bump(p);
@@ -932,6 +938,7 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
                     const sp = lparen.span.join(rparen.span);
                     const outer = std.fmt.allocPrint(p.allocator, "$$dest_{d}", .{local.items.len}) catch @panic("OOM in parser");
                     local.append(p.allocator, .{ .name = outer, .span = sp }) catch @panic("OOM in parser");
+                    local_tys.append(p.allocator, null) catch @panic("OOM in parser");
                     pending_dest.append(p.allocator, .{
                         .idx = local.items.len - 1,
                         .names = names.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
@@ -952,6 +959,7 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
         if (std.meta.activeTag(support.peekKind(p).*) == .Arrow) {
             _ = support.bump(p);
             const params = local.toOwnedSlice(p.allocator) catch @panic("OOM in parser");
+            const param_tys = local_tys.toOwnedSlice(p.allocator) catch @panic("OOM in parser");
             var dest_stmts: std.ArrayList(Stmt) = .empty;
             for (pending_dest.items) |pd| {
                 const init = Expr{ .Path = .{
@@ -967,6 +975,7 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
             }
             return LambdaHeader{
                 .params = params,
+                .param_tys = param_tys,
                 .dest_stmts = dest_stmts.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
             };
         }

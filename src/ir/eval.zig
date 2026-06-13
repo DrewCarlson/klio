@@ -1521,7 +1521,21 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // never lexically saw.
             const result = host.callValueNamed(allocator, &callee_v, arg_values_list.items, names_list.items);
             switch (try result) {
-                .ok => |rv| try frame.write(cv.dst, rv),
+                .ok => |rv| {
+                    var out = rv;
+                    // A stdlib container creator dispatched as an
+                    // intrinsic value records its call-site type-argument
+                    // heads on the built container.
+                    if (cv.type_args.len != 0 and callee_v == .Intrinsic) {
+                        var ta: std.ArrayList([]const u8) = .empty;
+                        defer ta.deinit(allocator);
+                        for (cv.type_args) |c| {
+                            try ta.append(allocator, constStr(frame.module, c) orelse "");
+                        }
+                        runtime.attachDeclaredElemTypes(callee_v.Intrinsic.fqn, ta.items, &out);
+                    }
+                    try frame.write(cv.dst, out);
+                },
                 .err => |e| return errResult(e),
             }
         },

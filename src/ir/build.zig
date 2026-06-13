@@ -311,6 +311,11 @@ pub const FuncBuilder = struct {
     /// as its implicit label (`with(n) { … }` → the lambda's body Func
     /// gets `implicit_label = "with"`).
     pending_lambda_label: ?[]const u8 = null,
+    /// The lambda literal about to be lowered is a `suspend { … }`
+    /// expression: its body `Func` is marked `is_suspend` so runtime
+    /// overload dispatch can tell a suspend lambda value from a plain
+    /// one. Consumed (reset) by the lambda lowering.
+    pending_suspend_lambda: bool = false,
     /// Expected type for the expression currently in tail position of a
     /// typed context (a `val x: T = …` initializer, a `fun f(): T = …`
     /// expression body, or `return …`). Lets an inline `reified` call

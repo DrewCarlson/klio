@@ -17,6 +17,7 @@ const vmhost = @import("vmhost.zig");
 const trace = @import("trace.zig");
 const host_call_member = @import("host_call_member.zig");
 const host_globals = @import("host_globals.zig");
+const overload_match = @import("overload_match.zig");
 
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -388,7 +389,10 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
         },
     };
 
-    if (std.mem.eql(u8, nm, v_ty)) return 100;
+    if (std.mem.eql(u8, nm, v_ty)) {
+        const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
+        return 100 + d;
+    }
     if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
     if (arg.* == .Null and param_ty.nullable) return 50;
 
@@ -409,7 +413,11 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
             const expected = nm["Function".len..];
             if (std.fmt.parseInt(usize, expected, 10)) |want| {
                 if (arg_arity) |got| {
-                    return if (got == want or got == want + 1) @as(i32, 90) else 20;
+                    if (got == want or got == want + 1) {
+                        const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
+                        return 90 + d;
+                    }
+                    return 20;
                 }
                 return 20;
             } else |_| {}
@@ -460,7 +468,8 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     for (builtin_supers, 0..) |s, pos| {
         if (std.mem.eql(u8, s, nm) or std.mem.eql(u8, s, nm_simple)) {
             const dist: i32 = if (pos > 20) 20 else @intCast(pos);
-            return 75 - dist;
+            const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
+            return 75 - dist + d;
         }
     }
 
@@ -955,7 +964,7 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
         }
     }
 
-    const result = try callFuncNamed(self, allocator, module, resolved, args, arg_names);
+    var result = try callFuncNamed(self, allocator, module, resolved, args, arg_names);
 
     var ri: usize = saved.items.len;
     while (ri > 0) {
@@ -969,7 +978,18 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
             g.get().removeLocal(s.name);
         }
     }
+    attachDeclaredElemTypes(module, resolved, type_args, &result);
     return result;
+}
+
+/// Record the call-site type-argument heads on a container a stdlib
+/// creator just built (`listOf<String>()`); shared with the `CallValue`
+/// intrinsic path in the evaluator.
+fn attachDeclaredElemTypes(module: *const Module, func: FuncId, type_args: []const []const u8, result: *EvalResult) void {
+    if (type_args.len == 0) return;
+    if (result.* != .ok) return;
+    const f = funcAt(module, func) orelse return;
+    runtime.attachDeclaredElemTypes(f.fqn, type_args, &result.ok);
 }
 
 pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {

@@ -33,6 +33,7 @@ pub const reclaimEnabled = objcell.reclaimEnabled;
 pub const Value = value_mod.Value;
 pub const RuntimeError = value_mod.RuntimeError;
 pub const EvalResult = value_mod.EvalResult;
+pub const attachDeclaredElemTypes = value_mod.attachDeclaredElemTypes;
 pub const MapViewKind = value_mod.MapViewKind;
 pub const MapBacking = value_mod.MapBacking;
 pub const MapPair = value_mod.MapPair;

@@ -685,6 +685,12 @@ pub const Expr = union(enum) {
     },
     Lambda: struct {
         params: []Ident,
+        /// Declared parameter type annotations (`{ s: String -> … }`),
+        /// aligned with `params`; `null` per unannotated slot. Empty when
+        /// the literal declares no header (the injected `it` carries no
+        /// annotation). Runtime overload dispatch reads these to match a
+        /// lambda against a declared function-type parameter.
+        param_tys: []?TypeRef = &.{},
         body: Block,
         span: Span,
         /// True when the single `it` parameter was injected by the parser

@@ -204,12 +204,18 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         const is_ext = f.receiver_type != null;
         var param_idents = try b.allocator.alloc(ast.Ident, f.params.len + @intFromBool(is_ext));
         defer b.allocator.free(param_idents);
+        const param_tys = try b.allocator.alloc(?ast.TypeRef, f.params.len + @intFromBool(is_ext));
+        defer b.allocator.free(param_tys);
         {
             const offset = @intFromBool(is_ext);
             if (is_ext) {
                 param_idents[0] = .{ .name = "this", .span = dummy_span };
+                param_tys[0] = f.receiver_type;
             }
-            for (f.params, 0..) |p, i| param_idents[offset + i] = p.name;
+            for (f.params, 0..) |p, i| {
+                param_idents[offset + i] = p.name;
+                param_tys[offset + i] = p.ty;
+            }
         }
         const tailrec_self: ?[]const u8 = if (f.is_tailrec) f.name.name else null;
         const enclosing_owner: ?lambda_body.EnclosingOwner = if (b.ownerClass()) |o|
@@ -220,6 +226,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         const lowered = try lowerLambdaBodyCapturingKindWith(
             b.module,
             param_idents,
+            param_tys,
             &body,
             outer_names,
             true,
