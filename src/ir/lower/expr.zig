@@ -443,6 +443,15 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             else
                 b.module.resolveBareRefIndexed(pr.name.name, b.self_package, pr.name.span.file);
             refAudit(b, pr.name.name, ref_pick);
+            // A callable reference whose only declaration is in an
+            // unimported package is unresolved (kotlinc rejects `::name` /
+            // `::Ctor` the same as a bare call to it). Record the
+            // diagnostic before binding the lenient pick.
+            if (class_pick) |cid| {
+                _ = try recordOutOfScopeRef(b, pr.name.name, pr.name.span, classFqnOf(b, cid), b.module.classRefTier(pr.name.name, b.self_package, pr.name.span.file));
+            } else if (ref_pick) |fid| {
+                _ = try recordOutOfScopeRef(b, pr.name.name, pr.name.span, fqnOf(b, fid), b.module.bareRefTier(pr.name.name, b.self_package, pr.name.span.file));
+            }
             if (class_pick) |cid| {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cid } });
             } else if (ref_pick) |fid| {
@@ -1035,6 +1044,11 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
             !(inReceiverContext(b) and b.module.registry.class_member_names.contains(name0)))
         {
+            // A bare read whose only declaration is an unimported
+            // cross-package property is unresolved (kotlinc rejects it).
+            if (b.module.topLevelPropFqn(name0)) |pfqn| {
+                _ = try recordOutOfScopeRef(b, name0, segments[0].span, pfqn, b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file));
+            }
             orEmitAudit(b, "top_level_prop", "LoadGlobal", name0);
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -1054,6 +1068,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             refAudit(b, name0, ref_pick);
             if (ref_pick) |fid| {
                 if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                    _ = try recordOutOfScopeRef(b, name0, segments[0].span, f.fqn, b.module.bareRefTier(name0, b.self_package, segments[0].span.file));
                     const dst = b.allocReg();
                     const n = try b.module.internConst(b.allocator, .{ .String = f.fqn });
                     try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
@@ -3180,6 +3195,50 @@ fn indexDeferReason(res: ir.Module.BareCallResolution) ?ir.Module.ResolveDeferRe
     };
 }
 
+/// Kotlin does not resolve a value-position reference — `::name`, a
+/// `::Ctor`, or a bare read — whose only declaration lives in a package
+/// the caller neither declares, imports, nor sees by default. Record the
+/// unresolved diagnostic (the same one the bare-call path emits) when the
+/// reference would otherwise bind such an out-of-scope declaration. A
+/// reference denotes the declaration itself, so there is no arity or
+/// member-redispatch shape to defer on: a tier-5 verdict is final, exactly
+/// as for the call form. Returns true when the diagnostic was recorded so
+/// the caller can suppress the lenient bind.
+fn recordOutOfScopeRef(
+    b: *FuncBuilder,
+    name: []const u8,
+    ref_span: ir.Span,
+    fqn: []const u8,
+    tier: ?u8,
+) Allocator.Error!bool {
+    if (tier != ir.Module.other_package_tier) return false;
+    // The verdict is trustworthy only when the declaration carries a real
+    // package: a bare FQN (no package prefix) is a lift artifact whose
+    // scoping metadata is unreliable — an upstream class such as
+    // `io.ktor.utils.io.ClosedByteChannelException` can lose its package
+    // during the lift and read as the empty package even when the
+    // reference is same-package and genuinely in scope. The resolver still
+    // binds it (`classIdIndexed`/`resolveBareRefIndexed` return the best
+    // pick); rejecting it would be a false positive, so a bare-FQN
+    // declaration is never reported out of scope.
+    if (std.mem.indexOfScalar(u8, fqn, '.') == null) return false;
+    try b.module.resolve_diags.append(b.allocator, .{
+        .name = name,
+        .fqn_a = fqn,
+        .fqn_b = "",
+        .span = ref_span,
+        .kind = .unresolved,
+    });
+    return true;
+}
+
+/// The FQN of a class by id, for an out-of-scope value-reference
+/// diagnostic.
+fn classFqnOf(b: *FuncBuilder, id: ir.ClassId) []const u8 {
+    if (idGet(ir.Class, b.module.classes.items, id.int())) |c| return c.fqn;
+    return "<invalid>";
+}
+
 /// The target a bare call binds when both the heuristic and the index
 /// produced one: the index's exact-FQN pick wins, EXCEPT when the
 /// heuristic chose an extension (implicit `this`) and the index a plain
@@ -3241,10 +3300,48 @@ fn recordOutOfScopeCall(
         .resolved => true,
         .deferred => |r| r == .unimported_set or r == .type_overload,
     };
-    if (!precise) return false;
+    // A loose-shape deferral (default/vararg/trailing-lambda arity, an
+    // unmatched arity, a low-priority-only or bodyless-only set) is
+    // unresolved too WHEN every rankable candidate is out of scope — the
+    // winning tier is `other_package_tier`, i.e. there is no in-scope
+    // candidate of any shape the runtime could re-pick. The member-
+    // redispatch guard is `inReceiverContext`: inside a receiver context a
+    // runtime member of the same name may still bind (kotlinc resolves
+    // `g.apply { greet() }` to `g`'s member even when a top-level `greet`
+    // is out of scope), so the loose-shape rejection only fires outside
+    // any receiver context, where no implicit receiver can supply the
+    // call. The bare-call member-shadowable routing already sends those
+    // receiver-context calls to `CallMemberOrGlobal` rather than here.
+    const loose_out_of_scope = switch (index_res.outcome) {
+        .resolved => false,
+        .deferred => |r| switch (r) {
+            .default_param_shape,
+            .vararg_only,
+            .trailing_lambda_shape,
+            .arity_mismatch,
+            .low_priority_only,
+            .bodyless_only,
+            => index_res.tier == ir.Module.other_package_tier and !inReceiverContext(b),
+            // The index defers a vararg/default call to `extension_form`
+            // when an in-scope extension namesake exists, since it cannot
+            // tell whether the receiver applies. Outside any receiver
+            // context no receiver can supply such an extension, so a
+            // heuristic that landed on a tier-5 NON-extension top-level
+            // function is the same unresolved reference kotlinc rejects.
+            // The `isNonExt(final_id)` + tier-5 checks below confirm the
+            // bound target is out of scope before this fires.
+            .extension_form => !inReceiverContext(b),
+            else => false,
+        },
+    };
+    if (!precise and !loose_out_of_scope) return false;
     if (!isNonExt(b, final_id)) return false;
     const tier = b.module.bareCallTierOf(final_id, name, b.self_package, file) orelse return false;
     if (tier != ir.Module.other_package_tier) return false;
+    // A bare-FQN target (no package prefix) is a lift artifact with
+    // unreliable scoping metadata; never report it out of scope (see
+    // `recordOutOfScopeRef`).
+    if (std.mem.indexOfScalar(u8, fqnOf(b, final_id), '.') == null) return false;
     const fqn_a = if (index_res.first) |f| fqnOf(b, f) else fqnOf(b, final_id);
     const fqn_b = if (index_res.second) |s2| fqnOf(b, s2) else "";
     try b.module.resolve_diags.append(b.allocator, .{
@@ -3757,7 +3854,13 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         break :blk null;
     };
     const run = try lowerArgRunWithArity(b, args, arg_arity);
-    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    // A trailing lambda always binds the target's last (function-typed)
+    // parameter. When a vararg parameter precedes it, positional binding
+    // would otherwise pack the lambda into the vararg and leave the last
+    // parameter unfilled (Kotlin forbids a positional argument after a
+    // vararg, so the trailing lambda is the only filler). Name the lambda
+    // to the last parameter so the runtime binds it correctly.
+    const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
     const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
     const dst = b.allocReg();
     try b.push(.{ .Call = .{
@@ -3770,6 +3873,41 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         .exact = was_cast,
     } });
     return dst;
+}
+
+/// Arg names for a bare `Call`, synthesizing a name for a trailing lambda
+/// that follows a vararg parameter so it binds the target's last
+/// (function-typed) parameter rather than being packed into the vararg.
+/// Returns the plain interned names otherwise.
+fn trailingLambdaArgNames(
+    b: *FuncBuilder,
+    func_id: FuncId,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error![]?ConstId {
+    if (args.len != 0 and allNull(ast_arg_names) and lastArgIsLambda(args)) {
+        if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
+            const last_is_fn = f.params.len != 0 and
+                std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
+            var has_vararg = false;
+            for (f.params) |p| {
+                if (p.is_vararg) has_vararg = true;
+            }
+            // Only the vararg-before-trailing-lambda shape needs the
+            // synthesized name; a plain positional trailing lambda already
+            // lands on the last parameter. A vararg may absorb any number
+            // of leading positional args, so the count is not bounded by
+            // the parameter count here.
+            if (last_is_fn and has_vararg) {
+                const tagged = try b.allocator.alloc(?ConstId, args.len);
+                for (tagged) |*t| t.* = null;
+                const cid = try b.module.internConst(b.allocator, .{ .String = f.params[f.params.len - 1].name });
+                tagged[tagged.len - 1] = cid;
+                return tagged;
+            }
+        }
+    }
+    return internArgNames(b.allocator, b.module, ast_arg_names);
 }
 
 /// The extension-fn bare-call path: prepend `this`, with trailing-lambda

@@ -8,18 +8,6 @@ Remove entries as they are resolved.
 
 ## Runtime divergences from kotlinc
 
-### 3. Tier-5 leniency: unimported cross-package value references and loose-shape calls
-
-An unimported cross-package bare *call* whose index verdict is
-`resolved`/`unimported_set`/`type_overload` at tier 5 is an
-unresolved-reference diagnostic (kotlinc-faithful). Two shapes still resolve
-leniently where kotlinc rejects: value references (`::name` and bare reads)
-to tier-5 targets, and loose shapes (default/vararg/trailing-lambda arity)
-whose calls the heuristic still binds because the runtime member-redispatch
-path can also claim them. Erroring these requires the index to model the
-runtime's member-redispatch shapes first. Recorded in
-`execution-architecture.md` row 8.
-
 ### 4. `with`-subject outer-tower leniency — RESOLVED
 
 `with(x) { … }` exposes only `x` itself in kotlinc; the call-side
@@ -105,6 +93,19 @@ model. The sweep is deliberately not wired into `zig build test`; a new
 name in the lenient arm trips it and should be triaged as a prover gap,
 not widened into the residue set. The readout in
 `execution-architecture.md` records the same baseline and counting method.
+
+The lenient arm is load-bearing and must not be deleted. Two attempts to
+delete it (after teaching the strict prover to prove the corpus-visible
+`dispatch` receivers) both regressed the ktor client: the arm also serves
+`async`/`proceed` (and, on the response exception path,
+`unwrapCancellationException`) whose receivers the strict prover does not
+fully model, and the `or_audit_sweep` corpus does not exercise the
+live-server ktor path, so a sweep reading of an empty residue is not proof
+the arm is unused. Deleting it caused spurious dispatch misses that
+cascaded into the exception branch. Closing this properly means completing
+the strict prover to cover those receiver classes AND enumerating consumers
+under the full gate (including the ktor itests, which spawn a child against
+a live server); until then the arm stays and the detector monitors it.
 
 ## Architecture residue
 

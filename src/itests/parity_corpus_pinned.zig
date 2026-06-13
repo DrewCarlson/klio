@@ -498,3 +498,131 @@ test "inner_member_calls_outer_member" {
 test "backtick_this_param_not_receiver" {
     try checkErr("backtick_this_param_not_receiver", "show");
 }
+
+/// Run a multi-file program and assert it is rejected before it runs, the
+/// rejection containing `needle`. Mirrors kotlinc's `unresolved reference`
+/// for an unimported cross-package reference.
+fn checkErrFiles(files: []const []const u8, needle: []const u8) !void {
+    const a = arenaAllocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const res = try parity.runFilesWithPacks(a, io, files);
+    switch (res) {
+        .ok => |got| {
+            std.debug.print("multi-file: expected rejection, ran with output:\n{s}\n", .{got});
+            return error.ExpectedRejection;
+        },
+        .err => |m| {
+            if (std.mem.indexOf(u8, m, needle) == null) {
+                std.debug.print("multi-file: rejection `{s}` missing `{s}`\n", .{ m, needle });
+                return error.WrongRejection;
+            }
+        },
+    }
+}
+
+/// Run a multi-file program and assert its stdout.
+fn checkFiles(files: []const []const u8, expected: []const u8) !void {
+    const a = arenaAllocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const res = try parity.runFilesWithPacks(a, io, files);
+    switch (res) {
+        .ok => |got| try std.testing.expectEqualStrings(expected, got),
+        .err => |m| {
+            std.debug.print("multi-file: klio error: {s}\n", .{m});
+            return error.KlioRunFailed;
+        },
+    }
+}
+
+const T5_VALUE = CORPUS_DIR ++ "/tier5_value_ref";
+const T5_LOOSE = CORPUS_DIR ++ "/tier5_loose_calls";
+
+// An unimported cross-package value reference is unresolved exactly as
+// kotlinc rejects it (kotlinc-jvm 2.3.21). A callable reference `::name`,
+// a `::Ctor`, and a bare read of an unimported cross-package top-level
+// property each report `unresolved reference`; before this they ran
+// leniently (the function ran, the property's value printed, the
+// constructor built).
+test "tier5_value_ref_fn_callable_reference_rejected" {
+    try checkErrFiles(&.{ T5_VALUE ++ "/lib.kt", T5_VALUE ++ "/app_fnref.kt" }, "unresolved reference `helper`");
+}
+
+test "tier5_value_ref_bare_property_read_rejected" {
+    try checkErrFiles(&.{ T5_VALUE ++ "/lib.kt", T5_VALUE ++ "/app_bareread.kt" }, "unresolved reference `flag`");
+}
+
+test "tier5_value_ref_ctor_reference_rejected" {
+    try checkErrFiles(&.{ T5_VALUE ++ "/lib.kt", T5_VALUE ++ "/app_ctorref.kt" }, "unresolved reference `Box`");
+}
+
+// Loose-shape calls (default-arg / vararg / default+trailing-lambda /
+// vararg+trailing-lambda) to an unimported cross-package target are
+// unresolved too — the heuristic could bind them only because the runtime
+// member-redispatch path can also claim them, but no receiver is in scope
+// here. kotlinc rejects all four; the vararg+trailing-lambda one even
+// misrouted and crashed (`get_field 'entries' on kotlin.Int`) before.
+test "tier5_loose_default_arg_call_rejected" {
+    try checkErrFiles(&.{ T5_LOOSE ++ "/lib.kt", T5_LOOSE ++ "/app_default.kt" }, "unresolved reference `greet`");
+}
+
+test "tier5_loose_vararg_call_rejected" {
+    try checkErrFiles(&.{ T5_LOOSE ++ "/lib.kt", T5_LOOSE ++ "/app_vararg.kt" }, "unresolved reference `sum`");
+}
+
+test "tier5_loose_default_plus_lambda_call_rejected" {
+    try checkErrFiles(&.{ T5_LOOSE ++ "/lib.kt", T5_LOOSE ++ "/app_combo.kt" }, "unresolved reference `combo`");
+}
+
+test "tier5_loose_vararg_plus_lambda_call_rejected" {
+    try checkErrFiles(&.{ T5_LOOSE ++ "/lib.kt", T5_LOOSE ++ "/app_vlam.kt" }, "unresolved reference `vlam`");
+}
+
+// Positive counterparts that MUST still resolve. An imported cross-package
+// program references every shape with explicit imports; kotlinc compiles
+// and runs it. The same shapes in a single same-package file resolve too.
+test "tier5_value_ref_imported_resolves" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/tier5_value_ref_positive/lib.kt",
+        CORPUS_DIR ++ "/tier5_value_ref_positive/app_imported.kt",
+    },
+        \\helper-ran
+        \\42
+        \\3
+        \\hi world
+        \\6
+        \\x
+        \\3
+        \\
+    );
+}
+
+test "tier5_loose_same_package_resolves" {
+    try checkFiles(&.{CORPUS_DIR ++ "/tier5_loose_calls_positive/samepkg.kt"},
+        \\helper-ran
+        \\42
+        \\3
+        \\hi world
+        \\6
+        \\x
+        \\3
+        \\
+    );
+}
+
+// A loose-shape bare call inside a receiver context (`g.apply { greet() }`)
+// must bind the runtime receiver's member even when a same-named top-level
+// function is out of scope — the member-redispatch shape the tightening
+// must NOT over-reject (kotlinc resolves it to the member).
+test "tier5_loose_member_redispatch_resolves" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/tier5_loose_calls_positive/mr_lib.kt",
+        CORPUS_DIR ++ "/tier5_loose_calls_positive/mr_app.kt",
+    },
+        \\member-member
+        \\
+    );
+}

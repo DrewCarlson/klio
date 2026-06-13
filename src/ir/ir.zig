@@ -1676,6 +1676,89 @@ pub const Module = struct {
         return null;
     }
 
+    /// The best (lowest) scope tier among the value-referenceable
+    /// non-extension funcs of `name` at a reference site, or `null` when
+    /// no such func exists. A value reference (`::name` / a bare read)
+    /// denotes the declaration itself, so this ranks under the same
+    /// scoping order as `resolveBareRefIndexed` but ignores arity and
+    /// uniqueness. `other_package_tier` means every candidate lives in a
+    /// package the caller neither declares, imports, nor sees by default
+    /// or via the shipped surface — Kotlin does not resolve such a
+    /// reference at all, so the lowerer rejects it (kotlinc:
+    /// `unresolved reference`).
+    pub fn bareRefTier(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?u8 {
+        if (intrinsicOwnsBareName(name)) return null;
+        const cands = self.funcsBySimpleName(name);
+        if (cands.len == 0) return null;
+        var best_tier: u8 = 255;
+        for (cands) |id| {
+            const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
+            if (funcHasImplicitThis(f)) continue;
+            if (f.blocks.len == 0 and self.stubDeclArity(id) == null) continue;
+            const t = self.bareCallTier(f, name, caller_pkg, caller_file);
+            if (t < best_tier) best_tier = t;
+        }
+        if (best_tier == 255) return null;
+        return best_tier;
+    }
+
+    /// The best (lowest) scope tier among the classes named `name` at a
+    /// reference site, or `null` when no such class exists. Mirrors
+    /// `bareRefTier` for `::Ctor` callable references and bare type-name
+    /// value reads; `other_package_tier` means the only matching class is
+    /// in an unimported package.
+    pub fn classRefTier(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?u8 {
+        var best_tier: u8 = 255;
+        for (self.class_index.items) |entry| {
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            const c = idGet(Class, self.classes.items, entry.id.int()) orelse continue;
+            const t = self.scopeTier(c.fqn, c.package, name, caller_pkg, caller_file);
+            if (t < best_tier) best_tier = t;
+        }
+        if (best_tier == 255) return null;
+        return best_tier;
+    }
+
+    /// The best (lowest) scope tier among the top-level property
+    /// declarations named `name` at a reference site, or `null` when no
+    /// such property is known. A bare property read resolves under the
+    /// same Kotlin scoping order as a call; `other_package_tier` means
+    /// every declaration is in an unimported package, so kotlinc rejects
+    /// the read as unresolved.
+    pub fn topLevelPropRefTier(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?u8 {
+        const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
+        var best_tier: u8 = 255;
+        for (list.items) |pd| {
+            const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
+            if (t < best_tier) best_tier = t;
+        }
+        if (best_tier == 255) return null;
+        return best_tier;
+    }
+
+    /// The FQN of the first known top-level property declaration named
+    /// `name`, for an out-of-scope value-reference diagnostic.
+    pub fn topLevelPropFqn(self: *const Module, name: []const u8) ?[]const u8 {
+        const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
+        if (list.items.len == 0) return null;
+        return list.items[0].fqn;
+    }
+
     /// Register a class declaration and return its id. If the name
     /// was previously `reserveClass`d, the reserved slot/id is reused
     /// so forward references that resolved to that id stay valid.
@@ -1936,8 +2019,20 @@ pub const ModuleRegistry = struct {
     /// `(class_name, member_name) → Const` for class / companion
     /// `const val name = <literal>`.
     class_const_inits: StrPairMap(Const),
+    /// Top-level (file-scope) property simple name → every declaration of
+    /// that name, each carrying its FQN and declaring package. A bare read
+    /// of such a property resolves under Kotlin scoping, so the lowerer
+    /// ranks the read's tier the same way it ranks a bare call: a read
+    /// whose only declaration is in an unimported package is unresolved.
+    top_level_prop_pkgs: std.StringHashMap(std.ArrayList(PropDecl)),
 
     allocator: Allocator,
+
+    /// One top-level property declaration's scoping identity.
+    pub const PropDecl = struct {
+        fqn: []const u8,
+        package: []const u8,
+    };
 
     /// One non-wildcard import: its full dotted path (owned by the
     /// registry allocator) and the same path as segments (an owned
@@ -1972,6 +2067,7 @@ pub const ModuleRegistry = struct {
             .nested_object_aliases = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
             .mangled_nested = std.StringHashMap([]const u8).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
+            .top_level_prop_pkgs = std.StringHashMap(std.ArrayList(PropDecl)).init(allocator),
             .allocator = allocator,
         };
     }
@@ -2046,6 +2142,11 @@ pub const ModuleRegistry = struct {
         }
         self.mangled_nested.deinit();
         self.class_const_inits.deinit();
+        {
+            var it = self.top_level_prop_pkgs.valueIterator();
+            while (it.next()) |list| list.deinit(a);
+            self.top_level_prop_pkgs.deinit();
+        }
     }
 
     /// Clone for extension (see `Module.cloneForExtend`). Outer container
@@ -2141,6 +2242,14 @@ pub const ModuleRegistry = struct {
         {
             var it = self.class_const_inits.iterator();
             while (it.next()) |e| try out.class_const_inits.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.top_level_prop_pkgs.iterator();
+            while (it.next()) |e| {
+                var list: std.ArrayList(PropDecl) = .empty;
+                try list.appendSlice(a, e.value_ptr.items);
+                try out.top_level_prop_pkgs.put(e.key_ptr.*, list);
+            }
         }
         return out;
     }
