@@ -65,7 +65,7 @@ fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Envi
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
-        "kotlin-klio/klio-ktor-client",
+        "kotlin-klio/klio-ktor",
     };
     const pack_files = [_][]const u8{
         "target/packs/kotlinx.atomicfu.klio-pack",
@@ -113,7 +113,7 @@ fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
     const path = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ TMP_DIR, name });
     try cwd.writeFile(io, .{ .sub_path = path, .data = src });
 
-    const r = try runKlio(a, io, &env, &.{ klioBin(&env), "run", path });
+    const r = try runKlio(a, io, &env, &.{ klioBin(&env), "run", "--feature", "io.ktor/utils", path });
     if (!r.ok) {
         std.debug.print("concurrency_stress {s}: klio run failed:\nstdout:\n{s}\nstderr:\n{s}\n", .{ name, r.stdout, r.stderr });
         return error.KlioRunFailed;

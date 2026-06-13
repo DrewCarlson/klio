@@ -13,8 +13,8 @@
 [submodule "kotlin-klio/klio-kotlinx-serialization/upstream"]
 	path = kotlin-klio/klio-kotlinx-serialization/upstream
 	url = https://github.com/Kotlin/kotlinx.serialization
-[submodule "kotlin-klio/klio-ktor-client/upstream"]
-	path = kotlin-klio/klio-ktor-client/upstream
+[submodule "kotlin-klio/klio-ktor/upstream"]
+	path = kotlin-klio/klio-ktor/upstream
 	url = https://github.com/ktorio/ktor
 # Upstream Kotlin: the interpreter reads its stdlib sources from
 # kotlin/libraries/stdlib at runtime. The full repo is ~5GB, so a blanket

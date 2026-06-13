@@ -125,7 +125,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-serialization",
-        "kotlin-klio/klio-ktor-client",
+        "kotlin-klio/klio-ktor",
     } },
     // Async ByteChannel gate: upstream channel write side (Slot suspension
     // protocol) through child `klio` + installed packs.
@@ -133,7 +133,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
-        "kotlin-klio/klio-ktor-client",
+        "kotlin-klio/klio-ktor",
     } },
     // Threaded stress gate for the pack concurrency primitives
     // (ConcurrentMap/Attributes computeIfAbsent once-only, the ktor locks
@@ -143,7 +143,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
-        "kotlin-klio/klio-ktor-client",
+        "kotlin-klio/klio-ktor",
     } },
     // Reified inline Json extension shapes through the installed pack
     // (kotlinc-verified expected output; the in-process parity harness
