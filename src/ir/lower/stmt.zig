@@ -554,8 +554,9 @@ fn lowerAssign(
 
 // Route the already-combined value to the assignment target: a single
 // Path name (local / cell / capture / member / global), a Member field,
-// or an Index `set` call.
-fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg) Allocator.Error!void {
+// or an Index `set` call. Shared by compound-assign, prefix ++/--, and
+// postfix ++/-- so the write-back decision lives in exactly one place.
+pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg) Allocator.Error!void {
     switch (target.*) {
         .Path => |p| {
             if (p.segments.len != 1) {
@@ -618,6 +619,7 @@ fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg) Al
             }
         },
         .Member => |m| {
+            if (m.safe) return;
             const recv = try lowerReceiver(b, m.receiver);
             const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
             try b.push(.{ .SetField = .{

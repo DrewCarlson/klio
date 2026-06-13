@@ -626,3 +626,86 @@ test "tier5_loose_member_redispatch_resolves" {
         \\
     );
 }
+
+// `++`/`--` write-back must reach the real binding for every lvalue shape,
+// not a dead local. Regression: prefix/postfix on a top-level `var` mutated
+// from a non-reader function dropped the write. All outputs match kotlinc.
+test "incdec_toplevel_postinc" {
+    try check("incdec_toplevel_postinc",
+        \\2
+        \\
+    );
+}
+
+test "incdec_toplevel_preinc" {
+    try check("incdec_toplevel_preinc",
+        \\2
+        \\
+    );
+}
+
+test "incdec_toplevel_postdec" {
+    try check("incdec_toplevel_postdec",
+        \\3
+        \\
+    );
+}
+
+test "incdec_toplevel_predec" {
+    try check("incdec_toplevel_predec",
+        \\3
+        \\
+    );
+}
+
+test "incdec_member_bare" {
+    try check("incdec_member_bare",
+        \\2
+        \\
+    );
+}
+
+test "incdec_member_this" {
+    try check("incdec_member_this",
+        \\2
+        \\
+    );
+}
+
+test "incdec_captured_lambda" {
+    try check("incdec_captured_lambda",
+        \\2
+        \\
+    );
+}
+
+test "incdec_member_lambda_outer" {
+    try check("incdec_member_lambda_outer",
+        \\2
+        \\
+    );
+}
+
+test "incdec_postfix_expr_old" {
+    try check("incdec_postfix_expr_old",
+        \\5
+        \\6
+        \\
+    );
+}
+
+test "incdec_prefix_expr_new" {
+    try check("incdec_prefix_expr_new",
+        \\6
+        \\6
+        \\
+    );
+}
+
+test "incdec_index_array" {
+    try check("incdec_index_array",
+        \\3
+        \\4
+        \\
+    );
+}

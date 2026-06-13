@@ -704,62 +704,12 @@ fn isGenericOperand(b: *FuncBuilder, e: *const Expr) bool {
 }
 
 /// Write `val` back to the lvalue `target` (shared by prefix ++/-- and the
-/// postfix path's pre-snapshot path).
+/// postfix path's pre-snapshot path). Delegates to the single write-back
+/// decision in `stmt_mod.storeCombinedToTarget` so compound-assign, prefix,
+/// and postfix never diverge on where a bare name lands (local / cell /
+/// capture / own-member / lambda-this / top-level global).
 fn writeBackLvalue(b: *FuncBuilder, target: *const Expr, val: Reg) Allocator.Error!void {
-    switch (target.*) {
-        .Path => |p| {
-            if (p.segments.len != 1) return;
-            const name = p.segments[0].name;
-            if (b.isBoxed(name)) {
-                // Captured-and-written outer var: boxed at its binding site,
-                // so the write is a `CellSet` on the shared cell (subsumes
-                // the former captured-outer `StoreGlobal` fallback).
-                const cell = try boxedCellReg(b, name);
-                try b.push(.{ .CellSet = .{ .cell = cell, .value = val } });
-            } else if (b.mutableHome(name)) |home| {
-                try b.push(.{ .Move = .{ .dst = home, .src = val } });
-            } else if (b.hasOwnMember(name) and b.resolve("this") != null) {
-                const this_reg = b.resolve("this").?;
-                const field = try b.module.internConst(b.allocator, .{ .String = name });
-                try b.push(.{ .SetField = .{ .receiver = this_reg, .field = field, .value = val } });
-            } else {
-                try b.rebind(name, val);
-            }
-        },
-        .Member => |m| {
-            if (m.safe) return;
-            const recv = try lowerReceiver(b, m.receiver);
-            const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
-            try b.push(.{ .SetField = .{ .receiver = recv, .field = field, .value = val } });
-        },
-        .Index => |ix| {
-            const recv = try lowerReceiver(b, ix.receiver);
-            const n_keys = ix.args.len;
-            const key_start = b.allocReg();
-            const key_slots = try b.allocator.alloc(Reg, if (n_keys == 0) 1 else n_keys);
-            defer b.allocator.free(key_slots);
-            key_slots[0] = key_start;
-            var k: usize = 1;
-            while (k < n_keys) : (k += 1) key_slots[k] = b.allocReg();
-            const val_slot = b.allocReg();
-            for (ix.args, 0..) |*arg, i| {
-                const r = try lowerExpr(b, arg);
-                try b.push(.{ .Move = .{ .dst = key_slots[i], .src = r } });
-            }
-            try b.push(.{ .Move = .{ .dst = val_slot, .src = val } });
-            const ret = b.allocReg();
-            const nm = try b.module.internConst(b.allocator, .{ .String = "set" });
-            try b.push(.{ .CallMember = .{
-                .dst = ret,
-                .receiver = recv,
-                .name = nm,
-                .args = key_start,
-                .n_args = @as(u8, @intCast(n_keys)) + 1,
-                .arg_names = &.{},
-            } });
-        },
-        else => {},
-    }
+    try stmt_mod.storeCombinedToTarget(b, target, val);
 }
 
 /// The mangled lift name a type reference `name` resolves to in the
@@ -1793,63 +1743,9 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             try b.push(.{ .Move = .{ .dst = old, .src = s } });
             const new = b.allocReg();
             try b.push(.{ .UnOp = .{ .dst = new, .op = uo, .operand = old } });
-            switch (inner.*) {
-                .Path => |p| {
-                    if (p.segments.len == 1) {
-                        const nm = p.segments[0].name;
-                        if (b.isBoxed(nm)) {
-                            // Captured-and-written outer var: boxed at its
-                            // binding site, so `++`/`--` is a `CellSet` on
-                            // the shared cell (subsumes the former captured-
-                            // outer `StoreGlobal` fallback).
-                            const cell = try boxedCellReg(b, nm);
-                            try b.push(.{ .CellSet = .{ .cell = cell, .value = new } });
-                        } else if (b.mutableHome(nm)) |home| {
-                            try b.push(.{ .Move = .{ .dst = home, .src = new } });
-                        } else if (b.hasOwnMember(nm) and b.resolve("this") != null) {
-                            const this_reg = b.resolve("this").?;
-                            const field = try b.module.internConst(b.allocator, .{ .String = nm });
-                            try b.push(.{ .SetField = .{ .receiver = this_reg, .field = field, .value = new } });
-                        } else {
-                            try b.rebind(nm, new);
-                        }
-                    }
-                },
-                .Member => |m| {
-                    if (!m.safe) {
-                        const recv = try lowerReceiver(b, m.receiver);
-                        const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
-                        try b.push(.{ .SetField = .{ .receiver = recv, .field = field, .value = new } });
-                    }
-                },
-                .Index => |ix| {
-                    const recv = try lowerReceiver(b, ix.receiver);
-                    const n_keys = ix.args.len;
-                    const key_start = b.allocReg();
-                    const key_slots = try b.allocator.alloc(Reg, if (n_keys == 0) 1 else n_keys);
-                    defer b.allocator.free(key_slots);
-                    key_slots[0] = key_start;
-                    var k: usize = 1;
-                    while (k < n_keys) : (k += 1) key_slots[k] = b.allocReg();
-                    const val_slot = b.allocReg();
-                    for (ix.args, 0..) |*arg, i| {
-                        const r = try lowerExpr(b, arg);
-                        try b.push(.{ .Move = .{ .dst = key_slots[i], .src = r } });
-                    }
-                    try b.push(.{ .Move = .{ .dst = val_slot, .src = new } });
-                    const dst = b.allocReg();
-                    const nm = try b.module.internConst(b.allocator, .{ .String = "set" });
-                    try b.push(.{ .CallMember = .{
-                        .dst = dst,
-                        .receiver = recv,
-                        .name = nm,
-                        .args = key_start,
-                        .n_args = @as(u8, @intCast(n_keys)) + 1,
-                        .arg_names = &.{},
-                    } });
-                },
-                else => {},
-            }
+            // Postfix `x++` evaluates to the OLD value but writes the NEW
+            // value back through the shared write-back decision.
+            try stmt_mod.storeCombinedToTarget(b, inner, new);
             return old;
         },
     }
