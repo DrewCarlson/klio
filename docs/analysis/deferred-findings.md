@@ -8,33 +8,6 @@ Remove entries as they are resolved.
 
 ## Runtime divergences from kotlinc
 
-### 1. Runtime overload dispatch is blind to generic arguments, function shapes, and suspend
-
-`type_overload` sets whose signatures differ only inside generic arguments
-(`pick(List<Int>)` vs `pick(List<String>)`), function-type components
-(`call((Int)->Int)` vs `call((String)->String)`), or `suspend` are correctly
-deferred to runtime dispatch by the index, but `pickOverload` then selects by
-declaration order: klio prints `pick(List<Int>)` where kotlinc resolves by
-type and prints `pick(List<String>)`. Lowering has carried the full declared
-`TypeRef` (generic args, function shapes, suspend, variance) since the
-signature-identity work, so the scorer has the declared side available; what
-it lacks is element-type knowledge on the runtime value. Fix direction: a
-declared-type-aware scorer that uses runtime element knowledge where the
-value carries it and falls back to kotlinc's most-specific rules otherwise.
-Repro shapes: the b4/verify8 probes from the resolution review (same-arity
-generic and function-shape overload pairs called with disambiguating
-arguments).
-
-### 2. Explicit-receiver named-argument dispatch picks a type-incompatible extension over the member
-
-`tests/fixtures/parity_corpus/named_arg_member_over_extension.kt` fails:
-`userMethodNamed` scoring admits an extension whose receiver type does not
-match instead of the receiver's own member. Not part of the *OrGlobal family
-(explicit receiver), so the single-resolver work did not absorb it. The
-strict receiver-proof machinery (`receiverImplementsType` plus the
-strict-then-lenient pass in `host_call_member.zig`) is the natural mechanism
-to reuse in the named-overload scorer.
-
 ### 3. Tier-5 leniency: unimported cross-package value references and loose-shape calls
 
 An unimported cross-package bare *call* whose index verdict is
@@ -49,39 +22,68 @@ runtime's member-redispatch shapes first. Recorded in
 
 ### 4. `with`-subject outer-tower leniency
 
-`with(x) { … }` exposes only `x` itself in kotlinc; klio's host-internal
-`getField` rescues (`outerChainFallback`) can still resolve a name through
-the subject's outer tower in shapes kotlinc rejects (probes p0f/p0f2 from
-the item-7 work). A leniency, not a wrong value for valid programs.
-Recorded as the §4.2 residual in `execution-architecture.md`; goes away if
-the field-read rescues are folded into the single resolver's candidate
-discipline.
+`with(x) { … }` exposes only `x` itself in kotlinc; the call-side
+`outerChainFallback` (`host_call_member.zig` — the surviving half of the
+old field-read rescues, whose `getField` side is gone) can still resolve a
+name through the subject's outer tower in shapes kotlinc rejects (probes
+p0f/p0f2 from the single-resolver work). A leniency, not a wrong value for
+valid programs. Recorded as the §4.2 residual in
+`execution-architecture.md`; goes away if the call-side fallback is folded
+into the single resolver's candidate discipline.
 
-### 5. Empty-container generic-arg proofs are unprovable
+### 5. Empty containers without a creation-site type argument are unprovable
 
-`listOf<String>()` carries no runtime element knowledge, so a
-`List<String>`-receiver extension cannot be receiver-proven; under a
-competing outer member the member wins where kotlinc binds the extension.
-Sanctioned divergence of the strict-then-lenient design — the prover cannot
-know erased element types. Would be subsumed by declared-type plumbing on
-values (same root as finding 1).
+Resolved for the explicit-type-argument subset: an empty container created
+with an explicit type argument on a stdlib creator (`listOf<String>()`,
+`emptyList<Int>()`, the set/map/array families) carries that element head
+on the value (`Value.List.declared_elem`, stamped by
+`runtime.attachDeclaredElemTypes` on both the lowered-func `Call` path and
+the intrinsic-value `CallValue` path), so receiver proofs and overload
+refinement succeed for it. Pinned by `empty_container_declared_elem` and
+the `emptyList` lines of `overload_generic_args`. What remains sanctioned
+is the shape where the element type exists only in static inference, which
+the runtime value cannot carry without a typechecker: an empty container
+typed by its binding (`val xs: List<String> = emptyList()`) or flowing out
+of an erased generic call (`fun <T> make(): List<T> = emptyList()`;
+`make<String>()` — user-call type args bind reified globals, they do not
+stamp returned containers). Under a competing outer member the member
+still wins for those two shapes where kotlinc binds the
+`List<String>.describe()` extension (probe f5b from the declared-type
+dispatch work).
 
-### 6. Forward-referenced top-level property reads the initialized value, not the pre-init default
+### 6. Forward-referenced top-level property: unannotated reads still observe the initialized value
 
-kotlinc reads a not-yet-initialized top-level property's typed default
-(`0`/`null`); klio drives the initializer on demand, so the read observes
-the initialized value. Side-effect order and once-only initialization match
-kotlinc; only the read-before-init value differs. Exact fidelity needs
-per-property typed defaults, which the VM lacks type information for.
-Pinned (as current behavior) by
+Resolved for the annotated subset: a forward read of a not-yet-initialized
+top-level property with an explicit type annotation returns the declared
+type's static-field default (0/false/0.0/NUL/null), matching kotlinc JVM
+2.3.21, while the initializer still runs exactly once at its file-order
+turn. The carrier is `TypedDefault` on `build.NameFunc` /
+`ProgramImage.TopLevelPropInit`, consulted by
+`host_impl.pendingTypedDefault` inside the startup-pass window only;
+properties whose startup turn already deferred keep on-access driving.
+Pinned by the four `forward_read_*` tests in `parity_object_init.zig`. The
+remaining boundary is unannotated top-level properties: kotlinc defaults
+from the inferred field type, but the VM has no inferred type to default
+from, so klio drives the initializer on demand and the forward read
+observes the initialized value (side-effect order and once-only init still
+match). Pinned (as divergence) by
 `forward_referenced_top_level_prop_initializes_once`.
 
 ### 7. Lenient extension-dispatch residue
 
-The lenient pass after the strict receiver-proven walk decides 8 dispatches
-across the corpus, all kotlinx-internal `dispatch` member-extensions with
-erased receivers — the designed residue. The KLIO_OR_AUDIT readout in
-`execution-architecture.md` tracks the count; growth is a regression signal.
+The lenient pass after the strict receiver-proven walk remains the designed
+residue of the strict-then-lenient call policy, now pinned by an on-demand
+detector: `python3 scripts/or_audit_sweep.py` runs examples +
+coroutine_smoke + parity_corpus (583 programs) under `KLIO_OR_AUDIT=1`,
+dedups identical runtime `arm=member_lenient` lines per program, and fails
+if any lenient name falls outside the documented residue set (`{dispatch}`).
+Current baseline: 10 deduped lenient lines across 10 programs (38 raw
+occurrences), all `name=dispatch` — the kotlinx coroutine-internal
+`dispatch` member-extensions whose erased receiver the strict prover cannot
+model. The sweep is deliberately not wired into `zig build test`; a new
+name in the lenient arm trips it and should be triaged as a prover gap,
+not widened into the residue set. The readout in
+`execution-architecture.md` records the same baseline and counting method.
 
 ## Architecture residue
 
@@ -112,19 +114,6 @@ coroutine's. Cancellation then over-delivers (preempting via the root)
 rather than under-delivering; the d-probe shapes all pass. The exact fix
 is a per-activation scope carried in the frame snapshot, not a threadlocal.
 
-### 13. Stdlib image bake is shaped by the first program after a cache clear
-
-The CLI's auto-bake on first use keys the image on the stdlib/pack hashes
-plus a load gate, but resolution coverage in practice varies with the
-first program's import surface: a cache primed by a minimal program leaves
-later programs failing with `unresolved global` (`with`,
-`EmptyCoroutineContext`) until the cache is cleared and re-primed. Also a
-`klio pack install` does not invalidate the bake. Reproduced on the
-pre-diff HEAD binary, so it predates the dispatcher work; the in-process
-SourcePacks harnesses are unaffected. Needs a bake whose resolution
-coverage is program-independent (or a cache key that includes the gate
-inputs that actually vary).
-
 ### 14. A zero-param receiver lambda binds `it` to its receiver
 
 `recv.block()` on a `R.() -> Unit` lambda whose body references `it`
@@ -138,19 +127,16 @@ object. The fix belongs in lambda lowering: a parameterless lambda must
 not synthesize an `it` binding from the invocation receiver/argument
 when the name resolves as a capture.
 
-## Tooling
+### 15. Fully-qualified stdlib references without an import never load the gated sources
 
-### 10. `klio run` resolves the kotlin/ stdlib checkout relative to the working directory
-
-Running the binary from outside the repo silently loses stdlib inline
-functions (`run`, `let`) and fails with `unresolved global` — it masqueraded
-as nondeterminism during the object-init work. Needs robust resource
-discovery (binary-relative or configured path) or at minimum a diagnostic
-naming the missing stdlib root.
-
-### 11. `zigcheck.py itests` hits the RSS watchdog
-
-The script's monolithic itests mode builds every integration test into one
-compilation and exceeds the 6GB cap; the sharded `zig build test` (one
-binary per itest file) is the real gate. Either shard the script's itests
-mode the same way or drop that mode.
+The embedded curated-source load gate keys exclusively on the program's
+`import` lines (`loadEmbeddedStdlibSources` builds `user_import_prefixes`
+from `f.imports`; the gate decision is `pack_cache.zig:318-326`), and the
+stdlib-image cache key folds that same gate bit. A program that uses a
+gated package only through fully-qualified names with no import (kotlinc
+accepts this; no import is required for qualified use) therefore never
+loads the non-implicit curated sources, and fails identically on both the
+baked-image path and the in-process source-parse path — consistent across
+cache states, but a divergence from kotlinc. Fix direction: derive the
+gate (and the image key's gate input) from qualified-name usage as well as
+import lines, or drop the gate once bake cost allows always-full loading.

@@ -51,6 +51,8 @@ const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 const HostBindings = stdlib.HostBindings;
 
+const stdlib_pack = @import("stdlib_pack");
+
 const io = @import("io.zig");
 const pack_cache = @import("pack_cache.zig");
 const RequestedFeatures = pack_cache.RequestedFeatures;
@@ -127,10 +129,11 @@ fn exeStamp(gpa: Allocator) ?[2]u64 {
     return .{ st.size, mtime_ns };
 }
 
-/// Content hash of every stdlib source the bake consumes: the
-/// `KLIO_STDLIB_PACK` override pack when set, else the curated upstream
-/// files + klio actuals the embedded pack builder reads. Null when any
-/// input is unreadable (then there is nothing to bake either).
+/// Content hash of every stdlib source the bake consumes, mirroring
+/// `stdlibPackBytes`'s resolution order: the `KLIO_STDLIB_PACK` override
+/// pack when set, else the curated upstream files + klio actuals the cwd
+/// checkout provides, else the pack bytes embedded in the binary. Null
+/// only when no source resolves (then there is nothing to bake either).
 fn stdlibContentHash(gpa: Allocator) ?[32]u8 {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
@@ -139,41 +142,68 @@ fn stdlibContentHash(gpa: Allocator) ?[32]u8 {
 
     var hasher = std.crypto.hash.Blake3.init(.{});
 
+    var override_hashed = false;
     if (getEnvVar(gpa, "KLIO_STDLIB_PACK")) |override_path| {
         defer gpa.free(override_path);
-        const bytes = cwd.readFileAlloc(fio, override_path, gpa, .unlimited) catch return null;
-        defer gpa.free(bytes);
-        hasher.update("override:");
-        hasher.update(override_path);
-        hasher.update(bytes);
-    } else {
-        const pb = stdlib.pack_builder;
-        var upstream = cwd.openDir(fio, pb.UPSTREAM_STDLIB_ROOT, .{}) catch return null;
-        defer upstream.close(fio);
-        for (pb.CURATED_UPSTREAM_SOURCES) |rel| {
-            const bytes = upstream.readFileAlloc(fio, rel, gpa, .unlimited) catch return null;
+        if (cwd.readFileAlloc(fio, override_path, gpa, .unlimited) catch null) |bytes| {
             defer gpa.free(bytes);
-            hasher.update(rel);
-            hasher.update(":");
-            var len_buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &len_buf, bytes.len, .little);
-            hasher.update(&len_buf);
+            hasher.update("override:");
+            hasher.update(override_path);
             hasher.update(bytes);
+            override_hashed = true;
         }
-        var klio_dir = cwd.openDir(fio, pb.KLIO_STDLIB_DIR, .{}) catch return null;
-        defer klio_dir.close(fio);
-        for (pb.KLIO_STDLIB_ACTUAL_FILES) |rel| {
-            const bytes = klio_dir.readFileAlloc(fio, rel, gpa, .unlimited) catch return null;
-            defer gpa.free(bytes);
-            hasher.update(rel);
-            hasher.update(":");
-            var len_buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &len_buf, bytes.len, .little);
-            hasher.update(&len_buf);
-            hasher.update(bytes);
-        }
+        // An unreadable override falls through to the checkout, exactly
+        // like `stdlibPackBytes`.
+    }
+    if (!override_hashed and !hashCheckoutSources(gpa, fio, &hasher)) {
+        return embeddedContentHash();
     }
 
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
+
+/// Fold the cwd checkout's stdlib sources into `hasher`. False when any
+/// file is unreadable (the pack build would fail the same way, so the run
+/// falls through to the embedded pack and its hash).
+fn hashCheckoutSources(gpa: Allocator, fio: std.Io, hasher: *std.crypto.hash.Blake3) bool {
+    const cwd = std.Io.Dir.cwd();
+    const pb = stdlib.pack_builder;
+    var upstream = cwd.openDir(fio, pb.UPSTREAM_STDLIB_ROOT, .{}) catch return false;
+    defer upstream.close(fio);
+    for (pb.CURATED_UPSTREAM_SOURCES) |rel| {
+        const bytes = upstream.readFileAlloc(fio, rel, gpa, .unlimited) catch return false;
+        defer gpa.free(bytes);
+        hasher.update(rel);
+        hasher.update(":");
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+        hasher.update(&len_buf);
+        hasher.update(bytes);
+    }
+    var klio_dir = cwd.openDir(fio, pb.KLIO_STDLIB_DIR, .{}) catch return false;
+    defer klio_dir.close(fio);
+    for (pb.KLIO_STDLIB_ACTUAL_FILES) |rel| {
+        const bytes = klio_dir.readFileAlloc(fio, rel, gpa, .unlimited) catch return false;
+        defer gpa.free(bytes);
+        hasher.update(rel);
+        hasher.update(":");
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+        hasher.update(&len_buf);
+        hasher.update(bytes);
+    }
+    return true;
+}
+
+/// Hash of the pack bytes embedded in the binary, or null in builds
+/// carrying none (zigcheck stub builds).
+fn embeddedContentHash() ?[32]u8 {
+    const bytes = stdlib_pack.EMBEDDED_PACK_BYTES orelse return null;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update("embedded:");
+    hasher.update(bytes);
     var out: [32]u8 = undefined;
     hasher.final(&out);
     return out;

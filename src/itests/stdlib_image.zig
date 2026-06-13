@@ -302,6 +302,47 @@ test "editing a stdlib source rebakes under a new key" {
     try std.testing.expectEqual(@as(usize, 2), countImages(a, io, home));
 }
 
+test "outside a checkout the embedded pack serves the stdlib" {
+    const a = file_arena.allocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+
+    // Empty cwd: no kotlin/ checkout, no kotlin-klio/. The binary's
+    // embedded pack must serve the curated sources (inline `run`/`let`
+    // come from them), and the image cache must key off the embedded
+    // bytes (bake once, hit on rerun).
+    const sandbox = try std.fmt.allocPrint(a, "{s}/outside_sandbox", .{TMP_ROOT});
+    cwd.deleteTree(io, sandbox) catch {};
+    try cwd.createDirPath(io, sandbox);
+
+    const home = try freshHome(a, io, "outside");
+    var env = try baseEnv(a, io, home);
+    defer env.deinit();
+    _ = env.array_hash_map.swapRemove(@as([]const u8, "KLIO_STDLIB_PACK"));
+    const bin = try klioBin(a, io, &env);
+    const prog = try writeProgram(a, io, "outside_probe.kt",
+        \\fun main() {
+        \\    val doubled = listOf(1, 2, 3).map { it * 2 }
+        \\    val msg = doubled.joinToString(",").let { "doubled: $it" }
+        \\    run { println(msg) }
+        \\}
+        \\
+    );
+
+    const first = try runKlio(a, io, &env, sandbox, &.{ bin, "run", prog });
+    try std.testing.expectEqualStrings("", first.stderr);
+    try std.testing.expectEqual(@as(u32, 0), first.code);
+    try std.testing.expectEqualStrings("doubled: 2,4,6\n", first.stdout);
+    try std.testing.expectEqual(@as(usize, 1), countImages(a, io, home));
+
+    const second = try runKlio(a, io, &env, sandbox, &.{ bin, "run", prog });
+    try std.testing.expectEqual(@as(u32, 0), second.code);
+    try std.testing.expectEqualStrings(first.stdout, second.stdout);
+    try std.testing.expectEqual(@as(usize, 1), countImages(a, io, home));
+}
+
 test "pack-using program: image path matches legacy with installed packs" {
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});

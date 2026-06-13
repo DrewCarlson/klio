@@ -237,7 +237,14 @@ fn loadEmbeddedStdlibSources(
     var env = procEnvMap(allocator);
     defer env.deinit();
     var err: PackError = undefined;
-    const bytes = (stdlib_pack.stdlibPackBytes(allocator, &env, &err) catch return) orelse return;
+    const bytes = (stdlib_pack.stdlibPackBytes(allocator, &env, &err) catch return) orelse {
+        // Every pack source failed (override, cwd checkout, embedded
+        // bytes). Surface the builder's message instead of letting the
+        // program die later on an unresolved stdlib global.
+        io.printStderr(allocator, "error: stdlib sources unavailable: {f}\n", .{err});
+        io.printStderr(allocator, "set KLIO_STDLIB_PACK to a stdlib .klio-pack, or run from a klio checkout\n", .{});
+        return;
+    };
     var reader = (PackReader.fromBytes(allocator, bytes, &err) catch return) orelse return;
     defer reader.deinit();
     const payload = (reader.readSection(section_names.SOURCES, &err) catch return) orelse return;

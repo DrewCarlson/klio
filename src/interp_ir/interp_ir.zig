@@ -72,12 +72,17 @@ pub const StrFunc = build.StrFunc;
 pub const NameFunc = build.NameFunc;
 pub const EnumEntryArgInit = build.EnumEntryArgInit;
 
+/// One top-level property's on-demand init entry: the 0-arg initializer
+/// thunk plus the declared type's pre-init default category (`.none` when
+/// the declaration carries no usable annotation).
+pub const TopLevelPropInit = struct { func: FuncId, default: build.TypedDefault };
+
 /// Build-time-immutable program metadata. Produced once by
 /// `build.build_module` and shared by handle with every OS thread the
 /// program spawns. Nothing here is mutated after construction.
 pub const ProgramImage = struct {
-    /// Top-level property name → 0-arg initializer `FuncId`.
-    top_level_prop_inits: std.StringHashMap(FuncId),
+    /// Top-level property name → initializer thunk + typed default.
+    top_level_prop_inits: std.StringHashMap(TopLevelPropInit),
     body_prop_inits: PairFuncMap,
     instance_prop_getters: PairFuncMap,
     instance_prop_setters: PairFuncMap,
@@ -171,7 +176,7 @@ pub const ProgramImage = struct {
 
     pub fn init(allocator: Allocator) Allocator.Error!ProgramImage {
         return .{
-            .top_level_prop_inits = std.StringHashMap(FuncId).init(allocator),
+            .top_level_prop_inits = std.StringHashMap(TopLevelPropInit).init(allocator),
             .body_prop_inits = PairFuncMap.init(allocator),
             .instance_prop_getters = PairFuncMap.init(allocator),
             .instance_prop_setters = PairFuncMap.init(allocator),

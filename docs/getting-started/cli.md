@@ -55,11 +55,25 @@ stdlib gate variants). Old images beyond a small keep-count are pruned.
 The registry defaults to `~/.klio/registry`; its layout mirrors a
 Maven cache plus an `index.json`.
 
+## Stdlib resolution
+
+The interpreter resolves its stdlib pack in this order:
+
+1. `KLIO_STDLIB_PACK` — an explicit on-disk pack override (a deliberate
+   per-run choice, so it wins over everything).
+2. The working directory's source checkout (`kotlin/libraries/stdlib`
+   plus `kotlin-klio/`), built fresh per run. This sits ahead of the
+   embedded bytes so in-repo stdlib `.kt` edits take effect without
+   rebuilding the binary.
+3. The pack bytes baked into the binary at build time — present in
+   every `zig build` binary, so `klio run` works from any directory
+   with no setup.
+
 ## Environment variables
 
 - `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack` — use an on-disk
-  stdlib pack instead of the embedded bytes. Useful when iterating
-  on stdlib changes without rebuilding the binary.
+  stdlib pack instead of the checkout or the embedded bytes. Useful
+  when iterating on a pack without rebuilding the binary.
 - `KLIO_STDLIB_IMAGE=0` — disable the stdlib image cache (every run
   lowers the full dependency set, as before).
 - `KLIO_TRACE_STDLIB_IMAGE=1` — print one `hit`/`baked`/`fallback`

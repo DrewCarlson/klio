@@ -774,8 +774,11 @@ catalogued so nobody mistakes them for Class-A/B/C point-fixes; most are **keep*
   false at every run boundary (wired into
   `vmhost.resetReceiverThreadLocals`) — previously the only TLS-holding VM
   module with no run-boundary assert.
-- **Removes via:** §6 item **7** (the full TLS→param conversion rides the
-  single-resolver work), not a resolution-class fix.
+- **Removes via:** a per-activation frame context (the drain recursion
+  crosses the host→eval→host boundary, so the flag needs a carrier riding
+  the activation, not a parameter of one call) — tracked with finding 12 in
+  `deferred-findings.md`. §6 item 7 (the single resolver) is done and did
+  not absorb it; not a resolution-class fix.
 - **Removal test:** `parity_collections_intensive`/`parity_maps_intensive` with a
   user-defined `Map`/`Iterable`; must stay green (a regression would hang).
 
@@ -785,9 +788,10 @@ catalogued so nobody mistakes them for Class-A/B/C point-fixes; most are **keep*
 - **What it does:** re-entrancy flag so a companion whose `outer` is its class (whose
   member lookup forwards back to the companion) cannot loop.
 - **Class:** other-correctness.
-- **Deletable?** **Keep** (loop prevention); TLS→param under §6 item 7.
-  Now asserted false at run boundaries via `host_call_member.resetReceiverTls`
-  (item-6 close-out).
+- **Deletable?** **Keep** (loop prevention). The TLS→param conversion needs
+  a per-activation frame context (§6 item 7 is done and did not absorb it;
+  tracked with finding 12 in `deferred-findings.md`). Now asserted false at
+  run boundaries via `host_call_member.resetReceiverTls` (item-6 close-out).
 - **Removal test:** companion-outer cyclic fixtures in `parity_inner_classes` stay
   green.
 

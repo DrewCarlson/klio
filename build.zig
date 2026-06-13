@@ -1,4 +1,5 @@
 const std = @import("std");
+const stdlib_sources = @import("src/stdlib/stdlib_sources.zig");
 
 /// One Zig module per former Rust crate. `deps` are the non-dev crate
 /// dependencies (the acyclic graph). `tested` flips on once a module has been
@@ -295,6 +296,37 @@ pub fn build(b: *std.Build) void {
         pack_harness.linkLibrary(zstd_harness);
     }
 
+    // The stdlib pack is baked into the binary: embed_gen builds it from
+    // the repo source checkout at build time and the bytes reach
+    // `stdlib_pack` through the `stdlib_embedded` module, so the installed
+    // binary runs from any directory (`stdlibPackBytes` still prefers the
+    // env override and the cwd checkout when present). Every source the
+    // builder reads is declared as a run-step input, so editing a stdlib
+    // `.kt` regenerates the embed on the next build.
+    const embed_gen = b.addExecutable(.{
+        .name = "stdlib-embed-gen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/stdlib_pack/embed_gen.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pack", .module = mods.get("pack").? },
+                .{ .name = "stdlib", .module = mods.get("stdlib").? },
+            },
+        }),
+    });
+    const embed_run = b.addRunArtifact(embed_gen);
+    embed_run.setCwd(b.path("."));
+    const embedded_pack = embed_run.addOutputFileArg("stdlib.klio-pack");
+    for (stdlib_sources.CURATED_UPSTREAM_SOURCES) |rel|
+        embed_run.addFileInput(b.path(b.fmt("{s}/{s}", .{ stdlib_sources.UPSTREAM_STDLIB_ROOT, rel })));
+    for (stdlib_sources.KLIO_STDLIB_ACTUAL_FILES) |rel|
+        embed_run.addFileInput(b.path(b.fmt("{s}/{s}", .{ stdlib_sources.KLIO_STDLIB_DIR, rel })));
+    wireEmbeddedPack(b, &mods, target, optimize, embedded_pack);
+    if (harness_optimize != optimize) {
+        wireEmbeddedPack(b, &harness_mods, target, harness_optimize, embedded_pack);
+    }
+
     // Install the compiled static library to zig-out/lib/libzstd.a so
     // per-module verification (scripts/zigcheck.py) can link the extern
     // ZSTD_* symbols without re-running the whole build graph.
@@ -413,6 +445,26 @@ pub fn build(b: *std.Build) void {
         }
         test_step.dependOn(&run_t.step);
     }
+}
+
+/// Attach the build-time-generated stdlib pack to one module universe:
+/// `stdlib_pack` imports `stdlib_embedded`, whose root embeds the generated
+/// pack bytes via the `stdlib_pack_bytes` anonymous import. zigcheck.py
+/// builds substitute `embedded_stub.zig` (no bytes) for the same module.
+fn wireEmbeddedPack(
+    b: *std.Build,
+    mods: *std.StringHashMap(*std.Build.Module),
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    embedded_pack: std.Build.LazyPath,
+) void {
+    const embedded_mod = b.createModule(.{
+        .root_source_file = b.path("src/stdlib_pack/embedded.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    embedded_mod.addAnonymousImport("stdlib_pack_bytes", .{ .root_source_file = embedded_pack });
+    mods.get("stdlib_pack").?.addImport("stdlib_embedded", embedded_mod);
 }
 
 /// Fold the listed environment variables (those that are set) into the run
