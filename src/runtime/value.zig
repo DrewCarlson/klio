@@ -318,6 +318,12 @@ pub const Value = union(enum) {
         enum_class: ?StringRef,
         /// Set when this is a live `MutableMap.values` view.
         backing: ?*MapBacking,
+        /// Declared element-type head from an explicit call-site type
+        /// argument on the creating stdlib function (`listOf<String>()`).
+        /// Head name only; borrows the module's interned consts, which
+        /// outlive every value. Dispatch reads it to type an empty list;
+        /// `null` everywhere the creation site carried no annotation.
+        declared_elem: ?[]const u8 = null,
     },
     /// `kotlin.Array<T>` and primitive-array siblings.
     Array: struct {
@@ -330,11 +336,18 @@ pub const Value = union(enum) {
         mutable: bool,
         /// Set when this is a live `MutableMap.keys`/`.entries` view.
         backing: ?*MapBacking,
+        /// Declared element-type head from an explicit call-site type
+        /// argument on the creating stdlib function; see `List`.
+        declared_elem: ?[]const u8 = null,
     },
     /// `kotlin.collections.Map` / `MutableMap`.
     Map: struct {
         entries: MapEntries,
         mutable: bool,
+        /// Declared key/value type heads from explicit call-site type
+        /// arguments on the creating stdlib function; see `List`.
+        declared_key: ?[]const u8 = null,
+        declared_value: ?[]const u8 = null,
     },
     /// `kotlin.Pair`.
     Pair: struct { first: *Value, second: *Value },
@@ -1329,6 +1342,63 @@ pub const EvalResult = union(enum) {
     ok: Value,
     err: RuntimeError,
 };
+
+// -------------------------------------------------------------------------
+// Declared element types on container creators.
+// -------------------------------------------------------------------------
+
+/// Stdlib container creators whose call-site type arguments name the
+/// element type of the value they build. Explicit type arguments on these
+/// calls are the only place an empty container's element type is ever
+/// written, so the value records the head name for receiver proofs and
+/// overload refinement (`with(listOf<String>()) { … }` can then bind a
+/// `List<String>` extension). Head names only — the lowering records what
+/// the source wrote, without nested generic arguments.
+const elem_typed_creators = [_][]const u8{
+    "listOf",       "mutableListOf", "emptyList",    "arrayListOf", "listOfNotNull",
+    "buildList",    "setOf",         "mutableSetOf", "emptySet",    "hashSetOf",
+    "linkedSetOf",  "sortedSetOf",   "buildSet",     "arrayOf",     "emptyArray",
+    "arrayOfNulls", "sequenceOf",    "emptySequence",
+};
+
+const pair_typed_creators = [_][]const u8{
+    "mapOf", "mutableMapOf", "emptyMap", "hashMapOf", "linkedMapOf", "sortedMapOf", "buildMap",
+};
+
+/// Record the call-site type-argument heads on a container a stdlib
+/// creator just built. `fqn` is the creator's declared FQN (only
+/// `kotlin*` creators qualify — a user function named `listOf` does not),
+/// and the `type_args` strings must outlive the value (they are the
+/// module's interned consts).
+pub fn attachDeclaredElemTypes(fqn: []const u8, type_args: []const []const u8, v: *Value) void {
+    if (type_args.len == 0) return;
+    if (!std.mem.startsWith(u8, fqn, "kotlin")) return;
+    const name = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
+    const elem_arg = type_args[0];
+    if (elem_arg.len == 0) return;
+    for (elem_typed_creators) |c| {
+        if (!std.mem.eql(u8, c, name)) continue;
+        switch (v.*) {
+            .List => |*l| {
+                if (l.declared_elem == null) l.declared_elem = elem_arg;
+            },
+            .Set => |*s| {
+                if (s.declared_elem == null) s.declared_elem = elem_arg;
+            },
+            else => {},
+        }
+        return;
+    }
+    if (type_args.len < 2 or type_args[1].len == 0) return;
+    for (pair_typed_creators) |c| {
+        if (!std.mem.eql(u8, c, name)) continue;
+        if (v.* == .Map) {
+            if (v.Map.declared_key == null) v.Map.declared_key = type_args[0];
+            if (v.Map.declared_value == null) v.Map.declared_value = type_args[1];
+        }
+        return;
+    }
+}
 
 // -------------------------------------------------------------------------
 // Tests

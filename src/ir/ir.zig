@@ -202,6 +202,11 @@ pub const Inst = union(enum) {
         args: Reg,
         n_args: u8,
         arg_names: []?ConstId = &.{},
+        /// Call-site type arguments (interned head names), recorded for
+        /// the bare-call-to-global form so a stdlib container creator
+        /// dispatched as an intrinsic value (`emptyList<String>()`) can
+        /// stamp its result's declared element type.
+        type_args: []ConstId = &.{},
     },
     /// Call a callable value with a mix of positional and spread
     /// args. Each `SpreadPart` is one source register; spread

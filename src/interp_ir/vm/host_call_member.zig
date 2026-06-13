@@ -18,6 +18,7 @@ const host_globals = @import("host_globals.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const trace = @import("trace.zig");
+const overload_match = @import("overload_match.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -454,40 +455,9 @@ fn allUppercase(s: []const u8) bool {
     return true;
 }
 
-/// Coarse builtin value kinds for definite argument-type disproof.
-/// Numeric widths collapse into one kind: klio's lowered literals may
-/// carry a narrower tag than the declared parameter type.
-const BuiltinKind = enum { numeric, string, boolean, char };
-
-fn builtinParamKind(pn: []const u8) ?BuiltinKind {
-    const eq = std.mem.eql;
-    if (eq(u8, pn, "Int") or eq(u8, pn, "Long") or eq(u8, pn, "Short") or eq(u8, pn, "Byte") or
-        eq(u8, pn, "UInt") or eq(u8, pn, "ULong") or eq(u8, pn, "UShort") or eq(u8, pn, "UByte") or
-        eq(u8, pn, "Double") or eq(u8, pn, "Float") or eq(u8, pn, "Number")) return .numeric;
-    if (eq(u8, pn, "String")) return .string;
-    if (eq(u8, pn, "Boolean")) return .boolean;
-    if (eq(u8, pn, "Char")) return .char;
-    return null;
-}
-
-fn builtinValueKind(v: *const Value) ?BuiltinKind {
-    return switch (v.*) {
-        .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float => .numeric,
-        .String => .string,
-        .Bool => .boolean,
-        .Char => .char,
-        else => null,
-    };
-}
-
-/// `true` when the parameter's declared builtin kind and the argument's
-/// runtime builtin kind are both known and differ — a definite
-/// inapplicability kotlinc would never consider.
-fn builtinKindMismatch(pn: []const u8, arg: *const Value) bool {
-    const pk = builtinParamKind(pn) orelse return false;
-    const vk = builtinValueKind(arg) orelse return false;
-    return pk != vk;
-}
+// Coarse builtin value kinds for definite argument-type disproof live in
+// overload_match.zig, shared with the declared-type scorer refinement.
+const builtinKindMismatch = overload_match.builtinKindMismatch;
 
 /// Kotlin-faithful `hashCode()` for builtin value types.
 fn kotlinHashCode(v: *const Value) i32 {
@@ -909,9 +879,12 @@ fn extReceiverSpecificity(self: *VmHost, receiver: *const Value, ty_name: []cons
 ///     head check;
 ///   * generic arguments participate where the runtime value carries
 ///     element knowledge (`List<String>.f()` on a list of Ints is
-///     disproven; on a list of Strings proven); where it cannot (empty
-///     containers, erased user generics) the candidate is NOT proven and
-///     falls to the resolver's ordered lenient pass.
+///     disproven; on a list of Strings proven). An empty container
+///     proves through the declared element head its creation site
+///     recorded (`listOf<String>()`); where neither is available
+///     (untyped empty literals flowing through erased generics) the
+///     candidate is NOT proven and falls to the resolver's ordered
+///     lenient pass.
 fn strictReceiverProven(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, ty: *const TypeRef) Allocator.Error!bool {
     // A null receiver (a `with(t)` subject whose value is null) is
     // provably accepted only by a nullable receiver type.
@@ -1065,16 +1038,21 @@ fn typeParamOf(self: *VmHost, fid: FuncId, pn: []const u8) bool {
 }
 
 /// Generic-argument proof over the receiver's actual elements. Only
-/// builtin containers carry element knowledge; everything else (and an
-/// empty container) is unprovable and reports false so the candidate
-/// falls to the lenient pass.
+/// builtin containers carry element knowledge; an empty container proves
+/// through the declared element head its creation site recorded (an
+/// explicit `listOf<String>()` type argument), and everything else is
+/// unprovable and reports false so the candidate falls to the lenient
+/// pass.
 fn elementsProveArgs(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, pn: []const u8, ty_args: []const TypeRef, fuel: u8) Allocator.Error!bool {
     if (std.mem.eql(u8, pn, "Map") or std.mem.eql(u8, pn, "MutableMap")) {
         if (receiver.* != .Map or ty_args.len < 2) return false;
         const g = receiver.Map.entries.borrow();
         defer g.deinit();
         const entries = g.get().items;
-        if (entries.len == 0) return false;
+        if (entries.len == 0) {
+            return overload_match.declaredElemProves(self, &ty_args[0], receiver.Map.declared_key) and
+                overload_match.declaredElemProves(self, &ty_args[1], receiver.Map.declared_value);
+        }
         for (entries) |*e| {
             if (!try elementSatisfies(self, allocator, &e.key, fid, &ty_args[0], fuel)) return false;
             if (!try elementSatisfies(self, allocator, &e.value, fid, &ty_args[1], fuel)) return false;
@@ -1089,10 +1067,15 @@ fn elementsProveArgs(self: *VmHost, allocator: Allocator, receiver: *const Value
     };
     const list = items orelse return false;
     if (ty_args.len < 1) return false;
+    const declared_elem: ?[]const u8 = switch (receiver.*) {
+        .List => |l| l.declared_elem,
+        .Set => |st| st.declared_elem,
+        else => null,
+    };
     const g = list.borrow();
     defer g.deinit();
     const elems = g.get().items;
-    if (elems.len == 0) return false;
+    if (elems.len == 0) return overload_match.declaredElemProves(self, &ty_args[0], declared_elem);
     for (elems) |*e| {
         if (!try elementSatisfies(self, allocator, e, fid, &ty_args[0], fuel)) return false;
     }
@@ -1516,7 +1499,10 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
         },
         else => v_ty = simpleName(arg.typeFqn()),
     }
-    if (std.mem.eql(u8, nm, v_ty)) return 100;
+    if (std.mem.eql(u8, nm, v_ty)) {
+        const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
+        return 100 + d;
+    }
     if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
     if (arg.* == .Null and param_ty.nullable) return 50;
     if (std.mem.eql(u8, nm, "Long") and std.mem.eql(u8, v_ty, "Int")) return 40;
@@ -1535,7 +1521,10 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
         if (std.mem.startsWith(u8, nm, "Function")) {
             const want = std.fmt.parseInt(usize, nm["Function".len..], 10) catch return 20;
             if (arg_arity) |got| {
-                if (got == want or got == want + 1) return 90;
+                if (got == want or got == want + 1) {
+                    const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
+                    return 90 + d;
+                }
                 return 20;
             }
             return 20;
@@ -1558,7 +1547,8 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     for (builtin_supers, 0..) |s, pos| {
         if (std.mem.eql(u8, s, nm) or std.mem.eql(u8, s, nm_simple)) {
             const dist: i32 = @intCast(@min(pos, @as(usize, 20)));
-            return 75 - dist;
+            const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
+            return 75 - dist + d;
         }
     }
     if (nm.len <= 2 and allUppercase(nm)) return 5;
@@ -5435,6 +5425,77 @@ fn memberApplicableForWalk(self: *VmHost, f: *const Func, args: []const Value) b
     return true;
 }
 
+/// `memberApplicableForWalk` for a call that supplies argument names:
+/// every supplied name must name a declared value parameter (kotlinc: a
+/// candidate without the named param is not applicable), each argument is
+/// checked against the parameter it would actually bind (by name when
+/// named, by leading position otherwise), and every unbound parameter
+/// must be defaulted or a vararg.
+fn memberApplicableForWalkNamed(self: *VmHost, f: *const Func, args: []const Value, arg_names: ?[]const ?[]const u8) bool {
+    const names = arg_names orelse return memberApplicableForWalk(self, f, args);
+    var any_named = false;
+    for (names) |n| {
+        if (n != null) any_named = true;
+    }
+    if (!any_named) return memberApplicableForWalk(self, f, args);
+
+    const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    const effective = f.params[skip..];
+    var bound = [_]bool{false} ** 64;
+    if (effective.len > bound.len) return memberApplicableForWalk(self, f, args);
+    var positional: usize = 0;
+    for (args, 0..) |*a, i| {
+        const supplied_name: ?[]const u8 = if (i < names.len) names[i] else null;
+        var param: ?*const ir.Param = null;
+        if (supplied_name) |nm| {
+            for (effective, 0..) |*p, k| {
+                if (std.mem.eql(u8, p.name, nm)) {
+                    param = p;
+                    bound[k] = true;
+                    break;
+                }
+            }
+            if (param == null) return false;
+        } else if (i == args.len - 1 and isCallable(a) and effective.len > 0 and
+            !bound[effective.len - 1] and
+            lastParamIsFunctionShaped(self, &effective[effective.len - 1]))
+        {
+            // Kotlin's trailing-lambda rule: the unnamed trailing callable
+            // binds the LAST function-typed parameter (the middle gap must
+            // be defaulted, which the unbound-parameter check below
+            // enforces).
+            param = &effective[effective.len - 1];
+            bound[effective.len - 1] = true;
+        } else {
+            if (positional < effective.len) {
+                param = &effective[positional];
+                bound[positional] = true;
+            } else if (effective.len == 0 or !effective[effective.len - 1].is_vararg) {
+                return false;
+            }
+            positional += 1;
+        }
+        if (param) |p| {
+            if (!p.is_vararg and argDefinitelyNotParamType(self, &p.ty, a)) return false;
+        }
+    }
+    const defaults = funcDefaults(self, f);
+    for (effective, 0..) |*p, k| {
+        if (bound[k] or p.is_vararg or paramHasDefault(defaults, skip + k)) continue;
+        return false;
+    }
+    return true;
+}
+
+/// Mirrors `memberApplicableForWalk`'s last-param shape test: a declared
+/// function type, a typealias expanding to one, or a bare type parameter.
+fn lastParamIsFunctionShaped(self: *VmHost, p: *const ir.Param) bool {
+    const last_ty = resolveAliasName(self, p.ty.name);
+    return std.mem.startsWith(u8, last_ty, "Function") or
+        std.mem.indexOf(u8, last_ty, "->") != null or
+        (last_ty.len > 0 and last_ty.len <= 2 and allUppercase(last_ty));
+}
+
 fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: ?[]const ?[]const u8) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     var start: []const u8 = undefined;
@@ -5467,9 +5528,11 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                                 // A name match alone is not a candidate:
                                 // the member must be *applicable* to the
                                 // supplied args (an unsupplied param needs
-                                // a default or vararg slot), or Kotlin
+                                // a default or vararg slot, a named arg
+                                // needs a matching param, a typed arg must
+                                // not definitely mismatch), or Kotlin
                                 // resolution moves on to the next tier.
-                                if (memberApplicableForWalk(self, &f, args)) {
+                                if (memberApplicableForWalkNamed(self, &f, args, arg_names)) {
                                     method_fid = fid;
                                     break;
                                 }

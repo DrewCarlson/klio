@@ -1508,6 +1508,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const lowered = try lowerLambdaBodyCapturing(
         b.module,
         lam.params,
+        lam.param_tys,
         &lam.body,
         outer_names,
         &outer_boxed,
@@ -1523,6 +1524,13 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.pending_lambda_label = null;
         if (idGetMut(Func, b.module.funcs.items, body_func.int())) |f| {
             f.implicit_label = label;
+        }
+    }
+    // A `suspend { … }` literal: the body is a suspend function value.
+    if (b.pending_suspend_lambda) {
+        b.pending_suspend_lambda = false;
+        if (idGetMut(Func, b.module.funcs.items, body_func.int())) |f| {
+            f.is_suspend = true;
         }
     }
     const captures = try b.allocator.alloc(Reg, captured_names.len);
@@ -1561,9 +1569,12 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const param_names = try b.allocator.alloc([]const u8, af.params.len);
     const param_idents = try b.allocator.alloc(ast.Ident, af.params.len);
     defer b.allocator.free(param_idents);
-    for (af.params, param_names, param_idents) |p, *pn, *pi| {
+    const param_tys = try b.allocator.alloc(?ast.TypeRef, af.params.len);
+    defer b.allocator.free(param_tys);
+    for (af.params, param_names, param_idents, param_tys) |p, *pn, *pi, *pt| {
         pn.* = p.name.name;
         pi.* = p.name;
+        pt.* = p.ty;
     }
     // `outer_names` / `inherited_rlp` ownership passes into the lambda lower.
     const outer_names = try b.visibleNames();
@@ -1576,6 +1587,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const lowered = try lowerLambdaBodyCapturingKind(
         b.module,
         param_idents,
+        param_tys,
         &body_block,
         outer_names,
         false,
@@ -2237,11 +2249,14 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return dst;
     }
 
-    // `suspend { … }` builder.
+    // `suspend { … }` builder: the value is the lambda itself, with its
+    // body marked suspend so dispatch can distinguish it from a plain
+    // function value.
     if (callee.* == .Path and callee.Path.segments.len == 1 and
         std.mem.eql(u8, callee.Path.segments[0].name, "suspend") and
         args.len == 1 and args[0] == .Lambda)
     {
+        b.pending_suspend_lambda = true;
         return lowerExpr(b, &args[0]);
     }
     // `contract { … }` — compile-time marker with no runtime effect.
@@ -2351,7 +2366,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.module.classId(callee.Path.segments[0].name) == null and
         b.module.funcId(callee.Path.segments[0].name) == null)
     {
-        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names)) |r| return r;
+        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
     }
 
     // Built-in stdlib companion shortcuts: `Result.success(x)` etc.
@@ -3842,6 +3857,7 @@ fn lowerUnresolvedBareCall(
     callee: *const Expr,
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
 ) Allocator.Error!?Reg {
     const name0 = callee.Path.segments[0].name;
     // A bare call to a name the enclosing anon object closes over.
@@ -3889,6 +3905,7 @@ fn lowerUnresolvedBareCall(
         try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
         const dst = b.allocReg();
         try b.push(.{ .CallValue = .{
             .dst = dst,
@@ -3896,6 +3913,7 @@ fn lowerUnresolvedBareCall(
             .args = run[0],
             .n_args = run[1],
             .arg_names = arg_names,
+            .type_args = type_args,
         } });
         return dst;
     }

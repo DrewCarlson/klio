@@ -329,3 +329,52 @@ test "tailrec_member_receiver" {
         \\
     );
 }
+
+test "named_arg_member_over_extension" {
+    try check("named_arg_member_over_extension",
+        \\ints[3]
+        \\ints[2]
+        \\text[ell]
+        \\
+    );
+}
+
+// kotlinc-native 2.3.10 is the oracle: kotlinc-jvm rejects this overload
+// pair under JVM erasure (platform declaration clash), the native compiler
+// resolves it by the full declared type.
+test "overload_generic_args" {
+    try check("overload_generic_args",
+        \\pick(List<String>)
+        \\pick(List<Int>)
+        \\pick(List<String>)
+        \\pick(List<Int>)
+        \\
+    );
+}
+
+// kotlinc-native 2.3.10 is the oracle: kotlinc-jvm rejects this overload
+// pair under JVM erasure (platform declaration clash), the native compiler
+// resolves it by the full declared type.
+test "overload_function_shapes" {
+    try check("overload_function_shapes",
+        \\call((String)->String)
+        \\call((Int)->Int)
+        \\
+    );
+}
+
+test "overload_suspend_vs_plain" {
+    try check("overload_suspend_vs_plain",
+        \\take(plain)
+        \\take(suspend)
+        \\
+    );
+}
+
+test "empty_container_declared_elem" {
+    try check("empty_container_declared_elem",
+        \\ext List<String>
+        \\ext List<String>
+        \\
+    );
+}

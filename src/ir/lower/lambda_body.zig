@@ -91,6 +91,7 @@ pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
 pub fn lowerLambdaBodyCapturing(
     module: *Module,
     params: []const ast.Ident,
+    param_tys: []const ?ast.TypeRef,
     body: *const ast.Block,
     outer: StringSet,
     outer_boxed: *const StringSet,
@@ -101,6 +102,7 @@ pub fn lowerLambdaBodyCapturing(
     return lowerLambdaBodyCapturingKind(
         module,
         params,
+        param_tys,
         body,
         outer,
         true,
@@ -115,6 +117,7 @@ pub fn lowerLambdaBodyCapturing(
 pub fn lowerLambdaBodyCapturingKind(
     module: *Module,
     params: []const ast.Ident,
+    param_tys: []const ?ast.TypeRef,
     body: *const ast.Block,
     outer: StringSet,
     is_lambda: bool,
@@ -127,6 +130,7 @@ pub fn lowerLambdaBodyCapturingKind(
     return lowerLambdaBodyCapturingKindWith(
         module,
         params,
+        param_tys,
         body,
         outer,
         is_lambda,
@@ -144,6 +148,7 @@ pub fn lowerLambdaBodyCapturingKind(
 pub fn lowerLambdaBodyCapturingKindWith(
     module: *Module,
     params: []const ast.Ident,
+    param_tys: []const ?ast.TypeRef,
     body: *const ast.Block,
     outer: StringSet,
     is_lambda: bool,
@@ -229,11 +234,22 @@ pub fn lowerLambdaBodyCapturingKindWith(
     const id = FuncId.from(@intCast(module.funcs.items.len));
     func.id = id;
     func.is_lambda = is_lambda;
+    // Declared parameter annotations (`{ s: String -> … }`, an anonymous
+    // function's typed params) land on the body func so runtime overload
+    // dispatch can match the value against a declared function-type
+    // parameter. Unannotated slots (and the injected implicit `it`) keep
+    // the Unit placeholder, which dispatch treats as no-information.
     const placed_params = try b.allocator.alloc(Param, names.items.len);
-    for (names.items, placed_params) |n, *dst| {
+    for (names.items, placed_params, 0..) |n, *dst, i| {
+        const ty: ir.TypeRef = blk: {
+            if (i < param_tys.len) {
+                if (param_tys[i]) |*t| break :blk try decl.loweredTypeRef(b.allocator, t, false);
+            }
+            break :blk build.typeUnit();
+        };
         dst.* = .{
             .name = n,
-            .ty = build.typeUnit(),
+            .ty = ty,
             .default = null,
             .is_property = false,
             .is_vararg = false,
