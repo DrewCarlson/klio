@@ -393,11 +393,18 @@ pub fn build(b: *std.Build) void {
                 keyOnEnv(b, run_t, &interp_env_keys);
                 if (spec.fuzz_env) keyOnEnv(b, run_t, &fuzz_env_keys);
                 // Child-spawning tests run programs through the
-                // harness-optimized `klio` installed alongside the suite.
+                // harness-optimized `klio` installed alongside the suite. They
+                // must never be cached: the run-step manifest keys on the test
+                // binary and declared file inputs, not on the separately-built
+                // `klio-harness` they spawn, so an interpreter change rebuilds
+                // the harness without invalidating the test and a stale pass is
+                // served. These tests also bind sockets and mutate a scratch
+                // HOME — genuine side effects — so always re-run them.
                 if (spec.needs_exe) {
                     const hinst = b.addInstallArtifact(harness_exe, .{});
                     run_t.step.dependOn(&hinst.step);
                     run_t.setEnvironmentVariable("KLIO_ITEST_BIN", "zig-out/bin/klio-harness");
+                    run_t.has_side_effects = true;
                 }
                 if (spec.parity_data) {
                     declareDataDirs(b, run_t, &data_memo, &stdlib_data_dirs);
