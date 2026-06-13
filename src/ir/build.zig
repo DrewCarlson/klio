@@ -715,12 +715,16 @@ pub const FuncBuilder = struct {
         return self.own_members.contains(name) or self.enclosing_members.contains(name);
     }
     /// The enclosing-class member set to hand a lambda lowered inside
-    /// this builder. The caller owns the returned set.
+    /// this builder. A lambda body's enclosing receivers are this
+    /// builder's own receiver plus whatever receivers were already
+    /// enclosing it, so the child sees the union of `own_members` and
+    /// `enclosing_members`. The caller owns the returned set.
     pub fn enclosingMembersForChild(self: *const FuncBuilder) Allocator.Error!StringSet {
-        if (self.own_members.count() == 0) {
-            return cloneStringSet(self.allocator, &self.enclosing_members);
-        }
-        return cloneStringSet(self.allocator, &self.own_members);
+        var out = try cloneStringSet(self.allocator, &self.own_members);
+        errdefer out.deinit();
+        var it = self.enclosing_members.keyIterator();
+        while (it.next()) |k| try out.put(k.*, {});
+        return out;
     }
     /// Replace the private-method-fid map. Takes ownership of `map`.
     pub fn setPrivateMethodFids(self: *FuncBuilder, map: StringFuncIdMap) void {

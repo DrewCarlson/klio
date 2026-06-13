@@ -20,16 +20,37 @@ path can also claim them. Erroring these requires the index to model the
 runtime's member-redispatch shapes first. Recorded in
 `execution-architecture.md` row 8.
 
-### 4. `with`-subject outer-tower leniency
+### 4. `with`-subject outer-tower leniency — RESOLVED
 
 `with(x) { … }` exposes only `x` itself in kotlinc; the call-side
-`outerChainFallback` (`host_call_member.zig` — the surviving half of the
-old field-read rescues, whose `getField` side is gone) can still resolve a
-name through the subject's outer tower in shapes kotlinc rejects (probes
-p0f/p0f2 from the single-resolver work). A leniency, not a wrong value for
-valid programs. Recorded as the §4.2 residual in
-`execution-architecture.md`; goes away if the call-side fallback is folded
-into the single resolver's candidate discipline.
+`outerChainFallback` could still resolve a name through the subject's outer
+tower in shapes kotlinc rejects (probes p0f/p0f2 from the single-resolver
+work).
+
+Root-caused to the lowering: a bare call inside a lifted nested/inner
+class's method body whose name is a member of the *enclosing* class was
+lowered to a plain `CallMember` on this receiver, because the enclosing
+class's member names were merged into the method builder's `own_members`.
+That plain member call then reached the enclosing member only via the
+runtime `outerChainFallback`, which walks ANY receiver Instance's `outer`
+links regardless of how it became the receiver — so it also fired for a
+`with`/`run`/`apply` subject whose outer tower is not in scope (and even
+for an explicit `outer.Inner().describe()`, which kotlinc rejects too).
+
+Fixed by separating the two member sets: a lifted class's enclosing-class
+members are now the method builder's `enclosing_members` (members of an
+enclosing `this@Outer`, reached only through the implicit-receiver
+candidate walk), kept distinct from `own_members` (the receiver's genuine
+own/inherited members). An enclosing-member bare call therefore lowers to
+`CallMemberOrGlobal`, resolved by the single candidate resolver
+(`implicitCandidatesAlloc`): the inner's own `this` then its `outer` links
+are searched (dispatch receiver — tower in scope), while a subject brings
+only itself (tower NOT in scope). `outerChainFallback` and its
+`call_outer_active` guard are deleted (see finding 9). Pinned by
+`with_subject_outer_member_call_rejected` (rejection),
+`inner_member_calls_outer_member` (positive: the dispatch-receiver tower
+keeps resolving), and `backtick_this_param_not_receiver` in
+`parity_corpus_pinned.zig`, all kotlinc-verified (kotlinc-jvm 2.3.21).
 
 ### 5. Empty containers without a creation-site type argument are unprovable
 
@@ -87,20 +108,53 @@ not widened into the residue set. The readout in
 
 ## Architecture residue
 
-### 8. Frame's own `this` is not folded into the receiver-chain carrier
+### 8. Frame's own `this` recovered by name — RESOLVED (kind-disciplined, not depth-folded)
 
-The last §4.2 line item: `frameThisParam`/`callerThisValue` still recover the
-frame receiver by param/capture name instead of riding
-`Frame.enclosing_this[0]`. Folding it changes `implicitReceiverChain` depth
-assumptions across every consumer; the consumer inventory lives in
-`execution-architecture.md` §4.2.
+`frameThisParam`/`callerThisValue` recovered the frame receiver by scanning
+`func.params`/`capture_order` for the literal name `"this"`, with no regard
+for whether that param was a *synthesized* dispatch receiver. A user
+parameter spelled `this` (`fun probe(\`this\`: Box)`, backticked because
+`this` is a hard keyword) was treated as a dispatch receiver, so a bare
+`show()` in the body resolved against it — kotlinc rejects (`unresolved
+reference 'show'`).
+
+The fold was landed bundled with finding 4, as the validator required. The
+realization is the *kind discipline* the chain already uses, not a depth
+shift: `ownReceiverEntry` seeds the frame's own receiver onto
+`Frame.enclosing_this` only for a synthesized receiver (method / extension
+by `func.kind`; constructor / init / local-extension by injection).
+`frameThisParam` now consults the same provenance — a new
+`Func.has_receiver_param` flag, set wherever the lowerer injects a leading
+`this` (method/extension bodies via `implicit_params`, local-extension
+lambdas, constructors/init/accessor/default-arg thunks) — instead of a bare
+name scan. A user `this` parameter has no synthesized receiver, so
+`frameThisParam` returns null and the bare call resolves no implicit
+receiver, matching kotlinc. The by-name path and the chain's
+`ownReceiverEntry` are now the same kind-gated discipline (one receiver
+provenance), so `implicitCandidatesAlloc` and every other consumer keep
+their existing depth assumptions — no depth-churn was needed once finding
+4's leniency was root-caused in the lowering rather than the runtime
+fallback. Pinned by `backtick_this_param_not_receiver` in
+`parity_corpus_pinned.zig` (kotlinc-jvm 2.3.21).
+
+The deeper structural ideal — deleting the param/capture recovery entirely
+in favor of reading `enclosing_this[0]` — was deliberately NOT taken: with
+`has_receiver_param` the two paths now agree by construction, and removing
+the by-name recovery would churn `implicitCandidatesAlloc`'s capture-slot
+and depth-0 handling for no behavioral gain. The leniency #8 named is
+closed; the redundancy is reconciled, not removed.
 
 ### 9. Kept re-entrancy thread-locals
 
-`map_fallback_active`, `iterable_fallback_active`, `call_outer_active`,
-`field_outer_active` stay thread-local with run-boundary asserts: each
-breaks a recursion that crosses the host→eval→host boundary, which a
-parameter cannot follow. Tracked in `guard-inventory.md` (keep rows).
+`call_outer_active` is DELETED: it guarded exactly the `outerChainFallback`
+that finding 4 removed, so it died with that fold (no remaining caller).
+`map_fallback_active`, `iterable_fallback_active`, and `field_outer_active`
+stay thread-local with run-boundary asserts: each breaks an intra-thread
+host materialization / rescue recursion that crosses the host→eval→host
+boundary, which a parameter cannot follow (NOT a resolver-order flag, so the
+single resolver did not retire them; NOT the finding-12 coroutine-scope
+carrier's axis). Tracked in `guard-inventory.md` (O1/B9 keep rows, O2
+removed).
 
 ### 12. Active-scope staleness after a resume — RESOLVED (over-delivery)
 
@@ -133,9 +187,9 @@ not reach a coroutine on an independent `CoroutineScope(Job())`) in
 kotlinx-coroutines).
 
 The carrier is the coroutine-*scope* carrier; it is distinct from the
-receiver-resolution chain carrier (`Frame.enclosing_this`, already
-per-activation and already carried across suspend) that findings 4/8/9 ride
-— those are not absorbed by this change and remain open below.
+receiver-resolution chain carrier (`Frame.enclosing_this`) that findings
+4/8/9 rode — those landed separately (4 and 8 RESOLVED above, 9's
+`call_outer_active` deleted) and were never absorbed by this change.
 
 Residual coroutine divergences surfaced by the #12 probes (each verified
 against kotlinc-jvm 2.3.21, separate root causes, not in the scope carrier):
@@ -160,3 +214,23 @@ against kotlinc-jvm 2.3.21, separate root causes, not in the scope carrier):
   non-daemon awaited scope alive). Distinguishing daemon (correctly
   abandoned) from awaited-non-daemon (must complete) is the
   daemon-lifecycle piece; not the scope carrier.
+
+## Tooling
+
+### 16. assert_single_path can flake on coroutine+atomic programs under real-thread dispatch
+
+`scripts/assert_single_path.py` asserts each program's `[PATH]` dispatch-record
+set is identical across reruns. Since `Dispatchers.Default`/`IO` run on a real
+worker pool, a program with atomic contention (e.g. an `AtomicRef.compareAndSet`
+retry loop across coroutine cancellation) can take a different number of CAS
+retries per run, so the dispatch-record *set* legitimately differs run-to-run
+even though stdout is stable. Observed ~1-in-several on the coroutine corpus
+(record `compareAndSet … AtomicRef,ChildContinuation,Removed …
+intrinsic_call_member`); not reproducible on reruns. The oracle cannot
+distinguish legitimate concurrency nondeterminism from a real dispatch
+nondeterminism bug. Fix direction: canonicalize records before the set compare
+(drop retry-count multiplicity, or key CAS records by site not occurrence), or
+exclude the genuinely-nondeterministic coroutine+atomic programs from the
+rerun-stability assertion while keeping the determinism assertion for the rest.
+Predates this finding's discovery — it is a property of real-thread dispatch
+(landed earlier) meeting the determinism oracle, not of any one fix.

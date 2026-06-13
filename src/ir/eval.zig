@@ -2164,10 +2164,19 @@ fn instanceOuter(v: *const Value) ?Value {
     };
 }
 
-/// Index of the frame's `this` parameter, if any.
+/// Index of the frame's *synthesized* `this` receiver parameter, if any.
+/// A leading `this` param is the frame's own dispatch receiver only when
+/// the lowerer injected it (`has_receiver_param`): a method / extension /
+/// local-extension receiver, or a constructor / init thunk's instance
+/// under construction. A user parameter that merely spells its name `this`
+/// (`fun f(\`this\`: T)`, written with backticks since `this` is a hard
+/// keyword) is NOT a dispatch receiver, so a bare call in its body
+/// resolves no implicit receiver — matching kotlinc, which rejects such a
+/// call. The synthesized receiver is always at index 0.
 fn frameThisParam(frame: *const Frame) ?usize {
-    for (frame.func.params, 0..) |p, i| {
-        if (std.mem.eql(u8, p.name, "this")) return i;
+    if (!frame.func.has_receiver_param) return null;
+    if (frame.func.params.len != 0 and std.mem.eql(u8, frame.func.params[0].name, "this")) {
+        return 0;
     }
     return null;
 }

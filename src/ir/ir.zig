@@ -636,6 +636,15 @@ pub const Func = struct {
     /// or top-level extension.
     kind: FuncKind = .plain,
     is_tailrec: bool = false,
+    /// True when `params[0]` is a *synthesized* `this` receiver — an
+    /// instance method's / extension's / local-extension's dispatch
+    /// receiver, a constructor's or init thunk's instance under
+    /// construction, or any other frame the lowerer injects a leading
+    /// `this` for. It distinguishes a genuine receiver from a user
+    /// parameter that merely spells its name `this` (`fun f(\`this\`: T)`),
+    /// which is not a dispatch receiver. Set wherever the implicit leading
+    /// `this` param is bound.
+    has_receiver_param: bool = false,
     /// True for synthetic lambda bodies. `return` inside the body
     /// propagates as a non-local return through this frame instead
     /// of being caught locally.

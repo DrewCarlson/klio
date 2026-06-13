@@ -312,6 +312,13 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         };
     }
     func.params = placed_params;
+    // A local extension function is lowered as a lambda body with a
+    // synthesized leading `this` receiver param (ordinary receiver lambdas
+    // carry their receiver as a capture, not a param). Mark it so bare
+    // member resolution treats the receiver as a genuine dispatch
+    // receiver.
+    func.has_receiver_param = placed_params.len != 0 and
+        std.mem.eql(u8, placed_params[0].name, "this");
     try module.funcs.append(b.allocator, func);
     return .{ .func = id, .captures = captured };
 }
