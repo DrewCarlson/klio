@@ -191,29 +191,48 @@ receiver-resolution chain carrier (`Frame.enclosing_this`) that findings
 4/8/9 rode — those landed separately (4 and 8 RESOLVED above, 9's
 `call_outer_active` deleted) and were never absorbed by this change.
 
-Residual coroutine divergences surfaced by the #12 probes (each verified
-against kotlinc-jvm 2.3.21, separate root causes, not in the scope carrier):
+Residual coroutine divergences surfaced by the #12 probes — all RESOLVED
+(each kotlinc-jvm 2.3.21 verified, separate root causes, not in the scope
+carrier):
 
-- **`withContext(NonCancellable){}` fails**: `non-bool in branch:
-  kotlin.coroutines.CombinedContext`. Root-caused to the super-constructor
-  argument binding for `AbstractCoroutine` — `JobSupport(active)`'s `active`
-  (a `Boolean`) is read in the `__init_prop_JobSupport__state` thunk as the
-  `parentContext` (a `CombinedContext`). Reproduces only through the real
-  coroutine `AbstractCoroutine<in T>(parentContext: CoroutineContext,
-  initParentJob, active) : JobSupport(active), Job, Continuation<T>,
-  CoroutineScope` shape; minimal non-coroutine super-chains with the same
-  arity/variance/multiple-supertype shape do NOT reproduce, so the trigger is
-  narrower than "super-ctor arg by position". A constructor-lowering bug,
-  unrelated to the scope carrier.
-- **explicit `coroutineContext.cancel()` on the root is a silent no-op**
-  (a bare-read-captured `[Job]` cancel works), so it is a context-element
-  lookup gap in the `cancel()` extension's `[Job]` resolution.
-- **an independent (own-scope, not in the runBlocking tree) coroutine still
-  parked when the pump exits is abandoned**, so its later completion line is
-  not printed when the program awaits it past runBlocking (kotlinc keeps a
-  non-daemon awaited scope alive). Distinguishing daemon (correctly
-  abandoned) from awaited-non-daemon (must complete) is the
-  daemon-lifecycle piece; not the scope carrier.
+- **`withContext(NonCancellable){}` (and any context-changing `withContext`
+  whose dispatcher is unchanged) — RESOLVED**. The original `non-bool in
+  branch: kotlin.coroutines.CombinedContext` was not a super-ctor binding
+  bug: `withContext`'s undispatched fast path builds an
+  `UndispatchedCoroutine`, which the common source declares only as an
+  `expect class` (its supertype `ScopeCoroutine<T>` appears with no
+  constructor delegation). With no actual, the VM materialised the bare
+  expect, so `ScopeCoroutine`/`JobSupport` received the leaf's args and
+  `JobSupport._state`'s `if (active)` read a `CombinedContext`. Fixed by
+  supplying the klio actual `UndispatchedCoroutine : ScopeCoroutine<T>` in
+  `klioMain/.../ContextActuals.kt`. That exposed a second, *general* lowering
+  bug (not coroutine-specific): an inline function whose parameter name
+  collides with a variable a lambda argument references resolved the
+  reference to the inline parameter — `withContext`'s `block` was shadowed by
+  `withCoroutineContext`'s `block` param inside the spliced
+  `withCoroutineContext(...) { return@sc startUndispatchedOrReturn(coroutine,
+  block) }`, re-running the body. Fixed in the inline splice
+  (`ir/lower/inline_call.zig` + `ir/build.zig`): a spliced lambda body now
+  resolves its free names against the caller's scopes plus the lambda's own
+  scopes, skipping the inline fn's parameter scopes
+  (`lambda_splice_resolve`). A third, smaller lowering gap was fixed
+  alongside: an explicit label on a lambda literal (`sc@ { … }`) is now
+  recorded as the lambda's `implicit_label`, and a `LabeledReturn` matches a
+  frame's `implicit_label` as well as its name, so a `return@sc` spliced out
+  of an inlined argument unwinds to the labelled lambda. Pinned by
+  `tl_withcontext_noncancellable` in `parity_threaded_litmus.zig` and the
+  non-coroutine `inline_param_shadows_caller` in `parity_corpus_pinned.zig`.
+- **`coroutineContext.cancel()` / `coroutineContext[Job]!!.cancel()` —
+  RESOLVED**. Both call shapes now find the context's installed Job and
+  cancel its children (the #12 scope-carrier work installs the right Job on
+  the implicit `coroutineContext`). Pinned by
+  `tl_cancel_via_coroutine_context`.
+- **independent awaited coroutine kept alive — RESOLVED**. An
+  independent-scope coroutine (own `Job`, not in the runBlocking tree) that
+  is explicitly awaited completes before the awaiter proceeds even when its
+  body parks, while a fire-and-forget daemon stays correctly abandoned (the
+  `tl_daemon_*` pins are unchanged). Pinned by
+  `tl_independent_awaited_completes`.
 
 ## Tooling
 

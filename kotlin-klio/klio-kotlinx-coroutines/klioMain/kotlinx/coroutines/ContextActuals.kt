@@ -1,6 +1,7 @@
 package kotlinx.coroutines
 
 import kotlin.coroutines.*
+import kotlinx.coroutines.internal.ScopeCoroutine
 
 public actual fun CoroutineScope.newCoroutineContext(
     context: CoroutineContext
@@ -29,6 +30,13 @@ internal actual inline fun <T> withContinuationContext(
 ): T = block()
 
 internal actual fun Continuation<*>.toDebugString(): String = toString()
+
+// klio runs every `withContext` body on the same cooperative pump, so the
+// undispatched coroutine is just a scope coroutine over the unchanged context.
+internal actual class UndispatchedCoroutine<in T> actual constructor(
+    context: CoroutineContext,
+    uCont: Continuation<T>
+) : ScopeCoroutine<T>(context, uCont)
 
 internal actual val CoroutineContext.coroutineName: String?
     get() = this[CoroutineName]?.name

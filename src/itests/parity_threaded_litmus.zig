@@ -172,6 +172,9 @@ const RUNNABLE = [_][]const u8{
     "tl_daemon_not_awaited",
     "tl_daemon_queued_dropped",
     "tl_daemon_infinite_abandoned",
+    "tl_withcontext_noncancellable",
+    "tl_cancel_via_coroutine_context",
+    "tl_independent_awaited_completes",
     "tl_runblocking_worker_visibility",
     "tl_early_error_with_thread",
 };
@@ -292,6 +295,15 @@ test "tl_daemon_queued_dropped" {
 }
 test "tl_daemon_infinite_abandoned" {
     try check("tl_daemon_infinite_abandoned");
+}
+test "tl_withcontext_noncancellable" {
+    try check("tl_withcontext_noncancellable");
+}
+test "tl_cancel_via_coroutine_context" {
+    try check("tl_cancel_via_coroutine_context");
+}
+test "tl_independent_awaited_completes" {
+    try check("tl_independent_awaited_completes");
 }
 test "tl_runblocking_worker_visibility" {
     try check("tl_runblocking_worker_visibility");
