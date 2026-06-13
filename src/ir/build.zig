@@ -293,6 +293,15 @@ pub const FuncBuilder = struct {
     /// expression executes in the declaring function's scope, not as
     /// a member of the (extension) receiver.
     is_param_thunk: bool,
+    /// This lambda body declared no parameters and was lowered without an
+    /// implicit `it` binding, because its functional type takes zero
+    /// parameters (a `() -> R` or a `T.() -> R` receiver lambda). An `it`
+    /// reference that resolves to nothing here is an unresolved reference,
+    /// matching kotlinc, rather than a silent null.
+    it_suppressed: bool = false,
+    /// Span of the lambda literal whose `it` was suppressed, for the
+    /// unresolved-reference diagnostic.
+    it_suppressed_span: ?ast.Span = null,
     /// Inline-expansion state. `inline_return` is a stack of
     /// (result reg, join block): a `return` inside an inlined body
     /// assigns the result and jumps to the join. `inline_stack`
@@ -324,6 +333,14 @@ pub const FuncBuilder = struct {
     /// Declared return type of the function being lowered, used to infer
     /// the type argument of a reified inline call in `return …` position.
     declared_return: ?ast.TypeRef = null,
+    /// The expected lambda parameter count for the single lambda literal
+    /// about to be lowered (consumed and reset by `lowerLambda`). `-1`
+    /// means unknown. A zero-`->` lambda drops its parser-injected `it`
+    /// only when this is exactly `0` (a `() -> R` or a `T.() -> R` receiver
+    /// lambda — neither declares an `it`), so the `it` reference belongs to
+    /// the nearest enclosing lambda. Any other value (including unknown)
+    /// keeps the single-`it` binding.
+    pending_lambda_arity: i16 = -1,
 
     pub fn init(allocator: Allocator, module: *Module) Allocator.Error!FuncBuilder {
         var self = FuncBuilder{

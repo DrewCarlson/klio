@@ -48,6 +48,7 @@ const astBinop = helpers.astBinop;
 const boxedCellReg = helpers.boxedCellReg;
 const calleeLabel = helpers.calleeLabel;
 const lowerArgRun = helpers.lowerArgRun;
+const lowerArgRunWithArity = helpers.lowerArgRunWithArity;
 const internArgNames = helpers.internArgNames;
 const internTypeArgs = helpers.internTypeArgs;
 const exprSpan = helpers.exprSpan;
@@ -923,6 +924,20 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             return cell;
         }
+        // An `it` written in a zero-parameter / receiver lambda whose
+        // implicit `it` was suppressed, with no enclosing lambda supplying
+        // one: kotlinc rejects this as an unresolved reference. Record the
+        // diagnostic so the build driver fails the program before it runs.
+        if (b.it_suppressed and std.mem.eql(u8, name0, "it")) {
+            try b.module.resolve_diags.append(b.allocator, .{
+                .name = "it",
+                .fqn_a = "",
+                .fqn_b = "",
+                .span = segments[0].span,
+                .kind = .unresolved_local,
+            });
+            return b.emitConst(.Unit);
+        }
         // A bare `coroutineContext` member of the implicit receiver.
         if (std.mem.eql(u8, name0, "coroutineContext") and b.hasOwnMember("coroutineContext")) {
             if (b.resolve("this")) |this_reg| {
@@ -1497,6 +1512,22 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
 fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const lam = expr.Lambda;
+    // Consume the per-argument expected lambda arity set by the call
+    // lowering for this argument slot before the body recurses (which
+    // re-arms it for the body's own nested calls).
+    const expected_arity = b.pending_lambda_arity;
+    b.pending_lambda_arity = -1;
+    // A zero-`->` lambda gets its implicit `it` only when its own
+    // functional type takes exactly one parameter. A `() -> R` and a
+    // `T.() -> R` receiver lambda both encode arity 0, so the
+    // parser-injected `it` is dropped and an `it` reference inside resolves
+    // to the nearest enclosing lambda's `it` (or is rejected when none
+    // exists). Suppression applies only to the arity-0 shapes; an unknown
+    // arity (-1, an unconstrained value position) keeps the single-`it`
+    // binding unchanged.
+    const suppress_it = lam.implicit_it and expected_arity == 0;
+    const eff_params: []const ast.Ident = if (suppress_it) &.{} else lam.params;
+    const eff_param_tys: []const ?ast.TypeRef = if (suppress_it) &.{} else lam.param_tys;
     // `outer_names` / `inherited_rlp` ownership passes into the lambda lower.
     const outer_names = try b.visibleNames();
     const inherited_rlp = try b.receiverLambdaParamNames();
@@ -1505,16 +1536,21 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const enclosing_owner = try enclosingOwnerFor(b);
 
     const inherited_lef = try b.localExtFnNames();
-    const lowered = try lowerLambdaBodyCapturing(
+    const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
-        lam.params,
-        lam.param_tys,
+        eff_params,
+        eff_param_tys,
         &lam.body,
         outer_names,
+        true,
         &outer_boxed,
+        null,
+        false,
         inherited_rlp,
         inherited_lef,
         enclosing_owner,
+        suppress_it,
+        if (suppress_it) lam.span else null,
     );
     const body_func = lowered.func;
     const captured_names = lowered.captures;
@@ -1536,7 +1572,10 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const captures = try b.allocator.alloc(Reg, captured_names.len);
     for (captured_names, captures) |n, *c| c.* = try resolveCapture(b, n);
 
-    const param_names = try lambdaParamNames(b.allocator, lam.params);
+    const param_names = if (suppress_it)
+        try b.allocator.alloc([]const u8, 0)
+    else
+        try lambdaParamNames(b.allocator, lam.params);
     const body_ast = lam.body;
     const dst = b.allocReg();
     try b.push(.{ .AstLambda = .{
@@ -1629,6 +1668,54 @@ fn lambdaParamNames(allocator: Allocator, params: []const ast.Ident) Allocator.E
     }
     const out = try allocator.alloc([]const u8, params.len);
     for (params, out) |p, *o| o.* = p.name;
+    return out;
+}
+
+/// The non-receiver parameter count encoded in a lowered function-type
+/// head (`Function{N}` from `decl.loweredTypeRef`), or null when the type
+/// is not a function type. A `T.() -> R` receiver lambda and a `() -> R`
+/// lambda both encode `Function0`; a `(T) -> R` lambda encodes `Function1`.
+fn fnTypeArity(ty: ir.TypeRef) ?i16 {
+    const head = ty.name;
+    if (!std.mem.startsWith(u8, head, "Function")) return null;
+    const digits = head["Function".len..];
+    if (digits.len == 0) return null;
+    const n = std.fmt.parseInt(i16, digits, 10) catch return null;
+    return n;
+}
+
+/// Per-argument expected lambda arity for a call dispatched to the
+/// resolved runtime `func`, parallel to `args`. Each entry is the
+/// non-receiver parameter count of the matching parameter's function type,
+/// or `-1` when the parameter is not a function type or cannot be aligned.
+/// `recv_offset` skips a leading implicit `this` parameter (member /
+/// extension calls). Positional alignment only: a named or spread argument
+/// list yields all-unknown so a misaligned guess never suppresses an `it`.
+fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]i16 {
+    if (args.len == 0) return null;
+    for (arg_names) |an| if (an != null) return null;
+    for (args) |*a| if (a.* == .Spread) return null;
+    if (func.params.len < recv_offset) return null;
+    const params = func.params[recv_offset..];
+    // A trailing lambda fills the last function-typed parameter even when
+    // earlier defaulted parameters are omitted; align the trailing lambda
+    // with the last parameter and the leading args from the front.
+    const out = try b.allocator.alloc(i16, args.len);
+    for (out) |*o| o.* = -1;
+    const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
+    if (trailing_lambda and args.len <= params.len) {
+        // Leading positional args map 1:1 from the front.
+        var i: usize = 0;
+        while (i + 1 < args.len) : (i += 1) {
+            out[i] = fnTypeArity(params[i].ty) orelse -1;
+        }
+        // The trailing lambda maps to the last parameter.
+        out[args.len - 1] = fnTypeArity(params[params.len - 1].ty) orelse -1;
+    } else if (args.len == params.len) {
+        for (params, out) |p, *o| o.* = fnTypeArity(p.ty) orelse -1;
+    } else {
+        return null;
+    }
     return out;
 }
 
@@ -3654,7 +3741,14 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
             return dst;
         }
     }
-    const run = try lowerArgRun(b, args);
+    const arg_arity: ?[]const i16 = blk: {
+        if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
+            const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            break :blk try argFnArities(b, f, args, ast_arg_names, recv_off);
+        }
+        break :blk null;
+    };
+    const run = try lowerArgRunWithArity(b, args, arg_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
     const dst = b.allocReg();
@@ -3688,7 +3782,17 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
     synth_segs[0] = .{ .name = "this", .span = sp };
     all[0] = .{ .Path = .{ .segments = synth_segs, .span = sp } };
     for (args, 0..) |a, i| all[i + 1] = a;
-    const run = try lowerArgRun(b, all);
+    const arg_arity: ?[]const i16 = blk: {
+        if (allNull(ast_arg_names)) {
+            if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
+                // `all` leads with the synthesized `this`, aligned with the
+                // function's own leading `this` parameter, so no offset.
+                break :blk try argFnArities(b, f, all, &.{}, 0);
+            }
+        }
+        break :blk null;
+    };
+    const run = try lowerArgRunWithArity(b, all, arg_arity);
 
     // Target params for trailing-lambda arg-name synthesis.
     var target_params: [][]const u8 = &.{};

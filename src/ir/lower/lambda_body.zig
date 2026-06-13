@@ -77,6 +77,21 @@ pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
         try b.bind(name, dst);
         return dst;
     }
+    // A zero-parameter / receiver lambda whose `it` was deliberately not
+    // bound, and no enclosing lambda supplies one: kotlinc rejects this as
+    // an unresolved reference. Record the diagnostic so the build driver
+    // fails the program before it runs, rather than reading a silent null.
+    if (b.it_suppressed and std.mem.eql(u8, name, "it")) {
+        if (b.it_suppressed_span) |sp| {
+            try b.module.resolve_diags.append(b.allocator, .{
+                .name = "it",
+                .fqn_a = "",
+                .fqn_b = "",
+                .span = sp,
+                .kind = .unresolved_local,
+            });
+        }
+    }
     const dst = b.allocReg();
     const unit = try b.module.internConst(b.allocator, .Unit);
     try b.push(.{ .Const = .{ .dst = dst, .value = unit } });
@@ -159,8 +174,48 @@ pub fn lowerLambdaBodyCapturingKindWith(
     inherited_lef: StringSet,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
+    return lowerLambdaBodyCapturingKindWithIt(
+        module,
+        params,
+        param_tys,
+        body,
+        outer,
+        is_lambda,
+        outer_boxed,
+        tailrec_self,
+        is_named_local_fn,
+        inherited_rlp,
+        inherited_lef,
+        enclosing_owner,
+        false,
+        null,
+    );
+}
+
+/// As `lowerLambdaBodyCapturingKindWith`, but with the explicit-`it`
+/// suppression decision: when `suppress_it` is set the body declares no
+/// implicit `it`, so an `it` reference inside resolves to an enclosing
+/// lambda's `it` (or, resolving nowhere, is rejected as unresolved).
+pub fn lowerLambdaBodyCapturingKindWithIt(
+    module: *Module,
+    params: []const ast.Ident,
+    param_tys: []const ?ast.TypeRef,
+    body: *const ast.Block,
+    outer: StringSet,
+    is_lambda: bool,
+    outer_boxed: *const StringSet,
+    tailrec_self: ?[]const u8,
+    is_named_local_fn: bool,
+    inherited_rlp: StringSet,
+    inherited_lef: StringSet,
+    enclosing_owner: ?EnclosingOwner,
+    suppress_it: bool,
+    it_span: ?ast.Span,
+) Allocator.Error!LoweredLambda {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
+    b.it_suppressed = suppress_it;
+    b.it_suppressed_span = it_span;
     // Carry the lexically enclosing class (and its member-name set) so a
     // member reference inside the lambda resolves against the class that
     // declares it: a private getter (`closed`) reads the right field, and
@@ -209,7 +264,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(b.allocator);
     for (params) |p| try names.append(b.allocator, p.name);
-    if (params.len == 0) {
+    if (params.len == 0 and !suppress_it) {
         try names.append(b.allocator, "it");
     }
     // A lambda parameter that a deeper nested lambda *writes* is itself a

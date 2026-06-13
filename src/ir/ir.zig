@@ -826,6 +826,11 @@ pub const Module = struct {
             /// declares, imports, nor sees by default. Kotlin does not
             /// resolve such a reference at all.
             unresolved,
+            /// A simple in-scope reference resolves to nothing: notably an
+            /// `it` written in a lambda that declares no parameters and is
+            /// not invoked with a single argument, where no enclosing
+            /// lambda provides an `it` either.
+            unresolved_local,
         };
 
         /// Render the diagnostic with the call site (and declaration
@@ -839,6 +844,13 @@ pub const Module = struct {
         pub fn render(self: ResolveDiag, allocator: Allocator, map: *const span.SourceMap) Allocator.Error![]u8 {
             const call_loc = try locOf(allocator, map, self.span);
             defer allocator.free(call_loc);
+            if (self.kind == .unresolved_local) {
+                return std.fmt.allocPrint(
+                    allocator,
+                    "{s}: error: unresolved reference `{s}`",
+                    .{ call_loc, self.name },
+                );
+            }
             if (self.kind == .unresolved) {
                 if (self.fqn_b.len != 0 and !std.mem.eql(u8, self.fqn_a, self.fqn_b)) {
                     return std.fmt.allocPrint(

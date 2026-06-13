@@ -225,6 +225,27 @@ test "channel_send_receive" {
     try assertKlio("channel", src, "7,8\n");
 }
 
+test "launch_in_repeat_resolves_enclosing_it" {
+    // `launch { ch.send(it) }` is a receiver lambda (`suspend
+    // CoroutineScope.() -> Unit`) with no `it` of its own, so `it` resolves
+    // to the enclosing `repeat` lambda's index — kotlinc prints [0, 1, 2].
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\fun main() = runBlocking {
+        \\    val ch = Channel<Int>(3)
+        \\    repeat(3) { launch { ch.send(it) } }
+        \\    val got = mutableListOf<Int>()
+        \\    repeat(3) { got.add(ch.receive()) }
+        \\    got.sort()
+        \\    println(got)
+        \\}
+        \\
+    ;
+    try assertKlio("launch_in_repeat_it", src, "[0, 1, 2]\n");
+}
+
 test "with_timeout_or_null_returns_value_within_budget_and_null_on_expiry" {
     const src =
         \\
