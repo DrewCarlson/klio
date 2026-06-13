@@ -30,7 +30,12 @@ const Output = runtime.Output;
 const HostBindings = stdlib.HostBindings;
 
 const Allocator = std.mem.Allocator;
-const linux = std.os.linux;
+// The HTTP transport is a small blocking client/server over libc sockets,
+// which the binary links on every target (zstd pulls in libc). `posix`
+// supplies the address/constant types; `c` the syscalls; errno comes back
+// through `posix.errno`.
+const c = std.c;
+const posix = std.posix;
 
 /// Build the FQN -> `StdlibFn` registry for the ktor-client pack. Mirrors
 /// the Rust `host_bindings!` macro expansion: each `"fqn" => function`
@@ -227,7 +232,7 @@ fn httpRequest(allocator: Allocator, in: RequestInputs) TransportError![][]const
     const addr = try resolveIp4(target.host, target.port);
     const connect_ms = in.connect_timeout_ms orelse in.timeout_ms;
     const fd = try connectTimeout(addr, connect_ms);
-    defer _ = linux.close(fd);
+    defer _ = c.close(fd);
     applyTimeout(fd, in.timeout_ms);
 
     // `GET`/`HEAD`/`DELETE` and any empty-body method skip sending a
@@ -348,7 +353,7 @@ fn parseUrl(url: []const u8) TransportError!ParsedUrl {
 
 /// Resolve a host to an IPv4 `sockaddr.in`. Numeric dotted-quads are
 /// parsed directly; hostnames are looked up over UDP DNS.
-fn resolveIp4(host: []const u8, port: u16) TransportError!linux.sockaddr.in {
+fn resolveIp4(host: []const u8, port: u16) TransportError!posix.sockaddr.in {
     if (parseIp4Literal(host)) |octets| {
         return makeSockaddrIn(octets, port);
     }
@@ -356,11 +361,11 @@ fn resolveIp4(host: []const u8, port: u16) TransportError!linux.sockaddr.in {
     return makeSockaddrIn(octets, port);
 }
 
-fn makeSockaddrIn(octets: [4]u8, port: u16) linux.sockaddr.in {
+fn makeSockaddrIn(octets: [4]u8, port: u16) posix.sockaddr.in {
     // `addr` holds the four octets in network order in memory; a bit-cast
     // preserves that layout regardless of host endianness.
     return .{
-        .family = linux.AF.INET,
+        .family = posix.AF.INET,
         .port = std.mem.nativeToBig(u16, port),
         .addr = @bitCast(octets),
     };
@@ -388,39 +393,37 @@ fn resolveDns(host: []const u8) ![4]u8 {
     var query: [512]u8 = undefined;
     const qlen = buildDnsQuery(&query, host) orelse return error.InvalidUrl;
 
-    const fd_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
-    if (linux.errno(fd_rc) != .SUCCESS) return error.SocketFailed;
-    const fd: i32 = @intCast(fd_rc);
-    defer _ = linux.close(fd);
+    const fd = c.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    if (fd < 0) return error.SocketFailed;
+    defer _ = c.close(fd);
     applyTimeout(fd, 5000);
 
     const addr = makeSockaddrIn(server, 53);
-    const sent = linux.sendto(
+    const sent = c.sendto(
         fd,
         &query,
         qlen,
         0,
         @ptrCast(&addr),
-        @sizeOf(linux.sockaddr.in),
+        @sizeOf(posix.sockaddr.in),
     );
-    if (linux.errno(sent) != .SUCCESS) return error.WriteFailed;
+    if (sent < 0) return error.WriteFailed;
 
     var resp: [512]u8 = undefined;
-    const got = linux.recvfrom(fd, &resp, resp.len, 0, null, null);
-    if (linux.errno(got) != .SUCCESS) return error.ReadFailed;
-    return parseDnsAnswer(resp[0..got]) orelse error.ResolveFailed;
+    const got = c.recvfrom(fd, &resp, resp.len, 0, null, null);
+    if (got < 0) return error.ReadFailed;
+    return parseDnsAnswer(resp[0..@intCast(got)]) orelse error.ResolveFailed;
 }
 
 /// Read the first `nameserver` line from `/etc/resolv.conf`.
 fn readResolvConf() ?[4]u8 {
-    const fd_rc = linux.open("/etc/resolv.conf", .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(fd_rc) != .SUCCESS) return null;
-    const fd: i32 = @intCast(fd_rc);
-    defer _ = linux.close(fd);
+    const fd = c.open("/etc/resolv.conf", .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
     var buf: [4096]u8 = undefined;
-    const n_rc = linux.read(fd, &buf, buf.len);
-    if (linux.errno(n_rc) != .SUCCESS) return null;
-    const text = buf[0..n_rc];
+    const n_rc = c.read(fd, &buf, buf.len);
+    if (n_rc < 0) return null;
+    const text = buf[0..@intCast(n_rc)];
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         const t = std.mem.trim(u8, line, " \t\r");
@@ -515,49 +518,50 @@ fn skipName(resp: []const u8, start: usize) ?usize {
 
 /// Connect a fresh TCP socket to `addr`, honoring `timeout_ms` for the
 /// connect itself.
-fn connectTimeout(addr: linux.sockaddr.in, timeout_ms: u64) TransportError!i32 {
-    const fd_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
-    if (linux.errno(fd_rc) != .SUCCESS) return error.SocketFailed;
-    const fd: i32 = @intCast(fd_rc);
-    errdefer _ = linux.close(fd);
+fn connectTimeout(addr: posix.sockaddr.in, timeout_ms: u64) TransportError!i32 {
+    const fd = c.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.SocketFailed;
+    errdefer _ = c.close(fd);
     applyTimeout(fd, timeout_ms);
-    const rc = linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
-    if (linux.errno(rc) != .SUCCESS) return error.ConnectFailed;
+    const rc = c.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    if (rc < 0) return error.ConnectFailed;
     return fd;
 }
 
 /// Apply a send/receive timeout to a socket (best-effort).
 fn applyTimeout(fd: i32, timeout_ms: u64) void {
-    const tv = linux.timeval{
+    const tv = posix.timeval{
         .sec = @intCast(timeout_ms / 1000),
         .usec = @intCast((timeout_ms % 1000) * 1000),
     };
     const bytes = std.mem.asBytes(&tv);
-    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, bytes.ptr, @intCast(bytes.len));
-    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, bytes.ptr, @intCast(bytes.len));
+    _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, bytes.ptr, @intCast(bytes.len));
+    _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, bytes.ptr, @intCast(bytes.len));
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
     var off: usize = 0;
     while (off < data.len) {
-        const rc = linux.write(fd, data.ptr + off, data.len - off);
-        const e = linux.errno(rc);
-        if (e == .INTR) continue;
-        if (e != .SUCCESS) return error.WriteFailed;
+        const rc = c.write(fd, data.ptr + off, data.len - off);
+        if (rc < 0) {
+            if (posix.errno(rc) == .INTR) continue;
+            return error.WriteFailed;
+        }
         if (rc == 0) return error.WriteFailed;
-        off += rc;
+        off += @intCast(rc);
     }
 }
 
 fn readToEnd(allocator: Allocator, fd: i32, out: *std.ArrayList(u8)) !void {
     var chunk: [4096]u8 = undefined;
     while (true) {
-        const rc = linux.read(fd, &chunk, chunk.len);
-        const e = linux.errno(rc);
-        if (e == .INTR) continue;
-        if (e != .SUCCESS) return error.ReadFailed;
+        const rc = c.read(fd, &chunk, chunk.len);
+        if (rc < 0) {
+            if (posix.errno(rc) == .INTR) continue;
+            return error.ReadFailed;
+        }
         if (rc == 0) break;
-        try out.appendSlice(allocator, chunk[0..rc]);
+        try out.appendSlice(allocator, chunk[0..@intCast(rc)]);
     }
 }
 
@@ -641,11 +645,13 @@ fn read_request(allocator: Allocator, fd: i32) Allocator.Error!?ParsedRequest {
     var chunk: [1024]u8 = undefined;
     var header_end: ?usize = null;
     while (header_end == null) {
-        const rc = linux.read(fd, &chunk, chunk.len);
-        const e = linux.errno(rc);
-        if (e == .INTR) continue;
-        if (e != .SUCCESS or rc == 0) return null;
-        try buf.appendSlice(allocator, chunk[0..rc]);
+        const rc = c.read(fd, &chunk, chunk.len);
+        if (rc < 0) {
+            if (posix.errno(rc) == .INTR) continue;
+            return null;
+        }
+        if (rc == 0) return null;
+        try buf.appendSlice(allocator, chunk[0..@intCast(rc)]);
         header_end = std.mem.indexOf(u8, buf.items, "\r\n\r\n");
     }
     const sep = header_end.?;
@@ -676,11 +682,13 @@ fn read_request(allocator: Allocator, fd: i32) Allocator.Error!?ParsedRequest {
         @memcpy(body_buf[0..take], buf.items[sep + 4 .. sep + 4 + take]);
         var filled = take;
         while (filled < content_length) {
-            const rc = linux.read(fd, body_buf.ptr + filled, content_length - filled);
-            const e = linux.errno(rc);
-            if (e == .INTR) continue;
-            if (e != .SUCCESS or rc == 0) return null;
-            filled += rc;
+            const rc = c.read(fd, body_buf.ptr + filled, content_length - filled);
+            if (rc < 0) {
+                if (posix.errno(rc) == .INTR) continue;
+                return null;
+            }
+            if (rc == 0) return null;
+            filled += @intCast(rc);
         }
         body = body_buf;
     }
@@ -746,13 +754,12 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
         const msg = try std.fmt.allocPrint(a, "__kktor_serve: bind {d} failed", .{port});
         return .{ .err = .{ .Type = msg } };
     };
-    defer _ = linux.close(listen_fd);
+    defer _ = c.close(listen_fd);
 
     while (true) {
-        const accept_rc = linux.accept(listen_fd, null, null);
-        if (linux.errno(accept_rc) != .SUCCESS) continue;
-        const conn: i32 = @intCast(accept_rc);
-        defer _ = linux.close(conn);
+        const conn = c.accept(listen_fd, null, null);
+        if (conn < 0) continue;
+        defer _ = c.close(conn);
         const parsed = (try read_request(a, conn)) orelse continue;
         var items: std.ArrayList(Value) = .empty;
         try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, parsed.method)) });
@@ -773,15 +780,14 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
 
 /// Bind and listen on `127.0.0.1:port`, returning the listening fd.
 fn bindListener(port: u16) !i32 {
-    const fd_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
-    if (linux.errno(fd_rc) != .SUCCESS) return error.SocketFailed;
-    const fd: i32 = @intCast(fd_rc);
-    errdefer _ = linux.close(fd);
+    const fd = c.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.SocketFailed;
+    errdefer _ = c.close(fd);
     const one: c_int = 1;
-    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int));
+    _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int));
     const addr = makeSockaddrIn(.{ 127, 0, 0, 1 }, port);
-    if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.BindFailed;
-    if (linux.errno(linux.listen(fd, 128)) != .SUCCESS) return error.ListenFailed;
+    if (c.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) < 0) return error.BindFailed;
+    if (c.listen(fd, 128) < 0) return error.ListenFailed;
     return fd;
 }
 
@@ -848,10 +854,10 @@ fn _kind_in_scope(_: PrimitiveArrayKind) void {}
 fn stderrPrint(s: []const u8) void {
     var off: usize = 0;
     while (off < s.len) {
-        const rc = linux.write(2, s.ptr + off, s.len - off);
-        if (linux.errno(rc) != .SUCCESS) return;
+        const rc = c.write(2, s.ptr + off, s.len - off);
+        if (rc < 0) return;
         if (rc == 0) return;
-        off += rc;
+        off += @intCast(rc);
     }
 }
 
