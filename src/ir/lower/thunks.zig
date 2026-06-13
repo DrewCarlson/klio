@@ -145,8 +145,17 @@ pub fn lowerExprAsParamThunkScoped(
     }
     const v = try lowerExpr(&b, expr);
     b.terminate(.{ .Return = v });
-    const func = try b.finish(name, name, build.typeUnit());
+    var func = try b.finish(name, name, build.typeUnit());
+    func.has_receiver_param = leadsWithThis(params);
     return pushFunc(module, func);
+}
+
+/// Whether a synthesized param list leads with the implicit `this`
+/// receiver. Thunk/accessor/init param lists are compiler-built, so a
+/// leading `this` is always the synthesized receiver (never a user
+/// backtick parameter).
+fn leadsWithThis(params: []const []const u8) bool {
+    return params.len != 0 and std.mem.eql(u8, params[0], "this");
 }
 
 /// Lower an init-style block with arbitrary bound parameter names.
@@ -173,6 +182,7 @@ pub fn lowerInitBlockWithParams(
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
     func.params = try accessorParams(allocator, params);
+    func.has_receiver_param = leadsWithThis(params);
     return pushFunc(module, func);
 }
 
@@ -204,7 +214,8 @@ pub fn lowerInitBlock(
     try bindParams(&b, &.{"this"});
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
-    const func = try b.finish(name, name, build.typeUnit());
+    var func = try b.finish(name, name, build.typeUnit());
+    func.has_receiver_param = true;
     return pushFunc(module, func);
 }
 
@@ -253,6 +264,7 @@ pub fn lowerAccessorExprWithExpected(
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
     func.params = try accessorParams(allocator, params);
+    func.has_receiver_param = leadsWithThis(params);
     return pushFunc(module, func);
 }
 
@@ -291,7 +303,8 @@ pub fn lowerAccessorBlock(
     try bindParams(&b, params);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
-    const func = try b.finish(name, name, build.typeUnit());
+    var func = try b.finish(name, name, build.typeUnit());
+    func.has_receiver_param = leadsWithThis(params);
     return pushFunc(module, func);
 }
 

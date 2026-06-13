@@ -33,8 +33,8 @@ called out explicitly.
 | A — closure execution / lambda variable access | 9 | 7 | 1 | 1 | 3 (A1, A2 via 4b; A5 via item 9) |
 | B — receiver/`this` across suspend/inline | 14 | 8 | 1 | 2 | 4 (B1 via item 6; B2–B5 relocated onto the frame chain; B6, B7, B10 via the item-6 close-out) |
 | C — pack-vs-direct resolution | 12 | 10 | 1 | 1 | 1 (C6 via item 9) |
-| Other-correctness / re-entrancy | 7 | 0 | 6 | 0 | 1 (O3's duplicate copy collapsed; the guard itself stays) |
-| **Total** | **42** | **25** | **9** | **4** | **9** |
+| Other-correctness / re-entrancy | 7 | 0 | 5 | 0 | 2 (O3's duplicate copy collapsed, guard stays; O2 removed via finding 4) |
+| **Total** | **42** | **25** | **8** | **4** | **10** |
 
 (A guard counted "needs-verification" is also counted in exactly one of
 deletable/keep per its best-current assessment; the four NV rows are A4, B9,
@@ -361,15 +361,28 @@ or a re-entrant dispatch.
 - **What it does:** prevents the inner-class outer-chain *field* fallback from
   recursing.
 - **Class:** B (TLS) / other-correctness (loop prevention).
-- **Deletable?** **Needs-verification.** Part guard-for-B1's-fallback, part genuine
-  re-entrancy protection. Once the outer chain is structural (§4.2) the fallback
-  it guards may vanish; but a loop-prevention flag for a legitimately recursive
-  walk could remain necessary — confirm by removing it and checking the cyclic
-  outer/companion fixtures (`parity_inner_classes`).
-- **Removes via:** §6 item **6**.
+- **Stays a TLS — confirmed reason (re-checked at the findings 4/8/9 fold).**
+  This is the field-READ analog of the call-side `outerChainFallback` that
+  finding 4 deleted (O2), but it does NOT die with that fold and does NOT
+  ride the receiver-chain carrier. It walks the receiver *value's* `outer`
+  links (not the frame's `enclosing_this` chain — the chain-based
+  enclosing-receiver field fallback is the separate block just above it,
+  which correctly respects subject discipline) and re-enters `getFieldInner`
+  → host dispatch, so the recursion crosses the host→eval→host boundary and
+  the guard must survive that whole synchronous activation, which a
+  parameter cannot follow. With findings 4/8 landed, the with-subject and
+  bare-read leniencies are closed by the candidate resolver upstream (a bare
+  enclosing-member read lowers to `LoadFromThisOrGlobal` and resolves
+  through `implicitCandidatesAlloc`), so this fallback now only serves
+  explicit `recv.field` access where `recv` has an `outer` link — the
+  residual chain-top rescue §4.2 documents (a leniency over kotlinc for
+  explicit qualified outer access, not a wrong value for valid programs).
+  Removing it standalone leaves that residual unchanged (it flows through a
+  different path) while risking the inner-class field-read positives, so it
+  stays a TLS with run-boundary asserts.
 - **Removal test:** `parity_inner_classes` + companion-with-cyclic-outer fixtures
-  green after removal; if they loop, it is a keep (loop-prevention) reclassified
-  toward C-style guards.
+  green; the residual explicit-qualified outer field-read leniency is tracked
+  in `execution-architecture.md` §4.2, not by this guard.
 
 ### B10 — `inner_outer_hint` thread-local — REMOVED (item-6 close-out)
 
@@ -774,32 +787,46 @@ catalogued so nobody mistakes them for Class-A/B/C point-fixes; most are **keep*
   false at every run boundary (wired into
   `vmhost.resetReceiverThreadLocals`) — previously the only TLS-holding VM
   module with no run-boundary assert.
-- **Removes via:** a carrier riding the synchronous host→eval→host
-  *activation* (the drain recursion crosses that boundary, so the flag
-  cannot be a parameter of one call). NOT the finding-12 carrier: that one
-  carries the coroutine *scope* per parked activation at the pump level, a
-  different axis from this materialization re-entrancy flag (which is purely
-  intra-thread and unrelated to suspension). §6 item 7 (the single resolver)
-  is done and did not absorb it; not a resolution-class fix. Stays a TLS.
+- **Stays a TLS — confirmed reason.** It guards a purely intra-thread host
+  materialization re-entrancy: while the Map/Iterable fallback drains the
+  user collection, the drain calls back into `callMember` (host→eval→host),
+  and the flag must survive that whole synchronous activation, which a
+  parameter of one call cannot. It is NOT a resolver-order flag, so the
+  single resolver (§6 item 7, done) does not retire it; and NOT the
+  finding-12 axis (that carries the coroutine *scope* per parked activation
+  at the pump level — this flag is unrelated to suspension). The receiver-
+  chain fold (findings 4/8) does not let it ride the carrier either: the
+  carrier is per-frame receiver state, while this is per-activation
+  re-entrancy state for a host-internal drain that has no receiver to ride.
+  Stays a TLS with run-boundary asserts.
 - **Removal test:** `parity_collections_intensive`/`parity_maps_intensive` with a
   user-defined `Map`/`Iterable`; must stay green (a regression would hang).
 
-### O2 — `call_outer_active`
+### O2 — `call_outer_active` — REMOVED (finding 4)
 
-- **Location:** `src/interp_ir/vm/host_call_member.zig:3982-3987`.
-- **What it does:** re-entrancy flag so a companion whose `outer` is its class (whose
-  member lookup forwards back to the companion) cannot loop.
-- **Class:** other-correctness.
-- **Deletable?** **Keep** for now (loop prevention). This guard rides the
-  receiver-resolution chain, NOT the coroutine-scope carrier from finding 12
-  (those are different axes — see O5). `call_outer_active` guards exactly the
-  `outerChainFallback` that finding 4 (`with`-subject outer-tower leniency,
-  still open in `deferred-findings.md`) would remove by folding the call-side
-  outer fallback into the single resolver's candidate discipline; this guard
-  dies with that fold, not with the scope carrier. Now asserted false at run
-  boundaries via `host_call_member.resetReceiverTls` (item-6 close-out).
-- **Removal test:** companion-outer cyclic fixtures in `parity_inner_classes` stay
-  green.
+- **Status:** REMOVED. It guarded exactly the `outerChainFallback` that
+  finding 4 deleted, so it had no remaining caller and died with that fold.
+  Finding 4 was root-caused in the *lowering*, not the runtime: an
+  enclosing-member bare call inside a lifted nested/inner class body was
+  lowered to a plain `CallMember` on this receiver (because the enclosing
+  class's members were merged into the method builder's `own_members`), and
+  reached the enclosing member only via the runtime outer-link
+  `outerChainFallback` — which also fired for a `with`/`run`/`apply` subject
+  whose outer tower is not in scope. The fix keeps the enclosing-class
+  members as the builder's `enclosing_members` (distinct from
+  `own_members`), so such a call lowers to `CallMemberOrGlobal` and the
+  single candidate resolver (`implicitCandidatesAlloc`) walks the proper
+  implicit-receiver tower: a dispatch receiver brings its `outer` links, a
+  subject brings only itself. With the fallback gone the guard is gone; its
+  line is removed from `host_call_member.resetReceiverTls`.
+- **Was at:** `src/interp_ir/vm/host_call_member.zig` (the
+  `outerChainFallback` block).
+- **Class:** other-correctness (re-entrancy bound for a now-deleted walk).
+- **Verified by:** `with_subject_outer_member_call_rejected` (rejection),
+  `inner_member_calls_outer_member` (positive — the companion-outer /
+  inner-outer member resolution that this guard's walk used to serve now
+  resolves through the candidate tower) and `backtick_this_param_not_receiver`
+  in `parity_corpus_pinned.zig`, plus `parity_inner_classes` green.
 
 ### O3 — `ctor_guard` (was defined twice) — duplication REMOVED (item-6 close-out)
 
@@ -911,7 +938,8 @@ registry-kind) rather than deleting the behavior.
 2. **`map_fallback_active` / `iterable_fallback_active` (O1)** — the *flag* is a TLS
    to relocate, but the re-entrancy protection it provides is mandatory (infinite
    recursion otherwise).
-3. **`call_outer_active` (O2)** — companion/outer cycle loop-prevention.
+3. **`call_outer_active` (O2)** — REMOVED via finding 4 (it guarded the deleted
+   `outerChainFallback`); no longer a keep entry.
 4. **`ctor_guard` (O3)** — object/secondary-ctor init guard; the duplicate is now
    collapsed (item-6 close-out), keep the one guard.
 5. **`top_level_init_depth` (O4)** — forward-reference init-order semantics.

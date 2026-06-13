@@ -462,3 +462,31 @@ test "qualified_unimported_ref" {
         \\
     );
 }
+
+// A `with(x) { … }` subject exposes only `x`; its enclosing-instance tower
+// is NOT in scope, so a bare call to a member of the subject's outer class
+// is unresolved (kotlinc: `unresolved reference 'describe'`). The
+// dispatch-receiver tower stays in scope (see
+// `inner_member_calls_outer_member`); the difference is subject vs dispatch
+// receiver.
+test "with_subject_outer_member_call_rejected" {
+    try checkErr("with_subject_outer_member_call_rejected", "describe");
+}
+
+// The positive companion: an inner-class method calling a bare member of
+// its enclosing class resolves through the real dispatch-receiver `this`
+// tower (`this@Inner` → `this@Outer`). Must keep working.
+test "inner_member_calls_outer_member" {
+    try check("inner_member_calls_outer_member",
+        \\outer-describe
+        \\
+    );
+}
+
+// A user parameter named `this` (backticked, since `this` is a hard
+// keyword) is an ordinary parameter, not a dispatch receiver, so a bare
+// call in the function body is unresolved (kotlinc: `unresolved reference
+// 'show'`).
+test "backtick_this_param_not_receiver" {
+    try checkErr("backtick_this_param_not_receiver", "show");
+}

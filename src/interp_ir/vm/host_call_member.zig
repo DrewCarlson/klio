@@ -60,10 +60,8 @@ threadlocal var iterable_fallback_active: bool = false;
 pub fn resetReceiverTls() void {
     std.debug.assert(!map_fallback_active);
     std.debug.assert(!iterable_fallback_active);
-    std.debug.assert(!call_outer_active);
     map_fallback_active = false;
     iterable_fallback_active = false;
-    call_outer_active = false;
 }
 
 fn unsupported(name: []const u8) EvalResult {
@@ -2597,8 +2595,6 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         return mapRuntimeResult(allocator, r);
     }
 
-    // Inner-class outer-chain fallback.
-    if (try outerChainFallback(self, allocator, receiver, name, args)) |r| return r;
 
     // Map fallback.
     if (receiver.* == .Instance and !map_fallback_active and
@@ -5093,45 +5089,6 @@ fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: *con
             dg.deinit();
         }
         cg.deinit();
-    }
-    return null;
-}
-
-/// Re-entrancy flag for the inner-class outer-chain member fallback,
-/// mirroring `CALL_OUTER_ACTIVE` / `with_call_outer_guard` in Rust: a
-/// nested outer-chain walk is a no-op so a companion whose `outer` is its
-/// class (whose member lookup forwards back to the companion) cannot loop.
-threadlocal var call_outer_active: bool = false;
-
-fn outerChainFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    if (call_outer_active) return null;
-    call_outer_active = true;
-    defer call_outer_active = false;
-    var cur: ?Value = switch (receiver.*) {
-        .Instance => |i| blk: {
-            const g = i.borrow();
-            defer g.deinit();
-            break :blk g.get().outer;
-        },
-        else => null,
-    };
-    while (cur) |o| {
-        if (o == .Null or o == .Unit) break;
-        const r = try callMemberRec(self, allocator, &o, name, args);
-        switch (r) {
-            .ok => return r,
-            .err => |e| {
-                if (e != .Unimplemented) return r;
-            },
-        }
-        cur = switch (o) {
-            .Instance => |i| blk: {
-                const g = i.borrow();
-                defer g.deinit();
-                break :blk g.get().outer;
-            },
-            else => null,
-        };
     }
     return null;
 }

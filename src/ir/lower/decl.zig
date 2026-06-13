@@ -339,8 +339,18 @@ pub fn lowerClassWithExtras(
     });
     // Collect this class's own member names so method-body lowering can
     // tell `someMember()` (this.someMember) apart from `topLevelFn()`
-    // (LoadGlobal).
-    var own_member_names = try cloneStringSet(a, extra_members);
+    // (LoadGlobal). The lexically-enclosing class's members
+    // (`extra_members`, for a lifted nested/inner class) are kept SEPARATE
+    // — they are members of an enclosing `this@Outer`, reached only
+    // through the implicit-receiver candidate walk, never through a direct
+    // `this.<name>` on this receiver. Merging them into `own_members`
+    // would route an enclosing-member bare call to a plain `CallMember` on
+    // this receiver, which then resolved only via the runtime outer-link
+    // fallback — a leniency that also fired for a `with`-subject whose
+    // outer tower is not in scope. Routing them through the candidate
+    // resolver instead matches kotlinc: the inner's own `this` then its
+    // `outer` links are searched, while a subject brings only itself.
+    var own_member_names = StringSet.init(a);
     defer own_member_names.deinit();
     // Walk this class + every supertype reachable through the file's
     // class registry so inherited member names also route as
@@ -386,6 +396,7 @@ pub fn lowerClassWithExtras(
                 f,
                 c.name.name,
                 &own_member_names,
+                extra_members,
                 &private_method_fids,
             );
             try methods.append(a, placed.id);
@@ -665,7 +676,9 @@ pub fn lowerMethod(
 ) Allocator.Error!Func {
     var empty = StringFuncIdMap.init(module.registry.allocator);
     defer empty.deinit();
-    return lowerMethodWithPrivate(module, f, owner_class, own_members, &empty);
+    var no_enclosing = StringSet.init(module.registry.allocator);
+    defer no_enclosing.deinit();
+    return lowerMethodWithPrivate(module, f, owner_class, own_members, &no_enclosing, &empty);
 }
 
 pub fn lowerMethodWithPrivate(
@@ -673,6 +686,7 @@ pub fn lowerMethodWithPrivate(
     f: *const ast.Function,
     owner_class: []const u8,
     own_members: *const StringSet,
+    enclosing_members: *const StringSet,
     private_method_fids: *const StringFuncIdMap,
 ) Allocator.Error!Func {
     const a = module.registry.allocator;
@@ -691,7 +705,7 @@ pub fn lowerMethodWithPrivate(
     // extensions use (the receiver is prepended as the implicit `this`).
     if (f.receiver_type != null) {
         const implicit = [_][]const u8{"this"};
-        const func = try lowerFunctionBodyWithImplicitOwner(module, f, &implicit, null, null);
+        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, null, null, enclosing_members, null);
         const id = FuncId.from(@intCast(module.funcs.items.len));
         var placed = func;
         placed.id = id;
@@ -711,12 +725,13 @@ pub fn lowerMethodWithPrivate(
         try recordMethodParamDefaults(module, f, id, null, null);
         return placed;
     }
-    const func = try lowerFunctionBodyWithImplicitOwnerPriv(
+    const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(
         module,
         f,
         &[_][]const u8{"this"},
         owner_class,
         own_members,
+        enclosing_members,
         private_method_fids,
     );
     const id = FuncId.from(@intCast(module.funcs.items.len));
@@ -735,12 +750,13 @@ pub fn lowerFunctionBodyWithImplicitOwner(
     owner_class: ?[]const u8,
     own_members: ?*const StringSet,
 ) Allocator.Error!Func {
-    return lowerFunctionBodyWithImplicitOwnerPriv(
+    return lowerFunctionBodyWithImplicitOwnerEnclosing(
         module,
         f,
         implicit_params,
         owner_class,
         own_members,
+        null,
         null,
     );
 }
@@ -751,6 +767,32 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
     implicit_params: []const []const u8,
     owner_class: ?[]const u8,
     own_members: ?*const StringSet,
+    private_method_fids: ?*const StringFuncIdMap,
+) Allocator.Error!Func {
+    return lowerFunctionBodyWithImplicitOwnerEnclosing(
+        module,
+        f,
+        implicit_params,
+        owner_class,
+        own_members,
+        null,
+        private_method_fids,
+    );
+}
+
+/// Lower a method body, threading the lexically-enclosing class's member
+/// names (a lifted nested/inner class's outer members) as the builder's
+/// `enclosing_members` — distinct from `own_members`. An enclosing member
+/// is in scope only through the implicit-receiver candidate walk
+/// (`this` → its `outer` links), so a bare reference to one resolves
+/// through that walk, not a direct `this.<name>` on this receiver.
+pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
+    module: *Module,
+    f: *const ast.Function,
+    implicit_params: []const []const u8,
+    owner_class: ?[]const u8,
+    own_members: ?*const StringSet,
+    enclosing_members: ?*const StringSet,
     private_method_fids: ?*const StringFuncIdMap,
 ) Allocator.Error!Func {
     const a = module.registry.allocator;
@@ -816,6 +858,9 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
     b.setRecvTy(if (f.receiver_type) |r| r.name.name else null);
     if (own_members) |set| {
         b.setOwnMembers(try cloneStringSet(a, set));
+    }
+    if (enclosing_members) |set| {
+        if (set.count() != 0) b.setEnclosingMembers(try cloneStringSet(a, set));
     }
     if (private_method_fids) |map| {
         b.setPrivateMethodFids(try cloneStringFuncIdMap(a, map));
@@ -898,6 +943,11 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
     }
     func.is_suspend = f.is_suspend;
     func.low_priority = isLowPriorityOverload(f);
+    // A leading `this` injected via `implicit_params` is a synthesized
+    // dispatch/extension receiver, distinguishing it from a user param
+    // that merely spells its name `this`.
+    func.has_receiver_param = implicit_params.len != 0 and
+        std.mem.eql(u8, implicit_params[0], "this");
     return func;
 }
 

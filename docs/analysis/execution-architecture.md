@@ -573,28 +573,37 @@ class.
   rescue all re-enter host dispatch through `ir.eval` frames), which a
   parameter cannot follow. They stay TLS with this as the documented
   reason.
-- **Remaining §4.2 line item — fold the frame's own `this` into the
-  carrier.** The frame's own receiver is still a param/capture recovered by
-  name (`frameThisParam`, `callerThisValue` with its `.Instance`-only gate,
-  `implicitThisValue`), not `enclosing_this[0]`. Folding it changes the
-  depth assumptions of every chain consumer:
-  `implicitCandidatesAlloc` (eval's choke point already collapses the
-  consecutive duplicate a receiver-split records, but the depth-0 slot
-  would shift), the
-  getField enclosing-receiver rescue (chain-top-only read in
-  `host_fields.zig`), `enclosingOwnerSet`/`enclosingChainClassOrder`
-  (member-ext visibility), `checkReceiverChain` (the KLIO_TRACE_INVARIANTS
-  interior-hole rule), and the B13 `.Instance`-only gate. Set the frame
-  receiver slot at call entry on every dispatch path; drop the
-  `== .Instance` restriction so primitive/`String` receivers thread
-  identically; the inline splice sets the slot for the spliced region
-  instead of binding a scope local named `"this"`. Known residual until
-  then: the dynamic chain-top rescue in `getField` can still resolve a
-  bare name inside an inner-class member body against an unrelated
-  enclosing receiver when neither the instance, its captured outer
-  chain, nor any earlier ladder step owns the name — a leniency over
-  kotlinc (which rejects such programs at compile time), not a wrong
-  value for valid programs.
+- **Frame's own `this` — DONE (findings 4/8 fold), kind-disciplined.**
+  The frame's own receiver is still recovered by `frameThisParam` /
+  `callerThisValue` / `implicitThisValue`, but the recovery is now gated by
+  the SAME synthesized-receiver provenance the chain's `ownReceiverEntry`
+  uses, so the two are one discipline rather than two divergent name scans.
+  `frameThisParam` consults a new `Func.has_receiver_param` flag (set
+  wherever the lowerer injects a leading `this`: method / extension bodies,
+  local-extension lambdas, constructors / init / accessor / default-arg
+  thunks) instead of a bare name scan, so a user parameter spelled
+  `this` (`fun probe(\`this\`: Box)`) is no longer treated as a dispatch
+  receiver — a bare call in its body resolves no implicit receiver,
+  matching kotlinc (`unresolved reference`). The depth-assumption churn the
+  validator flagged was avoided because finding 4's `with`-subject leniency
+  was root-caused in the LOWERING (an enclosing-member bare call now lowers
+  to `CallMemberOrGlobal`, resolved by the candidate walk, instead of a
+  plain `CallMember` that reached the enclosing member only via the runtime
+  `outerChainFallback`), not by shifting the chain's depth-0 slot; so
+  `implicitCandidatesAlloc`, the getField rescues,
+  `enclosingOwnerSet`/`enclosingChainClassOrder`, `checkReceiverChain`, and
+  the B13 `.Instance` gate keep their existing assumptions. The deeper ideal
+  — deleting the by-name recovery entirely for a single `enclosing_this[0]`
+  read — was deliberately not taken: with `has_receiver_param` the by-name
+  path and the chain agree by construction, and removing the recovery would
+  churn the capture-slot / depth-0 handling for no behavioral gain. Pinned by
+  `with_subject_outer_member_call_rejected` /
+  `inner_member_calls_outer_member` / `backtick_this_param_not_receiver`
+  (`parity_corpus_pinned.zig`, kotlinc-jvm 2.3.21). Known residual: the
+  dynamic chain-top rescue in `getField` (the `field_outer_active` walk,
+  guard B9) can still resolve an explicit `recv.field` against `recv`'s
+  `outer` link inside an inner-class context — a leniency over kotlinc for
+  explicit qualified outer access, not a wrong value for valid programs.
 
 ### 4.3 One name-resolution function (→ Class A/B dispatch order)
 
