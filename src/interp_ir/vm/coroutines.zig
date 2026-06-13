@@ -260,24 +260,33 @@ pub fn drainSlotOwners() void {
 /// boundary (`drainPersistedParked` from `joinAllThreads`) exactly like
 /// `SlotOwners`.
 const PersistedParked = struct {
+    /// A cross-pump parked activation: its frames plus the per-activation
+    /// scope delta (page-allocator owned, so it can move across threads)
+    /// that must be re-established when it resumes on whatever pump claims
+    /// its slot.
+    const Entry = struct {
+        state: SuspendState,
+        scope_delta: []Value = &.{},
+    };
+
     var mutex: SpinMutex = .{};
-    var map: ?std.AutoHashMap(i64, SuspendState) = null;
+    var map: ?std.AutoHashMap(i64, Entry) = null;
 
     fn allocator() Allocator {
         return std.heap.page_allocator;
     }
 
-    fn put(slot: i64, state: SuspendState) Allocator.Error!void {
+    fn put(slot: i64, state: SuspendState, scope_delta: []Value) Allocator.Error!void {
         mutex.lock();
         defer mutex.unlock();
         if (map == null) {
-            map = std.AutoHashMap(i64, SuspendState).init(allocator());
+            map = std.AutoHashMap(i64, Entry).init(allocator());
         }
-        try map.?.put(slot, state);
+        try map.?.put(slot, .{ .state = state, .scope_delta = scope_delta });
     }
 
-    /// Claim the persisted state for `slot`. Single winner.
-    fn take(slot: i64) ?SuspendState {
+    /// Claim the persisted entry for `slot`. Single winner.
+    fn take(slot: i64) ?Entry {
         mutex.lock();
         defer mutex.unlock();
         if (map) |*m| {
@@ -290,6 +299,10 @@ const PersistedParked = struct {
         mutex.lock();
         defer mutex.unlock();
         if (map) |*m| {
+            var it = m.valueIterator();
+            while (it.next()) |e| {
+                if (e.scope_delta.len != 0) allocator().free(e.scope_delta);
+            }
             m.deinit();
             map = null;
         }
@@ -302,6 +315,129 @@ const PersistedParked = struct {
 /// survive into the next run's reset arena.
 pub fn drainPersistedParked() void {
     PersistedParked.drainAll();
+}
+
+/// Process-global virtual-time barrier coordinating the independent
+/// per-pump logical clocks under `TimeMode.Virtual`. A `runBlocking`
+/// driver and every coroutine it dispatches onto a `Dispatchers.Default`
+/// worker each run their own `CooperativeInterceptor` with its own
+/// `virtual_now`; left uncoordinated, a dispatched child's clock races
+/// ahead of its parent's and fires the child's `delay` before the parent
+/// has even reached the `delay`/`cancel` that should preempt it (a
+/// cross-pump cancellation lost to a future timer). Real kotlinx shares a
+/// single monotonic clock across dispatchers; this barrier restores that
+/// ordering for the virtual clock: a pump may jump its clock to a *future*
+/// timer at time `t` only once no other live virtual pump is parked on an
+/// earlier timer that could post a cross-pump resume effective before `t`.
+/// A pump publishes a "floor" — its soonest parked timer — only while it
+/// actually holds a future timer; a pump with no virtual timer (running a
+/// body, blocked in a real `Thread.sleep`, or awaiting an external resume)
+/// is implicitly `INDEFINITE` and never holds the global clock back.
+/// Registration is lazy (`UNREGISTERED` until the first finite publish),
+/// so the vast majority of pumps — every timer-free dispatcher task —
+/// never touch the global lock. A timer already due at the current instant
+/// (`yield`) is ready-now work and fires without consulting the barrier.
+const VirtualClock = struct {
+    const Slot = struct {
+        id: u64,
+        /// Earliest virtual time this pump may still act at. `INDEFINITE`
+        /// when the pump has only indefinitely-parked work (it can be
+        /// resumed only by an external event, never by the clock, so it
+        /// never holds the global minimum back).
+        floor: i64,
+    };
+
+    /// Sentinel for a pump that has never published a finite floor and so
+    /// is not in `slots`. The overwhelming majority of pumps — every
+    /// dispatcher task with no `delay`, every `Thread.sleep` body — never
+    /// touch a virtual timer, so registration is lazy: a pump joins the
+    /// barrier only the first time it would publish a finite deadline.
+    /// This keeps heavy fan-out workloads (hundreds of short-lived
+    /// `Dispatchers.Default` tasks) entirely off the single global lock.
+    const UNREGISTERED: u64 = 0;
+
+    var mutex: SpinMutex = .{};
+    var slots: std.ArrayList(Slot) = .empty;
+    var next_id: u64 = 1;
+
+    fn allocator() Allocator {
+        return std.heap.page_allocator;
+    }
+
+    /// Lazily join the barrier with an initial finite floor. Returns the
+    /// pump's id (`UNREGISTERED` only on OOM, treated as "never holds the
+    /// clock back").
+    fn registerWith(floor: i64) u64 {
+        mutex.lock();
+        defer mutex.unlock();
+        const id = next_id;
+        next_id += 1;
+        slots.append(allocator(), .{ .id = id, .floor = floor }) catch return UNREGISTERED;
+        return id;
+    }
+
+    fn unregister(id: u64) void {
+        if (id == UNREGISTERED) return;
+        mutex.lock();
+        defer mutex.unlock();
+        for (slots.items, 0..) |s, i| {
+            if (s.id == id) {
+                _ = slots.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn publish(id: u64, floor: i64) void {
+        if (id == UNREGISTERED) return;
+        mutex.lock();
+        defer mutex.unlock();
+        for (slots.items) |*s| {
+            if (s.id == id) {
+                s.floor = floor;
+                return;
+            }
+        }
+    }
+
+    /// The minimum floor across every registered pump *other* than `id`.
+    /// `null` when no other pump has a finite floor: the caller is free to
+    /// advance to its own timer.
+    fn minOtherFloor(id: u64) ?i64 {
+        mutex.lock();
+        defer mutex.unlock();
+        var m: ?i64 = null;
+        for (slots.items) |s| {
+            if (s.id == id) continue;
+            if (s.floor == INDEFINITE) continue;
+            if (m == null or s.floor < m.?) m = s.floor;
+        }
+        return m;
+    }
+
+    /// Whether a pump holding token `id`, idle with its soonest timer at
+    /// `t`, may fire it now. It may unless another live pump still has a
+    /// floor strictly below `t` (that pump runs first and may post a
+    /// cross-pump resume that preempts this timer).
+    fn mayFire(id: u64, t: i64) bool {
+        const other = minOtherFloor(id) orelse return true;
+        return other >= t;
+    }
+
+    /// Clear every registered pump at a run boundary. Pumps unregister
+    /// themselves at `deinit`, so this is normally a no-op; it drops
+    /// anything an error path left behind so a stale floor cannot hold the
+    /// next run's pumps back.
+    fn drainAll() void {
+        mutex.lock();
+        defer mutex.unlock();
+        slots.clearAndFree(allocator());
+    }
+};
+
+/// Clear the process-global virtual-clock barrier at a run boundary.
+pub fn drainVirtualClock() void {
+    VirtualClock.drainAll();
 }
 
 /// Register `slot` → `wakeup` so a worker thread's completion resume
@@ -375,6 +511,16 @@ pub const CooperativeInterceptor = struct {
     pub const ParkedEntry = struct {
         state: SuspendState,
         wake_at: i64,
+        /// The active-scope pushes this activation owns (the
+        /// `__klio_co_pushScope` entries it made since it last began
+        /// running, captured off the live `active_scope_stack` when it
+        /// parked). Restored onto the stack when the activation resumes
+        /// so a suspend-implicit `coroutineContext` read *after* the
+        /// resume resolves to this coroutine's own scope, not to the
+        /// resuming pump's active scope. Page-allocator owned; freed when
+        /// the entry is taken (`takeParked`) or dropped. Empty when the
+        /// activation held no scope of its own.
+        scope_delta: []Value = &.{},
     };
 
     /// Cross-thread wakeup. Shared with worker threads dispatched from
@@ -388,6 +534,18 @@ pub const CooperativeInterceptor = struct {
     started: ?i128,
     next_token: u64,
     virtual_now: i64,
+    /// This pump's id in the process-global `VirtualClock` barrier, or
+    /// `VirtualClock.UNREGISTERED` until it first publishes a finite floor.
+    /// Coordinates clock jumps with every other live virtual pump so a
+    /// dispatched child's logical clock cannot run ahead of its parent's.
+    clock_id: u64,
+    /// The floor value last written to the global `VirtualClock` for this
+    /// pump. The barrier is republished only when the floor actually
+    /// changes, so an idle pump waiting on an external resume (the common
+    /// case: every `Dispatchers.Default` await) does not hammer the global
+    /// barrier lock once per pump round — that contention alone, with tens
+    /// of concurrent pumps, serialised the whole runtime.
+    published_floor: i64,
     parked: std.AutoHashMap(u64, ParkedEntry),
     /// FIFO of tokens whose wakeup is due (timer fired or yielded).
     ready: std.ArrayList(u64),
@@ -412,6 +570,10 @@ pub const CooperativeInterceptor = struct {
             .started = null,
             .next_token = 0,
             .virtual_now = 0,
+            // Join the barrier lazily (on the first finite-floor publish),
+            // so timer-free pumps never touch the global lock.
+            .clock_id = VirtualClock.UNREGISTERED,
+            .published_floor = INDEFINITE,
             .parked = std.AutoHashMap(u64, ParkedEntry).init(allocator),
             .ready = .empty,
             .launched = .empty,
@@ -423,7 +585,17 @@ pub const CooperativeInterceptor = struct {
     }
 
     pub fn deinit(self: *CooperativeInterceptor) void {
+        VirtualClock.unregister(self.clock_id);
         self.wakeup.deinit();
+        // Free the page-allocator scope deltas held by any still-parked
+        // activation (a pump abandoning parked coroutines at exit) before
+        // dropping the map spine.
+        {
+            var it = self.parked.valueIterator();
+            while (it.next()) |e| {
+                if (e.scope_delta.len != 0) coroStackAllocator().free(e.scope_delta);
+            }
+        }
         self.parked.deinit();
         self.ready.deinit(self.allocator);
         self.launched.deinit(self.allocator);
@@ -453,7 +625,7 @@ pub const CooperativeInterceptor = struct {
     /// (negative = park indefinitely, `0` = ready now, positive = wake
     /// that much later on the active clock), and records it. Returns the
     /// token so the driver can recognise the root's completion.
-    pub fn interceptSuspend(self: *CooperativeInterceptor, state_in: SuspendState) Allocator.Error!u64 {
+    pub fn interceptSuspend(self: *CooperativeInterceptor, state_in: SuspendState, scope_delta: []Value) Allocator.Error!u64 {
         var state = state_in;
         self.next_token += 1;
         const token = self.next_token;
@@ -476,7 +648,7 @@ pub const CooperativeInterceptor = struct {
             self.pending_slot = null;
             try self.slot_to_token.put(slot, token);
         }
-        try self.parked.put(token, .{ .state = state, .wake_at = wake_at });
+        try self.parked.put(token, .{ .state = state, .wake_at = wake_at, .scope_delta = scope_delta });
         return token;
     }
 
@@ -541,7 +713,7 @@ pub const CooperativeInterceptor = struct {
             if (is_indefinite) {
                 if (self.parked.fetchRemove(st.token)) |kv| {
                     _ = self.slot_to_token.remove(st.slot);
-                    try out.append(allocator, .{ .slot = st.slot, .state = kv.value.state });
+                    try out.append(allocator, .{ .slot = st.slot, .state = kv.value.state, .scope_delta = kv.value.scope_delta });
                 }
             }
         }
@@ -573,11 +745,43 @@ pub const CooperativeInterceptor = struct {
         return null;
     }
 
+    /// Outcome of a time-advance attempt.
+    pub const Advance = enum {
+        /// At least one timer fired (its token is now ready).
+        fired,
+        /// No timer to advance to (only indefinite parks, or nothing
+        /// parked).
+        none,
+        /// A timer exists but the process-global virtual-clock barrier is
+        /// holding it: another live virtual pump still has earlier work
+        /// that may post a cross-pump resume. The caller must keep
+        /// draining its mailbox and retry rather than fire or exit.
+        blocked,
+    };
+
+    /// Publish `floor` to the global barrier only when it differs from the
+    /// last value this pump wrote. Idle pumps overwhelmingly republish the
+    /// same floor every round; skipping the no-op write keeps tens of
+    /// concurrent pumps off the single barrier lock. A pump joins the
+    /// barrier lazily, on its first *finite* floor: while it has no virtual
+    /// timer it stays unregistered (implicitly `INDEFINITE`), so a heavy
+    /// fan-out of timer-free tasks never touches the global lock.
+    fn publishFloor(self: *CooperativeInterceptor, floor: i64) void {
+        if (self.published_floor == floor) return;
+        self.published_floor = floor;
+        if (self.clock_id == VirtualClock.UNREGISTERED) {
+            if (floor == INDEFINITE) return; // implicitly indefinite already
+            self.clock_id = VirtualClock.registerWith(floor);
+            return;
+        }
+        VirtualClock.publish(self.clock_id, floor);
+    }
+
     /// Seam: nothing ready — advance the clock to the soonest timer and
-    /// arm every activation due then. Under `Virtual` the clock jumps
-    /// instantly; under `Wall` the thread sleeps until the real
-    /// deadline. Returns whether any progress was made.
-    pub fn advanceTime(self: *CooperativeInterceptor) Allocator.Error!bool {
+    /// arm every activation due then. Under `Virtual` the clock jumps to
+    /// the timer once the global barrier permits; under `Wall` the thread
+    /// sleeps toward the real deadline.
+    pub fn advanceTimeGated(self: *CooperativeInterceptor) Allocator.Error!Advance {
         var soonest: ?i64 = null;
         {
             var it = self.parked.iterator();
@@ -587,10 +791,32 @@ pub const CooperativeInterceptor = struct {
                 if (soonest == null or w < soonest.?) soonest = w;
             }
         }
-        const t = soonest orelse return false;
+        const t = soonest orelse {
+            // No finite timer: publish an indefinite floor so this pump
+            // never holds another pump's clock back while it waits on an
+            // external resume.
+            if (self.mode == .Virtual) self.publishFloor(INDEFINITE);
+            return .none;
+        };
         switch (self.mode) {
             .Virtual => {
-                if (t > self.virtual_now) self.virtual_now = t;
+                // A timer already due at the current instant (`yield`, an
+                // immediate dispatch handshake) is ready-now work, not a
+                // clock advance: fire it without consulting the barrier so
+                // it cannot deadlock against another pump sitting at the
+                // same instant. The barrier only gates a genuine jump into
+                // the future, where a still-earlier pump might post a
+                // cross-pump resume that should preempt this timer. While
+                // this pump holds a due timer its floor stays at the
+                // current instant, so a pump with a *future* timer still
+                // waits for it.
+                if (t > self.virtual_now) {
+                    self.publishFloor(t);
+                    if (!VirtualClock.mayFire(self.clock_id, t)) return .blocked;
+                    self.virtual_now = t;
+                } else {
+                    self.publishFloor(self.virtual_now);
+                }
             },
             .Wall => {
                 const wait = @max(t - self.nowMillis(), 0);
@@ -604,7 +830,7 @@ pub const CooperativeInterceptor = struct {
                     // `true` reports the pending timer as progress; the
                     // pump comes back next round.
                     sleepMillis(@min(@as(u64, @intCast(wait)), 1));
-                    if (self.nowMillis() < t) return true;
+                    if (self.nowMillis() < t) return .fired;
                 }
             },
         }
@@ -635,12 +861,22 @@ pub const CooperativeInterceptor = struct {
         for (due.items) |d| {
             try self.ready.append(self.allocator, d.tok);
         }
-        return due.items.len != 0;
+        return if (due.items.len != 0) .fired else .none;
+    }
+
+    /// Bool-returning shim over `advanceTimeGated`: progress was made when
+    /// a timer fired. A `.blocked` outcome reports no progress (the caller
+    /// must keep draining its mailbox), preserving the historical
+    /// single-pump contract for callers that do not coordinate the global
+    /// clock barrier.
+    pub fn advanceTime(self: *CooperativeInterceptor) Allocator.Error!bool {
+        return (try self.advanceTimeGated()) == .fired;
     }
 
     pub const SlotState = struct {
         slot: i64,
         state: SuspendState,
+        scope_delta: []Value = &.{},
     };
 
     const SlotToken = struct {
@@ -727,6 +963,38 @@ pub fn activeCoroScope() ?Value {
     return active_scope_stack.items[active_scope_stack.items.len - 1];
 }
 
+/// The current active-scope stack depth — the base an activation's run
+/// segment starts at, so the pushes it makes above this base can be
+/// captured as its per-activation scope delta when it parks.
+fn activeScopeDepth() usize {
+    return active_scope_stack.items.len;
+}
+
+/// Capture and remove the active-scope pushes above `base` — the scope
+/// delta owned by the activation that is about to park. A suspension
+/// unwinds through Zig without running the Kotlin `finally` that would
+/// pop these, so they would otherwise linger on the live stack and a
+/// later sibling resume would read this activation's stale scope as its
+/// own (cancellation over-delivery). Returning them to the ParkedEntry
+/// keeps the live stack reflecting only running activations. Caller owns
+/// the returned slice (page-allocator). Empty when nothing was pushed.
+fn captureScopeDelta(base: usize) []Value {
+    const n = active_scope_stack.items.len;
+    if (n <= base) return &.{};
+    const delta = coroStackAllocator().dupe(Value, active_scope_stack.items[base..n]) catch return &.{};
+    active_scope_stack.shrinkRetainingCapacity(base);
+    return delta;
+}
+
+/// Restore a parked activation's captured scope delta onto the live
+/// stack just before it resumes, so its post-resume suspending calls and
+/// `coroutineContext` reads see its own scope on top. The resumed body's
+/// `__klio_co_popScope` (from `startBlock`'s `finally`) balances these
+/// pushes when it finally completes; a re-suspension re-captures them.
+fn restoreScopeDelta(delta: []const Value) void {
+    for (delta) |s| active_scope_stack.append(coroStackAllocator(), s) catch {};
+}
+
 /// RAII-style scope guard: pushes the driven coroutine's scope for the
 /// lifetime of a `driveRoot` activation so the `coroutineContext`
 /// intrinsic resolves to it. Only `Instance` scopes are pushed, matching
@@ -773,11 +1041,12 @@ fn mapDriverErr(allocator: Allocator, e: EvalError) RuntimeError {
 /// completion. The `*SuspendState` box is consumed: its value is copied
 /// into the interceptor and the box freed (the inner `frames` ArrayList /
 /// dup'd slices are now owned by the copied value).
-fn park(allocator: Allocator, st: *SuspendState) Allocator.Error!u64 {
+fn park(allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Error!u64 {
     const top = coroTop() orelse return error.OutOfMemory; // "park outside runBlocking"
     const value = st.*;
     allocator.destroy(st);
-    return top.interceptSuspend(value);
+    const delta = captureScopeDelta(scope_base);
+    return top.interceptSuspend(value, delta);
 }
 
 /// Layer 2 — the default interceptor's dispatch loop (`drive_run_blocking`).
@@ -806,10 +1075,11 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
     // Root coroutine.
     var root_value: ?Value = null;
     var root_token: ?u64 = null;
+    const root_scope_base = activeScopeDepth();
     switch (try intrinsic_host.evalClosureRaw(self, block, &.{}, scope, out)) {
         .ok => |v| root_value = v,
         .err => |e| switch (e) {
-            .Suspended => |st| root_token = try park(a, st),
+            .Suspended => |st| root_token = try park(a, st, root_scope_base),
             else => {
                 // Error exit runs the same exit protocol as quiescence:
                 // persist (in persist mode), close the mailbox, release
@@ -829,6 +1099,40 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
     return .{ .ok = root_value orelse Value.Unit };
 }
 
+/// Drive a `suspend fun main` to completion. kotlinc wraps a suspend main
+/// in `runSuspend`; this is the equivalent root driver, so a real
+/// suspension (`delay`, an awaited `Job`, …) parks and resumes here instead
+/// of escaping the run loop as a "suspended outside a driver" error. `main`
+/// runs in the empty coroutine context (the `Unit` root scope).
+pub fn driveSuspendMain(self: *VmIntrinsicHost, main_id: ir.FuncId, out: Output) Allocator.Error!RuntimeEvalResult {
+    const a = self.allocator;
+    try coroPush(a);
+    const scope_depth = active_scope_stack.items.len;
+    defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
+    const unit: Value = .Unit;
+    const guard = ActiveScopeGuard.enter(&unit);
+    defer guard.leave();
+
+    var root_value: ?Value = null;
+    var root_token: ?u64 = null;
+    const root_scope_base = activeScopeDepth();
+    switch (try intrinsic_host.evalFuncRaw(self, main_id, out)) {
+        .ok => |v| root_value = v,
+        .err => |e| switch (e) {
+            .Suspended => |st| root_token = try park(a, st, root_scope_base),
+            else => {
+                try pumpExit(self, out, false);
+                return .{ .err = mapDriverErr(a, e) };
+            },
+        },
+    }
+    if (try pumpLoop(self, &unit, out, false, &root_token, &root_value)) |err_result| {
+        return err_result;
+    }
+    try pumpExit(self, out, false);
+    return .{ .ok = root_value orelse Value.Unit };
+}
+
 /// Resume a persisted continuation claimed from `PersistedParked` and
 /// drive it (and anything it launches) to quiescence on the calling
 /// thread, under a fresh pump. This is the cross-pump resume engine: a
@@ -837,7 +1141,7 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
 /// worker, because the resume itself travels as a dispatched runnable).
 /// A new indefinite park is re-persisted, so a coroutine can hop pumps
 /// any number of times.
-pub fn driveResumed(self: *VmIntrinsicHost, state_in: SuspendState, value: Value, out: Output) Allocator.Error!void {
+pub fn driveResumed(self: *VmIntrinsicHost, state_in: SuspendState, value: Value, scope_delta: []const Value, out: Output) Allocator.Error!void {
     const a = self.allocator;
     try coroPush(a);
     const scope_depth = active_scope_stack.items.len;
@@ -845,10 +1149,16 @@ pub fn driveResumed(self: *VmIntrinsicHost, state_in: SuspendState, value: Value
     var root_value: ?Value = null;
     var root_token: ?u64 = null;
     var state = state_in;
+    // Re-establish the cross-pump activation's own scope before it runs,
+    // so its post-resume suspending calls resolve `coroutineContext` to
+    // its own coroutine. Base is the depth before restore (a re-suspend
+    // re-captures the restored delta).
+    const root_scope_base = activeScopeDepth();
+    restoreScopeDelta(scope_delta);
     switch (try intrinsic_host.resumeRaw(self, &state, value, out)) {
         .ok => |v| root_value = v,
         .err => |e| switch (e) {
-            .Suspended => |st| root_token = try park(a, st),
+            .Suspended => |st| root_token = try park(a, st, root_scope_base),
             else => {
                 // The resumed coroutine's terminal outcome is delivered
                 // through its completion continuation inside the frames;
@@ -909,10 +1219,11 @@ fn pumpLoop(
         const launched = try (coroTop().?).drainLaunched(a);
         defer a.free(launched);
         for (launched) |child| {
+            const child_scope_base = activeScopeDepth();
             switch (try intrinsic_host.evalClosureRaw(self, &child, &.{}, scope, out)) {
                 .ok => {},
                 .err => |e| switch (e) {
-                    .Suspended => |st| _ = try park(a, st),
+                    .Suspended => |st| _ = try park(a, st, child_scope_base),
                     else => {
                         try pumpExit(self, out, persist);
                         return .{ .err = mapDriverErr(a, e) };
@@ -930,6 +1241,14 @@ fn pumpLoop(
             if ((coroTop().?).takeParked(tok)) |entry_in| {
                 var entry = entry_in;
                 const resume_with = (coroTop().?).takeResumeValue(tok) orelse Value.Unit;
+                // Re-establish this activation's own scope before it runs:
+                // its post-resume suspending calls and `coroutineContext`
+                // reads must see its scope, not the pump's. The base is the
+                // depth *before* restore, so a re-suspension re-captures the
+                // restored delta (whose `finally` pop was skipped).
+                const scope_base = activeScopeDepth();
+                restoreScopeDelta(entry.scope_delta);
+                coroStackAllocator().free(entry.scope_delta);
                 switch (try intrinsic_host.resumeRaw(self, &entry.state, resume_with, out)) {
                     .ok => |v| {
                         if (root_token.* != null and root_token.*.? == tok) {
@@ -939,7 +1258,7 @@ fn pumpLoop(
                     },
                     .err => |e| switch (e) {
                         .Suspended => |st2| {
-                            const new_tok = try park(a, st2);
+                            const new_tok = try park(a, st2, scope_base);
                             if (root_token.* != null and root_token.*.? == tok) {
                                 root_token.* = new_tok;
                             }
@@ -966,9 +1285,17 @@ fn pumpLoop(
             continue;
         }
 
-        // 3. No ready coroutine — advance virtual time to the nearest timer
-        //    and arm every coroutine due then.
-        if (try (coroTop().?).advanceTime()) continue;
+        // 3. No ready coroutine — advance virtual time to the nearest
+        //    timer and arm every coroutine due then. A `.blocked` outcome
+        //    means a *future* timer is parked but the global virtual-clock
+        //    barrier is holding it because another live pump still has
+        //    earlier work that may cancel this one; fall through to drain
+        //    the mailbox (the cancellation's arrival path) and retry. An
+        //    immediate (`<= now`) timer always fires, so a timer-free or
+        //    yield-only pump behaves exactly as before the barrier.
+        const advance = try (coroTop().?).advanceTimeGated();
+        if (advance == .fired) continue;
+        const barrier_blocked = advance == .blocked;
 
         // 3b. Cross-thread bridge: drain any resumes posted by worker
         //     threads (e.g. `Dispatchers.Default`) into the interceptor; if
@@ -995,7 +1322,17 @@ fn pumpLoop(
             continue;
         }
 
-        // 3c. A blocking root must not return while its root coroutine is
+        // 3c. The global virtual-clock barrier is still holding this pump's
+        //     timer: yield so the pump with the earlier deadline runs and
+        //     can post a cross-pump cancellation, then loop to re-drain.
+        //     Never break here — the timer is real work, just not yet
+        //     allowed to fire.
+        if (barrier_blocked) {
+            std.Thread.yield() catch sleepMillis(1);
+            continue;
+        }
+
+        // 3d. A blocking root must not return while its root coroutine is
         //     still parked. For `runBlocking` the root parks until its
         //     coroutine's job completes, and the job machinery — not a
         //     host-side count — decides when that is: children on this
@@ -1032,7 +1369,7 @@ fn pumpExit(self: *VmIntrinsicHost, out: Output, persist: bool) Allocator.Error!
     if (persist) {
         const saved = try (coroTop().?).drainIndefiniteParked(a);
         defer a.free(saved);
-        for (saved) |s| try PersistedParked.put(s.slot, s.state);
+        for (saved) |s| try PersistedParked.put(s.slot, s.state, s.scope_delta);
     }
     var leftovers: []DriverWakeup.MailboxEntry = &.{};
     if (coroPop()) |w| {
@@ -1047,8 +1384,9 @@ fn pumpExit(self: *VmIntrinsicHost, out: Output, persist: bool) Allocator.Error!
     }
     defer if (leftovers.len != 0) a.free(leftovers);
     for (leftovers) |entry| {
-        if (PersistedParked.take(entry.slot)) |st| {
-            try driveResumed(self, st, entry.value, out);
+        if (PersistedParked.take(entry.slot)) |pe| {
+            try driveResumed(self, pe.state, entry.value, pe.scope_delta, out);
+            coroStackAllocator().free(pe.scope_delta);
         }
         // No persisted state: the waiter was abandoned with its driver
         // (a runBlocking exit) — the entry has nowhere to land.
@@ -1126,6 +1464,7 @@ pub fn coroutineRunRoot(self: *VmIntrinsicHost, scope: ?*const Value, block: *co
         const a = self.allocator;
         // Make the coroutine's own scope active while the block runs so a
         // suspend-implicit `coroutineContext` read resolves to its `Job`.
+        const scope_base = activeScopeDepth();
         var guard = ActiveScopeGuard{ .pushed = false };
         if (scope) |s| guard = ActiveScopeGuard.enter(s);
         defer guard.leave();
@@ -1133,7 +1472,13 @@ pub fn coroutineRunRoot(self: *VmIntrinsicHost, scope: ?*const Value, block: *co
             .ok => |v| return .{ .ok = v },
             .err => |e| switch (e) {
                 .Suspended => |st| {
-                    _ = try park(a, st);
+                    // The activation parks with its own scope (this guard's
+                    // push plus anything the block pushed) carried in its
+                    // ParkedEntry, re-established on resume. `park` removes
+                    // them from the live stack, so the guard must not pop
+                    // again on its `defer`.
+                    guard.pushed = false;
+                    _ = try park(a, st, scope_base);
                     return .{ .ok = Value.Unit };
                 },
                 .Throw => |v| return .{ .err = .{ .Thrown = v } },
@@ -1229,8 +1574,9 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
             if (posted) return;
             // Mailbox closed: the owner just exited and persisted its
             // parked coroutines strictly before closing.
-            if (PersistedParked.take(slot)) |st| {
-                try driveResumed(self, st, value, out);
+            if (PersistedParked.take(slot)) |pe| {
+                try driveResumed(self, pe.state, value, pe.scope_delta, out);
+                coroStackAllocator().free(pe.scope_delta);
             }
             // No persisted state either: the waiter was abandoned with
             // its driver (a runBlocking exit) — nowhere to land.
@@ -1241,8 +1587,9 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
         // and drive it to quiescence on this thread under a fresh pump —
         // the cross-pump resume that lets a coroutine continue on a
         // different OS thread.
-        if (PersistedParked.take(slot)) |st| {
-            try driveResumed(self, st, value, out);
+        if (PersistedParked.take(slot)) |pe| {
+            try driveResumed(self, pe.state, value, pe.scope_delta, out);
+            coroStackAllocator().free(pe.scope_delta);
             return;
         }
         if (try SlotOwners.stashPendingIfUnowned(slot, value)) return;
@@ -1259,10 +1606,11 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
         defer a.free(launched);
         const scope = activeCoroScope() orelse Value.Unit;
         for (launched) |child| {
+            const child_scope_base = activeScopeDepth();
             switch (try intrinsic_host.evalClosureRaw(self, &child, &.{}, &scope, out)) {
                 .ok => {},
                 .err => |e| switch (e) {
-                    .Suspended => |st| _ = try park(a, st),
+                    .Suspended => |st| _ = try park(a, st, child_scope_base),
                     .Throw => |v| {
                         if (!root.isCancellationException(&v)) return mapDriverErr(a, e);
                     },
@@ -1277,10 +1625,13 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
             if ((coroTop().?).takeParked(tok)) |entry_in| {
                 var entry = entry_in;
                 const resume_with = (coroTop().?).takeResumeValue(tok) orelse Value.Unit;
+                const scope_base = activeScopeDepth();
+                restoreScopeDelta(entry.scope_delta);
+                coroStackAllocator().free(entry.scope_delta);
                 switch (try intrinsic_host.resumeRaw(self, &entry.state, resume_with, out)) {
                     .ok => {},
                     .err => |e| switch (e) {
-                        .Suspended => |st2| _ = try park(a, st2),
+                        .Suspended => |st2| _ = try park(a, st2, scope_base),
                         .Throw => |v| {
                             if (!root.isCancellationException(&v)) return mapDriverErr(a, e);
                         },
@@ -1308,10 +1659,10 @@ test "intercept_suspend assigns tokens and queues ready / parks timed" {
     ci.mode = .Virtual;
 
     // wake_in_millis == 0 -> immediately ready.
-    const tok_ready = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = 0 });
+    const tok_ready = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = 0 }, &.{});
     try testing.expectEqual(@as(u64, 1), tok_ready);
     // positive -> parked on a timer, not ready yet.
-    const tok_timed = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = 50 });
+    const tok_timed = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = 50 }, &.{});
     try testing.expectEqual(@as(u64, 2), tok_timed);
 
     try testing.expectEqual(@as(?u64, tok_ready), ci.nextReady());
@@ -1323,8 +1674,8 @@ test "advance_time jumps the virtual clock and arms due tokens in order" {
     defer ci.deinit();
     ci.mode = .Virtual;
 
-    const a = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = 30 });
-    const b = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = 10 });
+    const a = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = 30 }, &.{});
+    const b = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = 10 }, &.{});
     _ = a;
     _ = b;
     try testing.expectEqual(@as(?u64, null), ci.nextReady());
@@ -1349,7 +1700,7 @@ test "indefinite park survives advance_time and drains by slot" {
     ci.mode = .Virtual;
 
     try ci.setPendingSlot(7);
-    const tok = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = -1 });
+    const tok = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = -1 }, &.{});
     // No timed parks -> no progress.
     try testing.expect(!try ci.advanceTime());
 
@@ -1373,7 +1724,7 @@ test "resume_slot_value queues the waiter and records its resume value" {
     ci.mode = .Virtual;
 
     try ci.setPendingSlot(3);
-    const tok = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = -1 });
+    const tok = try ci.interceptSuspend(.{ .token = 0, .wake_in_millis = -1 }, &.{});
 
     try testing.expect(try ci.resumeSlotValue(3, .{ .Int = 42 }));
     try testing.expectEqual(@as(?u64, tok), ci.nextReady());

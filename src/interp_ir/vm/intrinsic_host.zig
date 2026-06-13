@@ -277,6 +277,23 @@ pub fn evalClosureRaw(
     return ir.eval.evalWithCapturesChained(VmHost, self.allocator, module, info.module, func, args_owned, caps_owned, info.chain, &host);
 }
 
+/// Evaluate a top-level function (no args, no captures) as the root of a
+/// coroutine driver, with a raw `EvalError` out — the `evalClosureRaw`
+/// analogue used to drive a `suspend fun main`.
+pub fn evalFuncRaw(self: *VmIntrinsicHost, func_id: ir.FuncId, out: Output) Allocator.Error!RawResult {
+    const module_g = self.module.borrow();
+    defer module_g.deinit();
+    const module = module_g.get();
+    if (func_id.int() >= module.funcs.items.len) {
+        return .{ .err = .{ .Type = "invalid main FuncId" } };
+    }
+    const func = &module.funcs.items[func_id.int()];
+    const state = vmhost.SharedHandles.fromIntrinsic(self);
+    var host = VmHost.borrowed(state, state.globals, out);
+    const empty: std.ArrayList(Value) = .empty;
+    return ir.eval.evalWith(VmHost, self.allocator, module, func, empty, &host);
+}
+
 /// Resume a parked activation with `value`, raw `EvalError` out.
 pub fn resumeRaw(self: *VmIntrinsicHost, state: *SuspendState, value: Value, out: Output) Allocator.Error!RawResult {
     const module_g = self.module.borrow();
