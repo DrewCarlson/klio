@@ -6,8 +6,8 @@
 //! Keying — the image is addressed by a Blake3 over every input the bake
 //! consumed:
 //!   - the image format version and the `klio` executable's own identity
-//!     (size + mtime of /proc/self/exe — any rebuild of the interpreter
-//!     invalidates every image),
+//!     (size + mtime of the running executable — any rebuild of the
+//!     interpreter invalidates every image),
 //!   - the content of every stdlib source the pack builder reads (the
 //!     curated upstream files + the klio actuals, or the `KLIO_STDLIB_PACK`
 //!     override pack bytes),
@@ -85,7 +85,6 @@ fn trace(gpa: Allocator, comptime fmt: []const u8, args: anytype) void {
 }
 
 fn disabled(gpa: Allocator) bool {
-    if (builtin.os.tag != .linux) return true;
     if (getEnvVar(gpa, "KLIO_PACK_DIAG")) |v| {
         gpa.free(v);
         return true;
@@ -124,7 +123,20 @@ fn cacheDir(gpa: Allocator) ?[]u8 {
 fn exeStamp(gpa: Allocator) ?[2]u64 {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
-    const st = std.Io.Dir.cwd().statFile(threaded.io(), "/proc/self/exe", .{}) catch return null;
+    const fio = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    const st = blk: {
+        if (builtin.os.tag == .linux)
+            break :blk cwd.statFile(fio, "/proc/self/exe", .{}) catch return null;
+        if (builtin.os.tag.isDarwin()) {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            var n: u32 = buf.len;
+            if (std.c._NSGetExecutablePath(&buf, &n) != 0) return null;
+            const path = std.mem.sliceTo(&buf, 0);
+            break :blk cwd.statFile(fio, path, .{}) catch return null;
+        }
+        return null;
+    };
     const mtime_ns: u64 = @truncate(@as(u128, @bitCast(@as(i128, st.mtime.nanoseconds))));
     return .{ st.size, mtime_ns };
 }
@@ -294,7 +306,11 @@ fn writeAtomic(gpa: Allocator, cache: []const u8, dest: []const u8, bytes: []con
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
     const fio = threaded.io();
-    const unique = runtime.clockMonotonicNanos() ^ (@as(u64, @intCast(std.os.linux.getpid())) << 32);
+    const pid: u64 = switch (builtin.os.tag) {
+        .linux => @intCast(std.os.linux.getpid()),
+        else => @intCast(std.c.getpid()),
+    };
+    const unique = runtime.clockMonotonicNanos() ^ (pid << 32);
     const tmp = std.fmt.allocPrint(gpa, "{s}/.tmp-{x}", .{ cache, unique }) catch return;
     defer gpa.free(tmp);
     const cwd = std.Io.Dir.cwd();

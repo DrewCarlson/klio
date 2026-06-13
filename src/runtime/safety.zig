@@ -16,9 +16,9 @@
 //!   timeout.
 //!
 //! Each `start*` is call-once: wiring it at every run/test entry point is
-//! safe and idempotent. RSS reads are Linux-native (`/proc/self/statm`);
-//! on macOS/Windows the watchdog no-ops with a one-time note rather than
-//! blocking those targets.
+//! safe and idempotent. RSS is read from `/proc/self/statm` on Linux and
+//! from the mach task basic info on macOS; on targets without an RSS source
+//! the watchdog no-ops with a one-time note rather than blocking them.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -51,9 +51,9 @@ var noted_no_rss = std.atomic.Value(bool).init(false);
 pub fn startMemoryWatchdog() void {
     if (memory_watchdog_started.swap(true, .seq_cst)) return;
 
-    // RSS reads are only wired for Linux; elsewhere the watchdog is a no-op
-    // (with a one-time note) so we never block macOS / Windows builds.
-    if (builtin.os.tag != .linux) {
+    // Start only where RSS can be sampled (Linux, macOS); elsewhere the
+    // watchdog is a no-op with a one-time note so other targets never block.
+    if (currentRssKb() == null) {
         noteNoRss();
         return;
     }
@@ -93,7 +93,15 @@ fn sleepNs(ns: u64) void {
         _ = std.os.linux.nanosleep(&ts, null);
         return;
     }
-    // Cross-platform fallback (used by the one-shot deadline on non-Linux).
+    if (builtin.os.tag.isDarwin()) {
+        const ts = std.c.timespec{
+            .sec = @intCast(ns / std.time.ns_per_s),
+            .nsec = @intCast(ns % std.time.ns_per_s),
+        };
+        _ = std.c.nanosleep(&ts, null);
+        return;
+    }
+    // Cross-platform fallback (used by the one-shot deadline on other targets).
     const ms: i64 = @intCast(ns / std.time.ns_per_ms);
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
@@ -118,29 +126,45 @@ fn memoryWatchdogLoop(cap_kb: u64) void {
     }
 }
 
-/// Current resident-set size in KiB, read from `/proc/self/statm` on Linux
-/// (field 2 = resident pages). Returns `null` on any platform or read error.
+/// Current resident-set size in KiB. Read from `/proc/self/statm` on Linux
+/// (field 2 = resident pages) and from the mach task basic info on macOS.
+/// Returns `null` on any other platform or on a read error.
 fn currentRssKb() ?u64 {
-    if (builtin.os.tag != .linux) return null;
-    const linux = std.os.linux;
-    const fd_raw = linux.open("/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(fd_raw) != .SUCCESS) return null;
-    const fd: i32 = @intCast(fd_raw);
-    defer _ = linux.close(fd);
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const fd_raw = linux.open("/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(fd_raw) != .SUCCESS) return null;
+        const fd: i32 = @intCast(fd_raw);
+        defer _ = linux.close(fd);
 
-    var buf: [256]u8 = undefined;
-    const n = linux.read(fd, &buf, buf.len);
-    if (linux.errno(n) != .SUCCESS or n == 0) return null;
-    const data = buf[0..n];
+        var buf: [256]u8 = undefined;
+        const n = linux.read(fd, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS or n == 0) return null;
+        const data = buf[0..n];
 
-    // statm: "size resident shared text lib data dt" (pages).
-    var it = std.mem.tokenizeScalar(u8, data, ' ');
-    _ = it.next() orelse return null; // total program size
-    const resident = it.next() orelse return null;
-    const trimmed = std.mem.trim(u8, resident, " \t\r\n");
-    const pages = std.fmt.parseInt(u64, trimmed, 10) catch return null;
-    const page_kb = std.heap.pageSize() / 1024;
-    return pages * page_kb;
+        // statm: "size resident shared text lib data dt" (pages).
+        var it = std.mem.tokenizeScalar(u8, data, ' ');
+        _ = it.next() orelse return null; // total program size
+        const resident = it.next() orelse return null;
+        const trimmed = std.mem.trim(u8, resident, " \t\r\n");
+        const pages = std.fmt.parseInt(u64, trimmed, 10) catch return null;
+        const page_kb = std.heap.pageSize() / 1024;
+        return pages * page_kb;
+    }
+    if (builtin.os.tag.isDarwin()) {
+        // mach `task_info(MACH_TASK_BASIC_INFO)` reports `resident_size` in bytes.
+        var info: std.c.mach_task_basic_info = undefined;
+        var count: std.c.mach_msg_type_number_t = std.c.MACH.TASK.BASIC.INFO_COUNT;
+        const kr = std.c.task_info(
+            std.c.mach_task_self(),
+            std.c.MACH.TASK.BASIC.INFO,
+            @ptrCast(&info),
+            &count,
+        );
+        if (kr != 0) return null;
+        return @as(u64, @intCast(info.resident_size)) / 1024;
+    }
+    return null;
 }
 
 fn noteNoRss() void {
