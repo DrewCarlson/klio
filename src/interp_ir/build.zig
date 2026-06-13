@@ -628,6 +628,30 @@ fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *
 /// Used to seed `setLowerSelfPackage` around accessor/thunk lowering
 /// that runs outside the class/function body drivers, so the symbol
 /// index keys those bodies on their declaring package too.
+/// Record one top-level property's scoping identity (FQN + declaring
+/// package) into the registry, so a bare read can be ranked under Kotlin
+/// scoping. Uses the property-FQN override map (which already carries the
+/// package-qualified FQN for packaged properties) and `decl_pkg` for the
+/// package, falling back to the package derived from the FQN.
+fn notePropScope(
+    a: Allocator,
+    module: *Module,
+    func_fqn_overrides: *const SpanStrMap,
+    decl_pkg: *const SpanStrMap,
+    package_prefix: []const u8,
+    p: *const ast.Property,
+) Allocator.Error!void {
+    const fqn = try resolveFqn(a, func_fqn_overrides, p.span, package_prefix, p.name.name);
+    const pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
+    const gop = try module.registry.top_level_prop_pkgs.getOrPut(p.name.name);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    // A re-lowered property (same FQN) is not a second declaration.
+    for (gop.value_ptr.items) |existing| {
+        if (std.mem.eql(u8, existing.fqn, fqn)) return;
+    }
+    try gop.value_ptr.append(a, .{ .fqn = fqn, .package = pkg });
+}
+
 fn declPackage(a: Allocator, decl_pkg: *const SpanStrMap, overrides: *const SpanStrMap, decl_span: Span, package_prefix: []const u8, simple: []const u8) Allocator.Error![]const u8 {
     if (decl_pkg.get(decl_span)) |p| return p;
     const fqn = try resolveFqn(a, overrides, decl_span, package_prefix, simple);
@@ -1236,19 +1260,23 @@ fn buildModuleWithOverrides(
         ir.lower.setShadowedInlineNames(shadowed);
     }
 
-    // Top-level (file-scope) property names.
+    // Top-level (file-scope) property names, plus each declaration's
+    // scoping identity (FQN + package) so a bare read ranks under Kotlin
+    // scoping exactly as a bare call does.
     {
         var top_props = StringSet.init(tl);
         if (base) |bs| {
             for (bs.lifted_decls) |*d| {
                 if (d.* == .Property and d.Property.receiver_type == null) {
                     try top_props.put(d.Property.name.name, {});
+                    try notePropScope(a, module, func_fqn_overrides, decl_pkg, package_prefix, &d.Property);
                 }
             }
         }
         for (decls) |*d| {
             if (d.* == .Property and d.Property.receiver_type == null) {
                 try top_props.put(d.Property.name.name, {});
+                try notePropScope(a, module, func_fqn_overrides, decl_pkg, package_prefix, &d.Property);
             }
         }
         ir.lower.setTopLevelPropNames(top_props);

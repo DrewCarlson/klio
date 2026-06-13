@@ -8,18 +8,6 @@ Remove entries as they are resolved.
 
 ## Runtime divergences from kotlinc
 
-### 3. Tier-5 leniency: unimported cross-package value references and loose-shape calls
-
-An unimported cross-package bare *call* whose index verdict is
-`resolved`/`unimported_set`/`type_overload` at tier 5 is an
-unresolved-reference diagnostic (kotlinc-faithful). Two shapes still resolve
-leniently where kotlinc rejects: value references (`::name` and bare reads)
-to tier-5 targets, and loose shapes (default/vararg/trailing-lambda arity)
-whose calls the heuristic still binds because the runtime member-redispatch
-path can also claim them. Erroring these requires the index to model the
-runtime's member-redispatch shapes first. Recorded in
-`execution-architecture.md` row 8.
-
 ### 4. `with`-subject outer-tower leniency — RESOLVED
 
 `with(x) { … }` exposes only `x` itself in kotlinc; the call-side
