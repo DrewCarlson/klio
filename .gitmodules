@@ -16,3 +16,14 @@
 [submodule "kotlin-klio/klio-ktor-client/upstream"]
 	path = kotlin-klio/klio-ktor-client/upstream
 	url = https://github.com/ktorio/ktor
+# Upstream Kotlin: the interpreter reads its stdlib sources from
+# kotlin/libraries/stdlib at runtime. The full repo is ~5GB, so a blanket
+# `submodule update` must not pull it -- `update = none` skips it, and the
+# checkout is populated as a blobless, sparse (libraries/stdlib only),
+# shallow clone of the `branch` tag. See scripts/init-kotlin-submodule.sh.
+[submodule "kotlin"]
+	path = kotlin
+	url = https://github.com/JetBrains/kotlin
+	update = none
+	shallow = true
+	branch = v2.3.21

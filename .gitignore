@@ -1,6 +1,5 @@
 .DS_Store
 kotlin-language-spec
-kotlin
 .idea
 zig-out/
 .zig-cache/

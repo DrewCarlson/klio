@@ -37,7 +37,7 @@ kt-exp/
 ├── examples/                   .kt programs that pass parity against kotlinc
 ├── tests/                      Corpus, expected output, and fixtures
 ├── docs/                       This site (mkdocs)
-└── kotlin/                     JetBrains/kotlin checkout (read-only, gitignored)
+└── kotlin/                     JetBrains/kotlin submodule (sparse: libraries/stdlib)
 ```
 
 ## Roles

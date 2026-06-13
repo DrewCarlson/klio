@@ -175,12 +175,20 @@ src/
 ## Building from source
 
 ```sh
+git submodule update --init --recursive   # kotlinx + ktor vendor sources
+./scripts/init-kotlin-submodule.sh         # upstream Kotlin stdlib (sparse)
 zig build
 zig build test
 ./zig-out/bin/klio run examples/showcase.kt
 ```
 
 Zig 0.16.0+ is required (pinned in `build.zig.zon`).
+
+The interpreter reads upstream Kotlin's stdlib sources from
+`kotlin/libraries/stdlib` at build/run time. `kotlin` is a submodule, but
+the full JetBrains/kotlin repo is ~5GB, so it is marked `update = none` and
+populated by `scripts/init-kotlin-submodule.sh` as a sparse, blobless clone
+of just `libraries/stdlib` at the pinned tag.
 
 The `parity` module needs a `kotlinc` on `PATH`; without one the
 parity tests skip. The `stdlib_gen` module needs a checkout of
@@ -190,13 +198,13 @@ under `src/stdlib/`.
 
 ## Reference sources
 
-Two trees are gitignored and consumed as references only:
-
-- `kotlin-language-spec/` — the Kotlin language specification PDFs.
-- `kotlin/` — JetBrains/kotlin at the target tag, read for
-  compiler cross-reference and as the source of truth for stdlib
-  shape. When the spec and the source disagree, the source wins —
-  it is what real Kotlin compiles against.
+- `kotlin-language-spec/` — the Kotlin language specification PDFs
+  (gitignored, reference only).
+- `kotlin/` — JetBrains/kotlin at the pinned tag (the `kotlin` submodule,
+  populated sparsely; see *Building from source*). Read for compiler
+  cross-reference and as the source of truth for stdlib shape. When the
+  spec and the source disagree, the source wins — it is what real Kotlin
+  compiles against.
 
 ## License
 
