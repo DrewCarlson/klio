@@ -236,20 +236,3 @@ carrier):
 
 ## Tooling
 
-### 16. assert_single_path can flake on coroutine+atomic programs under real-thread dispatch
-
-`scripts/assert_single_path.py` asserts each program's `[PATH]` dispatch-record
-set is identical across reruns. Since `Dispatchers.Default`/`IO` run on a real
-worker pool, a program with atomic contention (e.g. an `AtomicRef.compareAndSet`
-retry loop across coroutine cancellation) can take a different number of CAS
-retries per run, so the dispatch-record *set* legitimately differs run-to-run
-even though stdout is stable. Observed ~1-in-several on the coroutine corpus
-(record `compareAndSet … AtomicRef,ChildContinuation,Removed …
-intrinsic_call_member`); not reproducible on reruns. The oracle cannot
-distinguish legitimate concurrency nondeterminism from a real dispatch
-nondeterminism bug. Fix direction: canonicalize records before the set compare
-(drop retry-count multiplicity, or key CAS records by site not occurrence), or
-exclude the genuinely-nondeterministic coroutine+atomic programs from the
-rerun-stability assertion while keeping the determinism assertion for the rest.
-Predates this finding's discovery — it is a property of real-thread dispatch
-(landed earlier) meeting the determinism oracle, not of any one fix.
