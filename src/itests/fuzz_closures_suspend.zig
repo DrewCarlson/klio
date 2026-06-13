@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const parity = @import("parity");
+const runtime = @import("runtime");
 
 /// Where a reproducing failing program is written so it becomes a permanent
 /// regression case.
@@ -263,42 +264,12 @@ fn envFlag(gpa: std.mem.Allocator, io: std.Io, name: []const u8) bool {
     return v.len != 0 and !std.mem.eql(u8, v, "0");
 }
 
-/// Read one env var from the parent process environment. `/proc/self/environ`
-/// reports a 0-byte stat size, so `readFileAlloc` (which trusts the stat size)
-/// yields nothing; read it with a manual `read` loop until EOF instead.
+/// Read one env var from the parent process environment via the portable
+/// `proc_env` accessor (Linux `/proc/self/environ`, the libc `environ` array
+/// on other POSIX hosts, the PEB on Windows).
 fn parityGetEnv(gpa: std.mem.Allocator, io: std.Io, name: []const u8) ?[]u8 {
     _ = io;
-    const data = readProcEnviron(gpa) orelse return null;
-    defer gpa.free(data);
-    var it = std.mem.splitScalar(u8, data, 0);
-    while (it.next()) |entry| {
-        if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        if (std.mem.eql(u8, entry[0..eq], name)) {
-            return gpa.dupe(u8, entry[eq + 1 ..]) catch null;
-        }
-    }
-    return null;
-}
-
-/// Slurp `/proc/self/environ` (a 0-stat-size procfs file) via a raw read loop.
-fn readProcEnviron(gpa: std.mem.Allocator) ?[]u8 {
-    const fd = std.os.linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
-    if (@as(isize, @bitCast(fd)) < 0) return null;
-    const ifd: i32 = @intCast(fd);
-    defer _ = std.os.linux.close(ifd);
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(gpa);
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        const rc = std.os.linux.read(ifd, &chunk, chunk.len);
-        const e = std.os.linux.errno(rc);
-        if (e == .INTR) continue;
-        if (e != .SUCCESS) return null;
-        if (rc == 0) break;
-        buf.appendSlice(gpa, chunk[0..rc]) catch return null;
-    }
-    return buf.toOwnedSlice(gpa) catch null;
+    return runtime.procEnvGetVar(gpa, name) catch null;
 }
 
 // -------------------------------------------------------------------------

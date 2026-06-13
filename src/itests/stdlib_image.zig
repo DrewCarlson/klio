@@ -16,6 +16,7 @@ const span = @import("span");
 const lexer = @import("lexer");
 const parser = @import("parser");
 const ast = @import("ast");
+const runtime = @import("runtime");
 
 const SourceMap = span.SourceMap;
 
@@ -34,17 +35,10 @@ fn klioBin(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map
     return std.Io.Dir.cwd().realPathFileAlloc(io, rel, a) catch rel;
 }
 
-fn baseEnv(a: std.mem.Allocator, io: std.Io, home: []const u8) !std.process.Environ.Map {
+fn baseEnv(a: std.mem.Allocator, home: []const u8) !std.process.Environ.Map {
     var map = std.process.Environ.Map.init(a);
     errdefer map.deinit();
-    const data = std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/environ", a, .unlimited) catch
-        return map;
-    var it = std.mem.splitScalar(u8, data, 0);
-    while (it.next()) |entry| {
-        if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        map.put(entry[0..eq], entry[eq + 1 ..]) catch {};
-    }
+    runtime.procEnvPutAllInto(a, &map);
     try map.put("HOME", home);
     // The comparisons assert byte-identical stderr; keep tracing off.
     _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_TRACE_STDLIB_IMAGE"));
@@ -227,7 +221,7 @@ test "image path is byte-identical to legacy: basic, fallback, no-main" {
     const io = threaded.io();
 
     const home = try freshHome(a, io, "basic");
-    var env = try baseEnv(a, io, home);
+    var env = try baseEnv(a, home);
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
 
@@ -249,7 +243,7 @@ test "fully-qualified unimported reference: image path matches legacy" {
     const io = threaded.io();
 
     const home = try freshHome(a, io, "qualified");
-    var env = try baseEnv(a, io, home);
+    var env = try baseEnv(a, home);
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
 
@@ -267,7 +261,7 @@ test "corrupted image is rejected and rebaked transparently" {
     const io = threaded.io();
 
     const home = try freshHome(a, io, "corrupt");
-    var env = try baseEnv(a, io, home);
+    var env = try baseEnv(a, home);
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
 
@@ -316,7 +310,7 @@ test "editing a stdlib source rebakes under a new key" {
     }
 
     const home = try freshHome(a, io, "stale");
-    var env = try baseEnv(a, io, home);
+    var env = try baseEnv(a, home);
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
     const prog = try writeProgram(a, io, "stale_probe.kt", P_BASIC);
@@ -359,7 +353,7 @@ test "outside a checkout the embedded pack serves the stdlib" {
     try cwd.createDirPath(io, sandbox);
 
     const home = try freshHome(a, io, "outside");
-    var env = try baseEnv(a, io, home);
+    var env = try baseEnv(a, home);
     defer env.deinit();
     _ = env.array_hash_map.swapRemove(@as([]const u8, "KLIO_STDLIB_PACK"));
     const bin = try klioBin(a, io, &env);
@@ -391,7 +385,7 @@ test "pack-using program: image path matches legacy with installed packs" {
     const io = threaded.io();
 
     const home = try freshHome(a, io, "packs");
-    var env = try baseEnv(a, io, home);
+    var env = try baseEnv(a, home);
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
 
