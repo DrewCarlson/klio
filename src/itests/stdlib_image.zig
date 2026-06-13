@@ -16,6 +16,7 @@ const span = @import("span");
 const lexer = @import("lexer");
 const parser = @import("parser");
 const ast = @import("ast");
+const runtime = @import("runtime");
 
 const SourceMap = span.SourceMap;
 
@@ -34,17 +35,10 @@ fn klioBin(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map
     return std.Io.Dir.cwd().realPathFileAlloc(io, rel, a) catch rel;
 }
 
-fn baseEnv(a: std.mem.Allocator, io: std.Io, home: []const u8) !std.process.Environ.Map {
+fn baseEnv(a: std.mem.Allocator, home: []const u8) !std.process.Environ.Map {
     var map = std.process.Environ.Map.init(a);
     errdefer map.deinit();
-    const data = std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/environ", a, .unlimited) catch
-        return map;
-    var it = std.mem.splitScalar(u8, data, 0);
-    while (it.next()) |entry| {
-        if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        map.put(entry[0..eq], entry[eq + 1 ..]) catch {};
-    }
+    runtime.procEnvPutAllInto(a, &map);
     try map.put("HOME", home);
     // The comparisons assert byte-identical stderr; keep tracing off.
     _ = map.array_hash_map.swapRemove(@as([]const u8, "KLIO_TRACE_STDLIB_IMAGE"));
@@ -193,6 +187,29 @@ const P_KX =
     \\
 ;
 
+/// A package member used by fully-qualified name with no `import`. The load
+/// gate must harvest the qualified prefix identically on the image and
+/// legacy paths so the gated sources load (and fold into the same image key)
+/// regardless of cache state.
+const P_QUALIFIED_IMPLICIT =
+    \\fun main() {
+    \\    println(kotlin.math.max(3, 7))
+    \\    println(kotlin.math.sqrt(16.0))
+    \\}
+    \\
+;
+
+/// The same shape against a non-implicit gated package (`kotlin.coroutines`):
+/// the qualified reference alone must open the curated sources, byte-identical
+/// across cache modes.
+const P_QUALIFIED_GATED =
+    \\fun main() {
+    \\    val ctx = kotlin.coroutines.EmptyCoroutineContext
+    \\    println(ctx != null)
+    \\}
+    \\
+;
+
 // -------------------------------------------------------------------------
 // CLI scenarios.
 // -------------------------------------------------------------------------
@@ -204,7 +221,7 @@ test "image path is byte-identical to legacy: basic, fallback, no-main" {
     const io = threaded.io();
 
     const home = try freshHome(a, io, "basic");
-    var env = try baseEnv(a, io, home);
+    var env = try baseEnv(a, home);
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
 
@@ -219,6 +236,24 @@ test "image path is byte-identical to legacy: basic, fallback, no-main" {
     try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", no_main });
 }
 
+test "fully-qualified unimported reference: image path matches legacy" {
+    const a = file_arena.allocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const home = try freshHome(a, io, "qualified");
+    var env = try baseEnv(a, home);
+    defer env.deinit();
+    const bin = try klioBin(a, io, &env);
+
+    const implicit = try writeProgram(a, io, "qualified_implicit.kt", P_QUALIFIED_IMPLICIT);
+    try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", implicit });
+
+    const gated = try writeProgram(a, io, "qualified_gated.kt", P_QUALIFIED_GATED);
+    try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", gated });
+}
+
 test "corrupted image is rejected and rebaked transparently" {
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -226,7 +261,7 @@ test "corrupted image is rejected and rebaked transparently" {
     const io = threaded.io();
 
     const home = try freshHome(a, io, "corrupt");
-    var env = try baseEnv(a, io, home);
+    var env = try baseEnv(a, home);
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
 
@@ -275,7 +310,7 @@ test "editing a stdlib source rebakes under a new key" {
     }
 
     const home = try freshHome(a, io, "stale");
-    var env = try baseEnv(a, io, home);
+    var env = try baseEnv(a, home);
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
     const prog = try writeProgram(a, io, "stale_probe.kt", P_BASIC);
@@ -302,6 +337,47 @@ test "editing a stdlib source rebakes under a new key" {
     try std.testing.expectEqual(@as(usize, 2), countImages(a, io, home));
 }
 
+test "outside a checkout the embedded pack serves the stdlib" {
+    const a = file_arena.allocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+
+    // Empty cwd: no kotlin/ checkout, no kotlin-klio/. The binary's
+    // embedded pack must serve the curated sources (inline `run`/`let`
+    // come from them), and the image cache must key off the embedded
+    // bytes (bake once, hit on rerun).
+    const sandbox = try std.fmt.allocPrint(a, "{s}/outside_sandbox", .{TMP_ROOT});
+    cwd.deleteTree(io, sandbox) catch {};
+    try cwd.createDirPath(io, sandbox);
+
+    const home = try freshHome(a, io, "outside");
+    var env = try baseEnv(a, home);
+    defer env.deinit();
+    _ = env.array_hash_map.swapRemove(@as([]const u8, "KLIO_STDLIB_PACK"));
+    const bin = try klioBin(a, io, &env);
+    const prog = try writeProgram(a, io, "outside_probe.kt",
+        \\fun main() {
+        \\    val doubled = listOf(1, 2, 3).map { it * 2 }
+        \\    val msg = doubled.joinToString(",").let { "doubled: $it" }
+        \\    run { println(msg) }
+        \\}
+        \\
+    );
+
+    const first = try runKlio(a, io, &env, sandbox, &.{ bin, "run", prog });
+    try std.testing.expectEqualStrings("", first.stderr);
+    try std.testing.expectEqual(@as(u32, 0), first.code);
+    try std.testing.expectEqualStrings("doubled: 2,4,6\n", first.stdout);
+    try std.testing.expectEqual(@as(usize, 1), countImages(a, io, home));
+
+    const second = try runKlio(a, io, &env, sandbox, &.{ bin, "run", prog });
+    try std.testing.expectEqual(@as(u32, 0), second.code);
+    try std.testing.expectEqualStrings(first.stdout, second.stdout);
+    try std.testing.expectEqual(@as(usize, 1), countImages(a, io, home));
+}
+
 test "pack-using program: image path matches legacy with installed packs" {
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -309,7 +385,7 @@ test "pack-using program: image path matches legacy with installed packs" {
     const io = threaded.io();
 
     const home = try freshHome(a, io, "packs");
-    var env = try baseEnv(a, io, home);
+    var env = try baseEnv(a, home);
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
 

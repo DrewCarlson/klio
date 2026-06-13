@@ -6,8 +6,8 @@
 //! Keying — the image is addressed by a Blake3 over every input the bake
 //! consumed:
 //!   - the image format version and the `klio` executable's own identity
-//!     (size + mtime of /proc/self/exe — any rebuild of the interpreter
-//!     invalidates every image),
+//!     (size + mtime of the running executable — any rebuild of the
+//!     interpreter invalidates every image),
 //!   - the content of every stdlib source the pack builder reads (the
 //!     curated upstream files + the klio actuals, or the `KLIO_STDLIB_PACK`
 //!     override pack bytes),
@@ -51,6 +51,8 @@ const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 const HostBindings = stdlib.HostBindings;
 
+const stdlib_pack = @import("stdlib_pack");
+
 const io = @import("io.zig");
 const pack_cache = @import("pack_cache.zig");
 const RequestedFeatures = pack_cache.RequestedFeatures;
@@ -83,7 +85,6 @@ fn trace(gpa: Allocator, comptime fmt: []const u8, args: anytype) void {
 }
 
 fn disabled(gpa: Allocator) bool {
-    if (builtin.os.tag != .linux) return true;
     if (getEnvVar(gpa, "KLIO_PACK_DIAG")) |v| {
         gpa.free(v);
         return true;
@@ -122,15 +123,29 @@ fn cacheDir(gpa: Allocator) ?[]u8 {
 fn exeStamp(gpa: Allocator) ?[2]u64 {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
-    const st = std.Io.Dir.cwd().statFile(threaded.io(), "/proc/self/exe", .{}) catch return null;
+    const fio = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    const st = blk: {
+        if (builtin.os.tag == .linux)
+            break :blk cwd.statFile(fio, "/proc/self/exe", .{}) catch return null;
+        if (builtin.os.tag.isDarwin()) {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            var n: u32 = buf.len;
+            if (std.c._NSGetExecutablePath(&buf, &n) != 0) return null;
+            const path = std.mem.sliceTo(&buf, 0);
+            break :blk cwd.statFile(fio, path, .{}) catch return null;
+        }
+        return null;
+    };
     const mtime_ns: u64 = @truncate(@as(u128, @bitCast(@as(i128, st.mtime.nanoseconds))));
     return .{ st.size, mtime_ns };
 }
 
-/// Content hash of every stdlib source the bake consumes: the
-/// `KLIO_STDLIB_PACK` override pack when set, else the curated upstream
-/// files + klio actuals the embedded pack builder reads. Null when any
-/// input is unreadable (then there is nothing to bake either).
+/// Content hash of every stdlib source the bake consumes, mirroring
+/// `stdlibPackBytes`'s resolution order: the `KLIO_STDLIB_PACK` override
+/// pack when set, else the curated upstream files + klio actuals the cwd
+/// checkout provides, else the pack bytes embedded in the binary. Null
+/// only when no source resolves (then there is nothing to bake either).
 fn stdlibContentHash(gpa: Allocator) ?[32]u8 {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
@@ -139,41 +154,68 @@ fn stdlibContentHash(gpa: Allocator) ?[32]u8 {
 
     var hasher = std.crypto.hash.Blake3.init(.{});
 
+    var override_hashed = false;
     if (getEnvVar(gpa, "KLIO_STDLIB_PACK")) |override_path| {
         defer gpa.free(override_path);
-        const bytes = cwd.readFileAlloc(fio, override_path, gpa, .unlimited) catch return null;
-        defer gpa.free(bytes);
-        hasher.update("override:");
-        hasher.update(override_path);
-        hasher.update(bytes);
-    } else {
-        const pb = stdlib.pack_builder;
-        var upstream = cwd.openDir(fio, pb.UPSTREAM_STDLIB_ROOT, .{}) catch return null;
-        defer upstream.close(fio);
-        for (pb.CURATED_UPSTREAM_SOURCES) |rel| {
-            const bytes = upstream.readFileAlloc(fio, rel, gpa, .unlimited) catch return null;
+        if (cwd.readFileAlloc(fio, override_path, gpa, .unlimited) catch null) |bytes| {
             defer gpa.free(bytes);
-            hasher.update(rel);
-            hasher.update(":");
-            var len_buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &len_buf, bytes.len, .little);
-            hasher.update(&len_buf);
+            hasher.update("override:");
+            hasher.update(override_path);
             hasher.update(bytes);
+            override_hashed = true;
         }
-        var klio_dir = cwd.openDir(fio, pb.KLIO_STDLIB_DIR, .{}) catch return null;
-        defer klio_dir.close(fio);
-        for (pb.KLIO_STDLIB_ACTUAL_FILES) |rel| {
-            const bytes = klio_dir.readFileAlloc(fio, rel, gpa, .unlimited) catch return null;
-            defer gpa.free(bytes);
-            hasher.update(rel);
-            hasher.update(":");
-            var len_buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &len_buf, bytes.len, .little);
-            hasher.update(&len_buf);
-            hasher.update(bytes);
-        }
+        // An unreadable override falls through to the checkout, exactly
+        // like `stdlibPackBytes`.
+    }
+    if (!override_hashed and !hashCheckoutSources(gpa, fio, &hasher)) {
+        return embeddedContentHash();
     }
 
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
+
+/// Fold the cwd checkout's stdlib sources into `hasher`. False when any
+/// file is unreadable (the pack build would fail the same way, so the run
+/// falls through to the embedded pack and its hash).
+fn hashCheckoutSources(gpa: Allocator, fio: std.Io, hasher: *std.crypto.hash.Blake3) bool {
+    const cwd = std.Io.Dir.cwd();
+    const pb = stdlib.pack_builder;
+    var upstream = cwd.openDir(fio, pb.UPSTREAM_STDLIB_ROOT, .{}) catch return false;
+    defer upstream.close(fio);
+    for (pb.CURATED_UPSTREAM_SOURCES) |rel| {
+        const bytes = upstream.readFileAlloc(fio, rel, gpa, .unlimited) catch return false;
+        defer gpa.free(bytes);
+        hasher.update(rel);
+        hasher.update(":");
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+        hasher.update(&len_buf);
+        hasher.update(bytes);
+    }
+    var klio_dir = cwd.openDir(fio, pb.KLIO_STDLIB_DIR, .{}) catch return false;
+    defer klio_dir.close(fio);
+    for (pb.KLIO_STDLIB_ACTUAL_FILES) |rel| {
+        const bytes = klio_dir.readFileAlloc(fio, rel, gpa, .unlimited) catch return false;
+        defer gpa.free(bytes);
+        hasher.update(rel);
+        hasher.update(":");
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+        hasher.update(&len_buf);
+        hasher.update(bytes);
+    }
+    return true;
+}
+
+/// Hash of the pack bytes embedded in the binary, or null in builds
+/// carrying none (zigcheck stub builds).
+fn embeddedContentHash() ?[32]u8 {
+    const bytes = stdlib_pack.EMBEDDED_PACK_BYTES orelse return null;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update("embedded:");
+    hasher.update(bytes);
     var out: [32]u8 = undefined;
     hasher.final(&out);
     return out;
@@ -264,7 +306,11 @@ fn writeAtomic(gpa: Allocator, cache: []const u8, dest: []const u8, bytes: []con
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
     const fio = threaded.io();
-    const unique = runtime.clockMonotonicNanos() ^ (@as(u64, @intCast(std.os.linux.getpid())) << 32);
+    const pid: u64 = switch (builtin.os.tag) {
+        .linux => @intCast(std.os.linux.getpid()),
+        else => @intCast(std.c.getpid()),
+    };
+    const unique = runtime.clockMonotonicNanos() ^ (pid << 32);
     const tmp = std.fmt.allocPrint(gpa, "{s}/.tmp-{x}", .{ cache, unique }) catch return;
     defer gpa.free(tmp);
     const cwd = std.Io.Dir.cwd();
@@ -368,22 +414,57 @@ pub fn tryPrepare(
 
     // Cache packs load per run (bindings, hints, known packages, and the
     // selection identity); only the embedded stdlib comes from the image.
-    // A program with no imports can never match a pack's library id, so
-    // the cache walk (reading + verifying every pack file) is skipped and
-    // the selection is the empty one the loader would compute.
-    var selection = pack_cache.Selection{};
-    var any_imports = false;
-    for (user.asts) |f| {
-        if (f.imports.len != 0) any_imports = true;
+    // A program with neither imports nor a package-rooted qualified
+    // reference can never match a pack's library id, so the cache walk
+    // (reading + verifying every pack file) is skipped and the selection
+    // is the empty one the loader would compute.
+    var qref_prefixes = pack_cache.collectQualifiedRefPrefixes(gpa, user.asts) catch
+        std.StringHashMap(void).init(gpa);
+    defer {
+        var it = qref_prefixes.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        qref_prefixes.deinit();
     }
-    var packs_map = SourceMap.init(gpa);
-    const pack_bindings = if (any_imports)
-        pack_cache.loadInstalledPacksOpts(gpa, user.asts, &packs_map, features, .{
+    var selection = pack_cache.Selection{};
+    var any_refs = qref_prefixes.count() != 0;
+    for (user.asts) |f| {
+        if (f.imports.len != 0) any_refs = true;
+    }
+    // Packs are parsed only to read their bindings + selection identity; the
+    // image already holds their lowered form. Parse the (large, e.g. ktor)
+    // pack ASTs and source into a scratch arena and drop it before the program
+    // runs — keeping only the bindings table and the selection, copied into
+    // process-lifetime storage. This avoids retaining tens of MB of pack AST
+    // for a server's whole life.
+    var pack_arena = std.heap.ArenaAllocator.init(gpa);
+    defer pack_arena.deinit();
+    const paa = pack_arena.allocator();
+    var packs_map = SourceMap.init(paa);
+    const pack_bindings = if (any_refs) blk: {
+        var sel_tmp = pack_cache.Selection{};
+        const tmp = pack_cache.loadInstalledPacksOpts(paa, user.asts, &packs_map, features, .{
             .include_stdlib = false,
-            .selection = &selection,
-        }).bindings
-    else
-        pack_cache.mergedHostBindings(gpa);
+            .selection = &sel_tmp,
+        }).bindings;
+        for (sel_tmp.packs.items) |p| {
+            const feats = gpa.alloc([]const u8, p.features.len) catch return null;
+            for (p.features, 0..) |f, i| feats[i] = gpa.dupe(u8, f) catch return null;
+            selection.packs.append(gpa, .{
+                .path = gpa.dupe(u8, p.path) catch return null,
+                .hash = p.hash,
+                .features = feats,
+            }) catch return null;
+        }
+        for (sel_tmp.final_prefixes.items) |pfx|
+            selection.final_prefixes.append(gpa, gpa.dupe(u8, pfx) catch return null) catch return null;
+        var out = HostBindings.init(gpa);
+        var it = tmp.table.iterator();
+        while (it.next()) |e| {
+            const k = gpa.dupe(u8, e.key_ptr.*) catch continue;
+            out.register(k, e.value_ptr.*) catch {};
+        }
+        break :blk out;
+    } else pack_cache.mergedHostBindings(gpa);
     const t_packs = runtime.clockMonotonicNanos();
 
     // Load gate from the meta sidecar; missing meta means cold path.
@@ -393,6 +474,8 @@ pub fn tryPrepare(
         var prefix_set = std.StringHashMap(void).init(gpa);
         defer prefix_set.deinit();
         for (selection.final_prefixes.items) |p| prefix_set.put(p, {}) catch return null;
+        var qit = qref_prefixes.keyIterator();
+        while (qit.next()) |k| prefix_set.put(k.*, {}) catch return null;
         var imported_match = false;
         for (meta.pkgs) |pkg| {
             if (pack_cache.importPrefixMatches(gpa, &prefix_set, pkg)) {
@@ -448,14 +531,46 @@ fn writeTombstone(gpa: Allocator, cache: []const u8, hex: [32]u8) void {
 
 /// Read + decode an image file. Null on any mismatch (the caller rebakes).
 fn loadImageFile(gpa: Allocator, path: []const u8) ?image.Loaded {
-    var threaded = threadedIo(gpa);
-    defer threaded.deinit();
-    // The decoded base borrows from these bytes; they live on the
-    // process-lifetime arena, never freed.
-    const bytes = std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, gpa, .unlimited) catch return null;
+    // The decoded base borrows from these bytes for the process's life. Prefer a
+    // read-only mmap: the decode only touches the pages it eagerly decodes, so
+    // the deferred body/IR sections and the (slice-only) stdlib source text stay
+    // file-backed and never count against RSS until something reads them. Fall
+    // back to a heap read where mmap is unavailable.
+    const bytes = mmapImage(path) orelse blk: {
+        var threaded = threadedIo(gpa);
+        defer threaded.deinit();
+        break :blk std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, gpa, .unlimited) catch return null;
+    };
     const loaded = image.load(gpa, bytes) catch null;
     if (loaded == null) trace(gpa, "image rejected: {s}", .{image.lastLoadFailure()});
     return loaded;
+}
+
+/// Read-only `MAP_PRIVATE` mmap of the image, never unmapped (process-lifetime,
+/// like the base that borrows it). Returns null on any error so the caller
+/// falls back to a heap read.
+fn mmapImage(path: []const u8) ?[]const u8 {
+    if (path.len >= 4095) return null;
+    var buf: [4096]u8 = undefined;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&buf);
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end <= 0) return null;
+    _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
+    const len: usize = @intCast(end);
+    const mapped = std.posix.mmap(
+        null,
+        len,
+        .{ .READ = true },
+        .{ .TYPE = .PRIVATE },
+        fd,
+        0,
+    ) catch return null;
+    return mapped[0..len];
 }
 
 /// Shared tail of the hit and bake paths: replay the image's registry

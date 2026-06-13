@@ -67,8 +67,65 @@ pub const ClassTable = std.StringHashMap(ObjRef(ClassDef));
 /// `(supertype simple name, thunk FuncId)` class-delegation entry.
 pub const StrFunc = struct { name: []const u8, func: FuncId };
 
-/// `(name, FuncId)` top-level property initializer entry.
-pub const NameFunc = struct { name: []const u8, func: FuncId };
+/// JVM static-field default category for a top-level property's declared
+/// type. While the startup pass runs initializers in file order, a forward
+/// read of a not-yet-initialized annotated property observes this default
+/// (the field's pre-<clinit> value on the JVM) instead of driving the
+/// initializer out of order. `.none` marks a property with no usable
+/// declared type (unannotated, `const`, or delegated); those keep the
+/// drive-on-demand path.
+pub const TypedDefault = enum(u8) {
+    none,
+    int,
+    long,
+    short,
+    byte,
+    uint,
+    ulong,
+    ushort,
+    ubyte,
+    boolean,
+    char,
+    float,
+    double,
+    null_ref,
+};
+
+/// Map a declared property type annotation to its static-field default
+/// category. Nullable, function, and non-primitive heads are references
+/// (default null); a qualified head only counts as a builtin primitive
+/// when the qualifier is exactly `kotlin`.
+pub fn typedDefaultFor(ty: ?*const ast.TypeRef) TypedDefault {
+    const t = ty orelse return .none;
+    if (t.nullable or t.function != null) return .null_ref;
+    const heads = .{
+        .{ "Int", TypedDefault.int },
+        .{ "Long", TypedDefault.long },
+        .{ "Short", TypedDefault.short },
+        .{ "Byte", TypedDefault.byte },
+        .{ "UInt", TypedDefault.uint },
+        .{ "ULong", TypedDefault.ulong },
+        .{ "UShort", TypedDefault.ushort },
+        .{ "UByte", TypedDefault.ubyte },
+        .{ "Boolean", TypedDefault.boolean },
+        .{ "Char", TypedDefault.char },
+        .{ "Float", TypedDefault.float },
+        .{ "Double", TypedDefault.double },
+    };
+    inline for (heads) |h| {
+        if (std.mem.eql(u8, t.name.name, h[0])) {
+            if (t.qualified_path) |q| {
+                if (!std.mem.startsWith(u8, q, "kotlin.") or !std.mem.eql(u8, q["kotlin.".len..], h[0])) return .null_ref;
+            }
+            return h[1];
+        }
+    }
+    return .null_ref;
+}
+
+/// `(name, FuncId)` top-level property initializer entry, plus the
+/// declared type's pre-init default category.
+pub const NameFunc = struct { name: []const u8, func: FuncId, default: TypedDefault = .none };
 
 /// Per enum-entry constructor-arg thunks.
 pub const EnumEntryArgInit = struct {
@@ -1927,7 +1984,8 @@ fn buildModuleWithOverrides(
         if (p.init) |*init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, init, nm);
-            try top_level_props.append(a, .{ .name = p.name.name, .func = fid });
+            const dflt = typedDefaultFor(if (p.ty) |*t| t else null);
+            try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .default = dflt });
         } else if (p.delegate) |*delegate| {
             try top_level_delegated_props.put(p.name.name, {});
             const nm = try std.fmt.allocPrint(a, "__top_prop_delegate_{s}", .{p.name.name});

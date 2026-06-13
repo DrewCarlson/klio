@@ -3,7 +3,8 @@
 //! threads), declaration-order interleaving of init blocks and property
 //! initializers in object literals, and init-failure propagation
 //! (`FileFailedToInitializeException` at the access site, no retry).
-//! Every expectation here is pinned against kotlinc-native 2.3.10.
+//! Every expectation here is pinned against kotlinc-native 2.3.10,
+//! except where a test notes kotlinc JVM 2.3.21 explicitly.
 
 const std = @import("std");
 const parity = @import("parity");
@@ -414,10 +415,12 @@ test "top_level_prop_init_stays_eager_and_drives_object" {
 
 // A top-level property initializer driven on demand by an earlier
 // initializer (through an object's init reading a later property) runs
-// exactly once — the startup pass does not re-run it. kotlinc-native
-// reads the pre-init default (0) instead of driving the later
-// initializer, so the values diverge (klio: 11, kotlinc: 1); the side
-// effects and their order match.
+// exactly once — the startup pass does not re-run it. kotlinc (both
+// JVM 2.3.21 and native 2.3.10) reads the pre-init field default (0)
+// instead of driving the later initializer, so the values diverge for
+// this UNANNOTATED property (klio: 11, kotlinc: 1) — the VM has no
+// inferred type to default from. The side effects and their order
+// match. The annotated shapes below are the kotlinc-faithful ones.
 test "forward_referenced_top_level_prop_initializes_once" {
     const src =
         \\
@@ -428,6 +431,67 @@ test "forward_referenced_top_level_prop_initializes_once" {
         \\
     ;
     try assertKlio("forward_ref_once", src, "a-init\nb-init\nmain 11 10\n");
+}
+
+// kotlinc (JVM 2.3.21): a forward read of a NOT-yet-initialized top-level
+// property with an explicit `Int` annotation observes the typed field
+// default 0 (so `O.v` is 1), the read does not drive `b`'s initializer
+// out of order, and `b` still initializes exactly once at its file-order
+// turn (`b-init` after `a-init`, `b` is 10 in main).
+test "forward_read_of_annotated_int_prop_sees_typed_default" {
+    const src =
+        \\
+        \\val a = run { println("a-init"); O.v }
+        \\object O { val v = b + 1 }
+        \\val b: Int = run { println("b-init"); 10 }
+        \\fun main() { println("main " + a + " " + b) }
+        \\
+    ;
+    try assertKlio("forward_ref_int_default", src, "a-init\nb-init\nmain 1 10\n");
+}
+
+// kotlinc (JVM 2.3.21): a `String`-annotated forward read observes the
+// reference default null (printed "null"), with the initializer still
+// running once in file order.
+test "forward_read_of_annotated_string_prop_sees_null_default" {
+    const src =
+        \\
+        \\val a = run { println("a-init"); O.v }
+        \\object O { val v = "" + s }
+        \\val s: String = run { println("s-init"); "hello" }
+        \\fun main() { println("main " + a + " " + s) }
+        \\
+    ;
+    try assertKlio("forward_ref_string_default", src, "a-init\ns-init\nmain null hello\n");
+}
+
+// kotlinc (JVM 2.3.21): a `Boolean`-annotated forward read observes false.
+test "forward_read_of_annotated_boolean_prop_sees_false_default" {
+    const src =
+        \\
+        \\val a = run { println("a-init"); O.v }
+        \\object O { val v = flag }
+        \\val flag: Boolean = run { println("flag-init"); true }
+        \\fun main() { println("main " + a + " " + flag) }
+        \\
+    ;
+    try assertKlio("forward_ref_bool_default", src, "a-init\nflag-init\nmain false true\n");
+}
+
+// kotlinc (JVM 2.3.21): the forward read may be mediated by a function
+// call — `peek()` runs during `a`'s initializer and reads `b` before its
+// turn, observing 0; `b` then initializes normally for main.
+test "forward_read_through_function_call_sees_typed_default" {
+    const src =
+        \\
+        \\val a = peek()
+        \\fun peek(): Int = b
+        \\val b: Int = computeB()
+        \\fun computeB(): Int { println("init b"); return 42 }
+        \\fun main() { println(a); println(b) }
+        \\
+    ;
+    try assertKlio("forward_ref_fn_default", src, "init b\n0\n42\n");
 }
 
 /// Run `src` under both in-process load modes (`EmbeddedOnly` and

@@ -8,7 +8,15 @@ time. Three modules collaborate to produce it:
 |-----------------|-------------------------------------------------------------------------------------------------|
 | `stdlib`        | Hand-written Zig intrinsics keyed by FQN, plus the `HostBindings` registry.                     |
 | `stdlib_gen`    | Mines upstream Kotlin's `kotlin/libraries/stdlib/` to produce the symbol index.                 |
-| `stdlib_pack`   | Calls `stdlib.build_stdlib_pack(...)` to produce the pack bytes the interpreter loads at startup. |
+| `stdlib_pack`   | Resolves the pack bytes the interpreter loads at startup: `KLIO_STDLIB_PACK` override, else a fresh `stdlib.build_stdlib_pack(...)` from the cwd checkout, else the bytes baked into the binary. |
+
+The bake itself happens in build.zig: `src/stdlib_pack/embed_gen.zig`
+builds the pack from the repo checkout (every consumed `.kt` is a
+declared input of the step, so stdlib edits regenerate it) and the
+bytes flow in through the `stdlib_embedded` module. The cwd checkout
+outranks the embedded bytes so in-repo stdlib iteration needs no
+rebuild; the embedded bytes make the installed binary self-contained
+from any directory.
 
 ## Symbol registry
 

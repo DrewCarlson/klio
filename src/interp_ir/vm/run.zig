@@ -99,8 +99,8 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         defer pg.deinit();
         const prog = pg.get();
         for (built.top_level_props.items) |nf| {
-            try vm.top_level_props.append(allocator, .{ .name = nf.name, .func = nf.func });
-            try prog.top_level_prop_inits.put(nf.name, nf.func);
+            try vm.top_level_props.append(allocator, nf);
+            try prog.top_level_prop_inits.put(nf.name, .{ .func = nf.func, .default = nf.default });
         }
 
         // Move every dispatch-time side table into the program image. Each
@@ -358,31 +358,41 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     // against the env see the initial values. A property already defined
     // (its initializer was driven on demand by an earlier initialiser via
     // `ensureTopLevelInited`) is not re-run: the initializer executes once.
-    for (self.top_level_props.items) |nf| {
-        if (nf.func.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
-        {
-            const g = self.globals.borrow();
-            const exists = g.get().lookup(nf.name) != null;
-            g.deinit();
-            if (exists) continue;
-        }
-        const init_func = &module.funcs.items[nf.func.int()];
-        var host = vmMakeHost(self, sink);
-        const r = try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host);
-        switch (r) {
-            .ok => |v| {
-                const g = self.globals.borrowMut();
-                defer g.deinit();
-                g.get().define(nf.name, v) catch {};
-            },
-            // A top-level `val` whose initializer references a not-yet-
-            // consumed symbol is deferred to on-access; only a missing-
-            // symbol failure defers. `CalleeFailed` is the body-exit
-            // re-tag of the same missing-symbol condition.
-            .err => |e| switch (e) {
-                .Unbound, .Unimplemented, .CalleeFailed => {},
-                else => return .{ .err = vmErrorFromEval(self.allocator, e) },
-            },
+    // While this pass is mid-flight, a forward read of a later annotated
+    // property observes its declared type's default (JVM <clinit> field
+    // semantics) instead of driving the initializer out of order; the flag
+    // scopes that window to this loop alone.
+    {
+        vmhost.host_impl.setStartupInitsActive(true);
+        defer vmhost.host_impl.setStartupInitsActive(false);
+        for (self.top_level_props.items) |nf| {
+            if (nf.func.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
+            {
+                const g = self.globals.borrow();
+                const exists = g.get().lookup(nf.name) != null;
+                g.deinit();
+                if (exists) continue;
+            }
+            const init_func = &module.funcs.items[nf.func.int()];
+            var host = vmMakeHost(self, sink);
+            const r = try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host);
+            switch (r) {
+                .ok => |v| {
+                    const g = self.globals.borrowMut();
+                    defer g.deinit();
+                    g.get().define(nf.name, v) catch {};
+                },
+                // A top-level `val` whose initializer references a not-yet-
+                // consumed symbol is deferred to on-access; only a missing-
+                // symbol failure defers. `CalleeFailed` is the body-exit
+                // re-tag of the same missing-symbol condition. A deferred
+                // property is past its turn, so later reads inside this
+                // window drive it rather than defaulting it.
+                .err => |e| switch (e) {
+                    .Unbound, .Unimplemented, .CalleeFailed => vmhost.host_impl.noteStartupDeferred(nf.name),
+                    else => return .{ .err = vmErrorFromEval(self.allocator, e) },
+                },
+            }
         }
     }
 

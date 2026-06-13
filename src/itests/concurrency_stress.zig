@@ -17,6 +17,7 @@
 //! reliably instead of only on a rare interleaving.
 
 const std = @import("std");
+const runtime = @import("runtime");
 
 /// The `klio` binary to spawn: `KLIO_ITEST_BIN` when set (the build run
 /// step points it at the harness-optimized install), else the Debug install.
@@ -24,17 +25,10 @@ fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
 }
 
-fn envWithHome(allocator: std.mem.Allocator, io: std.Io, home: []const u8) !std.process.Environ.Map {
+fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Environ.Map {
     var map = std.process.Environ.Map.init(allocator);
     errdefer map.deinit();
-    const data = std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/environ", allocator, .unlimited) catch
-        return map;
-    var it = std.mem.splitScalar(u8, data, 0);
-    while (it.next()) |entry| {
-        if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        map.put(entry[0..eq], entry[eq + 1 ..]) catch {};
-    }
+    runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
     // Widen the borrow-acquisition windows in the child so a genuine
     // race reproduces reliably under this gate.
@@ -108,7 +102,7 @@ fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var env = try envWithHome(a, io, SCRATCH_HOME);
+    var env = try envWithHome(a, SCRATCH_HOME);
     if (!packs_installed) {
         try installPacks(a, io, &env, SCRATCH_HOME);
         packs_installed = true;

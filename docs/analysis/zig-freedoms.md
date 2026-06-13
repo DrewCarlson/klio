@@ -364,7 +364,7 @@ cleanup path, not in `ConstraintSystem.deinit`. In
 `.TypeParam` does `allocator.free(name)` (`src/types/types.zig:190`). A
 `fresh[1]` `TypeParam` carries an **arena-owned** name, so freeing it through
 `self.allocator` releases arena memory and corrupts live `var_names` keys. That
-is the cross-allocator free commit `10eb90a` chased; the fix stores a self-owned
+is the cross-allocator free commit `1c03f7bc` chased; the fix stores a self-owned
 clone instead — `try local_subst.put(name, try fresh[1].clone(self.allocator))`
 (`src/typeck/check/expr_calls.zig:775`, with the explaining comment at
 `:770-774`). In Rust the `'arena` lifetime made mixing `&'arena Type` into a

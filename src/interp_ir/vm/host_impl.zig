@@ -13,6 +13,7 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 
+const build = @import("../build.zig");
 const vmhost = @import("vmhost.zig");
 const VmHost = vmhost.VmHost;
 
@@ -23,6 +24,69 @@ const EvalError = ir.eval.EvalError;
 
 /// `Result<?Value, EvalError>` for `ensureTopLevelInited`.
 pub const MaybeValueResult = ir.eval.MaybeValueResult;
+
+/// True while the startup pass is running the top-level property
+/// initializers in file order on this thread. Inside that window a forward
+/// read of a later annotated property resolves to its declared type's
+/// static-field default (`pendingTypedDefault`) instead of driving the
+/// initializer out of order, matching the JVM's <clinit> field semantics.
+threadlocal var startup_inits_active: bool = false;
+
+/// Properties whose startup turn already came and deferred (a missing-
+/// symbol failure left them to on-access driving). These are not forward
+/// references — their declarations precede the initializer doing the
+/// reading — so they keep the drive-on-demand path rather than a default.
+/// Holds run-stable `top_level_props` name slices for the window only.
+threadlocal var startup_deferred: std.ArrayListUnmanaged([]const u8) = .empty;
+
+/// Set by `vmRunBody` around the in-order top-level init loop.
+pub fn setStartupInitsActive(active: bool) void {
+    startup_inits_active = active;
+    if (!active) startup_deferred.clearRetainingCapacity();
+}
+
+/// Record a property whose startup-pass initializer deferred to on-access.
+pub fn noteStartupDeferred(name: []const u8) void {
+    startup_deferred.append(std.heap.page_allocator, name) catch {};
+}
+
+/// The declared type's pre-init default for a top-level property read
+/// before its initializer has run, while the startup pass is mid-flight.
+/// Null when the window is closed, the name is not a top-level property,
+/// or the declaration has no usable type annotation (the caller keeps the
+/// drive-on-demand path). Callers have already established that `name` is
+/// not yet bound in globals.
+pub fn pendingTypedDefault(self: *VmHost, name: []const u8) ?Value {
+    if (!startup_inits_active) return null;
+    for (startup_deferred.items) |n| {
+        if (std.mem.eql(u8, n, name)) return null;
+    }
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    const entry = pg.get().top_level_prop_inits.get(name) orelse return null;
+    return typedDefaultValue(entry.default);
+}
+
+/// The runtime value of a static-field default category, or null for
+/// `.none` (no annotation to default from).
+fn typedDefaultValue(kind: build.TypedDefault) ?Value {
+    return switch (kind) {
+        .none => null,
+        .int => .{ .Int = 0 },
+        .long => .{ .Long = 0 },
+        .short => .{ .Short = 0 },
+        .byte => .{ .Byte = 0 },
+        .uint => .{ .UInt = 0 },
+        .ulong => .{ .ULong = 0 },
+        .ushort => .{ .UShort = 0 },
+        .ubyte => .{ .UByte = 0 },
+        .boolean => .{ .Bool = false },
+        .char => .{ .Char = 0 },
+        .float => .{ .Float = 0.0 },
+        .double => .{ .Double = 0.0 },
+        .null_ref => .Null,
+    };
+}
 
 /// Top-level property initializers currently executing on this thread —
 /// breaks initializer cycles, mirroring Rust's `IN_PROGRESS` thread-local.
@@ -82,14 +146,18 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
             return .{ .ok = v };
         }
     }
+    // A pre-init forward read during the startup pass: an annotated
+    // property resolves to its declared type's default and its initializer
+    // stays queued for the in-order pass (JVM <clinit> semantics).
+    if (pendingTypedDefault(self, name)) |d| return .{ .ok = d };
     const init = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
         const inits = &pg.get().top_level_prop_inits;
-        const fid = inits.get(name) orelse return .{ .ok = null };
+        const entry = inits.get(name) orelse return .{ .ok = null };
         // The program-image key is run-stable (shared by the `prog` handle),
         // so it outlives this guard frame without a per-key copy.
-        break :blk .{ .fid = fid, .key = inits.getKey(name) orelse name };
+        break :blk .{ .fid = entry.func, .key = inits.getKey(name) orelse name };
     };
     const fid = init.fid;
     const init_key = init.key;

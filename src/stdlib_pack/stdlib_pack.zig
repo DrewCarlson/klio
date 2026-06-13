@@ -1,18 +1,20 @@
 //! Embedded stdlib pack.
 //!
-//! In the Rust build the crate's `build.rs` calls
-//! `klio_stdlib::build_stdlib_pack` once per Cargo build and writes the
-//! resulting `.klio-pack` byte stream into `OUT_DIR`; the crate root then
-//! embeds those bytes via `include_bytes!` so the interpreter ships with
-//! the pack inlined into the binary. The Zig port has no compile-time
-//! embed step, so the equivalent of the embedded bytes is produced on
-//! demand by `build_stdlib_pack` — the same routine `build.rs` runs.
+//! The interpreter ships with the stdlib pack baked into the binary, the
+//! same shape the Rust build produced with `build.rs` + `include_bytes!`:
+//! the top-level build.zig runs `embed_gen` over the repo source checkout
+//! and wires the bytes in through the `stdlib_embedded` module.
 //!
-//! For day-to-day stdlib iteration, set
-//! `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack` and `stdlibPackBytes`
-//! returns the on-disk pack instead. The environment is supplied by the
-//! host through an `Environ.Map`; passing `null` skips the override and
-//! always builds the pack.
+//! `stdlibPackBytes` resolves the pack in this order:
+//!   1. `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack` — an explicit on-disk
+//!      pack override, strongest because it is a deliberate per-run choice.
+//!   2. The cwd source checkout (`kotlin/libraries/stdlib` + `kotlin-klio`),
+//!      built fresh by `build_stdlib_pack`. Ahead of the embedded bytes so
+//!      in-repo stdlib `.kt` edits take effect without rebuilding the
+//!      binary; in-repo behavior is byte-identical to the pre-embed build.
+//!   3. The embedded bytes — always present in a build.zig-produced binary,
+//!      so `klio run` works from any directory with zero setup.
+//! A `null` `env` skips the override and starts at the checkout.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -20,31 +22,41 @@ const EnvMap = std.process.Environ.Map;
 
 const pack = @import("pack");
 const stdlib = @import("stdlib");
+const embedded = @import("stdlib_embedded");
 
 const PackError = pack.PackError;
+
+/// The pack bytes baked into the binary by build.zig, or `null` in builds
+/// that bypass build.zig (scripts/zigcheck.py wires the stub module).
+pub const EMBEDDED_PACK_BYTES: ?[]const u8 = embedded.pack_bytes;
 
 /// Name of the environment variable that, when set to a readable file
 /// path, overrides the built stdlib pack with the file's contents.
 pub const STDLIB_PACK_ENV: []const u8 = "KLIO_STDLIB_PACK";
 
-/// Return the stdlib pack bytes the host should load. Respects the
-/// `KLIO_STDLIB_PACK` environment variable in `env`: when it names a
-/// readable file path, the file's contents are returned (handy for
-/// in-place pack edits without rebuilding the binary). Otherwise the pack
-/// is built from the embedded stdlib surface via `build_stdlib_pack`.
+/// Return the stdlib pack bytes the host should load, resolving in the
+/// order documented at the top of this file: `KLIO_STDLIB_PACK` override,
+/// then the cwd source checkout, then the bytes embedded in the binary.
 /// A `null` `env` skips the override entirely.
 ///
 /// The returned slice is always owned by the caller and freed with
-/// `allocator`. On a build failure `result` is set and `null` is returned.
+/// `allocator`. When every source fails, `result` carries the checkout
+/// builder's error (it names the missing root) and `null` is returned.
 pub fn stdlibPackBytes(allocator: Allocator, env: ?*const EnvMap, result: *PackError) Allocator.Error!?[]u8 {
     if (env) |m| {
         if (m.get(STDLIB_PACK_ENV)) |path| {
             if (try readFile(allocator, path)) |bytes| return bytes;
         }
     }
-    var built = (try stdlib.build_stdlib_pack(allocator, true, result)) orelse return null;
-    defer built.deinit(allocator);
-    return try allocator.dupe(u8, built.items);
+    var built_opt = try stdlib.build_stdlib_pack(allocator, true, result);
+    if (built_opt) |*built| {
+        defer built.deinit(allocator);
+        return try allocator.dupe(u8, built.items);
+    }
+    if (EMBEDDED_PACK_BYTES) |bytes| {
+        return try allocator.dupe(u8, bytes);
+    }
+    return null;
 }
 
 /// Read the embedded stdlib pack's manifest and return the implicit
@@ -113,6 +125,27 @@ test "embedded pack loads" {
     }
     try std.testing.expect(saw_manifest);
     try std.testing.expect(saw_bindings);
+}
+
+test "baked-in pack bytes parse and carry every section" {
+    // Skipped under scripts/zigcheck.py (stub module, no baked bytes).
+    const a = std.testing.allocator;
+    const bytes = EMBEDDED_PACK_BYTES orelse return error.SkipZigTest;
+    var err: PackError = undefined;
+    var reader = (try pack.PackReader.fromBytes(a, try a.dupe(u8, bytes), &err)).?;
+    defer reader.deinit();
+    for ([_][]const u8{
+        pack.section_names.MANIFEST,
+        pack.section_names.SYMBOLS,
+        pack.section_names.BINDINGS,
+        pack.section_names.SOURCES,
+    }) |want| {
+        var saw = false;
+        for (reader.sections()) |entry| {
+            if (std.mem.eql(u8, entry.name, want)) saw = true;
+        }
+        try std.testing.expect(saw);
+    }
 }
 
 test "embedded implicit packages match static list" {

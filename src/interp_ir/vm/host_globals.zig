@@ -664,7 +664,13 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
 
     // Top-level property whose own initializer has not produced its value
     // yet: a deferred prop (`cached == null`) is driven on first access.
+    // During the startup pass an annotated property read ahead of its
+    // initializer resolves to its declared type's default instead — and
+    // that default must surface even when it is `Null` (a forward-read
+    // String prints "null" on the JVM), so it returns before the
+    // Null-dropping unwrap below.
     if (cached == null and progHasTopLevelPropInit(self, name)) {
+        if (host_impl.pendingTypedDefault(self, name)) |d| return d;
         const r = host_impl.ensureTopLevelInited(self, name) catch return null;
         if (r == .ok) {
             if (r.ok) |v| {
