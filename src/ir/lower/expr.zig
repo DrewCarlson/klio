@@ -1838,6 +1838,33 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // Empty stdlib container creator (`emptyList()`, `setOf()`, `mapOf()`)
+    // typed only by its binding annotation. With no explicit creation-site
+    // type argument the runtime value cannot carry its element head, so a
+    // receiver proof (`List<String>.describe()`) cannot bind. When the
+    // tail-position expected type names the container's element/entry heads
+    // (`val xs: List<String> = emptyList()`), synthesize those heads as the
+    // call's type args so the existing creation-site path stamps
+    // `declared_elem` on the built value, exactly as an explicit
+    // `emptyList<String>()` would.
+    if (!is_infix and ast_type_args.len == 0 and args.len == 0 and
+        callee.* == .Path and callee.Path.segments.len == 1)
+    {
+        const cname = callee.Path.segments[0].name;
+        if (b.resolve(cname) == null and !b.knowsOuter(cname)) {
+            const want_heads = emptyContainerCreatorArity(cname);
+            if (want_heads != 0) {
+                if (b.peekExpected()) |exp| {
+                    if (try synthesizeContainerTypeArgs(b, exp, want_heads)) |synth| {
+                        var rewritten = expr.*;
+                        rewritten.Call.type_args = synth;
+                        return lowerCallGeneral(b, &rewritten);
+                    }
+                }
+            }
+        }
+    }
+
     // A member call onto an inline `reified` extension (`xs.filterIsInstance<T>()`).
     // Explicit type args or an expected type let the splice bind the
     // reified parameters. Without either — a lambda body has no expected
@@ -1952,6 +1979,75 @@ fn anyReified(type_params: []const ast.TypeParam) bool {
         if (tp.is_reified) return true;
     }
     return false;
+}
+
+/// Number of element/entry heads a bare stdlib container creator carries
+/// (`emptyList` -> 1, `emptyMap` -> 2), or 0 when the name is not one of
+/// them. Mirrors `runtime.attachDeclaredElemTypes`'s creator sets so a
+/// binding-typed empty creation stamps the same `declared_elem`/`declared_*`
+/// fields an explicit creation-site type argument would.
+fn emptyContainerCreatorArity(name: []const u8) u8 {
+    const elem_creators = [_][]const u8{
+        "listOf",      "mutableListOf", "emptyList",     "arrayListOf",
+        "setOf",       "mutableSetOf",  "emptySet",      "hashSetOf",
+        "linkedSetOf", "sortedSetOf",   "arrayOf",       "emptyArray",
+        "sequenceOf",  "emptySequence",
+    };
+    const pair_creators = [_][]const u8{
+        "mapOf", "mutableMapOf", "emptyMap", "hashMapOf", "linkedMapOf", "sortedMapOf",
+    };
+    for (elem_creators) |c| {
+        if (std.mem.eql(u8, c, name)) return 1;
+    }
+    for (pair_creators) |c| {
+        if (std.mem.eql(u8, c, name)) return 2;
+    }
+    return 0;
+}
+
+/// True when `name` is a concrete type head (a stdlib value type or a
+/// lowered user class) rather than an erased type-parameter name. Used to
+/// gate the binding-typed empty-container element stamp so the
+/// erased-generic-return shape (`List<T>`) is left to on-demand dispatch.
+fn isConcreteTypeHead(b: *FuncBuilder, name: []const u8) bool {
+    const value_type_heads = [_][]const u8{
+        "Int",     "Long",       "Short",  "Byte",    "UInt",      "ULong",
+        "UShort",  "UByte",      "Double", "Float",   "Boolean",   "Char",
+        "String",  "Any",        "Number", "Unit",    "CharObject", "List",
+        "Set",     "Map",        "MutableList", "MutableSet", "MutableMap",
+        "Array",   "Collection", "Iterable",    "Sequence",  "Pair",  "Triple",
+    };
+    for (value_type_heads) |h| {
+        if (std.mem.eql(u8, h, name)) return true;
+    }
+    return b.module.classId(name) != null;
+}
+
+/// Build `want` synthetic call-site type-arg `TypeRef`s from the expected
+/// container type `exp` (`List<String>` -> `[String]`). Returns null when
+/// `exp` does not name `want` concrete (non-star, non-type-parameter) heads,
+/// so an unannotated or partially-erased binding keeps the on-demand path.
+fn synthesizeContainerTypeArgs(
+    b: *FuncBuilder,
+    exp: ast.TypeRef,
+    want: u8,
+) Allocator.Error!?[]ast.TypeRef {
+    if (exp.type_args.len < want) return null;
+    const out = try b.allocator.alloc(ast.TypeRef, want);
+    var i: usize = 0;
+    while (i < want) : (i += 1) {
+        const ta = exp.type_args[i];
+        if (ta.is_star) return null;
+        if (ta.ty.name.name.len == 0) return null;
+        // Only a concrete head carries runtime element identity. A bare
+        // type-parameter head (`List<T>` from a generic function's declared
+        // return) is erased — stamping the parameter name would forge a
+        // proof — so that erased-generic-return shape keeps the on-demand
+        // path rather than a synthesized element type.
+        if (!isConcreteTypeHead(b, ta.ty.name.name)) return null;
+        out[i] = ta.ty;
+    }
+    return out;
 }
 
 fn anyLambdaWritesOuter(b: *FuncBuilder, args: []const Expr) Allocator.Error!bool {
@@ -4039,6 +4135,34 @@ fn lowerUnresolvedBareCall(
             } });
             return dst;
         }
+    }
+    // A stdlib container creator (`emptyList<String>()`) called with type
+    // args inside a method body. The name is a host-intrinsic global, never
+    // a class member, so the runtime `this.<name>()` redispatch the general
+    // receiver-context path would emit cannot apply — and that path drops
+    // the type args, losing the element head the value needs for receiver
+    // proofs. Bind the global value directly and carry the type args so the
+    // creation-site stamp (`runtime.attachDeclaredElemTypes`) runs.
+    if (ast_type_args.len != 0 and emptyContainerCreatorArity(name0) != 0 and
+        b.module.funcId(name0) == null and !b.module.registry.class_member_names.contains(name0))
+    {
+        orEmitAudit(b, "container_creator_typed", "LoadGlobal", name0);
+        const callee_r = b.allocReg();
+        const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+        try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
+        const run = try lowerArgRun(b, args);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+        const dst = b.allocReg();
+        try b.push(.{ .CallValue = .{
+            .dst = dst,
+            .callee = callee_r,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+            .type_args = type_args,
+        } });
+        return dst;
     }
     // Outside any receiver context no member can serve the call (kotlinc
     // rejects resolving a bare call against a caller's receiver), and

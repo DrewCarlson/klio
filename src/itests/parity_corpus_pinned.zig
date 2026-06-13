@@ -290,6 +290,24 @@ test "when_comma_conditions_lazy" {
     );
 }
 
+test "when_string_subject" {
+    try check("when_string_subject",
+        \\star
+        \\foobar
+        \\foobar
+        \\empty
+        \\other:baz
+        \\
+    );
+}
+
+test "error_in_receiver_context" {
+    try check("error_in_receiver_context",
+        \\real-error
+        \\
+    );
+}
+
 test "member_lambda_param_vs_inline_ext" {
     try check("member_lambda_param_vs_inline_ext",
         \\[on] lambda message 2
@@ -455,6 +473,22 @@ test "empty_container_declared_elem" {
     try check("empty_container_declared_elem",
         \\ext List<String>
         \\ext List<String>
+        \\
+    );
+}
+
+// An empty container typed by its binding annotation (`val xs: List<String>
+// = emptyList()`) binds the `List<String>.describe()` extension over the
+// enclosing class's `describe()` member, matching kotlinc — the lowering
+// reads the annotation's element head and stamps it where an explicit
+// creation-site type argument would. The erased-generic-return shape
+// (`fun <T> make(): List<T> = emptyList()`) is the documented residue:
+// `T` carries no runtime element identity, so that one keeps on-demand
+// dispatch.
+test "empty_container_binding_elem" {
+    try check("empty_container_binding_elem",
+        \\ext List<String>
+        \\ext Map<String, Int>
         \\
     );
 }

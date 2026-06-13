@@ -123,6 +123,35 @@ pub fn typedDefaultFor(ty: ?*const ast.TypeRef) TypedDefault {
     return .null_ref;
 }
 
+/// Static-field default category for an unannotated top-level property,
+/// inferred from a trivially-typed initializer. kotlinc defaults a forward
+/// read of a not-yet-initialized property from the property's inferred type;
+/// without a type checker the only inferable shapes on the lowering path are
+/// the literal initializers whose type is fixed by the literal itself
+/// (`val n = 10` -> Int, `val s = "x"` -> reference). Non-literal
+/// initializers (a HOF call, an arithmetic expression) need full inference
+/// and keep the on-demand drive path (`.none`).
+pub fn typedDefaultForInit(init: *const ast.Expr) TypedDefault {
+    return switch (init.*) {
+        .IntLit => |lit| switch (lit.kind) {
+            .Int => .int,
+            .Long => .long,
+            .UInt => .uint,
+            .ULong => .ulong,
+        },
+        .FloatLit => |lit| switch (lit.kind) {
+            .Double => .double,
+            .Float => .float,
+        },
+        .BoolLit => .boolean,
+        .CharLit => .char,
+        // A string literal / template is a non-null reference; its
+        // pre-init field default is null, matching kotlinc.
+        .StringTemplate => .null_ref,
+        else => .none,
+    };
+}
+
 /// `(name, FuncId)` top-level property initializer entry, plus the
 /// declared type's pre-init default category.
 pub const NameFunc = struct { name: []const u8, func: FuncId, default: TypedDefault = .none };
@@ -2012,7 +2041,12 @@ fn buildModuleWithOverrides(
         if (p.init) |*init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, init, nm);
-            const dflt = typedDefaultFor(if (p.ty) |*t| t else null);
+            // Annotated: default from the declared type. Unannotated: infer
+            // from a trivially-typed literal initializer so a forward read
+            // observes the typed field default (matching kotlinc) instead of
+            // driving the initializer out of order; non-literal unannotated
+            // initializers keep the on-demand path (`.none`).
+            const dflt = if (p.ty) |*t| typedDefaultFor(t) else typedDefaultForInit(init);
             try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .default = dflt });
         } else if (p.delegate) |*delegate| {
             try top_level_delegated_props.put(p.name.name, {});

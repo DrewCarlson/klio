@@ -40,43 +40,66 @@ only itself (tower NOT in scope). `outerChainFallback` and its
 keeps resolving), and `backtick_this_param_not_receiver` in
 `parity_corpus_pinned.zig`, all kotlinc-verified (kotlinc-jvm 2.3.21).
 
-### 5. Empty containers without a creation-site type argument are unprovable
+### 5. Empty containers without a creation-site type argument: erased-generic-return residue
 
-Resolved for the explicit-type-argument subset: an empty container created
-with an explicit type argument on a stdlib creator (`listOf<String>()`,
-`emptyList<Int>()`, the set/map/array families) carries that element head
-on the value (`Value.List.declared_elem`, stamped by
+Resolved for the explicit-type-argument and binding-typed subsets. An empty
+container created with an explicit type argument on a stdlib creator
+(`listOf<String>()`, `emptyList<Int>()`, the set/map/array families) carries
+that element head on the value (`Value.List.declared_elem`, stamped by
 `runtime.attachDeclaredElemTypes` on both the lowered-func `Call` path and
-the intrinsic-value `CallValue` path), so receiver proofs and overload
-refinement succeed for it. Pinned by `empty_container_declared_elem` and
-the `emptyList` lines of `overload_generic_args`. What remains sanctioned
-is the shape where the element type exists only in static inference, which
-the runtime value cannot carry without a typechecker: an empty container
-typed by its binding (`val xs: List<String> = emptyList()`) or flowing out
-of an erased generic call (`fun <T> make(): List<T> = emptyList()`;
-`make<String>()` — user-call type args bind reified globals, they do not
-stamp returned containers). Under a competing outer member the member
-still wins for those two shapes where kotlinc binds the
-`List<String>.describe()` extension (probe f5b from the declared-type
-dispatch work).
+the intrinsic-value `CallValue` path). A container typed only by its binding
+annotation (`val xs: List<String> = emptyList()`) is now resolved too: the
+lowering reads the tail-position expected type the binding pushes
+(`FuncBuilder.peekExpected`, set by `stmt.zig`'s `pushExpected(p.ty)`),
+synthesizes the annotation's element/entry heads as call-site type args on
+the creator (`synthesizeContainerTypeArgs` in `ir/lower/expr.zig`), and the
+existing creation-site stamp runs. A creator dispatched as a host-intrinsic
+global inside a method body keeps those type args through a direct
+`LoadGlobal`+`CallValue` (the `CallMemberOrGlobal` redispatch a stdlib
+creator never needs would have dropped them). Pinned by
+`empty_container_declared_elem`, `empty_container_binding_elem` (binding-typed
+list + map), and the `emptyList` lines of `overload_generic_args`.
 
-### 6. Forward-referenced top-level property: unannotated reads still observe the initialized value
+What remains is the erased-generic-return shape, whose element type exists
+only in static inference and which the lowering cannot recover without a
+type checker: an empty container flowing out of an erased generic call
+(`fun <T> make(): List<T> = emptyList()`; `make<String>()` — user-call type
+args bind reified globals, they do not stamp returned containers). The
+synthesizer declines a bare type-parameter head (`List<T>`) precisely
+because stamping the parameter name would forge a proof; under a competing
+outer member the member still wins there where kotlinc binds the extension
+(probe f5b from the declared-type dispatch work). Closing it needs the
+typeck-inference carrier on the run path, which the latency-gated stdlib
+typeck bake does not currently justify for this single shape.
 
-Resolved for the annotated subset: a forward read of a not-yet-initialized
-top-level property with an explicit type annotation returns the declared
-type's static-field default (0/false/0.0/NUL/null), matching kotlinc JVM
-2.3.21, while the initializer still runs exactly once at its file-order
-turn. The carrier is `TypedDefault` on `build.NameFunc` /
+### 6. Forward-referenced top-level property: non-literal unannotated reads still observe the initialized value
+
+Resolved for the annotated subset and the trivially-typed-literal
+unannotated subset. A forward read of a not-yet-initialized top-level
+property whose type is recoverable on the lowering path returns the type's
+static-field default (0/false/0.0/NUL/null), matching kotlinc JVM 2.3.21,
+while the initializer still runs exactly once at its file-order turn. The
+carrier is `TypedDefault` on `build.NameFunc` /
 `ProgramImage.TopLevelPropInit`, consulted by
 `host_impl.pendingTypedDefault` inside the startup-pass window only;
-properties whose startup turn already deferred keep on-access driving.
-Pinned by the four `forward_read_*` tests in `parity_object_init.zig`. The
-remaining boundary is unannotated top-level properties: kotlinc defaults
-from the inferred field type, but the VM has no inferred type to default
-from, so klio drives the initializer on demand and the forward read
-observes the initialized value (side-effect order and once-only init still
-match). Pinned (as divergence) by
-`forward_referenced_top_level_prop_initializes_once`.
+properties whose startup turn already deferred keep on-access driving. For
+an explicit annotation the default comes from the declared type
+(`typedDefaultFor`); for an unannotated property whose initializer is a
+trivially-typed literal (`val n = 5` -> Int, `val s = "x"` -> reference) the
+default is inferred from the literal itself (`typedDefaultForInit` in
+`interp_ir/build.zig`). Pinned by the `forward_read_*` tests in
+`parity_object_init.zig`, including
+`forward_read_of_unannotated_literal_through_function_sees_typed_default`.
+
+The remaining boundary is an unannotated property whose initializer is NOT a
+literal — a HOF call (`val b = run { … }`), an arithmetic expression — whose
+inferred type the lowering cannot recover without a type checker. kotlinc
+defaults from the inferred field type; klio drives the initializer on demand
+and the forward read observes the initialized value (side-effect order and
+once-only init still match). Pinned (as the narrowed divergence) by
+`forward_referenced_top_level_prop_initializes_once`, whose `b`'s
+initializer is a `run { … }` HOF. Closing it needs the typeck-inference
+carrier on the run path, deferred under the latency gate.
 
 ### 7. Lenient extension-dispatch residue
 

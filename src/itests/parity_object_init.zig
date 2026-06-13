@@ -415,12 +415,14 @@ test "top_level_prop_init_stays_eager_and_drives_object" {
 
 // A top-level property initializer driven on demand by an earlier
 // initializer (through an object's init reading a later property) runs
-// exactly once — the startup pass does not re-run it. kotlinc (both
-// JVM 2.3.21 and native 2.3.10) reads the pre-init field default (0)
-// instead of driving the later initializer, so the values diverge for
-// this UNANNOTATED property (klio: 11, kotlinc: 1) — the VM has no
-// inferred type to default from. The side effects and their order
-// match. The annotated shapes below are the kotlinc-faithful ones.
+// exactly once — the startup pass does not re-run it. Here `b`'s
+// initializer is a HOF call (`run { … }`) whose inferred type the lowering
+// cannot recover without a type checker, so the forward read drives it
+// (klio: 11) where kotlinc reads the inferred field default (1). The side
+// effects and their order match. An unannotated property with a
+// trivially-typed LITERAL initializer is now kotlinc-faithful (see
+// `forward_read_of_unannotated_literal_through_function_sees_typed_default`);
+// only this non-literal, inference-required shape remains divergent.
 test "forward_referenced_top_level_prop_initializes_once" {
     const src =
         \\
@@ -476,6 +478,24 @@ test "forward_read_of_annotated_boolean_prop_sees_false_default" {
         \\
     ;
     try assertKlio("forward_ref_bool_default", src, "a-init\nflag-init\nmain false true\n");
+}
+
+// kotlinc (JVM 2.3.21): an UNANNOTATED property whose initializer is a
+// trivially-typed literal (`val n = 5` -> Int) defaults a forward read from
+// the inferred field type just like an explicit annotation. `peek()` runs
+// during `a`'s init and reads `n` before its turn, observing the inferred
+// default 0; `n` then initializes normally for main. The lowering infers the
+// typed default from the literal without a type checker.
+test "forward_read_of_unannotated_literal_through_function_sees_typed_default" {
+    const src =
+        \\
+        \\val a = peek()
+        \\fun peek(): Int = n
+        \\val n = 5
+        \\fun main() { println(a); println(n) }
+        \\
+    ;
+    try assertKlio("forward_ref_unannot_literal", src, "0\n5\n");
 }
 
 // kotlinc (JVM 2.3.21): the forward read may be mediated by a function
