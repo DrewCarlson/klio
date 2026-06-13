@@ -43,6 +43,31 @@ fn check(stem: []const u8, expected: []const u8) !void {
     }
 }
 
+/// Run `tests/fixtures/parity_corpus/<stem>.kt` and assert the program is
+/// rejected before it runs, the rejection message containing `needle`.
+/// Mirrors a kotlinc compile error (e.g. `unresolved reference 'it'`).
+fn checkErr(stem: []const u8, needle: []const u8) !void {
+    const a = arenaAllocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const file = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ CORPUS_DIR, stem });
+    const res = try parity.runWithPacks(a, io, file);
+    switch (res) {
+        .ok => |got| {
+            std.debug.print("parity corpus {s}: expected rejection, ran with output:\n{s}\n", .{ stem, got });
+            return error.ExpectedRejection;
+        },
+        .err => |m| {
+            if (std.mem.indexOf(u8, m, needle) == null) {
+                std.debug.print("parity corpus {s}: rejection `{s}` missing `{s}`\n", .{ stem, m, needle });
+                return error.WrongRejection;
+            }
+        },
+    }
+}
+
 test "annotated_expression_body" {
     try check("annotated_expression_body",
         \\neg
@@ -52,6 +77,53 @@ test "annotated_expression_body" {
         \\null
         \\
     );
+}
+
+test "lambda_it_receiver_enclosing" {
+    try check("lambda_it_receiver_enclosing",
+        \\0
+        \\1
+        \\
+    );
+}
+
+test "lambda_it_zero_param_enclosing" {
+    try check("lambda_it_zero_param_enclosing",
+        \\0
+        \\1
+        \\
+    );
+}
+
+test "lambda_it_nested_shadow" {
+    try check("lambda_it_nested_shadow",
+        \\1
+        \\2
+        \\1
+        \\2
+        \\
+    );
+}
+
+test "lambda_it_receiver_in_foreach" {
+    try check("lambda_it_receiver_in_foreach",
+        \\7
+        \\8
+        \\
+    );
+}
+
+test "lambda_it_single_arg" {
+    try check("lambda_it_single_arg",
+        \\2
+        \\4
+        \\6
+        \\
+    );
+}
+
+test "lambda_it_unresolved" {
+    try checkErr("lambda_it_unresolved", "unresolved reference `it`");
 }
 
 test "elvis_line_continuation" {
@@ -375,6 +447,18 @@ test "empty_container_declared_elem" {
     try check("empty_container_declared_elem",
         \\ext List<String>
         \\ext List<String>
+        \\
+    );
+}
+
+// A package member used by fully-qualified name with no `import` needs no
+// import in Kotlin; the load gate harvests the qualified prefix so the
+// gated sources load just as an import of it would.
+test "qualified_unimported_ref" {
+    try check("qualified_unimported_ref",
+        \\7
+        \\4.0
+        \\5
         \\
     );
 }

@@ -113,30 +113,3 @@ parent-cancellation handle on the pump root's Job instead of its own
 coroutine's. Cancellation then over-delivers (preempting via the root)
 rather than under-delivering; the d-probe shapes all pass. The exact fix
 is a per-activation scope carried in the frame snapshot, not a threadlocal.
-
-### 14. A zero-param receiver lambda binds `it` to its receiver
-
-`recv.block()` on a `R.() -> Unit` lambda whose body references `it`
-resolves `it` to the receiver instead of the enclosing lambda's `it`
-(kotlinc: a receiver lambda declares no `it`; the reference belongs to
-the enclosing scope). Pre-existing (reproduces at the pre-dispatcher
-HEAD with no coroutines: `runWith("R") { println(it) }` inside
-`repeat {}` prints `R`), and now also observable as
-`launch { ch.send(it) }` inside `repeat {}` sending the coroutine
-object. The fix belongs in lambda lowering: a parameterless lambda must
-not synthesize an `it` binding from the invocation receiver/argument
-when the name resolves as a capture.
-
-### 15. Fully-qualified stdlib references without an import never load the gated sources
-
-The embedded curated-source load gate keys exclusively on the program's
-`import` lines (`loadEmbeddedStdlibSources` builds `user_import_prefixes`
-from `f.imports`; the gate decision is `pack_cache.zig:318-326`), and the
-stdlib-image cache key folds that same gate bit. A program that uses a
-gated package only through fully-qualified names with no import (kotlinc
-accepts this; no import is required for qualified use) therefore never
-loads the non-implicit curated sources, and fails identically on both the
-baked-image path and the in-process source-parse path — consistent across
-cache states, but a divergence from kotlinc. Fix direction: derive the
-gate (and the image key's gate input) from qualified-name usage as well as
-import lines, or drop the gate once bake cost allows always-full loading.

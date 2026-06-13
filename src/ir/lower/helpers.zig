@@ -145,6 +145,16 @@ pub fn calleeLabel(callee: *const Expr) ?[]const u8 {
 /// args_start + n_args) is dense), lower each arg into its own scratch
 /// reg, then `Move` the scratch into the matching arg slot.
 pub fn lowerArgRun(b: *FuncBuilder, args: []const Expr) Allocator.Error!struct { Reg, u8 } {
+    return lowerArgRunWithArity(b, args, null);
+}
+
+/// As `lowerArgRun`, with an optional per-argument expected lambda arity
+/// (parallel to `args`). A zero-`->` lambda in slot `j` binds its implicit
+/// `it` only when `arg_arity[j] == 1`; for `0` (a `() -> R` or receiver
+/// lambda) the `it` reference resolves to an enclosing lambda. Passed
+/// explicitly rather than through builder state so a stale value can never
+/// leak into an unrelated call's arguments.
+pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]const i16) Allocator.Error!struct { Reg, u8 } {
     const n = args.len;
     if (n == 0) {
         // Reserve a sentinel slot so the n_args=0 reads do not alias an
@@ -168,8 +178,10 @@ pub fn lowerArgRun(b: *FuncBuilder, args: []const Expr) Allocator.Error!struct {
     const prev_expected = b.pushExpected(null);
     for (slots, 0..) |slot, j| {
         b.pending_lambda_label = call_label;
+        b.pending_lambda_arity = if (arg_arity) |aa| (if (j < aa.len) aa[j] else -1) else -1;
         const r = try expr_mod.lowerExpr(b, &args[j]);
         b.pending_lambda_label = null;
+        b.pending_lambda_arity = -1;
         try b.push(.{ .Move = .{ .dst = slot, .src = r } });
     }
     b.restoreExpected(prev_expected);
