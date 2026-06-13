@@ -14,7 +14,9 @@ jobs:
     steps:
       # The kotlin-klio/*/upstream vendor trees (kotlinx + ktor sources the
       # interpreter consumes at runtime) are submodules; without them every
-      # pack-using test fails with unresolved kotlinx/ktor globals.
+      # pack-using test fails with unresolved kotlinx/ktor globals. The
+      # `kotlin` submodule is `update = none` (the full repo is ~5GB), so the
+      # recursive checkout skips it; it is populated sparsely below.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
@@ -29,23 +31,19 @@ jobs:
         run: zig version
 
       # The interpreter reads upstream Kotlin stdlib sources from kotlin/ at
-      # runtime (the stdlib pack is built from them). A sparse, blobless clone
-      # of libraries/stdlib at the target tag is enough.
+      # runtime (the stdlib pack is built from them). The `kotlin` submodule is
+      # populated as a sparse, blobless clone of libraries/stdlib at the pinned
+      # tag; the cache key tracks the submodule pin recorded in .gitmodules.
       - name: cache kotlin stdlib sources (kotlin/)
         id: kotlin-src-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: kotlin
-          key: kotlin-src-2.3.21-libraries-stdlib
+          key: kotlin-src-${{ hashFiles('.gitmodules') }}-libraries-stdlib
 
-      - name: checkout kotlin stdlib sources (if not cached)
+      - name: populate kotlin submodule (if not cached)
         if: steps.kotlin-src-cache.outputs.cache-hit != 'true'
-        run: |
-          git clone --filter=blob:none --no-checkout --depth 1 --branch v2.3.21 \
-            https://github.com/JetBrains/kotlin kotlin
-          git -C kotlin sparse-checkout init --cone
-          git -C kotlin sparse-checkout set libraries/stdlib
-          git -C kotlin checkout v2.3.21
+        run: ./scripts/init-kotlin-submodule.sh
 
       # Both zig caches: the global cache (package fetches like the vendored
       # zstd tarball, compiled artifacts) and the project-local .zig-cache
