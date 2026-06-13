@@ -2,7 +2,7 @@
 //
 // `embeddedServer(engine, port) { … }` runs the module lambda to collect
 // routes, then `start(wait = true)` hands a per-request dispatch closure
-// to the native `__kktor_serve` loop (klio-ktor-client/src/lib.rs). The
+// to the native `__kktor_serve` loop (src/ktor_client/ktor_client.zig). The
 // closure matches the request against the route table, runs the handler
 // with a fresh `RoutingContext`, and returns the response triple.
 

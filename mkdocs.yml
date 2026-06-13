@@ -74,7 +74,8 @@ nav:
       - kotlinx.io: packs/shipped/io.md
       - kotlinx.datetime: packs/shipped/datetime.md
       - kotlinx.coroutines: packs/shipped/coroutines.md
-      - io.ktor.client: packs/shipped/ktor-client.md
+      - io.ktor: packs/shipped/ktor.md
+      - androidx.compose.runtime: packs/shipped/compose-runtime.md
   - Development:
     - Workspace Layout: development/workspace.md
     - Testing: development/testing.md

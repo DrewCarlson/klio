@@ -13,10 +13,10 @@ auto_bindings = true
 
 # Real upstream ktor-http value types consumed verbatim from the
 # submodule (the start of the upstream-consumption migration; see
-# plans/KTOR-UPSTREAM.md). These are ungated (core), always available.
+# plans/KTOR-UPSTREAM.md). Gated under the `io` feature.
 # Real upstream `io.ktor.utils.io` annotations (`InternalAPI`, `KtorDsl`,
 # `ExperimentalKtorApi`, …) consumed verbatim — pure declarations the rest
-# of ktor's commonMain imports. Ungated (core).
+# of ktor's commonMain imports. Gated under the `io` feature.
 [[source]]
 root = "upstream/ktor-io/common/src"
 include = [
@@ -48,7 +48,7 @@ include = [
 
 # Upstream `io.ktor.util` string helpers (escapeHTML / quote /
 # toLowerCasePreservingASCIIRules / caseInsensitive …) — self-contained,
-# foundational for the http header/value parsing layer. Ungated (core).
+# foundational for the http header/value parsing layer. Gated under `utils`.
 [[source]]
 root = "upstream/ktor-utils/common/src"
 include = [
@@ -158,7 +158,7 @@ include = [
     "io/ktor/client/engine/Loader.kt",
 ]
 
-# Event bus (`io.ktor.events.Events`) — `HttpClient.monitor`. Ungated (core).
+# Event bus (`io.ktor.events.Events`) — `HttpClient.monitor`. Gated under `events`.
 [[source]]
 root = "upstream/ktor-shared/ktor-events/common/src"
 include = [
@@ -173,12 +173,12 @@ include = [
     "io/ktor/http/URLBuilderPosix.kt",
 ]
 
-# Upstream ktor-client-core commonMain. The engine layer (`EmptyContent`,
-# the engine config base, the capability interface) is ungated core
-# (`HttpClientEngineCapability`'s eager `DEFAULT_CAPABILITIES` references
-# the timeout plugin; klio defers a missing-symbol top-level-val init to
-# on-access). The client itself (request/statement/call layers, default
-# plugins, `HttpClient`) is gated under the `client` feature.
+# Upstream ktor-client-core commonMain. The whole module — the engine layer
+# (`EmptyContent`, the engine config base, the capability interface; note
+# `HttpClientEngineCapability`'s eager `DEFAULT_CAPABILITIES` references the
+# timeout plugin, so klio defers a missing-symbol top-level-val init to
+# on-access) plus the client itself (request/statement/call layers, default
+# plugins, `HttpClient`) — is gated under the `client` feature.
 [[source]]
 root = "upstream/ktor-client/ktor-client-core/common/src"
 include = [
@@ -251,44 +251,90 @@ id = "kotlinx.atomicfu"
 [[deps]]
 id = "kotlinx.io"
 
-# Cargo-style features mirroring ktor's Gradle module structure. The
-# core (io.ktor.http types under shim/core) is ungated and always loads;
-# everything else is opt-in via `--feature io.ktor/<name>`. The
-# *-serialization features pull the kotlinx.serialization pack only when
-# enabled, so a plain client/server program needs no serializer.
+# Features mirror ktor's Gradle module structure: one feature per ktor
+# module, all opt-in via `--feature io.ktor/<name>`. Nothing loads by
+# default; a higher-level feature pulls the modules it needs through
+# `requires` (matching upstream's inter-module deps), so e.g.
+# `--feature io.ktor/client` activates http -> utils -> io and events.
 [features]
 default = []
-# ktor-client-core: the real upstream client (HttpClient + plugins +
-# request/response pipelines), consumed verbatim from commonMain. klio
-# supplies the platform pieces under `shim/client-upstream`: the
-# `KlioClientEngine` actual over the host `__kktor_request` transport and
-# the engine-less `HttpClient()` actual bound to it (each platform's
-# actual resolves a default engine its own way; klio ships one engine).
-# Both `HttpClient()` and `HttpClient(KlioClient)` construct.
-# The nonJvm engine loader (the `engines` registry the posix
-# `HttpClient()` actual discovers a default engine through) is consumed
-# and usable (`engines.append` / iteration), but stays superseded as the
-# default-engine mechanism: klio's actual binds `KlioClient` directly, so
-# the posix `HttpClient.kt` actual is not consumed alongside it.
-client = { sources = [
-    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/utils/ClientEvents.kt",
-    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/content/",
-    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/request/",
-    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/statement/",
-    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/call/",
-    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/",
-    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/HttpClient.kt",
-    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/HttpClientConfig.kt",
-    "upstream/ktor-client/ktor-client-core/nonJvm/src/io/ktor/client/engine/Loader.kt",
-    "shim/client-upstream",
-] }
-# ktor-server-core: embeddedServer + routing + respondText.
-server = { sources = ["shim/server"] }
+
+# ktor-io (`io.ktor.utils.io.*`): the channel layer (the fully-buffered
+# read side + the async `ByteChannel` Slot state machine and write side),
+# locks, and charsets. klio supplies the `locks` / `DEVELOPMENT_MODE` /
+# `ByteChannel` actuals under `shim/core`.
+[features.io]
+sources = [
+    "upstream/ktor-io/common/src/",
+    "shim/core/io/ktor/utils/io/",
+]
+
+# ktor-utils (`io.ktor.util.*`): string/collection helpers,
+# CaseInsensitiveMap, Attributes, GMTDate, the pipeline runtime, and
+# logging. klio supplies the platform / concurrent-map / date / logger
+# actuals under `shim/core`. Depends on ktor-io.
+[features.utils]
+sources = [
+    "upstream/ktor-utils/common/src/",
+    "upstream/ktor-utils/posix/src/",
+    "shim/core/io/ktor/util/",
+]
+requires = ["io"]
+
+# ktor-http (`io.ktor.http.*`): status codes, methods, headers, content
+# types, URLs, and the `OutgoingContent` body layer. `_hex` (response-body
+# hex decoding) is the klio-side helper for this module. Depends on
+# ktor-utils (and ktor-io through it).
+[features.http]
+sources = [
+    "upstream/ktor-http/common/src/",
+    "upstream/ktor-http/posix/src/",
+    "shim/core/io/ktor/_hex.kt",
+]
+requires = ["utils"]
+
+# ktor-events (`io.ktor.events.*`): the event bus behind `HttpClient.monitor`
+# and the server's monitor. Depends on ktor-utils.
+[features.events]
+sources = [
+    "upstream/ktor-shared/ktor-events/common/src/",
+]
+requires = ["utils"]
+
+# ktor-client-core: the real upstream client (the engine layer +
+# request/statement/call layers + default plugins + `HttpClient`), consumed
+# verbatim. klio supplies the platform pieces under `shim/client-upstream`
+# + the `shim/core` engine actual: the `KlioClientEngine` actual over the
+# host `__kktor_request` transport and the engine-less `HttpClient()` actual
+# bound to it. The nonJvm engine loader (the `engines` registry) is consumed
+# and usable, but klio's actual binds `KlioClient` directly. Depends on
+# ktor-http and ktor-events.
+[features.client]
+sources = [
+    "upstream/ktor-client/ktor-client-core/",
+    "shim/core/io/ktor/client/",
+    "shim/client-upstream/",
+]
+requires = ["http", "events"]
+
+# ktor-server-core: `embeddedServer` + routing + `respondText` over the
+# native `__kktor_serve` loop. Depends on ktor-http and ktor-events.
+[features.server]
+sources = ["shim/server/"]
+requires = ["http", "events"]
+
 # ktor-client-content-negotiation + ktor-serialization-kotlinx-json:
 # `install(ContentNegotiation) { json() }` backed by kotlinx-serialization,
 # so the upstream `body<T>()` / `setBody(value)` round-trip typed JSON.
 # Pulls the serialization pack's `json` feature (its core alone has no Json).
-client-serialization = { sources = ["shim/client-serialization"], deps = ["kotlinx.serialization/json"], requires = ["client"] }
+[features.client-serialization]
+sources = ["shim/client-serialization/"]
+deps = ["kotlinx.serialization/json"]
+requires = ["client"]
+
 # ktor-server-content-negotiation + ktor-serialization-kotlinx-json:
-# typed respond<T>() / receive<T>() and ContentNegotiation { json() }.
-server-serialization = { sources = ["shim/server-serialization"], deps = ["kotlinx.serialization/json"], requires = ["server"] }
+# typed `respond<T>()` / `receive<T>()` and `ContentNegotiation { json() }`.
+[features.server-serialization]
+sources = ["shim/server-serialization/"]
+deps = ["kotlinx.serialization/json"]
+requires = ["server"]

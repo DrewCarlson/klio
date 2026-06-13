@@ -172,7 +172,7 @@ fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Envi
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-serialization",
-        "kotlin-klio/klio-ktor-client",
+        "kotlin-klio/klio-ktor",
     };
     const pack_files = [_][]const u8{
         "target/packs/kotlinx.atomicfu.klio-pack",
