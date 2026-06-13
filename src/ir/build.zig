@@ -31,6 +31,14 @@ const StringFuncIdMap = std.StringHashMap(FuncId);
 const InlineLambdaFrame = struct {
     subst: std.StringHashMap(*const ast.Expr),
     snapshot: []InlineReturn,
+    /// Scope count at the inline call site, before the inline fn's
+    /// parameters were bound. A lambda argument spliced from this frame
+    /// was defined in the caller, so its free names must resolve in the
+    /// caller's scopes (`[0, caller_scope_depth)`) plus the spliced
+    /// lambda's own params — never against the inline fn's parameter
+    /// scopes, whose names would otherwise shadow a same-named caller
+    /// variable the lambda body references.
+    caller_scope_depth: usize,
 };
 
 /// One `(result reg, join block)` entry on the `inline_return` stack:
@@ -313,6 +321,14 @@ pub const FuncBuilder = struct {
     /// was pushed. An unlabeled `return` inside a spliced lambda must
     /// localize to the owner splice (restore the snapshot).
     inline_lambda_subst: std.ArrayList(InlineLambdaFrame) = .empty,
+    /// While a spliced inline-argument lambda body is being lowered, the
+    /// resolution window for its free names. `resolve` searches the
+    /// lambda's own scopes (`[own_base, top)` — its params plus any
+    /// blocks it opens) and then the caller scopes (`[0, caller_depth)`),
+    /// skipping the inline fn's parameter scopes in between whose names
+    /// would otherwise shadow a same-named caller variable the lambda
+    /// body references. Null when no such splice is in progress.
+    lambda_splice_resolve: ?struct { caller_depth: usize, own_base: usize } = null,
     /// Labeled-return targets for spliced inline-argument lambdas.
     inline_lambda_ret: std.ArrayList(InlineLambdaRet) = .empty,
     /// Simple name of the call whose arguments are currently being
@@ -498,9 +514,22 @@ pub const FuncBuilder = struct {
     /// Push an inline-fn-splice frame. Takes ownership of `m`; a
     /// snapshot of the current `inline_return` is duplicated into the
     /// frame.
-    pub fn pushInlineLambdaFrame(self: *FuncBuilder, m: std.StringHashMap(*const ast.Expr)) Allocator.Error!void {
+    pub fn pushInlineLambdaFrame(self: *FuncBuilder, m: std.StringHashMap(*const ast.Expr), caller_scope_depth: usize) Allocator.Error!void {
         const snap = try self.allocator.dupe(InlineReturn, self.inline_return.items);
-        try self.inline_lambda_subst.append(self.allocator, .{ .subst = m, .snapshot = snap });
+        try self.inline_lambda_subst.append(self.allocator, .{ .subst = m, .snapshot = snap, .caller_scope_depth = caller_scope_depth });
+    }
+
+    /// The caller scope depth recorded for the innermost inline-lambda
+    /// frame (see `InlineLambdaFrame.caller_scope_depth`).
+    pub fn inlineLambdaCallerDepth(self: *const FuncBuilder) ?usize {
+        if (self.inline_lambda_subst.items.len == 0) return null;
+        return self.inline_lambda_subst.items[self.inline_lambda_subst.items.len - 1].caller_scope_depth;
+    }
+
+    /// Current scope count — the caller depth to record before an inline
+    /// fn binds its parameters.
+    pub fn scopeDepth(self: *const FuncBuilder) usize {
+        return self.scopes.items.len;
     }
     pub fn popInlineLambdaFrame(self: *FuncBuilder) void {
         if (self.inline_lambda_subst.pop()) |frame| {
@@ -896,6 +925,24 @@ pub const FuncBuilder = struct {
     }
 
     pub fn resolve(self: *const FuncBuilder, name: []const u8) ?Reg {
+        // Inside a spliced inline-argument lambda body, the inline fn's
+        // parameter scopes are not in the lambda's lexical scope: search
+        // the lambda's own scopes and then the caller scopes, skipping
+        // the inline fn's parameter scopes in between.
+        if (self.lambda_splice_resolve) |w| {
+            const top = self.scopes.items.len;
+            var i = top;
+            while (i > w.own_base) {
+                i -= 1;
+                if (self.scopes.items[i].get(name)) |r| return r;
+            }
+            var j = @min(w.caller_depth, top);
+            while (j > 0) {
+                j -= 1;
+                if (self.scopes.items[j].get(name)) |r| return r;
+            }
+            return null;
+        }
         var i = self.scopes.items.len;
         while (i > 0) {
             i -= 1;

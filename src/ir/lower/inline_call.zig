@@ -207,8 +207,15 @@ pub fn spliceInlineLambda(b: *FuncBuilder, lam: *const Expr, arg_exprs: []const 
     for (arg_exprs, 0..) |*a, i| {
         arg_regs[i] = try lowerExpr(b, a);
     }
+    // The lambda being spliced was defined in the inline call's caller
+    // scope, so its free names must resolve there — not against the
+    // inline fn's parameter scope, whose names would shadow a same-named
+    // caller variable the lambda body references. The caller depth was
+    // recorded on the current inline-lambda frame at the call site.
+    const splice_caller_depth = b.inlineLambdaCallerDepth();
     const counted = inline_state.inlineExpandEnter();
     try b.pushScope();
+    const lambda_own_base = b.scopeDepth() - 1;
     if (params.len == 0) {
         if (arg_regs.len > 0) {
             try b.bind("it", arg_regs[0]);
@@ -227,7 +234,7 @@ pub fn spliceInlineLambda(b: *FuncBuilder, lam: *const Expr, arg_exprs: []const 
         try b.allocator.dupe(InlineReturn, o)
     else
         null;
-    try b.pushInlineLambdaFrame(std.StringHashMap(*const ast.Expr).init(b.allocator));
+    try b.pushInlineLambdaFrame(std.StringHashMap(*const ast.Expr).init(b.allocator), b.scopeDepth());
     const saved = try b.takeInlineReturn();
     if (owner_ret) |o| {
         try b.restoreInlineReturn(o);
@@ -240,7 +247,13 @@ pub fn spliceInlineLambda(b: *FuncBuilder, lam: *const Expr, arg_exprs: []const 
     if (label) |lbl| {
         try b.pushInlineLambdaRet(lbl, result, end);
     }
+    // Resolve the lambda body's free names against the caller scopes
+    // plus the lambda's own scopes, skipping the inline fn's parameter
+    // scopes in between.
+    const prev_splice = b.lambda_splice_resolve;
+    if (splice_caller_depth) |d| b.lambda_splice_resolve = .{ .caller_depth = d, .own_base = lambda_own_base };
     const v = try lowerBlock(b, &body);
+    b.lambda_splice_resolve = prev_splice;
     try b.push(.{ .Move = .{ .dst = result, .src = v } });
     b.terminate(.{ .Goto = end });
     b.switchTo(end);
@@ -604,6 +617,10 @@ pub fn tryInlineCallWithTypeArgs(
         return null;
     }
     try b.pushInlineName(fname);
+    // Scope depth before the inline fn binds its parameters: a lambda
+    // argument spliced from this call resolves its free names in these
+    // caller scopes, not against the inline fn's parameter scope.
+    const caller_scope_depth = b.scopeDepth();
     try b.pushScope();
     // Precise captured-`var` carrier across the inline splice. The inline
     // body is lowered into THIS (the caller's) builder, so its own `var`
@@ -722,7 +739,7 @@ pub fn tryInlineCallWithTypeArgs(
             try marked_rlp.append(b.allocator, p.name.name);
         }
     }
-    try b.pushInlineLambdaFrame(lambda_map);
+    try b.pushInlineLambdaFrame(lambda_map, caller_scope_depth);
     if (f.receiver_type != null) {
         if (this_arg) |recv| {
             const rr = try lowerExpr(b, recv);

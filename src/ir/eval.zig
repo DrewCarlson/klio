@@ -591,6 +591,18 @@ pub fn evalWithCapturesIn(
     return evalWithCapturesChained(H, allocator, module, owning, func, args, captures, &.{}, host);
 }
 
+/// A `return@label` targets a frame when the frame's function carries
+/// that name directly or as its implicit lambda label. A lambda's body
+/// func is named synthetically, so an explicit/implicit label (`sc@`,
+/// `with`, …) only ever matches through `implicit_label` — used when a
+/// labeled return is spliced out of an inlined argument lambda as a
+/// `LabeledReturn` and must unwind to the labeled lambda's frame.
+fn frameMatchesLabel(func: *const Func, label: []const u8) bool {
+    if (std.mem.eql(u8, func.name, label)) return true;
+    if (func.implicit_label) |il| return std.mem.eql(u8, il, label);
+    return false;
+}
+
 /// Like `evalWithCapturesIn` but additionally seeds the frame's
 /// enclosing-`this` chain with `chain_seed` (storage order, innermost
 /// last). This is the closure-invocation entry: the seed is the closure's
@@ -610,7 +622,6 @@ pub fn evalWithCapturesChained(
 ) Allocator.Error!EvalResult {
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
-    const func_name = func.name;
     var frame = try Frame.newWithCaptures(allocator, module, func, args, captures);
     defer frame.deinit();
     frame.module_arc = owning;
@@ -622,7 +633,7 @@ pub fn evalWithCapturesChained(
     // normal return. Other labels propagate further outward until the
     // matching frame catches them.
     if (result == .err and result.err == .LabeledReturn and
-        std.mem.eql(u8, result.err.LabeledReturn.label, func_name))
+        frameMatchesLabel(func, result.err.LabeledReturn.label))
     {
         result = ok(result.err.LabeledReturn.value);
     }
@@ -1019,7 +1030,7 @@ fn runFrameInner(
             },
             .LabeledReturn => |lr| {
                 const v = if (lr.value) |r| frame.read(r) else Value.Unit;
-                if (std.mem.eql(u8, frame.func.name, lr.label)) {
+                if (frameMatchesLabel(frame.func, lr.label)) {
                     return ok(v);
                 }
                 return errResult(.{ .LabeledReturn = .{ .label = lr.label, .value = v } });

@@ -1875,6 +1875,14 @@ fn lowerLabeled(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.switchTo(exit);
             return b.emitConst(.Unit);
         },
+        // An explicit label on a lambda / anonymous function literal
+        // (`sc@ { … }`) names that body for `return@sc`. It overrides any
+        // implicit callee-derived label `lowerExpr` would otherwise arm,
+        // so the lambda's own `implicit_label` is the explicit one.
+        .Lambda, .AnonFun => {
+            b.pending_lambda_label = label.name;
+            return lowerExpr(b, inner);
+        },
         else => return lowerExpr(b, inner),
     }
 }

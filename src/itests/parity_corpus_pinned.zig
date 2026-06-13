@@ -79,6 +79,14 @@ test "annotated_expression_body" {
     );
 }
 
+test "inline_param_shadows_caller" {
+    try check("inline_param_shadows_caller",
+        \\result=40
+        \\calls=1
+        \\
+    );
+}
+
 test "lambda_it_receiver_enclosing" {
     try check("lambda_it_receiver_enclosing",
         \\0
