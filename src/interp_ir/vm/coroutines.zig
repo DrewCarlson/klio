@@ -317,6 +317,129 @@ pub fn drainPersistedParked() void {
     PersistedParked.drainAll();
 }
 
+/// Process-global virtual-time barrier coordinating the independent
+/// per-pump logical clocks under `TimeMode.Virtual`. A `runBlocking`
+/// driver and every coroutine it dispatches onto a `Dispatchers.Default`
+/// worker each run their own `CooperativeInterceptor` with its own
+/// `virtual_now`; left uncoordinated, a dispatched child's clock races
+/// ahead of its parent's and fires the child's `delay` before the parent
+/// has even reached the `delay`/`cancel` that should preempt it (a
+/// cross-pump cancellation lost to a future timer). Real kotlinx shares a
+/// single monotonic clock across dispatchers; this barrier restores that
+/// ordering for the virtual clock: a pump may jump its clock to a *future*
+/// timer at time `t` only once no other live virtual pump is parked on an
+/// earlier timer that could post a cross-pump resume effective before `t`.
+/// A pump publishes a "floor" — its soonest parked timer — only while it
+/// actually holds a future timer; a pump with no virtual timer (running a
+/// body, blocked in a real `Thread.sleep`, or awaiting an external resume)
+/// is implicitly `INDEFINITE` and never holds the global clock back.
+/// Registration is lazy (`UNREGISTERED` until the first finite publish),
+/// so the vast majority of pumps — every timer-free dispatcher task —
+/// never touch the global lock. A timer already due at the current instant
+/// (`yield`) is ready-now work and fires without consulting the barrier.
+const VirtualClock = struct {
+    const Slot = struct {
+        id: u64,
+        /// Earliest virtual time this pump may still act at. `INDEFINITE`
+        /// when the pump has only indefinitely-parked work (it can be
+        /// resumed only by an external event, never by the clock, so it
+        /// never holds the global minimum back).
+        floor: i64,
+    };
+
+    /// Sentinel for a pump that has never published a finite floor and so
+    /// is not in `slots`. The overwhelming majority of pumps — every
+    /// dispatcher task with no `delay`, every `Thread.sleep` body — never
+    /// touch a virtual timer, so registration is lazy: a pump joins the
+    /// barrier only the first time it would publish a finite deadline.
+    /// This keeps heavy fan-out workloads (hundreds of short-lived
+    /// `Dispatchers.Default` tasks) entirely off the single global lock.
+    const UNREGISTERED: u64 = 0;
+
+    var mutex: SpinMutex = .{};
+    var slots: std.ArrayList(Slot) = .empty;
+    var next_id: u64 = 1;
+
+    fn allocator() Allocator {
+        return std.heap.page_allocator;
+    }
+
+    /// Lazily join the barrier with an initial finite floor. Returns the
+    /// pump's id (`UNREGISTERED` only on OOM, treated as "never holds the
+    /// clock back").
+    fn registerWith(floor: i64) u64 {
+        mutex.lock();
+        defer mutex.unlock();
+        const id = next_id;
+        next_id += 1;
+        slots.append(allocator(), .{ .id = id, .floor = floor }) catch return UNREGISTERED;
+        return id;
+    }
+
+    fn unregister(id: u64) void {
+        if (id == UNREGISTERED) return;
+        mutex.lock();
+        defer mutex.unlock();
+        for (slots.items, 0..) |s, i| {
+            if (s.id == id) {
+                _ = slots.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn publish(id: u64, floor: i64) void {
+        if (id == UNREGISTERED) return;
+        mutex.lock();
+        defer mutex.unlock();
+        for (slots.items) |*s| {
+            if (s.id == id) {
+                s.floor = floor;
+                return;
+            }
+        }
+    }
+
+    /// The minimum floor across every registered pump *other* than `id`.
+    /// `null` when no other pump has a finite floor: the caller is free to
+    /// advance to its own timer.
+    fn minOtherFloor(id: u64) ?i64 {
+        mutex.lock();
+        defer mutex.unlock();
+        var m: ?i64 = null;
+        for (slots.items) |s| {
+            if (s.id == id) continue;
+            if (s.floor == INDEFINITE) continue;
+            if (m == null or s.floor < m.?) m = s.floor;
+        }
+        return m;
+    }
+
+    /// Whether a pump holding token `id`, idle with its soonest timer at
+    /// `t`, may fire it now. It may unless another live pump still has a
+    /// floor strictly below `t` (that pump runs first and may post a
+    /// cross-pump resume that preempts this timer).
+    fn mayFire(id: u64, t: i64) bool {
+        const other = minOtherFloor(id) orelse return true;
+        return other >= t;
+    }
+
+    /// Clear every registered pump at a run boundary. Pumps unregister
+    /// themselves at `deinit`, so this is normally a no-op; it drops
+    /// anything an error path left behind so a stale floor cannot hold the
+    /// next run's pumps back.
+    fn drainAll() void {
+        mutex.lock();
+        defer mutex.unlock();
+        slots.clearAndFree(allocator());
+    }
+};
+
+/// Clear the process-global virtual-clock barrier at a run boundary.
+pub fn drainVirtualClock() void {
+    VirtualClock.drainAll();
+}
+
 /// Register `slot` → `wakeup` so a worker thread's completion resume
 /// routes back through the driver's mailbox.
 pub fn registerSlotOwner(slot: i64, wakeup: *const ObjRef(DriverWakeup)) Allocator.Error!void {
@@ -411,6 +534,18 @@ pub const CooperativeInterceptor = struct {
     started: ?i128,
     next_token: u64,
     virtual_now: i64,
+    /// This pump's id in the process-global `VirtualClock` barrier, or
+    /// `VirtualClock.UNREGISTERED` until it first publishes a finite floor.
+    /// Coordinates clock jumps with every other live virtual pump so a
+    /// dispatched child's logical clock cannot run ahead of its parent's.
+    clock_id: u64,
+    /// The floor value last written to the global `VirtualClock` for this
+    /// pump. The barrier is republished only when the floor actually
+    /// changes, so an idle pump waiting on an external resume (the common
+    /// case: every `Dispatchers.Default` await) does not hammer the global
+    /// barrier lock once per pump round — that contention alone, with tens
+    /// of concurrent pumps, serialised the whole runtime.
+    published_floor: i64,
     parked: std.AutoHashMap(u64, ParkedEntry),
     /// FIFO of tokens whose wakeup is due (timer fired or yielded).
     ready: std.ArrayList(u64),
@@ -435,6 +570,10 @@ pub const CooperativeInterceptor = struct {
             .started = null,
             .next_token = 0,
             .virtual_now = 0,
+            // Join the barrier lazily (on the first finite-floor publish),
+            // so timer-free pumps never touch the global lock.
+            .clock_id = VirtualClock.UNREGISTERED,
+            .published_floor = INDEFINITE,
             .parked = std.AutoHashMap(u64, ParkedEntry).init(allocator),
             .ready = .empty,
             .launched = .empty,
@@ -446,6 +585,7 @@ pub const CooperativeInterceptor = struct {
     }
 
     pub fn deinit(self: *CooperativeInterceptor) void {
+        VirtualClock.unregister(self.clock_id);
         self.wakeup.deinit();
         // Free the page-allocator scope deltas held by any still-parked
         // activation (a pump abandoning parked coroutines at exit) before
@@ -605,11 +745,43 @@ pub const CooperativeInterceptor = struct {
         return null;
     }
 
+    /// Outcome of a time-advance attempt.
+    pub const Advance = enum {
+        /// At least one timer fired (its token is now ready).
+        fired,
+        /// No timer to advance to (only indefinite parks, or nothing
+        /// parked).
+        none,
+        /// A timer exists but the process-global virtual-clock barrier is
+        /// holding it: another live virtual pump still has earlier work
+        /// that may post a cross-pump resume. The caller must keep
+        /// draining its mailbox and retry rather than fire or exit.
+        blocked,
+    };
+
+    /// Publish `floor` to the global barrier only when it differs from the
+    /// last value this pump wrote. Idle pumps overwhelmingly republish the
+    /// same floor every round; skipping the no-op write keeps tens of
+    /// concurrent pumps off the single barrier lock. A pump joins the
+    /// barrier lazily, on its first *finite* floor: while it has no virtual
+    /// timer it stays unregistered (implicitly `INDEFINITE`), so a heavy
+    /// fan-out of timer-free tasks never touches the global lock.
+    fn publishFloor(self: *CooperativeInterceptor, floor: i64) void {
+        if (self.published_floor == floor) return;
+        self.published_floor = floor;
+        if (self.clock_id == VirtualClock.UNREGISTERED) {
+            if (floor == INDEFINITE) return; // implicitly indefinite already
+            self.clock_id = VirtualClock.registerWith(floor);
+            return;
+        }
+        VirtualClock.publish(self.clock_id, floor);
+    }
+
     /// Seam: nothing ready — advance the clock to the soonest timer and
-    /// arm every activation due then. Under `Virtual` the clock jumps
-    /// instantly; under `Wall` the thread sleeps until the real
-    /// deadline. Returns whether any progress was made.
-    pub fn advanceTime(self: *CooperativeInterceptor) Allocator.Error!bool {
+    /// arm every activation due then. Under `Virtual` the clock jumps to
+    /// the timer once the global barrier permits; under `Wall` the thread
+    /// sleeps toward the real deadline.
+    pub fn advanceTimeGated(self: *CooperativeInterceptor) Allocator.Error!Advance {
         var soonest: ?i64 = null;
         {
             var it = self.parked.iterator();
@@ -619,10 +791,32 @@ pub const CooperativeInterceptor = struct {
                 if (soonest == null or w < soonest.?) soonest = w;
             }
         }
-        const t = soonest orelse return false;
+        const t = soonest orelse {
+            // No finite timer: publish an indefinite floor so this pump
+            // never holds another pump's clock back while it waits on an
+            // external resume.
+            if (self.mode == .Virtual) self.publishFloor(INDEFINITE);
+            return .none;
+        };
         switch (self.mode) {
             .Virtual => {
-                if (t > self.virtual_now) self.virtual_now = t;
+                // A timer already due at the current instant (`yield`, an
+                // immediate dispatch handshake) is ready-now work, not a
+                // clock advance: fire it without consulting the barrier so
+                // it cannot deadlock against another pump sitting at the
+                // same instant. The barrier only gates a genuine jump into
+                // the future, where a still-earlier pump might post a
+                // cross-pump resume that should preempt this timer. While
+                // this pump holds a due timer its floor stays at the
+                // current instant, so a pump with a *future* timer still
+                // waits for it.
+                if (t > self.virtual_now) {
+                    self.publishFloor(t);
+                    if (!VirtualClock.mayFire(self.clock_id, t)) return .blocked;
+                    self.virtual_now = t;
+                } else {
+                    self.publishFloor(self.virtual_now);
+                }
             },
             .Wall => {
                 const wait = @max(t - self.nowMillis(), 0);
@@ -636,7 +830,7 @@ pub const CooperativeInterceptor = struct {
                     // `true` reports the pending timer as progress; the
                     // pump comes back next round.
                     sleepMillis(@min(@as(u64, @intCast(wait)), 1));
-                    if (self.nowMillis() < t) return true;
+                    if (self.nowMillis() < t) return .fired;
                 }
             },
         }
@@ -667,7 +861,16 @@ pub const CooperativeInterceptor = struct {
         for (due.items) |d| {
             try self.ready.append(self.allocator, d.tok);
         }
-        return due.items.len != 0;
+        return if (due.items.len != 0) .fired else .none;
+    }
+
+    /// Bool-returning shim over `advanceTimeGated`: progress was made when
+    /// a timer fired. A `.blocked` outcome reports no progress (the caller
+    /// must keep draining its mailbox), preserving the historical
+    /// single-pump contract for callers that do not coordinate the global
+    /// clock barrier.
+    pub fn advanceTime(self: *CooperativeInterceptor) Allocator.Error!bool {
+        return (try self.advanceTimeGated()) == .fired;
     }
 
     pub const SlotState = struct {
@@ -1048,9 +1251,17 @@ fn pumpLoop(
             continue;
         }
 
-        // 3. No ready coroutine — advance virtual time to the nearest timer
-        //    and arm every coroutine due then.
-        if (try (coroTop().?).advanceTime()) continue;
+        // 3. No ready coroutine — advance virtual time to the nearest
+        //    timer and arm every coroutine due then. A `.blocked` outcome
+        //    means a *future* timer is parked but the global virtual-clock
+        //    barrier is holding it because another live pump still has
+        //    earlier work that may cancel this one; fall through to drain
+        //    the mailbox (the cancellation's arrival path) and retry. An
+        //    immediate (`<= now`) timer always fires, so a timer-free or
+        //    yield-only pump behaves exactly as before the barrier.
+        const advance = try (coroTop().?).advanceTimeGated();
+        if (advance == .fired) continue;
+        const barrier_blocked = advance == .blocked;
 
         // 3b. Cross-thread bridge: drain any resumes posted by worker
         //     threads (e.g. `Dispatchers.Default`) into the interceptor; if
@@ -1077,7 +1288,17 @@ fn pumpLoop(
             continue;
         }
 
-        // 3c. A blocking root must not return while its root coroutine is
+        // 3c. The global virtual-clock barrier is still holding this pump's
+        //     timer: yield so the pump with the earlier deadline runs and
+        //     can post a cross-pump cancellation, then loop to re-drain.
+        //     Never break here — the timer is real work, just not yet
+        //     allowed to fire.
+        if (barrier_blocked) {
+            std.Thread.yield() catch sleepMillis(1);
+            continue;
+        }
+
+        // 3d. A blocking root must not return while its root coroutine is
         //     still parked. For `runBlocking` the root parks until its
         //     coroutine's job completes, and the job machinery — not a
         //     host-side count — decides when that is: children on this

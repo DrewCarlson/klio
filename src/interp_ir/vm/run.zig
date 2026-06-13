@@ -471,6 +471,7 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     // state (e.g. the kxco channel registry) through its registered
     // run-boundary hook.
     defer runtime.runBoundarySweep();
+    defer vmhost.coroutines.drainVirtualClock();
     defer vmhost.coroutines.drainPersistedParked();
     defer vmhost.coroutines.drainSlotOwners();
     // Two worker populations drain in turn: explicit `kotlin.concurrent`
