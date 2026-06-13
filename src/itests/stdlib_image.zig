@@ -193,6 +193,29 @@ const P_KX =
     \\
 ;
 
+/// A package member used by fully-qualified name with no `import`. The load
+/// gate must harvest the qualified prefix identically on the image and
+/// legacy paths so the gated sources load (and fold into the same image key)
+/// regardless of cache state.
+const P_QUALIFIED_IMPLICIT =
+    \\fun main() {
+    \\    println(kotlin.math.max(3, 7))
+    \\    println(kotlin.math.sqrt(16.0))
+    \\}
+    \\
+;
+
+/// The same shape against a non-implicit gated package (`kotlin.coroutines`):
+/// the qualified reference alone must open the curated sources, byte-identical
+/// across cache modes.
+const P_QUALIFIED_GATED =
+    \\fun main() {
+    \\    val ctx = kotlin.coroutines.EmptyCoroutineContext
+    \\    println(ctx != null)
+    \\}
+    \\
+;
+
 // -------------------------------------------------------------------------
 // CLI scenarios.
 // -------------------------------------------------------------------------
@@ -217,6 +240,24 @@ test "image path is byte-identical to legacy: basic, fallback, no-main" {
 
     const no_main = try writeProgram(a, io, "no_main.kt", P_NO_MAIN);
     try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", no_main });
+}
+
+test "fully-qualified unimported reference: image path matches legacy" {
+    const a = file_arena.allocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const home = try freshHome(a, io, "qualified");
+    var env = try baseEnv(a, io, home);
+    defer env.deinit();
+    const bin = try klioBin(a, io, &env);
+
+    const implicit = try writeProgram(a, io, "qualified_implicit.kt", P_QUALIFIED_IMPLICIT);
+    try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", implicit });
+
+    const gated = try writeProgram(a, io, "qualified_gated.kt", P_QUALIFIED_GATED);
+    try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", gated });
 }
 
 test "corrupted image is rejected and rebaked transparently" {

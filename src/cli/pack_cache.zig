@@ -39,6 +39,7 @@ const kotlinx_serialization = @import("kotlinx_serialization");
 const ktor_client = @import("ktor_client");
 
 const io = @import("io.zig");
+const qualified_refs = @import("qualified_refs.zig");
 
 /// Per-`library_id` set of feature names a consumer requested (cargo
 /// style). Seeds the loader's feature resolution; default features are
@@ -169,9 +170,12 @@ fn joinIdentPath(allocator: Allocator, path: []const ast.Ident) Allocator.Error!
     return buf.toOwnedSlice(allocator);
 }
 
-/// The set of dotted import prefixes a user's AST files declare. Each
-/// key is owned by the returned map's allocator; the caller deinits with
-/// `freeStringSet`.
+/// The set of dotted prefixes a user's AST files imply for the load gate:
+/// every `import` line, plus the package prefix of every package-rooted
+/// fully-qualified reference in the program body (`kotlin.coroutines.Foo`
+/// used inline needs no import in Kotlin, and must open the same gated
+/// sources an import of it would). Each key is owned by the returned map's
+/// allocator; the caller deinits with `freeStringSet`.
 fn collectUserImportPrefixes(
     allocator: Allocator,
     user_asts: []const KotlinFile,
@@ -189,7 +193,38 @@ fn collectUserImportPrefixes(
             }
         }
     }
+    try mergeQualifiedRefPrefixes(allocator, &out, user_asts);
     return out;
+}
+
+/// The package-rooted qualified-reference prefixes of `user_asts`, as a set
+/// of owned dotted strings. The stdlib-image fast path consults this to
+/// decide whether to walk the pack cache and to feed the load gate when the
+/// program imports nothing but uses a gated package by fully-qualified name.
+/// Caller deinits with `freeStringSet`.
+pub fn collectQualifiedRefPrefixes(
+    allocator: Allocator,
+    user_asts: []const KotlinFile,
+) Allocator.Error!std.StringHashMap(void) {
+    return qualified_refs.collect(allocator, user_asts);
+}
+
+/// Fold the package-rooted qualified-reference prefixes of `user_asts` into
+/// `out`, owning fresh keys.
+pub fn mergeQualifiedRefPrefixes(
+    allocator: Allocator,
+    out: *std.StringHashMap(void),
+    user_asts: []const KotlinFile,
+) Allocator.Error!void {
+    var qrefs = try qualified_refs.collect(allocator, user_asts);
+    defer freeStringSet(&qrefs);
+    var it = qrefs.keyIterator();
+    while (it.next()) |k| {
+        const gop = try out.getOrPut(k.*);
+        if (gop.found_existing) continue;
+        gop.key_ptr.* = try allocator.dupe(u8, k.*);
+        gop.value_ptr.* = {};
+    }
 }
 
 /// Free a `StringHashMap(void)` whose keys are owned by its allocator.

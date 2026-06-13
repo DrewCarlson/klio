@@ -398,16 +398,24 @@ pub fn tryPrepare(
 
     // Cache packs load per run (bindings, hints, known packages, and the
     // selection identity); only the embedded stdlib comes from the image.
-    // A program with no imports can never match a pack's library id, so
-    // the cache walk (reading + verifying every pack file) is skipped and
-    // the selection is the empty one the loader would compute.
+    // A program with neither imports nor a package-rooted qualified
+    // reference can never match a pack's library id, so the cache walk
+    // (reading + verifying every pack file) is skipped and the selection
+    // is the empty one the loader would compute.
+    var qref_prefixes = pack_cache.collectQualifiedRefPrefixes(gpa, user.asts) catch
+        std.StringHashMap(void).init(gpa);
+    defer {
+        var it = qref_prefixes.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        qref_prefixes.deinit();
+    }
     var selection = pack_cache.Selection{};
-    var any_imports = false;
+    var any_refs = qref_prefixes.count() != 0;
     for (user.asts) |f| {
-        if (f.imports.len != 0) any_imports = true;
+        if (f.imports.len != 0) any_refs = true;
     }
     var packs_map = SourceMap.init(gpa);
-    const pack_bindings = if (any_imports)
+    const pack_bindings = if (any_refs)
         pack_cache.loadInstalledPacksOpts(gpa, user.asts, &packs_map, features, .{
             .include_stdlib = false,
             .selection = &selection,
@@ -423,6 +431,8 @@ pub fn tryPrepare(
         var prefix_set = std.StringHashMap(void).init(gpa);
         defer prefix_set.deinit();
         for (selection.final_prefixes.items) |p| prefix_set.put(p, {}) catch return null;
+        var qit = qref_prefixes.keyIterator();
+        while (qit.next()) |k| prefix_set.put(k.*, {}) catch return null;
         var imported_match = false;
         for (meta.pkgs) |pkg| {
             if (pack_cache.importPrefixMatches(gpa, &prefix_set, pkg)) {
