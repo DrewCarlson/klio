@@ -774,11 +774,13 @@ catalogued so nobody mistakes them for Class-A/B/C point-fixes; most are **keep*
   false at every run boundary (wired into
   `vmhost.resetReceiverThreadLocals`) — previously the only TLS-holding VM
   module with no run-boundary assert.
-- **Removes via:** a per-activation frame context (the drain recursion
-  crosses the host→eval→host boundary, so the flag needs a carrier riding
-  the activation, not a parameter of one call) — tracked with finding 12 in
-  `deferred-findings.md`. §6 item 7 (the single resolver) is done and did
-  not absorb it; not a resolution-class fix.
+- **Removes via:** a carrier riding the synchronous host→eval→host
+  *activation* (the drain recursion crosses that boundary, so the flag
+  cannot be a parameter of one call). NOT the finding-12 carrier: that one
+  carries the coroutine *scope* per parked activation at the pump level, a
+  different axis from this materialization re-entrancy flag (which is purely
+  intra-thread and unrelated to suspension). §6 item 7 (the single resolver)
+  is done and did not absorb it; not a resolution-class fix. Stays a TLS.
 - **Removal test:** `parity_collections_intensive`/`parity_maps_intensive` with a
   user-defined `Map`/`Iterable`; must stay green (a regression would hang).
 
@@ -788,10 +790,14 @@ catalogued so nobody mistakes them for Class-A/B/C point-fixes; most are **keep*
 - **What it does:** re-entrancy flag so a companion whose `outer` is its class (whose
   member lookup forwards back to the companion) cannot loop.
 - **Class:** other-correctness.
-- **Deletable?** **Keep** (loop prevention). The TLS→param conversion needs
-  a per-activation frame context (§6 item 7 is done and did not absorb it;
-  tracked with finding 12 in `deferred-findings.md`). Now asserted false at
-  run boundaries via `host_call_member.resetReceiverTls` (item-6 close-out).
+- **Deletable?** **Keep** for now (loop prevention). This guard rides the
+  receiver-resolution chain, NOT the coroutine-scope carrier from finding 12
+  (those are different axes — see O5). `call_outer_active` guards exactly the
+  `outerChainFallback` that finding 4 (`with`-subject outer-tower leniency,
+  still open in `deferred-findings.md`) would remove by folding the call-side
+  outer fallback into the single resolver's candidate discipline; this guard
+  dies with that fold, not with the scope carrier. Now asserted false at run
+  boundaries via `host_call_member.resetReceiverTls` (item-6 close-out).
 - **Removal test:** companion-outer cyclic fixtures in `parity_inner_classes` stay
   green.
 
@@ -827,16 +833,27 @@ catalogued so nobody mistakes them for Class-A/B/C point-fixes; most are **keep*
 
 ### O5 — coroutine driver TLS (`coro_stack`, `active_scope_stack`, `persisted_parked`)
 
-- **Location:** `src/interp_ir/vm/coroutines.zig:514,520,527`.
+- **Location:** `src/interp_ir/vm/coroutines.zig` (`coro_stack`,
+  `active_scope_stack`, `PersistedParked`).
 - **What it does:** the coroutine interceptor stack, active-scope stack, and
   indefinitely-parked continuation map — the real coroutine machinery.
 - **Class:** other (genuine runtime state) — but per §2 Class B companion list it is
   the same "TLS, never reset between runs" hazard.
 - **Deletable?** **Keep** the state; it should be owned by the driver and asserted
   empty between runs (§5.2), not deleted.
+- **Per-activation scope fix (finding 12 close-out):** the `active_scope_stack`
+  is no longer read at the top of stack on resume — that was the
+  cancellation-over-delivery bug. Each parked activation now owns its scope
+  delta (`ParkedEntry.scope_delta` / `PersistedParked.Entry.scope_delta`):
+  `park` captures and removes the activation's own scope pushes off the live
+  stack, and each resume site restores them just before the activation runs.
+  The TLS stack stays (it is the live driver's working scope), but it is no
+  longer the per-activation carrier — that rides the parked entry. The
+  threadlocal would still move onto the driver under §6 item 6.
 - **Removes via:** §5.2 reset asserts (interim) + §6 item 6 (own it on the driver).
 - **Removal test:** §5.2 "TLS empty between runs" assert; `parity_coroutine_smoke`
-  green run back-to-back.
+  green run back-to-back; the over-delivery pins `tl_cancel_sibling_plain` /
+  `tl_cancel_sibling_after_scope` / `tl_cancel_root_not_independent`.
 
 ### O6 — `materializeUserMap` / `drainIterableToList` fallbacks
 

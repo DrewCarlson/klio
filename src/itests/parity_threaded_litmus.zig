@@ -164,6 +164,9 @@ const RUNNABLE = [_][]const u8{
     "tl_dispatched_failure_no_join",
     "tl_dispatched_failure_caught",
     "tl_cancel_dispatched_child",
+    "tl_cancel_sibling_plain",
+    "tl_cancel_sibling_after_scope",
+    "tl_cancel_root_not_independent",
     "tl_runblocking_on_worker",
     "tl_thread_resume_child",
     "tl_daemon_not_awaited",
@@ -265,6 +268,15 @@ test "tl_dispatched_failure_caught" {
 }
 test "tl_cancel_dispatched_child" {
     try check("tl_cancel_dispatched_child");
+}
+test "tl_cancel_sibling_plain" {
+    try check("tl_cancel_sibling_plain");
+}
+test "tl_cancel_sibling_after_scope" {
+    try check("tl_cancel_sibling_after_scope");
+}
+test "tl_cancel_root_not_independent" {
+    try check("tl_cancel_root_not_independent");
 }
 test "tl_runblocking_on_worker" {
     try check("tl_runblocking_on_worker");

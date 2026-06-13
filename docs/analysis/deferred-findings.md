@@ -102,14 +102,61 @@ assumptions across every consumer; the consumer inventory lives in
 breaks a recursion that crosses the host→eval→host boundary, which a
 parameter cannot follow. Tracked in `guard-inventory.md` (keep rows).
 
-### 12. Active-scope staleness after a resume
+### 12. Active-scope staleness after a resume — RESOLVED (over-delivery)
 
-The suspend-implicit `coroutineContext` resolves through the threadlocal
+The suspend-implicit `coroutineContext` resolved through the threadlocal
 active-scope stack, pushed when a coroutine's block starts (`driveRoot`,
 `__klio_co_runRoot`, `startBlock`'s undispatched push). A suspension that
-resumes later runs under whatever scope the resuming pump has active, so a
-cancellable suspension created after a resume can install its
+resumed later ran under whatever scope the resuming pump had active, so a
+cancellable suspension created after a resume installed its
 parent-cancellation handle on the pump root's Job instead of its own
-coroutine's. Cancellation then over-delivers (preempting via the root)
-rather than under-delivering; the d-probe shapes all pass. The exact fix
-is a per-activation scope carried in the frame snapshot, not a threadlocal.
+coroutine's, and cancellation over-delivered.
+
+Fixed by carrying each parked activation's own scope per-activation, at the
+pump level rather than in a threadlocal stack: a suspension unwinds through
+Zig without running the Kotlin `finally` that `startBlock` uses to pop its
+`__klio_co_pushScope`, so those pushes would otherwise linger on the live
+`active_scope_stack` and a sibling resume would read this activation's stale
+scope as its own. `park` now captures the scope pushes the activation owns
+(the delta above the depth its run segment began at) into the
+`ParkedEntry.scope_delta` and removes them from the live stack; on resume
+(`pumpLoop`, `driveResumed`, `coroutineDrainToIdle`, `coroutineRunRoot`) the
+delta is restored just before the activation runs and the resumed body's own
+`finally` pop balances it. The carrier travels cross-pump through
+`SlotState`/`PersistedParked` so a dispatcher coroutine that hops pumps keeps
+its scope. Pinned by `tl_cancel_sibling_plain` (control),
+`tl_cancel_sibling_after_scope` (sibling parks inside `coroutineScope`,
+leaving its scope push; cancelling it must not over-deliver to a sibling),
+and `tl_cancel_root_not_independent` (cancelling the runBlocking root must
+not reach a coroutine on an independent `CoroutineScope(Job())`) in
+`parity_threaded_litmus.zig`, all kotlinc-faithful (kotlinc-jvm 2.3.21 +
+kotlinx-coroutines).
+
+The carrier is the coroutine-*scope* carrier; it is distinct from the
+receiver-resolution chain carrier (`Frame.enclosing_this`, already
+per-activation and already carried across suspend) that findings 4/8/9 ride
+— those are not absorbed by this change and remain open below.
+
+Residual coroutine divergences surfaced by the #12 probes (each verified
+against kotlinc-jvm 2.3.21, separate root causes, not in the scope carrier):
+
+- **`withContext(NonCancellable){}` fails**: `non-bool in branch:
+  kotlin.coroutines.CombinedContext`. Root-caused to the super-constructor
+  argument binding for `AbstractCoroutine` — `JobSupport(active)`'s `active`
+  (a `Boolean`) is read in the `__init_prop_JobSupport__state` thunk as the
+  `parentContext` (a `CombinedContext`). Reproduces only through the real
+  coroutine `AbstractCoroutine<in T>(parentContext: CoroutineContext,
+  initParentJob, active) : JobSupport(active), Job, Continuation<T>,
+  CoroutineScope` shape; minimal non-coroutine super-chains with the same
+  arity/variance/multiple-supertype shape do NOT reproduce, so the trigger is
+  narrower than "super-ctor arg by position". A constructor-lowering bug,
+  unrelated to the scope carrier.
+- **explicit `coroutineContext.cancel()` on the root is a silent no-op**
+  (a bare-read-captured `[Job]` cancel works), so it is a context-element
+  lookup gap in the `cancel()` extension's `[Job]` resolution.
+- **an independent (own-scope, not in the runBlocking tree) coroutine still
+  parked when the pump exits is abandoned**, so its later completion line is
+  not printed when the program awaits it past runBlocking (kotlinc keeps a
+  non-daemon awaited scope alive). Distinguishing daemon (correctly
+  abandoned) from awaited-non-daemon (must complete) is the
+  daemon-lifecycle piece; not the scope carrier.
