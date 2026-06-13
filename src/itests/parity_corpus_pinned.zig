@@ -459,6 +459,22 @@ test "empty_container_declared_elem" {
     );
 }
 
+// An empty container typed by its binding annotation (`val xs: List<String>
+// = emptyList()`) binds the `List<String>.describe()` extension over the
+// enclosing class's `describe()` member, matching kotlinc — the lowering
+// reads the annotation's element head and stamps it where an explicit
+// creation-site type argument would. The erased-generic-return shape
+// (`fun <T> make(): List<T> = emptyList()`) is the documented residue:
+// `T` carries no runtime element identity, so that one keeps on-demand
+// dispatch.
+test "empty_container_binding_elem" {
+    try check("empty_container_binding_elem",
+        \\ext List<String>
+        \\ext Map<String, Int>
+        \\
+    );
+}
+
 // A package member used by fully-qualified name with no `import` needs no
 // import in Kotlin; the load gate harvests the qualified prefix so the
 // gated sources load just as an import of it would.
