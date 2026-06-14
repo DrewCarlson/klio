@@ -239,23 +239,30 @@ const SERVER_SRC =
     \\}
 ;
 
-// `start(wait = false)` returns immediately (so `delay` + `println` run) and
-// the daemon serve loop is abandoned at the run boundary (so the process
-// exits instead of hanging in `joinAllThreads`).
+// `start(wait = false)` returns immediately (so the following `delay` +
+// `println` run) and the daemon serve loop is abandoned at the run boundary
+// (so the process exits instead of hanging in `joinAllThreads`).
+//
+// `embeddedServer` is called at top level, not inside `runBlocking`: Kotlin
+// resolves a bare call with an implicit `CoroutineScope` receiver to the
+// `CoroutineScope.embeddedServer` extension, which would parent the
+// application `SupervisorJob` to the enclosing `runBlocking` job and make
+// `runBlocking` wait on it forever. The top-level overload parents the
+// application to `GlobalScope`, which the run boundary abandons cleanly.
 const ASYNC_SRC =
     \\import io.ktor.server.engine.embeddedServer
     \\import io.ktor.server.engine.klio.Klio
-    \\import io.ktor.server.application.Application
     \\import io.ktor.server.routing.routing
     \\import io.ktor.server.response.respondText
     \\import kotlinx.coroutines.runBlocking
     \\import kotlinx.coroutines.delay
     \\
-    \\fun main() = runBlocking {
-    \\    embeddedServer(Klio, port = PORT) {
+    \\fun main() {
+    \\    val server = embeddedServer(Klio, port = PORT) {
     \\        routing { get("/hi") { call.respondText("ok") } }
-    \\    }.start(wait = false)
-    \\    delay(300)
+    \\    }
+    \\    server.start(wait = false)
+    \\    runBlocking { delay(300) }
     \\    println("served and exiting")
     \\}
 ;
