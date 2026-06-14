@@ -275,6 +275,7 @@ include = [
     "io/ktor/server/engine/ApplicationEngineEnvironment.nonJvm.kt",
     "io/ktor/server/http/content/DefaultTransform.nonJvm.kt",
     "io/ktor/server/engine/internal/ExceptionUtils.nonJvm.kt",
+    "io/ktor/server/application/internal/TypeUtils.nonJvm.kt",
 ]
 
 # Default auto-binding prefix is `io.ktor.`, covering both the client

@@ -38,6 +38,12 @@ pub const ClassDef = struct {
     is_sealed: bool,
     /// Simple supertype names recorded from `class Foo : Bar(), Baz`.
     supertype_names: []const []const u8,
+    /// Parallel to `supertype_names`: the dotted source qualifier when a
+    /// supertype was written qualified (`Outer.Inner`), else null. Lets
+    /// parent resolution disambiguate a nested base from a same-simple-name
+    /// class in scope — including a subtype named like its base. Empty when
+    /// no supertype carried a qualifier (the common case).
+    supertype_paths: []const ?[]const u8 = &.{},
     /// Resolved parent class for method-resolution chain walking.
     /// Backpatched once during two-phase class linking, then immutable for
     /// the rest of the process; read lock-free on the dispatch path.
@@ -295,6 +301,19 @@ pub const InstanceData = struct {
         if (!self.set(name, v)) {
             try self.fields.append(allocator, .{ .name = name, .value = v });
         }
+    }
+
+    /// Reference-counting teardown: run when an instance's strong count
+    /// reaches zero. Releases the field values, the captured outer
+    /// instance, and the (cloned) class handle, then frees the field list.
+    /// The class is part of the immutable program graph and is held alive by
+    /// the module, so this only drops the instance's own clone of it;
+    /// `native_state` is owned by its host binding.
+    pub fn deinit(self: *InstanceData, allocator: std.mem.Allocator) void {
+        for (self.fields.items) |f| f.value.release(allocator);
+        if (self.outer) |o| o.release(allocator);
+        self.fields.deinit(allocator);
+        self.class.deinit();
     }
 
     /// Fetch the instance's native-state cell, creating it via `init` on
@@ -720,6 +739,68 @@ test "InstanceData get/set/define round-trip" {
     try testing.expectEqual(@as(i32, 9), inst.get("x").?.Int);
 }
 
+test "instance release recursively frees a retained instance field" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+
+    // Inner instance B (strong count 1, holding one clone of the class).
+    const b = try objcell.ObjRef(InstanceData).init(allocator, .{
+        .class = fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 1,
+        .native_state = null,
+    });
+    const b_val = Value{ .Instance = b };
+
+    // Outer instance A storing B as a field. The store retains B (count 2).
+    var a_data: InstanceData = .{
+        .class = fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 2,
+        .native_state = null,
+    };
+    b_val.retain();
+    try a_data.define(allocator, "b", b_val);
+    const a = try objcell.ObjRef(InstanceData).init(allocator, a_data);
+    const a_val = Value{ .Instance = a };
+
+    // Releasing A drops to zero → its deinit releases field B (2 → 1) and
+    // A's class clone. Releasing the local B handle drops it to zero → freed.
+    // `testing.allocator` asserts the whole graph is reclaimed with no leak
+    // and no double-free.
+    a_val.release(allocator);
+    b_val.release(allocator);
+}
+
+test "list release recursively frees retained instance elements" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+
+    const inst = try ObjRef(InstanceData).init(allocator, .{
+        .class = fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 1,
+        .native_state = null,
+    });
+    const inst_val = Value{ .Instance = inst };
+
+    var arr: std.ArrayList(Value) = .empty;
+    inst_val.retain(); // storing into the list retains the element (count 2)
+    try arr.append(allocator, inst_val);
+    const items = try ObjRef(std.ArrayList(Value)).init(allocator, arr);
+    const list_val = Value{ .List = .{ .items = items, .mutable = true, .enum_class = null, .backing = null } };
+
+    // Releasing the list (its last owner) releases the element (2 → 1) and
+    // frees the backing array; releasing the local handle frees the instance.
+    list_val.release(allocator);
+    inst_val.release(allocator);
+}
+
 test "findMethod walks the parent chain and prefers concrete bodies" {
     const allocator = testing.allocator;
 
@@ -862,9 +943,8 @@ test "allCompanions collects self and parent companions" {
         .identity = 1,
         .native_state = null,
     });
-    // `InstanceData` has no destructor (its `class` handle is an arena-owned
-    // clone in the real runtime); release the field clone explicitly here.
-    defer parent_comp.asPtr().class.deinit();
+    // `InstanceData.deinit` releases the instance's class clone, so the
+    // ObjRef drop reclaims the whole instance.
     defer parent_comp.deinit();
     const child_comp = try ObjRef(InstanceData).init(allocator, .{
         .class = child_fx.handle.clone(),
@@ -873,7 +953,6 @@ test "allCompanions collects self and parent companions" {
         .identity = 2,
         .native_state = null,
     });
-    defer child_comp.asPtr().class.deinit();
     defer child_comp.deinit();
     {
         const g = parent_fx.ptr().companion.borrowMut();

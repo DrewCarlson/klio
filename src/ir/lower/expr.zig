@@ -4368,10 +4368,13 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const name = callee.Member.name;
 
     // A bound local/param/captured-outer of this name shadows the member.
+    // A plain bound local (`for (module in modules) { application.module() }`,
+    // a `T.() -> R` value invoked with receiver syntax) is included too: the
+    // member is still tried first at runtime, with the local as the fallback.
     const anon_cap = isLowerAnonCapture(name.name) and b.resolve(name.name) == null and
         !b.isLocalFn(name.name) and !b.isParam(name.name) and !b.knowsOuter(name.name);
     const local_callable = b.isLocalFn(name.name) or b.isParam(name.name) or
-        b.knowsOuter(name.name) or anon_cap;
+        b.knowsOuter(name.name) or anon_cap or b.resolve(name.name) != null;
     if (local_callable) {
         const local_reg = blk: {
             if (anon_cap) {
@@ -4379,6 +4382,18 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
                 const r = b.allocReg();
                 try b.push(.{ .LoadCapture = .{ .dst = r, .idx = idx } });
                 break :blk r;
+            }
+            // A directly-bound local (a loop variable / `val`) uses its own
+            // register; `resolveCapture` would mint a bogus capture slot
+            // (resolving to `Nothing`) for a name that is not actually
+            // closed over.
+            if (b.resolve(name.name)) |reg| {
+                if (b.isBoxed(name.name)) {
+                    const c = b.allocReg();
+                    try b.push(.{ .CellGet = .{ .dst = c, .cell = reg } });
+                    break :blk c;
+                }
+                break :blk reg;
             }
             break :blk try resolveCapture(b, name.name);
         };

@@ -470,7 +470,11 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         });
     }
     var supertype_names = try allocator.alloc([]const u8, class.supertypes.len);
-    for (class.supertypes, 0..) |*t, i| supertype_names[i] = t.name.name;
+    var supertype_paths = try allocator.alloc(?[]const u8, class.supertypes.len);
+    for (class.supertypes, 0..) |*t, i| {
+        supertype_names[i] = t.name.name;
+        supertype_paths[i] = t.qualified_path;
+    }
 
     const env = try ObjRef(Env).init(allocator, Env.init(allocator));
     return ObjRef(ClassDef).init(allocator, .{
@@ -488,6 +492,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         .is_enum = class.is_enum,
         .is_sealed = class.is_sealed,
         .supertype_names = supertype_names,
+        .supertype_paths = supertype_paths,
         .parent = null,
         .interfaces = &.{},
         .is_interface = class.is_interface,

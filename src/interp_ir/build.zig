@@ -1782,16 +1782,24 @@ fn buildModuleWithOverrides(
         for (new_defs.items) |def| {
             const dg = def.borrow();
             const supertype_names = dg.get().supertype_names;
+            const supertype_paths = dg.get().supertype_paths;
             const def_pkg = packageOfFqn(dg.get().fqn, dg.get().name);
             dg.deinit();
             var ifaces: std.ArrayList(ObjRef(ClassDef)) = .empty;
-            for (supertype_names) |sup_name| {
+            for (supertype_names, 0..) |sup_name, si| {
                 // A supertype name is written as a simple name in source;
                 // resolve it Kotlin-style — the subclass's own package
                 // before the cross-package simple-name view — so a
                 // same-simple-name class from another package cannot
-                // become the parent.
+                // become the parent. A qualified reference (`Outer.Inner`)
+                // resolves by FQN suffix first, disambiguating a nested base
+                // from a same-simple-name class in scope (including a subtype
+                // named like its base).
+                const qp: ?[]const u8 = if (si < supertype_paths.len) supertype_paths[si] else null;
                 const sup_def = blk: {
+                    if (qp) |p| {
+                        if (classTableByQualifiedSuffix(&classes, p)) |sd| break :blk sd;
+                    }
                     if (def_pkg.len != 0) {
                         const qualified = try std.fmt.allocPrint(a, "{s}.{s}", .{ def_pkg, sup_name });
                         defer a.free(qualified);
@@ -2379,6 +2387,7 @@ fn buildClassDef(
     for (c.secondary_ctors, 0..) |*sc, i| secondary[i] = sc;
 
     var supertype_names = try a.alloc([]const u8, c.supertypes.len);
+    var supertype_paths = try a.alloc(?[]const u8, c.supertypes.len);
     for (c.supertypes, 0..) |*t, i| {
         // A supertype naming a renamed file-private class resolves to the
         // mangled lift name; the rename is keyed by the reference's own
@@ -2387,6 +2396,7 @@ fn buildClassDef(
             ir.build.fileTypeRename(t.name.name, t.span.file.int()) orelse t.name.name
         else
             t.name.name;
+        supertype_paths[i] = t.qualified_path;
     }
 
     const fqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
@@ -2406,6 +2416,7 @@ fn buildClassDef(
         .is_enum = c.is_enum,
         .is_sealed = c.is_sealed,
         .supertype_names = supertype_names,
+        .supertype_paths = supertype_paths,
         .parent = null,
         .interfaces = &.{},
         .is_interface = c.is_interface,
@@ -2869,6 +2880,30 @@ fn copyPairMap(dst: *PairFuncMap, src: *const PairFuncMap) Allocator.Error!void 
 fn copyStrMap(comptime V: type, dst: *std.StringHashMap(V), src: *const std.StringHashMap(V)) Allocator.Error!void {
     var it = src.iterator();
     while (it.next()) |e| try dst.put(e.key_ptr.*, e.value_ptr.*);
+}
+
+/// Resolve a class written with a dotted qualifier (`Outer.Inner`) by matching
+/// it as a `.`-aligned suffix of a registered class's FQN, preferring the
+/// shortest (least-nested) match. The table holds each class under both its
+/// simple name and FQN, so scanning values (not keys) avoids double-counting.
+fn classTableByQualifiedSuffix(classes: *const ClassTable, qualified: []const u8) ?ObjRef(ClassDef) {
+    if (std.mem.indexOfScalar(u8, qualified, '.') == null) return null;
+    var best: ?ObjRef(ClassDef) = null;
+    var best_len: usize = std.math.maxInt(usize);
+    var it = classes.valueIterator();
+    while (it.next()) |d| {
+        const dg = d.borrow();
+        const fqn = dg.get().fqn;
+        const ok = std.mem.endsWith(u8, fqn, qualified) and
+            (fqn.len == qualified.len or fqn[fqn.len - qualified.len - 1] == '.');
+        const flen = fqn.len;
+        dg.deinit();
+        if (ok and flen < best_len) {
+            best_len = flen;
+            best = d.*;
+        }
+    }
+    return best;
 }
 
 /// Deep-clone the runtime ClassDef graph: a run mutates ClassDefs (startup

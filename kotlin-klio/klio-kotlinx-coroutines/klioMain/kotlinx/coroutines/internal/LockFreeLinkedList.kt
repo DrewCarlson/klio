@@ -71,6 +71,11 @@ public actual open class LockFreeLinkedListNode actual constructor() {
         }
     }
 
+    // The unconditional add: callers that predate the permissions bitmask
+    // (the event bus subscribes a handler with no close gating) add with an
+    // all-permitted mask.
+    public fun addLast(node: Node): Boolean = addLast(node, 0)
+
     public actual fun close(forbiddenElementsBit: Int) {
         addLast(ListClosed(forbiddenElementsBit), forbiddenElementsBit)
     }
