@@ -4892,7 +4892,7 @@ fn instanceOuterLink(v: *const Value) ?Value {
 ///   4. parameter specificity — the most-specific declared parameter types
 ///      for the supplied value args;
 ///   5. a stable key (lowest `FuncId`) so the winner is always unique.
-const ExtKey = [6]i32;
+const ExtKey = [7]i32;
 
 fn extKeyGreater(a: ExtKey, b: ExtKey) bool {
     inline for (0..a.len) |i| {
@@ -4909,15 +4909,27 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
     var tied: std.ArrayList(Func) = .empty;
     defer tied.deinit(self.allocator);
     var best: ?Candidate = null;
-    var best_key: ExtKey = .{std.math.minInt(i32)} ** 6;
+    var best_key: ExtKey = .{std.math.minInt(i32)} ** 7;
     for (candidates, 0..) |c, idx| {
         const f = c.func;
         const recv_score = overloadScoreArg(self, &f.params[0].ty, receiver) orelse -1;
         var score: i32 = recv_score *| 1000;
         var param_spec: i32 = 0;
+        // Applicability is Kotlin's hard gate: a candidate whose declared
+        // parameter type a supplied value argument definitely does not
+        // satisfy is removed from the overload set before any specificity
+        // ranking. Without this the receiver-specificity tier could elect an
+        // inapplicable sibling whose receiver matches more tightly (e.g.
+        // `install(RoutingRoot, …)` selecting `Application.install(plugin:
+        // ContentNegotiation, …)` over the generic `Plugin` overload).
+        var applicable: i32 = 1;
         for (args, 0..) |*a, i| {
             if (f.params.len > i + 1) {
-                score += overloadScoreArg(self, &f.params[i + 1].ty, a) orelse -1;
+                const arg_score = overloadScoreArg(self, &f.params[i + 1].ty, a);
+                if (arg_score == null and !f.params[i + 1].has_default and !f.params[i + 1].is_vararg) {
+                    applicable = 0;
+                }
+                score += arg_score orelse -1;
                 // A concrete (non-top, non-generic) param type that the arg
                 // satisfies is more specific than a top/`Any`/`T` param.
                 if (!isTopOrGenericType(f.params[i + 1].ty.name)) param_spec += 1;
@@ -4953,7 +4965,7 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // Stable final discriminator: lowest FuncId. Negated so a smaller id
         // ranks higher, guaranteeing a unique winner.
         const neg_fid: i32 = -@as(i32, @intCast(@intFromEnum(c.fid) & 0x7fff_ffff));
-        const key: ExtKey = .{ recv_match, score, owner_rank, spec, param_spec, neg_fid };
+        const key: ExtKey = .{ applicable, recv_match, score, owner_rank, spec, param_spec, neg_fid };
         if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
             tied.append(self.allocator, f) catch {};
         }

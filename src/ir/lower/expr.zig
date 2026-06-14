@@ -1682,6 +1682,29 @@ fn fnTypeArityAlias(b: *FuncBuilder, ty: ir.TypeRef) ?i16 {
 /// `recv_offset` skips a leading implicit `this` parameter (member /
 /// extension calls). Positional alignment only: a named or spread argument
 /// list yields all-unknown so a misaligned guess never suppresses an `it`.
+/// The extension overload named `name` that hosts a trailing lambda for a
+/// call of `user_arg_count` arguments: an extension (leading `this`) whose
+/// last parameter is function-typed and whose non-receiver arity equals
+/// `user_arg_count`. The bare-call heuristic resolves one FuncId by
+/// declaration order, which for an overloaded name (`get` — `List.get`,
+/// `Map.get`, `Route.get(path, body)`) may not be the overload the trailing
+/// lambda lands on; the per-argument arity readout must read the lambda's
+/// expected arity from the hosting overload so a `T.() -> R` handler drops
+/// its synthetic `it`.
+fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
+    const list = b.module.func_name_index.get(name) orelse return null;
+    for (list.items) |fid| {
+        const f = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
+        if (f.blocks.len == 0) continue;
+        if (!(f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+        if (userParams(f) != user_arg_count) continue;
+        const last = f.params[f.params.len - 1];
+        if (last.is_vararg) continue;
+        if (fnTypeArityAlias(b, last.ty) != null) return fid;
+    }
+    return null;
+}
+
 fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]i16 {
     if (args.len == 0) return null;
     for (arg_names) |an| if (an != null) return null;
@@ -3307,6 +3330,14 @@ fn recordOutOfScopeCall(
     index_res: ir.Module.BareCallResolution,
 ) Allocator.Error!bool {
     const file = call_span.file;
+    // A bare call whose name is a known class member and that sits in a
+    // receiver context is routed to runtime member-or-global dispatch by
+    // `emitBareFuncCall` (`CallMemberOrGlobal`): the implicit receiver may
+    // supply the member, so the reference is not out of scope even when
+    // the only package-scope candidate is unimported. kotlinc resolves
+    // `fun Source.discard() { request(count) }` to the receiver's
+    // `request` member, not the package-scope `request` function.
+    if (inReceiverContext(b) and b.module.registry.class_member_names.contains(name)) return false;
     // Only the index's own out-of-scope verdicts count: a unique
     // exact-arity match, or a tier-5 candidate set (identical or
     // type-distinct). Loose-shape deferrals (arity/default/vararg/
@@ -3948,10 +3979,23 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
     for (args, 0..) |a, i| all[i + 1] = a;
     const arg_arity: ?[]const i16 = blk: {
         if (allNull(ast_arg_names)) {
-            if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
-                // `all` leads with the synthesized `this`, aligned with the
-                // function's own leading `this` parameter, so no offset.
-                break :blk try argFnArities(b, f, all, &.{}, 0);
+            // The trailing lambda lands on whichever same-name overload
+            // declares a function-typed last parameter of the call's user
+            // arity — the bare-call heuristic may have resolved a sibling
+            // (`List.get(index)`) that cannot host the lambda, leaving the
+            // receiver lambda's `it` unsuppressed. Prefer the overload that
+            // actually hosts the trailing lambda for the arity readout.
+            const arity_fid: ?FuncId = if (lastArgIsLambda(args))
+                (overloadHostingTrailingLambda(b, callee.Path.segments[0].name, args.len) orelse func_id)
+            else
+                func_id;
+            if (arity_fid) |fid| {
+                if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                    // `all` leads with the synthesized `this`, aligned with
+                    // the function's own leading `this` parameter, so no
+                    // offset.
+                    break :blk try argFnArities(b, f, all, &.{}, 0);
+                }
             }
         }
         break :blk null;
@@ -3985,7 +4029,21 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
 
     if (!synth_names_needed and !was_cast) {
         // Member-of-receiver precedence: route through call_member on `this`.
-        const uargs = try lowerArgRun(b, args);
+        // Carry the trailing lambda's expected arity (from the overload that
+        // hosts it) so a `T.() -> R` receiver handler drops its synthetic
+        // `it` and resolves bare members through the receiver bound at
+        // invocation, even on this member-dispatch arm.
+        const uarg_arity: ?[]const i16 = ablk: {
+            if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
+                if (overloadHostingTrailingLambda(b, callee.Path.segments[0].name, args.len)) |fid| {
+                    if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                        break :ablk try argFnArities(b, f, args, &.{}, 1);
+                    }
+                }
+            }
+            break :ablk null;
+        };
+        const uargs = try lowerArgRunWithArity(b, args, uarg_arity);
         const uarg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nmc = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
         const dst = b.allocReg();
