@@ -71,6 +71,70 @@ engine contract is the `StdlibFn` shape every host binding shares
 (`*const fn (ctx: *CallCtx) Allocator.Error!EvalResult`); arguments are
 `[method, url, body, headers]` and the return is the flat string array.
 
+## Server
+
+`embeddedServer(CIO, port) { … }` runs a blocking HTTP/1.1 server on a
+single accept loop (the native `__kktor_serve` binding). The module lambda
+installs plugins and a `routing { … }` table; each handler runs against an
+`ApplicationCall` exposing the request and collecting the response.
+
+```kotlin
+import io.ktor.server.engine.embeddedServer
+import io.ktor.server.cio.CIO
+import io.ktor.server.routing.routing
+import io.ktor.server.response.respondText
+import io.ktor.server.response.respond
+import io.ktor.server.request.receiveText
+import io.ktor.server.request.receive
+import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.plugins.contentnegotiation.install
+import io.ktor.serialization.kotlinx.json.json
+import io.ktor.http.HttpStatusCode
+import io.ktor.http.ContentType
+import kotlinx.serialization.Serializable
+
+@Serializable
+data class User(val id: Int, val name: String)
+
+fun main() {
+    embeddedServer(CIO, port = 8080) {
+        install(ContentNegotiation) { json() }
+        routing {
+            get("/users/{id}") {
+                val id = call.parameters["id"]
+                val q = call.request.queryParameters["q"]
+                val tag = call.request.headers["X-Tag"]
+                call.respondText("id=$id q=$q tag=$tag", status = HttpStatusCode.OK)
+            }
+            post("/items") {
+                val body = call.receiveText()
+                call.response.headers.append("X-Made", "yes")
+                call.respondText("created:$body", contentType = ContentType.Text.Plain, status = HttpStatusCode.Created)
+            }
+            post("/users") {
+                val u = call.receive<User>()                 // typed JSON in
+                call.respond(HttpStatusCode.Created, User(u.id, u.name + "!"))  // typed JSON out
+            }
+        }
+    }.start(wait = true)
+}
+```
+
+Run it with `klio run --feature io.ktor/server-serialization server.kt`
+(use `io.ktor/server` if you do not need typed JSON), then drive it:
+
+```sh
+curl -i 'http://127.0.0.1:8080/users/42?q=hi' -H 'X-Tag: abc'
+curl -i -X POST --data 'widget' http://127.0.0.1:8080/items
+curl -i -X POST --data '{"id":7,"name":"Ada"}' http://127.0.0.1:8080/users
+```
+
+The handler surface: `call.parameters` (path `{name}` captures),
+`call.request.queryParameters`, `call.request.headers` (case-insensitive),
+`call.receiveText()` / `call.receive<T>()`, `call.respondText(text,
+contentType, status)`, `call.respond(status, value)` (typed JSON),
+`call.response.headers.append(name, value)`, and `call.response.status(code)`.
+
 ## Install
 
 ```sh
@@ -82,6 +146,8 @@ engine contract is the `StdlibFn` shape every host binding shares
 
 - Streaming / SSE bodies.
 - WebSocket support.
+- Server routing beyond exact / single-`{param}` segments (no nested
+  `route { … }` blocks, regex, or wildcard tails).
 - Pluggable client engines beyond the built-in transport. The slot is there
   if you want to swap in another one — wire a new module into
   `mergedHostBindings()` and adjust the binding manifest.

@@ -135,6 +135,16 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-ktor",
     } },
+    // End-to-end ktor server gate: a background child `klio` runs
+    // `embeddedServer` (routing, params, headers, status, typed JSON) while
+    // the test drives it as the HTTP client over real sockets.
+    .{ .name = "ktor_server", .parity_data = false, .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-io",
+        "kotlin-klio/klio-kotlinx-serialization",
+        "kotlin-klio/klio-ktor",
+    } },
     // Threaded stress gate for the pack concurrency primitives
     // (ConcurrentMap/Attributes computeIfAbsent once-only, the ktor locks
     // actuals, ByteChannel written from a Default worker) through child
