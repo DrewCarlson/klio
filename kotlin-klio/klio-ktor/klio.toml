@@ -249,6 +249,7 @@ include = [
     "io/ktor/server/config/",
     "io/ktor/server/util/",
     "io/ktor/server/logging/",
+    "io/ktor/server/plugins/OriginConnectionPoint.kt",
 ]
 
 # ktor-server-core posix actuals that are pure Kotlin (the cinterop ones —

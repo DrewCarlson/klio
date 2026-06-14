@@ -570,6 +570,27 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     break;
                 }
             }
+            // A declared member property (stored body property or
+            // constructor-parameter property) also outranks a same-named
+            // extension property — Kotlin resolves the member first. Without
+            // this a member-reading extension recurses (`val Route.application
+            // get() = when (this) { is RoutingRoot -> application; … }`).
+            {
+                const cg = self.classes.borrow();
+                const def = cg.get().get(cn);
+                if (def) |d| {
+                    const dg = d.borrow();
+                    for (dg.get().body_properties) |p| {
+                        if (std.mem.eql(u8, p.name, name)) found = true;
+                    }
+                    for (dg.get().primary_params) |p| {
+                        if (p.property != null and std.mem.eql(u8, p.name, name)) found = true;
+                    }
+                    dg.deinit();
+                }
+                cg.deinit();
+                if (found) break;
+            }
             cur = firstSupertype(self, cn);
         }
         break :blk found;
@@ -1321,6 +1342,9 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         if (try companionParentWalk(self, allocator, inst, name)) |v| return v;
         // Outer-instance chain fallback.
         if (try outerInstanceChain(self, allocator, inst, name)) |v| return v;
+        // A nested/companion object resolves a bare name against the
+        // enclosing class's superclass companions.
+        if (try enclosingCompanionWalk(self, allocator, inst, name)) |v| return v;
     }
     // Enum entry bare-name access.
     {
@@ -1501,16 +1525,64 @@ fn unwrapDelegate(self: *VmHost, allocator: Allocator, d: ObjRef(runtime.Delegat
 /// Walk the instance's class parent + interface chain looking for a
 /// companion singleton that owns the field.
 fn companionParentWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), name: []const u8) Allocator.Error!?EvalResult {
+    const seed = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        break :blk g.get().class.clone();
+    };
+    defer seed.deinit();
+    return companionWalkSeeded(self, allocator, seed, name);
+}
+
+/// An object/companion nested in a class resolves a bare name against the
+/// companion-object members of the enclosing class's superclass hierarchy
+/// (`RoutingRoot.Plugin` reads `Call` from `ApplicationCallPipeline`'s
+/// companion because `RoutingRoot : … : ApplicationCallPipeline`). Walk from
+/// the receiver class's enclosing class.
+fn enclosingCompanionWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), name: []const u8) Allocator.Error!?EvalResult {
+    // The enclosing class: the resolved `enclosing_class` link when present,
+    // else derived from the receiver class's lift name (`Root$Companion$Plugin`
+    // / `Outer$Inner`).
+    var encl: ?ObjRef(ClassDef) = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        const eg = cg.get().enclosing_class.borrow();
+        defer eg.deinit();
+        break :blk if (eg.get().*) |e| e.clone() else null;
+    };
+    if (encl == null) {
+        const cls_name = className(inst);
+        if (enclosingNameOf(cls_name)) |encl_name| {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            if (cg.get().get(encl_name)) |d| encl = d;
+        }
+    }
+    const seed = encl orelse return null;
+    defer seed.deinit();
+    return companionWalkSeeded(self, allocator, seed, name);
+}
+
+/// The enclosing-class lift name of a nested class / companion lift name:
+/// `Root$Companion$Plugin` -> `Root`, `Outer$Inner` -> `Outer`. Null when the
+/// name has no nesting marker.
+fn enclosingNameOf(name: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, name, "$Companion$")) |i| return name[0..i];
+    if (std.mem.lastIndexOfScalar(u8, name, '$')) |i| return name[0..i];
+    return null;
+}
+
+/// Walk `seed` plus its parent / interface supertypes, returning the first
+/// companion-object field named `name`.
+fn companionWalkSeeded(self: *VmHost, allocator: Allocator, seed: ObjRef(ClassDef), name: []const u8) Allocator.Error!?EvalResult {
     var queue: std.ArrayList(ObjRef(ClassDef)) = .empty;
     defer {
         for (queue.items) |c| c.deinit();
         queue.deinit(allocator);
     }
-    {
-        const g = inst.borrow();
-        defer g.deinit();
-        try queue.append(allocator, g.get().class.clone());
-    }
+    try queue.append(allocator, seed.clone());
     var visited: std.ArrayList([]const u8) = .empty;
     defer visited.deinit(allocator);
     while (queue.pop()) |c| {

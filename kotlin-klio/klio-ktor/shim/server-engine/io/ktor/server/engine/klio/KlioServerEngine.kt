@@ -150,7 +150,7 @@ internal class KlioApplicationRequest(
 
     @OptIn(InternalAPI::class)
     override val queryParameters: Parameters by lazy {
-        encodeParameters(rawQueryParameters).withEmptyStringForValuelessKeys()
+        encodeParameters(rawQueryParameters)
     }
 
     override val local: RequestConnectionPoint =

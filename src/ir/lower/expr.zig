@@ -1480,8 +1480,20 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Consume the per-argument expected lambda arity set by the call
     // lowering for this argument slot before the body recurses (which
     // re-arms it for the body's own nested calls).
-    const expected_arity = b.pending_lambda_arity;
+    var expected_arity = b.pending_lambda_arity;
     b.pending_lambda_arity = -1;
+    // A lambda assigned to a typed binding (`val h: Ctx.() -> Unit = { … }`)
+    // never reaches the call-argument arity path; derive the arity from the
+    // binding's functional type so a `T.() -> R` receiver lambda (zero value
+    // parameters) drops its `it` and resolves bare members through the
+    // receiver bound at invocation, rather than a spurious `it` parameter.
+    if (expected_arity == -1) {
+        if (b.peekExpected()) |exp| {
+            if (exp.function) |ft| {
+                expected_arity = @intCast(ft.params.len);
+            }
+        }
+    }
     // A zero-`->` lambda gets its implicit `it` only when its own
     // functional type takes exactly one parameter. A `() -> R` and a
     // `T.() -> R` receiver lambda both encode arity 0, so the
@@ -1649,6 +1661,20 @@ fn fnTypeArity(ty: ir.TypeRef) ?i16 {
     return n;
 }
 
+/// `fnTypeArity` resolving an aliased function-typed parameter
+/// (`RoutingHandler = RoutingContext.() -> Unit` → `Function0`) through the
+/// typealias registry before reading the `Function{N}` tag.
+fn fnTypeArityAlias(b: *FuncBuilder, ty: ir.TypeRef) ?i16 {
+    if (fnTypeArity(ty)) |n| return n;
+    if (b.module.registry.type_aliases.get(ty.name)) |resolved| {
+        if (std.mem.startsWith(u8, resolved, "Function")) {
+            const digits = resolved["Function".len..];
+            if (digits.len != 0) return std.fmt.parseInt(i16, digits, 10) catch null;
+        }
+    }
+    return null;
+}
+
 /// Per-argument expected lambda arity for a call dispatched to the
 /// resolved runtime `func`, parallel to `args`. Each entry is the
 /// non-receiver parameter count of the matching parameter's function type,
@@ -1672,12 +1698,12 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
         // Leading positional args map 1:1 from the front.
         var i: usize = 0;
         while (i + 1 < args.len) : (i += 1) {
-            out[i] = fnTypeArity(params[i].ty) orelse -1;
+            out[i] = fnTypeArityAlias(b, params[i].ty) orelse -1;
         }
         // The trailing lambda maps to the last parameter.
-        out[args.len - 1] = fnTypeArity(params[params.len - 1].ty) orelse -1;
+        out[args.len - 1] = fnTypeArityAlias(b, params[params.len - 1].ty) orelse -1;
     } else if (args.len == params.len) {
-        for (params, out) |p, *o| o.* = fnTypeArity(p.ty) orelse -1;
+        for (params, out) |p, *o| o.* = fnTypeArityAlias(b, p.ty) orelse -1;
     } else {
         return null;
     }
