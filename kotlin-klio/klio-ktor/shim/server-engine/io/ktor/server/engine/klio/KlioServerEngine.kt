@@ -36,7 +36,11 @@ import io.ktor.server.response.ResponseHeaders
 import io.ktor.util.InternalAPI
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import kotlin.coroutines.CoroutineContext
 
 /**
@@ -70,7 +74,18 @@ public class KlioServerEngine(
     override fun start(wait: Boolean): ApplicationEngine {
         val port = configuration.connectors.firstOrNull()?.port ?: 80
         resolvedConnectorsDeferred.complete(configuration.connectors)
-        __kktor_serve(port) { req -> handle(req) }
+        if (wait) {
+            __kktor_serve(port) { req -> handle(req) }
+        } else {
+            // `start(wait = false)` returns immediately and serves on a
+            // dispatcher-pool worker (a daemon task the run boundary can
+            // abandon), so the accept loop's run-boundary poll lets the
+            // process exit instead of blocking here.
+            GlobalScope.launch(Dispatchers.Default) {
+                yield()
+                __kktor_serve(port) { req -> handle(req) }
+            }
+        }
         return this
     }
 
