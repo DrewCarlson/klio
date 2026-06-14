@@ -269,6 +269,7 @@ pub const VmHost = struct {
     pub const callMemberStrictExt = host_call_member.callMemberStrictExt;
     pub const hostHasMember = host_call_member.hostHasMember;
     pub const hostHasProperty = host_call_member.hostHasProperty;
+    pub const hostHasExtPropSetter = host_fields.hostHasExtPropSetter;
     pub const companionWithMember = host_call_member.companionWithMember;
     pub const memberRef = host_call_member.memberRef;
     pub const callSuper = host_call_member.callSuper;

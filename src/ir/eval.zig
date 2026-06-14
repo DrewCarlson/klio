@@ -1893,10 +1893,19 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // *function* of the name never captures the write.
             var routed = false;
             {
-                const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, false, host, name_str);
+                // `consult_param = true`: the implicit receiver owning the
+                // written property may be the frame's `this` *parameter* (a
+                // bare `receiveType = …` inside an interface/extension method),
+                // not a capture — matching the read side. A bare write also
+                // resolves to an extension-property *setter* (`var T.x set(…)`)
+                // declared on the receiver's type or a supertype, not only a
+                // stored member; `setField` dispatches both.
+                const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str);
                 defer allocator.free(cands);
                 for (cands) |c| {
-                    if (c.v != .Instance or !host.hostHasProperty(&c.v, name_str)) continue;
+                    if (c.v != .Instance) continue;
+                    if (!host.hostHasProperty(&c.v, name_str) and
+                        !host.hostHasExtPropSetter(allocator, &c.v, name_str)) continue;
                     orAudit("StoreToThisOrGlobal", name_str, "member", c.depth, &c.v);
                     switch (try host.setField(allocator, &c.v, name_str, v)) {
                         .ok => {},
@@ -3141,6 +3150,11 @@ pub const NullHost = struct {
 
     pub fn hostHasProperty(self: *NullHost, receiver: *const Value, name: []const u8) bool {
         _ = .{ self, receiver, name };
+        return false;
+    }
+
+    pub fn hostHasExtPropSetter(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) bool {
+        _ = .{ self, allocator, receiver, name };
         return false;
     }
 

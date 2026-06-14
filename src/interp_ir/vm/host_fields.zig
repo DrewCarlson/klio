@@ -1186,10 +1186,54 @@ fn resolveExtensionProp(
     recv_simple: []const u8,
     name: []const u8,
 ) Allocator.Error!?FuncId {
+    return resolveExtensionPropImpl(self, allocator, receiver, recv_simple, name, false);
+}
+
+/// The setter half of `resolveExtensionProp`: walks the same
+/// receiver/supertype/companion/`Any` candidate set against the registered
+/// extension-property *setters*, so `var T.x set(value)` resolves for a
+/// subtype receiver (`var ApplicationCall.receiveType` on a
+/// `RoutingPipelineCall`) — not just the exact declared receiver type.
+fn resolveExtensionPropSetter(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    recv_simple: []const u8,
+    name: []const u8,
+) Allocator.Error!?FuncId {
+    return resolveExtensionPropImpl(self, allocator, receiver, recv_simple, name, true);
+}
+
+/// Whether `name` is settable on `receiver` through an extension-property
+/// setter (`var T.name set(value)`) declared on the receiver's type or any
+/// supertype. Used by the bare-name write path to route an implicit-`this`
+/// assignment to the extension setter instead of a top-level binding.
+pub fn hostHasExtPropSetter(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) bool {
+    const recv_simple: []const u8 = switch (receiver.*) {
+        .Instance => |i| className(i),
+        else => lastSegment(receiver.typeFqn()),
+    };
+    const fid = resolveExtensionPropSetter(self, allocator, receiver, recv_simple, name) catch return false;
+    return fid != null;
+}
+
+fn resolveExtensionPropImpl(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    recv_simple: []const u8,
+    name: []const u8,
+    comptime setters: bool,
+) Allocator.Error!?FuncId {
+    const Pick = struct {
+        fn map(p: anytype) @TypeOf(if (setters) p.extension_prop_setters else p.extension_props) {
+            return if (setters) p.extension_prop_setters else p.extension_props;
+        }
+    };
     {
         const pg = self.prog.borrow();
         defer pg.deinit();
-        if (lookupPairFunc(pg.get().extension_props, recv_simple, name)) |fid| return fid;
+        if (lookupPairFunc(Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
     }
     // An extension property on a supertype applies to a subtype receiver.
     if (receiver.* == .Instance) {
@@ -1213,7 +1257,7 @@ fn resolveExtensionProp(
             {
                 const pg = self.prog.borrow();
                 defer pg.deinit();
-                if (lookupPairFunc(pg.get().extension_props, sup, name)) |fid| return fid;
+                if (lookupPairFunc(Pick.map(pg.get().*), sup, name)) |fid| return fid;
             }
             const def: ?ObjRef(ClassDef) = blk: {
                 const cg = self.classes.borrow();
@@ -1235,14 +1279,14 @@ fn resolveExtensionProp(
             const outer = cls[0..i];
             const pg = self.prog.borrow();
             defer pg.deinit();
-            if (lookupPairFunc(pg.get().extension_props, outer, name)) |fid| return fid;
+            if (lookupPairFunc(Pick.map(pg.get().*), outer, name)) |fid| return fid;
         }
     }
     // An `Any` extension property applies to every receiver.
     {
         const pg = self.prog.borrow();
         defer pg.deinit();
-        if (lookupPairFunc(pg.get().extension_props, "Any", name)) |fid| return fid;
+        if (lookupPairFunc(Pick.map(pg.get().*), "Any", name)) |fid| return fid;
     }
     return null;
 }
@@ -1718,11 +1762,7 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             .Instance => |i| className(i),
             else => lastSegment(receiver.typeFqn()),
         };
-        const fid: ?FuncId = blk: {
-            const pg = self.prog.borrow();
-            defer pg.deinit();
-            break :blk lookupPairFunc(pg.get().extension_prop_setters, recv_simple, real_name);
-        };
+        const fid: ?FuncId = try resolveExtensionPropSetter(self, allocator, receiver, recv_simple, real_name);
         if (fid) |f| {
             const mptr: *const Module = self.module.asPtr();
             if (f.int() >= mptr.funcs.items.len) {
