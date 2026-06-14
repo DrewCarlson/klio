@@ -1691,6 +1691,25 @@ fn fnTypeArityAlias(b: *FuncBuilder, ty: ir.TypeRef) ?i16 {
 /// lambda lands on; the per-argument arity readout must read the lambda's
 /// expected arity from the hosting overload so a `T.() -> R` handler drops
 /// its synthetic `it`.
+/// Whether `f`'s trailing function-typed parameter declares more
+/// parameters than the call's trailing lambda supplies, leaving a reified
+/// type parameter that appears in that lambda-parameter list unbound. Used
+/// to reject a reified inline overload a bare/underfilled lambda cannot
+/// instantiate (`post<reified R>(path, RoutingContext.(R) -> Unit)` for a
+/// zero-parameter handler). Conservative: only fires when the last
+/// parameter resolves to a function type whose arity exceeds the lambda's.
+fn reifiedNeedsLambdaArity(b: *FuncBuilder, f: *const ast.Function, lambda_arity: usize) bool {
+    if (f.params.len == 0) return false;
+    const ty = f.params[f.params.len - 1].ty;
+    const fn_arity: usize = blk: {
+        if (ty.function) |ft| break :blk ft.params.len;
+        const tag = b.module.registry.type_aliases.get(ty.name.name) orelse return false;
+        if (!std.mem.startsWith(u8, tag, "Function")) return false;
+        break :blk std.fmt.parseInt(usize, tag["Function".len..], 10) catch return false;
+    };
+    return fn_arity > lambda_arity;
+}
+
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
     const list = b.module.func_name_index.get(name) orelse return null;
     for (list.items) |fid| {
@@ -1860,6 +1879,19 @@ fn lastArgIsLambdaOrAnon(args: []const Expr) bool {
     if (args.len == 0) return false;
     const last = args[args.len - 1];
     return last == .Lambda or last == .AnonFun;
+}
+
+/// Declared parameter arity of a trailing lambda/anon-fun argument, or
+/// `null` when the last argument is neither. A zero-`->` `{ … }` (its `it`
+/// injected by the parser) reports 0 — the literal declares no parameters,
+/// so overload resolution treats it as a `() -> R` handler.
+fn trailingLambdaArity(args: []const Expr) ?usize {
+    if (args.len == 0) return null;
+    return switch (args[args.len - 1]) {
+        .Lambda => |l| if (l.implicit_it) 0 else l.params.len,
+        .AnonFun => |af| af.params.len,
+        else => null,
+    };
 }
 
 fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
@@ -2349,9 +2381,22 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         const inline_call_shape = CallShape{
             .want = args.len,
             .last_is_lambda = lastArgIsLambdaOrAnon(args),
+            .trailing_lambda_arity = trailingLambdaArity(args),
         };
         if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
-            if (bareInlineNeedsSplice(b, nm, f, args)) {
+            // A reified inline overload whose type parameter lives only in
+            // the trailing lambda's parameter list (`T.(R) -> Unit`) cannot
+            // bind that parameter from a lambda that declares fewer
+            // arguments — `post("/p") { … }` against
+            // `post<reified R>(path, RoutingContext.(R) -> Unit)`. Kotlin
+            // drops such an overload (R unconstrained) and resolves the call
+            // to a non-reified namesake; decline the splice so the normal
+            // call path picks the plain `post(path, RoutingHandler)`.
+            const reified_underfilled = ast_type_args.len == 0 and
+                anyReified(f.type_params) and
+                inline_call_shape.trailing_lambda_arity != null and
+                reifiedNeedsLambdaArity(b, f, inline_call_shape.trailing_lambda_arity.?);
+            if (!reified_underfilled and bareInlineNeedsSplice(b, nm, f, args)) {
                 const expected = b.peekExpected();
                 const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
                 if (try tryInlineCallWithTypeArgs(b, nm, f, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {

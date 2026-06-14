@@ -190,7 +190,7 @@ const TMP_DIR = "/tmp/klio_itest_ktorsrv";
 
 const SERVER_SRC =
     \\import io.ktor.server.engine.embeddedServer
-    \\import io.ktor.server.cio.CIO
+    \\import io.ktor.server.engine.klio.Klio
     \\import io.ktor.server.application.Application
     \\import io.ktor.server.routing.routing
     \\import io.ktor.server.routing.route
@@ -209,7 +209,7 @@ const SERVER_SRC =
     \\data class User(val id: Int, val name: String)
     \\
     \\fun main() {
-    \\    embeddedServer(CIO, port = PORT) {
+    \\    embeddedServer(Klio, port = PORT) {
     \\        install(ContentNegotiation) { json() }
     \\        routing {
     \\            get("/users/{id}") {
@@ -232,7 +232,7 @@ const SERVER_SRC =
     \\                    get("/ping") { call.respondText("pong") }
     \\                }
     \\            }
-    \\            get("/files/{path...}") { call.respondText("f=" + call.parameters["path"]) }
+    \\            get("/files/{path...}") { call.respondText("f=" + (call.parameters.getAll("path")?.joinToString("/") ?: "")) }
     \\            get("/any/*/end") { call.respondText("wild") }
     \\        }
     \\    }.start(wait = true)
@@ -244,7 +244,7 @@ const SERVER_SRC =
 // exits instead of hanging in `joinAllThreads`).
 const ASYNC_SRC =
     \\import io.ktor.server.engine.embeddedServer
-    \\import io.ktor.server.cio.CIO
+    \\import io.ktor.server.engine.klio.Klio
     \\import io.ktor.server.application.Application
     \\import io.ktor.server.routing.routing
     \\import io.ktor.server.response.respondText
@@ -252,7 +252,7 @@ const ASYNC_SRC =
     \\import kotlinx.coroutines.delay
     \\
     \\fun main() = runBlocking {
-    \\    embeddedServer(CIO, port = PORT) {
+    \\    embeddedServer(Klio, port = PORT) {
     \\        routing { get("/hi") { call.respondText("ok") } }
     \\    }.start(wait = false)
     \\    delay(300)

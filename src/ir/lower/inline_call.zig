@@ -546,7 +546,12 @@ pub fn tryInlineCallWithTypeArgs(
             .Lambda, .AnonFun => true,
             else => false,
         };
-        const call_shape = CallShape{ .want = args.len, .last_is_lambda = last_is_lambda };
+        const trailing_arity: ?usize = if (args.len == 0) null else switch (args[args.len - 1]) {
+            .Lambda => |l| if (l.implicit_it) 0 else l.params.len,
+            .AnonFun => |af| af.params.len,
+            else => null,
+        };
+        const call_shape = CallShape{ .want = args.len, .last_is_lambda = last_is_lambda, .trailing_lambda_arity = trailing_arity };
         const recv_ty = try inferReceiverType(b, this_arg);
         const recv_chain: ?[]const []const u8 = if (recv_ty) |r|
             try expr_lower.recvChainOf(b, r)
@@ -823,7 +828,18 @@ pub fn tryInlineCallWithTypeArgs(
     const join = try b.allocBlock();
     try b.pushInlineReturn(result, join);
     const body_val = switch (body.*) {
-        .Expr => |*e| try lowerExpr(b, e),
+        // Lower an expression body with the inline function's own declared
+        // return type as the expected (tail-position) type — exactly as a
+        // normal function body lowers. A tail-position reified call then
+        // infers its type argument from this function's return type rather
+        // than the splice site's surrounding expected, so a chain like
+        // `receiveChannel(): ByteReadChannel = receive()` binds the inner
+        // `receive`'s `T` to `ByteReadChannel`.
+        .Expr => |*e| blk: {
+            const prev = b.pushExpected(f.return_type);
+            defer b.restoreExpected(prev);
+            break :blk try lowerExpr(b, e);
+        },
         .Block => |*blk| try lowerBlock(b, blk),
     };
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });

@@ -1378,6 +1378,7 @@ fn buildModuleWithOverrides(
             try module.registry.type_aliases.put(ta.name.name, tag);
         }
     }
+    ir.lower.setTypeAliasTags(&module.registry.type_aliases);
     // Lower each class.
     var empty_set = StringSet.init(a);
     defer empty_set.deinit();

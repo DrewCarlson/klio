@@ -19,6 +19,14 @@ const StringSet = std.StringHashMap(void);
 pub const CallShape = struct {
     want: usize,
     last_is_lambda: bool,
+    /// Declared parameter arity of the trailing lambda/anon-fun argument
+    /// (a zero-`->` `{ … }` is 0, not 1 — the injected `it` does not count),
+    /// or `null` when the last argument is not a lambda. Used to break a
+    /// trailing-lambda overload tie toward the candidate whose trailing
+    /// function-type parameter arity matches: a bare `{ … }` handler picks
+    /// the `T.() -> R` (0-param) overload over a reified `T.(X) -> R` one
+    /// whose type argument a bare lambda cannot supply.
+    trailing_lambda_arity: ?usize = null,
 };
 
 /// `suspend inline fun` ASTs by simple name, set by the build driver
@@ -29,6 +37,28 @@ pub const CallShape = struct {
 /// frame-kind non-local-return mechanism, so the inline blast radius
 /// stays minimal.
 threadlocal var inline_fn_asts: ?std.StringHashMap([]const *const ast.Function) = null;
+
+/// Function-typed `typealias` tags by alias name (`RoutingHandler` ->
+/// `"Function0"`), borrowed from `module.registry.type_aliases`. Lets the
+/// shape-based overload pick recognise a parameter whose declared type is a
+/// typealias for a function type — `body: RoutingHandler` is a trailing
+/// lambda slot even though its `TypeRef.function` is `null`.
+threadlocal var type_alias_tags: ?*const std.StringHashMap([]const u8) = null;
+
+pub fn setTypeAliasTags(m: *const std.StringHashMap([]const u8)) void {
+    type_alias_tags = m;
+}
+
+/// Non-receiver parameter arity of `ty` when it denotes a function type,
+/// resolving a function-typed `typealias` by its `Function{N}` tag. `null`
+/// when `ty` is not (directly or via alias) a function type.
+fn fnArityOfType(ty: ast.TypeRef) ?usize {
+    if (ty.function) |ft| return ft.params.len;
+    const tags = type_alias_tags orelse return null;
+    const tag = tags.get(ty.name.name) orelse return null;
+    if (!std.mem.startsWith(u8, tag, "Function")) return null;
+    return std.fmt.parseInt(usize, tag["Function".len..], 10) catch null;
+}
 
 /// Simple names that a default-imported host binding owns (e.g.
 /// `kotlin.synchronized`, `kotlin.arrayOf`). Any inline fn sharing a
@@ -290,7 +320,34 @@ fn pickByShapeNarrowed(
         }
     }
     if (count == 1) return match;
+    // Several overloads fit the trailing-lambda shape. Prefer the one whose
+    // trailing function-type parameter arity matches the lambda's declared
+    // arity: a bare `{ … }` handler (arity 0) resolves to the
+    // `T.() -> R` overload, not a reified `T.(X) -> R` one whose `X` a
+    // parameterless lambda cannot infer. Mirrors Kotlin dropping a generic
+    // overload whose type argument is unconstrained by the call.
+    if (shape.trailing_lambda_arity) |want_arity| {
+        var arity_match: ?*const ast.Function = null;
+        var arity_count: usize = 0;
+        for (cands) |f| {
+            if (!keepNarrowed(f, recv_ty, require_receiver, multi_recv)) continue;
+            if (!fitsTrailingLambda(f, lead)) continue;
+            if (trailingFnTypeArity(f) == want_arity) {
+                arity_match = f;
+                arity_count += 1;
+            }
+        }
+        if (arity_count == 1) return arity_match;
+    }
     return first;
+}
+
+/// Parameter arity of `f`'s trailing function-typed parameter (the
+/// non-receiver parameters of `T.(A, B) -> R`), or `null` when the last
+/// parameter is not a function type.
+fn trailingFnTypeArity(f: *const ast.Function) ?usize {
+    if (f.params.len == 0) return null;
+    return fnArityOfType(f.params[f.params.len - 1].ty);
 }
 
 fn pickNonlambdaShapeNarrowed(
@@ -316,7 +373,7 @@ fn pickNonlambdaShapeNarrowed(
 fn fitsTrailingLambda(f: *const ast.Function, lead: usize) bool {
     const n = f.params.len;
     if (n == 0) return false;
-    if (f.params[n - 1].ty.function == null) return false;
+    if (fnArityOfType(f.params[n - 1].ty) == null) return false;
     const leading = f.params[0 .. n - 1];
     var required: usize = 0;
     for (leading) |p| {
