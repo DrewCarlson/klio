@@ -1364,6 +1364,20 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* == .Class) _ = try module.reserveClass(a, d.Class.name.name, d.Class.is_inner);
     }
+    // Register typealias → head tags BEFORE phase-2 body lowering so the
+    // lambda-arity detection (`argFnArities`) resolves an aliased
+    // function-typed parameter (`RoutingHandler = RoutingContext.() -> Unit`)
+    // to its `Function{N}` tag while lowering the call site. The later pass
+    // (after lowering) re-registers and rewrites param-type names for the
+    // applicability/score consumers.
+    for (decls) |*d| {
+        if (d.* != .TypeAlias) continue;
+        const ta = &d.TypeAlias;
+        if (ta.target.function) |ft| {
+            const tag = try std.fmt.allocPrint(a, "Function{d}", .{ft.params.len});
+            try module.registry.type_aliases.put(ta.name.name, tag);
+        }
+    }
     // Lower each class.
     var empty_set = StringSet.init(a);
     defer empty_set.deinit();
@@ -2153,7 +2167,14 @@ fn buildModuleWithOverrides(
         if (d.* != .TypeAlias) continue;
         const ta = &d.TypeAlias;
         if (ta.target.function) |ft| {
-            const arity = ft.params.len + @as(usize, if (ft.receiver != null) 1 else 0);
+            // Match the direct function-type lowering (`loweredTypeRef`),
+            // which tags by the VALUE-parameter count and tracks the
+            // receiver separately: a `T.() -> R` alias is `Function0`, not
+            // `Function1`. Counting the receiver here made an aliased
+            // receiver-lambda parameter (`RoutingHandler = RoutingContext.()
+            // -> Unit`) look like arity 1, so the trailing lambda kept a
+            // spurious `it` and its receiver never bound on invocation.
+            const arity = ft.params.len;
             const tag = try std.fmt.allocPrint(a, "Function{d}", .{arity});
             try module.registry.type_aliases.put(ta.name.name, tag);
             continue;

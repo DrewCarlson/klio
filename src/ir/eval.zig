@@ -1467,10 +1467,6 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // by parameter name). The receiver is reachable here, so an
             // implicit extension receiver can be supplied before dispatch.
             var eff_func = call.func;
-            var prepended: ?[]Value = null;
-            defer if (prepended) |p| allocator.free(p);
-            var prepended_names: ?[]?[]const u8 = null;
-            defer if (prepended_names) |p| allocator.free(p);
             if (!call.exact) {
                 var any_named = false;
                 for (names) |n| {
@@ -1495,12 +1491,16 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                                 const na = try allocator.alloc(Value, arg_values.len + 1);
                                 na[0] = recv;
                                 @memcpy(na[1..], arg_values);
-                                prepended = na;
+                                // `arg_values`/`names` are owned by the
+                                // single `defer allocator.free(...)` above;
+                                // free the original buffers before replacing
+                                // the pointers so each is freed exactly once.
+                                allocator.free(arg_values);
                                 arg_values = na;
                                 const nn = try allocator.alloc(?[]const u8, names.len + 1);
                                 nn[0] = null;
                                 @memcpy(nn[1..], names);
-                                prepended_names = nn;
+                                allocator.free(names);
                                 names = nn;
                             }
                         }
@@ -1893,10 +1893,19 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // *function* of the name never captures the write.
             var routed = false;
             {
-                const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, false, host, name_str);
+                // `consult_param = true`: the implicit receiver owning the
+                // written property may be the frame's `this` *parameter* (a
+                // bare `receiveType = …` inside an interface/extension method),
+                // not a capture — matching the read side. A bare write also
+                // resolves to an extension-property *setter* (`var T.x set(…)`)
+                // declared on the receiver's type or a supertype, not only a
+                // stored member; `setField` dispatches both.
+                const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str);
                 defer allocator.free(cands);
                 for (cands) |c| {
-                    if (c.v != .Instance or !host.hostHasProperty(&c.v, name_str)) continue;
+                    if (c.v != .Instance) continue;
+                    if (!host.hostHasProperty(&c.v, name_str) and
+                        !host.hostHasExtPropSetter(allocator, &c.v, name_str)) continue;
                     orAudit("StoreToThisOrGlobal", name_str, "member", c.depth, &c.v);
                     switch (try host.setField(allocator, &c.v, name_str, v)) {
                         .ok => {},
@@ -2532,13 +2541,22 @@ fn valueTruthy(allocator: Allocator, v: *const Value) Allocator.Error!union(enum
 }
 
 fn constMatches(module: *const Module, id: ConstId, v: *const Value) bool {
-    var lhs = constToValueNoAlloc(&module.consts.items[id.int()]);
+    const c = &module.consts.items[id.int()];
+    // String switch keys (`when (s) { "lit" -> … }`) compare by content
+    // against the subject without allocating a StringRef for the key.
+    if (c.* == .String) {
+        if (v.* != .String) return false;
+        const g = v.String.borrow();
+        defer g.deinit();
+        return std.mem.eql(u8, c.String, g.get().*);
+    }
+    var lhs = constToValueNoAlloc(c);
     return Value.structuralEq(&lhs, v);
 }
 
 /// `const_to_value` for non-String consts: avoids an allocator when the
-/// caller only compares structurally. String consts are not produced by
-/// switch keys, so this is sufficient for `constMatches`.
+/// caller only compares structurally. String consts are handled directly
+/// in `constMatches`, so this maps them to `.Null`.
 fn constToValueNoAlloc(c: *const Const) Value {
     return switch (c.*) {
         .Unit => .Unit,
@@ -3141,6 +3159,11 @@ pub const NullHost = struct {
 
     pub fn hostHasProperty(self: *NullHost, receiver: *const Value, name: []const u8) bool {
         _ = .{ self, receiver, name };
+        return false;
+    }
+
+    pub fn hostHasExtPropSetter(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) bool {
+        _ = .{ self, allocator, receiver, name };
         return false;
     }
 

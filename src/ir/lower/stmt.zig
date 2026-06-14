@@ -589,18 +589,19 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                     .field = field,
                     .value = combined,
                 } });
-            } else if (b.capturesThisSlot()) {
-                // Unqualified write inside a lambda body whose
-                // name is not a local/param/captured-outer/
-                // own-member. By Kotlin scoping it is either a
-                // property of the lambda's bound receiver
-                // (`Sink.(Int) -> Unit` doing `sum = 99`) or a
-                // genuine top-level binding. Decide at runtime,
-                // symmetric to the read side's
-                // LoadFromThisOrGlobal: capture `this` on
-                // demand so a receiver-binding invoke populates
-                // the slot, then StoreToThisOrGlobal sets the
-                // receiver's member when present, else globals.
+            } else if (b.capturesThisSlot() or b.resolve("this") != null) {
+                // Unqualified write inside a lambda body or a
+                // method/extension body whose name is not a local/
+                // param/captured-outer/own-member. By Kotlin scoping
+                // it is either a property of the receiver — a member,
+                // or an extension-property setter (`var T.x set(…)`)
+                // on the receiver's type or a supertype
+                // (`receiveType = …` inside `PipelineCall.receiveNullable`)
+                // — or a genuine top-level binding. Decide at runtime,
+                // symmetric to the read side's LoadFromThisOrGlobal:
+                // capture `this` on demand so a receiver-binding invoke
+                // populates the slot, then StoreToThisOrGlobal sets the
+                // receiver's property when present, else globals.
                 const this_idx = try b.recordCapture("this");
                 const name_c = try b.module.internConst(b.allocator, .{ .String = seg });
                 expr_mod.orEmitAudit(b, "bare_name_assign", "StoreToThisOrGlobal", seg);

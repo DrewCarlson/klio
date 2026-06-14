@@ -1480,8 +1480,20 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Consume the per-argument expected lambda arity set by the call
     // lowering for this argument slot before the body recurses (which
     // re-arms it for the body's own nested calls).
-    const expected_arity = b.pending_lambda_arity;
+    var expected_arity = b.pending_lambda_arity;
     b.pending_lambda_arity = -1;
+    // A lambda assigned to a typed binding (`val h: Ctx.() -> Unit = { … }`)
+    // never reaches the call-argument arity path; derive the arity from the
+    // binding's functional type so a `T.() -> R` receiver lambda (zero value
+    // parameters) drops its `it` and resolves bare members through the
+    // receiver bound at invocation, rather than a spurious `it` parameter.
+    if (expected_arity == -1) {
+        if (b.peekExpected()) |exp| {
+            if (exp.function) |ft| {
+                expected_arity = @intCast(ft.params.len);
+            }
+        }
+    }
     // A zero-`->` lambda gets its implicit `it` only when its own
     // functional type takes exactly one parameter. A `() -> R` and a
     // `T.() -> R` receiver lambda both encode arity 0, so the
@@ -1649,6 +1661,20 @@ fn fnTypeArity(ty: ir.TypeRef) ?i16 {
     return n;
 }
 
+/// `fnTypeArity` resolving an aliased function-typed parameter
+/// (`RoutingHandler = RoutingContext.() -> Unit` → `Function0`) through the
+/// typealias registry before reading the `Function{N}` tag.
+fn fnTypeArityAlias(b: *FuncBuilder, ty: ir.TypeRef) ?i16 {
+    if (fnTypeArity(ty)) |n| return n;
+    if (b.module.registry.type_aliases.get(ty.name)) |resolved| {
+        if (std.mem.startsWith(u8, resolved, "Function")) {
+            const digits = resolved["Function".len..];
+            if (digits.len != 0) return std.fmt.parseInt(i16, digits, 10) catch null;
+        }
+    }
+    return null;
+}
+
 /// Per-argument expected lambda arity for a call dispatched to the
 /// resolved runtime `func`, parallel to `args`. Each entry is the
 /// non-receiver parameter count of the matching parameter's function type,
@@ -1656,6 +1682,29 @@ fn fnTypeArity(ty: ir.TypeRef) ?i16 {
 /// `recv_offset` skips a leading implicit `this` parameter (member /
 /// extension calls). Positional alignment only: a named or spread argument
 /// list yields all-unknown so a misaligned guess never suppresses an `it`.
+/// The extension overload named `name` that hosts a trailing lambda for a
+/// call of `user_arg_count` arguments: an extension (leading `this`) whose
+/// last parameter is function-typed and whose non-receiver arity equals
+/// `user_arg_count`. The bare-call heuristic resolves one FuncId by
+/// declaration order, which for an overloaded name (`get` — `List.get`,
+/// `Map.get`, `Route.get(path, body)`) may not be the overload the trailing
+/// lambda lands on; the per-argument arity readout must read the lambda's
+/// expected arity from the hosting overload so a `T.() -> R` handler drops
+/// its synthetic `it`.
+fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
+    const list = b.module.func_name_index.get(name) orelse return null;
+    for (list.items) |fid| {
+        const f = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
+        if (f.blocks.len == 0) continue;
+        if (!(f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+        if (userParams(f) != user_arg_count) continue;
+        const last = f.params[f.params.len - 1];
+        if (last.is_vararg) continue;
+        if (fnTypeArityAlias(b, last.ty) != null) return fid;
+    }
+    return null;
+}
+
 fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]i16 {
     if (args.len == 0) return null;
     for (arg_names) |an| if (an != null) return null;
@@ -1672,12 +1721,12 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
         // Leading positional args map 1:1 from the front.
         var i: usize = 0;
         while (i + 1 < args.len) : (i += 1) {
-            out[i] = fnTypeArity(params[i].ty) orelse -1;
+            out[i] = fnTypeArityAlias(b, params[i].ty) orelse -1;
         }
         // The trailing lambda maps to the last parameter.
-        out[args.len - 1] = fnTypeArity(params[params.len - 1].ty) orelse -1;
+        out[args.len - 1] = fnTypeArityAlias(b, params[params.len - 1].ty) orelse -1;
     } else if (args.len == params.len) {
-        for (params, out) |p, *o| o.* = fnTypeArity(p.ty) orelse -1;
+        for (params, out) |p, *o| o.* = fnTypeArityAlias(b, p.ty) orelse -1;
     } else {
         return null;
     }
@@ -3281,6 +3330,14 @@ fn recordOutOfScopeCall(
     index_res: ir.Module.BareCallResolution,
 ) Allocator.Error!bool {
     const file = call_span.file;
+    // A bare call whose name is a known class member and that sits in a
+    // receiver context is routed to runtime member-or-global dispatch by
+    // `emitBareFuncCall` (`CallMemberOrGlobal`): the implicit receiver may
+    // supply the member, so the reference is not out of scope even when
+    // the only package-scope candidate is unimported. kotlinc resolves
+    // `fun Source.discard() { request(count) }` to the receiver's
+    // `request` member, not the package-scope `request` function.
+    if (inReceiverContext(b) and b.module.registry.class_member_names.contains(name)) return false;
     // Only the index's own out-of-scope verdicts count: a unique
     // exact-arity match, or a tier-5 candidate set (identical or
     // type-distinct). Loose-shape deferrals (arity/default/vararg/
@@ -3922,10 +3979,23 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
     for (args, 0..) |a, i| all[i + 1] = a;
     const arg_arity: ?[]const i16 = blk: {
         if (allNull(ast_arg_names)) {
-            if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
-                // `all` leads with the synthesized `this`, aligned with the
-                // function's own leading `this` parameter, so no offset.
-                break :blk try argFnArities(b, f, all, &.{}, 0);
+            // The trailing lambda lands on whichever same-name overload
+            // declares a function-typed last parameter of the call's user
+            // arity — the bare-call heuristic may have resolved a sibling
+            // (`List.get(index)`) that cannot host the lambda, leaving the
+            // receiver lambda's `it` unsuppressed. Prefer the overload that
+            // actually hosts the trailing lambda for the arity readout.
+            const arity_fid: ?FuncId = if (lastArgIsLambda(args))
+                (overloadHostingTrailingLambda(b, callee.Path.segments[0].name, args.len) orelse func_id)
+            else
+                func_id;
+            if (arity_fid) |fid| {
+                if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                    // `all` leads with the synthesized `this`, aligned with
+                    // the function's own leading `this` parameter, so no
+                    // offset.
+                    break :blk try argFnArities(b, f, all, &.{}, 0);
+                }
             }
         }
         break :blk null;
@@ -3959,7 +4029,21 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
 
     if (!synth_names_needed and !was_cast) {
         // Member-of-receiver precedence: route through call_member on `this`.
-        const uargs = try lowerArgRun(b, args);
+        // Carry the trailing lambda's expected arity (from the overload that
+        // hosts it) so a `T.() -> R` receiver handler drops its synthetic
+        // `it` and resolves bare members through the receiver bound at
+        // invocation, even on this member-dispatch arm.
+        const uarg_arity: ?[]const i16 = ablk: {
+            if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
+                if (overloadHostingTrailingLambda(b, callee.Path.segments[0].name, args.len)) |fid| {
+                    if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                        break :ablk try argFnArities(b, f, args, &.{}, 1);
+                    }
+                }
+            }
+            break :ablk null;
+        };
+        const uargs = try lowerArgRunWithArity(b, args, uarg_arity);
         const uarg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nmc = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
         const dst = b.allocReg();
