@@ -2541,13 +2541,22 @@ fn valueTruthy(allocator: Allocator, v: *const Value) Allocator.Error!union(enum
 }
 
 fn constMatches(module: *const Module, id: ConstId, v: *const Value) bool {
-    var lhs = constToValueNoAlloc(&module.consts.items[id.int()]);
+    const c = &module.consts.items[id.int()];
+    // String switch keys (`when (s) { "lit" -> … }`) compare by content
+    // against the subject without allocating a StringRef for the key.
+    if (c.* == .String) {
+        if (v.* != .String) return false;
+        const g = v.String.borrow();
+        defer g.deinit();
+        return std.mem.eql(u8, c.String, g.get().*);
+    }
+    var lhs = constToValueNoAlloc(c);
     return Value.structuralEq(&lhs, v);
 }
 
 /// `const_to_value` for non-String consts: avoids an allocator when the
-/// caller only compares structurally. String consts are not produced by
-/// switch keys, so this is sufficient for `constMatches`.
+/// caller only compares structurally. String consts are handled directly
+/// in `constMatches`, so this maps them to `.Null`.
 fn constToValueNoAlloc(c: *const Const) Value {
     return switch (c.*) {
         .Unit => .Unit,
