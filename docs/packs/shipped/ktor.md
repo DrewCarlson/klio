@@ -43,9 +43,7 @@ fun main() {
         client.get("https://httpbin.org/get")
     }
     println("status=${resp.status}")
-    println("success=${resp.isSuccess()}")
-    println("ct=${resp.contentType}")
-    println("body_starts=${resp.bodyText.substring(0, 32)}")
+    println("body=${resp.bodyAsText()}")
     client.close()
 }
 ```
@@ -82,6 +80,7 @@ installs plugins and a `routing { … }` table; each handler runs against an
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.cio.CIO
 import io.ktor.server.routing.routing
+import io.ktor.server.routing.route
 import io.ktor.server.response.respondText
 import io.ktor.server.response.respond
 import io.ktor.server.request.receiveText
@@ -115,6 +114,12 @@ fun main() {
                 val u = call.receive<User>()                 // typed JSON in
                 call.respond(HttpStatusCode.Created, User(u.id, u.name + "!"))  // typed JSON out
             }
+            route("/api/v1") {                                // nested prefix
+                get("/ping") { call.respondText("pong") }     // -> /api/v1/ping
+            }
+            get("/files/{path...}") {                         // tailcard
+                call.respondText("file=${call.parameters["path"]}")
+            }
         }
     }.start(wait = true)
 }
@@ -135,6 +140,16 @@ The handler surface: `call.parameters` (path `{name}` captures),
 contentType, status)`, `call.respond(status, value)` (typed JSON),
 `call.response.headers.append(name, value)`, and `call.response.status(code)`.
 
+Route patterns support `{name}` (one captured segment), `{name...}` (a
+tailcard capturing the rest of the path), and `*` (any one segment, not
+captured); `route(prefix) { … }` nests, prepending its prefix to the routes
+inside it. The first registered route whose method and pattern match wins.
+
+`start(wait = true)` blocks the calling thread; `start(wait = false)`
+dispatches the accept loop onto the coroutine worker pool and returns, so a
+program can start the server, do other work, and exit (the daemon serve loop
+is abandoned cleanly at the run boundary).
+
 ## Install
 
 ```sh
@@ -146,8 +161,7 @@ contentType, status)`, `call.respond(status, value)` (typed JSON),
 
 - Streaming / SSE bodies.
 - WebSocket support.
-- Server routing beyond exact / single-`{param}` segments (no nested
-  `route { … }` blocks, regex, or wildcard tails).
+- Regex route segments and per-route plugins / interceptors.
 - Pluggable client engines beyond the built-in transport. The slot is there
   if you want to swap in another one — wire a new module into
   `mergedHostBindings()` and adjust the binding manifest.

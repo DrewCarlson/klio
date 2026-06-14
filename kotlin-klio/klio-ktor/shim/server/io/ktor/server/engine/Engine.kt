@@ -18,6 +18,9 @@ import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.ApplicationRequest
 import io.ktor.server.application.Headers
 import io.ktor.server.routing.RoutingContext
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
 
 internal fun __kktor_serve(
     port: Int,
@@ -70,52 +73,62 @@ private fun parseQuery(query: String): Map<String, String> {
 }
 
 class ApplicationEngine(val application: Application, val port: Int) {
+    // `wait = true` blocks the calling thread in the accept loop; `wait =
+    // false` dispatches the loop onto the coroutine worker pool (a daemon
+    // that the run boundary abandons) and returns immediately, so the caller
+    // can keep going and the process can exit cleanly.
     fun start(wait: Boolean): ApplicationEngine {
-        __kktor_serve(port) { req ->
-            val method = req[0]
-            val rawTarget = req[1]
-            val body = req[2]
-
-            // Trailing pairs are request headers (keys lowercased for the
-            // case-insensitive `Headers` lookup).
-            val headerMap = HashMap<String, String>()
-            var i = 3
-            while (i + 1 < req.size) {
-                headerMap[req[i].lowercase()] = req[i + 1]
-                i += 2
-            }
-
-            val q = rawTarget.indexOf('?')
-            val path = if (q >= 0) rawTarget.substring(0, q) else rawTarget
-            val query = if (q >= 0) rawTarget.substring(q + 1) else ""
-
-            val match = application.routing?.match(method, path)
-            if (match != null) {
-                val request = ApplicationRequest(
-                    httpMethod = method,
-                    uri = rawTarget,
-                    headers = Headers(headerMap),
-                    queryParameters = parseQuery(query),
-                    bodyText = body,
-                )
-                val call = ApplicationCall(request, match.parameters)
-                val ctx = RoutingContext(call)
-                ctx.run(match.route.handler)
-
-                val out = ArrayList<String>()
-                out.add(call.response.statusCode.toString())
-                out.add(call.response.contentType)
-                out.add(call.response.body)
-                for (entry in call.response.headers.entries) {
-                    out.add(entry.first)
-                    out.add(entry.second)
-                }
-                out.toTypedArray()
-            } else {
-                arrayOf("404", "text/plain", "Not Found")
+        val dispatch: (Array<String>) -> Array<String> = { req -> handle(req) }
+        if (wait) {
+            __kktor_serve(port, dispatch)
+        } else {
+            GlobalScope.launch(Dispatchers.IO) {
+                __kktor_serve(port, dispatch)
             }
         }
         return this
+    }
+
+    private fun handle(req: Array<String>): Array<String> {
+        val method = req[0]
+        val rawTarget = req[1]
+        val body = req[2]
+
+        // Trailing pairs are request headers (keys lowercased for the
+        // case-insensitive `Headers` lookup).
+        val headerMap = HashMap<String, String>()
+        var i = 3
+        while (i + 1 < req.size) {
+            headerMap[req[i].lowercase()] = req[i + 1]
+            i += 2
+        }
+
+        val q = rawTarget.indexOf('?')
+        val path = if (q >= 0) rawTarget.substring(0, q) else rawTarget
+        val query = if (q >= 0) rawTarget.substring(q + 1) else ""
+
+        val match = application.routing?.match(method, path)
+            ?: return arrayOf("404", "text/plain", "Not Found")
+
+        val request = ApplicationRequest(
+            httpMethod = method,
+            uri = rawTarget,
+            headers = Headers(headerMap),
+            queryParameters = parseQuery(query),
+            bodyText = body,
+        )
+        val call = ApplicationCall(request, match.parameters)
+        RoutingContext(call).run(match.route.handler)
+
+        val out = ArrayList<String>()
+        out.add(call.response.statusCode.toString())
+        out.add(call.response.contentType)
+        out.add(call.response.body)
+        for (entry in call.response.headers.entries) {
+            out.add(entry.first)
+            out.add(entry.second)
+        }
+        return out.toTypedArray()
     }
 
     fun stop() {}

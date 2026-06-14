@@ -193,6 +193,7 @@ const SERVER_SRC =
     \\import io.ktor.server.cio.CIO
     \\import io.ktor.server.application.Application
     \\import io.ktor.server.routing.routing
+    \\import io.ktor.server.routing.route
     \\import io.ktor.server.response.respondText
     \\import io.ktor.server.response.respond
     \\import io.ktor.server.request.receiveText
@@ -226,8 +227,36 @@ const SERVER_SRC =
     \\                val u = call.receive<User>()
     \\                call.respond(HttpStatusCode.Created, User(u.id, u.name + "!"))
     \\            }
+    \\            route("/api") {
+    \\                route("/v1") {
+    \\                    get("/ping") { call.respondText("pong") }
+    \\                }
+    \\            }
+    \\            get("/files/{path...}") { call.respondText("f=" + call.parameters["path"]) }
+    \\            get("/any/*/end") { call.respondText("wild") }
     \\        }
     \\    }.start(wait = true)
+    \\}
+;
+
+// `start(wait = false)` returns immediately (so `delay` + `println` run) and
+// the daemon serve loop is abandoned at the run boundary (so the process
+// exits instead of hanging in `joinAllThreads`).
+const ASYNC_SRC =
+    \\import io.ktor.server.engine.embeddedServer
+    \\import io.ktor.server.cio.CIO
+    \\import io.ktor.server.application.Application
+    \\import io.ktor.server.routing.routing
+    \\import io.ktor.server.response.respondText
+    \\import kotlinx.coroutines.runBlocking
+    \\import kotlinx.coroutines.delay
+    \\
+    \\fun main() = runBlocking {
+    \\    embeddedServer(CIO, port = PORT) {
+    \\        routing { get("/hi") { call.respondText("ok") } }
+    \\    }.start(wait = false)
+    \\    delay(300)
+    \\    println("served and exiting")
     \\}
 ;
 
@@ -259,16 +288,9 @@ test "server: routing, params, headers, status codes, and typed JSON" {
         std.debug.print("ktor_server: spawn klio failed: {s}\n", .{@errorName(e)});
         return error.SpawnFailed;
     };
-    // Stop the forever-serving child directly via the pid and reap it, rather
-    // than through Child.kill (whose Io-backed reaping path is finicky here).
-    defer {
-        if (child.id) |pid| {
-            std.posix.kill(pid, .KILL) catch {};
-            var status: c_int = undefined;
-            _ = std.c.waitpid(pid, &status, 0);
-            child.id = null;
-        }
-    }
+    // `kill` terminates the forever-serving child, waits, and reaps it in
+    // one call (a following `wait` would double-reap), so it stands alone.
+    defer child.kill(io);
 
     if (!waitForServer(io, port)) {
         std.debug.print("ktor_server: server never came up on port {d}\n", .{port});
@@ -307,4 +329,63 @@ test "server: routing, params, headers, status codes, and typed JSON" {
         const resp = try httpRequest(a, io, port, req);
         try std.testing.expectEqual(@as(?u16, 404), statusOf(resp));
     }
+
+    // Nested `route { route { get } }` -> the accumulated prefix matches.
+    {
+        const req = try buildRequest(a, "GET", "/api/v1/ping", &.{}, "");
+        const resp = try httpRequest(a, io, port, req);
+        try std.testing.expectEqual(@as(?u16, 200), statusOf(resp));
+        try std.testing.expectEqualStrings("pong", bodyOf(resp));
+    }
+
+    // Tailcard `{path...}` captures the rest of the path.
+    {
+        const req = try buildRequest(a, "GET", "/files/a/b/c.txt", &.{}, "");
+        const resp = try httpRequest(a, io, port, req);
+        try std.testing.expectEqual(@as(?u16, 200), statusOf(resp));
+        try std.testing.expectEqualStrings("f=a/b/c.txt", bodyOf(resp));
+    }
+
+    // `*` matches any single segment; a longer path does not.
+    {
+        const ok = try httpRequest(a, io, port, try buildRequest(a, "GET", "/any/X/end", &.{}, ""));
+        try std.testing.expectEqual(@as(?u16, 200), statusOf(ok));
+        try std.testing.expectEqualStrings("wild", bodyOf(ok));
+        const no = try httpRequest(a, io, port, try buildRequest(a, "GET", "/any/X/Y/end", &.{}, ""));
+        try std.testing.expectEqual(@as(?u16, 404), statusOf(no));
+    }
+}
+
+test "server: start(wait = false) is non-blocking and the daemon serve abandons at exit" {
+    _ = file_arena.reset(.retain_capacity);
+    const a = file_arena.allocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var env = try envWithHome(a, SCRATCH_HOME);
+    try installPacks(a, io, &env, SCRATCH_HOME);
+
+    const port = try freePort(io);
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, TMP_DIR) catch {};
+    const port_str = try std.fmt.allocPrint(a, "{d}", .{port});
+    const prog = try std.mem.replaceOwned(u8, a, ASYNC_SRC, "PORT", port_str);
+    const path = try std.fmt.allocPrint(a, "{s}/async_server.kt", .{TMP_DIR});
+    try cwd.writeFile(io, .{ .sub_path = path, .data = prog });
+
+    // `start(wait = false)` must return so `delay` + the final `println` run,
+    // and the program must then exit on its own (the daemon serve loop notices
+    // the run-boundary abandon) rather than hang in `joinAllThreads`. A
+    // timeout converts a hang into a visible failure.
+    const r = std.process.run(a, io, .{
+        .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server", path },
+        .environ_map = &env,
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(30_000), .clock = .awake } },
+    }) catch |e| {
+        std.debug.print("ktor_server async: run failed: {s}\n", .{@errorName(e)});
+        return error.RunFailed;
+    };
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "served and exiting") != null);
 }

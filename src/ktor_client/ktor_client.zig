@@ -755,11 +755,15 @@ fn write_response(
 
 /// `__kktor_serve(port, dispatch)`: bind `127.0.0.1:port` and serve
 /// forever. Each request is handed to `dispatch` — a Kotlin lambda
-/// `(Array<String>) -> Array<String>` taking `[method, path, body]` and
-/// returning `[status, contentType, body]` — run on this thread.
-/// Connections are accepted and handled sequentially on the serving
-/// thread (the dispatch lambda must run on the Vm that owns it), which
-/// is sufficient for the blocking `start(wait=true)` model.
+/// `(Array<String>) -> Array<String>` taking `[method, path, body, …headers]`
+/// and returning `[status, contentType, body, …headers]` — run on this
+/// thread. Connections are accepted and handled sequentially on the serving
+/// thread (the dispatch lambda runs on the Vm that owns it).
+///
+/// The accept is polled with a timeout so a daemon serve started by
+/// `start(wait = false)` (dispatched onto the coroutine worker pool) can
+/// notice the run-boundary abandon request between connections and return;
+/// on the main thread `shouldAbandon` stays false, so it serves forever.
 fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const port: u16 = blk: {
@@ -784,6 +788,10 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer _ = c.close(listen_fd);
 
     while (true) {
+        if (runtime.shouldAbandon()) break;
+        var pfd = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = c.poll(&pfd, 1, 200);
+        if (ready <= 0) continue; // timeout (re-check abandon) or transient error
         const conn = c.accept(listen_fd, null, null);
         if (conn < 0) continue;
         defer _ = c.close(conn);
