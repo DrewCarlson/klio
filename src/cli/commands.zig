@@ -292,7 +292,7 @@ fn runBuilt(
     // everything. Switch this thread to the reclaim fast path and restore
     // the prior mode after so the REPL's next program is unaffected.
     const prev_reclaim = runtime.reclaimEnabled();
-    runtime.setReclaim(false);
+    if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
 
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch return 1;
@@ -309,7 +309,7 @@ fn tryImagePath(
     features: *const RequestedFeatures,
 ) ?u8 {
     const prev_reclaim = runtime.reclaimEnabled();
-    runtime.setReclaim(false);
+    if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
     const prepared = stdlib_image.tryPrepare(gpa, paths, features) orelse return null;
     const msg = if (paths.len == 1) "error: no main function found" else "runtime error: no main function in module";
@@ -326,7 +326,7 @@ fn runBuiltModule(
     no_main_msg: []const u8,
 ) u8 {
     const prev_reclaim = runtime.reclaimEnabled();
-    runtime.setReclaim(false);
+    if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
 
     var built = built_in;

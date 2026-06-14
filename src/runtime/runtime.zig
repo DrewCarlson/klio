@@ -28,6 +28,8 @@ pub const BorrowMutError = objcell.BorrowMutError;
 pub const SpinMutex = objcell.SpinMutex;
 pub const setReclaim = objcell.setReclaim;
 pub const reclaimEnabled = objcell.reclaimEnabled;
+pub const reclaimRequested = objcell.reclaimRequested;
+pub const getenvSlice = objcell.getenvSlice;
 
 // value
 pub const Value = value_mod.Value;

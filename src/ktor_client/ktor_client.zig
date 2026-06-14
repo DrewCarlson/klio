@@ -628,16 +628,19 @@ fn set_header(ctx: *CallCtx) Allocator.Error!EvalResult {
 // ----- Server engine -----
 
 /// One parsed inbound HTTP/1.1 request.
+const HeaderPairOwned = struct { key: []const u8, value: []const u8 };
+
 const ParsedRequest = struct {
     method: []const u8,
     path: []const u8,
     body: []const u8,
+    headers: []HeaderPairOwned,
 };
 
-/// Read one HTTP/1.1 request off `fd`: returns `(method, path, body)`.
-/// Headers other than `Content-Length` are skipped; the body is read to
-/// the declared length. Returns `null` on a closed / malformed stream.
-/// All strings are owned by `allocator`.
+/// Read one HTTP/1.1 request off `fd`: returns `(method, path, body, headers)`.
+/// Every request header is collected (and `Content-Length` also drives the
+/// body read). Returns `null` on a closed / malformed stream. All strings
+/// are owned by `allocator`.
 fn read_request(allocator: Allocator, fd: i32) Allocator.Error!?ParsedRequest {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -666,13 +669,23 @@ fn read_request(allocator: Allocator, fd: i32) Allocator.Error!?ParsedRequest {
     const path = try allocator.dupe(u8, path_raw);
 
     var content_length: usize = 0;
+    var headers: std.ArrayList(HeaderPairOwned) = .empty;
     while (lines.next()) |line| {
         const t = std.mem.trimEnd(u8, line, " \t\r");
         if (t.len == 0) break;
-        if (asciiStripPrefixIgnoreCase(t, "content-length:")) |v| {
-            content_length = std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch 0;
+        const colon = std.mem.indexOfScalar(u8, t, ':') orelse continue;
+        const key = std.mem.trim(u8, t[0..colon], " \t");
+        const val = std.mem.trim(u8, t[colon + 1 ..], " \t");
+        if (key.len == 0) continue;
+        try headers.append(allocator, .{
+            .key = try allocator.dupe(u8, key),
+            .value = try allocator.dupe(u8, val),
+        });
+        if (std.ascii.eqlIgnoreCase(key, "content-length")) {
+            content_length = std.fmt.parseInt(usize, val, 10) catch 0;
         }
     }
+    const header_slice = try headers.toOwnedSlice(allocator);
 
     var body: []const u8 = "";
     if (content_length > 0) {
@@ -692,7 +705,7 @@ fn read_request(allocator: Allocator, fd: i32) Allocator.Error!?ParsedRequest {
         }
         body = body_buf;
     }
-    return .{ .method = method, .path = path, .body = body };
+    return .{ .method = method, .path = path, .body = body, .headers = header_slice };
 }
 
 /// Case-insensitive `strip_prefix`.
@@ -716,23 +729,41 @@ fn reason_phrase(status: i64) []const u8 {
     };
 }
 
-fn write_response(allocator: Allocator, fd: i32, status: i64, content_type: []const u8, body: []const u8) Allocator.Error!void {
-    const resp = try std.fmt.allocPrint(
-        allocator,
-        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-        .{ status, reason_phrase(status), content_type, body.len, body },
-    );
-    defer allocator.free(resp);
-    writeAll(fd, resp) catch {};
+fn write_response(
+    allocator: Allocator,
+    fd: i32,
+    status: i64,
+    content_type: []const u8,
+    body: []const u8,
+    headers: []const HeaderPairOwned,
+) Allocator.Error!void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.print(allocator, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n", .{ status, reason_phrase(status), content_type, body.len });
+    // Handler-supplied response headers. Content-Type / Content-Length /
+    // Connection are emitted above, so skip any duplicates the handler set.
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.key, "content-type") or
+            std.ascii.eqlIgnoreCase(h.key, "content-length") or
+            std.ascii.eqlIgnoreCase(h.key, "connection")) continue;
+        try out.print(allocator, "{s}: {s}\r\n", .{ h.key, h.value });
+    }
+    try out.appendSlice(allocator, "\r\n");
+    try out.appendSlice(allocator, body);
+    writeAll(fd, out.items) catch {};
 }
 
 /// `__kktor_serve(port, dispatch)`: bind `127.0.0.1:port` and serve
 /// forever. Each request is handed to `dispatch` — a Kotlin lambda
-/// `(Array<String>) -> Array<String>` taking `[method, path, body]` and
-/// returning `[status, contentType, body]` — run on this thread.
-/// Connections are accepted and handled sequentially on the serving
-/// thread (the dispatch lambda must run on the Vm that owns it), which
-/// is sufficient for the blocking `start(wait=true)` model.
+/// `(Array<String>) -> Array<String>` taking `[method, path, body, …headers]`
+/// and returning `[status, contentType, body, …headers]` — run on this
+/// thread. Connections are accepted and handled sequentially on the serving
+/// thread (the dispatch lambda runs on the Vm that owns it).
+///
+/// The accept is polled with a timeout so a daemon serve started by
+/// `start(wait = false)` (dispatched onto the coroutine worker pool) can
+/// notice the run-boundary abandon request between connections and return;
+/// on the main thread `shouldAbandon` stays false, so it serves forever.
 fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const port: u16 = blk: {
@@ -757,21 +788,31 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer _ = c.close(listen_fd);
 
     while (true) {
+        if (runtime.shouldAbandon()) break;
+        var pfd = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = c.poll(&pfd, 1, 200);
+        if (ready <= 0) continue; // timeout (re-check abandon) or transient error
         const conn = c.accept(listen_fd, null, null);
         if (conn < 0) continue;
         defer _ = c.close(conn);
         const parsed = (try read_request(a, conn)) orelse continue;
+        // Request array: [method, path, body, hk1, hv1, hk2, hv2, ...] — the
+        // shim reads the fixed head and the trailing header key/value pairs.
         var items: std.ArrayList(Value) = .empty;
         try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, parsed.method)) });
         try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, parsed.path)) });
         try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, parsed.body)) });
+        for (parsed.headers) |h| {
+            try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, h.key)) });
+            try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, h.value)) });
+        }
         const req = Value{ .Array = .{ .items = try ValueList.init(a, items), .prim = null } };
         const resp = try ctx.host.invokeCallable(&dispatch, &.{req}, ctx.out);
         switch (resp) {
             .err => |e| return .{ .err = e },
             .ok => |rv| {
                 const decoded = try decode_response(a, &rv);
-                try write_response(a, conn, decoded.status, decoded.content_type, decoded.body);
+                try write_response(a, conn, decoded.status, decoded.content_type, decoded.body, decoded.headers);
             },
         }
     }
@@ -791,16 +832,17 @@ fn bindListener(port: u16) !i32 {
     return fd;
 }
 
-/// Decoded `[status, contentType, body]` triple.
+/// Decoded `[status, contentType, body, hk1, hv1, ...]` response.
 const DecodedResponse = struct {
     status: i64,
     content_type: []const u8,
     body: []const u8,
+    headers: []HeaderPairOwned,
 };
 
-/// Pull `[status, contentType, body]` out of the dispatch lambda's
-/// returned `Array<String>`, with lenient fallbacks. Strings are owned by
-/// `allocator`.
+/// Pull `[status, contentType, body, hk1, hv1, ...]` out of the dispatch
+/// lambda's returned `Array<String>`, with lenient fallbacks. The trailing
+/// key/value pairs are response headers. Strings are owned by `allocator`.
 fn decode_response(allocator: Allocator, v: *const Value) Allocator.Error!DecodedResponse {
     const items_ref: ?ValueList = switch (v.*) {
         .Array => |a| a.items,
@@ -821,13 +863,27 @@ fn decode_response(allocator: Allocator, v: *const Value) Allocator.Error!Decode
             .Long => |l| l,
             else => 200,
         } else 200;
+        var hdrs: std.ArrayList(HeaderPairOwned) = .empty;
+        var i: usize = 3;
+        while (i + 1 < slice.len) : (i += 2) {
+            try hdrs.append(allocator, .{
+                .key = try strAt(allocator, slice, i),
+                .value = try strAt(allocator, slice, i + 1),
+            });
+        }
         return .{
             .status = status,
             .content_type = try strAt(allocator, slice, 1),
             .body = try strAt(allocator, slice, 2),
+            .headers = try hdrs.toOwnedSlice(allocator),
         };
     }
-    return .{ .status = 500, .content_type = try allocator.dupe(u8, "text/plain"), .body = try allocator.dupe(u8, "") };
+    return .{
+        .status = 500,
+        .content_type = try allocator.dupe(u8, "text/plain"),
+        .body = try allocator.dupe(u8, ""),
+        .headers = &.{},
+    };
 }
 
 /// The `i`th item rendered as an owned string, or `""` when it is missing
