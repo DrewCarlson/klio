@@ -515,10 +515,13 @@ pub fn parsePropertyWithFlags(p: *Parser, flags: ModifierFlags) ?Property {
     const mutable = kw_tok.kind == .Keyword and kw_tok.kind.Keyword == .Var;
     skipNl(p);
     // Type parameters on an extension property: `var <T> Box<T>.value: T`.
-    // klio erases generics, so the list is parsed and discarded — `T`
-    // resolves structurally in the receiver / type / accessors.
+    // klio erases generics, so the list is parsed for one purpose: when the
+    // receiver is a bare type parameter (`val <A : Pipeline<*, …>>
+    // A.pluginRegistry`), the property applies to the parameter's upper bound
+    // (`Pipeline`), so the receiver is rewritten to that bound below.
+    var prop_type_params: []ast.TypeParam = &.{};
     if (is(peekKind(p), .Lt)) {
-        _ = types.parseTypeParams(p, true);
+        prop_type_params = types.parseTypeParams(p, true);
         skipNl(p);
     }
     // A use-site-targeted annotation may prefix the extension receiver
@@ -529,7 +532,24 @@ pub fn parsePropertyWithFlags(p: *Parser, flags: ModifierFlags) ?Property {
         _ = file.parseAnnotations(p);
         skipNl(p);
     }
-    const receiver_type = parsePropertyReceiver(p) orelse return null;
+    var receiver_type = parsePropertyReceiver(p) orelse return null;
+    // A bare type-parameter receiver resolves to its declared upper bound:
+    // `<A : Pipeline<*, …>> A.x` is an extension on `Pipeline`, not on a type
+    // named `A`. An unbounded parameter (`<T> T.x`) applies to `Any`.
+    if (receiver_type) |*rt| {
+        if (rt.type_args.len == 0) {
+            for (prop_type_params) |tp| {
+                if (std.mem.eql(u8, tp.name.name, rt.name.name)) {
+                    if (tp.upper_bound) |bound| {
+                        receiver_type = bound;
+                    } else {
+                        rt.name = .{ .name = "Any", .span = rt.name.span };
+                    }
+                    break;
+                }
+            }
+        }
+    }
     const name = parseIdent(p, "property name") orelse return null;
     const ty = if (is(peekKind(p), .Colon)) blk: {
         _ = bump(p);
