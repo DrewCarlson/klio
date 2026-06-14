@@ -190,7 +190,7 @@ const TMP_DIR = "/tmp/klio_itest_ktorsrv";
 
 const SERVER_SRC =
     \\import io.ktor.server.engine.embeddedServer
-    \\import io.ktor.server.cio.CIO
+    \\import io.ktor.server.engine.klio.Klio
     \\import io.ktor.server.application.Application
     \\import io.ktor.server.routing.routing
     \\import io.ktor.server.routing.route
@@ -209,7 +209,7 @@ const SERVER_SRC =
     \\data class User(val id: Int, val name: String)
     \\
     \\fun main() {
-    \\    embeddedServer(CIO, port = PORT) {
+    \\    embeddedServer(Klio, port = PORT) {
     \\        install(ContentNegotiation) { json() }
     \\        routing {
     \\            get("/users/{id}") {
@@ -232,30 +232,37 @@ const SERVER_SRC =
     \\                    get("/ping") { call.respondText("pong") }
     \\                }
     \\            }
-    \\            get("/files/{path...}") { call.respondText("f=" + call.parameters["path"]) }
+    \\            get("/files/{path...}") { call.respondText("f=" + (call.parameters.getAll("path")?.joinToString("/") ?: "")) }
     \\            get("/any/*/end") { call.respondText("wild") }
     \\        }
     \\    }.start(wait = true)
     \\}
 ;
 
-// `start(wait = false)` returns immediately (so `delay` + `println` run) and
-// the daemon serve loop is abandoned at the run boundary (so the process
-// exits instead of hanging in `joinAllThreads`).
+// `start(wait = false)` returns immediately (so the following `delay` +
+// `println` run) and the daemon serve loop is abandoned at the run boundary
+// (so the process exits instead of hanging in `joinAllThreads`).
+//
+// `embeddedServer` is called at top level, not inside `runBlocking`: Kotlin
+// resolves a bare call with an implicit `CoroutineScope` receiver to the
+// `CoroutineScope.embeddedServer` extension, which would parent the
+// application `SupervisorJob` to the enclosing `runBlocking` job and make
+// `runBlocking` wait on it forever. The top-level overload parents the
+// application to `GlobalScope`, which the run boundary abandons cleanly.
 const ASYNC_SRC =
     \\import io.ktor.server.engine.embeddedServer
-    \\import io.ktor.server.cio.CIO
-    \\import io.ktor.server.application.Application
+    \\import io.ktor.server.engine.klio.Klio
     \\import io.ktor.server.routing.routing
     \\import io.ktor.server.response.respondText
     \\import kotlinx.coroutines.runBlocking
     \\import kotlinx.coroutines.delay
     \\
-    \\fun main() = runBlocking {
-    \\    embeddedServer(CIO, port = PORT) {
+    \\fun main() {
+    \\    val server = embeddedServer(Klio, port = PORT) {
     \\        routing { get("/hi") { call.respondText("ok") } }
-    \\    }.start(wait = false)
-    \\    delay(300)
+    \\    }
+    \\    server.start(wait = false)
+    \\    runBlocking { delay(300) }
     \\    println("served and exiting")
     \\}
 ;

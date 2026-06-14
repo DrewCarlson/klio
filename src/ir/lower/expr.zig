@@ -1691,6 +1691,25 @@ fn fnTypeArityAlias(b: *FuncBuilder, ty: ir.TypeRef) ?i16 {
 /// lambda lands on; the per-argument arity readout must read the lambda's
 /// expected arity from the hosting overload so a `T.() -> R` handler drops
 /// its synthetic `it`.
+/// Whether `f`'s trailing function-typed parameter declares more
+/// parameters than the call's trailing lambda supplies, leaving a reified
+/// type parameter that appears in that lambda-parameter list unbound. Used
+/// to reject a reified inline overload a bare/underfilled lambda cannot
+/// instantiate (`post<reified R>(path, RoutingContext.(R) -> Unit)` for a
+/// zero-parameter handler). Conservative: only fires when the last
+/// parameter resolves to a function type whose arity exceeds the lambda's.
+fn reifiedNeedsLambdaArity(b: *FuncBuilder, f: *const ast.Function, lambda_arity: usize) bool {
+    if (f.params.len == 0) return false;
+    const ty = f.params[f.params.len - 1].ty;
+    const fn_arity: usize = blk: {
+        if (ty.function) |ft| break :blk ft.params.len;
+        const tag = b.module.registry.type_aliases.get(ty.name.name) orelse return false;
+        if (!std.mem.startsWith(u8, tag, "Function")) return false;
+        break :blk std.fmt.parseInt(usize, tag["Function".len..], 10) catch return false;
+    };
+    return fn_arity > lambda_arity;
+}
+
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
     const list = b.module.func_name_index.get(name) orelse return null;
     for (list.items) |fid| {
@@ -1856,10 +1875,56 @@ fn lastArgIsLambda(args: []const Expr) bool {
     return args[args.len - 1] == .Lambda;
 }
 
+/// Last `.`-separated segment of a (possibly qualified) type name.
+fn lastTypeSegment(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    return name;
+}
+
+/// Whether any same-simple-name function is an extension whose declared
+/// receiver type is compatible with the spliced receiver's type chain
+/// (`chain`, the receiver simple-name plus its supertypes). Distinguishes
+/// a bare member/extension call on the spliced receiver
+/// (`receiveNullable(...)` — applies to that receiver) from a bare call
+/// whose extension namesakes target unrelated types (`maxOf(a, b)` inside
+/// `Buffer.indexOf` — its only extension overloads are `Iterable.maxOf` /
+/// array `maxOf`, none applies to `Buffer`, so the call binds the
+/// package-level `maxOf(Int, Int)`). Only the former dispatches on the
+/// splice's bound `this`; the latter falls through to the bare-name path.
+/// A null `chain` (no receiver type narrowing available) admits any
+/// extension namesake, preserving the prior receiver-agnostic behavior.
+fn nameHasReceiverCandidate(b: *FuncBuilder, name: []const u8, chain: ?[]const []const u8) bool {
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const idx = fid.int();
+        if (idx >= b.module.funcs.items.len) continue;
+        const f = &b.module.funcs.items[idx];
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        const recv_ty = lastTypeSegment(f.params[0].ty.name);
+        const ch = chain orelse return true;
+        for (ch) |c| {
+            if (std.mem.eql(u8, lastTypeSegment(c), recv_ty)) return true;
+        }
+    }
+    return false;
+}
+
 fn lastArgIsLambdaOrAnon(args: []const Expr) bool {
     if (args.len == 0) return false;
     const last = args[args.len - 1];
     return last == .Lambda or last == .AnonFun;
+}
+
+/// Declared parameter arity of a trailing lambda/anon-fun argument, or
+/// `null` when the last argument is neither. A zero-`->` `{ … }` (its `it`
+/// injected by the parser) reports 0 — the literal declares no parameters,
+/// so overload resolution treats it as a `() -> R` handler.
+fn trailingLambdaArity(args: []const Expr) ?usize {
+    if (args.len == 0) return null;
+    return switch (args[args.len - 1]) {
+        .Lambda => |l| if (l.implicit_it) 0 else l.params.len,
+        .AnonFun => |af| af.params.len,
+        else => null,
+    };
 }
 
 fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
@@ -2349,14 +2414,67 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         const inline_call_shape = CallShape{
             .want = args.len,
             .last_is_lambda = lastArgIsLambdaOrAnon(args),
+            .trailing_lambda_arity = trailingLambdaArity(args),
         };
         if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
-            if (bareInlineNeedsSplice(b, nm, f, args)) {
+            // A reified inline overload whose type parameter lives only in
+            // the trailing lambda's parameter list (`T.(R) -> Unit`) cannot
+            // bind that parameter from a lambda that declares fewer
+            // arguments — `post("/p") { … }` against
+            // `post<reified R>(path, RoutingContext.(R) -> Unit)`. Kotlin
+            // drops such an overload (R unconstrained) and resolves the call
+            // to a non-reified namesake; decline the splice so the normal
+            // call path picks the plain `post(path, RoutingHandler)`.
+            const reified_underfilled = ast_type_args.len == 0 and
+                anyReified(f.type_params) and
+                inline_call_shape.trailing_lambda_arity != null and
+                reifiedNeedsLambdaArity(b, f, inline_call_shape.trailing_lambda_arity.?);
+            if (!reified_underfilled and bareInlineNeedsSplice(b, nm, f, args)) {
                 const expected = b.peekExpected();
                 const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
                 if (try tryInlineCallWithTypeArgs(b, nm, f, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
                     return r;
                 }
+            }
+        }
+    }
+
+    // Inside an inline-extension splice, a bare call to a member of the
+    // spliced extension's bound receiver (`receiveNullable(...)` inside a
+    // spliced `ApplicationCall.receive`) is `this.member(...)` on that
+    // receiver. Resolve it here, before the bare-name paths below treat the
+    // member as a top-level function (which would lose the receiver). The
+    // bound `this` is a local register (the splice's receiver binding), not a
+    // captured frame slot, so dispatch it as an explicit `CallMember`.
+    if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1 and
+        b.currentInlineFn() != null)
+    {
+        const nm = callee.Path.segments[0].name;
+        // Only route to the spliced receiver when the bare name is a member
+        // of it or names an extension whose declared receiver type is
+        // compatible with the spliced receiver's type chain. A bare call
+        // whose only extension namesakes target unrelated types (`maxOf(a,
+        // b)` inside `Buffer.indexOf`, whose extension overloads are
+        // `Iterable.maxOf` / array `maxOf`) is the package-level function,
+        // not a receiver member — it must fall through to the bare-name path.
+        const recv_chain = try narrowingRecvChain(b);
+        if (b.resolve(nm) == null and !b.knowsOuter(nm) and
+            (b.hasOwnMember(nm) or nameHasReceiverCandidate(b, nm, recv_chain)))
+        {
+            if (b.resolve("this")) |bound_this| {
+                const run = try lowerArgRun(b, args);
+                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                const dst = b.allocReg();
+                const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
+                try b.push(.{ .CallMember = .{
+                    .dst = dst,
+                    .receiver = bound_this,
+                    .name = nmc,
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                } });
+                return dst;
             }
         }
     }

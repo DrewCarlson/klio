@@ -48,6 +48,7 @@ pub const exprSpan = mod.exprSpan;
 
 // Inline-state registries.
 pub const setInlineFnAsts = mod.setInlineFnAsts;
+pub const setTypeAliasTags = mod.setTypeAliasTags;
 pub const registerInlineFnId = mod.registerInlineFnId;
 pub const setShadowedInlineNames = mod.setShadowedInlineNames;
 pub const setTopLevelPropNames = mod.setTopLevelPropNames;
