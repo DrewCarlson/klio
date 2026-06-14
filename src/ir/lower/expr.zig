@@ -1875,6 +1875,21 @@ fn lastArgIsLambda(args: []const Expr) bool {
     return args[args.len - 1] == .Lambda;
 }
 
+/// Whether any same-simple-name function is an extension (its first lowered
+/// parameter is the `this` receiver). Distinguishes a bare member/extension
+/// call on the spliced receiver (`receiveNullable(...)` — has a receiver
+/// candidate) from a bare top-level function call (`println(...)` — none),
+/// so only the former dispatches on the splice's bound `this`.
+fn nameHasReceiverCandidate(b: *FuncBuilder, name: []const u8) bool {
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const idx = fid.int();
+        if (idx >= b.module.funcs.items.len) continue;
+        const f = &b.module.funcs.items[idx];
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) return true;
+    }
+    return false;
+}
+
 fn lastArgIsLambdaOrAnon(args: []const Expr) bool {
     if (args.len == 0) return false;
     const last = args[args.len - 1];
@@ -2402,6 +2417,38 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 if (try tryInlineCallWithTypeArgs(b, nm, f, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
                     return r;
                 }
+            }
+        }
+    }
+
+    // Inside an inline-extension splice, a bare call to a member of the
+    // spliced extension's bound receiver (`receiveNullable(...)` inside a
+    // spliced `ApplicationCall.receive`) is `this.member(...)` on that
+    // receiver. Resolve it here, before the bare-name paths below treat the
+    // member as a top-level function (which would lose the receiver). The
+    // bound `this` is a local register (the splice's receiver binding), not a
+    // captured frame slot, so dispatch it as an explicit `CallMember`.
+    if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1 and
+        b.currentInlineFn() != null)
+    {
+        const nm = callee.Path.segments[0].name;
+        if (b.resolve(nm) == null and !b.knowsOuter(nm) and
+            (b.hasOwnMember(nm) or nameHasReceiverCandidate(b, nm)))
+        {
+            if (b.resolve("this")) |bound_this| {
+                const run = try lowerArgRun(b, args);
+                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                const dst = b.allocReg();
+                const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
+                try b.push(.{ .CallMember = .{
+                    .dst = dst,
+                    .receiver = bound_this,
+                    .name = nmc,
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                } });
+                return dst;
             }
         }
     }

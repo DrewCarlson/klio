@@ -745,11 +745,27 @@ pub fn tryInlineCallWithTypeArgs(
         }
     }
     try b.pushInlineLambdaFrame(lambda_map, caller_scope_depth);
+    // An inline extension splice's body resolves names against the inline
+    // function's own parameter/receiver scopes, not the caller lambda's free
+    // names. When this splice is itself nested inside a spliced
+    // inline-argument lambda, that outer `lambda_splice_resolve` window skips
+    // the very scopes this splice binds its `this`/params into — so a bare
+    // member call in the body (`receiveNullable(...)` inside a spliced
+    // `ApplicationCall.receive`) cannot see the bound receiver. After lowering
+    // the receiver expression (which IS a caller free name and needs the
+    // window), suspend the window so the extension body's own bindings resolve
+    // normally; it is restored after the body.
+    const ext_splice = f.receiver_type != null and this_arg != null;
+    var prev_splice_window: @TypeOf(b.lambda_splice_resolve) = null;
     if (f.receiver_type != null) {
         if (this_arg) |recv| {
             const rr = try lowerExpr(b, recv);
             try b.bind("this", rr);
         }
+    }
+    if (ext_splice) {
+        prev_splice_window = b.lambda_splice_resolve;
+        b.lambda_splice_resolve = null;
     }
     // Bind each reified type parameter to the resolved class value at the
     // call site. Two bindings are needed:
@@ -843,6 +859,7 @@ pub fn tryInlineCallWithTypeArgs(
         .Block => |*blk| try lowerBlock(b, blk),
     };
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });
+    if (ext_splice) b.lambda_splice_resolve = prev_splice_window;
     b.terminate(.{ .Goto = join });
     b.switchTo(join);
     for (marked_rlp.items) |n| {
