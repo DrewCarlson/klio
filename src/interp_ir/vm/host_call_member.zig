@@ -5187,6 +5187,32 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         if (try userMethodNamed(self, allocator, receiver, name, args, arg_names)) |r| return r;
     }
 
+    // Nested-class construction on a class receiver with named arguments
+    // (`Outer.Nested(x, field = y)`). The positional path constructs by
+    // `newInstanceById`, which cannot honor the names — a primary-ctor
+    // default skipped by a named argument would otherwise bind positionally.
+    // Resolve the nested class the same way the positional path does and
+    // construct it through the name-aware path. (A companion `invoke`
+    // operator routes the call here rather than to a bare `NewInstance`.)
+    if (any_named and receiver.* == .Class) {
+        const cg = receiver.Class.borrow();
+        const cname = cg.get().name;
+        const cfqn = cg.get().fqn;
+        cg.deinit();
+        const mg = self.module.borrow();
+        const mod = mg.get();
+        const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+        var class_id = mod.classIdByFqn(fqn_probe);
+        if (class_id == null and !std.mem.eql(u8, cname, cfqn)) {
+            const name_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
+            class_id = mod.classIdByFqn(name_probe);
+        }
+        mg.deinit();
+        if (class_id) |cid| {
+            return self.newInstanceNamed(allocator, cid, args, arg_names, null);
+        }
+    }
+
     // Positional dispatch first.
     const primary = try callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, static_recv);
     if (!(primary == .err and primary.err == .Unimplemented)) return primary;
