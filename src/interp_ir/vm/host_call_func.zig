@@ -911,6 +911,22 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                 }
             }
 
+            // A trailing positional callable binds to the last function-typed
+            // parameter (the `f(a, …) { lambda }` block), out of sequence, so
+            // the intervening defaulted parameters are not consumed by it.
+            var trailing_lambda: ?usize = null;
+            if (args.len > 0 and params.len > 0) {
+                const last = args.len - 1;
+                const last_named = last < arg_names.len and arg_names[last] != null;
+                const last_param = params.len - 1;
+                if (!last_named and slots[last_param] == null and
+                    isFunctionType(&params[last_param].ty) and valueIsCallable(&args[last]))
+                {
+                    slots[last_param] = args[last];
+                    trailing_lambda = last;
+                }
+            }
+
             // Vararg-aware positional walk.
             var vararg_pos: ?usize = null;
             for (params, 0..) |p, pi| {
@@ -926,6 +942,7 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
             for (args, 0..) |a, i| {
                 const is_named = i < arg_names.len and arg_names[i] != null;
                 if (is_named) continue;
+                if (trailing_lambda != null and i == trailing_lambda.?) continue;
                 while (positional_idx < params.len and slots[positional_idx] != null) positional_idx += 1;
                 if (vararg_pos != null and positional_idx == vararg_pos.?) {
                     if (a == .Array and vararg_acc.items.len == 0) {

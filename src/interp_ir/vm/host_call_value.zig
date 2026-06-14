@@ -380,9 +380,29 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             defer pg.deinit();
             break :blk pg.get().func_defaults.get(info.body_func.int());
         };
-        var call_args = switch (try padArgsWithDefaults(self, allocator, module_ref, info.n_params, args, defaults)) {
-            .ok => |v| v,
-            .err => |e| return .{ .err = e },
+        // Trailing-lambda rule for a value call: `f { … }` where `f`'s last
+        // parameter is function-typed and the omitted leading parameters are
+        // defaulted (e.g. `runBlocking(context = …) { block }`) binds the
+        // lambda to the LAST parameter, not the first. Without this the
+        // closure lands in `context` and a later `context[Key]` misdispatches.
+        var call_args = blk: {
+            const np = info.n_params;
+            if (np >= 2 and args.len < np and args.len > 0 and func.params.len >= np) {
+                const last_p = &func.params[np - 1];
+                if (root.isFunctionType(&last_p.ty) and root.valueIsCallable(&args[args.len - 1])) {
+                    const leading = args[0 .. args.len - 1];
+                    var ca = switch (try padArgsWithDefaults(self, allocator, module_ref, np, leading, defaults)) {
+                        .ok => |v| v,
+                        .err => |e| return .{ .err = e },
+                    };
+                    ca.items[np - 1] = args[args.len - 1];
+                    break :blk ca;
+                }
+            }
+            break :blk switch (try padArgsWithDefaults(self, allocator, module_ref, info.n_params, args, defaults)) {
+                .ok => |v| v,
+                .err => |e| return .{ .err = e },
+            };
         };
         if (func.params.len != 0) {
             const last = func.params[func.params.len - 1];

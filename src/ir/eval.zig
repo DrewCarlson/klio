@@ -1709,16 +1709,26 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             defer allocator.free(names);
             const name_str = constStr(frame.module, cmv.name) orelse
                 return errResult(.{ .Type = "CallMemberOrValue: name not a string const" });
-            if (host.hostHasMember(&recv, name_str)) {
-                orAudit("CallMemberOrValue", name_str, "member", 0, &recv);
-                switch (try host.callMemberNamed(allocator, &recv, name_str, user_args, names)) {
+            const fb = frame.read(cmv.fallback);
+            // The local/captured fallback only wins when the receiver has no
+            // such member AND the fallback is actually invocable (a function
+            // value or callable reference). A same-named non-callable local
+            // (e.g. a captured `info` next to `logger.info(...)`) must not
+            // shadow the real member.
+            const fb_invocable = switch (fb) {
+                .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod, .PropertyRef => true,
+                .Instance => host.hostHasMember(&fb, "invoke") or host.callableReceiverShape(&fb) != null,
+                else => false,
+            };
+            if (fb_invocable and !host.hostHasMember(&recv, name_str)) {
+                orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
+                switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
                     .ok => |rv| try frame.write(cmv.dst, rv),
                     .err => |e| return errResult(e),
                 }
             } else {
-                orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
-                const fb = frame.read(cmv.fallback);
-                switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
+                orAudit("CallMemberOrValue", name_str, "member", 0, &recv);
+                switch (try host.callMemberNamed(allocator, &recv, name_str, user_args, names)) {
                     .ok => |rv| try frame.write(cmv.dst, rv),
                     .err => |e| return errResult(e),
                 }
