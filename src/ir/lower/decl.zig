@@ -412,6 +412,17 @@ pub fn lowerClassWithExtras(
     // simple-name collision binds the supertype this class can see.
     const class_pkg = lower_class_pkg orelse ir.packageOfFqn(class_fqn, c.name.name);
     for (c.supertypes) |*t| {
+        // A qualified supertype (`Outer.Inner`) disambiguates a nested base
+        // from a same-simple-name class in scope — including this class's own
+        // nested type. Resolve it through the nested-lift registry first so a
+        // subtype named like its base (`Engine.Configuration :
+        // ApplicationEngine.Configuration()`) binds the base, not itself.
+        if (t.qualified_path) |qp| {
+            if (module.classIdByQualifiedSuffix(qp)) |cid| {
+                try supertypes.append(a, cid);
+                continue;
+            }
+        }
         if (module.classIdIndexed(t.name.name, class_pkg, t.name.span.file)) |cid| {
             try supertypes.append(a, cid);
         }

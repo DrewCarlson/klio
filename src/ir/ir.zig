@@ -1002,6 +1002,33 @@ pub const Module = struct {
         return null;
     }
 
+    /// Resolve a class written with a dotted qualifier (`Outer.Inner`) by
+    /// matching it as a `.`-aligned suffix of a registered class's FQN. This
+    /// disambiguates a nested base from a same-simple-name class in scope
+    /// (including a subtype named like its base), which a simple-name lookup
+    /// cannot. Prefers the shortest FQN among matches (the least-nested, most
+    /// specific qualification). Returns null when the path is unqualified or
+    /// no class FQN ends with it.
+    pub fn classIdByQualifiedSuffix(self: *const Module, qualified: []const u8) ?ClassId {
+        if (std.mem.indexOfScalar(u8, qualified, '.') == null) return null;
+        var best: ?ClassId = null;
+        var best_len: usize = std.math.maxInt(usize);
+        for (self.class_index.items) |entry| {
+            const c = idGet(Class, self.classes.items, entry.id.int()) orelse continue;
+            const fqn = c.fqn;
+            if (!std.mem.endsWith(u8, fqn, qualified)) continue;
+            // Require a `.`-aligned boundary so `X.Configuration` does not
+            // match `OtherX.Configuration`.
+            const at = fqn.len - qualified.len;
+            if (at != 0 and fqn[at - 1] != '.') continue;
+            if (fqn.len < best_len) {
+                best_len = fqn.len;
+                best = entry.id;
+            }
+        }
+        return best;
+    }
+
     /// Resolve a class by simple name from the caller's scope, ranking
     /// same-simple-name classes from different packages under the bare-
     /// call tier order over `Class.package` (named import, own package,

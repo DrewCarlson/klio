@@ -1655,6 +1655,10 @@ fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
         const g = v.Instance.borrow();
         defer g.deinit();
         if (g.get().get("__sam_target__") != null) return true;
+        // A `recv::method` / `::prop` callable reference is a synthetic
+        // instance carrying `__bound_name__`; it dispatches through the
+        // call_value path, so it satisfies a function-typed parameter.
+        if (g.get().get("__bound_name__") != null) return true;
     }
     var start: []const u8 = undefined;
     {
@@ -2875,6 +2879,12 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
     _ = self;
     switch (receiver.*) {
         .List => |l| {
+            // A mutable list shares its backing so `MutableIterator.remove()`
+            // mutates the source (and the iterating loop observes it); an
+            // immutable list snapshots, as before.
+            if (l.mutable and l.backing == null) {
+                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
+            }
             const items = try cloneItemsList(allocator, l.items);
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
         },
@@ -3747,6 +3757,24 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         pmg.get().* = p + 1;
         pmg.deinit();
         return .{ .ok = v };
+    }
+    // `MutableIterator.remove()` — drop the element last returned by `next()`
+    // (at `pos - 1`) from the backing list and rewind the cursor so the
+    // following `next()` resumes correctly. A no-op before the first `next()`.
+    if (std.mem.eql(u8, name, "remove") and args.len == 0) {
+        const pg = it.pos.borrow();
+        const p = pg.get().*;
+        pg.deinit();
+        if (p == 0) return .{ .ok = .Unit };
+        const g = it.items.borrowMut();
+        defer g.deinit();
+        if (p - 1 < g.get().items.len) {
+            _ = g.get().orderedRemove(p - 1);
+            const pmg = it.pos.borrowMut();
+            pmg.get().* = p - 1;
+            pmg.deinit();
+        }
+        return .{ .ok = .Unit };
     }
     return null;
 }

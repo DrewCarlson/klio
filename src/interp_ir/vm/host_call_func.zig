@@ -747,7 +747,137 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
 }
 
 /// Single named-argument call dispatch flow.
-pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+/// Score a candidate overload for a named call: every named argument must map
+/// to a distinct parameter and type-fit, positional args fill the rest, and
+/// every unfilled parameter must be defaultable. `null` rejects the candidate.
+/// Fewer defaults used scores higher (the more specific overload wins).
+///
+/// `recv_external` means the call site supplies an implicit extension receiver
+/// (the enclosing frame's `this`) that is NOT among `args`: an extension
+/// candidate's leading `this` parameter is then receiver-filled rather than
+/// requiring a positional/named arg. A trailing callable positional argument
+/// (the `f(x) { … }` lambda) binds to the last function-typed parameter, not
+/// the next sequential slot — matching Kotlin's trailing-lambda rule.
+fn scoreNamedCandidate(
+    self: *VmHost,
+    module: *const Module,
+    cand: FuncId,
+    args: []const Value,
+    arg_names: []const ?[]const u8,
+    recv_external: bool,
+) ?i32 {
+    const cf = funcAt(module, cand) orelse return null;
+    if (cf.blocks.len == 0) return null; // never pick a bodyless `expect`
+    const params = cf.params;
+    if (params.len > 64) return null;
+    var filled = [_]bool{false} ** 64;
+    var total: i32 = 0;
+
+    const is_ext = paramIsThis(params);
+    // An implicit extension receiver fills the leading `this` parameter; a
+    // positional arg never lands on it.
+    if (is_ext and recv_external) filled[0] = true;
+
+    for (args, 0..) |a, i| {
+        const nm = if (i < arg_names.len) arg_names[i] else null;
+        const n = nm orelse continue;
+        var pos: ?usize = null;
+        for (params, 0..) |p, pi| {
+            if (std.mem.eql(u8, p.name, n)) {
+                pos = pi;
+                break;
+            }
+        }
+        const p = pos orelse return null; // a named arg with no matching param
+        if (filled[p]) return null;
+        // The named-parameter presence is the hard discriminator; the type
+        // score only ranks among the survivors, so an unscoreable arg (a
+        // generic/function-typed param, or an `Array` passed to a `vararg`)
+        // stays neutral rather than rejecting an otherwise-valid overload.
+        total += overloadScoreArg(self, &params[p].ty, &a) orelse 0;
+        filled[p] = true;
+    }
+
+    // A trailing positional callable binds to the last function-typed
+    // parameter (`module: Application.() -> Unit`), out of sequence.
+    var trailing_lambda: ?usize = null;
+    if (args.len > 0) {
+        const last = args.len - 1;
+        const last_named = last < arg_names.len and arg_names[last] != null;
+        const last_param = params.len - 1;
+        if (!last_named and params.len > 0 and !filled[last_param] and
+            isFunctionType(&params[last_param].ty) and valueIsCallable(&args[last]))
+        {
+            total += overloadScoreArg(self, &params[last_param].ty, &args[last]) orelse 0;
+            filled[last_param] = true;
+            trailing_lambda = last;
+        }
+    }
+
+    const has_vararg = lastIsVararg(params);
+    var pidx: usize = 0;
+    for (args, 0..) |a, i| {
+        const nm = if (i < arg_names.len) arg_names[i] else null;
+        if (nm != null) continue;
+        if (trailing_lambda != null and i == trailing_lambda.?) continue;
+        while (pidx < params.len and filled[pidx]) pidx += 1;
+        if (pidx >= params.len) {
+            if (has_vararg) continue;
+            return null; // too many positional args
+        }
+        total += overloadScoreArg(self, &params[pidx].ty, &a) orelse 0;
+        filled[pidx] = true;
+        pidx += 1;
+    }
+
+    const defaults = funcDefaults(self, cand);
+    for (params, 0..) |p, pi| {
+        if (filled[pi] or p.is_vararg) continue;
+        const has_default = defaults != null and pi < defaults.?.len and defaults.?[pi] != null;
+        if (!has_default) return null;
+        total -= 1;
+    }
+    return total;
+}
+
+/// Re-pick the overload for a named call. The IR resolves the call site to one
+/// FuncId by a positional-arity heuristic, but with named arguments a sibling
+/// overload that carries the named parameters is the real target (Kotlin
+/// resolves named calls by parameter name). Without this, a named arg whose
+/// name is absent from the resolved func is silently dropped and the wrong
+/// sibling is kept — e.g. a delegating `embeddedServer(connectors = …)`
+/// resolves back to its `port`-taking caller and recurses forever.
+///
+/// `recv_external` is true when the call site has an implicit extension
+/// receiver in scope (the bare call sits inside an extension/method body) that
+/// the lowerer did not bake into `args`; an extension overload is then a valid
+/// target with its `this` receiver-supplied. Returns `null` when no sibling
+/// outscores the resolved func (or there is no overload set), leaving the
+/// caller's pick in place.
+pub fn pickNamedOverloadId(
+    self: *VmHost,
+    module: *const Module,
+    func: FuncId,
+    args: []const Value,
+    arg_names: []const ?[]const u8,
+    recv_external: bool,
+) ?FuncId {
+    const f0 = funcAt(module, func) orelse return null;
+    const candidates = module.funcsBySimpleName(f0.name);
+    if (candidates.len < 2) return null;
+    var best: ?FuncId = null;
+    var best_score: i32 = std.math.minInt(i32);
+    for (candidates) |cand| {
+        const score = scoreNamedCandidate(self, module, cand, args, arg_names, recv_external) orelse continue;
+        if (best == null or score > best_score) {
+            best = cand;
+            best_score = score;
+        }
+    }
+    return best;
+}
+
+pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module, func_in: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     var any_named = false;
     for (arg_names) |n| {
         if (n != null) {
@@ -755,6 +885,10 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
             break;
         }
     }
+    // The caller (the `.Call` evaluator path) has already re-picked the
+    // overload by parameter name and supplied any implicit extension
+    // receiver, so bind against `func_in` as given.
+    const func = func_in;
     if (any_named) {
         if (funcAt(module, func)) |f| {
             const params = f.params;

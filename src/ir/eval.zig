@@ -1442,20 +1442,77 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             }
         },
         .Call => |call| {
-            const arg_values = try readArgRun(allocator, frame, call.args, call.n_args);
+            var arg_values = try readArgRun(allocator, frame, call.args, call.n_args);
             defer allocator.free(arg_values);
-            const names = try resolveArgNames(allocator, frame.module, call.arg_names);
+            var names = try resolveArgNames(allocator, frame.module, call.arg_names);
             defer allocator.free(names);
             var ta: std.ArrayList([]const u8) = .empty;
             defer ta.deinit(allocator);
             for (call.type_args) |c| {
                 try ta.append(allocator, constStr(frame.module, c) orelse "");
             }
+
+            const bakedExt = struct {
+                fn f(m: *const Module, id: FuncId) bool {
+                    if (id.int() >= m.funcs.items.len) return false;
+                    const fp = m.funcs.items[id.int()].params;
+                    return fp.len > 0 and std.mem.eql(u8, fp[0].name, "this");
+                }
+            }.f;
+            const baked_is_ext = bakedExt(frame.module, call.func);
+
+            // Named-argument overload re-resolution. The lowerer baked the
+            // call to a positional-arity heuristic FuncId; a named call may
+            // really target a sibling overload (Kotlin resolves named calls
+            // by parameter name). The receiver is reachable here, so an
+            // implicit extension receiver can be supplied before dispatch.
+            var eff_func = call.func;
+            var prepended: ?[]Value = null;
+            defer if (prepended) |p| allocator.free(p);
+            var prepended_names: ?[]?[]const u8 = null;
+            defer if (prepended_names) |p| allocator.free(p);
+            if (!call.exact) {
+                var any_named = false;
+                for (names) |n| {
+                    if (n != null) any_named = true;
+                }
+                if (any_named) {
+                    // The implicit extension receiver is in scope (a bare
+                    // call inside an extension/method body) but absent from
+                    // `args` only when the baked target is not itself an
+                    // extension — otherwise the lowerer already prepended it.
+                    const caller_this = frameThisParam(frame);
+                    const recv_external = caller_this != null and !baked_is_ext;
+                    if (host.pickNamedOverloadId(frame.module, call.func, arg_values, names, recv_external)) |picked| {
+                        eff_func = picked;
+                        const picked_is_ext = bakedExt(frame.module, picked);
+                        if (picked_is_ext and !baked_is_ext) {
+                            if (caller_this) |ct_idx| {
+                                // Supply the enclosing `this` as the leading
+                                // (unnamed) receiver argument the chosen
+                                // extension overload expects.
+                                const recv = frame.params.items[ct_idx];
+                                const na = try allocator.alloc(Value, arg_values.len + 1);
+                                na[0] = recv;
+                                @memcpy(na[1..], arg_values);
+                                prepended = na;
+                                arg_values = na;
+                                const nn = try allocator.alloc(?[]const u8, names.len + 1);
+                                nn[0] = null;
+                                @memcpy(nn[1..], names);
+                                prepended_names = nn;
+                                names = nn;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Invoking an extension / member-extension function from
             // inside a method: keep the caller's instance `this`
             // reachable as the enclosing receiver.
-            const callee_fn: ?*const Func = if (call.func.int() < frame.module.funcs.items.len)
-                &frame.module.funcs.items[call.func.int()]
+            const callee_fn: ?*const Func = if (eff_func.int() < frame.module.funcs.items.len)
+                &frame.module.funcs.items[eff_func.int()]
             else
                 null;
             const callee_is_ext = callee_fn != null and callee_fn.?.params.len > 0 and
@@ -1484,7 +1541,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     }
                 }
             }
-            const res = host.callFuncTyped(allocator, frame.module, call.func, arg_values, names, ta.items, call.exact);
+            const res = host.callFuncTyped(allocator, frame.module, eff_func, arg_values, names, ta.items, call.exact);
             if (pushed_enclosing) popEnclosing();
             switch (try res) {
                 .ok => |result| try frame.write(call.dst, result),
@@ -3258,6 +3315,12 @@ pub const NullHost = struct {
     pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
         _ = .{ self, allocator, module, name, args, arg_names };
         return .{ .ok = null };
+    }
+
+    pub fn pickNamedOverloadId(self: *NullHost, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, recv_external: bool) ?FuncId {
+        _ = .{ self, module, args, arg_names, recv_external };
+        _ = func;
+        return null;
     }
 
     pub fn callableReceiverShape(self: *NullHost, v: *const Value) ?ReceiverShape {

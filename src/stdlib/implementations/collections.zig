@@ -4058,6 +4058,8 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
     switch (arg) {
         .List => |l| to_add = try snapshotItems(a, l.items),
         .Set => |s| to_add = try snapshotItems(a, s.items),
+        // `MutableCollection<in T>.addAll(elements: Array<out T>)`.
+        .Array => |arr| to_add = try snapshotItems(a, arr.items),
         else => {
             const ad = try display(a, arg);
             return typeErr(try fmt(a, "addAll requires a collection, got {s}", .{ad}));

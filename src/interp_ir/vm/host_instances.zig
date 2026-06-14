@@ -97,6 +97,34 @@ fn classDefByName(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
     return null;
 }
 
+/// Resolve a class written with a dotted qualifier (`Outer.Inner`) by
+/// matching it as a `.`-aligned suffix of a registered class's FQN, taking
+/// the shortest (least-nested) FQN among matches. Disambiguates a nested base
+/// from a same-simple-name class in scope — including a subtype named like its
+/// base. `null` when `qualified` is unqualified or unmatched.
+fn classDefByQualifiedSuffix(self: *VmHost, qualified: []const u8) ?ObjRef(ClassDef) {
+    if (std.mem.indexOfScalar(u8, qualified, '.') == null) return null;
+    const g = self.classes.borrow();
+    defer g.deinit();
+    var best: ?ObjRef(ClassDef) = null;
+    var best_len: usize = std.math.maxInt(usize);
+    var it = g.get().valueIterator();
+    while (it.next()) |d| {
+        const dg = d.borrow();
+        const fqn = dg.get().fqn;
+        const ok = std.mem.endsWith(u8, fqn, qualified) and
+            (fqn.len == qualified.len or fqn[fqn.len - qualified.len - 1] == '.');
+        const flen = fqn.len;
+        dg.deinit();
+        if (ok and flen < best_len) {
+            if (best) |b| b.deinit();
+            best_len = flen;
+            best = d.clone();
+        }
+    }
+    return best;
+}
+
 /// First concrete (non-abstract, non-interface) class sharing `name`.
 fn concreteSibling(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
     const g = self.classes.borrow();
@@ -720,8 +748,10 @@ fn firstNonInterfaceSuper(self: *VmHost, def: ObjRef(ClassDef)) ?SuperRef {
     defer dg.deinit();
     const child_fqn = dg.get().fqn;
     const child_name = dg.get().name;
-    for (dg.get().supertype_names) |n| {
-        const sd = classDefForSuper(self, child_fqn, child_name, n);
+    const paths = dg.get().supertype_paths;
+    for (dg.get().supertype_names, 0..) |n, i| {
+        const qp: ?[]const u8 = if (i < paths.len) paths[i] else null;
+        const sd = if (qp) |p| (classDefByQualifiedSuffix(self, p) orelse classDefForSuper(self, child_fqn, child_name, n)) else classDefForSuper(self, child_fqn, child_name, n);
         if (sd) |s| {
             const is_iface = classDefIsInterface(s);
             const sfqn = classDefFqn(s);
@@ -1700,6 +1730,71 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
     return materializeInstance(self, allocator, class_def, ir_name, effective.items, outer_hint);
 }
 
+/// Pad a parent class's super-delegation args with the defaults for any
+/// trailing primary-ctor params the subclass omitted. A subclass that writes
+/// `: Base(a)` for `Base(a, b = default)` delegates only `a`; without this the
+/// `b` slot would materialize as Unit instead of running its default. Mirrors
+/// the direct-construction default fill. `args` is grown in place.
+fn padParentCtorDefaults(
+    self: *VmHost,
+    allocator: Allocator,
+    parent_def: ObjRef(ClassDef),
+    fqn: ?[]const u8,
+    name: []const u8,
+    args: *std.ArrayList(Value),
+) Allocator.Error!UnitOrErr {
+    const n_primary = classDefPrimaryParamCount(parent_def);
+    if (args.items.len >= n_primary) return .{ .ok = {} };
+    const default_thunks = primaryDefaultThunks(self, fqn, name);
+    var idx = args.items.len;
+    while (idx < n_primary) : (idx += 1) {
+        var dflt_expr: ?*const ast.Expr = null;
+        {
+            const dg = parent_def.borrow();
+            defer dg.deinit();
+            if (idx < dg.get().primary_params.len) dflt_expr = dg.get().primary_params[idx].default;
+        }
+        var v: Value = .Null;
+        var resolved = false;
+        if (dflt_expr) |e| {
+            if (try defaultValueForPrimary(allocator, e)) |lv| {
+                v = lv;
+                resolved = true;
+            } else if (try pathConstDefault(self, e)) |lv| {
+                v = lv;
+                resolved = true;
+            }
+        }
+        if (!resolved) {
+            if (default_thunks) |slots| {
+                if (idx < slots.len) {
+                    if (slots[idx]) |dfid| {
+                        const fr = try funcAt(self, dfid, "parent primary ctor default");
+                        switch (fr) {
+                            .err => {},
+                            .ok => |func| {
+                                var thunk_args: std.ArrayList(Value) = .empty;
+                                defer thunk_args.deinit(allocator);
+                                try thunk_args.append(allocator, .Null); // `this`
+                                try thunk_args.appendSlice(allocator, args.items);
+                                while (thunk_args.items.len < n_primary + 1) {
+                                    try thunk_args.append(allocator, .Null);
+                                }
+                                switch (try evalThunk(self, func, thunk_args.items)) {
+                                    .ok => |rv| v = rv,
+                                    .err => |e| return .{ .err = e },
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+        }
+        try args.append(allocator, v);
+    }
+    return .{ .ok = {} };
+}
+
 /// Among same-named factory overloads pick the best fit. `clean_only`
 /// requires every supplied arg to cleanly type-match (used by the
 /// ctor-unsatisfiable path); otherwise any arity-applicable factory.
@@ -1967,10 +2062,23 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         }
         const parent_def = classDefByName(self, sideTableKey(pref.fqn, pname));
         const parent_is_iface = if (parent_def) |d| classDefIsInterface(d) else true;
-        if (parent_def) |d| d.deinit();
         if (parent_def == null or parent_is_iface) {
+            if (parent_def) |d| d.deinit();
             parent_args.deinit(allocator);
             break;
+        }
+        // Fill any trailing primary-ctor params the subclass omitted from
+        // its `super(...)` delegation with the parent's defaults.
+        if (parent_def) |d| {
+            switch (try padParentCtorDefaults(self, allocator, d, pref.fqn, pname, &parent_args)) {
+                .ok => {},
+                .err => |e| {
+                    d.deinit();
+                    parent_args.deinit(allocator);
+                    return .{ .err = e };
+                },
+            }
+            d.deinit();
         }
         // Pack the delegation args for the parent's vararg primary param.
         const packed_parent = try packPrimaryCtorVarargs(self, pref.fqn, pname, try parent_args.toOwnedSlice(allocator));

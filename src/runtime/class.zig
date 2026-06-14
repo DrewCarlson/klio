@@ -38,6 +38,12 @@ pub const ClassDef = struct {
     is_sealed: bool,
     /// Simple supertype names recorded from `class Foo : Bar(), Baz`.
     supertype_names: []const []const u8,
+    /// Parallel to `supertype_names`: the dotted source qualifier when a
+    /// supertype was written qualified (`Outer.Inner`), else null. Lets
+    /// parent resolution disambiguate a nested base from a same-simple-name
+    /// class in scope — including a subtype named like its base. Empty when
+    /// no supertype carried a qualifier (the common case).
+    supertype_paths: []const ?[]const u8 = &.{},
     /// Resolved parent class for method-resolution chain walking.
     /// Backpatched once during two-phase class linking, then immutable for
     /// the rest of the process; read lock-free on the dispatch path.
