@@ -1099,6 +1099,40 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
     return .{ .ok = root_value orelse Value.Unit };
 }
 
+/// Drive a `suspend fun main` to completion. kotlinc wraps a suspend main
+/// in `runSuspend`; this is the equivalent root driver, so a real
+/// suspension (`delay`, an awaited `Job`, …) parks and resumes here instead
+/// of escaping the run loop as a "suspended outside a driver" error. `main`
+/// runs in the empty coroutine context (the `Unit` root scope).
+pub fn driveSuspendMain(self: *VmIntrinsicHost, main_id: ir.FuncId, out: Output) Allocator.Error!RuntimeEvalResult {
+    const a = self.allocator;
+    try coroPush(a);
+    const scope_depth = active_scope_stack.items.len;
+    defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
+    const unit: Value = .Unit;
+    const guard = ActiveScopeGuard.enter(&unit);
+    defer guard.leave();
+
+    var root_value: ?Value = null;
+    var root_token: ?u64 = null;
+    const root_scope_base = activeScopeDepth();
+    switch (try intrinsic_host.evalFuncRaw(self, main_id, out)) {
+        .ok => |v| root_value = v,
+        .err => |e| switch (e) {
+            .Suspended => |st| root_token = try park(a, st, root_scope_base),
+            else => {
+                try pumpExit(self, out, false);
+                return .{ .err = mapDriverErr(a, e) };
+            },
+        },
+    }
+    if (try pumpLoop(self, &unit, out, false, &root_token, &root_value)) |err_result| {
+        return err_result;
+    }
+    try pumpExit(self, out, false);
+    return .{ .ok = root_value orelse Value.Unit };
+}
+
 /// Resume a persisted continuation claimed from `PersistedParked` and
 /// drive it (and anything it launches) to quiescence on the calling
 /// thread, under a fresh pump. This is the cross-pump resume engine: a

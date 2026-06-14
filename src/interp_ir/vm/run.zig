@@ -443,6 +443,18 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
 
     if (main.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
     const func = &module.funcs.items[main.int()];
+    // A `suspend fun main` is driven through the cooperative coroutine pump
+    // (kotlinc wraps it in `runSuspend`), so a real suspension such as
+    // `delay` parks and resumes instead of escaping as a "suspended outside a
+    // driver" error.
+    if (func.is_suspend) {
+        var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
+        const r = try vmhost.coroutines.driveSuspendMain(&intrinsic, main, sink);
+        return switch (r) {
+            .ok => |v| .{ .ok = v },
+            .err => |e| .{ .err = .{ .Eval = vmEvalMessage(self.allocator, e) } },
+        };
+    }
     var host = vmMakeHost(self, sink);
     const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, .empty, &host);
     return switch (r) {

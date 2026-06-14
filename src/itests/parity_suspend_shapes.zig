@@ -59,6 +59,24 @@ test "suspend_chain_of_calls" {
     try assertKlio("suspend_chain", src, "result=15\n");
 }
 
+test "suspend_main_drives_real_delay" {
+    // A `suspend fun main` runs under an implicit driver (kotlinc wraps it in
+    // `runSuspend`), so a real suspension like `delay` parks and resumes
+    // rather than escaping as "coroutine suspended outside a driver".
+    const src =
+        \\
+        \\import kotlinx.coroutines.delay
+        \\suspend fun compute(): Int { delay(5); return 42 }
+        \\suspend fun main() {
+        \\    println("start")
+        \\    val v = compute()
+        \\    println("got $v")
+        \\}
+        \\
+    ;
+    try assertKlio("suspend_main_delay", src, "start\ngot 42\n");
+}
+
 test "suspend_in_lambda" {
     const src =
         \\
