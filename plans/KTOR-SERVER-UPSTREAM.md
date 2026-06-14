@@ -84,18 +84,35 @@ ByteWriteChannel response) like the ones fixed for simpler programs.
         `Application.() -> Unit` local);
       - generic extension property on a type-parameter receiver
         (`val <A : Pipeline<*,…>> A.pluginRegistry`).
-- [ ] **NEXT BLOCKER (routing): bare companion-member resolution.**
-      `RoutingRoot.Plugin.install` does `pipeline.intercept(Call)` where `Call`
-      is `ApplicationCallPipeline.ApplicationPhase.Call` (a named-companion
-      `val`). klio resolves bare `Call` as a field on the enclosing `Plugin`
-      object (`get_field Call on RoutingRoot.Plugin`) instead of the companion
-      member reachable through `import io.ktor.server.application.*`. Routing
-      setup otherwise progresses deep into the route-tree / pipeline build.
-- [ ] also pending in the start path (revealed, not yet hit again): the
-      connector-logging `launch { resolvedConnectors().forEach { … } }` +
-      `destroyBlocking`/`cancelAndJoin` must complete cleanly (a job-cancel
-      that resumes children parked on `await()`); only exercised on the failure
-      path, so deferred until routing starts a real request.
+- [x] **A routing server STARTS, LISTENS, and answers real HTTP** — routing
+      resolves (200 for a matched route, 404 for an unknown one, 500 when the
+      handler throws) and the matched **handler executes** through the upstream
+      pipeline. Reaching this fixed more interpreter bugs (committed):
+      - enclosing-class companion resolution (a nested/companion object reads a
+        bare name from its enclosing class's superclass companions —
+        `RoutingRoot.Plugin` resolving `Call` from `ApplicationCallPipeline`);
+      - a declared member property outranks a same-named extension property
+        (`val Route.application get() = … is RoutingRoot -> application`,
+        which otherwise recursed);
+      - receiver-lambda invoke binds the receiver (`handler.invoke(ctx)`);
+      - typealias function-type arity counts value params only
+        (`RoutingHandler = RoutingContext.() -> Unit` → `Function0`), registered
+        before body lowering so the trailing lambda drops its spurious `it`;
+      - pack now consumes `io/ktor/server/plugins/OriginConnectionPoint.kt`.
+- [ ] **NEXT BLOCKER (response body): `respondText`'s content does not reach
+      the engine.** The handler runs and calls `call.respondText(...)`, but the
+      send pipeline never reaches `BaseApplicationResponse.respondOutgoingContent`
+      → the engine `respondFromBytes` (verified: a throw planted there never
+      fires; the response comes back `200 text/plain Content-Length: 0`). The
+      `OutgoingContent` is lost/emptied somewhere in the send-pipeline stages
+      (Render/Transform → Engine phase) before the `setupSendPipeline`
+      `intercept(Engine)` interceptor delivers it to
+      `call.attributes[EngineResponseAttributeKey].respondOutgoingContent`.
+- [ ] start-path coroutine flakiness: the connector-logging
+      `launch { resolvedConnectors().forEach { … } }` + the binding race make
+      `start()` intermittently slow to bind; and `destroyBlocking`/
+      `cancelAndJoin` on the failure path must resume children parked on
+      `await()`.
 - [ ] (superseded) klio engine actual + cinterop actuals authored. SPI:
       - `BaseApplicationResponse` abstract: `setStatus(HttpStatusCode)`,
         `responseChannel(): ByteWriteChannel`, `respondUpgrade(ProtocolUpgrade)`,
