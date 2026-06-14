@@ -136,3 +136,37 @@ ByteWriteChannel response) like the ones fixed for simpler programs.
 
 This is in progress on a branch; `main` keeps the (to-be-replaced) shim server
 so CI stays green until the upstream engine routes a real request.
+
+## Status update
+
+End-to-end, against the real upstream ktor-server-core through the Klio engine:
+
+- Client: `HttpClient().get(url)` returns status + body (verified vs a Python server).
+- Root route: `get("/") { call.respondText("…") }` delivers `200` + the body
+  with the right `Content-Type`/`Content-Length`.
+- Typed JSON: `install(ContentNegotiation) { json() }` + `call.respond(value)`
+  serializes through the send pipeline's Render phase to a JSON `TextContent`
+  (`application/json`), delivered to the engine.
+
+Interpreter fixes that unblocked the above:
+- Bare `call` inside a routing handler resolved to the receiver (a
+  `T.() -> R` receiver handler must drop its synthetic `it`; the trailing-lambda
+  arity is read from the overload that actually hosts the lambda).
+- Extension-overload applicability gate so `install(RoutingRoot, …)` picks the
+  generic `Plugin` overload, not a receiver-tight but inapplicable sibling.
+- Named arguments honored when constructing a nested class through member
+  dispatch (a companion `invoke` diverts `Outer.Nested(x, field = y)` off the
+  bare `NewInstance` path); fixes `RouteSelectorEvaluation.Success(…,
+  segmentIncrement = 1)` so constant path segments are consumed and non-root
+  routes match.
+- The server-serialization shim no longer defines a conflicting `respond`/
+  `receive` overload; ContentNegotiation hooks the real send pipeline instead.
+
+Open: a non-root route now *matches* (the resolve descends fully — constant
+consumes its segment, the method selector matches at the next index), but
+`RoutingResolveContext.resolve()` parks during the recursive `handleRoute`
+unwind and `runBlocking` abandons it, so the handler never runs and the
+response is an empty default `200`. The park reproduces only through the full
+routing path (every isolated reduction of the recursive-suspend + virtual
+`evaluate` shape completes), so it is the same class as the original
+send-pipeline park and needs coroutine-runtime investigation.
