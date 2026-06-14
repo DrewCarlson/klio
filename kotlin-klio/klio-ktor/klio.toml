@@ -231,6 +231,52 @@ include = [
     "io/ktor/client/statement/HttpStatement.kt",
     "io/ktor/client/statement/Readers.kt",
 ]
+
+# Real upstream ktor-server-core commonMain: the Application / engine /
+# routing / request / response pipeline, consumed verbatim and gated under
+# the `server` feature. klio supplies a server-engine actual over the native
+# `__kktor_serve` transport under `shim/server-engine` (the one new piece),
+# plus actuals for the cinterop/reflect `expect`s the posix/nonJvm sets back.
+[[source]]
+root = "upstream/ktor-server/ktor-server-core/common/src"
+include = [
+    "io/ktor/server/application/",
+    "io/ktor/server/engine/",
+    "io/ktor/server/request/",
+    "io/ktor/server/response/",
+    "io/ktor/server/routing/",
+    "io/ktor/server/http/",
+    "io/ktor/server/config/",
+    "io/ktor/server/util/",
+    "io/ktor/server/logging/",
+]
+
+# ktor-server-core posix actuals that are pure Kotlin (the cinterop ones —
+# ApplicationUtilsNix / ShutdownHookNative / EnvironmentUtils* — are replaced
+# by klio actuals under shim/server-engine).
+[[source]]
+root = "upstream/ktor-server/ktor-server-core/posix/src"
+include = [
+    "io/ktor/server/engine/EmbeddedServerNix.kt",
+    "io/ktor/server/engine/DefaultTransformNix.kt",
+    "io/ktor/server/engine/internal/EngineUtilsNix.kt",
+    "io/ktor/server/request/ApplicationReceiveFunctions.posix.kt",
+]
+
+# ktor-server-core nonJvm actuals that are pure Kotlin (TypeUtils.nonJvm uses
+# kotlin.reflect and is replaced by a klio actual).
+[[source]]
+root = "upstream/ktor-server/ktor-server-core/nonJvm/src"
+include = [
+    "io/ktor/server/config/ConfigLoaders.nonJvm.kt",
+    "io/ktor/server/application/ApplicationEnvironment.nonJvm.kt",
+    "io/ktor/server/application/Application.nonJvm.kt",
+    "io/ktor/server/engine/EngineConnectorConfing.nonJvm.kt",
+    "io/ktor/server/engine/ApplicationEngineEnvironment.nonJvm.kt",
+    "io/ktor/server/http/content/DefaultTransform.nonJvm.kt",
+    "io/ktor/server/engine/internal/ExceptionUtils.nonJvm.kt",
+]
+
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
 # native engine helpers.
@@ -320,7 +366,12 @@ requires = ["http", "events"]
 # ktor-server-core: `embeddedServer` + routing + `respondText` over the
 # native `__kktor_serve` loop. Depends on ktor-http and ktor-events.
 [features.server]
-sources = ["shim/server/"]
+sources = [
+    "upstream/ktor-server/ktor-server-core/common/src/io/ktor/server/",
+    "upstream/ktor-server/ktor-server-core/posix/src/io/ktor/server/",
+    "upstream/ktor-server/ktor-server-core/nonJvm/src/io/ktor/server/",
+    "shim/server-engine/",
+]
 requires = ["http", "events"]
 
 # ktor-client-content-negotiation + ktor-serialization-kotlinx-json:
