@@ -61,7 +61,42 @@ ByteWriteChannel response) like the ones fixed for simpler programs.
 - [x] shim/server deleted.
 - [x] manifest consumes upstream server-core + curated posix/nonJvm (verified:
       pack builds and a `import io.ktor.server.routing.*` program loads).
-- [ ] klio engine actual + cinterop actuals authored. SPI identified:
+- [x] klio engine actual authored (`shim/server-engine/.../KlioServerEngine.kt`,
+      `object Klio : ApplicationEngineFactory`), driving the native
+      `__kktor_serve` transport; cinterop actuals authored.
+- [x] **An empty `embeddedServer(Klio, port){ }.start()` constructs, starts,
+      and BINDS — the server listens on the port end-to-end.** Getting here
+      root-caused and fixed a stack of interpreter bugs (all with standalone
+      repros + tests, committed):
+      - named-argument overload re-resolution + implicit extension receiver
+        (`embeddedServer` overload recursion);
+      - qualified-supertype linking (`Engine.Configuration :
+        ApplicationEngine.Configuration()` inheriting base fields);
+      - super-constructor default arguments (`BaseApplicationEngine`'s default
+        `pipeline` param);
+      - `recv::method` / `::prop` bound-reference args satisfying a
+        function-typed parameter;
+      - `MutableIterator.remove()` (mergePhases);
+      - `MutableCollection.addAll(Array)`; coroutines `addLast(node)` 1-arg;
+      - value-call + named-call trailing-lambda binding (`runBlocking { }`,
+        `embeddedServer(…){ module }`);
+      - receiver-function-value invocation (`application.module()` for a
+        `Application.() -> Unit` local);
+      - generic extension property on a type-parameter receiver
+        (`val <A : Pipeline<*,…>> A.pluginRegistry`).
+- [ ] **NEXT BLOCKER (routing): bare companion-member resolution.**
+      `RoutingRoot.Plugin.install` does `pipeline.intercept(Call)` where `Call`
+      is `ApplicationCallPipeline.ApplicationPhase.Call` (a named-companion
+      `val`). klio resolves bare `Call` as a field on the enclosing `Plugin`
+      object (`get_field Call on RoutingRoot.Plugin`) instead of the companion
+      member reachable through `import io.ktor.server.application.*`. Routing
+      setup otherwise progresses deep into the route-tree / pipeline build.
+- [ ] also pending in the start path (revealed, not yet hit again): the
+      connector-logging `launch { resolvedConnectors().forEach { … } }` +
+      `destroyBlocking`/`cancelAndJoin` must complete cleanly (a job-cancel
+      that resumes children parked on `await()`); only exercised on the failure
+      path, so deferred until routing starts a real request.
+- [ ] (superseded) klio engine actual + cinterop actuals authored. SPI:
       - `BaseApplicationResponse` abstract: `setStatus(HttpStatusCode)`,
         `responseChannel(): ByteWriteChannel`, `respondUpgrade(ProtocolUpgrade)`,
         plus a `headers: ResponseHeaders` (abstract `engineAppendHeader`,
