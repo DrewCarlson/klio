@@ -129,13 +129,15 @@ ByteWriteChannel response) like the ones fixed for simpler programs.
         (`availableProcessorsBridge`, `Dispatchers.IOBridge`, `printError`,
         `configureShutdownUrl`), `ShutdownHookNative`, `EnvironmentUtils*`,
         `application/internal/TypeUtils.nonJvm` (`starProjectedTypeBridge`).
-- [ ] a real GET routes through the upstream pipeline (expect interpreter gaps:
-      suspend send/receive pipelines, ByteWriteChannel response, routing tree).
-- [ ] itest/docs ported to real ktor server API; full suite green.
+- [x] a real GET routes through the upstream pipeline; the response body
+      (`respondText` / `respond(value)`) reaches the engine.
+- [x] itest ported to the real ktor server API; the full server itest is green
+      (`zig build itest-ktor_server`): GET with path/query/header params + status
+      codes, POST raw text, POST typed JSON through ContentNegotiation
+      (`receive<User>` deserialize + `respond(value)` serialize), nested routes,
+      tailcard `{path...}`, single-segment wildcard `*`, and 404; plus a
+      non-blocking `start(wait = false)` server that exits cleanly.
 - [ ] Phase 2: audit shim/core + shim/*-serialization for reimplementations.
-
-This is in progress on a branch; `main` keeps the (to-be-replaced) shim server
-so CI stays green until the upstream engine routes a real request.
 
 ## Status update
 
@@ -162,11 +164,32 @@ Interpreter fixes that unblocked the above:
 - The server-serialization shim no longer defines a conflicting `respond`/
   `receive` overload; ContentNegotiation hooks the real send pipeline instead.
 
-Open: a non-root route now *matches* (the resolve descends fully — constant
-consumes its segment, the method selector matches at the next index), but
-`RoutingResolveContext.resolve()` parks during the recursive `handleRoute`
-unwind and `runBlocking` abandons it, so the handler never runs and the
-response is an empty default `200`. The park reproduces only through the full
-routing path (every isolated reduction of the recursive-suspend + virtual
-`evaluate` shape completes), so it is the same class as the original
-send-pipeline park and needs coroutine-runtime investigation.
+Routing now fully resolves and the handler runs through the recursive
+`handleRoute` unwind — the earlier "park" is gone. Constant, wildcard, and
+tailcard selectors all consume their segments and dispatch the handler.
+
+Interpreter fixes that landed the green server itest:
+- `when` over a String subject lowers to a switch keyed on string constants;
+  the switch comparison now matches String keys by content instead of falling
+  through to `else` (`parseConstant("*")` returns the wildcard selector, so
+  `/any/*/end` matches a single segment). Pinned: `when_string_subject`.
+- Typed `receive<User>()` deserializes (the inline-extension splice threads the
+  bound `this` receiver to `receiveNullable`); 1-arg and 2-arg `respond(value)`
+  serialize through ContentNegotiation's Render phase.
+- The non-blocking server itest calls `embeddedServer` at top level: a bare
+  call inside `runBlocking` resolves (correctly, per Kotlin overload rules) to
+  the `CoroutineScope.embeddedServer` extension, which parents the application
+  job to the `runBlocking` job so it never returns; the top-level overload
+  parents to `GlobalScope`, which the run boundary abandons cleanly at exit.
+
+Known pre-existing interpreter issue (not a server blocker, surfaced while
+testing): a bare `error(msg)` (stdlib `kotlin.error`, whose parameter is `Any`)
+called inside a `CoroutineScope`/`runBlocking` receiver lambda binds the
+implicit receiver as the `message` argument and drops the literal, so the
+thrown `IllegalStateException` carries the scope's `toString()` instead of the
+message. `error` is the only stdlib precondition affected (its `Any` parameter
+matches the receiver where `check`/`require`/`TODO` do not). The mis-dispatch
+is routed to `CallMemberOrGlobal` because some loaded class declares an `error`
+member, but the call executes through the coroutine state-machine path rather
+than `execCallMemberOrGlobal`; the fix needs that path located. Plain
+(non-coroutine) `error(msg)` is correct.
