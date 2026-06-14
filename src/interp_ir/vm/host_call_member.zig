@@ -1740,7 +1740,14 @@ fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *cons
     pn = resolveAliasName(self, pn);
     if (std.mem.indexOfScalar(u8, pn, '.') != null) return false;
 
-    if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit") or param_ty.nullable) return false;
+    if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return false;
+    // A nullable parameter (`TypeInfo?`) accepts `null` — that is never a
+    // definite mismatch — but a non-null argument must still match the
+    // underlying type, so a `User` does not satisfy `typeInfo: TypeInfo?`
+    // (which would otherwise let the engine's `respond(message, typeInfo)`
+    // shadow the reified `respond(status, message)` for `respond(Created,
+    // user)`). Adjudicate the non-null case against the underlying type below.
+    if (param_ty.nullable and arg.* == .Null) return false;
     if (pn.len <= 2 and allUppercase(pn)) return false;
     // A callable argument definitely does not satisfy a primitive/String
     // parameter: `logger.trace { … }` must drop the member `trace(String)`
