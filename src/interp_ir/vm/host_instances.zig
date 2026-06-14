@@ -965,6 +965,7 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
             }
         }
         if (primary_satisfiable) {
+            const default_thunks = primaryDefaultThunks(self, class_fqn, class_name);
             var final_args: std.ArrayList(Value) = .empty;
             defer final_args.deinit(allocator);
             for (reordered, 0..) |slot, idx| {
@@ -973,6 +974,7 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
                     continue;
                 }
                 var resolved: Value = .Null;
+                var simple = false;
                 if (class_def) |d| {
                     var dflt: ?*const ast.Expr = null;
                     {
@@ -985,8 +987,37 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
                     if (dflt) |e| {
                         if (try defaultValueForPrimary(allocator, e)) |v| {
                             resolved = v;
+                            simple = true;
                         } else if (try pathConstDefault(self, e)) |v| {
                             resolved = v;
+                            simple = true;
+                        }
+                    }
+                }
+                // A skipped parameter whose default is a complex expression
+                // (`parameters: Parameters = Parameters.Empty`) cannot be read
+                // as a literal/path constant; evaluate its default-arg thunk,
+                // exactly as the positional path does, so the slot is the real
+                // default rather than a spurious `null` (which a later
+                // `.appendAll(null)` would hang on).
+                if (!simple and default_thunks != null and idx < default_thunks.?.len) {
+                    if (default_thunks.?[idx]) |dfid| {
+                        const fr = try funcAt(self, dfid, "primary ctor default");
+                        switch (fr) {
+                            .err => {},
+                            .ok => |func| {
+                                var thunk_args: std.ArrayList(Value) = .empty;
+                                defer thunk_args.deinit(allocator);
+                                try thunk_args.append(allocator, .Null); // `this`
+                                try thunk_args.appendSlice(allocator, final_args.items);
+                                while (thunk_args.items.len < primary_names.items.len + 1) {
+                                    try thunk_args.append(allocator, .Null);
+                                }
+                                switch (try evalThunk(self, func, thunk_args.items)) {
+                                    .ok => |rv| resolved = rv,
+                                    .err => |e| return .{ .err = e },
+                                }
+                            },
                         }
                     }
                 }
