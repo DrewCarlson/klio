@@ -290,6 +290,17 @@ test "when_comma_conditions_lazy" {
     );
 }
 
+test "when_string_subject" {
+    try check("when_string_subject",
+        \\star
+        \\foobar
+        \\foobar
+        \\empty
+        \\other:baz
+        \\
+    );
+}
+
 test "member_lambda_param_vs_inline_ext" {
     try check("member_lambda_param_vs_inline_ext",
         \\[on] lambda message 2
