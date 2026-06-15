@@ -205,7 +205,7 @@ fn sbCharByte(buf: []const u8, idx: i64) ?usize {
 pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) {
-        return ok(.{ .String = try StringRef.init(a, try a.dupe(u8, "")) });
+        return ok(.{ .String = try StringRef.initOwned(a, try a.dupe(u8, "")) });
     }
     switch (ctx.args[0]) {
         // CharArray is a Value.Array, but some producers (e.g. toCharArray)
@@ -235,6 +235,7 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
             const end = @min(start +| count, elems.len);
             if (start > elems.len or end > elems.len) {
                 const msg = try std.fmt.allocPrint(a, "offset {d}, count {d}, size {d}", .{ start, count, elems.len });
+                defer if (runtime.reclaimEnabled()) a.free(msg);
                 return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
             }
 
@@ -259,7 +260,7 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                     try bytes.append(a, b);
                 }
                 const s = try utf8Lossy(a, bytes.items);
-                return ok(.{ .String = try StringRef.init(a, s) });
+                return ok(.{ .String = try StringRef.initOwned(a, s) });
             } else {
                 var units = try a.alloc(u16, end - start);
                 defer a.free(units);
@@ -270,24 +271,24 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                     };
                 }
                 const s = try fromUtf16Lossy(a, units);
-                return ok(.{ .String = try StringRef.init(a, s) });
+                return ok(.{ .String = try StringRef.initOwned(a, s) });
             }
         },
         .String => |s| {
             const sg = s.borrow();
             defer sg.deinit();
             const dup = try a.dupe(u8, sg.get().*);
-            return ok(.{ .String = try StringRef.init(a, dup) });
+            return ok(.{ .String = try StringRef.initOwned(a, dup) });
         },
         .StringBuilder => |sb| {
             const sg = sb.borrow();
             defer sg.deinit();
             const dup = try a.dupe(u8, sg.get().items);
-            return ok(.{ .String = try StringRef.init(a, dup) });
+            return ok(.{ .String = try StringRef.initOwned(a, dup) });
         },
         else => {
             const s = try displayValue(a, ctx.args[0]);
-            return ok(.{ .String = try StringRef.init(a, s) });
+            return ok(.{ .String = try StringRef.initOwned(a, s) });
         },
     }
 }
@@ -346,6 +347,7 @@ pub fn string_builder_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                 if (n < 0) {
                     buf.deinit(a);
                     const msg = try std.fmt.allocPrint(a, "{d}", .{n});
+                    defer if (runtime.reclaimEnabled()) a.free(msg);
                     return thrown(a, "kotlin.NegativeArraySizeException", msg);
                 }
                 try buf.ensureTotalCapacity(a, @intCast(n));
@@ -385,6 +387,7 @@ pub fn string_builder_set_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const len: i64 = @intCast(units.len);
     if (start < 0 or start > len or start > end or end > len) {
         const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, length: {d}", .{ start, end, len });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return errResult(try rangeOob(a, msg));
     }
     const new_units = try spliceUnits(a, units, @intCast(start), @intCast(end), value.?);
@@ -420,6 +423,7 @@ pub fn string_builder_append_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const end = if (ctx.args.len > 3) (ctx.args[3].asI64() orelse vlen) else vlen;
     if (start < 0 or start > end or end > vlen) {
         const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, vlen });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return errResult(try rangeOob(a, msg));
     }
     const slice = value.?[@intCast(start)..@intCast(end)];
@@ -451,6 +455,7 @@ pub fn string_builder_insert_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const end = if (ctx.args.len > 4) (ctx.args[4].asI64() orelse vlen) else vlen;
     if (start < 0 or start > end or end > vlen) {
         const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, vlen });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return errResult(try rangeOob(a, msg));
     }
 
@@ -462,6 +467,7 @@ pub fn string_builder_insert_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const len: i64 = @intCast(units.len);
     if (index < 0 or index > len) {
         const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ index, len });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return errResult(try rangeOob(a, msg));
     }
     const slice = value.?[@intCast(start)..@intCast(end)];
@@ -527,6 +533,7 @@ pub fn string_builder_set(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer a.free(units);
     if (index.? < 0 or @as(usize, @intCast(index.?)) >= units.len) {
         const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ index.?, units.len });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
     units[@intCast(index.?)] = unit;
@@ -564,7 +571,7 @@ pub fn string_builder_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrow();
     defer g.deinit();
     const dup = try a.dupe(u8, g.get().items);
-    return ok(.{ .String = try StringRef.init(a, dup) });
+    return ok(.{ .String = try StringRef.initOwned(a, dup) });
 }
 
 pub fn string_builder_get(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -581,6 +588,7 @@ pub fn string_builder_get(ctx: *CallCtx) Allocator.Error!EvalResult {
     const n: i64 = @intCast(units.len);
     if (idx.? < 0 or idx.? >= n) {
         const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
     return ok(.{ .Char = units[@intCast(idx.?)] });
@@ -631,6 +639,7 @@ pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     const n: i64 = @intCast(charCount(buf.items));
     if (idx.? < 0 or idx.? > n) {
         const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
     const byte = sbCharByte(buf.items, idx.?).?;
@@ -650,6 +659,7 @@ pub fn string_builder_delete_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     const n: i64 = @intCast(charCount(buf.items));
     if (idx.? < 0 or idx.? >= n) {
         const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
     const byte = sbCharByte(buf.items, idx.?).?;
@@ -672,6 +682,7 @@ pub fn string_builder_delete_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const n: i64 = @intCast(charCount(buf.items));
     if (start.? < 0 or end.? > n or start.? > end.?) {
         const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, length: {d}", .{ start.?, end.?, n });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
     const sb_byte = sbCharByte(buf.items, start.?).?;
@@ -700,6 +711,7 @@ pub fn string_builder_set_length(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (new_len == null) return errResult(.{ .Type = "setLength requires Int" });
     if (new_len.? < 0) {
         const msg = try std.fmt.allocPrint(a, "newLength: {d}", .{new_len.?});
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
 
@@ -757,12 +769,13 @@ pub fn string_builder_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     if (start.? < 0 or end > n or start.? > end) {
         const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, length: {d}", .{ start.?, end, n });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
     const sb_byte = sbCharByte(buf, start.?).?;
     const eb_byte = sbCharByte(buf, end).?;
     const dup = try a.dupe(u8, buf[sb_byte..eb_byte]);
-    return ok(.{ .String = try StringRef.init(a, dup) });
+    return ok(.{ .String = try StringRef.initOwned(a, dup) });
 }
 
 pub fn string_builder_set_char_at(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -781,6 +794,7 @@ pub fn string_builder_set_char_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     const n: i64 = @intCast(charCount(buf.items));
     if (idx.? < 0 or idx.? >= n) {
         const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
     const byte = sbCharByte(buf.items, idx.?).?;
@@ -817,6 +831,7 @@ pub fn string_builder_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
     const n: i64 = @intCast(charCount(buf.items));
     if (start.? < 0 or start.? > n or start.? > end0.?) {
         const msg = try std.fmt.allocPrint(a, "start {d}, end {d}, length {d}", .{ start.?, end0.?, n });
+        defer if (runtime.reclaimEnabled()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
     // Kotlin/JVM clamps the end to the current length.
@@ -847,30 +862,20 @@ fn newSb(a: Allocator, seed: []const u8) Allocator.Error!Value {
     return .{ .StringBuilder = try StringBuilderRef.init(a, buf) };
 }
 
-/// Free a produced value and its backing heap. In the interpreter these
-/// strings live in an arena; the tests use `testing.allocator`, so they
-/// must free the inner `[]const u8` (the `StringRef` cell does not own it)
-/// alongside the refcounted cell.
+/// Free a produced value and its backing heap. Under reclaim the `StringRef`
+/// cell owns its `[]const u8` and frees it on `deinit`, so dropping the cell
+/// is enough; under the arena fast path `deinit` is a no-op and the arena
+/// reclaims the bytes wholesale.
 fn freeSb(v: Value, a: Allocator) void {
+    _ = a;
     switch (v) {
         .StringBuilder => |sb| sb.deinit(),
         .String => |s| {
-            {
-                const g = s.borrow();
-                a.free(g.get().*);
-                g.deinit();
-            }
             s.deinit();
         },
         .Exception => |e| {
-            // The fqn is always a static literal; only the message is heap.
             e.fqn.deinit();
             if (e.message) |m| {
-                {
-                    const g = m.borrow();
-                    a.free(g.get().*);
-                    g.deinit();
-                }
                 m.deinit();
             }
         },

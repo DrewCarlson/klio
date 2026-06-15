@@ -1678,7 +1678,10 @@ pub fn coll_list_get(ctx: *CallCtx) Error!EvalResult {
     defer g.deinit();
     const items = g.get().items;
     if (i < 0 or @as(usize, @intCast(i)) >= items.len) {
-        return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, items.len }));
+        const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, items.len });
+        const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        if (runtime.reclaimEnabled()) a.free(msg);
+        return e;
     }
     return ok(items[@intCast(i)]);
 }
@@ -1908,7 +1911,10 @@ fn joinToStringImpl(ctx: *CallCtx, items: []const Value, allow_instance_to_strin
         try out.appendSlice(a, truncated);
     }
     try out.appendSlice(a, postfix);
-    return ok(try makeStringOwned(a, try out.toOwnedSlice(a)));
+    const buf = try out.toOwnedSlice(a);
+    const s = try makeStringOwned(a, buf);
+    if (runtime.reclaimEnabled()) a.free(buf);
+    return ok(s);
 }
 
 pub fn coll_list_join_to_string(ctx: *CallCtx) Error!EvalResult {
@@ -1934,7 +1940,10 @@ pub fn coll_array_join_to_string(ctx: *CallCtx) Error!EvalResult {
 fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
-    return ok(try makeStringOwned(a, try display(a, ctx.args[0])));
+    const buf = try display(a, ctx.args[0]);
+    const s = try makeStringOwned(a, buf);
+    if (runtime.reclaimEnabled()) a.free(buf);
+    return ok(s);
 }
 pub fn coll_list_to_string(ctx: *CallCtx) Error!EvalResult {
     return collToString(ctx, "List.toString");
@@ -1961,7 +1970,10 @@ pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
         defer g.deinit();
         const len = g.get().items.len;
         if (i < 0 or @as(usize, @intCast(i)) > len) {
-            return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len }));
+            const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
+            const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+            if (runtime.reclaimEnabled()) a.free(msg);
+            return e;
         }
         try g.get().insert(a, @intCast(i), item);
         return ok(Value.Unit);
@@ -2016,7 +2028,10 @@ pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
     defer g.deinit();
     const len = g.get().items.len;
     if (i < 0 or @as(usize, @intCast(i)) >= len) {
-        return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len }));
+        const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
+        const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        if (runtime.reclaimEnabled()) a.free(msg);
+        return e;
     }
     return ok(g.get().orderedRemove(@intCast(i)));
 }
@@ -2880,7 +2895,10 @@ fn listTakeCount(ctx: *CallCtx, what: []const u8) Error!union(enum) { n: i64, er
     const a = ctx.allocator;
     const n = if (ctx.args.len > 1) (ctx.args[1].asI64() orelse return .{ .err = typeErr(try fmt(a, "{s} requires an Int", .{what})) }) else return .{ .err = typeErr(try fmt(a, "{s} requires an Int", .{what})) };
     if (n < 0) {
-        return .{ .err = try thrown(a, "kotlin.IllegalArgumentException", try fmt(a, "Requested element count {d} is less than zero.", .{n})) };
+        const msg = try fmt(a, "Requested element count {d} is less than zero.", .{n});
+        const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
+        if (runtime.reclaimEnabled()) a.free(msg);
+        return .{ .err = e };
     }
     return .{ .n = n };
 }
@@ -2935,7 +2953,10 @@ pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
         var rit = RangeIter.init(r.start, r.end, r.step);
         while (rit.next()) |i| {
             if (i < 0 or i >= len) {
-                return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len }));
+                const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
+                const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+                if (runtime.reclaimEnabled()) a.free(msg);
+                return e;
             }
             try out.append(a, items[@intCast(i)]);
         }
@@ -2945,7 +2966,10 @@ pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
         for (idx_g.get().items) |idx_val| {
             const i = idx_val.asI64() orelse return typeErr("slice indices must be Int");
             if (i < 0 or i >= len) {
-                return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len }));
+                const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
+                const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+                if (runtime.reclaimEnabled()) a.free(msg);
+                return e;
             }
             try out.append(a, items[@intCast(i)]);
         }
@@ -2968,7 +2992,10 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     const items = g.get().items;
     const len: i64 = @intCast(items.len);
     if (from < 0 or to > len or from > to) {
-        return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "fromIndex: {d}, toIndex: {d}, size: {d}", .{ from, to, len }));
+        const msg = try fmt(a, "fromIndex: {d}, toIndex: {d}, size: {d}", .{ from, to, len });
+        const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        if (runtime.reclaimEnabled()) a.free(msg);
+        return e;
     }
     return ok(try makeList(a, items[@intCast(from)..@intCast(to)], false));
 }
@@ -3040,7 +3067,10 @@ pub fn coll_list_chunked(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2 or ctx.args[1] != .Int) return typeErr("chunked requires an Int size");
     const size_i = ctx.args[1].Int;
     if (size_i <= 0) {
-        return try thrown(a, "kotlin.IllegalArgumentException", try fmt(a, "Size {d} must be greater than zero.", .{size_i}));
+        const msg = try fmt(a, "Size {d} must be greater than zero.", .{size_i});
+        const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
+        if (runtime.reclaimEnabled()) a.free(msg);
+        return e;
     }
     const size: usize = @intCast(size_i);
     const transform: ?Value = if (ctx.args.len > 2 and ctx.args[2] != .Null) ctx.args[2] else null;
@@ -3073,11 +3103,17 @@ pub fn coll_list_windowed(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2 or ctx.args[1] != .Int) return typeErr("windowed requires an Int size");
     const size_i = ctx.args[1].Int;
     if (size_i <= 0) {
-        return try thrown(a, "kotlin.IllegalArgumentException", try fmt(a, "size {d} must be greater than zero.", .{size_i}));
+        const msg = try fmt(a, "size {d} must be greater than zero.", .{size_i});
+        const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
+        if (runtime.reclaimEnabled()) a.free(msg);
+        return e;
     }
     const step_i: i64 = if (ctx.args.len <= 2) 1 else (if (ctx.args[2].isIntegral()) ctx.args[2].asI64().? else return typeErr("windowed step must be Int"));
     if (step_i <= 0) {
-        return try thrown(a, "kotlin.IllegalArgumentException", try fmt(a, "step {d} must be greater than zero.", .{step_i}));
+        const msg = try fmt(a, "step {d} must be greater than zero.", .{step_i});
+        const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
+        if (runtime.reclaimEnabled()) a.free(msg);
+        return e;
     }
     const partial_windows: bool = if (ctx.args.len <= 3) false else (if (ctx.args[3] == .Bool) ctx.args[3].Bool else return typeErr("windowed partialWindows must be Bool"));
     const items = try snapshotItems(a, it);
@@ -3871,7 +3907,10 @@ pub fn pair_to_string(ctx: *CallCtx) Error!EvalResult {
         .pair => |v| v,
         .err => |e| return e,
     };
-    return ok(try makeStringOwned(a, try display(a, p)));
+    const buf = try display(a, p);
+    const s = try makeStringOwned(a, buf);
+    if (runtime.reclaimEnabled()) a.free(buf);
+    return ok(s);
 }
 pub fn pair_to_list(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -3918,7 +3957,10 @@ pub fn triple_to_string(ctx: *CallCtx) Error!EvalResult {
         .triple => |v| v,
         .err => |e| return e,
     };
-    return ok(try makeStringOwned(a, try display(a, t)));
+    const buf = try display(a, t);
+    const s = try makeStringOwned(a, buf);
+    if (runtime.reclaimEnabled()) a.free(buf);
+    return ok(s);
 }
 pub fn triple_to_list(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4124,7 +4166,10 @@ pub fn coll_mut_list_set(ctx: *CallCtx) Error!EvalResult {
     defer g.deinit();
     const len = g.get().items.len;
     if (i < 0 or @as(usize, @intCast(i)) >= len) {
-        return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len }));
+        const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
+        const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        if (runtime.reclaimEnabled()) a.free(msg);
+        return e;
     }
     const prev = g.get().items[@intCast(i)];
     g.get().items[@intCast(i)] = value;
@@ -4245,7 +4290,10 @@ pub fn coll_map_get_value(ctx: *CallCtx) Error!EvalResult {
         if (findKeyIndexBoxed(g.get().items, &key)) |i| return ok(g.get().items[i].value);
     }
     const kd = try display(a, key);
-    return try thrown(a, "kotlin.NoSuchElementException", try fmt(a, "Key {s} is missing in the map.", .{kd}));
+    const msg = try fmt(a, "Key {s} is missing in the map.", .{kd});
+    const e = try thrown(a, "kotlin.NoSuchElementException", msg);
+    if (runtime.reclaimEnabled()) a.free(msg);
+    return e;
 }
 
 pub fn coll_map_to_list(ctx: *CallCtx) Error!EvalResult {
@@ -4404,8 +4452,12 @@ fn arrayOptIndex(a: Allocator, ctx: *CallCtx, idx: usize, default: i64, what: []
     return .{ .err = typeErr(try fmt(a, "{s}: index argument must be an Int", .{what})) };
 }
 
+/// Every caller passes a freshly-`fmt`'d (owned) message; free it after
+/// `thrown` has duped it into the StringRef under the reclaim path.
 fn indexOob(a: Allocator, msg: []const u8) Error!EvalResult {
-    return try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+    const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+    if (runtime.reclaimEnabled()) a.free(msg);
+    return e;
 }
 
 pub fn array_slice_impl(ctx: *CallCtx) Error!EvalResult {
@@ -4468,7 +4520,10 @@ pub fn array_content_to_string(ctx: *CallCtx) Error!EvalResult {
         try out.appendSlice(a, try display(a, v));
     }
     try out.append(a, ']');
-    return ok(try makeStringOwned(a, try out.toOwnedSlice(a)));
+    const buf = try out.toOwnedSlice(a);
+    const s = try makeStringOwned(a, buf);
+    if (runtime.reclaimEnabled()) a.free(buf);
+    return ok(s);
 }
 
 fn longHash(bits: i64) i32 {
@@ -4575,7 +4630,10 @@ pub fn array_content_deep_to_string(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return typeErr("contentDeepToString requires a receiver");
     const recv = ctx.args[0];
     if (recv == .Null) return ok(try makeStringOwned(a, "null"));
-    return ok(try makeStringOwned(a, try deepToString(a, recv)));
+    const buf = try deepToString(a, recv);
+    const s = try makeStringOwned(a, buf);
+    if (runtime.reclaimEnabled()) a.free(buf);
+    return ok(s);
 }
 
 fn deepEq(x: Value, y: Value) bool {
@@ -4926,7 +4984,10 @@ fn arrayMaxMinImpl(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalRe
         .err => |e| return e,
     };
     if (items.len == 0) {
-        return try thrown(a, "kotlin.NoSuchElementException", try fmt(a, "{s}: empty", .{what}));
+        const msg = try fmt(a, "{s}: empty", .{what});
+        const e = try thrown(a, "kotlin.NoSuchElementException", msg);
+        if (runtime.reclaimEnabled()) a.free(msg);
+        return e;
     }
     var best = items[0];
     for (items[1..]) |v| {

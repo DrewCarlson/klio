@@ -853,7 +853,7 @@ fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) ?Value {
                 buf.appendSlice(allocator, p.Text) catch return null;
             }
             const owned = buf.toOwnedSlice(allocator) catch return null;
-            const ref = runtime.StringRef.init(allocator, owned) catch return null;
+            const ref = runtime.StringRef.initOwned(allocator, owned) catch return null;
             return .{ .String = ref };
         },
         else => return null,

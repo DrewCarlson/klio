@@ -1299,7 +1299,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     .err => |e| return errResult(e),
                 };
                 const combined = try std.mem.concat(allocator, u8, &.{ ls, rs });
-                try frame.write(bo.dst, .{ .String = try StringRef.init(allocator, combined) });
+                try frame.write(bo.dst, .{ .String = try StringRef.initOwned(allocator, combined) });
                 return ok(.Unit);
             }
             // Collection `+` / `-` operators are stdlib operator
@@ -1833,7 +1833,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
                 const exc = Value{ .Exception = .{
                     .fqn = try StringRef.init(allocator, "kotlin.ClassCastException"),
-                    .message = try StringRef.init(allocator, msg),
+                    .message = try StringRef.initOwned(allocator, msg),
                     .cause = null,
                 } };
                 return errResult(.{ .Throw = exc });
@@ -2834,7 +2834,7 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
                 const rs = try renderValue(allocator, r);
                 defer allocator.free(rs);
                 const s = try std.mem.concat(allocator, u8, &.{ g.get().*, rs });
-                return ok(.{ .String = try StringRef.init(allocator, s) });
+                return ok(.{ .String = try StringRef.initOwned(allocator, s) });
             }
             if (r.* == .String) {
                 const ls = try renderValue(allocator, l);
@@ -2842,7 +2842,7 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
                 const g = r.String.borrow();
                 defer g.deinit();
                 const s = try std.mem.concat(allocator, u8, &.{ ls, g.get().* });
-                return ok(.{ .String = try StringRef.init(allocator, s) });
+                return ok(.{ .String = try StringRef.initOwned(allocator, s) });
             }
         },
         .Sub => {
@@ -2971,7 +2971,7 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
             const rs = try renderValue(allocator, r);
             defer allocator.free(rs);
             const s = try std.mem.concat(allocator, u8, &.{ ls, rs });
-            return ok(.{ .String = try StringRef.init(allocator, s) });
+            return ok(.{ .String = try StringRef.initOwned(allocator, s) });
         },
         else => {},
     }

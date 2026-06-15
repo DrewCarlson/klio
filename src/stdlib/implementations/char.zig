@@ -285,7 +285,7 @@ fn casedStringValue(ctx: *CallCtx, comptime what: []const u8, map: []const CaseE
         try caseString(ctx.allocator, c, map)
     else
         try charUnitToString(ctx.allocator, unit);
-    return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
 }
 
 pub fn char_uppercase(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -303,7 +303,7 @@ pub fn char_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .unit => |u| u,
     };
     const s = try charUnitToString(ctx.allocator, unit);
-    return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
 }
 
 /// `Result<u32, RuntimeError>` for the validated `digitToInt` radix.
@@ -321,7 +321,7 @@ fn charDigitRadix(allocator: std.mem.Allocator, args: []const Value) std.mem.All
         const msg = try std.fmt.allocPrint(allocator, "radix {d} is not in valid range 2..36", .{radix});
         return .{ .err = .{ .Thrown = .{ .Exception = .{
             .fqn = try StringRef.init(allocator, "kotlin.IllegalArgumentException"),
-            .message = try StringRef.init(allocator, msg),
+            .message = try StringRef.initOwned(allocator, msg),
             .cause = null,
         } } } };
     }
@@ -365,7 +365,7 @@ pub fn char_digit_to_int(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     );
     return .{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try StringRef.init(ctx.allocator, "kotlin.IllegalArgumentException"),
-        .message = try StringRef.init(ctx.allocator, msg),
+        .message = try StringRef.initOwned(ctx.allocator, msg),
         .cause = null,
     } } } };
 }
@@ -642,7 +642,6 @@ fn expectStringResult(r: EvalResult, want: []const u8) !void {
     try testing.expect(r == .ok);
     const g = r.ok.String.borrow();
     defer {
-        testing.allocator.free(g.get().*);
         g.deinit();
         r.ok.String.deinit();
     }
@@ -720,7 +719,6 @@ test "digitToInt throws for a non-digit" {
             "Char \"Z\" is not a digit in the given radix=10",
             mg.get().*,
         );
-        testing.allocator.free(mg.get().*);
     }
     {
         const fg = exc.fqn.borrow();
@@ -742,7 +740,6 @@ test "digitToInt throws for an out-of-range radix" {
         const mg = exc.message.?.borrow();
         defer mg.deinit();
         try testing.expectEqualStrings("radix 99 is not in valid range 2..36", mg.get().*);
-        testing.allocator.free(mg.get().*);
     }
     {
         const fg = exc.fqn.borrow();

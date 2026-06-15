@@ -2082,10 +2082,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 // A dispatcher pool worker reports its registered
                 // upstream-shaped name (`DefaultDispatcher-worker-N`).
                 if (runtime.threadName(allocator, id)) |overridden| {
-                    return .{ .ok = .{ .String = try StringRef.init(allocator, overridden) } };
+                    return .{ .ok = .{ .String = try StringRef.initOwned(allocator, overridden) } };
                 }
                 const s = try std.fmt.allocPrint(allocator, "klio-thread-{d}", .{id});
-                return .{ .ok = .{ .String = try StringRef.init(allocator, s) } };
+                return .{ .ok = .{ .String = try StringRef.initOwned(allocator, s) } };
             } else if (std.mem.eql(u8, name, "start") or std.mem.eql(u8, name, "interrupt")) {
                 return .{ .ok = .Unit };
             }
@@ -2409,6 +2409,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 return .{ .ok = items[@intCast(idx)] };
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, items.len });
+            defer if (runtime.reclaimEnabled()) allocator.free(msg);
             return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
         }
     }
@@ -2422,6 +2423,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 return .{ .ok = .Unit };
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, items.len });
+            defer if (runtime.reclaimEnabled()) allocator.free(msg);
             return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
         }
     }
@@ -3198,6 +3200,7 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
             }
         }
         const msg = try std.fmt.allocPrint(allocator, "No enum constant {s}.{s}", .{ cg.get().fqn, want });
+        defer if (runtime.reclaimEnabled()) allocator.free(msg);
         sg.deinit();
         cg.deinit();
         return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
@@ -3312,7 +3315,7 @@ fn kclassMembers(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     }
     if (std.mem.eql(u8, name, "toString") and args.len == 0) {
         const s = try std.fmt.allocPrint(allocator, "class {s}", .{a_name});
-        return .{ .ok = .{ .String = try StringRef.init(allocator, s) } };
+        return .{ .ok = .{ .String = try StringRef.initOwned(allocator, s) } };
     }
     return null;
 }
@@ -3361,7 +3364,7 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
     }
     if (std.mem.eql(u8, name, "toString") and args.len == 0) {
         const s = try std.fmt.allocPrint(allocator, "property {s}", .{pname});
-        return .{ .ok = .{ .String = try StringRef.init(allocator, s) } };
+        return .{ .ok = .{ .String = try StringRef.initOwned(allocator, s) } };
     }
     return null;
 }
@@ -3592,7 +3595,7 @@ fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (chars[i] == .Char) try units.append(allocator, chars[i].Char);
         }
         const s = try runtime.charUnitsToString(allocator, units.items);
-        return .{ .ok = .{ .String = try StringRef.init(allocator, s) } };
+        return .{ .ok = .{ .String = try StringRef.initOwned(allocator, s) } };
     }
     return null;
 }
@@ -4026,7 +4029,7 @@ fn renderStructural(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceDa
     }
     try buf.append(allocator, ')');
     _ = self;
-    return .{ .String = try StringRef.init(allocator, try buf.toOwnedSlice(allocator)) };
+    return .{ .String = try StringRef.initOwned(allocator, try buf.toOwnedSlice(allocator)) };
 }
 
 fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
@@ -4326,7 +4329,7 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             return .{ .ok = try renderStructuralLocked(allocator, g.get(), cg.get()) };
         }
         const s = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ cg.get().fqn, g.get().identity });
-        return .{ .ok = .{ .String = try StringRef.init(allocator, s) } };
+        return .{ .ok = .{ .String = try StringRef.initOwned(allocator, s) } };
     }
     if (args.len == 0 and std.mem.eql(u8, name, "hashCode")) {
         const g = inst.borrow();
@@ -4355,7 +4358,7 @@ fn renderStructuralLocked(allocator: Allocator, inst: *const InstanceData, cls: 
         try buf.appendSlice(allocator, try v.display(allocator));
     }
     try buf.append(allocator, ')');
-    return .{ .String = try StringRef.init(allocator, try buf.toOwnedSlice(allocator)) };
+    return .{ .String = try StringRef.initOwned(allocator, try buf.toOwnedSlice(allocator)) };
 }
 
 fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
@@ -5664,7 +5667,7 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     var fields: std.ArrayList(InstanceData.Field) = .empty;
     try fields.append(allocator, .{ .name = "__bound_receiver__", .value = receiver.* });
     const name_dup = try allocator.dupe(u8, name);
-    try fields.append(allocator, .{ .name = "__bound_name__", .value = .{ .String = try ObjRef([]const u8).init(allocator, name_dup) } });
+    try fields.append(allocator, .{ .name = "__bound_name__", .value = .{ .String = try ObjRef([]const u8).initOwned(allocator, name_dup) } });
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = synth_class,
         .fields = fields,
@@ -5839,10 +5842,10 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                     try std.fmt.allocPrint(allocator, "{s}: {s}", .{ fqn, m })
                 else
                     try allocator.dupe(u8, fqn);
-                return .{ .ok = .{ .String = try ObjRef([]const u8).init(allocator, s) } };
+                return .{ .ok = .{ .String = try ObjRef([]const u8).initOwned(allocator, s) } };
             }
             const s = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ fqn, ig.get().identity });
-            return .{ .ok = .{ .String = try ObjRef([]const u8).init(allocator, s) } };
+            return .{ .ok = .{ .String = try ObjRef([]const u8).initOwned(allocator, s) } };
         }
         if (std.mem.eql(u8, name, "hashCode") and args.len == 0) {
             const ig = inst.borrow();

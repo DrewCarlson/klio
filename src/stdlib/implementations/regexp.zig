@@ -44,22 +44,22 @@ fn arityErr(msg: []const u8) EvalResult {
 
 fn makeString(allocator: std.mem.Allocator, bytes: []const u8) !Value {
     const owned = try allocator.dupe(u8, bytes);
-    return .{ .String = try StringRef.init(allocator, owned) };
+    return .{ .String = try StringRef.initOwned(allocator, owned) };
 }
 
 /// Wrap an already-owned byte slice as a `String` without re-copying.
 fn makeStringOwned(allocator: std.mem.Allocator, owned: []const u8) !Value {
-    return .{ .String = try StringRef.init(allocator, owned) };
+    return .{ .String = try StringRef.initOwned(allocator, owned) };
 }
 
 fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]const u8) !Value {
     const owned_fqn = try allocator.dupe(u8, fqn);
     const msg_ref: ?StringRef = if (message) |m|
-        try StringRef.init(allocator, try allocator.dupe(u8, m))
+        try StringRef.initOwned(allocator, try allocator.dupe(u8, m))
     else
         null;
     return .{ .Exception = .{
-        .fqn = try StringRef.init(allocator, owned_fqn),
+        .fqn = try StringRef.initOwned(allocator, owned_fqn),
         .message = msg_ref,
         .cause = null,
     } };
@@ -874,7 +874,7 @@ fn compileRegex(allocator: std.mem.Allocator, pattern: []const u8) !EvalResult {
     };
     const owned_pat = try allocator.dupe(u8, pattern);
     const data = RegexData{
-        .pattern = try StringRef.init(allocator, owned_pat),
+        .pattern = try StringRef.initOwned(allocator, owned_pat),
         .engine = @ptrCast(prog),
     };
     return ok(.{ .Regex = try ObjRef(RegexData).init(allocator, data) });
@@ -986,7 +986,7 @@ fn buildMatch(
                 end_char - 1;
             const owned = try allocator.dupe(u8, value_bytes);
             groups[i] = .{
-                .value = try StringRef.init(allocator, owned),
+                .value = try StringRef.initOwned(allocator, owned),
                 .start = start,
                 .end_inclusive = end_inclusive,
             };
@@ -1853,7 +1853,7 @@ test "expand kotlin replacement by index and name" {
     for (caps, 0..) |c, i| {
         if (c.start) |st| {
             const en = c.end.?;
-            groups[i] = .{ .value = try StringRef.init(a, try a.dupe(u8, "hi"[st..en])), .start = 0, .end_inclusive = 1 };
+            groups[i] = .{ .value = try StringRef.initOwned(a, try a.dupe(u8, "hi"[st..en])), .start = 0, .end_inclusive = 1 };
         } else groups[i] = null;
     }
     const out1 = try expandKotlinReplacement(a, "[$1]", prog, groups);

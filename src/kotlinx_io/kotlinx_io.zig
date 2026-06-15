@@ -127,7 +127,7 @@ fn ioError(ctx: *CallCtx, comptime fmt: []const u8, args: anytype) std.mem.Alloc
     const msg = try std.fmt.allocPrint(ctx.allocator, fmt, args);
     return .{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try StringRef.init(ctx.allocator, "kotlinx.io.IOException"),
-        .message = try StringRef.init(ctx.allocator, msg),
+        .message = try StringRef.initOwned(ctx.allocator, msg),
         .cause = null,
     } } } };
 }
@@ -305,7 +305,7 @@ fn fsResolve(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const n = std.Io.Dir.cwd().realPathFile(io, path, &buf) catch |e|
         return ioError(ctx, "resolve {s}: {s}", .{ path, @errorName(e) });
     const owned = try ctx.allocator.dupe(u8, buf[0..n]);
-    return ok(.{ .String = try StringRef.init(ctx.allocator, owned) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, owned) });
 }
 
 fn fsList(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -329,7 +329,7 @@ fn fsList(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         const owned = try ctx.allocator.dupe(u8, entry.name);
-        try names.append(ctx.allocator, .{ .String = try StringRef.init(ctx.allocator, owned) });
+        try names.append(ctx.allocator, .{ .String = try StringRef.initOwned(ctx.allocator, owned) });
     }
     return ok(.{ .List = .{
         .items = try ValueList.init(ctx.allocator, names),
@@ -347,7 +347,7 @@ fn fsTempDir(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .windows => "C:\\Windows\\Temp",
         else => "/tmp",
     };
-    return ok(.{ .String = try StringRef.init(ctx.allocator, try ctx.allocator.dupe(u8, dir)) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, try ctx.allocator.dupe(u8, dir)) });
 }
 
 fn base64Encode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -359,7 +359,7 @@ fn base64Encode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const enc = std.base64.standard.Encoder;
     const out = try ctx.allocator.alloc(u8, enc.calcSize(data.len));
     _ = enc.encode(out, data);
-    return ok(.{ .String = try StringRef.init(ctx.allocator, out) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, out) });
 }
 
 fn base64Decode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -393,7 +393,7 @@ fn hexEncode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         out.appendAssumeCapacity("0123456789abcdef"[byte & 0xf]);
     }
     const owned = try out.toOwnedSlice(ctx.allocator);
-    return ok(.{ .String = try StringRef.init(ctx.allocator, owned) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, owned) });
 }
 
 // Each nibble is a 4-bit hex digit, so the packed byte fits u8; the raw
@@ -457,9 +457,8 @@ fn freeResult(r: EvalResult) void {
 /// `ctx.allocator`; in production that is an arena, but the unit tests
 /// use the debug allocator and must release each allocation by hand.
 fn freeString(s: StringRef) void {
-    const g = s.borrow();
-    testing.allocator.free(g.get().*);
-    g.deinit();
+    // The intrinsics mint these via `initOwned`, so the cell owns its byte
+    // buffer and frees it on the final `deinit` under reclaim.
     s.deinit();
 }
 

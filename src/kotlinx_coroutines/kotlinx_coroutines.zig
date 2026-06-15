@@ -670,7 +670,7 @@ fn kxcoSystemProp(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         else => return .{ .ok = .Null },
     };
     if (lookupEnv(ctx.allocator, key)) |v| {
-        return .{ .ok = .{ .String = try StringRef.init(ctx.allocator, v) } };
+        return .{ .ok = .{ .String = try StringRef.initOwned(ctx.allocator, v) } };
     }
     // `.` → `_` alias.
     var alias_buf = try ctx.allocator.alloc(u8, key.len);
@@ -686,7 +686,7 @@ fn kxcoSystemProp(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     if (differs) {
         if (lookupEnv(ctx.allocator, alias_buf)) |v| {
-            return .{ .ok = .{ .String = try StringRef.init(ctx.allocator, v) } };
+            return .{ .ok = .{ .String = try StringRef.initOwned(ctx.allocator, v) } };
         }
     }
     return .{ .ok = .Null };

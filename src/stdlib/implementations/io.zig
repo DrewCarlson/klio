@@ -126,7 +126,7 @@ pub fn io_read_line(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
 
     const owned = try buf.toOwnedSlice(ctx.allocator);
-    return ok(.{ .String = try StringRef.init(ctx.allocator, owned) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, owned) });
 }
 
 /// `readlnOrNull()` — identical to `readLine()` (String, or null at EOF).

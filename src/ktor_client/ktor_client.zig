@@ -136,6 +136,16 @@ fn make_string_array(allocator: Allocator, values: [][]const u8) Allocator.Error
     return .{ .Array = .{ .items = items, .prim = null } };
 }
 
+/// Free an owned slice of owned strings produced by `perform`. The strings
+/// are copied into fresh `StringRef` cells by `make_string_array` (which
+/// `.init`-dupes under reclaim), so the originals must be released. Gated on
+/// reclaim: under the arena fast path the arena reclaims them wholesale.
+fn freeOwnedStrings(allocator: Allocator, values: [][]const u8) void {
+    if (!runtime.reclaimEnabled()) return;
+    for (values) |s| allocator.free(s);
+    allocator.free(values);
+}
+
 /// One header key/value pair captured off a response.
 const HeaderPair = struct { key: []const u8, value: []const u8 };
 
@@ -592,6 +602,7 @@ fn request(ctx: *CallCtx) Allocator.Error!EvalResult {
         stderrPrint(line);
     }
     const out = try perform(a, method, url, body, headers);
+    defer freeOwnedStrings(a, out);
     return .{ .ok = try make_string_array(a, out) };
 }
 
@@ -602,6 +613,7 @@ fn get(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     const out = try perform(a, "GET", url, "", &.{});
+    defer freeOwnedStrings(a, out);
     return .{ .ok = try make_string_array(a, out) };
 }
 
@@ -616,6 +628,7 @@ fn post(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     const out = try perform(a, "POST", url, body, &.{});
+    defer freeOwnedStrings(a, out);
     return .{ .ok = try make_string_array(a, out) };
 }
 
@@ -799,12 +812,12 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
         // Request array: [method, path, body, hk1, hv1, hk2, hv2, ...] — the
         // shim reads the fixed head and the trailing header key/value pairs.
         var items: std.ArrayList(Value) = .empty;
-        try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, parsed.method)) });
-        try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, parsed.path)) });
-        try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, parsed.body)) });
+        try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, parsed.method)) });
+        try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, parsed.path)) });
+        try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, parsed.body)) });
         for (parsed.headers) |h| {
-            try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, h.key)) });
-            try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, h.value)) });
+            try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, h.key)) });
+            try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, h.value)) });
         }
         const req = Value{ .Array = .{ .items = try ValueList.init(a, items), .prim = null } };
         const resp = try ctx.host.invokeCallable(&dispatch, &.{req}, ctx.out);

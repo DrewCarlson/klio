@@ -98,10 +98,12 @@ pub fn int_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     if (!(radix >= 2 and radix <= 36)) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
-        return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg) } };
+        const exc = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        if (runtime.reclaimEnabled()) ctx.allocator.free(msg);
+        return .{ .err = .{ .Thrown = exc } };
     }
     const s = try intToRadixString(ctx.allocator, n, @intCast(radix));
-    return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
 }
 
 /// Render `n` in `radix`. Kotlin prefixes a `-` and renders the absolute
@@ -311,7 +313,7 @@ pub fn unsigned_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     const s = try std.fmt.allocPrint(ctx.allocator, "{d}", .{v});
-    return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
 }
 
 // ============================================================
@@ -367,7 +369,7 @@ pub fn float_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     const s = try runtime.kotlinFloatToString(ctx.allocator, d);
-    return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
 }
 pub fn float_is_nan(ctx: *CallCtx) Allocator.Error!EvalResult {
     const f = switch (try recvFloat(ctx.allocator, ctx.args, "Float.isNaN")) {
@@ -587,10 +589,12 @@ pub fn long_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     if (!(radix >= 2 and radix <= 36)) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
-        return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg) } };
+        const exc = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        if (runtime.reclaimEnabled()) ctx.allocator.free(msg);
+        return .{ .err = .{ .Thrown = exc } };
     }
     const s = try intToRadixString(ctx.allocator, n, @intCast(radix));
-    return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
 }
 
 pub fn long_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -644,7 +648,7 @@ pub fn double_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     const s = try runtime.kotlinDoubleToString(ctx.allocator, d);
-    return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
 }
 pub fn double_to_int(ctx: *CallCtx) Allocator.Error!EvalResult {
     const d = switch (try recvDouble(ctx.allocator, ctx.args, "Double.toInt")) {
