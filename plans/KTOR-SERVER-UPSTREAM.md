@@ -182,14 +182,12 @@ Interpreter fixes that landed the green server itest:
   job to the `runBlocking` job so it never returns; the top-level overload
   parents to `GlobalScope`, which the run boundary abandons cleanly at exit.
 
-Known pre-existing interpreter issue (not a server blocker, surfaced while
-testing): a bare `error(msg)` (stdlib `kotlin.error`, whose parameter is `Any`)
-called inside a `CoroutineScope`/`runBlocking` receiver lambda binds the
-implicit receiver as the `message` argument and drops the literal, so the
-thrown `IllegalStateException` carries the scope's `toString()` instead of the
-message. `error` is the only stdlib precondition affected (its `Any` parameter
-matches the receiver where `check`/`require`/`TODO` do not). The mis-dispatch
-is routed to `CallMemberOrGlobal` because some loaded class declares an `error`
-member, but the call executes through the coroutine state-machine path rather
-than `execCallMemberOrGlobal`; the fix needs that path located. Plain
-(non-coroutine) `error(msg)` is correct.
+- A bare control/precondition intrinsic (`error`/`check`/`require`/`TODO`/…)
+  called in a receiver context — routed through member-or-global dispatch when
+  some loaded class declares a same-named member (e.g. the coroutines
+  `ErrorCatching.error` extension) — reached `stdlibMemberDispatch`, which
+  prepended the enclosing receiver to the intrinsic's value parameter. A bare
+  `error("msg")` inside a `runBlocking` CoroutineScope lambda therefore threw
+  with the scope's `toString()` instead of `"msg"`. `isToplevelFunction` now
+  reports these as top-level non-extensions, so the receiver is never
+  prepended. Pinned: `error_in_receiver_context`.
