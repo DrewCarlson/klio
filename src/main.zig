@@ -9,6 +9,13 @@ const runtime = @import("runtime");
 /// arena fast path (`setReclaim(false)` in the run path), so reclamation is a
 /// no-op — the arena reclaims everything wholesale.
 ///
+/// `KLIO_RECLAIM=free`: a real freeing allocator (`smp_allocator`) with the
+/// reference-counting reclamation path left OFF. Reclaims the host scratch and
+/// container temporaries the run path explicitly frees (the bulk of a server's
+/// per-request churn) without activating `ObjRef.deinit`'s value-graph teardown
+/// (not yet reconciled on the coroutine/ktor host path). Safe for long-running
+/// processes.
+///
 /// `KLIO_RECLAIM=smp`/`1`: a real freeing allocator (`smp_allocator`) with the
 /// reference-counting reclamation path left ON. Use to measure that a
 /// long-running process keeps memory bounded.
@@ -17,7 +24,7 @@ const runtime = @import("runtime");
 /// thread-safety + safety quarantine) with reclamation ON. Use to surface
 /// use-after-free / double-free / leaks at their source.
 pub fn main(init: std.process.Init.Minimal) !u8 {
-    const mode = reclaimAllocMode();
+    const mode = runtime.allocChoice();
     switch (mode) {
         .arena => {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -35,14 +42,4 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             return cli.run(dbg.allocator(), init.args);
         },
     }
-}
-
-const AllocMode = enum { arena, smp, debug };
-
-fn reclaimAllocMode() AllocMode {
-    const v = runtime.reclaimRequested();
-    if (!v) return .arena;
-    const raw = runtime.getenvSlice("KLIO_RECLAIM") orelse return .smp;
-    if (std.mem.eql(u8, raw, "debug")) return .debug;
-    return .smp;
 }

@@ -112,10 +112,27 @@ pub fn reclaimRequested() bool {
     }
     const on = blk: {
         const v = getenvSlice("KLIO_RECLAIM") orelse break :blk false;
+        // `free` selects a freeing allocator (see `main.zig`) while leaving
+        // the refcount reclamation path OFF: it reclaims the host scratch and
+        // container temporaries the run path explicitly frees, without
+        // activating `ObjRef.deinit`'s value-graph teardown (not yet
+        // reconciled on the coroutine/ktor host path).
+        if (std.mem.eql(u8, v, "free")) break :blk false;
         break :blk v.len != 0 and !std.mem.eql(u8, v, "0");
     };
     reclaim_req_state.store(if (on) 2 else 1, .monotonic);
     return on;
+}
+
+/// Which backing allocator the process entry point should install. Distinct
+/// from `reclaimRequested` because `free` mode wants a freeing allocator with
+/// reclaim OFF.
+pub const AllocChoice = enum { arena, smp, debug };
+pub fn allocChoice() AllocChoice {
+    const v = getenvSlice("KLIO_RECLAIM") orelse return .arena;
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return .arena;
+    if (std.mem.eql(u8, v, "debug")) return .debug;
+    return .smp; // "free", "smp", "1", or any other non-zero value
 }
 
 /// Reader/writer spin lock. `state` encodes the lock as `RefCell` does

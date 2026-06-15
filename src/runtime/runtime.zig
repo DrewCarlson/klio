@@ -30,6 +30,8 @@ pub const SpinMutex = objcell.SpinMutex;
 pub const setReclaim = objcell.setReclaim;
 pub const reclaimEnabled = objcell.reclaimEnabled;
 pub const reclaimRequested = objcell.reclaimRequested;
+pub const AllocChoice = objcell.AllocChoice;
+pub const allocChoice = objcell.allocChoice;
 pub const getenvSlice = objcell.getenvSlice;
 
 // alloc_track (opt-in allocation accounting; KLIO_ALLOC_TRACK)
