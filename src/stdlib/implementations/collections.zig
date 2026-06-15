@@ -3686,12 +3686,20 @@ pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
     if (try mapKeyIndex(ctx, entries, key)) |i| {
         const g = entries.borrowMut();
         defer g.deinit();
+        // The map owns the new value; the replaced value's ownership transfers
+        // to the returned `prev` (Kotlin `put` returns the previous value).
+        if (runtime.reclaimEnabled()) value.retain();
         const prev = g.get().items[i].value;
         g.get().items[i].value = value;
         return ok(prev);
     }
     const g = entries.borrowMut();
     defer g.deinit();
+    // The map takes ownership of one ref to the stored key and value.
+    if (runtime.reclaimEnabled()) {
+        key.retain();
+        value.retain();
+    }
     try g.get().append(a, .{ .key = key, .value = value });
     return ok(Value.Null);
 }
@@ -3743,9 +3751,20 @@ fn mapSet(a: Allocator, entries: MapEntries, key: Value, value: Value) Error!voi
     defer g.deinit();
     for (g.get().items) |*kv| {
         if (eqBoxed(&kv.key, &key)) {
+            // Replace: the map owns the new value and drops the replaced one
+            // (the existing key is kept; the new key arg is discarded).
+            if (runtime.reclaimEnabled()) {
+                value.retain();
+                kv.value.release(a);
+            }
             kv.value = value;
             return;
         }
+    }
+    // Append: the map takes ownership of one ref to the stored key and value.
+    if (runtime.reclaimEnabled()) {
+        key.retain();
+        value.retain();
     }
     try g.get().append(a, .{ .key = key, .value = value });
 }

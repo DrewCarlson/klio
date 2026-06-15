@@ -522,10 +522,9 @@ pub const Value = union(enum) {
             .StringBuilder => |s| s.deinit(),
             .Cell => |c| c.deinit(),
             .Function => |f| f.env.deinit(),
-            .IrClosure => |c| {
-                releaseSliceElems(c.captures, allocator);
-                c.captures.deinit();
-            },
+            // `releaseSliceElems` already drops the slice handle (its tail
+            // `slice.deinit()`); do not deinit it again.
+            .IrClosure => |c| releaseSliceElems(c.captures, allocator),
             .Comparator => |c| c.steps.deinit(),
             .List => |x| releaseValueList(x.items, allocator),
             .Set => |x| releaseValueList(x.items, allocator),

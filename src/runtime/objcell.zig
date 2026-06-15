@@ -85,6 +85,25 @@ pub fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
     return std.mem.span(raw);
 }
 
+/// Diagnostic: when `KLIO_RC_DETECT` is set, `ObjRef.deinit` leaks freed cells
+/// and dumps a stack trace on a second decrement (a double-free). Off by
+/// default; only used to pinpoint reclamation double-frees during the host
+/// reconciliation.
+var detect_df_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+fn detectDoubleFree() bool {
+    switch (detect_df_state.load(.monotonic)) {
+        1 => return false,
+        2 => return true,
+        else => {},
+    }
+    const on = blk: {
+        const v = getenvSlice("KLIO_RC_DETECT") orelse break :blk false;
+        break :blk v.len != 0 and !std.mem.eql(u8, v, "0");
+    };
+    detect_df_state.store(if (on) 2 else 1, .monotonic);
+    return on;
+}
+
 pub fn reclaimRequested() bool {
     switch (reclaim_req_state.load(.monotonic)) {
         1 => return false,
@@ -318,7 +337,28 @@ pub fn ObjRef(comptime T: type) type {
         /// the refcount/free discipline that catches UAF/leaks.
         pub fn deinit(self: Self) void {
             if (!reclaim_tls) return;
-            if (self.cell.refcount.fetchSub(1, .release) == 1) {
+            const prev = self.cell.refcount.fetchSub(1, .release);
+            if (detectDoubleFree()) {
+                // Diagnostic mode: never destroy the cell (leak it) so a second
+                // decrement is observable. A `prev` of 0 means we just dropped a
+                // cell whose count was already zero — a double-free; dump the
+                // offending stack.
+                if (prev == 0 or prev > (1 << 40)) {
+                    std.debug.print("\n[RC DOUBLE-FREE] cell={*} payload={s}\n", .{ self.cell, @typeName(T) });
+                    std.debug.dumpCurrentStackTrace(.{});
+                }
+                if (prev == 1) {
+                    const allocator = self.cell.allocator;
+                    if (comptime owns_bytes) {
+                        allocator.free(self.cell.data);
+                    } else if (comptime hasDeinit(T)) {
+                        deinitData(&self.cell.data, allocator);
+                    }
+                    // leak the control block (do not destroy) to keep count==0 observable
+                }
+                return;
+            }
+            if (prev == 1) {
                 // Acquire-load pairs with the release decrements of the
                 // other handles so all their writes happen-before this
                 // free (Arc's drop ordering).
