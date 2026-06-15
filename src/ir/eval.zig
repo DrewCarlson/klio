@@ -494,6 +494,14 @@ const Frame = struct {
     }
 
     fn deinit(self: *Frame) void {
+        // A register owns one reference to its value; release them all on
+        // teardown. The return/escaping value is retained out before this runs,
+        // and a suspended frame's registers are retained into its snapshot.
+        // `params`/`captures` are borrows — only their buffers are freed here.
+        // No-op under the arena fast path.
+        if (runtime.reclaimEnabled()) {
+            for (self.regs.items) |v| v.release(self.allocator);
+        }
         self.regs.deinit(self.allocator);
         self.params.deinit(self.allocator);
         self.captures.deinit(self.allocator);
@@ -506,12 +514,20 @@ const Frame = struct {
         return .Unit;
     }
 
+    /// Store `v` into register `r`, taking ownership of one reference to `v`.
+    /// The previous occupant is released. No refcount traffic under the arena.
     fn write(self: *Frame, r: Reg, v: Value) Allocator.Error!void {
         const idx = r.int();
         if (idx >= self.regs.items.len) {
             try self.regs.appendNTimes(self.allocator, .Unit, idx + 1 - self.regs.items.len);
         }
-        self.regs.items[idx] = v;
+        if (runtime.reclaimEnabled()) {
+            const old = self.regs.items[idx];
+            self.regs.items[idx] = v;
+            old.release(self.allocator);
+        } else {
+            self.regs.items[idx] = v;
+        }
     }
 
     fn block(self: *const Frame, b: BlockId) *const ir.Block {
@@ -1001,6 +1017,9 @@ fn runFrameInner(
             },
             .Return => |maybe_r| {
                 const v = if (maybe_r) |r| frame.read(r) else Value.Unit;
+                // The value escapes this frame; retain so frame teardown does
+                // not free it from under the caller.
+                v.retain();
                 // Walk the try-stack for the nearest finally; route the
                 // return through it.
                 var chosen: ?struct { i: usize, jump: BlockId, key: BlockId } = null;
@@ -1023,6 +1042,7 @@ fn runFrameInner(
             },
             .NonLocalReturn => |maybe_r| {
                 const v = if (maybe_r) |r| frame.read(r) else Value.Unit;
+                v.retain();
                 if (frame.func.is_lambda or frame.func.is_inline) {
                     return errResult(.{ .NonLocalReturn = v });
                 }
@@ -1030,6 +1050,7 @@ fn runFrameInner(
             },
             .LabeledReturn => |lr| {
                 const v = if (lr.value) |r| frame.read(r) else Value.Unit;
+                v.retain();
                 if (frameMatchesLabel(frame.func, lr.label)) {
                     return ok(v);
                 }
@@ -1037,6 +1058,7 @@ fn runFrameInner(
             },
             .Throw => |r| {
                 const exc = frame.read(r);
+                exc.retain();
                 if (envVarSet("KLIO_THROW_TRACE")) {
                     const s = displayThrow(allocator, &exc) catch "";
                     std.debug.print("[throw-trace] from fn {s} (fqn={s}): {s}\n", .{ frame.func.name, frame.func.fqn, s });
@@ -1189,10 +1211,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .Move => |mv| {
             const v = frame.read(mv.src);
+            v.retain();
             try frame.write(mv.dst, v);
         },
         .MakeCell => |mc| {
             const v = frame.read(mc.src);
+            v.retain();
             try frame.write(mc.dst, try Value.newCell(allocator, v));
         },
         .CellGet => |cg| {
@@ -1204,15 +1228,19 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 },
                 else => |other| other,
             };
+            v.retain();
             try frame.write(cg.dst, v);
         },
         .CellSet => |cs| {
             const v = frame.read(cs.value);
+            v.retain();
             switch (frame.read(cs.cell)) {
                 .Cell => |c| {
                     const g = c.borrowMut();
                     defer g.deinit();
+                    const old = g.get().*;
                     g.get().* = v;
+                    if (runtime.reclaimEnabled()) old.release(allocator);
                 },
                 else => {
                     try frame.write(cs.cell, v);
@@ -1395,6 +1423,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .Trace => {},
         .LoadParam => |lp| {
             const v = if (lp.idx < frame.params.items.len) frame.params.items[lp.idx] else Value.Unit;
+            v.retain();
             try frame.write(lp.dst, v);
         },
         .NotNullAssert => |nn| {
@@ -1407,6 +1436,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 } };
                 return errResult(.{ .Throw = exc });
             }
+            v.retain();
             try frame.write(nn.dst, v);
         },
         .GetField => |gf| {
@@ -1427,7 +1457,11 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const got = host.getField(allocator, &recv, name);
             if (pushed_enclosing) popEnclosing();
             switch (try got) {
-                .ok => |v| try frame.write(gf.dst, v),
+                // host.getField returns a borrowed field value; the register owns its ref.
+                .ok => |v| {
+                    v.retain();
+                    try frame.write(gf.dst, v);
+                },
                 .err => |e| return errResult(e),
             }
         },
@@ -1818,8 +1852,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .Cast => |cast| {
             const v = frame.read(cast.src);
             if (host.instanceOf(&v, cast.ty)) {
+                v.retain();
                 try frame.write(cast.dst, v);
             } else if (typeParamCastPasses(H, frame, cast.ty, host)) {
+                v.retain();
                 try frame.write(cast.dst, v);
             } else if (cast.safe) {
                 try frame.write(cast.dst, .Null);
@@ -1948,10 +1984,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                 return errResult(.{ .Unbound = msg });
             }
+            v.retain();
             try frame.write(lg.dst, v);
         },
         .LoadCapture => |lc| {
             const v = if (lc.idx < frame.captures.items.len) frame.captures.items[lc.idx] else Value.Unit;
+            v.retain();
             try frame.write(lc.dst, v);
         },
         .LoadFromThisOrGlobal => |lt| {
@@ -2017,6 +2055,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     .err => |e| return errResult(e),
                 }
             }
+            v.retain();
             try frame.write(lt.dst, v);
         },
         .Index => |ix| {
@@ -2053,7 +2092,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const qual_str = constStr(frame.module, qt.qualifier) orelse
                 return errResult(.{ .Type = "QualifiedThis: qualifier not a string const" });
             switch (try host.qualifiedThis(allocator, &recv, qual_str)) {
-                .ok => |v| try frame.write(qt.dst, v),
+                .ok => |v| {
+                    v.retain();
+                    try frame.write(qt.dst, v);
+                },
                 .err => |e| return errResult(e),
             }
         },

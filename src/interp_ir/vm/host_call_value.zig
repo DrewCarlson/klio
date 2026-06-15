@@ -626,6 +626,9 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
         .captures = cell,
         .chain = try ir.eval.captureChainAlloc(allocator),
     });
+    // The IrClosure owns one ref to each capture (its `release` recursively
+    // frees them); the registry `cell` above is a non-owning view.
+    if (runtime.reclaimEnabled()) for (captures) |c| c.retain();
     const caps_ref = try ValueSlice.init(allocator, try allocator.dupe(Value, captures));
     return .{ .ok = .{ .IrClosure = .{ .id = id, .captures = caps_ref } } };
 }
@@ -648,6 +651,7 @@ pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, module:
         .captures = cell,
         .chain = try ir.eval.captureChainAlloc(allocator),
     });
+    if (runtime.reclaimEnabled()) for (captures) |c| c.retain();
     const caps_ref = try ValueSlice.init(allocator, try allocator.dupe(Value, captures));
     return .{ .ok = .{ .IrClosure = .{ .id = id, .captures = caps_ref } } };
 }
