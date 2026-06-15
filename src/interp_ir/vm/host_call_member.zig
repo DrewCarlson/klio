@@ -2699,11 +2699,31 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
-    // Dispatch-miss sentinel: returned on every member call that falls through
-    // to a fallback, so it must not allocate (the message would leak per call,
-    // and downstream discards can't tell it from a static `.Unimplemented`).
-    // A genuine "no such member" error is re-tagged with call context upstream.
-    return .{ .err = .{ .Unimplemented = "member dispatch: no matching member or extension" } };
+    // Dispatch-miss: the message carries `Vm::call_member `name` on `fqn``,
+    // which downstream fallbacks pattern-match (e.g. the object-singleton walk)
+    // to tell a top-level miss for *this* name from a deeper genuine error.
+    // Discard sites free it via `freeDispatchMiss` (it is recognizable and
+    // allocated here), so it does not leak per call.
+    if (receiver.* == .Instance) {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, cg.get().fqn });
+    }
+    return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, receiver.typeFqn() });
+}
+
+/// Free an `Unimplemented` result's message iff it is the dispatch-miss message
+/// allocated by `callMemberInnerStatic` (recognizable by its `Vm::call_member`
+/// prefix). Safe to call at any discard site: a static `.Unimplemented`
+/// literal does not match, so it is never freed. No-op under the arena.
+fn freeDispatchMiss(allocator: Allocator, r: EvalResult) void {
+    if (!runtime.reclaimEnabled()) return;
+    if (r == .err and r.err == .Unimplemented) {
+        const m = r.err.Unimplemented;
+        if (std.mem.indexOf(u8, m, "Vm::call_member") != null) allocator.free(m);
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -3183,12 +3203,17 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         if (singleton) |s| {
             if (s == .Instance) {
                 const no_such = try std.fmt.allocPrint(allocator, "`{s}` on", .{name});
+                defer allocator.free(no_such);
                 const r = try callMemberRec(self, allocator, &s, name, args);
                 switch (r) {
                     .ok => return r,
                     .err => |e| switch (e) {
                         .Unimplemented => |m| {
                             if (!(std.mem.indexOf(u8, m, "Vm::call_member") != null and std.mem.indexOf(u8, m, no_such) != null)) return r;
+                            // Top-level miss for `name` on the singleton: fall
+                            // through to other dispatch; the miss message is
+                            // discarded here, so free it.
+                            freeDispatchMiss(allocator, r);
                         },
                         else => return r,
                     },
