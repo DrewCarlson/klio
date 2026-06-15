@@ -2779,7 +2779,12 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
     }
 
     var probes: std.ArrayList([]const u8) = .empty;
-    defer probes.deinit(allocator);
+    // Probe FQNs are per-call scratch (all `allocPrint`ed below); free them and
+    // the list. No-op under the arena; reclaims under a freeing allocator.
+    defer {
+        for (probes.items) |p| allocator.free(p);
+        probes.deinit(allocator);
+    }
     try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name }));
     try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_name, name }));
     // Walk supertype chain.
@@ -4399,7 +4404,12 @@ fn renderStructuralLocked(allocator: Allocator, inst: *const InstanceData, cls: 
 fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const type_fqn = receiver.typeFqn();
     var probes: std.ArrayList([]const u8) = .empty;
-    defer probes.deinit(allocator);
+    // Probe FQNs are per-call scratch (all `allocPrint`ed below); free them and
+    // the list. No-op under the arena; reclaims under a freeing allocator.
+    defer {
+        for (probes.items) |p| allocator.free(p);
+        probes.deinit(allocator);
+    }
     if (args.len == 0) {
         try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }));
         try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}));
@@ -4426,6 +4436,7 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     if (sibling) |sib| {
         const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ sib, name });
         const anchor = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name });
+        defer allocator.free(anchor);
         var inserted = false;
         for (probes.items, 0..) |p, idx| {
             if (std.mem.eql(u8, p, anchor)) {
@@ -4449,6 +4460,7 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     // Array builder global factory direct dispatch.
     if (stdlib.isArrayBuilder(name) and !hostHasMember(self, receiver, name)) {
         const probe = try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name});
+        defer allocator.free(probe);
         if (lookupIntrinsic(self, probe)) |func| {
             return try dispatchIntrinsic(self, allocator, probe, func, args);
         }
@@ -4458,6 +4470,7 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
         for (probes.items) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
                 const all_args = try prependReceiver(allocator, receiver, args);
+                defer allocator.free(all_args);
                 return try dispatchIntrinsic(self, allocator, probe, func, all_args);
             }
         }
