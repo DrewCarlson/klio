@@ -311,6 +311,35 @@ Diagnostic added: `KLIO_RC_DETECT=1` makes `ObjRef.deinit` leak freed cells and
 dump the stack on a double-free (DebugAllocator quarantine masks these; smp
 crashes downstream) — used to pinpoint each value-ownership bug.
 
+**Leak-validation methodology correction.** `smp_allocator` max-RSS is
+**non-deterministic** (it retains/releases OS pages unpredictably — observed
+RSS at N=1,000,000 *below* N=500,000 for the same program), so RSS slope is
+NOT a reliable leak oracle. The reliable oracle is the **DebugAllocator leaked-
+allocation count** diffed across two N (`(count(N₂)−count(N₁))/(N₂−N₁)` =
+true allocs leaked per iteration), filtering the one-time stdlib-image/module
+baseline (`image.zig`/`build.zig`/`ir.zig` sites are loaded once and resident).
+Use this, not smp RSS, to confirm bounding.
+
+**Workload split observed in practice.** Light-stdlib loops (pure strings,
+isolated lists/maps/instances) load a small resident baseline and are fully
+bounded under reclaim. A program that *combines* features (data class + string-
+keyed map + method dispatch) loads the full stdlib (~670 MB baseline) and its
+member-dispatch path allocates ~tens of per-call scratch objects (probes, arg
+arrays, candidate/type-resolution temps) — the host-temp class — most of which
+the port never frees. That is the bulk of the remaining per-iteration leak and
+is pervasive across the heavy dispatch path.
+
+**Recommended pragmatic path to the goal** (given the host-temp audit is huge):
+1. **§8 lazy/compact stdlib** — fixes the ~670 MB baseline that is the only
+   "high usage" for *batch* simple/stdlib programs (they exit, so the arena
+   already bounds their per-run allocation).
+2. **Per-request/run-boundary arena reset for the ktor server** — reclaims
+   temps *and* values per request without the full host-temp-free audit; the
+   reset already exists for the test harness. Trades the temp audit for
+   coroutine-lifetime/escape bookkeeping.
+The value refcounting committed here is complementary (it bounds the value
+graph for any path and is required for anything that escapes a reset boundary).
+
 ### 7.0 Revised approach (decided after a full subsystem re-audit)
 
 A complete re-audit of the IR, lowering, evaluator, host, and coroutine
