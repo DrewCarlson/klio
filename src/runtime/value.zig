@@ -428,6 +428,91 @@ pub const Value = union(enum) {
         return p;
     }
 
+    /// Reference-counting increment (Rust `Clone`): bump the strong count of
+    /// every refcounted handle this value holds, returning another owning
+    /// copy of the same value graph. Primitives and the immutable program
+    /// graph (`Class`) are no-ops. Owning-`*Value` variants
+    /// (`Pair`/`Triple`/`MapEntry`/`Result`/`BoundMethod`/`Exception.cause`)
+    /// are not yet refcounted — they share their boxes on copy and are
+    /// retained/released as no-ops here until they are converted to `ObjRef`.
+    pub fn retain(self: Value) void {
+        switch (self) {
+            .String => |s| _ = s.clone(),
+            .Instance => |i| _ = i.clone(),
+            .BoundUserMethod => |m| _ = m.receiver.clone(),
+            .Sequence => |s| _ = s.clone(),
+            .Delegate => |d| _ = d.clone(),
+            .Regex => |r| _ = r.clone(),
+            .Match => |m| _ = m.clone(),
+            .StringBuilder => |s| _ = s.clone(),
+            .Cell => |c| _ = c.clone(),
+            .Function => |f| _ = f.env.clone(),
+            .IrClosure => |c| _ = c.captures.clone(),
+            .Comparator => |c| _ = c.steps.clone(),
+            .List => |x| _ = x.items.clone(),
+            .Set => |x| _ = x.items.clone(),
+            .Array => |x| _ = x.items.clone(),
+            .Map => |x| _ = x.entries.clone(),
+            .Iterator => |x| {
+                _ = x.items.clone();
+                _ = x.pos.clone();
+            },
+            .RangeIter => |x| _ = x.cur.clone(),
+            .PropertyRef => |p| _ = p.name.clone(),
+            .MatchGroup => |g| _ = g.value.clone(),
+            .Exception => |e| {
+                _ = e.fqn.clone();
+                if (e.message) |m| _ = m.clone();
+            },
+            else => {},
+        }
+    }
+
+    /// Reference-counting decrement (Rust `Drop`): drop one owning handle to
+    /// this value graph. When a handle's strong count reaches zero its
+    /// payload `deinit` recursively releases what it owns. The dual of
+    /// `retain`; primitives, `Class`, and the not-yet-refcounted
+    /// owning-`*Value` variants are no-ops.
+    pub fn release(self: Value, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .String => |s| s.deinit(),
+            .Instance => |i| i.deinit(),
+            .BoundUserMethod => |m| m.receiver.deinit(),
+            .Sequence => |s| s.deinit(),
+            .Delegate => |d| d.deinit(),
+            .Regex => |r| r.deinit(),
+            .Match => |m| m.deinit(),
+            .StringBuilder => |s| s.deinit(),
+            .Cell => |c| c.deinit(),
+            .Function => |f| f.env.deinit(),
+            .IrClosure => |c| c.captures.deinit(),
+            .Comparator => |c| c.steps.deinit(),
+            .List => |x| x.items.deinit(),
+            .Set => |x| x.items.deinit(),
+            .Array => |x| x.items.deinit(),
+            .Map => |x| x.entries.deinit(),
+            .Iterator => |x| {
+                x.items.deinit();
+                x.pos.deinit();
+            },
+            .RangeIter => |x| x.cur.deinit(),
+            .PropertyRef => |p| p.name.deinit(),
+            .MatchGroup => |g| g.value.deinit(),
+            .Exception => |e| {
+                e.fqn.deinit();
+                if (e.message) |m| m.deinit();
+            },
+            else => {},
+        }
+        _ = allocator;
+    }
+
+    /// `ObjRef(Value)` (capture `Cell`) payload teardown: a boxed value is
+    /// released when its cell's strong count reaches zero.
+    pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
+        self.release(allocator);
+    }
+
     pub fn isIntegral(self: Value) bool {
         return switch (self) {
             .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte => true,

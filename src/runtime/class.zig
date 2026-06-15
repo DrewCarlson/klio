@@ -303,6 +303,19 @@ pub const InstanceData = struct {
         }
     }
 
+    /// Reference-counting teardown: run when an instance's strong count
+    /// reaches zero. Releases the field values, the captured outer
+    /// instance, and the (cloned) class handle, then frees the field list.
+    /// The class is part of the immutable program graph and is held alive by
+    /// the module, so this only drops the instance's own clone of it;
+    /// `native_state` is owned by its host binding.
+    pub fn deinit(self: *InstanceData, allocator: std.mem.Allocator) void {
+        for (self.fields.items) |f| f.value.release(allocator);
+        if (self.outer) |o| o.release(allocator);
+        self.fields.deinit(allocator);
+        self.class.deinit();
+    }
+
     /// Fetch the instance's native-state cell, creating it via `init` on
     /// first access. `T` is the host binding's concrete payload type and
     /// `kind` is its discriminator (convention: the binding's FQN). On a
@@ -726,6 +739,42 @@ test "InstanceData get/set/define round-trip" {
     try testing.expectEqual(@as(i32, 9), inst.get("x").?.Int);
 }
 
+test "instance release recursively frees a retained instance field" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+
+    // Inner instance B (strong count 1, holding one clone of the class).
+    const b = try objcell.ObjRef(InstanceData).init(allocator, .{
+        .class = fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 1,
+        .native_state = null,
+    });
+    const b_val = Value{ .Instance = b };
+
+    // Outer instance A storing B as a field. The store retains B (count 2).
+    var a_data: InstanceData = .{
+        .class = fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 2,
+        .native_state = null,
+    };
+    b_val.retain();
+    try a_data.define(allocator, "b", b_val);
+    const a = try objcell.ObjRef(InstanceData).init(allocator, a_data);
+    const a_val = Value{ .Instance = a };
+
+    // Releasing A drops to zero → its deinit releases field B (2 → 1) and
+    // A's class clone. Releasing the local B handle drops it to zero → freed.
+    // `testing.allocator` asserts the whole graph is reclaimed with no leak
+    // and no double-free.
+    a_val.release(allocator);
+    b_val.release(allocator);
+}
+
 test "findMethod walks the parent chain and prefers concrete bodies" {
     const allocator = testing.allocator;
 
@@ -868,9 +917,8 @@ test "allCompanions collects self and parent companions" {
         .identity = 1,
         .native_state = null,
     });
-    // `InstanceData` has no destructor (its `class` handle is an arena-owned
-    // clone in the real runtime); release the field clone explicitly here.
-    defer parent_comp.asPtr().class.deinit();
+    // `InstanceData.deinit` releases the instance's class clone, so the
+    // ObjRef drop reclaims the whole instance.
     defer parent_comp.deinit();
     const child_comp = try ObjRef(InstanceData).init(allocator, .{
         .class = child_fx.handle.clone(),
@@ -879,7 +927,6 @@ test "allCompanions collects self and parent companions" {
         .identity = 2,
         .native_state = null,
     });
-    defer child_comp.asPtr().class.deinit();
     defer child_comp.deinit();
     {
         const g = parent_fx.ptr().companion.borrowMut();
