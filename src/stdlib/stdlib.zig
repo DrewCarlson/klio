@@ -142,6 +142,16 @@ pub fn isToplevelFunction(name: []const u8) bool {
     for (receiver_infix) |r| {
         if (std.mem.eql(u8, r, name)) return false;
     }
+    // Top-level control / precondition intrinsics (`kotlin.error`,
+    // `kotlin.check`, …). Their first parameter is a plain value, not a
+    // receiver, so member dispatch must never prepend the enclosing
+    // receiver as a spurious first argument — otherwise a bare
+    // `error("msg")` inside a receiver context (e.g. a `runBlocking`
+    // CoroutineScope lambda) would pass `this` as the message and drop the
+    // literal. Same `Any`-typed-parameter trap the array builders avoid.
+    for (CONTROL_INTRINSICS) |c| {
+        if (std.mem.eql(u8, c, name)) return true;
+    }
     for (IMPLICIT_ALIASES) |a| {
         if (std.mem.eql(u8, a.name, name) and name.len > 0 and std.ascii.isLower(name[0])) {
             return true;
@@ -149,6 +159,16 @@ pub fn isToplevelFunction(name: []const u8) bool {
     }
     return false;
 }
+
+/// Top-level non-extension control / precondition functions in `kotlin`.
+/// Each takes a value (not a receiver) as its first parameter, so member
+/// dispatch must resolve a bare call to the global intrinsic instead of
+/// prepending the enclosing receiver.
+pub const CONTROL_INTRINSICS = [_][]const u8{
+    "error",     "check",          "checkNotNull",
+    "require",   "requireNotNull", "TODO",
+    "assert",
+};
 
 /// Packages whose top-level entities are implicitly visible in every Kotlin
 /// source file. The exact set the spec lists for `Kotlin/Core`.
@@ -663,4 +683,13 @@ test "is array builder and toplevel function" {
     try testing.expect(isToplevelFunction("listOf"));
     try testing.expect(!isToplevelFunction("to"));
     try testing.expect(!isToplevelFunction("Pair"));
+    // Control / precondition intrinsics are top-level functions: member
+    // dispatch must not prepend a receiver to their value parameter.
+    try testing.expect(isToplevelFunction("error"));
+    try testing.expect(isToplevelFunction("check"));
+    try testing.expect(isToplevelFunction("require"));
+    try testing.expect(isToplevelFunction("requireNotNull"));
+    try testing.expect(isToplevelFunction("checkNotNull"));
+    try testing.expect(isToplevelFunction("TODO"));
+    try testing.expect(isToplevelFunction("assert"));
 }

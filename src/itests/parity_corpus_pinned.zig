@@ -301,6 +301,13 @@ test "when_string_subject" {
     );
 }
 
+test "error_in_receiver_context" {
+    try check("error_in_receiver_context",
+        \\real-error
+        \\
+    );
+}
+
 test "member_lambda_param_vs_inline_ext" {
     try check("member_lambda_param_vs_inline_ext",
         \\[on] lambda message 2
