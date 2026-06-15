@@ -35,6 +35,7 @@
 //! one) when the count reaches zero.
 
 const std = @import("std");
+pub const gc = @import("gc.zig");
 
 /// Per-thread teardown mode for `ObjRef.deinit`.
 ///
@@ -112,10 +113,27 @@ pub fn reclaimRequested() bool {
     }
     const on = blk: {
         const v = getenvSlice("KLIO_RECLAIM") orelse break :blk false;
+        // `free` selects a freeing allocator (see `main.zig`) while leaving
+        // the refcount reclamation path OFF: it reclaims the host scratch and
+        // container temporaries the run path explicitly frees, without
+        // activating `ObjRef.deinit`'s value-graph teardown (not yet
+        // reconciled on the coroutine/ktor host path).
+        if (std.mem.eql(u8, v, "free")) break :blk false;
         break :blk v.len != 0 and !std.mem.eql(u8, v, "0");
     };
     reclaim_req_state.store(if (on) 2 else 1, .monotonic);
     return on;
+}
+
+/// Which backing allocator the process entry point should install. Distinct
+/// from `reclaimRequested` because `free` mode wants a freeing allocator with
+/// reclaim OFF.
+pub const AllocChoice = enum { arena, smp, debug };
+pub fn allocChoice() AllocChoice {
+    const v = getenvSlice("KLIO_RECLAIM") orelse return .arena;
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return .arena;
+    if (std.mem.eql(u8, v, "debug")) return .debug;
+    return .smp; // "free", "smp", "1", or any other non-zero value
 }
 
 /// Reader/writer spin lock. `state` encodes the lock as `RefCell` does
@@ -250,11 +268,92 @@ pub fn ControlBlock(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// GC header first so the type-erased collector recovers `data` by a
+        /// fixed offset via `@fieldParentPtr("hdr", header)`.
+        hdr: gc.GcHeader,
         refcount: std.atomic.Value(usize),
         lock: SpinRwLock,
         data: T,
         allocator: std.mem.Allocator,
     };
+}
+
+// ---------------------------------------------------------------------------
+// GC trace/finalize dispatch (duck-typed; `objcell` stays free of any
+// dependency on `value`/`class`/`env`). A cell's payload `T` declares how the
+// collector walks its out-edges and tears down its own buffers:
+//   - `pub fn gcMark(self, *gc.Marker)`   — a Value (shades its child cells)
+//   - `pub fn gcTrace(self: *const T, *gc.Marker)` — a struct holding Values
+//   - `pub fn gcFinalize(self: *T, Allocator)` — shallow teardown (own buffers)
+// std payloads (`ArrayList(Value)`/`ArrayList(MapPair)`/`[]Value`/`[]const u8`)
+// are handled structurally. Any other payload with Value out-edges that lacks
+// these decls traces as a leaf — caught by the GC-mode verify oracle.
+// ---------------------------------------------------------------------------
+
+fn isContainer(comptime U: type) bool {
+    return switch (@typeInfo(U)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => true,
+        else => false,
+    };
+}
+fn hasDeclSafe(comptime U: type, comptime name: []const u8) bool {
+    return isContainer(U) and @hasDecl(U, name);
+}
+fn isArrayListLike(comptime U: type) bool {
+    return @typeInfo(U) == .@"struct" and @hasField(U, "items") and @hasField(U, "capacity");
+}
+fn isSlice(comptime U: type) bool {
+    return @typeInfo(U) == .pointer and @typeInfo(U).pointer.size == .slice;
+}
+/// An `ObjRef(X)` handle is a struct with a `.cell` field and a `clone` decl.
+fn isObjRef(comptime U: type) bool {
+    return @typeInfo(U) == .@"struct" and @hasField(U, "cell") and @hasDecl(U, "clone");
+}
+
+/// Trace one out-edge value `e` of type `E` (a Value, a struct with gcTrace, an
+/// `ObjRef` handle, or an optional thereof). Shading an `ObjRef` cell is how the
+/// graph advances; the cell's own `gc_trace` reaches the next level.
+fn gcTraceElem(comptime E: type, e: *const E, m: *gc.Marker) void {
+    if (comptime hasDeclSafe(E, "gcMark")) {
+        e.gcMark(m);
+    } else if (comptime hasDeclSafe(E, "gcTrace")) {
+        e.gcTrace(m);
+    } else if (comptime isObjRef(E)) {
+        m.shade(&e.cell.hdr);
+    } else if (comptime @typeInfo(E) == .optional) {
+        if (e.*) |inner| gcTraceElem(@TypeOf(inner), &inner, m);
+    }
+    // else: a leaf element (e.g. u8 bytes) with no out-edges.
+}
+
+fn gcTraceData(comptime U: type, data: *const U, m: *gc.Marker) void {
+    if (comptime hasDeclSafe(U, "gcTrace")) {
+        data.gcTrace(m);
+    } else if (comptime hasDeclSafe(U, "gcMark")) {
+        data.gcMark(m);
+    } else if (comptime isObjRef(U)) {
+        m.shade(&data.cell.hdr);
+    } else if (comptime @typeInfo(U) == .optional) {
+        if (data.*) |inner| gcTraceElem(@TypeOf(inner), &inner, m);
+    } else if (comptime isArrayListLike(U)) {
+        for (data.items) |*e| gcTraceElem(@TypeOf(e.*), e, m);
+    } else if (comptime isSlice(U)) {
+        for (data.*) |*e| gcTraceElem(@TypeOf(e.*), e, m);
+    }
+    // else: a leaf payload (scalar / Value-free struct) — nothing to trace.
+}
+
+fn gcFinalizeData(comptime U: type, data: *U, a: std.mem.Allocator) void {
+    if (comptime hasDeclSafe(U, "gcFinalize")) {
+        data.gcFinalize(a);
+    } else if (comptime U == []const u8) {
+        a.free(data.*);
+    } else if (comptime isArrayListLike(U)) {
+        data.deinit(a);
+    } else if (comptime isSlice(U)) {
+        a.free(data.*);
+    }
+    // else: scalar / leaf payload — no owned buffer to free.
 }
 
 /// Error returned by `ObjRef.tryBorrowMut` when the cell is already
@@ -306,14 +405,30 @@ pub fn ObjRef(comptime T: type) type {
         /// buffer (and will free it on teardown under the reclaim path); the
         /// caller must not free it afterward. Identical to `init` for every
         /// non-bytes payload.
+        /// The GC trace thunk for this cell type: recover the control block from
+        /// its `hdr` and walk the payload's out-edges.
+        fn gcTraceThunk(h: *gc.GcHeader, m: *gc.Marker) void {
+            const cb: *Cell = @fieldParentPtr("hdr", h);
+            gcTraceData(T, &cb.data, m);
+        }
+        /// The GC finalize thunk: shallow-free the payload's own buffers, then
+        /// destroy the control block. Child cells are swept independently.
+        fn gcFinalizeThunk(h: *gc.GcHeader) void {
+            const cb: *Cell = @fieldParentPtr("hdr", h);
+            gcFinalizeData(T, &cb.data, cb.allocator);
+            cb.allocator.destroy(cb);
+        }
+
         pub fn initOwned(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
             const cell = try allocator.create(Cell);
             cell.* = .{
+                .hdr = .{ .gc_trace = gcTraceThunk, .gc_finalize = gcFinalizeThunk },
                 .refcount = std.atomic.Value(usize).init(1),
                 .lock = .{},
                 .data = v,
                 .allocator = allocator,
             };
+            if (gc.gc_enabled) gc.register(&cell.hdr, @sizeOf(Cell));
             return .{ .cell = cell };
         }
 

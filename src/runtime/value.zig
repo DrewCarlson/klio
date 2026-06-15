@@ -30,7 +30,15 @@ pub const ValueList = ObjRef(std.ArrayList(Value));
 /// `Arc<Vec<Value>>` — shared, frozen element storage.
 pub const ValueSlice = ObjRef([]Value);
 /// One key/value pair inside a `Map`.
-pub const MapPair = struct { key: Value, value: Value };
+pub const MapPair = struct {
+    key: Value,
+    value: Value,
+    /// GC tracer: a map entry owns one ref to its key and value.
+    pub fn gcTrace(self: *const MapPair, m: *objcell.gc.Marker) void {
+        self.key.gcMark(m);
+        self.value.gcMark(m);
+    }
+};
 /// `ObjRef<Vec<(Value, Value)>>` — shared, growable map entry storage.
 pub const MapEntries = ObjRef(std.ArrayList(MapPair));
 /// A refcounted box holding a single `Value` (Rust `Box<Value>` mapped to a
@@ -518,6 +526,20 @@ pub const Value = union(enum) {
         // refcount traffic. Under reclaim-on both run and stay balanced.
         if (!objcell.reclaimEnabled()) return;
         self.forEachChildCell(RetainVisitor{});
+    }
+
+    const MarkVisitor = struct {
+        m: *objcell.gc.Marker,
+        inline fn visit(self: MarkVisitor, objref: anytype) void {
+            self.m.shade(&objref.cell.hdr);
+        }
+    };
+
+    /// GC tracer for a `Value`: shade each cell this value directly references
+    /// (one level; the shaded cell's own `gc_trace` reaches the next level).
+    /// Same edge set as `retain`, so they cannot diverge.
+    pub fn gcMark(self: Value, m: *objcell.gc.Marker) void {
+        self.forEachChildCell(MarkVisitor{ .m = m });
     }
 
     /// Reference-counting decrement (Rust `Drop`): drop one owning handle to
@@ -1278,7 +1300,13 @@ pub const Value = union(enum) {
 
 /// One key-selector step of a `Comparator`: a callable plus a per-step
 /// descending flag.
-pub const ComparatorStep = struct { selector: Value, descending: bool };
+pub const ComparatorStep = struct {
+    selector: Value,
+    descending: bool,
+    pub fn gcTrace(self: *const ComparatorStep, m: *objcell.gc.Marker) void {
+        self.selector.gcMark(m);
+    }
+};
 
 fn writeElements(writer: *std.Io.Writer, items: ValueList) std.Io.Writer.Error!void {
     const g = items.borrow();

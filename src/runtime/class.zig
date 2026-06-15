@@ -93,6 +93,22 @@ pub const ClassDef = struct {
 
     const MAX_WALK = 128;
 
+    /// GC tracer for the class graph. Marks every cell a class reaches:
+    /// supertypes, nested/companion/enclosing/object-singleton, the captured
+    /// definition environment, and enum-entry singleton instances. (Method/
+    /// property/init bodies are AST-backed and hold no runtime Value cells.)
+    pub fn gcTrace(self: *const ClassDef, m: *objcell.gc.Marker) void {
+        if (self.parent) |p| m.shade(&p.cell.hdr);
+        for (self.interfaces) |i| m.shade(&i.cell.hdr);
+        for (self.nested_classes) |nc| m.shade(&nc.class.cell.hdr);
+        for (self.enum_entries) |e| e.value.gcMark(m);
+        for (self.supertype_delegates) |d| if (d.interface) |i| m.shade(&i.cell.hdr);
+        m.shade(&self.companion.cell.hdr);
+        m.shade(&self.enclosing_class.cell.hdr);
+        m.shade(&self.captured_env.cell.hdr);
+        m.shade(&self.object_singleton.cell.hdr);
+    }
+
     /// Walk the class chain (self, then parent, then grandparent, …) and
     /// return the first method matching `name`, paired with its declaring
     /// class. Caller owns nothing extra; the returned handles are clones.
@@ -325,6 +341,23 @@ pub const InstanceData = struct {
         if (self.outer) |o| o.release(allocator);
         self.fields.deinit(allocator);
         self.class.deinit();
+    }
+
+    /// GC tracer: an instance references its class cell, owns one ref per field
+    /// value, and (for an inner class) its captured outer.
+    pub fn gcTrace(self: *const InstanceData, m: *objcell.gc.Marker) void {
+        m.shade(&self.class.cell.hdr);
+        for (self.fields.items) |f| f.value.gcMark(m);
+        if (self.outer) |o| o.gcMark(m);
+        // `native_state` is host-owned; value-bearing bindings install a
+        // NativeBox gc_trace (none today — kotlinx.io.Buffer is value-free).
+    }
+
+    /// GC finalizer (shallow): free only the field-list spine. Field values,
+    /// the outer, and the class cell are independent cells swept on their own
+    /// reachability, so they are NOT released here.
+    pub fn gcFinalize(self: *InstanceData, allocator: std.mem.Allocator) void {
+        self.fields.deinit(allocator);
     }
 
     /// Fetch the instance's native-state cell, creating it via `init` on

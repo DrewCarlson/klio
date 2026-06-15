@@ -29,6 +29,21 @@ pub const Env = struct {
         if (self.parent) |p| p.deinit();
     }
 
+    /// GC tracer: an env references its parent cell and owns one ref per bound
+    /// value.
+    pub fn gcTrace(self: *const Env, m: *objcell.gc.Marker) void {
+        if (self.parent) |p| m.shade(&p.cell.hdr);
+        var it = self.vars.valueIterator();
+        while (it.next()) |v| v.gcMark(m);
+    }
+
+    /// GC finalizer (shallow): free only the binding map's spine. The bound
+    /// values and the parent are independent cells swept on their own.
+    pub fn gcFinalize(self: *Env, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.vars.deinit();
+    }
+
     pub fn define(self: *Env, name: []const u8, value: Value) !void {
         try self.vars.put(name, value);
     }
