@@ -988,7 +988,7 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name: []const u
             if (is_uninit_notnull) {
                 const fqn = try StringRef.init(allocator, "kotlin.IllegalStateException");
                 const msg_text = try std.fmt.allocPrint(allocator, "Property {s} should be initialized before get.", .{name});
-                const msg = try StringRef.init(allocator, msg_text);
+                const msg = try StringRef.initOwned(allocator, msg_text);
                 return .{ .err = .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = null } } } };
             }
         }

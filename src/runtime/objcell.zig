@@ -256,9 +256,38 @@ pub fn ObjRef(comptime T: type) type {
 
         cell: *Cell,
 
+        /// Whether this cell's payload is a `[]const u8` the cell owns and
+        /// must free on teardown. Only the string-bytes payload qualifies;
+        /// every other `ObjRef` payload is freed by its own `deinit` or is a
+        /// borrow.
+        const owns_bytes = (T == []const u8);
+
         /// Allocate a new cell holding `v`. The allocator is retained
         /// inside the control block and reused for `deinit`.
+        ///
+        /// For a `[]const u8` payload under the reclaim path, the bytes are
+        /// **duped** so the cell owns a private copy it can free on teardown:
+        /// `StringRef` byte ownership is otherwise ambiguous (some callers pass
+        /// interned/borrowed module-const bytes, others owned buffers), and a
+        /// uniform owned copy makes `release` able to free without corrupting a
+        /// borrowed original. Under the arena fast path (`!reclaim_tls`) the
+        /// slice is stored as-is — the arena reclaims everything wholesale, so
+        /// the dupe would be wasted. Owned-buffer callers that want to transfer
+        /// their buffer instead of paying a second allocation use `initOwned`.
         pub fn init(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
+            var data = v;
+            if (comptime owns_bytes) {
+                if (reclaim_tls) data = try allocator.dupe(u8, v);
+            }
+            return initOwned(allocator, data);
+        }
+
+        /// Like `init`, but takes ownership of `v` verbatim with no dupe.
+        /// For a `[]const u8` payload this means the cell adopts the caller's
+        /// buffer (and will free it on teardown under the reclaim path); the
+        /// caller must not free it afterward. Identical to `init` for every
+        /// non-bytes payload.
+        pub fn initOwned(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
             const cell = try allocator.create(Cell);
             cell.* = .{
                 .refcount = std.atomic.Value(usize).init(1),
@@ -295,7 +324,10 @@ pub fn ObjRef(comptime T: type) type {
                 // free (Arc's drop ordering).
                 _ = self.cell.refcount.load(.acquire);
                 const allocator = self.cell.allocator;
-                if (comptime hasDeinit(T)) {
+                if (comptime owns_bytes) {
+                    // The cell owns its string bytes (see `init`); free them.
+                    allocator.free(self.cell.data);
+                } else if (comptime hasDeinit(T)) {
                     deinitData(&self.cell.data, allocator);
                 }
                 allocator.destroy(self.cell);

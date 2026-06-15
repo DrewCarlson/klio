@@ -1053,7 +1053,7 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
                                     }
                                 }
                                 const fqn = try StringRef.init(allocator, "kotlin.IllegalArgumentException");
-                                const msg = try StringRef.init(allocator, try std.fmt.allocPrint(allocator, "No enum constant {s}.{s}", .{ cd.get().fqn, want }));
+                                const msg = try StringRef.initOwned(allocator, try std.fmt.allocPrint(allocator, "No enum constant {s}.{s}", .{ cd.get().fqn, want }));
                                 sg.deinit();
                                 cd.deinit();
                                 return .{ .err = .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = null } } } };

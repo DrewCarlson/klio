@@ -137,7 +137,7 @@ pub fn builders_build_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         break :blk try ctx.allocator.dupe(u8, g.get().items);
     };
     sb.StringBuilder.deinit();
-    return ok(.{ .String = try StringRef.init(ctx.allocator, owned) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, owned) });
 }
 
 pub fn contract_error(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -152,7 +152,7 @@ pub fn contract_error(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     return .{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try StringRef.init(ctx.allocator, "kotlin.IllegalStateException"),
-        .message = try StringRef.init(ctx.allocator, msg),
+        .message = try StringRef.initOwned(ctx.allocator, msg),
         .cause = null,
     } } } };
 }
@@ -172,7 +172,7 @@ pub fn contract_todo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     } else try ctx.allocator.dupe(u8, "An operation is not implemented.");
     return .{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try StringRef.init(ctx.allocator, "kotlin.NotImplementedError"),
-        .message = try StringRef.init(ctx.allocator, msg),
+        .message = try StringRef.initOwned(ctx.allocator, msg),
         .cause = null,
     } } } };
 }
@@ -264,9 +264,8 @@ fn freeListResult(v: Value) void {
 fn freeException(e: anytype) void {
     e.fqn.deinit();
     if (e.message) |m| {
-        const g = m.borrow();
-        testing.allocator.free(g.get().*);
-        g.deinit();
+        // The message cell owns its bytes (built via `initOwned`/`init`) and
+        // frees them on the final `deinit`; do not free the bytes manually.
         m.deinit();
     }
 }
@@ -372,7 +371,8 @@ test "buildString returns the accumulated buffer" {
     try testing.expect(r == .ok);
     const g = r.ok.String.borrow();
     defer {
-        testing.allocator.free(g.get().*);
+        // The String cell owns its bytes (built via `initOwned`) and frees
+        // them on the final `deinit`; do not free the bytes manually.
         g.deinit();
         r.ok.String.deinit();
     }

@@ -565,7 +565,7 @@ pub fn map_entry_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return err(.{ .Type = "Map.Entry.toString requires a Map.Entry receiver" });
     }
     const s = try ctx.args[0].display(ctx.allocator);
-    const ref = try runtime.StringRef.init(ctx.allocator, s);
+    const ref = try runtime.StringRef.initOwned(ctx.allocator, s);
     return ok(.{ .String = ref });
 }
 

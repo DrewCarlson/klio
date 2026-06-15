@@ -365,7 +365,7 @@ pub fn result_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         try std.fmt.allocPrint(ctx.allocator, "Success({s})", .{inner})
     else
         try std.fmt.allocPrint(ctx.allocator, "Failure({s})", .{inner});
-    return .{ .ok = .{ .String = try StringRef.init(ctx.allocator, s) } };
+    return .{ .ok = .{ .String = try StringRef.initOwned(ctx.allocator, s) } };
 }
 
 // -------------------------------------------------------------------------

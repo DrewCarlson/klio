@@ -54,7 +54,7 @@ pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             const msg = try std.fmt.allocPrint(ctx.allocator, "Step must be positive, was: {d}.", .{n});
             return .{ .err = .{ .Thrown = .{ .Exception = .{
                 .fqn = try StringRef.init(ctx.allocator, "kotlin.IllegalArgumentException"),
-                .message = try StringRef.init(ctx.allocator, msg),
+                .message = try StringRef.initOwned(ctx.allocator, msg),
                 .cause = null,
             } } } };
         }
@@ -201,7 +201,7 @@ pub fn range_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .kind = view.kind,
     } };
     const s = try r.display(ctx.allocator);
-    return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
 }
 
 pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -423,13 +423,12 @@ test "step throws on non-positive step" {
     try testing.expect(r == .err);
     try testing.expect(r.err == .Thrown);
     const exc = r.err.Thrown.Exception;
-    // The message bytes are arena-style owned by the call allocator; free
-    // them here, then drop the two refcounted handles.
+    // The message cell owns its bytes and frees them on the final drop;
+    // just borrow to assert, then drop the two refcounted handles.
     {
         const mg = exc.message.?.borrow();
         defer mg.deinit();
         try testing.expectEqualStrings("Step must be positive, was: 0.", mg.get().*);
-        testing.allocator.free(mg.get().*);
     }
     {
         const fg = exc.fqn.borrow();
@@ -558,7 +557,6 @@ test "to string renders the range form" {
     try testing.expect(r == .ok);
     const g = r.ok.String.borrow();
     defer {
-        testing.allocator.free(g.get().*);
         g.deinit();
         r.ok.String.deinit();
     }

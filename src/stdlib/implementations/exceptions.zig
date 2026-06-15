@@ -85,18 +85,16 @@ fn messageOf(allocator: std.mem.Allocator, v: *const Value) std.mem.Allocator.Er
         .Null => null,
         else => blk: {
             const s = try v.display(allocator);
-            break :blk try StringRef.init(allocator, s);
+            break :blk try StringRef.initOwned(allocator, s);
         },
     };
 }
 
-/// Free a message handle built by `messageOf` (its rendered bytes and the
-/// refcounted handle). Used on the error path that discards a half-built
-/// exception, mirroring Rust dropping the unused `Option<String>`.
+/// Free a message handle built by `messageOf`. The cell owns its bytes and
+/// frees them on the last `deinit`. Used on the error path that discards a
+/// half-built exception, mirroring Rust dropping the unused `Option<String>`.
 fn freeMessage(allocator: std.mem.Allocator, m: StringRef) void {
-    const g = m.borrow();
-    allocator.free(g.get().*);
-    g.deinit();
+    _ = allocator;
     m.deinit();
 }
 
@@ -165,7 +163,7 @@ pub fn throwable_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("toString requires a Throwable receiver");
     }
     const s = try ctx.args[0].display(ctx.allocator);
-    return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
 }
 
 /// `Throwable.addSuppressed(other)` — klio does not surface
@@ -220,12 +218,7 @@ fn noopCtx(args: []const Value) CallCtx {
 
 fn freeException(exc: anytype) void {
     exc.fqn.deinit();
-    if (exc.message) |m| {
-        const g = m.borrow();
-        testing.allocator.free(g.get().*);
-        g.deinit();
-        m.deinit();
-    }
+    if (exc.message) |m| m.deinit();
     if (exc.cause) |c| testing.allocator.destroy(c);
 }
 
@@ -409,7 +402,6 @@ test "throwable toString renders fqn and message" {
     try testing.expect(r == .ok);
     const g = r.ok.String.borrow();
     defer {
-        testing.allocator.free(g.get().*);
         g.deinit();
         r.ok.String.deinit();
     }
@@ -425,7 +417,6 @@ test "throwable toString renders fqn alone when message is absent" {
     try testing.expect(r == .ok);
     const g = r.ok.String.borrow();
     defer {
-        testing.allocator.free(g.get().*);
         g.deinit();
         r.ok.String.deinit();
     }

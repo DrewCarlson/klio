@@ -232,7 +232,7 @@ fn jsonEncode(ctx: *CallCtx) Error!EvalResult {
         .{};
     const s = std.json.Stringify.valueAlloc(ctx.allocator, jv, opts) catch
         return error.OutOfMemory;
-    return ok(.{ .String = try StringRef.init(ctx.allocator, s) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
 }
 
 // ----- JSON decode (driven by the target class's declared types) -----
@@ -314,7 +314,7 @@ fn decodeField(
                     }
                 }
             }
-            return .{ .ok = .{ .String = try StringRef.init(a, try a.dupe(u8, s)) } };
+            return .{ .ok = .{ .String = try StringRef.initOwned(a, try a.dupe(u8, s)) } };
         },
         .array => |arr| {
             // The element type is the first generic argument of the
@@ -375,7 +375,7 @@ fn decodeMap(map: JsonObjectMap, val_shape: ?*const TypeShape, ctx: *CallCtx) Er
             .err => |er| return .{ .err = er },
         };
         entries.appendAssumeCapacity(.{
-            .key = .{ .String = try StringRef.init(a, try a.dupe(u8, entry.key_ptr.*)) },
+            .key = .{ .String = try StringRef.initOwned(a, try a.dupe(u8, entry.key_ptr.*)) },
             .value = v,
         });
     }
@@ -513,7 +513,7 @@ fn ctorParamNames(ctx: *CallCtx) Error!EvalResult {
     var items: std.ArrayList(Value) = .empty;
     for (cls.primary_params) |p| {
         if (p.property == null) continue;
-        try items.append(a, .{ .String = try StringRef.init(a, try a.dupe(u8, p.name)) });
+        try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, p.name)) });
     }
     return ok(.{ .List = .{
         .items = try ValueList.init(a, items),

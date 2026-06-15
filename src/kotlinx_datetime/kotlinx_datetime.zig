@@ -83,7 +83,7 @@ fn currentNanosOfSecond(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 fn currentSystemTzId(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const id = systemTimeZoneId(ctx.allocator) catch try ctx.allocator.dupe(u8, "UTC");
-    return ok(.{ .String = try StringRef.init(ctx.allocator, id) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, id) });
 }
 
 /// Best-effort detection of the host IANA tz id. Honors `$TZ` when it
@@ -501,7 +501,7 @@ fn instantToString(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     else
         try std.fmt.allocPrint(ctx.allocator, "{s}.{d:0>9}Z", .{ head, p.nano });
 
-    return ok(.{ .String = try StringRef.init(ctx.allocator, owned) });
+    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, owned) });
 }
 
 fn parseInstant(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -741,9 +741,8 @@ fn freeArray(v: Value) void {
 }
 
 fn freeString(v: Value) void {
-    const g = v.String.borrow();
-    testing.allocator.free(g.get().*);
-    g.deinit();
+    // The intrinsics mint these via `initOwned`, so the cell owns its byte
+    // buffer and frees it on the final `deinit` under reclaim.
     v.String.deinit();
 }
 

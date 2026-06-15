@@ -41,13 +41,22 @@ fn errArity(msg: []const u8) EvalResult {
 /// Build a thrown Kotlin Throwable value. `message` is owned by the
 /// allocator (or null). Mirrors `exceptions::make_exception`.
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
-    const fqn_ref = try StringRef.init(allocator, try allocator.dupe(u8, fqn));
+    const fqn_ref = try StringRef.initOwned(allocator, try allocator.dupe(u8, fqn));
     const msg_ref: ?StringRef = if (message) |m| try StringRef.init(allocator, m) else null;
     return .{ .Exception = .{ .fqn = fqn_ref, .message = msg_ref, .cause = null } };
 }
 
 fn thrown(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!EvalResult {
     return .{ .err = .{ .Thrown = try makeException(allocator, fqn, message) } };
+}
+
+/// Like `thrown`, but for an OWNED `message` buffer. `makeException` dupes the
+/// message under the reclaim path, so the caller's buffer must be freed there
+/// to avoid leaking it (the arena fast path reclaims it wholesale).
+fn thrownOwned(allocator: Allocator, fqn: []const u8, message: []const u8) Allocator.Error!EvalResult {
+    const res = try thrown(allocator, fqn, message);
+    if (runtime.reclaimEnabled()) allocator.free(message);
+    return res;
 }
 
 /// Build a `List` / `MutableList` from an owned slice of values. Mirrors
@@ -70,7 +79,7 @@ fn makeSequence(allocator: Allocator, items: []Value) Allocator.Error!Value {
 
 /// Wrap an owned `[]const u8` in a fresh `String` value.
 fn newString(allocator: Allocator, owned: []const u8) Allocator.Error!Value {
-    return .{ .String = try StringRef.init(allocator, owned) };
+    return .{ .String = try StringRef.initOwned(allocator, owned) };
 }
 
 /// Default radix (10) or the Int radix in `v`. Mirrors `numeric::recv_int_radix`.
@@ -253,7 +262,7 @@ pub fn byte_array_decode_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     const end = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse len) else len;
     if (start < 0 or end > len or start > end) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "decodeToString: [{d}, {d}) out of bounds for length {d}", .{ start, end, len });
-        return try thrown(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
     }
     const out = try utf8Lossy(ctx.allocator, bytes[@intCast(start)..@intCast(end)]);
     return .{ .ok = try newString(ctx.allocator, out) };
@@ -324,13 +333,13 @@ pub fn string_get(ctx: *CallCtx) Allocator.Error!EvalResult {
     const idx = ctx.args[1].Int;
     if (idx < 0) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "index {d} out of bounds", .{idx});
-        return try thrown(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
     }
     if (utf16UnitAt(s, @intCast(idx))) |c| {
         return .{ .ok = .{ .Char = c } };
     }
     const msg = try std.fmt.allocPrint(ctx.allocator, "index {d} out of bounds (length {d})", .{ idx, utf16Len(s) });
-    return try thrown(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+    return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
 }
 
 pub fn string_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -354,7 +363,7 @@ pub fn string_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     if (start < 0 or end > len or start > end) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "substring({d},{d}) on length {d}", .{ start, end, len });
-        return try thrown(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
     }
     return .{ .ok = try newString(ctx.allocator, try utf16Slice(ctx.allocator, s, @intCast(start), @intCast(end))) };
 }
@@ -377,7 +386,7 @@ fn stringPad(ctx: *CallCtx, at_start: bool, who: []const u8) Allocator.Error!Eva
     };
     if (length < 0) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "Desired length {d} is less than zero.", .{length});
-        return try thrown(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
     var pad: u16 = ' ';
     if (ctx.args.len > 2) {
@@ -703,7 +712,7 @@ pub fn char_sequence_element_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     const idx = index.?;
     if (idx < 0 or @as(usize, @intCast(idx)) >= units.len) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "index: {d}, length: {d}", .{ idx, units.len });
-        return try thrown(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
     }
     return .{ .ok = .{ .Char = units[@intCast(idx)] } };
 }
@@ -920,7 +929,7 @@ pub fn string_repeat(ctx: *CallCtx) Allocator.Error!EvalResult {
     const n = ctx.args[1].Int;
     if (n < 0) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "Count `n` must be non-negative, but was {d}", .{n});
-        return try thrown(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
     const count: usize = @intCast(n);
     var out = try ctx.allocator.alloc(u8, s.len * count);
@@ -986,7 +995,7 @@ pub fn string_to_int(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     if (radix < 2 or radix > 36) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
-        return try thrown(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
     const parsed = parseIntRadix(s, @intCast(radix));
     if (parsed) |v| {
@@ -995,7 +1004,7 @@ pub fn string_to_int(ctx: *CallCtx) Allocator.Error!EvalResult {
         }
     }
     const msg = try std.fmt.allocPrint(ctx.allocator, "For input string: \"{s}\"", .{s});
-    return try thrown(ctx.allocator, "kotlin.NumberFormatException", msg);
+    return try thrownOwned(ctx.allocator, "kotlin.NumberFormatException", msg);
 }
 
 pub fn string_to_int_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -1232,7 +1241,7 @@ pub fn string_chunked(ctx: *CallCtx) Allocator.Error!EvalResult {
     const size_i = ctx.args[1].Int;
     if (size_i <= 0) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "Size {d} must be greater than zero.", .{size_i});
-        return try thrown(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
     const size: usize = @intCast(size_i);
     const transform: ?Value = if (ctx.args.len > 2 and ctx.args[2] != .Null) ctx.args[2] else null;
@@ -1271,7 +1280,7 @@ pub fn string_windowed(ctx: *CallCtx) Allocator.Error!EvalResult {
     const size_i = ctx.args[1].Int;
     if (size_i <= 0) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "size {d} must be greater than zero.", .{size_i});
-        return try thrown(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
     var step: i64 = 1;
     if (ctx.args.len > 2) {
@@ -1290,7 +1299,7 @@ pub fn string_windowed(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     if (step <= 0) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "step {d} must be greater than zero.", .{step});
-        return try thrown(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
     const chars = try utf16Units(ctx.allocator, s);
     defer ctx.allocator.free(chars);
@@ -1321,12 +1330,12 @@ pub fn string_to_double(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     if (parseDouble(s)) |d| return .{ .ok = .{ .Double = d } };
     const msg = try std.fmt.allocPrint(ctx.allocator, "For input string: \"{s}\"", .{s});
-    return try thrown(ctx.allocator, "kotlin.NumberFormatException", msg);
+    return try thrownOwned(ctx.allocator, "kotlin.NumberFormatException", msg);
 }
 
 fn numberFormatError(allocator: Allocator, s: []const u8) Allocator.Error!EvalResult {
     const msg = try std.fmt.allocPrint(allocator, "For input string: \"{s}\"", .{s});
-    return try thrown(allocator, "kotlin.NumberFormatException", msg);
+    return try thrownOwned(allocator, "kotlin.NumberFormatException", msg);
 }
 
 pub fn string_to_float(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -1685,13 +1694,13 @@ pub fn string_to_long(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     if (radix < 2 or radix > 36) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
-        return try thrown(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
     if (parseIntRadix(s, @intCast(radix))) |v| {
         return .{ .ok = .{ .Long = v } };
     }
     const msg = try std.fmt.allocPrint(ctx.allocator, "For input string: \"{s}\"", .{s});
-    return try thrown(ctx.allocator, "kotlin.NumberFormatException", msg);
+    return try thrownOwned(ctx.allocator, "kotlin.NumberFormatException", msg);
 }
 
 pub fn string_to_long_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -1785,7 +1794,7 @@ fn formatKotlin(allocator: Allocator, fmt: []const u8, args: []const Value) Allo
         }
         i += 1;
         if (i >= chars.len) {
-            return .{ .err = .{ .Thrown = try makeException(allocator, "java.util.UnknownFormatConversionException", try allocator.dupe(u8, "trailing %")) } };
+            return .{ .err = .{ .Thrown = try makeException(allocator, "java.util.UnknownFormatConversionException", "trailing %") } };
         }
         // Optional argument index `n$`.
         const start_i = i;
@@ -1832,7 +1841,7 @@ fn formatKotlin(allocator: Allocator, fmt: []const u8, args: []const Value) Allo
             if (i > pstart) precision = parseUsizeScalars(chars[pstart..i]) orelse 0;
         }
         if (i >= chars.len) {
-            return .{ .err = .{ .Thrown = try makeException(allocator, "java.util.UnknownFormatConversionException", try allocator.dupe(u8, "incomplete format specifier")) } };
+            return .{ .err = .{ .Thrown = try makeException(allocator, "java.util.UnknownFormatConversionException", "incomplete format specifier") } };
         }
         const conv = chars[i];
         i += 1;
@@ -2050,7 +2059,9 @@ fn formatConv(
         },
         else => {
             const msg = try std.fmt.allocPrint(allocator, "conversion: {u}", .{conv});
-            return .{ .err = .{ .Thrown = try makeException(allocator, "java.util.UnknownFormatConversionException", msg) } };
+            const exc = try makeException(allocator, "java.util.UnknownFormatConversionException", msg);
+            if (runtime.reclaimEnabled()) allocator.free(msg);
+            return .{ .err = .{ .Thrown = exc } };
         },
     }
 }
@@ -2478,7 +2489,7 @@ fn ctxFor(allocator: Allocator, args: []const Value) CallCtx {
 }
 
 fn strVal(allocator: Allocator, s: []const u8) !Value {
-    return .{ .String = try StringRef.init(allocator, try allocator.dupe(u8, s)) };
+    return .{ .String = try StringRef.initOwned(allocator, try allocator.dupe(u8, s)) };
 }
 
 fn expectStr(allocator: Allocator, res: EvalResult, want: []const u8) !void {

@@ -476,10 +476,10 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 // A dispatcher pool worker reports its registered
                 // upstream-shaped name (`DefaultDispatcher-worker-N`).
                 if (runtime.threadName(allocator, id)) |overridden| {
-                    return ok(.{ .String = try StringRef.init(allocator, overridden) });
+                    return ok(.{ .String = try StringRef.initOwned(allocator, overridden) });
                 }
                 const s = try std.fmt.allocPrint(allocator, "klio-thread-{d}", .{id});
-                return ok(.{ .String = try StringRef.init(allocator, s) });
+                return ok(.{ .String = try StringRef.initOwned(allocator, s) });
             }
         }
     }
@@ -1368,7 +1368,7 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 const m = try std.fmt.allocPrint(allocator, "lateinit property {s} has not been initialized", .{name});
                 return errRes(.{ .Throw = .{ .Exception = .{
                     .fqn = try StringRef.init(allocator, "kotlin.UninitializedPropertyAccessException"),
-                    .message = try StringRef.init(allocator, m),
+                    .message = try StringRef.initOwned(allocator, m),
                     .cause = null,
                 } } });
             }
@@ -1559,7 +1559,7 @@ fn unwrapDelegate(self: *VmHost, allocator: Allocator, d: ObjRef(runtime.Delegat
             const m = try std.fmt.allocPrint(allocator, "Property {s} should be initialized before get.", .{name});
             return errRes(.{ .Throw = .{ .Exception = .{
                 .fqn = try StringRef.init(allocator, "kotlin.IllegalStateException"),
-                .message = try StringRef.init(allocator, m),
+                .message = try StringRef.initOwned(allocator, m),
                 .cause = null,
             } } });
         },
