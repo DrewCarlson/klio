@@ -352,6 +352,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "cli", .module = mods.get("cli").? },
+                .{ .name = "runtime", .module = mods.get("runtime").? },
             },
         }),
     });
@@ -368,6 +369,7 @@ pub fn build(b: *std.Build) void {
             .optimize = harness_optimize,
             .imports = &.{
                 .{ .name = "cli", .module = harness_mods.get("cli").? },
+                .{ .name = "runtime", .module = harness_mods.get("runtime").? },
             },
         }),
     });

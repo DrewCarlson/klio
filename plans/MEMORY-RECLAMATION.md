@@ -203,7 +203,62 @@ any gap corrupts basic execution. The runtime cannot cheaply know, at a given
 This attempt was **reverted** (`src/ir/eval.zig` restored to `HEAD`). The
 committed foundation (§5) is untouched and correct.
 
-## 7. The plan: activate reclamation via IR `Retain`/`Drop` (correct-by-construction)
+## 7. The plan: activate reclamation (the ownership contract)
+
+### 7.0 Revised approach (decided after a full subsystem re-audit)
+
+A complete re-audit of the IR, lowering, evaluator, host, and coroutine
+subsystems revised the premise behind the §6 "runtime reclamation is
+all-or-nothing" conclusion. That attempt crashed **because the host/container
+stores did not retain their elements** (the §7.3 prerequisite), so dropping a
+register that held a container double-freed elements other registers still
+aliased. That prerequisite is required *identically* by the IR-`Retain`/`Drop`
+pass and by per-handler ownership — neither escapes it. The decisive realization:
+ownership at a given instruction is **statically known by its handler**
+(`LoadParam` always aliases a param slot, `NewList` always mints, `Move` always
+copies). That is not the "guess at `frame.write`/`read`" dead end of §6; it is
+correct-by-construction at the handler granularity, and it handles the hard
+cases (exception edges, suspension, `var`-home re-defs, phi joins, inlining)
+without a CFG liveness analysis.
+
+**The ownership contract (the model now being implemented):**
+
+- A **register owns exactly one strong reference** to the refcounted value it
+  holds. `Frame.read` is a borrow (no count change). `Frame.write` releases the
+  previous occupant, then stores (retain-new-before-release-old on the handler
+  side).
+- **Producers**: *mint* handlers (`Const` string, `BinOp` concat, `NewList`,
+  `MakeCell`, every host `Call`/`NewInstance` result) leave the dest owning the
+  one fresh ref — no retain. *alias* handlers (`Move`, `CellGet`, `LoadParam`,
+  `LoadCapture`, `GetField`, `LoadGlobal`, `Index`, `Cast`, `NotNullAssert`,
+  `QualifiedThis`, `MemberRef`, …) copy a value owned elsewhere — they `retain`
+  so the dest owns its own ref.
+- **Host-returns-owned contract**: every host function returns a value the
+  caller solely owns. Mints return as-is; accessors that return a borrowed
+  field/element/capture `retain` before returning.
+- **Stores retain**: every store into a container / field / global / cell /
+  capture slice `retain`s the element (the container owns its own ref) and
+  releases the value it overwrote.
+- **Frame teardown** releases the frame's regs, params, and captures. The return
+  (and escaping throw / non-local-return) value is retained out before teardown.
+- **Suspension**: the snapshot retains the regs/params/captures it copies; resume
+  retains into the rebuilt frame and releases+frees the consumed snapshot.
+- **Value model**: `StringRef` owns its bytes (init dupes; release frees);
+  the owning-`*Value` variants become `ObjRef`-backed so copies share by
+  refcount.
+
+**Everything is gated on `runtime.reclaimEnabled()`.** With reclaim off (today's
+production = arena + `setReclaim(false)`) the data model and behavior are
+byte-for-byte unchanged. With reclaim on (unit tests under `testing.allocator`,
+and the new checked/measured binary) the whole contract activates and is
+leak-/UAF-checked. The §7.8 flip removes `setReclaim(false)` and switches the
+process allocator to a freeing one. The IR `Retain`/`Drop` instructions of the
+original §7.1/§7.2 are **not required** by this model and are not being added;
+if validation ever shows growth the handler model cannot bound (a single
+never-returning frame that accumulates without overwrite), a liveness `Drop`
+pass can be layered on later.
+
+### Original §7.1/§7.2 sketch (superseded by 7.0; kept for reference)
 
 Stop guessing ownership at runtime. Make the **lowering** emit explicit
 ownership instructions, because the lowering generated the IR and knows the
@@ -350,12 +405,18 @@ in-memory representation. Independent of the leak; do it after.
       inert in production (`ba6bec4b`, `58266139`).
 - [x] Proven that runtime-guessing frame reclamation is all-or-nothing and
       corrupts trivial programs — reverted.
-- [ ] IR `Retain`/`Drop` instructions + liveness pass in the lowering (the
-      activation; §7). The committed `retain`/`release` is exactly what they call.
-- [ ] Container stores (IR + host) retain their elements (§7.3).
-- [ ] Coroutine suspension ownership handoff (§7.5).
-- [ ] Convert owning-`*Value` variants to `ObjRef` (§7.6).
+- [x] Decided the ownership contract (§7.0): per-handler ownership, gated on
+      `reclaimEnabled()`; no IR `Retain`/`Drop` pass needed.
+- [ ] Checked/measured binary path: env-gated freeing allocator + reclaim-ON
+      (`KLIO_RECLAIM`), `KLIO_ALLOC_TRACK` size histogram (§9 oracles).
 - [ ] `StringRef` owns+frees its bytes (§7.7).
+- [ ] Convert owning-`*Value` variants to `ObjRef` (§7.6).
+- [ ] Container/field/global/cell/capture stores retain + release-old (§7.3),
+      runtime + host audit.
+- [ ] Host-returns-owned contract: accessors retain borrowed returns.
+- [ ] eval register balance: `Frame.write` release-old, `Frame.deinit`
+      release regs/params/captures, alias-handlers retain, return retains out.
+- [ ] Coroutine suspension ownership handoff (§7.5).
 - [ ] Flip production to reclaim-ON + freeing allocator; verify server RSS flat
       (§7.8).
 - [ ] Startup baseline / lazy stdlib (§8).

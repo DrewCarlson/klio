@@ -69,6 +69,36 @@ pub fn reclaimEnabled() bool {
     return reclaim_tls;
 }
 
+/// Whether the process was asked to run the freeing reference-counting path
+/// (a real allocator + reclaim-ON) instead of the arena fast path, via the
+/// `KLIO_RECLAIM` environment variable (`1`/`smp`/`debug` = on; unset/`0` =
+/// off). The run path consults this to decide whether to disable reclaim; the
+/// process entry point consults it to pick the backing allocator. Cached so
+/// repeated checks across the run are cheap and consistent.
+var reclaim_req_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0); // 0 unknown, 1 off, 2 on
+
+/// libc `getenv` wrapper returning a borrowed slice. Returns null in a build
+/// without libc (module test binaries) — those never set the env anyway.
+pub fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
+    if (comptime !@import("builtin").link_libc) return null;
+    const raw = std.c.getenv(name) orelse return null;
+    return std.mem.span(raw);
+}
+
+pub fn reclaimRequested() bool {
+    switch (reclaim_req_state.load(.monotonic)) {
+        1 => return false,
+        2 => return true,
+        else => {},
+    }
+    const on = blk: {
+        const v = getenvSlice("KLIO_RECLAIM") orelse break :blk false;
+        break :blk v.len != 0 and !std.mem.eql(u8, v, "0");
+    };
+    reclaim_req_state.store(if (on) 2 else 1, .monotonic);
+    return on;
+}
+
 /// Reader/writer spin lock. `state` encodes the lock as `RefCell` does
 /// its flag: `0` free, `n > 0` n active readers, `WRITER` (the sign bit)
 /// exclusive writer. Many readers proceed concurrently; a writer is
