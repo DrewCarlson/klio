@@ -2155,6 +2155,8 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                             fv = .{ .Long = n };
                         }
                         retainFieldList(&fields, allocator, pp[k].name);
+                        // The instance owns one ref to each primary-ctor field.
+                        if (runtime.reclaimEnabled()) fv.retain();
                         try fields.append(allocator, .{ .name = pp[k].name, .value = fv });
                     }
                 }

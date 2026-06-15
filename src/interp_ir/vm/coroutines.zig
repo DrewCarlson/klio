@@ -598,6 +598,9 @@ pub const CooperativeInterceptor = struct {
         }
         self.parked.deinit();
         self.ready.deinit(self.allocator);
+        // Release any blocks still queued (never drained) so the queue's owned
+        // references do not leak when the interceptor is torn down.
+        if (runtime.reclaimEnabled()) for (self.launched.items) |b| b.release(self.allocator);
         self.launched.deinit(self.allocator);
         self.slot_to_token.deinit();
         self.token_resume_value.deinit();
@@ -728,8 +731,11 @@ pub const CooperativeInterceptor = struct {
         return out;
     }
 
-    /// Seam: queue a child `launch` block.
+    /// Seam: queue a child `launch` block. The queue owns one reference to
+    /// the block until it is drained and dispatched (`drainLaunched` callers
+    /// release it after running it).
     pub fn enqueueLaunch(self: *CooperativeInterceptor, block: Value) Allocator.Error!void {
+        if (runtime.reclaimEnabled()) block.retain();
         try self.launched.append(self.allocator, block);
     }
 
@@ -1220,8 +1226,14 @@ fn pumpLoop(
         defer a.free(launched);
         for (launched) |child| {
             const child_scope_base = activeScopeDepth();
-            switch (try intrinsic_host.evalClosureRaw(self, &child, &.{}, scope, out)) {
-                .ok => {},
+            const child_res = try intrinsic_host.evalClosureRaw(self, &child, &.{}, scope, out);
+            switch (child_res) {
+                // The block ran to completion: the launch queue's owned
+                // reference is no longer needed. A *suspended* block is still
+                // in flight (its captured continuation must stay live until it
+                // resumes), so its reference is kept and released when its
+                // park completes via the snapshot teardown.
+                .ok => if (runtime.reclaimEnabled()) child.release(a),
                 .err => |e| switch (e) {
                     .Suspended => |st| _ = try park(a, st, child_scope_base),
                     else => {
@@ -1607,8 +1619,9 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
         const scope = activeCoroScope() orelse Value.Unit;
         for (launched) |child| {
             const child_scope_base = activeScopeDepth();
-            switch (try intrinsic_host.evalClosureRaw(self, &child, &.{}, &scope, out)) {
-                .ok => {},
+            const child_res = try intrinsic_host.evalClosureRaw(self, &child, &.{}, &scope, out);
+            switch (child_res) {
+                .ok => if (runtime.reclaimEnabled()) child.release(a),
                 .err => |e| switch (e) {
                     .Suspended => |st| _ = try park(a, st, child_scope_base),
                     .Throw => |v| {

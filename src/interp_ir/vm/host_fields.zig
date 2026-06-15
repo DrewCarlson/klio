@@ -429,7 +429,9 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // Value-class internal-field read on `kotlin.Result` /
     // `ChannelResult`: a bare `value`/`holder` read yields the payload.
     if ((std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "holder")) and receiver.* == .Result) {
-        return ok(receiver.Result.payload.*);
+        const out = receiver.Result.payload.asPtr().*;
+        out.retain();
+        return ok(out);
     }
     // Backing-field bypass: `field` lowers into a read on this synthetic
     // name. Route straight to the raw instance slot.
@@ -465,7 +467,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if (receiver.* == .BoundMethod) {
         const bm = receiver.BoundMethod;
         if (std.mem.eql(u8, bm.fqn, "kotlin.concurrent.Thread")) {
-            const id: u64 = switch (bm.receiver.*) {
+            const id: u64 = switch (bm.receiver.asPtr().*) {
                 .Long => |v| @bitCast(v),
                 else => 0,
             };
@@ -1885,6 +1887,11 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             }
         }
         {
+            // `define` adopts one owned reference, but `value` here is the
+            // caller's borrow (the `SetField` opcode reads it straight out of a
+            // register). Retain so the field owns its own reference and the
+            // instance's teardown release is balanced. No-op under the arena.
+            value.retain();
             const g = inst.borrowMut();
             defer g.deinit();
             try g.get().define(allocator, real_name, value);

@@ -33,6 +33,13 @@ pub const ValueSlice = ObjRef([]Value);
 pub const MapPair = struct { key: Value, value: Value };
 /// `ObjRef<Vec<(Value, Value)>>` — shared, growable map entry storage.
 pub const MapEntries = ObjRef(std.ArrayList(MapPair));
+/// A refcounted box holding a single `Value` (Rust `Box<Value>` mapped to a
+/// shared handle). Used for the component slots of `Pair`/`Triple`/`MapEntry`/
+/// `Result`/`Exception.cause`/`BoundMethod.receiver`/`Sequence` generators so a
+/// copy of the enclosing value shares the box by refcount and releasing the
+/// last copy recursively frees the boxed `Value` (via `ObjRef(Value).deinit` →
+/// `Value.deinit`). Same backing type as a capture `Cell`.
+pub const ValueBox = ObjRef(Value);
 
 /// Which face of a `MutableMap` a live view exposes.
 pub const MapViewKind = enum { Keys, Values, Entries };
@@ -197,7 +204,7 @@ pub const SequenceSource = union(enum) {
     Items: ValueSlice,
     /// `generateSequence(seed) { it -> next }`. `seed` is null for the
     /// nullary form.
-    Generate: struct { seed: ?*Value, next: *Value },
+    Generate: struct { seed: ?ValueBox, next: ValueBox },
 };
 
 pub const SeqOp = union(enum) {
@@ -297,7 +304,7 @@ pub const Value = union(enum) {
     BoundMethod: struct {
         fqn: []const u8,
         func: StdlibFn,
-        receiver: *Value,
+        receiver: ValueBox,
     },
     /// A user-method reference bound to a specific instance.
     BoundUserMethod: struct {
@@ -308,7 +315,7 @@ pub const Value = union(enum) {
     Exception: struct {
         fqn: StringRef,
         message: ?StringRef,
-        cause: ?*Value,
+        cause: ?ValueBox,
     },
     /// `kotlin.collections.List` / `MutableList`.
     List: struct {
@@ -350,20 +357,20 @@ pub const Value = union(enum) {
         declared_value: ?[]const u8 = null,
     },
     /// `kotlin.Pair`.
-    Pair: struct { first: *Value, second: *Value },
+    Pair: struct { first: ValueBox, second: ValueBox },
     /// `kotlin.Triple`.
-    Triple: struct { first: *Value, second: *Value, third: *Value },
+    Triple: struct { first: ValueBox, second: ValueBox, third: ValueBox },
     /// `kotlin.collections.Map.Entry`.
     MapEntry: struct {
-        key: *Value,
-        value: *Value,
+        key: ValueBox,
+        value: ValueBox,
         /// When set, the live map's entries: `setValue` writes through.
         backing: ?MapEntries,
     },
     /// `kotlin.Result<T>`.
     Result: struct {
         ok: bool,
-        payload: *Value,
+        payload: ValueBox,
     },
     /// `kotlin.Comparator<T>`.
     Comparator: struct {
@@ -428,6 +435,13 @@ pub const Value = union(enum) {
         return p;
     }
 
+    /// Box a `Value` into a refcounted `ValueBox` (the owning component slot of
+    /// `Pair`/`Triple`/`MapEntry`/`Result`/etc.). The box owns `v`; copies of
+    /// the enclosing value clone the box, and the last release frees `v`.
+    pub fn boxRef(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error!ValueBox {
+        return ValueBox.init(allocator, v);
+    }
+
     /// Reference-counting increment (Rust `Clone`): bump the strong count of
     /// every refcounted handle this value holds, returning another owning
     /// copy of the same value graph. Primitives and the immutable program
@@ -435,37 +449,75 @@ pub const Value = union(enum) {
     /// (`Pair`/`Triple`/`MapEntry`/`Result`/`BoundMethod`/`Exception.cause`)
     /// are not yet refcounted — they share their boxes on copy and are
     /// retained/released as no-ops here until they are converted to `ObjRef`.
-    pub fn retain(self: Value) void {
+    /// Single source of truth for the value graph's out-edges: invokes
+    /// `visitor.visit(objref)` for every refcounted `ObjRef` handle this value
+    /// *directly* holds (one level — the handle's own cell, not its transitive
+    /// elements; a container backing cell's own children are reached through the
+    /// cell's GC `trace_fn`). `retain` (incref), `release` (decref), and the GC
+    /// mark phase all drive this same walk, so they cannot diverge. `backing`
+    /// write-through views are non-owning and intentionally not visited.
+    pub fn forEachChildCell(self: Value, visitor: anytype) void {
         switch (self) {
-            .String => |s| _ = s.clone(),
-            .Instance => |i| _ = i.clone(),
-            .BoundUserMethod => |m| _ = m.receiver.clone(),
-            .Sequence => |s| _ = s.clone(),
-            .Delegate => |d| _ = d.clone(),
-            .Regex => |r| _ = r.clone(),
-            .Match => |m| _ = m.clone(),
-            .StringBuilder => |s| _ = s.clone(),
-            .Cell => |c| _ = c.clone(),
-            .Function => |f| _ = f.env.clone(),
-            .IrClosure => |c| _ = c.captures.clone(),
-            .Comparator => |c| _ = c.steps.clone(),
-            .List => |x| _ = x.items.clone(),
-            .Set => |x| _ = x.items.clone(),
-            .Array => |x| _ = x.items.clone(),
-            .Map => |x| _ = x.entries.clone(),
+            .String => |s| visitor.visit(s),
+            .Instance => |i| visitor.visit(i),
+            .BoundUserMethod => |m| visitor.visit(m.receiver),
+            .Sequence => |s| visitor.visit(s),
+            .Delegate => |d| visitor.visit(d),
+            .Regex => |r| visitor.visit(r),
+            .Match => |m| visitor.visit(m),
+            .StringBuilder => |s| visitor.visit(s),
+            .Cell => |c| visitor.visit(c),
+            .Function => |f| visitor.visit(f.env),
+            .IrClosure => |c| visitor.visit(c.captures),
+            .Comparator => |c| visitor.visit(c.steps),
+            .List => |x| visitor.visit(x.items),
+            .Set => |x| visitor.visit(x.items),
+            .Array => |x| visitor.visit(x.items),
+            .Map => |x| visitor.visit(x.entries),
             .Iterator => |x| {
-                _ = x.items.clone();
-                _ = x.pos.clone();
+                visitor.visit(x.items);
+                visitor.visit(x.pos);
             },
-            .RangeIter => |x| _ = x.cur.clone(),
-            .PropertyRef => |p| _ = p.name.clone(),
-            .MatchGroup => |g| _ = g.value.clone(),
+            .RangeIter => |x| visitor.visit(x.cur),
+            .PropertyRef => |p| visitor.visit(p.name),
+            .MatchGroup => |g| visitor.visit(g.value),
             .Exception => |e| {
-                _ = e.fqn.clone();
-                if (e.message) |m| _ = m.clone();
+                visitor.visit(e.fqn);
+                if (e.message) |m| visitor.visit(m);
+                if (e.cause) |c| visitor.visit(c);
             },
+            .Pair => |p| {
+                visitor.visit(p.first);
+                visitor.visit(p.second);
+            },
+            .Triple => |t| {
+                visitor.visit(t.first);
+                visitor.visit(t.second);
+                visitor.visit(t.third);
+            },
+            .MapEntry => |e| {
+                visitor.visit(e.key);
+                visitor.visit(e.value);
+            },
+            .Result => |r| visitor.visit(r.payload),
+            .BoundMethod => |m| visitor.visit(m.receiver),
             else => {},
         }
+    }
+
+    const RetainVisitor = struct {
+        inline fn visit(_: RetainVisitor, objref: anytype) void {
+            _ = objref.clone();
+        }
+    };
+
+    pub fn retain(self: Value) void {
+        // Gated to match `release` (whose `ObjRef.deinit` is a no-op under the
+        // arena fast path): under reclaim-off retains and releases are both
+        // skipped, so the arena reclaims everything and production pays no
+        // refcount traffic. Under reclaim-on both run and stay balanced.
+        if (!objcell.reclaimEnabled()) return;
+        self.forEachChildCell(RetainVisitor{});
     }
 
     /// Reference-counting decrement (Rust `Drop`): drop one owning handle to
@@ -485,10 +537,9 @@ pub const Value = union(enum) {
             .StringBuilder => |s| s.deinit(),
             .Cell => |c| c.deinit(),
             .Function => |f| f.env.deinit(),
-            .IrClosure => |c| {
-                releaseSliceElems(c.captures, allocator);
-                c.captures.deinit();
-            },
+            // `releaseSliceElems` already drops the slice handle (its tail
+            // `slice.deinit()`); do not deinit it again.
+            .IrClosure => |c| releaseSliceElems(c.captures, allocator),
             .Comparator => |c| c.steps.deinit(),
             .List => |x| releaseValueList(x.items, allocator),
             .Set => |x| releaseValueList(x.items, allocator),
@@ -515,7 +566,24 @@ pub const Value = union(enum) {
             .Exception => |e| {
                 e.fqn.deinit();
                 if (e.message) |m| m.deinit();
+                if (e.cause) |c| c.deinit();
             },
+            .Pair => |p| {
+                p.first.deinit();
+                p.second.deinit();
+            },
+            .Triple => |t| {
+                t.first.deinit();
+                t.second.deinit();
+                t.third.deinit();
+            },
+            .MapEntry => |e| {
+                e.key.deinit();
+                e.value.deinit();
+                // `backing` is a non-owning write-through reference; not released.
+            },
+            .Result => |r| r.payload.deinit(),
+            .BoundMethod => |m| m.receiver.deinit(),
             else => {},
         }
     }
@@ -941,13 +1009,13 @@ pub const Value = union(enum) {
             .Set => |x| if (b.* == .Set) return setEqBoxed(x.items, b.Set.items),
             .Map => |x| if (b.* == .Map) return mapEqBoxed(x.entries, b.Map.entries),
             .Pair => |x| if (b.* == .Pair)
-                return structuralEqBoxed(x.first, b.Pair.first) and structuralEqBoxed(x.second, b.Pair.second),
+                return structuralEqBoxed(x.first.asPtr(), b.Pair.first.asPtr()) and structuralEqBoxed(x.second.asPtr(), b.Pair.second.asPtr()),
             .Triple => |x| if (b.* == .Triple)
-                return structuralEqBoxed(x.first, b.Triple.first) and
-                    structuralEqBoxed(x.second, b.Triple.second) and
-                    structuralEqBoxed(x.third, b.Triple.third),
+                return structuralEqBoxed(x.first.asPtr(), b.Triple.first.asPtr()) and
+                    structuralEqBoxed(x.second.asPtr(), b.Triple.second.asPtr()) and
+                    structuralEqBoxed(x.third.asPtr(), b.Triple.third.asPtr()),
             .MapEntry => |x| if (b.* == .MapEntry)
-                return structuralEqBoxed(x.key, b.MapEntry.key) and structuralEqBoxed(x.value, b.MapEntry.value),
+                return structuralEqBoxed(x.key.asPtr(), b.MapEntry.key.asPtr()) and structuralEqBoxed(x.value.asPtr(), b.MapEntry.value.asPtr()),
             else => {},
         }
         // Any other mix of two numerics is a cross-type boxed comparison.
@@ -985,17 +1053,17 @@ pub const Value = union(enum) {
             .Set => |x| b.* == .Set and setEqBoxed(x.items, b.Set.items),
             .Map => |x| b.* == .Map and mapEqBoxed(x.entries, b.Map.entries),
             .Pair => |x| b.* == .Pair and
-                structuralEqBoxed(x.first, b.Pair.first) and structuralEqBoxed(x.second, b.Pair.second),
+                structuralEqBoxed(x.first.asPtr(), b.Pair.first.asPtr()) and structuralEqBoxed(x.second.asPtr(), b.Pair.second.asPtr()),
             .Triple => |x| b.* == .Triple and
-                structuralEqBoxed(x.first, b.Triple.first) and
-                structuralEqBoxed(x.second, b.Triple.second) and
-                structuralEqBoxed(x.third, b.Triple.third),
+                structuralEqBoxed(x.first.asPtr(), b.Triple.first.asPtr()) and
+                structuralEqBoxed(x.second.asPtr(), b.Triple.second.asPtr()) and
+                structuralEqBoxed(x.third.asPtr(), b.Triple.third.asPtr()),
             .MapEntry => |x| b.* == .MapEntry and
-                structuralEqBoxed(x.key, b.MapEntry.key) and structuralEqBoxed(x.value, b.MapEntry.value),
-            .Result => |x| b.* == .Result and x.ok == b.Result.ok and structuralEq(x.payload, b.Result.payload),
+                structuralEqBoxed(x.key.asPtr(), b.MapEntry.key.asPtr()) and structuralEqBoxed(x.value.asPtr(), b.MapEntry.value.asPtr()),
+            .Result => |x| b.* == .Result and x.ok == b.Result.ok and structuralEq(x.payload.asPtr(), b.Result.payload.asPtr()),
             .Class => |x| b.* == .Class and classFqnEq(x, b.Class),
             .IrClosure => |x| b.* == .IrClosure and x.id == b.IrClosure.id and ValueSlice.ptrEq(x.captures, b.IrClosure.captures),
-            .BoundMethod => |x| b.* == .BoundMethod and std.mem.eql(u8, x.fqn, b.BoundMethod.fqn) and structuralEq(x.receiver, b.BoundMethod.receiver),
+            .BoundMethod => |x| b.* == .BoundMethod and std.mem.eql(u8, x.fqn, b.BoundMethod.fqn) and structuralEq(x.receiver.asPtr(), b.BoundMethod.receiver.asPtr()),
             .Instance => |x| b.* == .Instance and instanceEq(x, b.Instance),
             else => false,
         };
@@ -1115,28 +1183,28 @@ pub const Value = union(enum) {
             },
             .Pair => |p| {
                 try writer.writeByte('(');
-                try p.first.writeTo(writer);
+                try p.first.asPtr().writeTo(writer);
                 try writer.writeAll(", ");
-                try p.second.writeTo(writer);
+                try p.second.asPtr().writeTo(writer);
                 try writer.writeByte(')');
             },
             .Triple => |t| {
                 try writer.writeByte('(');
-                try t.first.writeTo(writer);
+                try t.first.asPtr().writeTo(writer);
                 try writer.writeAll(", ");
-                try t.second.writeTo(writer);
+                try t.second.asPtr().writeTo(writer);
                 try writer.writeAll(", ");
-                try t.third.writeTo(writer);
+                try t.third.asPtr().writeTo(writer);
                 try writer.writeByte(')');
             },
             .MapEntry => |e| {
-                try e.key.writeTo(writer);
+                try e.key.asPtr().writeTo(writer);
                 try writer.writeByte('=');
-                try e.value.writeTo(writer);
+                try e.value.asPtr().writeTo(writer);
             },
             .Result => |r| {
                 try writer.writeAll(if (r.ok) "Success(" else "Failure(");
-                try r.payload.writeTo(writer);
+                try r.payload.asPtr().writeTo(writer);
                 try writer.writeByte(')');
             },
             .Comparator => try writer.writeAll("Comparator"),

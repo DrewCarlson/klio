@@ -380,7 +380,54 @@ pub const SuspendState = struct {
     /// it records the frame snapshot. Always `null` once a frame has
     /// been pushed.
     pending_resume_reg: ?Reg = null,
+
+    /// Release every value reference this state's snapshots retained on
+    /// suspend and free the snapshot slice buffers. Call this exactly once
+    /// when a parked state is dropped *without* being resumed (a cancelled
+    /// or abandoned coroutine) — `resumeContinuation` instead transfers the
+    /// retained references into the rebuilt frames. No-op under the arena.
+    /// The caller still owns the `frames` ArrayList itself.
+    pub fn deinit(self: *SuspendState, allocator: Allocator) void {
+        if (runtime.reclaimEnabled()) {
+            for (self.frames.items) |snap| releaseSnapshotValues(snap, allocator);
+        }
+        for (self.frames.items) |snap| freeSnapshotBuffers(snap, allocator);
+        self.frames.deinit(allocator);
+    }
 };
+
+/// Retain the value references a freshly-built snapshot copies out of a
+/// suspending frame: regs (the frame owns them and releases them as it
+/// unwinds), and params/captures (aliases of caller registers / closure
+/// captures that the unwinding stack will release). The receiver chain is a
+/// borrow kept alive by those owners, so it is not retained here. No-op
+/// under the arena.
+fn retainSnapshotValues(snap: FrameSnapshot) void {
+    if (!runtime.reclaimEnabled()) return;
+    for (snap.regs) |v| v.retain();
+    for (snap.params) |v| v.retain();
+    for (snap.captures) |v| v.retain();
+}
+
+/// Release what `retainSnapshotValues` retained (the drop-without-resume
+/// path). Mirrors the retain set exactly.
+fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
+    for (snap.regs) |v| v.release(allocator);
+    for (snap.params) |v| v.release(allocator);
+    for (snap.captures) |v| v.release(allocator);
+}
+
+/// Free the dupe'd slice buffers a snapshot owns. Gated on reclaim: under
+/// the arena, `free` can rewind the last bump allocation, so production
+/// leaves the buffers for wholesale reclaim (byte-identical to before).
+fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
+    if (!runtime.reclaimEnabled()) return;
+    allocator.free(snap.regs);
+    allocator.free(snap.params);
+    allocator.free(snap.captures);
+    allocator.free(snap.enclosing_this);
+    allocator.free(snap.try_stack);
+}
 
 /// Per-call evaluation frame.
 const Frame = struct {
@@ -415,6 +462,12 @@ const Frame = struct {
     /// the main one (which would index a different, wrong function).
     module_arc: ?*const Module,
     allocator: Allocator,
+    /// A frame rebuilt by `resumeContinuation` *adopts* the values its
+    /// `SuspendState` snapshot retained: it owns one reference to each
+    /// param/capture (not just the regs), so its teardown must release them
+    /// to balance the retain the snapshot took on suspend. A freshly-called
+    /// frame leaves this false — its params/captures are borrows.
+    owns_params_caps: bool = false,
 
     fn newWithCaptures(
         allocator: Allocator,
@@ -494,6 +547,18 @@ const Frame = struct {
     }
 
     fn deinit(self: *Frame) void {
+        // A register owns one reference to its value; release them all on
+        // teardown. The return/escaping value is retained out before this runs,
+        // and a suspended frame's registers are retained into its snapshot.
+        // `params`/`captures` are borrows — only their buffers are freed here.
+        // No-op under the arena fast path.
+        if (runtime.reclaimEnabled()) {
+            for (self.regs.items) |v| v.release(self.allocator);
+            if (self.owns_params_caps) {
+                for (self.params.items) |v| v.release(self.allocator);
+                for (self.captures.items) |v| v.release(self.allocator);
+            }
+        }
         self.regs.deinit(self.allocator);
         self.params.deinit(self.allocator);
         self.captures.deinit(self.allocator);
@@ -506,12 +571,20 @@ const Frame = struct {
         return .Unit;
     }
 
+    /// Store `v` into register `r`, taking ownership of one reference to `v`.
+    /// The previous occupant is released. No refcount traffic under the arena.
     fn write(self: *Frame, r: Reg, v: Value) Allocator.Error!void {
         const idx = r.int();
         if (idx >= self.regs.items.len) {
             try self.regs.appendNTimes(self.allocator, .Unit, idx + 1 - self.regs.items.len);
         }
-        self.regs.items[idx] = v;
+        if (runtime.reclaimEnabled()) {
+            const old = self.regs.items[idx];
+            self.regs.items[idx] = v;
+            old.release(self.allocator);
+        } else {
+            self.regs.items[idx] = v;
+        }
     }
 
     fn block(self: *const Frame, b: BlockId) *const ir.Block {
@@ -690,6 +763,10 @@ pub fn resumeContinuation(
         var frame = try Frame.newWithCaptures(allocator, m, func, params, caps);
         defer frame.deinit();
         frame.module_arc = snap_module;
+        // This frame adopts the references the snapshot retained on suspend:
+        // its params/captures (and regs, always owned) are released by its
+        // teardown, balancing the suspend-time retain.
+        frame.owns_params_caps = true;
         // Restore the frame's enclosing-`this` chain verbatim so implicit
         // receivers resolved before the park resolve identically after it.
         try frame.activateChainFrom(snap.enclosing_this);
@@ -708,7 +785,7 @@ pub fn resumeContinuation(
             resume_throw = exc;
         } else if (first) {
             if (carry == .Result and !carry.Result.ok) {
-                resume_throw = carry.Result.payload.*;
+                resume_throw = carry.Result.payload.asPtr().*;
             }
         }
         first = false;
@@ -720,6 +797,11 @@ pub fn resumeContinuation(
         var try_stack: std.ArrayList(TryFrame) = .empty;
         defer try_stack.deinit(allocator);
         try try_stack.appendSlice(allocator, snap.try_stack);
+        // Everything the snapshot held is now copied into frame-owned buffers
+        // (regs/params/captures/chain/try-stack); the frame owns the value
+        // references (released by its teardown). Free the snapshot's own slice
+        // buffers — but not its values, which moved into the frame.
+        freeSnapshotBuffers(snap, allocator);
         const r = try runFrameInner(H, allocator, m, &frame, &try_stack, snap.block, snap.inst_idx, resume_throw, host);
         switch (r) {
             .ok => |v| carry = v,
@@ -872,7 +954,7 @@ fn runFrameInner(
                             state.pending_resume_reg = null;
                             break :blk rr;
                         } else instDst(inst);
-                        try state.frames.append(allocator, .{
+                        const snap: FrameSnapshot = .{
                             .func = frame.func.id,
                             .module = frame.module_arc,
                             .block = cur,
@@ -884,7 +966,13 @@ fn runFrameInner(
                             .try_stack = try allocator.dupe(TryFrame, try_stack.items),
                             .is_lambda = frame.func.is_lambda,
                             .resume_reg = resume_reg,
-                        });
+                        };
+                        // The snapshot now holds the only references that will
+                        // survive this frame's teardown (its regs are released
+                        // as the stack unwinds; its params/captures alias caller
+                        // regs / closure captures the unwind also releases).
+                        retainSnapshotValues(snap);
+                        try state.frames.append(allocator, snap);
                         return errResult(.{ .Suspended = state });
                     },
                     else => return errResult(e),
@@ -1001,6 +1089,9 @@ fn runFrameInner(
             },
             .Return => |maybe_r| {
                 const v = if (maybe_r) |r| frame.read(r) else Value.Unit;
+                // The value escapes this frame; retain so frame teardown does
+                // not free it from under the caller.
+                v.retain();
                 // Walk the try-stack for the nearest finally; route the
                 // return through it.
                 var chosen: ?struct { i: usize, jump: BlockId, key: BlockId } = null;
@@ -1023,6 +1114,7 @@ fn runFrameInner(
             },
             .NonLocalReturn => |maybe_r| {
                 const v = if (maybe_r) |r| frame.read(r) else Value.Unit;
+                v.retain();
                 if (frame.func.is_lambda or frame.func.is_inline) {
                     return errResult(.{ .NonLocalReturn = v });
                 }
@@ -1030,6 +1122,7 @@ fn runFrameInner(
             },
             .LabeledReturn => |lr| {
                 const v = if (lr.value) |r| frame.read(r) else Value.Unit;
+                v.retain();
                 if (frameMatchesLabel(frame.func, lr.label)) {
                     return ok(v);
                 }
@@ -1037,6 +1130,7 @@ fn runFrameInner(
             },
             .Throw => |r| {
                 const exc = frame.read(r);
+                exc.retain();
                 if (envVarSet("KLIO_THROW_TRACE")) {
                     const s = displayThrow(allocator, &exc) catch "";
                     std.debug.print("[throw-trace] from fn {s} (fqn={s}): {s}\n", .{ frame.func.name, frame.func.fqn, s });
@@ -1189,10 +1283,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .Move => |mv| {
             const v = frame.read(mv.src);
+            v.retain();
             try frame.write(mv.dst, v);
         },
         .MakeCell => |mc| {
             const v = frame.read(mc.src);
+            v.retain();
             try frame.write(mc.dst, try Value.newCell(allocator, v));
         },
         .CellGet => |cg| {
@@ -1204,15 +1300,19 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 },
                 else => |other| other,
             };
+            v.retain();
             try frame.write(cg.dst, v);
         },
         .CellSet => |cs| {
             const v = frame.read(cs.value);
+            v.retain();
             switch (frame.read(cs.cell)) {
                 .Cell => |c| {
                     const g = c.borrowMut();
                     defer g.deinit();
+                    const old = g.get().*;
                     g.get().* = v;
+                    if (runtime.reclaimEnabled()) old.release(allocator);
                 },
                 else => {
                     try frame.write(cs.cell, v);
@@ -1395,6 +1495,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .Trace => {},
         .LoadParam => |lp| {
             const v = if (lp.idx < frame.params.items.len) frame.params.items[lp.idx] else Value.Unit;
+            v.retain();
             try frame.write(lp.dst, v);
         },
         .NotNullAssert => |nn| {
@@ -1407,6 +1508,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 } };
                 return errResult(.{ .Throw = exc });
             }
+            v.retain();
             try frame.write(nn.dst, v);
         },
         .GetField => |gf| {
@@ -1427,7 +1529,11 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const got = host.getField(allocator, &recv, name);
             if (pushed_enclosing) popEnclosing();
             switch (try got) {
-                .ok => |v| try frame.write(gf.dst, v),
+                // host.getField returns a borrowed field value; the register owns its ref.
+                .ok => |v| {
+                    v.retain();
+                    try frame.write(gf.dst, v);
+                },
                 .err => |e| return errResult(e),
             }
         },
@@ -1653,6 +1759,8 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .CallSuper => |csup| {
             const recv = frame.read(csup.receiver);
+            recv.retain();
+            defer recv.release(allocator);
             const owner_str = constStr(frame.module, csup.owner_class) orelse
                 return errResult(.{ .Type = "CallSuper: owner not a string const" });
             const qual_str: ?[]const u8 = if (csup.qualifier) |id| constStr(frame.module, id) else null;
@@ -1670,6 +1778,14 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |cm| {
             const recv = frame.read(cm.receiver);
+            // A method borrows its receiver for the call's whole duration.
+            // Pin it: the dispatched body may, via the coroutine machinery,
+            // drop every other reference to the receiver (e.g. a job
+            // completing inside `runBlocking.joinBlocking`), and the register
+            // read is only a borrow. Retain across the dispatch so the
+            // receiver outlives the call regardless. No-op under the arena.
+            recv.retain();
+            defer recv.release(allocator);
             const name_str = constStr(frame.module, cm.name) orelse
                 return errResult(.{ .Type = "CallMember: name not a string const" });
             const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
@@ -1703,6 +1819,8 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .CallMemberOrValue => |cmv| {
             const recv = frame.read(cmv.receiver);
+            recv.retain();
+            defer recv.release(allocator);
             const user_args = try readArgRun(allocator, frame, cmv.args, cmv.n_args);
             defer allocator.free(user_args);
             const names = try resolveArgNames(allocator, frame.module, cmv.arg_names);
@@ -1818,8 +1936,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .Cast => |cast| {
             const v = frame.read(cast.src);
             if (host.instanceOf(&v, cast.ty)) {
+                v.retain();
                 try frame.write(cast.dst, v);
             } else if (typeParamCastPasses(H, frame, cast.ty, host)) {
+                v.retain();
                 try frame.write(cast.dst, v);
             } else if (cast.safe) {
                 try frame.write(cast.dst, .Null);
@@ -1948,10 +2068,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                 return errResult(.{ .Unbound = msg });
             }
+            v.retain();
             try frame.write(lg.dst, v);
         },
         .LoadCapture => |lc| {
             const v = if (lc.idx < frame.captures.items.len) frame.captures.items[lc.idx] else Value.Unit;
+            v.retain();
             try frame.write(lc.dst, v);
         },
         .LoadFromThisOrGlobal => |lt| {
@@ -2017,6 +2139,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     .err => |e| return errResult(e),
                 }
             }
+            v.retain();
             try frame.write(lt.dst, v);
         },
         .Index => |ix| {
@@ -2053,7 +2176,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const qual_str = constStr(frame.module, qt.qualifier) orelse
                 return errResult(.{ .Type = "QualifiedThis: qualifier not a string const" });
             switch (try host.qualifiedThis(allocator, &recv, qual_str)) {
-                .ok => |v| try frame.write(qt.dst, v),
+                .ok => |v| {
+                    v.retain();
+                    try frame.write(qt.dst, v);
+                },
                 .err => |e| return errResult(e),
             }
         },

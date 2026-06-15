@@ -84,12 +84,8 @@ const FILE_INIT_FAILED_MSG = "There was an error during file or class initializa
 fn fileInitFailedThrow(allocator: Allocator, cause: ?Value) Allocator.Error!EvalError {
     const fqn = try StringRef.init(allocator, FILE_INIT_FAILED_FQN);
     const msg = try StringRef.init(allocator, FILE_INIT_FAILED_MSG);
-    const cause_ptr: ?*Value = if (cause) |c| blk: {
-        const p = try allocator.create(Value);
-        p.* = c;
-        break :blk p;
-    } else null;
-    return .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = cause_ptr } } };
+    const cause_box = if (cause) |c| try Value.boxRef(allocator, c) else null;
+    return .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = cause_box } } };
 }
 
 /// What the claim step decided for one gate pass.

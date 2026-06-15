@@ -297,10 +297,21 @@ pub const InstanceData = struct {
         return false;
     }
 
+    /// Store `v` into field `name` (creating it if absent), **adopting** one
+    /// owned reference to `v` (the caller hands off a fresh/owned ref; an alias
+    /// caller retains first). The value replaced on an existing field is
+    /// released — `InstanceData.deinit` releases every field value, so the
+    /// instance owns exactly one ref per field. No refcount traffic under the
+    /// arena fast path.
     pub fn define(self: *InstanceData, allocator: std.mem.Allocator, name: []const u8, v: Value) !void {
-        if (!self.set(name, v)) {
-            try self.fields.append(allocator, .{ .name = name, .value = v });
+        for (self.fields.items) |*f| {
+            if (std.mem.eql(u8, f.name, name)) {
+                if (objcell.reclaimEnabled()) f.value.release(allocator);
+                f.value = v;
+                return;
+            }
         }
+        try self.fields.append(allocator, .{ .name = name, .value = v });
     }
 
     /// Reference-counting teardown: run when an instance's strong count
