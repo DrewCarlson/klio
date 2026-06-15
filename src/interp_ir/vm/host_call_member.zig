@@ -2699,14 +2699,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
-    if (receiver.* == .Instance) {
-        const g = receiver.Instance.borrow();
-        defer g.deinit();
-        const cg = g.get().class.borrow();
-        defer cg.deinit();
-        return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, cg.get().fqn });
-    }
-    return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, receiver.typeFqn() });
+    // Dispatch-miss sentinel: returned on every member call that falls through
+    // to a fallback, so it must not allocate (the message would leak per call,
+    // and downstream discards can't tell it from a static `.Unimplemented`).
+    // A genuine "no such member" error is re-tagged with call context upstream.
+    return .{ .err = .{ .Unimplemented = "member dispatch: no matching member or extension" } };
 }
 
 // -------------------------------------------------------------------------
