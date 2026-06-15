@@ -340,6 +340,42 @@ is pervasive across the heavy dispatch path.
 The value refcounting committed here is complementary (it bounds the value
 graph for any path and is required for anything that escapes a reset boundary).
 
+**§8 confirmed uniform (~646 MB) under the production arena.** Measured: every
+program — `fun main(){ val x=1+2 }`, `println("hi")`, a `listOf`, a string concat
+— is ~646 MB resident under the arena (the embedded stdlib AST+IR+registry is
+deserialized in full at startup by `image.zig:load`→`moduleFromImage`, eager and
+uniform; the 7.6 MB on-disk image expands ~88×). This is the dominant "high
+usage for simple programs" and is independent of reclamation. Reducing it needs
+lazy/on-demand decl deserialization in `image.zig` (decode a func/class on first
+lookup) or a more compact in-memory node representation — a focused workstream in
+that module.
+
+### Continuation roadmap (each a focused increment)
+1. **Split allocator** (the enabler): a process-arena for the persistent compile/
+   stdlib graph (the §8 baseline, genuinely resident) + a freeing allocator for
+   runtime values/temps. `ObjRef` already carries its own allocator, so the two
+   free correctly when mixed, and persistent→runtime references don't occur.
+   This makes the DebugAllocator leak report show *only* runtime allocations
+   (fast, clean — no 200 K stdlib-baseline noise), which makes the host-temp
+   audit tractable, and it is the §7.8 production shape.
+2. **Finish host-temp + value reconciliation** under the split's clean oracle
+   until a heavy-stdlib loop and a never-returning loop are bounded (DebugAllocator
+   per-iter leak count → 0).
+3. **Re-apply + validate coroutine suspend/resume ownership** (Phase 4: snapshot
+   retain on suspend, retain-into-frame + release/free snapshot on resume).
+4. **Ktor server**: per-request/run-boundary arena reset when a request's
+   coroutines complete (or rely on the completed reconciliation). Validate with
+   `zig build itest-ktor_server` under a freeing allocator, RSS flat over many
+   requests.
+5. **§8 lazy/compact stdlib** to cut the ~646 MB baseline.
+6. **Flip production** (§7.8): drop `setReclaim(false)`, switch `main.zig` to the
+   split (arena + smp), verify server/client RSS flat.
+
+Follow-up (quality): the member dispatch-miss now returns a static sentinel; a
+genuine "no such member" error should be re-tagged with `name`+receiver-type
+context at the dispatch top (`callMemberNamed` final return) so diagnostics keep
+the specifics without a per-call allocation.
+
 ### 7.0 Revised approach (decided after a full subsystem re-audit)
 
 A complete re-audit of the IR, lowering, evaluator, host, and coroutine
