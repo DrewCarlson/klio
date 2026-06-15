@@ -757,8 +757,20 @@ fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) A
 /// Extract `(key, value)` from a map-entry value.
 fn mapEntryKv(self: *VmHost, allocator: Allocator, e: *const Value) Allocator.Error!union(enum) { ok: MapPair, err: EvalError } {
     switch (e.*) {
-        .MapEntry => |me| return .{ .ok = .{ .key = me.key.*, .value = me.value.* } },
-        .Pair => |p| return .{ .ok = .{ .key = p.first.*, .value = p.second.* } },
+        .MapEntry => |me| {
+            const k = me.key.asPtr().*;
+            const v = me.value.asPtr().*;
+            k.retain();
+            v.retain();
+            return .{ .ok = .{ .key = k, .value = v } };
+        },
+        .Pair => |p| {
+            const k = p.first.asPtr().*;
+            const v = p.second.asPtr().*;
+            k.retain();
+            v.retain();
+            return .{ .ok = .{ .key = k, .value = v } };
+        },
         else => {
             const kr = try callMemberRec(self, allocator, e, "key", &.{});
             const k = switch (kr) {
@@ -773,6 +785,14 @@ fn mapEntryKv(self: *VmHost, allocator: Allocator, e: *const Value) Allocator.Er
             return .{ .ok = .{ .key = k, .value = v } };
         },
     }
+}
+
+/// Read a boxed component slot and return an owned copy to the interpreter.
+/// The boxed `Value` stays in its slot; the caller receives its own ref.
+fn extractOwned(box: runtime.ObjRef(Value)) EvalResult {
+    const out = box.asPtr().*;
+    out.retain();
+    return .{ .ok = out };
 }
 
 /// Find a function-typed property `name` reachable from the enclosing-this
@@ -2067,7 +2087,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     if (receiver.* == .BoundMethod) {
         const bm = receiver.BoundMethod;
         if (std.mem.eql(u8, bm.fqn, "kotlin.concurrent.Thread")) {
-            const id: u64 = switch (bm.receiver.*) {
+            const id: u64 = switch (bm.receiver.asPtr().*) {
                 .Long => |v| @bitCast(v),
                 else => 0,
             };
@@ -2906,8 +2926,10 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             defer g.deinit();
             var items: std.ArrayList(Value) = .empty;
             for (g.get().items) |kv| {
-                const k = try Value.box(allocator, kv.key);
-                const v = try Value.box(allocator, kv.value);
+                kv.key.retain();
+                kv.value.retain();
+                const k = try Value.boxRef(allocator, kv.key);
+                const v = try Value.boxRef(allocator, kv.value);
                 try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = null } });
             }
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
@@ -3654,7 +3676,13 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                 defer to_put.deinit(allocator);
                 const a2 = args[0];
                 switch (a2) {
-                    .Pair => |p| try to_put.append(allocator, .{ .key = p.first.*, .value = p.second.* }),
+                    .Pair => |p| {
+                        const k = p.first.asPtr().*;
+                        const v = p.second.asPtr().*;
+                        k.retain();
+                        v.retain();
+                        try to_put.append(allocator, .{ .key = k, .value = v });
+                    },
                     .Map => |other| {
                         const og = other.entries.borrow();
                         defer og.deinit();
@@ -3689,32 +3717,39 @@ fn collectPairs(allocator: Allocator, out: *std.ArrayList(MapPair), items: runti
     const g = items.borrow();
     defer g.deinit();
     for (g.get().items) |v| {
-        if (v == .Pair) try out.append(allocator, .{ .key = v.Pair.first.*, .value = v.Pair.second.* });
+        if (v == .Pair) {
+            const k = v.Pair.first.asPtr().*;
+            const val = v.Pair.second.asPtr().*;
+            k.retain();
+            val.retain();
+            try out.append(allocator, .{ .key = k, .value = val });
+        }
     }
 }
 
 fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     switch (receiver.*) {
         .Pair => |p| {
-            if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "first")) return .{ .ok = p.first.* };
-            if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "second")) return .{ .ok = p.second.* };
+            if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "first")) return extractOwned(p.first);
+            if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "second")) return extractOwned(p.second);
         },
         .Triple => |t| {
-            if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "first")) return .{ .ok = t.first.* };
-            if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "second")) return .{ .ok = t.second.* };
-            if (std.mem.eql(u8, name, "component3") or std.mem.eql(u8, name, "third")) return .{ .ok = t.third.* };
+            if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "first")) return extractOwned(t.first);
+            if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "second")) return extractOwned(t.second);
+            if (std.mem.eql(u8, name, "component3") or std.mem.eql(u8, name, "third")) return extractOwned(t.third);
         },
         .MapEntry => |me| {
-            if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "key")) return .{ .ok = me.key.* };
-            if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "value")) return .{ .ok = me.value.* };
+            if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "key")) return extractOwned(me.key);
+            if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "value")) return extractOwned(me.value);
             if (std.mem.eql(u8, name, "setValue")) {
                 const new_v = if (args.len > 0) args[0] else Value.Unit;
-                const prev = me.value.*;
+                const prev = me.value.asPtr().*;
+                prev.retain();
                 if (me.backing) |entries| {
                     const g = entries.borrowMut();
                     defer g.deinit();
                     for (g.get().items) |*slot| {
-                        if (Value.structuralEq(&slot.key, me.key)) {
+                        if (Value.structuralEq(&slot.key, me.key.asPtr())) {
                             slot.value = new_v;
                             break;
                         }

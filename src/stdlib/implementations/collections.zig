@@ -137,14 +137,14 @@ fn makeMapFromArrayList(a: Allocator, entries: std.ArrayList(MapPair), mutable: 
 }
 
 fn makePair(a: Allocator, first: Value, second: Value) Error!Value {
-    return .{ .Pair = .{ .first = try Value.box(a, first), .second = try Value.box(a, second) } };
+    return .{ .Pair = .{ .first = try Value.boxRef(a, first), .second = try Value.boxRef(a, second) } };
 }
 
 fn makeTriple(a: Allocator, first: Value, second: Value, third: Value) Error!Value {
     return .{ .Triple = .{
-        .first = try Value.box(a, first),
-        .second = try Value.box(a, second),
-        .third = try Value.box(a, third),
+        .first = try Value.boxRef(a, first),
+        .second = try Value.boxRef(a, second),
+        .third = try Value.boxRef(a, third),
     } };
 }
 
@@ -485,9 +485,11 @@ fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcome {
             const src = g.get().items;
             var out = try a.alloc(Value, src.len);
             for (src, 0..) |kv, i| {
+                kv.key.retain();
+                kv.value.retain();
                 out[i] = .{ .MapEntry = .{
-                    .key = try Value.box(a, kv.key),
-                    .value = try Value.box(a, kv.value),
+                    .key = try Value.boxRef(a, kv.key),
+                    .value = try Value.boxRef(a, kv.value),
                     .backing = null,
                 } };
             }
@@ -803,8 +805,8 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
             .err => |e| return e,
         };
         if (r != .Pair) return typeErr("associate selector must return Pair");
-        const key = r.Pair.first.*;
-        const val = r.Pair.second.*;
+        const key = r.Pair.first.asPtr().*;
+        const val = r.Pair.second.asPtr().*;
         if (findKeyIndexBoxed(entries.items, &key)) |i| {
             entries.items[i].value = val;
         } else {
@@ -1317,6 +1319,8 @@ pub fn coll_pair_ctor(ctx: *CallCtx) Error!EvalResult {
         .pair => |p| p,
         .err => |e| return e,
     };
+    p.a.retain();
+    p.b.retain();
     return ok(try makePair(ctx.allocator, p.a, p.b));
 }
 
@@ -1453,7 +1457,7 @@ fn mapOfImpl(ctx: *CallCtx, mutable: bool, who: []const u8) Error!EvalResult {
     var entries: std.ArrayList(MapPair) = .empty;
     for (ctx.args) |v| {
         if (v != .Pair) return typeErr(try fmt(a, "{s} expects Pair arguments (use `key to value` or `Pair(k, v)`)", .{who}));
-        try entries.append(a, .{ .key = v.Pair.first.*, .value = v.Pair.second.* });
+        try entries.append(a, .{ .key = v.Pair.first.asPtr().*, .value = v.Pair.second.asPtr().* });
     }
     return ok(try makeMapFromArrayList(a, try dedupeMapInPlace(a, entries), mutable));
 }
@@ -1556,7 +1560,7 @@ pub fn coll_sorted_map_of(ctx: *CallCtx) Error!EvalResult {
     var entries: std.ArrayList(MapPair) = .empty;
     for (ctx.args) |v| {
         if (v != .Pair) return typeErr("sortedMapOf expects Pair arguments");
-        try entries.append(a, .{ .key = v.Pair.first.*, .value = v.Pair.second.* });
+        try entries.append(a, .{ .key = v.Pair.first.asPtr().*, .value = v.Pair.second.asPtr().* });
     }
     if (try sortMapByKey(a, entries.items, false)) |e| return e;
     return ok(try makeMap(a, entries.items, true));
@@ -2090,7 +2094,7 @@ fn syncMapView(a: Allocator, receiver: Value) void {
         if (j < items.len) {
             const it = items[j];
             const target = switch (kind) {
-                .Entries => if (it == .MapEntry) it.MapEntry.key.* else it,
+                .Entries => if (it == .MapEntry) it.MapEntry.key.asPtr().* else it,
                 else => it,
             };
             matched = eqBoxed(&proj, &target);
@@ -2360,13 +2364,17 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             }
         },
         .Generate => |gen| {
-            var cur: ?Value = if (gen.seed) |s| s.* else null;
+            var cur: ?Value = if (gen.seed) |s| blk: {
+                const sv = s.asPtr().*;
+                sv.retain();
+                break :blk sv;
+            } else null;
             const limit: usize = 1_000_000;
             var produced: usize = 0;
             while (true) {
                 if (takeCapReached(seq.ops, st.taken)) break;
                 const candidate = if (cur) |v| v else blk: {
-                    const r = switch (try seqCall(host, gen.next, &.{}, out)) {
+                    const r = switch (try seqCall(host, gen.next.asPtr(), &.{}, out)) {
                         .value => |v| v,
                         .err => |e| return .{ .err = e },
                     };
@@ -2385,7 +2393,7 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 if (max) |m| {
                     if (output.items.len >= m) break;
                 }
-                const nxt = switch (try seqCall(host, gen.next, &.{candidate}, out)) {
+                const nxt = switch (try seqCall(host, gen.next.asPtr(), &.{candidate}, out)) {
                     .value => |v| v,
                     .err => |e| return .{ .err = e },
                 };
@@ -2407,10 +2415,14 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
         },
         .Generate => |gen| {
             const limit: usize = 1024;
-            var cur: ?Value = if (gen.seed) |s| s.* else null;
+            var cur: ?Value = if (gen.seed) |s| blk: {
+                const sv = s.asPtr().*;
+                sv.retain();
+                break :blk sv;
+            } else null;
             while (items.items.len < limit) {
                 const candidate = if (cur) |v| v else blk: {
-                    const r = switch (try seqCall(host, gen.next, &.{}, out)) {
+                    const r = switch (try seqCall(host, gen.next.asPtr(), &.{}, out)) {
                         .value => |v| v,
                         .err => |e| return .{ .err = e },
                     };
@@ -2418,7 +2430,7 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                     break :blk r;
                 };
                 try items.append(a, candidate);
-                const nxt = switch (try seqCall(host, gen.next, &.{candidate}, out)) {
+                const nxt = switch (try seqCall(host, gen.next.asPtr(), &.{candidate}, out)) {
                     .value => |v| v,
                     .err => |e| return .{ .err = e },
                 };
@@ -2850,8 +2862,8 @@ fn pairsFromValues(a: Allocator, items: []const Value, who: []const u8) Error!un
     var entries: std.ArrayList(MapPair) = .empty;
     for (items) |v| {
         if (v != .Pair) return .{ .err = typeErr(try fmt(a, "{s} requires a collection of Pair<K, V>", .{who})) };
-        const key = v.Pair.first.*;
-        const val = v.Pair.second.*;
+        const key = v.Pair.first.asPtr().*;
+        const val = v.Pair.second.asPtr().*;
         if (findKeyIndexBoxed(entries.items, &key)) |i| {
             entries.items[i].value = val;
         } else {
@@ -3168,6 +3180,8 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
             };
             try result.append(a, r);
         } else {
+            lhs_items[i].retain();
+            rhs.items[i].retain();
             try result.append(a, try makePair(a, lhs_items[i], rhs.items[i]));
         }
     }
@@ -3467,20 +3481,20 @@ pub fn coll_map_plus(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("plus requires an argument");
     const arg = ctx.args[1];
     switch (arg) {
-        .Pair => try out.append(a, .{ .key = arg.Pair.first.*, .value = arg.Pair.second.* }),
+        .Pair => try out.append(a, .{ .key = arg.Pair.first.asPtr().*, .value = arg.Pair.second.asPtr().* }),
         .Map => |e| try out.appendSlice(a, try snapshotEntries(a, e.entries)),
         .List => |l| {
             const g = l.items.borrow();
             defer g.deinit();
             for (g.get().items) |p| {
-                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.*, .value = p.Pair.second.* });
+                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtr().*, .value = p.Pair.second.asPtr().* });
             }
         },
         .Set => |s| {
             const g = s.items.borrow();
             defer g.deinit();
             for (g.get().items) |p| {
-                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.*, .value = p.Pair.second.* });
+                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtr().*, .value = p.Pair.second.asPtr().* });
             }
         },
         else => return typeErr("Map.plus expects a Pair, Map, or Iterable<Pair>"),
@@ -3642,9 +3656,11 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
         const g = entries.borrow();
         defer g.deinit();
         for (g.get().items) |kv| {
+            kv.key.retain();
+            kv.value.retain();
             try map_entries.append(a, .{ .MapEntry = .{
-                .key = try Value.box(a, kv.key),
-                .value = try Value.box(a, kv.value),
+                .key = try Value.boxRef(a, kv.key),
+                .value = try Value.boxRef(a, kv.value),
                 .backing = entries,
             } });
         }
@@ -3892,14 +3908,18 @@ pub fn pair_first(ctx: *CallCtx) Error!EvalResult {
         .pair => |v| v,
         .err => |e| return e,
     };
-    return ok(p.Pair.first.*);
+    const out = p.Pair.first.asPtr().*;
+    out.retain();
+    return ok(out);
 }
 pub fn pair_second(ctx: *CallCtx) Error!EvalResult {
     const p = switch (try recvPair(ctx.allocator, ctx.args, "Pair.second")) {
         .pair => |v| v,
         .err => |e| return e,
     };
-    return ok(p.Pair.second.*);
+    const out = p.Pair.second.asPtr().*;
+    out.retain();
+    return ok(out);
 }
 pub fn pair_to_string(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -3918,7 +3938,7 @@ pub fn pair_to_list(ctx: *CallCtx) Error!EvalResult {
         .pair => |v| v,
         .err => |e| return e,
     };
-    return ok(try makeList(a, &.{ p.Pair.first.*, p.Pair.second.* }, false));
+    return ok(try makeList(a, &.{ p.Pair.first.asPtr().*, p.Pair.second.asPtr().* }, false));
 }
 
 fn recvTriple(a: Allocator, args: []const Value, what: []const u8) Error!union(enum) { triple: Value, err: EvalResult } {
@@ -3928,6 +3948,9 @@ fn recvTriple(a: Allocator, args: []const Value, what: []const u8) Error!union(e
 
 pub fn coll_triple_ctor(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len != 3) return arityErr("Triple expects 3 arguments");
+    ctx.args[0].retain();
+    ctx.args[1].retain();
+    ctx.args[2].retain();
     return ok(try makeTriple(ctx.allocator, ctx.args[0], ctx.args[1], ctx.args[2]));
 }
 pub fn triple_first(ctx: *CallCtx) Error!EvalResult {
@@ -3935,21 +3958,27 @@ pub fn triple_first(ctx: *CallCtx) Error!EvalResult {
         .triple => |v| v,
         .err => |e| return e,
     };
-    return ok(t.Triple.first.*);
+    const out = t.Triple.first.asPtr().*;
+    out.retain();
+    return ok(out);
 }
 pub fn triple_second(ctx: *CallCtx) Error!EvalResult {
     const t = switch (try recvTriple(ctx.allocator, ctx.args, "Triple.second")) {
         .triple => |v| v,
         .err => |e| return e,
     };
-    return ok(t.Triple.second.*);
+    const out = t.Triple.second.asPtr().*;
+    out.retain();
+    return ok(out);
 }
 pub fn triple_third(ctx: *CallCtx) Error!EvalResult {
     const t = switch (try recvTriple(ctx.allocator, ctx.args, "Triple.third")) {
         .triple => |v| v,
         .err => |e| return e,
     };
-    return ok(t.Triple.third.*);
+    const out = t.Triple.third.asPtr().*;
+    out.retain();
+    return ok(out);
 }
 pub fn triple_to_string(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -3968,7 +3997,7 @@ pub fn triple_to_list(ctx: *CallCtx) Error!EvalResult {
         .triple => |v| v,
         .err => |e| return e,
     };
-    return ok(try makeList(a, &.{ t.Triple.first.*, t.Triple.second.*, t.Triple.third.* }, false));
+    return ok(try makeList(a, &.{ t.Triple.first.asPtr().*, t.Triple.second.asPtr().*, t.Triple.third.asPtr().* }, false));
 }
 
 // =====================================================================
@@ -4007,8 +4036,8 @@ pub fn coll_list_unzip(ctx: *CallCtx) Error!EvalResult {
     const src = try snapshotItems(a, it);
     for (src) |v| {
         if (v != .Pair) return typeErr("unzip requires List<Pair<A, B>>");
-        try firsts.append(a, v.Pair.first.*);
-        try seconds.append(a, v.Pair.second.*);
+        try firsts.append(a, v.Pair.first.asPtr().*);
+        try seconds.append(a, v.Pair.second.asPtr().*);
     }
     return ok(try makePair(a, try makeListFromArrayList(a, firsts, false), try makeListFromArrayList(a, seconds, false)));
 }
@@ -4065,6 +4094,7 @@ pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
 fn withIndexImpl(a: Allocator, items: []const Value) Error!Value {
     var indexed: std.ArrayList(Value) = .empty;
     for (items, 0..) |v, i| {
+        v.retain();
         try indexed.append(a, try makePair(a, Value.newInt(@intCast(i)), v));
     }
     return makeListFromArrayList(a, indexed, false);
@@ -4306,7 +4336,11 @@ pub fn coll_map_to_list(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        for (g.get().items) |kv| try pairs.append(a, try makePair(a, kv.key, kv.value));
+        for (g.get().items) |kv| {
+            kv.key.retain();
+            kv.value.retain();
+            try pairs.append(a, try makePair(a, kv.key, kv.value));
+        }
     }
     return ok(try makeListFromArrayList(a, pairs, false));
 }

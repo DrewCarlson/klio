@@ -27,7 +27,7 @@ const Recv = struct { ok: bool, payload: *Value };
 fn recvResult(args: []const Value) ?Recv {
     if (args.len > 0) {
         switch (args[0]) {
-            .Result => |r| return .{ .ok = r.ok, .payload = r.payload },
+            .Result => |r| return .{ .ok = r.ok, .payload = r.payload.asPtr() },
             else => {},
         }
     }
@@ -36,7 +36,7 @@ fn recvResult(args: []const Value) ?Recv {
 
 /// Construct a `Value::Result { ok, payload }` with a heap-boxed payload.
 fn makeResult(allocator: std.mem.Allocator, ok: bool, payload: Value) std.mem.Allocator.Error!Value {
-    return .{ .Result = .{ .ok = ok, .payload = try Value.box(allocator, payload) } };
+    return .{ .Result = .{ .ok = ok, .payload = try Value.boxRef(allocator, payload) } };
 }
 
 pub fn result_success(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -106,6 +106,7 @@ pub fn result_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const payload = recv.payload.*;
     const block = ctx.args[1];
     if (!recv.ok) {
+        payload.retain();
         return .{ .ok = try makeResult(ctx.allocator, false, payload) };
     }
     const r = try ctx.host.invokeCallable(&block, &.{payload}, ctx.out);
@@ -124,6 +125,7 @@ pub fn result_map_catching(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const payload = recv.payload.*;
     const block = ctx.args[1];
     if (!recv.ok) {
+        payload.retain();
         return .{ .ok = try makeResult(ctx.allocator, false, payload) };
     }
     const r = try ctx.host.invokeCallable(&block, &.{payload}, ctx.out);
@@ -178,7 +180,9 @@ pub fn result_get_or_null(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = recvResult(ctx.args) orelse
         return .{ .err = .{ .Type = "Result.getOrNull requires a Result receiver" } };
     if (recv.ok) {
-        return .{ .ok = recv.payload.* };
+        const out = recv.payload.*;
+        out.retain();
+        return .{ .ok = out };
     } else {
         return .{ .ok = Value.Null };
     }
@@ -190,7 +194,9 @@ pub fn result_exception_or_null(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
     if (recv.ok) {
         return .{ .ok = Value.Null };
     } else {
-        return .{ .ok = recv.payload.* };
+        const out = recv.payload.*;
+        out.retain();
+        return .{ .ok = out };
     }
 }
 
@@ -322,9 +328,13 @@ pub fn result_get_or_throw(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = recvResult(ctx.args) orelse
         return .{ .err = .{ .Type = "Result.getOrThrow requires a Result receiver" } };
     if (recv.ok) {
-        return .{ .ok = recv.payload.* };
+        const out = recv.payload.*;
+        out.retain();
+        return .{ .ok = out };
     } else {
-        return .{ .err = .{ .Thrown = recv.payload.* } };
+        const thrown = recv.payload.*;
+        thrown.retain();
+        return .{ .err = .{ .Thrown = thrown } };
     }
 }
 
@@ -335,7 +345,9 @@ pub fn result_get_or_else(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = recvResult(ctx.args[0..1]) orelse
         return .{ .err = .{ .Type = "Result.getOrElse requires a Result receiver" } };
     if (recv.ok) {
-        return .{ .ok = recv.payload.* };
+        const out = recv.payload.*;
+        out.retain();
+        return .{ .ok = out };
     }
     const payload = recv.payload.*;
     const block = ctx.args[1];
@@ -350,7 +362,9 @@ pub fn result_get_or_default(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     const default = ctx.args[1];
     if (recv.ok) {
-        return .{ .ok = recv.payload.* };
+        const out = recv.payload.*;
+        out.retain();
+        return .{ .ok = out };
     } else {
         return .{ .ok = default };
     }
@@ -427,6 +441,13 @@ fn ctxWith(args: []const Value, h: runtime.IntrinsicHost, out: runtime.Output, a
     return .{ .args = args, .out = out, .host = h, .allocator = allocator };
 }
 
+/// Test helper: box `v` into a `ValueBox` on `a` (an arena), for the
+/// component slots of hand-built `Value::Result` test receivers. OOM is
+/// unreachable in these tests; the arena frees the box on teardown.
+fn tbox(a: std.mem.Allocator, v: Value) runtime.ObjRef(Value) {
+    return Value.boxRef(a, v) catch unreachable;
+}
+
 test "result_success and result_failure box the payload" {
     var noop = NoopHost.init(testing.allocator);
     defer noop.deinit();
@@ -443,13 +464,13 @@ test "result_success and result_failure box the payload" {
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .Result);
     try testing.expect(r.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 7), r.ok.Result.payload.Int);
+    try testing.expectEqual(@as(i32, 7), r.ok.Result.payload.asPtr().Int);
 
     var ctx2 = ctxWith(&ok_args, noop.host(), cap.output(), a);
     const r2 = try result_failure(&ctx2);
     try testing.expect(r2.ok == .Result);
     try testing.expect(!r2.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 7), r2.ok.Result.payload.Int);
+    try testing.expectEqual(@as(i32, 7), r2.ok.Result.payload.asPtr().Int);
 }
 
 test "result_success defaults to Unit when no arg" {
@@ -463,7 +484,7 @@ test "result_success defaults to Unit when no arg" {
     var ctx = ctxWith(&.{}, noop.host(), cap.output(), arena.allocator());
     const r = try result_success(&ctx);
     try testing.expect(r.ok.Result.ok);
-    try testing.expect(r.ok.Result.payload.* == .Unit);
+    try testing.expect(r.ok.Result.payload.asPtr().* == .Unit);
 }
 
 test "isSuccess / isFailure read the ok flag" {
@@ -475,9 +496,9 @@ test "isSuccess / isFailure read the ok flag" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var payload: Value = .{ .Int = 1 };
-    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = &payload } }};
-    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = &payload } }};
+    const payload: Value = .{ .Int = 1 };
+    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = tbox(a, payload) } }};
+    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = tbox(a, payload) } }};
 
     var c1 = ctxWith(&success, noop.host(), cap.output(), a);
     try testing.expect((try result_is_success(&c1)).ok.Bool);
@@ -498,10 +519,10 @@ test "getOrNull / exceptionOrNull pick the right branch" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var ok_payload: Value = .{ .Int = 5 };
-    var err_payload: Value = .{ .Int = 9 };
-    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = &ok_payload } }};
-    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = &err_payload } }};
+    const ok_payload: Value = .{ .Int = 5 };
+    const err_payload: Value = .{ .Int = 9 };
+    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }};
+    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }};
 
     var c1 = ctxWith(&success, noop.host(), cap.output(), a);
     try testing.expectEqual(@as(i32, 5), (try result_get_or_null(&c1)).ok.Int);
@@ -522,10 +543,10 @@ test "getOrThrow returns success and rethrows failure" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var ok_payload: Value = .{ .Int = 3 };
-    var err_payload: Value = .{ .Int = 4 };
-    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = &ok_payload } }};
-    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = &err_payload } }};
+    const ok_payload: Value = .{ .Int = 3 };
+    const err_payload: Value = .{ .Int = 4 };
+    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }};
+    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }};
 
     var c1 = ctxWith(&success, noop.host(), cap.output(), a);
     try testing.expectEqual(@as(i32, 3), (try result_get_or_throw(&c1)).ok.Int);
@@ -545,11 +566,11 @@ test "getOrDefault falls back on failure and requires a default" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var ok_payload: Value = .{ .Int = 1 };
-    var err_payload: Value = .{ .Int = 2 };
-    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = &ok_payload } }, .{ .Int = 99 } };
-    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = &err_payload } }, .{ .Int = 99 } };
-    const no_default = [_]Value{.{ .Result = .{ .ok = false, .payload = &err_payload } }};
+    const ok_payload: Value = .{ .Int = 1 };
+    const err_payload: Value = .{ .Int = 2 };
+    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }, .{ .Int = 99 } };
+    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }, .{ .Int = 99 } };
+    const no_default = [_]Value{.{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }};
 
     var c1 = ctxWith(&success, noop.host(), cap.output(), a);
     try testing.expectEqual(@as(i32, 1), (try result_get_or_default(&c1)).ok.Int);
@@ -583,9 +604,9 @@ test "result_to_string renders Success/Failure" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var payload: Value = .{ .Int = 42 };
-    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = &payload } }};
-    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = &payload } }};
+    const payload: Value = .{ .Int = 42 };
+    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = tbox(a, payload) } }};
+    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = tbox(a, payload) } }};
 
     var c1 = ctxWith(&success, noop.host(), cap.output(), a);
     const s1 = (try result_to_string(&c1)).ok;
@@ -618,14 +639,14 @@ test "runCatching wraps a returned value and a thrown one" {
     var c1 = ctxWith(&args, stub.host(), cap.output(), a);
     const r1 = try result_run_catching(&c1);
     try testing.expect(r1.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 11), r1.ok.Result.payload.Int);
+    try testing.expectEqual(@as(i32, 11), r1.ok.Result.payload.asPtr().Int);
 
     // Block throws -> Failure(thrown).
     stub.reply = .{ .err = .{ .Thrown = .{ .Int = 13 } } };
     var c2 = ctxWith(&args, stub.host(), cap.output(), a);
     const r2 = try result_run_catching(&c2);
     try testing.expect(!r2.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 13), r2.ok.Result.payload.Int);
+    try testing.expectEqual(@as(i32, 13), r2.ok.Result.payload.asPtr().Int);
 
     // A non-Thrown runtime error propagates unchanged.
     stub.reply = .{ .err = .{ .Type = "boom" } };
@@ -660,16 +681,16 @@ test "result_map maps success, passes failure through, mapCatching catches throw
     defer arena.deinit();
     const a = arena.allocator();
 
-    var ok_payload: Value = .{ .Int = 2 };
-    var err_payload: Value = .{ .Int = 7 };
-    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = &ok_payload } }, Value.Unit };
-    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = &err_payload } }, Value.Unit };
+    const ok_payload: Value = .{ .Int = 2 };
+    const err_payload: Value = .{ .Int = 7 };
+    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }, Value.Unit };
+    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }, Value.Unit };
 
     stub.reply = .{ .ok = .{ .Int = 100 } };
     var c1 = ctxWith(&success, stub.host(), cap.output(), a);
     const r1 = try result_map(&c1);
     try testing.expect(r1.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 100), r1.ok.Result.payload.Int);
+    try testing.expectEqual(@as(i32, 100), r1.ok.Result.payload.asPtr().Int);
     try testing.expectEqual(@as(i32, 2), stub.last_arg.?.Int);
 
     // map on a failure does not invoke the block.
@@ -677,7 +698,7 @@ test "result_map maps success, passes failure through, mapCatching catches throw
     var c2 = ctxWith(&failure, stub.host(), cap.output(), a);
     const r2 = try result_map(&c2);
     try testing.expect(!r2.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 7), r2.ok.Result.payload.Int);
+    try testing.expectEqual(@as(i32, 7), r2.ok.Result.payload.asPtr().Int);
     try testing.expectEqual(@as(usize, 0), stub.invoked);
 
     // mapCatching turns a thrown block into a Failure.
@@ -685,7 +706,7 @@ test "result_map maps success, passes failure through, mapCatching catches throw
     var c3 = ctxWith(&success, stub.host(), cap.output(), a);
     const r3 = try result_map_catching(&c3);
     try testing.expect(!r3.ok.Result.ok);
-    try testing.expectEqual(@as(i32, 55), r3.ok.Result.payload.Int);
+    try testing.expectEqual(@as(i32, 55), r3.ok.Result.payload.asPtr().Int);
 }
 
 test "result_fold dispatches to onSuccess or onFailure" {
@@ -697,11 +718,11 @@ test "result_fold dispatches to onSuccess or onFailure" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var ok_payload: Value = .{ .Int = 21 };
-    var err_payload: Value = .{ .Int = 31 };
+    const ok_payload: Value = .{ .Int = 21 };
+    const err_payload: Value = .{ .Int = 31 };
     // (receiver, onSuccess, onFailure)
-    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = &ok_payload } }, Value.Unit, Value.Unit };
-    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = &err_payload } }, Value.Unit, Value.Unit };
+    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }, Value.Unit, Value.Unit };
+    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }, Value.Unit, Value.Unit };
 
     stub.reply = .{ .ok = .{ .Int = 0 } };
     var c1 = ctxWith(&success, stub.host(), cap.output(), a);
@@ -722,8 +743,8 @@ test "onSuccess / onFailure run the side effect then return the receiver" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var ok_payload: Value = .{ .Int = 8 };
-    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = &ok_payload } }, Value.Unit };
+    const ok_payload: Value = .{ .Int = 8 };
+    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }, Value.Unit };
 
     stub.reply = .{ .ok = Value.Unit };
     stub.invoked = 0;
@@ -749,10 +770,10 @@ test "getOrElse returns success or calls onFailure" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var ok_payload: Value = .{ .Int = 6 };
-    var err_payload: Value = .{ .Int = 9 };
-    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = &ok_payload } }, Value.Unit };
-    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = &err_payload } }, Value.Unit };
+    const ok_payload: Value = .{ .Int = 6 };
+    const err_payload: Value = .{ .Int = 9 };
+    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }, Value.Unit };
+    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }, Value.Unit };
 
     var c1 = ctxWith(&success, stub.host(), cap.output(), a);
     try testing.expectEqual(@as(i32, 6), (try result_get_or_else(&c1)).ok.Int);

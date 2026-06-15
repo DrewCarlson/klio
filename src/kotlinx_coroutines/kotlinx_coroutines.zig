@@ -386,9 +386,10 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     defer regAllocator().free(sends);
 
     const exc = try closedReceiveExc(ctx.allocator);
+    defer exc.release(ctx.allocator);
     for (recvs) |slot| {
-        const payload = try Value.box(ctx.allocator, exc);
-        const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
+        exc.retain();
+        const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, exc) } };
         ctx.host.coroutineResumeSlotValue(slot, failure);
     }
     // Iterator-style waiters resume with `Bool(false)` so the
@@ -397,9 +398,10 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         ctx.host.coroutineResumeSlotValue(w.slot, .{ .Bool = false });
     }
     const send_exc = try closedSendExc(ctx.allocator);
+    defer send_exc.release(ctx.allocator);
     for (sends) |sw| {
-        const payload = try Value.box(ctx.allocator, send_exc);
-        const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
+        send_exc.retain();
+        const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, send_exc) } };
         ctx.host.coroutineResumeSlotValue(sw.slot, failure);
     }
     return .{ .ok = .{ .Bool = true } };

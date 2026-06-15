@@ -233,9 +233,8 @@ pub fn concurrent_thread(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
-    const receiver = try ctx.allocator.create(Value);
     // The OS thread id is carried as a Kotlin Long via a bit reinterpretation.
-    receiver.* = .{ .Long = @bitCast(id) };
+    const receiver = try Value.boxRef(ctx.allocator, .{ .Long = @bitCast(id) });
     return .{ .ok = .{ .BoundMethod = .{
         .fqn = "kotlin.concurrent.Thread",
         .func = threadHandleStub,
@@ -282,9 +281,8 @@ fn sleepMillis(millis: u64) void {
 /// (the calling thread is, by definition, running).
 pub fn concurrent_thread_current(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const id: u64 = std.Thread.getCurrentId();
-    const receiver = try ctx.allocator.create(Value);
     // The thread id is carried as a Kotlin Long via a bit reinterpretation.
-    receiver.* = .{ .Long = @bitCast(id) };
+    const receiver = try Value.boxRef(ctx.allocator, .{ .Long = @bitCast(id) });
     return .{ .ok = .{ .BoundMethod = .{
         .fqn = "kotlin.concurrent.Thread",
         .func = threadHandleStub,
@@ -489,7 +487,7 @@ test "currentThread yields a Thread BoundMethod handle" {
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .BoundMethod);
     try testing.expectEqualStrings("kotlin.concurrent.Thread", r.ok.BoundMethod.fqn);
-    testing.allocator.destroy(r.ok.BoundMethod.receiver);
+    r.ok.BoundMethod.receiver.deinit();
 }
 
 test "thread handle is not callable" {

@@ -708,7 +708,7 @@ pub fn resumeContinuation(
             resume_throw = exc;
         } else if (first) {
             if (carry == .Result and !carry.Result.ok) {
-                resume_throw = carry.Result.payload.*;
+                resume_throw = carry.Result.payload.asPtr().*;
             }
         }
         first = false;

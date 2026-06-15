@@ -12,6 +12,7 @@ const RuntimeError = runtime.RuntimeError;
 const EvalResult = runtime.EvalResult;
 const CallCtx = runtime.CallCtx;
 const ObjRef = runtime.ObjRef;
+const ValueBox = ObjRef(Value);
 const ValueSlice = runtime.ValueSlice;
 const ValueList = runtime.ValueList;
 const SequenceData = runtime.SequenceData;
@@ -319,7 +320,8 @@ pub fn seq_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const args = ctx.args;
     if (args.len == 1 and isLambdaLike(args[0])) {
-        const next = try Value.box(ctx.allocator, args[0]);
+        args[0].retain();
+        const next = try Value.boxRef(ctx.allocator, args[0]);
         const data = try ObjRef(SequenceData).init(ctx.allocator, .{
             .source = .{ .Generate = .{ .seed = null, .next = next } },
             .ops = &.{},
@@ -327,11 +329,13 @@ pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return ok(.{ .Sequence = data });
     }
     if (args.len == 2 and isLambdaLike(args[1])) {
-        var seed: ?*Value = null;
+        var seed: ?ValueBox = null;
         if (args[0] != .Null) {
-            seed = try Value.box(ctx.allocator, args[0]);
+            args[0].retain();
+            seed = try Value.boxRef(ctx.allocator, args[0]);
         }
-        const next = try Value.box(ctx.allocator, args[1]);
+        args[1].retain();
+        const next = try Value.boxRef(ctx.allocator, args[1]);
         const data = try ObjRef(SequenceData).init(ctx.allocator, .{
             .source = .{ .Generate = .{ .seed = seed, .next = next } },
             .ops = &.{},
@@ -550,14 +554,18 @@ pub fn map_entry_key(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 1 or ctx.args[0] != .MapEntry) {
         return err(.{ .Type = "Map.Entry.key requires a Map.Entry receiver" });
     }
-    return ok(ctx.args[0].MapEntry.key.*);
+    const out = ctx.args[0].MapEntry.key.asPtr().*;
+    out.retain();
+    return ok(out);
 }
 
 pub fn map_entry_value(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 1 or ctx.args[0] != .MapEntry) {
         return err(.{ .Type = "Map.Entry.value requires a Map.Entry receiver" });
     }
-    return ok(ctx.args[0].MapEntry.value.*);
+    const out = ctx.args[0].MapEntry.value.asPtr().*;
+    out.retain();
+    return ok(out);
 }
 
 pub fn map_entry_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -636,7 +644,11 @@ fn materialiseSequenceBounded(
                 }
             },
             .Generate => |gen| {
-                var cur: ?Value = if (gen.seed) |s| s.* else null;
+                var cur: ?Value = if (gen.seed) |s| blk: {
+                    const sv = s.asPtr().*;
+                    sv.retain();
+                    break :blk sv;
+                } else null;
                 const limit: usize = 1_000_000;
                 var produced: usize = 0;
                 while (true) {
@@ -645,7 +657,7 @@ fn materialiseSequenceBounded(
                     if (cur) |v| {
                         candidate = v;
                     } else {
-                        const r = try invokeCallable(host, gen.next, &.{}, out);
+                        const r = try invokeCallable(host, gen.next.asPtr(), &.{}, out);
                         switch (r) {
                             .ok => |rv| {
                                 if (rv == .Null) break;
@@ -671,7 +683,7 @@ fn materialiseSequenceBounded(
                         },
                     }
                     if (max) |m| if (output.items.len >= m) break;
-                    const nr = try invokeCallable(host, gen.next, &.{candidate}, out);
+                    const nr = try invokeCallable(host, gen.next.asPtr(), &.{candidate}, out);
                     switch (nr) {
                         .ok => |nv| {
                             if (nv == .Null) break;
@@ -698,13 +710,17 @@ fn materialiseSequenceBounded(
         },
         .Generate => |gen| {
             const limit: usize = 1024;
-            var cur: ?Value = if (gen.seed) |s| s.* else null;
+            var cur: ?Value = if (gen.seed) |s| blk: {
+                const sv = s.asPtr().*;
+                sv.retain();
+                break :blk sv;
+            } else null;
             while (items.items.len < limit) {
                 var candidate: Value = undefined;
                 if (cur) |v| {
                     candidate = v;
                 } else {
-                    const r = try invokeCallable(host, gen.next, &.{}, out);
+                    const r = try invokeCallable(host, gen.next.asPtr(), &.{}, out);
                     switch (r) {
                         .ok => |rv| {
                             if (rv == .Null) break;
@@ -717,7 +733,7 @@ fn materialiseSequenceBounded(
                     }
                 }
                 try items.append(allocator, candidate);
-                const nr = try invokeCallable(host, gen.next, &.{candidate}, out);
+                const nr = try invokeCallable(host, gen.next.asPtr(), &.{candidate}, out);
                 switch (nr) {
                     .ok => |nv| {
                         if (nv == .Null) break;
@@ -1588,9 +1604,13 @@ test "Map.Entry key and value accessors" {
     var h = Harness.init();
     defer h.deinit();
 
-    var key: Value = .{ .Int = 3 };
-    var val: Value = .{ .Int = 9 };
-    const entry: Value = .{ .MapEntry = .{ .key = &key, .value = &val, .backing = null } };
+    const key: Value = .{ .Int = 3 };
+    const val: Value = .{ .Int = 9 };
+    const entry: Value = .{ .MapEntry = .{
+        .key = try Value.boxRef(h.allocator(), key),
+        .value = try Value.boxRef(h.allocator(), val),
+        .backing = null,
+    } };
     var args = [_]Value{entry};
     var ctx = h.ctx(&args);
     const k = try map_entry_key(&ctx);

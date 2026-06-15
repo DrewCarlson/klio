@@ -12,6 +12,7 @@ const EvalResult = runtime.EvalResult;
 const CallCtx = runtime.CallCtx;
 const StringRef = runtime.StringRef;
 const ValueList = runtime.ValueList;
+const ValueBox = runtime.ObjRef(Value);
 
 fn ok(v: Value) EvalResult {
     return .{ .ok = v };
@@ -43,7 +44,7 @@ pub fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]
 /// becomes `message`.
 pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!EvalResult {
     var message: ?StringRef = null;
-    var cause: ?*Value = null;
+    var cause: ?ValueBox = null;
 
     const first = if (ctx.args.len > 0) &ctx.args[0] else null;
     const second = if (ctx.args.len > 1) &ctx.args[1] else null;
@@ -56,7 +57,10 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
                 // A builtin exception is `Value.Exception`; a user / pack
                 // exception subclass is a `Value.Instance` of a
                 // Throwable-derived class. Both are valid causes.
-                .Exception, .Instance => cause = try Value.box(ctx.allocator, c.*),
+                .Exception, .Instance => {
+                    c.retain();
+                    cause = try Value.boxRef(ctx.allocator, c.*);
+                },
                 else => {
                     if (message) |m| freeMessage(ctx.allocator, m);
                     return typeErr("Throwable cause must be a Throwable or null");
@@ -64,7 +68,8 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
             }
         } else {
             if (v.* == .Exception) {
-                cause = try Value.box(ctx.allocator, v.*);
+                v.retain();
+                cause = try Value.boxRef(ctx.allocator, v.*);
             } else {
                 message = try messageOf(ctx.allocator, v);
             }
@@ -187,7 +192,9 @@ pub fn throwable_cause(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     const cause = ctx.args[0].Exception.cause;
     if (cause) |c| {
-        return ok(c.*);
+        const out = c.asPtr().*;
+        out.retain();
+        return ok(out);
     }
     return ok(.Null);
 }
@@ -219,7 +226,7 @@ fn noopCtx(args: []const Value) CallCtx {
 fn freeException(exc: anytype) void {
     exc.fqn.deinit();
     if (exc.message) |m| m.deinit();
-    if (exc.cause) |c| testing.allocator.destroy(c);
+    if (exc.cause) |c| c.deinit();
 }
 
 test "build exception with no arguments" {
@@ -290,8 +297,8 @@ test "single throwable argument is treated as the cause" {
     defer freeException(exc);
     try testing.expect(exc.message == null);
     try testing.expect(exc.cause != null);
-    try testing.expect(exc.cause.?.* == .Exception);
-    const ig = exc.cause.?.Exception.fqn.borrow();
+    try testing.expect(exc.cause.?.asPtr().* == .Exception);
+    const ig = exc.cause.?.asPtr().Exception.fqn.borrow();
     defer ig.deinit();
     try testing.expectEqualStrings("kotlin.IllegalStateException", ig.get().*);
 }
@@ -447,23 +454,23 @@ test "suppressed returns an empty list" {
 }
 
 test "cause accessor returns the cause value" {
-    const cause = try testing.allocator.create(Value);
-    cause.* = try makeException(testing.allocator, "kotlin.IllegalStateException", null);
-    defer {
-        cause.Exception.fqn.deinit();
-        testing.allocator.destroy(cause);
-    }
+    const cause = try makeException(testing.allocator, "kotlin.IllegalStateException", null);
+    const cause_box = try Value.boxRef(testing.allocator, cause);
     const outer = Value{ .Exception = .{
         .fqn = try StringRef.init(testing.allocator, "kotlin.RuntimeException"),
         .message = null,
-        .cause = cause,
+        .cause = cause_box,
     } };
-    defer outer.Exception.fqn.deinit();
+    defer {
+        outer.Exception.fqn.deinit();
+        outer.Exception.cause.?.deinit();
+    }
     const args = [_]Value{outer};
     var ctx = noopCtx(&args);
     const r = try throwable_cause(&ctx);
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .Exception);
+    defer r.ok.release(testing.allocator);
     const g = r.ok.Exception.fqn.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("kotlin.IllegalStateException", g.get().*);
