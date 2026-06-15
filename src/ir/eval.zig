@@ -380,7 +380,54 @@ pub const SuspendState = struct {
     /// it records the frame snapshot. Always `null` once a frame has
     /// been pushed.
     pending_resume_reg: ?Reg = null,
+
+    /// Release every value reference this state's snapshots retained on
+    /// suspend and free the snapshot slice buffers. Call this exactly once
+    /// when a parked state is dropped *without* being resumed (a cancelled
+    /// or abandoned coroutine) — `resumeContinuation` instead transfers the
+    /// retained references into the rebuilt frames. No-op under the arena.
+    /// The caller still owns the `frames` ArrayList itself.
+    pub fn deinit(self: *SuspendState, allocator: Allocator) void {
+        if (runtime.reclaimEnabled()) {
+            for (self.frames.items) |snap| releaseSnapshotValues(snap, allocator);
+        }
+        for (self.frames.items) |snap| freeSnapshotBuffers(snap, allocator);
+        self.frames.deinit(allocator);
+    }
 };
+
+/// Retain the value references a freshly-built snapshot copies out of a
+/// suspending frame: regs (the frame owns them and releases them as it
+/// unwinds), and params/captures (aliases of caller registers / closure
+/// captures that the unwinding stack will release). The receiver chain is a
+/// borrow kept alive by those owners, so it is not retained here. No-op
+/// under the arena.
+fn retainSnapshotValues(snap: FrameSnapshot) void {
+    if (!runtime.reclaimEnabled()) return;
+    for (snap.regs) |v| v.retain();
+    for (snap.params) |v| v.retain();
+    for (snap.captures) |v| v.retain();
+}
+
+/// Release what `retainSnapshotValues` retained (the drop-without-resume
+/// path). Mirrors the retain set exactly.
+fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
+    for (snap.regs) |v| v.release(allocator);
+    for (snap.params) |v| v.release(allocator);
+    for (snap.captures) |v| v.release(allocator);
+}
+
+/// Free the dupe'd slice buffers a snapshot owns. Gated on reclaim: under
+/// the arena, `free` can rewind the last bump allocation, so production
+/// leaves the buffers for wholesale reclaim (byte-identical to before).
+fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
+    if (!runtime.reclaimEnabled()) return;
+    allocator.free(snap.regs);
+    allocator.free(snap.params);
+    allocator.free(snap.captures);
+    allocator.free(snap.enclosing_this);
+    allocator.free(snap.try_stack);
+}
 
 /// Per-call evaluation frame.
 const Frame = struct {
@@ -415,6 +462,12 @@ const Frame = struct {
     /// the main one (which would index a different, wrong function).
     module_arc: ?*const Module,
     allocator: Allocator,
+    /// A frame rebuilt by `resumeContinuation` *adopts* the values its
+    /// `SuspendState` snapshot retained: it owns one reference to each
+    /// param/capture (not just the regs), so its teardown must release them
+    /// to balance the retain the snapshot took on suspend. A freshly-called
+    /// frame leaves this false — its params/captures are borrows.
+    owns_params_caps: bool = false,
 
     fn newWithCaptures(
         allocator: Allocator,
@@ -501,6 +554,10 @@ const Frame = struct {
         // No-op under the arena fast path.
         if (runtime.reclaimEnabled()) {
             for (self.regs.items) |v| v.release(self.allocator);
+            if (self.owns_params_caps) {
+                for (self.params.items) |v| v.release(self.allocator);
+                for (self.captures.items) |v| v.release(self.allocator);
+            }
         }
         self.regs.deinit(self.allocator);
         self.params.deinit(self.allocator);
@@ -706,6 +763,10 @@ pub fn resumeContinuation(
         var frame = try Frame.newWithCaptures(allocator, m, func, params, caps);
         defer frame.deinit();
         frame.module_arc = snap_module;
+        // This frame adopts the references the snapshot retained on suspend:
+        // its params/captures (and regs, always owned) are released by its
+        // teardown, balancing the suspend-time retain.
+        frame.owns_params_caps = true;
         // Restore the frame's enclosing-`this` chain verbatim so implicit
         // receivers resolved before the park resolve identically after it.
         try frame.activateChainFrom(snap.enclosing_this);
@@ -736,6 +797,11 @@ pub fn resumeContinuation(
         var try_stack: std.ArrayList(TryFrame) = .empty;
         defer try_stack.deinit(allocator);
         try try_stack.appendSlice(allocator, snap.try_stack);
+        // Everything the snapshot held is now copied into frame-owned buffers
+        // (regs/params/captures/chain/try-stack); the frame owns the value
+        // references (released by its teardown). Free the snapshot's own slice
+        // buffers — but not its values, which moved into the frame.
+        freeSnapshotBuffers(snap, allocator);
         const r = try runFrameInner(H, allocator, m, &frame, &try_stack, snap.block, snap.inst_idx, resume_throw, host);
         switch (r) {
             .ok => |v| carry = v,
@@ -888,7 +954,7 @@ fn runFrameInner(
                             state.pending_resume_reg = null;
                             break :blk rr;
                         } else instDst(inst);
-                        try state.frames.append(allocator, .{
+                        const snap: FrameSnapshot = .{
                             .func = frame.func.id,
                             .module = frame.module_arc,
                             .block = cur,
@@ -900,7 +966,13 @@ fn runFrameInner(
                             .try_stack = try allocator.dupe(TryFrame, try_stack.items),
                             .is_lambda = frame.func.is_lambda,
                             .resume_reg = resume_reg,
-                        });
+                        };
+                        // The snapshot now holds the only references that will
+                        // survive this frame's teardown (its regs are released
+                        // as the stack unwinds; its params/captures alias caller
+                        // regs / closure captures the unwind also releases).
+                        retainSnapshotValues(snap);
+                        try state.frames.append(allocator, snap);
                         return errResult(.{ .Suspended = state });
                     },
                     else => return errResult(e),

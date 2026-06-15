@@ -624,8 +624,36 @@ optional; 127 MB for a fully-loaded stdlib is acceptable.
       per-request arena for the ktor server (reclaims temps+values without the
       audit). Validate with the DebugAllocator leaked-count diffed across N
       (smp RSS is non-deterministic).
-- [ ] Re-apply coroutine suspend/resume ownership (snapshot retain/release; §7.5).
-- [ ] ktor server/client RSS flat over many requests.
+- [x] **Coroutine suspend/resume snapshot ownership re-applied (§7.5)** —
+      eval-side, committed, gated (production byte-identical, no suite
+      regressions). `FrameSnapshot` now *owns* the regs/params/captures it
+      copies on suspend (`retainSnapshotValues`); a resumed frame adopts that
+      ownership (`Frame.owns_params_caps`) and releases it on teardown;
+      `SuspendState.deinit` releases the never-resumed (cancelled/abandoned)
+      path. This is the correct foundation but is NOT sufficient alone — see
+      the coroutine-host finding below.
+- [ ] **Coroutine/ktor host value reconciliation (the remaining large work).**
+      Under `KLIO_RECLAIM=smp` (reclaim-ON) even `runBlocking { println("x") }`
+      (no suspension) use-after-frees: `samInstanceDispatch` dispatches a
+      SAM/continuation instance whose cell was already released
+      (`class.zig:284` reads `0xaa…` poison). Plain SAM / lambda / suspend-fun
+      dispatch is clean under smp; the bug is specific to the coroutine
+      *builder* machinery (`runBlocking`/scope/continuation), which creates and
+      shares intermediate SAM/continuation instances without the clone-on-share
+      / host-returns-owned retains. This is the §7.3 host reconciliation scoped
+      to the coroutine host — multi-site, and the prerequisite for reclaim-ON on
+      any coroutine program (hence ktor). Until it lands, reclaim-ON corrupts
+      the coroutine path; the safe production option for a server is
+      `KLIO_RECLAIM=free`.
+- [ ] **ktor server/client RSS flat over many requests.** Measured (with the §8
+      fix): under the default arena a ktor `GET` server grows ~8.5 MB/request
+      (mostly transients the run path *explicitly frees* — 556 MB freed / 830 MB
+      allocated over 30 requests — that the arena cannot return) and hits the
+      6 GB cap in ~700 requests. Under `KLIO_RECLAIM=free` the per-request growth
+      drops ~5× to ~1.75 MB/request (no crash; the residual is the ObjRef value
+      graph, which reclaim-ON would free but currently corrupts — see above).
+      Full bounding needs either the coroutine-host reconciliation (then
+      reclaim-ON) or a per-request/run-boundary arena reset for the server.
 - [x] **Startup baseline ROOT-CAUSED + FIXED (§8): 646 MB → 127 MB.** The
       baseline was `decodeSymbols` deserialising the symbol index into the
       page-granular `page_allocator` (~33 K tiny allocs × 16 KB page = ~535 MB);
