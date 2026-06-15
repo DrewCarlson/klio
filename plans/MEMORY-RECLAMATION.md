@@ -586,12 +586,24 @@ in-memory representation. Independent of the leak; do it after.
       reconciliation** is complete; this prerequisite is identical for the
       `Frame.deinit` route and the §7 IR `Drop` route. Foundation is green &
       stable under `smp` (leaks, never corrupts).
-- [ ] **Host ownership reconciliation (the large prerequisite, §7.-1)**:
-      clone-on-share, host-returns-owned, stores-retain+release-old across
-      `src/interp_ir/vm/*` and `src/stdlib/*`. Validate with `KLIO_RECLAIM=smp`
-      on real programs (init → simple → stdlib → ktor).
-- [ ] Re-land eval register balance + coroutine handoff (written & string-loop-
-      validated, reverted pending the reconciliation; §7.5).
-- [ ] Flip production to reclaim-ON + freeing allocator; verify server RSS flat
-      (§7.8).
-- [ ] Startup baseline / lazy stdlib (§8).
+- [x] **eval register balance + value-graph reconciliation LANDED & WORKING**
+      (committed): under `KLIO_RECLAIM=smp`, simple / string-churn / Pair /
+      mutable-collection / data-class-instance programs run double-free-clean.
+      `Frame` owns/releases its registers; alias/accessor/escaping-return
+      retains; closure-capture + collection-store + instance-field retains;
+      `IrClosure` release double-deinit fixed. No suite regressions — the 2
+      itest failures (`parity_coroutine_smoke.cs6`, `parity_kotlinx_io_read.
+      read_line`) are PRE-EXISTING at session-start (a flaky Flow/concurrency
+      test and a cross-test global-state pollution), orthogonal to reclamation;
+      all reclaim changes are gated no-ops under the arena those tests use.
+- [ ] **Host-temporary reconciliation (the remaining large work)**: free the
+      per-call host scratch the port never freed (probes, arg arrays, dispatch
+      temps) — pervasive across `src/interp_ir/vm/*`/`src/stdlib/*`; gate every
+      free on `reclaimEnabled()` (arena `free` rewinds the last alloc). Or use a
+      per-request arena for the ktor server (reclaims temps+values without the
+      audit). Validate with the DebugAllocator leaked-count diffed across N
+      (smp RSS is non-deterministic).
+- [ ] Re-apply coroutine suspend/resume ownership (snapshot retain/release; §7.5).
+- [ ] ktor server/client RSS flat over many requests.
+- [ ] Startup baseline / lazy/compact stdlib (§8, ~646 MB uniform).
+- [ ] Flip production to reclaim-ON + (split) freeing allocator (§7.8).
