@@ -269,6 +269,48 @@ N=300 and N=300000), then reverted because they corrupt under the unreconciled
 host. They are the correct activation; re-land them only after the host
 reconciliation above is complete and `smp` runs the corpus clean.
 
+### 7.-0.5 SECOND CRITICAL FINDING: two independent leak classes
+
+Activating reclamation surfaced **two** distinct memory problems, not one:
+
+1. **Value-graph ownership** (the refcounting). Fixed incrementally and working:
+   under `KLIO_RECLAIM=smp` (a real freeing allocator), `fun main(){}`,
+   string-churn loops, `Pair`/destructuring, mutable list/map loops, and
+   data-class/instance loops all run **double-free-clean** and **bounded**
+   (RSS flat across 2000→2,000,000 iterations). The fixes: alias-handler/
+   accessor/escaping-return retains in eval (`Frame` owns its registers,
+   releases on overwrite + teardown), `IrClosure` release double-deinit fix,
+   closure-capture retain, collection map-put retain + release-old,
+   instance-ctor field retain + `InstanceData.define` adopt+release-old.
+
+2. **Host temporary allocations relying on the arena** (the Rust→Zig port
+   dropped explicit frees). Pervasive: every host path that `allocPrint`s a
+   probe FQN, builds an arg/`prependReceiver` array, or a scratch `ArrayList`
+   and lets the arena reclaim it **leaks per call** under a freeing allocator —
+   independent of Value refcounting. Freeing the member-dispatch scratch
+   (`stdlibMemberDispatch` probe FQNs, sibling anchor, array-builder probe,
+   prepended args) halved the per-iteration leak of a combined instance+map
+   loop. The remainder is the same class in other host paths.
+
+**Implication for §7.8.** "One freeing allocator for everything" is *not* free:
+it requires restoring explicit deallocation of every host temporary the port
+dropped — a large audit on top of Value refcounting. The leak classes split by
+workload, which points at the most practical decomposition of the goal:
+- **Simple programs / stdlib usage are batch**: they exit, so the arena already
+  bounds them for the run. Their only "high usage" is the **§8 startup baseline
+  (~670 MB)** — fix that (lazy/compact stdlib), not reclamation.
+- **A long-running ktor server/client** is the case that needs continuous
+  reclamation. Either finish the host-temp + Value reconciliation under a
+  freeing allocator, **or** reset a per-request/run-boundary arena when a
+  request's coroutines complete (reclaims temps *and* values without the
+  full temp-free audit; the run-boundary reset already exists for the test
+  harness — `coroutines.zig`). The per-request-arena route trades the temp-free
+  audit for coroutine-lifetime/escape bookkeeping.
+
+Diagnostic added: `KLIO_RC_DETECT=1` makes `ObjRef.deinit` leak freed cells and
+dump the stack on a double-free (DebugAllocator quarantine masks these; smp
+crashes downstream) — used to pinpoint each value-ownership bug.
+
 ### 7.0 Revised approach (decided after a full subsystem re-audit)
 
 A complete re-audit of the IR, lowering, evaluator, host, and coroutine
