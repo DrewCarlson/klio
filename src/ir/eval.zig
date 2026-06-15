@@ -1467,10 +1467,6 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // by parameter name). The receiver is reachable here, so an
             // implicit extension receiver can be supplied before dispatch.
             var eff_func = call.func;
-            var prepended: ?[]Value = null;
-            defer if (prepended) |p| allocator.free(p);
-            var prepended_names: ?[]?[]const u8 = null;
-            defer if (prepended_names) |p| allocator.free(p);
             if (!call.exact) {
                 var any_named = false;
                 for (names) |n| {
@@ -1495,12 +1491,16 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                                 const na = try allocator.alloc(Value, arg_values.len + 1);
                                 na[0] = recv;
                                 @memcpy(na[1..], arg_values);
-                                prepended = na;
+                                // `arg_values`/`names` are owned by the
+                                // single `defer allocator.free(...)` above;
+                                // free the original buffers before replacing
+                                // the pointers so each is freed exactly once.
+                                allocator.free(arg_values);
                                 arg_values = na;
                                 const nn = try allocator.alloc(?[]const u8, names.len + 1);
                                 nn[0] = null;
                                 @memcpy(nn[1..], names);
-                                prepended_names = nn;
+                                allocator.free(names);
                                 names = nn;
                             }
                         }
