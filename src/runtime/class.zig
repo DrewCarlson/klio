@@ -775,6 +775,32 @@ test "instance release recursively frees a retained instance field" {
     b_val.release(allocator);
 }
 
+test "list release recursively frees retained instance elements" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+
+    const inst = try ObjRef(InstanceData).init(allocator, .{
+        .class = fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 1,
+        .native_state = null,
+    });
+    const inst_val = Value{ .Instance = inst };
+
+    var arr: std.ArrayList(Value) = .empty;
+    inst_val.retain(); // storing into the list retains the element (count 2)
+    try arr.append(allocator, inst_val);
+    const items = try ObjRef(std.ArrayList(Value)).init(allocator, arr);
+    const list_val = Value{ .List = .{ .items = items, .mutable = true, .enum_class = null, .backing = null } };
+
+    // Releasing the list (its last owner) releases the element (2 → 1) and
+    // frees the backing array; releasing the local handle frees the instance.
+    list_val.release(allocator);
+    inst_val.release(allocator);
+}
+
 test "findMethod walks the parent chain and prefers concrete bodies" {
     const allocator = testing.allocator;
 

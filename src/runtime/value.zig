@@ -485,14 +485,28 @@ pub const Value = union(enum) {
             .StringBuilder => |s| s.deinit(),
             .Cell => |c| c.deinit(),
             .Function => |f| f.env.deinit(),
-            .IrClosure => |c| c.captures.deinit(),
+            .IrClosure => |c| {
+                releaseSliceElems(c.captures, allocator);
+                c.captures.deinit();
+            },
             .Comparator => |c| c.steps.deinit(),
-            .List => |x| x.items.deinit(),
-            .Set => |x| x.items.deinit(),
-            .Array => |x| x.items.deinit(),
-            .Map => |x| x.entries.deinit(),
+            .List => |x| releaseValueList(x.items, allocator),
+            .Set => |x| releaseValueList(x.items, allocator),
+            .Array => |x| releaseValueList(x.items, allocator),
+            .Map => |x| {
+                // Last owner: release each entry's key and value.
+                if (x.entries.strongCount() == 1) {
+                    const g = x.entries.borrow();
+                    for (g.get().items) |pair| {
+                        pair.key.release(allocator);
+                        pair.value.release(allocator);
+                    }
+                    g.deinit();
+                }
+                x.entries.deinit();
+            },
             .Iterator => |x| {
-                x.items.deinit();
+                releaseValueList(x.items, allocator);
                 x.pos.deinit();
             },
             .RangeIter => |x| x.cur.deinit(),
@@ -504,7 +518,29 @@ pub const Value = union(enum) {
             },
             else => {},
         }
-        _ = allocator;
+    }
+
+    /// Drop one owning handle to a `ValueList` and, when it was the last,
+    /// release each contained element first. Safe without locking the count:
+    /// `strongCount() == 1` means this is the only handle, so no other thread
+    /// can hold one to clone from concurrently.
+    fn releaseValueList(items: ValueList, allocator: std.mem.Allocator) void {
+        if (items.strongCount() == 1) {
+            const g = items.borrow();
+            for (g.get().items) |e| e.release(allocator);
+            g.deinit();
+        }
+        items.deinit();
+    }
+
+    /// `releaseValueList` for an `ObjRef([]Value)` capture slice.
+    fn releaseSliceElems(slice: ValueSlice, allocator: std.mem.Allocator) void {
+        if (slice.strongCount() == 1) {
+            const g = slice.borrow();
+            for (g.get().*) |e| e.release(allocator);
+            g.deinit();
+        }
+        slice.deinit();
     }
 
     /// `ObjRef(Value)` (capture `Cell`) payload teardown: a boxed value is
