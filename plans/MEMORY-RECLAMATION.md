@@ -205,6 +205,70 @@ committed foundation (§5) is untouched and correct.
 
 ## 7. The plan: activate reclamation (the ownership contract)
 
+### 7.-1 DEFINITIVE FINDING (validated with a freeing allocator)
+
+The committed value-model foundation below (StringRef byte ownership, `ValueBox`
+refcounting, retain-gating, the `KLIO_RECLAIM` oracle) is **done, green, and
+stable** under a real freeing allocator: `KLIO_RECLAIM=smp ./klio run x.kt`
+runs every program correctly (it leaks, because no register reclamation is
+active, but never corrupts). Per-module leak-checked tests pass under reclaim-on.
+
+Activating register reclamation (the eval `Frame.deinit` releasing registers +
+per-handler retains, equivalently the §7 IR `Drop` emission) was implemented and
+**proven to corrupt even `fun main() {}`** under `KLIO_RECLAIM=smp`. Root cause,
+now established with hard evidence:
+
+- The interpreter **host** (`src/interp_ir/vm/*`, `src/stdlib/*`, ~600 KB) was
+  written for the arena model: it copies `Value`s — and the refcounted
+  sub-handles inside them (`ValueList`/`MapEntries`/`StringRef`/`ObjRef`) —
+  **bitwise, without cloning**, all over: building an `Iterator` that shares a
+  collection's `items` cell, packing a vararg `Array`, returning an arg/element/
+  field/receiver borrow, sharing a backing store between a view and its source.
+  Under the arena none of this mattered (nothing was ever freed). The moment a
+  register release decrements one of those shared handles, the other aliases
+  dangle → use-after-free / double-free. `DebugAllocator` quarantine *masks*
+  some of these (the run appears to "pass"); `smp_allocator` aborts on them,
+  which is why `fun main(){}` aborts under smp but looked clean under debug.
+- This is exactly the §6 "all-or-nothing" wall, now **confirmed independently**.
+  It is **not** specific to the runtime-`Frame.deinit` mechanism: the §7 IR
+  `Retain`/`Drop` route hits the identical wall, because dropping a Call-result
+  register requires the host to have returned an owned value, and dropping any
+  register requires every container the value flows into to own (clone) its
+  copy. The register mechanism is interchangeable; the **prerequisite is the
+  host reconciliation**, and it is the whole job.
+
+**The required (large) prerequisite — host ownership reconciliation.** Before any
+register reclamation can be turned on, every host site must obey one rule:
+*a refcounted handle copied into a separately-owned or longer-lived location
+must be cloned; a borrowed value returned to the interpreter must be retained
+(host-returns-owned); a container/field/global/cell store must retain its
+element and release the value it overwrote.* Concretely audit, in
+`src/interp_ir/vm/*` and `src/stdlib/*`:
+1. **clone-on-share**: every `Value.Iterator`/view/derived-value construction
+   that reuses another value's `items`/`entries`/backing `ObjRef` must
+   `.clone()` it (e.g. `iterator()` on a List/Array, map key/value/entry views,
+   `withIndex`, the vararg `Array` packer in `host_call_func.zig`).
+2. **host-returns-owned**: accessors returning a borrowed element/field/receiver
+   (`get`/`first`/`last`/`[]`/`getValue`/`component1..3`/`iterator.next`/
+   `getField`/global reads/`apply`/`also`) `retain()` before returning.
+3. **stores-retain + release-old**: collection `add`/`put`/`set`/build, instance
+   `set`/`define`/primary-ctor init, `StoreGlobal`, `CellSet`, closure capture
+   build (`host_call_value.zig` `buildClosure`), `InstanceData.set`.
+
+Validation must use `KLIO_RECLAIM=smp` on real programs (it aborts on the latent
+double-frees that `DebugAllocator` quarantine hides). Per-module leak tests are
+necessary but **not sufficient** — they exercise host intrinsics in isolation,
+not the Kotlin-source stdlib functions (`apply`, `forEachIndexed`, …) that run
+through the evaluator and where the sharing bugs actually bite.
+
+The eval register-balance edits (`Frame.write` release-old, `Frame.deinit`
+release-regs, alias-handler retains, terminator retains for escaping
+return/throw values, the suspend/resume snapshot retain/release) were written
+and validated to *bound* a pure-string loop (`leak_strings`: RSS identical at
+N=300 and N=300000), then reverted because they corrupt under the unreconciled
+host. They are the correct activation; re-land them only after the host
+reconciliation above is complete and `smp` runs the corpus clean.
+
 ### 7.0 Revised approach (decided after a full subsystem re-audit)
 
 A complete re-audit of the IR, lowering, evaluator, host, and coroutine
@@ -405,18 +469,22 @@ in-memory representation. Independent of the leak; do it after.
       inert in production (`ba6bec4b`, `58266139`).
 - [x] Proven that runtime-guessing frame reclamation is all-or-nothing and
       corrupts trivial programs — reverted.
-- [x] Decided the ownership contract (§7.0): per-handler ownership, gated on
-      `reclaimEnabled()`; no IR `Retain`/`Drop` pass needed.
-- [ ] Checked/measured binary path: env-gated freeing allocator + reclaim-ON
-      (`KLIO_RECLAIM`), `KLIO_ALLOC_TRACK` size histogram (§9 oracles).
-- [ ] `StringRef` owns+frees its bytes (§7.7).
-- [ ] Convert owning-`*Value` variants to `ObjRef` (§7.6).
-- [ ] Container/field/global/cell/capture stores retain + release-old (§7.3),
-      runtime + host audit.
-- [ ] Host-returns-owned contract: accessors retain borrowed returns.
-- [ ] eval register balance: `Frame.write` release-old, `Frame.deinit`
-      release regs/params/captures, alias-handlers retain, return retains out.
-- [ ] Coroutine suspension ownership handoff (§7.5).
+- [x] Checked/measured binary path: env-gated freeing allocator + reclaim-ON
+      (`KLIO_RECLAIM={smp,debug}`) (§9 oracles). Committed.
+- [x] `StringRef` owns+frees its bytes (§7.7). Committed, leak-clean.
+- [x] Convert owning-`*Value` variants to `ObjRef`/`ValueBox` (§7.6). Committed,
+      leak-clean.
+- [x] DEFINITIVELY established (§7.-1): register reclamation corrupts trivial
+      programs under a freeing allocator until the **host ownership
+      reconciliation** is complete; this prerequisite is identical for the
+      `Frame.deinit` route and the §7 IR `Drop` route. Foundation is green &
+      stable under `smp` (leaks, never corrupts).
+- [ ] **Host ownership reconciliation (the large prerequisite, §7.-1)**:
+      clone-on-share, host-returns-owned, stores-retain+release-old across
+      `src/interp_ir/vm/*` and `src/stdlib/*`. Validate with `KLIO_RECLAIM=smp`
+      on real programs (init → simple → stdlib → ktor).
+- [ ] Re-land eval register balance + coroutine handoff (written & string-loop-
+      validated, reverted pending the reconciliation; §7.5).
 - [ ] Flip production to reclaim-ON + freeing allocator; verify server RSS flat
       (§7.8).
 - [ ] Startup baseline / lazy stdlib (§8).
