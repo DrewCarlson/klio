@@ -1303,6 +1303,7 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
         return null;
     }
 
+    const snap0 = runtime.allocTrackSnapshot();
     var d = Decoder{ .a = a, .buf = bytes[payload_start .. payload_start + payload_len] };
     const root = a.create(ImageRoot) catch return error.OutOfMemory;
     decodeInto(ImageRoot, &d, root) catch |e| switch (e) {
@@ -1316,8 +1317,11 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
         load_failure = "trailing payload bytes";
         return null;
     }
+    runtime.allocTrackReportPhase("image.decode", snap0);
 
+    const snap1 = runtime.allocTrackSnapshot();
     const loaded = try baseFromRoot(a, root);
+    runtime.allocTrackReportPhase("image.baseFromRoot", snap1);
     if (loaded == null) load_failure = "inconsistent tables";
     return loaded;
 }

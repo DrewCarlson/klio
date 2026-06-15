@@ -40,10 +40,18 @@ pub fn stdlibSymbols() []const SymbolEntry {
     return symbols;
 }
 
+/// Process-lifetime bump arena for the decoded registry. The symbol index
+/// deserialises into tens of thousands of small strings/records; routing
+/// those through `page_allocator` directly mmaps a full page per allocation
+/// (~16 KB minimum on some hosts), inflating a few MB of data into hundreds
+/// of MB resident. An arena bump-allocates them into a handful of large
+/// chunks. The arena is intentionally never freed (the slices live for the
+/// process), matching the Rust `Box::leak` of the materialised registry.
+var symbol_arena: std.heap.ArenaAllocator = undefined;
+
 fn decodeSymbols() std.mem.Allocator.Error![]SymbolEntry {
-    // Process-lifetime allocator: the decoded strings outlive every caller,
-    // matching the Rust `Box::leak` of the materialised registry.
-    const a = std.heap.page_allocator;
+    symbol_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const a = symbol_arena.allocator();
     var err: pack.PackError = undefined;
     const index = (try pack.schema.decode(pack.schema.SymbolIndex, a, SYMBOLS_POSTCARD, &err)) orelse return &.{};
     const out = try a.alloc(SymbolEntry, index.entries.len);

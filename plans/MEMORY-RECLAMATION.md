@@ -500,14 +500,35 @@ exact value flow:
    it; otherwise one freeing allocator for everything (Rust's model) is fine —
    persistent data stays resident because it stays referenced.
 
-## 8. Startup baseline (~670 MB) — separate workstream
+## 8. Startup baseline — ROOT-CAUSED AND FIXED (646 MB → 127 MB)
 
-The whole embedded stdlib is lowered/loaded eagerly and kept resident even for
-`println("hi")`: ~205 MB in ~70 large buffers (lowered IR arrays, registry
-maps, embedded pack) + ~110 MB in small AST/IR nodes (128–512 B). Even the
-image-cache path expands to this (deserialization rebuilds the full live
-registry). Fixing requires lazy/on-demand decl lowering or a more compact
-in-memory representation. Independent of the leak; do it after.
+The ~646 MB uniform baseline was **not** the stdlib graph itself (that is only
+~100 MB live). It was a single allocator-misuse bug, found by instrumentation
+(`src/runtime/alloc_track.zig`, `KLIO_ALLOC_TRACK` / the `pageAllocator` probe):
+
+`src/stdlib/generated/mod.zig` `decodeSymbols` deserialised the embedded symbol
+index (`symbols.postcard`, ~33 K small strings/records ≈ the stdlib decl count)
+straight into **`std.heap.page_allocator`**. That allocator mmaps **one whole
+page per allocation** (16 KB minimum on macOS arm64), so ~33 K tiny decode
+allocations consumed ~535 MB resident — a few MB of real data inflated ~250×.
+(vmmap coalesced the adjacent pages into ~4781 × 112 KB regions, which is what
+made it look like a per-decl structure.)
+
+**Fix:** decode into a process-lifetime `ArenaAllocator` (bump-allocated into a
+handful of large chunks, intentionally never freed — the slices live for the
+process), instead of page-granular `page_allocator`. Result: every simple /
+stdlib program drops from ~646 MB to **~127 MB** RSS (the genuine live stdlib
+graph), output unchanged, no other behavior change. The diagnostic
+`alloc_track` module (arena byte/size-histogram tracking via `KLIO_ALLOC_TRACK`,
+plus a `pageAllocator` stack-tracing probe for attributing large mmaps) is kept
+as committed tooling.
+
+`std.heap.page_allocator` used for many small allocations is a latent footgun
+anywhere in the codebase; `decodeSymbols` was the only bulk offender (every
+other `pack.*.decode` site already threads a real `gpa`/arena). Further baseline
+reduction (the remaining ~127 MB) would need lazy/on-demand decl
+deserialisation in `image.zig` or a more compact in-memory node representation —
+optional; 127 MB for a fully-loaded stdlib is acceptable.
 
 ## 9. Validation methodology (oracles)
 
@@ -605,5 +626,9 @@ in-memory representation. Independent of the leak; do it after.
       (smp RSS is non-deterministic).
 - [ ] Re-apply coroutine suspend/resume ownership (snapshot retain/release; §7.5).
 - [ ] ktor server/client RSS flat over many requests.
-- [ ] Startup baseline / lazy/compact stdlib (§8, ~646 MB uniform).
+- [x] **Startup baseline ROOT-CAUSED + FIXED (§8): 646 MB → 127 MB.** The
+      baseline was `decodeSymbols` deserialising the symbol index into the
+      page-granular `page_allocator` (~33 K tiny allocs × 16 KB page = ~535 MB);
+      decoding into a process-lifetime arena removed it. Diagnostic tooling
+      (`src/runtime/alloc_track.zig`, `KLIO_ALLOC_TRACK`) committed.
 - [ ] Flip production to reclaim-ON + (split) freeing allocator (§7.8).

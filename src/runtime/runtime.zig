@@ -18,6 +18,7 @@ const clock_mod = @import("clock.zig");
 const float_fmt_mod = @import("float_fmt.zig");
 const safety_mod = @import("safety.zig");
 const threads_mod = @import("threads.zig");
+const alloc_track_mod = @import("alloc_track.zig");
 
 // objcell
 pub const ObjRef = objcell.ObjRef;
@@ -30,6 +31,16 @@ pub const setReclaim = objcell.setReclaim;
 pub const reclaimEnabled = objcell.reclaimEnabled;
 pub const reclaimRequested = objcell.reclaimRequested;
 pub const getenvSlice = objcell.getenvSlice;
+
+// alloc_track (opt-in allocation accounting; KLIO_ALLOC_TRACK)
+pub const allocTrackWrap = alloc_track_mod.wrap;
+pub const allocTrackSnapshot = alloc_track_mod.snapshot;
+pub const allocTrackReportPhase = alloc_track_mod.reportPhase;
+pub const allocTrackReportStderr = alloc_track_mod.reportStderr;
+pub const allocTrackIsActive = alloc_track_mod.isActive;
+pub const AllocTrackSnap = alloc_track_mod.Snap;
+pub const pageAllocator = alloc_track_mod.pageAllocator;
+pub const allocTrackReportPageStderr = alloc_track_mod.reportPageStderr;
 
 // value
 pub const Value = value_mod.Value;
@@ -146,6 +157,7 @@ test {
     _ = float_fmt_mod;
     _ = safety_mod;
     _ = threads_mod;
+    _ = alloc_track_mod;
 }
 
 // -------------------------------------------------------------------------

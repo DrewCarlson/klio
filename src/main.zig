@@ -22,7 +22,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .arena => {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
-            return cli.run(arena.allocator(), init.args);
+            const a = runtime.allocTrackWrap(arena.allocator());
+            defer runtime.allocTrackReportStderr();
+            return cli.run(a, init.args);
         },
         .smp => {
             return cli.run(std.heap.smp_allocator, init.args);
