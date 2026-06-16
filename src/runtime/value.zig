@@ -520,6 +520,20 @@ pub const Value = union(enum) {
         self.forEachChildCell(RetainVisitor{});
     }
 
+    const MarkVisitor = struct {
+        m: *objcell.gc.Marker,
+        inline fn visit(self: MarkVisitor, objref: anytype) void {
+            self.m.shade(&objref.cell.hdr);
+        }
+    };
+
+    /// GC tracer for a `Value`: shade each cell this value directly references
+    /// (one level; the shaded cell's own `gc_trace` reaches the next level).
+    /// Same edge set as `retain`, so they cannot diverge.
+    pub fn gcMark(self: Value, m: *objcell.gc.Marker) void {
+        self.forEachChildCell(MarkVisitor{ .m = m });
+    }
+
     /// Reference-counting decrement (Rust `Drop`): drop one owning handle to
     /// this value graph. When a handle's strong count reaches zero its
     /// payload `deinit` recursively releases what it owns. The dual of
