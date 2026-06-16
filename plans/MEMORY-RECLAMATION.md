@@ -914,6 +914,32 @@ The over-release is now pinned to the **parent coroutine** (`runBlocking`'s
   above is not a singleton) but is very likely needed before the tail is clean;
   do it with a cheap per-instance flag, not a per-op class borrow.
 
+Further bisecting (env gates on `Frame.deinit`'s per-slot releases):
+- Disabling the resumed frame's **captures** release (`KLIO_NO_CAP_REL`) makes
+  the async loop pass at every N — but that is a *buffer/leak*, not the fix:
+  it adds one un-released reference per suspension that absorbs the real
+  over-release. Removing the snapshot's capture retain *and* the resume release
+  together (making captures pure borrows) made it worse, confirming the snapshot
+  capture retain is the absorbing buffer, not the bug.
+- So the over-release is one un-matched **release** of the parent coroutine that
+  the snapshot-capture-retain (+1) and the receiver-retain (+1) together buffer —
+  exhausted at ~10 children.
+- Pinpointing it with env-gated prints is blocked by a *funnel*: every
+  `Instance` retain/release routes through `Value.retain`/`Value.release` →
+  `ObjRef.clone`/`deinit`, so both `@returnAddress()` and per-address tallies
+  collapse to those two wrapper sites; and retains vs releases live at different
+  code sites by nature, so address tallies never pair. A full-stack dump per op
+  perturbs the timing enough to move the crash.
+
+**What it needs:** a proper refcount-pairing tracker — record, per cell, the
+ordered (op, full call site) history and, for any cell whose count hits zero
+while a known borrow is still outstanding (or simply dump the complete history
+of the one `KlioBlockingCoroutine` cell), so the unmatched release is read
+directly. That is the same class of tool as `src/runtime/alloc_track.zig` and is
+the right next investment. Alternatively, the **per-request / per-coroutine-tree
+arena reset** (§12.4 option 2) sidesteps the value-graph reclaim entirely and is
+the more bounded route to a bounded server.
+
 The honest assessment: this is the §6/§7.-1 "all-or-nothing host reconciliation"
 wall — a long tail of borrow-without-retain share sites in the coroutine / job
 tree / suspend-resume machinery, each fix unblocking a little more. The
