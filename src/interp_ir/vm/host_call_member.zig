@@ -2040,6 +2040,10 @@ fn cloneItemsList(allocator: Allocator, src: runtime.ValueList) Allocator.Error!
     defer g.deinit();
     var out: std.ArrayList(Value) = .empty;
     try out.appendSlice(allocator, g.get().items);
+    // An owned copy: every wrapper built from this list (a new List/Array/Set/
+    // Iterator, or a `sorted` list that escapes) takes one reference per element,
+    // so retain each. The source still owns its own refs. No-op under the arena.
+    if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
     return out;
 }
 

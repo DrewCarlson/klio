@@ -29,6 +29,17 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
+/// Return the *receiver* StringBuilder (the fluent `append`/`insert`/… methods
+/// hand `this` back for chaining). Host calls return owned values and the
+/// dispatch writes the result into a register that takes ownership, so retain
+/// the borrowed receiver first or it is released one time too many when that
+/// register is overwritten/torn down. No-op under the arena fast path.
+fn okSb(sb: StringBuilderRef) EvalResult {
+    const v = Value{ .StringBuilder = sb };
+    v.retain();
+    return .{ .ok = v };
+}
+
 fn errResult(e: RuntimeError) EvalResult {
     return .{ .err = e };
 }
@@ -395,7 +406,7 @@ pub fn string_builder_set_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const s = try fromUtf16Lossy(a, new_units);
     defer a.free(s);
     try setBuf(buf, a, s);
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 /// `Vec::splice(start..end, value)` — replace `units[start..end]` with
@@ -438,7 +449,7 @@ pub fn string_builder_append_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const s = try fromUtf16Lossy(a, combined);
     defer a.free(s);
     try setBuf(buf, a, s);
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 /// `StringBuilder.insertRange(index, value, startIndex, endIndex)` — insert
@@ -476,7 +487,7 @@ pub fn string_builder_insert_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const s = try fromUtf16Lossy(a, new_units);
     defer a.free(s);
     try setBuf(buf, a, s);
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 // ============================================================
@@ -504,7 +515,7 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
             try appendValue(buf, a, v);
         }
     }
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 fn isCharSeqOrArray(v: Value) bool {
@@ -555,7 +566,7 @@ pub fn string_builder_append_line(ctx: *CallCtx) Allocator.Error!EvalResult {
         }
         try buf.append(a, '\n');
     }
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 pub fn string_builder_length(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -615,7 +626,7 @@ pub fn string_builder_clear(ctx: *CallCtx) Allocator.Error!EvalResult {
         defer g.deinit();
         g.get().clearRetainingCapacity();
     }
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 // ============================================================
@@ -644,7 +655,7 @@ pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const byte = sbCharByte(buf.items, idx.?).?;
     try buf.insertSlice(a, byte, piece.items);
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 pub fn string_builder_delete_at(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -665,7 +676,7 @@ pub fn string_builder_delete_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     const byte = sbCharByte(buf.items, idx.?).?;
     const ch_len = std.unicode.utf8ByteSequenceLength(buf.items[byte]) catch 1;
     try replaceRange(buf, a, byte, byte + ch_len, "");
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 pub fn string_builder_delete_range(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -688,7 +699,7 @@ pub fn string_builder_delete_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb_byte = sbCharByte(buf.items, start.?).?;
     const eb_byte = sbCharByte(buf.items, end.?).?;
     try replaceRange(buf, a, sb_byte, eb_byte, "");
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 /// `String::replace_range(start_byte..end_byte, repl)` — splice `repl` over a
@@ -746,7 +757,7 @@ pub fn string_builder_reverse(ctx: *CallCtx) Allocator.Error!EvalResult {
         try rev.insertSlice(a, 0, slice);
     }
     try setBuf(buf, a, rev.items);
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 pub fn string_builder_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -839,7 +850,7 @@ pub fn string_builder_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb_byte = sbCharByte(buf.items, start.?).?;
     const eb_byte = sbCharByte(buf.items, end).?;
     try replaceRange(buf, a, sb_byte, eb_byte, repl);
-    return ok(.{ .StringBuilder = sb });
+    return okSb(sb);
 }
 
 pub fn string_builder_last_index(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -938,6 +949,7 @@ test "append concatenates values" {
     var c = tc.ctx(a, &args);
     const r = try string_builder_append(&c);
     try testing.expect(r == .ok);
+    defer freeSb(r.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("a1true", g.get().items);
@@ -951,7 +963,8 @@ test "append null renders as null" {
     defer freeSb(sb, a);
     var args = [_]Value{ sb, .Null };
     var c = tc.ctx(a, &args);
-    _ = try string_builder_append(&c);
+    const __sbres = try string_builder_append(&c);
+    defer if (__sbres == .ok) freeSb(__sbres.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("null", g.get().items);
@@ -965,7 +978,8 @@ test "append char" {
     defer freeSb(sb, a);
     var args = [_]Value{ sb, .{ .Char = 'y' } };
     var c = tc.ctx(a, &args);
-    _ = try string_builder_append(&c);
+    const __sbres = try string_builder_append(&c);
+    defer if (__sbres == .ok) freeSb(__sbres.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("xy", g.get().items);
@@ -981,7 +995,8 @@ test "appendLine adds newline" {
     defer s.deinit();
     var args = [_]Value{ sb, .{ .String = s } };
     var c = tc.ctx(a, &args);
-    _ = try string_builder_append_line(&c);
+    const __sbres = try string_builder_append_line(&c);
+    defer if (__sbres == .ok) freeSb(__sbres.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("hi\n", g.get().items);
@@ -999,6 +1014,7 @@ test "append subrange overload appends slice" {
     var c = tc.ctx(a, &args);
     const r = try string_builder_append(&c);
     try testing.expect(r == .ok);
+    defer freeSb(r.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("bcd", g.get().items);
@@ -1086,7 +1102,8 @@ test "clear empties the buffer" {
     defer freeSb(sb, a);
     var args = [_]Value{sb};
     var c = tc.ctx(a, &args);
-    _ = try string_builder_clear(&c);
+    const __sbres = try string_builder_clear(&c);
+    defer if (__sbres == .ok) freeSb(__sbres.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqual(@as(usize, 0), g.get().items.len);
@@ -1100,7 +1117,8 @@ test "insert at index" {
     defer freeSb(sb, a);
     var args = [_]Value{ sb, .{ .Int = 1 }, .{ .Char = 'b' } };
     var c = tc.ctx(a, &args);
-    _ = try string_builder_insert(&c);
+    const __sbres = try string_builder_insert(&c);
+    defer if (__sbres == .ok) freeSb(__sbres.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("abc", g.get().items);
@@ -1127,7 +1145,8 @@ test "deleteAt removes a char" {
     defer freeSb(sb, a);
     var args = [_]Value{ sb, .{ .Int = 1 } };
     var c = tc.ctx(a, &args);
-    _ = try string_builder_delete_at(&c);
+    const __sbres = try string_builder_delete_at(&c);
+    defer if (__sbres == .ok) freeSb(__sbres.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("ac", g.get().items);
@@ -1141,7 +1160,8 @@ test "deleteRange removes a span" {
     defer freeSb(sb, a);
     var args = [_]Value{ sb, .{ .Int = 1 }, .{ .Int = 4 } };
     var c = tc.ctx(a, &args);
-    _ = try string_builder_delete_range(&c);
+    const __sbres = try string_builder_delete_range(&c);
+    defer if (__sbres == .ok) freeSb(__sbres.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("aef", g.get().items);
@@ -1156,7 +1176,8 @@ test "setLength truncates and pads" {
         defer freeSb(sb, a);
         var args = [_]Value{ sb, .{ .Int = 3 } };
         var c = tc.ctx(a, &args);
-        _ = try string_builder_set_length(&c);
+        const __sbres = try string_builder_set_length(&c);
+    defer if (__sbres == .ok) freeSb(__sbres.ok, a);
         const g = sb.StringBuilder.borrow();
         defer g.deinit();
         try testing.expectEqualStrings("abc", g.get().items);
@@ -1166,7 +1187,8 @@ test "setLength truncates and pads" {
         defer freeSb(sb, a);
         var args = [_]Value{ sb, .{ .Int = 4 } };
         var c = tc.ctx(a, &args);
-        _ = try string_builder_set_length(&c);
+        const __sbres = try string_builder_set_length(&c);
+    defer if (__sbres == .ok) freeSb(__sbres.ok, a);
         const g = sb.StringBuilder.borrow();
         defer g.deinit();
         try testing.expectEqual(@as(usize, 4), g.get().items.len);
@@ -1182,7 +1204,8 @@ test "reverse flips chars" {
     defer freeSb(sb, a);
     var args = [_]Value{sb};
     var c = tc.ctx(a, &args);
-    _ = try string_builder_reverse(&c);
+    const __sbres = try string_builder_reverse(&c);
+    defer if (__sbres == .ok) freeSb(__sbres.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("cba", g.get().items);
@@ -1214,6 +1237,7 @@ test "setCharAt replaces a char in place" {
     var c = tc.ctx(a, &args);
     const r = try string_builder_set_char_at(&c);
     try testing.expect(r == .ok);
+    defer freeSb(r.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("cut", g.get().items);
@@ -1229,6 +1253,7 @@ test "set replaces a code unit and returns Unit" {
     var c = tc.ctx(a, &args);
     const r = try string_builder_set(&c);
     try testing.expect(r == .ok);
+    defer freeSb(r.ok, a);
     try testing.expect(r.ok == .Unit);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
@@ -1247,6 +1272,7 @@ test "replace splices a string" {
     var c = tc.ctx(a, &args);
     const r = try string_builder_replace(&c);
     try testing.expect(r == .ok);
+    defer freeSb(r.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("aXYef", g.get().items);
@@ -1264,6 +1290,7 @@ test "setRange replaces utf16 units" {
     var c = tc.ctx(a, &args);
     const r = try string_builder_set_range(&c);
     try testing.expect(r == .ok);
+    defer freeSb(r.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("aZef", g.get().items);
@@ -1281,6 +1308,7 @@ test "appendRange appends a slice of a string" {
     var c = tc.ctx(a, &args);
     const r = try string_builder_append_range(&c);
     try testing.expect(r == .ok);
+    defer freeSb(r.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("xcde", g.get().items);
@@ -1298,6 +1326,7 @@ test "insertRange inserts a slice" {
     var c = tc.ctx(a, &args);
     const r = try string_builder_insert_range(&c);
     try testing.expect(r == .ok);
+    defer freeSb(r.ok, a);
     const g = sb.StringBuilder.borrow();
     defer g.deinit();
     try testing.expectEqualStrings("XbcY", g.get().items);
