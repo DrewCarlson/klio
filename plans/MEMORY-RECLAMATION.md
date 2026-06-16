@@ -18,15 +18,30 @@ Two distinct problems, both now largely solved:
    reclamation force-OFF. The value-lifetime layer the Rust→Zig port dropped is
    now rebuilt and, under a real freeing allocator with reclaim ON
    (`KLIO_RECLAIM=smp`), simple programs, string churn, `Pair`/destructuring,
-   mutable List/Set/Map loops, data-class instances, **and most coroutine
-   patterns** (`runBlocking`, suspend funcs, `delay`, `launch`, single/small
-   `async`) run double-free-clean and bounded. The one remaining corruption is
-   `async`/`await` **at scale** + `Dispatchers.Default` — the structured-
-   concurrency job tree's lock-free linked-list reclamation (§12). Until that
-   lands, a long-running server's safe option is `KLIO_RECLAIM=free` (a freeing
-   allocator with reclaim OFF: reclaims the explicitly-freed host/container
-   temporaries — ~5× better per-request — without the value-graph teardown that
-   still corrupts the job tree).
+   mutable List/Set/Map loops, data-class instances, **and the full coroutine
+   surface incl. `async`/`await` at scale** (`runBlocking`, suspend funcs,
+   `delay`, `launch`, `coroutineScope`, `Dispatchers.Default`) run
+   double-free-clean. The `async`-at-scale corruption was a cluster of
+   store-without-retain / borrowed-return bugs in the host, all now fixed:
+   - stored-property writes (`setField` → `define`) adopted a borrowed value;
+   - collection element *accessors* (map/array/list get) returned a borrow;
+   - collection *builders* (`NewList`, `makeList`/`Set`/`Array`, `listOfNotNull`)
+     stored borrowed elements; `MutableMap.remove` over-retained the transferred
+     value and dropped the removed key;
+   - instance `outer` links stored a borrow of the enclosing `this`/capture;
+   - bound-closure creation copied captures without retaining them;
+   - a block dispatched to a worker thread (`kotlin.concurrent.thread`,
+     `Dispatchers` pool) crossed threads without a retain.
+
+   With those landed, the **ktor server starts double-free-clean under reclaim**
+   (`embeddedServer{…}.start()` runs `df=0`). The remaining gap is ktor
+   **request handling** under reclaim: a single request currently hangs and a
+   concurrent burst still corrupts, both pointing at the structured-concurrency
+   job tree's lock-free linked-list reclamation (§12) the request pipeline
+   leans on. Until that lands, a long-running server's safe option is
+   `KLIO_RECLAIM=free` (a freeing allocator with reclaim OFF: reclaims the
+   explicitly-freed host/container temporaries — ~5× better per-request —
+   without the value-graph teardown that still corrupts the job tree).
 
 **Allocator modes** (`src/main.zig`, selected by `KLIO_RECLAIM`):
 - *(unset)* `arena` — production: one process-lifetime arena, reclaim OFF
