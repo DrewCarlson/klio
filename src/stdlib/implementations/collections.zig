@@ -1230,6 +1230,13 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries_rc.borrowMut();
         defer g.deinit();
+        // The map takes ownership of one ref to the stored key and value; the
+        // block's `new_v` is also returned, so retain both for the map and
+        // hand back the block's owned ref untouched.
+        if (runtime.reclaimEnabled()) {
+            key.retain();
+            new_v.retain();
+        }
         try g.get().append(a, .{ .key = key, .value = new_v });
     }
     return ok(new_v);
@@ -3852,7 +3859,8 @@ pub fn map_put_if_absent(ctx: *CallCtx) Error!EvalResult {
     const key = ctx.args[1];
     if (ctx.args.len < 3) return arityErr("putIfAbsent requires a value");
     const value = ctx.args[2];
-    if (mapFind(entries, key)) |old| return ok(old);
+    // The present value is borrowed from the map; retain before returning it.
+    if (mapFind(entries, key)) |old| return okElem(old);
     try mapSet(a, entries, key, value);
     return ok(Value.Null);
 }
@@ -3879,6 +3887,10 @@ pub fn map_replace(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 3) return arityErr("replace requires a value");
     const value = ctx.args[2];
     if (mapFind(entries, key)) |old| {
+        // `replace` returns the previous value: retain it before `mapSet`
+        // releases the map's reference, so the returned result carries an
+        // owned ref instead of a freed one.
+        if (runtime.reclaimEnabled()) old.retain();
         try mapSet(a, entries, key, value);
         return ok(old);
     }
@@ -3893,7 +3905,9 @@ pub fn map_compute_if_absent(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("computeIfAbsent requires a key");
     const key = ctx.args[1];
-    if (mapFind(entries, key)) |v| return ok(v);
+    // The present value is borrowed from the map; the register adopting the
+    // result must own its ref, so retain before returning.
+    if (mapFind(entries, key)) |v| return okElem(v);
     if (ctx.args.len < 3) return arityErr("computeIfAbsent requires a block");
     const block = ctx.args[2];
     const v = switch (try invoke(ctx, &block, &.{key})) {
