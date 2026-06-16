@@ -448,6 +448,20 @@ fn retainSnapshotValues(snap: FrameSnapshot) void {
     for (snap.captures) |v| v.retain();
 }
 
+/// GC: mark every Value a parked suspend state keeps live — each frame
+/// snapshot's regs, params, captures, and enclosing-receiver chain. Mirrors the
+/// `retainSnapshotValues` set plus the receiver chain (the GC owns the view of
+/// it: a parked continuation is the chain's sole keeper while parked). Driven by
+/// the coroutine root provider for every persisted/active parked activation.
+pub fn gcMarkSuspendState(state: *const SuspendState, m: *runtime.gc.Marker) void {
+    for (state.frames.items) |snap| {
+        for (snap.regs) |v| v.gcMark(m);
+        for (snap.params) |v| v.gcMark(m);
+        for (snap.captures) |v| v.gcMark(m);
+        for (snap.enclosing_this) |e| e.v.gcMark(m);
+    }
+}
+
 /// Release what `retainSnapshotValues` retained (the drop-without-resume
 /// path). Mirrors the retain set exactly.
 fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
