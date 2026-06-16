@@ -33,15 +33,24 @@ Two distinct problems, both now largely solved:
    - a block dispatched to a worker thread (`kotlin.concurrent.thread`,
      `Dispatchers` pool) crossed threads without a retain.
 
-   With those landed, the **ktor server starts double-free-clean under reclaim**
-   (`embeddedServer{…}.start()` runs `df=0`). The remaining gap is ktor
-   **request handling** under reclaim: a single request currently hangs and a
-   concurrent burst still corrupts, both pointing at the structured-concurrency
-   job tree's lock-free linked-list reclamation (§12) the request pipeline
-   leans on. Until that lands, a long-running server's safe option is
-   `KLIO_RECLAIM=free` (a freeing allocator with reclaim OFF: reclaims the
-   explicitly-freed host/container temporaries — ~5× better per-request —
-   without the value-graph teardown that still corrupts the job tree).
+   With those landed, an **empty-body `embeddedServer{}` runs `df=0` and is
+   functional under real reclaim** (`KLIO_RECLAIM=smp`). The remaining gap is
+   the **routing pipeline**: a server with even a single `routing { get(...) }`
+   *livelocks and leaks* under real reclaim — the process never gets past
+   `start()`'s following `delay`, RSS climbs unbounded (hits the 6 GB RSS cap
+   in ~1 s), `df=0` throughout (no double-free; a pure spin-allocate). Under
+   `KLIO_RC_DETECT=1` (which leaks every freed cell instead of destroying it)
+   the same server starts cleanly and prints `ok` — so the trigger is a cell
+   that real reclaim *frees* while the structured-concurrency machinery still
+   needs it, leaving the pump unable to observe the application `SupervisorJob`
+   as complete and re-driving it forever. This is the job tree's lock-free
+   linked-list reclamation (§12). A second, cosmetic reclaim bug: logger-name
+   strings garble under `smp` (a borrowed `String` freed before the log line is
+   formatted) — clean under `free`. Until §12 lands, a long-running server's
+   safe option is `KLIO_RECLAIM=free` (a freeing allocator with reclaim OFF:
+   reclaims the explicitly-freed host/container temporaries — ~5× better
+   per-request — without the value-graph teardown that still corrupts the job
+   tree).
 
 **Allocator modes** (`src/main.zig`, selected by `KLIO_RECLAIM`):
 - *(unset)* `arena` — production: one process-lifetime arena, reclaim OFF
