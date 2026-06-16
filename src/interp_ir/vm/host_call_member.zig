@@ -711,6 +711,14 @@ fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) A
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
+    // `entries_val` is an owned container (host-returns-owned). entry_items only
+    // borrows its elements; the pairs loop retains what it keeps, so release it
+    // at function exit. No-op under the arena fast path.
+    defer if (runtime.reclaimEnabled()) entries_val.release(allocator);
+    // The Instance arm drains into an owned list whose elements `entry_items`
+    // borrows; keep it alive until after the pairs loop, then release.
+    var drained: ?Value = null;
+    defer if (runtime.reclaimEnabled()) if (drained) |d| d.release(allocator);
     var entry_items: std.ArrayList(Value) = .empty;
     defer entry_items.deinit(allocator);
     switch (entries_val) {
@@ -727,13 +735,16 @@ fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) A
         .Instance => {
             const dr = try drainIterableToList(self, allocator, &entries_val);
             switch (dr) {
-                .ok => |dv| switch (dv) {
-                    .List => |l| {
-                        const g = l.items.borrow();
-                        defer g.deinit();
-                        try entry_items.appendSlice(allocator, g.get().items);
-                    },
-                    else => {},
+                .ok => |dv| {
+                    drained = dv; // released after the pairs loop (see defer)
+                    switch (dv) {
+                        .List => |l| {
+                            const g = l.items.borrow();
+                            defer g.deinit();
+                            try entry_items.appendSlice(allocator, g.get().items);
+                        },
+                        else => {},
+                    }
                 },
                 .err => |e| return .{ .err = e },
             }
@@ -1405,6 +1416,9 @@ fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const Val
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
+    // `iter` is an owned iterator container (host-returns-owned); release it on
+    // every exit path. The per-next() elements are transferred into `items`.
+    defer if (runtime.reclaimEnabled()) iter.release(allocator);
     var items: std.ArrayList(Value) = .empty;
     var guard: usize = 0;
     while (guard < 1_000_000) : (guard += 1) {
