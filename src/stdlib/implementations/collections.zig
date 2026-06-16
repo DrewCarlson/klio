@@ -869,14 +869,28 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
             .value => |val| val,
             .err => |e| return e,
         };
-        if (r != .Pair) return typeErr("associate selector must return Pair");
+        if (r != .Pair) {
+            if (runtime.reclaimEnabled()) r.release(a);
+            return typeErr("associate selector must return Pair");
+        }
         const key = r.Pair.first.asPtr().*;
         const val = r.Pair.second.asPtr().*;
+        // key/val are borrowed reads of the owned Pair `r`'s boxes; the map owns
+        // its own ref to each, so retain before storing, then release `r`.
+        if (runtime.reclaimEnabled()) {
+            key.retain();
+            val.retain();
+        }
         if (findKeyIndexBoxed(entries.items, &key)) |i| {
+            if (runtime.reclaimEnabled()) {
+                entries.items[i].value.release(a);
+                key.release(a); // existing key kept; drop the duplicate's retain
+            }
             entries.items[i].value = val;
         } else {
             try entries.append(a, .{ .key = key, .value = val });
         }
+        if (runtime.reclaimEnabled()) r.release(a);
     }
     return ok(try makeMapFromArrayList(a, entries, false));
 }
@@ -4594,16 +4608,28 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
     }
     const g = entries.borrowMut();
     defer g.deinit();
+    // `to_add` entries are borrowed (snapshotEntries of the source map, or
+    // Pair-component reads); the destination owns one ref per key+value.
     for (to_add) |kv| {
         var found = false;
         for (g.get().items) |*slot| {
             if (eqBoxed(&slot.key, &kv.key)) {
+                if (runtime.reclaimEnabled()) {
+                    kv.value.retain();
+                    slot.value.release(a);
+                }
                 slot.value = kv.value;
                 found = true;
                 break;
             }
         }
-        if (!found) try g.get().append(a, kv);
+        if (!found) {
+            if (runtime.reclaimEnabled()) {
+                kv.key.retain();
+                kv.value.retain();
+            }
+            try g.get().append(a, kv);
+        }
     }
     return ok(Value.Unit);
 }

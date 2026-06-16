@@ -307,6 +307,10 @@ fn decodeField(
                         if (cls.is_enum) {
                             for (cls.enum_entries) |entry| {
                                 if (std.mem.eql(u8, entry.name, s)) {
+                                    // The enum singleton is owned by the immutable
+                                    // ClassDef; the decoded value escapes into an
+                                    // owning container, so retain (host-returns-owned).
+                                    if (runtime.reclaimEnabled()) entry.value.retain();
                                     return .{ .ok = entry.value };
                                 }
                             }

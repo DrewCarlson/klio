@@ -3727,7 +3727,15 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                     .Map => |other| {
                         const og = other.entries.borrow();
                         defer og.deinit();
-                        try to_put.appendSlice(allocator, og.get().items);
+                        // Entries are borrowed from `other`; the destination map
+                        // owns its own ref per key+value, so retain each.
+                        for (og.get().items) |kv| {
+                            if (runtime.reclaimEnabled()) {
+                                kv.key.retain();
+                                kv.value.retain();
+                            }
+                            try to_put.append(allocator, kv);
+                        }
                     },
                     .List => |lst| try collectPairs(allocator, &to_put, lst.items),
                     .Set => |st| try collectPairs(allocator, &to_put, st.items),
@@ -3739,6 +3747,12 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                     var found = false;
                     for (g.get().items) |*slot| {
                         if (Value.structuralEq(&slot.key, &kv.key)) {
+                            // Overwrite: release the displaced value and the
+                            // staged (now-orphaned) key; transfer the staged value.
+                            if (runtime.reclaimEnabled()) {
+                                slot.value.release(allocator);
+                                kv.key.release(allocator);
+                            }
                             slot.value = kv.value;
                             found = true;
                             break;
@@ -3785,12 +3799,18 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
             if (std.mem.eql(u8, name, "setValue")) {
                 const new_v = if (args.len > 0) args[0] else Value.Unit;
                 const prev = me.value.asPtr().*;
-                prev.retain();
+                // host-returns-owned: the old value escapes as the result.
+                if (runtime.reclaimEnabled()) prev.retain();
                 if (me.backing) |entries| {
                     const g = entries.borrowMut();
                     defer g.deinit();
                     for (g.get().items) |*slot| {
                         if (Value.structuralEq(&slot.key, me.key.asPtr())) {
+                            // The slot owns its value: release the old, retain the new.
+                            if (runtime.reclaimEnabled()) {
+                                new_v.retain();
+                                slot.value.release(allocator);
+                            }
                             slot.value = new_v;
                             break;
                         }
@@ -3803,12 +3823,18 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
             if (std.mem.eql(u8, name, "component1") and
                 (receiverImplementsType(self, receiver, "Entry") or receiverImplementsType(self, receiver, "MutableEntry")))
             {
-                return try getFieldRec(self, allocator, receiver, "key");
+                // getFieldRec returns the field borrowed; this result escapes
+                // through callMember, so retain (host-returns-owned).
+                var r = try getFieldRec(self, allocator, receiver, "key");
+                if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+                return r;
             }
             if (std.mem.eql(u8, name, "component2") and
                 (receiverImplementsType(self, receiver, "Entry") or receiverImplementsType(self, receiver, "MutableEntry")))
             {
-                return try getFieldRec(self, allocator, receiver, "value");
+                var r = try getFieldRec(self, allocator, receiver, "value");
+                if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+                return r;
             }
         },
         else => {},
