@@ -44,7 +44,17 @@ Two distinct problems, both now largely solved:
    that real reclaim *frees* while the structured-concurrency machinery still
    needs it, leaving the pump unable to observe the application `SupervisorJob`
    as complete and re-driving it forever. This is the job tree's lock-free
-   linked-list reclamation (§12). A second, cosmetic reclaim bug: logger-name
+   linked-list reclamation (§12). *Localization (next-session lead):* the spin
+   is NOT pump-dispatch overhead — a `KLIO_PUMP_RUNAWAY` iteration counter on
+   `pumpLoop` does not trip, and `sample(1)` shows the hot stack is interpreted
+   method dispatch (`callMemberInnerStatic`/`irMethodWalk`/`classHasUserMethod`/
+   `lookupIntrinsic`), i.e. a launched coroutine **re-executes its whole body**
+   each round rather than completing. So the freed cell is in the
+   launch/job-completion bookkeeping (a child `Job`/`ChildHandleNode` the parent
+   awaits): under real reclaim it is freed, the parent reads it as not-complete,
+   re-suspends, is re-readied, and re-runs. Trace from `drainLaunched` /
+   `evalClosureRaw` (§12) and the `Job.isCompleted`/`join` host path. A second,
+   cosmetic reclaim bug: logger-name
    strings garble under `smp` (a borrowed `String` freed before the log line is
    formatted) — clean under `free`. Until §12 lands, a long-running server's
    safe option is `KLIO_RECLAIM=free` (a freeing allocator with reclaim OFF:
