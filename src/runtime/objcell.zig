@@ -305,12 +305,23 @@ fn isArrayListLike(comptime U: type) bool {
 fn isSlice(comptime U: type) bool {
     return @typeInfo(U) == .pointer and @typeInfo(U).pointer.size == .slice;
 }
+/// An `ObjRef(X)` handle is a struct with a `.cell` field and a `clone` decl.
+fn isObjRef(comptime U: type) bool {
+    return @typeInfo(U) == .@"struct" and @hasField(U, "cell") and @hasDecl(U, "clone");
+}
 
+/// Trace one out-edge value `e` of type `E` (a Value, a struct with gcTrace, an
+/// `ObjRef` handle, or an optional thereof). Shading an `ObjRef` cell is how the
+/// graph advances; the cell's own `gc_trace` reaches the next level.
 fn gcTraceElem(comptime E: type, e: *const E, m: *gc.Marker) void {
     if (comptime hasDeclSafe(E, "gcMark")) {
         e.gcMark(m);
     } else if (comptime hasDeclSafe(E, "gcTrace")) {
         e.gcTrace(m);
+    } else if (comptime isObjRef(E)) {
+        m.shade(&e.cell.hdr);
+    } else if (comptime @typeInfo(E) == .optional) {
+        if (e.*) |inner| gcTraceElem(@TypeOf(inner), &inner, m);
     }
     // else: a leaf element (e.g. u8 bytes) with no out-edges.
 }
@@ -320,6 +331,10 @@ fn gcTraceData(comptime U: type, data: *const U, m: *gc.Marker) void {
         data.gcTrace(m);
     } else if (comptime hasDeclSafe(U, "gcMark")) {
         data.gcMark(m);
+    } else if (comptime isObjRef(U)) {
+        m.shade(&data.cell.hdr);
+    } else if (comptime @typeInfo(U) == .optional) {
+        if (data.*) |inner| gcTraceElem(@TypeOf(inner), &inner, m);
     } else if (comptime isArrayListLike(U)) {
         for (data.items) |*e| gcTraceElem(@TypeOf(e.*), e, m);
     } else if (comptime isSlice(U)) {
