@@ -83,9 +83,24 @@ var reg_lock: SpinLock = .{};
 var all_cells: ?*GcHeader = null;
 var bytes_since_gc: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var live_bytes: usize = 0;
+
+/// Collection-trigger floor in bytes. A collection is requested once this many
+/// bytes of cells have been registered since the last one; after each
+/// collection the next floor is `max(threshold_floor, live * 2)` (Appel). The
+/// floor is tunable via `KLIO_GC_THRESHOLD_KB` (default 8 MB) — a small floor
+/// collects frequently to surface root/tracer holes without stress mode's
+/// O(safe-points x live) cost.
+var threshold_floor: usize = 8 * 1024 * 1024;
 var threshold: usize = 8 * 1024 * 1024;
 var cur_epoch: usize = 1;
 var gc_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Set the collection-trigger floor (bytes). Called by `main` from
+/// `KLIO_GC_THRESHOLD_KB`. Lowers the initial threshold too.
+pub fn setThresholdFloor(bytes: usize) void {
+    threshold_floor = bytes;
+    threshold = bytes;
+}
 
 /// Whether the process runs the GC reclamation path (set by `main` for
 /// `KLIO_RECLAIM=gc`). When false, `register` is never called and the
@@ -97,6 +112,13 @@ pub var gc_enabled: bool = false;
 /// tracer is incomplete, collecting on every opcode boundary surfaces the UAF
 /// immediately instead of waiting for 8MB of churn. Off in normal runs.
 pub var gc_stress: bool = false;
+
+/// Sampled stress (`KLIO_GC_STRESS_EVERY=N`): force a collection every N safe
+/// points. Catches the same narrow-window holes as full stress (a premature
+/// free recurs across a long run) at roughly 1/N the cost, so long programs
+/// validate without the O(safe-points x live) blowup of N=1. `0` disables.
+pub var gc_stress_every: usize = 0;
+threadlocal var safepoint_counter: usize = 0;
 
 /// Permanent generation. Cells minted while this is true (the stdlib image /
 /// module / class graph loaded before the program body runs) are NOT placed on
@@ -121,7 +143,12 @@ pub fn register(h: *GcHeader, bytes: usize) void {
 
 /// Cheap poll at opcode-boundary safe points.
 pub inline fn pending() bool {
-    return gc_stress or gc_pending.load(.monotonic);
+    if (gc_stress) return true;
+    if (gc_stress_every != 0) {
+        safepoint_counter += 1;
+        if (safepoint_counter >= gc_stress_every) return true;
+    }
+    return gc_pending.load(.monotonic);
 }
 
 /// Called from an opcode-boundary safe point when a collection is pending. In
@@ -129,7 +156,9 @@ pub inline fn pending() bool {
 /// it collects in place; the multi-thread stop-the-world handshake is layered
 /// on by `threads` (it parks the other mutators here before collecting).
 pub fn safePoint() void {
-    if (!gc_stress and !gc_pending.load(.monotonic)) return;
+    const sampled = gc_stress_every != 0 and safepoint_counter >= gc_stress_every;
+    if (sampled) safepoint_counter = 0;
+    if (!gc_stress and !sampled and !gc_pending.load(.monotonic)) return;
     collect();
 }
 
@@ -178,7 +207,7 @@ pub fn collect() void {
     const freed = sweep();
     gc_pending.store(false, .monotonic);
     bytes_since_gc.store(0, .monotonic);
-    threshold = @max(8 * 1024 * 1024, live_bytes *| 2);
+    threshold = @max(threshold_floor, live_bytes *| 2);
     if (gc_debug) std.debug.print(
         "[kgc] epoch={d} marked={d} live={d} freed={d}\n",
         .{ cur_epoch, marked, live_bytes, freed },

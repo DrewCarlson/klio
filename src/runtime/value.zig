@@ -278,8 +278,15 @@ pub const MatchData = struct {
 // reaches the API through `runtime`.
 // ---------------------------------------------------------------------------
 
-/// `many` keeps a whole slice rooted in O(1) (no per-element copy).
-const KeepEntry = union(enum) { one: Value, many: []const Value };
+/// `many`/`pairs` keep a whole slice rooted in O(1) (no per-element copy);
+/// `cell` pins a raw object cell (e.g. a transient scope `Env` the host swapped
+/// into place) whose own `gc_trace` then reaches its contents.
+const KeepEntry = union(enum) {
+    one: Value,
+    many: []const Value,
+    pairs: []const MapPair,
+    cell: *objcell.gc.GcHeader,
+};
 threadlocal var host_keepalive: std.ArrayListUnmanaged(KeepEntry) = .empty;
 var keepalive_root_registered = std.atomic.Value(bool).init(false);
 
@@ -287,6 +294,8 @@ fn gcMarkKeepalive(m: *objcell.gc.Marker) void {
     for (host_keepalive.items) |e| switch (e) {
         .one => |v| v.gcMark(m),
         .many => |vs| for (vs) |v| v.gcMark(m),
+        .pairs => |ps| for (ps) |*p| p.gcTrace(m),
+        .cell => |h| m.shade(h),
     };
 }
 
@@ -320,6 +329,26 @@ pub fn keepalivePushSlice(vs: []const Value) void {
     if (!objcell.gc.gc_enabled) return;
     ensureKeepaliveRoot();
     host_keepalive.append(std.heap.page_allocator, .{ .many = vs }) catch
+        @panic("KGC: host_keepalive push failed");
+}
+
+/// Pin a slice of `MapPair`s (a map/grouping accumulator's live contents)
+/// across a re-entrant host call. No-op unless GC is on.
+pub fn keepalivePushPairs(ps: []const MapPair) void {
+    if (!objcell.gc.gc_enabled) return;
+    ensureKeepaliveRoot();
+    host_keepalive.append(std.heap.page_allocator, .{ .pairs = ps }) catch
+        @panic("KGC: host_keepalive push failed");
+}
+
+/// Pin a raw object cell across a re-entrant host call — for a transient cell
+/// the host holds in a stack local that no frame register or Vm-graph root
+/// reaches (a scope `Env` swapped into the host's active globals). The cell's
+/// own `gc_trace` reaches its contents. No-op unless GC is on.
+pub fn keepalivePushCell(h: *objcell.gc.GcHeader) void {
+    if (!objcell.gc.gc_enabled) return;
+    ensureKeepaliveRoot();
+    host_keepalive.append(std.heap.page_allocator, .{ .cell = h }) catch
         @panic("KGC: host_keepalive push failed");
 }
 

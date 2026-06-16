@@ -4290,6 +4290,12 @@ fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Value,
         sg.deinit();
         self.globals = scoped;
     }
+    // The host's active globals scope is only held in this stack-local VmHost
+    // field; pin it so a collection during the body eval cannot sweep the
+    // transient capture-layer env (its parent chain reaches the rooted globals).
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushCell(&self.globals.cell.hdr);
     var cap_vec: std.ArrayList(Value) = .empty;
     for (f.capture_order) |cn| {
         if (std.mem.eql(u8, cn, "this")) {
