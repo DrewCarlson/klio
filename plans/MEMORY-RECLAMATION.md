@@ -1,23 +1,171 @@
 # Memory reclamation: making the value model free memory again
 
-## TL;DR for a fresh agent
+## TL;DR for a fresh agent (current state)
 
-KLIO leaks unboundedly in any long-running process (a ktor server hits the
-6 GB self-cap and aborts in ~24 s). Root cause: the whole interpreter runs on
-a **single process-lifetime arena that is never reset**, and the
-reference-counting reclamation the design documents is **disabled in
-production** and, even when enabled, is **structurally incomplete** — the value
-model has *no recursive teardown at any level*. The fix is to finish the
-value-lifetime layer the Rust→Zig port dropped: give every value graph a
-correct `release` (done — see "Committed foundation"), then **activate** it by
-emitting explicit `Retain`/`Drop` IR instructions from a liveness pass in the
-lowering (not yet done — see "The plan"). Do **not** try to add runtime
-retain/release by guessing ownership at each instruction handler: that is
-all-or-nothing and corrupts even trivial programs (proven below).
+Two distinct problems, both now largely solved:
 
-Production today is stable but leaky (arena frees everything at process exit).
-Every change below is gated so production behavior does not change until the
-new path is complete and validated.
+1. **Startup baseline / "high usage for simple programs" — FIXED.** Every
+   program (even `println("hi")`) used ~646 MB resident. Root cause was a single
+   allocator misuse, not the stdlib graph: `decodeSymbols`
+   (`src/stdlib/generated/mod.zig`) deserialised the embedded symbol index
+   (~33 K tiny records) straight into `std.heap.page_allocator`, which mmaps a
+   whole page **per allocation** (16 KB min on macOS) — ~535 MB for a few MB of
+   data. Decoding into a process-lifetime arena dropped every simple/stdlib
+   program to **~127 MB** (`d0b126c8`). See §8.
+
+2. **Long-running leak (the value model never frees) — largely reconciled.**
+   The interpreter runs on one never-reset arena with reference-counting
+   reclamation force-OFF. The value-lifetime layer the Rust→Zig port dropped is
+   now rebuilt and, under a real freeing allocator with reclaim ON
+   (`KLIO_RECLAIM=smp`), simple programs, string churn, `Pair`/destructuring,
+   mutable List/Set/Map loops, data-class instances, **and most coroutine
+   patterns** (`runBlocking`, suspend funcs, `delay`, `launch`, single/small
+   `async`) run double-free-clean and bounded. The one remaining corruption is
+   `async`/`await` **at scale** + `Dispatchers.Default` — the structured-
+   concurrency job tree's lock-free linked-list reclamation (§12). Until that
+   lands, a long-running server's safe option is `KLIO_RECLAIM=free` (a freeing
+   allocator with reclaim OFF: reclaims the explicitly-freed host/container
+   temporaries — ~5× better per-request — without the value-graph teardown that
+   still corrupts the job tree).
+
+**Allocator modes** (`src/main.zig`, selected by `KLIO_RECLAIM`):
+- *(unset)* `arena` — production: one process-lifetime arena, reclaim OFF
+  (`ObjRef.deinit` is a no-op). Byte-for-byte the original behavior. Every
+  reclamation change below is gated on `reclaimEnabled()` so this path is
+  unchanged.
+- `free` — `smp_allocator`, reclaim OFF. Safe for long-running processes; frees
+  what the run path explicitly frees, leaks the value graph (bounded enough to
+  be a real improvement, not yet flat).
+- `smp` / `1` — `smp_allocator`, reclaim ON. The full reclamation path; the
+  oracle for "does the value graph stay bounded / never corrupt".
+- `debug` — `DebugAllocator(thread_safe, safety)`, reclaim ON. Surfaces UAF /
+  double-free at the source.
+
+**Do NOT** try to add runtime retain/release by guessing ownership at each
+instruction handler blindly — ownership is known *statically by the handler*
+(`LoadParam` aliases, `NewList` mints, `Move` copies); that is the model that
+works (§7.0). The superseded `Retain`/`Drop`-IR sketch (§7.1) is not being used.
+
+---
+
+## 0. Current state (consolidated)
+
+### 0.1 Committed work (all gated on `reclaimEnabled()`; production unchanged)
+
+Value-model foundation (earlier; see §5):
+- `ada8fcdb` — fixed a real arena-masked double-free in the `Call` dispatch.
+- `ba6bec4b` — `Value.retain`/`release`/`deinit` + `InstanceData.deinit`.
+- `58266139` — recursive release of container elements (List/Set/Array/Map/
+  Iterator/IrClosure), `strongCount()==1`-guarded.
+- `StringRef` byte ownership (init dupes, release frees); owning-`*Value`
+  variants (`Pair`/`Triple`/`MapEntry`/`Result`/`Exception.cause`/
+  `BoundMethod.receiver`/`Generate`) converted to `ValueBox` (`ObjRef(Value)`).
+- eval register balance: `Frame` owns one ref per register, releases on
+  overwrite (`Frame.write`) and teardown (`Frame.deinit`); alias handlers
+  (`Move`/`CellGet`/`LoadParam`/`LoadCapture`/`Cast`/`NotNullAssert`), accessors
+  (`GetField`/`LoadGlobal`/`QualifiedThis`), and terminators (escaping
+  `Return`/`Throw`/non-local-return) retain. Closure-capture, instance-ctor
+  field, and collection-map-put stores retain + release-old.
+
+This session:
+- `d0b126c8` — **§8 baseline 646 → 127 MB**: `decodeSymbols` decodes the symbol
+  index into a process-lifetime arena instead of `page_allocator`. Adds
+  `src/runtime/alloc_track.zig` (committed diagnostic tooling — `KLIO_ALLOC_TRACK`
+  byte/size-histogram + phase snapshots + a `pageAllocator` stack-tracing probe).
+- `d0efb310` — **`KLIO_RECLAIM=free`** mode (freeing allocator, reclaim OFF).
+- `a3a7db4e` — **suspend/resume snapshot value ownership** (§7.5 / Phase 4):
+  `FrameSnapshot` owns the regs/params/captures it copies on suspend
+  (`retainSnapshotValues`); a resumed frame adopts that ownership
+  (`Frame.owns_params_caps`) and releases on teardown; `SuspendState.deinit`
+  releases the never-resumed path and frees snapshot buffers.
+- `174ebf38` — **mutable List/Set store-retain** (add/insert/addAll/set retain;
+  remove/clear/removeAll/retainAll release the discarded; index-removes
+  transfer) **and the coroutine launch queue** (`enqueueLaunch` retains on
+  enqueue, releases a drained block on completion — a suspended block keeps its
+  ref until it resumes — and releases still-queued blocks on interceptor
+  teardown).
+- `f2ab5ecd` — **AtomicRef** `compareAndSet`/`getAndSet` own their stored value
+  (retain the new; transfer the returned previous instead of `define`-releasing
+  it and handing back freed memory).
+
+### 0.2 What works under reclaim ON (`KLIO_RECLAIM=smp`), verified
+
+- Simple / arithmetic / string-churn / `Pair` + destructuring.
+- Mutable List / Set / Map loops with **reference-typed** elements (the prior
+  collection tests only used `Int`s, which have no refcount, so the List/Set
+  over-release stayed hidden).
+- Data-class / instance loops; linked-node (`var next`) graphs.
+- `runBlocking` with and without suspension; loops inside `runBlocking`.
+- Plain `suspend fun` call chains.
+- `delay` (real park → resume).
+- `launch` (cooperative child coroutine).
+- Single and small (`n ≤ 5`) `async { … }.await()`.
+
+The full unit + itest suite is green under reclaim-ON `testing.allocator`
+(leak-checked) except two PRE-EXISTING failures unrelated to reclamation
+(`parity_coroutine_smoke.cs6`, a flaky Flow test; `parity_kotlinx_io_read.
+read_line`, cross-test global-state pollution — both bisected to the
+session-start commit).
+
+### 0.3 What still corrupts under reclaim ON
+
+- `async`/`await` **at scale** — deterministic threshold: `n ≤ 5` children OK,
+  `n ≥ 8` use-after-frees (`afterCompletion` dispatched on a released job-handle
+  node). The structured-concurrency **job tree** (`LockFreeLinkedList` +
+  `JobSupport` completion-notify) reclaims handler nodes while a traversal /
+  dispatch still references them. See §12.
+- `Dispatchers.Default` / the real worker pool: `scheduler.post` stores `block.*`
+  cross-thread without cloning (`intrinsic_host.zig:817`), plus the same
+  job-tree issue. The ktor server hits both at startup.
+
+### 0.4 Measurements
+
+- Simple/stdlib program RSS: **646 MB → 127 MB** (arena, after the §8 fix).
+- ktor `GET` server, default arena: **~8.5 MB/request**, hits the 6 GB cap in
+  ~700 requests. Per-request profile (30 requests via `KLIO_ALLOC_TRACK`):
+  830 MB allocated / **556 MB explicitly freed** but retained by the arena /
+  ~1.5 MB live growth per request.
+- ktor `GET` server, `KLIO_RECLAIM=free`: **~1.75 MB/request** (≈5× better, no
+  crash); residual is the ObjRef value graph (reclaim-OFF), which reclaim-ON
+  would free once the job tree is reconciled.
+
+### 0.5 Validation methodology / tooling (use these)
+
+- **`KLIO_RECLAIM=smp`** on real programs is the corruption oracle (it aborts on
+  the latent double-frees `DebugAllocator`'s quarantine hides). `0xaa…` faults
+  are Zig's `undefined` poison reaching a reused/uninitialised cell.
+- **`KLIO_RC_DETECT=1`** makes `ObjRef.deinit` leak the control block and dump a
+  stack on a *second* decrement. NB: it still runs `T.deinit` at count 0, so it
+  does **not** mask a missing-retain UAF (only true double-decrements).
+- **Instance-free tracing**: a temporary `if (getenvSlice("…")) { print
+  identity+class; dumpCurrentStackTrace }` at the top of `InstanceData.deinit`
+  (`src/runtime/class.zig`) pinpoints which instance is freed and from where —
+  the technique that found the launch-queue, AtomicRef, and job-tree frees.
+  Pair it with a print of the dispatched method + receiver cell at
+  `samInstanceDispatch` / `instanceBindingProbe` entry to identify the
+  dispatched-after-free receiver.
+- **`KLIO_ALLOC_TRACK=1`** (`src/runtime/alloc_track.zig`) reports total/live
+  bytes + a size histogram + per-phase deltas; `runtime.pageAllocator()` is a
+  page-alloc stack-tracing probe (route a suspect allocator through it to
+  attribute large mmaps — this found the §8 bug).
+- **DebugAllocator leaked-count diffed across two N** is the bounding oracle
+  (`smp` max-RSS is non-deterministic — it returns OS pages unpredictably).
+- The unit suite under `testing.allocator` (reclaim-ON, leak-checked) validates
+  that a fix retains/releases in balance; run it after every ownership change.
+
+### 0.6 Remaining work (ordered)
+
+1. **Job-tree lock-free reclamation** (§12) — the last reclaim-ON corruption;
+   unblocks `async` at scale and the ktor server under reclaim-ON.
+2. **Cross-thread `scheduler.post`** block ownership (`Dispatchers.Default`).
+3. **ktor server/client RSS flat over many requests** under reclaim-ON (follows
+   from 1+2), validated with `zig build itest-ktor_server`.
+4. **Flip production** (§7.8): drop `setReclaim(false)`, default to a freeing
+   allocator (or the split arena+smp) once the corpus is clean under reclaim-ON.
+5. **Optional**: further cut the ~127 MB baseline (lazy/compact stdlib decode in
+   `image.zig`) and the resume-value / `scope_delta` retain audit
+   (`token_resume_value`, `interceptSuspend` — currently fine because the tested
+   resume values are primitives, but a real value would leak/corrupt).
 
 ---
 
@@ -49,10 +197,16 @@ hit by HTTP requests:
   with `KLIO_RSS_CAP_KB`). The watchdog existing at all is a tell: the authors
   knew growth was a hazard.
 
-Tooling built during investigation (re-create if useful): an opt-in tracking
-allocator wrapping the arena (`KLIO_ALLOC_TRACK=1`) that prints total bytes,
-alloc count, free count, and a power-of-two size histogram at exit. It lives in
-`src/main.zig` when enabled; it is not committed.
+(NOTE: §2 records the as-found symptoms. The ~670 MB baseline is FIXED — see §8
+/ §0 — and the "per-request growth" and tooling below are superseded by the
+current measurements in §0.4 and the committed tracker.)
+
+Tooling built during investigation, now COMMITTED as `src/runtime/alloc_track.zig`
+(`KLIO_ALLOC_TRACK=1`): an opt-in tracking allocator wrapping the arena that
+prints total/live bytes, alloc/free counts, a power-of-two size histogram, and
+named per-phase deltas; plus `runtime.pageAllocator()`, a page-alloc
+stack-tracing probe (route a suspect allocator through it to attribute large
+direct mmaps — this is what found the §8 bug).
 
 ## 3. Root cause
 
@@ -671,3 +825,77 @@ optional; 127 MB for a fully-loaded stdlib is acceptable.
       decoding into a process-lifetime arena removed it. Diagnostic tooling
       (`src/runtime/alloc_track.zig`, `KLIO_ALLOC_TRACK`) committed.
 - [ ] Flip production to reclaim-ON + (split) freeing allocator (§7.8).
+
+## 12. The remaining frontier: structured-concurrency job-tree reclamation
+
+This is the one reclaim-ON corruption left after §0.1, and the blocker for the
+ktor server under reclaim-ON.
+
+### 12.1 Reproducer and signature
+
+```kotlin
+import kotlinx.coroutines.*
+fun main() { runBlocking { var s = 0; for (i in 1..N) { val d = async { i*2 }; s += d.await() }; println(s) } }
+```
+- `KLIO_RECLAIM=smp`: **`N ≤ 5` succeeds, `N ≥ 8` faults** (deterministic
+  threshold, not a race — small async loops and a single `async` are clean).
+- `async(Dispatchers.Default){…}` faults at any N (also exercises the
+  cross-thread `scheduler.post` gap).
+- The fault is a use-after-free: `samInstanceDispatch` /
+  `instanceBindingProbe` dispatches a method (`afterCompletion`, `equals`) on a
+  released instance — under plain `smp` it surfaces downstream as
+  `incorrect alignment` in `SmpAllocator` (free-list corruption from the earlier
+  double-free); under `KLIO_RC_DETECT=1` it surfaces as the raw `0xaa…` read.
+
+### 12.2 What is freed
+
+Instrumenting `InstanceData.deinit` (§0.5) shows the released classes are the
+Job machinery: `ChildHandleNode`, `Removed` (LockFreeLinkedList sentinel),
+`NonDisposableHandle`, `KlioBlockingCoroutine`, `JobSupport$Finishing`, plus
+many `AtomicRef`. The dispatched-after-free receiver is a job **completion
+handler node** invoked via `afterCompletion` during the parent job's
+completion-notify.
+
+### 12.3 Where to look
+
+- `kotlin-klio/klio-kotlinx-coroutines/klioMain/kotlinx/coroutines/internal/
+  LockFreeLinkedList.kt` — `forEach` (the notify traversal), `addLast`,
+  `removeOrNext`, `correctPrev`, the `Removed` sentinel. Each `_next`/`_prev` is
+  an atomicfu `atomic<Any>` (an `AtomicRef` instance — so it flows through the
+  now-fixed `atomicRefCas` / the `value` getField/setField, which DO retain).
+- Upstream `JobSupport` completion path (`notifyCompletion` / the handler-list
+  promotion Empty → single node → `NodeList`).
+- `nextNode` getter reads `_next.value` via `getField` (retains, §GetField), and
+  the `forEach` `cur` variable owns each node — so a *naive* traversal should
+  keep nodes alive. The corruption is subtler: a node's refcount reaching zero
+  while a register/`cur`/handler still aliases it, i.e. one release without a
+  matching retain somewhere in the add/remove/correctPrev/notify interleaving,
+  *or* the AtomicRef-CAS `release-old` dropping a link's ref to a node that is
+  still logically in the list during a repair (`correctPrev`) rather than a
+  removal. The `release-old` is correct for an *ownership-transfer* CAS but the
+  lock-free list also CASes for pointer *repair*, where the old value is not
+  being given up — that asymmetry is the prime suspect.
+
+### 12.4 Likely shape of the fix
+
+Lock-free reclamation + refcounting do not compose by naive per-CAS
+retain/release. Options, roughly in order of safety:
+1. **Audit the LockFreeLinkedList ownership model** end to end: decide exactly
+   which `_next`/`_prev` links *own* a node ref vs which are *borrows* (back-
+   pointers / repair), and make CAS retain/release only on the owning links.
+   The `_prev` back-pointer almost certainly should NOT own (else cycles /
+   double-counting); only `_next` (forward) should own, with the head holding
+   the list. This likely means the AtomicRef CAS cannot uniformly release-old —
+   the list needs link-kind-aware store ops, or the nodes need an explicit
+   single-owner discipline.
+2. **Per-request / per-coroutine-tree arena** for the server: sidesteps the
+   lock-free reclamation entirely by reclaiming the whole request's value graph
+   at a completion boundary (the run-boundary reset already exists for the test
+   harness — `coroutines.zig`). Trades the lock-free audit for coroutine-
+   lifetime/escape bookkeeping.
+3. **Cross-thread `scheduler.post`** (`intrinsic_host.zig:817`) must clone the
+   block on post and release it when the worker task completes — required for
+   `Dispatchers.Default` regardless of which path above is chosen.
+
+Validate any fix with the §12.1 reproducer sweeping N, then the coroutine
+itests, then `zig build itest-ktor_server`, all under `KLIO_RECLAIM=smp`.
