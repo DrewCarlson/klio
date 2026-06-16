@@ -657,6 +657,9 @@ fn atomicRefCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const guard = g.get();
     const cur = guard.get("value") orelse Value.Null;
     if (Value.referenceEq(&cur, &expected)) {
+        // The atomic owns its stored value; `define` releases the replaced
+        // `cur`, so retain `update` to keep the store balanced.
+        if (runtime.reclaimEnabled()) update.retain();
         try guard.define(ctx.allocator, "value", update);
         return ok(.{ .Bool = true });
     }
@@ -673,7 +676,11 @@ fn atomicRefGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     defer g.deinit();
     const guard = g.get();
     const prev = guard.get("value") orelse Value.Null;
-    try guard.define(ctx.allocator, "value", next);
+    // getAndSet returns the previous value: its ownership transfers to the
+    // caller, so overwrite without releasing it (a plain `set`, not `define`),
+    // and retain `next` since the atomic now owns it.
+    if (runtime.reclaimEnabled()) next.retain();
+    _ = guard.set("value", next);
     return ok(prev);
 }
 
