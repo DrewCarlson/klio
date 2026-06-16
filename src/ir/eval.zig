@@ -1759,6 +1759,8 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .CallSuper => |csup| {
             const recv = frame.read(csup.receiver);
+            recv.retain();
+            defer recv.release(allocator);
             const owner_str = constStr(frame.module, csup.owner_class) orelse
                 return errResult(.{ .Type = "CallSuper: owner not a string const" });
             const qual_str: ?[]const u8 = if (csup.qualifier) |id| constStr(frame.module, id) else null;
@@ -1776,6 +1778,14 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |cm| {
             const recv = frame.read(cm.receiver);
+            // A method borrows its receiver for the call's whole duration.
+            // Pin it: the dispatched body may, via the coroutine machinery,
+            // drop every other reference to the receiver (e.g. a job
+            // completing inside `runBlocking.joinBlocking`), and the register
+            // read is only a borrow. Retain across the dispatch so the
+            // receiver outlives the call regardless. No-op under the arena.
+            recv.retain();
+            defer recv.release(allocator);
             const name_str = constStr(frame.module, cm.name) orelse
                 return errResult(.{ .Type = "CallMember: name not a string const" });
             const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
@@ -1809,6 +1819,8 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .CallMemberOrValue => |cmv| {
             const recv = frame.read(cmv.receiver);
+            recv.retain();
+            defer recv.release(allocator);
             const user_args = try readArgRun(allocator, frame, cmv.args, cmv.n_args);
             defer allocator.free(user_args);
             const names = try resolveArgNames(allocator, frame.module, cmv.arg_names);
