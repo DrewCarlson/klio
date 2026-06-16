@@ -820,12 +820,17 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
             try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, h.value)) });
         }
         const req = Value{ .Array = .{ .items = try ValueList.init(a, items), .prim = null } };
+        // serve owns `req`; invokeCallable BORROWS its args, so release it per
+        // iteration. No-op under the arena fast path.
+        defer if (runtime.reclaimEnabled()) req.release(a);
         const resp = try ctx.host.invokeCallable(&dispatch, &.{req}, ctx.out);
         switch (resp) {
             .err => |e| return .{ .err = e },
             .ok => |rv| {
                 const decoded = try decode_response(a, &rv);
                 try write_response(a, conn, decoded.status, decoded.content_type, decoded.body, decoded.headers);
+                // `rv` is an owned host result; release it once decoded+written.
+                if (runtime.reclaimEnabled()) rv.release(a);
             },
         }
     }

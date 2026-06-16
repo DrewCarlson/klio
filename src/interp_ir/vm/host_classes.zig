@@ -639,7 +639,14 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
 fn buildCapturePairs(allocator: Allocator, captured_names: []const []const u8, captures: []const Value) Allocator.Error![]NameValue {
     const n = @min(captured_names.len, captures.len);
     var pairs = try allocator.alloc(NameValue, n);
-    for (0..n) |i| pairs[i] = .{ .name = captured_names[i], .value = captures[i] };
+    for (0..n) |i| {
+        // The anon-method registry holds these captures for the object's whole
+        // lifetime (its methods read them long after the enclosing frame that
+        // produced them has returned). Retain so a captured value outlives that
+        // frame; released when the registry entry is dropped. No-op under arena.
+        if (runtime.reclaimEnabled()) captures[i].retain();
+        pairs[i] = .{ .name = captured_names[i], .value = captures[i] };
+    }
     return pairs;
 }
 

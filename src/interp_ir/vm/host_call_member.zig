@@ -711,6 +711,14 @@ fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) A
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
+    // `entries_val` is an owned container (host-returns-owned). entry_items only
+    // borrows its elements; the pairs loop retains what it keeps, so release it
+    // at function exit. No-op under the arena fast path.
+    defer if (runtime.reclaimEnabled()) entries_val.release(allocator);
+    // The Instance arm drains into an owned list whose elements `entry_items`
+    // borrows; keep it alive until after the pairs loop, then release.
+    var drained: ?Value = null;
+    defer if (runtime.reclaimEnabled()) if (drained) |d| d.release(allocator);
     var entry_items: std.ArrayList(Value) = .empty;
     defer entry_items.deinit(allocator);
     switch (entries_val) {
@@ -727,13 +735,16 @@ fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) A
         .Instance => {
             const dr = try drainIterableToList(self, allocator, &entries_val);
             switch (dr) {
-                .ok => |dv| switch (dv) {
-                    .List => |l| {
-                        const g = l.items.borrow();
-                        defer g.deinit();
-                        try entry_items.appendSlice(allocator, g.get().items);
-                    },
-                    else => {},
+                .ok => |dv| {
+                    drained = dv; // released after the pairs loop (see defer)
+                    switch (dv) {
+                        .List => |l| {
+                            const g = l.items.borrow();
+                            defer g.deinit();
+                            try entry_items.appendSlice(allocator, g.get().items);
+                        },
+                        else => {},
+                    }
                 },
                 .err => |e| return .{ .err = e },
             }
@@ -1405,6 +1416,9 @@ fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const Val
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
+    // `iter` is an owned iterator container (host-returns-owned); release it on
+    // every exit path. The per-next() elements are transferred into `items`.
+    defer if (runtime.reclaimEnabled()) iter.release(allocator);
     var items: std.ArrayList(Value) = .empty;
     var guard: usize = 0;
     while (guard < 1_000_000) : (guard += 1) {
@@ -2040,6 +2054,10 @@ fn cloneItemsList(allocator: Allocator, src: runtime.ValueList) Allocator.Error!
     defer g.deinit();
     var out: std.ArrayList(Value) = .empty;
     try out.appendSlice(allocator, g.get().items);
+    // An owned copy: every wrapper built from this list (a new List/Array/Set/
+    // Iterator, or a `sorted` list that escapes) takes one reference per element,
+    // so retain each. The source still owns its own refs. No-op under the arena.
+    if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
     return out;
 }
 
@@ -2426,7 +2444,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             defer g.deinit();
             const items = g.get().items;
             if (idx >= 0 and @as(usize, @intCast(idx)) < items.len) {
-                return .{ .ok = items[@intCast(idx)] };
+                const elem = items[@intCast(idx)];
+                // Borrowed element: the array still owns it, so retain before
+                // handing it to the register that will own the result.
+                elem.retain();
+                return .{ .ok = elem };
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, items.len });
             defer if (runtime.reclaimEnabled()) allocator.free(msg);
@@ -2439,6 +2461,12 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             defer g.deinit();
             const items = g.get().items;
             if (idx >= 0 and @as(usize, @intCast(idx)) < items.len) {
+                // The array owns one ref per element: release the value being
+                // overwritten and retain the incoming borrow. No-op under arena.
+                if (runtime.reclaimEnabled()) {
+                    items[@intCast(idx)].release(allocator);
+                    args[1].retain();
+                }
                 items[@intCast(idx)] = args[1];
                 return .{ .ok = .Unit };
             }
@@ -3225,7 +3253,10 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
     if (is_enum and std.mem.eql(u8, name, "values") and args.len == 0) {
         const cg = cls.borrow();
         var items: std.ArrayList(Value) = .empty;
-        for (cg.get().enum_entries) |e| try items.append(allocator, e.value);
+        for (cg.get().enum_entries) |e| {
+            e.value.retain();
+            try items.append(allocator, e.value);
+        }
         const enum_name = try StringRef.init(allocator, cg.get().name);
         cg.deinit();
         return .{ .ok = .{ .List = .{
@@ -3243,6 +3274,8 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         for (cg.get().enum_entries) |e| {
             if (std.mem.eql(u8, e.name, want)) {
                 const v = e.value;
+                // host-returns-owned: the singleton is owned by the ClassDef.
+                v.retain();
                 sg.deinit();
                 cg.deinit();
                 return .{ .ok = v };
@@ -3315,7 +3348,11 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
             const first = args[0];
             const rest = args[1..];
             if (rest.len == 0 and memberIsProperty(self, &first, n)) {
-                return try getFieldRec(self, allocator, &first, n);
+                // getFieldRec returns the field borrowed; this escapes as a
+                // callMember return whose register takes ownership, so retain.
+                var r = try getFieldRec(self, allocator, &first, n);
+                if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+                return r;
             }
             return try callMemberRec(self, allocator, &first, n, rest);
         }
@@ -3324,7 +3361,9 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
     if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and
         args.len == 0 and memberIsProperty(self, &recv_capt, n))
     {
-        return try getFieldRec(self, allocator, &recv_capt, n);
+        var r = try getFieldRec(self, allocator, &recv_capt, n);
+        if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+        return r;
     }
     // Bound method reference: forward the call.
     const r = try callMemberRec(self, allocator, &recv_capt, n, args);
@@ -3713,7 +3752,15 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                     .Map => |other| {
                         const og = other.entries.borrow();
                         defer og.deinit();
-                        try to_put.appendSlice(allocator, og.get().items);
+                        // Entries are borrowed from `other`; the destination map
+                        // owns its own ref per key+value, so retain each.
+                        for (og.get().items) |kv| {
+                            if (runtime.reclaimEnabled()) {
+                                kv.key.retain();
+                                kv.value.retain();
+                            }
+                            try to_put.append(allocator, kv);
+                        }
                     },
                     .List => |lst| try collectPairs(allocator, &to_put, lst.items),
                     .Set => |st| try collectPairs(allocator, &to_put, st.items),
@@ -3725,6 +3772,12 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                     var found = false;
                     for (g.get().items) |*slot| {
                         if (Value.structuralEq(&slot.key, &kv.key)) {
+                            // Overwrite: release the displaced value and the
+                            // staged (now-orphaned) key; transfer the staged value.
+                            if (runtime.reclaimEnabled()) {
+                                slot.value.release(allocator);
+                                kv.key.release(allocator);
+                            }
                             slot.value = kv.value;
                             found = true;
                             break;
@@ -3771,12 +3824,18 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
             if (std.mem.eql(u8, name, "setValue")) {
                 const new_v = if (args.len > 0) args[0] else Value.Unit;
                 const prev = me.value.asPtr().*;
-                prev.retain();
+                // host-returns-owned: the old value escapes as the result.
+                if (runtime.reclaimEnabled()) prev.retain();
                 if (me.backing) |entries| {
                     const g = entries.borrowMut();
                     defer g.deinit();
                     for (g.get().items) |*slot| {
                         if (Value.structuralEq(&slot.key, me.key.asPtr())) {
+                            // The slot owns its value: release the old, retain the new.
+                            if (runtime.reclaimEnabled()) {
+                                new_v.retain();
+                                slot.value.release(allocator);
+                            }
                             slot.value = new_v;
                             break;
                         }
@@ -3789,12 +3848,18 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
             if (std.mem.eql(u8, name, "component1") and
                 (receiverImplementsType(self, receiver, "Entry") or receiverImplementsType(self, receiver, "MutableEntry")))
             {
-                return try getFieldRec(self, allocator, receiver, "key");
+                // getFieldRec returns the field borrowed; this result escapes
+                // through callMember, so retain (host-returns-owned).
+                var r = try getFieldRec(self, allocator, receiver, "key");
+                if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+                return r;
             }
             if (std.mem.eql(u8, name, "component2") and
                 (receiverImplementsType(self, receiver, "Entry") or receiverImplementsType(self, receiver, "MutableEntry")))
             {
-                return try getFieldRec(self, allocator, receiver, "value");
+                var r = try getFieldRec(self, allocator, receiver, "value");
+                if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+                return r;
             }
         },
         else => {},
@@ -3824,6 +3889,9 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator exhausted") };
         }
         const v = ig.get().items[p];
+        // Borrowed element: the backing list still owns it, so retain before
+        // handing it to the register that will own the iteration result.
+        if (runtime.reclaimEnabled()) v.retain();
         ig.deinit();
         const pmg = it.pos.borrowMut();
         pmg.get().* = p + 1;
@@ -3970,6 +4038,9 @@ fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
                         if (g.get().get(pname)) |v| {
                             cg.deinit();
                             g.deinit();
+                            // Borrowed instance field; the register owns the
+                            // result, so retain before returning (host-returns-owned).
+                            if (runtime.reclaimEnabled()) v.retain();
                             return .{ .ok = v };
                         }
                     }
@@ -4381,7 +4452,11 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
         if (cg.get().is_enum) {
             if (g.get().get("name")) |nv| {
-                if (nv == .String) return .{ .ok = nv };
+                if (nv == .String) {
+                    // Borrowed instance field escaping through callMember.
+                    nv.retain();
+                    return .{ .ok = nv };
+                }
             }
         }
         if (cg.get().is_object) {

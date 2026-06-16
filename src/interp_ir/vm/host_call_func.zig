@@ -1029,6 +1029,11 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
                             if (std.mem.eql(u8, f.name, "enumValues")) {
                                 var items: std.ArrayList(Value) = .empty;
                                 for (cd.get().enum_entries) |entry| {
+                                    // The List owns one reference per element;
+                                    // `enum_entries` keeps its own. Retain so
+                                    // the List teardown does not free the shared
+                                    // singleton out from under the ClassDef.
+                                    entry.value.retain();
                                     items.append(allocator, entry.value) catch {};
                                 }
                                 const enum_class = try StringRef.init(allocator, cd.get().name);
@@ -1047,6 +1052,9 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
                                 for (cd.get().enum_entries) |entry| {
                                     if (std.mem.eql(u8, entry.name, want)) {
                                         const out = entry.value;
+                                        // host-returns-owned: the singleton is owned
+                                        // by the immutable ClassDef; retain.
+                                        out.retain();
                                         sg.deinit();
                                         cd.deinit();
                                         return .{ .ok = out };

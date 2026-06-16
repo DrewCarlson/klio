@@ -1333,6 +1333,8 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
     if (classDefIsFunInterface(class_def) and args.len == 1) {
         const identity = nextInstanceId(self);
         var fields: std.ArrayList(InstanceData.Field) = .empty;
+        // The SAM instance owns one ref to its target; `args[0]` is a borrow.
+        if (runtime.reclaimEnabled()) args[0].retain();
         try fields.append(allocator, .{ .name = "__sam_target__", .value = args[0] });
         const inst = try ObjRef(InstanceData).init(allocator, .{
             .class = class_def.clone(),
@@ -2212,6 +2214,9 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             const default_outer = og.get().get(class_name);
             og.deinit();
             if (default_outer) |o| {
+                // `outer` is an owned field (teardown releases it); the value
+                // read from the default-outer table is a borrow, so retain.
+                o.retain();
                 const g = inst.borrowMut();
                 g.get().outer = o;
                 g.deinit();
@@ -2227,6 +2232,9 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         };
         if (!has_outer) {
             if (try selectInnerOuter(self, allocator, class_def, ir_name, outer_hint)) |outer_v| {
+                // `selectInnerOuter` hands back a borrow of the outer-hint /
+                // capture; `outer` is an owned field, so retain before storing.
+                outer_v.retain();
                 const g = inst.borrowMut();
                 g.get().outer = outer_v;
                 g.deinit();
@@ -2474,7 +2482,13 @@ fn anonKey(allocator: Allocator, class_name: []const u8, member: []const u8) All
 fn buildCapturePairs(allocator: Allocator, captured_names: []const []const u8, captures: []const Value) Allocator.Error![]NameValue {
     const n = @min(captured_names.len, captures.len);
     var pairs = try allocator.alloc(NameValue, n);
-    for (0..n) |i| pairs[i] = .{ .name = captured_names[i], .value = captures[i] };
+    for (0..n) |i| {
+        // The anon-method registry holds these captures for the object's whole
+        // lifetime; retain so a captured value outlives the enclosing frame that
+        // produced it. Released when the registry entry is dropped. No-op arena.
+        if (runtime.reclaimEnabled()) captures[i].retain();
+        pairs[i] = .{ .name = captured_names[i], .value = captures[i] };
+    }
     return pairs;
 }
 
@@ -2859,6 +2873,9 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     }
 
     const outer: ?Value = findCapture(capture_pairs, "this");
+    // `outer` is an owned field of the instance (its teardown releases it);
+    // `findCapture` returns a borrow, so retain before adopting it.
+    if (outer) |o| o.retain();
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = class_def,
         .fields = fields,

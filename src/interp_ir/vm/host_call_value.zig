@@ -122,6 +122,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         if (is_fun_interface and args.len == 1) {
             const identity = nextInstanceId(self);
             var fields: std.ArrayList(InstanceData.Field) = .empty;
+            // The SAM instance owns one ref to its target; `args[0]` is a borrow
+            // of the caller's register, so retain (instance teardown releases it).
+            if (runtime.reclaimEnabled()) args[0].retain();
             try fields.append(allocator, .{ .name = "__sam_target__", .value = args[0] });
             const inst = try ObjRef(InstanceData).init(allocator, .{
                 .class = cls.clone(),
@@ -170,6 +173,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             var i: usize = 0;
             while (i < cdef.primary_params.len and i < args.len) : (i += 1) {
                 if (cdef.primary_params[i].property != null) {
+                    // The instance owns one ref per primary-ctor field; `args[i]`
+                    // is a borrow of the caller's register, so retain.
+                    if (runtime.reclaimEnabled()) args[i].retain();
                     try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = args[i] });
                 }
             }
@@ -485,6 +491,10 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 const explicit_receiver = info.n_params >= 1 and args.len == info.n_params + 1;
                 const receiver: Value = if (explicit_receiver) args[0] else this_value.*;
                 var body_args: []const Value = if (explicit_receiver) args[1..] else args;
+                // The receiver-prepended buffer below is a borrowed-into-call
+                // scratch slice the collector never owns; free it on the way out.
+                var body_args_owned: ?[]Value = null;
+                defer if (body_args_owned) |b| if (runtime.freeScratch()) allocator.free(b);
                 // Receiver-bound call of a closure that declares one more
                 // positional param than the call supplies: the callee is a
                 // plain `(T, …) -> R` lambda used where a `T.(…) -> R` is
@@ -498,6 +508,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                     with_recv[0] = receiver;
                     @memcpy(with_recv[1..], args);
                     body_args = with_recv;
+                    body_args_owned = with_recv;
                 }
 
                 // Bind the receiver into a fresh captures cell's `this` slot

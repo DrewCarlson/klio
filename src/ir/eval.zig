@@ -1921,6 +1921,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     break :blk cg.get().is_inner and g.get().outer == null;
                 };
                 if (needs_outer and outer_hint != null) {
+                    // The instance's `outer` is an owned field (its teardown
+                    // releases it); `outer_hint` is the caller's borrow, so
+                    // retain before storing. No-op under the arena.
+                    outer_hint.?.retain();
                     const g = inst_ref.borrowMut();
                     defer g.deinit();
                     g.get().outer = outer_hint.?;
@@ -2164,6 +2168,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             var list: std.ArrayList(Value) = .empty;
             try list.appendSlice(allocator, items);
             allocator.free(items);
+            // The list owns one reference to each element (its teardown
+            // releases them); `readArgRun` handed back borrows of the source
+            // registers, so retain each. No-op under the arena fast path.
+            if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
             try frame.write(nl.dst, .{ .List = .{
                 .items = try ValueList.init(allocator, list),
                 .mutable = false,

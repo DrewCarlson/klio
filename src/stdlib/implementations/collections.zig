@@ -45,6 +45,17 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
+/// Return a value that the accessor *borrowed* from its receiver (a stored
+/// list/array element or map entry value, not a freshly built result). Host
+/// calls return owned values — the dispatch writes the result into a register
+/// that takes ownership — so a borrowed element must be retained first or it is
+/// released one time too many when the register is overwritten/torn down. The
+/// retain is a no-op under the arena fast path.
+fn okElem(v: Value) EvalResult {
+    v.retain();
+    return .{ .ok = v };
+}
+
 fn typeErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
@@ -76,6 +87,9 @@ fn makeStringOwned(a: Allocator, s: []const u8) Error!Value {
 fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(a, items);
+    // `items` is a borrowed slice (call args, or a `snapshotItems`/`dupe` copy
+    // that did not bump counts); the list owns one ref per element, so retain.
+    if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
     return .{ .List = .{
         .items = try ValueList.init(a, list),
         .mutable = mutable,
@@ -94,11 +108,25 @@ fn makeListFromArrayList(a: Allocator, list: std.ArrayList(Value), mutable: bool
     } };
 }
 
+/// Like `makeListFromArrayList`, but for a backing whose elements are *borrowed*
+/// (copied in from `snapshotItems`/`iterableItems`/call args without bumping
+/// counts). The new list owns one reference per element, so retain each before
+/// adopting the backing — exactly as `makeList` does for a borrowed slice.
+/// Callers that build the backing from freshly *owned* elements (a `makePair`
+/// result, a block-invocation result, an explicitly pre-retained value) use
+/// `makeListFromArrayList` instead so ownership transfers without a leak.
+fn makeListBorrowed(a: Allocator, list: std.ArrayList(Value), mutable: bool) Error!Value {
+    if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
+    return makeListFromArrayList(a, list, mutable);
+}
+
 /// `make_set(items, mutable)` — dedupe by boxed structural equality.
 fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var deduped: std.ArrayList(Value) = .empty;
     for (items) |v| {
         if (!containsBoxed(deduped.items, &v)) {
+            // Borrowed input element; the set owns one ref per kept element.
+            if (runtime.reclaimEnabled()) v.retain();
             try deduped.append(a, v);
         }
     }
@@ -112,6 +140,8 @@ fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
 fn makeArray(a: Allocator, items: []const Value, prim: ?PrimitiveArrayKind) Error!Value {
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(a, items);
+    // Borrowed input slice; the array owns one ref per element.
+    if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
     return .{ .Array = .{ .items = try ValueList.init(a, list), .prim = prim } };
 }
 
@@ -119,13 +149,32 @@ fn makeArrayFromArrayList(a: Allocator, list: std.ArrayList(Value), prim: ?Primi
     return .{ .Array = .{ .items = try ValueList.init(a, list), .prim = prim } };
 }
 
-/// `make_map(entries, mutable)` — dedupe keys, last write wins.
+/// `makeArrayFromArrayList` for a backing whose elements are *borrowed* (see
+/// `makeListBorrowed`): the new array owns one ref per element, so retain each.
+fn makeArrayBorrowed(a: Allocator, list: std.ArrayList(Value), prim: ?PrimitiveArrayKind) Error!Value {
+    if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
+    return makeArrayFromArrayList(a, list, prim);
+}
+
+/// `make_map(entries, mutable)` — dedupe keys, last write wins. The input
+/// entries are BORROWED (snapshotEntries copies / Pair-arg reads): the new map
+/// owns one ref for each kept key and value, so retain them; on a last-write
+/// overwrite release the dropped value (the key keeps its existing ref). Every
+/// `makeMap` caller passes borrowed (or empty) entries. No-op under the arena.
 fn makeMap(a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
     var out: std.ArrayList(MapPair) = .empty;
     for (entries) |kv| {
         if (findKeyIndexBoxed(out.items, &kv.key)) |i| {
+            if (runtime.reclaimEnabled()) {
+                out.items[i].value.release(a);
+                kv.value.retain();
+            }
             out.items[i].value = kv.value;
         } else {
+            if (runtime.reclaimEnabled()) {
+                kv.key.retain();
+                kv.value.retain();
+            }
             try out.append(a, kv);
         }
     }
@@ -134,6 +183,17 @@ fn makeMap(a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
 
 fn makeMapFromArrayList(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool) Error!Value {
     return .{ .Map = .{ .entries = try MapEntries.init(a, entries), .mutable = mutable } };
+}
+
+/// `makeMapFromArrayList` for entries whose key+value are *borrowed*: the new
+/// map owns one ref for each key and value, so retain both. Mirrors
+/// `makeListBorrowed` for map entries.
+fn makeMapBorrowed(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool) Error!Value {
+    if (runtime.reclaimEnabled()) for (entries.items) |kv| {
+        kv.key.retain();
+        kv.value.retain();
+    };
+    return makeMapFromArrayList(a, entries, mutable);
 }
 
 fn makePair(a: Allocator, first: Value, second: Value) Error!Value {
@@ -523,7 +583,7 @@ pub fn coll_iter_filter_not_null(ctx: *CallCtx) Error!EvalResult {
     for (items) |v| {
         if (v != .Null) try result.append(a, v);
     }
-    return ok(try makeListFromArrayList(a, result, false));
+    return ok(try makeListBorrowed(a, result, false));
 }
 
 pub fn coll_iter_sum_of(ctx: *CallCtx) Error!EvalResult {
@@ -621,7 +681,7 @@ pub fn coll_iter_distinct_by(ctx: *CallCtx) Error!EvalResult {
             try result.append(a, v);
         }
     }
-    return ok(try makeListFromArrayList(a, result, false));
+    return ok(try makeListBorrowed(a, result, false));
 }
 
 pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
@@ -655,7 +715,7 @@ pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
     }
     var entries: std.ArrayList(MapPair) = .empty;
     for (groups.items) |g| {
-        try entries.append(a, .{ .key = g.key, .value = try makeListFromArrayList(a, g.vs, false) });
+        try entries.append(a, .{ .key = g.key, .value = try makeListBorrowed(a, g.vs, false) });
     }
     return ok(try makeMapFromArrayList(a, entries, false));
 }
@@ -779,11 +839,16 @@ pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
         };
         if (findKeyIndexBoxed(acc.items, &k)) |p| {
             const cur = acc.items[p].value;
-            acc.items[p].value = switch (try invoke(ctx, &op, &.{ k, cur, v })) {
+            const next = switch (try invoke(ctx, &op, &.{ k, cur, v })) {
                 .value => |val| val,
                 .err => |e| return e,
             };
+            // The reduced result is owned (invoke); drop the displaced value.
+            if (runtime.reclaimEnabled()) cur.release(a);
+            acc.items[p].value = next;
         } else {
+            // k is owned (invoke); v is a borrowed source element, so retain it.
+            if (runtime.reclaimEnabled()) v.retain();
             try acc.append(a, .{ .key = k, .value = v });
         }
     }
@@ -804,14 +869,28 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
             .value => |val| val,
             .err => |e| return e,
         };
-        if (r != .Pair) return typeErr("associate selector must return Pair");
+        if (r != .Pair) {
+            if (runtime.reclaimEnabled()) r.release(a);
+            return typeErr("associate selector must return Pair");
+        }
         const key = r.Pair.first.asPtr().*;
         const val = r.Pair.second.asPtr().*;
+        // key/val are borrowed reads of the owned Pair `r`'s boxes; the map owns
+        // its own ref to each, so retain before storing, then release `r`.
+        if (runtime.reclaimEnabled()) {
+            key.retain();
+            val.retain();
+        }
         if (findKeyIndexBoxed(entries.items, &key)) |i| {
+            if (runtime.reclaimEnabled()) {
+                entries.items[i].value.release(a);
+                key.release(a); // existing key kept; drop the duplicate's retain
+            }
             entries.items[i].value = val;
         } else {
             try entries.append(a, .{ .key = key, .value = val });
         }
+        if (runtime.reclaimEnabled()) r.release(a);
     }
     return ok(try makeMapFromArrayList(a, entries, false));
 }
@@ -830,9 +909,16 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
             .value => |val| val,
             .err => |e| return e,
         };
+        // key is owned (invoke result); v is a borrowed receiver element, so
+        // the map owns its own ref to it. On overwrite, drop the displaced value.
         if (findKeyIndexBoxed(entries.items, &key)) |i| {
+            if (runtime.reclaimEnabled()) {
+                entries.items[i].value.release(a);
+                v.retain();
+            }
             entries.items[i].value = v;
         } else {
+            if (runtime.reclaimEnabled()) v.retain();
             try entries.append(a, .{ .key = key, .value = v });
         }
     }
@@ -853,9 +939,13 @@ pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
             .value => |x| x,
             .err => |e| return e,
         };
+        // val is owned (invoke result); v is a borrowed receiver element used as
+        // the key, so the map owns its own ref to it.
         if (findKeyIndexBoxed(entries.items, &v)) |i| {
+            if (runtime.reclaimEnabled()) entries.items[i].value.release(a);
             entries.items[i].value = val;
         } else {
+            if (runtime.reclaimEnabled()) v.retain();
             try entries.append(a, .{ .key = v, .value = val });
         }
     }
@@ -1188,7 +1278,7 @@ pub fn map_get_or_else(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args[0] != .Map) return typeErr("getOrElse requires a Map receiver");
     const entries = try snapshotEntries(a, ctx.args[0].Map.entries);
     const key = ctx.args[1];
-    if (findKeyIndexBoxed(entries, &key)) |i| return ok(entries[i].value);
+    if (findKeyIndexBoxed(entries, &key)) |i| return okElem(entries[i].value);
     const block = ctx.args[2];
     return try ctx.host.invokeCallable(&block, &.{}, ctx.out);
 }
@@ -1202,7 +1292,7 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries_rc.borrow();
         defer g.deinit();
-        if (findKeyIndexBoxed(g.get().items, &key)) |i| return ok(g.get().items[i].value);
+        if (findKeyIndexBoxed(g.get().items, &key)) |i| return okElem(g.get().items[i].value);
     }
     const block = ctx.args[2];
     const new_v = switch (try invoke(ctx, &block, &.{})) {
@@ -1212,6 +1302,13 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries_rc.borrowMut();
         defer g.deinit();
+        // The map takes ownership of one ref to the stored key and value; the
+        // block's `new_v` is also returned, so retain both for the map and
+        // hand back the block's owned ref untouched.
+        if (runtime.reclaimEnabled()) {
+            key.retain();
+            new_v.retain();
+        }
         try g.get().append(a, .{ .key = key, .value = new_v });
     }
     return ok(new_v);
@@ -1336,7 +1433,10 @@ pub fn coll_list_of_not_null(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     var items: std.ArrayList(Value) = .empty;
     for (ctx.args) |v| {
-        if (v != .Null) try items.append(a, v);
+        if (v != .Null) {
+            if (runtime.reclaimEnabled()) v.retain();
+            try items.append(a, v);
+        }
     }
     return ok(try makeListFromArrayList(a, items, false));
 }
@@ -1459,7 +1559,10 @@ fn mapOfImpl(ctx: *CallCtx, mutable: bool, who: []const u8) Error!EvalResult {
         if (v != .Pair) return typeErr(try fmt(a, "{s} expects Pair arguments (use `key to value` or `Pair(k, v)`)", .{who}));
         try entries.append(a, .{ .key = v.Pair.first.asPtr().*, .value = v.Pair.second.asPtr().* });
     }
-    return ok(try makeMapFromArrayList(a, try dedupeMapInPlace(a, entries), mutable));
+    // Entries hold borrowed key/value (read from the Pair args the caller owns).
+    // Dedupe over the still-borrowed entries, then makeMapBorrowed retains the
+    // survivors so the map owns one ref per key+value.
+    return ok(try makeMapBorrowed(a, try dedupeMapInPlace(a, entries), mutable));
 }
 
 /// Apply make_map dedupe semantics to an already-collected entry list.
@@ -1687,7 +1790,7 @@ pub fn coll_list_get(ctx: *CallCtx) Error!EvalResult {
         if (runtime.reclaimEnabled()) a.free(msg);
         return e;
     }
-    return ok(items[@intCast(i)]);
+    return okElem(items[@intCast(i)]);
 }
 pub fn coll_list_contains(ctx: *CallCtx) Error!EvalResult {
     const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.contains")) {
@@ -1811,12 +1914,12 @@ fn listLastImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
                 .value => |x| x,
                 .err => |e| return e,
             };
-            if (r == .Bool and r.Bool) return ok(items[i]);
+            if (r == .Bool and r.Bool) return okElem(items[i]);
         }
         if (or_null) return ok(Value.Null);
         return try thrown(a, "kotlin.NoSuchElementException", "Collection contains no element matching the predicate.");
     }
-    if (items.len > 0) return ok(items[items.len - 1]);
+    if (items.len > 0) return okElem(items[items.len - 1]);
     if (or_null) return ok(Value.Null);
     return try thrown(a, "kotlin.NoSuchElementException", "Collection is empty.");
 }
@@ -2906,7 +3009,7 @@ pub fn coll_list_distinct(ctx: *CallCtx) Error!EvalResult {
     for (g.get().items) |v| {
         if (!containsBoxed(out.items, &v)) try out.append(a, v);
     }
-    return ok(try makeListFromArrayList(a, out, false));
+    return ok(try makeListBorrowed(a, out, false));
 }
 
 fn listTakeCount(ctx: *CallCtx, what: []const u8) Error!union(enum) { n: i64, err: EvalResult } {
@@ -2994,7 +3097,7 @@ pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
     } else {
         return typeErr("slice requires an IntRange or List<Int>");
     }
-    return ok(try makeListFromArrayList(a, out, false));
+    return ok(try makeListBorrowed(a, out, false));
 }
 
 pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
@@ -3040,7 +3143,7 @@ pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
         },
         else => try out.append(a, arg),
     }
-    return ok(try makeListFromArrayList(a, out, false));
+    return ok(try makeListBorrowed(a, out, false));
 }
 
 pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
@@ -3073,7 +3176,7 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
             try out.append(a, v);
         }
     }
-    return ok(try makeListFromArrayList(a, out, false));
+    return ok(try makeListBorrowed(a, out, false));
 }
 
 pub fn coll_list_chunked(ctx: *CallCtx) Error!EvalResult {
@@ -3234,6 +3337,9 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
             if (!containsBoxed(out.items, &arg)) try out.append(a, arg);
         },
     }
+    // `out` holds borrowed elements (snapshot/args); the new set owns one ref
+    // per element, so retain each before adopting the backing.
+    if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
     return ok(.{ .Set = .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null } });
 }
 
@@ -3263,6 +3369,9 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     for (src) |v| {
         if (!containsBoxed(removals.items, &v)) try out.append(a, v);
     }
+    // `out` holds borrowed elements (snapshot/args); the new set owns one ref
+    // per element, so retain each before adopting the backing.
+    if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
     return ok(.{ .Set = .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null } });
 }
 pub fn coll_set_subtract(ctx: *CallCtx) Error!EvalResult {
@@ -3288,6 +3397,9 @@ pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
     for (src) |v| {
         if (containsBoxed(other.items, &v)) try out.append(a, v);
     }
+    // `out` holds borrowed elements (snapshot/args); the new set owns one ref
+    // per element, so retain each before adopting the backing.
+    if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
     return ok(.{ .Set = .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null } });
 }
 
@@ -3357,6 +3469,8 @@ pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
     const g = it.borrowMut();
     defer g.deinit();
     if (containsBoxed(g.get().items, &arg)) return ok(.{ .Bool = false });
+    // The set owns one reference per element; retain the borrowed argument.
+    if (runtime.reclaimEnabled()) arg.retain();
     try g.get().append(a, arg);
     return ok(.{ .Bool = true });
 }
@@ -3392,6 +3506,8 @@ pub fn coll_mut_set_clear(ctx: *CallCtx) Error!EvalResult {
     {
         const g = it.borrowMut();
         defer g.deinit();
+        // clear() discards every element; drop the set's owned references.
+        if (runtime.reclaimEnabled()) for (g.get().items) |v| v.release(a);
         g.get().clearRetainingCapacity();
     }
     syncMapView(a, ctx.args[0]);
@@ -3595,7 +3711,7 @@ pub fn coll_map_get(ctx: *CallCtx) Error!EvalResult {
     if (try mapKeyIndex(ctx, entries, key)) |i| {
         const g = entries.borrow();
         defer g.deinit();
-        if (i < g.get().items.len) return ok(g.get().items[i].value);
+        if (i < g.get().items.len) return okElem(g.get().items[i].value);
     }
     return ok(Value.Null);
 }
@@ -3635,7 +3751,13 @@ pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        for (g.get().items) |kv| try keys.append(a, kv.key);
+        // The keys view owns one ref per element (its teardown releases them
+        // via releaseValueList regardless of `backing`); retain each borrowed
+        // key, mirroring `coll_map_entries`.
+        for (g.get().items) |kv| {
+            if (runtime.reclaimEnabled()) kv.key.retain();
+            try keys.append(a, kv.key);
+        }
     }
     const backing = try a.create(MapBacking);
     backing.* = .{ .entries = entries, .kind = .Keys };
@@ -3651,7 +3773,11 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        for (g.get().items) |kv| try values.append(a, kv.value);
+        // The values view owns one ref per element; retain each borrowed value.
+        for (g.get().items) |kv| {
+            if (runtime.reclaimEnabled()) kv.value.retain();
+            try values.append(a, kv.value);
+        }
     }
     const backing = try a.create(MapBacking);
     backing.* = .{ .entries = entries, .kind = .Values };
@@ -3727,6 +3853,10 @@ pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
         const g = entries.borrowMut();
         defer g.deinit();
         const kv = g.get().orderedRemove(pos);
+        // `remove` transfers the entry out of the map: the value's owned ref
+        // moves to the returned result (no retain), and the removed key — which
+        // the map owned and which is not returned — must be released.
+        if (runtime.reclaimEnabled()) kv.key.release(a);
         return ok(kv.value);
     }
     return ok(Value.Null);
@@ -3827,7 +3957,8 @@ pub fn map_put_if_absent(ctx: *CallCtx) Error!EvalResult {
     const key = ctx.args[1];
     if (ctx.args.len < 3) return arityErr("putIfAbsent requires a value");
     const value = ctx.args[2];
-    if (mapFind(entries, key)) |old| return ok(old);
+    // The present value is borrowed from the map; retain before returning it.
+    if (mapFind(entries, key)) |old| return okElem(old);
     try mapSet(a, entries, key, value);
     return ok(Value.Null);
 }
@@ -3854,6 +3985,10 @@ pub fn map_replace(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 3) return arityErr("replace requires a value");
     const value = ctx.args[2];
     if (mapFind(entries, key)) |old| {
+        // `replace` returns the previous value: retain it before `mapSet`
+        // releases the map's reference, so the returned result carries an
+        // owned ref instead of a freed one.
+        if (runtime.reclaimEnabled()) old.retain();
         try mapSet(a, entries, key, value);
         return ok(old);
     }
@@ -3868,7 +4003,9 @@ pub fn map_compute_if_absent(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("computeIfAbsent requires a key");
     const key = ctx.args[1];
-    if (mapFind(entries, key)) |v| return ok(v);
+    // The present value is borrowed from the map; the register adopting the
+    // result must own its ref, so retain before returning.
+    if (mapFind(entries, key)) |v| return okElem(v);
     if (ctx.args.len < 3) return arityErr("computeIfAbsent requires a block");
     const block = ctx.args[2];
     const v = switch (try invoke(ctx, &block, &.{key})) {
@@ -4053,7 +4190,7 @@ pub fn coll_list_flatten(ctx: *CallCtx) Error!EvalResult {
             },
         }
     }
-    return ok(try makeListFromArrayList(a, out, false));
+    return ok(try makeListBorrowed(a, out, false));
 }
 
 pub fn coll_list_unzip(ctx: *CallCtx) Error!EvalResult {
@@ -4070,7 +4207,7 @@ pub fn coll_list_unzip(ctx: *CallCtx) Error!EvalResult {
         try firsts.append(a, v.Pair.first.asPtr().*);
         try seconds.append(a, v.Pair.second.asPtr().*);
     }
-    return ok(try makePair(a, try makeListFromArrayList(a, firsts, false), try makeListFromArrayList(a, seconds, false)));
+    return ok(try makePair(a, try makeListBorrowed(a, firsts, false), try makeListBorrowed(a, seconds, false)));
 }
 
 pub fn coll_list_contains_all(ctx: *CallCtx) Error!EvalResult {
@@ -4318,6 +4455,8 @@ pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
     var changed = false;
     for (to_add) |v| {
         if (!containsBoxed(g.get().items, &v)) {
+            // The set owns one ref per element; `to_add` is a borrowed snapshot.
+            if (runtime.reclaimEnabled()) v.retain();
             try g.get().append(a, v);
             changed = true;
         }
@@ -4341,7 +4480,7 @@ pub fn coll_map_get_or_default(ctx: *CallCtx) Error!EvalResult {
     const default = ctx.args[2];
     const g = entries.borrow();
     defer g.deinit();
-    if (findKeyIndexBoxed(g.get().items, &key)) |i| return ok(g.get().items[i].value);
+    if (findKeyIndexBoxed(g.get().items, &key)) |i| return okElem(g.get().items[i].value);
     return ok(default);
 }
 
@@ -4356,7 +4495,7 @@ pub fn coll_map_get_value(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        if (findKeyIndexBoxed(g.get().items, &key)) |i| return ok(g.get().items[i].value);
+        if (findKeyIndexBoxed(g.get().items, &key)) |i| return okElem(g.get().items[i].value);
     }
     const kd = try display(a, key);
     const msg = try fmt(a, "Key {s} is missing in the map.", .{kd});
@@ -4469,16 +4608,28 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
     }
     const g = entries.borrowMut();
     defer g.deinit();
+    // `to_add` entries are borrowed (snapshotEntries of the source map, or
+    // Pair-component reads); the destination owns one ref per key+value.
     for (to_add) |kv| {
         var found = false;
         for (g.get().items) |*slot| {
             if (eqBoxed(&slot.key, &kv.key)) {
+                if (runtime.reclaimEnabled()) {
+                    kv.value.retain();
+                    slot.value.release(a);
+                }
                 slot.value = kv.value;
                 found = true;
                 break;
             }
         }
-        if (!found) try g.get().append(a, kv);
+        if (!found) {
+            if (runtime.reclaimEnabled()) {
+                kv.key.retain();
+                kv.value.retain();
+            }
+            try g.get().append(a, kv);
+        }
     }
     return ok(Value.Unit);
 }
@@ -4770,7 +4921,7 @@ pub fn array_element_at(ctx: *CallCtx) Error!EvalResult {
     if (index < 0 or @as(usize, @intCast(index)) >= items.len) {
         return indexOob(a, try fmt(a, "index: {d}, size: {d}", .{ index, items.len }));
     }
-    return ok(items[@intCast(index)]);
+    return okElem(items[@intCast(index)]);
 }
 
 pub fn array_plus(ctx: *CallCtx) Error!EvalResult {
@@ -4797,7 +4948,7 @@ pub fn array_plus(ctx: *CallCtx) Error!EvalResult {
         },
         else => try items.append(a, other),
     }
-    return ok(try makeArrayFromArrayList(a, items, arrayPrimOf(recv)));
+    return ok(try makeArrayBorrowed(a, items, arrayPrimOf(recv)));
 }
 
 pub fn array_plus_element(ctx: *CallCtx) Error!EvalResult {
@@ -4813,7 +4964,7 @@ pub fn array_plus_element(ctx: *CallCtx) Error!EvalResult {
     };
     try items.appendSlice(a, xs);
     try items.append(a, other);
-    return ok(try makeArrayFromArrayList(a, items, arrayPrimOf(recv)));
+    return ok(try makeArrayBorrowed(a, items, arrayPrimOf(recv)));
 }
 
 pub fn array_copy_into(ctx: *CallCtx) Error!EvalResult {
@@ -4854,7 +5005,15 @@ pub fn array_copy_into(ctx: *CallCtx) Error!EvalResult {
         const g = dest.borrowMut();
         defer g.deinit();
         const base: usize = @intCast(dest_offset);
-        for (slice, 0..) |v, i| g.get().items[base + i] = v;
+        // Overwriting a slot: the destination array owns one ref per element, so
+        // release the displaced value and retain the incoming (borrowed) one.
+        for (slice, 0..) |v, i| {
+            if (runtime.reclaimEnabled()) {
+                g.get().items[base + i].release(a);
+                v.retain();
+            }
+            g.get().items[base + i] = v;
+        }
     }
     return ok(dest_val);
 }
@@ -4880,7 +5039,7 @@ pub fn array_copy_of(ctx: *CallCtx) Error!EvalResult {
     while (i < n) : (i += 1) {
         try out.append(a, if (i < cur.len) cur[i] else default);
     }
-    return ok(try makeArrayFromArrayList(a, out, prim));
+    return ok(try makeArrayBorrowed(a, out, prim));
 }
 
 pub fn array_copy_of_range(ctx: *CallCtx) Error!EvalResult {
