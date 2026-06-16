@@ -449,60 +449,75 @@ pub const Value = union(enum) {
     /// (`Pair`/`Triple`/`MapEntry`/`Result`/`BoundMethod`/`Exception.cause`)
     /// are not yet refcounted — they share their boxes on copy and are
     /// retained/released as no-ops here until they are converted to `ObjRef`.
+    /// Single source of truth for the value graph's out-edges: invokes
+    /// `visitor.visit(objref)` for every refcounted `ObjRef` handle this value
+    /// *directly* holds (one level — the handle's own cell, not its transitive
+    /// elements; a container backing cell's own children are reached through the
+    /// cell's GC `trace_fn`). `retain` (incref), `release` (decref), and the GC
+    /// mark phase all drive this same walk, so they cannot diverge. `backing`
+    /// write-through views are non-owning and intentionally not visited.
+    pub fn forEachChildCell(self: Value, visitor: anytype) void {
+        switch (self) {
+            .String => |s| visitor.visit(s),
+            .Instance => |i| visitor.visit(i),
+            .BoundUserMethod => |m| visitor.visit(m.receiver),
+            .Sequence => |s| visitor.visit(s),
+            .Delegate => |d| visitor.visit(d),
+            .Regex => |r| visitor.visit(r),
+            .Match => |m| visitor.visit(m),
+            .StringBuilder => |s| visitor.visit(s),
+            .Cell => |c| visitor.visit(c),
+            .Function => |f| visitor.visit(f.env),
+            .IrClosure => |c| visitor.visit(c.captures),
+            .Comparator => |c| visitor.visit(c.steps),
+            .List => |x| visitor.visit(x.items),
+            .Set => |x| visitor.visit(x.items),
+            .Array => |x| visitor.visit(x.items),
+            .Map => |x| visitor.visit(x.entries),
+            .Iterator => |x| {
+                visitor.visit(x.items);
+                visitor.visit(x.pos);
+            },
+            .RangeIter => |x| visitor.visit(x.cur),
+            .PropertyRef => |p| visitor.visit(p.name),
+            .MatchGroup => |g| visitor.visit(g.value),
+            .Exception => |e| {
+                visitor.visit(e.fqn);
+                if (e.message) |m| visitor.visit(m);
+                if (e.cause) |c| visitor.visit(c);
+            },
+            .Pair => |p| {
+                visitor.visit(p.first);
+                visitor.visit(p.second);
+            },
+            .Triple => |t| {
+                visitor.visit(t.first);
+                visitor.visit(t.second);
+                visitor.visit(t.third);
+            },
+            .MapEntry => |e| {
+                visitor.visit(e.key);
+                visitor.visit(e.value);
+            },
+            .Result => |r| visitor.visit(r.payload),
+            .BoundMethod => |m| visitor.visit(m.receiver),
+            else => {},
+        }
+    }
+
+    const RetainVisitor = struct {
+        inline fn visit(_: RetainVisitor, objref: anytype) void {
+            _ = objref.clone();
+        }
+    };
+
     pub fn retain(self: Value) void {
         // Gated to match `release` (whose `ObjRef.deinit` is a no-op under the
         // arena fast path): under reclaim-off retains and releases are both
         // skipped, so the arena reclaims everything and production pays no
         // refcount traffic. Under reclaim-on both run and stay balanced.
         if (!objcell.reclaimEnabled()) return;
-        switch (self) {
-            .String => |s| _ = s.clone(),
-            .Instance => |i| _ = i.clone(),
-            .BoundUserMethod => |m| _ = m.receiver.clone(),
-            .Sequence => |s| _ = s.clone(),
-            .Delegate => |d| _ = d.clone(),
-            .Regex => |r| _ = r.clone(),
-            .Match => |m| _ = m.clone(),
-            .StringBuilder => |s| _ = s.clone(),
-            .Cell => |c| _ = c.clone(),
-            .Function => |f| _ = f.env.clone(),
-            .IrClosure => |c| _ = c.captures.clone(),
-            .Comparator => |c| _ = c.steps.clone(),
-            .List => |x| _ = x.items.clone(),
-            .Set => |x| _ = x.items.clone(),
-            .Array => |x| _ = x.items.clone(),
-            .Map => |x| _ = x.entries.clone(),
-            .Iterator => |x| {
-                _ = x.items.clone();
-                _ = x.pos.clone();
-            },
-            .RangeIter => |x| _ = x.cur.clone(),
-            .PropertyRef => |p| _ = p.name.clone(),
-            .MatchGroup => |g| _ = g.value.clone(),
-            .Exception => |e| {
-                _ = e.fqn.clone();
-                if (e.message) |m| _ = m.clone();
-                if (e.cause) |c| _ = c.clone();
-            },
-            .Pair => |p| {
-                _ = p.first.clone();
-                _ = p.second.clone();
-            },
-            .Triple => |t| {
-                _ = t.first.clone();
-                _ = t.second.clone();
-                _ = t.third.clone();
-            },
-            .MapEntry => |e| {
-                _ = e.key.clone();
-                _ = e.value.clone();
-                // `backing` is a non-owning write-through reference to the live
-                // map's entries, not an owned handle — not retained/released.
-            },
-            .Result => |r| _ = r.payload.clone(),
-            .BoundMethod => |m| _ = m.receiver.clone(),
-            else => {},
-        }
+        self.forEachChildCell(RetainVisitor{});
     }
 
     /// Reference-counting decrement (Rust `Drop`): drop one owning handle to
