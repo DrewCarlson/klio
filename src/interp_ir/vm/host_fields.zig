@@ -1887,6 +1887,11 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             }
         }
         {
+            // `define` adopts one owned reference, but `value` here is the
+            // caller's borrow (the `SetField` opcode reads it straight out of a
+            // register). Retain so the field owns its own reference and the
+            // instance's teardown release is balanced. No-op under the arena.
+            value.retain();
             const g = inst.borrowMut();
             defer g.deinit();
             try g.get().define(allocator, real_name, value);
