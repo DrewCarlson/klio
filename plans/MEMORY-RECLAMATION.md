@@ -87,6 +87,14 @@ This session:
 - `f2ab5ecd` — **AtomicRef** `compareAndSet`/`getAndSet` own their stored value
   (retain the new; transfer the returned previous instead of `define`-releasing
   it and handing back freed memory).
+- `8eeab3b7` — **receiver pinned across member-call dispatch**
+  (`CallMember`/`CallMemberOrValue`/`CallSuper` retain the receiver and release
+  after). A method borrows its receiver, but the dispatched body can drop every
+  other reference to it before the call returns — the canonical case is
+  `runBlocking`'s `joinBlocking` reading `this.failed` *after* the pump completes
+  the job and the job tree releases the coroutine instance. Fixes single/small
+  `async` and the general dangling-receiver class; raises the async-loop crash
+  threshold from `n≥8` to `n≥10`.
 
 ### 0.2 What works under reclaim ON (`KLIO_RECLAIM=smp`), verified
 
@@ -99,7 +107,8 @@ This session:
 - Plain `suspend fun` call chains.
 - `delay` (real park → resume).
 - `launch` (cooperative child coroutine).
-- Single and small (`n ≤ 5`) `async { … }.await()`.
+- Single and small (`n ≤ 9`) `async { … }.await()` (was `n ≤ 5` before the
+  receiver-retain `8eeab3b7`).
 
 The full unit + itest suite is green under reclaim-ON `testing.allocator`
 (leak-checked) except two PRE-EXISTING failures unrelated to reclamation
@@ -109,11 +118,10 @@ session-start commit).
 
 ### 0.3 What still corrupts under reclaim ON
 
-- `async`/`await` **at scale** — deterministic threshold: `n ≤ 5` children OK,
-  `n ≥ 8` use-after-frees (`afterCompletion` dispatched on a released job-handle
-  node). The structured-concurrency **job tree** (`LockFreeLinkedList` +
-  `JobSupport` completion-notify) reclaims handler nodes while a traversal /
-  dispatch still references them. See §12.
+- `async`/`await` **at scale** — deterministic threshold: `n ≤ 9` children OK,
+  `n ≥ 10` over-releases the parent coroutine in the suspend/resume + job-tree
+  machinery (fatal release in `resumeContinuation`'s `frame.deinit`). See §12,
+  esp. §12.3a for the refined finding.
 - `Dispatchers.Default` / the real worker pool: `scheduler.post` stores `block.*`
   cross-thread without cloning (`intrinsic_host.zig:817`), plus the same
   job-tree issue. The ktor server hits both at startup.
@@ -875,6 +883,42 @@ completion-notify.
   removal. The `release-old` is correct for an *ownership-transfer* CAS but the
   lock-free list also CASes for pointer *repair*, where the old value is not
   being given up — that asymmetry is the prime suspect.
+
+### 12.3a Refined finding (this session)
+
+The over-release is now pinned to the **parent coroutine** (`runBlocking`'s
+`KlioBlockingCoroutine`), not (only) the lock-free list nodes:
+
+- Tracing `Value.release` for `KlioBlockingCoroutine`: the fatal release
+  (refcount → 0) is always **`resumeContinuation`'s `frame.deinit`**
+  (`eval.zig:558`, the per-register release), reached via `pumpLoop`
+  (`coroutines.zig:1264`) → `resumeRaw` → `resumeContinuation`. A resumed frame
+  releases a register that holds the parent coroutine.
+- Total retains == total releases (the instance is freed *exactly once*, no
+  leak, no double-free in aggregate) — but the **last** release happens during
+  the pump, while `joinBlocking`'s receiver borrow still needs the instance.
+- It is a per-iteration NET drift: the receiver-retain (`8eeab3b7`) adds one
+  buffer reference, which is why the threshold moved from `n≥8` to `n≥10` rather
+  than being fixed outright. So somewhere in the suspend/resume + job-tree
+  interplay the parent coroutine is released slightly more eagerly than it is
+  retained, and the buffer is exhausted at ~10 children.
+- Under plain `smp` this surfaces downstream as `incorrect alignment`
+  (free-list corruption); under `KLIO_RC_DETECT=1` as the `0xaa…` UAF, and at
+  larger N as an actual `[RC DOUBLE-FREE]` in the same `resumeContinuation`
+  `frame.deinit`.
+- Object **singletons** (`NonDisposableHandle`, an `object`) are also shared by
+  value all over the job tree without retaining; a systematic fix is to make
+  `ClassDef.is_object` instances immune to reclamation (retain/release no-op,
+  like the immutable `Class` graph) since they are process-global. This was
+  prototyped and is neutral for the *current* bottleneck (the parent coroutine
+  above is not a singleton) but is very likely needed before the tail is clean;
+  do it with a cheap per-instance flag, not a per-op class borrow.
+
+The honest assessment: this is the §6/§7.-1 "all-or-nothing host reconciliation"
+wall — a long tail of borrow-without-retain share sites in the coroutine / job
+tree / suspend-resume machinery, each fix unblocking a little more. The
+remaining sites live in the resume path's register ownership and the structured-
+concurrency parent/child reference management.
 
 ### 12.4 Likely shape of the fix
 
