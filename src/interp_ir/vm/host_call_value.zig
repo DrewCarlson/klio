@@ -341,6 +341,10 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     try new_caps.appendNTimes(allocator, Value.Null, this_idx + 1 - new_caps.items.len);
                 }
                 new_caps.items[this_idx] = args[0];
+                // The bound closure owns one ref to each capture (its teardown
+                // releases them); the copied originals and the bound receiver
+                // are borrows, so retain. No-op under the arena fast path.
+                if (runtime.reclaimEnabled()) for (new_caps.items) |c| c.retain();
                 const slice = try new_caps.toOwnedSlice(allocator);
                 const caps_ref = try ValueSlice.init(allocator, slice);
                 break :bnd Value{ .IrClosure = .{ .id = id, .captures = caps_ref } };
@@ -512,6 +516,10 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                     try new_caps.appendNTimes(allocator, Value.Null, idx + 1 - new_caps.items.len);
                 }
                 new_caps.items[idx] = receiver;
+                // The bound closure owns one ref to each capture (its teardown
+                // releases them); the copied originals and the bound receiver
+                // are borrows, so retain. No-op under the arena fast path.
+                if (runtime.reclaimEnabled()) for (new_caps.items) |c| c.retain();
                 const slice = try new_caps.toOwnedSlice(allocator);
                 const caps_ref = try ValueSlice.init(allocator, slice);
                 const bound = Value{ .IrClosure = .{ .id = id, .captures = caps_ref } };
