@@ -278,8 +278,15 @@ pub const MatchData = struct {
 // reaches the API through `runtime`.
 // ---------------------------------------------------------------------------
 
-/// `many` keeps a whole slice rooted in O(1) (no per-element copy).
-const KeepEntry = union(enum) { one: Value, many: []const Value };
+/// `many`/`pairs` keep a whole slice rooted in O(1) (no per-element copy);
+/// `cell` pins a raw object cell (e.g. a transient scope `Env` the host swapped
+/// into place) whose own `gc_trace` then reaches its contents.
+const KeepEntry = union(enum) {
+    one: Value,
+    many: []const Value,
+    pairs: []const MapPair,
+    cell: *objcell.gc.GcHeader,
+};
 threadlocal var host_keepalive: std.ArrayListUnmanaged(KeepEntry) = .empty;
 var keepalive_root_registered = std.atomic.Value(bool).init(false);
 
@@ -287,6 +294,8 @@ fn gcMarkKeepalive(m: *objcell.gc.Marker) void {
     for (host_keepalive.items) |e| switch (e) {
         .one => |v| v.gcMark(m),
         .many => |vs| for (vs) |v| v.gcMark(m),
+        .pairs => |ps| for (ps) |*p| p.gcTrace(m),
+        .cell => |h| m.shade(h),
     };
 }
 
@@ -320,6 +329,26 @@ pub fn keepalivePushSlice(vs: []const Value) void {
     if (!objcell.gc.gc_enabled) return;
     ensureKeepaliveRoot();
     host_keepalive.append(std.heap.page_allocator, .{ .many = vs }) catch
+        @panic("KGC: host_keepalive push failed");
+}
+
+/// Pin a slice of `MapPair`s (a map/grouping accumulator's live contents)
+/// across a re-entrant host call. No-op unless GC is on.
+pub fn keepalivePushPairs(ps: []const MapPair) void {
+    if (!objcell.gc.gc_enabled) return;
+    ensureKeepaliveRoot();
+    host_keepalive.append(std.heap.page_allocator, .{ .pairs = ps }) catch
+        @panic("KGC: host_keepalive push failed");
+}
+
+/// Pin a raw object cell across a re-entrant host call — for a transient cell
+/// the host holds in a stack local that no frame register or Vm-graph root
+/// reaches (a scope `Env` swapped into the host's active globals). The cell's
+/// own `gc_trace` reaches its contents. No-op unless GC is on.
+pub fn keepalivePushCell(h: *objcell.gc.GcHeader) void {
+    if (!objcell.gc.gc_enabled) return;
+    ensureKeepaliveRoot();
+    host_keepalive.append(std.heap.page_allocator, .{ .cell = h }) catch
         @panic("KGC: host_keepalive push failed");
 }
 
@@ -600,9 +629,20 @@ pub const Value = union(enum) {
 
     /// GC tracer for a `Value`: shade each cell this value directly references
     /// (one level; the shaded cell's own `gc_trace` reaches the next level).
-    /// Same edge set as `retain`, so they cannot diverge.
+    /// Covers the same owning edges as `retain`, PLUS the non-owning
+    /// view->source `backing` edges that retain/release intentionally skip: a
+    /// live `MutableMap.keys`/`.values`/`.entries` view or a `Map.Entry` write-
+    /// through must keep the source map's entries cell reachable, or the
+    /// collector frees the map out from under a live view. It cannot leak the
+    /// map: once the view is gone, nothing marks the backing.
     pub fn gcMark(self: Value, m: *objcell.gc.Marker) void {
         self.forEachChildCell(MarkVisitor{ .m = m });
+        switch (self) {
+            .List => |x| if (x.backing) |b| m.shade(&b.entries.cell.hdr),
+            .Set => |x| if (x.backing) |b| m.shade(&b.entries.cell.hdr),
+            .MapEntry => |e| if (e.backing) |b| m.shade(&b.cell.hdr),
+            else => {},
+        }
     }
 
     /// Reference-counting decrement (Rust `Drop`): drop one owning handle to

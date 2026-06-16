@@ -2801,6 +2801,13 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         .delegate_forwarders = &.{},
         .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
     });
+    // The synthesized anon class lives only in this stack local until it is
+    // registered into `classes` (below) and adopted by the instance; pin it
+    // across the body-property / super-arg initializer evals so a collection
+    // there cannot sweep it (its `gc_trace` reaches its parent and captured env).
+    const ka_class = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka_class);
+    runtime.keepalivePushCell(&class_def.cell.hdr);
 
     // Initialise body-property fields.
     var fields: std.ArrayList(InstanceData.Field) = .empty;
@@ -3062,6 +3069,12 @@ fn runAnonThunk(
         sg.deinit();
         self.globals = scoped;
     }
+    // Pin the active globals scope across the body eval (see the same pattern in
+    // host_call_member): a transient capture-layer env is reachable only through
+    // this stack-local field.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushCell(&self.globals.cell.hdr);
     var cap_vec: std.ArrayList(Value) = .empty;
     for (func.capture_order) |cn| {
         if (std.mem.eql(u8, cn, "this")) {

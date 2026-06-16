@@ -40,6 +40,8 @@ pub const gc = objcell.gc;
 pub const keepaliveMark = value_mod.keepaliveMark;
 pub const keepalivePush = value_mod.keepalivePush;
 pub const keepalivePushSlice = value_mod.keepalivePushSlice;
+pub const keepalivePushPairs = value_mod.keepalivePushPairs;
+pub const keepalivePushCell = value_mod.keepalivePushCell;
 pub const keepaliveRestore = value_mod.keepaliveRestore;
 
 // alloc_track (opt-in allocation accounting; KLIO_ALLOC_TRACK)

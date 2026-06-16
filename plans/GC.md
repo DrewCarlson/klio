@@ -121,3 +121,52 @@ Throughput validation: copy-heavy microbenchmarks (string-template concat, boxed
 5. Epoch-wrap is a non-issue for soundness (usize width makes it astronomically far; documented invariant: reachable cells are re-marked every collection so wrap can only delay, never prevent, reclamation of an unreachable cell — a bounded leak, never a UAF).
 
 6. Stage 2/3 concurrency: the Dijkstra/generational barriers add memory-ordering obligations between the shade CAS and the per-cell SpinRwLock; gc_mark is kept on its own word with specified ordering, but concurrent-mark correctness is the hardest-to-test part and is deliberately the LAST, optional stage — Stage 1 (STW, non-moving) is the complete, correct, bounded-RSS GC that can ship and become the default on its own.
+
+
+## Build status
+
+Implemented and validated:
+
+- Collector core (gc.zig): GcHeader epoch-mark, tri-color Marker with explicit
+  grey worklist, intrusive cell registry, Appel threshold with a tunable floor
+  (KLIO_GC_THRESHOLD_KB), permanent generation (the stdlib/class image built
+  before the program body is never swept), shallow gcFinalize sweep.
+- Test oracles: KLIO_GC_STRESS (collect every safe point), KLIO_GC_STRESS_EVERY=N
+  (every N safe points — narrow-window detection without the O(safe-points x
+  live) blowup), KLIO_GC_NOFREE (mark-only — isolates premature frees from
+  marking/sweep bugs), KLIO_GC_DEBUG (per-collection accounting + freed-type).
+- Single-thread roots: the eval frame chain (regs/params/captures/enclosing
+  receivers), the Vm program graph (globals, classes, class_default_outer, the
+  closure / anon-method / object-state side tables, the program image), the
+  host-op keepalive stack (Value / Value-slice / MapPair-slice / raw-cell
+  pins), and the host's active scope env swapped during member/object bodies.
+- Tracers: ClosureInfo, AnonMethodEntry, ObjectInitState, InstanceData,
+  ClassDef, Env, MapPair, ComparatorStep; gcMark additionally follows the
+  non-owning map-view backing edges (List/Set/MapEntry) that retain/release skip.
+- Coroutines: a root provider marks this thread's interceptor stack (parked
+  frame snapshots, scope deltas, queued launches, pending resume values), the
+  active scope stack, the persisted-continuation registry, and the slot-owner
+  wakeup mailboxes; SuspendState/DriverWakeup/CooperativeInterceptor markers.
+
+Validated: all 88 example programs run byte-identically to the arena baseline
+under aggressive collection (KLIO_GC_THRESHOLD_KB=64); the default arena path is
+unchanged (the collector is inert unless gc_enabled).
+
+Remaining:
+
+- host_keepalive completeness across the ~65 stdlib invoke / callValueRec
+  accumulator sites (narrow-window premature frees under full stress; realistic
+  thresholds already pass).
+- Multi-thread root visibility + stop-the-world. Each thread registers the
+  stable addresses of its threadlocal roots (frame_chain, host_keepalive,
+  coro_stack, active_scope_stack) into process-global intrusive lists at its
+  entry seam and unlinks at exit; the collector marks every registered thread's
+  roots (a parked/blocking thread's stack is stable, so reading it cross-thread
+  is sound). An STW handshake (stop flag + parked-count rendezvous, with
+  enterBlockingSafe/exitBlockingSafe bracketing the blocking primitives) ensures
+  no thread mutates mid-collection. Worker threads flip alloc_perm=false only
+  once their roots are visible — doing it earlier would let one thread's
+  collection sweep another's unrooted cells.
+- Closure side-table slot-map + free-list for bounded RSS (today the registry is
+  strong-rooted and append-only, so per-request closures leak — correct but not
+  yet flat-RSS).
