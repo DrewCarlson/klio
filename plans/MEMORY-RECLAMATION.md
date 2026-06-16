@@ -61,33 +61,33 @@ Two distinct problems, both now largely solved:
    gated check in the `BinOp.StringConcat` path (`s.strongCount()==0 or huge`)
    caught the freed string mid-concat as `"[INFO] (" + <freed name>`.
 
-   *Remaining — one `df=1` in the routing/pipeline setup graph (cyclic
-   over-release):* the JSON/ContentNegotiation server prints exactly one
-   `[RC DOUBLE-FREE]` at teardown under `KLIO_RECLAIM=smp KLIO_RC_DETECT=1`
-   (`wait = false`, completes in ~0.1 s, so easy to repro). Tracing the class of
-   each `InstanceData` freed (gated `KLIO_FREE_CLS` print in `InstanceData.deinit`)
-   shows the teardown walking the **ktor routing tree** right before the
-   double-free: `RoutingNode → ApplicationSendPipeline / ApplicationReceivePipeline
-   → KlioAttributes → AtomicRef → … → PathSegmentConstantRouteSelector →
-   [RC DOUBLE-FREE]`. So a node in that graph is released twice — a **cyclic /
-   back-reference over-release**, the same class as the lock-free list: a
-   `RoutingNode.parent` (or a node shared between a selector and a pipeline) is
-   now a counted owning field (every `setField` retains), but a back-reference in
-   a parent↔child tree must be *non-owning*, or the cycle is both unreclaimable
-   (a leak) and, when one side is released through two paths, an over-release.
-   Under real reclaim the freed cell is reused, which is what turns this into the
-   `wait = true` 99 %-CPU spin (the reused cell makes a routing/comparison loop
-   never converge); `wait = false` exits before the reuse bites. **This is the
-   structural §12 limit of naive refcounting for ktor's cyclic graphs (routing
-   tree, intrusive lock-free lists), not a one-line store fix.** Two real options:
-   (a) link-kind-aware ownership — mark back-reference fields (`parent`, lock-free
-   `_prev`) non-owning so only forward links own, which the interpreter cannot
-   infer for interpreted Kotlin and would need a per-class annotation/heuristic;
-   or (b) the plan's §12.4 option 2 — reclaim the per-request / per-setup value
-   graph at a boundary via an arena, sidestepping per-field ownership in the
-   cyclic structures entirely (the run-boundary reset already exists). Repro and
-   class-trace recipe above; the `KLIO_FREE_CLS` deinit print is the fast tool
-   (per-op stack tracing slows startup past the teardown).
+   The `df=1` that the routing/pipeline setup showed at teardown is **fixed** and
+   was NOT a cycle: the per-cell RC-history tracker (re-added in `ObjRef`, dumped
+   on `KLIO_RC_DETECT` double-free) pinned the doubly-freed `PipelinePhase` to a
+   borrowed return from **`Iterator.next()`** — `iteratorMember` in
+   `host_call_member.zig` returned `items[p]` without retaining, so a `for (phase
+   in phases)` / route-node walk freed an element one ref early. `next()` now
+   retains the element. With that, the full JSON/ContentNegotiation server
+   (`wait = false`) runs `df`-clean under `KLIO_RECLAIM=smp KLIO_RC_DETECT=1`. The
+   technique to find these: re-add the RC-history tracker, run the *completing*
+   (`wait = false`) repro, read the doomed cell's full clone/deinit trajectory at
+   the double-free, then a gated `KLIO_RET_DBG` print of member-call Instance
+   results (+ a `KLIO_BLANKET` retain to confirm "df→0 ⇒ a borrowed Instance
+   return") narrows to the exact accessor.
+
+   *Remaining — `start(wait = true)` request serving:* with the iterator fix the
+   `wait = true` server no longer spins — it now **segfaults during request
+   handling** (`serve → invokeCallable(dispatch) → … → getField` on a freed
+   `InstanceData`, reading `0xaa…` poison; `df=0`, so a *missing-retain UAF* that
+   `RC_DETECT` does not catch). So a method receiver / call object is freed while
+   the request pipeline still holds a borrow of it. This is the next link in the
+   same chain — another borrowed return / store-without-retain on the per-request
+   value graph (the call, the pipeline, a phase), reachable only once serving
+   actually runs. Continue with the same hunt: repro `start(wait = true)` under
+   `KLIO_RECLAIM=smp`, sample/`getField`-guard to name the freed class, RC-history
+   to name the unmatched store. The deeper structural option (per-request arena
+   reset, §12.4 option 2) remains the way to retire the whole request-path tail at
+   once if the per-accessor hunt proves long.
    Separately, the anon-capture retains are released only at host teardown (a
    bounded per-anon-class hold, fine for a once-created logger but worth
    releasing on registry eviction). (The logger-name garble noted previously was
