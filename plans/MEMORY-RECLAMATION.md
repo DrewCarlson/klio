@@ -632,19 +632,30 @@ optional; 127 MB for a fully-loaded stdlib is acceptable.
       `SuspendState.deinit` releases the never-resumed (cancelled/abandoned)
       path. This is the correct foundation but is NOT sufficient alone — see
       the coroutine-host finding below.
-- [ ] **Coroutine/ktor host value reconciliation (the remaining large work).**
-      Under `KLIO_RECLAIM=smp` (reclaim-ON) even `runBlocking { println("x") }`
-      (no suspension) use-after-frees: `samInstanceDispatch` dispatches a
-      SAM/continuation instance whose cell was already released
-      (`class.zig:284` reads `0xaa…` poison). Plain SAM / lambda / suspend-fun
-      dispatch is clean under smp; the bug is specific to the coroutine
-      *builder* machinery (`runBlocking`/scope/continuation), which creates and
-      shares intermediate SAM/continuation instances without the clone-on-share
-      / host-returns-owned retains. This is the §7.3 host reconciliation scoped
-      to the coroutine host — multi-site, and the prerequisite for reclaim-ON on
-      any coroutine program (hence ktor). Until it lands, reclaim-ON corrupts
-      the coroutine path; the safe production option for a server is
-      `KLIO_RECLAIM=free`.
+- [~] **Coroutine host value reconciliation — largely landed.** Several
+      store-retain / host-returns-owned gaps fixed (all gated, suite-green):
+      - **Mutable List/Set** mutators stored elements without retaining while
+        teardown released them (over-release for reference elements; Int-element
+        tests missed it). add/insert/addAll/set retain; remove/clear/removeAll
+        release; index-removes transfer.
+      - **Coroutine launch queue** (`enqueueLaunch`, the `__kxco_spawn` seam)
+        appended blocks without retaining → a dispatched continuation wrapper was
+        freed when its dispatching frame returned. Now retain-on-enqueue,
+        release-on-completion (a suspended block keeps its ref until it resumes).
+      - **AtomicRef** `compareAndSet`/`getAndSet` stored without retaining (and
+        `getAndSet` returned a value it had just `define`-released). Now own the
+        stored value; transfer the returned previous.
+      - **Suspend/resume snapshot ownership** (§7.5, the Phase-4 foundation).
+
+      Result under `KLIO_RECLAIM=smp`: `runBlocking` (with/without suspension),
+      loops, suspend funcs, `delay`, and `launch` all run correct & UAF-clean.
+      **Remaining: `async`/`await` (structured-concurrency job tree).** A
+      completion handler node is read during job-completion notify and
+      dispatched (`afterCompletion`) after being released — the lock-free linked
+      list (`LockFreeLinkedList`) + Job state machine, where node reclamation and
+      refcounting interleave. This is the hard remaining frontier (lock-free
+      reclamation), and it is what the ktor server hits at startup. Until it
+      lands, the safe server option is `KLIO_RECLAIM=free`.
 - [ ] **ktor server/client RSS flat over many requests.** Measured (with the §8
       fix): under the default arena a ktor `GET` server grows ~8.5 MB/request
       (mostly transients the run path *explicitly frees* — 556 MB freed / 830 MB
