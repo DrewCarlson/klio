@@ -1363,8 +1363,16 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
     }
     const block = ctx.args[1];
     var list: std.ArrayList(Value) = .empty;
+    // The accumulated results live only in `list` (no frame register holds
+    // them) and the per-element `invoke` reaches a GC safe point, so pin the
+    // accumulator across each call. Re-push after every append: the append may
+    // reallocate `list.items`.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
     var i: i64 = 0;
     while (i < n) : (i += 1) {
+        runtime.keepaliveRestore(ka);
+        runtime.keepalivePushSlice(list.items);
         const v = switch (try invoke(ctx, &block, &.{Value.newInt(i)})) {
             .value => |x| x,
             .err => |e| return e,

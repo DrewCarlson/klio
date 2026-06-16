@@ -192,6 +192,45 @@ threadlocal var active_chain: ?*std.ArrayList(EnclosingEntry) = null;
 /// frame entered.
 threadlocal var active_chain_base: usize = 0;
 
+// -------------------------------------------------------------------------
+// GC roots: the per-thread chain of active interpreter frames. The tracing
+// collector (runtime.gc) seeds its mark phase from every active frame's
+// registers/params/captures/enclosing-`this`. Frames are Zig-stack locals, so
+// each `evalWithCapturesChained`/`resumeContinuation` activation links its
+// frame onto this innermost-first chain for its lifetime. Registered once.
+// -------------------------------------------------------------------------
+threadlocal var frame_chain: ?*Frame = null;
+var frame_root_registered = std.atomic.Value(bool).init(false);
+
+inline fn gcPushFrame(f: *Frame) void {
+    if (!runtime.gc.gc_enabled) return;
+    gcInstallFrameRoot();
+    f.gc_link = frame_chain;
+    frame_chain = f;
+}
+inline fn gcPopFrame(f: *Frame) void {
+    if (!runtime.gc.gc_enabled) return;
+    frame_chain = f.gc_link;
+}
+
+/// Root provider: mark every live Value reachable from this thread's active
+/// frame chain.
+fn gcMarkFrames(m: *runtime.gc.Marker) void {
+    var cur = frame_chain;
+    while (cur) |f| : (cur = f.gc_link) {
+        for (f.regs.items) |v| v.gcMark(m);
+        for (f.params.items) |v| v.gcMark(m);
+        for (f.captures.items) |v| v.gcMark(m);
+        for (f.enclosing_this.items) |e| e.v.gcMark(m);
+    }
+}
+
+/// Register the frame-chain root provider once (idempotent).
+pub fn gcInstallFrameRoot() void {
+    if (frame_root_registered.swap(true, .monotonic)) return;
+    runtime.gc.registerRoot(gcMarkFrames);
+}
+
 /// Push `v` as an enclosing implicit receiver for the about-to-be-invoked
 /// callable. Appends to the current frame's chain; the invoked frame picks
 /// it up at entry. A no-op (silently dropped) when no frame is active.
@@ -409,6 +448,20 @@ fn retainSnapshotValues(snap: FrameSnapshot) void {
     for (snap.captures) |v| v.retain();
 }
 
+/// GC: mark every Value a parked suspend state keeps live — each frame
+/// snapshot's regs, params, captures, and enclosing-receiver chain. Mirrors the
+/// `retainSnapshotValues` set plus the receiver chain (the GC owns the view of
+/// it: a parked continuation is the chain's sole keeper while parked). Driven by
+/// the coroutine root provider for every persisted/active parked activation.
+pub fn gcMarkSuspendState(state: *const SuspendState, m: *runtime.gc.Marker) void {
+    for (state.frames.items) |snap| {
+        for (snap.regs) |v| v.gcMark(m);
+        for (snap.params) |v| v.gcMark(m);
+        for (snap.captures) |v| v.gcMark(m);
+        for (snap.enclosing_this) |e| e.v.gcMark(m);
+    }
+}
+
 /// Release what `retainSnapshotValues` retained (the drop-without-resume
 /// path). Mirrors the retain set exactly.
 fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
@@ -468,6 +521,8 @@ const Frame = struct {
     /// to balance the retain the snapshot took on suspend. A freshly-called
     /// frame leaves this false — its params/captures are borrows.
     owns_params_caps: bool = false,
+    /// Intrusive link onto the per-thread GC frame chain (see `frame_chain`).
+    gc_link: ?*Frame = null,
 
     fn newWithCaptures(
         allocator: Allocator,
@@ -697,6 +752,8 @@ pub fn evalWithCapturesChained(
     defer try_stack.deinit(allocator);
     var frame = try Frame.newWithCaptures(allocator, module, func, args, captures);
     defer frame.deinit();
+    gcPushFrame(&frame);
+    defer gcPopFrame(&frame);
     frame.module_arc = owning;
     try frame.activateChain(chain_seed);
     defer frame.deactivateChain();
@@ -762,6 +819,8 @@ pub fn resumeContinuation(
         try caps.appendSlice(allocator, snap.captures);
         var frame = try Frame.newWithCaptures(allocator, m, func, params, caps);
         defer frame.deinit();
+        gcPushFrame(&frame);
+        defer gcPopFrame(&frame);
         frame.module_arc = snap_module;
         // This frame adopts the references the snapshot retained on suspend:
         // its params/captures (and regs, always owned) are released by its
@@ -896,6 +955,9 @@ fn runFrameInner(
         if (runtime.shouldAbandon()) {
             return errResult(.{ .Type = "daemon task abandoned at run boundary" });
         }
+        // GC safe point: at an opcode boundary all live Values are in registered
+        // frames/globals (no host op mid-flight), so the collector can run.
+        if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();
         const block = &func.blocks[cur.int()];
         const insts: []const Inst = block.insts;
         const term = block.terminator;

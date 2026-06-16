@@ -128,11 +128,12 @@ pub fn reclaimRequested() bool {
 /// Which backing allocator the process entry point should install. Distinct
 /// from `reclaimRequested` because `free` mode wants a freeing allocator with
 /// reclaim OFF.
-pub const AllocChoice = enum { arena, smp, debug };
+pub const AllocChoice = enum { arena, smp, debug, gc };
 pub fn allocChoice() AllocChoice {
     const v = getenvSlice("KLIO_RECLAIM") orelse return .arena;
     if (v.len == 0 or std.mem.eql(u8, v, "0")) return .arena;
     if (std.mem.eql(u8, v, "debug")) return .debug;
+    if (std.mem.eql(u8, v, "gc")) return .gc; // tracing GC (KGC)
     return .smp; // "free", "smp", "1", or any other non-zero value
 }
 
@@ -302,6 +303,9 @@ fn hasDeclSafe(comptime U: type, comptime name: []const u8) bool {
 fn isArrayListLike(comptime U: type) bool {
     return @typeInfo(U) == .@"struct" and @hasField(U, "items") and @hasField(U, "capacity");
 }
+fn isHashMapLike(comptime U: type) bool {
+    return @typeInfo(U) == .@"struct" and @hasDecl(U, "valueIterator") and @hasDecl(U, "count");
+}
 fn isSlice(comptime U: type) bool {
     return @typeInfo(U) == .pointer and @typeInfo(U).pointer.size == .slice;
 }
@@ -339,6 +343,9 @@ fn gcTraceData(comptime U: type, data: *const U, m: *gc.Marker) void {
         for (data.items) |*e| gcTraceElem(@TypeOf(e.*), e, m);
     } else if (comptime isSlice(U)) {
         for (data.*) |*e| gcTraceElem(@TypeOf(e.*), e, m);
+    } else if (comptime isHashMapLike(U)) {
+        var it = data.valueIterator();
+        while (it.next()) |v| gcTraceElem(@TypeOf(v.*), v, m);
     }
     // else: a leaf payload (scalar / Value-free struct) — nothing to trace.
 }
@@ -352,6 +359,8 @@ fn gcFinalizeData(comptime U: type, data: *U, a: std.mem.Allocator) void {
         data.deinit(a);
     } else if (comptime isSlice(U)) {
         a.free(data.*);
+    } else if (comptime isHashMapLike(U)) {
+        data.deinit();
     }
     // else: scalar / leaf payload — no owned buffer to free.
 }
@@ -395,7 +404,10 @@ pub fn ObjRef(comptime T: type) type {
         pub fn init(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
             var data = v;
             if (comptime owns_bytes) {
-                if (reclaim_tls) data = try allocator.dupe(u8, v);
+                // Dupe under reclaim OR GC: in both the cell owns its bytes and
+                // frees them on teardown (refcount `deinit` / GC `gcFinalize`).
+                // Under the pure arena path the slice is stored as-is.
+                if (reclaim_tls or gc.gc_enabled) data = try allocator.dupe(u8, v);
             }
             return initOwned(allocator, data);
         }
@@ -415,6 +427,7 @@ pub fn ObjRef(comptime T: type) type {
         /// destroy the control block. Child cells are swept independently.
         fn gcFinalizeThunk(h: *gc.GcHeader) void {
             const cb: *Cell = @fieldParentPtr("hdr", h);
+            if (gc.gc_debug) std.debug.print("[kgc] free {s}\n", .{@typeName(T)});
             gcFinalizeData(T, &cb.data, cb.allocator);
             cb.allocator.destroy(cb);
         }

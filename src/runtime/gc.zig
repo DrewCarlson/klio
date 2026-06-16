@@ -51,6 +51,15 @@ pub const Marker = struct {
     pub fn drain(self: *Marker) void {
         while (self.grey.pop()) |h| h.gc_trace(h, self);
     }
+
+    fn drainCounted(self: *Marker) usize {
+        var n: usize = 0;
+        while (self.grey.pop()) |h| {
+            n += 1;
+            h.gc_trace(h, self);
+        }
+        return n;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -83,9 +92,25 @@ var gc_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 /// `GcHeader` fields lie dormant — arena/smp behavior is unchanged.
 pub var gc_enabled: bool = false;
 
+/// Stress mode (`KLIO_GC_STRESS=1`): force a collection at every safe point,
+/// regardless of the byte threshold. A correctness oracle — if any root or
+/// tracer is incomplete, collecting on every opcode boundary surfaces the UAF
+/// immediately instead of waiting for 8MB of churn. Off in normal runs.
+pub var gc_stress: bool = false;
+
+/// Permanent generation. Cells minted while this is true (the stdlib image /
+/// module / class graph loaded before the program body runs) are NOT placed on
+/// the sweep registry, so they are never collected — they are immutable and
+/// program-lifetime, and reference only other perm cells. They are still
+/// traceable: when a nursery cell points at one, marking shades + traces it
+/// (harmlessly, since it is never swept), reaching any nursery children.
+/// Flipped to false by `vmRun` just before the program body executes.
+pub threadlocal var alloc_perm: bool = true;
+
 /// Push a freshly-minted cell onto the registry and account its size. Called
 /// only in GC mode, from `ObjRef.initOwned`.
 pub fn register(h: *GcHeader, bytes: usize) void {
+    if (alloc_perm) return; // permanent — never swept, still traceable
     reg_lock.lock();
     h.gc_next = all_cells;
     all_cells = h;
@@ -96,7 +121,16 @@ pub fn register(h: *GcHeader, bytes: usize) void {
 
 /// Cheap poll at opcode-boundary safe points.
 pub inline fn pending() bool {
-    return gc_pending.load(.monotonic);
+    return gc_stress or gc_pending.load(.monotonic);
+}
+
+/// Called from an opcode-boundary safe point when a collection is pending. In
+/// the single-threaded common case the calling thread is the only mutator, so
+/// it collects in place; the multi-thread stop-the-world handshake is layered
+/// on by `threads` (it parks the other mutators here before collecting).
+pub fn safePoint() void {
+    if (!gc_stress and !gc_pending.load(.monotonic)) return;
+    collect();
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +157,12 @@ pub fn registerRoot(f: RootFn) void {
 /// Run one full mark-sweep. The caller guarantees the world is stopped (all
 /// mutator threads parked at safe points with their roots published) — in the
 /// single-threaded common case that is simply "called from the safe point".
+pub var gc_debug: bool = false;
+/// Diagnostic: mark fully but never actually free a white cell. If a program
+/// that crashes under real sweep runs cleanly here, the crash is a premature
+/// free (an incomplete root/tracer), not a marking/sweep bug.
+pub var gc_nofree: bool = false;
+
 pub fn collect() void {
     cur_epoch +%= 1;
     if (cur_epoch == 0) cur_epoch = 1; // 0 is the never-marked sentinel
@@ -133,18 +173,23 @@ pub fn collect() void {
     const root_list = roots.items;
     roots_lock.unlock();
     for (root_list) |f| f(&marker);
-    marker.drain();
+    const marked = marker.drainCounted();
 
-    sweep();
+    const freed = sweep();
     gc_pending.store(false, .monotonic);
     bytes_since_gc.store(0, .monotonic);
     threshold = @max(8 * 1024 * 1024, live_bytes *| 2);
+    if (gc_debug) std.debug.print(
+        "[kgc] epoch={d} marked={d} live={d} freed={d}\n",
+        .{ cur_epoch, marked, live_bytes, freed },
+    );
 }
 
-fn sweep() void {
+fn sweep() usize {
     reg_lock.lock();
     defer reg_lock.unlock();
     var live: usize = 0;
+    var freed: usize = 0;
     var prev: ?*GcHeader = null;
     var cur = all_cells;
     while (cur) |h| {
@@ -153,14 +198,21 @@ fn sweep() void {
             prev = h;
             cur = next;
             live += 1;
+        } else if (gc_nofree) {
+            // Diagnostic: keep white cells linked and alive.
+            prev = h;
+            cur = next;
+            live += 1;
         } else {
             // White: unlink, shallow-finalize, destroy.
             if (prev) |p| p.gc_next = next else all_cells = next;
             h.gc_finalize(h);
             cur = next;
+            freed += 1;
         }
     }
     live_bytes = live; // cell count proxy until Stage 2 tracks bytes
+    return freed;
 }
 
 test "marker shades, drains, and stops at fixpoint without recursion" {

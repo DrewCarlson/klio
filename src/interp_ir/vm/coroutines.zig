@@ -80,6 +80,19 @@ pub const DriverWakeup = struct {
         self.owned_slot_set.deinit(self.allocator);
     }
 
+    /// GC tracer: a wakeup's mailbox holds resume Values not yet delivered.
+    pub fn gcTrace(self: *const DriverWakeup, m: *runtime.gc.Marker) void {
+        for (self.mailbox_entries.items) |e| e.value.gcMark(m);
+    }
+
+    /// GC finalizer (shallow): free the mailbox/owned-slot spines. The mailbox
+    /// entries' Values are independent cells swept on their own.
+    pub fn gcFinalize(self: *DriverWakeup, gc_alloc: std.mem.Allocator) void {
+        _ = gc_alloc;
+        self.mailbox_entries.deinit(self.allocator);
+        self.owned_slot_set.deinit(self.allocator);
+    }
+
     /// Post a `(slot, value)` resume entry and wake the driver. Returns
     /// `false` when the mailbox is already closed (the driver exited);
     /// the caller must route the resume through the persisted registry.
@@ -584,6 +597,21 @@ pub const CooperativeInterceptor = struct {
         };
     }
 
+    /// GC: mark every Value this driver keeps live — its wakeup mailbox, every
+    /// parked activation's frames + scope delta, the queued `launch` blocks, and
+    /// the resume values waiting to be delivered.
+    pub fn gcMark(self: *CooperativeInterceptor, m: *runtime.gc.Marker) void {
+        m.shade(&self.wakeup.cell.hdr);
+        var pit = self.parked.valueIterator();
+        while (pit.next()) |e| {
+            ir.eval.gcMarkSuspendState(&e.state, m);
+            for (e.scope_delta) |v| v.gcMark(m);
+        }
+        for (self.launched.items) |v| v.gcMark(m);
+        var rit = self.token_resume_value.valueIterator();
+        while (rit.next()) |v| v.gcMark(m);
+    }
+
     pub fn deinit(self: *CooperativeInterceptor) void {
         VirtualClock.unregister(self.clock_id);
         self.wakeup.deinit();
@@ -945,8 +973,44 @@ fn coroTop() ?*CooperativeInterceptor {
     return &coro_stack.items[coro_stack.items.len - 1];
 }
 
+/// GC root provider for the coroutine subsystem. Marks every Value reachable
+/// from a parked or in-flight coroutine: this thread's active interceptors and
+/// scope stack, the process-global persisted-continuation registry, and the
+/// slot-owner wakeup mailboxes. The locks are never held across a safe point
+/// (coroutine bookkeeping runs between eval frames, not inside the block loop),
+/// so taking them here cannot deadlock against the collecting mutator.
+fn gcMarkCoroutines(m: *runtime.gc.Marker) void {
+    for (coro_stack.items) |*ci| ci.gcMark(m);
+    for (active_scope_stack.items) |v| v.gcMark(m);
+
+    PersistedParked.mutex.lock();
+    if (PersistedParked.map) |*pm| {
+        var it = pm.valueIterator();
+        while (it.next()) |e| {
+            ir.eval.gcMarkSuspendState(&e.state, m);
+            for (e.scope_delta) |v| v.gcMark(m);
+        }
+    }
+    PersistedParked.mutex.unlock();
+
+    SlotOwners.mutex.lock();
+    if (SlotOwners.map) |*sm| {
+        var it = sm.valueIterator();
+        while (it.next()) |w| m.shade(&w.cell.hdr);
+    }
+    SlotOwners.mutex.unlock();
+}
+
+var coro_root_registered = std.atomic.Value(bool).init(false);
+
+fn ensureCoroRoot() void {
+    if (runtime.gc.gc_enabled and !coro_root_registered.swap(true, .monotonic))
+        runtime.gc.registerRoot(gcMarkCoroutines);
+}
+
 /// Push a fresh interceptor for a newly-entered driven root.
 fn coroPush(allocator: Allocator) Allocator.Error!void {
+    ensureCoroRoot();
     try coro_stack.append(coroStackAllocator(), try CooperativeInterceptor.new(allocator));
 }
 
