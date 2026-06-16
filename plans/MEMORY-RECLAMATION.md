@@ -33,31 +33,36 @@ Two distinct problems, both now largely solved:
    - a block dispatched to a worker thread (`kotlin.concurrent.thread`,
      `Dispatchers` pool) crossed threads without a retain.
 
-   With those landed, an **empty-body `embeddedServer{}` runs `df=0` and is
-   functional under real reclaim** (`KLIO_RECLAIM=smp`). The remaining gap is
-   the **routing pipeline**: a server with even a single `routing { get(...) }`
-   *livelocks and leaks* under real reclaim — the process never gets past
-   `start()`'s following `delay`, RSS climbs unbounded (hits the 6 GB RSS cap
-   in ~1 s), `df=0` throughout (no double-free; a pure spin-allocate). Under
-   `KLIO_RC_DETECT=1` (which leaks every freed cell instead of destroying it)
-   the same server starts cleanly and prints `ok` — so the trigger is a cell
-   that real reclaim *frees* while the structured-concurrency machinery still
-   needs it, leaving the pump unable to observe the application `SupervisorJob`
-   as complete and re-driving it forever. This is the job tree's lock-free
-   linked-list reclamation (§12). *Localization (next-session lead):* the spin
-   is NOT pump-dispatch overhead — a `KLIO_PUMP_RUNAWAY` iteration counter on
-   `pumpLoop` does not trip, and `sample(1)` shows the hot stack is interpreted
-   method dispatch (`callMemberInnerStatic`/`irMethodWalk`/`classHasUserMethod`/
-   `lookupIntrinsic`), i.e. a launched coroutine **re-executes its whole body**
-   each round rather than completing. So the freed cell is in the
-   launch/job-completion bookkeeping (a child `Job`/`ChildHandleNode` the parent
-   awaits): under real reclaim it is freed, the parent reads it as not-complete,
-   re-suspends, is re-readied, and re-runs. Trace from `drainLaunched` /
-   `evalClosureRaw` (§12) and the `Job.isCompleted`/`join` host path. A second,
-   cosmetic reclaim bug: logger-name
-   strings garble under `smp` (a borrowed `String` freed before the log line is
-   formatted) — clean under `free`. Until §12 lands, a long-running server's
-   safe option is `KLIO_RECLAIM=free` (a freeing allocator with reclaim OFF:
+   With those landed, the **ktor server runs bounded under real reclaim**
+   (`KLIO_RECLAIM=smp`): the JSON/routing server handles 4000 requests with RSS
+   flat at ~415 MB (zero per-request growth), and a routing server starts +
+   completes `df`-clean. The routing *livelock + multi-GB leak* that previously
+   blocked this was a single root cause: **anonymous-object captures were stored
+   in the anon-method registry as borrows.** `KtorSimpleLogger(name)` returns an
+   `object : Logger` that captures `name`; when the enclosing function returned
+   and freed its `name` register, the captured `String` dangled. The next log
+   line read that freed `String` cell, whose reader/writer lock now held garbage
+   (a stray sign bit = "writer held"), so `renderValue`'s `borrow` spun in
+   `lockShared` forever — and the surrounding retry allocated, exploding RSS.
+   `KLIO_RC_DETECT=1` (leaks freed cells) masked it because the cell was never
+   destroyed. Fix: `buildCapturePairs` retains each captured value (the registry
+   owns them for the object's lifetime), matching closures. The same pass fixed
+   the `MutableMap` accessors the pipeline/event-bus use (`computeIfAbsent` /
+   `putIfAbsent` returned the present value borrowed; `getOrPut` stored the new
+   entry without retaining; `replace` returned a value `mapSet` had already
+   freed). The hunt technique that pinned it: `sample(1)` showed the worker
+   spinning in `SpinRwLock.lockShared` under `renderValue → StringRef.borrow`; a
+   gated check in the `BinOp.StringConcat` path (`s.strongCount()==0 or huge`)
+   caught the freed string mid-concat as `"[INFO] (" + <freed name>`.
+
+   *Remaining (smaller):* the full JSON/ContentNegotiation server shows one
+   residual `df` (a single over-release, not a per-request leak — RSS stays
+   flat) somewhere in the typed-receive / serialization path; and the
+   anon-capture retains are released only at host teardown (a bounded
+   per-anon-class hold, fine for a once-created logger but worth releasing on
+   registry eviction). (The logger-name garble noted previously was the same
+   anon-capture bug and is fixed — names now render correctly.) A long-running
+   server can also run `KLIO_RECLAIM=free` (a freeing allocator with reclaim OFF:
    reclaims the explicitly-freed host/container temporaries — ~5× better
    per-request — without the value-graph teardown that still corrupts the job
    tree).
