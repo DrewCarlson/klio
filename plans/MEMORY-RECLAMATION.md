@@ -119,6 +119,45 @@ Two distinct problems, both now largely solved:
    **converging, not diverging** — it is the same store-without-retain class,
    just spread across the StringValues / routing / pipeline / response builders.
 
+   **Two ownership audits run + applied (19 confirmed fixes, all leak-suite-green):**
+   adversarial workflow audits over the host stdlib/interp found and verified the
+   container/accessor/builder ownership bugs; all confirmed UAF/double-free fixes
+   and the safe missing-release leak fixes are committed. Highlights of round 2:
+   SAM-conversion & direct local-class allocation stored borrowed ctor args as
+   owned fields without retaining; `Enum.valueOf`/`enumValueOf`/enum `.name`
+   returned the immutable-ClassDef singleton borrowed; `boundRefDispatch`
+   returned borrowed `getField` results; `serve`/`drainIterableToList`/
+   `materializeUserMap` leaked owned containers. (Deferred: `funcValueById`
+   returns a fresh owned `IrClosure` its three callers treat as borrowed — a
+   leak; the fix is to make it borrow-returning across all three sites.)
+
+   **Residual blocker — a layout-sensitive query-param value-substitution UAF.**
+   With ping serving cleanly, the param/query/body/JSON routes still crash under
+   reclaim-on, now with an *unstable* signature (segfault `0xaa`, then
+   `call_member percentEncode on kotlin.Function`, then `incorrect alignment` in
+   `allocator.create`) — the hallmark of a heap double-free whose manifestation
+   shifts with allocation layout. Root: a query-param `String`/`Char` in the
+   `parseQueryString`→`StringValues`→`encodeParameters` path is freed one ref
+   early; its smp cell is reused (e.g. for the `.map { it.encodeURLParameterValue() }`
+   lambda closure), so an upstream `it.percentEncode()` dispatches on a `Function`.
+   It resists BOTH tools now: the static audits have covered the host ops this
+   path uses (all fixed), and the dynamic freed-cell tracer's bookkeeping shifts
+   the layout enough to make the crash vanish (heisenbug). The remaining
+   missing-retain is therefore either in a host op neither audit reached or in a
+   subtle StringValues interaction; pinning it needs a near-zero-overhead probe
+   (a single refcount-poison check at the exact dispatch, not a registry).
+
+   **Recommended close-out: the structural per-request arena reset (§12.4
+   option 2).** The residual tail is layout-sensitive and resists per-site
+   fixing; the robust fix is to run each request's value graph with reclaim
+   *off* in a per-request sub-arena and reset it after copying the response out —
+   no per-request `ObjRef.deinit`, so no missing-retain UAF is possible, and the
+   sub-arena reset reclaims everything (flat RSS). This needs the VM to support a
+   scoped allocator swap around `invokeCallable` in `serve` and a deep-copy of the
+   response to the long-lived allocator; it retires the entire request-path tail
+   at once. `free` mode already proves the request *logic* is correct (every route
+   serves), so only the reclaim discipline is at issue.
+
    **Open tail (next):** the eager `engineReceiveChannel: ByteReadChannel =
    ByteReadChannel(bodyText.encodeToByteArray())` in `KlioApplicationRequest`
    builds a `prim=null` Value array that is freed at the property-init frame's
