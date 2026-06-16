@@ -74,6 +74,9 @@ const SpinLock = struct {
     fn lock(self: *SpinLock) void {
         while (self.state.swap(true, .acquire)) std.atomic.spinLoopHint();
     }
+    fn tryLock(self: *SpinLock) bool {
+        return !self.state.swap(true, .acquire);
+    }
     fn unlock(self: *SpinLock) void {
         self.state.store(false, .release);
     }
@@ -156,6 +159,12 @@ pub inline fn pending() bool {
 /// it collects in place; the multi-thread stop-the-world handshake is layered
 /// on by `threads` (it parks the other mutators here before collecting).
 pub fn safePoint() void {
+    // Another thread is collecting: park until it finishes (publishing this
+    // thread's roots as quiescent) instead of starting our own collection.
+    if (stop_flag.load(.acquire)) {
+        parkForStop();
+        return;
+    }
     const sampled = gc_stress_every != 0 and safepoint_counter >= gc_stress_every;
     if (sampled) safepoint_counter = 0;
     if (!gc_stress and !sampled and !gc_pending.load(.monotonic)) return;
@@ -179,6 +188,126 @@ pub fn registerRoot(f: RootFn) void {
 }
 
 // ---------------------------------------------------------------------------
+// Per-thread roots. A subsystem's roots live in threadlocals (the eval frame
+// chain, the host-op keepalive stack, the coroutine interceptor/scope stacks),
+// so one global `RootFn` reading them only sees the COLLECTING thread's. Each
+// thread instead registers a `ThreadRoot` whose `ctx` is the stable address of
+// its own threadlocal; the collector dereferences that pointer to mark that
+// thread's roots from any thread. A registered thread is parked at a safe point
+// (or in a blocking-safe region) during collection, so its stack/threadlocals
+// are stable to read cross-thread.
+// ---------------------------------------------------------------------------
+
+pub const ThreadRootFn = *const fn (ctx: *anyopaque, m: *Marker) void;
+pub const ThreadRoot = struct {
+    next: ?*ThreadRoot = null,
+    ctx: *anyopaque,
+    mark: ThreadRootFn,
+    linked: bool = false,
+};
+var thread_roots: ?*ThreadRoot = null;
+var thread_roots_lock: SpinLock = .{};
+
+/// Link a thread's root node (its `ctx` is one of its threadlocal addresses).
+/// `node` is itself a threadlocal/stable-storage value owned by the thread.
+pub fn registerThreadRoot(node: *ThreadRoot) void {
+    thread_roots_lock.lock();
+    defer thread_roots_lock.unlock();
+    if (node.linked) return;
+    node.linked = true;
+    node.next = thread_roots;
+    thread_roots = node;
+}
+
+/// Unlink a thread's root node at thread exit (its threadlocal storage is about
+/// to become invalid).
+pub fn unregisterThreadRoot(node: *ThreadRoot) void {
+    thread_roots_lock.lock();
+    defer thread_roots_lock.unlock();
+    if (!node.linked) return;
+    var pp: *?*ThreadRoot = &thread_roots;
+    while (pp.*) |n| {
+        if (n == node) {
+            pp.* = n.next;
+            node.linked = false;
+            node.next = null;
+            return;
+        }
+        pp = &n.next;
+    }
+}
+
+fn markThreadRoots(m: *Marker) void {
+    // Held for the whole walk: register/unregister (thread entry/exit) splice
+    // this list, and a concurrent splice during the walk would corrupt it.
+    // Contention is negligible — links change only at thread start/stop.
+    thread_roots_lock.lock();
+    defer thread_roots_lock.unlock();
+    var cur = thread_roots;
+    while (cur) |n| : (cur = n.next) n.mark(n.ctx, m);
+}
+
+// ---------------------------------------------------------------------------
+// Stop-the-world handshake. The collecting thread sets `stop_flag`; every other
+// registered mutator parks at its next safe point (or is already parked in a
+// blocking-safe region). The collector waits until every other mutator is
+// parked, marks all roots (global + every thread's), sweeps, then clears the
+// flag and releases the parked threads. `gc_lock` makes the collection itself
+// single-collector. Single-threaded common case: `mutators == 1`, the wait is a
+// no-op, and this degenerates to "collect right here".
+// ---------------------------------------------------------------------------
+
+var stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var parked_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var mutators: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var gc_lock: SpinLock = .{};
+
+/// Register the calling thread as an active mutator (it runs program code and
+/// holds collectable roots). Called at a thread's entry seam, after its
+/// per-thread root nodes are linked.
+pub fn enterMutator() void {
+    _ = mutators.fetchAdd(1, .acq_rel);
+}
+
+/// Deregister the calling thread as a mutator at its exit seam, before its
+/// per-thread root nodes unlink. Counts as parked across any in-flight
+/// collection so the collector's rendezvous cannot wait forever for a thread
+/// that is leaving, and waits out an active collection so the caller can safely
+/// unlink its (still-readable) root nodes immediately afterward.
+pub fn exitMutator() void {
+    _ = parked_count.fetchAdd(1, .acq_rel);
+    _ = mutators.fetchSub(1, .acq_rel);
+    while (stop_flag.load(.acquire)) std.atomic.spinLoopHint();
+    _ = parked_count.fetchSub(1, .acq_rel);
+}
+
+/// Park the calling thread for the duration of an in-progress collection: it
+/// publishes itself as quiescent (its roots are stable in its registered
+/// threadlocals) and spins until the collector clears `stop_flag`.
+fn parkForStop() void {
+    _ = parked_count.fetchAdd(1, .acq_rel);
+    while (stop_flag.load(.acquire)) std.atomic.spinLoopHint();
+    _ = parked_count.fetchSub(1, .acq_rel);
+}
+
+/// Bracket a blocking primitive (timer sleep, thread join, socket accept, idle
+/// park): the thread holds no unrooted live Value (its state is in registered
+/// threadlocals) and is about to stop making progress, so it counts as already
+/// parked for the STW rendezvous.
+pub fn enterBlockingSafe() void {
+    if (!gc_enabled) return;
+    _ = parked_count.fetchAdd(1, .acq_rel);
+}
+
+/// Leave a blocking-safe region. If a collection is in progress, wait for it to
+/// finish before touching the heap again, then stop counting as parked.
+pub fn exitBlockingSafe() void {
+    if (!gc_enabled) return;
+    while (stop_flag.load(.acquire)) std.atomic.spinLoopHint();
+    _ = parked_count.fetchSub(1, .acq_rel);
+}
+
+// ---------------------------------------------------------------------------
 // Collection. Stage 1 is single-threaded stop-the-world driven by the
 // safe-point poll; the multi-thread handshake is layered in by `threads`.
 // ---------------------------------------------------------------------------
@@ -193,6 +322,24 @@ pub var gc_debug: bool = false;
 pub var gc_nofree: bool = false;
 
 pub fn collect() void {
+    // Single collector at a time. A thread that loses the race for `gc_lock`
+    // found a collection already underway; it parks (publishing its roots) and
+    // returns rather than queueing a redundant second collection.
+    if (!gc_lock.tryLock()) {
+        parkForStop();
+        return;
+    }
+    defer gc_lock.unlock();
+
+    // Stop the world: signal every other registered mutator to park at its next
+    // safe point, then wait until all of them are parked (or in a blocking-safe
+    // region). Single-threaded: `others == 0`, so this is a no-op.
+    const others = mutators.load(.acquire) -| 1;
+    if (others != 0) {
+        stop_flag.store(true, .release);
+        while (parked_count.load(.acquire) < others) std.atomic.spinLoopHint();
+    }
+
     cur_epoch +%= 1;
     if (cur_epoch == 0) cur_epoch = 1; // 0 is the never-marked sentinel
     var marker: Marker = .{ .epoch = cur_epoch, .arena = std.heap.page_allocator };
@@ -202,11 +349,13 @@ pub fn collect() void {
     const root_list = roots.items;
     roots_lock.unlock();
     for (root_list) |f| f(&marker);
+    markThreadRoots(&marker);
     const marked = marker.drainCounted();
 
     const freed = sweep();
     gc_pending.store(false, .monotonic);
     bytes_since_gc.store(0, .monotonic);
+    if (others != 0) stop_flag.store(false, .release);
     threshold = @max(threshold_floor, live_bytes *| 2);
     if (gc_debug) std.debug.print(
         "[kgc] epoch={d} marked={d} live={d} freed={d}\n",

@@ -288,15 +288,24 @@ const KeepEntry = union(enum) {
     cell: *objcell.gc.GcHeader,
 };
 threadlocal var host_keepalive: std.ArrayListUnmanaged(KeepEntry) = .empty;
-var keepalive_root_registered = std.atomic.Value(bool).init(false);
+threadlocal var keepalive_troot: objcell.gc.ThreadRoot = undefined;
+threadlocal var keepalive_troot_inited: bool = false;
 
-fn gcMarkKeepalive(m: *objcell.gc.Marker) void {
-    for (host_keepalive.items) |e| switch (e) {
+fn gcMarkKeepaliveCtx(ctx: *anyopaque, m: *objcell.gc.Marker) void {
+    const stack: *const std.ArrayListUnmanaged(KeepEntry) = @ptrCast(@alignCast(ctx));
+    for (stack.items) |e| switch (e) {
         .one => |v| v.gcMark(m),
         .many => |vs| for (vs) |v| v.gcMark(m),
         .pairs => |ps| for (ps) |*p| p.gcTrace(m),
         .cell => |h| m.shade(h),
     };
+}
+
+/// Unlink this thread's keepalive root node at its exit seam.
+pub fn gcUninstallKeepaliveRoot() void {
+    if (!keepalive_troot_inited) return;
+    objcell.gc.unregisterThreadRoot(&keepalive_troot);
+    keepalive_troot_inited = false;
 }
 
 /// Snapshot the keepalive depth; pass to `keepaliveRestore` to pop everything
@@ -310,8 +319,10 @@ pub inline fn keepaliveMark() usize {
 /// the collecting thread's — sufficient single-threaded; per-thread records
 /// extend it across worker threads.
 inline fn ensureKeepaliveRoot() void {
-    if (!keepalive_root_registered.swap(true, .monotonic))
-        objcell.gc.registerRoot(gcMarkKeepalive);
+    if (keepalive_troot_inited) return;
+    keepalive_troot_inited = true;
+    keepalive_troot = .{ .ctx = @ptrCast(&host_keepalive), .mark = gcMarkKeepaliveCtx };
+    objcell.gc.registerThreadRoot(&keepalive_troot);
 }
 
 /// Pin a single Value across a re-entrant host call. No-op unless GC is on.

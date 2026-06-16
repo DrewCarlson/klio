@@ -979,10 +979,9 @@ fn coroTop() ?*CooperativeInterceptor {
 /// slot-owner wakeup mailboxes. The locks are never held across a safe point
 /// (coroutine bookkeeping runs between eval frames, not inside the block loop),
 /// so taking them here cannot deadlock against the collecting mutator.
-fn gcMarkCoroutines(m: *runtime.gc.Marker) void {
-    for (coro_stack.items) |*ci| ci.gcMark(m);
-    for (active_scope_stack.items) |v| v.gcMark(m);
-
+/// Process-global coroutine roots: the persisted-continuation registry and the
+/// slot-owner wakeup mailboxes. Registered once.
+fn gcMarkCoroGlobal(m: *runtime.gc.Marker) void {
     PersistedParked.mutex.lock();
     if (PersistedParked.map) |*pm| {
         var it = pm.valueIterator();
@@ -1001,11 +1000,64 @@ fn gcMarkCoroutines(m: *runtime.gc.Marker) void {
     SlotOwners.mutex.unlock();
 }
 
-var coro_root_registered = std.atomic.Value(bool).init(false);
+/// Per-thread coroutine roots: this thread's interceptor stack and active scope
+/// stack. `ctx` is `&coro_anchor` (pointers to this thread's two stacks).
+const CoroAnchor = struct {
+    coro: *std.ArrayList(CooperativeInterceptor),
+    scope: *std.ArrayList(Value),
+};
+threadlocal var coro_anchor: CoroAnchor = undefined;
+threadlocal var coro_troot: runtime.gc.ThreadRoot = undefined;
+threadlocal var coro_troot_inited: bool = false;
+
+fn gcMarkCoroLocalCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
+    const a: *const CoroAnchor = @ptrCast(@alignCast(ctx));
+    for (a.coro.items) |*ci| ci.gcMark(m);
+    for (a.scope.items) |v| v.gcMark(m);
+}
+
+var coro_global_registered = std.atomic.Value(bool).init(false);
 
 fn ensureCoroRoot() void {
-    if (runtime.gc.gc_enabled and !coro_root_registered.swap(true, .monotonic))
-        runtime.gc.registerRoot(gcMarkCoroutines);
+    if (!runtime.gc.gc_enabled) return;
+    if (!coro_global_registered.swap(true, .monotonic))
+        runtime.gc.registerRoot(gcMarkCoroGlobal);
+    if (!coro_troot_inited) {
+        coro_troot_inited = true;
+        coro_anchor = .{ .coro = &coro_stack, .scope = &active_scope_stack };
+        coro_troot = .{ .ctx = @ptrCast(&coro_anchor), .mark = gcMarkCoroLocalCtx };
+        runtime.gc.registerThreadRoot(&coro_troot);
+    }
+}
+
+/// Unlink this thread's coroutine root node at its exit seam.
+pub fn gcUninstallCoroRoot() void {
+    if (!coro_troot_inited) return;
+    runtime.gc.unregisterThreadRoot(&coro_troot);
+    coro_troot_inited = false;
+}
+
+/// Thread-entry GC seam (the main run thread and every spawned worker /
+/// dispatcher thread): join the mutator set so a collection on any thread stops
+/// this one at its next safe point before reading the shared heap. The
+/// per-thread root nodes (frames, keepalive, interceptor stack) link lazily on
+/// first use. Worker threads stay in the permanent generation for now — their
+/// own cells are never swept — so only main-minted cells they reference (kept
+/// reachable through these roots) are reclaimed.
+pub fn gcThreadEnter() void {
+    if (!runtime.gc.gc_enabled) return;
+    runtime.gc.enterMutator();
+}
+
+/// Thread-exit GC seam: leave the mutator set (parking through any in-flight
+/// collection) and unlink every per-thread root node before this thread's
+/// threadlocal storage is torn down.
+pub fn gcThreadExit() void {
+    if (!runtime.gc.gc_enabled) return;
+    runtime.gc.exitMutator();
+    ir.eval.gcUninstallFrameRoot();
+    runtime.gcUninstallKeepaliveRoot();
+    gcUninstallCoroRoot();
 }
 
 /// Push a fresh interceptor for a newly-entered driven root.

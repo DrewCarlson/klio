@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const threads_mod = @import("threads.zig");
+const gc = @import("gc.zig");
 
 /// Wall-clock time in milliseconds since the Unix epoch.
 pub fn wallMillis() i64 {
@@ -47,6 +48,11 @@ pub fn monotonicNanos() u64 {
 /// task promptly instead of waiting out the full duration.
 pub fn sleepMillis(ms: i64) void {
     if (ms <= 0) return;
+    // A sleeping thread makes no progress and holds its live Values in its
+    // registered per-thread roots, so it counts as parked for a concurrent
+    // collection's stop-the-world rendezvous rather than blocking it.
+    gc.enterBlockingSafe();
+    defer gc.exitBlockingSafe();
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();

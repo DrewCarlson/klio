@@ -140,6 +140,29 @@ fn regAllocator() std.mem.Allocator {
     return std.heap.page_allocator;
 }
 
+// GC root: the channel registry is a process-global with no Vm linkage, so the
+// Values buffered in channels and parked in waiter lists are reachable only
+// here. Registered once on first channel creation; the collector marks them
+// under the registry mutex (never held across a safe point, so STW-safe).
+var coro_reg_root_registered = std.atomic.Value(bool).init(false);
+
+fn ensureCoroRegRoot() void {
+    if (!runtime.gc.gc_enabled) return;
+    if (!coro_reg_root_registered.swap(true, .monotonic))
+        runtime.gc.registerRoot(gcMarkCoroReg);
+}
+
+fn gcMarkCoroReg(m: *runtime.gc.Marker) void {
+    coro_reg_mutex.lock();
+    defer coro_reg_mutex.unlock();
+    var it = coro_reg.channels.valueIterator();
+    while (it.next()) |st| {
+        for (st.buffer.items.items) |v| v.gcMark(m);
+        for (st.send_waiters.items.items) |w| w.value.gcMark(m);
+        for (st.receive_iter_waiters.items.items) |w| m.shade(&w.iter.cell.hdr);
+    }
+}
+
 /// Empty the registry at the run boundary. The registry spine is
 /// page-allocator-backed, but the `Value`s buffered in channels (and the
 /// iterator handles in waiter lists) reach into the run's value graph,
@@ -180,6 +203,7 @@ fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     else
         @intCast(capacity);
     const id = ctx.host.allocInstanceId();
+    ensureCoroRegRoot();
     {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();

@@ -733,6 +733,10 @@ fn workerEntry(wargs: WorkerArgs) void {
     // `ObjRef.deinit`/`vm.deinit()` take the same path as the parent over
     // the shared arena.
     runtime.setReclaim(args.reclaim);
+    // Join the mutator set for the worker's lifetime; the per-thread GC roots
+    // link lazily on first use and unlink here (runs last, after teardown).
+    coroutines.gcThreadEnter();
+    defer coroutines.gcThreadExit();
     // Balance the spawn-time retain: drop the worker's hold on the block once
     // the task is done. Registered before `vm.deinit` so it runs after the
     // child Vm tears down (LIFO), keeping the block alive for the whole run.
@@ -853,8 +857,13 @@ pub fn joinOsThread(self: *VmIntrinsicHost, id: u64) Allocator.Error!?RuntimeErr
         break :blk null;
     };
     if (handle) |h| {
-        // join() establishes happens-before with the worker's writes.
+        // join() establishes happens-before with the worker's writes. The
+        // joining thread is blocked, so it counts as parked for a worker's
+        // concurrent collection rendezvous — otherwise the collector would
+        // wait forever for a thread stuck in `join`.
+        runtime.gc.enterBlockingSafe();
         h.join();
+        runtime.gc.exitBlockingSafe();
     }
     const g = self.threads.borrow();
     defer g.deinit();

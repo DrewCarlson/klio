@@ -27,6 +27,7 @@ const std = @import("std");
 
 const runtime = @import("runtime");
 const root = @import("../interp_ir.zig");
+const coroutines = @import("coroutines.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -276,6 +277,8 @@ pub const Pool = struct {
         const name = std.fmt.bufPrint(&name_buf, "DefaultDispatcher-worker-{d}", .{seq}) catch "DefaultDispatcher-worker";
         runtime.setThreadName(tid, name);
         defer runtime.clearThreadName(tid);
+        coroutines.gcThreadEnter();
+        defer coroutines.gcThreadExit();
         while (true) {
             var task: Task = blk: {
                 while (true) {
@@ -290,7 +293,9 @@ pub const Pool = struct {
                     }
                     // Idle park: poll at a millisecond cadence until a
                     // task arrives, a Default cap slot frees, or the run
-                    // ends.
+                    // ends. The sleep itself brackets the GC blocking-safe
+                    // region (clock.sleepMillis), so an idle worker never
+                    // stalls a concurrent collection's rendezvous.
                     runtime.clockSleepMillis(1);
                 }
             };
