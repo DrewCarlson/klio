@@ -61,27 +61,33 @@ Two distinct problems, both now largely solved:
    gated check in the `BinOp.StringConcat` path (`s.strongCount()==0 or huge`)
    caught the freed string mid-concat as `"[INFO] (" + <freed name>`.
 
-   *Remaining — `start(wait = true)` (the normal blocking serve mode):* under
-   real reclaim the server spins at ~99 % CPU and never logs `Application
-   started`; under `KLIO_RC_DETECT=1` it does **not** spin (cpu ~0 %) but prints
-   exactly one `[RC DOUBLE-FREE]`, so this is a genuine *over-release* (real
-   reclaim frees the cell, the freed slot is reused, and a later read of the
-   reused cell makes the algorithm loop). The double-free stack is a setup-graph
-   teardown: `InstanceData A.deinit → releaseValueList(A.field) → InstanceData
-   B.deinit → release(B.field = C)` where `C` is double-freed. `wait = false`
-   does not hit it (it launches serve on a pool worker and the process exits
-   after the demo delay). Leading hypothesis: a *double-ownership* introduced by
-   the anon-capture retain above — a capture value now owned by `capture_pairs`
-   is also adopted (via `define`, no extra retain) into a constructed instance's
-   field during object/singleton setup, so teardown releases it twice. Next
-   step: identify the exact construction site that stores a `capture_pairs[i]`
-   value into a long-lived field without retaining (candidates:
-   `host_instances.zig` runAnonThunk scoped-env `define` at ~3059, the
-   object-singleton field defines, and any `findCapture`-result field store),
-   and either retain there or give the registry an independently-retained copy
-   so transient construction keeps borrowing. Reproduce with `start(wait = true)`
-   + `KLIO_RECLAIM=smp KLIO_RC_DETECT=1` (the double-free prints within ~5 s with
-   no other instrumentation; adding per-op tracing slows startup past it).
+   *Remaining — one `df=1` in the routing/pipeline setup graph (cyclic
+   over-release):* the JSON/ContentNegotiation server prints exactly one
+   `[RC DOUBLE-FREE]` at teardown under `KLIO_RECLAIM=smp KLIO_RC_DETECT=1`
+   (`wait = false`, completes in ~0.1 s, so easy to repro). Tracing the class of
+   each `InstanceData` freed (gated `KLIO_FREE_CLS` print in `InstanceData.deinit`)
+   shows the teardown walking the **ktor routing tree** right before the
+   double-free: `RoutingNode → ApplicationSendPipeline / ApplicationReceivePipeline
+   → KlioAttributes → AtomicRef → … → PathSegmentConstantRouteSelector →
+   [RC DOUBLE-FREE]`. So a node in that graph is released twice — a **cyclic /
+   back-reference over-release**, the same class as the lock-free list: a
+   `RoutingNode.parent` (or a node shared between a selector and a pipeline) is
+   now a counted owning field (every `setField` retains), but a back-reference in
+   a parent↔child tree must be *non-owning*, or the cycle is both unreclaimable
+   (a leak) and, when one side is released through two paths, an over-release.
+   Under real reclaim the freed cell is reused, which is what turns this into the
+   `wait = true` 99 %-CPU spin (the reused cell makes a routing/comparison loop
+   never converge); `wait = false` exits before the reuse bites. **This is the
+   structural §12 limit of naive refcounting for ktor's cyclic graphs (routing
+   tree, intrusive lock-free lists), not a one-line store fix.** Two real options:
+   (a) link-kind-aware ownership — mark back-reference fields (`parent`, lock-free
+   `_prev`) non-owning so only forward links own, which the interpreter cannot
+   infer for interpreted Kotlin and would need a per-class annotation/heuristic;
+   or (b) the plan's §12.4 option 2 — reclaim the per-request / per-setup value
+   graph at a boundary via an arena, sidestepping per-field ownership in the
+   cyclic structures entirely (the run-boundary reset already exists). Repro and
+   class-trace recipe above; the `KLIO_FREE_CLS` deinit print is the fast tool
+   (per-op stack tracing slows startup past the teardown).
    Separately, the anon-capture retains are released only at host teardown (a
    bounded per-anon-class hold, fine for a once-created logger but worth
    releasing on registry eviction). (The logger-name garble noted previously was
