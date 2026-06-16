@@ -3834,6 +3834,9 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator exhausted") };
         }
         const v = ig.get().items[p];
+        // Borrowed element: the backing list still owns it, so retain before
+        // handing it to the register that will own the iteration result.
+        if (runtime.reclaimEnabled()) v.retain();
         ig.deinit();
         const pmg = it.pos.borrowMut();
         pmg.get().* = p + 1;
