@@ -75,19 +75,54 @@ Two distinct problems, both now largely solved:
    results (+ a `KLIO_BLANKET` retain to confirm "df→0 ⇒ a borrowed Instance
    return") narrows to the exact accessor.
 
-   *Remaining — `start(wait = true)` request serving:* with the iterator fix the
-   `wait = true` server no longer spins — it now **segfaults during request
-   handling** (`serve → invokeCallable(dispatch) → … → getField` on a freed
-   `InstanceData`, reading `0xaa…` poison; `df=0`, so a *missing-retain UAF* that
-   `RC_DETECT` does not catch). So a method receiver / call object is freed while
-   the request pipeline still holds a borrow of it. This is the next link in the
-   same chain — another borrowed return / store-without-retain on the per-request
-   value graph (the call, the pipeline, a phase), reachable only once serving
-   actually runs. Continue with the same hunt: repro `start(wait = true)` under
-   `KLIO_RECLAIM=smp`, sample/`getField`-guard to name the freed class, RC-history
-   to name the unmatched store. The deeper structural option (per-request arena
-   reset, §12.4 option 2) remains the way to retire the whole request-path tail at
-   once if the per-accessor hunt proves long.
+   *Remaining — request serving under reclaim:* a tail of the SAME bug class
+   (host builders/accessors that adopt a borrowed value without retaining) still
+   lives in the request path. A large batch is now fixed — see below — and a
+   single route (`GET /api/v1/ping`, no params/body) **serves correctly under
+   `KLIO_RECLAIM=smp`**. Routes that touch path params / query / headers / body /
+   JSON still segfault on a freed container.
+
+   **Correction (important): `KLIO_RECLAIM=arena` is NOT the arena mode.**
+   `allocChoice` maps any unrecognised value to `.smp` and `reclaimRequested`
+   maps it to reclaim-ON, so `KLIO_RECLAIM=arena` runs **smp + reclaim-ON** (the
+   corruption oracle). True arena = `KLIO_RECLAIM` *unset* (or `0`). Under true
+   arena the full ktor server serves every route cleanly — the crashes are
+   purely reclaim-on missing-retains, exactly as expected.
+
+   **Diagnostic method that works:** run `KLIO_RECLAIM=smp` (reliable `0xaa`
+   crash; no detector). A gated freed-cell UAF tracer (threadlocal freed-address
+   registry recording the freeing stack, cleared on realloc to survive smp
+   address reuse; read-side checks at `getField`/`Array.get`/the response
+   `strAt`; a per-cell retain/release history) names the freed cell, the
+   over-releasing frame (`Frame.deinit` releasing a register that held the only
+   counted ref), and the unbalanced store. Heavy history capture perturbs the
+   deepest bugs (heisenbug) — keep it to the freed-registry + read-checks for
+   those. (This tracer was scaffolding; not committed.)
+
+   **Fixed and validated (committed; leak suite green, `ping` serves):** the
+   borrowed-element builders — `makeListBorrowed`/`makeArrayBorrowed` routing
+   (filterNotNull, distinctBy, groupBy, distinct, slice, list/array
+   plus/minus/flatten/unzip, array copyOf/copyInto), `makeMap` (retain kept
+   key+value, release displaced), map `keys()`/`values()` views, set
+   plus/minus/intersect, associateBy/associateWith, groupingBy.reduce,
+   `cloneItemsList` (toList/toMutableList/asList/toTypedArray/toSet/iterators/
+   sorted), and StringBuilder fluent returns (`okSb`).
+
+   **Open tail (next):** the eager `engineReceiveChannel: ByteReadChannel =
+   ByteReadChannel(bodyText.encodeToByteArray())` in `KlioApplicationRequest`
+   builds a `prim=null` Value array that is freed at the property-init frame's
+   teardown while still referenced — read later via `Array.get` (`0xaa`). The
+   store-without-retain is inside the upstream-Kotlin `ByteReadChannel(ByteArray)`
+   buffer construction (kotlinx.io Buffer / ChunkBuffer), not a klio builtin, so
+   it needs the tracer's history to pin. Plus the remaining audit findings not
+   yet applied: `host_call_member` collectionMutators/componentMembers/
+   dataClassAutoMembers, and `kotlinx_serialization.decodeObject` (releases the
+   owned decoded args the constructor borrows — a JSON-path leak). The
+   `host_fields`/`host_instances` *over-retain* audit findings are suspected
+   false positives (leak suite is clean) — verify before touching (removing a
+   needed retain would introduce a UAF). The deeper structural option
+   (per-request arena reset, §12.4 option 2) retires the whole request-path tail
+   at once if the per-accessor hunt proves long.
    Separately, the anon-capture retains are released only at host teardown (a
    bounded per-anon-class hold, fine for a once-created logger but worth
    releasing on registry eviction). (The logger-name garble noted previously was
