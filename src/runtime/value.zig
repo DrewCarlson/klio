@@ -629,9 +629,20 @@ pub const Value = union(enum) {
 
     /// GC tracer for a `Value`: shade each cell this value directly references
     /// (one level; the shaded cell's own `gc_trace` reaches the next level).
-    /// Same edge set as `retain`, so they cannot diverge.
+    /// Covers the same owning edges as `retain`, PLUS the non-owning
+    /// view->source `backing` edges that retain/release intentionally skip: a
+    /// live `MutableMap.keys`/`.values`/`.entries` view or a `Map.Entry` write-
+    /// through must keep the source map's entries cell reachable, or the
+    /// collector frees the map out from under a live view. It cannot leak the
+    /// map: once the view is gone, nothing marks the backing.
     pub fn gcMark(self: Value, m: *objcell.gc.Marker) void {
         self.forEachChildCell(MarkVisitor{ .m = m });
+        switch (self) {
+            .List => |x| if (x.backing) |b| m.shade(&b.entries.cell.hdr),
+            .Set => |x| if (x.backing) |b| m.shade(&b.entries.cell.hdr),
+            .MapEntry => |e| if (e.backing) |b| m.shade(&b.cell.hdr),
+            else => {},
+        }
     }
 
     /// Reference-counting decrement (Rust `Drop`): drop one owning handle to
