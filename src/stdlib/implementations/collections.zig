@@ -3455,6 +3455,8 @@ pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
     const g = it.borrowMut();
     defer g.deinit();
     if (containsBoxed(g.get().items, &arg)) return ok(.{ .Bool = false });
+    // The set owns one reference per element; retain the borrowed argument.
+    if (runtime.reclaimEnabled()) arg.retain();
     try g.get().append(a, arg);
     return ok(.{ .Bool = true });
 }
@@ -3490,6 +3492,8 @@ pub fn coll_mut_set_clear(ctx: *CallCtx) Error!EvalResult {
     {
         const g = it.borrowMut();
         defer g.deinit();
+        // clear() discards every element; drop the set's owned references.
+        if (runtime.reclaimEnabled()) for (g.get().items) |v| v.release(a);
         g.get().clearRetainingCapacity();
     }
     syncMapView(a, ctx.args[0]);
@@ -4437,6 +4441,8 @@ pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
     var changed = false;
     for (to_add) |v| {
         if (!containsBoxed(g.get().items, &v)) {
+            // The set owns one ref per element; `to_add` is a borrowed snapshot.
+            if (runtime.reclaimEnabled()) v.retain();
             try g.get().append(a, v);
             changed = true;
         }
