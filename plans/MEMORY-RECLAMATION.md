@@ -940,6 +940,35 @@ the right next investment. Alternatively, the **per-request / per-coroutine-tree
 arena reset** (§12.4 option 2) sidesteps the value-graph reclaim entirely and is
 the more bounded route to a bounded server.
 
+**Built and run that tracker (this session, then reverted as it adds hot-path
+cost):** a per-cell op history in `ObjRef.clone`/`deinit` (gated `KLIO_RCH`),
+dumped with symbolized stacks on the `KLIO_RC_DETECT` double-free. Definitive
+finding for `n=20`:
+- The over-released cell is the `KlioBlockingCoroutine` (the `runBlocking`
+  scope). It reaches refcount 0 legitimately, then is released ~4 more times
+  (the trace shows the count wrap through `0, -1, -2, …`).
+- **Every** one of those extra releases is `resumeContinuation` →
+  `frame.deinit` (the per-register release at `eval.zig:556`, via
+  `pumpLoop:1264` → `resumeRaw` → `resumeContinuation`). So the resumed frames
+  release the scope register more times than it was retained.
+- The scope's *retain* sites are all correct (`GetField` `v.retain()`, the
+  alias-handler retains, the receiver-retain `8eeab3b7`, and
+  `retainSnapshotValues`). So the missing retain is a **store** that puts the
+  scope into a register without retaining — invisible to a refcount tracker
+  (a `frame.write`/`appendSlice`, not a `clone`/`deinit`). The two structural
+  candidates: a host function that *returns* the scope as a borrow (the eval
+  `Call`/`CallMember` `.ok` arm writes the result with no retain, relying on the
+  host-returns-owned contract), or a `SuspendState` whose frames are resumed
+  more than once (each resume releasing the snapshot's single reg retain).
+- The over-release is roughly proportional to N (the receiver-retain `+1` and
+  the snapshot-capture `+1` buffer it, so it only crosses zero at ~10 children).
+
+The next concrete step is a **store tracker**: instrument `Frame.write` (and the
+resume-path `appendSlice`/`frame.write(carry)`) to log when the
+`KlioBlockingCoroutine` value is stored into a register *and whether the stored
+value carried an owning ref*, pairing those against the `resumeContinuation`
+releases to expose the host-returns-borrowed (or double-resume) site directly.
+
 The honest assessment: this is the §6/§7.-1 "all-or-nothing host reconciliation"
 wall — a long tail of borrow-without-retain share sites in the coroutine / job
 tree / suspend-resume machinery, each fix unblocking a little more. The
