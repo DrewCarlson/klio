@@ -54,6 +54,11 @@ pub const AnonMethodEntry = struct {
     module: ObjRef(Module),
     func: FuncId,
     captures: []NameValue,
+
+    pub fn gcTrace(self: *const AnonMethodEntry, m: *runtime.gc.Marker) void {
+        m.shade(&self.module.cell.hdr);
+        for (self.captures) |nv| nv.value.gcMark(m);
+    }
 };
 
 pub const NameValue = struct {
@@ -472,6 +477,13 @@ pub const ClosureInfo = struct {
     /// frame, coroutine resume, or worker thread — seeds the body frame's
     /// chain from this snapshot rather than the dynamic caller's chain.
     chain: []const ir.eval.EnclosingEntry = &.{},
+
+    /// GC out-edges: the live capture store and every receiver the chain
+    /// snapshot pins. Reached when the collector traces the closure side-table.
+    pub fn gcTrace(self: *const ClosureInfo, m: *runtime.gc.Marker) void {
+        m.shade(&self.captures.cell.hdr);
+        for (self.chain) |e| e.v.gcMark(m);
+    }
 };
 
 /// Lambda/closure side-table shared across every OS thread of one
@@ -548,6 +560,13 @@ pub const ObjectInitState = union(enum) {
     /// every later access throws `FileFailedToInitializeException`
     /// without the original cause, matching kotlinc.
     Failed,
+
+    pub fn gcTrace(self: *const ObjectInitState, m: *runtime.gc.Marker) void {
+        switch (self.*) {
+            .InProgress => |ip| if (ip.instance) |v| v.gcMark(m),
+            .Failed => {},
+        }
+    }
 };
 
 /// Shared lazy-`object` init table: one entry per singleton whose

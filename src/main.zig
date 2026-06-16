@@ -36,6 +36,23 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .smp => {
             return cli.run(std.heap.smp_allocator, init.args);
         },
+        .gc => {
+            // Tracing GC (KGC): a freeing backing allocator + reachability-based
+            // reclamation. Reference counting is neutralized (deinit/retain/
+            // release no-op), so the collector alone frees, by reachability.
+            runtime.gc.gc_enabled = true;
+            if (runtime.getenvSlice("KLIO_GC_STRESS")) |v| {
+                runtime.gc.gc_stress = v.len != 0 and !std.mem.eql(u8, v, "0");
+            }
+            if (runtime.getenvSlice("KLIO_GC_DEBUG")) |v| {
+                runtime.gc.gc_debug = v.len != 0 and !std.mem.eql(u8, v, "0");
+            }
+            if (runtime.getenvSlice("KLIO_GC_NOFREE")) |v| {
+                runtime.gc.gc_nofree = v.len != 0 and !std.mem.eql(u8, v, "0");
+            }
+            runtime.setReclaim(false);
+            return cli.run(std.heap.smp_allocator, init.args);
+        },
         .debug => {
             var dbg: std.heap.DebugAllocator(.{ .thread_safe = true, .safety = true }) = .init;
             defer _ = dbg.deinit();

@@ -266,6 +266,69 @@ pub const MatchData = struct {
     regex: ObjRef(RegexData),
 };
 
+// ---------------------------------------------------------------------------
+// Host-op temporary keepalive (a GC root). A pure-host re-entry — a stdlib op
+// iterating a host-built slice and calling a user callable via `invoke*` /
+// `callValueRec` — holds its accumulator/snapshot in a native `ArrayList`/slice
+// with NO calling frame register pinning it. The nested eval the callable runs
+// reaches a safe point, so those host-local Values must be a root for that
+// window. Each such op marks the stack depth on entry, pushes its in-progress
+// contents before each re-entrant call, and restores to the entry mark at exit.
+// Lives here (not in `ir/eval`) because the stdlib layer cannot import `ir`; it
+// reaches the API through `runtime`.
+// ---------------------------------------------------------------------------
+
+/// `many` keeps a whole slice rooted in O(1) (no per-element copy).
+const KeepEntry = union(enum) { one: Value, many: []const Value };
+threadlocal var host_keepalive: std.ArrayListUnmanaged(KeepEntry) = .empty;
+var keepalive_root_registered = std.atomic.Value(bool).init(false);
+
+fn gcMarkKeepalive(m: *objcell.gc.Marker) void {
+    for (host_keepalive.items) |e| switch (e) {
+        .one => |v| v.gcMark(m),
+        .many => |vs| for (vs) |v| v.gcMark(m),
+    };
+}
+
+/// Snapshot the keepalive depth; pass to `keepaliveRestore` to pop everything
+/// pushed since. Valid (and cheap) even when the GC is off.
+pub inline fn keepaliveMark() usize {
+    return host_keepalive.items.len;
+}
+
+/// Register the keepalive root provider once. Lazy: the first push on any thread
+/// installs it (idempotent across threads). The threadlocal stack it reads is
+/// the collecting thread's — sufficient single-threaded; per-thread records
+/// extend it across worker threads.
+inline fn ensureKeepaliveRoot() void {
+    if (!keepalive_root_registered.swap(true, .monotonic))
+        objcell.gc.registerRoot(gcMarkKeepalive);
+}
+
+/// Pin a single Value across a re-entrant host call. No-op unless GC is on.
+pub fn keepalivePush(v: Value) void {
+    if (!objcell.gc.gc_enabled) return;
+    ensureKeepaliveRoot();
+    host_keepalive.append(std.heap.page_allocator, .{ .one = v }) catch
+        @panic("KGC: host_keepalive push failed");
+}
+
+/// Pin a whole slice of Values (an accumulator's live contents, a snapshot)
+/// across a re-entrant host call. The slice must stay valid until the matching
+/// restore. No-op unless GC is on.
+pub fn keepalivePushSlice(vs: []const Value) void {
+    if (!objcell.gc.gc_enabled) return;
+    ensureKeepaliveRoot();
+    host_keepalive.append(std.heap.page_allocator, .{ .many = vs }) catch
+        @panic("KGC: host_keepalive push failed");
+}
+
+/// Pop the keepalive stack back to a depth from `keepaliveMark`.
+pub inline fn keepaliveRestore(mark: usize) void {
+    if (!objcell.gc.gc_enabled) return;
+    host_keepalive.items.len = mark;
+}
+
 /// The runtime value: a tagged union over every Kotlin value the
 /// interpreter manipulates.
 pub const Value = union(enum) {

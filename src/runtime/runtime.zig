@@ -33,6 +33,14 @@ pub const reclaimRequested = objcell.reclaimRequested;
 pub const AllocChoice = objcell.AllocChoice;
 pub const allocChoice = objcell.allocChoice;
 pub const getenvSlice = objcell.getenvSlice;
+// Tracing GC (KGC) — see gc.zig / plans/GC.md.
+pub const gc = objcell.gc;
+// Host-op temporary keepalive (a GC root for accumulators/snapshots held across
+// a re-entrant user callable). No-ops unless the GC is active.
+pub const keepaliveMark = value_mod.keepaliveMark;
+pub const keepalivePush = value_mod.keepalivePush;
+pub const keepalivePushSlice = value_mod.keepalivePushSlice;
+pub const keepaliveRestore = value_mod.keepaliveRestore;
 
 // alloc_track (opt-in allocation accounting; KLIO_ALLOC_TRACK)
 pub const allocTrackWrap = alloc_track_mod.wrap;

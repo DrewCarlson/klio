@@ -283,7 +283,43 @@ pub fn vmRunThreadBlock(self: *Vm, block: *const Value) Allocator.Error!runtime.
 /// Run the program's `main` function. All evaluation writes through one
 /// shared serialized sink (`out_sink`); on completion the accumulated
 /// output is replayed into the caller's `out` in order.
+// ---- GC: the Vm program-graph root provider -----------------------------
+var gc_vms: std.ArrayListUnmanaged(*const Vm) = .empty;
+var gc_vm_root_registered = std.atomic.Value(bool).init(false);
+
+fn gcMarkAllVms(m: *runtime.gc.Marker) void {
+    for (gc_vms.items) |vm| {
+        m.shade(&vm.globals.cell.hdr);
+        m.shade(&vm.classes.cell.hdr);
+        m.shade(&vm.class_default_outer.cell.hdr);
+        // The lambda side-table pins every live closure's capture store and
+        // receiver-chain snapshot (the invoke path reads them by id, so the
+        // cell graph alone cannot reach them).
+        m.shade(&vm.closures.obj.cell.hdr);
+        // Object/companion singletons captured mid-construction, anon-object
+        // method receivers, and the program image's default-value Values.
+        m.shade(&vm.object_states.cell.hdr);
+        m.shade(&vm.anon_methods.cell.hdr);
+        m.shade(&vm.prog.cell.hdr);
+    }
+}
+
+/// Register a live Vm as a GC root (its globals/class graph). Idempotent root
+/// registration; the Vm pointer is stable for the run.
+pub fn gcRegisterVm(vm: *const Vm) void {
+    if (!runtime.gc.gc_enabled) return;
+    if (!gc_vm_root_registered.swap(true, .monotonic)) runtime.gc.registerRoot(gcMarkAllVms);
+    gc_vms.append(std.heap.page_allocator, vm) catch @panic("KGC: vm root registration failed");
+}
+
 pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
+    gcRegisterVm(self);
+    // Close the permanent generation: everything minted up to here (the stdlib
+    // image, the program's class/IR graph, the empty global/class tables) is
+    // immortal and reference-stable; cells minted from here on are nursery and
+    // tracked for sweep. Worker threads minting cells run program code only and
+    // set their own threadlocal `alloc_perm = false` at thread entry.
+    runtime.gc.alloc_perm = false;
     const result = try vmRunInner(self, main);
     self.out_sink.replayInto(out);
     return result;
