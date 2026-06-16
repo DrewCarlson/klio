@@ -2168,6 +2168,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             var list: std.ArrayList(Value) = .empty;
             try list.appendSlice(allocator, items);
             allocator.free(items);
+            // The list owns one reference to each element (its teardown
+            // releases them); `readArgRun` handed back borrows of the source
+            // registers, so retain each. No-op under the arena fast path.
+            if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
             try frame.write(nl.dst, .{ .List = .{
                 .items = try ValueList.init(allocator, list),
                 .mutable = false,

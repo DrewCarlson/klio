@@ -87,6 +87,9 @@ fn makeStringOwned(a: Allocator, s: []const u8) Error!Value {
 fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(a, items);
+    // `items` is a borrowed slice (call args, or a `snapshotItems`/`dupe` copy
+    // that did not bump counts); the list owns one ref per element, so retain.
+    if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
     return .{ .List = .{
         .items = try ValueList.init(a, list),
         .mutable = mutable,
@@ -110,6 +113,8 @@ fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var deduped: std.ArrayList(Value) = .empty;
     for (items) |v| {
         if (!containsBoxed(deduped.items, &v)) {
+            // Borrowed input element; the set owns one ref per kept element.
+            if (runtime.reclaimEnabled()) v.retain();
             try deduped.append(a, v);
         }
     }
@@ -123,6 +128,8 @@ fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
 fn makeArray(a: Allocator, items: []const Value, prim: ?PrimitiveArrayKind) Error!Value {
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(a, items);
+    // Borrowed input slice; the array owns one ref per element.
+    if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
     return .{ .Array = .{ .items = try ValueList.init(a, list), .prim = prim } };
 }
 
@@ -1347,7 +1354,10 @@ pub fn coll_list_of_not_null(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     var items: std.ArrayList(Value) = .empty;
     for (ctx.args) |v| {
-        if (v != .Null) try items.append(a, v);
+        if (v != .Null) {
+            if (runtime.reclaimEnabled()) v.retain();
+            try items.append(a, v);
+        }
     }
     return ok(try makeListFromArrayList(a, items, false));
 }
@@ -3738,7 +3748,11 @@ pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
         const g = entries.borrowMut();
         defer g.deinit();
         const kv = g.get().orderedRemove(pos);
-        return okElem(kv.value);
+        // `remove` transfers the entry out of the map: the value's owned ref
+        // moves to the returned result (no retain), and the removed key — which
+        // the map owned and which is not returned — must be released.
+        if (runtime.reclaimEnabled()) kv.key.release(a);
+        return ok(kv.value);
     }
     return ok(Value.Null);
 }
