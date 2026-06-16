@@ -198,3 +198,32 @@ GC-managed cells, so sustained-load flat RSS needs those frees ungated for the
 GC path (or the scratch moved onto a per-call arena). The KLIO_GC_GUARD=dbg
 mode (route the GC's freeing backing through the checking allocator) is the
 tool that pinpoints both double-frees and these leaks.
+
+
+## RSS measurement (sustained allocation churn)
+
+`/tmp/sustained.kt` — 200k iterations each constructing an instance, a list, and
+a `map { }.filter { }` chain — measured with `scripts/gc_rss.sh`:
+
+- 200k iters: arena hits the 6 GB RSS cap and aborts (the arena never frees);
+  the GC completes at ~2.6 GB.
+- 20k iters: arena 945 MB, free 432 MB, **gc 385 MB** — the collector uses the
+  least of the three and is the only one that stays bounded as the count grows.
+
+Two effects remain on the way to truly flat RSS:
+
+1. The freeing backend is `smp_allocator`, which caches reclaimed pages rather
+   than returning them to the OS, so RSS reflects the allocation high-water mark
+   of the churn, not the live set (which the collector keeps to ~6 MB here).
+   This is an allocator-policy choice, not a leak; an arena-of-free-lists or a
+   periodic `madvise`/trim would tighten it.
+2. The live cell set grows ~430 cells per collection because the closure
+   side-table is append-only and strong-rooted: every `map`/`filter` lambda is
+   retained for the run. Bounded per run, unbounded for an infinitely-running
+   server, so the slot-map + free-list conversion (collectable closures keyed by
+   live `IrClosure` reachability, with the scheduler's in-flight task blocks
+   rooted so a dispatched closure is not pruned) is the remaining flat-RSS work.
+
+Host-op raw scratch (allocPrint keys, dup'd probe FQNs) is freed by the host run
+path; the anon-method dispatch keys were the one hot site still gated to the
+arena and are now freed unconditionally.
