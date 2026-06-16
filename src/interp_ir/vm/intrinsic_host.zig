@@ -733,6 +733,10 @@ fn workerEntry(wargs: WorkerArgs) void {
     // `ObjRef.deinit`/`vm.deinit()` take the same path as the parent over
     // the shared arena.
     runtime.setReclaim(args.reclaim);
+    // Balance the spawn-time retain: drop the worker's hold on the block once
+    // the task is done. Registered before `vm.deinit` so it runs after the
+    // child Vm tears down (LIFO), keeping the block alive for the whole run.
+    defer if (runtime.reclaimEnabled()) args.block.release(args.seed.allocator);
     var vm = args.seed.materialize() catch {
         publishThreadResult(args.threads, args.id, .{ .err = .{ .Type = "failed to materialize worker Vm" } });
         return;
@@ -773,6 +777,11 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!Host
         try g.get().put(id, .{ .handle = null, .result = null });
     }
 
+    // The block (and the value graph its captures reach) crosses to the
+    // worker thread, which may outlive the spawning frame's hold on it.
+    // Retain so it survives regardless; `workerEntry` releases it when the
+    // task finishes. No-op under the arena fast path.
+    block.retain();
     const wargs = WorkerArgs{
         .seed = spawnSeed(self),
         .block = block.*,
@@ -783,6 +792,7 @@ fn startWorker(self: *VmIntrinsicHost, block: *const Value) Allocator.Error!Host
     };
 
     const handle = std.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, workerEntry, .{wargs}) catch {
+        block.release(self.allocator);
         const g = self.threads.borrowMut();
         defer g.deinit();
         _ = g.get().remove(id);
@@ -812,13 +822,20 @@ pub fn spawnOsThread(self: *VmIntrinsicHost, block: *const Value, out: Output) A
 /// its own reader/writer lock (the spawned-thread boundary contract).
 pub fn coroutineDispatchPooled(self: *VmIntrinsicHost, block: *const Value, io_kind: bool, out: Output) Allocator.Error!?RuntimeError {
     _ = out;
-    try scheduler.post(.{
+    // The runnable crosses to a pool thread that outlives this call; retain so
+    // its captures survive until the task runs (or is dropped). The pool's
+    // task runner / drop path releases it. No-op under the arena fast path.
+    block.retain();
+    scheduler.post(.{
         .seed = spawnSeed(self),
         .block = block.*,
         .time_mode = root.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
         .kind = if (io_kind) .io else .default,
-    });
+    }) catch |e| {
+        block.release(self.allocator);
+        return e;
+    };
     return null;
 }
 

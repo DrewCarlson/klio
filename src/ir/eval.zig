@@ -1921,6 +1921,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     break :blk cg.get().is_inner and g.get().outer == null;
                 };
                 if (needs_outer and outer_hint != null) {
+                    // The instance's `outer` is an owned field (its teardown
+                    // releases it); `outer_hint` is the caller's borrow, so
+                    // retain before storing. No-op under the arena.
+                    outer_hint.?.retain();
                     const g = inst_ref.borrowMut();
                     defer g.deinit();
                     g.get().outer = outer_hint.?;

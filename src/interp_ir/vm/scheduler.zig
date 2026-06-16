@@ -321,6 +321,9 @@ pub const Pool = struct {
 fn runVmTask(task: *Task) ?RuntimeError {
     root.setCoroutineTimeMode(task.time_mode);
     runtime.setReclaim(task.reclaim);
+    // Balance the post-time retain on the block; runs after `vm.deinit`
+    // (LIFO) so the block stays live for the whole task.
+    defer if (runtime.reclaimEnabled()) task.block.release(task.seed.allocator);
     var vm = task.seed.materialize() catch {
         return .{ .Type = "failed to materialize dispatch worker Vm" };
     };
@@ -345,6 +348,7 @@ fn runVmTask(task: *Task) ?RuntimeError {
 /// Drop a task that never ran (pool stopping). The seed's handles are
 /// released through the same child-Vm teardown a completed task uses.
 fn dropVmTask(task: *Task) void {
+    if (runtime.reclaimEnabled()) task.block.release(task.seed.allocator);
     var vm = task.seed.materialize() catch return;
     vm.deinit();
 }

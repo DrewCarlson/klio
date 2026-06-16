@@ -45,6 +45,17 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
+/// Return a value that the accessor *borrowed* from its receiver (a stored
+/// list/array element or map entry value, not a freshly built result). Host
+/// calls return owned values — the dispatch writes the result into a register
+/// that takes ownership — so a borrowed element must be retained first or it is
+/// released one time too many when the register is overwritten/torn down. The
+/// retain is a no-op under the arena fast path.
+fn okElem(v: Value) EvalResult {
+    v.retain();
+    return .{ .ok = v };
+}
+
 fn typeErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
@@ -1188,7 +1199,7 @@ pub fn map_get_or_else(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args[0] != .Map) return typeErr("getOrElse requires a Map receiver");
     const entries = try snapshotEntries(a, ctx.args[0].Map.entries);
     const key = ctx.args[1];
-    if (findKeyIndexBoxed(entries, &key)) |i| return ok(entries[i].value);
+    if (findKeyIndexBoxed(entries, &key)) |i| return okElem(entries[i].value);
     const block = ctx.args[2];
     return try ctx.host.invokeCallable(&block, &.{}, ctx.out);
 }
@@ -1202,7 +1213,7 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries_rc.borrow();
         defer g.deinit();
-        if (findKeyIndexBoxed(g.get().items, &key)) |i| return ok(g.get().items[i].value);
+        if (findKeyIndexBoxed(g.get().items, &key)) |i| return okElem(g.get().items[i].value);
     }
     const block = ctx.args[2];
     const new_v = switch (try invoke(ctx, &block, &.{})) {
@@ -1687,7 +1698,7 @@ pub fn coll_list_get(ctx: *CallCtx) Error!EvalResult {
         if (runtime.reclaimEnabled()) a.free(msg);
         return e;
     }
-    return ok(items[@intCast(i)]);
+    return okElem(items[@intCast(i)]);
 }
 pub fn coll_list_contains(ctx: *CallCtx) Error!EvalResult {
     const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.contains")) {
@@ -1811,12 +1822,12 @@ fn listLastImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
                 .value => |x| x,
                 .err => |e| return e,
             };
-            if (r == .Bool and r.Bool) return ok(items[i]);
+            if (r == .Bool and r.Bool) return okElem(items[i]);
         }
         if (or_null) return ok(Value.Null);
         return try thrown(a, "kotlin.NoSuchElementException", "Collection contains no element matching the predicate.");
     }
-    if (items.len > 0) return ok(items[items.len - 1]);
+    if (items.len > 0) return okElem(items[items.len - 1]);
     if (or_null) return ok(Value.Null);
     return try thrown(a, "kotlin.NoSuchElementException", "Collection is empty.");
 }
@@ -3595,7 +3606,7 @@ pub fn coll_map_get(ctx: *CallCtx) Error!EvalResult {
     if (try mapKeyIndex(ctx, entries, key)) |i| {
         const g = entries.borrow();
         defer g.deinit();
-        if (i < g.get().items.len) return ok(g.get().items[i].value);
+        if (i < g.get().items.len) return okElem(g.get().items[i].value);
     }
     return ok(Value.Null);
 }
@@ -3727,7 +3738,7 @@ pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
         const g = entries.borrowMut();
         defer g.deinit();
         const kv = g.get().orderedRemove(pos);
-        return ok(kv.value);
+        return okElem(kv.value);
     }
     return ok(Value.Null);
 }
@@ -4341,7 +4352,7 @@ pub fn coll_map_get_or_default(ctx: *CallCtx) Error!EvalResult {
     const default = ctx.args[2];
     const g = entries.borrow();
     defer g.deinit();
-    if (findKeyIndexBoxed(g.get().items, &key)) |i| return ok(g.get().items[i].value);
+    if (findKeyIndexBoxed(g.get().items, &key)) |i| return okElem(g.get().items[i].value);
     return ok(default);
 }
 
@@ -4356,7 +4367,7 @@ pub fn coll_map_get_value(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        if (findKeyIndexBoxed(g.get().items, &key)) |i| return ok(g.get().items[i].value);
+        if (findKeyIndexBoxed(g.get().items, &key)) |i| return okElem(g.get().items[i].value);
     }
     const kd = try display(a, key);
     const msg = try fmt(a, "Key {s} is missing in the map.", .{kd});
@@ -4770,7 +4781,7 @@ pub fn array_element_at(ctx: *CallCtx) Error!EvalResult {
     if (index < 0 or @as(usize, @intCast(index)) >= items.len) {
         return indexOob(a, try fmt(a, "index: {d}, size: {d}", .{ index, items.len }));
     }
-    return ok(items[@intCast(index)]);
+    return okElem(items[@intCast(index)]);
 }
 
 pub fn array_plus(ctx: *CallCtx) Error!EvalResult {

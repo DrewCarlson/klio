@@ -2426,7 +2426,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             defer g.deinit();
             const items = g.get().items;
             if (idx >= 0 and @as(usize, @intCast(idx)) < items.len) {
-                return .{ .ok = items[@intCast(idx)] };
+                const elem = items[@intCast(idx)];
+                // Borrowed element: the array still owns it, so retain before
+                // handing it to the register that will own the result.
+                elem.retain();
+                return .{ .ok = elem };
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, items.len });
             defer if (runtime.reclaimEnabled()) allocator.free(msg);
@@ -2439,6 +2443,12 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             defer g.deinit();
             const items = g.get().items;
             if (idx >= 0 and @as(usize, @intCast(idx)) < items.len) {
+                // The array owns one ref per element: release the value being
+                // overwritten and retain the incoming borrow. No-op under arena.
+                if (runtime.reclaimEnabled()) {
+                    items[@intCast(idx)].release(allocator);
+                    args[1].retain();
+                }
                 items[@intCast(idx)] = args[1];
                 return .{ .ok = .Unit };
             }

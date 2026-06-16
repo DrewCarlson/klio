@@ -2212,6 +2212,9 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             const default_outer = og.get().get(class_name);
             og.deinit();
             if (default_outer) |o| {
+                // `outer` is an owned field (teardown releases it); the value
+                // read from the default-outer table is a borrow, so retain.
+                o.retain();
                 const g = inst.borrowMut();
                 g.get().outer = o;
                 g.deinit();
@@ -2227,6 +2230,9 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         };
         if (!has_outer) {
             if (try selectInnerOuter(self, allocator, class_def, ir_name, outer_hint)) |outer_v| {
+                // `selectInnerOuter` hands back a borrow of the outer-hint /
+                // capture; `outer` is an owned field, so retain before storing.
+                outer_v.retain();
                 const g = inst.borrowMut();
                 g.get().outer = outer_v;
                 g.deinit();
@@ -2859,6 +2865,9 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     }
 
     const outer: ?Value = findCapture(capture_pairs, "this");
+    // `outer` is an owned field of the instance (its teardown releases it);
+    // `findCapture` returns a borrow, so retain before adopting it.
+    if (outer) |o| o.retain();
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = class_def,
         .fields = fields,
