@@ -33,12 +33,18 @@ Two distinct problems, both now largely solved:
    - a block dispatched to a worker thread (`kotlin.concurrent.thread`,
      `Dispatchers` pool) crossed threads without a retain.
 
-   With those landed, the **ktor server runs bounded under real reclaim**
-   (`KLIO_RECLAIM=smp`): the JSON/routing server handles 4000 requests with RSS
-   flat at ~415 MB (zero per-request growth), and a routing server starts +
-   completes `df`-clean. The routing *livelock + multi-GB leak* that previously
-   blocked this was a single root cause: **anonymous-object captures were stored
-   in the anon-method registry as borrows.** `KtorSimpleLogger(name)` returns an
+   With those landed, the routing *livelock + multi-GB leak* that previously
+   exploded RSS to the 6 GB cap in ~1 s is **fixed**: a `routing { get(...) }`
+   server now starts `df`-clean under real reclaim and (with
+   `start(wait = false)`) logs `Responding` and runs to a clean exit — the full
+   route set + `install(ContentNegotiation){json()}` + `@Serializable` all
+   included. (Caveat: end-to-end request *serving* under reclaim is not yet
+   green — see the `start(wait = true)` residual below — so the earlier
+   "4000 requests, flat RSS" reading was a server stuck in startup, not serving;
+   the real, verified win is that the livelock/explosion is gone and startup is
+   `df`-clean.) The root cause was a single bug: **anonymous-object captures were
+   stored in the anon-method registry as borrows.** `KtorSimpleLogger(name)`
+   returns an
    `object : Logger` that captures `name`; when the enclosing function returned
    and freed its `name` register, the captured `String` dangled. The next log
    line read that freed `String` cell, whose reader/writer lock now held garbage
@@ -55,14 +61,32 @@ Two distinct problems, both now largely solved:
    gated check in the `BinOp.StringConcat` path (`s.strongCount()==0 or huge`)
    caught the freed string mid-concat as `"[INFO] (" + <freed name>`.
 
-   *Remaining (smaller):* the full JSON/ContentNegotiation server shows one
-   residual `df` (a single over-release, not a per-request leak — RSS stays
-   flat) somewhere in the typed-receive / serialization path; and the
-   anon-capture retains are released only at host teardown (a bounded
-   per-anon-class hold, fine for a once-created logger but worth releasing on
-   registry eviction). (The logger-name garble noted previously was the same
-   anon-capture bug and is fixed — names now render correctly.) A long-running
-   server can also run `KLIO_RECLAIM=free` (a freeing allocator with reclaim OFF:
+   *Remaining — `start(wait = true)` (the normal blocking serve mode):* under
+   real reclaim the server spins at ~99 % CPU and never logs `Application
+   started`; under `KLIO_RC_DETECT=1` it does **not** spin (cpu ~0 %) but prints
+   exactly one `[RC DOUBLE-FREE]`, so this is a genuine *over-release* (real
+   reclaim frees the cell, the freed slot is reused, and a later read of the
+   reused cell makes the algorithm loop). The double-free stack is a setup-graph
+   teardown: `InstanceData A.deinit → releaseValueList(A.field) → InstanceData
+   B.deinit → release(B.field = C)` where `C` is double-freed. `wait = false`
+   does not hit it (it launches serve on a pool worker and the process exits
+   after the demo delay). Leading hypothesis: a *double-ownership* introduced by
+   the anon-capture retain above — a capture value now owned by `capture_pairs`
+   is also adopted (via `define`, no extra retain) into a constructed instance's
+   field during object/singleton setup, so teardown releases it twice. Next
+   step: identify the exact construction site that stores a `capture_pairs[i]`
+   value into a long-lived field without retaining (candidates:
+   `host_instances.zig` runAnonThunk scoped-env `define` at ~3059, the
+   object-singleton field defines, and any `findCapture`-result field store),
+   and either retain there or give the registry an independently-retained copy
+   so transient construction keeps borrowing. Reproduce with `start(wait = true)`
+   + `KLIO_RECLAIM=smp KLIO_RC_DETECT=1` (the double-free prints within ~5 s with
+   no other instrumentation; adding per-op tracing slows startup past it).
+   Separately, the anon-capture retains are released only at host teardown (a
+   bounded per-anon-class hold, fine for a once-created logger but worth
+   releasing on registry eviction). (The logger-name garble noted previously was
+   the same anon-capture bug and is fixed — names now render correctly.) A
+   long-running server can also run `KLIO_RECLAIM=free` (a freeing allocator with reclaim OFF:
    reclaims the explicitly-freed host/container temporaries — ~5× better
    per-request — without the value-graph teardown that still corrupts the job
    tree).
