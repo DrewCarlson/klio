@@ -3987,6 +3987,9 @@ fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
                         if (g.get().get(pname)) |v| {
                             cg.deinit();
                             g.deinit();
+                            // Borrowed instance field; the register owns the
+                            // result, so retain before returning (host-returns-owned).
+                            if (runtime.reclaimEnabled()) v.retain();
                             return .{ .ok = v };
                         }
                     }

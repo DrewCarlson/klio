@@ -431,6 +431,11 @@ fn decodeObject(map: JsonObjectMap, cls_val: *const Value, ctx: *CallCtx) Error!
         try args.append(a, v);
     }
     const r = try ctx.host.invokeCallable(cls_val, args.items, ctx.out);
+    // `decodeField` returns OWNED values; the constructor reached through
+    // `invokeCallable` BORROWS its args (it retains each into a field via
+    // `newInstance`), so release the decoder's owned refs here — on both paths —
+    // or every non-primitive @Serializable field leaks. No-op under the arena.
+    if (runtime.reclaimEnabled()) for (args.items) |av| av.release(a);
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = e },
