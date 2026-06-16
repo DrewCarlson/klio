@@ -1963,6 +1963,8 @@ pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     if (user == 1) {
         const g = it.borrowMut();
         defer g.deinit();
+        // The list owns one ref to each element it stores.
+        if (runtime.reclaimEnabled()) ctx.args[1].retain();
         try g.get().append(a, ctx.args[1]);
         return ok(.{ .Bool = true });
     }
@@ -1979,6 +1981,7 @@ pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
             if (runtime.reclaimEnabled()) a.free(msg);
             return e;
         }
+        if (runtime.reclaimEnabled()) item.retain();
         try g.get().insert(a, @intCast(i), item);
         return ok(Value.Unit);
     }
@@ -1993,6 +1996,7 @@ pub fn coll_mut_list_add_first(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("addFirst requires an argument");
     const g = it.borrowMut();
     defer g.deinit();
+    if (runtime.reclaimEnabled()) ctx.args[1].retain();
     try g.get().insert(a, 0, ctx.args[1]);
     return ok(Value.Unit);
 }
@@ -2048,6 +2052,8 @@ pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
     {
         const g = it.borrowMut();
         defer g.deinit();
+        // clear() discards every element; drop the list's owned references.
+        if (runtime.reclaimEnabled()) for (g.get().items) |v| v.release(a);
         g.get().clearRetainingCapacity();
     }
     syncMapView(a, ctx.args[0]);
@@ -3367,7 +3373,10 @@ pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
         const g = it.borrowMut();
         defer g.deinit();
         if (indexOfBoxed(g.get().items, &arg)) |pos| {
-            _ = g.get().orderedRemove(pos);
+            const gone = g.get().orderedRemove(pos);
+            // remove(element): Boolean discards the element; drop the
+            // collection's owned reference to it.
+            if (runtime.reclaimEnabled()) gone.release(a);
             removed = true;
         }
     }
@@ -3429,6 +3438,9 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
             if (keep) {
                 list.items[w] = v;
                 w += 1;
+            } else if (runtime.reclaimEnabled()) {
+                // Dropped element: release the collection's owned reference.
+                v.release(a);
             }
         }
         list.shrinkRetainingCapacity(w);
@@ -4159,6 +4171,8 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
     const changed = to_add.len != 0;
     const g = it.borrowMut();
     defer g.deinit();
+    // The list owns one ref to each element it stores.
+    if (runtime.reclaimEnabled()) for (to_add) |v| v.retain();
     try g.get().appendSlice(a, to_add);
     return ok(.{ .Bool = changed });
 }
@@ -4176,7 +4190,10 @@ pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
         const g = it.borrowMut();
         defer g.deinit();
         if (indexOfBoxed(g.get().items, &arg)) |pos| {
-            _ = g.get().orderedRemove(pos);
+            const gone = g.get().orderedRemove(pos);
+            // remove(element): Boolean discards the element; drop the
+            // collection's owned reference to it.
+            if (runtime.reclaimEnabled()) gone.release(a);
             removed = true;
         }
     }
@@ -4220,6 +4237,9 @@ pub fn coll_mut_list_set(ctx: *CallCtx) Error!EvalResult {
         if (runtime.reclaimEnabled()) a.free(msg);
         return e;
     }
+    // The list owns the new value; the replaced value's ownership transfers
+    // to the returned `prev` (Kotlin `set` returns the previous element).
+    if (runtime.reclaimEnabled()) value.retain();
     const prev = g.get().items[@intCast(i)];
     g.get().items[@intCast(i)] = value;
     return ok(prev);
