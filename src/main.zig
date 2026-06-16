@@ -23,6 +23,44 @@ const runtime = @import("runtime");
 /// `KLIO_RECLAIM=debug`: a checking allocator (`DebugAllocator` with
 /// thread-safety + safety quarantine) with reclamation ON. Use to surface
 /// use-after-free / double-free / leaks at their source.
+/// Diagnostic backing allocator (KLIO_GC_GUARD): panic with a stack trace on an
+/// allocation whose size is absurd (the signature of a use-after-free reading a
+/// corrupted length out of a swept buffer), so the offending site is pinpointed
+/// instead of surfacing as a generic out-of-memory far away.
+fn guardAllocator(inner: std.mem.Allocator) std.mem.Allocator {
+    const G = struct {
+        var backing: std.mem.Allocator = undefined;
+        // Only arm during program execution (alloc_perm flips false in vmRun);
+        // startup reads the multi-MB stdlib image while still permanent.
+        const LIMIT = 1 << 20; // 1 MB
+        fn armed(len: usize) bool {
+            return len > LIMIT and runtime.gc.program_started;
+        }
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            _ = ctx;
+            if (armed(len)) @panic("KGC guard: absurd allocation size (likely UAF on a swept buffer)");
+            return backing.rawAlloc(len, a, ra);
+        }
+        fn resize(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new: usize, ra: usize) bool {
+            _ = ctx;
+            if (armed(new)) @panic("KGC guard: absurd resize size (likely UAF on a swept buffer)");
+            return backing.rawResize(buf, a, new, ra);
+        }
+        fn remap(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new: usize, ra: usize) ?[*]u8 {
+            _ = ctx;
+            if (armed(new)) @panic("KGC guard: absurd remap size (likely UAF on a swept buffer)");
+            return backing.rawRemap(buf, a, new, ra);
+        }
+        fn free(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, ra: usize) void {
+            _ = ctx;
+            backing.rawFree(buf, a, ra);
+        }
+        const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    };
+    G.backing = inner;
+    return .{ .ptr = undefined, .vtable = &G.vtable };
+}
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
     const mode = runtime.allocChoice();
     switch (mode) {
@@ -59,6 +97,17 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 runtime.gc.gc_stress_every = std.fmt.parseInt(usize, v, 10) catch 0;
             }
             runtime.setReclaim(false);
+            if (runtime.getenvSlice("KLIO_GC_GUARD")) |v| {
+                // GUARD=dbg: route the GC's freeing backing through the checking
+                // allocator so a use-after-free of a swept cell is caught at the
+                // access with a stack trace, not as a far-away corruption.
+                if (std.mem.eql(u8, v, "dbg")) {
+                    var dbg: std.heap.DebugAllocator(.{ .thread_safe = true, .safety = true }) = .init;
+                    defer _ = dbg.deinit();
+                    return cli.run(dbg.allocator(), init.args);
+                }
+                return cli.run(guardAllocator(std.heap.smp_allocator), init.args);
+            }
             return cli.run(std.heap.smp_allocator, init.args);
         },
         .debug => {

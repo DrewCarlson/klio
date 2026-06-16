@@ -43,6 +43,7 @@ pub const keepalivePushSlice = value_mod.keepalivePushSlice;
 pub const keepalivePushPairs = value_mod.keepalivePushPairs;
 pub const keepalivePushCell = value_mod.keepalivePushCell;
 pub const keepaliveRestore = value_mod.keepaliveRestore;
+pub const gcUninstallKeepaliveRoot = value_mod.gcUninstallKeepaliveRoot;
 
 // alloc_track (opt-in allocation accounting; KLIO_ALLOC_TRACK)
 pub const allocTrackWrap = alloc_track_mod.wrap;

@@ -478,13 +478,36 @@ pub const ClosureInfo = struct {
     /// chain from this snapshot rather than the dynamic caller's chain.
     chain: []const ir.eval.EnclosingEntry = &.{},
 
-    /// GC out-edges: the live capture store and every receiver the chain
-    /// snapshot pins. Reached when the collector traces the closure side-table.
+    /// No-op tracer: a closure's capture store and receiver chain are kept alive
+    /// ONLY while a live value references the closure id (see `markClosureThunk`
+    /// / `runtime.gc.markClosureHook`), so the side-table spine must not pin
+    /// them — that was the leak. The spine is permanent and never swept, so it
+    /// needs no out-edges of its own.
     pub fn gcTrace(self: *const ClosureInfo, m: *runtime.gc.Marker) void {
-        m.shade(&self.captures.cell.hdr);
-        for (self.chain) |e| e.v.gcMark(m);
+        _ = self;
+        _ = m;
     }
 };
+
+/// The process-wide closure side-table the GC's `markClosureHook` consults. All
+/// Vms (the main run plus every dispatch/worker child) share one spine by handle
+/// clone, so a single installed handle serves every thread's collector.
+var active_closures: ?SharedClosures = null;
+
+fn markClosureThunk(id: u64, m: *runtime.gc.Marker) void {
+    const sc = active_closures orelse return;
+    if (sc.get(id)) |info| {
+        for (info.chain) |e| e.v.gcMark(m);
+        m.shade(&info.captures.cell.hdr);
+    }
+}
+
+/// Install the closure-liveness hook with this program's shared side-table.
+/// Idempotent across Vms (they share the spine).
+pub fn gcInstallClosureHook(closures: SharedClosures) void {
+    active_closures = closures;
+    runtime.gc.markClosureHook = markClosureThunk;
+}
 
 /// Lambda/closure side-table shared across every OS thread of one
 /// program. Indices (`Value.IrClosure.id`) are append-stable — `push`

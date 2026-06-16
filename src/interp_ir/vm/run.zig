@@ -292,10 +292,10 @@ fn gcMarkAllVms(m: *runtime.gc.Marker) void {
         m.shade(&vm.globals.cell.hdr);
         m.shade(&vm.classes.cell.hdr);
         m.shade(&vm.class_default_outer.cell.hdr);
-        // The lambda side-table pins every live closure's capture store and
-        // receiver-chain snapshot (the invoke path reads them by id, so the
-        // cell graph alone cannot reach them).
-        m.shade(&vm.closures.obj.cell.hdr);
+        // The lambda side-table spine is permanent and traces nothing (its
+        // per-closure captures/chain are kept alive by `markClosureHook` only
+        // while a live value references the id), so it is NOT shaded here — that
+        // strong root was the closure leak.
         // Object/companion singletons captured mid-construction, anon-object
         // method receivers, and the program image's default-value Values.
         m.shade(&vm.object_states.cell.hdr);
@@ -310,6 +310,9 @@ pub fn gcRegisterVm(vm: *const Vm) void {
     if (!runtime.gc.gc_enabled) return;
     if (!gc_vm_root_registered.swap(true, .monotonic)) runtime.gc.registerRoot(gcMarkAllVms);
     gc_vms.append(std.heap.page_allocator, vm) catch @panic("KGC: vm root registration failed");
+    // All Vms share one closure side-table by handle clone; install the
+    // liveness hook with it so `Value.gcMark` can keep live closures' captures.
+    root.gcInstallClosureHook(vm.closures);
 }
 
 pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
@@ -320,6 +323,10 @@ pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
     // tracked for sweep. Worker threads minting cells run program code only and
     // set their own threadlocal `alloc_perm = false` at thread entry.
     runtime.gc.alloc_perm = false;
+    runtime.gc.program_started = true;
+    // The main run thread joins the mutator set so a collection started by any
+    // spawned worker stops it at a safe point before touching the shared heap.
+    vmhost.coroutines.gcThreadEnter();
     const result = try vmRunInner(self, main);
     self.out_sink.replayInto(out);
     return result;

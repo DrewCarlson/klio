@@ -170,3 +170,97 @@ Remaining:
 - Closure side-table slot-map + free-list for bounded RSS (today the registry is
   strong-rooted and append-only, so per-request closures leak — correct but not
   yet flat-RSS).
+
+
+## Multi-thread + coroutine close-out
+
+The stop-the-world handshake (per-thread root records, parked-count rendezvous,
+blocking-safe brackets on timer sleeps / thread joins) brought real-threaded
+programs under the collector: 8-thread monitor counters, `Dispatchers.Default`
+parallelism, `withContext(IO)`, and cross-dispatcher channels all run
+byte-identically to the arena baseline under aggressive collection.
+
+The async-hammer fixture (`GlobalScope.async(Dispatchers.Default)` x1200 with
+`await`) surfaced the final correctness hole, caught as a DebugAllocator double
+free: `materializeInstance` builds an instance, then runs its body-property /
+init-block initializers (user code, hence safe points) while the half-built
+shell is reachable only through a host local. A collection there swept the
+instance and freed its field list, which construction then freed again. Object
+and companion singletons were anchored through the in-flight object-state table,
+but regular instances had no anchor — they are now pinned on the keepalive stack
+across construction. This was a latent single-thread bug the corpus rarely hit;
+aggressive multi-thread collection made it deterministic.
+
+Known residual (does not crash): host-scratch raw allocations (e.g. the
+`allocPrint` keys in the anon-method dispatch path) are freed only under
+`reclaimEnabled()`, which is off in GC mode, so they leak. They are not
+GC-managed cells, so sustained-load flat RSS needs those frees ungated for the
+GC path (or the scratch moved onto a per-call arena). The KLIO_GC_GUARD=dbg
+mode (route the GC's freeing backing through the checking allocator) is the
+tool that pinpoints both double-frees and these leaks.
+
+
+## RSS measurement (sustained allocation churn)
+
+`/tmp/sustained.kt` — 200k iterations each constructing an instance, a list, and
+a `map { }.filter { }` chain — measured with `scripts/gc_rss.sh`:
+
+- 200k iters: arena hits the 6 GB RSS cap and aborts (the arena never frees);
+  the GC completes at ~2.6 GB.
+- 20k iters: arena 945 MB, free 432 MB, **gc 385 MB** — the collector uses the
+  least of the three and is the only one that stays bounded as the count grows.
+
+Two effects remain on the way to truly flat RSS:
+
+1. The freeing backend is `smp_allocator`, which caches reclaimed pages rather
+   than returning them to the OS, so RSS reflects the allocation high-water mark
+   of the churn, not the live set (which the collector keeps to ~6 MB here).
+   This is an allocator-policy choice, not a leak; an arena-of-free-lists or a
+   periodic `madvise`/trim would tighten it.
+2. The live cell set grows ~430 cells per collection because the closure
+   side-table is append-only and strong-rooted: every `map`/`filter` lambda is
+   retained for the run. Bounded per run, unbounded for an infinitely-running
+   server, so the slot-map + free-list conversion (collectable closures keyed by
+   live `IrClosure` reachability, with the scheduler's in-flight task blocks
+   rooted so a dispatched closure is not pruned) is the remaining flat-RSS work.
+
+Host-op raw scratch (allocPrint keys, dup'd probe FQNs) is freed by the host run
+path; the anon-method dispatch keys were the one hot site still gated to the
+arena and are now freed unconditionally.
+
+
+## Collectable closures (bounded live set)
+
+The closure side-table was append-only and strong-rooted, pinning every lambda's
+captures for the whole run — the live cell set grew unboundedly in a map/filter
+loop (~430 cells per collection). Adversarially hardened (a design panel found
+fatal cross-thread and ordering holes in the first slot-map+free-list sketch),
+the landed mechanism is simpler and safer than a slot-map:
+
+- A closure is kept alive by ordinary reachability of its `IrClosure` Value.
+  `Value.gcMark` for an `IrClosure` invokes `runtime.gc.markClosureHook`, which
+  marks the side-table slot's capture store + receiver chain for that id. The
+  normal drain reaches this transitively — a closure captured by another closure
+  is marked when the outer's captures cell is drained — so no second pass and no
+  ordering hazard. A closure no live value references is never marked here, so
+  its captures cell goes white and is swept.
+- The spine tracer pins nothing (`ClosureInfo.gcTrace` is a no-op); the spine is
+  permanent metadata, never swept. Ids are monotonic and never reused, so no
+  free-list and no stale-id aliasing — a closure id any value still carries
+  always dispatches correctly.
+- Dispatched closures stay rooted across post→queue→dequeue→run: the pool FIFO
+  marks every queued task block, and a worker pins its in-flight block on the
+  keepalive stack (runVmTask / workerEntry).
+
+Result: the live set is flat (~16-20 cells across 345 collections over a
+200k-iteration instance+closure+collection churn loop, where the arena hits the
+6 GB cap and aborts). `marked` is flat (~1415). All 88 examples, the async
+dispatch hammer, and the real-threaded litmus fixtures stay correct under
+aggressive collection.
+
+Residual: process RSS still reflects the smp_allocator's reclaimed-page cache
+(the allocation high-water of the churn), not the live set — an allocator-policy
+refinement (trim/`madvise`, or an arena-of-free-lists), not a leak. The
+per-closure `ClosureInfo` metadata (a few words + two small slices) is not freed
+mid-run; it is bounded by distinct closure-creation events, dwarfed by the
+reclaimed capture data, and a follow-up could prune it once liveness is proven.

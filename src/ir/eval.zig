@@ -200,7 +200,33 @@ threadlocal var active_chain_base: usize = 0;
 // frame onto this innermost-first chain for its lifetime. Registered once.
 // -------------------------------------------------------------------------
 threadlocal var frame_chain: ?*Frame = null;
-var frame_root_registered = std.atomic.Value(bool).init(false);
+
+/// An in-flight `resumeContinuation` on this thread: while it rebuilds a parked
+/// activation one frame at a time, the not-yet-rebuilt snapshots live only in
+/// its Zig-local `frames` list (already taken out of the park registry, not yet
+/// on `frame_chain`), so a collection during an inner frame's eval would sweep
+/// them. Each resume links a node here; the GC marks `frames.items[head..]`.
+/// Resumes nest (a resumed frame can suspend/resume again), so it is a chain.
+const ResumeFrames = struct {
+    prev: ?*ResumeFrames,
+    frames: *const std.ArrayList(FrameSnapshot),
+    head: *const usize,
+};
+threadlocal var resuming: ?*ResumeFrames = null;
+
+/// The per-thread root anchor: stable addresses of this thread's frame chain
+/// and in-flight-resume chain. `frame_troot.ctx` points at this.
+const FrameAnchor = struct {
+    chain: *const ?*Frame,
+    resuming: *const ?*ResumeFrames,
+};
+threadlocal var frame_anchor: FrameAnchor = undefined;
+/// This thread's GC root node. Its `ctx` is `&frame_anchor`, so the collector
+/// can mark this thread's frames from any thread while it is parked at a safe
+/// point. Registered lazily on first frame push; unlinked at the thread's exit
+/// seam (its threadlocal storage dies with it).
+threadlocal var frame_troot: runtime.gc.ThreadRoot = undefined;
+threadlocal var frame_troot_inited: bool = false;
 
 inline fn gcPushFrame(f: *Frame) void {
     if (!runtime.gc.gc_enabled) return;
@@ -213,22 +239,47 @@ inline fn gcPopFrame(f: *Frame) void {
     frame_chain = f.gc_link;
 }
 
-/// Root provider: mark every live Value reachable from this thread's active
-/// frame chain.
-fn gcMarkFrames(m: *runtime.gc.Marker) void {
-    var cur = frame_chain;
+/// Mark every live Value reachable from the `ctx` thread's frame chain and any
+/// in-flight resume. `ctx` is that thread's `&frame_anchor`.
+fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
+    const anchor: *const FrameAnchor = @ptrCast(@alignCast(ctx));
+    var cur = anchor.chain.*;
     while (cur) |f| : (cur = f.gc_link) {
         for (f.regs.items) |v| v.gcMark(m);
         for (f.params.items) |v| v.gcMark(m);
         for (f.captures.items) |v| v.gcMark(m);
         for (f.enclosing_this.items) |e| e.v.gcMark(m);
     }
+    // Not-yet-rebuilt snapshots of every in-flight resume on this thread.
+    var r = anchor.resuming.*;
+    while (r) |node| : (r = node.prev) {
+        const head = node.head.*;
+        const items = node.frames.items;
+        var i = head;
+        while (i < items.len) : (i += 1) {
+            const snap = items[i];
+            for (snap.regs) |v| v.gcMark(m);
+            for (snap.params) |v| v.gcMark(m);
+            for (snap.captures) |v| v.gcMark(m);
+            for (snap.enclosing_this) |e| e.v.gcMark(m);
+        }
+    }
 }
 
-/// Register the frame-chain root provider once (idempotent).
+/// Link this thread's frame-chain root node (idempotent per thread).
 pub fn gcInstallFrameRoot() void {
-    if (frame_root_registered.swap(true, .monotonic)) return;
-    runtime.gc.registerRoot(gcMarkFrames);
+    if (frame_troot_inited) return;
+    frame_troot_inited = true;
+    frame_anchor = .{ .chain = &frame_chain, .resuming = &resuming };
+    frame_troot = .{ .ctx = @ptrCast(&frame_anchor), .mark = gcMarkFramesCtx };
+    runtime.gc.registerThreadRoot(&frame_troot);
+}
+
+/// Unlink this thread's frame-chain root node at its exit seam.
+pub fn gcUninstallFrameRoot() void {
+    if (!frame_troot_inited) return;
+    runtime.gc.unregisterThreadRoot(&frame_troot);
+    frame_troot_inited = false;
 }
 
 /// Push `v` as an enclosing implicit receiver for the about-to-be-invoked
@@ -802,6 +853,17 @@ pub fn resumeContinuation(
     var frames = state.frames;
     defer frames.deinit(allocator);
     var head: usize = 0;
+    // Root the not-yet-rebuilt outer snapshots (`frames.items[head..]`) for the
+    // duration of the resume: they are out of the park registry and not yet on
+    // the frame chain, so an inner frame's collection would otherwise sweep them.
+    var resume_node = ResumeFrames{ .prev = resuming, .frames = &frames, .head = &head };
+    if (runtime.gc.gc_enabled) {
+        gcInstallFrameRoot();
+        resuming = &resume_node;
+    }
+    defer if (runtime.gc.gc_enabled) {
+        resuming = resume_node.prev;
+    };
     var first = true;
     var pending_throw_from_inner: ?Value = null;
     while (head < frames.items.len) {
