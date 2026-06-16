@@ -2201,6 +2201,15 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         .native_state = null,
     });
     const inst_value = Value{ .Instance = inst };
+    // The instance under construction is reachable only through this host local
+    // until it is returned and bound; its body-property/init-block initializers
+    // run user code (safe points), so pin it across construction or a collection
+    // there sweeps the half-built shell and frees its field list out from under
+    // us. (Object/companion singletons are additionally pinned via the in-flight
+    // object-state table, but regular instances have no such anchor.)
+    const ka_inst = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka_inst);
+    runtime.keepalivePush(inst_value);
 
     // Attach a stored default-outer.
     {

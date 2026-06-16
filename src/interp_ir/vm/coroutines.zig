@@ -1041,9 +1041,10 @@ pub fn gcUninstallCoroRoot() void {
 /// dispatcher thread): join the mutator set so a collection on any thread stops
 /// this one at its next safe point before reading the shared heap. The
 /// per-thread root nodes (frames, keepalive, interceptor stack) link lazily on
-/// first use. Worker threads stay in the permanent generation for now — their
-/// own cells are never swept — so only main-minted cells they reference (kept
-/// reachable through these roots) are reclaimed.
+/// first use. Worker threads stay in the permanent generation: a worker-minted
+/// cell can be referenced cross-thread through paths the collector does not yet
+/// fully root (queued tasks, the dispatched result handoff), so sweeping them
+/// would be unsound. Only main-minted cells they reference are reclaimed.
 pub fn gcThreadEnter() void {
     if (!runtime.gc.gc_enabled) return;
     runtime.gc.enterMutator();

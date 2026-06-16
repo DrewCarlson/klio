@@ -170,3 +170,31 @@ Remaining:
 - Closure side-table slot-map + free-list for bounded RSS (today the registry is
   strong-rooted and append-only, so per-request closures leak — correct but not
   yet flat-RSS).
+
+
+## Multi-thread + coroutine close-out
+
+The stop-the-world handshake (per-thread root records, parked-count rendezvous,
+blocking-safe brackets on timer sleeps / thread joins) brought real-threaded
+programs under the collector: 8-thread monitor counters, `Dispatchers.Default`
+parallelism, `withContext(IO)`, and cross-dispatcher channels all run
+byte-identically to the arena baseline under aggressive collection.
+
+The async-hammer fixture (`GlobalScope.async(Dispatchers.Default)` x1200 with
+`await`) surfaced the final correctness hole, caught as a DebugAllocator double
+free: `materializeInstance` builds an instance, then runs its body-property /
+init-block initializers (user code, hence safe points) while the half-built
+shell is reachable only through a host local. A collection there swept the
+instance and freed its field list, which construction then freed again. Object
+and companion singletons were anchored through the in-flight object-state table,
+but regular instances had no anchor — they are now pinned on the keepalive stack
+across construction. This was a latent single-thread bug the corpus rarely hit;
+aggressive multi-thread collection made it deterministic.
+
+Known residual (does not crash): host-scratch raw allocations (e.g. the
+`allocPrint` keys in the anon-method dispatch path) are freed only under
+`reclaimEnabled()`, which is off in GC mode, so they leak. They are not
+GC-managed cells, so sustained-load flat RSS needs those frees ungated for the
+GC path (or the scratch moved onto a per-call arena). The KLIO_GC_GUARD=dbg
+mode (route the GC's freeing backing through the checking allocator) is the
+tool that pinpoints both double-frees and these leaks.

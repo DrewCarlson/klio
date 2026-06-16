@@ -320,6 +320,7 @@ pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
     // tracked for sweep. Worker threads minting cells run program code only and
     // set their own threadlocal `alloc_perm = false` at thread entry.
     runtime.gc.alloc_perm = false;
+    runtime.gc.program_started = true;
     // The main run thread joins the mutator set so a collection started by any
     // spawned worker stops it at a safe point before touching the shared heap.
     vmhost.coroutines.gcThreadEnter();

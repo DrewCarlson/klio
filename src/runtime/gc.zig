@@ -110,6 +110,11 @@ pub fn setThresholdFloor(bytes: usize) void {
 /// `GcHeader` fields lie dormant — arena/smp behavior is unchanged.
 pub var gc_enabled: bool = false;
 
+/// Set true by `vmRun` once the program body begins (after the static image is
+/// built). Used only by the KLIO_GC_GUARD diagnostic to exempt the multi-MB
+/// startup reads (stdlib image) from its absurd-allocation tripwire.
+pub var program_started: bool = false;
+
 /// Stress mode (`KLIO_GC_STRESS=1`): force a collection at every safe point,
 /// regardless of the byte threshold. A correctness oracle — if any root or
 /// tracer is incomplete, collecting on every opcode boundary surfaces the UAF
