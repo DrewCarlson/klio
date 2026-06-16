@@ -108,6 +108,17 @@ Two distinct problems, both now largely solved:
    `cloneItemsList` (toList/toMutableList/asList/toTypedArray/toSet/iterators/
    sorted), and StringBuilder fluent returns (`okSb`).
 
+   **Also fixed since:** `MutableSet.add`/`addAll` stored borrows without
+   retaining and `MutableSet.clear` dropped elements without releasing
+   (the `MutableList` equivalents were already correct); data-class
+   `componentN()` returned the instance field borrowed (destructuring UAF);
+   `kotlinx_serialization.decodeObject` leaked the owned decoded ctor args the
+   constructor borrows. Each fix moves a ktor route further before the next
+   crash (e.g. `GET /users` now reaches the routing method-dispatch /
+   `delegateForward` before hitting the next freed-receiver UAF), so the tail is
+   **converging, not diverging** — it is the same store-without-retain class,
+   just spread across the StringValues / routing / pipeline / response builders.
+
    **Open tail (next):** the eager `engineReceiveChannel: ByteReadChannel =
    ByteReadChannel(bodyText.encodeToByteArray())` in `KlioApplicationRequest`
    builds a `prim=null` Value array that is freed at the property-init frame's
