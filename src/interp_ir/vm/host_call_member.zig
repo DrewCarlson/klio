@@ -3239,7 +3239,10 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
     if (is_enum and std.mem.eql(u8, name, "values") and args.len == 0) {
         const cg = cls.borrow();
         var items: std.ArrayList(Value) = .empty;
-        for (cg.get().enum_entries) |e| try items.append(allocator, e.value);
+        for (cg.get().enum_entries) |e| {
+            e.value.retain();
+            try items.append(allocator, e.value);
+        }
         const enum_name = try StringRef.init(allocator, cg.get().name);
         cg.deinit();
         return .{ .ok = .{ .List = .{
@@ -3257,6 +3260,8 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         for (cg.get().enum_entries) |e| {
             if (std.mem.eql(u8, e.name, want)) {
                 const v = e.value;
+                // host-returns-owned: the singleton is owned by the ClassDef.
+                v.retain();
                 sg.deinit();
                 cg.deinit();
                 return .{ .ok = v };
@@ -3329,7 +3334,11 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
             const first = args[0];
             const rest = args[1..];
             if (rest.len == 0 and memberIsProperty(self, &first, n)) {
-                return try getFieldRec(self, allocator, &first, n);
+                // getFieldRec returns the field borrowed; this escapes as a
+                // callMember return whose register takes ownership, so retain.
+                var r = try getFieldRec(self, allocator, &first, n);
+                if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+                return r;
             }
             return try callMemberRec(self, allocator, &first, n, rest);
         }
@@ -3338,7 +3347,9 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
     if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and
         args.len == 0 and memberIsProperty(self, &recv_capt, n))
     {
-        return try getFieldRec(self, allocator, &recv_capt, n);
+        var r = try getFieldRec(self, allocator, &recv_capt, n);
+        if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+        return r;
     }
     // Bound method reference: forward the call.
     const r = try callMemberRec(self, allocator, &recv_capt, n, args);
@@ -4427,7 +4438,11 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
         if (cg.get().is_enum) {
             if (g.get().get("name")) |nv| {
-                if (nv == .String) return .{ .ok = nv };
+                if (nv == .String) {
+                    // Borrowed instance field escaping through callMember.
+                    nv.retain();
+                    return .{ .ok = nv };
+                }
             }
         }
         if (cg.get().is_object) {

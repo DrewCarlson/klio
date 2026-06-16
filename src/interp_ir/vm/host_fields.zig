@@ -499,7 +499,10 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 const enum_name = blk: {
                     const g = receiver.Class.borrow();
                     defer g.deinit();
-                    for (g.get().enum_entries) |e| try items.append(allocator, e.value);
+                    for (g.get().enum_entries) |e| {
+                        e.value.retain();
+                        try items.append(allocator, e.value);
+                    }
                     break :blk g.get().name;
                 };
                 return ok(try frozenList(allocator, items, try StringRef.init(allocator, enum_name)));
@@ -1409,7 +1412,10 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (std.mem.eql(u8, name, "entries")) {
                 var items: std.ArrayList(Value) = .empty;
                 errdefer items.deinit(allocator);
-                for (cg.get().enum_entries) |e| try items.append(allocator, e.value);
+                for (cg.get().enum_entries) |e| {
+                    e.value.retain();
+                    try items.append(allocator, e.value);
+                }
                 const ename = cg.get().name;
                 const enum_class = try StringRef.init(allocator, ename);
                 cg.deinit();

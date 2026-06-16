@@ -122,6 +122,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         if (is_fun_interface and args.len == 1) {
             const identity = nextInstanceId(self);
             var fields: std.ArrayList(InstanceData.Field) = .empty;
+            // The SAM instance owns one ref to its target; `args[0]` is a borrow
+            // of the caller's register, so retain (instance teardown releases it).
+            if (runtime.reclaimEnabled()) args[0].retain();
             try fields.append(allocator, .{ .name = "__sam_target__", .value = args[0] });
             const inst = try ObjRef(InstanceData).init(allocator, .{
                 .class = cls.clone(),
@@ -170,6 +173,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             var i: usize = 0;
             while (i < cdef.primary_params.len and i < args.len) : (i += 1) {
                 if (cdef.primary_params[i].property != null) {
+                    // The instance owns one ref per primary-ctor field; `args[i]`
+                    // is a borrow of the caller's register, so retain.
+                    if (runtime.reclaimEnabled()) args[i].retain();
                     try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = args[i] });
                 }
             }

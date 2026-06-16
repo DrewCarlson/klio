@@ -1333,6 +1333,8 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
     if (classDefIsFunInterface(class_def) and args.len == 1) {
         const identity = nextInstanceId(self);
         var fields: std.ArrayList(InstanceData.Field) = .empty;
+        // The SAM instance owns one ref to its target; `args[0]` is a borrow.
+        if (runtime.reclaimEnabled()) args[0].retain();
         try fields.append(allocator, .{ .name = "__sam_target__", .value = args[0] });
         const inst = try ObjRef(InstanceData).init(allocator, .{
             .class = class_def.clone(),
