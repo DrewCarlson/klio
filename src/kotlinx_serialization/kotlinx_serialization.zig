@@ -77,8 +77,13 @@ fn jsonString(allocator: std.mem.Allocator, s: []const u8) Error!Json {
     return .{ .string = try allocator.dupe(u8, s) };
 }
 
-fn valueToJson(v: *const Value, ctx: *CallCtx) Error!JsonResult {
-    const a = ctx.allocator;
+/// Build a `std.json.Value` tree for `v`. Tree nodes (maps, arrays, duped
+/// strings) come from `tree` — a call-scoped arena the caller frees wholesale
+/// after stringifying — so the intermediate tree never leaks onto the collector's
+/// heap. Host re-entry (`readProp`) still runs on `ctx.allocator`, so any cells a
+/// property getter mints stay GC-managed.
+fn valueToJson(v: *const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!JsonResult {
+    const a = tree;
     switch (v.*) {
         .Null, .Unit => return .{ .ok = .null },
         .Bool => |b| return .{ .ok = .{ .bool = b } },
@@ -131,7 +136,7 @@ fn valueToJson(v: *const Value, ctx: *CallCtx) Error!JsonResult {
                     .ok => |val| val,
                     .err => |e| return .{ .err = e },
                 };
-                const jv_r = try valueToJson(&pv, ctx);
+                const jv_r = try valueToJson(&pv, ctx, tree);
                 const jv = switch (jv_r) {
                     .ok => |val| val,
                     .err => |e| return .{ .err = e },
@@ -140,9 +145,9 @@ fn valueToJson(v: *const Value, ctx: *CallCtx) Error!JsonResult {
             }
             return .{ .ok = .{ .object = map } };
         },
-        .List => |l| return listToJson(l.items, ctx),
-        .Array => |arr| return listToJson(arr.items, ctx),
-        .Set => |s| return listToJson(s.items, ctx),
+        .List => |l| return listToJson(l.items, ctx, tree),
+        .Array => |arr| return listToJson(arr.items, ctx, tree),
+        .Set => |s| return listToJson(s.items, ctx, tree),
         .Map => |m| {
             var map: JsonObjectMap = .empty;
             const g = m.entries.borrow();
@@ -150,7 +155,7 @@ fn valueToJson(v: *const Value, ctx: *CallCtx) Error!JsonResult {
             const pairs = try a.dupe(MapPair, g.get().items);
             g.deinit();
             for (pairs) |pair| {
-                const jv_r = try valueToJson(&pair.value, ctx);
+                const jv_r = try valueToJson(&pair.value, ctx, tree);
                 const jv = switch (jv_r) {
                     .ok => |val| val,
                     .err => |e| return .{ .err = e },
@@ -166,15 +171,15 @@ fn valueToJson(v: *const Value, ctx: *CallCtx) Error!JsonResult {
     }
 }
 
-fn listToJson(items: ValueList, ctx: *CallCtx) Error!JsonResult {
-    const a = ctx.allocator;
+fn listToJson(items: ValueList, ctx: *CallCtx, tree: std.mem.Allocator) Error!JsonResult {
+    const a = tree;
     const g = items.borrow();
     const elems = try a.dupe(Value, g.get().items);
     g.deinit();
     var arr = JsonArray.init(a);
     try arr.ensureTotalCapacity(elems.len);
     for (elems) |*e| {
-        const jv_r = try valueToJson(e, ctx);
+        const jv_r = try valueToJson(e, ctx, tree);
         switch (jv_r) {
             .ok => |val| arr.appendAssumeCapacity(val),
             .err => |er| return .{ .err = er },
@@ -221,7 +226,12 @@ fn jsonEncode(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return typeErr("__klsx_jsonEncode: missing value");
     const value = ctx.args[0];
     const pretty = ctx.args.len > 1 and ctx.args[1] == .Bool and ctx.args[1].Bool;
-    const jv_r = try valueToJson(&value, ctx);
+    // The intermediate json.Value tree is pure scratch — build it in a call-scoped
+    // arena so it is freed wholesale, instead of leaking every map/array/string
+    // node onto the collector's heap on each encode.
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const jv_r = try valueToJson(&value, ctx, arena.allocator());
     const jv = switch (jv_r) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
@@ -450,13 +460,21 @@ fn jsonDecode(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .String) {
         return typeErr("__klsx_jsonDecode: first arg must be a String");
     }
+    // `src` and the parsed tree are scratch consumed entirely within this call —
+    // the decoder copies every string it keeps into freshly-owned cells — so hold
+    // them in a call-scoped arena instead of leaking them (and every node the
+    // leaky parser allocates) onto the collector's heap on each decode.
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const pa = arena.allocator();
+
     const sg = ctx.args[0].String.borrow();
-    const src = try ctx.allocator.dupe(u8, sg.get().*);
+    const src = try pa.dupe(u8, sg.get().*);
     sg.deinit();
 
     const cls_val: Value = if (ctx.args.len > 1) ctx.args[1] else .Null;
 
-    const j = std.json.parseFromSliceLeaky(Json, ctx.allocator, src, .{}) catch |e| {
+    const j = std.json.parseFromSliceLeaky(Json, pa, src, .{}) catch |e| {
         const msg = try std.fmt.allocPrint(ctx.allocator, "json decode: {s}", .{@errorName(e)});
         return typeErr(msg);
     };
@@ -698,14 +716,14 @@ test "valueToJson encodes scalars and collections" {
     {
         var ctx = noopCtx(a, &.{}, cap.output(), noop.host());
         const v = Value{ .Int = 5 };
-        const r = try valueToJson(&v, &ctx);
+        const r = try valueToJson(&v, &ctx, a);
         try testing.expect(r == .ok);
         try testing.expectEqual(@as(i64, 5), r.ok.integer);
     }
     {
         var ctx = noopCtx(a, &.{}, cap.output(), noop.host());
         const v = Value{ .String = try StringRef.init(a, "hi") };
-        const r = try valueToJson(&v, &ctx);
+        const r = try valueToJson(&v, &ctx, a);
         try testing.expectEqualStrings("hi", r.ok.string);
     }
     {
@@ -719,7 +737,7 @@ test "valueToJson encodes scalars and collections" {
             .enum_class = null,
             .backing = null,
         } };
-        const r = try valueToJson(&v, &ctx);
+        const r = try valueToJson(&v, &ctx, a);
         try testing.expect(r.ok == .array);
         try testing.expectEqual(@as(usize, 2), r.ok.array.items.len);
     }
