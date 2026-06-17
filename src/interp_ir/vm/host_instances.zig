@@ -3137,10 +3137,15 @@ fn runAnonThunk(
     }
     // Pin the active globals scope across the body eval (see the same pattern in
     // host_call_member): a transient capture-layer env is reachable only through
-    // this stack-local field.
+    // this stack-local field. Also pin the thunk's sub-module: it is a transient
+    // cell held only by this stack-local `mref` (anon-object init/property/super
+    // thunks lower into fresh side modules), and the eval frame keeps it as a raw
+    // `*const Module` the collector cannot reach — so a collection during the
+    // body would sweep it and dangle `frame.module`.
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
     runtime.keepalivePushCell(&self.globals.cell.hdr);
+    runtime.keepalivePushCell(&mref.cell.hdr);
     var cap_vec: std.ArrayList(Value) = .empty;
     for (func.capture_order) |cn| {
         if (std.mem.eql(u8, cn, "this")) {

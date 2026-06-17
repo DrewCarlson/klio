@@ -2586,7 +2586,16 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
     switch (op) {
         .Map => |f| {
             var nx = try a.alloc(Value, items.len);
+            // Pin the source and the already-mapped prefix across the lambda
+            // calls (the GC cannot reach these host-locals); only `nx[0..i]` is
+            // initialized, so never pin the undefined tail.
+            const ka = runtime.keepaliveMark();
+            defer runtime.keepaliveRestore(ka);
+            runtime.keepalivePushSlice(items);
+            const ka2 = runtime.keepaliveMark();
             for (items, 0..) |v, i| {
+                runtime.keepaliveRestore(ka2);
+                runtime.keepalivePushSlice(nx[0..i]);
                 nx[i] = switch (try seqCall(host, &f, &.{v}, out)) {
                     .value => |x| x,
                     .err => |e| return .{ .err = e },
@@ -2605,7 +2614,13 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
         },
         .MapIndexed => |f| {
             var nx = try a.alloc(Value, items.len);
+            const ka = runtime.keepaliveMark();
+            defer runtime.keepaliveRestore(ka);
+            runtime.keepalivePushSlice(items);
+            const ka2 = runtime.keepaliveMark();
             for (items, 0..) |v, i| {
+                runtime.keepaliveRestore(ka2);
+                runtime.keepalivePushSlice(nx[0..i]);
                 nx[i] = switch (try seqCall(host, &f, &.{ Value.newInt(@intCast(i)), v }, out)) {
                     .value => |x| x,
                     .err => |e| return .{ .err = e },
