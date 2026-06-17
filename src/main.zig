@@ -134,6 +134,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             //   gpa              — page-returning general-purpose allocator (slow)
             //   calloc           — libc malloc + macOS pressure-relief trim
             const alloc_mode = runtime.getenvSlice("KLIO_GC_ALLOC") orelse "slab";
+            // The slab backend returns the pages of stably-sparse regions to the OS
+            // after each sweep; the non-slab backends below either override this or
+            // do not touch the slab (the hook then no-ops over empty class lists).
+            runtime.gc.release_to_os = runtime.slab.reclaimDormant;
             if (std.mem.eql(u8, alloc_mode, "smp")) {
                 return cli.run(std.heap.smp_allocator, init.args);
             }

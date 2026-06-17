@@ -53,12 +53,31 @@ const FreeCell = struct { next: ?*FreeCell };
 const SlabHeader = struct {
     class_idx: u32,
     total: u32, // cells in this slab
-    free_count: u32, // currently-free cells
+    free_count: u32, // free cells currently on `free_head` (excludes dormant)
     cell_size: u32,
     free_head: ?*FreeCell,
     next: ?*SlabHeader, // partial-list links (owned by the class lock)
     prev: ?*SlabHeader,
+    /// Pages `madvise`d/decommitted away (their cells pulled off the free list so
+    /// the discarded link storage is never read). Bit p = page p.
+    dormant_pages: u64,
+    /// Cells removed from the free list because they live in a dormant page. Not
+    /// re-handed-out until revived; counted toward the `live == 0` unmap test.
+    dormant_cells: u32,
+    /// Consecutive reclaim passes this slab has been mostly free. A few passes of
+    /// hysteresis keep transiently-empty slabs (between two allocations) out of
+    /// reclaim, so only stably-idle stragglers pay the decommit/revive churn.
+    idle_passes: u8,
 };
+
+/// Upper bounds for the per-slab reclaim scan, independent of the runtime page
+/// size: a slab holds at most `SLAB / CELL_ALIGN` cells and, at the smallest
+/// conceivable page, `SLAB / 4096` pages.
+const MAX_PAGES = SLAB / 4096;
+const MAX_CELL_WORDS = (SLAB / CELL_ALIGN + 63) / 64;
+/// Reclaim a slab only after it has been mostly free this many consecutive
+/// passes (hysteresis against decommit/revive thrash on actively-cycled slabs).
+const RECLAIM_IDLE_PASSES = 2;
 
 const ClassState = struct {
     lock: SpinLock = .{},
@@ -311,6 +330,9 @@ fn newSlab(class_idx: usize) ?*SlabHeader {
         .free_head = null,
         .next = null,
         .prev = null,
+        .dormant_pages = 0,
+        .dormant_cells = 0,
+        .idle_passes = 0,
     };
     // Thread cells onto the free list (descending so the head is cell 0).
     var i: usize = total;
@@ -337,11 +359,31 @@ fn allocSmall(len: usize) ?[*]u8 {
         cs.partial = s;
         break :blk s;
     };
+    // The head may have had its free cells decommitted into dormant pages by a
+    // reclaim pass. Re-commit one (reusing that slab) before mapping fresh memory
+    // — this is what keeps the reclaim from growing the address space unboundedly.
+    while (slab.free_head == null) {
+        if (slab.dormant_pages != 0) {
+            _ = reviveOnePage(slab, class_sizes[ci], std.heap.pageSize());
+            continue;
+        }
+        // Truly exhausted (no free cells, nothing dormant): drop and take the next
+        // partial slab, mapping a fresh one only when none remain.
+        cs.partial = slab.next;
+        if (slab.next) |n| n.prev = null;
+        slab.next = null;
+        slab = cs.partial orelse blk: {
+            const s = newSlab(ci) orelse return null;
+            cs.partial = s;
+            break :blk s;
+        };
+    }
     const cell = slab.free_head.?;
     slab.free_head = cell.next;
     slab.free_count -= 1;
-    if (slab.free_count == 0) {
-        // Full: drop from the partial list (re-linked on the next free).
+    if (slab.free_count == 0 and slab.dormant_pages == 0) {
+        // No free cells and nothing dormant to revive: drop from the partial list
+        // (re-linked on the next free of one of its live cells).
         cs.partial = slab.next;
         if (slab.next) |n| n.prev = null;
         slab.next = null;
@@ -359,7 +401,11 @@ fn freeSmall(ptr: [*]u8) void {
     cs.lock.lock();
     defer cs.lock.unlock();
     if (cell_trace_enabled and (@intFromPtr(ptr) & 0xff) == 0) _ = class_trace[slab.class_idx].map.remove(@intFromPtr(ptr));
-    const was_full = slab.free_count == 0;
+    // Off the partial list only when *truly* full — no free cell and no dormant
+    // page. A reclaim pass can leave `free_count == 0` while the slab stays linked
+    // (its capacity dormant, revived on demand); re-linking on `free_count` alone
+    // would re-insert an already-linked slab and cycle the list.
+    const was_full = slab.free_count == 0 and slab.dormant_pages == 0;
     const cell: *FreeCell = @ptrCast(@alignCast(ptr));
     cell.next = slab.free_head;
     slab.free_head = cell;
@@ -371,11 +417,188 @@ fn freeSmall(ptr: [*]u8) void {
         if (cs.partial) |p| p.prev = slab;
         cs.partial = slab;
     }
-    if (slab.free_count == slab.total) {
-        // Fully free: unlink and return the whole slab to the OS.
+    if (slab.free_count + slab.dormant_cells == slab.total) {
+        // No live cells remain (the rest are free or dormant): unlink and return
+        // the whole slab — `munmap` reclaims the dormant pages too.
         if (slab.prev) |p| p.next = slab.next else cs.partial = slab.next;
         if (slab.next) |n| n.prev = slab.prev;
         unmapRaw(@ptrCast(slab), SLAB);
+    }
+}
+
+// --- page reclamation --------------------------------------------------------
+// A slab is `munmap`ped only when its last live cell frees, so a region holding
+// even one long-lived straggler keeps its whole span resident even after the rest
+// churns free. This pass — run during the stop-the-world GC — hands the physical
+// pages of such stably-sparse regions back to the OS: a page no live cell overlaps
+// is decommitted, and the free cells whose intrusive link storage lived in it are
+// pulled off the free list so the discarded links are never read. Those cells go
+// "dormant" — re-committed and re-threaded on demand by `allocSmall` rather than
+// mapping a fresh slab, so the address space stays bounded.
+
+/// Return the resident pages of `[addr, addr+len)` to the OS while keeping the
+/// range mapped (zero-fill on the next touch). Overlaying a fresh anonymous
+/// `MAP_FIXED` mapping is the portable way to actually drop RSS — on macOS
+/// `madvise(MADV_FREE*/DONTNEED)` leaves the pages counted resident until
+/// reclaimed under pressure, so it does not move RSS at all.
+inline fn decommit(addr: usize, len: usize) void {
+    const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(addr);
+    _ = std.posix.mmap(
+        p,
+        len,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true },
+        -1,
+        0,
+    ) catch {};
+}
+
+/// Re-commit one dormant page's cells onto the free list. The decommitted page
+/// stayed mapped (zero-filled), so re-threading its cells — which faults the page
+/// back in as it is touched — makes them allocatable again. Reusing dormant
+/// capacity rather than mapping a fresh slab is what bounds the address space.
+fn reviveOnePage(s: *SlabHeader, cell_size: usize, pg: usize) u32 {
+    if (s.dormant_pages == 0) return 0;
+    const p: usize = @ctz(s.dormant_pages);
+    s.dormant_pages &= ~(@as(u64, 1) << @intCast(p));
+    const slab_base = @intFromPtr(s);
+    const data_start = std.mem.alignForward(usize, slab_base + @sizeOf(SlabHeader), CELL_ALIGN);
+    var revived: u32 = 0;
+    var i: usize = 0;
+    while (i < s.total) : (i += 1) {
+        const cell_off = data_start + i * cell_size;
+        if ((cell_off - slab_base) / pg != p) continue;
+        const cell: *FreeCell = @ptrFromInt(cell_off);
+        cell.next = s.free_head;
+        s.free_head = cell;
+        revived += 1;
+    }
+    s.free_count += revived;
+    s.dormant_cells -= revived;
+    return revived;
+}
+
+/// Decommit the all-free pages of one stably-sparse slab. STW-only: the class
+/// lock is held and no other thread mutates the slab.
+fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
+    // Hysteresis: only act on slabs that have been mostly free for several
+    // consecutive passes, so a slab that is merely between two allocations is not
+    // churned into dormant pages and immediately revived.
+    const live = s.total - s.free_count - s.dormant_cells;
+    if (live * 2 > s.total) {
+        s.idle_passes = 0;
+        return;
+    }
+    if (s.idle_passes < RECLAIM_IDLE_PASSES) {
+        s.idle_passes += 1;
+        return;
+    }
+    const slab_base = @intFromPtr(s);
+    const data_start = std.mem.alignForward(usize, slab_base + @sizeOf(SlabHeader), CELL_ALIGN);
+    const n_pages = SLAB / pg;
+
+    // Bitset of cells currently on the free list.
+    var free_bits = [_]u64{0} ** MAX_CELL_WORDS;
+    {
+        var fc = s.free_head;
+        while (fc) |cell| {
+            const idx = (@intFromPtr(cell) - data_start) / cell_size;
+            free_bits[idx >> 6] |= @as(u64, 1) << @intCast(idx & 63);
+            fc = cell.next;
+        }
+    }
+
+    // A page is reclaimable iff no *live* cell overlaps it. Page 0 holds the
+    // header; already-dormant pages are left as they are.
+    var reclaimable = [_]bool{false} ** MAX_PAGES;
+    {
+        var p: usize = 1;
+        while (p < n_pages) : (p += 1) {
+            reclaimable[p] = (s.dormant_pages & (@as(u64, 1) << @intCast(p))) == 0;
+        }
+    }
+    {
+        var i: usize = 0;
+        while (i < s.total) : (i += 1) {
+            const is_free = (free_bits[i >> 6] & (@as(u64, 1) << @intCast(i & 63))) != 0;
+            const cell_off = data_start + i * cell_size;
+            const start_pg = (cell_off - slab_base) / pg;
+            const is_dormant = (s.dormant_pages & (@as(u64, 1) << @intCast(start_pg))) != 0;
+            if (is_free or is_dormant) continue; // not a live cell
+            const end_pg = (cell_off + cell_size - 1 - slab_base) / pg;
+            var p = start_pg;
+            while (p <= end_pg) : (p += 1) reclaimable[p] = false;
+        }
+    }
+
+    var any = false;
+    for (reclaimable[0..n_pages]) |r| {
+        if (r) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return;
+
+    // Rebuild the free list, dropping every cell whose link storage (its start)
+    // sits in a page about to be discarded — reading its `next` afterward would
+    // fault in a zeroed page and corrupt the chain.
+    var new_head: ?*FreeCell = null;
+    var kept: u32 = 0;
+    var dropped: u32 = 0;
+    {
+        var fc = s.free_head;
+        while (fc) |cell| {
+            const nxt = cell.next;
+            const start_pg = (@intFromPtr(cell) - slab_base) / pg;
+            if (reclaimable[start_pg]) {
+                dropped += 1;
+            } else {
+                cell.next = new_head;
+                new_head = cell;
+                kept += 1;
+            }
+            fc = nxt;
+        }
+    }
+    s.free_head = new_head;
+    s.free_count = kept;
+    s.dormant_cells += dropped;
+
+    // Decommit the reclaimable pages in contiguous runs (one mapping op per run).
+    var p: usize = 1;
+    while (p < n_pages) {
+        if (!reclaimable[p]) {
+            p += 1;
+            continue;
+        }
+        const run_start = p;
+        while (p < n_pages and reclaimable[p]) : (p += 1) {
+            s.dormant_pages |= @as(u64, 1) << @intCast(p);
+        }
+        decommit(slab_base + run_start * pg, (p - run_start) * pg);
+    }
+}
+
+/// Return the resident pages of sparsely-populated slabs to the OS. Wired as the
+/// GC's `release_to_os` hook for the slab backend; runs stop-the-world after a
+/// sweep, so the partial lists are stable and no cell is concurrently touched.
+pub fn reclaimDormant() void {
+    const pg = std.heap.pageSize();
+    if (SLAB / pg > MAX_PAGES) return; // defensive: oversized runtime page
+    for (&class_states, 0..) |*cs, ci| {
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        // Skip the partial head: it is the active allocation frontier, so
+        // decommitting it would just be undone by the next allocation. Reclaimed
+        // slabs stay linked — their dormant capacity is revived on demand by
+        // `allocSmall` — so the partial list stays a stable spine across passes.
+        const head = cs.partial orelse continue;
+        var slab = head.next;
+        while (slab) |s| {
+            reclaimSlab(s, class_sizes[ci], pg);
+            slab = s.next;
+        }
     }
 }
 
@@ -455,4 +678,39 @@ test "slab reuses a freed cell (same address) within a class" {
     defer a.free(p2);
     // Same class, freed then re-allocated: the slab's free list returns it.
     try std.testing.expectEqual(addr1, @intFromPtr(p2.ptr));
+}
+
+test "slab reclaim decommits sparse slabs, preserves stragglers, revives dormant" {
+    const a = allocator;
+    const T = std.testing;
+    const N = 300; // 2 KiB cells (~128/slab) → spans several slabs
+    var bufs: [N][]u8 = undefined;
+    for (&bufs, 0..) |*b, i| {
+        b.* = try a.alloc(u8, 2048);
+        @memset(b.*, @intCast(i & 0xff));
+    }
+    // Free everything except a few scattered stragglers, so the slabs they do not
+    // pin go mostly free and become reclaim candidates.
+    const kept = [_]usize{ 7, 140, 293 };
+    for (bufs, 0..) |b, i| {
+        const keep = i == kept[0] or i == kept[1] or i == kept[2];
+        if (!keep) a.free(b);
+    }
+    // Clear the idle-pass hysteresis so the sparse non-head slabs decommit.
+    var pass: usize = 0;
+    while (pass < RECLAIM_IDLE_PASSES + 2) : (pass += 1) reclaimDormant();
+    // A straggler shares its slab with decommitted pages, but its own page is
+    // never discarded — its bytes must be intact.
+    for (kept) |k| for (bufs[k]) |byte| try T.expectEqual(@as(u8, @intCast(k & 0xff)), byte);
+    // Allocating again must revive dormant capacity (or map fresh) and hand back
+    // sound, writable cells.
+    var more: [N][]u8 = undefined;
+    for (&more, 0..) |*b, i| {
+        b.* = try a.alloc(u8, 2048);
+        @memset(b.*, @intCast((i ^ 0x5a) & 0xff));
+    }
+    for (more, 0..) |b, i| for (b) |byte| try T.expectEqual(@as(u8, @intCast((i ^ 0x5a) & 0xff)), byte);
+    for (kept) |k| for (bufs[k]) |byte| try T.expectEqual(@as(u8, @intCast(k & 0xff)), byte);
+    for (more) |b| a.free(b);
+    for (kept) |k| a.free(bufs[k]);
 }
