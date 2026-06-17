@@ -2749,7 +2749,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 /// prefix). Safe to call at any discard site: a static `.Unimplemented`
 /// literal does not match, so it is never freed. No-op under the arena.
 fn freeDispatchMiss(allocator: Allocator, r: EvalResult) void {
-    if (!runtime.reclaimEnabled()) return;
+    if (!runtime.freeScratch()) return;
     if (r == .err and r.err == .Unimplemented) {
         const m = r.err.Unimplemented;
         if (std.mem.indexOf(u8, m, "Vm::call_member") != null) allocator.free(m);
@@ -4189,6 +4189,8 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
         g.deinit();
     }
     const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ name, args.len });
+    // Scratch lookup key (lookupAnonMethod dupes what it stores); free it.
+    defer if (runtime.freeScratch()) allocator.free(arity_name);
 
     // Enum-entry override class first.
     if (entry_tag) |tag| {

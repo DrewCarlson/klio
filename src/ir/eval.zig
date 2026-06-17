@@ -1499,7 +1499,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     return ok(.Unit);
                 },
                 .err => |e| switch (e) {
-                    .Unimplemented => {},
+                    .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
                     else => return errResult(e),
                 },
             }
@@ -2347,6 +2347,16 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
 /// `inner_ext_over_outer_member` kotlinc parity fixture), then the
 /// top-level tiers — runtime overload selection, the lowering-resolved
 /// constructor class, the global by name — and only then an error.
+/// Free a discarded member-dispatch-miss message (the host allocates a
+/// `Vm::call_member …` string on a total miss; the resolver discards it while
+/// walking to the next candidate / a global). Recognizable by its prefix, so a
+/// static `.Unimplemented` literal is never freed. No-op unless a freeing
+/// backend is active.
+fn freeDispatchMissMsg(allocator: Allocator, msg: []const u8) void {
+    if (!runtime.freeScratch()) return;
+    if (std.mem.indexOf(u8, msg, "Vm::call_member") != null) allocator.free(msg);
+}
+
 fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!EvalResult {
     const name_str = constStr(frame.module, cmg.name) orelse
         return errResult(.{ .Type = "CallMemberOrGlobal: name not a string const" });
@@ -2407,7 +2417,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     // would re-execute its side effects on an outer
                     // receiver — same doctrine as `CalleeFailed`.
                     .Throw, .NonLocalReturn, .LabeledReturn => return errResult(e),
-                    .Unimplemented => {},
+                    .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
                     else => if (first_real_err == null) {
                         first_real_err = e;
                     },
@@ -2430,7 +2440,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                         // Same as the strict pass: a body that ran owns
                         // its control flow; never re-probe.
                         .Throw, .NonLocalReturn, .LabeledReturn => return errResult(e),
-                        .Unimplemented => {},
+                        .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
                         else => if (first_real_err == null) {
                             first_real_err = e;
                         },
