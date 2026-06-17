@@ -2553,6 +2553,28 @@ fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef
     };
 }
 
+/// Stable synthetic class name for an anonymous-object expression, keyed by the
+/// AST node address (the program is immutable, so the address is a stable site
+/// id). The first instantiation of a site mints `$anon$<n>` and registers the
+/// site's class + methods under it; later instantiations of the same site reuse
+/// that name, so the `classes`/`anon_methods` registries stay bounded by the
+/// number of `object` expressions in the program instead of growing per instance
+/// (a per-request leak for a server). Names are permanent (page-allocator) since
+/// they are used as long-lived map keys.
+var anon_site_names: std.AutoHashMapUnmanaged(usize, []const u8) = .empty;
+var anon_site_lock: runtime.SpinMutex = .{};
+
+fn anonSiteName(expr: *const ast.Expr) []const u8 {
+    const key = @intFromPtr(expr);
+    anon_site_lock.lock();
+    defer anon_site_lock.unlock();
+    if (anon_site_names.get(key)) |n| return n;
+    const n = anon_site_names.count();
+    const name = std.fmt.allocPrint(std.heap.page_allocator, "$anon${d}", .{n}) catch return "$anon$x";
+    anon_site_names.put(std.heap.page_allocator, key, name) catch {};
+    return name;
+}
+
 pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, captured_names: []const []const u8, captures: []const Value, scope_renames: []const ir.ScopeRename) Allocator.Error!EvalResult {
     if (expr.* != .ObjectExpr) {
         return .{ .err = try typeErr(allocator, "Vm::build_object: not an ObjectExpr AST node", .{}) };
@@ -2574,7 +2596,18 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     // NOT freed here — the instance owns them now.
     defer if (runtime.freeScratch()) allocator.free(capture_pairs);
     const identity = nextInstanceId(self);
-    const synth_class_name = try std.fmt.allocPrint(allocator, "$anon${d}", .{identity});
+    // Site-stable class name: shared by every instantiation of this `object`
+    // expression so the class/method registries don't grow per instance.
+    const synth_class_name = anonSiteName(expr);
+    // Whether this site's class + methods are already registered (a prior
+    // instantiation built them). On a hit the per-method lowering and the
+    // class-def construction are skipped — only the per-instance captures,
+    // field/super-arg initializers, and instance allocation run.
+    const site_built = blk: {
+        const g = self.classes.borrow();
+        defer g.deinit();
+        break :blk g.get().contains(synth_class_name);
+    };
 
     // Collect the anon object's own + inherited + enclosing member names so
     // bare identifiers inside method bodies resolve through `this`.
@@ -2640,6 +2673,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         switch (m.*) {
             .Function => |*f| {
                 if (f.body == null) continue;
+                if (site_built) continue; // methods already registered for this site
                 const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
                 const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, synth_class_name, &own_members);
                 const fid = func.id;
@@ -2654,7 +2688,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 tbl.deinit();
             },
             .Property => |*p| {
-                if (p.getter) |*getter| {
+                if (p.getter) |*getter| if (!site_built) {
                     const thunk = synthThunk(p.name, getter.body, getter.return_type, p.is_override);
                     const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
@@ -2663,7 +2697,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                     const tbl = self.anon_methods.borrowMut();
                     tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = fid, .captures = &.{} }) catch {};
                     tbl.deinit();
-                }
+                };
                 const init_expr = if (p.init) |*e| e else continue;
                 const is_lit = (try simpleLiteral(allocator, init_expr)) != null;
                 if (is_lit) continue;
@@ -2745,79 +2779,95 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     }
     ir.lower.setLowerAnonCaptures(null);
 
-    // Body-property defs from the object's own properties.
-    var body_props: std.ArrayList(PropertyDef) = .empty;
-    for (members) |*m| {
-        if (m.* != .Property) continue;
-        const p = &m.Property;
-        try body_props.append(allocator, .{
-            .name = p.name.name,
-            .mutable = p.mutable,
-            .init = if (p.init) |*e| e else null,
-            .getter = if (p.getter) |*g| g else null,
-            .setter = if (p.setter) |*s| s else null,
-            .delegate = if (p.delegate) |*e| e else null,
-            .is_abstract = p.is_abstract,
-            .is_lateinit = p.is_lateinit,
-            .primitive_zero = build.primitiveZeroFor(p),
-        });
-    }
-    var supertype_names = try allocator.alloc([]const u8, supertypes.len);
-    for (supertypes, 0..) |*t, i| {
-        supertype_names[i] = ir.build.anonScopeRename(t.name.name) orelse t.name.name;
-    }
-
-    // First non-interface supertype as resolved parent class.
-    var anon_parent: ?ObjRef(ClassDef) = null;
-    for (supertype_names) |sn| {
-        const def = classDefByName(self, sn) orelse continue;
-        const is_iface = blk: {
-            const dg = def.borrow();
-            defer dg.deinit();
-            break :blk dg.get().is_interface;
-        };
-        if (!is_iface) {
-            anon_parent = def;
-            break;
+    // The anon ClassDef is site-stable: on a hit, reuse the one a prior
+    // instantiation registered; on a miss, build it and register it under the
+    // site name (the per-instance captures and field values are applied below,
+    // not stored in the class).
+    const class_def = if (site_built) blk: {
+        const g = self.classes.borrow();
+        defer g.deinit();
+        break :blk g.get().get(synth_class_name).?.clone();
+    } else blk: {
+        // Body-property defs from the object's own properties.
+        var body_props: std.ArrayList(PropertyDef) = .empty;
+        for (members) |*m| {
+            if (m.* != .Property) continue;
+            const p = &m.Property;
+            try body_props.append(allocator, .{
+                .name = p.name.name,
+                .mutable = p.mutable,
+                .init = if (p.init) |*e| e else null,
+                .getter = if (p.getter) |*g| g else null,
+                .setter = if (p.setter) |*s| s else null,
+                .delegate = if (p.delegate) |*e| e else null,
+                .is_abstract = p.is_abstract,
+                .is_lateinit = p.is_lateinit,
+                .primitive_zero = build.primitiveZeroFor(p),
+            });
         }
-        def.deinit();
-    }
+        var supertype_names = try allocator.alloc([]const u8, supertypes.len);
+        for (supertypes, 0..) |*t, i| {
+            supertype_names[i] = ir.build.anonScopeRename(t.name.name) orelse t.name.name;
+        }
 
-    const env = try ObjRef(Env).init(allocator, Env.init(allocator));
-    const class_def = try ObjRef(ClassDef).init(allocator, .{
-        .name = synth_class_name,
-        .fqn = synth_class_name,
-        .annotation_names = &.{},
-        .primary_params = &.{},
-        .methods = &.{},
-        .body_properties = try body_props.toOwnedSlice(allocator),
-        .init_blocks = &.{},
-        .init_block_property_positions = &.{},
-        .is_data = false,
-        .is_value = false,
-        .is_object = false,
-        .is_enum = false,
-        .is_sealed = false,
-        .supertype_names = supertype_names,
-        .parent = anon_parent,
-        .interfaces = &.{},
-        .is_interface = false,
-        .is_fun_interface = false,
-        .parent_ctor_args = &.{},
-        .is_open = false,
-        .is_abstract = false,
-        .is_inner = false,
-        .is_anonymous = true,
-        .secondary_ctors = &.{},
-        .enum_entries = &.{},
-        .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
-        .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-        .nested_classes = &.{},
-        .captured_env = env,
-        .supertype_delegates = &.{},
-        .delegate_forwarders = &.{},
-        .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
-    });
+        // First non-interface supertype as resolved parent class.
+        var anon_parent: ?ObjRef(ClassDef) = null;
+        for (supertype_names) |sn| {
+            const def = classDefByName(self, sn) orelse continue;
+            const is_iface = b2: {
+                const dg = def.borrow();
+                defer dg.deinit();
+                break :b2 dg.get().is_interface;
+            };
+            if (!is_iface) {
+                anon_parent = def;
+                break;
+            }
+            def.deinit();
+        }
+
+        const env = try ObjRef(Env).init(allocator, Env.init(allocator));
+        const cd = try ObjRef(ClassDef).init(allocator, .{
+            .name = synth_class_name,
+            .fqn = synth_class_name,
+            .annotation_names = &.{},
+            .primary_params = &.{},
+            .methods = &.{},
+            .body_properties = try body_props.toOwnedSlice(allocator),
+            .init_blocks = &.{},
+            .init_block_property_positions = &.{},
+            .is_data = false,
+            .is_value = false,
+            .is_object = false,
+            .is_enum = false,
+            .is_sealed = false,
+            .supertype_names = supertype_names,
+            .parent = anon_parent,
+            .interfaces = &.{},
+            .is_interface = false,
+            .is_fun_interface = false,
+            .parent_ctor_args = &.{},
+            .is_open = false,
+            .is_abstract = false,
+            .is_inner = false,
+            .is_anonymous = true,
+            .secondary_ctors = &.{},
+            .enum_entries = &.{},
+            .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+            .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+            .nested_classes = &.{},
+            .captured_env = env,
+            .supertype_delegates = &.{},
+            .delegate_forwarders = &.{},
+            .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        });
+        {
+            const g = self.classes.borrowMut();
+            defer g.deinit();
+            try g.get().put(synth_class_name, cd.clone());
+        }
+        break :blk cd;
+    };
     // The synthesized anon class lives only in this stack local until it is
     // registered into `classes` (below) and adopted by the instance; pin it
     // across the body-property / super-arg initializer evals so a collection
@@ -2887,13 +2937,6 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             }
         }
         try super_args_by_class.put(sup.name.name, vals);
-    }
-
-    // Register the anon ClassDef.
-    {
-        const g = self.classes.borrowMut();
-        defer g.deinit();
-        try g.get().put(synth_class_name, class_def.clone());
     }
 
     const outer: ?Value = findCapture(capture_pairs, "this");
