@@ -2358,7 +2358,19 @@ fn pumpItem(
     output: *std.ArrayList(Value),
 ) Error!union(enum) { cont: bool, err: RuntimeError } {
     var current = start_value;
+    // Pin the values the GC cannot otherwise reach across the re-entrant lambda
+    // invocations below: the accumulated results so far (`output`, stable for
+    // this pump — it is only appended to at the end) and the in-flight `current`
+    // value threading through the ops. Without this, a collection during a later
+    // element's `map`/`filter` lambda sweeps the earlier elements (e.g. the
+    // `RoutingPathSegment`s a `splitToSequence().map{}.toList()` accumulates).
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(output.items);
+    const ka_cur = runtime.keepaliveMark();
     for (ops, 0..) |op, idx| {
+        runtime.keepaliveRestore(ka_cur);
+        runtime.keepalivePush(current);
         switch (op) {
             .Map => |f| {
                 current = switch (try seqCall(host, &f, &.{current}, out)) {
@@ -2464,10 +2476,14 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
     @memset(st.indices, 0);
     var output: std.ArrayList(Value) = .empty;
 
+    const ka_src = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka_src);
     switch (seq.source) {
         .Items => |v| {
             const g = v.borrow();
             defer g.deinit();
+            // Pin the not-yet-processed source items across the per-item pumps.
+            runtime.keepalivePushSlice(g.get().*);
             for (g.get().*) |item| {
                 if (takeCapReached(seq.ops, st.taken)) break;
                 const res = try pumpItem(a, host, out, item, seq.ops, &st, &output);
