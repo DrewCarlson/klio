@@ -4336,6 +4336,9 @@ fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Value,
         }
     }
     var packed_list = try argsListFromSlice(allocator, packed_args);
+    // `argsListFromSlice` copied the args into the frame-owned list; the
+    // `packed_args` buffer (a full allocation from `packVarargArgs`) is dead.
+    if (runtime.freeScratch()) allocator.free(packed_args);
     _ = &packed_list;
     vmhost.emitPath(allocator, "member_anon", f.fqn, f.id, receiver, args);
     return ir.eval.evalWithCapturesIn(VmHost, allocator, module_rc, module_rc, &f, packed_list, cap_vec, self);
