@@ -542,20 +542,32 @@ pub fn gcInstallClosureHook(closures: SharedClosures) void {
 /// closure creation sound while every existing id stays valid.
 pub const SharedClosures = struct {
     obj: ObjRef(std.ArrayList(ClosureInfo)),
+    /// Free list of slot ids reclaimed by `reclaimDead` (no live value
+    /// referenced them in the last collection). `push` reuses one before
+    /// extending the spine, so the table stays bounded by the live closure set
+    /// rather than growing per closure-creation event (an unbounded per-request
+    /// leak for a server). Reuse is sound: a slot is freed only after a full
+    /// mark proved no live value references its id, and a marked closure value
+    /// always marks its slot (`markClosureThunk`), so a reused id can never
+    /// alias a still-live value. Shared by handle; touched only under the spine
+    /// cell's writer lock or inside the stop-the-world pause.
+    free_ids: ObjRef(std.ArrayList(u64)),
 
     pub fn new(allocator: Allocator) Allocator.Error!SharedClosures {
         const obj = try ObjRef(std.ArrayList(ClosureInfo)).init(allocator, .empty);
         // The side-table is shared across every thread from creation, so
         // `get`/`push` go through the cell's reader/writer lock.
-        return .{ .obj = obj };
+        const free_ids = try ObjRef(std.ArrayList(u64)).init(allocator, .empty);
+        return .{ .obj = obj, .free_ids = free_ids };
     }
 
     pub fn clone(self: SharedClosures) SharedClosures {
-        return .{ .obj = self.obj.clone() };
+        return .{ .obj = self.obj.clone(), .free_ids = self.free_ids.clone() };
     }
 
     pub fn deinit(self: SharedClosures) void {
         self.obj.deinit();
+        self.free_ids.deinit();
     }
 
     pub fn get(self: SharedClosures, id: usize) ?ClosureInfo {
@@ -583,22 +595,35 @@ pub const SharedClosures = struct {
     pub fn reclaimDead(self: SharedClosures, epoch: usize) void {
         const g = self.obj.borrowMut();
         defer g.deinit();
+        const fg = self.free_ids.borrowMut();
+        defer fg.deinit();
         const a = self.obj.cell.allocator;
-        for (g.get().items) |*info| {
+        for (g.get().items, 0..) |*info, idx| {
             if (info.reclaimed or info.mark_epoch == epoch) continue;
             if (info.capture_names.len != 0) a.free(info.capture_names);
             if (info.chain.len != 0) a.free(info.chain);
             info.capture_names = &.{};
             info.chain = &.{};
             info.reclaimed = true;
+            fg.get().append(a, @intCast(idx)) catch {};
         }
     }
 
-    /// Append `info`, returning its stable id.
+    /// Bind `info` to a slot, returning its id. Reuses a reclaimed slot (its old
+    /// capture-store cell was already swept by reachability, and its fields are
+    /// overwritten here before any read) before extending the spine.
     pub fn push(self: SharedClosures, info: ClosureInfo) Allocator.Error!u64 {
         const g = self.obj.borrowMut();
         defer g.deinit();
         const list = g.get();
+        {
+            const fg = self.free_ids.borrowMut();
+            defer fg.deinit();
+            if (fg.get().pop()) |id| {
+                list.items[@intCast(id)] = info;
+                return id;
+            }
+        }
         const id: u64 = list.items.len;
         try list.append(self.obj.cell.allocator, info);
         return id;

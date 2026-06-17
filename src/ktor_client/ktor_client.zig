@@ -137,11 +137,12 @@ fn make_string_array(allocator: Allocator, values: [][]const u8) Allocator.Error
 }
 
 /// Free an owned slice of owned strings produced by `perform`. The strings
-/// are copied into fresh `StringRef` cells by `make_string_array` (which
-/// `.init`-dupes under reclaim), so the originals must be released. Gated on
-/// reclaim: under the arena fast path the arena reclaims them wholesale.
+/// are copied into fresh `StringRef` cells by `make_string_array`, which dupes
+/// the bytes whenever a freeing allocator is active (reclaim or GC), so the
+/// originals are independent and must be released. Gated on `freeScratch`; only
+/// the legacy arena fast path reclaims them wholesale.
 fn freeOwnedStrings(allocator: Allocator, values: [][]const u8) void {
-    if (!runtime.reclaimEnabled()) return;
+    if (!runtime.freeScratch()) return;
     for (values) |s| allocator.free(s);
     allocator.free(values);
 }

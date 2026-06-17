@@ -521,11 +521,13 @@ fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
     for (snap.captures) |v| v.release(allocator);
 }
 
-/// Free the dupe'd slice buffers a snapshot owns. Gated on reclaim: under
-/// the arena, `free` can rewind the last bump allocation, so production
-/// leaves the buffers for wholesale reclaim (byte-identical to before).
+/// Free the dupe'd slice buffers a snapshot owns. These are raw host arrays
+/// (not GC cells), so the tracing collector never reclaims them — they must be
+/// freed explicitly whenever a real freeing allocator is active. Gated on
+/// `freeScratch` (reclaim mode or GC on); only the legacy arena fast path,
+/// where `free` would rewind a bump pointer, leaves them.
 fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
-    if (!runtime.reclaimEnabled()) return;
+    if (!runtime.freeScratch()) return;
     allocator.free(snap.regs);
     allocator.free(snap.params);
     allocator.free(snap.captures);

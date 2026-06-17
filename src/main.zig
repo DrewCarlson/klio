@@ -157,6 +157,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 runtime.leaktrack.report();
                 return rc;
             }
+            if (runtime.getenvSlice("KLIO_SLAB_TRACE")) |_| {
+                runtime.slab.trace_enabled = true;
+                runtime.slab.installTraceSignalDump();
+                const rc = cli.run(runtime.slab.allocator, init.args);
+                runtime.slab.traceReport();
+                return rc;
+            }
             if (runtime.getenvSlice("KLIO_SLAB_STAT")) |_| {
                 const rc = cli.run(runtime.slab.allocator, init.args);
                 std.debug.print(

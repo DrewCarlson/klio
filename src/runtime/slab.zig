@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const gc = @import("gc.zig");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 
@@ -89,6 +90,92 @@ var class_states: [class_sizes.len]ClassState = blk: {
 /// flat GC live set pinpoints non-cell (host-temporary) leaks.
 pub var mapped_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
+// --- Diagnostic mmap-site tracer (KLIO_SLAB_TRACE) ---------------------------
+// Below the GC allocator wrapper and the perm/nursery + main/worker split, so
+// it sees every slab/large mmap regardless of thread or generation — catching
+// leaks that bypass `leaktrack` (worker raw-slab allocations) or the GC sweep
+// (permanent-generation cells). Records the capture stack of each live mmap and
+// dumps the top sites by mapped bytes on SIGTERM/SIGINT.
+pub var trace_enabled: bool = false;
+const TRACE_FRAMES = 14;
+const MapRec = struct { size: usize, addrs: [TRACE_FRAMES]usize, n: usize };
+var trace_map: std.AutoHashMapUnmanaged(usize, MapRec) = .empty;
+var trace_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn traceLock() void {
+    while (trace_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+}
+fn traceUnlock() void {
+    trace_lock.store(false, .release);
+}
+
+fn traceNote(ptr: usize, size: usize) void {
+    var rec: MapRec = .{ .size = size, .addrs = undefined, .n = 0 };
+    const st = std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &rec.addrs);
+    rec.n = st.return_addresses.len;
+    traceLock();
+    defer traceUnlock();
+    trace_map.put(std.heap.page_allocator, ptr, rec) catch {};
+}
+
+fn traceForget(ptr: usize) void {
+    traceLock();
+    defer traceUnlock();
+    _ = trace_map.remove(ptr);
+}
+
+const TraceSite = struct { addrs: [TRACE_FRAMES]usize, n: usize, bytes: usize, count: usize };
+
+/// Dump the top live-mmap sites by mapped bytes (KLIO_SLAB_TRACE).
+pub fn traceReport() void {
+    if (!trace_enabled) return;
+    traceLock();
+    var sites: std.ArrayListUnmanaged(TraceSite) = .empty;
+    var it = trace_map.iterator();
+    outer: while (it.next()) |e| {
+        const r = e.value_ptr;
+        for (sites.items) |*s| {
+            if (s.n == r.n and std.mem.eql(usize, s.addrs[0..s.n], r.addrs[0..r.n])) {
+                s.bytes += r.size;
+                s.count += 1;
+                continue :outer;
+            }
+        }
+        const s: TraceSite = .{ .addrs = r.addrs, .n = r.n, .bytes = r.size, .count = 1 };
+        sites.append(std.heap.page_allocator, s) catch {};
+    }
+    traceUnlock();
+    std.sort.pdq(TraceSite, sites.items, {}, struct {
+        fn lt(_: void, x: TraceSite, y: TraceSite) bool {
+            return x.bytes > y.bytes;
+        }
+    }.lt);
+    var shown: usize = 0;
+    for (sites.items) |*s| {
+        if (shown >= 25) break;
+        shown += 1;
+        std.debug.print("\n[slabtrace] live {d} bytes in {d} mmaps:\n", .{ s.bytes, s.count });
+        const st: std.debug.StackTrace = .{ .return_addresses = s.addrs[0..s.n], .skipped = .none };
+        std.debug.dumpStackTrace(&st);
+    }
+}
+
+fn onTraceSignal(_: std.c.SIG) callconv(.c) void {
+    traceReport();
+    std.c._exit(0);
+}
+
+/// Install a SIGTERM/SIGINT handler that dumps the mmap-site report and exits.
+pub fn installTraceSignalDump() void {
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onTraceSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
+
 /// Whether an `(len, alignment)` request is served from a slab (vs direct mmap).
 /// Both alloc and free apply this identical test, so free needs no per-pointer
 /// table to tell the two apart.
@@ -108,11 +195,15 @@ fn mapRaw(size: usize) ?[]align(std.heap.page_size_min) u8 {
         0,
     ) catch return null;
     _ = mapped_bytes.fetchAdd(size, .monotonic);
+    // Only track post-startup mmaps so the permanent stdlib-image baseline does
+    // not crowd out the per-iteration host leaks this hunts.
+    if (trace_enabled and gc.program_started) traceNote(@intFromPtr(m.ptr), size);
     return m;
 }
 
 fn unmapRaw(ptr: [*]u8, size: usize) void {
     const aligned: [*]align(std.heap.page_size_min) u8 = @alignCast(ptr);
+    if (trace_enabled) traceForget(@intFromPtr(ptr));
     std.posix.munmap(aligned[0..size]);
     _ = mapped_bytes.fetchSub(size, .monotonic);
 }

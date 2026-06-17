@@ -440,7 +440,6 @@ pub fn ObjRef(comptime T: type) type {
         /// destroy the control block. Child cells are swept independently.
         fn gcFinalizeThunk(h: *gc.GcHeader) void {
             const cb: *Cell = @fieldParentPtr("hdr", h);
-            if (gc.gc_debug) std.debug.print("[kgc] free {s}\n", .{@typeName(T)});
             gcFinalizeData(T, &cb.data, cb.allocator);
             cb.allocator.destroy(cb);
         }
