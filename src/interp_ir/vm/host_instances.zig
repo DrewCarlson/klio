@@ -2621,6 +2621,34 @@ fn anonSiteThunksGet(key: usize) ?AnonSiteThunks {
     return anon_site_thunks.get(key);
 }
 
+/// Clear the process-global anon-`object` site caches at a program-run
+/// boundary. Both are keyed by AST-node address, which is only stable within a
+/// single run; a later run can reuse a freed address, so a stale entry would
+/// dispatch through a thunk sub-module owned by the finished run's allocator
+/// (a cross-run use-after-free). Frees the permanent (page-allocator) site
+/// names and thunk-list spines; the thunk sub-module cells are GC cells the
+/// collector reclaims once unrooted. Run-boundary only (no workers live).
+pub fn resetAnonSiteCache() void {
+    const pa = std.heap.page_allocator;
+    anon_site_lock.lock();
+    defer anon_site_lock.unlock();
+    {
+        var it = anon_site_names.valueIterator();
+        while (it.next()) |n| pa.free(n.*);
+        anon_site_names.clearAndFree(pa);
+    }
+    {
+        var it = anon_site_thunks.valueIterator();
+        while (it.next()) |t| {
+            if (t.complex_prop_inits.len != 0) pa.free(t.complex_prop_inits);
+            if (t.init_thunks.len != 0) pa.free(t.init_thunks);
+            for (t.super_arg_thunks) |slots| if (slots.len != 0) pa.free(slots);
+            if (t.super_arg_thunks.len != 0) pa.free(t.super_arg_thunks);
+        }
+        anon_site_thunks.clearAndFree(pa);
+    }
+}
+
 /// Publish a site's thunks (first publisher wins). A racing second build of the
 /// same site loses; the loser's modules are left unrooted and GC reclaims them.
 /// Returns the entry now in the cache.

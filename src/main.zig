@@ -138,7 +138,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 return cli.run(std.heap.smp_allocator, init.args);
             }
             if (std.mem.eql(u8, alloc_mode, "gpa")) {
-                var gpa: std.heap.DebugAllocator(.{ .thread_safe = true, .safety = false }) = .init;
+                var gpa: std.heap.DebugAllocator(.{ .thread_safe = true, .safety = false, .stack_trace_frames = 10 }) = .init;
                 defer _ = gpa.deinit();
                 return cli.run(gpa.allocator(), init.args);
             }

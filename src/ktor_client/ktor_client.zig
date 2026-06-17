@@ -801,8 +801,17 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     defer _ = c.close(listen_fd);
 
+    // Diagnostic: serve a bounded number of requests then return cleanly, so a
+    // leak-checking allocator (KLIO_GC_ALLOC=gpa) reaches its end-of-run report.
+    const serve_max: usize = blk: {
+        const v = runtime.getenvSlice("KLIO_SERVE_MAX") orelse break :blk 0;
+        break :blk std.fmt.parseInt(usize, v, 10) catch 0;
+    };
+    var served: usize = 0;
+
     while (true) {
         if (runtime.shouldAbandon()) break;
+        if (serve_max != 0 and served >= serve_max) break;
         var pfd = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
         const ready = c.poll(&pfd, 1, 200);
         if (ready <= 0) continue; // timeout (re-check abandon) or transient error
@@ -834,6 +843,7 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
                 if (runtime.reclaimEnabled()) rv.release(a);
             },
         }
+        served += 1;
     }
     return .{ .ok = .Unit };
 }
