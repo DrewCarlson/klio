@@ -491,6 +491,10 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 const explicit_receiver = info.n_params >= 1 and args.len == info.n_params + 1;
                 const receiver: Value = if (explicit_receiver) args[0] else this_value.*;
                 var body_args: []const Value = if (explicit_receiver) args[1..] else args;
+                // The receiver-prepended buffer below is a borrowed-into-call
+                // scratch slice the collector never owns; free it on the way out.
+                var body_args_owned: ?[]Value = null;
+                defer if (body_args_owned) |b| if (runtime.freeScratch()) allocator.free(b);
                 // Receiver-bound call of a closure that declares one more
                 // positional param than the call supplies: the callee is a
                 // plain `(T, …) -> R` lambda used where a `T.(…) -> R` is
@@ -504,6 +508,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                     with_recv[0] = receiver;
                     @memcpy(with_recv[1..], args);
                     body_args = with_recv;
+                    body_args_owned = with_recv;
                 }
 
                 // Bind the receiver into a fresh captures cell's `this` slot
