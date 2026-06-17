@@ -819,6 +819,20 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
         if (conn < 0) continue;
         defer _ = c.close(conn);
         const parsed = (try read_request(a, conn)) orelse continue;
+        // The parsed strings are owned by `a`; their bytes are copied into the
+        // request array's `StringRef` cells below, so the originals are dead
+        // once the array is built. Free them under a freeing allocator (the
+        // collector never owns these raw host buffers).
+        defer if (runtime.freeScratch()) {
+            a.free(parsed.method);
+            a.free(parsed.path);
+            if (parsed.body.len != 0) a.free(parsed.body);
+            for (parsed.headers) |h| {
+                a.free(h.key);
+                a.free(h.value);
+            }
+            a.free(parsed.headers);
+        };
         // Request array: [method, path, body, hk1, hv1, hk2, hv2, ...] — the
         // shim reads the fixed head and the trailing header key/value pairs.
         var items: std.ArrayList(Value) = .empty;
@@ -839,6 +853,17 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
             .ok => |rv| {
                 const decoded = try decode_response(a, &rv);
                 try write_response(a, conn, decoded.status, decoded.content_type, decoded.body, decoded.headers);
+                // The decoded strings are owned by `a` and only needed to build
+                // the on-wire response; free them once written.
+                if (runtime.freeScratch()) {
+                    a.free(decoded.content_type);
+                    a.free(decoded.body);
+                    for (decoded.headers) |h| {
+                        a.free(h.key);
+                        a.free(h.value);
+                    }
+                    a.free(decoded.headers);
+                }
                 // `rv` is an owned host result; release it once decoded+written.
                 if (runtime.reclaimEnabled()) rv.release(a);
             },

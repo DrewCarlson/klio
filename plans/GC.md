@@ -358,3 +358,59 @@ shows the remaining per-request sites:
 
 This is the §11 host-temporary reconciliation, now scoped concretely to the
 sites above rather than the whole interpreter.
+
+## Session update: crash root-caused, side-table bounded, residual characterized
+
+**The intermittent crash is fixed.** It was a use-after-free in
+`materializeInstance`: the packed parent-ctor-arg buffer was freed under the
+freeing allocator and then `cur_args` was pointed at it, so the next chain level
+read its super-args from freed memory. With the page-returning slab the region
+is eventually unmapped, turning the read into a hard fault after sustained
+construction (the server faulted deterministically at ~1176 requests). `cur_args`
+now points at the live chain-owned copy. A parallel 60 000-request load and the
+GC-stress corpus both run clean.
+
+**Leaks closed this session (all were freed only under the reference-counting
+path, so the collector — which never owns them — leaked them):**
+- coroutine frame-snapshot slice buffers (`regs`/`params`/`captures`/
+  `enclosing_this`/`try_stack`) on every suspend/resume;
+- the ktor client's owned response strings per request;
+- the duped body-property array in anon-object construction.
+
+**Closure side-table now bounded.** `reclaimDead` feeds GC-confirmed-dead slots
+to a free list that `push` reuses, so the spine stays bounded by the live
+closure set instead of growing per closure-creation event (was ~58 MB after a
+few thousand requests). Reuse is sound: a slot is freed only after a full mark
+proved no live value referenced its id, and a marked closure value always marks
+its slot, so a reused id can never alias a live value.
+
+**Anon-object thunks site-cached.** The complex-property / `init`-block /
+super-arg thunks are lowered once per `object` source site and kept alive by a
+GC root, instead of re-lowered (and leaked, since a swept Module cell frees only
+its header) per instantiation. The caches are AST-address-keyed and so are
+cleared at each run boundary (a stale cross-run entry was a use-after-free).
+
+**Residual ktor RSS, precisely characterized.** With every fix above, a ktor
+server's live cell count is flat (~2700 across a 40 000-request run, verified via
+`KLIO_GC_DEBUG`), so there is no value-graph leak. RSS still grows ~50 KB/request
+(slab) / more under libc — raw host-temporaries in the dispatch hot path that the
+collector never owns and an explicit free does not yet reclaim (the §11 tail).
+The per-allocation leak locators (`leaktrack`, the new cell tracer) cannot
+pinpoint these under the concurrent-server workload: tracking every cell
+contends with the stop-the-world sweep and starves collection, inflating the run
+rather than reporting it. A non-perturbing (sampled, lock-sharded) per-allocation
+tracker, or a per-request/per-coroutine-tree arena that frees host scratch
+wholesale (§12.4 option 2), is the next investment.
+
+**Diagnostic tooling added (all gated, off by default):** `KLIO_SLAB_TRACE`
+(records the capture stack of every live slab/large mmap and dumps the top sites
+on signal — sees allocations that bypass `leaktrack` or the sweep);
+`KLIO_CELL_TRACE` (per-cell allocation tracking at the slab's guaranteed-paired
+free path); `KLIO_SERVE_MAX` (bounded serve so a leak run reaches its report).
+
+**Pre-existing coroutine GC root holes (unchanged, the §12 frontier).** Under
+*aggressive* stress (`KLIO_GC_STRESS_EVERY=200`-300) three suspend/`async`/`launch`
+examples premature-free a receiver/closure (confirmed: `KLIO_GC_NOFREE=1` makes
+them pass). The window is narrow — they pass at the normal collection cadence —
+so a reachable coroutine value is briefly unrooted during the resume handoff.
+Closing it is the structured-concurrency root-completeness work of §12.
