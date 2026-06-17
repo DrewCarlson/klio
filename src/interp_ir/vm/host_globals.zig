@@ -796,7 +796,12 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
         };
         if (mapped) |m| {
             if (lookupIntrinsic(self, m)) |func| {
-                const fqn = allocator.dupe(u8, m) catch return null;
+                // `m` is a program-lifetime string (the instruction's const-pool
+                // name, or a prog-owned default-import / pack-alias entry), so the
+                // resolved value can borrow it directly: `Intrinsic.fqn` is a raw
+                // slice the collector never frees, and a duped copy would leak on
+                // every discarded bare-name intrinsic reference.
+                const fqn = m;
                 if (trace.enabled(name)) {
                     trace.emit("map=global_fqn name={s} fqn={s}", .{ name, fqn });
                 }

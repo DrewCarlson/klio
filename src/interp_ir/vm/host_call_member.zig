@@ -3054,7 +3054,9 @@ fn eqIgnoreCase(allocator: Allocator, a: StringRef, b: StringRef) bool {
     const bg = b.borrow();
     defer bg.deinit();
     const la = std.ascii.allocLowerString(allocator, ag.get().*) catch return false;
+    defer if (runtime.freeScratch()) allocator.free(la);
     const lb = std.ascii.allocLowerString(allocator, bg.get().*) catch return false;
+    defer if (runtime.freeScratch()) allocator.free(lb);
     return std.mem.eql(u8, la, lb);
 }
 
@@ -5579,6 +5581,7 @@ fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
         if (lookupIntrinsic(self, probe)) |func| {
             const all_args = try prependReceiver(allocator, receiver, reordered.items);
+            defer if (runtime.freeScratch()) allocator.free(all_args);
             return try dispatchIntrinsic(self, allocator, probe, func, all_args);
         }
         break;
@@ -5595,7 +5598,9 @@ fn userMethodNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     }
     if (resolveExtOverloadLocal(self, allocator, name, receiver, args, arg_names)) |fid| {
         const all = try prependReceiver(allocator, receiver, args);
+        defer if (runtime.freeScratch()) allocator.free(all);
         var names = try allocator.alloc(?[]const u8, arg_names.len + 1);
+        defer if (runtime.freeScratch()) allocator.free(names);
         names[0] = null;
         @memcpy(names[1..], arg_names);
         const mg = self.module.borrow();
@@ -5818,7 +5823,9 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
     }
     if (method_fid) |fid| {
         const all = try prependReceiver(allocator, receiver, args);
+        defer if (runtime.freeScratch()) allocator.free(all);
         var names = try allocator.alloc(?[]const u8, all.len);
+        defer if (runtime.freeScratch()) allocator.free(names);
         names[0] = null;
         if (arg_names) |an| {
             for (an, 0..) |n, i| {
@@ -5918,7 +5925,9 @@ fn firstSupertypeName(self: *VmHost, allocator: Allocator, class_name: []const u
     defer dg.deinit();
     const sups = dg.get().supertype_names;
     if (sups.len == 0) return null;
-    return allocator.dupe(u8, sups[0]) catch null;
+    // Class-table-owned (program-lifetime); returned borrowed per the contract.
+    _ = allocator;
+    return sups[0];
 }
 
 /// Whether `q` is one of `class_name`'s registered supertypes.
@@ -5954,7 +5963,8 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
     var parent_name: ?[]const u8 = null;
     if (qualifier) |q| {
         if (ownerHasSupertype(self, owner_class, q)) {
-            parent_name = try allocator.dupe(u8, q);
+            // `q` is the const-pool super qualifier (program-lifetime); borrow it.
+            parent_name = q;
         } else {
             parent_name = firstSupertypeName(self, allocator, q);
         }
