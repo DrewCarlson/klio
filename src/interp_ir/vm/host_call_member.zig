@@ -2880,6 +2880,13 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name }),
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_name, name }),
         };
+        // The synthesized lookup keys are scratch; free them once probed (a
+        // per-anon-method-call leak — the ktor pipeline calls anon-object
+        // methods on every request).
+        defer if (runtime.freeScratch()) {
+            allocator.free(synth[0]);
+            allocator.free(synth[1]);
+        };
         for (synth) |p| {
             if (lookupIntrinsic(self, p)) |func| {
                 const all_args = try prependReceiver(allocator, receiver, args);
@@ -4773,7 +4780,9 @@ fn delegateForward(self: *VmHost, allocator: Allocator, receiver: *const Value, 
                 if (swallow_unimplemented_only) {
                     if (e != .Unimplemented) return r;
                 }
-                // else: swallow all errors and continue.
+                // else: swallow all errors and continue. The swallowed miss's
+                // `Vm::call_member` message is discarded here; free it.
+                freeDispatchMiss(allocator, r);
             },
         }
     }
@@ -5277,6 +5286,7 @@ fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const V
             if (s == .Instance) {
                 const r = try callMemberRec(self, allocator, &s, name, args);
                 if (r == .ok) return r;
+                freeDispatchMiss(allocator, r);
             }
         }
     }
@@ -5326,6 +5336,9 @@ fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: *con
                     if (sid != recv_id) {
                         const r = try callMemberRec(self, allocator, &s, name, args);
                         if (r == .ok) return r;
+                        // The companion probe missed; free its discarded
+                        // `Vm::call_member` message before trying the next.
+                        freeDispatchMiss(allocator, r);
                     }
                 }
             }
