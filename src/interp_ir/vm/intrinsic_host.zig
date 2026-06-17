@@ -737,6 +737,11 @@ fn workerEntry(wargs: WorkerArgs) void {
     // link lazily on first use and unlink here (runs last, after teardown).
     coroutines.gcThreadEnter();
     defer coroutines.gcThreadExit();
+    // Pin the thread block so its closure's captures survive a collection for
+    // the whole run (it is reachable only through this stack local).
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePush(args.block);
     // Balance the spawn-time retain: drop the worker's hold on the block once
     // the task is done. Registered before `vm.deinit` so it runs after the
     // child Vm tears down (LIFO), keeping the block alive for the whole run.

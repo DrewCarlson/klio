@@ -192,6 +192,18 @@ pub fn registerRoot(f: RootFn) void {
     roots.append(std.heap.page_allocator, f) catch @panic("KGC: root registration failed");
 }
 
+/// Closures are collected by ordinary reachability of their `IrClosure` Value.
+/// When `Value.gcMark` marks an `IrClosure`, it shades the Value's own captures
+/// cell (via `forEachChildCell`); this hook additionally keeps the closure
+/// side-table's canonical capture store and receiver-chain alive for that id,
+/// so a live closure's invoke-time state survives while a closure no live value
+/// references is left white and swept. Set by `interp_ir` once the program's
+/// closure table exists; null (a no-op) otherwise. The transitive case — a
+/// closure captured by another closure — needs no second pass: shading the
+/// outer captures cell enqueues it, and draining it marks the inner closure
+/// Value, whose own `gcMark` re-invokes this hook.
+pub var markClosureHook: ?*const fn (id: u64, m: *Marker) void = null;
+
 // ---------------------------------------------------------------------------
 // Per-thread roots. A subsystem's roots live in threadlocals (the eval frame
 // chain, the host-op keepalive stack, the coroutine interceptor/scope stacks),

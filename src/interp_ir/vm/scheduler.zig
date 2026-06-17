@@ -144,6 +144,7 @@ pub const Pool = struct {
     /// below its ceiling. A post into a stopping pool is dropped (the
     /// run is past its boundary; dispatcher threads are daemons).
     pub fn post(self: *Pool, task: Task) Allocator.Error!void {
+        gcInstallPoolRoot();
         const a = self.allocator();
         {
             self.mutex.lock();
@@ -326,6 +327,12 @@ pub const Pool = struct {
 fn runVmTask(task: *Task) ?RuntimeError {
     root.setCoroutineTimeMode(task.time_mode);
     runtime.setReclaim(task.reclaim);
+    // The block left the queue, so its closure is reachable only through this
+    // stack local now; pin it on the keepalive stack so a collection during the
+    // task keeps the closure's capture store + chain alive.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePush(task.block);
     // Balance the post-time retain on the block; runs after `vm.deinit`
     // (LIFO) so the block stays live for the whole task.
     defer if (runtime.reclaimEnabled()) task.block.release(task.seed.allocator);
@@ -363,6 +370,29 @@ var global_pool: Pool = .{};
 
 pub fn globalPool() *Pool {
     return &global_pool;
+}
+
+// GC root: a queued task's block is an `IrClosure` reachable only through the
+// pool FIFO until a worker dequeues it, so the collector must mark it or its
+// closure would be reclaimed before it runs. The in-flight (dequeued, running)
+// block is pinned by the worker via the keepalive stack in `runVmTask` /
+// `workerEntry`. Marking runs during stop-the-world with every worker parked at
+// a safe point, so the pool mutex is uncontended here.
+var pool_root_registered = std.atomic.Value(bool).init(false);
+
+fn gcInstallPoolRoot() void {
+    if (!runtime.gc.gc_enabled) return;
+    if (!pool_root_registered.swap(true, .monotonic))
+        runtime.gc.registerRoot(gcMarkPool);
+}
+
+fn gcMarkPool(m: *runtime.gc.Marker) void {
+    global_pool.mutex.lock();
+    defer global_pool.mutex.unlock();
+    const qd = &global_pool.queue_default;
+    for (qd.items.items[qd.head..]) |*t| t.block.gcMark(m);
+    const qi = &global_pool.queue_io;
+    for (qi.items.items[qi.head..]) |*t| t.block.gcMark(m);
 }
 
 /// Post onto the global pool.

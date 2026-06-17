@@ -652,6 +652,11 @@ pub const Value = union(enum) {
             .List => |x| if (x.backing) |b| m.shade(&b.entries.cell.hdr),
             .Set => |x| if (x.backing) |b| m.shade(&b.entries.cell.hdr),
             .MapEntry => |e| if (e.backing) |b| m.shade(&b.cell.hdr),
+            // Keep the side-table's canonical capture store + receiver chain for
+            // this closure alive (the dup'd `captures` ValueSlice is already
+            // shaded by `forEachChildCell` above). A closure no live value marks
+            // never reaches here, so its slot's captures go white and are swept.
+            .IrClosure => |c| if (objcell.gc.markClosureHook) |f| f(c.id, m),
             else => {},
         }
     }
