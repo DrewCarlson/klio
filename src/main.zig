@@ -71,6 +71,7 @@ fn guardAllocator(inner: std.mem.Allocator) std.mem.Allocator {
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
+    if (runtime.getenvSlice("KLIO_SEGV_TRACE")) |_| std.debug.attachSegfaultHandler();
     const mode = runtime.allocChoice();
     switch (mode) {
         .arena => {

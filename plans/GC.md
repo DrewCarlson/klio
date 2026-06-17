@@ -264,3 +264,65 @@ refinement (trim/`madvise`, or an arena-of-free-lists), not a leak. The
 per-closure `ClosureInfo` metadata (a few words + two small slices) is not freed
 mid-run; it is bounded by distinct closure-creation events, dwarfed by the
 reclaimed capture data, and a follow-up could prune it once liveness is proven.
+
+## Memory-reclamation results (host temporaries, per-request graphs, RSS)
+
+The collector keeps the *reachable* set flat, but two non-cell growth sources
+remained; both are now closed under the GC, and RSS is tracked rather than the
+allocator's reclaimed-page cache.
+
+### Page-returning backing (`src/runtime/slab.zig`)
+
+The stock free-list allocators (`smp_allocator`, libc) never return reclaimed
+pages to the OS, so a long-running server's RSS grew with cumulative churn even
+though the live set stayed flat. The slab allocator groups same-size cells into
+`SLAB`-aligned slabs and `munmap`s a slab the instant its last cell is freed, so
+RSS tracks the live set. It is the default GC backing (`KLIO_GC_ALLOC` selects
+`smp`/`gpa`/`calloc`/`leaktrack` for comparison). Measured: a `smp`-backed ktor
+server's RSS grows to >1 GB over a few hundred requests; the slab keeps the live
+cell set flat.
+
+### Host temporaries (`freeScratch`)
+
+The per-call host scratch the Rust→Zig port left unfreed (probe FQNs, arg/prepend
+arrays, error messages) was gated on `reclaimEnabled()`, which is OFF under the
+GC, so it leaked through the freeing backend. Split the predicate:
+`freeScratch()` frees raw scratch whenever the backend actually frees (reclaim OR
+GC) while value-graph ownership stays on `reclaimEnabled()`. The 48 raw-free
+sites use `freeScratch()`, and the previously-unfreed prepend-array /
+extension-dispatch / string-concat-rendering scratch in the member-dispatch and
+eval paths is now freed. A stdlib loop (`listOf().map{}.filter{}` + map build)
+drops from ~6.5 KB/iter to flat (147 MB at 200 K iterations, ~the 116 MB at 20 K
+plus fragmentation noise).
+
+### Per-request value graphs (anonymous objects)
+
+Two registries rooted per-request anonymous-object state forever:
+- captures were stored in the process-global `anon_methods` registry keyed by a
+  per-instance class name, so every request's value graph (the call, params,
+  deserialized bodies) stayed reachable. Moved onto the instance
+  (`InstanceData.anon_captures`), reclaimed with it.
+- the class + method registrations used a per-instance `$anon$<id>` name, so
+  `classes`/`anon_methods` gained never-released entries per instantiation. Keyed
+  by the source AST node instead (the lowered IR is identical for every
+  instantiation of a site), so the first instantiation registers and later ones
+  reuse.
+
+Result: a ktor server's live-cell counts stay flat across requests (`InstanceData`,
+`Module`, `ClassDef`, `Env`: constant instead of growing ~linearly — measured
+flat over 240+ requests where they previously grew ~55×).
+
+## Remaining frontier: host-keepalive narrow windows (host re-entry)
+
+A ktor server under the GC still hits an intermittent premature-free: a value a
+host op holds in a Zig local across a re-entrant `evalWith`/`invokeCallable` is
+swept if a collection fires during that inner eval, then reused (a hard fault
+under the slab's `munmap`; a wrong-type cell under any backend). It reproduces
+deterministically under `KLIO_GC_STRESS_EVERY=N` and was localized to a
+Kotlin-class map-entry destructuring (`kotlin.collections.component1` reading
+`.key` off a swept entry Instance) during routing/pipeline setup; native-map
+iteration is clean. Both the slab and `smp` backends crash on it (it is a real
+UAF, not an allocator artifact). Closing it is the per-site keepalive work
+(push the held values onto the keepalive root across the re-entrant call) across
+the map-iterator / instance-materialization / pipeline-construction paths — the
+same "host reconciliation" wall the refcount path hit, now scoped to GC roots.
