@@ -312,17 +312,49 @@ Result: a ktor server's live-cell counts stay flat across requests (`InstanceDat
 `Module`, `ClassDef`, `Env`: constant instead of growing ~linearly — measured
 flat over 240+ requests where they previously grew ~55×).
 
-## Remaining frontier: host-keepalive narrow windows (host re-entry)
+## Host-keepalive narrow windows (host re-entry) — largely closed
 
-A ktor server under the GC still hits an intermittent premature-free: a value a
-host op holds in a Zig local across a re-entrant `evalWith`/`invokeCallable` is
-swept if a collection fires during that inner eval, then reused (a hard fault
-under the slab's `munmap`; a wrong-type cell under any backend). It reproduces
-deterministically under `KLIO_GC_STRESS_EVERY=N` and was localized to a
-Kotlin-class map-entry destructuring (`kotlin.collections.component1` reading
-`.key` off a swept entry Instance) during routing/pipeline setup; native-map
-iteration is clean. Both the slab and `smp` backends crash on it (it is a real
-UAF, not an allocator artifact). Closing it is the per-site keepalive work
-(push the held values onto the keepalive root across the re-entrant call) across
-the map-iterator / instance-materialization / pipeline-construction paths — the
-same "host reconciliation" wall the refcount path hit, now scoped to GC roots.
+A value a host op holds in a Zig local across a re-entrant `evalWith` /
+`invokeCallable` is swept if a collection fires during that inner eval, then
+reused (a hard fault under the slab's `munmap`; a wrong-type cell otherwise).
+Reproduced deterministically with `KLIO_GC_STRESS_EVERY=N`. Found and closed
+(each via the `KLIO_GC_ALLOC=leaktrack` locator + the segfault handler under
+`KLIO_SEGV_TRACE`):
+
+- the lazy-Sequence pipeline accumulator + in-flight value (`pumpItem`,
+  `applySeqOp`) — crashed ktor routing setup (`splitToSequence().map{}.toList()`);
+- the anonymous-object init / property / super-arg thunk sub-module
+  (`runAnonThunk`) held as a raw `frame.module` pointer — crashed serving;
+- the source items of a streamed sequence.
+
+A ktor server now survives routing setup and thousands of requests under the GC,
+where it formerly crashed at startup or within a few hundred requests. A rare
+intermittent crash remains at large request counts (~thousands), surfaced only
+by the normal 8 MB-threshold collection timing (not by aggressive stress, which
+serves cleanly) — the last unrooted host-local in the sustained request path,
+the same class as those above, to be pinned the same way.
+
+## Host-temporary reclamation in the ktor request path — in progress
+
+With the value graph flat (live cells constant across requests) and the leaks
+above closed, a ktor server's RSS growth dropped from ~8.5 MB/request (arena, the
+as-found number) to ~100 KB/request — the remaining per-request host scratch the
+collector cannot reclaim (it is raw, not a cell). Closed so far: the
+member-dispatch and field-resolution miss messages, the `anonMethodDispatch`
+lookup key, the `invokeAnonMethod` / `irMethodWalk` packed-arg buffers, the
+map-get key snapshot, and the parent-ctor packed args. The leaktrack locator
+shows the remaining per-request sites:
+
+- the closure side-table is append-only (monotonic ids, no reuse), so each
+  per-request lambda's `ClosureInfo` (capture-name dupe + chain) accumulates —
+  needs GC-confirmed-dead slot reclamation (a free-list keyed by the
+  mark epoch);
+- the anon-object init / property / super-arg thunks are re-lowered per instance
+  (only the methods + class are site-cached) — needs caching the thunk side
+  modules per source site;
+- per-intrinsic internal scratch (`dispatchIntrinsic` callees) and ctor / eval
+  arg arrays — the long tail of the host reconciliation, each a `freeScratch()`
+  free or an accumulator the GC cannot see.
+
+This is the §11 host-temporary reconciliation, now scoped concretely to the
+sites above rather than the whole interpreter.
