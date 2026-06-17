@@ -2116,6 +2116,9 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         // Pack the delegation args for the parent's vararg primary param.
         const packed_parent = try packPrimaryCtorVarargs(self, pref.fqn, pname, try parent_args.toOwnedSlice(allocator));
         try chain.append(allocator, .{ .name = pname, .fqn = pref.fqn, .args = try allocator.dupe(Value, packed_parent) });
+        // `chain` owns the duped args (freed on chain teardown); the packed
+        // buffer is a full allocation that is now dead.
+        if (runtime.freeScratch()) allocator.free(packed_parent);
         cur_class = pname;
         cur_fqn = pref.fqn;
         cur_args = packed_parent;

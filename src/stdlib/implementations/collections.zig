@@ -3727,6 +3727,8 @@ fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!?usize {
         for (g.get().items, 0..) |kv, i| ks[i] = kv.key;
         break :blk ks;
     };
+    // Scratch key snapshot (the key Values themselves stay owned by the map).
+    defer if (runtime.freeScratch()) ctx.allocator.free(keys);
     for (keys, 0..) |k, i| {
         if (try ctx.host.invokeMethod(&k, "equals", &.{key}, ctx.out)) |m| {
             if (m == .ok and m.ok == .Bool) {
