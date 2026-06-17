@@ -322,6 +322,22 @@ fn isHashMapLike(comptime U: type) bool {
 fn isSlice(comptime U: type) bool {
     return @typeInfo(U) == .pointer and @typeInfo(U).pointer.size == .slice;
 }
+
+/// Bytes of heap backing a payload owns beyond its control block — the
+/// `ArrayList`/slice element storage and `[]const u8` bytes. The GC trigger
+/// must count these (they are freed by the cell's `gcFinalize`), or a cell
+/// with a large backing but a small control block (a `ByteArray`'s element
+/// vector, a long `String`) would not advance the collection threshold and the
+/// backing would accumulate uncollected.
+fn externalBytes(comptime U: type, data: *const U) usize {
+    if (comptime U == []const u8) return data.len;
+    if (comptime isArrayListLike(U)) {
+        const Elem = @typeInfo(@TypeOf(data.items)).pointer.child;
+        return data.capacity * @sizeOf(Elem);
+    }
+    if (comptime isSlice(U)) return data.len * @sizeOf(@typeInfo(U).pointer.child);
+    return 0;
+}
 /// An `ObjRef(X)` handle is a struct with a `.cell` field and a `clone` decl.
 fn isObjRef(comptime U: type) bool {
     return @typeInfo(U) == .@"struct" and @hasField(U, "cell") and @hasDecl(U, "clone");
@@ -453,7 +469,7 @@ pub fn ObjRef(comptime T: type) type {
                 .data = v,
                 .allocator = allocator,
             };
-            if (gc.gc_enabled) gc.register(&cell.hdr, @sizeOf(Cell));
+            if (gc.gc_enabled) gc.register(&cell.hdr, @sizeOf(Cell) + externalBytes(T, &cell.data));
             return .{ .cell = cell };
         }
 
