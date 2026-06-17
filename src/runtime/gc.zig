@@ -27,7 +27,15 @@ pub const GcHeader = struct {
     gc_mark: usize = 0,
     gc_trace: *const fn (*GcHeader, *Marker) void,
     gc_finalize: *const fn (*GcHeader) void,
+    /// `@typeName(T)` of the payload, for the live-cell type histogram
+    /// (`KLIO_GC_HIST`). Interned per type, so pointer identity keys the buckets.
+    gc_type: [*:0]const u8 = "",
 };
+
+/// Diagnostic (KLIO_GC_HIST): after each collection, print the live-cell count
+/// per payload type. A type whose live count climbs request-over-request is a
+/// reachability (root) leak — something keeps that object graph rooted.
+pub var gc_hist: bool = false;
 
 /// Tri-color marker: an explicit grey worklist (never native recursion — the
 /// value graph is deep and cyclic). `shade` is white→grey (stamp + enqueue);
@@ -374,11 +382,63 @@ pub fn collect() void {
     bytes_since_gc.store(0, .monotonic);
     if (others != 0) stop_flag.store(false, .release);
     threshold = @max(threshold_floor, live_bytes *| 2);
+    // Return the pages the swept cells freed back to the OS. The backing
+    // allocator caches freed memory in its free-lists (RSS reflects the
+    // allocation high-water, not the live set), so after a collection that
+    // reclaimed real garbage, ask it to trim — keeping process RSS tracking the
+    // live set, not the cumulative churn. Set by `main` to the platform trim.
+    if (freed != 0) if (release_to_os) |f| f();
     if (gc_debug) std.debug.print(
         "[kgc] epoch={d} marked={d} live={d} freed={d}\n",
         .{ cur_epoch, marked, live_bytes, freed },
     );
+    if (gc_hist) liveTypeHistogram();
 }
+
+/// Print the top live-cell payload types by count (KLIO_GC_HIST). Buckets by
+/// `gc_type` pointer identity (interned `@typeName`). O(live x distinct types);
+/// fine for a diagnostic. Walks the registry under the same lock as the sweep.
+fn liveTypeHistogram() void {
+    const Bucket = struct { name: [*:0]const u8, count: usize };
+    var buckets: [128]Bucket = undefined;
+    var n: usize = 0;
+    reg_lock.lock();
+    var cur = all_cells;
+    while (cur) |h| : (cur = h.gc_next) {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (buckets[i].name == h.gc_type) {
+                buckets[i].count += 1;
+                break;
+            }
+        }
+        if (i == n and n < buckets.len) {
+            buckets[n] = .{ .name = h.gc_type, .count = 1 };
+            n += 1;
+        }
+    }
+    reg_lock.unlock();
+    // Simple selection of the top 16 by count.
+    var shown: usize = 0;
+    while (shown < 16) : (shown += 1) {
+        var best: usize = buckets.len;
+        var best_count: usize = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (buckets[i].count > best_count) {
+                best_count = buckets[i].count;
+                best = i;
+            }
+        }
+        if (best == buckets.len) break;
+        std.debug.print("[kgc-hist] {d} x {s}\n", .{ buckets[best].count, buckets[best].name });
+        buckets[best].count = 0;
+    }
+}
+
+/// Platform hook to return cached free memory to the OS after a collection
+/// (e.g. `malloc_zone_pressure_relief` on macOS). Null = no trim.
+pub var release_to_os: ?*const fn () void = null;
 
 fn sweep() usize {
     reg_lock.lock();

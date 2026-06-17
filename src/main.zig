@@ -1,6 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("cli");
 const runtime = @import("runtime");
+
+/// macOS: ask every malloc zone to return its cached free pages to the OS.
+/// Called by the collector after a sweep so process RSS tracks the live set,
+/// not the cumulative allocation churn the libc free-lists would otherwise hold.
+extern "c" fn malloc_zone_pressure_relief(zone: ?*anyopaque, goal: usize) usize;
+fn gcReleaseToOs() void {
+    if (builtin.os.tag == .macos) _ = malloc_zone_pressure_relief(null, 0);
+}
 
 /// Backing-allocator selection for the process.
 ///
@@ -85,6 +94,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             if (runtime.getenvSlice("KLIO_GC_DEBUG")) |v| {
                 runtime.gc.gc_debug = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
+            if (runtime.getenvSlice("KLIO_GC_HIST")) |v| {
+                runtime.gc.gc_hist = v.len != 0 and !std.mem.eql(u8, v, "0");
+            }
             if (runtime.getenvSlice("KLIO_GC_NOFREE")) |v| {
                 runtime.gc.gc_nofree = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
@@ -108,7 +120,51 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 }
                 return cli.run(guardAllocator(std.heap.smp_allocator), init.args);
             }
-            return cli.run(std.heap.smp_allocator, init.args);
+            // Backing allocator. The collector frees by reachability, but the
+            // backend decides whether reclaimed pages return to the OS. The
+            // default is the slab allocator (`runtime.slab`): same-size cells
+            // share a slab, and a slab returns to the OS the instant its last
+            // cell is freed — so RSS tracks the live set, not cumulative churn.
+            // The stock free-list allocators never return pages (RSS grew with
+            // total work even though the collector kept the live set flat).
+            // KLIO_GC_ALLOC selects an alternative for comparison:
+            //   slab   (default) — page-returning slab allocator
+            //   smp              — fastest; free-lists never return pages
+            //   gpa              — page-returning general-purpose allocator (slow)
+            //   calloc           — libc malloc + macOS pressure-relief trim
+            const alloc_mode = runtime.getenvSlice("KLIO_GC_ALLOC") orelse "slab";
+            if (std.mem.eql(u8, alloc_mode, "smp")) {
+                return cli.run(std.heap.smp_allocator, init.args);
+            }
+            if (std.mem.eql(u8, alloc_mode, "gpa")) {
+                var gpa: std.heap.DebugAllocator(.{ .thread_safe = true, .safety = false }) = .init;
+                defer _ = gpa.deinit();
+                return cli.run(gpa.allocator(), init.args);
+            }
+            if (std.mem.eql(u8, alloc_mode, "calloc")) {
+                runtime.gc.release_to_os = gcReleaseToOs;
+                return cli.run(std.heap.c_allocator, init.args);
+            }
+            if (std.mem.eql(u8, alloc_mode, "leaktrack")) {
+                const a = runtime.leaktrack.wrap(runtime.slab.allocator);
+                runtime.leaktrack.installSignalDump();
+                const rc = cli.run(a, init.args);
+                // Force a final collection so GC-managed cells that were merely
+                // uncollected (not leaked) are freed before the report; what
+                // remains outstanding is the genuine raw host-temporary leak.
+                runtime.gc.collect();
+                runtime.leaktrack.report();
+                return rc;
+            }
+            if (runtime.getenvSlice("KLIO_SLAB_STAT")) |_| {
+                const rc = cli.run(runtime.slab.allocator, init.args);
+                std.debug.print(
+                    "[slab] mapped_bytes={d} ({d} MB)\n",
+                    .{ runtime.slab.mapped_bytes.load(.monotonic), runtime.slab.mapped_bytes.load(.monotonic) / (1024 * 1024) },
+                );
+                return rc;
+            }
+            return cli.run(runtime.slab.allocator, init.args);
         },
         .debug => {
             var dbg: std.heap.DebugAllocator(.{ .thread_safe = true, .safety = true }) = .init;

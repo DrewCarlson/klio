@@ -55,7 +55,7 @@ fn thrown(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator
 /// to avoid leaking it (the arena fast path reclaims it wholesale).
 fn thrownOwned(allocator: Allocator, fqn: []const u8, message: []const u8) Allocator.Error!EvalResult {
     const res = try thrown(allocator, fqn, message);
-    if (runtime.reclaimEnabled()) allocator.free(message);
+    if (runtime.freeScratch()) allocator.free(message);
     return res;
 }
 
@@ -2060,7 +2060,7 @@ fn formatConv(
         else => {
             const msg = try std.fmt.allocPrint(allocator, "conversion: {u}", .{conv});
             const exc = try makeException(allocator, "java.util.UnknownFormatConversionException", msg);
-            if (runtime.reclaimEnabled()) allocator.free(msg);
+            if (runtime.freeScratch()) allocator.free(msg);
             return .{ .err = .{ .Thrown = exc } };
         },
     }

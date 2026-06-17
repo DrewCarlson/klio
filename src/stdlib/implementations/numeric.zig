@@ -99,7 +99,7 @@ pub fn int_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (!(radix >= 2 and radix <= 36)) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
         const exc = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
-        if (runtime.reclaimEnabled()) ctx.allocator.free(msg);
+        if (runtime.freeScratch()) ctx.allocator.free(msg);
         return .{ .err = .{ .Thrown = exc } };
     }
     const s = try intToRadixString(ctx.allocator, n, @intCast(radix));
@@ -590,7 +590,7 @@ pub fn long_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (!(radix >= 2 and radix <= 36)) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
         const exc = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
-        if (runtime.reclaimEnabled()) ctx.allocator.free(msg);
+        if (runtime.freeScratch()) ctx.allocator.free(msg);
         return .{ .err = .{ .Thrown = exc } };
     }
     const s = try intToRadixString(ctx.allocator, n, @intCast(radix));

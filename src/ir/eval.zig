@@ -1523,6 +1523,13 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     .err => |e| return errResult(e),
                 };
                 const combined = try std.mem.concat(allocator, u8, &.{ ls, rs });
+                // `ls`/`rs` are owned renderings (stringify/renderValue allocate
+                // a private copy); `combined` is adopted by the StringRef cell.
+                // Free the two now-dead pieces under a freeing allocator.
+                if (runtime.freeScratch()) {
+                    allocator.free(ls);
+                    allocator.free(rs);
+                }
                 try frame.write(bo.dst, .{ .String = try StringRef.initOwned(allocator, combined) });
                 return ok(.Unit);
             }

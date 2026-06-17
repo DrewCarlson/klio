@@ -70,6 +70,19 @@ pub fn reclaimEnabled() bool {
     return reclaim_tls;
 }
 
+/// Whether raw host-temporary buffers (scratch arrays, probe FQN strings, error
+/// messages — allocations that are NOT refcounted cells and never escape the
+/// host op) should be explicitly freed. True whenever the backing allocator
+/// actually frees: the reference-counting modes (`reclaim_tls`) AND the tracing
+/// GC (`gc.gc_enabled`), under which `reclaim_tls` is OFF (the collector frees
+/// cells by reachability) but raw scratch is invisible to the collector and
+/// would otherwise leak. False only under the pure process arena, where `free`
+/// is a no-op anyway. Keeps the value-graph ownership ops gated on
+/// `reclaimEnabled()` (must stay off under GC) distinct from scratch frees.
+pub fn freeScratch() bool {
+    return reclaim_tls or gc.gc_enabled;
+}
+
 /// Whether the process was asked to run the freeing reference-counting path
 /// (a real allocator + reclaim-ON) instead of the arena fast path, via the
 /// `KLIO_RECLAIM` environment variable (`1`/`smp`/`debug` = on; unset/`0` =
@@ -435,7 +448,7 @@ pub fn ObjRef(comptime T: type) type {
         pub fn initOwned(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
             const cell = try allocator.create(Cell);
             cell.* = .{
-                .hdr = .{ .gc_trace = gcTraceThunk, .gc_finalize = gcFinalizeThunk },
+                .hdr = .{ .gc_trace = gcTraceThunk, .gc_finalize = gcFinalizeThunk, .gc_type = @typeName(T) },
                 .refcount = std.atomic.Value(usize).init(1),
                 .lock = .{},
                 .data = v,

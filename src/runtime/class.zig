@@ -293,8 +293,16 @@ pub const InstanceData = struct {
     identity: u64,
     /// Opaque per-instance state owned by a native host binding.
     native_state: ?NativeState,
+    /// For an anonymous-object instance, the values it captured from its
+    /// enclosing scope, used to seed the method-body env at dispatch. Held here
+    /// (per instance) rather than in a global registry so they are reclaimed
+    /// with the instance — the registry's anon method/class entries are
+    /// site-stable and shared across instances. Names are borrowed
+    /// (program-lifetime); the slice and the values are owned by the instance.
+    anon_captures: []Capture = &.{},
 
     pub const Field = struct { name: []const u8, value: Value };
+    pub const Capture = struct { name: []const u8, value: Value };
 
     pub fn get(self: *const InstanceData, name: []const u8) ?Value {
         for (self.fields.items) |f| {
@@ -339,6 +347,8 @@ pub const InstanceData = struct {
     pub fn deinit(self: *InstanceData, allocator: std.mem.Allocator) void {
         for (self.fields.items) |f| f.value.release(allocator);
         if (self.outer) |o| o.release(allocator);
+        for (self.anon_captures) |c| c.value.release(allocator);
+        if (self.anon_captures.len != 0) allocator.free(self.anon_captures);
         self.fields.deinit(allocator);
         self.class.deinit();
     }
@@ -349,6 +359,7 @@ pub const InstanceData = struct {
         m.shade(&self.class.cell.hdr);
         for (self.fields.items) |f| f.value.gcMark(m);
         if (self.outer) |o| o.gcMark(m);
+        for (self.anon_captures) |c| c.value.gcMark(m);
         // `native_state` is host-owned; value-bearing bindings install a
         // NativeBox gc_trace (none today — kotlinx.io.Buffer is value-free).
     }
@@ -357,6 +368,7 @@ pub const InstanceData = struct {
     /// the outer, and the class cell are independent cells swept on their own
     /// reachability, so they are NOT released here.
     pub fn gcFinalize(self: *InstanceData, allocator: std.mem.Allocator) void {
+        if (self.anon_captures.len != 0) allocator.free(self.anon_captures);
         self.fields.deinit(allocator);
     }
 

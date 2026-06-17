@@ -2569,6 +2569,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     const supertype_args = obj.supertype_args;
 
     const capture_pairs = try buildCapturePairs(allocator, captured_names, captures);
+    // The pair array is consumed here (its retained values move into the
+    // instance's `anon_captures`); free the array spine at exit. The values are
+    // NOT freed here — the instance owns them now.
+    defer if (runtime.freeScratch()) allocator.free(capture_pairs);
     const identity = nextInstanceId(self);
     const synth_class_name = try std.fmt.allocPrint(allocator, "$anon${d}", .{identity});
 
@@ -2641,8 +2645,12 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 const fid = func.id;
                 const tbl = self.anon_methods.borrowMut();
                 const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
-                tbl.get().put(try anonKey(allocator, synth_class_name, arity_name), .{ .module = sub_ref, .func = fid, .captures = capture_pairs }) catch {};
-                tbl.get().put(try anonKey(allocator, synth_class_name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = capture_pairs }) catch {};
+                // Captures are stored per-instance (`InstanceData.anon_captures`),
+                // not in this shared registry entry — the entry's method/module is
+                // site-stable, the captures vary per object, and holding them here
+                // would root every request's value graph forever.
+                tbl.get().put(try anonKey(allocator, synth_class_name, arity_name), .{ .module = sub_ref, .func = fid, .captures = &.{} }) catch {};
+                tbl.get().put(try anonKey(allocator, synth_class_name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = &.{} }) catch {};
                 tbl.deinit();
             },
             .Property => |*p| {
@@ -2653,7 +2661,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                     const fid = func.id;
                     const key = try std.fmt.allocPrint(allocator, "$get${s}", .{p.name.name});
                     const tbl = self.anon_methods.borrowMut();
-                    tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = fid, .captures = capture_pairs }) catch {};
+                    tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = fid, .captures = &.{} }) catch {};
                     tbl.deinit();
                 }
                 const init_expr = if (p.init) |*e| e else continue;
@@ -2892,12 +2900,18 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     // `outer` is an owned field of the instance (its teardown releases it);
     // `findCapture` returns a borrow, so retain before adopting it.
     if (outer) |o| o.retain();
+    // Move the captures onto the instance: it owns the refs `buildCapturePairs`
+    // retained (released on teardown). The `capture_pairs` array itself is freed
+    // at function exit; the values live on in `anon_caps`.
+    const anon_caps = try allocator.alloc(InstanceData.Capture, capture_pairs.len);
+    for (capture_pairs, 0..) |p, i| anon_caps[i] = .{ .name = p.name, .value = p.value };
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = class_def,
         .fields = fields,
         .outer = outer,
         .identity = identity,
         .native_state = null,
+        .anon_captures = anon_caps,
     });
     const inst_value: Value = .{ .Instance = inst.clone() };
 
