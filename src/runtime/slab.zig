@@ -346,7 +346,10 @@ fn allocSmall(len: usize) ?[*]u8 {
         if (slab.next) |n| n.prev = null;
         slab.next = null;
     }
-    if (cell_trace_enabled and gc.program_started) cellTraceNote(ci, @intFromPtr(cell), len);
+    // Sample 1-in-256 by address (deterministic, so free's remove agrees) to
+    // keep the per-allocation stack capture from starving the collector on a
+    // heavily-churning workload. Reported bytes are ~1/256 of the true total.
+    if (cell_trace_enabled and gc.program_started and (@intFromPtr(cell) & 0xff) == 0) cellTraceNote(ci, @intFromPtr(cell), len);
     return @ptrCast(cell);
 }
 
@@ -355,7 +358,7 @@ fn freeSmall(ptr: [*]u8) void {
     const cs = &class_states[slab.class_idx];
     cs.lock.lock();
     defer cs.lock.unlock();
-    if (cell_trace_enabled) _ = class_trace[slab.class_idx].map.remove(@intFromPtr(ptr));
+    if (cell_trace_enabled and (@intFromPtr(ptr) & 0xff) == 0) _ = class_trace[slab.class_idx].map.remove(@intFromPtr(ptr));
     const was_full = slab.free_count == 0;
     const cell: *FreeCell = @ptrCast(@alignCast(ptr));
     cell.next = slab.free_head;

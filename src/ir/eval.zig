@@ -2238,7 +2238,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                             resolved = v;
                             break;
                         },
-                        .err => {},
+                        // Each candidate miss allocates a `Vm::get_field` message
+                        // the resolver discards while walking to the next
+                        // candidate / global tier; free it (a per-lookup leak in
+                        // bare-identifier resolution, which the coroutine shim
+                        // does heavily).
+                        .err => |e| freeMissErr(allocator, e),
                     }
                 }
             }
@@ -2356,7 +2361,17 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
 /// backend is active.
 fn freeDispatchMissMsg(allocator: Allocator, msg: []const u8) void {
     if (!runtime.freeScratch()) return;
-    if (std.mem.indexOf(u8, msg, "Vm::call_member") != null) allocator.free(msg);
+    // Every host dispatch-miss message is `allocPrint`-built with a `Vm::`
+    // prefix (`Vm::call_member`, `Vm::get_field`, …); static `.Unimplemented`
+    // literals never carry that prefix, so this frees only owned messages.
+    if (std.mem.startsWith(u8, msg, "Vm::")) allocator.free(msg);
+}
+
+/// Free a discarded host dispatch-miss `EvalError` (the resolver tries many
+/// receiver candidates / fallback tiers and drops each miss). Only the
+/// `Unimplemented` arm carries an owned message.
+fn freeMissErr(allocator: Allocator, e: EvalError) void {
+    if (e == .Unimplemented) freeDispatchMissMsg(allocator, e.Unimplemented);
 }
 
 fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!EvalResult {

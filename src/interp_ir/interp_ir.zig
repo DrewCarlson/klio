@@ -526,6 +526,14 @@ fn markClosureThunk(id: u64, m: *runtime.gc.Marker) void {
 fn sweepClosuresThunk(epoch: usize) void {
     const sc = active_closures orelse return;
     sc.reclaimDead(epoch);
+    if (runtime.gc.gc_debug) {
+        const g = sc.obj.borrow();
+        const fg = sc.free_ids.borrow();
+        const mb = runtime.slab.mapped_bytes.load(.monotonic);
+        std.debug.print("[clos] spine={d} free={d} slab_mapped={d}MB\n", .{ g.get().items.len, fg.get().items.len, mb / (1024 * 1024) });
+        fg.deinit();
+        g.deinit();
+    }
 }
 
 /// Install the closure-liveness hook with this program's shared side-table.
