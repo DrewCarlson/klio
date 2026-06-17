@@ -414,3 +414,62 @@ examples premature-free a receiver/closure (confirmed: `KLIO_GC_NOFREE=1` makes
 them pass). The window is narrow — they pass at the normal collection cadence —
 so a reachable coroutine value is briefly unrooted during the resume handoff.
 Closing it is the structured-concurrency root-completeness work of §12.
+
+## Dispatch-path host-temporary leaks closed; slab page reclamation
+
+The §11 "raw host-temporaries in the dispatch hot path" tail is now largely
+closed, and the slab gained genuine page-return for partially-free regions.
+
+**Dispatch-path frees.** Several host helpers allocated scratch the collector
+never owns and never freed:
+- `eqIgnoreCase` dropped two `allocLowerString` copies (case-insensitive String
+  equals is heavy in HTTP header routing — the hottest site).
+- `userMethodNamed` / `instanceMethodWalkNamed` and the named stdlib-intrinsic
+  path built a receiver-prepended arg buffer plus a names buffer and never freed
+  them after `callFuncNamed` (which borrows both).
+- the intrinsic-name resolver duped the resolved fqn into `Intrinsic.fqn` (a raw
+  slice the collector never frees); the source string is already program-lifetime
+  so it is borrowed directly now, and every discarded bare-name intrinsic
+  reference stops leaking.
+- `firstSupertypeName` / `callSuper` duped the parent class name though the
+  contract borrows it and nothing frees the result.
+- the bound-closure call path (`with(recv){…}`, receiver-delivered-positionally)
+  leaked its prepended arg slice.
+- `kotlinx.serialization` `jsonEncode`/`jsonDecode` built their whole
+  `std.json.Value` scratch tree (and ran `parseFromSliceLeaky`) on the collector
+  heap and dropped it; both now use a call-scoped arena, with host re-entry and
+  the produced cells staying on the real allocator.
+
+**Slab page reclamation.** A slab unmapped only when its last live cell freed, so
+a region a few long-lived stragglers pinned kept its whole 256 KiB resident. The
+collector now decommits the all-free pages of slabs that have stayed mostly free
+for several consecutive passes (idle-pass hysteresis avoids churning slabs merely
+between two allocations). A reclaimed page is replaced by a fresh anonymous
+`MAP_FIXED` mapping — verified the only portable way to actually drop RSS, since
+`madvise(MADV_FREE/MADV_FREE_REUSABLE/DONTNEED)` leaves the pages counted
+resident on macOS (301 MB → 301 MB) while `MAP_FIXED` drops them (301 MB → 51 MB).
+The free cells whose intrusive link sat in a discarded page go dormant —
+re-committed and re-threaded on demand by `allocSmall` rather than mapping a
+fresh slab, so the address space stays bounded (an early revive-less version grew
+virtual memory ~34 KB/req and exhausted the VM map). Covered by a slab unit test
+(data integrity of a straggler through decommit + revive) and validated under
+`KLIO_GC_STRESS_EVERY=25` over a live ktor server.
+
+**Measurements (all fixes, tracing GC, `ps` RSS).**
+- Simple alloc-loop (2 000 000 iterations of `"item-$i" + mutableListOf`): peak
+  **123 MB, flat** — no per-iteration growth.
+- ktor 4-endpoint server: **~50 KB/req → ~13 KB/req** over 4000 requests
+  (275 MB → 335 MB), baseline ~50 MB lower than before the reclaim.
+- ktor `GET`-only: ~2.0 KB/req (the reclaim trims ~25% off the unreclaimed 2.7).
+
+**Residual, precisely characterized.** The live cell count is *flat* over long
+runs — `GET` ~2645, the 4-endpoint mix ~2795 across 1800 collections
+(`KLIO_GC_DEBUG`) — so there is **no value-graph leak**; the residual RSS growth
+is slab fragmentation: per-request medium-lived cells (response/call/coroutine
+state) land in fresh slabs and pin them, and the slope is independent of the GC
+threshold (1 MB vs 8 MB floors give the same slope, only a lower baseline). The
+page reclaim recovers the *stably*-idle stragglers but is neutral on the denser
+mixed workload, whose slabs stay above the reclaim's live fraction between
+collections. Fully flattening this needs either compaction (a moving collector,
+out of scope for the current non-moving design) or a per-request/per-coroutine
+arena that frees host scratch wholesale at the request boundary.
