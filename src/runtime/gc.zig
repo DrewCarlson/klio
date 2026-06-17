@@ -212,6 +212,12 @@ pub fn registerRoot(f: RootFn) void {
 /// Value, whose own `gcMark` re-invokes this hook.
 pub var markClosureHook: ?*const fn (id: u64, m: *Marker) void = null;
 
+/// Post-sweep hook: reclaim the metadata of closure side-table slots no live
+/// value referenced this collection (`epoch`). Set by `interp_ir` alongside
+/// `markClosureHook`; null (a no-op) otherwise. Called inside the stop-the-world
+/// pause, after the sweep, so the side-table is stable.
+pub var sweepClosureHook: ?*const fn (epoch: usize) void = null;
+
 // ---------------------------------------------------------------------------
 // Per-thread roots. A subsystem's roots live in threadlocals (the eval frame
 // chain, the host-op keepalive stack, the coroutine interceptor/scope stacks),
@@ -378,6 +384,10 @@ pub fn collect() void {
     const marked = marker.drainCounted();
 
     const freed = sweep();
+    // Reclaim closure side-table metadata for slots no live value marked this
+    // epoch (still stop-the-world: the side-table is stable). Done after the
+    // sweep so the capture-store cells of dead closures are already gone.
+    if (sweepClosureHook) |f| f(cur_epoch);
     gc_pending.store(false, .monotonic);
     bytes_since_gc.store(0, .monotonic);
     if (others != 0) stop_flag.store(false, .release);

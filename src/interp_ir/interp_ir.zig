@@ -478,6 +478,17 @@ pub const ClosureInfo = struct {
     /// chain from this snapshot rather than the dynamic caller's chain.
     chain: []const ir.eval.EnclosingEntry = &.{},
 
+    /// The collection epoch in which a live value last marked this closure
+    /// (see `markClosureThunk`). The post-sweep reclamation frees a slot's owned
+    /// metadata (`capture_names`, `chain`) once no live value references its id
+    /// — i.e. it was not marked in the just-finished collection — so the
+    /// append-only spine's per-closure bytes stay bounded by the live set rather
+    /// than by total closure-creation events (a per-request leak for a server).
+    mark_epoch: usize = 0,
+    /// True once the slot's metadata has been reclaimed; the id is never reused
+    /// (ids stay append-stable, so no value can dispatch on a stale id).
+    reclaimed: bool = false,
+
     /// No-op tracer: a closure's capture store and receiver chain are kept alive
     /// ONLY while a live value references the closure id (see `markClosureThunk`
     /// / `runtime.gc.markClosureHook`), so the side-table spine must not pin
@@ -496,10 +507,25 @@ var active_closures: ?SharedClosures = null;
 
 fn markClosureThunk(id: u64, m: *runtime.gc.Marker) void {
     const sc = active_closures orelse return;
-    if (sc.get(id)) |info| {
+    // Mark the slot live for this epoch (so the post-sweep reclamation spares
+    // it), then shade its capture store + receiver chain. Runs during the
+    // stop-the-world mark, so the in-place pointer is stable (no concurrent
+    // push can realloc the spine).
+    if (sc.getPtr(id)) |info| {
+        info.mark_epoch = m.epoch;
         for (info.chain) |e| e.v.gcMark(m);
         m.shade(&info.captures.cell.hdr);
     }
+}
+
+/// Free the owned metadata of every closure slot no live value referenced in
+/// the just-finished collection (`epoch`). Called once after the sweep, still
+/// stop-the-world, so the spine is stable and no slot is concurrently pushed.
+/// The capture-store cell is collected on its own reachability; ids are never
+/// reused.
+fn sweepClosuresThunk(epoch: usize) void {
+    const sc = active_closures orelse return;
+    sc.reclaimDead(epoch);
 }
 
 /// Install the closure-liveness hook with this program's shared side-table.
@@ -507,6 +533,7 @@ fn markClosureThunk(id: u64, m: *runtime.gc.Marker) void {
 pub fn gcInstallClosureHook(closures: SharedClosures) void {
     active_closures = closures;
     runtime.gc.markClosureHook = markClosureThunk;
+    runtime.gc.sweepClosureHook = sweepClosuresThunk;
 }
 
 /// Lambda/closure side-table shared across every OS thread of one
@@ -537,6 +564,34 @@ pub const SharedClosures = struct {
         const list = g.get();
         if (id >= list.items.len) return null;
         return list.items[id];
+    }
+
+    /// In-place slot pointer for the stop-the-world GC mark/sweep only. The
+    /// spine only ever grows, and `push` cannot run concurrently with a
+    /// collection (the world is stopped), so the returned pointer is stable.
+    pub fn getPtr(self: SharedClosures, id: usize) ?*ClosureInfo {
+        const g = self.obj.borrowMut();
+        defer g.deinit();
+        const list = g.get();
+        if (id >= list.items.len) return null;
+        return &list.items[id];
+    }
+
+    /// Free the owned metadata of every slot not marked in `epoch` (no live
+    /// value references its id). The capture-store cell is swept separately by
+    /// reachability; the id is never reused. STW-only.
+    pub fn reclaimDead(self: SharedClosures, epoch: usize) void {
+        const g = self.obj.borrowMut();
+        defer g.deinit();
+        const a = self.obj.cell.allocator;
+        for (g.get().items) |*info| {
+            if (info.reclaimed or info.mark_epoch == epoch) continue;
+            if (info.capture_names.len != 0) a.free(info.capture_names);
+            if (info.chain.len != 0) a.free(info.chain);
+            info.capture_names = &.{};
+            info.chain = &.{};
+            info.reclaimed = true;
+        }
     }
 
     /// Append `info`, returning its stable id.
