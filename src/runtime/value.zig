@@ -141,6 +141,22 @@ pub const DelegateKind = union(enum) {
     Observable: struct { value: Value, on_change: Value },
     /// `Delegates.notNull<T>()`.
     NotNull: struct { value: ?Value, name: []const u8 },
+
+    /// GC out-edges: a delegate held across a collection must keep its producer
+    /// / change lambda and stored/cached value reachable (they live only here).
+    pub fn gcTrace(self: *const DelegateKind, m: *objcell.gc.Marker) void {
+        switch (self.*) {
+            .Lazy => |l| {
+                l.producer.gcMark(m);
+                if (l.cached) |c| c.gcMark(m);
+            },
+            .Observable => |o| {
+                o.value.gcMark(m);
+                o.on_change.gcMark(m);
+            },
+            .NotNull => |n| if (n.value) |v| v.gcMark(m),
+        }
+    }
 };
 
 /// State-machine representation of a `suspend fun` body.
@@ -205,6 +221,37 @@ pub const SuspendFrame = struct {
 pub const SequenceData = struct {
     source: SequenceSource,
     ops: []SeqOp,
+
+    /// GC out-edges: the lazy source (eager items, or the seed/step generator
+    /// closures) and every pipeline op's lambda. Without this a `Sequence` held
+    /// across a collection sweeps its generator/op closures and source elements
+    /// (they are reachable only through here), so reads after the collection hit
+    /// freed cells.
+    pub fn gcTrace(self: *const SequenceData, m: *objcell.gc.Marker) void {
+        switch (self.source) {
+            .Items => |items| m.shade(&items.cell.hdr),
+            .Generate => |g| {
+                if (g.seed) |s| m.shade(&s.cell.hdr);
+                m.shade(&g.next.cell.hdr);
+            },
+        }
+        for (self.ops) |op| switch (op) {
+            .Map,
+            .Filter,
+            .FilterNot,
+            .OnEach,
+            .MapIndexed,
+            .FilterIndexed,
+            .TakeWhile,
+            .DropWhile,
+            .FlatMap,
+            .DistinctBy,
+            .SortedWith,
+            => |v| v.gcMark(m),
+            .SortedBy => |sb| sb.selector.gcMark(m),
+            .Take, .Drop, .Distinct, .Sorted => {},
+        };
+    }
 };
 
 pub const SequenceSource = union(enum) {
@@ -246,6 +293,11 @@ pub const RegexData = struct {
     pattern: StringRef,
     /// Opaque compiled-regex handle owned by the host regex binding.
     engine: ?*anyopaque,
+
+    /// GC out-edge: a live regex keeps its pattern bytes reachable.
+    pub fn gcTrace(self: *const RegexData, m: *objcell.gc.Marker) void {
+        m.shade(&self.pattern.cell.hdr);
+    }
 };
 
 pub const MatchGroupData = struct {
@@ -264,6 +316,14 @@ pub const MatchData = struct {
     /// Byte offset in `input` immediately after the matched span.
     end_byte: usize,
     regex: ObjRef(RegexData),
+
+    /// GC out-edges: the matched input, the originating regex, and each capture
+    /// group's text — all reachable only through a held `MatchResult`.
+    pub fn gcTrace(self: *const MatchData, m: *objcell.gc.Marker) void {
+        m.shade(&self.input.cell.hdr);
+        m.shade(&self.regex.cell.hdr);
+        for (self.groups) |g| if (g) |grp| m.shade(&grp.value.cell.hdr);
+    }
 };
 
 // ---------------------------------------------------------------------------
