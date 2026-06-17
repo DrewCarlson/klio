@@ -2143,6 +2143,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Static call on an Intrinsic receiver: probe `<fqn>.<name>`.
     if (receiver.* == .Intrinsic) {
         const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ receiver.Intrinsic.fqn, name });
+        defer if (runtime.freeScratch()) allocator.free(probe);
         if (lookupIntrinsic(self, probe)) |func| {
             return dispatchIntrinsic(self, allocator, probe, func, args);
         }
@@ -2154,8 +2155,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const cfqn = cg.get().fqn;
         cg.deinit();
         const probe_simple = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
-        if (lookupIntrinsic(self, probe_simple)) |func| return dispatchIntrinsic(self, allocator, probe_simple, func, args);
         const probe_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+        // `dispatchIntrinsic` borrows the key for the call only; free both
+        // scratch probe keys on exit (a per-Class-member-call leak).
+        defer if (runtime.freeScratch()) {
+            allocator.free(probe_simple);
+            allocator.free(probe_fqn);
+        };
+        if (lookupIntrinsic(self, probe_simple)) |func| return dispatchIntrinsic(self, allocator, probe_simple, func, args);
         if (lookupIntrinsic(self, probe_fqn)) |func| return dispatchIntrinsic(self, allocator, probe_fqn, func, args);
     }
 
@@ -2279,9 +2286,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const mg = self.module.borrow();
         const mod = mg.get();
         const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+        defer if (runtime.freeScratch()) allocator.free(fqn_probe);
         var class_id = mod.classIdByFqn(fqn_probe);
         if (class_id == null and !std.mem.eql(u8, cname, cfqn)) {
             const name_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
+            defer if (runtime.freeScratch()) allocator.free(name_probe);
             class_id = mod.classIdByFqn(name_probe);
         }
         if (class_id == null) class_id = mod.classId(name);
@@ -2662,6 +2671,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         hostHasMember(self, receiver, "entries") and !hostHasMember(self, receiver, "iterator"))
     {
         const probe = try std.fmt.allocPrint(allocator, "kotlin.collections.Map.{s}", .{name});
+        defer if (runtime.freeScratch()) allocator.free(probe);
         if (lookupIntrinsic(self, probe)) |f| {
             const built = blk: {
                 map_fallback_active = true;
@@ -2681,10 +2691,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Iterable fallback.
     if (receiver.* == .Instance and !iterable_fallback_active and hostHasMember(self, receiver, "iterator")) {
         const p1 = try std.fmt.allocPrint(allocator, "kotlin.collections.Iterable.{s}", .{name});
+        defer if (runtime.freeScratch()) allocator.free(p1);
         var matched: []const u8 = p1;
         var intrinsic = lookupIntrinsic(self, p1);
+        var p2_owned: ?[]const u8 = null;
+        defer if (runtime.freeScratch()) if (p2_owned) |p| allocator.free(p);
         if (intrinsic == null) {
             const p2 = try std.fmt.allocPrint(allocator, "kotlin.collections.List.{s}", .{name});
+            p2_owned = p2;
             intrinsic = lookupIntrinsic(self, p2);
             matched = p2;
         }
@@ -5423,9 +5437,11 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         const mg = self.module.borrow();
         const mod = mg.get();
         const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+        defer if (runtime.freeScratch()) allocator.free(fqn_probe);
         var class_id = mod.classIdByFqn(fqn_probe);
         if (class_id == null and !std.mem.eql(u8, cname, cfqn)) {
             const name_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
+            defer if (runtime.freeScratch()) allocator.free(name_probe);
             class_id = mod.classIdByFqn(name_probe);
         }
         mg.deinit();
@@ -5516,6 +5532,9 @@ fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
         try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}),
         try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name}),
     };
+    // The probe keys are scratch for the lookup loop; free them on exit (a
+    // per-stdlib-call leak on the ktor request path).
+    defer if (runtime.freeScratch()) for (probes) |p| allocator.free(p);
     for (probes) |probe| {
         const params = stdlib.paramNames(probe) orelse continue;
         var slots = try allocator.alloc(?Value, params.len);
