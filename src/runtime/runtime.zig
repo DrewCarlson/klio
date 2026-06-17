@@ -29,12 +29,17 @@ pub const BorrowMutError = objcell.BorrowMutError;
 pub const SpinMutex = objcell.SpinMutex;
 pub const setReclaim = objcell.setReclaim;
 pub const reclaimEnabled = objcell.reclaimEnabled;
+pub const freeScratch = objcell.freeScratch;
 pub const reclaimRequested = objcell.reclaimRequested;
 pub const AllocChoice = objcell.AllocChoice;
 pub const allocChoice = objcell.allocChoice;
 pub const getenvSlice = objcell.getenvSlice;
 // Tracing GC (KGC) — see gc.zig / plans/GC.md.
 pub const gc = objcell.gc;
+// Page-returning slab allocator for the GC backend (keeps RSS tracking the
+// live set; smp/libc free-lists never return reclaimed pages to the OS).
+pub const slab = @import("slab.zig");
+pub const leaktrack = @import("leaktrack.zig");
 // Host-op temporary keepalive (a GC root for accumulators/snapshots held across
 // a re-entrant user callable). No-ops unless the GC is active.
 pub const keepaliveMark = value_mod.keepaliveMark;

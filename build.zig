@@ -19,6 +19,7 @@ const mod_list = [_]Mod{
     .{ .name = "lexer", .deps = &.{ "diagnostics", "span" }, .tested = true },
     .{ .name = "pack", .deps = &.{ "ast", "span", "types" }, .tested = true },
     .{ .name = "parser", .deps = &.{ "ast", "diagnostics", "lexer", "span" }, .tested = true },
+    .{ .name = "jit", .tested = true },
     .{ .name = "ir", .deps = &.{ "span", "ast", "types", "runtime", "diagnostics" }, .tested = true },
     .{ .name = "stdlib", .deps = &.{ "runtime", "pack" }, .tested = true },
     .{ .name = "cfa", .deps = &.{ "ast", "diagnostics", "lexer", "parser", "span", "types" }, .tested = true },
@@ -350,6 +351,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            // libc for the GC backing (`c_allocator`) + the macOS
+            // `malloc_zone_pressure_relief` page trim that keeps process RSS
+            // tracking the live set under the tracing collector.
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "cli", .module = mods.get("cli").? },
                 .{ .name = "runtime", .module = mods.get("runtime").? },

@@ -2143,6 +2143,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Static call on an Intrinsic receiver: probe `<fqn>.<name>`.
     if (receiver.* == .Intrinsic) {
         const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ receiver.Intrinsic.fqn, name });
+        defer if (runtime.freeScratch()) allocator.free(probe);
         if (lookupIntrinsic(self, probe)) |func| {
             return dispatchIntrinsic(self, allocator, probe, func, args);
         }
@@ -2154,8 +2155,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const cfqn = cg.get().fqn;
         cg.deinit();
         const probe_simple = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
-        if (lookupIntrinsic(self, probe_simple)) |func| return dispatchIntrinsic(self, allocator, probe_simple, func, args);
         const probe_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+        // `dispatchIntrinsic` borrows the key for the call only; free both
+        // scratch probe keys on exit (a per-Class-member-call leak).
+        defer if (runtime.freeScratch()) {
+            allocator.free(probe_simple);
+            allocator.free(probe_fqn);
+        };
+        if (lookupIntrinsic(self, probe_simple)) |func| return dispatchIntrinsic(self, allocator, probe_simple, func, args);
         if (lookupIntrinsic(self, probe_fqn)) |func| return dispatchIntrinsic(self, allocator, probe_fqn, func, args);
     }
 
@@ -2279,9 +2286,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const mg = self.module.borrow();
         const mod = mg.get();
         const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+        defer if (runtime.freeScratch()) allocator.free(fqn_probe);
         var class_id = mod.classIdByFqn(fqn_probe);
         if (class_id == null and !std.mem.eql(u8, cname, cfqn)) {
             const name_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
+            defer if (runtime.freeScratch()) allocator.free(name_probe);
             class_id = mod.classIdByFqn(name_probe);
         }
         if (class_id == null) class_id = mod.classId(name);
@@ -2451,7 +2460,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 return .{ .ok = elem };
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, items.len });
-            defer if (runtime.reclaimEnabled()) allocator.free(msg);
+            defer if (runtime.freeScratch()) allocator.free(msg);
             return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
         }
     }
@@ -2471,7 +2480,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 return .{ .ok = .Unit };
             }
             const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, items.len });
-            defer if (runtime.reclaimEnabled()) allocator.free(msg);
+            defer if (runtime.freeScratch()) allocator.free(msg);
             return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
         }
     }
@@ -2662,6 +2671,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         hostHasMember(self, receiver, "entries") and !hostHasMember(self, receiver, "iterator"))
     {
         const probe = try std.fmt.allocPrint(allocator, "kotlin.collections.Map.{s}", .{name});
+        defer if (runtime.freeScratch()) allocator.free(probe);
         if (lookupIntrinsic(self, probe)) |f| {
             const built = blk: {
                 map_fallback_active = true;
@@ -2673,6 +2683,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 .err => |e| return .{ .err = e },
             };
             const new_args = try prependReceiver(allocator, &map_val, args);
+            defer if (runtime.freeScratch()) allocator.free(new_args);
             return dispatchIntrinsic(self, allocator, probe, f, new_args);
         }
     }
@@ -2680,10 +2691,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Iterable fallback.
     if (receiver.* == .Instance and !iterable_fallback_active and hostHasMember(self, receiver, "iterator")) {
         const p1 = try std.fmt.allocPrint(allocator, "kotlin.collections.Iterable.{s}", .{name});
+        defer if (runtime.freeScratch()) allocator.free(p1);
         var matched: []const u8 = p1;
         var intrinsic = lookupIntrinsic(self, p1);
+        var p2_owned: ?[]const u8 = null;
+        defer if (runtime.freeScratch()) if (p2_owned) |p| allocator.free(p);
         if (intrinsic == null) {
             const p2 = try std.fmt.allocPrint(allocator, "kotlin.collections.List.{s}", .{name});
+            p2_owned = p2;
             intrinsic = lookupIntrinsic(self, p2);
             matched = p2;
         }
@@ -2698,6 +2713,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 .err => |e| return .{ .err = e },
             };
             const new_args = try prependReceiver(allocator, &dv, args);
+            defer if (runtime.freeScratch()) allocator.free(new_args);
             return dispatchIntrinsic(self, allocator, matched, f, new_args);
         }
     }
@@ -2747,7 +2763,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 /// prefix). Safe to call at any discard site: a static `.Unimplemented`
 /// literal does not match, so it is never freed. No-op under the arena.
 fn freeDispatchMiss(allocator: Allocator, r: EvalResult) void {
-    if (!runtime.reclaimEnabled()) return;
+    if (!runtime.freeScratch()) return;
     if (r == .err and r.err == .Unimplemented) {
         const m = r.err.Unimplemented;
         if (std.mem.indexOf(u8, m, "Vm::call_member") != null) allocator.free(m);
@@ -2827,7 +2843,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
     // Probe FQNs are per-call scratch (all `allocPrint`ed below); free them and
     // the list. No-op under the arena; reclaims under a freeing allocator.
     defer {
-        if (runtime.reclaimEnabled()) for (probes.items) |p| allocator.free(p);
+        if (runtime.freeScratch()) for (probes.items) |p| allocator.free(p);
         probes.deinit(allocator);
     }
     try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name }));
@@ -2867,6 +2883,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         };
         if (installed) |func| {
             const all_args = try prependReceiver(allocator, receiver, args);
+            defer if (runtime.freeScratch()) allocator.free(all_args);
             return try dispatchIntrinsic(self, allocator, p, func, all_args);
         }
     }
@@ -2877,9 +2894,17 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name }),
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_name, name }),
         };
+        // The synthesized lookup keys are scratch; free them once probed (a
+        // per-anon-method-call leak — the ktor pipeline calls anon-object
+        // methods on every request).
+        defer if (runtime.freeScratch()) {
+            allocator.free(synth[0]);
+            allocator.free(synth[1]);
+        };
         for (synth) |p| {
             if (lookupIntrinsic(self, p)) |func| {
                 const all_args = try prependReceiver(allocator, receiver, args);
+                defer if (runtime.freeScratch()) allocator.free(all_args);
                 return try dispatchIntrinsic(self, allocator, p, func, all_args);
             }
         }
@@ -2921,6 +2946,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         if (mapped) |p| {
             if (lookupIntrinsic(self, p)) |func| {
                 const all_args = try prependReceiver(allocator, receiver, args);
+                defer if (runtime.freeScratch()) allocator.free(all_args);
                 return try dispatchIntrinsic(self, allocator, p, func, all_args);
             }
         }
@@ -3028,7 +3054,9 @@ fn eqIgnoreCase(allocator: Allocator, a: StringRef, b: StringRef) bool {
     const bg = b.borrow();
     defer bg.deinit();
     const la = std.ascii.allocLowerString(allocator, ag.get().*) catch return false;
+    defer if (runtime.freeScratch()) allocator.free(la);
     const lb = std.ascii.allocLowerString(allocator, bg.get().*) catch return false;
+    defer if (runtime.freeScratch()) allocator.free(lb);
     return std.mem.eql(u8, la, lb);
 }
 
@@ -3231,7 +3259,7 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         if (singleton) |s| {
             if (s == .Instance) {
                 const no_such = try std.fmt.allocPrint(allocator, "`{s}` on", .{name});
-                defer if (runtime.reclaimEnabled()) allocator.free(no_such);
+                defer if (runtime.freeScratch()) allocator.free(no_such);
                 const r = try callMemberRec(self, allocator, &s, name, args);
                 switch (r) {
                     .ok => return r,
@@ -3282,7 +3310,7 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
             }
         }
         const msg = try std.fmt.allocPrint(allocator, "No enum constant {s}.{s}", .{ cg.get().fqn, want });
-        defer if (runtime.reclaimEnabled()) allocator.free(msg);
+        defer if (runtime.freeScratch()) allocator.free(msg);
         sg.deinit();
         cg.deinit();
         return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
@@ -4184,6 +4212,8 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
         g.deinit();
     }
     const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ name, args.len });
+    // Scratch lookup key (lookupAnonMethod dupes what it stores); free it.
+    defer if (runtime.freeScratch()) allocator.free(arity_name);
 
     // Enum-entry override class first.
     if (entry_tag) |tag| {
@@ -4282,16 +4312,31 @@ fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Value,
     }
     const packed_args = try packVarargArgs(self, allocator, &f, try all.toOwnedSlice(allocator));
 
+    // Captures come from the instance for an anonymous-object expression
+    // (`buildObject` stores them per-instance, registry entry empty), or from
+    // the registry entry for a local class (`registerClassCaptured` registers
+    // once per declaration — site-stable, no leak). Prefer the instance; fall
+    // back to the entry. `InstanceData.Capture` and `NameValue` are the same
+    // shape, so the instance slice reinterprets as `[]const NameValue`.
+    comptime std.debug.assert(@sizeOf(InstanceData.Capture) == @sizeOf(NameValue));
+    const inst_caps: []const InstanceData.Capture = blk: {
+        if (receiver.* != .Instance) break :blk &.{};
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().anon_captures;
+    };
+    const caps: []const NameValue = if (inst_caps.len != 0) @ptrCast(inst_caps) else hit.captures;
+
     // Layer captured outer-env names onto globals + build the capture vec.
     const prev = self.globals.clone();
     defer {
         self.globals.deinit();
         self.globals = prev;
     }
-    if (hit.captures.len != 0) {
+    if (caps.len != 0) {
         const scoped = try ObjRef(runtime.Env).init(allocator, runtime.Env.withParent(allocator, self.globals.clone()));
         const sg = scoped.borrowMut();
-        for (hit.captures) |nv| sg.get().define(nv.name, nv.value) catch {};
+        for (caps) |nv| sg.get().define(nv.name, nv.value) catch {};
         sg.deinit();
         self.globals = scoped;
     }
@@ -4307,13 +4352,16 @@ fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Value,
             try cap_vec.append(allocator, receiver.*);
         } else {
             var found: Value = .Null;
-            for (hit.captures) |nv| {
+            for (caps) |nv| {
                 if (std.mem.eql(u8, nv.name, cn)) found = nv.value;
             }
             try cap_vec.append(allocator, found);
         }
     }
     var packed_list = try argsListFromSlice(allocator, packed_args);
+    // `argsListFromSlice` copied the args into the frame-owned list; the
+    // `packed_args` buffer (a full allocation from `packVarargArgs`) is dead.
+    if (runtime.freeScratch()) allocator.free(packed_args);
     _ = &packed_list;
     vmhost.emitPath(allocator, "member_anon", f.fqn, f.id, receiver, args);
     return ir.eval.evalWithCapturesIn(VmHost, allocator, module_rc, module_rc, &f, packed_list, cap_vec, self);
@@ -4415,18 +4463,30 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                         if (pg.get().func_defaults.get(@intFromEnum(f.id))) |d| break :blk try allocator.dupe(?FuncId, d);
                         break :blk null;
                     };
+                    defer if (defaults) |d| if (runtime.freeScratch()) allocator.free(d);
                     if (defaults != null and all.len < f.params.len) {
                         const padded = try padArgsWithDefaults(self, allocator, mod, f.params.len, all, defaults);
                         switch (padded) {
-                            .ok => |p| all = p,
+                            .ok => |p| {
+                                // `padArgsWithDefaults` builds a fresh slice and does
+                                // not free its input; the original prepend buffer is dead.
+                                if (runtime.freeScratch()) allocator.free(all);
+                                all = p;
+                            },
                             .err => |e| {
+                                if (runtime.freeScratch()) allocator.free(all);
                                 mg.deinit();
                                 return .{ .err = e };
                             },
                         }
                     }
+                    // `packVarargArgs` returns `all` as-is when there is no vararg, or
+                    // frees `all` and returns a fresh buffer when packing one. Either
+                    // way `packed_args` is the live buffer to free; `argsListFromSlice`
+                    // copies it into a frame-owned list, so it is dead afterward.
                     const packed_args = try packVarargArgs(self, allocator, &f, all);
                     var packed_list = try argsListFromSlice(allocator, packed_args);
+                    if (runtime.freeScratch()) allocator.free(packed_args);
                     _ = &packed_list;
                     if (trace.invariantsEnabled()) {
                         checkFuncInRange(self, "irMethodWalk", f.id);
@@ -4515,7 +4575,7 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     // Probe FQNs are per-call scratch (all `allocPrint`ed below); free them and
     // the list. No-op under the arena; reclaims under a freeing allocator.
     defer {
-        if (runtime.reclaimEnabled()) for (probes.items) |p| allocator.free(p);
+        if (runtime.freeScratch()) for (probes.items) |p| allocator.free(p);
         probes.deinit(allocator);
     }
     if (args.len == 0) {
@@ -4544,7 +4604,7 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     if (sibling) |sib| {
         const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ sib, name });
         const anchor = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name });
-        defer if (runtime.reclaimEnabled()) allocator.free(anchor);
+        defer if (runtime.freeScratch()) allocator.free(anchor);
         var inserted = false;
         for (probes.items, 0..) |p, idx| {
             if (std.mem.eql(u8, p, anchor)) {
@@ -4568,7 +4628,7 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     // Array builder global factory direct dispatch.
     if (stdlib.isArrayBuilder(name) and !hostHasMember(self, receiver, name)) {
         const probe = try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name});
-        defer if (runtime.reclaimEnabled()) allocator.free(probe);
+        defer if (runtime.freeScratch()) allocator.free(probe);
         if (lookupIntrinsic(self, probe)) |func| {
             return try dispatchIntrinsic(self, allocator, probe, func, args);
         }
@@ -4578,7 +4638,7 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
         for (probes.items) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
                 const all_args = try prependReceiver(allocator, receiver, args);
-                defer if (runtime.reclaimEnabled()) allocator.free(all_args);
+                defer if (runtime.freeScratch()) allocator.free(all_args);
                 return try dispatchIntrinsic(self, allocator, probe, func, all_args);
             }
         }
@@ -4736,7 +4796,9 @@ fn delegateForward(self: *VmHost, allocator: Allocator, receiver: *const Value, 
                 if (swallow_unimplemented_only) {
                     if (e != .Unimplemented) return r;
                 }
-                // else: swallow all errors and continue.
+                // else: swallow all errors and continue. The swallowed miss's
+                // `Vm::call_member` message is discarded here; free it.
+                freeDispatchMiss(allocator, r);
             },
         }
     }
@@ -4966,17 +5028,22 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         if (receiver.* != .Instance) break :blk false;
         const c = chosen.?;
         const coll = try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name});
+        defer if (runtime.freeScratch()) allocator.free(coll);
         const seq = try std.fmt.allocPrint(allocator, "kotlin.sequences.{s}", .{name});
+        defer if (runtime.freeScratch()) allocator.free(seq);
         if (!(std.mem.eql(u8, c.func.fqn, coll) or std.mem.eql(u8, c.func.fqn, seq))) break :blk false;
         if (!hostHasMember(self, receiver, "iterator")) break :blk false;
         const ip = try std.fmt.allocPrint(allocator, "kotlin.collections.Iterable.{s}", .{name});
+        defer if (runtime.freeScratch()) allocator.free(ip);
         const lp = try std.fmt.allocPrint(allocator, "kotlin.collections.List.{s}", .{name});
+        defer if (runtime.freeScratch()) allocator.free(lp);
         break :blk (lookupIntrinsic(self, ip) != null) or (lookupIntrinsic(self, lp) != null);
     };
 
     if (!defer_to_property and !defer_to_iterable) {
         const c = chosen.?;
         const all = try prependReceiver(allocator, receiver, args);
+        defer if (runtime.freeScratch()) allocator.free(all);
         const mg = self.module.borrow();
         const mod = mg.get();
         // A member-extension's body has its declaring class's `this` in
@@ -5235,6 +5302,7 @@ fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const V
             if (s == .Instance) {
                 const r = try callMemberRec(self, allocator, &s, name, args);
                 if (r == .ok) return r;
+                freeDispatchMiss(allocator, r);
             }
         }
     }
@@ -5284,6 +5352,9 @@ fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: *con
                     if (sid != recv_id) {
                         const r = try callMemberRec(self, allocator, &s, name, args);
                         if (r == .ok) return r;
+                        // The companion probe missed; free its discarded
+                        // `Vm::call_member` message before trying the next.
+                        freeDispatchMiss(allocator, r);
                     }
                 }
             }
@@ -5368,9 +5439,11 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         const mg = self.module.borrow();
         const mod = mg.get();
         const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+        defer if (runtime.freeScratch()) allocator.free(fqn_probe);
         var class_id = mod.classIdByFqn(fqn_probe);
         if (class_id == null and !std.mem.eql(u8, cname, cfqn)) {
             const name_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
+            defer if (runtime.freeScratch()) allocator.free(name_probe);
             class_id = mod.classIdByFqn(name_probe);
         }
         mg.deinit();
@@ -5461,6 +5534,9 @@ fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
         try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}),
         try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name}),
     };
+    // The probe keys are scratch for the lookup loop; free them on exit (a
+    // per-stdlib-call leak on the ktor request path).
+    defer if (runtime.freeScratch()) for (probes) |p| allocator.free(p);
     for (probes) |probe| {
         const params = stdlib.paramNames(probe) orelse continue;
         var slots = try allocator.alloc(?Value, params.len);
@@ -5505,6 +5581,7 @@ fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
         if (lookupIntrinsic(self, probe)) |func| {
             const all_args = try prependReceiver(allocator, receiver, reordered.items);
+            defer if (runtime.freeScratch()) allocator.free(all_args);
             return try dispatchIntrinsic(self, allocator, probe, func, all_args);
         }
         break;
@@ -5521,7 +5598,9 @@ fn userMethodNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     }
     if (resolveExtOverloadLocal(self, allocator, name, receiver, args, arg_names)) |fid| {
         const all = try prependReceiver(allocator, receiver, args);
+        defer if (runtime.freeScratch()) allocator.free(all);
         var names = try allocator.alloc(?[]const u8, arg_names.len + 1);
+        defer if (runtime.freeScratch()) allocator.free(names);
         names[0] = null;
         @memcpy(names[1..], arg_names);
         const mg = self.module.borrow();
@@ -5744,7 +5823,9 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
     }
     if (method_fid) |fid| {
         const all = try prependReceiver(allocator, receiver, args);
+        defer if (runtime.freeScratch()) allocator.free(all);
         var names = try allocator.alloc(?[]const u8, all.len);
+        defer if (runtime.freeScratch()) allocator.free(names);
         names[0] = null;
         if (arg_names) |an| {
             for (an, 0..) |n, i| {
@@ -5844,7 +5925,9 @@ fn firstSupertypeName(self: *VmHost, allocator: Allocator, class_name: []const u
     defer dg.deinit();
     const sups = dg.get().supertype_names;
     if (sups.len == 0) return null;
-    return allocator.dupe(u8, sups[0]) catch null;
+    // Class-table-owned (program-lifetime); returned borrowed per the contract.
+    _ = allocator;
+    return sups[0];
 }
 
 /// Whether `q` is one of `class_name`'s registered supertypes.
@@ -5880,7 +5963,8 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
     var parent_name: ?[]const u8 = null;
     if (qualifier) |q| {
         if (ownerHasSupertype(self, owner_class, q)) {
-            parent_name = try allocator.dupe(u8, q);
+            // `q` is the const-pool super qualifier (program-lifetime); borrow it.
+            parent_name = q;
         } else {
             parent_name = firstSupertypeName(self, allocator, q);
         }

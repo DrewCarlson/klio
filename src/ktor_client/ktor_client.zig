@@ -137,11 +137,12 @@ fn make_string_array(allocator: Allocator, values: [][]const u8) Allocator.Error
 }
 
 /// Free an owned slice of owned strings produced by `perform`. The strings
-/// are copied into fresh `StringRef` cells by `make_string_array` (which
-/// `.init`-dupes under reclaim), so the originals must be released. Gated on
-/// reclaim: under the arena fast path the arena reclaims them wholesale.
+/// are copied into fresh `StringRef` cells by `make_string_array`, which dupes
+/// the bytes whenever a freeing allocator is active (reclaim or GC), so the
+/// originals are independent and must be released. Gated on `freeScratch`; only
+/// the legacy arena fast path reclaims them wholesale.
 fn freeOwnedStrings(allocator: Allocator, values: [][]const u8) void {
-    if (!runtime.reclaimEnabled()) return;
+    if (!runtime.freeScratch()) return;
     for (values) |s| allocator.free(s);
     allocator.free(values);
 }
@@ -800,8 +801,17 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     defer _ = c.close(listen_fd);
 
+    // Diagnostic: serve a bounded number of requests then return cleanly, so a
+    // leak-checking allocator (KLIO_GC_ALLOC=gpa) reaches its end-of-run report.
+    const serve_max: usize = blk: {
+        const v = runtime.getenvSlice("KLIO_SERVE_MAX") orelse break :blk 0;
+        break :blk std.fmt.parseInt(usize, v, 10) catch 0;
+    };
+    var served: usize = 0;
+
     while (true) {
         if (runtime.shouldAbandon()) break;
+        if (serve_max != 0 and served >= serve_max) break;
         var pfd = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
         const ready = c.poll(&pfd, 1, 200);
         if (ready <= 0) continue; // timeout (re-check abandon) or transient error
@@ -809,6 +819,20 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
         if (conn < 0) continue;
         defer _ = c.close(conn);
         const parsed = (try read_request(a, conn)) orelse continue;
+        // The parsed strings are owned by `a`; their bytes are copied into the
+        // request array's `StringRef` cells below, so the originals are dead
+        // once the array is built. Free them under a freeing allocator (the
+        // collector never owns these raw host buffers).
+        defer if (runtime.freeScratch()) {
+            a.free(parsed.method);
+            a.free(parsed.path);
+            if (parsed.body.len != 0) a.free(parsed.body);
+            for (parsed.headers) |h| {
+                a.free(h.key);
+                a.free(h.value);
+            }
+            a.free(parsed.headers);
+        };
         // Request array: [method, path, body, hk1, hv1, hk2, hv2, ...] — the
         // shim reads the fixed head and the trailing header key/value pairs.
         var items: std.ArrayList(Value) = .empty;
@@ -829,10 +853,22 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
             .ok => |rv| {
                 const decoded = try decode_response(a, &rv);
                 try write_response(a, conn, decoded.status, decoded.content_type, decoded.body, decoded.headers);
+                // The decoded strings are owned by `a` and only needed to build
+                // the on-wire response; free them once written.
+                if (runtime.freeScratch()) {
+                    a.free(decoded.content_type);
+                    a.free(decoded.body);
+                    for (decoded.headers) |h| {
+                        a.free(h.key);
+                        a.free(h.value);
+                    }
+                    a.free(decoded.headers);
+                }
                 // `rv` is an owned host result; release it once decoded+written.
                 if (runtime.reclaimEnabled()) rv.release(a);
             },
         }
+        served += 1;
     }
     return .{ .ok = .Unit };
 }

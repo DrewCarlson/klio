@@ -70,6 +70,19 @@ pub fn reclaimEnabled() bool {
     return reclaim_tls;
 }
 
+/// Whether raw host-temporary buffers (scratch arrays, probe FQN strings, error
+/// messages — allocations that are NOT refcounted cells and never escape the
+/// host op) should be explicitly freed. True whenever the backing allocator
+/// actually frees: the reference-counting modes (`reclaim_tls`) AND the tracing
+/// GC (`gc.gc_enabled`), under which `reclaim_tls` is OFF (the collector frees
+/// cells by reachability) but raw scratch is invisible to the collector and
+/// would otherwise leak. False only under the pure process arena, where `free`
+/// is a no-op anyway. Keeps the value-graph ownership ops gated on
+/// `reclaimEnabled()` (must stay off under GC) distinct from scratch frees.
+pub fn freeScratch() bool {
+    return reclaim_tls or gc.gc_enabled;
+}
+
 /// Whether the process was asked to run the freeing reference-counting path
 /// (a real allocator + reclaim-ON) instead of the arena fast path, via the
 /// `KLIO_RECLAIM` environment variable (`1`/`smp`/`debug` = on; unset/`0` =
@@ -112,13 +125,17 @@ pub fn reclaimRequested() bool {
         else => {},
     }
     const on = blk: {
+        // Unset is the tracing GC (the collector reclaims by reachability;
+        // refcount teardown stays off — `main.zig` forces `setReclaim(false)`).
         const v = getenvSlice("KLIO_RECLAIM") orelse break :blk false;
         // `free` selects a freeing allocator (see `main.zig`) while leaving
         // the refcount reclamation path OFF: it reclaims the host scratch and
         // container temporaries the run path explicitly frees, without
         // activating `ObjRef.deinit`'s value-graph teardown (not yet
-        // reconciled on the coroutine/ktor host path).
-        if (std.mem.eql(u8, v, "free")) break :blk false;
+        // reconciled on the coroutine/ktor host path). `arena`/`0` and `gc`
+        // also leave refcount teardown off (arena never frees; gc's collector
+        // reclaims instead).
+        if (std.mem.eql(u8, v, "free") or std.mem.eql(u8, v, "arena") or std.mem.eql(u8, v, "gc")) break :blk false;
         break :blk v.len != 0 and !std.mem.eql(u8, v, "0");
     };
     reclaim_req_state.store(if (on) 2 else 1, .monotonic);
@@ -130,8 +147,15 @@ pub fn reclaimRequested() bool {
 /// reclaim OFF.
 pub const AllocChoice = enum { arena, smp, debug, gc };
 pub fn allocChoice() AllocChoice {
+    // Default (unset): `arena`. The tracing GC (`gc`) is the goal default — it
+    // is the only mode that bounds memory for long-running processes — but it is
+    // not yet safe as the universal default: heavy coroutine I/O (e.g. a 1 MB+
+    // channel write) can trigger a collection mid-host-call that reclaims a live
+    // value not yet covered by host keepalive (a use-after-free; see the
+    // host-keepalive work). Until that is closed, `arena` (never-free, correct)
+    // stays the default; every mode is explicitly selectable for testing.
     const v = getenvSlice("KLIO_RECLAIM") orelse return .arena;
-    if (v.len == 0 or std.mem.eql(u8, v, "0")) return .arena;
+    if (v.len == 0 or std.mem.eql(u8, v, "arena") or std.mem.eql(u8, v, "0")) return .arena;
     if (std.mem.eql(u8, v, "debug")) return .debug;
     if (std.mem.eql(u8, v, "gc")) return .gc; // tracing GC (KGC)
     return .smp; // "free", "smp", "1", or any other non-zero value
@@ -309,6 +333,22 @@ fn isHashMapLike(comptime U: type) bool {
 fn isSlice(comptime U: type) bool {
     return @typeInfo(U) == .pointer and @typeInfo(U).pointer.size == .slice;
 }
+
+/// Bytes of heap backing a payload owns beyond its control block — the
+/// `ArrayList`/slice element storage and `[]const u8` bytes. The GC trigger
+/// must count these (they are freed by the cell's `gcFinalize`), or a cell
+/// with a large backing but a small control block (a `ByteArray`'s element
+/// vector, a long `String`) would not advance the collection threshold and the
+/// backing would accumulate uncollected.
+fn externalBytes(comptime U: type, data: *const U) usize {
+    if (comptime U == []const u8) return data.len;
+    if (comptime isArrayListLike(U)) {
+        const Elem = @typeInfo(@TypeOf(data.items)).pointer.child;
+        return data.capacity * @sizeOf(Elem);
+    }
+    if (comptime isSlice(U)) return data.len * @sizeOf(@typeInfo(U).pointer.child);
+    return 0;
+}
 /// An `ObjRef(X)` handle is a struct with a `.cell` field and a `clone` decl.
 fn isObjRef(comptime U: type) bool {
     return @typeInfo(U) == .@"struct" and @hasField(U, "cell") and @hasDecl(U, "clone");
@@ -427,7 +467,6 @@ pub fn ObjRef(comptime T: type) type {
         /// destroy the control block. Child cells are swept independently.
         fn gcFinalizeThunk(h: *gc.GcHeader) void {
             const cb: *Cell = @fieldParentPtr("hdr", h);
-            if (gc.gc_debug) std.debug.print("[kgc] free {s}\n", .{@typeName(T)});
             gcFinalizeData(T, &cb.data, cb.allocator);
             cb.allocator.destroy(cb);
         }
@@ -435,13 +474,13 @@ pub fn ObjRef(comptime T: type) type {
         pub fn initOwned(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
             const cell = try allocator.create(Cell);
             cell.* = .{
-                .hdr = .{ .gc_trace = gcTraceThunk, .gc_finalize = gcFinalizeThunk },
+                .hdr = .{ .gc_trace = gcTraceThunk, .gc_finalize = gcFinalizeThunk, .gc_type = @typeName(T) },
                 .refcount = std.atomic.Value(usize).init(1),
                 .lock = .{},
                 .data = v,
                 .allocator = allocator,
             };
-            if (gc.gc_enabled) gc.register(&cell.hdr, @sizeOf(Cell));
+            if (gc.gc_enabled) gc.register(&cell.hdr, @sizeOf(Cell) + externalBytes(T, &cell.data));
             return .{ .cell = cell };
         }
 

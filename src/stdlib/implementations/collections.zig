@@ -120,6 +120,33 @@ fn makeListBorrowed(a: Allocator, list: std.ArrayList(Value), mutable: bool) Err
     return makeListFromArrayList(a, list, mutable);
 }
 
+/// Build a new List from the live contents of a `ValueList`, copying under the
+/// borrow. Replaces `makeList(a, try snapshotItems(a, vl), m)`: that idiom
+/// allocates a `snapshotItems` dupe, has `makeList` copy it again, then orphans
+/// the dupe (a per-call raw-temp leak under a freeing/gc backend — the arena
+/// reclaimed it for free). One copy, no dangling intermediate.
+fn makeListVL(a: Allocator, vl: ValueList, mutable: bool) Error!Value {
+    const g = vl.borrow();
+    defer g.deinit();
+    return makeList(a, g.get().items, mutable);
+}
+
+/// `makeListVL` for sets.
+fn makeSetVL(a: Allocator, vl: ValueList, mutable: bool) Error!Value {
+    const g = vl.borrow();
+    defer g.deinit();
+    return makeSet(a, g.get().items, mutable);
+}
+
+/// Append a `ValueList`'s live elements to `dst`, copying under the borrow.
+/// Replaces `dst.appendSlice(a, try snapshotItems(a, vl))`, which leaked the
+/// `snapshotItems` dupe (the arena reclaimed it; a freeing/gc backend does not).
+fn appendVL(dst: *std.ArrayList(Value), a: Allocator, vl: ValueList) Error!void {
+    const g = vl.borrow();
+    defer g.deinit();
+    try dst.appendSlice(a, g.get().items);
+}
+
 /// `make_set(items, mutable)` — dedupe by boxed structural equality.
 fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var deduped: std.ArrayList(Value) = .empty;
@@ -1705,8 +1732,8 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
             const arg = ctx.args[0];
             switch (arg) {
                 .Int => return ok(try makeList(a, &.{}, true)),
-                .List => |l| return ok(try makeList(a, try snapshotItems(a, l.items), true)),
-                .Set => |s| return ok(try makeList(a, try snapshotItems(a, s.items), true)),
+                .List => |l| return ok(try makeListVL(a, l.items, true)),
+                .Set => |s| return ok(try makeListVL(a, s.items, true)),
                 .Instance => {
                     const items = switch (try materialiseIterableInstance(ctx, arg)) {
                         .items => |x| x,
@@ -1740,8 +1767,8 @@ pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
             const arg = ctx.args[0];
             switch (arg) {
                 .Int => return ok(try makeSet(a, &.{}, true)),
-                .List => |l| return ok(try makeSet(a, try snapshotItems(a, l.items), true)),
-                .Set => |s| return ok(try makeSet(a, try snapshotItems(a, s.items), true)),
+                .List => |l| return ok(try makeSetVL(a, l.items, true)),
+                .Set => |s| return ok(try makeSetVL(a, s.items, true)),
                 .Instance => {
                     const items = switch (try materialiseIterableInstance(ctx, arg)) {
                         .items => |x| x,
@@ -1795,7 +1822,7 @@ pub fn coll_list_get(ctx: *CallCtx) Error!EvalResult {
     if (i < 0 or @as(usize, @intCast(i)) >= items.len) {
         const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, items.len });
         const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
-        if (runtime.reclaimEnabled()) a.free(msg);
+        if (runtime.freeScratch()) a.free(msg);
         return e;
     }
     return okElem(items[@intCast(i)]);
@@ -2028,7 +2055,7 @@ fn joinToStringImpl(ctx: *CallCtx, items: []const Value, allow_instance_to_strin
     try out.appendSlice(a, postfix);
     const buf = try out.toOwnedSlice(a);
     const s = try makeStringOwned(a, buf);
-    if (runtime.reclaimEnabled()) a.free(buf);
+    if (runtime.freeScratch()) a.free(buf);
     return ok(s);
 }
 
@@ -2057,7 +2084,7 @@ fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
     const buf = try display(a, ctx.args[0]);
     const s = try makeStringOwned(a, buf);
-    if (runtime.reclaimEnabled()) a.free(buf);
+    if (runtime.freeScratch()) a.free(buf);
     return ok(s);
 }
 pub fn coll_list_to_string(ctx: *CallCtx) Error!EvalResult {
@@ -2089,7 +2116,7 @@ pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
         if (i < 0 or @as(usize, @intCast(i)) > len) {
             const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
             const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
-            if (runtime.reclaimEnabled()) a.free(msg);
+            if (runtime.freeScratch()) a.free(msg);
             return e;
         }
         if (runtime.reclaimEnabled()) item.retain();
@@ -2149,7 +2176,7 @@ pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
     if (i < 0 or @as(usize, @intCast(i)) >= len) {
         const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
         const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
-        if (runtime.reclaimEnabled()) a.free(msg);
+        if (runtime.freeScratch()) a.free(msg);
         return e;
     }
     return ok(g.get().orderedRemove(@intCast(i)));
@@ -2358,7 +2385,19 @@ fn pumpItem(
     output: *std.ArrayList(Value),
 ) Error!union(enum) { cont: bool, err: RuntimeError } {
     var current = start_value;
+    // Pin the values the GC cannot otherwise reach across the re-entrant lambda
+    // invocations below: the accumulated results so far (`output`, stable for
+    // this pump — it is only appended to at the end) and the in-flight `current`
+    // value threading through the ops. Without this, a collection during a later
+    // element's `map`/`filter` lambda sweeps the earlier elements (e.g. the
+    // `RoutingPathSegment`s a `splitToSequence().map{}.toList()` accumulates).
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(output.items);
+    const ka_cur = runtime.keepaliveMark();
     for (ops, 0..) |op, idx| {
+        runtime.keepaliveRestore(ka_cur);
+        runtime.keepalivePush(current);
         switch (op) {
             .Map => |f| {
                 current = switch (try seqCall(host, &f, &.{current}, out)) {
@@ -2464,10 +2503,14 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
     @memset(st.indices, 0);
     var output: std.ArrayList(Value) = .empty;
 
+    const ka_src = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka_src);
     switch (seq.source) {
         .Items => |v| {
             const g = v.borrow();
             defer g.deinit();
+            // Pin the not-yet-processed source items across the per-item pumps.
+            runtime.keepalivePushSlice(g.get().*);
             for (g.get().*) |item| {
                 if (takeCapReached(seq.ops, st.taken)) break;
                 const res = try pumpItem(a, host, out, item, seq.ops, &st, &output);
@@ -2570,7 +2613,16 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
     switch (op) {
         .Map => |f| {
             var nx = try a.alloc(Value, items.len);
+            // Pin the source and the already-mapped prefix across the lambda
+            // calls (the GC cannot reach these host-locals); only `nx[0..i]` is
+            // initialized, so never pin the undefined tail.
+            const ka = runtime.keepaliveMark();
+            defer runtime.keepaliveRestore(ka);
+            runtime.keepalivePushSlice(items);
+            const ka2 = runtime.keepaliveMark();
             for (items, 0..) |v, i| {
+                runtime.keepaliveRestore(ka2);
+                runtime.keepalivePushSlice(nx[0..i]);
                 nx[i] = switch (try seqCall(host, &f, &.{v}, out)) {
                     .value => |x| x,
                     .err => |e| return .{ .err = e },
@@ -2589,7 +2641,13 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
         },
         .MapIndexed => |f| {
             var nx = try a.alloc(Value, items.len);
+            const ka = runtime.keepaliveMark();
+            defer runtime.keepaliveRestore(ka);
+            runtime.keepalivePushSlice(items);
+            const ka2 = runtime.keepaliveMark();
             for (items, 0..) |v, i| {
+                runtime.keepaliveRestore(ka2);
+                runtime.keepalivePushSlice(nx[0..i]);
                 nx[i] = switch (try seqCall(host, &f, &.{ Value.newInt(@intCast(i)), v }, out)) {
                     .value => |x| x,
                     .err => |e| return .{ .err = e },
@@ -2672,8 +2730,8 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
                     .err => |e| return .{ .err = e },
                 };
                 switch (mapped) {
-                    .List => |xs| try nx.appendSlice(a, try snapshotItems(a, xs.items)),
-                    .Set => |xs| try nx.appendSlice(a, try snapshotItems(a, xs.items)),
+                    .List => |xs| try appendVL(&nx, a, xs.items),
+                    .Set => |xs| try appendVL(&nx, a, xs.items),
                     .Sequence => {
                         const sub = switch (try materialiseSequence(a, host, out, mapped)) {
                             .items => |xs| xs,
@@ -3026,7 +3084,7 @@ fn listTakeCount(ctx: *CallCtx, what: []const u8) Error!union(enum) { n: i64, er
     if (n < 0) {
         const msg = try fmt(a, "Requested element count {d} is less than zero.", .{n});
         const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
-        if (runtime.reclaimEnabled()) a.free(msg);
+        if (runtime.freeScratch()) a.free(msg);
         return .{ .err = e };
     }
     return .{ .n = n };
@@ -3084,7 +3142,7 @@ pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
             if (i < 0 or i >= len) {
                 const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
                 const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
-                if (runtime.reclaimEnabled()) a.free(msg);
+                if (runtime.freeScratch()) a.free(msg);
                 return e;
             }
             try out.append(a, items[@intCast(i)]);
@@ -3097,7 +3155,7 @@ pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
             if (i < 0 or i >= len) {
                 const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
                 const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
-                if (runtime.reclaimEnabled()) a.free(msg);
+                if (runtime.freeScratch()) a.free(msg);
                 return e;
             }
             try out.append(a, items[@intCast(i)]);
@@ -3123,7 +3181,7 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     if (from < 0 or to > len or from > to) {
         const msg = try fmt(a, "fromIndex: {d}, toIndex: {d}, size: {d}", .{ from, to, len });
         const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
-        if (runtime.reclaimEnabled()) a.free(msg);
+        if (runtime.freeScratch()) a.free(msg);
         return e;
     }
     return ok(try makeList(a, items[@intCast(from)..@intCast(to)], false));
@@ -3136,12 +3194,12 @@ pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     var out: std.ArrayList(Value) = .empty;
-    try out.appendSlice(a, try snapshotItems(a, it));
+    try appendVL(&out, a, it);
     if (ctx.args.len < 2) return arityErr("plus requires an argument");
     const arg = ctx.args[1];
     switch (arg) {
-        .List => |l| try out.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try out.appendSlice(a, try snapshotItems(a, s.items)),
+        .List => |l| try appendVL(&out, a, l.items),
+        .Set => |s| try appendVL(&out, a, s.items),
         .Range, .Sequence, .Array => {
             const xs = switch (try iterableItems(a, arg, "plus")) {
                 .items => |x| x,
@@ -3164,8 +3222,8 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     var removals: std.ArrayList(Value) = .empty;
     switch (arg) {
-        .List => |l| try removals.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try removals.appendSlice(a, try snapshotItems(a, s.items)),
+        .List => |l| try appendVL(&removals, a, l.items),
+        .Set => |s| try appendVL(&removals, a, s.items),
         .Range, .Sequence, .Array => {
             const xs = switch (try iterableItems(a, arg, "minus")) {
                 .items => |x| x,
@@ -3198,7 +3256,7 @@ pub fn coll_list_chunked(ctx: *CallCtx) Error!EvalResult {
     if (size_i <= 0) {
         const msg = try fmt(a, "Size {d} must be greater than zero.", .{size_i});
         const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
-        if (runtime.reclaimEnabled()) a.free(msg);
+        if (runtime.freeScratch()) a.free(msg);
         return e;
     }
     const size: usize = @intCast(size_i);
@@ -3234,14 +3292,14 @@ pub fn coll_list_windowed(ctx: *CallCtx) Error!EvalResult {
     if (size_i <= 0) {
         const msg = try fmt(a, "size {d} must be greater than zero.", .{size_i});
         const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
-        if (runtime.reclaimEnabled()) a.free(msg);
+        if (runtime.freeScratch()) a.free(msg);
         return e;
     }
     const step_i: i64 = if (ctx.args.len <= 2) 1 else (if (ctx.args[2].isIntegral()) ctx.args[2].asI64().? else return typeErr("windowed step must be Int"));
     if (step_i <= 0) {
         const msg = try fmt(a, "step {d} must be greater than zero.", .{step_i});
         const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
-        if (runtime.reclaimEnabled()) a.free(msg);
+        if (runtime.freeScratch()) a.free(msg);
         return e;
     }
     const partial_windows: bool = if (ctx.args.len <= 3) false else (if (ctx.args[3] == .Bool) ctx.args[3].Bool else return typeErr("windowed partialWindows must be Bool"));
@@ -3273,9 +3331,9 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
     const transform: ?Value = if (ctx.args.len > 2 and isZipTransform(ctx.args[2])) ctx.args[2] else null;
     var rhs: std.ArrayList(Value) = .empty;
     switch (rhs_val) {
-        .List => |l| try rhs.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try rhs.appendSlice(a, try snapshotItems(a, s.items)),
-        .Array => |arr| try rhs.appendSlice(a, try snapshotItems(a, arr.items)),
+        .List => |l| try appendVL(&rhs, a, l.items),
+        .Set => |s| try appendVL(&rhs, a, s.items),
+        .Array => |arr| try appendVL(&rhs, a, arr.items),
         .Range => |r| {
             var rit = RangeIter.init(r.start, r.end, r.step);
             while (rit.next()) |n| try rhs.append(a, Value.newInt(n));
@@ -3323,7 +3381,7 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
         .err => |e| return e,
     };
     var out: std.ArrayList(Value) = .empty;
-    try out.appendSlice(a, try snapshotItems(a, it));
+    try appendVL(&out, a, it);
     if (ctx.args.len < 2) return arityErr("plus requires an argument");
     const arg = ctx.args[1];
     switch (arg) {
@@ -3368,8 +3426,8 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     var removals: std.ArrayList(Value) = .empty;
     switch (arg) {
-        .List => |l| try removals.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try removals.appendSlice(a, try snapshotItems(a, s.items)),
+        .List => |l| try appendVL(&removals, a, l.items),
+        .Set => |s| try appendVL(&removals, a, s.items),
         else => try removals.append(a, arg),
     }
     var out: std.ArrayList(Value) = .empty;
@@ -3396,8 +3454,8 @@ pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     var other: std.ArrayList(Value) = .empty;
     switch (arg) {
-        .List => |l| try other.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try other.appendSlice(a, try snapshotItems(a, s.items)),
+        .List => |l| try appendVL(&other, a, l.items),
+        .Set => |s| try appendVL(&other, a, s.items),
         else => return typeErr("intersect requires a collection"),
     }
     var out: std.ArrayList(Value) = .empty;
@@ -3648,8 +3706,8 @@ pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     var keys: std.ArrayList(Value) = .empty;
     switch (arg) {
-        .List => |l| try keys.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try keys.appendSlice(a, try snapshotItems(a, s.items)),
+        .List => |l| try appendVL(&keys, a, l.items),
+        .Set => |s| try appendVL(&keys, a, s.items),
         else => try keys.append(a, arg),
     }
     var out: std.ArrayList(MapPair) = .empty;
@@ -3696,6 +3754,8 @@ fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!?usize {
         for (g.get().items, 0..) |kv, i| ks[i] = kv.key;
         break :blk ks;
     };
+    // Scratch key snapshot (the key Values themselves stay owned by the map).
+    defer if (runtime.freeScratch()) ctx.allocator.free(keys);
     for (keys, 0..) |k, i| {
         if (try ctx.host.invokeMethod(&k, "equals", &.{key}, ctx.out)) |m| {
             if (m == .ok and m.ok == .Bool) {
@@ -4105,7 +4165,7 @@ pub fn pair_to_string(ctx: *CallCtx) Error!EvalResult {
     };
     const buf = try display(a, p);
     const s = try makeStringOwned(a, buf);
-    if (runtime.reclaimEnabled()) a.free(buf);
+    if (runtime.freeScratch()) a.free(buf);
     return ok(s);
 }
 pub fn pair_to_list(ctx: *CallCtx) Error!EvalResult {
@@ -4164,7 +4224,7 @@ pub fn triple_to_string(ctx: *CallCtx) Error!EvalResult {
     };
     const buf = try display(a, t);
     const s = try makeStringOwned(a, buf);
-    if (runtime.reclaimEnabled()) a.free(buf);
+    if (runtime.freeScratch()) a.free(buf);
     return ok(s);
 }
 pub fn triple_to_list(ctx: *CallCtx) Error!EvalResult {
@@ -4190,8 +4250,8 @@ pub fn coll_list_flatten(ctx: *CallCtx) Error!EvalResult {
     const src = try snapshotItems(a, it);
     for (src) |v| {
         switch (v) {
-            .List => |l| try out.appendSlice(a, try snapshotItems(a, l.items)),
-            .Set => |s| try out.appendSlice(a, try snapshotItems(a, s.items)),
+            .List => |l| try appendVL(&out, a, l.items),
+            .Set => |s| try appendVL(&out, a, s.items),
             else => {
                 const vd = try display(a, v);
                 return typeErr(try fmt(a, "flatten requires nested collections, got {s}", .{vd}));
@@ -4240,7 +4300,7 @@ pub fn coll_list_to_list(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeList(a, try snapshotItems(a, it), false));
+    return ok(try makeListVL(a, it, false));
 }
 pub fn coll_list_to_mutable_list(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4248,7 +4308,7 @@ pub fn coll_list_to_mutable_list(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeList(a, try snapshotItems(a, it), true));
+    return ok(try makeListVL(a, it, true));
 }
 pub fn coll_list_to_set(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4256,7 +4316,7 @@ pub fn coll_list_to_set(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSet(a, try snapshotItems(a, it), false));
+    return ok(try makeSetVL(a, it, false));
 }
 pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4264,7 +4324,7 @@ pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSet(a, try snapshotItems(a, it), true));
+    return ok(try makeSetVL(a, it, true));
 }
 
 fn withIndexImpl(a: Allocator, items: []const Value) Error!Value {
@@ -4379,7 +4439,7 @@ pub fn coll_mut_list_set(ctx: *CallCtx) Error!EvalResult {
     if (i < 0 or @as(usize, @intCast(i)) >= len) {
         const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
         const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
-        if (runtime.reclaimEnabled()) a.free(msg);
+        if (runtime.freeScratch()) a.free(msg);
         return e;
     }
     // The list owns the new value; the replaced value's ownership transfers
@@ -4416,7 +4476,7 @@ pub fn coll_set_to_list(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeList(a, try snapshotItems(a, it), false));
+    return ok(try makeListVL(a, it, false));
 }
 pub fn coll_set_to_mutable_list(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4424,7 +4484,7 @@ pub fn coll_set_to_mutable_list(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeList(a, try snapshotItems(a, it), true));
+    return ok(try makeListVL(a, it, true));
 }
 pub fn coll_set_to_set_(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4432,7 +4492,7 @@ pub fn coll_set_to_set_(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSet(a, try snapshotItems(a, it), false));
+    return ok(try makeSetVL(a, it, false));
 }
 pub fn coll_set_to_mutable_set_(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4440,7 +4500,7 @@ pub fn coll_set_to_mutable_set_(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSet(a, try snapshotItems(a, it), true));
+    return ok(try makeSetVL(a, it, true));
 }
 pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4508,7 +4568,7 @@ pub fn coll_map_get_value(ctx: *CallCtx) Error!EvalResult {
     const kd = try display(a, key);
     const msg = try fmt(a, "Key {s} is missing in the map.", .{kd});
     const e = try thrown(a, "kotlin.NoSuchElementException", msg);
-    if (runtime.reclaimEnabled()) a.free(msg);
+    if (runtime.freeScratch()) a.free(msg);
     return e;
 }
 
@@ -4688,7 +4748,7 @@ fn arrayOptIndex(a: Allocator, ctx: *CallCtx, idx: usize, default: i64, what: []
 /// `thrown` has duped it into the StringRef under the reclaim path.
 fn indexOob(a: Allocator, msg: []const u8) Error!EvalResult {
     const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
-    if (runtime.reclaimEnabled()) a.free(msg);
+    if (runtime.freeScratch()) a.free(msg);
     return e;
 }
 
@@ -4754,7 +4814,7 @@ pub fn array_content_to_string(ctx: *CallCtx) Error!EvalResult {
     try out.append(a, ']');
     const buf = try out.toOwnedSlice(a);
     const s = try makeStringOwned(a, buf);
-    if (runtime.reclaimEnabled()) a.free(buf);
+    if (runtime.freeScratch()) a.free(buf);
     return ok(s);
 }
 
@@ -4864,7 +4924,7 @@ pub fn array_content_deep_to_string(ctx: *CallCtx) Error!EvalResult {
     if (recv == .Null) return ok(try makeStringOwned(a, "null"));
     const buf = try deepToString(a, recv);
     const s = try makeStringOwned(a, buf);
-    if (runtime.reclaimEnabled()) a.free(buf);
+    if (runtime.freeScratch()) a.free(buf);
     return ok(s);
 }
 
@@ -5226,7 +5286,7 @@ fn arrayMaxMinImpl(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalRe
     if (items.len == 0) {
         const msg = try fmt(a, "{s}: empty", .{what});
         const e = try thrown(a, "kotlin.NoSuchElementException", msg);
-        if (runtime.reclaimEnabled()) a.free(msg);
+        if (runtime.freeScratch()) a.free(msg);
         return e;
     }
     var best = items[0];

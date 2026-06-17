@@ -366,7 +366,7 @@ pub fn captureChainAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry 
 /// a `FrameSnapshot` on suspend), so it is backed by the same per-call
 /// allocator the frame's regs/params/captures use.
 fn chainAllocator() Allocator {
-    return std.heap.page_allocator;
+    return runtime.slab.tracedPage();
 }
 
 fn maxEvalDepth() usize {
@@ -521,11 +521,13 @@ fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
     for (snap.captures) |v| v.release(allocator);
 }
 
-/// Free the dupe'd slice buffers a snapshot owns. Gated on reclaim: under
-/// the arena, `free` can rewind the last bump allocation, so production
-/// leaves the buffers for wholesale reclaim (byte-identical to before).
+/// Free the dupe'd slice buffers a snapshot owns. These are raw host arrays
+/// (not GC cells), so the tracing collector never reclaims them — they must be
+/// freed explicitly whenever a real freeing allocator is active. Gated on
+/// `freeScratch` (reclaim mode or GC on); only the legacy arena fast path,
+/// where `free` would rewind a bump pointer, leaves them.
 fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
-    if (!runtime.reclaimEnabled()) return;
+    if (!runtime.freeScratch()) return;
     allocator.free(snap.regs);
     allocator.free(snap.params);
     allocator.free(snap.captures);
@@ -1499,7 +1501,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     return ok(.Unit);
                 },
                 .err => |e| switch (e) {
-                    .Unimplemented => {},
+                    .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
                     else => return errResult(e),
                 },
             }
@@ -1523,6 +1525,13 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     .err => |e| return errResult(e),
                 };
                 const combined = try std.mem.concat(allocator, u8, &.{ ls, rs });
+                // `ls`/`rs` are owned renderings (stringify/renderValue allocate
+                // a private copy); `combined` is adopted by the StringRef cell.
+                // Free the two now-dead pieces under a freeing allocator.
+                if (runtime.freeScratch()) {
+                    allocator.free(ls);
+                    allocator.free(rs);
+                }
                 try frame.write(bo.dst, .{ .String = try StringRef.initOwned(allocator, combined) });
                 return ok(.Unit);
             }
@@ -2148,7 +2157,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 // resolves to an extension-property *setter* (`var T.x set(…)`)
                 // declared on the receiver's type or a supertype, not only a
                 // stored member; `setField` dispatches both.
-                const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str);
+                const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str, null);
                 defer allocator.free(cands);
                 for (cands) |c| {
                     if (c.v != .Instance) continue;
@@ -2212,7 +2221,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 // `consult_param = true`: in a method / extension body the
                 // implicit receiver is the frame's `this` *parameter*, not
                 // a capture slot.
-                const cands = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str));
+                const cands = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str), null);
                 defer allocator.free(cands);
                 // Per-candidate probes are member-only (`getMemberField`):
                 // a candidate must not "resolve" a global or an outer
@@ -2229,7 +2238,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                             resolved = v;
                             break;
                         },
-                        .err => {},
+                        // Each candidate miss allocates a `Vm::get_field` message
+                        // the resolver discards while walking to the next
+                        // candidate / global tier; free it (a per-lookup leak in
+                        // bare-identifier resolution, which the coroutine shim
+                        // does heavily).
+                        .err => |e| freeMissErr(allocator, e),
                     }
                 }
             }
@@ -2340,6 +2354,26 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
 /// `inner_ext_over_outer_member` kotlinc parity fixture), then the
 /// top-level tiers — runtime overload selection, the lowering-resolved
 /// constructor class, the global by name — and only then an error.
+/// Free a discarded member-dispatch-miss message (the host allocates a
+/// `Vm::call_member …` string on a total miss; the resolver discards it while
+/// walking to the next candidate / a global). Recognizable by its prefix, so a
+/// static `.Unimplemented` literal is never freed. No-op unless a freeing
+/// backend is active.
+fn freeDispatchMissMsg(allocator: Allocator, msg: []const u8) void {
+    if (!runtime.freeScratch()) return;
+    // Every host dispatch-miss message is `allocPrint`-built with a `Vm::`
+    // prefix (`Vm::call_member`, `Vm::get_field`, …); static `.Unimplemented`
+    // literals never carry that prefix, so this frees only owned messages.
+    if (std.mem.startsWith(u8, msg, "Vm::")) allocator.free(msg);
+}
+
+/// Free a discarded host dispatch-miss `EvalError` (the resolver tries many
+/// receiver candidates / fallback tiers and drops each miss). Only the
+/// `Unimplemented` arm carries an owned message.
+fn freeMissErr(allocator: Allocator, e: EvalError) void {
+    if (e == .Unimplemented) freeDispatchMissMsg(allocator, e.Unimplemented);
+}
+
 fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!EvalResult {
     const name_str = constStr(frame.module, cmg.name) orelse
         return errResult(.{ .Type = "CallMemberOrGlobal: name not a string const" });
@@ -2347,9 +2381,11 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cmg.arg_names);
     defer allocator.free(names);
-    // The receiver is the lambda capture slot, or — when that is empty —
-    // the enclosing function's `this` *parameter*.
-    const this_val = implicitThisValue(frame, cmg.this_idx, true);
+    // A direct splice receiver (a bound `this` register) is the innermost
+    // implicit receiver when present; otherwise the lambda capture slot, or —
+    // when that is empty — the enclosing function's `this` *parameter*.
+    const direct_this: ?Value = if (cmg.recv) |r| frame.read(r) else null;
+    const this_val = if (direct_this) |dt| dt else implicitThisValue(frame, cmg.this_idx, true);
     // A bare callee whose name starts uppercase is a constructor / type,
     // never an instance member.
     const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]);
@@ -2363,7 +2399,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         ((this_val == .Null or this_val == .Unit) or !host.hostHasMember(&this_val, name_str));
 
     if (!is_ctor_name and !shadow_capture) {
-        const cands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str);
+        const cands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
         defer allocator.free(cands);
         // Inside an extension body, the implicit `this` has the
         // extension's DECLARED receiver type, and Kotlin resolves a bare
@@ -2400,7 +2436,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     // would re-execute its side effects on an outer
                     // receiver — same doctrine as `CalleeFailed`.
                     .Throw, .NonLocalReturn, .LabeledReturn => return errResult(e),
-                    .Unimplemented => {},
+                    .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
                     else => if (first_real_err == null) {
                         first_real_err = e;
                     },
@@ -2423,7 +2459,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                         // Same as the strict pass: a body that ran owns
                         // its control flow; never re-probe.
                         .Throw, .NonLocalReturn, .LabeledReturn => return errResult(e),
-                        .Unimplemented => {},
+                        .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
                         else => if (first_real_err == null) {
                             first_real_err = e;
                         },
@@ -2600,29 +2636,41 @@ const ImplicitCandidate = struct {
 /// while a `with`/`run`/`apply` subject brings only itself
 /// (`with(x) { … }` never puts `x`'s enclosing instances or companion in
 /// scope). Caller frees the returned slice.
-fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const Frame, this_idx: usize, consult_param: bool, host: *H, bare_name: []const u8) Allocator.Error![]ImplicitCandidate {
+fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const Frame, this_idx: usize, consult_param: bool, host: *H, bare_name: []const u8, direct_this: ?Value) Allocator.Error![]ImplicitCandidate {
     var out: std.ArrayList(ImplicitCandidate) = .empty;
     errdefer out.deinit(allocator);
-    const this_val = implicitThisValue(frame, this_idx, consult_param);
+    var depth: u16 = 0;
     const entries = try enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
-    var depth: u16 = 0;
-    if (this_val != .Null and this_val != .Unit) {
-        // When the frame's own `this` is also the innermost chain entry
-        // (a seeded method/extension receiver, or a receiver-split
-        // subject), the entry's own run covers it with the right kind.
-        const dup = entries.len > 0 and sameReceiver(entries[0].v, this_val);
-        if (!dup) {
-            // The frame's own `this` brings its class-nesting tower (and
-            // companion) only when it is a *dispatch* receiver. An
-            // extension receiver is subject-like — `fun Owner.Inner.f()`
-            // does not put `Inner`'s enclosing `Owner` instance or
-            // companion in scope.
-            const own_is_subject = switch (frame.func.kind) {
-                .top_level_extension, .member_extension => true,
-                else => false,
-            };
-            try appendCandidateRun(H, allocator, &out, this_val, own_is_subject, &depth, host, bare_name);
+    // The innermost candidate is the inline-splice's bound receiver when
+    // supplied (it lives in a local register, invisible to the frame `this`
+    // slot / capture lookup), otherwise the frame's own `this`. A supplied
+    // direct receiver is subject-like (its own value only, no class-nesting
+    // tower); it replaces, rather than precedes, the frame `this`.
+    const inner: ?Value = if (direct_this) |dt|
+        dt
+    else blk: {
+        const tv = implicitThisValue(frame, this_idx, consult_param);
+        break :blk if (tv == .Null or tv == .Unit) null else tv;
+    };
+    if (inner) |iv| {
+        if (iv != .Unit) {
+            // When the innermost receiver is also the innermost chain entry
+            // (a seeded method/extension receiver, or a receiver-split
+            // subject), the entry's own run covers it with the right kind.
+            const dup = entries.len > 0 and sameReceiver(entries[0].v, iv);
+            if (!dup) {
+                // The frame's own `this` brings its class-nesting tower (and
+                // companion) only when it is a *dispatch* receiver. An
+                // extension receiver — or a supplied splice receiver — is
+                // subject-like: `fun Owner.Inner.f()` does not put `Inner`'s
+                // enclosing `Owner` instance or companion in scope.
+                const own_is_subject = direct_this != null or switch (frame.func.kind) {
+                    .top_level_extension, .member_extension => true,
+                    else => false,
+                };
+                try appendCandidateRun(H, allocator, &out, iv, own_is_subject, &depth, host, bare_name);
+            }
         }
     }
     for (entries) |e| try appendCandidateRun(H, allocator, &out, e.v, e.isSubject(), &depth, host, bare_name);

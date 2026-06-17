@@ -2115,10 +2115,15 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         }
         // Pack the delegation args for the parent's vararg primary param.
         const packed_parent = try packPrimaryCtorVarargs(self, pref.fqn, pname, try parent_args.toOwnedSlice(allocator));
-        try chain.append(allocator, .{ .name = pname, .fqn = pref.fqn, .args = try allocator.dupe(Value, packed_parent) });
+        // `chain` owns this duped copy (freed on chain teardown) and it
+        // outlives the loop, so the next iteration reads its super-args from
+        // it. The packed buffer is a dead full allocation once duped.
+        const chain_args = try allocator.dupe(Value, packed_parent);
+        try chain.append(allocator, .{ .name = pname, .fqn = pref.fqn, .args = chain_args });
+        if (runtime.freeScratch()) allocator.free(packed_parent);
         cur_class = pname;
         cur_fqn = pref.fqn;
-        cur_args = packed_parent;
+        cur_args = chain_args;
     }
 
     // Apply primary-param properties bottom-up so child overrides win.
@@ -2553,9 +2558,114 @@ fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef
     };
 }
 
+/// Stable synthetic class name for an anonymous-object expression, keyed by the
+/// AST node address (the program is immutable, so the address is a stable site
+/// id). The first instantiation of a site mints `$anon$<n>` and registers the
+/// site's class + methods under it; later instantiations of the same site reuse
+/// that name, so the `classes`/`anon_methods` registries stay bounded by the
+/// number of `object` expressions in the program instead of growing per instance
+/// (a per-request leak for a server). Names are permanent (page-allocator) since
+/// they are used as long-lived map keys.
+var anon_site_names: std.AutoHashMapUnmanaged(usize, []const u8) = .empty;
+var anon_site_lock: runtime.SpinMutex = .{};
+
+fn anonSiteName(expr: *const ast.Expr) []const u8 {
+    const key = @intFromPtr(expr);
+    anon_site_lock.lock();
+    defer anon_site_lock.unlock();
+    if (anon_site_names.get(key)) |n| return n;
+    const n = anon_site_names.count();
+    const name = std.fmt.allocPrint(std.heap.page_allocator, "$anon${d}", .{n}) catch return "$anon$x";
+    anon_site_names.put(std.heap.page_allocator, key, name) catch {};
+    return name;
+}
+
+/// An `object` literal's field/init/super-arg initializers that need real
+/// evaluation are lowered into side modules. Those modules are site-stable
+/// (pure functions of the AST site — captures resolve at run time, not lowering
+/// time), so they are lowered once per site and cached here, keyed by the
+/// site's AST address. Reused by every instantiation: a per-request `object`
+/// literal evaluates the cached thunks instead of re-lowering them into fresh
+/// Module cells that, when swept, free only their header and leak the lowered
+/// IR they own.
+const AnonComplexInit = struct { name: []const u8, module: ObjRef(Module), func: FuncId };
+const AnonInitThunk = struct { module: ObjRef(Module), func: FuncId, prop_pos: usize };
+const AnonSuperArgThunk = struct { module: ObjRef(Module), func: FuncId };
+const AnonSiteThunks = struct {
+    complex_prop_inits: []const AnonComplexInit,
+    init_thunks: []const AnonInitThunk,
+    super_arg_thunks: []const []const ?AnonSuperArgThunk,
+};
+var anon_site_thunks: std.AutoHashMapUnmanaged(usize, AnonSiteThunks) = .empty;
+var anon_site_thunks_root_registered = std.atomic.Value(bool).init(false);
+
+/// GC root: shade every cached anon-site thunk sub-module so the cached lowered
+/// IR is never swept (it is reused across all instantiations of the site). Read
+/// without locking: the stop-the-world handshake parks every mutator at a safe
+/// point and neither `get` nor `put` spans a safe point, so the map is stable
+/// here.
+fn gcMarkAnonSites(m: *runtime.gc.Marker) void {
+    var it = anon_site_thunks.valueIterator();
+    while (it.next()) |t| {
+        for (t.complex_prop_inits) |c| m.shade(&c.module.cell.hdr);
+        for (t.init_thunks) |i| m.shade(&i.module.cell.hdr);
+        for (t.super_arg_thunks) |slots| {
+            for (slots) |s| if (s) |th| m.shade(&th.module.cell.hdr);
+        }
+    }
+}
+
+fn anonSiteThunksGet(key: usize) ?AnonSiteThunks {
+    anon_site_lock.lock();
+    defer anon_site_lock.unlock();
+    return anon_site_thunks.get(key);
+}
+
+/// Clear the process-global anon-`object` site caches at a program-run
+/// boundary. Both are keyed by AST-node address, which is only stable within a
+/// single run; a later run can reuse a freed address, so a stale entry would
+/// dispatch through a thunk sub-module owned by the finished run's allocator
+/// (a cross-run use-after-free). Frees the permanent (page-allocator) site
+/// names and thunk-list spines; the thunk sub-module cells are GC cells the
+/// collector reclaims once unrooted. Run-boundary only (no workers live).
+pub fn resetAnonSiteCache() void {
+    const pa = std.heap.page_allocator;
+    anon_site_lock.lock();
+    defer anon_site_lock.unlock();
+    {
+        var it = anon_site_names.valueIterator();
+        while (it.next()) |n| pa.free(n.*);
+        anon_site_names.clearAndFree(pa);
+    }
+    {
+        var it = anon_site_thunks.valueIterator();
+        while (it.next()) |t| {
+            if (t.complex_prop_inits.len != 0) pa.free(t.complex_prop_inits);
+            if (t.init_thunks.len != 0) pa.free(t.init_thunks);
+            for (t.super_arg_thunks) |slots| if (slots.len != 0) pa.free(slots);
+            if (t.super_arg_thunks.len != 0) pa.free(t.super_arg_thunks);
+        }
+        anon_site_thunks.clearAndFree(pa);
+    }
+}
+
+/// Publish a site's thunks (first publisher wins). A racing second build of the
+/// same site loses; the loser's modules are left unrooted and GC reclaims them.
+/// Returns the entry now in the cache.
+fn anonSiteThunksPut(key: usize, entry: AnonSiteThunks) AnonSiteThunks {
+    anon_site_lock.lock();
+    defer anon_site_lock.unlock();
+    if (anon_site_thunks.get(key)) |existing| return existing;
+    anon_site_thunks.put(std.heap.page_allocator, key, entry) catch return entry;
+    return entry;
+}
+
 pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, captured_names: []const []const u8, captures: []const Value, scope_renames: []const ir.ScopeRename) Allocator.Error!EvalResult {
     if (expr.* != .ObjectExpr) {
         return .{ .err = try typeErr(allocator, "Vm::build_object: not an ObjectExpr AST node", .{}) };
+    }
+    if (runtime.gc.gc_enabled and !anon_site_thunks_root_registered.swap(true, .monotonic)) {
+        runtime.gc.registerRoot(gcMarkAnonSites);
     }
     // The member bodies below lower into fresh side modules with none of
     // the build's scope registries; install the lexical site's rename
@@ -2569,8 +2679,23 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     const supertype_args = obj.supertype_args;
 
     const capture_pairs = try buildCapturePairs(allocator, captured_names, captures);
+    // The pair array is consumed here (its retained values move into the
+    // instance's `anon_captures`); free the array spine at exit. The values are
+    // NOT freed here — the instance owns them now.
+    defer if (runtime.freeScratch()) allocator.free(capture_pairs);
     const identity = nextInstanceId(self);
-    const synth_class_name = try std.fmt.allocPrint(allocator, "$anon${d}", .{identity});
+    // Site-stable class name: shared by every instantiation of this `object`
+    // expression so the class/method registries don't grow per instance.
+    const synth_class_name = anonSiteName(expr);
+    // Whether this site's class + methods are already registered (a prior
+    // instantiation built them). On a hit the per-method lowering and the
+    // class-def construction are skipped — only the per-instance captures,
+    // field/super-arg initializers, and instance allocation run.
+    const site_built = blk: {
+        const g = self.classes.borrow();
+        defer g.deinit();
+        break :blk g.get().contains(synth_class_name);
+    };
 
     // Collect the anon object's own + inherited + enclosing member names so
     // bare identifiers inside method bodies resolve through `this`.
@@ -2629,187 +2754,252 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     ir.lower.setLowerAnonCaptures(anon_cap_set);
     // `setLowerAnonCaptures` takes ownership; clear it after lowering.
 
-    // Lower each method + getter, and collect complex property-init thunks.
-    const ComplexInit = struct { name: []const u8, module: ObjRef(Module), func: FuncId };
-    var complex_prop_inits: std.ArrayList(ComplexInit) = .empty;
+    // Lower each method + getter into the shared `anon_methods` registry
+    // (once per site, on the first instantiation).
     for (members) |*m| {
         switch (m.*) {
             .Function => |*f| {
                 if (f.body == null) continue;
+                if (site_built) continue; // methods already registered for this site
                 const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
                 const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, synth_class_name, &own_members);
                 const fid = func.id;
                 const tbl = self.anon_methods.borrowMut();
                 const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
-                tbl.get().put(try anonKey(allocator, synth_class_name, arity_name), .{ .module = sub_ref, .func = fid, .captures = capture_pairs }) catch {};
-                tbl.get().put(try anonKey(allocator, synth_class_name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = capture_pairs }) catch {};
+                // Captures are stored per-instance (`InstanceData.anon_captures`),
+                // not in this shared registry entry — the entry's method/module is
+                // site-stable, the captures vary per object, and holding them here
+                // would root every request's value graph forever.
+                tbl.get().put(try anonKey(allocator, synth_class_name, arity_name), .{ .module = sub_ref, .func = fid, .captures = &.{} }) catch {};
+                tbl.get().put(try anonKey(allocator, synth_class_name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = &.{} }) catch {};
                 tbl.deinit();
             },
             .Property => |*p| {
-                if (p.getter) |*getter| {
+                if (p.getter) |*getter| if (!site_built) {
                     const thunk = synthThunk(p.name, getter.body, getter.return_type, p.is_override);
                     const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
                     const fid = func.id;
                     const key = try std.fmt.allocPrint(allocator, "$get${s}", .{p.name.name});
                     const tbl = self.anon_methods.borrowMut();
-                    tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = fid, .captures = capture_pairs }) catch {};
+                    tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = fid, .captures = &.{} }) catch {};
                     tbl.deinit();
-                }
-                const init_expr = if (p.init) |*e| e else continue;
-                const is_lit = (try simpleLiteral(allocator, init_expr)) != null;
-                if (is_lit) continue;
-                // A bare one-segment name resolvable from the captured
-                // scope is filled directly at field init below. Any other
-                // bare name (a top-level property, an object singleton, a
-                // class reference) must evaluate through a lowered thunk
-                // like every other initializer — the capture pairs alone
-                // cannot resolve it.
-                if (bareCaptureResolvable(init_expr, capture_pairs)) continue;
-                const thunk_name: ast.Ident = .{
-                    .name = try std.fmt.allocPrint(allocator, "$init${s}", .{p.name.name}),
-                    .span = p.name.span,
                 };
-                const thunk = synthThunk(thunk_name, .{ .Expr = init_expr.* }, null, false);
-                const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
-                const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
-                try complex_prop_inits.append(allocator, .{ .name = p.name.name, .module = sub_ref, .func = func.id });
             },
             else => {},
         }
     }
-    // Lower the object literal's own `init { … }` blocks as 0-arg method
-    // thunks over `this`, recording each block's position as the number of
-    // properties declared before it so the run below interleaves blocks
-    // and property initializers in declaration order.
-    const InitThunk = struct { module: ObjRef(Module), func: FuncId, prop_pos: usize };
-    var init_thunks: std.ArrayList(InitThunk) = .empty;
-    for (obj.init_blocks, 0..) |*blk, idx| {
-        const member_pos = if (idx < obj.init_block_positions.len) obj.init_block_positions[idx] else members.len;
-        const upto = @min(member_pos, members.len);
-        var prop_pos: usize = 0;
-        for (members[0..upto]) |*m| {
-            if (m.* == .Property) prop_pos += 1;
-        }
-        const thunk_name: ast.Ident = .{
-            .name = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx}),
-            .span = blk.span,
-        };
-        const thunk = synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
-        const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
-        const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
-        try init_thunks.append(allocator, .{ .module = sub_ref, .func = func.id, .prop_pos = prop_pos });
-    }
-    // Lower a thunk for every supertype ctor arg the captured scope
-    // cannot resolve directly (anything beyond a literal or a captured
-    // name): `object : Base(g + 1)` evaluates `g + 1` for real. The
-    // thunks run against the *enclosing* `this` — a super arg is
-    // evaluated before the object exists and never sees its members, so
-    // they lower with no own-member set.
-    const SuperArgThunk = struct { module: ObjRef(Module), func: FuncId };
-    var super_arg_thunks = try allocator.alloc([]?SuperArgThunk, supertypes.len);
-    {
-        var no_members = StringSet.init(allocator);
-        defer no_members.deinit();
-        for (supertypes, 0..) |_, si| {
-            const arg_exprs: []const ast.Expr = blk: {
-                if (si < supertype_args.len) {
-                    if (supertype_args[si]) |ae| break :blk ae;
-                }
-                break :blk &.{};
+
+    // The complex property-init / `init { … }` / supertype-ctor-arg thunks are
+    // site-stable: lower them once and cache (keyed by the AST site), reuse
+    // after. The cached sub-modules are kept alive by `gcMarkAnonSites`.
+    const site_key = @intFromPtr(expr);
+    var complex_prop_inits: []const AnonComplexInit = &.{};
+    var init_thunks: []const AnonInitThunk = &.{};
+    var super_arg_thunks: []const []const ?AnonSuperArgThunk = &.{};
+    if (anonSiteThunksGet(site_key)) |cached| {
+        complex_prop_inits = cached.complex_prop_inits;
+        init_thunks = cached.init_thunks;
+        super_arg_thunks = cached.super_arg_thunks;
+        ir.lower.setLowerAnonCaptures(null);
+    } else {
+        // Complex property initializers: anything past a literal or a bare
+        // captured name evaluates through a lowered thunk.
+        var complex_local: std.ArrayList(AnonComplexInit) = .empty;
+        for (members) |*m| {
+            if (m.* != .Property) continue;
+            const p = &m.Property;
+            const init_expr = if (p.init) |*e| e else continue;
+            const is_lit = (try simpleLiteral(allocator, init_expr)) != null;
+            if (is_lit) continue;
+            // A bare one-segment name resolvable from the captured scope is
+            // filled directly at field init below. Any other bare name (a
+            // top-level property, an object singleton, a class reference) must
+            // evaluate through a lowered thunk like every other initializer —
+            // the capture pairs alone cannot resolve it.
+            if (bareCaptureResolvable(init_expr, capture_pairs)) continue;
+            const thunk_name: ast.Ident = .{
+                .name = try std.fmt.allocPrint(allocator, "$init${s}", .{p.name.name}),
+                .span = p.name.span,
             };
-            const slots = try allocator.alloc(?SuperArgThunk, arg_exprs.len);
-            super_arg_thunks[si] = slots;
-            for (arg_exprs, 0..) |*ae, ai| {
-                slots[ai] = null;
-                if ((try simpleLiteral(allocator, ae)) != null) continue;
-                if (bareCaptureResolvable(ae, capture_pairs)) continue;
-                const thunk_name: ast.Ident = .{
-                    .name = try std.fmt.allocPrint(allocator, "$superarg${d}${d}", .{ si, ai }),
-                    .span = obj.span,
+            const thunk = synthThunk(thunk_name, .{ .Expr = init_expr.* }, null, false);
+            const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+            const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
+            try complex_local.append(allocator, .{ .name = p.name.name, .module = sub_ref, .func = func.id });
+        }
+
+        // `init { … }` blocks lower as 0-arg method thunks over `this`, each
+        // tagged with the number of properties declared before it so the run
+        // below interleaves blocks and property initializers in declaration
+        // order.
+        var init_local: std.ArrayList(AnonInitThunk) = .empty;
+        for (obj.init_blocks, 0..) |*blk, idx| {
+            const member_pos = if (idx < obj.init_block_positions.len) obj.init_block_positions[idx] else members.len;
+            const upto = @min(member_pos, members.len);
+            var prop_pos: usize = 0;
+            for (members[0..upto]) |*m| {
+                if (m.* == .Property) prop_pos += 1;
+            }
+            const thunk_name: ast.Ident = .{
+                .name = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx}),
+                .span = blk.span,
+            };
+            const thunk = synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
+            const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+            const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
+            try init_local.append(allocator, .{ .module = sub_ref, .func = func.id, .prop_pos = prop_pos });
+        }
+
+        // A thunk for every supertype ctor arg the captured scope cannot
+        // resolve directly: `object : Base(g + 1)` evaluates `g + 1` for real.
+        // These run against the *enclosing* `this` — a super arg is evaluated
+        // before the object exists and never sees its members, so they lower
+        // with no own-member set.
+        const super_local = try allocator.alloc([]const ?AnonSuperArgThunk, supertypes.len);
+        {
+            var no_members = StringSet.init(allocator);
+            defer no_members.deinit();
+            for (supertypes, 0..) |_, si| {
+                const arg_exprs: []const ast.Expr = blk: {
+                    if (si < supertype_args.len) {
+                        if (supertype_args[si]) |ae| break :blk ae;
+                    }
+                    break :blk &.{};
                 };
-                const thunk = synthThunk(thunk_name, .{ .Expr = ae.* }, null, false);
-                const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
-                const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &no_members);
-                slots[ai] = .{ .module = sub_ref, .func = func.id };
+                const slots = try allocator.alloc(?AnonSuperArgThunk, arg_exprs.len);
+                for (arg_exprs, 0..) |*ae, ai| {
+                    slots[ai] = null;
+                    if ((try simpleLiteral(allocator, ae)) != null) continue;
+                    if (bareCaptureResolvable(ae, capture_pairs)) continue;
+                    const thunk_name: ast.Ident = .{
+                        .name = try std.fmt.allocPrint(allocator, "$superarg${d}${d}", .{ si, ai }),
+                        .span = obj.span,
+                    };
+                    const thunk = synthThunk(thunk_name, .{ .Expr = ae.* }, null, false);
+                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &no_members);
+                    slots[ai] = .{ .module = sub_ref, .func = func.id };
+                }
+                super_local[si] = slots;
             }
         }
-    }
-    ir.lower.setLowerAnonCaptures(null);
+        ir.lower.setLowerAnonCaptures(null);
 
-    // Body-property defs from the object's own properties.
-    var body_props: std.ArrayList(PropertyDef) = .empty;
-    for (members) |*m| {
-        if (m.* != .Property) continue;
-        const p = &m.Property;
-        try body_props.append(allocator, .{
-            .name = p.name.name,
-            .mutable = p.mutable,
-            .init = if (p.init) |*e| e else null,
-            .getter = if (p.getter) |*g| g else null,
-            .setter = if (p.setter) |*s| s else null,
-            .delegate = if (p.delegate) |*e| e else null,
-            .is_abstract = p.is_abstract,
-            .is_lateinit = p.is_lateinit,
-            .primitive_zero = build.primitiveZeroFor(p),
-        });
-    }
-    var supertype_names = try allocator.alloc([]const u8, supertypes.len);
-    for (supertypes, 0..) |*t, i| {
-        supertype_names[i] = ir.build.anonScopeRename(t.name.name) orelse t.name.name;
-    }
-
-    // First non-interface supertype as resolved parent class.
-    var anon_parent: ?ObjRef(ClassDef) = null;
-    for (supertype_names) |sn| {
-        const def = classDefByName(self, sn) orelse continue;
-        const is_iface = blk: {
-            const dg = def.borrow();
-            defer dg.deinit();
-            break :blk dg.get().is_interface;
-        };
-        if (!is_iface) {
-            anon_parent = def;
-            break;
+        // Copy the spines into permanent storage so `gcMarkAnonSites` can read
+        // them cross-thread and the lowered sub-modules are rooted (reused, not
+        // re-lowered, by every later instantiation).
+        const pa = std.heap.page_allocator;
+        const cpi_perm = pa.dupe(AnonComplexInit, complex_local.items) catch @panic("KGC: anon-site thunk cache alloc failed");
+        const it_perm = pa.dupe(AnonInitThunk, init_local.items) catch @panic("KGC: anon-site thunk cache alloc failed");
+        const sat_perm = pa.alloc([]const ?AnonSuperArgThunk, super_local.len) catch @panic("KGC: anon-site thunk cache alloc failed");
+        for (super_local, 0..) |slots, i| sat_perm[i] = pa.dupe(?AnonSuperArgThunk, slots) catch @panic("KGC: anon-site thunk cache alloc failed");
+        // The per-call spine arrays are dead now (the modules they referenced
+        // live on, by value, in the permanent copies).
+        if (runtime.freeScratch()) {
+            complex_local.deinit(allocator);
+            init_local.deinit(allocator);
+            for (super_local) |slots| allocator.free(slots);
+            allocator.free(super_local);
         }
-        def.deinit();
+        const winner = anonSiteThunksPut(site_key, .{
+            .complex_prop_inits = cpi_perm,
+            .init_thunks = it_perm,
+            .super_arg_thunks = sat_perm,
+        });
+        complex_prop_inits = winner.complex_prop_inits;
+        init_thunks = winner.init_thunks;
+        super_arg_thunks = winner.super_arg_thunks;
     }
 
-    const env = try ObjRef(Env).init(allocator, Env.init(allocator));
-    const class_def = try ObjRef(ClassDef).init(allocator, .{
-        .name = synth_class_name,
-        .fqn = synth_class_name,
-        .annotation_names = &.{},
-        .primary_params = &.{},
-        .methods = &.{},
-        .body_properties = try body_props.toOwnedSlice(allocator),
-        .init_blocks = &.{},
-        .init_block_property_positions = &.{},
-        .is_data = false,
-        .is_value = false,
-        .is_object = false,
-        .is_enum = false,
-        .is_sealed = false,
-        .supertype_names = supertype_names,
-        .parent = anon_parent,
-        .interfaces = &.{},
-        .is_interface = false,
-        .is_fun_interface = false,
-        .parent_ctor_args = &.{},
-        .is_open = false,
-        .is_abstract = false,
-        .is_inner = false,
-        .is_anonymous = true,
-        .secondary_ctors = &.{},
-        .enum_entries = &.{},
-        .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
-        .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
-        .nested_classes = &.{},
-        .captured_env = env,
-        .supertype_delegates = &.{},
-        .delegate_forwarders = &.{},
-        .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
-    });
+    // The anon ClassDef is site-stable: on a hit, reuse the one a prior
+    // instantiation registered; on a miss, build it and register it under the
+    // site name (the per-instance captures and field values are applied below,
+    // not stored in the class).
+    const class_def = if (site_built) blk: {
+        const g = self.classes.borrow();
+        defer g.deinit();
+        break :blk g.get().get(synth_class_name).?.clone();
+    } else blk: {
+        // Body-property defs from the object's own properties.
+        var body_props: std.ArrayList(PropertyDef) = .empty;
+        for (members) |*m| {
+            if (m.* != .Property) continue;
+            const p = &m.Property;
+            try body_props.append(allocator, .{
+                .name = p.name.name,
+                .mutable = p.mutable,
+                .init = if (p.init) |*e| e else null,
+                .getter = if (p.getter) |*g| g else null,
+                .setter = if (p.setter) |*s| s else null,
+                .delegate = if (p.delegate) |*e| e else null,
+                .is_abstract = p.is_abstract,
+                .is_lateinit = p.is_lateinit,
+                .primitive_zero = build.primitiveZeroFor(p),
+            });
+        }
+        var supertype_names = try allocator.alloc([]const u8, supertypes.len);
+        for (supertypes, 0..) |*t, i| {
+            supertype_names[i] = ir.build.anonScopeRename(t.name.name) orelse t.name.name;
+        }
+
+        // First non-interface supertype as resolved parent class.
+        var anon_parent: ?ObjRef(ClassDef) = null;
+        for (supertype_names) |sn| {
+            const def = classDefByName(self, sn) orelse continue;
+            const is_iface = b2: {
+                const dg = def.borrow();
+                defer dg.deinit();
+                break :b2 dg.get().is_interface;
+            };
+            if (!is_iface) {
+                anon_parent = def;
+                break;
+            }
+            def.deinit();
+        }
+
+        const env = try ObjRef(Env).init(allocator, Env.init(allocator));
+        const cd = try ObjRef(ClassDef).init(allocator, .{
+            .name = synth_class_name,
+            .fqn = synth_class_name,
+            .annotation_names = &.{},
+            .primary_params = &.{},
+            .methods = &.{},
+            .body_properties = try body_props.toOwnedSlice(allocator),
+            .init_blocks = &.{},
+            .init_block_property_positions = &.{},
+            .is_data = false,
+            .is_value = false,
+            .is_object = false,
+            .is_enum = false,
+            .is_sealed = false,
+            .supertype_names = supertype_names,
+            .parent = anon_parent,
+            .interfaces = &.{},
+            .is_interface = false,
+            .is_fun_interface = false,
+            .parent_ctor_args = &.{},
+            .is_open = false,
+            .is_abstract = false,
+            .is_inner = false,
+            .is_anonymous = true,
+            .secondary_ctors = &.{},
+            .enum_entries = &.{},
+            .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+            .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+            .nested_classes = &.{},
+            .captured_env = env,
+            .supertype_delegates = &.{},
+            .delegate_forwarders = &.{},
+            .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        });
+        {
+            const g = self.classes.borrowMut();
+            defer g.deinit();
+            try g.get().put(synth_class_name, cd.clone());
+        }
+        break :blk cd;
+    };
     // The synthesized anon class lives only in this stack local until it is
     // registered into `classes` (below) and adopted by the instance; pin it
     // across the body-property / super-arg initializer evals so a collection
@@ -2881,23 +3071,22 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         try super_args_by_class.put(sup.name.name, vals);
     }
 
-    // Register the anon ClassDef.
-    {
-        const g = self.classes.borrowMut();
-        defer g.deinit();
-        try g.get().put(synth_class_name, class_def.clone());
-    }
-
     const outer: ?Value = findCapture(capture_pairs, "this");
     // `outer` is an owned field of the instance (its teardown releases it);
     // `findCapture` returns a borrow, so retain before adopting it.
     if (outer) |o| o.retain();
+    // Move the captures onto the instance: it owns the refs `buildCapturePairs`
+    // retained (released on teardown). The `capture_pairs` array itself is freed
+    // at function exit; the values live on in `anon_caps`.
+    const anon_caps = try allocator.alloc(InstanceData.Capture, capture_pairs.len);
+    for (capture_pairs, 0..) |p, i| anon_caps[i] = .{ .name = p.name, .value = p.value };
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = class_def,
         .fields = fields,
         .outer = outer,
         .identity = identity,
         .native_state = null,
+        .anon_captures = anon_caps,
     });
     const inst_value: Value = .{ .Instance = inst.clone() };
 
@@ -2962,6 +3151,9 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             defer cg.deinit();
             break :blk try allocator.dupe(PropertyDef, cg.get().body_properties);
         };
+        // The dupe is a shallow array of `PropertyDef` (each field a borrow into
+        // the class def / AST); free the array spine once this level is built.
+        defer if (runtime.freeScratch()) allocator.free(props);
         for (props, 0..) |p, pi| {
             switch (try runInitBlocksAt(self, cls, pi, &inst_value, super_chain_entries.items, cls_args)) {
                 .ok => {},
@@ -3012,8 +3204,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     var prop_idx: usize = 0;
     for (members) |*m| {
         if (m.* != .Property) continue;
-        while (next_init < init_thunks.items.len and init_thunks.items[next_init].prop_pos <= prop_idx) : (next_init += 1) {
-            const it = init_thunks.items[next_init];
+        while (next_init < init_thunks.len and init_thunks[next_init].prop_pos <= prop_idx) : (next_init += 1) {
+            const it = init_thunks[next_init];
             switch (try runAnonThunk(self, allocator, it.module, it.func, &inst_value, capture_pairs)) {
                 .ok => {},
                 .err => |e| return .{ .err = e },
@@ -3021,8 +3213,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         }
         prop_idx += 1;
         const pname = m.Property.name.name;
-        const cpi: ?ComplexInit = blk: {
-            for (complex_prop_inits.items) |c| {
+        const cpi: ?AnonComplexInit = blk: {
+            for (complex_prop_inits) |c| {
                 if (std.mem.eql(u8, c.name, pname)) break :blk c;
             }
             break :blk null;
@@ -3037,8 +3229,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             .err => |e| return .{ .err = e },
         }
     }
-    while (next_init < init_thunks.items.len) : (next_init += 1) {
-        const it = init_thunks.items[next_init];
+    while (next_init < init_thunks.len) : (next_init += 1) {
+        const it = init_thunks[next_init];
         switch (try runAnonThunk(self, allocator, it.module, it.func, &inst_value, capture_pairs)) {
             .ok => {},
             .err => |e| return .{ .err = e },
@@ -3080,10 +3272,15 @@ fn runAnonThunk(
     }
     // Pin the active globals scope across the body eval (see the same pattern in
     // host_call_member): a transient capture-layer env is reachable only through
-    // this stack-local field.
+    // this stack-local field. Also pin the thunk's sub-module: it is a transient
+    // cell held only by this stack-local `mref` (anon-object init/property/super
+    // thunks lower into fresh side modules), and the eval frame keeps it as a raw
+    // `*const Module` the collector cannot reach — so a collection during the
+    // body would sweep it and dangle `frame.module`.
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
     runtime.keepalivePushCell(&self.globals.cell.hdr);
+    runtime.keepalivePushCell(&mref.cell.hdr);
     var cap_vec: std.ArrayList(Value) = .empty;
     for (func.capture_order) |cn| {
         if (std.mem.eql(u8, cn, "this")) {

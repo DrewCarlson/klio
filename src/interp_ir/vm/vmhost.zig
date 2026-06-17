@@ -152,6 +152,10 @@ pub fn resetReceiverThreadLocals() void {
     host_fields.resetReceiverTls();
     host_impl.resetReceiverTls();
     coroutines.resetReceiverTls();
+    // Drop the AST-address-keyed anon-`object` site caches: their keys and
+    // thunk sub-modules belong to the finished run and must not be reused by
+    // the next one in the same process (tests, repeated CLI runs).
+    host_instances.resetAnonSiteCache();
 }
 
 /// A borrowed view over a `Vm`'s (or another host's) shared program-state

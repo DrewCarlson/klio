@@ -2458,23 +2458,76 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // `Iterable.maxOf` / array `maxOf`) is the package-level function,
         // not a receiver member — it must fall through to the bare-name path.
         const recv_chain = try narrowingRecvChain(b);
-        if (b.resolve(nm) == null and !b.knowsOuter(nm) and
-            (b.hasOwnMember(nm) or nameHasReceiverCandidate(b, nm, recv_chain)))
-        {
-            if (b.resolve("this")) |bound_this| {
-                const run = try lowerArgRun(b, args);
-                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-                const dst = b.allocReg();
-                const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
-                try b.push(.{ .CallMember = .{
-                    .dst = dst,
-                    .receiver = bound_this,
-                    .name = nmc,
-                    .args = run[0],
-                    .n_args = run[1],
-                    .arg_names = arg_names,
-                } });
-                return dst;
+        if (b.resolve(nm) == null and !b.knowsOuter(nm)) {
+            // Confident the call binds to the spliced `this`: the name is a
+            // member of its class, or an extension whose declared receiver is
+            // compatible with the *known* receiver-type chain. Dispatch it
+            // straight onto the bound receiver register.
+            const binds_this = b.hasOwnMember(nm) or
+                (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain));
+            if (binds_this) {
+                if (b.resolve("this")) |bound_this| {
+                    const run = try lowerArgRun(b, args);
+                    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                    const dst = b.allocReg();
+                    const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
+                    try b.push(.{ .CallMember = .{
+                        .dst = dst,
+                        .receiver = bound_this,
+                        .name = nmc,
+                        .args = run[0],
+                        .n_args = run[1],
+                        .arg_names = arg_names,
+                    } });
+                    return dst;
+                }
+            } else if (recv_chain == null and nameHasReceiverCandidate(b, nm, null)) {
+                // The name is an extension namesake but the spliced receiver's
+                // type is unknown here, so we cannot prove it binds to the
+                // innermost `this`. Emit the receiver-walking form rather than
+                // pinning it to `this`: a bare `collect` inside a nested
+                // `FlowCollector.()` lambda must reach the outer `Flow`
+                // receiver (`this@unsafeTransform`), not dispatch on the
+                // collector. `CallMemberOrGlobal` tries the bound receiver,
+                // then each enclosing receiver innermost-first, before any
+                // global. Pass the bound `this` register directly so the splice
+                // receiver (`filterIsInstanceTo` on the bound `List`) is the
+                // innermost candidate even though it is a local register, not a
+                // capture. Still handled here so the bare-name paths below
+                // cannot grab it as a top-level function and drop the receiver.
+                if (b.resolve("this")) |bound_this| {
+                    const run = try lowerArgRun(b, args);
+                    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                    const dst = b.allocReg();
+                    const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
+                    orEmitAudit(b, "inline_splice_unknown_recv", "CallMemberOrGlobal", nm);
+                    try b.push(.{ .CallMemberOrGlobal = .{
+                        .dst = dst,
+                        .this_idx = 0,
+                        .name = nmc,
+                        .args = run[0],
+                        .n_args = run[1],
+                        .arg_names = arg_names,
+                        .recv = bound_this,
+                    } });
+                    return dst;
+                } else if (b.knowsOuter("this") or b.capturesThisSlot()) {
+                    const run = try lowerArgRun(b, args);
+                    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                    const this_idx = try b.recordCapture("this");
+                    const dst = b.allocReg();
+                    const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
+                    orEmitAudit(b, "inline_splice_unknown_recv", "CallMemberOrGlobal", nm);
+                    try b.push(.{ .CallMemberOrGlobal = .{
+                        .dst = dst,
+                        .this_idx = this_idx,
+                        .name = nmc,
+                        .args = run[0],
+                        .n_args = run[1],
+                        .arg_names = arg_names,
+                    } });
+                    return dst;
+                }
             }
         }
     }

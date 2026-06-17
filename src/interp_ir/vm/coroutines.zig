@@ -952,7 +952,7 @@ threadlocal var coro_stack: std.ArrayList(CooperativeInterceptor) = .empty;
 threadlocal var active_scope_stack: std.ArrayList(Value) = .empty;
 
 fn coroStackAllocator() Allocator {
-    return std.heap.page_allocator;
+    return runtime.slab.tracedPage();
 }
 
 /// Assert (Debug) the coroutine interceptor and active-scope stacks are empty
@@ -998,6 +998,15 @@ fn gcMarkCoroGlobal(m: *runtime.gc.Marker) void {
         while (it.next()) |w| m.shade(&w.cell.hdr);
     }
     SlotOwners.mutex.unlock();
+
+    if (runtime.gc.gc_debug) {
+        const so = if (SlotOwners.map) |sm| sm.count() else 0;
+        const sp = if (SlotOwners.pending) |pm| pm.count() else 0;
+        const pp = if (PersistedParked.map) |pm| pm.count() else 0;
+        const cs = coro_stack.items.len;
+        const ss = active_scope_stack.items.len;
+        std.debug.print("[coro] slot_owners={d} pending={d} persisted={d} coro_stack={d} scope_stack={d}\n", .{ so, sp, pp, cs, ss });
+    }
 }
 
 /// Per-thread coroutine roots: this thread's interceptor stack and active scope

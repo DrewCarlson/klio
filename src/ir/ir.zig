@@ -386,6 +386,13 @@ pub const Inst = union(enum) {
         /// shadow it; the global leg calls exactly this declaration
         /// instead of re-resolving the simple name.
         func: ?FuncId = null,
+        /// An inline-splice's bound receiver, held in a local register rather
+        /// than the frame's `this` slot or a capture. When set it is the
+        /// innermost implicit-receiver candidate, ahead of the frame `this`
+        /// and the enclosing chain — so a bare extension call inside a spliced
+        /// receiver-lambda (`collect` in `FlowCollector.()`) can miss the
+        /// lambda receiver and bind the outer one.
+        recv: ?Reg = null,
     },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host.store_global` so a

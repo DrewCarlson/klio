@@ -264,3 +264,212 @@ refinement (trim/`madvise`, or an arena-of-free-lists), not a leak. The
 per-closure `ClosureInfo` metadata (a few words + two small slices) is not freed
 mid-run; it is bounded by distinct closure-creation events, dwarfed by the
 reclaimed capture data, and a follow-up could prune it once liveness is proven.
+
+## Memory-reclamation results (host temporaries, per-request graphs, RSS)
+
+The collector keeps the *reachable* set flat, but two non-cell growth sources
+remained; both are now closed under the GC, and RSS is tracked rather than the
+allocator's reclaimed-page cache.
+
+### Page-returning backing (`src/runtime/slab.zig`)
+
+The stock free-list allocators (`smp_allocator`, libc) never return reclaimed
+pages to the OS, so a long-running server's RSS grew with cumulative churn even
+though the live set stayed flat. The slab allocator groups same-size cells into
+`SLAB`-aligned slabs and `munmap`s a slab the instant its last cell is freed, so
+RSS tracks the live set. It is the default GC backing (`KLIO_GC_ALLOC` selects
+`smp`/`gpa`/`calloc`/`leaktrack` for comparison). Measured: a `smp`-backed ktor
+server's RSS grows to >1 GB over a few hundred requests; the slab keeps the live
+cell set flat.
+
+### Host temporaries (`freeScratch`)
+
+The per-call host scratch the Rust→Zig port left unfreed (probe FQNs, arg/prepend
+arrays, error messages) was gated on `reclaimEnabled()`, which is OFF under the
+GC, so it leaked through the freeing backend. Split the predicate:
+`freeScratch()` frees raw scratch whenever the backend actually frees (reclaim OR
+GC) while value-graph ownership stays on `reclaimEnabled()`. The 48 raw-free
+sites use `freeScratch()`, and the previously-unfreed prepend-array /
+extension-dispatch / string-concat-rendering scratch in the member-dispatch and
+eval paths is now freed. A stdlib loop (`listOf().map{}.filter{}` + map build)
+drops from ~6.5 KB/iter to flat (147 MB at 200 K iterations, ~the 116 MB at 20 K
+plus fragmentation noise).
+
+### Per-request value graphs (anonymous objects)
+
+Two registries rooted per-request anonymous-object state forever:
+- captures were stored in the process-global `anon_methods` registry keyed by a
+  per-instance class name, so every request's value graph (the call, params,
+  deserialized bodies) stayed reachable. Moved onto the instance
+  (`InstanceData.anon_captures`), reclaimed with it.
+- the class + method registrations used a per-instance `$anon$<id>` name, so
+  `classes`/`anon_methods` gained never-released entries per instantiation. Keyed
+  by the source AST node instead (the lowered IR is identical for every
+  instantiation of a site), so the first instantiation registers and later ones
+  reuse.
+
+Result: a ktor server's live-cell counts stay flat across requests (`InstanceData`,
+`Module`, `ClassDef`, `Env`: constant instead of growing ~linearly — measured
+flat over 240+ requests where they previously grew ~55×).
+
+## Host-keepalive narrow windows (host re-entry) — largely closed
+
+A value a host op holds in a Zig local across a re-entrant `evalWith` /
+`invokeCallable` is swept if a collection fires during that inner eval, then
+reused (a hard fault under the slab's `munmap`; a wrong-type cell otherwise).
+Reproduced deterministically with `KLIO_GC_STRESS_EVERY=N`. Found and closed
+(each via the `KLIO_GC_ALLOC=leaktrack` locator + the segfault handler under
+`KLIO_SEGV_TRACE`):
+
+- the lazy-Sequence pipeline accumulator + in-flight value (`pumpItem`,
+  `applySeqOp`) — crashed ktor routing setup (`splitToSequence().map{}.toList()`);
+- the anonymous-object init / property / super-arg thunk sub-module
+  (`runAnonThunk`) held as a raw `frame.module` pointer — crashed serving;
+- the source items of a streamed sequence.
+
+A ktor server now survives routing setup and thousands of requests under the GC,
+where it formerly crashed at startup or within a few hundred requests. A rare
+intermittent crash remains at large request counts (~thousands), surfaced only
+by the normal 8 MB-threshold collection timing (not by aggressive stress, which
+serves cleanly) — the last unrooted host-local in the sustained request path,
+the same class as those above, to be pinned the same way.
+
+## Host-temporary reclamation in the ktor request path — in progress
+
+With the value graph flat (live cells constant across requests) and the leaks
+above closed, a ktor server's RSS growth dropped from ~8.5 MB/request (arena, the
+as-found number) to ~100 KB/request — the remaining per-request host scratch the
+collector cannot reclaim (it is raw, not a cell). Closed so far: the
+member-dispatch and field-resolution miss messages, the `anonMethodDispatch`
+lookup key, the `invokeAnonMethod` / `irMethodWalk` packed-arg buffers, the
+map-get key snapshot, and the parent-ctor packed args. The leaktrack locator
+shows the remaining per-request sites:
+
+- the closure side-table is append-only (monotonic ids, no reuse), so each
+  per-request lambda's `ClosureInfo` (capture-name dupe + chain) accumulates —
+  needs GC-confirmed-dead slot reclamation (a free-list keyed by the
+  mark epoch);
+- the anon-object init / property / super-arg thunks are re-lowered per instance
+  (only the methods + class are site-cached) — needs caching the thunk side
+  modules per source site;
+- per-intrinsic internal scratch (`dispatchIntrinsic` callees) and ctor / eval
+  arg arrays — the long tail of the host reconciliation, each a `freeScratch()`
+  free or an accumulator the GC cannot see.
+
+This is the §11 host-temporary reconciliation, now scoped concretely to the
+sites above rather than the whole interpreter.
+
+## Session update: crash root-caused, side-table bounded, residual characterized
+
+**The intermittent crash is fixed.** It was a use-after-free in
+`materializeInstance`: the packed parent-ctor-arg buffer was freed under the
+freeing allocator and then `cur_args` was pointed at it, so the next chain level
+read its super-args from freed memory. With the page-returning slab the region
+is eventually unmapped, turning the read into a hard fault after sustained
+construction (the server faulted deterministically at ~1176 requests). `cur_args`
+now points at the live chain-owned copy. A parallel 60 000-request load and the
+GC-stress corpus both run clean.
+
+**Leaks closed this session (all were freed only under the reference-counting
+path, so the collector — which never owns them — leaked them):**
+- coroutine frame-snapshot slice buffers (`regs`/`params`/`captures`/
+  `enclosing_this`/`try_stack`) on every suspend/resume;
+- the ktor client's owned response strings per request;
+- the duped body-property array in anon-object construction.
+
+**Closure side-table now bounded.** `reclaimDead` feeds GC-confirmed-dead slots
+to a free list that `push` reuses, so the spine stays bounded by the live
+closure set instead of growing per closure-creation event (was ~58 MB after a
+few thousand requests). Reuse is sound: a slot is freed only after a full mark
+proved no live value referenced its id, and a marked closure value always marks
+its slot, so a reused id can never alias a live value.
+
+**Anon-object thunks site-cached.** The complex-property / `init`-block /
+super-arg thunks are lowered once per `object` source site and kept alive by a
+GC root, instead of re-lowered (and leaked, since a swept Module cell frees only
+its header) per instantiation. The caches are AST-address-keyed and so are
+cleared at each run boundary (a stale cross-run entry was a use-after-free).
+
+**Residual ktor RSS, precisely characterized.** With every fix above, a ktor
+server's live cell count is flat (~2700 across a 40 000-request run, verified via
+`KLIO_GC_DEBUG`), so there is no value-graph leak. RSS still grows ~50 KB/request
+(slab) / more under libc — raw host-temporaries in the dispatch hot path that the
+collector never owns and an explicit free does not yet reclaim (the §11 tail).
+The per-allocation leak locators (`leaktrack`, the new cell tracer) cannot
+pinpoint these under the concurrent-server workload: tracking every cell
+contends with the stop-the-world sweep and starves collection, inflating the run
+rather than reporting it. A non-perturbing (sampled, lock-sharded) per-allocation
+tracker, or a per-request/per-coroutine-tree arena that frees host scratch
+wholesale (§12.4 option 2), is the next investment.
+
+**Diagnostic tooling added (all gated, off by default):** `KLIO_SLAB_TRACE`
+(records the capture stack of every live slab/large mmap and dumps the top sites
+on signal — sees allocations that bypass `leaktrack` or the sweep);
+`KLIO_CELL_TRACE` (per-cell allocation tracking at the slab's guaranteed-paired
+free path); `KLIO_SERVE_MAX` (bounded serve so a leak run reaches its report).
+
+**Pre-existing coroutine GC root holes (unchanged, the §12 frontier).** Under
+*aggressive* stress (`KLIO_GC_STRESS_EVERY=200`-300) three suspend/`async`/`launch`
+examples premature-free a receiver/closure (confirmed: `KLIO_GC_NOFREE=1` makes
+them pass). The window is narrow — they pass at the normal collection cadence —
+so a reachable coroutine value is briefly unrooted during the resume handoff.
+Closing it is the structured-concurrency root-completeness work of §12.
+
+## Dispatch-path host-temporary leaks closed; slab page reclamation
+
+The §11 "raw host-temporaries in the dispatch hot path" tail is now largely
+closed, and the slab gained genuine page-return for partially-free regions.
+
+**Dispatch-path frees.** Several host helpers allocated scratch the collector
+never owns and never freed:
+- `eqIgnoreCase` dropped two `allocLowerString` copies (case-insensitive String
+  equals is heavy in HTTP header routing — the hottest site).
+- `userMethodNamed` / `instanceMethodWalkNamed` and the named stdlib-intrinsic
+  path built a receiver-prepended arg buffer plus a names buffer and never freed
+  them after `callFuncNamed` (which borrows both).
+- the intrinsic-name resolver duped the resolved fqn into `Intrinsic.fqn` (a raw
+  slice the collector never frees); the source string is already program-lifetime
+  so it is borrowed directly now, and every discarded bare-name intrinsic
+  reference stops leaking.
+- `firstSupertypeName` / `callSuper` duped the parent class name though the
+  contract borrows it and nothing frees the result.
+- the bound-closure call path (`with(recv){…}`, receiver-delivered-positionally)
+  leaked its prepended arg slice.
+- `kotlinx.serialization` `jsonEncode`/`jsonDecode` built their whole
+  `std.json.Value` scratch tree (and ran `parseFromSliceLeaky`) on the collector
+  heap and dropped it; both now use a call-scoped arena, with host re-entry and
+  the produced cells staying on the real allocator.
+
+**Slab page reclamation.** A slab unmapped only when its last live cell freed, so
+a region a few long-lived stragglers pinned kept its whole 256 KiB resident. The
+collector now decommits the all-free pages of slabs that have stayed mostly free
+for several consecutive passes (idle-pass hysteresis avoids churning slabs merely
+between two allocations). A reclaimed page is replaced by a fresh anonymous
+`MAP_FIXED` mapping — verified the only portable way to actually drop RSS, since
+`madvise(MADV_FREE/MADV_FREE_REUSABLE/DONTNEED)` leaves the pages counted
+resident on macOS (301 MB → 301 MB) while `MAP_FIXED` drops them (301 MB → 51 MB).
+The free cells whose intrusive link sat in a discarded page go dormant —
+re-committed and re-threaded on demand by `allocSmall` rather than mapping a
+fresh slab, so the address space stays bounded (an early revive-less version grew
+virtual memory ~34 KB/req and exhausted the VM map). Covered by a slab unit test
+(data integrity of a straggler through decommit + revive) and validated under
+`KLIO_GC_STRESS_EVERY=25` over a live ktor server.
+
+**Measurements (all fixes, tracing GC, `ps` RSS).**
+- Simple alloc-loop (2 000 000 iterations of `"item-$i" + mutableListOf`): peak
+  **123 MB, flat** — no per-iteration growth.
+- ktor 4-endpoint server: **~50 KB/req → ~13 KB/req** over 4000 requests
+  (275 MB → 335 MB), baseline ~50 MB lower than before the reclaim.
+- ktor `GET`-only: ~2.0 KB/req (the reclaim trims ~25% off the unreclaimed 2.7).
+
+**Residual, precisely characterized.** The live cell count is *flat* over long
+runs — `GET` ~2645, the 4-endpoint mix ~2795 across 1800 collections
+(`KLIO_GC_DEBUG`) — so there is **no value-graph leak**; the residual RSS growth
+is slab fragmentation: per-request medium-lived cells (response/call/coroutine
+state) land in fresh slabs and pin them, and the slope is independent of the GC
+threshold (1 MB vs 8 MB floors give the same slope, only a lower baseline). The
+page reclaim recovers the *stably*-idle stragglers but is neutral on the denser
+mixed workload, whose slabs stay above the reclaim's live fraction between
+collections. Fully flattening this needs either compaction (a moving collector,
+out of scope for the current non-moving design) or a per-request/per-coroutine
+arena that frees host scratch wholesale at the request boundary.
