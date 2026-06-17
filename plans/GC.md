@@ -227,3 +227,40 @@ Two effects remain on the way to truly flat RSS:
 Host-op raw scratch (allocPrint keys, dup'd probe FQNs) is freed by the host run
 path; the anon-method dispatch keys were the one hot site still gated to the
 arena and are now freed unconditionally.
+
+
+## Collectable closures (bounded live set)
+
+The closure side-table was append-only and strong-rooted, pinning every lambda's
+captures for the whole run — the live cell set grew unboundedly in a map/filter
+loop (~430 cells per collection). Adversarially hardened (a design panel found
+fatal cross-thread and ordering holes in the first slot-map+free-list sketch),
+the landed mechanism is simpler and safer than a slot-map:
+
+- A closure is kept alive by ordinary reachability of its `IrClosure` Value.
+  `Value.gcMark` for an `IrClosure` invokes `runtime.gc.markClosureHook`, which
+  marks the side-table slot's capture store + receiver chain for that id. The
+  normal drain reaches this transitively — a closure captured by another closure
+  is marked when the outer's captures cell is drained — so no second pass and no
+  ordering hazard. A closure no live value references is never marked here, so
+  its captures cell goes white and is swept.
+- The spine tracer pins nothing (`ClosureInfo.gcTrace` is a no-op); the spine is
+  permanent metadata, never swept. Ids are monotonic and never reused, so no
+  free-list and no stale-id aliasing — a closure id any value still carries
+  always dispatches correctly.
+- Dispatched closures stay rooted across post→queue→dequeue→run: the pool FIFO
+  marks every queued task block, and a worker pins its in-flight block on the
+  keepalive stack (runVmTask / workerEntry).
+
+Result: the live set is flat (~16-20 cells across 345 collections over a
+200k-iteration instance+closure+collection churn loop, where the arena hits the
+6 GB cap and aborts). `marked` is flat (~1415). All 88 examples, the async
+dispatch hammer, and the real-threaded litmus fixtures stay correct under
+aggressive collection.
+
+Residual: process RSS still reflects the smp_allocator's reclaimed-page cache
+(the allocation high-water of the churn), not the live set — an allocator-policy
+refinement (trim/`madvise`, or an arena-of-free-lists), not a leak. The
+per-closure `ClosureInfo` metadata (a few words + two small slices) is not freed
+mid-run; it is bounded by distinct closure-creation events, dwarfed by the
+reclaimed capture data, and a follow-up could prune it once liveness is proven.
