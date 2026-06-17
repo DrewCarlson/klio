@@ -130,27 +130,50 @@ fn traceForget(ptr: usize) void {
     _ = trace_map.remove(ptr);
 }
 
+// Per-size-class cell trace maps, each guarded by that class's existing slab
+// lock (already held in allocSmall/freeSmall). Using the class lock instead of
+// a global one means the tracer adds no new cross-thread contention, so it does
+// not starve the stop-the-world sweep the way a single global lock did.
+const ClassTrace = struct { map: std.AutoHashMapUnmanaged(usize, MapRec) = .empty };
+var class_trace: [class_sizes.len]ClassTrace = blk: {
+    var t: [class_sizes.len]ClassTrace = undefined;
+    for (&t) |*c| c.* = .{};
+    break :blk t;
+};
+
+fn cellTraceNote(ci: usize, ptr: usize, size: usize) void {
+    var rec: MapRec = .{ .size = size, .addrs = undefined, .n = 0 };
+    const st = std.debug.captureCurrentStackTrace(.{ .first_address = @returnAddress() }, &rec.addrs);
+    rec.n = st.return_addresses.len;
+    class_trace[ci].map.put(std.heap.page_allocator, ptr, rec) catch {};
+}
+
 const TraceSite = struct { addrs: [TRACE_FRAMES]usize, n: usize, bytes: usize, count: usize };
 
-/// Dump the top live-mmap sites by mapped bytes (KLIO_SLAB_TRACE).
+fn mergeSite(sites: *std.ArrayListUnmanaged(TraceSite), r: *const MapRec) void {
+    for (sites.items) |*s| {
+        if (s.n == r.n and std.mem.eql(usize, s.addrs[0..s.n], r.addrs[0..r.n])) {
+            s.bytes += r.size;
+            s.count += 1;
+            return;
+        }
+    }
+    const s: TraceSite = .{ .addrs = r.addrs, .n = r.n, .bytes = r.size, .count = 1 };
+    sites.append(std.heap.page_allocator, s) catch {};
+}
+
+/// Dump the top live-allocation sites by bytes (KLIO_SLAB_TRACE / KLIO_CELL_TRACE).
 pub fn traceReport() void {
     if (!trace_enabled and !cell_trace_enabled) return;
-    traceLock();
     var sites: std.ArrayListUnmanaged(TraceSite) = .empty;
+    traceLock();
     var it = trace_map.iterator();
-    outer: while (it.next()) |e| {
-        const r = e.value_ptr;
-        for (sites.items) |*s| {
-            if (s.n == r.n and std.mem.eql(usize, s.addrs[0..s.n], r.addrs[0..r.n])) {
-                s.bytes += r.size;
-                s.count += 1;
-                continue :outer;
-            }
-        }
-        const s: TraceSite = .{ .addrs = r.addrs, .n = r.n, .bytes = r.size, .count = 1 };
-        sites.append(std.heap.page_allocator, s) catch {};
-    }
+    while (it.next()) |e| mergeSite(&sites, e.value_ptr);
     traceUnlock();
+    for (&class_trace) |*ct| {
+        var cit = ct.map.iterator();
+        while (cit.next()) |e| mergeSite(&sites, e.value_ptr);
+    }
     std.sort.pdq(TraceSite, sites.items, {}, struct {
         fn lt(_: void, x: TraceSite, y: TraceSite) bool {
             return x.bytes > y.bytes;
@@ -323,16 +346,16 @@ fn allocSmall(len: usize) ?[*]u8 {
         if (slab.next) |n| n.prev = null;
         slab.next = null;
     }
-    if (cell_trace_enabled and gc.program_started) traceNote(@intFromPtr(cell), len);
+    if (cell_trace_enabled and gc.program_started) cellTraceNote(ci, @intFromPtr(cell), len);
     return @ptrCast(cell);
 }
 
 fn freeSmall(ptr: [*]u8) void {
-    if (cell_trace_enabled) traceForget(@intFromPtr(ptr));
     const slab = slabOf(ptr);
     const cs = &class_states[slab.class_idx];
     cs.lock.lock();
     defer cs.lock.unlock();
+    if (cell_trace_enabled) _ = class_trace[slab.class_idx].map.remove(@intFromPtr(ptr));
     const was_full = slab.free_count == 0;
     const cell: *FreeCell = @ptrCast(@alignCast(ptr));
     cell.next = slab.free_head;
