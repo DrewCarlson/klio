@@ -952,7 +952,7 @@ threadlocal var coro_stack: std.ArrayList(CooperativeInterceptor) = .empty;
 threadlocal var active_scope_stack: std.ArrayList(Value) = .empty;
 
 fn coroStackAllocator() Allocator {
-    return std.heap.page_allocator;
+    return runtime.slab.tracedPage();
 }
 
 /// Assert (Debug) the coroutine interceptor and active-scope stacks are empty

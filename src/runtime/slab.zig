@@ -97,6 +97,12 @@ pub var mapped_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 // (permanent-generation cells). Records the capture stack of each live mmap and
 // dumps the top sites by mapped bytes on SIGTERM/SIGINT.
 pub var trace_enabled: bool = false;
+/// Like `trace_enabled` but for small slab cells (KLIO_CELL_TRACE). Tracks every
+/// live small allocation at `allocSmall`/`freeSmall` — the guaranteed-paired
+/// free path for slab cells, unlike the higher-level leak locator whose
+/// alloc/free can straddle the GC sweep. Surfaces leaked raw host-temporaries
+/// (non-cell allocations the collector never frees) by their allocation stack.
+pub var cell_trace_enabled: bool = false;
 const TRACE_FRAMES = 14;
 const MapRec = struct { size: usize, addrs: [TRACE_FRAMES]usize, n: usize };
 var trace_map: std.AutoHashMapUnmanaged(usize, MapRec) = .empty;
@@ -128,7 +134,7 @@ const TraceSite = struct { addrs: [TRACE_FRAMES]usize, n: usize, bytes: usize, c
 
 /// Dump the top live-mmap sites by mapped bytes (KLIO_SLAB_TRACE).
 pub fn traceReport() void {
-    if (!trace_enabled) return;
+    if (!trace_enabled and !cell_trace_enabled) return;
     traceLock();
     var sites: std.ArrayListUnmanaged(TraceSite) = .empty;
     var it = trace_map.iterator();
@@ -152,12 +158,13 @@ pub fn traceReport() void {
     }.lt);
     var shown: usize = 0;
     for (sites.items) |*s| {
-        if (shown >= 25) break;
+        if (shown >= 400) break;
         shown += 1;
         std.debug.print("\n[slabtrace] live {d} bytes in {d} mmaps:\n", .{ s.bytes, s.count });
         const st: std.debug.StackTrace = .{ .return_addresses = s.addrs[0..s.n], .skipped = .none };
         std.debug.dumpStackTrace(&st);
     }
+    std.debug.print("\n[slabtrace] total live sites: {d}\n", .{sites.items.len});
 }
 
 fn onTraceSignal(_: std.c.SIG) callconv(.c) void {
@@ -174,6 +181,38 @@ pub fn installTraceSignalDump() void {
     };
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
+
+// --- Diagnostic page-allocator wrapper (KLIO_SLAB_TRACE) ---------------------
+// `page_allocator` allocations bypass the slab (so the mmap-site tracer above
+// never sees them) and the GC (so they leak silently if a free is gated wrong).
+// Routing a subsystem's `page_allocator` through this wrapper records each live
+// allocation under the same site report, exposing per-iteration page leaks.
+fn pAlloc(_: *anyopaque, len: usize, a: Alignment, ra: usize) ?[*]u8 {
+    const p = std.heap.page_allocator.vtable.alloc(std.heap.page_allocator.ptr, len, a, ra) orelse return null;
+    if (gc.program_started) traceNote(@intFromPtr(p), len);
+    return p;
+}
+fn pResize(_: *anyopaque, buf: []u8, a: Alignment, new: usize, ra: usize) bool {
+    return std.heap.page_allocator.vtable.resize(std.heap.page_allocator.ptr, buf, a, new, ra);
+}
+fn pRemap(_: *anyopaque, buf: []u8, a: Alignment, new: usize, ra: usize) ?[*]u8 {
+    const p = std.heap.page_allocator.vtable.remap(std.heap.page_allocator.ptr, buf, a, new, ra) orelse return null;
+    traceForget(@intFromPtr(buf.ptr));
+    if (gc.program_started) traceNote(@intFromPtr(p), new);
+    return p;
+}
+fn pFree(_: *anyopaque, buf: []u8, a: Alignment, ra: usize) void {
+    traceForget(@intFromPtr(buf.ptr));
+    std.heap.page_allocator.vtable.free(std.heap.page_allocator.ptr, buf, a, ra);
+}
+const traced_page_vtable: Allocator.VTable = .{ .alloc = pAlloc, .resize = pResize, .remap = pRemap, .free = pFree };
+
+/// `page_allocator`, but every allocation is recorded in the mmap-site tracer
+/// when `KLIO_SLAB_TRACE` is on; otherwise the raw page allocator.
+pub fn tracedPage() Allocator {
+    if (!trace_enabled) return std.heap.page_allocator;
+    return .{ .ptr = undefined, .vtable = &traced_page_vtable };
 }
 
 /// Whether an `(len, alignment)` request is served from a slab (vs direct mmap).
@@ -284,10 +323,12 @@ fn allocSmall(len: usize) ?[*]u8 {
         if (slab.next) |n| n.prev = null;
         slab.next = null;
     }
+    if (cell_trace_enabled and gc.program_started) traceNote(@intFromPtr(cell), len);
     return @ptrCast(cell);
 }
 
 fn freeSmall(ptr: [*]u8) void {
+    if (cell_trace_enabled) traceForget(@intFromPtr(ptr));
     const slab = slabOf(ptr);
     const cs = &class_states[slab.class_idx];
     cs.lock.lock();

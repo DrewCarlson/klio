@@ -366,7 +366,7 @@ pub fn captureChainAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry 
 /// a `FrameSnapshot` on suspend), so it is backed by the same per-call
 /// allocator the frame's regs/params/captures use.
 fn chainAllocator() Allocator {
-    return std.heap.page_allocator;
+    return runtime.slab.tracedPage();
 }
 
 fn maxEvalDepth() usize {

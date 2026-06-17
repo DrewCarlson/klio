@@ -3123,6 +3123,9 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             defer cg.deinit();
             break :blk try allocator.dupe(PropertyDef, cg.get().body_properties);
         };
+        // The dupe is a shallow array of `PropertyDef` (each field a borrow into
+        // the class def / AST); free the array spine once this level is built.
+        defer if (runtime.freeScratch()) allocator.free(props);
         for (props, 0..) |p, pi| {
             switch (try runInitBlocksAt(self, cls, pi, &inst_value, super_chain_entries.items, cls_args)) {
                 .ok => {},
