@@ -267,6 +267,18 @@ pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Valu
 /// (see `getMemberField`); the adoption tails — globals, enclosing
 /// receivers, outer chain, companions — are skipped so the bare-name
 /// walk's candidate order decides precedence.
+/// Free a discarded field-resolution-miss message. `getFieldInner` allocates a
+/// `Vm::get_field …` string on a total miss; the delegate / companion / outer
+/// fallbacks discard it while probing the next receiver. Recognizable by its
+/// prefix, so a static `.Unimplemented` literal is never freed. No-op unless a
+/// freeing backend is active.
+fn freeFieldMiss(allocator: Allocator, e: EvalError) void {
+    if (!runtime.freeScratch()) return;
+    if (e == .Unimplemented and std.mem.indexOf(u8, e.Unimplemented, "Vm::get_field") != null) {
+        allocator.free(e.Unimplemented);
+    }
+}
+
 fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool) Allocator.Error!EvalResult {
     // Reflective reads on a *bound* member reference (`this::name`):
     // `.name`/`.simpleName` yield the referenced member's name, and
@@ -741,7 +753,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         for (delegates.items) |d| {
             switch (try getFieldInner(self, allocator, &d, name, suppress_cc_redirect, member_probe)) {
                 .ok => |v| if (v != .Unit) return ok(v),
-                .err => {},
+                .err => |e| freeFieldMiss(allocator, e),
             }
         }
     }
@@ -782,7 +794,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     if (s == .Instance) {
                         switch (try getFieldInner(self, allocator, &s, name, suppress_cc_redirect, member_probe)) {
                             .ok => |v| if (v != .Unit) return ok(v),
-                            .err => {},
+                            .err => |e| freeFieldMiss(allocator, e),
                         }
                     }
                 }
@@ -877,7 +889,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (o == .Null or o == .Unit) break;
             switch (try getFieldInner(self, allocator, &o, name, suppress_cc_redirect, member_probe)) {
                 .ok => |v| if (v != .Unit) return ok(v),
-                .err => {},
+                .err => |e| freeFieldMiss(allocator, e),
             }
             cur = switch (o) {
                 .Instance => |i| blk: {
@@ -909,7 +921,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 if (!same) {
                     switch (try getFieldInner(self, allocator, &c, name, suppress_cc_redirect, member_probe)) {
                         .ok => |v| return ok(v),
-                        .err => {},
+                        .err => |e| freeFieldMiss(allocator, e),
                     }
                 }
             }
