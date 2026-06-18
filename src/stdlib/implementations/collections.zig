@@ -120,6 +120,33 @@ fn makeListBorrowed(a: Allocator, list: std.ArrayList(Value), mutable: bool) Err
     return makeListFromArrayList(a, list, mutable);
 }
 
+/// Build a new List from the live contents of a `ValueList`, copying under the
+/// borrow. Replaces `makeList(a, try snapshotItems(a, vl), m)`: that idiom
+/// allocates a `snapshotItems` dupe, has `makeList` copy it again, then orphans
+/// the dupe (a per-call raw-temp leak under a freeing/gc backend — the arena
+/// reclaimed it for free). One copy, no dangling intermediate.
+fn makeListVL(a: Allocator, vl: ValueList, mutable: bool) Error!Value {
+    const g = vl.borrow();
+    defer g.deinit();
+    return makeList(a, g.get().items, mutable);
+}
+
+/// `makeListVL` for sets.
+fn makeSetVL(a: Allocator, vl: ValueList, mutable: bool) Error!Value {
+    const g = vl.borrow();
+    defer g.deinit();
+    return makeSet(a, g.get().items, mutable);
+}
+
+/// Append a `ValueList`'s live elements to `dst`, copying under the borrow.
+/// Replaces `dst.appendSlice(a, try snapshotItems(a, vl))`, which leaked the
+/// `snapshotItems` dupe (the arena reclaimed it; a freeing/gc backend does not).
+fn appendVL(dst: *std.ArrayList(Value), a: Allocator, vl: ValueList) Error!void {
+    const g = vl.borrow();
+    defer g.deinit();
+    try dst.appendSlice(a, g.get().items);
+}
+
 /// `make_set(items, mutable)` — dedupe by boxed structural equality.
 fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var deduped: std.ArrayList(Value) = .empty;
@@ -1705,8 +1732,8 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
             const arg = ctx.args[0];
             switch (arg) {
                 .Int => return ok(try makeList(a, &.{}, true)),
-                .List => |l| return ok(try makeList(a, try snapshotItems(a, l.items), true)),
-                .Set => |s| return ok(try makeList(a, try snapshotItems(a, s.items), true)),
+                .List => |l| return ok(try makeListVL(a, l.items, true)),
+                .Set => |s| return ok(try makeListVL(a, s.items, true)),
                 .Instance => {
                     const items = switch (try materialiseIterableInstance(ctx, arg)) {
                         .items => |x| x,
@@ -1740,8 +1767,8 @@ pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
             const arg = ctx.args[0];
             switch (arg) {
                 .Int => return ok(try makeSet(a, &.{}, true)),
-                .List => |l| return ok(try makeSet(a, try snapshotItems(a, l.items), true)),
-                .Set => |s| return ok(try makeSet(a, try snapshotItems(a, s.items), true)),
+                .List => |l| return ok(try makeSetVL(a, l.items, true)),
+                .Set => |s| return ok(try makeSetVL(a, s.items, true)),
                 .Instance => {
                     const items = switch (try materialiseIterableInstance(ctx, arg)) {
                         .items => |x| x,
@@ -2703,8 +2730,8 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
                     .err => |e| return .{ .err = e },
                 };
                 switch (mapped) {
-                    .List => |xs| try nx.appendSlice(a, try snapshotItems(a, xs.items)),
-                    .Set => |xs| try nx.appendSlice(a, try snapshotItems(a, xs.items)),
+                    .List => |xs| try appendVL(&nx, a, xs.items),
+                    .Set => |xs| try appendVL(&nx, a, xs.items),
                     .Sequence => {
                         const sub = switch (try materialiseSequence(a, host, out, mapped)) {
                             .items => |xs| xs,
@@ -3167,12 +3194,12 @@ pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     var out: std.ArrayList(Value) = .empty;
-    try out.appendSlice(a, try snapshotItems(a, it));
+    try appendVL(&out, a, it);
     if (ctx.args.len < 2) return arityErr("plus requires an argument");
     const arg = ctx.args[1];
     switch (arg) {
-        .List => |l| try out.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try out.appendSlice(a, try snapshotItems(a, s.items)),
+        .List => |l| try appendVL(&out, a, l.items),
+        .Set => |s| try appendVL(&out, a, s.items),
         .Range, .Sequence, .Array => {
             const xs = switch (try iterableItems(a, arg, "plus")) {
                 .items => |x| x,
@@ -3195,8 +3222,8 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     var removals: std.ArrayList(Value) = .empty;
     switch (arg) {
-        .List => |l| try removals.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try removals.appendSlice(a, try snapshotItems(a, s.items)),
+        .List => |l| try appendVL(&removals, a, l.items),
+        .Set => |s| try appendVL(&removals, a, s.items),
         .Range, .Sequence, .Array => {
             const xs = switch (try iterableItems(a, arg, "minus")) {
                 .items => |x| x,
@@ -3304,9 +3331,9 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
     const transform: ?Value = if (ctx.args.len > 2 and isZipTransform(ctx.args[2])) ctx.args[2] else null;
     var rhs: std.ArrayList(Value) = .empty;
     switch (rhs_val) {
-        .List => |l| try rhs.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try rhs.appendSlice(a, try snapshotItems(a, s.items)),
-        .Array => |arr| try rhs.appendSlice(a, try snapshotItems(a, arr.items)),
+        .List => |l| try appendVL(&rhs, a, l.items),
+        .Set => |s| try appendVL(&rhs, a, s.items),
+        .Array => |arr| try appendVL(&rhs, a, arr.items),
         .Range => |r| {
             var rit = RangeIter.init(r.start, r.end, r.step);
             while (rit.next()) |n| try rhs.append(a, Value.newInt(n));
@@ -3354,7 +3381,7 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
         .err => |e| return e,
     };
     var out: std.ArrayList(Value) = .empty;
-    try out.appendSlice(a, try snapshotItems(a, it));
+    try appendVL(&out, a, it);
     if (ctx.args.len < 2) return arityErr("plus requires an argument");
     const arg = ctx.args[1];
     switch (arg) {
@@ -3399,8 +3426,8 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     var removals: std.ArrayList(Value) = .empty;
     switch (arg) {
-        .List => |l| try removals.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try removals.appendSlice(a, try snapshotItems(a, s.items)),
+        .List => |l| try appendVL(&removals, a, l.items),
+        .Set => |s| try appendVL(&removals, a, s.items),
         else => try removals.append(a, arg),
     }
     var out: std.ArrayList(Value) = .empty;
@@ -3427,8 +3454,8 @@ pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     var other: std.ArrayList(Value) = .empty;
     switch (arg) {
-        .List => |l| try other.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try other.appendSlice(a, try snapshotItems(a, s.items)),
+        .List => |l| try appendVL(&other, a, l.items),
+        .Set => |s| try appendVL(&other, a, s.items),
         else => return typeErr("intersect requires a collection"),
     }
     var out: std.ArrayList(Value) = .empty;
@@ -3679,8 +3706,8 @@ pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     var keys: std.ArrayList(Value) = .empty;
     switch (arg) {
-        .List => |l| try keys.appendSlice(a, try snapshotItems(a, l.items)),
-        .Set => |s| try keys.appendSlice(a, try snapshotItems(a, s.items)),
+        .List => |l| try appendVL(&keys, a, l.items),
+        .Set => |s| try appendVL(&keys, a, s.items),
         else => try keys.append(a, arg),
     }
     var out: std.ArrayList(MapPair) = .empty;
@@ -4223,8 +4250,8 @@ pub fn coll_list_flatten(ctx: *CallCtx) Error!EvalResult {
     const src = try snapshotItems(a, it);
     for (src) |v| {
         switch (v) {
-            .List => |l| try out.appendSlice(a, try snapshotItems(a, l.items)),
-            .Set => |s| try out.appendSlice(a, try snapshotItems(a, s.items)),
+            .List => |l| try appendVL(&out, a, l.items),
+            .Set => |s| try appendVL(&out, a, s.items),
             else => {
                 const vd = try display(a, v);
                 return typeErr(try fmt(a, "flatten requires nested collections, got {s}", .{vd}));
@@ -4273,7 +4300,7 @@ pub fn coll_list_to_list(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeList(a, try snapshotItems(a, it), false));
+    return ok(try makeListVL(a, it, false));
 }
 pub fn coll_list_to_mutable_list(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4281,7 +4308,7 @@ pub fn coll_list_to_mutable_list(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeList(a, try snapshotItems(a, it), true));
+    return ok(try makeListVL(a, it, true));
 }
 pub fn coll_list_to_set(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4289,7 +4316,7 @@ pub fn coll_list_to_set(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSet(a, try snapshotItems(a, it), false));
+    return ok(try makeSetVL(a, it, false));
 }
 pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4297,7 +4324,7 @@ pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSet(a, try snapshotItems(a, it), true));
+    return ok(try makeSetVL(a, it, true));
 }
 
 fn withIndexImpl(a: Allocator, items: []const Value) Error!Value {
@@ -4449,7 +4476,7 @@ pub fn coll_set_to_list(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeList(a, try snapshotItems(a, it), false));
+    return ok(try makeListVL(a, it, false));
 }
 pub fn coll_set_to_mutable_list(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4457,7 +4484,7 @@ pub fn coll_set_to_mutable_list(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeList(a, try snapshotItems(a, it), true));
+    return ok(try makeListVL(a, it, true));
 }
 pub fn coll_set_to_set_(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4465,7 +4492,7 @@ pub fn coll_set_to_set_(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSet(a, try snapshotItems(a, it), false));
+    return ok(try makeSetVL(a, it, false));
 }
 pub fn coll_set_to_mutable_set_(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4473,7 +4500,7 @@ pub fn coll_set_to_mutable_set_(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSet(a, try snapshotItems(a, it), true));
+    return ok(try makeSetVL(a, it, true));
 }
 pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
