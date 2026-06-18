@@ -439,7 +439,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             try capture_values.appendSlice(allocator, g.get().*);
         }
         vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
-        return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, self);
+        return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, @intCast(id), self);
     }
     const msg = try std.fmt.allocPrint(allocator, "Vm::call_value on `{s}`", .{callee.typeFqn()});
     return .{ .err = .{ .Unimplemented = msg } };

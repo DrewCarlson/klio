@@ -101,6 +101,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             if (runtime.getenvSlice("KLIO_GC_NOFREE")) |v| {
                 runtime.gc.gc_nofree = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
+            if (runtime.getenvSlice("KLIO_GC_POISON")) |v| {
+                runtime.gc.gc_poison = v.len != 0 and !std.mem.eql(u8, v, "0");
+            }
             if (runtime.getenvSlice("KLIO_GC_THRESHOLD_KB")) |v| {
                 if (std.fmt.parseInt(usize, v, 10) catch null) |kb| {
                     if (kb != 0) runtime.gc.setThresholdFloor(kb * 1024);

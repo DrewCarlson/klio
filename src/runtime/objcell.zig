@@ -467,6 +467,15 @@ pub fn ObjRef(comptime T: type) type {
         /// destroy the control block. Child cells are swept independently.
         fn gcFinalizeThunk(h: *gc.GcHeader) void {
             const cb: *Cell = @fieldParentPtr("hdr", h);
+            if (gc.gc_poison) {
+                // Quarantine instead of free: keep the memory mapped, scribble
+                // the payload, and arm the trap so a later live reference is
+                // caught with this cell's type. Leaks by design (diagnostic).
+                @memset(std.mem.asBytes(&cb.data), 0xDD);
+                h.gc_trace = gc.poisonTrap;
+                h.gc_mark = 0;
+                return;
+            }
             gcFinalizeData(T, &cb.data, cb.allocator);
             cb.allocator.destroy(cb);
         }

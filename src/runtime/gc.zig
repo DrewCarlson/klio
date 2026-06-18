@@ -352,6 +352,21 @@ pub var gc_debug: bool = false;
 /// free (an incomplete root/tracer), not a marking/sweep bug.
 pub var gc_nofree: bool = false;
 
+/// Diagnostic (KLIO_GC_POISON): on sweep, do NOT free a white cell. Instead
+/// quarantine it — leak the memory, overwrite the payload, and swap its tracer
+/// to `poisonTrap`. If a live value still references the cell, the NEXT
+/// collection re-shades + traces it, firing the trap with the cell's type and a
+/// stack trace: the exact swept-while-live cell that an incomplete root missed.
+pub var gc_poison: bool = false;
+
+/// Tracer installed on a quarantined (poisoned) cell. Reaching it means a live
+/// value referenced a cell the prior collection swept — a missing-root UAF.
+pub fn poisonTrap(h: *GcHeader, _: *Marker) void {
+    std.debug.print("\n[GC-POISON] live reference to SWEPT cell: type={s}\n", .{h.gc_type});
+    std.debug.dumpCurrentStackTrace(.{});
+    @panic("KGC: use-after-free — a live value referenced a swept cell (incomplete root)");
+}
+
 pub fn collect() void {
     // Single collector at a time. A thread that loses the race for `gc_lock`
     // found a collection already underway; it parks (publishing its roots) and
