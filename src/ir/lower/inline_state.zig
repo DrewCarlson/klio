@@ -10,9 +10,46 @@
 
 const std = @import("std");
 const ast = @import("ast");
+const span = @import("span");
 
 const Allocator = std.mem.Allocator;
 const StringSet = std.StringHashMap(void);
+
+// --- Deferred inline-body decode --------------------------------------------
+//
+// A stdlib image holds `inline`, object-free function bodies in a side section,
+// decoded on first splice. The skeleton's marker is an empty block whose
+// `span.file == span.DEFERRED_BODY_FILE` and `span.start` is the body's byte
+// offset. The decoder lives in `interp_ir` (which depends on this module), so it
+// is injected here as a function pointer at base-install time.
+const DeferredDecodeFn = *const fn (Allocator, []const u8, u32) ?ast.FunctionBody;
+threadlocal var deferred_section: []const u8 = &.{};
+threadlocal var deferred_alloc: Allocator = undefined;
+threadlocal var deferred_decode: ?DeferredDecodeFn = null;
+
+/// Install the loaded base's deferred-body section, the process-lifetime
+/// allocator a decoded body must persist in, and the decoder. Called once per
+/// build that uses a base. A freshly-built base passes an empty section (its
+/// bodies are not deferred), so this is a no-op there.
+pub fn setDeferredSection(section: []const u8, alloc: Allocator, decode: DeferredDecodeFn) void {
+    deferred_section = section;
+    deferred_alloc = alloc;
+    deferred_decode = decode;
+}
+
+/// If `f`'s body is a deferred marker, decode the real body from the side
+/// section and patch it in place (idempotent: the patched body is no longer a
+/// marker). Call before reading an inline function's body for splicing.
+pub fn ensureInlineBody(f: *const ast.Function) void {
+    const decode = deferred_decode orelse return;
+    const body = f.body orelse return;
+    if (body != .Block) return;
+    const blk = body.Block;
+    if (blk.stmts.len != 0 or blk.span.file.int() != span.DEFERRED_BODY_FILE) return;
+    if (decode(deferred_alloc, deferred_section, blk.span.start)) |decoded| {
+        @constCast(f).body = decoded;
+    }
+}
 
 /// A call's shape at a candidate site: `(positional_arg_count,
 /// last_arg_is_lambda)`. `null` when the caller has no shape hint.

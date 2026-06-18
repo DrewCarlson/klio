@@ -16,6 +16,7 @@
 //! `Expr`/`Stmt` union case to be handled, so a future node kind cannot silently
 //! slip an anonymous object past the keep test.
 
+const std = @import("std");
 const ast = @import("ast");
 
 const Decl = ast.Decl;
@@ -67,9 +68,33 @@ fn fnBodySpan(b: *const FunctionBody) ast.Span {
     };
 }
 
+// --- Deferrable-body collection ----------------------------------------------
+
+/// Collect every `inline`, object-free function across `decls` (recursing into
+/// class / object members) into `out`. These are the bodies the baked image can
+/// hold in a lazily-decoded side section: a non-inline body is already stripped
+/// (it never runs from the AST), and an object-bearing body must stay eager (its
+/// `ObjectExpr` subtree is referenced by an `Inst.BuildObject`).
+pub fn collectDeferrable(allocator: std.mem.Allocator, decls: []const Decl, out: *std.ArrayList(*Function)) std.mem.Allocator.Error!void {
+    for (decls) |*d| try collectDeferrableDecl(allocator, d, out);
+}
+
+fn collectDeferrableDecl(allocator: std.mem.Allocator, d: *const Decl, out: *std.ArrayList(*Function)) std.mem.Allocator.Error!void {
+    switch (d.*) {
+        .Function => |*f| {
+            if (f.body) |*body| {
+                if (f.is_inline and !fnBodyHasObject(body)) try out.append(allocator, @constCast(f));
+            }
+        },
+        .Class => |*c| for (c.members) |*m| try collectDeferrableDecl(allocator, m, out),
+        .Object => |*o| for (o.members) |*m| try collectDeferrableDecl(allocator, m, out),
+        .Property, .TypeAlias => {},
+    }
+}
+
 // --- ObjectExpr detection (compiler-exhaustive) ------------------------------
 
-fn fnBodyHasObject(b: *const FunctionBody) bool {
+pub fn fnBodyHasObject(b: *const FunctionBody) bool {
     return switch (b.*) {
         .Block => |*blk| blockHasObject(blk),
         .Expr => |*e| exprHasObject(e),
@@ -181,7 +206,6 @@ fn exprHasObject(e: *const Expr) bool {
 
 // --- tests ------------------------------------------------------------------
 
-const std = @import("std");
 const testing = std.testing;
 
 fn tSpan(s: u32, e: u32) ast.Span {

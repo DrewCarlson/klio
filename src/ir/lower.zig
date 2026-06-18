@@ -50,6 +50,8 @@ pub const exprSpan = mod.exprSpan;
 pub const setInlineFnAsts = mod.setInlineFnAsts;
 pub const setTypeAliasTags = mod.setTypeAliasTags;
 pub const registerInlineFnId = mod.registerInlineFnId;
+pub const setDeferredSection = mod.setDeferredSection;
+pub const ensureInlineBody = mod.ensureInlineBody;
 pub const setShadowedInlineNames = mod.setShadowedInlineNames;
 pub const setTopLevelPropNames = mod.setTopLevelPropNames;
 

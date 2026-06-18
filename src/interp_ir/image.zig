@@ -43,6 +43,7 @@ const ast = @import("ast");
 const span = @import("span");
 
 const build = @import("build.zig");
+const prune = @import("prune.zig");
 
 const Allocator = std.mem.Allocator;
 const SourceMap = span.SourceMap;
@@ -120,6 +121,17 @@ const Encoder = struct {
         self.out.deinit(self.gpa);
         self.nodes.deinit();
         self.slices.deinit();
+    }
+
+    /// Clear the shared-graph registries (keeping the output buffer) so the
+    /// next value encodes self-contained — every node/slice defined inline,
+    /// no backref into anything written before. Used to bake each deferred
+    /// body as an independently decodable unit appended to one buffer.
+    fn resetRegistry(self: *Encoder) void {
+        self.nodes.clearRetainingCapacity();
+        self.slices.clearRetainingCapacity();
+        self.node_count = 0;
+        self.slice_count = 0;
     }
 
     fn byte(self: *Encoder, b: u8) Allocator.Error!void {
@@ -641,7 +653,25 @@ const ImageRoot = struct {
     /// sources and the host-binding FQNs installed alongside them.
     known_packages: []const []const u8,
     binding_fqns: []const []const u8,
+    /// Self-contained encodings of deferred `inline` function bodies (marked in
+    /// the skeleton by `span.DEFERRED_BODY_FILE`). Each entry is a
+    /// `FunctionBody` encoded with a fresh node/slice registry, so it decodes
+    /// standalone from its byte offset.
+    deferred_bodies: []const u8,
 };
+
+const DEFERRED_MAGIC: u32 = span.DEFERRED_BODY_FILE;
+
+/// Decode one deferred `FunctionBody` from `section` at `offset` (the value the
+/// marker block's `span.start` carried), allocating into `a`. The body was
+/// baked self-contained (fresh registry), so a fresh decoder reads it
+/// standalone. Returns null on a malformed section (a corrupt image).
+pub fn decodeDeferredBody(a: Allocator, section: []const u8, offset: u32) ?ast.FunctionBody {
+    var d = Decoder{ .a = a, .buf = section, .pos = offset };
+    var body: ast.FunctionBody = undefined;
+    decodeInto(ast.FunctionBody, &d, &body) catch return null;
+    return body;
+}
 
 const InlineIdImage = struct { id: u32, f: *const ast.Function };
 
@@ -671,6 +701,34 @@ pub fn bake(
 
     const root = (try rootFromBase(a, base, map, extras)) orelse return null;
 
+    // Defer `inline`, object-free function bodies into a self-contained side
+    // section, replacing each in the skeleton with a marker block whose span
+    // encodes its offset. The mutation is on the live base (shared with the
+    // current run), so the bodies are restored after the encode.
+    var body_enc = Encoder.init(gpa);
+    defer body_enc.deinit();
+    const Saved = struct { f: *ast.Function, body: ast.FunctionBody };
+    var saved: std.ArrayList(Saved) = .empty;
+    defer saved.deinit(a);
+    {
+        var deferrable: std.ArrayList(*ast.Function) = .empty;
+        defer deferrable.deinit(a);
+        try prune.collectDeferrable(a, root.lifted_decls, &deferrable);
+        for (deferrable.items) |f| {
+            const real = f.body.?;
+            const offset: u32 = @intCast(body_enc.out.items.len);
+            body_enc.resetRegistry();
+            try encodeValue(ast.FunctionBody, &body_enc, &real);
+            try saved.append(a, .{ .f = f, .body = real });
+            f.body = .{ .Block = .{ .stmts = &.{}, .span = .{
+                .file = @enumFromInt(DEFERRED_MAGIC),
+                .start = offset,
+                .end = 0,
+            } } };
+        }
+    }
+    root.deferred_bodies = body_enc.out.items;
+
     var e = Encoder.init(gpa);
     defer e.deinit();
 
@@ -684,6 +742,9 @@ pub fn bake(
     const payload_len: u64 = e.out.items.len - payload_start;
     @memcpy(e.out.items[len_slot .. len_slot + 8], &std.mem.toBytes(std.mem.nativeToLittle(u64, payload_len)));
     try e.bytes(TRAILER);
+
+    // Restore the live base's bodies before handing back the bytes.
+    for (saved.items) |s| s.f.body = s.body;
 
     return try e.out.toOwnedSlice(e.gpa);
 }
@@ -1356,6 +1417,8 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
         },
         .user_file_start = @intCast(root.files.len),
         .enum_id_next = root.enum_id_next,
+        .deferred_bodies = root.deferred_bodies,
+        .arena = a,
     };
 
     return .{

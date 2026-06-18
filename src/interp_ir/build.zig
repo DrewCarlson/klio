@@ -19,6 +19,7 @@ const stdlib = @import("stdlib");
 
 pub const lift = @import("build/lift.zig");
 const prune = @import("prune.zig");
+const image = @import("image.zig");
 
 const Allocator = std.mem.Allocator;
 const Module = ir.Module;
@@ -1271,6 +1272,11 @@ fn buildModuleWithOverrides(
         // resolves to a base inline fn still splice its declaration.
         if (base) |bs| {
             for (bs.inline_ids) |entry| try ir.lower.registerInlineFnId(entry.id, entry.f);
+            // Inline bodies in a loaded base are deferred markers; install the
+            // section + decoder so a splice materialises the real body on first
+            // use. Decoded into the base's own process-lifetime arena, since the
+            // patched `lifted_decls` are reused across per-program builds.
+            ir.lower.setDeferredSection(bs.deferred_bodies, bs.arena, image.decodeDeferredBody);
         }
 
         // Default-import host bindings shadow same-simple-name inline
@@ -2683,6 +2689,16 @@ pub const StdlibBase = struct {
     /// Next enum-entry identity, continuing the base build's sequence so
     /// default toString/hashCode match the whole-program numbering.
     enum_id_next: u64,
+    /// Side section holding the self-contained encodings of `inline`,
+    /// object-free function bodies, decoded lazily on first splice. Empty for a
+    /// freshly-built base (its `lifted_decls` keep full bodies); populated only
+    /// when loaded from an image, where those bodies are markers. Borrows the
+    /// image buffer.
+    deferred_bodies: []const u8 = &.{},
+    /// The process-lifetime allocator the base (and its `lifted_decls`) live in.
+    /// A lazily-decoded deferred body must persist across per-program builds, so
+    /// it is decoded here, not into a per-build arena.
+    arena: Allocator = undefined,
 
     pub const InlineId = struct { id: u32, f: *const ast.Function };
 };
@@ -2714,6 +2730,7 @@ pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocato
         .inline_ids = &.{},
         .user_file_start = 0,
         .enum_id_next = 1,
+        .arena = allocator,
     };
 
     // Name universes for the reuse gate, over raw AND lifted decls (a
