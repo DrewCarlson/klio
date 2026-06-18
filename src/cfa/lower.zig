@@ -469,7 +469,7 @@ pub const Lowering = struct {
             .StringTemplate => |e| {
                 for (e.parts) |*p| {
                     if (p.* == .Interp) {
-                        _ = try self.lowerExpr(&p.Interp, cur);
+                        _ = try self.lowerExpr(p.Interp, cur);
                     }
                 }
                 return try self.emitEval(cur.*, e.span);

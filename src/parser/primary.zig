@@ -249,13 +249,30 @@ pub fn parseIntLiteral(p: *Parser, base: NumBase, suffix: IntSuffix) Expr {
         },
     }
     const cleaned = filterOut(p, digits, '_');
-    const value: i64 = parseI64Radix(cleaned, radix) orelse blk: {
-        support.err(p, "E0010", "integer literal out of range", tok.span);
-        break :blk 0;
+    // An unsigned-suffixed literal (`u`/`uL`) ranges up to `u64::MAX`; parse the
+    // magnitude as `u64` and store its bit pattern in the `i64` value field
+    // (`kind` marks it unsigned so downstream reinterprets the bits). A signed
+    // literal stays bounded by `i64`.
+    const value: i64 = blk: {
+        if (suffix == .UInt or suffix == .ULong) {
+            if (std.fmt.parseInt(u64, cleaned, radix)) |u| {
+                break :blk @bitCast(u);
+            } else |_| {
+                support.err(p, "E0010", "integer literal out of range", tok.span);
+                break :blk 0;
+            }
+        }
+        break :blk parseI64Radix(cleaned, radix) orelse {
+            support.err(p, "E0010", "integer literal out of range", tok.span);
+            break :blk 0;
+        };
     };
     const kind: ast.IntLitKind = switch (suffix) {
         .Long => .Long,
-        .UInt => .UInt,
+        // A bare `u`/`U` literal is `UInt` only when it fits in 32 bits;
+        // a larger magnitude is a `ULong` (Kotlin promotes by magnitude,
+        // `uL`/`UL` forces `ULong`).
+        .UInt => if (@as(u64, @bitCast(value)) > std.math.maxInt(u32)) .ULong else .UInt,
         .ULong => .ULong,
         .None => .Int,
     };
@@ -324,7 +341,9 @@ pub fn parseStringTemplate(p: *Parser) ?Expr {
                 const e = exprmod.parseExpr(p) orelse return null;
                 support.skipNl(p);
                 _ = support.expect(p, .InterpEnd, "`}` to close string interpolation") orelse return null;
-                parts.append(p.allocator, StringPart{ .Interp = e }) catch @panic("OOM in primary");
+                const ep = p.allocator.create(Expr) catch @panic("OOM in primary");
+                ep.* = e;
+                parts.append(p.allocator, StringPart{ .Interp = ep }) catch @panic("OOM in primary");
             },
             .Eof => {
                 support.err(p, "E0013", "unterminated string template", open.span);

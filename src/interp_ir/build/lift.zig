@@ -95,7 +95,7 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8) Allocator.Err
         },
         .StringTemplate => |st| {
             for (st.parts) |*part| {
-                if (part.* == .Interp) try walkField(allocator, &part.Interp, prop);
+                if (part.* == .Interp) try walkField(allocator, part.Interp, prop);
             }
         },
         .Return => |r| {

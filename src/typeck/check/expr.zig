@@ -370,7 +370,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
         .StringTemplate => |st| {
             for (st.parts) |*part| {
                 if (part.* == .Interp) {
-                    var t = try self.checkExpr(&part.Interp, null);
+                    var t = try self.checkExpr(part.Interp, null);
                     t.deinit(a);
                 }
             }

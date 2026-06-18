@@ -121,7 +121,7 @@ fn walkExpr(
         .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit, .Path, .This, .Super, .PropertyRef, .Break, .Continue => {},
         .StringTemplate => |t| {
             for (t.parts) |part| switch (part) {
-                .Interp => |ie| try walkExpr(allocator, out, &ie),
+                .Interp => |ie| try walkExpr(allocator, out, ie),
                 .Text, .ShortInterp => {},
             };
         },

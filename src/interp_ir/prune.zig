@@ -163,7 +163,7 @@ fn exprHasObject(e: *const Expr) bool {
         .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit, .Path, .This, .Super, .PropertyRef, .Break, .Continue => false,
         .StringTemplate => |*x| {
             for (x.parts) |*p| switch (p.*) {
-                .Interp => |*ie| if (exprHasObject(ie)) return true,
+                .Interp => |ie| if (exprHasObject(ie)) return true,
                 .Text, .ShortInterp => {},
             };
             return false;

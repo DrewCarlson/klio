@@ -100,7 +100,7 @@ pub fn collectPathIdents(e: *const Expr, out: *StringSet) Allocator.Error!void {
         },
         .StringTemplate => |st| {
             for (st.parts) |*p| switch (p.*) {
-                .Interp => |*ex| try collectPathIdents(ex, out),
+                .Interp => |ex| try collectPathIdents(ex, out),
                 .ShortInterp => |id| try out.put(id.name, {}),
                 .Text => {},
             };
@@ -221,7 +221,7 @@ fn scanLambdaRefsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
         },
         .StringTemplate => |st| {
             for (st.parts) |*p| switch (p.*) {
-                .Interp => |*ex| try scanLambdaRefsExpr(ex, out),
+                .Interp => |ex| try scanLambdaRefsExpr(ex, out),
                 .ShortInterp => |id| try out.put(id.name, {}),
                 .Text => {},
             };
@@ -381,7 +381,7 @@ fn assignedInLambdasExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
         },
         .StringTemplate => |st| {
             for (st.parts) |*p| switch (p.*) {
-                .Interp => |*ex| try assignedInLambdasExpr(ex, out),
+                .Interp => |ex| try assignedInLambdasExpr(ex, out),
                 else => {},
             };
         },

@@ -1185,7 +1185,7 @@ fn lowerStringTemplate(b: *FuncBuilder, parts: []const ast.StringPart) Allocator
         const piece = switch (part) {
             .Text => |s| try b.emitConst(.{ .String = s }),
             .ShortInterp => |ident| try lowerShortInterp(b, ident),
-            .Interp => |*e| try lowerExpr(b, e),
+            .Interp => |e| try lowerExpr(b, e),
         };
         const dst = b.allocReg();
         try b.push(.{ .BinOp = .{ .dst = dst, .op = .StringConcat, .lhs = cur, .rhs = piece } });

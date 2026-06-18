@@ -469,7 +469,7 @@ pub fn walkExprForOptIn(
         .StringTemplate => |st| {
             for (st.parts) |*part| {
                 if (part.* == .Interp) {
-                    try walkExprForOptIn(allocator, &part.Interp, markers, required, scope, out);
+                    try walkExprForOptIn(allocator, part.Interp, markers, required, scope, out);
                 }
             }
         },
@@ -1030,7 +1030,7 @@ pub fn walkExprForDeprecation(
         .StringTemplate => |st| {
             for (st.parts) |*part| {
                 if (part.* == .Interp) {
-                    try walkExprForDeprecation(allocator, &part.Interp, info, out);
+                    try walkExprForDeprecation(allocator, part.Interp, info, out);
                 }
             }
         },
