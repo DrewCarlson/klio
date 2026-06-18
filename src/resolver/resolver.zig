@@ -678,7 +678,7 @@ const Resolver = struct {
 
     fn resolveParam(self: *Resolver, scope: ScopeId, p: *const Param) ResolveError!void {
         _ = try self.declare(scope, p.name.name, .Parameter, p.name.span, true);
-        if (p.default) |*default| {
+        if (p.default) |default| {
             try self.resolveExpr(scope, default);
         }
     }

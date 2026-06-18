@@ -1545,7 +1545,7 @@ fn buildModuleWithOverrides(
                 var i: usize = 0;
                 while (i < offset) : (i += 1) try slots.append(a, null);
                 for (f.params, 0..) |*p, idx| {
-                    if (p.default) |*default_expr| {
+                    if (p.default) |default_expr| {
                         const bind_upto = @min(offset + idx, name_refs.items.len);
                         const widened = ir.lower.widenNumericLiteral(default_expr, &p.ty);
                         const thunk_name = try std.fmt.allocPrint(a, "__default_{s}_{s}", .{ f.name.name, p.name.name });
@@ -2014,7 +2014,7 @@ fn buildModuleWithOverrides(
             }
             var default_arg_thunks = try a.alloc(?FuncId, sc.params.len);
             for (sc.params, 0..) |*p, p_idx| {
-                if (p.default) |*e| {
+                if (p.default) |e| {
                     const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_def{d}", .{ c.name.name, sc_idx, p_idx });
                     default_arg_thunks[p_idx] = try ir.lower.lowerExprAsParamThunkScoped(module, param_names, e, nm, c.name.name, &own_members);
                 } else {

@@ -593,7 +593,7 @@ pub fn tryInlineCallWithTypeArgs(
     }
     for (ordered, 0..) |*slot, i| {
         if (slot.* == null) {
-            if (f.params[i].default) |*d| {
+            if (f.params[i].default) |d| {
                 slot.* = d;
             } else {
                 return null;

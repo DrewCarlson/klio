@@ -272,7 +272,7 @@ fn recordAbstractMemberDefaults(
     errdefer slots.deinit(a);
     try slots.append(a, null); // implicit `this`
     for (f.params, 0..) |*p, idx| {
-        if (p.default) |*de| {
+        if (p.default) |de| {
             const bind_upto = @min(1 + idx, name_refs.len);
             var widened = mod.widenNumericLiteral(de, &p.ty);
             const expr_ptr: *const ast.Expr = if (widened) |*w| w else de;
@@ -649,7 +649,7 @@ pub fn recordMethodParamDefaults(
     errdefer slots.deinit(a);
     try slots.append(a, null); // implicit `this`
     for (f.params, 0..) |*p, idx| {
-        if (p.default) |*default_expr| {
+        if (p.default) |default_expr| {
             const bind_upto = @min(1 + idx, name_refs.len);
             var widened = mod.widenNumericLiteral(default_expr, &p.ty);
             const expr_ptr: *const ast.Expr = if (widened) |*w| w else default_expr;

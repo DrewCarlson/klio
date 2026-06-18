@@ -230,7 +230,7 @@ fn walkDecl(
     switch (d) {
         .Function => |fun| {
             for (fun.params) |p| {
-                if (p.default) |def| try walkExpr(allocator, out, &def);
+                if (p.default) |def| try walkExpr(allocator, out, def);
             }
             if (fun.body) |body| try walkFunctionBody(allocator, out, body);
         },

@@ -792,7 +792,7 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
             .class_name = cn,
             .decl_type_name = decl_type_name,
         });
-        if (p.default) |*default| {
+        if (p.default) |default| {
             var want = try convertTypeRefLossy(self.allocator, &p.ty);
             defer want.deinit(self.allocator);
             var dty = try self.checkExpr(default, &want);

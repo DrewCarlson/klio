@@ -323,6 +323,35 @@ fn enumFromIntAny(comptime T: type, raw: anytype) DecodeError!T {
     return @enumFromInt(tag);
 }
 
+var decode_stats: std.StringHashMapUnmanaged(struct { bytes: u64, count: u64 }) = .empty;
+var decode_stats_on: bool = false;
+fn decStat(comptime T: type, n: usize) void {
+    if (!decode_stats_on) return;
+    const key = @typeName(T);
+    const gop = decode_stats.getOrPut(std.heap.page_allocator, key) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = .{ .bytes = 0, .count = 0 };
+    gop.value_ptr.bytes += @as(u64, @sizeOf(T)) * n;
+    gop.value_ptr.count += n;
+}
+pub fn dumpDecodeStats() void {
+    if (!decode_stats_on) return;
+    const E = struct { name: []const u8, bytes: u64, count: u64 };
+    var list: std.ArrayListUnmanaged(E) = .empty;
+    var it = decode_stats.iterator();
+    while (it.next()) |kv| list.append(std.heap.page_allocator, .{ .name = kv.key_ptr.*, .bytes = kv.value_ptr.bytes, .count = kv.value_ptr.count }) catch {};
+    std.mem.sort(E, list.items, {}, struct {
+        fn lt(_: void, a: E, b: E) bool {
+            return a.bytes > b.bytes;
+        }
+    }.lt);
+    var n: usize = 0;
+    for (list.items) |e| {
+        if (n >= 25) break;
+        n += 1;
+        std.debug.print("[decode-stats] {d: >9} B  {d: >7} x  {s}\n", .{ e.bytes, e.count, e.name });
+    }
+}
+
 /// Decode one value in place. Decoding writes through `out` so the final
 /// resting address of every watched node / defined slice is registered,
 /// mirroring the encoder's traversal exactly.
@@ -373,6 +402,7 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
                 if (comptime isWatched(Child)) {
                     const tag = try d.varint();
                     if (tag == 0) {
+                        decStat(Child, 1);
                         const ptr = try d.a.create(Child);
                         try decodeInto(Child, d, ptr);
                         out.* = ptr;
@@ -382,6 +412,7 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
                         out.* = @ptrFromInt(d.nodes.items[id]);
                     }
                 } else {
+                    decStat(Child, 1);
                     const ptr = try d.a.create(Child);
                     try decodeInto(Child, d, ptr);
                     out.* = ptr;
@@ -400,6 +431,7 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
                         try d.slices.append(d.a, .{ .addr = @intFromPtr(s.ptr), .len = len });
                         out.* = s;
                     } else {
+                        decStat(p.child, len);
                         const arr = try d.a.alloc(p.child, len);
                         try d.slices.append(d.a, .{ .addr = @intFromPtr(arr.ptr), .len = len });
                         if (p.child == u8) {
@@ -1417,6 +1449,7 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
         return null;
     }
 
+    decode_stats_on = if (@import("builtin").link_libc) (std.c.getenv("KLIO_DECODE_STATS") != null) else false;
     const snap0 = runtime.allocTrackSnapshot();
     var d = Decoder{ .a = a, .buf = bytes[payload_start .. payload_start + payload_len] };
     const root = a.create(ImageRoot) catch return error.OutOfMemory;
@@ -1432,6 +1465,7 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
         return null;
     }
     runtime.allocTrackReportPhase("image.decode", snap0);
+    dumpDecodeStats();
 
     const snap1 = runtime.allocTrackSnapshot();
     const loaded = try baseFromRoot(a, root);
@@ -1908,6 +1942,56 @@ test "codec resolves watched AST pointers to the decoded tree" {
     try testing.expectEqualStrings("f", got.ref.name.name);
     // The external pointer aliases the decoded decl, not a copy.
     try testing.expect(got.ref == &got.decls[0].Function);
+}
+
+test "codec resolves an external pointer aliasing a boxed Param default" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sp = Span.init(FileId.from(0), 0, 0);
+    var def_expr = ast.Expr{ .IntLit = .{ .value = 7, .kind = .Int, .span = sp } };
+    var params = [_]ast.Param{.{
+        .name = .{ .name = "x", .span = sp },
+        .ty = .{ .name = .{ .name = "Int", .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+        .default = &def_expr,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = sp,
+    }};
+    const fn_decl = ast.Function{
+        .name = .{ .name = "f", .span = sp },
+        .receiver_type = null,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = &params,
+        .return_type = null,
+        .body = null,
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .is_operator = false,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = sp,
+    };
+    var decls = [_]ast.Decl{.{ .Function = fn_decl }};
+    // `ref` aliases the param's default Expr by pointer — the shape
+    // `ClassParamDef.default`/`parent_ctor_args` have into the AST forest.
+    const Holder = struct { decls: []ast.Decl, ref: *const ast.Expr };
+    const v = Holder{ .decls = &decls, .ref = &def_expr };
+    const bytes = try encodeOne(Holder, a, &v);
+    const got = try decodeOne(Holder, a, bytes);
+    try testing.expect(got.ref == got.decls[0].Function.params[0].default.?);
+    try testing.expectEqual(@as(i128, 7), got.ref.IntLit.value);
 }
 
 test "codec rejects truncated input" {
