@@ -72,6 +72,63 @@ deferred-`FunctionBody` pattern, generalised to a whole top-level decl).
 - **I3 — lazy load traversals.** Replace 1143/1260/1305 with the baked indices.
 - **I4 — drop eager `lifted_decls`.** Forest decodes purely on demand. Measure.
 
+## Refined design (decl,ordinal ForestRef + global resolver)
+
+Member-index navigation is fragile (synthesized methods, ordering), so resolve
+forest refs **generically** by node ordinal:
+
+- **Bake.** While emitting each per-decl self-contained section (Step 1, landed),
+  capture `encoder.nodes` after each decl: `global_addr -> ForestRef{decl: u32,
+  ord: u32}` (`ord` = the node's index in that decl's fresh registry). Then when
+  encoding `built`/`module`, every field that currently backrefs the forest
+  registry instead stores its `ForestRef` (looked up by pointer address). The
+  eager `lifted_decls` is then dropped from the payload.
+- **`ForestRef = struct { decl: u32, ord: u32 }`** — two varints; the generic
+  struct codec already handles it. Image structs (`ClassDefImage`,
+  `MethodImage`, `PropertyDefImage`, `inline_ids`, `BuildObject`) use `ForestRef`
+  in place of `*const ast.X` for forest-pointing fields.
+- **Global resolver (runtime, injected decode fn — mirrors `inline_state`'s
+  `deferred_decode`).** `setForestSection(section, offsets, arena, decodeFn)`;
+  `resolveNode(ref) usize` decodes `offsets[ref.decl]` once (memoised
+  `[]?{decl, registry}`), returns `registry[ref.ord]`. `decodeLiftedDeclWithRegistry`
+  returns the decoded decl plus its `Decoder.nodes` array (the ordinal table).
+  Decl decode order in the decoder matches the bake encoder exactly, so
+  `ord` is stable.
+- **Runtime structs** (`MethodDef`, `PropertyDef`, `ClassDef`) hold `ForestRef`s
+  + memoised `?*const ast.X`; accessors resolve via the global on first read.
+
+## Reader surface (verified — every site that must route through the resolver)
+
+`MethodDef.decl` (~6, all field-reads, NO identity compares):
+- `class.zig:504,536,551` (findMethodWalk/findMethodForArgWalk/firstParamTypeMatches: `.body`, `.params`)
+- `value.zig:1345,1597` (`.name`, `.params.len`); `host_call_member.zig:1049` (`.params.len`)
+
+`PropertyDef.init/getter/setter/delegate` + `ClassDef.parent_ctor_args/init_blocks/secondary_ctors` runtime reads:
+- `host_instances.zig` (instantiation): init reads at 2376, 2812, 3018; getter 2778; init_blocks AST walk 2836; init_block_property_positions 804
+- `host_call_value.zig:186-190` (init/getter/delegate/primitive_zero for default values)
+- `host_fields.zig:1548` (getter/delegate null checks)
+- `host_classes.zig:463-469` (copies PropertyDef AST pointers when registering a runtime class)
+- `parentCtorArgThunks`/`secondaryCtors`/init-block lookups read side-tables keyed by FuncId, NOT the AST pointers — those are safe.
+
+Bake-time only (NOT per-run-load — no resolver needed): `prune.zig:136-149`,
+`qualified_refs.zig:238-272`, and all of `build.zig` (constructs from AST at
+bake). `Inst.BuildObject.ast`/`RegisterClass.class` point into KEPT
+(object-bearing / non-deferred) function bodies — those functions can't be
+body-deferred, but their owning decls are still in the lazy forest, so the
+ref must become a `ForestRef` too.
+
+Three load traversals to replace with baked indices: `file_classes` (class
+name -> decl idx), `collectInline` (inline name -> ordered decl idxs),
+`top_props` (name + scope).
+
+## Status
+
+- **Step 1 (per-decl sections) — landed** (`b43476d9`): `decodeLiftedDecl`,
+  `lifted_decl_section`/`lifted_decl_offsets` baked + threaded to `StdlibBase`,
+  round-trip test, FORMAT_VERSION 5. Additive; eager forest still active.
+- Next: ForestRef + global resolver + the atomic flip (drop eager forest,
+  convert image-struct forest fields, baked indices, route readers).
+
 ## Invariants / risks
 
 - Codec: one registration per watched node (see MEMORY-RECLAMATION.md). A
