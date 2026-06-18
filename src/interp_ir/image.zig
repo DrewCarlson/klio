@@ -1443,8 +1443,11 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
 fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
     const map = try a.create(SourceMap);
     map.* = SourceMap.init(a);
+    // The image's file paths/sources are borrows of the process-lifetime mmap,
+    // so register them borrowed: no whole-stdlib source dupe, no eager line
+    // tables. Saves ~7 MB at startup.
     for (root.files) |f| {
-        _ = map.add(f.path, f.source) catch return error.OutOfMemory;
+        _ = map.addBorrowed(f.path, f.source) catch return error.OutOfMemory;
     }
 
     var module = Module.default(a);

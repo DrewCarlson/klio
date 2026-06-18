@@ -1328,3 +1328,27 @@ Next node-size levers (same approach): box `Function.body` (`?FunctionBody`,
 280 B) to drop `sizeof(Function)` 632 -> ~360 and `sizeof(Decl)` to ~368; shrink
 `Property` itself (box its `init`/`delegate`/`getter`/`setter`) so the boxed
 Property nodes stop costing 1752 B each.
+
+## Borrowed stdlib source — DONE (the real `baseFromRoot` cost)
+
+`image.baseFromRoot` was attributed to "the ClassDef graph (12 MB)" in earlier
+notes; sub-phase tracking proved that wrong. The ClassDef graph is **0.5 MB**;
+the registry/module rebuild **3.5 MB**; the dominant **~8 MB was the
+`SourceMap`** built at the top of `baseFromRoot`. `SourceMap.add` did
+`arena.dupe(source)` for every stdlib file (~6 MB of source text — most of the
+6.8 MB image) and `SourceFile.init` eagerly built a per-line `line_starts` index
+(~1 MB), all for source a trivial program never points a diagnostic at.
+
+Both were wasted: the image's file `path`/`source` are already borrows of the
+process-lifetime `mmap`. `SourceMap.addBorrowed` now stores those slices without
+copying and leaves `line_starts` empty; `SourceFile.lineCol` falls back to a
+one-shot linear scan when there is no index (a unit test pins the scan to the
+binary-search result across every offset). The image loader uses it for stdlib
+files; user programs still use the eager `add`. `baseFromRoot` 12 -> 4.1 MB;
+hello-world **52 -> 46 MB (gc), 60 -> 52 MB (arena)**. Full suite, both corpora,
+ktor server/client/channel itests, and bake determinism green.
+
+The fixed floor is small: a program that parse-errors before any stdlib decode
+is **5.7 MB** resident. So the whole remaining baseline is the eager stdlib
+materialisation — now `image.decode` 22.8 MB (the AST+IR node forest;
+~116 K small allocs) is the single dominant chunk and the next target.
