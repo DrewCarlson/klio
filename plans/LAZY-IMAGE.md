@@ -121,13 +121,48 @@ Three load traversals to replace with baked indices: `file_classes` (class
 name -> decl idx), `collectInline` (inline name -> ordered decl idxs),
 `top_props` (name + scope).
 
+## Eager vs lazy duality (verified) → `union { ptr, ref }`
+
+`buildClassDef` sets `methods = &.{}`; `MethodDef.decl` is populated only by the
+image load (`methodsFromImage`, a forest pointer) and by unit-test helpers (a
+real `*ast.Function`). But `PropertyDef.init/getter/setter/delegate` and
+`ClassDef.parent_ctor_args/init_blocks/secondary_ctors` are set by **both** the
+build path (real pointers into the live, un-sectioned `lifted_decls` — the
+image-disabled fallback) **and** the image load (forest backref). So a forest
+field must hold either form:
+
+```
+ForestField(T) = union(enum) { ptr: *const T, ref: forest.ForestRef };
+fn get(self) *const T { return switch (self) { .ptr => |p| p, .ref => |r| forest.resolve…(r).? }; }
+```
+
+Build / runtime-class / tests set `.ptr` (eager); image load sets `.ref` (lazy).
+Readers call `.get()`. The forest resolver memoises per-decl decode, so repeated
+`.get()` on a `.ref` is O(1) after first touch — no per-field memo needed.
+
+## Flip plan — split into a safe mechanical phase + a focused behavioral flip
+
+- **Phase A (mechanical, behavior-preserving, green):** change each forest field
+  to `ForestField`, route the verified readers through `.get()`, and have
+  `methodsFromImage`/`classDefFromImage` set `.ptr` (still resolving the forest
+  backref eagerly, as today). No RSS change; validates the union + accessor
+  plumbing across the whole surface. Do this one field at a time (vertical
+  slices), each green.
+- **Phase B (behavioral flip, the RSS win):** bake the `addr -> ForestRef` map
+  during the per-decl section loop; `*ToImage` emit `ForestRef`; image load sets
+  `.ref` (not `.ptr`); stop encoding the eager `lifted_decls` in the payload;
+  replace the three load traversals (`file_classes`/`collectInline`/`top_props`)
+  with baked indices. Measure (~31 MB gc target).
+
 ## Status
 
-- **Step 1 (per-decl sections) — landed** (`b43476d9`): `decodeLiftedDecl`,
-  `lifted_decl_section`/`lifted_decl_offsets` baked + threaded to `StdlibBase`,
-  round-trip test, FORMAT_VERSION 5. Additive; eager forest still active.
-- Next: ForestRef + global resolver + the atomic flip (drop eager forest,
-  convert image-struct forest fields, baked indices, route readers).
+- **Step 1 (per-decl sections) — landed** (`b43476d9`).
+- **Forest resolver — landed** (`3481bccc`): `runtime.forest` (ForestRef,
+  setSection, resolve{Node,Expr,Function,Accessor,Block,SecondaryCtor},
+  memoised per-decl decode + mutex), `decodeLiftedDeclReg`, installed at load
+  (inert until the flip), round-trip test.
+- **Design + verified reader surface — landed** (`428efb7a`, this section).
+- Next: Phase A (union+accessors, per-field vertical slices), then Phase B.
 
 ## Invariants / risks
 
