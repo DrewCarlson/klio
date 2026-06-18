@@ -269,7 +269,7 @@ fn auditIntrinsicProbe(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// divergence; a clean corpus run proves zero.
 pub fn linkAuditCheck(self: *VmHost, module: *const Module, func: FuncId, f: *const ir.Func, args_in: []const Value) void {
     if (!linkAuditOn()) return;
-    if (f.blocks.len != 0) {
+    if (f.hasBody()) {
         const per_call: ?StdlibFn = blk: {
             const g = self.prog.borrow();
             defer g.deinit();
@@ -293,7 +293,7 @@ pub fn linkAuditCheck(self: *VmHost, module: *const Module, func: FuncId, f: *co
         for (module.funcsBySimpleName(f.name)) |cand| {
             if (cand.int() == func.int()) continue;
             const g = funcAt(module, cand) orelse continue;
-            if (g.blocks.len == 0) continue;
+            if (!g.hasBody()) continue;
             const g_user = if (paramIsThis(g.params)) g.params.len - 1 else g.params.len;
             if (g_user != args_in.len and !lastIsVararg(g.params)) continue;
             break :blk cand;
@@ -505,7 +505,7 @@ fn overloadScore(self: *VmHost, module: *const Module, cand: FuncId, args: []con
     const f = funcAt(module, cand) orelse return null;
     // A bodyless `expect` declaration must never be selected over a
     // body-carrying sibling or the host intrinsic backing the name.
-    if (f.blocks.len == 0) return null;
+    if (!f.hasBody()) return null;
     const last_vararg = lastIsVararg(f.params);
     if (f.params.len < args.len and !last_vararg) return null;
 
@@ -615,7 +615,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // body siblings (declaration order); the first whose arity fits the
     // call runs. Settled once by `linkResolvedForms` — no per-call
     // `funcsBySimpleName` scan.
-    if (f.blocks.len == 0) {
+    if (!f.hasBody()) {
         const target: ?FuncId = blk: {
             const g = self.prog.borrow();
             defer g.deinit();
@@ -636,7 +636,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // settled once by `linkResolvedForms`; this consults it by `FuncId`
     // with no per-call FQN probe.
     if (resolvedNativeForm(self, func)) |intrinsic| {
-        if (f.blocks.len == 0 and trace.enabled(f.name)) {
+        if (!f.hasBody() and trace.enabled(f.name)) {
             trace.emit("map=bodyless_native name={s} fqn={s}", .{ f.name, f.fqn });
         }
         return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
@@ -647,7 +647,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // to the wrong type-specialized overload. When the resolved body's
     // concrete primitive parameter types definitely mismatch the runtime
     // arguments and a same-FQN intrinsic exists, dispatch the intrinsic.
-    if (f.blocks.len != 0 and args_in.len != 0) {
+    if (f.hasBody() and args_in.len != 0) {
         const user_offset: usize = if (paramIsThis(f.params)) 1 else 0;
         var mismatch = false;
         for (args_in, 0..) |*v, i| {
@@ -767,7 +767,7 @@ fn scoreNamedCandidate(
     recv_external: bool,
 ) ?i32 {
     const cf = funcAt(module, cand) orelse return null;
-    if (cf.blocks.len == 0) return null; // never pick a bodyless `expect`
+    if (!cf.hasBody()) return null; // never pick a bodyless `expect`
     const params = cf.params;
     if (params.len > 64) return null;
     var filled = [_]bool{false} ** 64;

@@ -81,8 +81,28 @@ pub const SourceFile = struct {
         };
     }
 
-    /// 1-based line and column for a byte offset.
+    /// 1-based line and column for a byte offset. Files added with a
+    /// precomputed `line_starts` index resolve by binary search; files added
+    /// borrowed (no index — the common case for the process-lifetime stdlib
+    /// image, whose source is rarely pointed at by a diagnostic) resolve by a
+    /// one-shot linear scan, trading a rare O(offset) walk for not building a
+    /// per-line table at load.
     pub fn lineCol(self: SourceFile, offset: u32) LineCol {
+        if (self.line_starts.len == 0) {
+            var line: u32 = 1;
+            var col: u32 = 1;
+            var i: u32 = 0;
+            const end = @min(offset, @as(u32, @intCast(self.source.len)));
+            while (i < end) : (i += 1) {
+                if (self.source[i] == '\n') {
+                    line += 1;
+                    col = 1;
+                } else {
+                    col += 1;
+                }
+            }
+            return .{ .line = line, .col = col };
+        }
         var lo: usize = 0;
         var hi: usize = self.line_starts.len;
         while (lo < hi) {
@@ -117,6 +137,23 @@ pub const SourceMap = struct {
         return id;
     }
 
+    /// Register a file whose `path`/`source` already have process-lifetime
+    /// backing (the mmap'd stdlib image), borrowing both slices instead of
+    /// copying them and skipping the eager per-line index. Saves the
+    /// whole-stdlib source dupe (~6 MB) and its line tables (~1 MB) at startup;
+    /// `lineCol` falls back to a linear scan for these files.
+    pub fn addBorrowed(self: *SourceMap, path: []const u8, source: []const u8) !FileId {
+        const a = self.arena.allocator();
+        const id = FileId.from(@intCast(self.files.items.len));
+        try self.files.append(a, .{
+            .id = id,
+            .path = path,
+            .source = source,
+            .line_starts = &.{},
+        });
+        return id;
+    }
+
     pub fn get(self: *const SourceMap, id: FileId) *const SourceFile {
         return &self.files.items[id.int()];
     }
@@ -136,4 +173,20 @@ test "line col resolves offsets" {
     const sf = sm.get(id);
     try std.testing.expectEqual(LineCol{ .line = 1, .col = 1 }, sf.lineCol(0));
     try std.testing.expectEqual(LineCol{ .line = 2, .col = 1 }, sf.lineCol(8));
+}
+
+test "borrowed file lineCol matches indexed lineCol" {
+    const src = "fun a()\nval b = 1\nval c = 2\n\nlast";
+    var indexed = SourceMap.init(std.testing.allocator);
+    defer indexed.deinit();
+    var borrowed = SourceMap.init(std.testing.allocator);
+    defer borrowed.deinit();
+    const ia = indexed.get(try indexed.add("x.kt", src));
+    const ib = borrowed.get(try borrowed.addBorrowed("x.kt", src));
+    // The borrowed file carries no precomputed line index.
+    try std.testing.expectEqual(@as(usize, 0), ib.line_starts.len);
+    var off: u32 = 0;
+    while (off <= src.len) : (off += 1) {
+        try std.testing.expectEqual(ia.lineCol(off), ib.lineCol(off));
+    }
 }

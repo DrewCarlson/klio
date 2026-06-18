@@ -559,7 +559,7 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
     defer mg.deinit();
     const m = mg.get();
     const func = idGet(m.funcs.items, fid.int()) orelse return null;
-    if (func.blocks.len != 0) {
+    if (func.hasBody()) {
         const caps = ObjRef(std.ArrayList(Value)).init(allocator, .empty) catch return null;
         const id = self.closures.push(.{
             .body_func = fid,
@@ -765,7 +765,7 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
                 for (m.funcsBySimpleName(name)) |c| {
                     if (!isExtFid(c, m)) {
                         if (idGet(m.funcs.items, c.int())) |f| {
-                            if (f.blocks.len != 0) break :pick c;
+                            if (f.hasBody()) break :pick c;
                         }
                     }
                 }
