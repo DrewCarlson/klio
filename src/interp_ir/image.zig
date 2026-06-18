@@ -741,12 +741,50 @@ pub fn decodeLiftedDeclReg(a: Allocator, section: []const u8, offset: u32) ?runt
     return .{ .decl = decl, .nodes = nodes };
 }
 
+/// Process-global memo for `decodeFuncBlocks`. A deferred func body is immutable
+/// and identical for a given `(section, offset)`, but the per-`Func`
+/// `deferred_offset` flag that gates `ensureFuncBody` is reset whenever the
+/// module's func table is rebuilt (a per-program `cloneForExtend`, a fresh Vm
+/// for a `runBlocking` body), so a long-running server re-enters
+/// `decodeFuncBlocks` for the same offset on every request and the decoded
+/// blocks — allocated into the process-lifetime `deferred_func_arena` — pile up
+/// unfreed. Memoising by `(section, offset)` decodes each body exactly once ever:
+/// the cache is bounded by the reachable-func set, not by request count.
+const BlockCacheKey = struct { section: [*]const u8, offset: u32 };
+var block_cache: std.AutoHashMapUnmanaged(BlockCacheKey, []ir.Block) = .empty;
+var block_cache_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+inline fn blockCacheLock() void {
+    while (block_cache_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+}
+inline fn blockCacheUnlock() void {
+    block_cache_lock.store(false, .release);
+}
+
 /// Decode a deferred function's `blocks` from the lazy-IR section at `offset`,
 /// allocating into `a`. Self-contained (fresh registry), like the AST bodies.
+/// Memoised: a repeated `(section, offset)` returns the first decode's blocks
+/// rather than re-decoding into the never-freed `deferred_func_arena`.
 pub fn decodeFuncBlocks(a: Allocator, section: []const u8, offset: u32) ?[]ir.Block {
+    const key = BlockCacheKey{ .section = section.ptr, .offset = offset };
+    blockCacheLock();
+    if (block_cache.get(key)) |cached| {
+        blockCacheUnlock();
+        return cached;
+    }
+    blockCacheUnlock();
+
     var d = Decoder{ .a = a, .buf = section, .pos = offset };
     var blocks: []ir.Block = undefined;
     decodeInto([]ir.Block, &d, &blocks) catch return null;
+
+    blockCacheLock();
+    defer blockCacheUnlock();
+    // Re-check under the lock: a racing thread may have decoded the same key
+    // while this one was decoding. Keep the winner; the loser's blocks are
+    // arena-backed and reclaimed with the process.
+    if (block_cache.get(key)) |cached| return cached;
+    block_cache.put(std.heap.page_allocator, key, blocks) catch {};
     return blocks;
 }
 
