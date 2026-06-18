@@ -504,14 +504,46 @@ fn writeTombstone(gpa: Allocator, cache: []const u8, hex: [32]u8) void {
 
 /// Read + decode an image file. Null on any mismatch (the caller rebakes).
 fn loadImageFile(gpa: Allocator, path: []const u8) ?image.Loaded {
-    var threaded = threadedIo(gpa);
-    defer threaded.deinit();
-    // The decoded base borrows from these bytes; they live on the
-    // process-lifetime arena, never freed.
-    const bytes = std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, gpa, .unlimited) catch return null;
+    // The decoded base borrows from these bytes for the process's life. Prefer a
+    // read-only mmap: the decode only touches the pages it eagerly decodes, so
+    // the deferred body/IR sections and the (slice-only) stdlib source text stay
+    // file-backed and never count against RSS until something reads them. Fall
+    // back to a heap read where mmap is unavailable.
+    const bytes = mmapImage(path) orelse blk: {
+        var threaded = threadedIo(gpa);
+        defer threaded.deinit();
+        break :blk std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, gpa, .unlimited) catch return null;
+    };
     const loaded = image.load(gpa, bytes) catch null;
     if (loaded == null) trace(gpa, "image rejected: {s}", .{image.lastLoadFailure()});
     return loaded;
+}
+
+/// Read-only `MAP_PRIVATE` mmap of the image, never unmapped (process-lifetime,
+/// like the base that borrows it). Returns null on any error so the caller
+/// falls back to a heap read.
+fn mmapImage(path: []const u8) ?[]const u8 {
+    if (path.len >= 4095) return null;
+    var buf: [4096]u8 = undefined;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&buf);
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return null;
+    if (st.size <= 0) return null;
+    const len: usize = @intCast(st.size);
+    const mapped = std.posix.mmap(
+        null,
+        len,
+        .{ .READ = true },
+        .{ .TYPE = .PRIVATE },
+        fd,
+        0,
+    ) catch return null;
+    return mapped[0..len];
 }
 
 /// Shared tail of the hit and bake paths: replay the image's registry
