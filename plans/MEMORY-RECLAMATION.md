@@ -1266,13 +1266,26 @@ cut from the lazy AST-body + lazy IR-block tiers combined. Post-tier footprint:
 `image.decode` 30.9 MB (mostly the AST skeleton) + `baseFromRoot` 12 MB (the
 ClassDef graph).
 
-**Remaining (the AST skeleton, ~25 MB) is the hard tier.** Unlike bodies/blocks,
-`lifted_decls` is *scanned* eagerly at every extend build —
-`for (bs.lifted_decls)` builds the class-name map, collects inline fns, and
-gathers top-level property names — and its function/class nodes are referenced
-by `MethodDef.decl` and `inline_ids`. Deferring it needs a different shape than
-lazy-decode: bake the scan *results* (the class map, an inline-fn registry, the
-top-prop set) so the extend build never walks the forest, then drop the
-top-level-function AST headers that duplicate the IR module's own
-`funcs[id].params` (verify the redundancy first). That, plus a
-position-independent/mmap'd image for what remains, is the route to Node-level.
+**Dead top-level signatures — DONE.** A non-inline, object-free top-level
+function's AST decl is never read after lowering (resolution goes through the
+baked symbol index + IR func; dispatch is by `FuncId`; only class members are
+read back via `MethodDef.decl`), so its params/types/receiver/return/annotations
+are stripped alongside the body. ~2 MB (these headers were a small slice).
+
+**Final running totals (hello-world): 104 -> 65 MB arena, 95 -> 58 MB gc** — a
+~39% cut. The lazy-decode + dead-strip approach is now at its limit. Remaining
+`image.decode` is 29 MB, dominated by **class-member AST headers** (kept because
+`MethodDef.decl` reads their params and `body != null` at dispatch) and type
+refs; `baseFromRoot` is the **12 MB ClassDef graph**.
+
+**Routes past ~58 MB, all deeper redesigns:**
+- *Class-member params:* defer them like bodies, or point `MethodDef` at the IR
+  `FuncId` (whose lowered params already exist) instead of the AST decl — a class
+  -dispatch refactor (`class.zig` reads `decl.params`/`decl.body` pervasively).
+- *ClassDef graph (12 MB):* lazily decode a class on first lookup.
+- *Position-independent / mmap'd image:* the architectural end state — store
+  AST+IR pointer-free so the loaded image is the file-backed mmap and only
+  touched pages are resident; would subsume all the per-tier deferral.
+
+The leak side is handled by the tracing GC (`KLIO_RECLAIM=gc`, bounded
+~13 KB/req); under it the simple-program baseline is the 58 MB above.
