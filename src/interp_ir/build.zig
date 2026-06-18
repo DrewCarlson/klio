@@ -2695,6 +2695,12 @@ pub const StdlibBase = struct {
     /// when loaded from an image, where those bodies are markers. Borrows the
     /// image buffer.
     deferred_bodies: []const u8 = &.{},
+    /// Per-decl self-contained encodings of `lifted_decls` and their byte
+    /// offsets (decl `i` at `lifted_decl_offsets[i]`). Borrow the image buffer.
+    /// Back the lazy forest: a decl decodes on first touch from here instead of
+    /// the whole forest materialising at load. Empty for a freshly-built base.
+    lifted_decl_section: []const u8 = &.{},
+    lifted_decl_offsets: []const u32 = &.{},
     /// The process-lifetime allocator the base (and its `lifted_decls`) live in.
     /// A lazily-decoded deferred body must persist across per-program builds, so
     /// it is decoded here, not into a per-build arena.

@@ -63,7 +63,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -694,6 +694,13 @@ const ImageRoot = struct {
     /// `FunctionBody` encoded with a fresh node/slice registry, so it decodes
     /// standalone from its byte offset.
     deferred_bodies: []const u8,
+    /// Per-decl self-contained encodings of `lifted_decls`, parallel to
+    /// `lifted_decl_offsets` (decl `i` lives at `lifted_decl_offsets[i]`). Backs
+    /// the lazy forest: a decl decodes on first runtime touch from this section
+    /// instead of materialising the whole forest eagerly. Mirrors the post-
+    /// deferral form of `lifted_decls` (inline bodies are markers).
+    lifted_decl_section: []const u8 = &.{},
+    lifted_decl_offsets: []const u32 = &.{},
 };
 
 const DEFERRED_MAGIC: u32 = span.DEFERRED_BODY_FILE;
@@ -707,6 +714,19 @@ pub fn decodeDeferredBody(a: Allocator, section: []const u8, offset: u32) ?ast.F
     var body: ast.FunctionBody = undefined;
     decodeInto(ast.FunctionBody, &d, &body) catch return null;
     return body;
+}
+
+/// Decode one whole top-level `ast.Decl` from the per-decl section at `offset`,
+/// allocating into `a`. Each decl is baked self-contained (fresh registry — the
+/// deferred-body pattern generalised to a whole decl), so a fresh decoder reads
+/// it standalone. Backs the lazy forest: a decl decodes on first runtime touch
+/// instead of materialising the whole forest at load. Returns null on a
+/// malformed section.
+pub fn decodeLiftedDecl(a: Allocator, section: []const u8, offset: u32) ?ast.Decl {
+    var d = Decoder{ .a = a, .buf = section, .pos = offset };
+    var decl: ast.Decl = undefined;
+    decodeInto(ast.Decl, &d, &decl) catch return null;
+    return decl;
 }
 
 /// Decode a deferred function's `blocks` from the lazy-IR section at `offset`,
@@ -806,6 +826,25 @@ pub fn bake(
             f.blocks = &.{};
         }
         root.module.deferred_func_section = fn_blk_enc.out.items;
+    }
+
+    // Per-decl self-contained sections: each top-level decl encoded with a
+    // fresh registry so the loader can decode it standalone on first touch
+    // (the lazy forest). Emitted after the body/IR deferral above so the
+    // sections capture the final baked decl form (marker bodies). Additive: the
+    // eager `lifted_decls` stay in the payload until the lazy path is the
+    // default; the loader picks one.
+    var decl_enc = Encoder.init(gpa);
+    defer decl_enc.deinit();
+    {
+        const offsets = try a.alloc(u32, root.lifted_decls.len);
+        for (root.lifted_decls, 0..) |*d, i| {
+            offsets[i] = @intCast(decl_enc.out.items.len);
+            decl_enc.resetRegistry();
+            try encodeValue(ast.Decl, &decl_enc, d);
+        }
+        root.lifted_decl_section = decl_enc.out.items;
+        root.lifted_decl_offsets = offsets;
     }
 
     var e = Encoder.init(gpa);
@@ -1508,6 +1547,8 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
         .user_file_start = @intCast(root.files.len),
         .enum_id_next = root.enum_id_next,
         .deferred_bodies = root.deferred_bodies,
+        .lifted_decl_section = root.lifted_decl_section,
+        .lifted_decl_offsets = root.lifted_decl_offsets,
         .arena = a,
     };
 
@@ -1992,6 +2033,57 @@ test "codec resolves an external pointer aliasing a boxed Param default" {
     const got = try decodeOne(Holder, a, bytes);
     try testing.expect(got.ref == got.decls[0].Function.params[0].default.?);
     try testing.expectEqual(@as(i128, 7), got.ref.IntLit.value);
+}
+
+test "per-decl self-contained sections decode standalone" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sp = Span.init(FileId.from(0), 0, 0);
+
+    // Two top-level function decls; bake each self-contained (fresh registry)
+    // into one buffer, recording offsets — exactly the per-decl section bake.
+    const names = [_][]const u8{ "alpha", "beta" };
+    var decls: [2]ast.Decl = undefined;
+    for (&decls, names) |*d, nm| {
+        d.* = .{ .Function = .{
+            .name = .{ .name = nm, .span = sp },
+            .receiver_type = null,
+            .type_params = &.{},
+            .where_bounds = &.{},
+            .params = &.{},
+            .return_type = null,
+            .body = null,
+            .is_open = false,
+            .is_override = false,
+            .is_abstract = false,
+            .is_operator = false,
+            .is_inline = false,
+            .is_infix = false,
+            .is_tailrec = false,
+            .is_suspend = false,
+            .is_expect = false,
+            .is_actual = false,
+            .visibility = .Public,
+            .annotations = &.{},
+            .span = sp,
+        } };
+    }
+    var enc = Encoder.init(a);
+    defer enc.deinit();
+    var offsets: [2]u32 = undefined;
+    for (&decls, 0..) |*d, i| {
+        offsets[i] = @intCast(enc.out.items.len);
+        enc.resetRegistry();
+        try encodeValue(ast.Decl, &enc, d);
+    }
+    const section = enc.out.items;
+    // Decode each standalone from its offset and check it round-trips.
+    for (offsets, names) |off, nm| {
+        const got = decodeLiftedDecl(a, section, off) orelse return error.TestUnexpectedResult;
+        try testing.expect(got == .Function);
+        try testing.expectEqualStrings(nm, got.Function.name.name);
+    }
 }
 
 test "codec rejects truncated input" {
