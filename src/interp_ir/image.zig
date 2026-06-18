@@ -729,6 +729,18 @@ pub fn decodeLiftedDecl(a: Allocator, section: []const u8, offset: u32) ?ast.Dec
     return decl;
 }
 
+/// Decode a whole top-level decl plus its node-ordinal registry (the
+/// decode-order watched-node address table), for the lazy forest resolver. The
+/// registry lets a `ForestRef{decl, ord}` in `built`/`module` resolve to the
+/// exact node by ordinal. Allocates into `a` (the process-lifetime base arena).
+pub fn decodeLiftedDeclReg(a: Allocator, section: []const u8, offset: u32) ?runtime.forest.DeclReg {
+    var d = Decoder{ .a = a, .buf = section, .pos = offset };
+    const decl = a.create(ast.Decl) catch return null;
+    decodeInto(ast.Decl, &d, decl) catch return null;
+    const nodes = d.nodes.toOwnedSlice(a) catch return null;
+    return .{ .decl = decl, .nodes = nodes };
+}
+
 /// Decode a deferred function's `blocks` from the lazy-IR section at `offset`,
 /// allocating into `a`. Self-contained (fresh registry), like the AST bodies.
 pub fn decodeFuncBlocks(a: Allocator, section: []const u8, offset: u32) ?[]ir.Block {
@@ -1552,6 +1564,11 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
         .arena = a,
     };
 
+    // Install the lazy-forest resolver (decode-on-touch). Harmless while the
+    // eager `lifted_decls` is the active path — nothing resolves a ForestRef
+    // yet; the flip routes built/module's forest pointers through it.
+    runtime.forest.setSection(root.lifted_decl_section, root.lifted_decl_offsets, a, decodeLiftedDeclReg);
+
     return .{
         .base = base,
         .map = map,
@@ -2084,6 +2101,52 @@ test "per-decl self-contained sections decode standalone" {
         try testing.expect(got == .Function);
         try testing.expectEqualStrings(nm, got.Function.name.name);
     }
+}
+
+test "forest resolver resolves a ForestRef to the decoded node" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sp = Span.init(FileId.from(0), 0, 0);
+
+    // One decl: a function (the decl's watched node 0, registered first).
+    var decl = ast.Decl{ .Function = .{
+        .name = .{ .name = "f", .span = sp },
+        .receiver_type = null,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = &.{},
+        .return_type = null,
+        .body = .{ .Expr = .{ .IntLit = .{ .value = 5, .kind = .Int, .span = sp } } },
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .is_operator = false,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = sp,
+    } };
+    var enc = Encoder.init(a);
+    defer enc.deinit();
+    enc.resetRegistry();
+    try encodeValue(ast.Decl, &enc, &decl);
+    // Capture the bake-time ForestRef for the function node (ordinal in the
+    // decl's fresh registry) — node 0 is the Function (registered first).
+    const fn_ord: u32 = enc.nodes.get(.{ .addr = @intFromPtr(&decl.Function), .ty = typeId(ast.Function) }).?;
+
+    const offsets = [_]u32{0};
+    runtime.forest.setSection(enc.out.items, &offsets, a, decodeLiftedDeclReg);
+    const got = runtime.forest.resolveFunction(.{ .decl = 0, .ord = fn_ord }) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("f", got.name.name);
+    // A second resolve hits the memo (same decoded pointer).
+    const got2 = runtime.forest.resolveFunction(.{ .decl = 0, .ord = fn_ord }).?;
+    try testing.expect(got == got2);
 }
 
 test "codec rejects truncated input" {
