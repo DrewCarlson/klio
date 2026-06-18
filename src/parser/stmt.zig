@@ -82,7 +82,9 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                     return parseDestructuringDecl(p);
                 }
                 const prop = members.parseProperty(p) orelse return null;
-                return Stmt{ .Decl = Decl{ .Property = prop } };
+                const pp = p.allocator.create(ast.Property) catch @panic("OOM");
+                pp.* = prop;
+                return Stmt{ .Decl = Decl{ .Property = pp } };
             },
             .Fun => {
                 const next: ?TokenKind = if (p.pos + 1 < p.tokens.len) p.tokens[p.pos + 1].kind else null;

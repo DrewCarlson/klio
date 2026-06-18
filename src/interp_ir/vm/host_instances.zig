@@ -2703,7 +2703,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     defer own_members.deinit();
     for (members) |*m| {
         switch (m.*) {
-            .Property => |*p| try own_members.put(p.name.name, {}),
+            .Property => |p| try own_members.put(p.name.name, {}),
             .Function => |*f| try own_members.put(f.name.name, {}),
             else => {},
         }
@@ -2774,7 +2774,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 tbl.get().put(try anonKey(allocator, synth_class_name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = &.{} }) catch {};
                 tbl.deinit();
             },
-            .Property => |*p| {
+            .Property => |p| {
                 if (p.getter) |*getter| if (!site_built) {
                     const thunk = synthThunk(p.name, getter.body, getter.return_type, p.is_override);
                     const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
@@ -2808,7 +2808,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         var complex_local: std.ArrayList(AnonComplexInit) = .empty;
         for (members) |*m| {
             if (m.* != .Property) continue;
-            const p = &m.Property;
+            const p = m.Property;
             const init_expr = if (p.init) |*e| e else continue;
             const is_lit = (try simpleLiteral(allocator, init_expr)) != null;
             if (is_lit) continue;
@@ -2924,7 +2924,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         var body_props: std.ArrayList(PropertyDef) = .empty;
         for (members) |*m| {
             if (m.* != .Property) continue;
-            const p = &m.Property;
+            const p = m.Property;
             try body_props.append(allocator, .{
                 .name = p.name.name,
                 .mutable = p.mutable,

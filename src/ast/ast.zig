@@ -68,7 +68,12 @@ pub const ImportDecl = struct {
 
 pub const Decl = union(enum) {
     Function: Function,
-    Property: Property,
+    /// Boxed: `Property` is the largest variant (its inline `init`/`delegate`/
+    /// `getter`/`setter` make it ~1.7 KB), so storing it behind a pointer keeps
+    /// every other `Decl` slot small. The pointee is heap-stable, so interior
+    /// pointers into it (e.g. `ClassDef.body_properties` -> `&property.getter`)
+    /// stay valid.
+    Property: *Property,
     Class: Class,
     /// Standalone `object Foo { … }` singleton.
     Object: ObjectDecl,

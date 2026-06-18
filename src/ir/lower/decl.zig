@@ -167,7 +167,7 @@ fn collectMembers(
             .Function => |*f| {
                 try out.put(f.name.name, {});
             },
-            .Property => |*p| {
+            .Property => |p| {
                 try out.put(p.name.name, {});
             },
             .Class => |*inner| {
@@ -175,7 +175,7 @@ fn collectMembers(
                     for (inner.members) |*cm| {
                         switch (cm.*) {
                             .Function => |*f| try out.put(f.name.name, {}),
-                            .Property => |*p| try out.put(p.name.name, {}),
+                            .Property => |p| try out.put(p.name.name, {}),
                             else => {},
                         }
                     }
@@ -236,7 +236,7 @@ fn addVisibleMemberNames(
             for (inner.members) |*cm| {
                 switch (cm.*) {
                     .Function => |*f| try own_member_names.put(f.name.name, {}),
-                    .Property => |*p| try own_member_names.put(p.name.name, {}),
+                    .Property => |p| try own_member_names.put(p.name.name, {}),
                     else => {},
                 }
             }
@@ -564,7 +564,7 @@ fn collectRecvMembers(
     for (c.members) |*m| {
         switch (m.*) {
             .Function => |*f| try out.put(f.name.name, {}),
-            .Property => |*p| try out.put(p.name.name, {}),
+            .Property => |p| try out.put(p.name.name, {}),
             else => {},
         }
     }

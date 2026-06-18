@@ -379,7 +379,7 @@ const Builder = struct {
     }
 
     fn localProp(self: *Builder, mutable: bool, name: []const u8, t: ?TypeRef, init_e: ?Expr) Stmt {
-        return .{ .Decl = .{ .Property = self.prop(mutable, name, t, init_e) } };
+        return .{ .Decl = .{ .Property = self.dup(Property, self.prop(mutable, name, t, init_e)) } };
     }
 
     fn prop(self: *Builder, mutable: bool, name: []const u8, t: ?TypeRef, init_e: ?Expr) Property {
@@ -1277,7 +1277,7 @@ test "delegate_with_operator_modifier_ok" {
     d.members = b.slice(Decl, &.{ .{ .Function = get_value }, .{ .Function = set_value } });
     var x = b.prop(true, "x", b.ty("Int"), null);
     x.delegate = b.call(b.path("D"), &.{});
-    const f = b.file(&.{ .{ .Class = d }, .{ .Property = x } });
+    const f = b.file(&.{ .{ .Class = d }, .{ .Property = b.dup(Property, x) } });
     var c = checkFile(testing.allocator, &f);
     defer c.deinit();
     try testing.expect(!c.hasCode(codes.TYPE_DELEGATE_OPERATOR_REQUIRED));
@@ -1293,7 +1293,7 @@ test "delegate_missing_operator_on_get_value_flagged" {
     d.members = b.slice(Decl, &.{.{ .Function = get_value }});
     var x = b.prop(false, "x", b.ty("Int"), null);
     x.delegate = b.call(b.path("D"), &.{});
-    const f = b.file(&.{ .{ .Class = d }, .{ .Property = x } });
+    const f = b.file(&.{ .{ .Class = d }, .{ .Property = b.dup(Property, x) } });
     var c = checkFile(testing.allocator, &f);
     defer c.deinit();
     try testing.expect(c.hasCode(codes.TYPE_DELEGATE_OPERATOR_REQUIRED));
@@ -1311,7 +1311,7 @@ test "delegate_missing_operator_on_set_value_flagged" {
     d.members = b.slice(Decl, &.{ .{ .Function = get_value }, .{ .Function = set_value } });
     var x = b.prop(true, "x", b.ty("Int"), null);
     x.delegate = b.call(b.path("D"), &.{});
-    const f = b.file(&.{ .{ .Class = d }, .{ .Property = x } });
+    const f = b.file(&.{ .{ .Class = d }, .{ .Property = b.dup(Property, x) } });
     var c = checkFile(testing.allocator, &f);
     defer c.deinit();
     try testing.expect(c.hasCode(codes.TYPE_DELEGATE_OPERATOR_REQUIRED));
@@ -1409,7 +1409,7 @@ test "lateinit_var_string_ok" {
     var box = b.class("Box");
     var s = b.prop(true, "s", b.ty("String"), null);
     s.is_lateinit = true;
-    box.members = b.slice(Decl, &.{.{ .Property = s }});
+    box.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, s) }});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.call(b.path("Box"), &.{})})),
     });
@@ -1429,7 +1429,7 @@ test "lateinit_val_flagged" {
     var box = b.class("Box");
     var s = b.prop(false, "s", b.ty("String"), null);
     s.is_lateinit = true;
-    box.members = b.slice(Decl, &.{.{ .Property = s }});
+    box.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, s) }});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.call(b.path("Box"), &.{})})),
     });
@@ -1446,7 +1446,7 @@ test "lateinit_primitive_flagged" {
     var box = b.class("Box");
     var n = b.prop(true, "n", b.ty("Int"), null);
     n.is_lateinit = true;
-    box.members = b.slice(Decl, &.{.{ .Property = n }});
+    box.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, n) }});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.call(b.path("Box"), &.{})})),
     });
@@ -1463,7 +1463,7 @@ test "lateinit_initializer_flagged" {
     var box = b.class("Box");
     var s = b.prop(true, "s", b.ty("String"), b.str("x"));
     s.is_lateinit = true;
-    box.members = b.slice(Decl, &.{.{ .Property = s }});
+    box.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, s) }});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.call(b.path("Box"), &.{})})),
     });
@@ -1480,7 +1480,7 @@ test "lateinit_nullable_flagged" {
     var box = b.class("Box");
     var s = b.prop(true, "s", b.tyNull("String"), null);
     s.is_lateinit = true;
-    box.members = b.slice(Decl, &.{.{ .Property = s }});
+    box.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, s) }});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.call(b.path("Box"), &.{})})),
     });
@@ -1506,7 +1506,7 @@ test "accessor_return_type_match_ok" {
         .annotations = &.{},
         .span = b.ts(),
     };
-    box.members = b.slice(Decl, &.{.{ .Property = x }});
+    box.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, x) }});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.member(b.call(b.path("Box"), &.{}), "x")})),
     });
@@ -1532,7 +1532,7 @@ test "accessor_return_type_mismatch_flagged" {
         .annotations = &.{},
         .span = b.ts(),
     };
-    box.members = b.slice(Decl, &.{.{ .Property = x }});
+    box.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, x) }});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.member(b.call(b.path("Box"), &.{}), "x")})),
     });
@@ -2190,7 +2190,7 @@ test "class_val_property_uninit_in_init_block" {
     defer b.deinit();
     var foo = b.class("Foo");
     foo.primary_params = b.slice(ast.ClassParam, &.{b.plainCtorParam("b", b.ty("Boolean"))});
-    foo.members = b.slice(Decl, &.{.{ .Property = b.prop(false, "x", b.ty("Int"), null) }});
+    foo.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, b.prop(false, "x", b.ty("Int"), null)) }});
     const init_blk: Block = .{
         .stmts = b.slice(Stmt, &.{b.exprStmt(b.ifExpr(
             b.path("b"),
@@ -2217,7 +2217,7 @@ test "class_val_property_initialized_in_all_init_branches" {
     defer b.deinit();
     var foo = b.class("Foo");
     foo.primary_params = b.slice(ast.ClassParam, &.{b.plainCtorParam("b", b.ty("Boolean"))});
-    foo.members = b.slice(Decl, &.{.{ .Property = b.prop(false, "x", b.ty("Int"), null) }});
+    foo.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, b.prop(false, "x", b.ty("Int"), null)) }});
     const init_blk: Block = .{
         .stmts = b.slice(Stmt, &.{b.exprStmt(b.ifExpr(
             b.path("b"),

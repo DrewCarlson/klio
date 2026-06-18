@@ -591,7 +591,7 @@ test "compute boxed vars keeps only captured var decls" {
     // var captured = 0; var untouched = 0; { x -> captured }
     const lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
     const lit1 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
-    const prop_captured = ast.Property{
+    var prop_captured = ast.Property{
         .mutable = true,
         .name = .{ .name = "captured", .span = dummySpan() },
         .receiver_type = null,
@@ -628,8 +628,8 @@ test "compute boxed vars keeps only captured var decls" {
     } };
 
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = prop_captured } },
-        .{ .Decl = .{ .Property = prop_untouched } },
+        .{ .Decl = .{ .Property = &prop_captured } },
+        .{ .Decl = .{ .Property = &prop_untouched } },
         .{ .Expr = lambda },
     };
     _ = &refexpr;

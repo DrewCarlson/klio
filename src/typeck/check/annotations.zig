@@ -118,7 +118,7 @@ pub fn collectRequiredOptIns(
                     allocator.free(m);
                 }
             },
-            .Property => |*p| {
+            .Property => |p| {
                 const m = try markerNamesIn(allocator, p.annotations, markers);
                 if (m.len != 0) {
                     try out.put(p.name.name, m);
@@ -237,7 +237,7 @@ pub fn walkDeclForOptIn(
             for (0..self_markers.len) |_| _ = scope.pop();
             for (0..added) |_| _ = scope.pop();
         },
-        .Property => |*p| {
+        .Property => |p| {
             const added = try pushScope(allocator, scope, p.annotations);
             const self_markers = try markerNamesIn(allocator, p.annotations, markers);
             defer allocator.free(self_markers);
@@ -600,7 +600,7 @@ pub fn collectSuppressDecl(
                 try pushSuppress(allocator, p.annotations, p.span, out);
             }
         },
-        .Property => |*p| {
+        .Property => |p| {
             try pushSuppress(allocator, p.annotations, p.span, out);
         },
         .Class => |*c| {
@@ -760,7 +760,7 @@ pub fn collectDeprecationInfo(
                     try out.put(f.name.name, info);
                 }
             },
-            .Property => |*p| {
+            .Property => |p| {
                 if (parseDeprecation(p.annotations)) |info| {
                     try out.put(p.name.name, info);
                 }
@@ -817,7 +817,7 @@ pub fn walkDeclForDeprecation(
                 }
             }
         },
-        .Property => |*p| {
+        .Property => |p| {
             if (p.init) |*init| {
                 try walkExprForDeprecation(allocator, init, info, out);
             }
@@ -1172,7 +1172,7 @@ pub const AnnotationWalker = struct {
     pub fn walkDecl(self: *AnnotationWalker, d: *const Decl) Allocator.Error!void {
         switch (d.*) {
             .Function => |*f| try self.walkFunction(f),
-            .Property => |*p| try self.walkProperty(p, false),
+            .Property => |p| try self.walkProperty(p, false),
             .Class => |*c| try self.walkClass(c),
             .Object => |*o| {
                 for (o.members) |*m| {
