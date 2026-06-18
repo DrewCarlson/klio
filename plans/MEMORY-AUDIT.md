@@ -23,47 +23,57 @@ The ktor-startup number is what the lazy/position-independent image
 (`plans/LAZY-IMAGE.md`) targets — it would help ktor most, since a program uses
 a small fraction of that 50 MB forest.
 
-## Lifetime RSS — ktor server under sustained requests (BUG: per-request leak)
+## Lifetime RSS — ktor server under sustained requests (FIXED)
 
-Mixed GET/POST(JSON) load, sampling the server PID's RSS:
+The per-request leak was the lazy func-body decode. `ensureFuncBody` decodes a
+deferred function's blocks into the process-lifetime `deferred_func_arena`,
+gated only by the per-`Func` `deferred_offset` flag; that flag is reset whenever
+the func table is rebuilt (a fresh Vm per `runBlocking` body), so every request
+re-decoded the same bodies and the blocks piled up unfreed. The tracing GC never
+sees them (raw arena memory, not cells) — which is exactly why the live-cell
+histogram stayed flat while RSS climbed, and why more-frequent collection looked
+like more retention (it was re-decoding, not re-rooting). `decodeFuncBlocks` now
+memoises by `(section, offset)`: each body decodes once for the whole process.
 
-| mode | start | trajectory | rate | drops on idle? |
-|---|---|---|---|---|
-| gc (default 8 MB threshold) | 235 | → 337 MB over 7,500 req | ~13.6 KB/req | no |
-| gc (256 KB threshold) | 155 | → 2,715 MB over 3,000 req | ~850 KB/req | no |
-| free | 211 | → 4,150+ MB over 1,500 req, then dies at the cap | ~2.7 MB/req | n/a |
+Server RSS, gc, 512 KB threshold, mixed GET/POST:
 
-RSS climbs **monotonically and never drops on idle** — genuine retention, not GC
-sawtooth. It is **pathologically GC-frequency-sensitive**: collecting more often
-makes it ~60× worse. That inversion (more GC → more retention) is the strongest
-lead — request/connection state is being re-rooted or pinned across collections
-in the serve path. Despite task #6 ("Flatten ktor RSS… eliminate residual
-per-request leaks") being marked done, the real serving path is **not**
-leak-free. OPEN.
+| | before memo | after memo |
+|---|---|---|
+| start | 159 MB | 136 MB |
+| 4,000 req | 4,170 MB | 153 MB |
+| rate | ~1 MB/req | warmup only, then ~flat |
 
-## gc-as-default blocker (BUG: use-after-free on heavy coroutine I/O)
+`leaktrack` (which tracks the logical alloc/free set, not RSS high-water)
+confirms no unbounded per-request raw-temp leak remains: GET-only outstanding is
+**identical** at 10 and 40 requests (0 leak); the POST path's closure-metadata
+and scratch is **warmup** — it plateaus (`buildAstLambda` outstanding is the same
+at 42 and 102 POSTs) and the non-decode total decelerates ~7.5× between request
+windows. The residual slow RSS creep is slab high-water (pages not returned for
+half-full slabs), bounded by working-set churn, not an unbounded leak.
 
-Flipping the default reclaim mode to `gc` (the only mode that bounds long-run
-memory) surfaced a **deterministic use-after-free** that arena masks: a 1 MB+
-channel write crashes under gc with `BinOp.Less on null and 0` in
-`kotlinx.io.checkOffsetAndCount`. A collection fires *mid-write* in the writer
-coroutine and reclaims a live `Long` that a host call still holds — a
-host-keepalive gap (task #2, in_progress). The frame chain is GC-rooted, so the
-collected value is held only by a host function across a re-entry into Kotlin
-(the kotlinx.io Buffer/write path), not by `Frame.regs`.
+## gc-as-default blocker (FIXED: coroutine GC-root completeness)
 
-Small programs never allocate enough (>8 MB) to trigger a mid-coroutine
-collection, which is why the corpus passes under gc — but any heavy coroutine
-I/O (channels, ktor request/response bodies) can hit it. A deterministically-
-crashing default is worse than a leaky-but-correct one, so the default stays
-`arena` until host-keepalive is complete; `KLIO_RECLAIM=gc` remains selectable.
-Repro: `KLIO_RECLAIM=gc klio run --feature io.ktor/io <1MB-channel-write>`.
+The deterministic use-after-free on heavy coroutine I/O (a 1 MB+ channel write
+crashing under gc with `BinOp.Less on null` / `compareTo on KlioBlockingCoroutine`)
+was two coroutine GC-root gaps, both surfacing only once a closure body outlives
+a collection that fires mid-execution:
+
+1. A running/parked closure body holds only a *copy* of its capture values, not
+   the `IrClosure` value, so nothing marked its side-table slot — `reclaimDead`
+   recycled the id (aliasing a live closure) and swept its capture store. Fixed
+   by threading the closure id onto `Frame`/`FrameSnapshot` and re-rooting the
+   slot via `markClosureHook` while the body runs or sleeps.
+2. `drainLaunched` moved queued launch blocks out of the GC-rooted
+   `self.launched` into a local slice; while an earlier block ran and suspended,
+   the not-yet-started blocks were unrooted. Fixed by keepaliving the drained
+   batch across the pump loop.
+
+Repro now passes across thresholds 256 KB–8 MB and both slab/smp backends; the
+1 MB writer-parks program is a regression itest under `reclaim=gc`. Diagnostic
+`KLIO_GC_POISON` (quarantine-on-sweep, names the swept-while-live cell type)
+added for future root-completeness work.
 
 ### Path to making gc the default
-1. Complete host-keepalive (task #2): every host re-entry site that can trigger
-   a collection while holding a `Value` must `keepalivePush` it. The channel/
-   Buffer write path is the first confirmed gap.
-2. Re-run the full suite + ktor itests under gc-as-default (the validation that
-   found this); fix every UAF it surfaces (under-retention = crash, the
-   dangerous direction).
-3. Then flip `allocChoice()`'s unset default to `.gc` and re-validate.
+Both blockers (the UAF and the server leak) are now closed. Remaining before the
+flip: re-run the full suite + ktor itests under gc-as-default and fix any further
+UAF it surfaces, then flip `allocChoice()`'s unset default to `.gc`.
