@@ -125,13 +125,17 @@ pub fn reclaimRequested() bool {
         else => {},
     }
     const on = blk: {
+        // Unset is the tracing GC (the collector reclaims by reachability;
+        // refcount teardown stays off — `main.zig` forces `setReclaim(false)`).
         const v = getenvSlice("KLIO_RECLAIM") orelse break :blk false;
         // `free` selects a freeing allocator (see `main.zig`) while leaving
         // the refcount reclamation path OFF: it reclaims the host scratch and
         // container temporaries the run path explicitly frees, without
         // activating `ObjRef.deinit`'s value-graph teardown (not yet
-        // reconciled on the coroutine/ktor host path).
-        if (std.mem.eql(u8, v, "free")) break :blk false;
+        // reconciled on the coroutine/ktor host path). `arena`/`0` and `gc`
+        // also leave refcount teardown off (arena never frees; gc's collector
+        // reclaims instead).
+        if (std.mem.eql(u8, v, "free") or std.mem.eql(u8, v, "arena") or std.mem.eql(u8, v, "gc")) break :blk false;
         break :blk v.len != 0 and !std.mem.eql(u8, v, "0");
     };
     reclaim_req_state.store(if (on) 2 else 1, .monotonic);
@@ -143,8 +147,15 @@ pub fn reclaimRequested() bool {
 /// reclaim OFF.
 pub const AllocChoice = enum { arena, smp, debug, gc };
 pub fn allocChoice() AllocChoice {
+    // Default (unset): `arena`. The tracing GC (`gc`) is the goal default — it
+    // is the only mode that bounds memory for long-running processes — but it is
+    // not yet safe as the universal default: heavy coroutine I/O (e.g. a 1 MB+
+    // channel write) can trigger a collection mid-host-call that reclaims a live
+    // value not yet covered by host keepalive (a use-after-free; see the
+    // host-keepalive work). Until that is closed, `arena` (never-free, correct)
+    // stays the default; every mode is explicitly selectable for testing.
     const v = getenvSlice("KLIO_RECLAIM") orelse return .arena;
-    if (v.len == 0 or std.mem.eql(u8, v, "0")) return .arena;
+    if (v.len == 0 or std.mem.eql(u8, v, "arena") or std.mem.eql(u8, v, "0")) return .arena;
     if (std.mem.eql(u8, v, "debug")) return .debug;
     if (std.mem.eql(u8, v, "gc")) return .gc; // tracing GC (KGC)
     return .smp; // "free", "smp", "1", or any other non-zero value
