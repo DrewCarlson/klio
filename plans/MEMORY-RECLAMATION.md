@@ -1380,3 +1380,18 @@ the loaded mmap *is* the decoded form and only touched pages stay resident,
 eliminating the ~24.8 MB of node allocation outright (target ~Python-level).
 That is a dedicated rewrite of the codec and every consumer that holds an
 AST/IR pointer, and is the documented architectural end state.
+
+### Codec invariant (do not break): one registration per watched node
+
+The shared-graph codec numbers watched nodes by traversal order; a `*WatchedT`
+pointer encodes as a backref to that number. The encoder bumps `node_count`
+once per fresh watched node (`encodeValue`, top of fn) and the decoder appends
+once per watched node (`decodeInto`, top of fn) — they must stay in lockstep or
+every backref past the divergence resolves to the wrong node. A node-size pass
+on the image once accidentally left **two** identical `if (isWatched(T))
+append` blocks in `decodeInto`, doubling the decoder's indices: simple programs
+and the corpus dodged it (a misaimed backref rarely lands somewhere fatal), but
+the ktor itests crashed on a class primary-ctor default Expr that decoded to
+garbage. The regression test `codec resolves an external pointer aliasing a
+boxed Param default` locks the invariant. `KLIO_DECODE_STATS` reports per-type
+decode bytes/counts (peer to `KLIO_ALLOC_TRACK`) for targeting future shrinks.
