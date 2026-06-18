@@ -1209,3 +1209,40 @@ block's span was read from when the span read sat inline in the struct literal.
 Reading the span into a local first fixes it. The image is keyed by exe stamp +
 stdlib hash, but reproducible bytes keep the rebake-after-corruption path (and
 its test) stable.
+
+## Lazy image decode — progress and the IR blocker
+
+The startup baseline is being cut by decoding the baked stdlib image lazily
+instead of materialising the whole forest at process start.
+
+**Landed (committed): lazy inline AST bodies.** `inline`, object-free function
+bodies are held in a side section and decoded on first splice (the splice is a
+lower-time event, so the decode never races the GC). hello-world RSS **104 ->
+79 MB (arena), 95 -> 70 MB (gc)**; a map/filter/groupBy program **117 -> 91 MB**.
+See `src/interp_ir/prune.zig` (collectDeferrable) and the bake-time deferral in
+`src/interp_ir/image.zig` (mutate -> encode -> restore, so the freshly-built base
+keeps full bodies; the image future runs load is the deferred form).
+
+**Attempted, reverted: lazy IR function blocks (~12-18 MB more).** Object-free
+(`RegisterClass`/`BuildObject`/`AstLambda`-free) function `blocks` were deferred
+to a second self-contained section, decoded at frame entry
+(`runFrameInner`, the single chokepoint — `TailCallFunc` is self-recursive so
+`func == frame.func` throughout). hello-world fell to **62-67 MB**, plain and
+collection programs stayed correct, and the decode was proven byte-identical
+(round-trip check + section hash match bake vs load, no materialisation miss).
+**But every coroutine program StackOverflows on the cached path** — even
+`runBlocking { println(...) }`. The blocks decode correctly; with deferral
+*disabled* (all the code present, nothing deferred) the same program runs. So a
+deferred function's blocks, byte-identical but at a *new address* / with
+per-function (un-deduplicated) interior slices, break something identity- or
+sharing-sensitive in the suspend/resume + scheduler path. The cause was not
+found (no pointer-identity comparison on funcs/blocks in the coroutine host; the
+3 AST-referencing Insts are all excluded by `funcRefsAst`; the decode arena is
+the stable base arena). Reverted rather than ship a coroutine corruption.
+
+**To finish the IR tier** (the next ~15 MB), either root-cause the suspend/
+scheduler identity assumption a deferred-block function violates, or decode the
+deferred blocks *in the main decoder's registry context* (skip-and-reserve the
+node/slice indices at load, resume the decode lazily) so interior-slice
+deduplication is preserved exactly as the eager path has it. The AST skeleton
+(~25 MB) and the position-independent/mmap image remain the routes past that.
