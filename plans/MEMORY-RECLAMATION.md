@@ -1250,10 +1250,29 @@ reach all 30+ sites *and* keep `blocks[0].insts` content valid before any
 lower-time inlining/analysis reads it, which is too invasive to land safely
 against the coroutine suite. Reverted.
 
-**To finish the IR tier** (the next ~15 MB) the deferral must preserve the
-"has body" invariant without keeping the blocks resident — e.g. add an explicit
-`Func.body_state` (`present` / `deferred` / `none`) that every `blocks.len`
-check consults, and materialize at the single executor chokepoint
-(`runFrameInner`) *and* at the lower-time sites that read block content. The
-AST skeleton (~25 MB) and the position-independent/mmap image remain the routes
-past that.
+**IR tier — DONE.** The fix was exactly the predicted one: `Func.hasBody()`
+(`blocks.len != 0 or deferred_offset != 0`) now backs every "is this bodyless?"
+check across the lowerer and VM (host dispatch, overload selection, stub
+detection, the symbol-index settle), so a deferred function is never mistaken
+for a native/abstract stub. `Func.deferred_offset` carries the offset into the
+module's `deferred_func_section`; the executor materialises at the
+`runFrameInner` chokepoint, and `cloneForExtend` propagates the section so an
+extending run decodes into the base's process-lifetime arena. hello-world fell
+**79 -> 67 MB (arena), 70 -> 60 MB (gc)**; map/filter/groupBy **91 -> 79 MB**.
+Full suite, corpus, and ktor itests green; bake byte-reproducible.
+
+**Running totals (hello-world):** 104 -> 67 MB arena, 95 -> 60 MB gc — a ~36%
+cut from the lazy AST-body + lazy IR-block tiers combined. Post-tier footprint:
+`image.decode` 30.9 MB (mostly the AST skeleton) + `baseFromRoot` 12 MB (the
+ClassDef graph).
+
+**Remaining (the AST skeleton, ~25 MB) is the hard tier.** Unlike bodies/blocks,
+`lifted_decls` is *scanned* eagerly at every extend build —
+`for (bs.lifted_decls)` builds the class-name map, collects inline fns, and
+gathers top-level property names — and its function/class nodes are referenced
+by `MethodDef.decl` and `inline_ids`. Deferring it needs a different shape than
+lazy-decode: bake the scan *results* (the class map, an inline-fn registry, the
+top-prop set) so the extend build never walks the forest, then drop the
+top-level-function AST headers that duplicate the IR module's own
+`funcs[id].params` (verify the redundancy first). That, plus a
+position-independent/mmap'd image for what remains, is the route to Node-level.
