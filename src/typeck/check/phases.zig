@@ -244,7 +244,7 @@ pub fn checkCtorParamScopeDecl(self: *Checker, d: *const Decl) Allocator.Error!v
                                 try checkCtorParamInBody(self, body, &non_prop, &local);
                             }
                         },
-                        .Property => |*p| {
+                        .Property => |p| {
                             // Property initializers run during instance init —
                             // non-property ctor params are visible there.
                             // Accessor bodies are invoked post-construction and
@@ -289,7 +289,7 @@ pub fn collectMemberNameSet(self: *const Checker, c: *const Class) Allocator.Err
     for (c.members) |*m| {
         switch (m.*) {
             .Function => |*f| try out.put(f.name.name, {}),
-            .Property => |*p| try out.put(p.name.name, {}),
+            .Property => |p| try out.put(p.name.name, {}),
             else => {},
         }
     }
@@ -328,7 +328,7 @@ pub fn checkCtorParamInBlock(
                 try checkCtorParamInExpr(self, &a.value, non_prop, local);
             },
             .Decl => |*d| switch (d.*) {
-                .Property => |*p| {
+                .Property => |p| {
                     if (p.init) |*init| try checkCtorParamInExpr(self, init, non_prop, local);
                     try local.put(p.name.name, {});
                 },
@@ -495,7 +495,7 @@ pub fn checkPropertyInitializerCycles(self: *Checker, file: *const KotlinFile) A
     defer by_name.deinit();
     for (file.decls) |*d| {
         if (d.* == .Property and d.Property.init != null) {
-            const p = &d.Property;
+            const p = d.Property;
             const idx = props.items.len;
             try by_name.put(p.name.name, idx);
             try props.append(a, p);
@@ -610,7 +610,7 @@ pub fn checkTailrecFunction(self: *Checker, f: *const Function) Allocator.Error!
 
 pub fn checkPhaseFDecl(self: *Checker, d: *const Decl, scope: PhaseFScope) Allocator.Error!void {
     switch (d.*) {
-        .Property => |*p| {
+        .Property => |p| {
             if (p.is_const) try checkConstVal(self, p, scope);
             if (p.is_inline) try checkInlineProperty(self, p);
             // A property without a backing field cannot declare an
@@ -646,7 +646,7 @@ pub fn checkPhaseFDecl(self: *Checker, d: *const Decl, scope: PhaseFScope) Alloc
 
 pub fn checkPhaseHDecl(self: *Checker, d: *const Decl) Allocator.Error!void {
     switch (d.*) {
-        .Property => |*p| {
+        .Property => |p| {
             if (p.receiver_type == null) return;
             if (p.init != null) {
                 const msg = try std.fmt.allocPrint(
@@ -735,7 +735,7 @@ pub fn checkPhaseJDecl(self: *Checker, d: *const Decl, in_accessor: bool) Alloca
         .Class => |*c| {
             for (c.members) |*m| try checkPhaseJDecl(self, m, false);
         },
-        .Property => |*p| {
+        .Property => |p| {
             // Extension properties never have a backing field — any `field`
             // reference inside their accessors is invalid.
             const has_backing_field = p.receiver_type == null;
@@ -1138,7 +1138,7 @@ pub fn walkBlockForInlineEscape(
                 try walkExprForInlineEscape(self, &a.value, inline_params, crossinline_params, false);
             },
             .Decl => |*d| switch (d.*) {
-                .Property => |*p| {
+                .Property => |p| {
                     if (p.init) |*init| {
                         try flagInlineEscape(self, init, inline_params, crossinline_params, "stored in a variable");
                         try walkExprForInlineEscape(self, init, inline_params, crossinline_params, false);
@@ -1505,7 +1505,7 @@ pub fn checkValueClass(self: *Checker, c: *const Class) Allocator.Error!void {
     }
     for (c.members) |*m| {
         switch (m.*) {
-            .Property => |*p| {
+            .Property => |p| {
                 // Body properties with a backing field are forbidden: an
                 // initializer or `lateinit` implies a backing field. A body
                 // property with only a `get()` accessor is allowed.
@@ -1812,7 +1812,7 @@ pub fn checkDefinitelyNonNullDecl(
             var popped = tp_scope.pop().?;
             popped.deinit();
         },
-        .Property => |*p| {
+        .Property => |p| {
             if (p.ty) |*t| try checkDnnTyperef(self, t, tp_scope.items);
             if (p.init) |*init| try walkExprForDnn(self, init, tp_scope);
         },
@@ -2282,7 +2282,7 @@ fn annotationWalkFile(self: *Checker, meta: *const std.StringHashMap(AnnotationM
 fn annotationWalkDecl(self: *Checker, meta: *const std.StringHashMap(AnnotationMeta), d: *const Decl) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| try annotationWalkFunction(self, meta, f),
-        .Property => |*p| try annotationWalkProperty(self, meta, p, false),
+        .Property => |p| try annotationWalkProperty(self, meta, p, false),
         .Class => |*c| try annotationWalkClass(self, meta, c),
         .Object => |*o| {
             for (o.members) |*m| try annotationWalkDecl(self, meta, m);
@@ -2474,7 +2474,7 @@ fn collectRequiredOptIns(
                     try out.put(f.name.name, m);
                 } else allocator.free(m);
             },
-            .Property => |*p| {
+            .Property => |p| {
                 const m = try markerNamesIn(allocator, p.annotations, markers);
                 if (m.len != 0) {
                     try out.put(p.name.name, m);
@@ -2535,7 +2535,7 @@ fn walkDeclForOptIn(
             popN(scope, self_markers.len);
             popN(scope, added);
         },
-        .Property => |*p| {
+        .Property => |p| {
             const added = try pushScope(a, scope, p.annotations);
             const self_markers = try markerNamesIn(a, p.annotations, markers);
             defer a.free(self_markers);
@@ -2845,7 +2845,7 @@ fn collectDeprecationInfo(allocator: Allocator, decls: []const Decl, out: *std.S
             .Function => |*f| {
                 if (try parseDeprecation(allocator, f.annotations)) |info| try out.put(f.name.name, info);
             },
-            .Property => |*p| {
+            .Property => |p| {
                 if (try parseDeprecation(allocator, p.annotations)) |info| try out.put(p.name.name, info);
             },
             .Class => |*c| {
@@ -2871,7 +2871,7 @@ fn collectNonDeprecatedNames(allocator: Allocator, decls: []const Decl, out: *st
             .Function => |*f| {
                 if (try parseDeprecation(allocator, f.annotations) == null) try out.put(f.name.name, {});
             },
-            .Property => |*p| {
+            .Property => |p| {
                 if (try parseDeprecation(allocator, p.annotations) == null) try out.put(p.name.name, {});
             },
             .Class => |*c| {
@@ -2907,7 +2907,7 @@ fn walkDeclForDeprecation(
                 if (p.default) |*def| try walkExprForDeprecation(self, def, info, out);
             }
         },
-        .Property => |*p| {
+        .Property => |p| {
             if (p.init) |*init| try walkExprForDeprecation(self, init, info, out);
             if (p.getter) |*acc| try walkAccessorBodyDeprecation(self, &acc.body, info, out);
             if (p.setter) |*acc| try walkAccessorBodyDeprecation(self, &acc.body, info, out);

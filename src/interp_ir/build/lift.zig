@@ -180,13 +180,13 @@ pub fn collectEnclosingMemberNames(c: *const Class, out: *StringSet) Allocator.E
     }
     for (c.members) |*m| {
         switch (m.*) {
-            .Property => |*p| try out.put(try a.dupe(u8, p.name.name), {}),
+            .Property => |p| try out.put(try a.dupe(u8, p.name.name), {}),
             .Function => |*f| try out.put(try a.dupe(u8, f.name.name), {}),
             .Class => |*nested| {
                 if (nested.is_companion) {
                     for (nested.members) |*m2| {
                         switch (m2.*) {
-                            .Property => |*p| try out.put(try a.dupe(u8, p.name.name), {}),
+                            .Property => |p| try out.put(try a.dupe(u8, p.name.name), {}),
                             .Function => |*f| try out.put(try a.dupe(u8, f.name.name), {}),
                             else => {},
                         }
@@ -277,7 +277,7 @@ pub fn liftClassRecursive(
                 for (c.primary_params) |*p| try extras.put(try a.dupe(u8, p.name.name), {});
                 for (c.members) |*m2| {
                     switch (m2.*) {
-                        .Property => |*p| try extras.put(try a.dupe(u8, p.name.name), {}),
+                        .Property => |p| try extras.put(try a.dupe(u8, p.name.name), {}),
                         .Function => |*f| try extras.put(try a.dupe(u8, f.name.name), {}),
                         else => {},
                     }
@@ -307,7 +307,7 @@ pub fn liftClassRecursive(
                 for (c.primary_params) |*p| try extras.put(try a.dupe(u8, p.name.name), {});
                 for (c.members) |*m2| {
                     switch (m2.*) {
-                        .Property => |*p| try extras.put(try a.dupe(u8, p.name.name), {}),
+                        .Property => |p| try extras.put(try a.dupe(u8, p.name.name), {}),
                         .Function => |*f| try extras.put(try a.dupe(u8, f.name.name), {}),
                         else => {},
                     }

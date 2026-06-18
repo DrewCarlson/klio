@@ -41,7 +41,7 @@ pub fn lowerStmt(b: *FuncBuilder, stmt: *const Stmt) Allocator.Error!?Reg {
     switch (stmt.*) {
         .Expr => |*e| return try lowerExpr(b, e),
         .Decl => |*d| switch (d.*) {
-            .Property => |*p| return lowerPropertyDecl(b, p),
+            .Property => |p| return lowerPropertyDecl(b, p),
             .Function => |*f| return lowerLocalFnDecl(b, f),
             .Class => |*c| return lowerLocalClassDecl(b, c),
             else => return null,
@@ -773,7 +773,7 @@ test "val without annotation binds directly" {
     defer m.deinit(testing.allocator);
     var b = try FuncBuilder.init(testing.allocator, &m);
     defer b.deinit();
-    const p = ast.Property{
+    var p = ast.Property{
         .mutable = false,
         .name = .{ .name = "x", .span = dummySpan() },
         .receiver_type = null,
@@ -795,7 +795,7 @@ test "val without annotation binds directly" {
         .annotations = &.{},
         .span = dummySpan(),
     };
-    const s = Stmt{ .Decl = .{ .Property = p } };
+    const s = Stmt{ .Decl = .{ .Property = &p } };
     const r = try lowerStmt(&b, &s);
     try testing.expect(r == null);
     // `val x = 3` binds `x` to the init register without a home slot.
@@ -808,7 +808,7 @@ test "var declaration gets a mutable home slot" {
     defer m.deinit(testing.allocator);
     var b = try FuncBuilder.init(testing.allocator, &m);
     defer b.deinit();
-    const p = ast.Property{
+    var p = ast.Property{
         .mutable = true,
         .name = .{ .name = "n", .span = dummySpan() },
         .receiver_type = null,
@@ -830,7 +830,7 @@ test "var declaration gets a mutable home slot" {
         .annotations = &.{},
         .span = dummySpan(),
     };
-    const s = Stmt{ .Decl = .{ .Property = p } };
+    const s = Stmt{ .Decl = .{ .Property = &p } };
     _ = try lowerStmt(&b, &s);
     try testing.expect(b.isMutable("n"));
     try testing.expect(b.mutableHome("n") != null);
@@ -856,7 +856,7 @@ test "any-typed val is marked" {
         .annotations = &.{},
         .qualified_path = null,
     };
-    const p = ast.Property{
+    var p = ast.Property{
         .mutable = false,
         .name = .{ .name = "a", .span = dummySpan() },
         .receiver_type = null,
@@ -878,7 +878,7 @@ test "any-typed val is marked" {
         .annotations = &.{},
         .span = dummySpan(),
     };
-    const s = Stmt{ .Decl = .{ .Property = p } };
+    const s = Stmt{ .Decl = .{ .Property = &p } };
     _ = try lowerStmt(&b, &s);
     try testing.expect(b.isAnyTyped("a"));
 }
@@ -889,7 +889,7 @@ test "assign to var rebinds through the home slot" {
     var b = try FuncBuilder.init(testing.allocator, &m);
     defer b.deinit();
     // Set up `var n = 0` first.
-    const p = ast.Property{
+    var p = ast.Property{
         .mutable = true,
         .name = .{ .name = "n", .span = dummySpan() },
         .receiver_type = null,
@@ -911,7 +911,7 @@ test "assign to var rebinds through the home slot" {
         .annotations = &.{},
         .span = dummySpan(),
     };
-    const decl = Stmt{ .Decl = .{ .Property = p } };
+    const decl = Stmt{ .Decl = .{ .Property = &p } };
     _ = try lowerStmt(&b, &decl);
     const home = b.mutableHome("n").?;
     // `n = 5`

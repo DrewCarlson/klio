@@ -131,7 +131,7 @@ const Scan = struct {
                         }) catch {};
                     }
                 },
-                .Property => |*p| {
+                .Property => |p| {
                     const owner = propOwner(self.allocator, p, enclosing);
                     const has_body =
                         p.init != null or p.delegate != null or p.getter != null;

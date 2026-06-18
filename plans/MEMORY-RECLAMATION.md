@@ -1305,3 +1305,26 @@ architectural end state that reaches Node-level, and is a dedicated rewrite.
 
 The leak side is handled by the tracing GC (`KLIO_RECLAIM=gc`, bounded
 ~13 KB/req); under it the simple-program baseline is the 57 MB above.
+
+## AST node-size shrink — reducing per-node bytes, not node count
+
+The 29 MB residual is `image.decode` AST+IR *nodes*; the lever is each node's
+byte size, since the node *count* is fixed by the stdlib. The `ast.Decl` union
+dominated at **1760 B/node** (~5880 nodes, ~10.3 MB) because its widest variant
+was `Property` (1752 B — inline `init`/`delegate` `?Expr` plus `getter`/`setter`
+`?Accessor`). Every `Decl`, including the thousands that are functions, paid the
+full Property width.
+
+**Property variant boxing — DONE.** `Decl.Property` is now `*Property` (a heap
+pointer), so the union's widest variant falls to `Function` (632 B) and
+`sizeof(Decl)` drops 1760 -> ~640. `Property` is a watched codec type, so the
+shared-graph encoder/decoder handles `*Property` automatically and keeps the
+pointee heap-stable — preserving the interior pointer `ClassDef.body_properties`
+holds into `ast.Property.getter`. hello-world **64 -> ~60 MB (arena),
+57 -> ~51 MB (gc)**; the map/filter/groupBy stdlib-heavy program **58 -> ~49 MB
+(gc)**. Full suite, both corpora (88/88 arena + gc), and bake determinism green.
+
+Next node-size levers (same approach): box `Function.body` (`?FunctionBody`,
+280 B) to drop `sizeof(Function)` 632 -> ~360 and `sizeof(Decl)` to ~368; shrink
+`Property` itself (box its `init`/`delegate`/`getter`/`setter`) so the boxed
+Property nodes stop costing 1752 B each.

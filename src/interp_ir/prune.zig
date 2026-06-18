@@ -132,7 +132,7 @@ fn stmtHasObject(s: *const Stmt) bool {
 fn declHasObject(d: *const Decl) bool {
     return switch (d.*) {
         .Function => |*f| if (f.body) |*b| fnBodyHasObject(b) else false,
-        .Property => |*p| {
+        .Property => |p| {
             if (p.init) |*e| if (exprHasObject(e)) return true;
             if (p.delegate) |*e| if (exprHasObject(e)) return true;
             if (p.getter) |*acc| if (fnBodyHasObject(&acc.body)) return true;

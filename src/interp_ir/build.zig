@@ -410,7 +410,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer name_counts.deinit();
         for (decls.items) |*d| {
             if (d.* != .Property) continue;
-            const p = &d.Property;
+            const p = d.Property;
             if (p.receiver_type != null) continue;
             const fid = p.span.file.int();
             const gop = try name_counts.getOrPut(p.name.name);
@@ -425,7 +425,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         // declaring file rewrite to them.
         for (decls.items) |*d| {
             if (d.* != .Property) continue;
-            const p = &d.Property;
+            const p = d.Property;
             if (p.receiver_type != null) continue;
             if (p.visibility != .Private or p.is_expect or p.is_actual) continue;
             const count = name_counts.get(p.name.name) orelse 0;
@@ -448,7 +448,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         }
         for (decls.items) |*d| {
             if (d.* != .Property) continue;
-            const p = &d.Property;
+            const p = d.Property;
             if (p.receiver_type != null) continue;
             if (p.visibility == .Private or p.is_expect or p.is_actual) continue;
             const count = name_counts.get(p.name.name) orelse 0;
@@ -462,7 +462,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             var other_pkg = false;
             for (decls.items) |*d2| {
                 if (d2.* != .Property) continue;
-                const q = &d2.Property;
+                const q = d2.Property;
                 if (q.receiver_type != null or q.is_expect or q.is_actual) continue;
                 if (q.visibility == .Private) continue;
                 if (!std.mem.eql(u8, q.name.name, p.name.name)) continue;
@@ -650,7 +650,7 @@ fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *
             for (o.members) |*m| try collectDeclPkgs(allocator, m, pkg, out);
         },
         .Function => |*f| try out.put(f.span, pkg),
-        .Property => |*p| try out.put(p.span, pkg),
+        .Property => |p| try out.put(p.span, pkg),
         else => {},
     }
 }
@@ -714,7 +714,7 @@ fn collectClassMemberNamesInto(out: *StringSet, primary_params: []const ast.Clas
     for (members) |*m| {
         switch (m.*) {
             .Function => |*f| try out.put(f.name.name, {}),
-            .Property => |*p| try out.put(p.name.name, {}),
+            .Property => |p| try out.put(p.name.name, {}),
             .Class => |*c| try collectClassMemberNamesInto(out, c.primary_params, c.members),
             .Object => |*o| try collectClassMemberNamesInto(out, &.{}, o.members),
             else => {},
@@ -759,7 +759,7 @@ fn collectHierarchyMemberNames(start: []const u8, by_name: *const FileClasses, o
     for (c.members) |*m| {
         switch (m.*) {
             .Function => |*f| try out.put(f.name.name, {}),
-            .Property => |*p| try out.put(p.name.name, {}),
+            .Property => |p| try out.put(p.name.name, {}),
             else => {},
         }
     }
@@ -1067,7 +1067,7 @@ fn buildModuleWithOverrides(
             .Function => |*f| if (f.is_actual) try actual_func_names.put(f.name.name, {}),
             .Class => |*c| if (c.is_actual) try actual_class_names_set.put(c.name.name, {}),
             .Object => |*o| if (o.is_actual) try actual_object_names_set.put(o.name.name, {}),
-            .Property => |*p| if (p.is_actual) try actual_prop_names.put(p.name.name, {}),
+            .Property => |p| if (p.is_actual) try actual_prop_names.put(p.name.name, {}),
             else => {},
         }
     }
@@ -1153,7 +1153,7 @@ fn buildModuleWithOverrides(
         for (decls) |*d| {
             switch (d.*) {
                 .Class => |*c| try collectConsts(module, c.name.name, c.members),
-                .Property => |*p| if (p.is_const) {
+                .Property => |p| if (p.is_const) {
                     if (p.init) |*init| {
                         if (literalToConst(init)) |cst| {
                             try module.registry.class_const_inits.put(.{ .a = "", .b = p.name.name }, cst);
@@ -1305,14 +1305,14 @@ fn buildModuleWithOverrides(
             for (bs.lifted_decls) |*d| {
                 if (d.* == .Property and d.Property.receiver_type == null) {
                     try top_props.put(d.Property.name.name, {});
-                    try notePropScope(a, module, func_fqn_overrides, decl_pkg, package_prefix, &d.Property);
+                    try notePropScope(a, module, func_fqn_overrides, decl_pkg, package_prefix, d.Property);
                 }
             }
         }
         for (decls) |*d| {
             if (d.* == .Property and d.Property.receiver_type == null) {
                 try top_props.put(d.Property.name.name, {});
-                try notePropScope(a, module, func_fqn_overrides, decl_pkg, package_prefix, &d.Property);
+                try notePropScope(a, module, func_fqn_overrides, decl_pkg, package_prefix, d.Property);
             }
         }
         ir.lower.setTopLevelPropNames(top_props);
@@ -1580,7 +1580,7 @@ fn buildModuleWithOverrides(
         }
         for (c.members) |*m| {
             switch (m.*) {
-                .Property => |*p| try own_members.put(p.name.name, {}),
+                .Property => |p| try own_members.put(p.name.name, {}),
                 .Function => |*f| try own_members.put(f.name.name, {}),
                 else => {},
             }
@@ -1615,7 +1615,7 @@ fn buildModuleWithOverrides(
         const body_prop_dual = !std.mem.eql(u8, body_prop_cfqn, c.name.name);
         for (c.members) |*m| {
             if (m.* != .Property) continue;
-            const p = &m.Property;
+            const p = m.Property;
             if (p.init) |*init| {
                 const nm = try std.fmt.allocPrint(a, "__init_prop_{s}_{s}", .{ c.name.name, p.name.name });
                 const fid = try ir.lower.lowerAccessorExprWithExpected(module, c.name.name, &own_members, prop_init_params.items, init, nm, p.ty);
@@ -1896,7 +1896,7 @@ fn buildModuleWithOverrides(
         }
         for (c.members) |*m| {
             switch (m.*) {
-                .Property => |*p| try own_members.put(p.name.name, {}),
+                .Property => |p| try own_members.put(p.name.name, {}),
                 .Function => |*f| try own_members.put(f.name.name, {}),
                 else => {},
             }
@@ -1970,14 +1970,14 @@ fn buildModuleWithOverrides(
         }
         for (c.members) |*m| {
             switch (m.*) {
-                .Property => |*p| try own_members.put(p.name.name, {}),
+                .Property => |p| try own_members.put(p.name.name, {}),
                 .Function => |*f| try own_members.put(f.name.name, {}),
                 .Class => |*inner| if (inner.is_companion) {
                     try own_members.put(inner.name.name, {});
                     for (inner.members) |*cm| {
                         switch (cm.*) {
                             .Function => |*f| try own_members.put(f.name.name, {}),
-                            .Property => |*p| try own_members.put(p.name.name, {}),
+                            .Property => |p| try own_members.put(p.name.name, {}),
                             else => {},
                         }
                     }
@@ -2050,7 +2050,7 @@ fn buildModuleWithOverrides(
     var top_level_delegated_props = if (seed) |*s| s.top_level_delegated_props else std.StringHashMap(void).init(a);
     for (decls) |*d| {
         if (d.* != .Property) continue;
-        const p = &d.Property;
+        const p = d.Property;
         if (p.receiver_type != null or !p.is_const) continue;
         const tp_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
         const prev_tp_pkg = ir.lower.decl.setLowerSelfPackage(tp_pkg);
@@ -2063,7 +2063,7 @@ fn buildModuleWithOverrides(
     }
     for (decls) |*d| {
         if (d.* != .Property) continue;
-        const p = &d.Property;
+        const p = d.Property;
         if (p.receiver_type != null or p.is_const) continue;
         const tp_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
         const prev_tp_pkg = ir.lower.decl.setLowerSelfPackage(tp_pkg);
@@ -2094,15 +2094,15 @@ fn buildModuleWithOverrides(
     defer ext_prop_decls.deinit(a);
     for (decls) |*d| {
         switch (d.*) {
-            .Property => |*p| if (p.receiver_type != null) try ext_prop_decls.append(a, .{ .p = p, .owner = null }),
+            .Property => |p| if (p.receiver_type != null) try ext_prop_decls.append(a, .{ .p = p, .owner = null }),
             .Class => |*c| {
                 for (c.members) |*m| {
-                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, .{ .p = &m.Property, .owner = c.name.name });
+                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, .{ .p = m.Property, .owner = c.name.name });
                 }
             },
             .Object => |*o| {
                 for (o.members) |*m| {
-                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, .{ .p = &m.Property, .owner = o.name.name });
+                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, .{ .p = m.Property, .owner = o.name.name });
                 }
             },
             else => {},
@@ -2306,7 +2306,7 @@ fn resolveMangled(allocator: Allocator, mangled_nested: *const lift.MangledMap, 
 fn collectConsts(module: *Module, cls_name: []const u8, members: []const Decl) Allocator.Error!void {
     for (members) |*m| {
         switch (m.*) {
-            .Property => |*p| if (p.is_const) {
+            .Property => |p| if (p.is_const) {
                 if (p.init) |*init| {
                     if (literalToConst(init)) |c| {
                         try module.registry.class_const_inits.put(.{ .a = cls_name, .b = p.name.name }, c);
@@ -2342,7 +2342,7 @@ fn collectCompanionOwnMembers(c: *const ast.Class, own: *StringSet) Allocator.Er
             for (inner.members) |*cm| {
                 switch (cm.*) {
                     .Function => |*f| try own.put(f.name.name, {}),
-                    .Property => |*p| try own.put(p.name.name, {}),
+                    .Property => |p| try own.put(p.name.name, {}),
                     else => {},
                 }
             }
@@ -2374,7 +2374,7 @@ fn buildClassDef(
     var body_props: std.ArrayList(PropertyDef) = .empty;
     for (c.members) |*m| {
         if (m.* != .Property) continue;
-        const p = &m.Property;
+        const p = m.Property;
         try body_props.append(a, .{
             .name = p.name.name,
             .mutable = p.mutable,
@@ -2621,7 +2621,7 @@ fn retainDecl(
         },
         .Class => |*c| return !(c.is_expect and actual_class_names_set.contains(c.name.name)),
         .Object => |*o| return !(o.is_expect and actual_object_names_set.contains(o.name.name)),
-        .Property => |*p| {
+        .Property => |p| {
             if (std.mem.eql(u8, p.name.name, "coroutineContext") or std.mem.eql(u8, p.name.name, "isInitialized")) return false;
             return !(p.is_expect and actual_prop_names.contains(p.name.name));
         },
@@ -2792,7 +2792,7 @@ pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocato
 fn noteBaseDeclNames(base: *StdlibBase, d: *const Decl) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| try base.decl_names.put(f.name.name, {}),
-        .Property => |*p| try base.decl_names.put(p.name.name, {}),
+        .Property => |p| try base.decl_names.put(p.name.name, {}),
         .Class => |*c| {
             try base.decl_names.put(c.name.name, {});
             try base.type_names.put(c.name.name, {});
@@ -2836,7 +2836,7 @@ pub fn canExtendBase(base: *const StdlibBase, user_files: []const KotlinFile) bo
                     if (fd.is_expect or fd.is_actual) return false;
                     if (base.decl_names.contains(fd.name.name)) return false;
                 },
-                .Property => |*pd| {
+                .Property => |pd| {
                     if (pd.is_expect or pd.is_actual) return false;
                     if (base.decl_names.contains(pd.name.name)) return false;
                 },

@@ -130,7 +130,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                 }
             }
         },
-        .Property => |*p| {
+        .Property => |p| {
             const ty = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
             const cn = if (p.ty) |*pt| classNameFromTyperef(pt) else null;
             if (p.receiver_type) |*recv| {
@@ -470,7 +470,7 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                 }
                 try info.member_visibility.put(f.name.name, f.visibility);
             },
-            .Property => |*p| {
+            .Property => |p| {
                 const ty = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
                 try info.member_sigs.put(p.name.name, .{ .Property = .{
                     .ty = try ty.clone(self.allocator),
@@ -508,7 +508,7 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
 pub fn checkDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
     switch (decl.*) {
         .Function => |*f| try checkFunction(self, f),
-        .Property => |*p| try checkTopLevelProperty(self, p),
+        .Property => |p| try checkTopLevelProperty(self, p),
         .Class => |*c| try checkClass(self, c),
         .Object => |*o| try checkObject(self, o),
         .TypeAlias => {},
@@ -1059,7 +1059,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
                     try checkPrivateOpenOrOverride(self, f.name.name, f.name.span, f.is_open, f.is_abstract, f.is_override);
                 }
             },
-            .Property => |*p| {
+            .Property => |p| {
                 if (p.visibility == .Private) {
                     try checkPrivateOpenOrOverride(self, p.name.name, p.name.span, false, p.is_abstract, p.is_override);
                 }
@@ -1103,7 +1103,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
                     .has_default_body = f.body != null and !f.is_abstract,
                 };
             },
-            .Property => |*p| {
+            .Property => |p| {
                 mname = p.name.name;
                 mspan = p.name.span;
                 mflags = .{
@@ -1170,7 +1170,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
                 }
                 try checkOverrideVisibility(self, f.name.name, f.name.span, f.visibility, base.visibility);
             },
-            .Property => |*p| {
+            .Property => |p| {
                 if (!p.is_override) continue;
                 const got = inherited_sigs.get(p.name.name) orelse continue;
                 if (got != .Property) continue;
@@ -1245,7 +1245,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         for (c.members) |*m| {
             switch (m.*) {
                 .Function => |*f| if (f.is_override) try class_overrides.put(f.name.name, {}),
-                .Property => |*p| if (p.is_override) try class_overrides.put(p.name.name, {}),
+                .Property => |p| if (p.is_override) try class_overrides.put(p.name.name, {}),
                 else => {},
             }
         }
@@ -1287,11 +1287,11 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
 
     // `lateinit` compile-time rules.
     for (c.members) |*m| {
-        if (m.* == .Property) try checkLateinit(self, &m.Property);
+        if (m.* == .Property) try checkLateinit(self, m.Property);
     }
     // Accessor return-type annotation.
     for (c.members) |*m| {
-        if (m.* == .Property) try checkAccessorReturnTypes(self, &m.Property);
+        if (m.* == .Property) try checkAccessorReturnTypes(self, m.Property);
     }
 
     try pushFrame(self);
@@ -1319,7 +1319,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
     defer uninitialized_properties.deinit(self.allocator);
     for (c.members) |*m| {
         if (m.* != .Property) continue;
-        const p = &m.Property;
+        const p = m.Property;
         if (p.init) |*init| {
             var want: ?Type = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else null;
             var ity = try self.checkExpr(init, if (want) |*a| a else null);
@@ -1880,7 +1880,7 @@ pub fn checkObject(self: *Checker, o: *const ObjectDecl) Allocator.Error!void {
     try pushFrame(self);
     for (o.members) |*m| {
         switch (m.*) {
-            .Property => |*p| {
+            .Property => |p| {
                 if (p.init) |*init| {
                     var want: ?Type = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else null;
                     var ity = try self.checkExpr(init, if (want) |*a| a else null);

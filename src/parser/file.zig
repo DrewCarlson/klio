@@ -258,7 +258,11 @@ pub fn parseTopDecl(p: *Parser) ?Decl {
                 return null;
             },
             .Val, .Var => {
-                if (members.parsePropertyWithFlags(p, flags)) |prop| return Decl{ .Property = prop };
+                if (members.parsePropertyWithFlags(p, flags)) |prop| {
+                    const pp = p.allocator.create(ast.Property) catch @panic("OOM");
+                    pp.* = prop;
+                    return Decl{ .Property = pp };
+                }
                 return null;
             },
             .Class, .Interface => {

@@ -354,7 +354,9 @@ pub fn synthesizeClassInitBody(self: *const Checker, c: *const Class) Allocator.
                 .visibility = p.visibility,
                 .annotations = &.{},
             };
-            try stmts.append(self.allocator, .{ .Decl = .{ .Property = shadow } });
+            const sp = try self.allocator.create(Property);
+            sp.* = shadow;
+            try stmts.append(self.allocator, .{ .Decl = .{ .Property = sp } });
         }
     }
     // Walk members in source order so property initializers

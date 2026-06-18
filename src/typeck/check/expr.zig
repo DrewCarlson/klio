@@ -155,7 +155,7 @@ pub fn checkStmt(self: *Checker, stmt: *const Stmt, expected: ?*const Type) Allo
 pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
     const a = self.allocator;
     switch (decl.*) {
-        .Property => |*p| {
+        .Property => |p| {
             var annot: ?Type = if (p.ty) |*t| try convertTypeRefLossyH(a, t) else null;
             defer if (annot) |*an| an.deinit(a);
 
@@ -1154,7 +1154,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             for (oe.members) |*m| {
                 switch (m.*) {
                     .Function => |*f| try decl_mod.checkFunction(self, f),
-                    .Property => |*p| {
+                    .Property => |p| {
                         if (p.init) |*init| {
                             var it = try self.checkExpr(init, null);
                             it.deinit(a);

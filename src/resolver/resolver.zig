@@ -604,7 +604,7 @@ const Resolver = struct {
     fn resolveDecl(self: *Resolver, scope: ScopeId, decl: *const Decl, is_top_level: bool) ResolveError!void {
         switch (decl.*) {
             .Function => |*f| try self.resolveFunction(scope, f),
-            .Property => |*p| try self.resolveProperty(scope, p, is_top_level),
+            .Property => |p| try self.resolveProperty(scope, p, is_top_level),
             .Class => |*c| try self.resolveClassBody(scope, c.primary_params, c.init_blocks, c.members),
             .Object => |*o| try self.resolveClassBody(scope, &.{}, o.init_blocks, o.members),
             .TypeAlias => {
@@ -754,7 +754,7 @@ const Resolver = struct {
                     // Name is pre-declared by `resolveBlock`; resolve body.
                     try self.resolveFunction(scope, f);
                 },
-                .Property => |*p| {
+                .Property => |p| {
                     if (p.init) |*p_init| {
                         try self.resolveExpr(scope, p_init);
                     }
@@ -1004,7 +1004,7 @@ const Resolver = struct {
                     }
                 }
             },
-            .Property => |*p| {
+            .Property => |p| {
                 if (p.init) |*e| {
                     try self.resolveExpr(scope, e);
                 }
@@ -1556,8 +1556,8 @@ test "shadowing in inner scope emits r0002" {
     const call = callExpr(&println_callee, &args);
 
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = x1 } },
-        .{ .Decl = .{ .Property = x2 } },
+        .{ .Decl = .{ .Property = &x1 } },
+        .{ .Decl = .{ .Property = &x2 } },
         .{ .Expr = call },
     };
     var main_fn = emptyFn("main");
@@ -1712,8 +1712,8 @@ test "unnecessary safe call on non nullable" {
     n_prop.init = member;
 
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = s_prop } },
-        .{ .Decl = .{ .Property = n_prop } },
+        .{ .Decl = .{ .Property = &s_prop } },
+        .{ .Decl = .{ .Property = &n_prop } },
     };
     var main_fn = emptyFn("main");
     main_fn.body = .{ .Block = .{ .stmts = &stmts, .span = ts() } };
@@ -1748,8 +1748,8 @@ test "safe call on nullable is silent" {
     n_prop.init = member;
 
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = s_prop } },
-        .{ .Decl = .{ .Property = n_prop } },
+        .{ .Decl = .{ .Property = &s_prop } },
+        .{ .Decl = .{ .Property = &n_prop } },
     };
     var main_fn = emptyFn("main");
     main_fn.body = .{ .Block = .{ .stmts = &stmts, .span = ts() } };
@@ -1832,7 +1832,7 @@ test "forward reference to local val in statement scope errors" {
 
     var stmts = [_]Stmt{
         .{ .Expr = call },
-        .{ .Decl = .{ .Property = x_prop } },
+        .{ .Decl = .{ .Property = &x_prop } },
     };
     var main_fn = emptyFn("main");
     main_fn.body = .{ .Block = .{ .stmts = &stmts, .span = ts() } };
@@ -1876,7 +1876,7 @@ test "object literal member forward reference resolves" {
 
     var obj_members = [_]Decl{
         .{ .Function = hello_impl },
-        .{ .Property = name_prop },
+        .{ .Property = &name_prop },
     };
     var greeter_super = [_]ast.TypeRef{typeRef("Greeter", false)};
     var super_args = [_]?[]Expr{null};
@@ -1909,7 +1909,7 @@ test "object literal member forward reference resolves" {
     const println_call = callExpr(&println_callee, &println_args);
 
     var main_stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = g_prop } },
+        .{ .Decl = .{ .Property = &g_prop } },
         .{ .Expr = println_call },
     };
     var main_fn = emptyFn("main");
@@ -1946,8 +1946,8 @@ test "safe call without annotation is silent" {
     n_prop.init = member;
 
     var stmts = [_]Stmt{
-        .{ .Decl = .{ .Property = s_prop } },
-        .{ .Decl = .{ .Property = n_prop } },
+        .{ .Decl = .{ .Property = &s_prop } },
+        .{ .Decl = .{ .Property = &n_prop } },
     };
     var main_fn = emptyFn("main");
     main_fn.body = .{ .Block = .{ .stmts = &stmts, .span = ts() } };

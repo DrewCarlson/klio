@@ -456,7 +456,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
     var body_props: std.ArrayList(PropertyDef) = .empty;
     for (class.members) |*m| {
         if (m.* != .Property) continue;
-        const p = &m.Property;
+        const p = m.Property;
         try body_props.append(allocator, .{
             .name = p.name.name,
             .mutable = p.mutable,
@@ -550,7 +550,7 @@ fn collectOwnMembers(class: *const ast.Class, out: *StringSet) Allocator.Error!v
     }
     for (class.members) |*m| {
         switch (m.*) {
-            .Property => |*p| try out.put(p.name.name, {}),
+            .Property => |p| try out.put(p.name.name, {}),
             .Function => |*f| try out.put(f.name.name, {}),
             else => {},
         }
