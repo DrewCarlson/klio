@@ -18,6 +18,7 @@ const span = @import("span");
 const stdlib = @import("stdlib");
 
 pub const lift = @import("build/lift.zig");
+const prune = @import("prune.zig");
 
 const Allocator = std.mem.Allocator;
 const Module = ir.Module;
@@ -2762,6 +2763,11 @@ pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocato
         }
         base.enum_id_next = 1 + n;
     }
+
+    // A non-inline base function never runs from its AST body (its lowered IR
+    // does); strip those bodies so the baked image and the resident forest drop
+    // the dead statement trees while keeping the metadata dispatch reads.
+    prune.stripDeadBodies(@constCast(base.lifted_decls));
 
     return base;
 }
