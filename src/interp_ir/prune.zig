@@ -27,25 +27,31 @@ const Stmt = ast.Stmt;
 const Expr = ast.Expr;
 
 /// Replace the bodies of non-inline, object-free functions across `decls`
-/// (recursing into class / object members) with an empty block.
+/// (recursing into class / object members) with an empty block. A non-inline,
+/// object-free *top-level* function additionally drops its signature (params,
+/// type params, receiver, return type, annotations): its AST declaration is
+/// never read again — resolution binds through the baked symbol index and the
+/// lowered IR func, calls dispatch by `FuncId`, and only class members are read
+/// back through `MethodDef.decl`. Inline functions (spliced) and class members
+/// keep their full signatures.
 pub fn stripDeadBodies(decls: []Decl) void {
-    for (decls) |*d| pruneDecl(d);
+    for (decls) |*d| pruneDecl(d, true);
 }
 
-fn pruneDecl(d: *Decl) void {
+fn pruneDecl(d: *Decl, top_level: bool) void {
     switch (d.*) {
-        .Function => |*f| pruneFunction(f),
+        .Function => |*f| pruneFunction(f, top_level),
         .Class => |*c| {
-            for (c.members) |*m| pruneDecl(m);
+            for (c.members) |*m| pruneDecl(m, false);
         },
         .Object => |*o| {
-            for (o.members) |*m| pruneDecl(m);
+            for (o.members) |*m| pruneDecl(m, false);
         },
         .Property, .TypeAlias => {},
     }
 }
 
-fn pruneFunction(f: *Function) void {
+fn pruneFunction(f: *Function, top_level: bool) void {
     if (f.body) |*body| {
         // Keep inline bodies (spliced into user code at lower time) and any body
         // that materialises an anonymous object at runtime.
@@ -58,6 +64,14 @@ fn pruneFunction(f: *Function) void {
         // Drop the statements; keep `body != null` so dispatch still treats the
         // method as concrete.
         f.body = .{ .Block = .{ .stmts = &.{}, .span = sp } };
+        if (top_level) {
+            f.receiver_type = null;
+            f.type_params = &.{};
+            f.where_bounds = &.{};
+            f.params = &.{};
+            f.return_type = null;
+            f.annotations = &.{};
+        }
     }
 }
 
@@ -248,7 +262,7 @@ fn tIntStmt() Stmt {
 test "non-inline body is stripped, span preserved" {
     var stmts = [_]Stmt{tIntStmt()};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(42, 99) } }, false);
-    pruneFunction(&f);
+    pruneFunction(&f, true);
     // Body kept (concrete sentinel) but statements dropped.
     try testing.expect(f.body != null);
     try testing.expect(f.body.? == .Block);
@@ -261,7 +275,7 @@ test "non-inline body is stripped, span preserved" {
 
 test "expression body is stripped, its span preserved" {
     var f = tFn(.{ .Expr = .{ .IntLit = .{ .value = 1, .kind = .Int, .span = tSpan(7, 13) } } }, false);
-    pruneFunction(&f);
+    pruneFunction(&f, true);
     try testing.expect(f.body.? == .Block);
     try testing.expectEqual(@as(usize, 0), f.body.?.Block.stmts.len);
     try testing.expectEqual(@as(u32, 7), f.body.?.Block.span.start);
@@ -271,7 +285,7 @@ test "expression body is stripped, its span preserved" {
 test "inline body is left intact" {
     var stmts = [_]Stmt{tIntStmt()};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } }, true);
-    pruneFunction(&f);
+    pruneFunction(&f, true);
     try testing.expectEqual(@as(usize, 1), f.body.?.Block.stmts.len);
 }
 
@@ -287,13 +301,13 @@ test "object-bearing body is left intact" {
     } };
     var stmts = [_]Stmt{.{ .Expr = obj }};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } }, false);
-    pruneFunction(&f);
+    pruneFunction(&f, true);
     // Must keep the statements: the runtime materialises the object from them.
     try testing.expectEqual(@as(usize, 1), f.body.?.Block.stmts.len);
 }
 
 test "abstract body (null) stays null" {
     var f = tFn(null, false);
-    pruneFunction(&f);
+    pruneFunction(&f, true);
     try testing.expect(f.body == null);
 }
