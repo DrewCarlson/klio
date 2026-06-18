@@ -89,6 +89,20 @@ const SCRATCH_HOME = "/tmp/klio_itest_channel_home";
 const TMP_DIR = "/tmp/klio_itest_channel";
 
 fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
+    return runProgramReclaim(name, src, expected, false);
+}
+
+/// Like `runProgram` but selects the tracing GC reclaim mode with a low
+/// collection threshold (256 KB) so a collection fires repeatedly *during* the
+/// channel I/O. This is the regression gate for coroutine GC-root completeness:
+/// a closure body (a `launch`ed block) or a not-yet-started launched block that
+/// outlives a mid-flight collection must keep its side-table slot and capture
+/// store rooted, or the resumed body reads reclaimed/swept state and crashes.
+fn runProgramGc(name: []const u8, src: []const u8, expected: []const u8) !void {
+    return runProgramReclaim(name, src, expected, true);
+}
+
+fn runProgramReclaim(name: []const u8, src: []const u8, expected: []const u8, gc: bool) !void {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -99,6 +113,10 @@ fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
     if (!packs_installed) {
         try installPacks(a, io, &env, SCRATCH_HOME);
         packs_installed = true;
+    }
+    if (gc) {
+        try env.put("KLIO_RECLAIM", "gc");
+        try env.put("KLIO_GC_THRESHOLD_KB", "256");
     }
 
     const cwd = std.Io.Dir.cwd();
@@ -172,6 +190,44 @@ test "reader parks on awaitContent and a later writer resumes it" {
 
 test "writer parks on flush past CHANNEL_MAX_SIZE and the reader resumes it" {
     try runProgram("channel_writer_parks",
+        \\import io.ktor.utils.io.*
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.io.readByteArray
+        \\
+        \\fun main() = runBlocking {
+        \\    val ch = ByteChannel()
+        \\    val big = ByteArray(1024 * 1024 + 64) { (it % 251).toByte() }
+        \\    val writer = launch {
+        \\        println("writer: writing " + big.size)
+        \\        ch.writeByteArray(big)
+        \\        ch.flushAndClose()
+        \\        println("writer: closed")
+        \\    }
+        \\    delay(10)
+        \\    val got = ch.readRemaining().readByteArray()
+        \\    writer.join()
+        \\    println("reader: size=" + got.size + " ok=" + got.contentEquals(big))
+        \\}
+        \\
+    ,
+        \\writer: writing 1048640
+        \\writer: closed
+        \\reader: size=1048640 ok=true
+        \\
+    );
+}
+
+test "writer parks past CHANNEL_MAX_SIZE survives repeated GC mid-write (reclaim=gc)" {
+    // Same 1 MB+ channel write as above, but under the tracing GC with a 256 KB
+    // collection floor: a collection fires many times *while the writer body
+    // runs and parks*. The writer is a `launch`ed closure whose block lives only
+    // in the pump's drained-launched slice and whose body frame holds a copy of
+    // its captures — neither pins the closure side-table slot, so without the
+    // launched-block keepalive + the frame's `closure_id` root the slot is
+    // reclaimed (its id recycled) and its capture store swept out from under the
+    // resumed body. The pre-fix failure was `BinOp.Less on null` /
+    // `compareTo on KlioBlockingCoroutine` inside the kotlinx-io transfer path.
+    try runProgramGc("channel_writer_parks_gc",
         \\import io.ktor.utils.io.*
         \\import kotlinx.coroutines.*
         \\import kotlinx.io.readByteArray

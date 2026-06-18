@@ -170,7 +170,10 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .host = intrinsic.intrinsicHost(),
         .allocator = allocator,
     };
+    const prev_fqn_lt = runtime.leaktrack.current_fqn;
+    runtime.leaktrack.current_fqn = fqn;
     const r = try func(&ctx);
+    runtime.leaktrack.current_fqn = prev_fqn_lt;
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = runtimeErrorToEval(allocator, e) },

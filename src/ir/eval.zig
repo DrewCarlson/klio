@@ -249,6 +249,7 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
         for (f.params.items) |v| v.gcMark(m);
         for (f.captures.items) |v| v.gcMark(m);
         for (f.enclosing_this.items) |e| e.v.gcMark(m);
+        markFrameClosure(f.closure_id, m);
     }
     // Not-yet-rebuilt snapshots of every in-flight resume on this thread.
     var r = anchor.resuming.*;
@@ -262,7 +263,19 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
             for (snap.params) |v| v.gcMark(m);
             for (snap.captures) |v| v.gcMark(m);
             for (snap.enclosing_this) |e| e.v.gcMark(m);
+            markFrameClosure(snap.closure_id, m);
         }
+    }
+}
+
+/// Keep the side-table slot of a closure whose body is currently on the stack
+/// (or parked) alive: marking it live spares it from `reclaimDead`'s id reuse
+/// and shades its capture-store cell + receiver chain. The running frame only
+/// holds a copy of the capture *values*, so this is the sole thing that roots
+/// the slot for a body that outlives the collection that fires during it.
+inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
+    if (closure_id) |id| {
+        if (runtime.gc.markClosureHook) |hook| hook(id, m);
     }
 }
 
@@ -450,6 +463,11 @@ pub const FrameSnapshot = struct {
     /// Register the resumed value is written into before execution
     /// continues (the destination of the suspending call site).
     resume_reg: ?Reg,
+    /// The closure side-table id when the suspended frame is a closure body
+    /// (mirrors `Frame.closure_id`). A parked coroutine keeps its closure slot
+    /// rooted through this so a collection while it sleeps cannot reclaim the
+    /// slot or sweep its capture store.
+    closure_id: ?u64 = null,
 };
 
 /// Layer 1 — a parked activation: a stack of frame snapshots
@@ -510,6 +528,7 @@ pub fn gcMarkSuspendState(state: *const SuspendState, m: *runtime.gc.Marker) voi
         for (snap.params) |v| v.gcMark(m);
         for (snap.captures) |v| v.gcMark(m);
         for (snap.enclosing_this) |e| e.v.gcMark(m);
+        markFrameClosure(snap.closure_id, m);
     }
 }
 
@@ -576,6 +595,14 @@ const Frame = struct {
     owns_params_caps: bool = false,
     /// Intrusive link onto the per-thread GC frame chain (see `frame_chain`).
     gc_link: ?*Frame = null,
+    /// The closure side-table id when this frame is executing a closure body
+    /// (`null` for a plain function / method body). A running closure body holds
+    /// only a *copy* of its capture values, not the `IrClosure` value, so without
+    /// this the collector would never mark the closure's slot — `reclaimDead`
+    /// would recycle its id and its capture-store cell would be swept out from
+    /// under a body that spans a collection (a long-running coroutine). The frame
+    /// re-roots the slot via `markClosureHook` for as long as it runs.
+    closure_id: ?u64 = null,
 
     fn newWithCaptures(
         allocator: Allocator,
@@ -769,7 +796,7 @@ pub fn evalWithCapturesIn(
     captures: std.ArrayList(Value),
     host: *H,
 ) Allocator.Error!EvalResult {
-    return evalWithCapturesChained(H, allocator, module, owning, func, args, captures, &.{}, host);
+    return evalWithCapturesChained(H, allocator, module, owning, func, args, captures, &.{}, null, host);
 }
 
 /// A `return@label` targets a frame when the frame's function carries
@@ -799,11 +826,13 @@ pub fn evalWithCapturesChained(
     args: std.ArrayList(Value),
     captures: std.ArrayList(Value),
     chain_seed: []const EnclosingEntry,
+    closure_id: ?u64,
     host: *H,
 ) Allocator.Error!EvalResult {
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
     var frame = try Frame.newWithCaptures(allocator, module, func, args, captures);
+    frame.closure_id = closure_id;
     defer frame.deinit();
     gcPushFrame(&frame);
     defer gcPopFrame(&frame);
@@ -882,6 +911,7 @@ pub fn resumeContinuation(
         var caps: std.ArrayList(Value) = .empty;
         try caps.appendSlice(allocator, snap.captures);
         var frame = try Frame.newWithCaptures(allocator, m, func, params, caps);
+        frame.closure_id = snap.closure_id;
         defer frame.deinit();
         gcPushFrame(&frame);
         defer gcPopFrame(&frame);
@@ -1096,6 +1126,7 @@ fn runFrameInner(
                             .try_stack = try allocator.dupe(TryFrame, try_stack.items),
                             .is_lambda = frame.func.is_lambda,
                             .resume_reg = resume_reg,
+                            .closure_id = frame.closure_id,
                         };
                         // The snapshot now holds the only references that will
                         // survive this frame's teardown (its regs are released

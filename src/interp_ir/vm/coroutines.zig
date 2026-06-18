@@ -1350,6 +1350,15 @@ fn pumpLoop(
         //    time, before `advanceTime` picks the next wakeup.
         const launched = try (coroTop().?).drainLaunched(a);
         defer a.free(launched);
+        // `drainLaunched` empties `self.launched`, so the interceptor no longer
+        // marks these blocks. While an earlier block runs and suspends, a
+        // collection would otherwise reclaim the not-yet-started blocks' closure
+        // slots (and sweep their capture stores). Root the whole batch for the
+        // loop; the restore is registered after the free's `defer` so it runs
+        // first (LIFO) — the slice is still valid when the keepalive drops it.
+        const ka_launched = runtime.keepaliveMark();
+        defer runtime.keepaliveRestore(ka_launched);
+        runtime.keepalivePushSlice(launched);
         for (launched) |child| {
             const child_scope_base = activeScopeDepth();
             const child_res = try intrinsic_host.evalClosureRaw(self, &child, &.{}, scope, out);

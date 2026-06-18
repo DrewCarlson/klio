@@ -404,7 +404,10 @@ fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []con
         .host = ih.intrinsicHost(),
         .allocator = self.allocator,
     };
+    const prev_fqn_lt = runtime.leaktrack.current_fqn;
+    runtime.leaktrack.current_fqn = fqn;
     const r = try func(&ctx);
+    runtime.leaktrack.current_fqn = prev_fqn_lt;
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| switch (e) {
