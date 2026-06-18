@@ -72,6 +72,8 @@ pub const exprSpan = helpers.exprSpan;
 pub const setInlineFnAsts = inline_state.setInlineFnAsts;
 pub const setTypeAliasTags = inline_state.setTypeAliasTags;
 pub const registerInlineFnId = inline_state.registerInlineFnId;
+pub const setDeferredSection = inline_state.setDeferredSection;
+pub const ensureInlineBody = inline_state.ensureInlineBody;
 pub const setShadowedInlineNames = inline_state.setShadowedInlineNames;
 pub const setTopLevelPropNames = inline_state.setTopLevelPropNames;
 

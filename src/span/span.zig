@@ -12,6 +12,12 @@ pub const FileId = enum(u32) {
     }
 };
 
+/// Sentinel `FileId.int()` the stdlib-image baker stamps on a deferred
+/// `inline`-function body marker: the empty block's `span.start` then holds the
+/// body's byte offset in the image's deferred-body section. Far above any real
+/// SourceMap id, so it can never collide with a genuine file.
+pub const DEFERRED_BODY_FILE: u32 = 0xDEFE_4DED;
+
 /// A half-open byte range within a single source file.
 pub const Span = struct {
     file: FileId,

@@ -567,6 +567,8 @@ pub fn tryInlineCallWithTypeArgs(
     if (b.inlineInProgress(fname)) {
         return null;
     }
+    // Materialise the body if it is a deferred image marker before reading it.
+    inline_state.ensureInlineBody(f);
     const body = if (f.body) |*body_ref| body_ref else return null;
 
     var ordered = try b.allocator.alloc(?*const Expr, f.params.len);
