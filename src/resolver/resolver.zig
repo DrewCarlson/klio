@@ -692,10 +692,10 @@ const Resolver = struct {
         if (p.init) |*p_init| {
             try self.resolveExpr(scope, p_init);
         }
-        if (p.getter) |*getter| {
+        if (p.getter) |getter| {
             try self.resolveAccessor(scope, getter, p.receiver_type != null);
         }
-        if (p.setter) |*setter| {
+        if (p.setter) |setter| {
             try self.resolveAccessor(scope, setter, p.receiver_type != null);
         }
     }
@@ -1008,7 +1008,7 @@ const Resolver = struct {
                 if (p.init) |*e| {
                     try self.resolveExpr(scope, e);
                 }
-                if (p.delegate) |*d| {
+                if (p.delegate) |d| {
                     try self.resolveExpr(scope, d);
                 }
             },

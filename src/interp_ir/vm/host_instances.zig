@@ -2775,7 +2775,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 tbl.deinit();
             },
             .Property => |p| {
-                if (p.getter) |*getter| if (!site_built) {
+                if (p.getter) |getter| if (!site_built) {
                     const thunk = synthThunk(p.name, getter.body, getter.return_type, p.is_override);
                     const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
@@ -2929,9 +2929,9 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 .name = p.name.name,
                 .mutable = p.mutable,
                 .init = if (p.init) |*e| e else null,
-                .getter = if (p.getter) |*g| g else null,
-                .setter = if (p.setter) |*s| s else null,
-                .delegate = if (p.delegate) |*e| e else null,
+                .getter = if (p.getter) |g| g else null,
+                .setter = if (p.setter) |s| s else null,
+                .delegate = if (p.delegate) |e| e else null,
                 .is_abstract = p.is_abstract,
                 .is_lateinit = p.is_lateinit,
                 .primitive_zero = build.primitiveZeroFor(p),

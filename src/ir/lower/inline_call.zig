@@ -465,7 +465,7 @@ fn collectRuntimeTypeNamesStmt(s: *const Stmt, out: *ast_scan.StringSet) Allocat
         .Decl => |d| switch (d) {
             .Property => |p| {
                 if (p.init) |*e| try collectRuntimeTypeNames(e, out);
-                if (p.delegate) |*e| try collectRuntimeTypeNames(e, out);
+                if (p.delegate) |e| try collectRuntimeTypeNames(e, out);
             },
             .Function => |f| {
                 if (f.body) |fb| switch (fb) {

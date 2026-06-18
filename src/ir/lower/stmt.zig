@@ -93,7 +93,7 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         // for `val`-style use; a `var x by D` mutating
         // delegate would need a true read-through dispatch
         // and is tracked separately).
-        const delegate = try lowerExpr(b, &de);
+        const delegate = try lowerExpr(b, de);
         const null_arg = try b.emitConst(.Null);
         const prop_ref = b.allocReg();
         const pname = try b.module.internConst(b.allocator, .{ .String = p.name.name });

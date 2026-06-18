@@ -236,7 +236,7 @@ fn walkDecl(
         },
         .Property => |prop| {
             if (prop.init) |e| try walkExpr(allocator, out, &e);
-            if (prop.delegate) |e| try walkExpr(allocator, out, &e);
+            if (prop.delegate) |e| try walkExpr(allocator, out, e);
             if (prop.getter) |g| try walkFunctionBody(allocator, out, g.body);
             if (prop.setter) |s| try walkFunctionBody(allocator, out, s.body);
         },

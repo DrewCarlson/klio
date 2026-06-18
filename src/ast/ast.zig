@@ -224,15 +224,18 @@ pub const Property = struct {
     init: ?Expr,
     /// `val foo: T by expr` — the delegate expression that produces an
     /// object with `getValue` (and `setValue` for `var`). When set, `init`
-    /// is `None`.
-    delegate: ?Expr,
+    /// is `None`. Boxed — present on almost no property, so an inline `Expr`
+    /// would tax every `Property` node for nothing.
+    delegate: ?*Expr,
     /// `val foo: T get() = …` or `get() { … }`. When set, reads of `foo`
     /// invoke this accessor instead of (or in addition to) the backing
-    /// field.
-    getter: ?Accessor,
+    /// field. Boxed (rarely present); `Accessor` is a watched codec type, so
+    /// the shared-graph decoder follows the pointer and `PropertyDef.getter`
+    /// resolves to the same heap node.
+    getter: ?*Accessor,
     /// `var foo: T set(value) { … }`. Receives the assigned value via the
-    /// first parameter (named `value` if the source omits a name).
-    setter: ?Accessor,
+    /// first parameter (named `value` if the source omits a name). Boxed.
+    setter: ?*Accessor,
     /// Declared with the `abstract` modifier — only valid on a member of an
     /// `abstract class` / `interface`. Abstract properties carry no `init`
     /// and no body for their accessors.
