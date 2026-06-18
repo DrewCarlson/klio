@@ -359,9 +359,6 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
     if (comptime isWatched(T)) {
         try d.nodes.append(d.a, @intFromPtr(out));
     }
-    if (comptime isWatched(T)) {
-        try d.nodes.append(d.a, @intFromPtr(out));
-    }
     const info = @typeInfo(T);
     switch (info) {
         .bool => out.* = (try d.byte()) != 0,
@@ -1945,6 +1942,56 @@ test "codec resolves watched AST pointers to the decoded tree" {
     try testing.expectEqualStrings("f", got.ref.name.name);
     // The external pointer aliases the decoded decl, not a copy.
     try testing.expect(got.ref == &got.decls[0].Function);
+}
+
+test "codec resolves an external pointer aliasing a boxed Param default" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sp = Span.init(FileId.from(0), 0, 0);
+    var def_expr = ast.Expr{ .IntLit = .{ .value = 7, .kind = .Int, .span = sp } };
+    var params = [_]ast.Param{.{
+        .name = .{ .name = "x", .span = sp },
+        .ty = .{ .name = .{ .name = "Int", .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+        .default = &def_expr,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = sp,
+    }};
+    const fn_decl = ast.Function{
+        .name = .{ .name = "f", .span = sp },
+        .receiver_type = null,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = &params,
+        .return_type = null,
+        .body = null,
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .is_operator = false,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = sp,
+    };
+    var decls = [_]ast.Decl{.{ .Function = fn_decl }};
+    // `ref` aliases the param's default Expr by pointer — the shape
+    // `ClassParamDef.default`/`parent_ctor_args` have into the AST forest.
+    const Holder = struct { decls: []ast.Decl, ref: *const ast.Expr };
+    const v = Holder{ .decls = &decls, .ref = &def_expr };
+    const bytes = try encodeOne(Holder, a, &v);
+    const got = try decodeOne(Holder, a, bytes);
+    try testing.expect(got.ref == got.decls[0].Function.params[0].default.?);
+    try testing.expectEqual(@as(i128, 7), got.ref.IntLit.value);
 }
 
 test "codec rejects truncated input" {

@@ -230,7 +230,7 @@ pub fn walkDeclForOptIn(
                 }
             }
             for (f.params) |*p| {
-                if (p.default) |*def| {
+                if (p.default) |def| {
                     try walkExprForOptIn(allocator, def, markers, required, scope, out);
                 }
             }
@@ -812,7 +812,7 @@ pub fn walkDeclForDeprecation(
                 }
             }
             for (f.params) |*p| {
-                if (p.default) |*def| {
+                if (p.default) |def| {
                     try walkExprForDeprecation(allocator, def, info, out);
                 }
             }

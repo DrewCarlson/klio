@@ -1324,10 +1324,19 @@ holds into `ast.Property.getter`. hello-world **64 -> ~60 MB (arena),
 57 -> ~51 MB (gc)**; the map/filter/groupBy stdlib-heavy program **58 -> ~49 MB
 (gc)**. Full suite, both corpora (88/88 arena + gc), and bake determinism green.
 
-Next node-size levers (same approach): box `Function.body` (`?FunctionBody`,
-280 B) to drop `sizeof(Function)` 632 -> ~360 and `sizeof(Decl)` to ~368; shrink
-`Property` itself (box its `init`/`delegate`/`getter`/`setter`) so the boxed
-Property nodes stop costing 1752 B each.
+**`Param.default: ?Expr -> ?*Expr` — DONE.** `default` inlined a full 272 B Expr
+into every parameter though almost none carries one; `sizeof(Param)` 448 -> 176,
+~1 MB off the decode (clean net win — the pointee is rarely allocated).
+`ClassParam.default` (a distinct primary-ctor param type) stays inline. Added
+`KLIO_DECODE_STATS` (a gated per-type byte/count report over the decode, peer to
+`KLIO_ALLOC_TRACK`) to target the shrink.
+
+**`Function.body` boxing — tried, reverted.** It shrank `sizeof(Decl)` 640 -> 360
+(Decl array -1.65 MB) but ~4200 functions carry a body, so a 280 B `FunctionBody`
+is then allocated per body: net decode ~-0.5 MB, gc RSS flat, ~55 edited sites
+(incl. ~25 test helpers) and a higher alloc count. Not worth the churn for a
+GC-flat result, so reverted. The remaining per-type levers (box `Property`'s
+inline Expr/Accessor fields ~0.6 MB; box rare `Expr` variants) are all sub-MB.
 
 ## Borrowed stdlib source — DONE (the real `baseFromRoot` cost)
 
@@ -1350,5 +1359,24 @@ ktor server/client/channel itests, and bake determinism green.
 
 The fixed floor is small: a program that parse-errors before any stdlib decode
 is **5.7 MB** resident. So the whole remaining baseline is the eager stdlib
-materialisation — now `image.decode` 22.8 MB (the AST+IR node forest;
-~116 K small allocs) is the single dominant chunk and the next target.
+materialisation — `image.decode` 22 MB (the AST+IR node forest; ~116 K small
+allocs) is the single dominant chunk.
+
+## Running totals and the architectural floor
+
+**hello-world: 104 -> 51 MB arena, 95 -> ~43 MB gc** (slab 42.9, calloc 40.6,
+smp 44.1 — the backing allocator moves the startup baseline only ~2 MB).
+stdlib-heavy map/filter/groupBy 49 MB gc. ktor server/client/channel bounded, no
+leaks. From the project's original 646 MB this is a ~15x reduction; the plan's
+earlier "Node (~40 MB)" target is met under gc.
+
+`image.decode`'s 24.8 MB live heap is *genuinely resident* — the allocator
+sweep above shows it is live node data, not slab fragmentation. So node-size
+nibbling and lazy-decode tiers have reached their practical floor for the
+eager-decode architecture (~43 MB gc). The one lever that goes materially lower
+is the **position-independent / mmap'd image**: bake the AST+IR in a fixed,
+pointer-free layout (offsets, swizzled once or dereferenced through a base) so
+the loaded mmap *is* the decoded form and only touched pages stay resident,
+eliminating the ~24.8 MB of node allocation outright (target ~Python-level).
+That is a dedicated rewrite of the codec and every consumer that holds an
+AST/IR pointer, and is the documented architectural end state.
