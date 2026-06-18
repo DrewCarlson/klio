@@ -1314,7 +1314,7 @@ fn methodToImage(m: *const runtime.MethodDef, out: *MethodImage) bool {
     if (m.sam_lambda != null) return false;
     out.* = .{
         .name = m.name,
-        .decl = m.decl,
+        .decl = m.decl.get(),
         .is_operator = m.is_operator,
         .is_open = m.is_open,
         .is_override = m.is_override,
@@ -1827,7 +1827,9 @@ fn methodsFromImage(a: Allocator, imgs: []const MethodImage) Allocator.Error![]r
     for (imgs, 0..) |m, i| {
         out[i] = .{
             .name = m.name,
-            .decl = m.decl,
+            // Phase A: eager `.ptr` (still resolving the forest backref at
+            // load); Phase B flips this to a lazy `.ref`.
+            .decl = .{ .ptr = m.decl },
             .is_operator = m.is_operator,
             .is_open = m.is_open,
             .is_override = m.is_override,

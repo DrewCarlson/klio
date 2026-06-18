@@ -20,6 +20,34 @@ const SpinMutex = @import("objcell.zig").SpinMutex;
 /// decode-order registry (stable: decode replays the bake traversal exactly).
 pub const ForestRef = struct { decl: u32, ord: u32 };
 
+/// A pointer to a forest AST node that is either eager (`ptr`, set by the build
+/// / runtime-class / fallback paths into live AST) or lazy (`ref`, set by the
+/// image load — resolved on first `get()`). Lets one field serve both the
+/// image-backed base and the freshly-built base.
+pub fn ForestField(comptime T: type) type {
+    return union(enum) {
+        ptr: *const T,
+        ref: ForestRef,
+
+        const Self = @This();
+
+        pub fn fromPtr(p: *const T) Self {
+            return .{ .ptr = p };
+        }
+        pub fn fromRef(r: ForestRef) Self {
+            return .{ .ref = r };
+        }
+        /// Resolve to the node pointer, decoding+memoising the owning decl on
+        /// first lazy access.
+        pub fn get(self: Self) *const T {
+            return switch (self) {
+                .ptr => |p| p,
+                .ref => |r| @ptrFromInt(resolveNode(r).?),
+            };
+        }
+    };
+}
+
 /// A decoded decl plus its node-ordinal table (`nodes[ord]` = node address).
 pub const DeclReg = struct { decl: *const ast.Decl, nodes: []const usize };
 

@@ -8,6 +8,7 @@ const span = @import("span");
 const objcell = @import("objcell.zig");
 const env_mod = @import("env.zig");
 const value_mod = @import("value.zig");
+const forest = @import("forest.zig");
 
 const ObjRef = objcell.ObjRef;
 const Env = env_mod.Env;
@@ -248,7 +249,9 @@ pub const TypeShape = struct {
 
 pub const MethodDef = struct {
     name: []const u8,
-    decl: *const ast.Function,
+    /// The method's AST function — eager (`.ptr`, build/runtime/test) or lazy
+    /// (`.ref`, image-backed forest). Read via `decl.get()`.
+    decl: forest.ForestField(ast.Function),
     is_operator: bool,
     is_open: bool,
     is_override: bool,
@@ -501,7 +504,7 @@ fn findMethodWalk(
     seen.append(allocator, ptr) catch return null;
     for (ptr.methods) |m| {
         if (std.mem.eql(u8, m.name, name) and
-            (m.decl.body != null or m.sam_lambda != null or m.delegate_field != null))
+            (m.decl.get().body != null or m.sam_lambda != null or m.delegate_field != null))
         {
             return .{ .method = m, .class = cls.clone() };
         }
@@ -533,7 +536,7 @@ fn findMethodForArgWalk(
     if (containsPtr(seen.items, ptr) or seen.items.len > ClassDef.MAX_WALK) return null;
     seen.append(allocator, ptr) catch return null;
     for (ptr.methods) |m| {
-        if (std.mem.eql(u8, m.name, name) and m.decl.body != null and firstParamTypeMatches(m, arg_type_name)) {
+        if (std.mem.eql(u8, m.name, name) and m.decl.get().body != null and firstParamTypeMatches(m, arg_type_name)) {
             return .{ .method = m, .class = cls.clone() };
         }
     }
@@ -548,8 +551,8 @@ fn findMethodForArgWalk(
 }
 
 fn firstParamTypeMatches(m: MethodDef, arg_type_name: []const u8) bool {
-    if (m.decl.params.len == 0) return false;
-    return std.mem.eql(u8, m.decl.params[0].ty.name.name, arg_type_name);
+    if (m.decl.get().params.len == 0) return false;
+    return std.mem.eql(u8, m.decl.get().params[0].ty.name.name, arg_type_name);
 }
 
 fn findBodyPropertyWalk(
@@ -738,7 +741,7 @@ fn fnWithBody(name: []const u8, params: []ast.Param, body: *ast.Block) ast.Funct
 fn methodDef(name: []const u8, decl: *const ast.Function) MethodDef {
     return .{
         .name = name,
-        .decl = decl,
+        .decl = .{ .ptr = decl },
         .is_operator = false,
         .is_open = false,
         .is_override = false,
@@ -918,7 +921,7 @@ test "findMethodForArg prefers the matching first-param overload" {
     const hit = ClassDef.findMethodForArg(fx.handle, allocator, "plus", "Bag").?;
     var h = hit;
     defer h.class.deinit();
-    try testing.expectEqualStrings("Bag", h.method.decl.params[0].ty.name.name);
+    try testing.expectEqualStrings("Bag", h.method.decl.get().params[0].ty.name.name);
 
     // Unknown arg type falls back to the first matching name.
     const fallback = ClassDef.findMethodForArg(fx.handle, allocator, "plus", "Other").?;
