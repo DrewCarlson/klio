@@ -162,7 +162,7 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
             var init_ty: Type = blk: {
                 if (p.init) |*init| {
                     break :blk try self.checkExpr(init, if (annot) |*an| an else null);
-                } else if (p.delegate) |*dexpr| {
+                } else if (p.delegate) |dexpr| {
                     var dt = try self.checkExpr(dexpr, null);
                     dt.deinit(a);
                     break :blk .Unresolved;

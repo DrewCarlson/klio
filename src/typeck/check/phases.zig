@@ -249,12 +249,12 @@ pub fn checkCtorParamScopeDecl(self: *Checker, d: *const Decl) Allocator.Error!v
                             // non-property ctor params are visible there.
                             // Accessor bodies are invoked post-construction and
                             // must not see them.
-                            if (p.getter) |*getter| {
+                            if (p.getter) |getter| {
                                 var local = std.StringHashMap(void).init(self.allocator);
                                 defer local.deinit();
                                 try checkCtorParamInBody(self, &getter.body, &non_prop, &local);
                             }
-                            if (p.setter) |*setter| {
+                            if (p.setter) |setter| {
                                 var local = std.StringHashMap(void).init(self.allocator);
                                 defer local.deinit();
                                 for (setter.params) |*i| try local.put(i.name, {});
@@ -739,10 +739,10 @@ pub fn checkPhaseJDecl(self: *Checker, d: *const Decl, in_accessor: bool) Alloca
             // Extension properties never have a backing field — any `field`
             // reference inside their accessors is invalid.
             const has_backing_field = p.receiver_type == null;
-            if (p.getter) |*g| {
+            if (p.getter) |g| {
                 try walkAccessorForPhaseJ(self, g, has_backing_field, p.name.name);
             }
-            if (p.setter) |*s| {
+            if (p.setter) |s| {
                 try walkAccessorForPhaseJ(self, s, has_backing_field, p.name.name);
             }
             if (p.init) |*init| {
@@ -1058,13 +1058,13 @@ pub fn propertyHasBackingField(p: *const Property) bool {
     if (getter == null and setter == null) return true;
     if (getter != null and setter == null) {
         if (p.mutable) return true;
-        return helpers.accessorUsesField(&getter.?);
+        return helpers.accessorUsesField(getter.?);
     }
     if (getter == null and setter != null) {
         if (p.mutable) return true;
-        return helpers.accessorUsesField(&setter.?);
+        return helpers.accessorUsesField(setter.?);
     }
-    return helpers.accessorUsesField(&getter.?) or helpers.accessorUsesField(&setter.?);
+    return helpers.accessorUsesField(getter.?) or helpers.accessorUsesField(setter.?);
 }
 
 /// A non-private function that returns an anonymous object with multiple
@@ -2302,8 +2302,8 @@ fn annotationWalkFunction(self: *Checker, meta: *const std.StringHashMap(Annotat
 fn annotationWalkProperty(self: *Checker, meta: *const std.StringHashMap(AnnotationMeta), p: *const Property, local: bool) Allocator.Error!void {
     const site: AnnotationTarget = if (local) .LocalVariable else .Property;
     try annotationCheckSet(self, meta, p.annotations, site);
-    if (p.getter) |*g| try annotationCheckSet(self, meta, g.annotations, .PropertyGetter);
-    if (p.setter) |*s| try annotationCheckSet(self, meta, s.annotations, .PropertySetter);
+    if (p.getter) |g| try annotationCheckSet(self, meta, g.annotations, .PropertyGetter);
+    if (p.setter) |s| try annotationCheckSet(self, meta, s.annotations, .PropertySetter);
 }
 
 fn annotationWalkClass(self: *Checker, meta: *const std.StringHashMap(AnnotationMeta), c: *const Class) Allocator.Error!void {
@@ -2541,8 +2541,8 @@ fn walkDeclForOptIn(
             defer a.free(self_markers);
             for (self_markers) |m| try scope.append(a, m);
             if (p.init) |*init| try walkExprForOptIn(self, init, markers, required, scope, out);
-            if (p.getter) |*acc| try walkAccessorBodyOptIn(self, &acc.body, markers, required, scope, out);
-            if (p.setter) |*acc| try walkAccessorBodyOptIn(self, &acc.body, markers, required, scope, out);
+            if (p.getter) |acc| try walkAccessorBodyOptIn(self, &acc.body, markers, required, scope, out);
+            if (p.setter) |acc| try walkAccessorBodyOptIn(self, &acc.body, markers, required, scope, out);
             popN(scope, self_markers.len);
             popN(scope, added);
         },
@@ -2909,8 +2909,8 @@ fn walkDeclForDeprecation(
         },
         .Property => |p| {
             if (p.init) |*init| try walkExprForDeprecation(self, init, info, out);
-            if (p.getter) |*acc| try walkAccessorBodyDeprecation(self, &acc.body, info, out);
-            if (p.setter) |*acc| try walkAccessorBodyDeprecation(self, &acc.body, info, out);
+            if (p.getter) |acc| try walkAccessorBodyDeprecation(self, &acc.body, info, out);
+            if (p.setter) |acc| try walkAccessorBodyDeprecation(self, &acc.body, info, out);
         },
         .Class => |*c| {
             for (c.init_blocks) |*ib| try walkBlockForDeprecation(self, ib, info, out);

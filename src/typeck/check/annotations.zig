@@ -248,8 +248,8 @@ pub fn walkDeclForOptIn(
                 try walkExprForOptIn(allocator, init, markers, required, scope, out);
             }
             const accessors = [_]?*const ast.Accessor{
-                if (p.getter) |*g| g else null,
-                if (p.setter) |*s| s else null,
+                if (p.getter) |g| g else null,
+                if (p.setter) |s| s else null,
             };
             for (accessors) |maybe_acc| {
                 const acc = maybe_acc orelse continue;
@@ -822,8 +822,8 @@ pub fn walkDeclForDeprecation(
                 try walkExprForDeprecation(allocator, init, info, out);
             }
             const accessors = [_]?*const ast.Accessor{
-                if (p.getter) |*g| g else null,
-                if (p.setter) |*s| s else null,
+                if (p.getter) |g| g else null,
+                if (p.setter) |s| s else null,
             };
             for (accessors) |maybe_acc| {
                 const acc = maybe_acc orelse continue;
@@ -1198,10 +1198,10 @@ pub const AnnotationWalker = struct {
     pub fn walkProperty(self: *AnnotationWalker, p: *const Property, local: bool) Allocator.Error!void {
         const site: AnnotationTarget = if (local) .LocalVariable else .Property;
         try self.checkSet(p.annotations, site);
-        if (p.getter) |*g| {
+        if (p.getter) |g| {
             try self.checkSet(g.annotations, .PropertyGetter);
         }
-        if (p.setter) |*s| {
+        if (p.setter) |s| {
             try self.checkSet(s.annotations, .PropertySetter);
         }
     }

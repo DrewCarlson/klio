@@ -1276,7 +1276,7 @@ test "delegate_with_operator_modifier_ok" {
     set_value.is_operator = true;
     d.members = b.slice(Decl, &.{ .{ .Function = get_value }, .{ .Function = set_value } });
     var x = b.prop(true, "x", b.ty("Int"), null);
-    x.delegate = b.call(b.path("D"), &.{});
+    x.delegate = b.dup(Expr, b.call(b.path("D"), &.{}));
     const f = b.file(&.{ .{ .Class = d }, .{ .Property = b.dup(Property, x) } });
     var c = checkFile(testing.allocator, &f);
     defer c.deinit();
@@ -1292,7 +1292,7 @@ test "delegate_missing_operator_on_get_value_flagged" {
     const get_value = b.funExpr("getValue", &.{ b.param("thisRef", b.tyNull("Any")), b.param("prop", b.tyNull("Any")) }, b.ty("Int"), b.intLit(1));
     d.members = b.slice(Decl, &.{.{ .Function = get_value }});
     var x = b.prop(false, "x", b.ty("Int"), null);
-    x.delegate = b.call(b.path("D"), &.{});
+    x.delegate = b.dup(Expr, b.call(b.path("D"), &.{}));
     const f = b.file(&.{ .{ .Class = d }, .{ .Property = b.dup(Property, x) } });
     var c = checkFile(testing.allocator, &f);
     defer c.deinit();
@@ -1310,7 +1310,7 @@ test "delegate_missing_operator_on_set_value_flagged" {
     const set_value = b.funBlock("setValue", &.{ b.param("thisRef", b.tyNull("Any")), b.param("prop", b.tyNull("Any")), b.param("value", b.ty("Int")) }, null, &.{});
     d.members = b.slice(Decl, &.{ .{ .Function = get_value }, .{ .Function = set_value } });
     var x = b.prop(true, "x", b.ty("Int"), null);
-    x.delegate = b.call(b.path("D"), &.{});
+    x.delegate = b.dup(Expr, b.call(b.path("D"), &.{}));
     const f = b.file(&.{ .{ .Class = d }, .{ .Property = b.dup(Property, x) } });
     var c = checkFile(testing.allocator, &f);
     defer c.deinit();
@@ -1497,7 +1497,7 @@ test "accessor_return_type_match_ok" {
     defer b.deinit();
     var box = b.class("Box");
     var x = b.prop(false, "x", b.ty("Int"), null);
-    x.getter = .{
+    x.getter = b.dup(Accessor, .{
         .params = &.{},
         .return_type = b.ty("Int"),
         .body = .{ .Expr = b.intLit(1) },
@@ -1505,7 +1505,7 @@ test "accessor_return_type_match_ok" {
         .is_inline = false,
         .annotations = &.{},
         .span = b.ts(),
-    };
+    });
     box.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, x) }});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.member(b.call(b.path("Box"), &.{}), "x")})),
@@ -1523,7 +1523,7 @@ test "accessor_return_type_mismatch_flagged" {
     defer b.deinit();
     var box = b.class("Box");
     var x = b.prop(false, "x", b.ty("Int"), null);
-    x.getter = .{
+    x.getter = b.dup(Accessor, .{
         .params = &.{},
         .return_type = b.ty("String"),
         .body = .{ .Expr = b.str("hi") },
@@ -1531,7 +1531,7 @@ test "accessor_return_type_mismatch_flagged" {
         .is_inline = false,
         .annotations = &.{},
         .span = b.ts(),
-    };
+    });
     box.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, x) }});
     const main = b.funBlock("main", &.{}, null, &.{
         b.exprStmt(b.call(b.path("println"), &.{b.member(b.call(b.path("Box"), &.{}), "x")})),

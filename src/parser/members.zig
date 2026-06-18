@@ -575,15 +575,30 @@ pub fn parsePropertyWithFlags(p: *Parser, flags: ModifierFlags) ?Property {
     }
     const accessors = parsePropertyAccessors(p) orelse return null;
     const end = p.tokens[p.pos -| 1].span;
+    const delegate_boxed: ?*Expr = if (delegate) |dv| blk: {
+        const e = p.allocator.create(Expr) catch @panic("OOM");
+        e.* = dv;
+        break :blk e;
+    } else null;
+    const getter_boxed: ?*Accessor = if (accessors.getter) |gv| blk: {
+        const acc = p.allocator.create(Accessor) catch @panic("OOM");
+        acc.* = gv;
+        break :blk acc;
+    } else null;
+    const setter_boxed: ?*Accessor = if (accessors.setter) |sv| blk: {
+        const acc = p.allocator.create(Accessor) catch @panic("OOM");
+        acc.* = sv;
+        break :blk acc;
+    } else null;
     return Property{
         .mutable = mutable,
         .name = name,
         .receiver_type = receiver_type,
         .ty = ty,
         .init = init,
-        .delegate = delegate,
-        .getter = accessors.getter,
-        .setter = accessors.setter,
+        .delegate = delegate_boxed,
+        .getter = getter_boxed,
+        .setter = setter_boxed,
         .is_abstract = flags.is_abstract,
         .is_open = flags.is_open,
         .is_override = flags.is_override,

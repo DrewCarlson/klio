@@ -153,7 +153,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                 try self.prop_visibility.put(p.name.name, .{ .visibility = p.visibility, .file = p.name.span.file });
                 if (p.setter_visibility) |sv| {
                     try self.setter_visibility.put(p.name.name, .{ .visibility = sv, .file = p.name.span.file });
-                } else if (p.setter) |*setter| {
+                } else if (p.setter) |setter| {
                     if (setter.visibility) |sv| {
                         try self.setter_visibility.put(p.name.name, .{ .visibility = sv, .file = p.name.span.file });
                     }
@@ -532,7 +532,7 @@ pub fn checkTopLevelProperty(self: *Checker, p: *const Property) Allocator.Error
             }
         }
     }
-    if (p.delegate) |*d| {
+    if (p.delegate) |d| {
         var dt = try self.checkExpr(d, null);
         dt.deinit(self.allocator);
         try checkDelegateOperator(self, p, d);
@@ -1660,9 +1660,9 @@ pub fn checkEnumEntry(self: *Checker, e: *const EnumEntry) Allocator.Error!void 
 }
 
 pub fn handleAccessors(self: *Checker, p: *const Property) Allocator.Error!void {
-    if (p.getter) |*g| try checkAccessor(self, g);
-    if (p.setter) |*s| try checkAccessor(self, s);
-    if (p.delegate) |*d| {
+    if (p.getter) |g| try checkAccessor(self, g);
+    if (p.setter) |s| try checkAccessor(self, s);
+    if (p.delegate) |d| {
         var t = try self.checkExpr(d, null);
         t.deinit(self.allocator);
         try checkDelegateOperator(self, p, d);
@@ -1727,8 +1727,8 @@ pub fn checkAccessorReturnTypes(self: *Checker, p: *const Property) Allocator.Er
     var prop_ty = try convertTypeRefLossy(self.allocator, prop_ty_ref);
     defer prop_ty.deinit(self.allocator);
     const accessors = [_]struct { a: ?*const Accessor, label: []const u8 }{
-        .{ .a = if (p.getter) |*g| g else null, .label = "getter" },
-        .{ .a = if (p.setter) |*s| s else null, .label = "setter" },
+        .{ .a = if (p.getter) |g| g else null, .label = "getter" },
+        .{ .a = if (p.setter) |s| s else null, .label = "setter" },
     };
     for (accessors) |item| {
         const a = item.a orelse continue;

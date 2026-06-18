@@ -1621,14 +1621,14 @@ fn buildModuleWithOverrides(
                 const fid = try ir.lower.lowerAccessorExprWithExpected(module, c.name.name, &own_members, prop_init_params.items, init, nm, p.ty);
                 try body_prop_inits.put(.{ .a = c.name.name, .b = p.name.name }, fid);
                 if (body_prop_dual) try body_prop_inits.put(.{ .a = body_prop_cfqn, .b = p.name.name }, fid);
-            } else if (p.delegate) |*delegate| {
+            } else if (p.delegate) |delegate| {
                 try delegated_body_props.put(.{ .a = c.name.name, .b = p.name.name }, {});
                 const nm = try std.fmt.allocPrint(a, "__delegate_prop_{s}_{s}", .{ c.name.name, p.name.name });
                 const fid = try ir.lower.lowerAccessorExpr(module, c.name.name, &own_members, prop_init_params.items, delegate, nm);
                 try body_prop_inits.put(.{ .a = c.name.name, .b = p.name.name }, fid);
                 if (body_prop_dual) try body_prop_inits.put(.{ .a = body_prop_cfqn, .b = p.name.name }, fid);
             }
-            if (p.getter) |*getter| {
+            if (p.getter) |getter| {
                 const nm = try std.fmt.allocPrint(a, "__get_{s}_{s}", .{ c.name.name, p.name.name });
                 const fid = switch (getter.body) {
                     .Expr => |body| blk: {
@@ -1646,7 +1646,7 @@ fn buildModuleWithOverrides(
                     try instance_prop_getters.put(.{ .a = cfqn, .b = p.name.name }, fid);
                 }
             }
-            if (p.setter) |*setter| {
+            if (p.setter) |setter| {
                 const setter_param_name = if (setter.params.len != 0) setter.params[0].name else "value";
                 const nm = try std.fmt.allocPrint(a, "__set_{s}_{s}", .{ c.name.name, p.name.name });
                 const fid = switch (setter.body) {
@@ -2078,7 +2078,7 @@ fn buildModuleWithOverrides(
             // initializers keep the on-demand path (`.none`).
             const dflt = if (p.ty) |*t| typedDefaultFor(t) else typedDefaultForInit(init);
             try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .default = dflt });
-        } else if (p.delegate) |*delegate| {
+        } else if (p.delegate) |delegate| {
             try top_level_delegated_props.put(p.name.name, {});
             const nm = try std.fmt.allocPrint(a, "__top_prop_delegate_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, delegate, nm);
@@ -2114,7 +2114,7 @@ fn buildModuleWithOverrides(
         const ep_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
         const prev_ep_pkg = ir.lower.decl.setLowerSelfPackage(ep_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_ep_pkg);
-        if (p.getter) |*getter| {
+        if (p.getter) |getter| {
             var empty_members = StringSet.init(a);
             defer empty_members.deinit();
             const nm = try std.fmt.allocPrint(a, "__ext_get_{s}_{s}", .{ recv.name.name, p.name.name });
@@ -2130,7 +2130,7 @@ fn buildModuleWithOverrides(
                 try module.registry.member_ext_owner_class.put(fid, owner);
             }
         }
-        if (p.setter) |*setter| {
+        if (p.setter) |setter| {
             const setter_param_name = if (setter.params.len != 0) setter.params[0].name else "value";
             var recv_members = StringSet.init(a);
             defer recv_members.deinit();
@@ -2379,9 +2379,9 @@ fn buildClassDef(
             .name = p.name.name,
             .mutable = p.mutable,
             .init = if (p.init) |*e| e else null,
-            .getter = if (p.getter) |*g| g else null,
-            .setter = if (p.setter) |*s| s else null,
-            .delegate = if (p.delegate) |*e| e else null,
+            .getter = if (p.getter) |g| g else null,
+            .setter = if (p.setter) |s| s else null,
+            .delegate = if (p.delegate) |e| e else null,
             .is_abstract = p.is_abstract,
             .is_lateinit = p.is_lateinit,
             .primitive_zero = primitiveZeroFor(p),
