@@ -193,7 +193,11 @@ pub const FunctionBody = union(enum) {
 pub const Param = struct {
     name: Ident,
     ty: TypeRef,
-    default: ?Expr,
+    /// Boxed so an absent default (the common case) costs a pointer, not a
+    /// full inline `Expr`. `Expr` is a watched codec type, so the shared-graph
+    /// encoder/decoder follows the pointer and materialises the default only
+    /// when present.
+    default: ?*Expr,
     /// `vararg x: T` — variadic parameter; runtime-collected into a typed
     /// array.
     is_vararg: bool,

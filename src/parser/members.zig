@@ -471,10 +471,15 @@ pub fn parseParamListWith(p: *Parser, allow_no_type: bool) []Param {
             default = exprmod.parseExpr(p);
         }
         const end = if (default) |d| d.span() else ty.span;
+        const default_boxed: ?*ast.Expr = if (default) |dv| blk: {
+            const e = p.allocator.create(ast.Expr) catch @panic("OOM");
+            e.* = dv;
+            break :blk e;
+        } else null;
         params.append(p.allocator, Param{
             .name = name,
             .ty = ty,
-            .default = default,
+            .default = default_boxed,
             .is_vararg = is_vararg,
             .is_crossinline = is_crossinline,
             .is_noinline = is_noinline,

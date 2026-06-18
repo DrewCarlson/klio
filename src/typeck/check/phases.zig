@@ -2530,7 +2530,7 @@ fn walkDeclForOptIn(
                 }
             }
             for (f.params) |*p| {
-                if (p.default) |*def| try walkExprForOptIn(self, def, markers, required, scope, out);
+                if (p.default) |def| try walkExprForOptIn(self, def, markers, required, scope, out);
             }
             popN(scope, self_markers.len);
             popN(scope, added);
@@ -2904,7 +2904,7 @@ fn walkDeclForDeprecation(
                 }
             }
             for (f.params) |*p| {
-                if (p.default) |*def| try walkExprForDeprecation(self, def, info, out);
+                if (p.default) |def| try walkExprForDeprecation(self, def, info, out);
             }
         },
         .Property => |p| {

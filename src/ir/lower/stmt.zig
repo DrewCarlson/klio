@@ -330,7 +330,7 @@ fn registerLocalFnDefaults(
     for (f.params, 0..) |p, idx| {
         if (p.default) |default_expr| {
             const bind_upto = @min(offset + idx, param_names.len);
-            const widened = widenNumericLiteral(&default_expr, &p.ty);
+            const widened = widenNumericLiteral(default_expr, &p.ty);
             const name = try std.fmt.allocPrint(
                 b.allocator,
                 "__default_local_{s}_{s}",
@@ -339,7 +339,7 @@ fn registerLocalFnDefaults(
             const fid = try lowerExprAsParamThunk(
                 b.module,
                 param_names[0..bind_upto],
-                if (widened) |*w| w else &default_expr,
+                if (widened) |*w| w else default_expr,
                 name,
             );
             try slots.append(reg_alloc, fid);
