@@ -1287,5 +1287,21 @@ refs; `baseFromRoot` is the **12 MB ClassDef graph**.
   AST+IR pointer-free so the loaded image is the file-backed mmap and only
   touched pages are resident; would subsume all the per-tier deferral.
 
+**mmap the image — DONE.** The image is now `mmap`'d read-only instead of read
+into the heap; the decode only touches eagerly-decoded pages, so the deferred
+sections + slice-only source text stay file-backed. hello-world 65 -> 64 MB
+(arena), 58 -> 57 MB (gc).
+
+**Final totals (hello-world): 104 -> 64 MB arena, 95 -> 57 MB gc** — ~40% off,
+all tiers green and bake byte-reproducible. The remaining ~29 MB decode is AST+IR
+*nodes* (the node count, not encoded size — stripping params saved ~0). The
+contained levers are exhausted; the only routes left both reduce the node count:
+remove class-member AST decls (needs `Value.Function`/`MethodDef` to stop
+carrying `*ast.Function` — a value-model + class-dispatch refactor), or the
+**in-place / position-independent image**: store AST+IR pointer-free so the
+loaded mmap *is* the decoded form (offsets swizzled or deref'd through a base),
+eliminating the 29 MB of node allocation entirely. The latter is the
+architectural end state that reaches Node-level, and is a dedicated rewrite.
+
 The leak side is handled by the tracing GC (`KLIO_RECLAIM=gc`, bounded
-~13 KB/req); under it the simple-program baseline is the 58 MB above.
+~13 KB/req); under it the simple-program baseline is the 57 MB above.
