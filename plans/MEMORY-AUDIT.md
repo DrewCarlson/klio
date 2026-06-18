@@ -43,13 +43,23 @@ Server RSS, gc, 512 KB threshold, mixed GET/POST:
 | 4,000 req | 4,170 MB | 153 MB |
 | rate | ~1 MB/req | warmup only, then ~flat |
 
-`leaktrack` (which tracks the logical alloc/free set, not RSS high-water)
-confirms no unbounded per-request raw-temp leak remains: GET-only outstanding is
-**identical** at 10 and 40 requests (0 leak); the POST path's closure-metadata
-and scratch is **warmup** — it plateaus (`buildAstLambda` outstanding is the same
-at 42 and 102 POSTs) and the non-decode total decelerates ~7.5× between request
-windows. The residual slow RSS creep is slab high-water (pages not returned for
-half-full slabs), bounded by working-set churn, not an unbounded leak.
+`leaktrack` then localized the remaining per-request growth to two classes of
+raw host-temporary that the process arena used to reclaim for free:
+
+- **`snapshotItems` dupes** — `make{List,Set}(a, try snapshotItems(a, vl), m)`
+  and `dst.appendSlice(a, try snapshotItems(a, vl))` allocate a dupe, copy it
+  again, then orphan it. Every `toList`/`toSet`/`plus`/`minus`/`union`/`distinct`
+  leaked one. Fixed by `makeListVL`/`makeSetVL`/`appendVL`, which copy once under
+  the `ValueList` borrow with no dangling intermediate (31 call sites).
+
+The remaining residual is a long tail of **per-intrinsic scratch**: stdlib host
+ops that allocate transient buffers on the run allocator and rely on the arena
+to reclaim them (the arena-era pattern). Each leaks a small amount under gc on
+the request path it sits on. The server's steady creep after warmup is ~0.7 KB/
+request — three orders of magnitude under the original decode leak. Fully
+closing it is a stdlib-wide pass making every intrinsic free its scratch (gate
+on `freeScratch()`), a separate broad effort from these two tasks. Closure
+metadata and the closure side-table spine are bounded (`leaktrack` constant).
 
 ## gc-as-default blocker (FIXED: coroutine GC-root completeness)
 
