@@ -1152,3 +1152,60 @@ retain/release. Options, roughly in order of safety:
 
 Validate any fix with the §12.1 reproducer sweeping N, then the coroutine
 itests, then `zig build itest-ktor_server`, all under `KLIO_RECLAIM=smp`.
+
+## Startup baseline today: where the ~104 MB goes, and the path to Node-level
+
+Hello-world (`println`) resident set is **~104 MB** (`/usr/bin/time -l`, warm
+image cache). Almost all of it is the eagerly-decoded stdlib image:
+
+- `image.decode` **~70 MB** / ~142 K allocations — the post-lift AST forest
+  (`lifted_decls`) plus the lowered IR `module`.
+- `image.baseFromRoot` **~12 MB** — the `ClassDef` graph.
+- The rest is the binary, stacks, and host scratch.
+
+Within the `image.decode` 70 MB, measured by stripping body classes at bake and
+reading `KLIO_ALLOC_TRACK`:
+
+- **Inline-function bodies ~26 MB.** Kept because the lowerer splices `inline fun`
+  bodies into user code. A trivial program inlines none of them yet pays for all.
+- **Non-inline (dead) function bodies ~6 MB.** Now stripped: a non-inline base
+  function runs from its lowered IR, never its AST body, so the body is replaced
+  with an empty block at `buildStdlibBase` (keeping the `body != null`
+  concrete-vs-abstract sentinel, `Inst.BuildObject` object subtrees, and the
+  inline bodies). See `src/interp_ir/prune.zig`.
+- **AST skeleton + lowered IR ~38 MB.** Decls, params, type refs, signatures,
+  class metadata, and the whole stdlib's lowered functions — needed eagerly by
+  the current loader.
+
+Stripping *all* bodies (inline included) lands hello-world at **~82 MB**, so the
+inline bodies are worth ~22 MB RSS but cannot be dropped wholesale — they are
+live for any program that inlines a collection/sequence/flow operator.
+
+**To reach Node (~40 MB) / Python (~15 MB)** the image must stop materialising
+the whole stdlib on the heap at startup. Two routes, both real format work:
+
+1. **Lazy-decode inline bodies** (~22 MB for trivial programs, and a fraction of
+   that paid per real program — each only materialises the operators it actually
+   inlines). Blocker: the current codec bakes the entire `lifted_decls` forest in
+   one traversal with a single shared node/slice registry, so a body's backrefs
+   reference globally-numbered nodes and cannot be decoded in isolation. Needs
+   inline bodies baked into a self-contained section (own local registry, shared
+   nodes duplicated), the skeleton decoded with a body-offset placeholder, and
+   `inlineAstById` decoding on first splice with memoization.
+2. **Position-independent / mmap'd image** (the big one, ~50 MB). Store the AST +
+   IR in a fixed, pointer-free layout (offsets, swizzled once or dereferenced
+   through a base) so the loaded image lives in the file-backed mmap and only
+   touched pages stay resident. Eliminates the 142 K heap allocations entirely.
+
+The dead-non-inline-body strip (route 0) is landed. Routes 1 and 2 are the
+remaining levers and are both core image-format changes.
+
+### Note: bake determinism
+
+The baked image is now byte-reproducible run to run. The earlier
+non-determinism was a single in-place result-location aliasing bug in the body
+strip: writing the empty block into `f.body` clobbered the body fields the new
+block's span was read from when the span read sat inline in the struct literal.
+Reading the span into a local first fixes it. The image is keyed by exe stamp +
+stdlib hash, but reproducible bytes keep the rebake-after-corruption path (and
+its test) stable.
