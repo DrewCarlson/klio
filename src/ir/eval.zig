@@ -2157,7 +2157,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 // resolves to an extension-property *setter* (`var T.x set(…)`)
                 // declared on the receiver's type or a supertype, not only a
                 // stored member; `setField` dispatches both.
-                const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str);
+                const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str, null);
                 defer allocator.free(cands);
                 for (cands) |c| {
                     if (c.v != .Instance) continue;
@@ -2221,7 +2221,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 // `consult_param = true`: in a method / extension body the
                 // implicit receiver is the frame's `this` *parameter*, not
                 // a capture slot.
-                const cands = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str));
+                const cands = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str), null);
                 defer allocator.free(cands);
                 // Per-candidate probes are member-only (`getMemberField`):
                 // a candidate must not "resolve" a global or an outer
@@ -2381,9 +2381,11 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cmg.arg_names);
     defer allocator.free(names);
-    // The receiver is the lambda capture slot, or — when that is empty —
-    // the enclosing function's `this` *parameter*.
-    const this_val = implicitThisValue(frame, cmg.this_idx, true);
+    // A direct splice receiver (a bound `this` register) is the innermost
+    // implicit receiver when present; otherwise the lambda capture slot, or —
+    // when that is empty — the enclosing function's `this` *parameter*.
+    const direct_this: ?Value = if (cmg.recv) |r| frame.read(r) else null;
+    const this_val = if (direct_this) |dt| dt else implicitThisValue(frame, cmg.this_idx, true);
     // A bare callee whose name starts uppercase is a constructor / type,
     // never an instance member.
     const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]);
@@ -2397,7 +2399,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         ((this_val == .Null or this_val == .Unit) or !host.hostHasMember(&this_val, name_str));
 
     if (!is_ctor_name and !shadow_capture) {
-        const cands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str);
+        const cands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
         defer allocator.free(cands);
         // Inside an extension body, the implicit `this` has the
         // extension's DECLARED receiver type, and Kotlin resolves a bare
@@ -2634,29 +2636,41 @@ const ImplicitCandidate = struct {
 /// while a `with`/`run`/`apply` subject brings only itself
 /// (`with(x) { … }` never puts `x`'s enclosing instances or companion in
 /// scope). Caller frees the returned slice.
-fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const Frame, this_idx: usize, consult_param: bool, host: *H, bare_name: []const u8) Allocator.Error![]ImplicitCandidate {
+fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const Frame, this_idx: usize, consult_param: bool, host: *H, bare_name: []const u8, direct_this: ?Value) Allocator.Error![]ImplicitCandidate {
     var out: std.ArrayList(ImplicitCandidate) = .empty;
     errdefer out.deinit(allocator);
-    const this_val = implicitThisValue(frame, this_idx, consult_param);
+    var depth: u16 = 0;
     const entries = try enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
-    var depth: u16 = 0;
-    if (this_val != .Null and this_val != .Unit) {
-        // When the frame's own `this` is also the innermost chain entry
-        // (a seeded method/extension receiver, or a receiver-split
-        // subject), the entry's own run covers it with the right kind.
-        const dup = entries.len > 0 and sameReceiver(entries[0].v, this_val);
-        if (!dup) {
-            // The frame's own `this` brings its class-nesting tower (and
-            // companion) only when it is a *dispatch* receiver. An
-            // extension receiver is subject-like — `fun Owner.Inner.f()`
-            // does not put `Inner`'s enclosing `Owner` instance or
-            // companion in scope.
-            const own_is_subject = switch (frame.func.kind) {
-                .top_level_extension, .member_extension => true,
-                else => false,
-            };
-            try appendCandidateRun(H, allocator, &out, this_val, own_is_subject, &depth, host, bare_name);
+    // The innermost candidate is the inline-splice's bound receiver when
+    // supplied (it lives in a local register, invisible to the frame `this`
+    // slot / capture lookup), otherwise the frame's own `this`. A supplied
+    // direct receiver is subject-like (its own value only, no class-nesting
+    // tower); it replaces, rather than precedes, the frame `this`.
+    const inner: ?Value = if (direct_this) |dt|
+        dt
+    else blk: {
+        const tv = implicitThisValue(frame, this_idx, consult_param);
+        break :blk if (tv == .Null or tv == .Unit) null else tv;
+    };
+    if (inner) |iv| {
+        if (iv != .Unit) {
+            // When the innermost receiver is also the innermost chain entry
+            // (a seeded method/extension receiver, or a receiver-split
+            // subject), the entry's own run covers it with the right kind.
+            const dup = entries.len > 0 and sameReceiver(entries[0].v, iv);
+            if (!dup) {
+                // The frame's own `this` brings its class-nesting tower (and
+                // companion) only when it is a *dispatch* receiver. An
+                // extension receiver — or a supplied splice receiver — is
+                // subject-like: `fun Owner.Inner.f()` does not put `Inner`'s
+                // enclosing `Owner` instance or companion in scope.
+                const own_is_subject = direct_this != null or switch (frame.func.kind) {
+                    .top_level_extension, .member_extension => true,
+                    else => false,
+                };
+                try appendCandidateRun(H, allocator, &out, iv, own_is_subject, &depth, host, bare_name);
+            }
         }
     }
     for (entries) |e| try appendCandidateRun(H, allocator, &out, e.v, e.isSubject(), &depth, host, bare_name);
