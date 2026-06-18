@@ -425,7 +425,7 @@ pub fn checkCtorParamInExpr(
                             try emitCtorParamOutOfScope(self, id.name, id.span);
                         }
                     },
-                    .Interp => |*pe| try checkCtorParamInExpr(self, pe, non_prop, local),
+                    .Interp => |pe| try checkCtorParamInExpr(self, pe, non_prop, local),
                     .Text => {},
                 }
             }
@@ -1341,7 +1341,7 @@ pub fn isConstInitializer(self: *const Checker, e: *const Expr) bool {
                 const ok = switch (part) {
                     .Text => true,
                     .ShortInterp => |id| isConstRef(self, id.name),
-                    .Interp => |*inner| isConstInitializer(self, inner),
+                    .Interp => |inner| isConstInitializer(self, inner),
                 };
                 if (!ok) return false;
             }
@@ -2713,7 +2713,7 @@ fn walkExprForOptIn(
         },
         .StringTemplate => |st| {
             for (st.parts) |part| {
-                if (part == .Interp) try walkExprForOptIn(self, &part.Interp, markers, required, scope, out);
+                if (part == .Interp) try walkExprForOptIn(self, part.Interp, markers, required, scope, out);
             }
         },
         else => {},
@@ -3071,7 +3071,7 @@ fn walkExprForDeprecation(
         },
         .StringTemplate => |st| {
             for (st.parts) |part| {
-                if (part == .Interp) try walkExprForDeprecation(self, &part.Interp, info, out);
+                if (part == .Interp) try walkExprForDeprecation(self, part.Interp, info, out);
             }
         },
         else => {},

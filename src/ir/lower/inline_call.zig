@@ -446,7 +446,7 @@ fn collectRuntimeTypeNames(e: *const Expr, out: *ast_scan.StringSet) Allocator.E
         },
         .StringTemplate => |st| {
             for (st.parts) |*p| switch (p.*) {
-                .Interp => |*ex| try collectRuntimeTypeNames(ex, out),
+                .Interp => |ex| try collectRuntimeTypeNames(ex, out),
                 else => {},
             };
         },

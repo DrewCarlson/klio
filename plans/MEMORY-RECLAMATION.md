@@ -1335,8 +1335,19 @@ into every parameter though almost none carries one; `sizeof(Param)` 448 -> 176,
 (Decl array -1.65 MB) but ~4200 functions carry a body, so a 280 B `FunctionBody`
 is then allocated per body: net decode ~-0.5 MB, gc RSS flat, ~55 edited sites
 (incl. ~25 test helpers) and a higher alloc count. Not worth the churn for a
-GC-flat result, so reverted. The remaining per-type levers (box `Property`'s
-inline Expr/Accessor fields ~0.6 MB; box rare `Expr` variants) are all sub-MB.
+GC-flat result, so reverted.
+
+**`Property.getter/setter/delegate` boxing — DONE.** A `Property` inlined two
+`?Accessor` (~320 B each) + a `?Expr` delegate though almost no property has
+any; box getter/setter to `?*Accessor`, delegate to `?*Expr`. `sizeof(Property)`
+1752 -> 600, ~0.6 MB off the decode. `init` stays inline (present on most).
+
+**`StringPart.Interp: Expr -> *Expr` boxing — DONE.** A string template's parts
+slice held a full inline `Expr` per `${…}` even though most parts are plain
+`Text`; box it. `sizeof(StringPart)` 280 -> 40, ~0.57 MB off the decode.
+
+Per-type node-size levers are now exhausted (remaining types are the `Expr`/
+`Stmt`/`Inst` unions, whose width is intrinsic). `image.decode` 22.0 -> 20.8 MB.
 
 ## Borrowed stdlib source — DONE (the real `baseFromRoot` cost)
 
@@ -1364,11 +1375,15 @@ allocs) is the single dominant chunk.
 
 ## Running totals and the architectural floor
 
-**hello-world: 104 -> 51 MB arena, 95 -> ~43 MB gc** (slab 42.9, calloc 40.6,
-smp 44.1 — the backing allocator moves the startup baseline only ~2 MB).
-stdlib-heavy map/filter/groupBy 49 MB gc. ktor server/client/channel bounded, no
+**hello-world: 104 -> ~48 MB arena, 95 -> ~41.8 MB gc** (after Property +
+StringPart boxing; the backing allocator moves the startup baseline only ~2 MB).
+stdlib-heavy map/filter/groupBy ~44 MB gc. ktor server/client/channel bounded, no
 leaks. From the project's original 646 MB this is a ~15x reduction; the plan's
-earlier "Node (~40 MB)" target is met under gc.
+earlier "Node (~40 MB)" target is met under gc. The contained node-size +
+lazy-body + borrowed-source tiers are now fully exhausted; the only lever past
+this is the lazy / position-independent image (see `plans/LAZY-IMAGE.md`), a
+dedicated rewrite that decouples the runtime's AST/IR pointers from the eager
+forest so unused stdlib stays file-backed (target below Node, toward Python).
 
 `image.decode`'s 24.8 MB live heap is *genuinely resident* — the allocator
 sweep above shows it is live node data, not slab fragmentation. So node-size

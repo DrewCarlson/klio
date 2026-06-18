@@ -224,7 +224,7 @@ const Printer = struct {
                         .Interp => |ie| {
                             try self.line("interp");
                             self.indent += 1;
-                            try self.expr(&ie);
+                            try self.expr(ie);
                             self.indent -= 1;
                         },
                     }

@@ -365,7 +365,7 @@ pub fn collectPropertyReads(
                     .ShortInterp => |id| {
                         if (by_name.get(id.name)) |idx| try out.put(idx, {});
                     },
-                    .Interp => |*pe| try collectPropertyReads(pe, by_name, out),
+                    .Interp => |pe| try collectPropertyReads(pe, by_name, out),
                     .Text => {},
                 }
             }

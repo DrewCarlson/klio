@@ -798,7 +798,7 @@ const Resolver = struct {
                         .ShortInterp => |id| {
                             try self.resolveNameUse(scope, id.name, id.span);
                         },
-                        .Interp => |*e| try self.resolveExpr(scope, e),
+                        .Interp => |e| try self.resolveExpr(scope, e),
                     }
                 }
             },

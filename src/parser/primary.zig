@@ -324,7 +324,9 @@ pub fn parseStringTemplate(p: *Parser) ?Expr {
                 const e = exprmod.parseExpr(p) orelse return null;
                 support.skipNl(p);
                 _ = support.expect(p, .InterpEnd, "`}` to close string interpolation") orelse return null;
-                parts.append(p.allocator, StringPart{ .Interp = e }) catch @panic("OOM in primary");
+                const ep = p.allocator.create(Expr) catch @panic("OOM in primary");
+                ep.* = e;
+                parts.append(p.allocator, StringPart{ .Interp = ep }) catch @panic("OOM in primary");
             },
             .Eof => {
                 support.err(p, "E0013", "unterminated string template", open.span);

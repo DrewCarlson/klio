@@ -907,7 +907,10 @@ pub const Catch = struct {
 pub const StringPart = union(enum) {
     Text: []const u8,
     ShortInterp: Ident,
-    Interp: Expr,
+    /// Boxed so a `StringPart` is pointer-sized, not Expr-sized: a string
+    /// template's parts slice held a full inline `Expr` per `${…}` even though
+    /// most parts are plain `Text`. `Expr` is a watched codec type.
+    Interp: *Expr,
 };
 
 pub const BinOp = enum {
