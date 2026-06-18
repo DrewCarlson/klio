@@ -1233,16 +1233,27 @@ collection programs stayed correct, and the decode was proven byte-identical
 **But every coroutine program StackOverflows on the cached path** — even
 `runBlocking { println(...) }`. The blocks decode correctly; with deferral
 *disabled* (all the code present, nothing deferred) the same program runs. So a
-deferred function's blocks, byte-identical but at a *new address* / with
-per-function (un-deduplicated) interior slices, break something identity- or
-sharing-sensitive in the suspend/resume + scheduler path. The cause was not
-found (no pointer-identity comparison on funcs/blocks in the coroutine host; the
-3 AST-referencing Insts are all excluded by `funcRefsAst`; the decode arena is
-the stable base arena). Reverted rather than ship a coroutine corruption.
+deferred function (its blocks emptied to a marker until first execution) was
+dispatched as if it had no body.
 
-**To finish the IR tier** (the next ~15 MB), either root-cause the suspend/
-scheduler identity assumption a deferred-block function violates, or decode the
-deferred blocks *in the main decoder's registry context* (skip-and-reserve the
-node/slice indices at load, resume the decode lazily) so interior-slice
-deduplication is preserved exactly as the eager path has it. The AST skeleton
-(~25 MB) and the position-independent/mmap image remain the routes past that.
+**Root cause (found):** the invariant `blocks.len == 0` means
+"native / abstract / stub, no IR body" is relied on in 30+ sites across both the
+lowerer and the VM host — symbol-index resolution, overload selection, stub
+detection (`f.blocks.len == 0 and stubDeclArity(id) == null`), `funcHasBody`,
+the `Call` dispatch (`host_call_func.zig`), and several places that read
+`func.blocks[0].insts` directly. Emptying a deferred function's blocks makes
+every one of these treat it as bodyless, so the function is mis-resolved /
+mis-dispatched (a coroutine builder routes to a fallback that recurses → the
+StackOverflow). It is not a localized bug; "blocks present == has body" is a
+foundational invariant. A sentinel-block or per-site flag fix would have to
+reach all 30+ sites *and* keep `blocks[0].insts` content valid before any
+lower-time inlining/analysis reads it, which is too invasive to land safely
+against the coroutine suite. Reverted.
+
+**To finish the IR tier** (the next ~15 MB) the deferral must preserve the
+"has body" invariant without keeping the blocks resident — e.g. add an explicit
+`Func.body_state` (`present` / `deferred` / `none`) that every `blocks.len`
+check consults, and materialize at the single executor chokepoint
+(`runFrameInner`) *and* at the lower-time sites that read block content. The
+AST skeleton (~25 MB) and the position-independent/mmap image remain the routes
+past that.
