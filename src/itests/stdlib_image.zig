@@ -493,6 +493,9 @@ test "bake/load round-trips the lowered base tables" {
             try std.testing.expectEqualStrings(f0.name, f1.name);
             try std.testing.expectEqualStrings(f0.fqn, f1.fqn);
             try std.testing.expectEqual(f0.id, f1.id);
+            // Materialise a lazily-deferred body so the round-trip is checked
+            // through the lazy-IR decode, not against an empty deferred marker.
+            m1.ensureFuncBody(@constCast(f1));
             try std.testing.expectEqual(f0.blocks.len, f1.blocks.len);
             try std.testing.expectEqual(f0.params.len, f1.params.len);
             for (f0.blocks, f1.blocks) |b0, b1| {

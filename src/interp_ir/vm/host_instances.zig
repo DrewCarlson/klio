@@ -1358,7 +1358,7 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
         for (m.funcsBySimpleName(class_name)) |fid| {
             if (fid.int() >= m.funcs.items.len) continue;
             const f = &m.funcs.items[fid.int()];
-            if (f.blocks.len == 0) continue;
+            if (!f.hasBody()) continue;
             if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
             const vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
             var arity_ok = vararg;
@@ -1844,7 +1844,7 @@ fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args
     for (m.funcsBySimpleName(class_name)) |fid| {
         if (fid.int() >= m.funcs.items.len) continue;
         const f = &m.funcs.items[fid.int()];
-        if (f.blocks.len == 0) continue;
+        if (!f.hasBody()) continue;
         if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
         const vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
         if (clean_only) {

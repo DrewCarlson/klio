@@ -635,6 +635,13 @@ pub const Func = struct {
     return_ty: TypeRef,
     n_locals: u32,
     blocks: []Block,
+    /// Lazy IR: `offset + 1` of this function's `blocks` in its module's
+    /// `deferred_func_section` when they are deferred (so `blocks` is empty
+    /// until the first execution decodes them), `0` when present. A function
+    /// "has a body" iff `blocks.len != 0 OR deferred_offset != 0` — see
+    /// `hasBody`, which every "is this bodyless?" check must consult so a
+    /// deferred function is never mistaken for a native / abstract stub.
+    deferred_offset: u32 = 0,
     entry: BlockId,
     is_suspend: bool,
     /// First-class func classification for the extension scorer. Defaults
@@ -679,6 +686,15 @@ pub const Func = struct {
     /// applies. Overload selection skips it while any normal sibling
     /// fits.
     low_priority: bool = false,
+
+    /// True when this function has an IR body — present blocks, or blocks
+    /// deferred to the image's lazy-IR section. Distinguishes a real function
+    /// (whose body may be lazily decoded) from a native / abstract / `expect`
+    /// stub (no blocks, not deferred). Every "is this bodyless?" check uses
+    /// this, never a bare `blocks.len`, so deferral stays invisible to dispatch.
+    pub fn hasBody(self: *const Func) bool {
+        return self.blocks.len != 0 or self.deferred_offset != 0;
+    }
 };
 
 pub const Param = struct {
@@ -755,6 +771,14 @@ const FuncIdMap = std.AutoHashMap;
 /// Top-level container.
 pub const Module = struct {
     funcs: std.ArrayList(Func) = .empty,
+    /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
+    /// self-contained, decoded on first execution. Borrows the image buffer;
+    /// empty unless this module was loaded from an image.
+    deferred_func_section: []const u8 = &.{},
+    /// Process-lifetime allocator a decoded `blocks` slice must persist in.
+    deferred_func_arena: Allocator = undefined,
+    /// Injected decoder (`image.decodeFuncBlocks`), null until installed.
+    deferred_func_decode: ?*const fn (Allocator, []const u8, u32) ?[]Block = null,
     classes: std.ArrayList(Class) = .empty,
     consts: std.ArrayList(Const) = .empty,
     /// Top-level (file-scope) function ids, in declaration order.
@@ -925,6 +949,18 @@ pub const Module = struct {
         return Module.init(allocator);
     }
 
+    /// Materialise `func`'s deferred `blocks` from the lazy-IR section, clearing
+    /// `deferred_offset` so it is a no-op afterwards. Decoded into the module's
+    /// process-lifetime arena so the patch persists across per-program builds.
+    pub fn ensureFuncBody(self: *const Module, func: *Func) void {
+        if (func.deferred_offset == 0) return;
+        const decode = self.deferred_func_decode orelse return;
+        if (decode(self.deferred_func_arena, self.deferred_func_section, func.deferred_offset - 1)) |blocks| {
+            func.blocks = blocks;
+            func.deferred_offset = 0;
+        }
+    }
+
     pub fn deinit(self: *Module, allocator: Allocator) void {
         self.funcs.deinit(allocator);
         self.classes.deinit(allocator);
@@ -965,6 +1001,13 @@ pub const Module = struct {
     pub fn cloneForExtend(self: *const Module, a: Allocator) Allocator.Error!Module {
         var out = Module.init(a);
         try out.funcs.appendSlice(a, self.funcs.items);
+        // Carry the lazy-IR section so a deferred base function materialises
+        // when the extending run executes it. Decode into the base's own
+        // process-lifetime arena (not this run's `a`, which a freeing/gc backend
+        // reclaims out from under the patched blocks).
+        out.deferred_func_section = self.deferred_func_section;
+        out.deferred_func_arena = self.deferred_func_arena;
+        out.deferred_func_decode = self.deferred_func_decode;
         try out.classes.appendSlice(a, self.classes.items);
         try out.consts.appendSlice(a, self.consts.items);
         try out.top_level.appendSlice(a, self.top_level.items);
@@ -1097,7 +1140,7 @@ pub const Module = struct {
         for (candidates) |id| {
             if (first == null) first = id;
             if (idGet(Func, self.funcs.items, id.int())) |f| {
-                if (first_body == null and f.blocks.len != 0) first_body = id;
+                if (first_body == null and f.hasBody()) first_body = id;
                 if (first_user != null) continue;
                 if (!isShippedPackage(f.package)) first_user = id;
             }
@@ -1408,7 +1451,7 @@ pub const Module = struct {
     };
 
     fn sigViewOf(self: *const Module, id: FuncId, f: *const Func) ?SigView {
-        if (f.blocks.len != 0) return .{ .body = f };
+        if (f.hasBody()) return .{ .body = f };
         if (self.decl_user_sig.get(id.int())) |sig| return .{ .decl = sig };
         return null;
     }
@@ -1457,7 +1500,7 @@ pub const Module = struct {
         const up = funcUserArity(f);
         const last_is_fn = f.params.len != 0 and
             std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
-        if (f.blocks.len == 0 or !last_is_fn or up < want or want < 1) return false;
+        if (!f.hasBody() or !last_is_fn or up < want or want < 1) return false;
         const this_off: usize = if (funcHasImplicitThis(f)) 1 else 0;
         const lead = want - 1;
         const last_user = up - 1;
@@ -1521,7 +1564,7 @@ pub const Module = struct {
                 continue;
             }
             all_ext = false;
-            if (f.blocks.len == 0 and self.stubDeclArity(id) == null) continue;
+            if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             const t = self.bareCallTier(f, name, caller_pkg, caller_file);
             if (t < best_tier) best_tier = t;
         }
@@ -1559,7 +1602,7 @@ pub const Module = struct {
             const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
             if (funcHasImplicitThis(f)) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
-            const is_stub = f.blocks.len == 0;
+            const is_stub = !f.hasBody();
             // The stub and body gates must accept the SAME candidate
             // shapes (exact arity, no defaults, no vararg at any
             // position) so the resolution — and the ambiguity verdict —
@@ -1691,7 +1734,7 @@ pub const Module = struct {
         for (cands) |id| {
             const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
             if (funcHasImplicitThis(f)) continue;
-            if (f.blocks.len == 0 and self.stubDeclArity(id) == null) continue;
+            if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             const t = self.bareCallTier(f, name, caller_pkg, caller_file);
             if (t < best_tier) best_tier = t;
         }
@@ -1701,7 +1744,7 @@ pub const Module = struct {
         for (cands) |id| {
             const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
             if (funcHasImplicitThis(f)) continue;
-            if (f.blocks.len == 0 and self.stubDeclArity(id) == null) continue;
+            if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
             if (chosen == null) chosen = id;
             count += 1;
@@ -1733,7 +1776,7 @@ pub const Module = struct {
         for (cands) |id| {
             const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
             if (funcHasImplicitThis(f)) continue;
-            if (f.blocks.len == 0 and self.stubDeclArity(id) == null) continue;
+            if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             const t = self.bareCallTier(f, name, caller_pkg, caller_file);
             if (t < best_tier) best_tier = t;
         }

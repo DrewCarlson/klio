@@ -183,7 +183,7 @@ fn overloadPickByCast(
     var best_score: i32 = 0;
     for (cands) |fid| {
         const f = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
-        if (f.blocks.len == 0 or (f.params.len != 0 and f.params[f.params.len - 1].is_vararg)) continue;
+        if (!f.hasBody() or (f.params.len != 0 and f.params[f.params.len - 1].is_vararg)) continue;
         const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         if (f.params.len -| base != want) continue;
         var score: i32 = 0;
@@ -1714,7 +1714,7 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
     const list = b.module.func_name_index.get(name) orelse return null;
     for (list.items) |fid| {
         const f = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
-        if (f.blocks.len == 0) continue;
+        if (!f.hasBody()) continue;
         if (!(f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
         if (userParams(f) != user_arg_count) continue;
         const last = f.params[f.params.len - 1];
@@ -2725,7 +2725,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 fn aFuncFits(b: *FuncBuilder, nm: []const u8, want: usize) bool {
     for (b.module.funcsBySimpleName(nm)) |fid| {
         const mf = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
-        if (mf.blocks.len == 0) continue;
+        if (!mf.hasBody()) continue;
         const has_this = mf.params.len != 0 and std.mem.eql(u8, mf.params[0].name, "this");
         const base: usize = if (has_this) 1 else 0;
         const user = mf.params.len - base;
@@ -3714,7 +3714,7 @@ fn resolveAudit(
 /// the index correcting a fallback shape, not a mis-bind.
 fn heurPickInexact(b: *FuncBuilder, fid: FuncId, want: usize) bool {
     const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return true;
-    if (f.blocks.len == 0) {
+    if (!f.hasBody()) {
         const da = b.module.decl_user_arity.get(fid.int()) orelse return true;
         return da.has_vararg or da.required != da.total or da.total != want;
     }
@@ -3846,7 +3846,7 @@ fn fqnOf(b: *FuncBuilder, id: FuncId) []const u8 {
 
 fn matchesRecv(b: *FuncBuilder, fid: FuncId, recv: []const u8) bool {
     const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return false;
-    if (f.blocks.len == 0) return false;
+    if (!f.hasBody()) return false;
     if (f.params.len == 0) return false;
     return std.mem.eql(u8, f.params[0].name, "this") and std.mem.eql(u8, f.params[0].ty.name, recv);
 }
@@ -3895,14 +3895,14 @@ fn userParams(f: *const Func) usize {
 fn arityMatch(b: *FuncBuilder, fid: FuncId, want: usize) bool {
     const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return false;
     const last_not_vararg = f.params.len == 0 or !f.params[f.params.len - 1].is_vararg;
-    return f.blocks.len != 0 and last_not_vararg and userParams(f) == want;
+    return f.hasBody() and last_not_vararg and userParams(f) == want;
 }
 
 fn arityMatchTl(b: *FuncBuilder, fid: FuncId, want: usize) bool {
     const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return false;
     const up = userParams(f);
     const last_is_fn = f.params.len != 0 and std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
-    if (f.blocks.len == 0 or !last_is_fn or up < want or want < 1) return false;
+    if (!f.hasBody() or !last_is_fn or up < want or want < 1) return false;
     const this_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     const lead = want - 1;
     const last_user = up - 1;
@@ -4704,7 +4704,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         var chosen: ?FuncId = null;
         for (b.module.funcsBySimpleName(name.name)) |fid| {
             const f = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
-            if (f.blocks.len == 0) continue;
+            if (!f.hasBody()) continue;
             if (f.params.len == 0) continue;
             const p0 = f.params[0];
             if (!std.mem.eql(u8, p0.name, "this") or !std.mem.eql(u8, p0.ty.name, cast_ty.name.name)) continue;

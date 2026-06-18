@@ -63,7 +63,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -508,6 +508,10 @@ const ModuleImage = struct {
     decl_user_arity: []KV(u32, Module.DeclArity),
     decl_user_sig: []KV(u32, []ir.TypeRef),
     decl_span: []KV(u32, Span),
+    /// Lazy IR: the self-contained `blocks` of AST-free functions, decoded on
+    /// first execution. A deferred function carries its `offset + 1` into this
+    /// section in `Func.deferred_offset` (its `blocks` is empty in the image).
+    deferred_func_section: []const u8,
 };
 
 /// Build-time `Value` reachable from an enum entry or a primitive-zero
@@ -673,6 +677,29 @@ pub fn decodeDeferredBody(a: Allocator, section: []const u8, offset: u32) ?ast.F
     return body;
 }
 
+/// Decode a deferred function's `blocks` from the lazy-IR section at `offset`,
+/// allocating into `a`. Self-contained (fresh registry), like the AST bodies.
+pub fn decodeFuncBlocks(a: Allocator, section: []const u8, offset: u32) ?[]ir.Block {
+    var d = Decoder{ .a = a, .buf = section, .pos = offset };
+    var blocks: []ir.Block = undefined;
+    decodeInto([]ir.Block, &d, &blocks) catch return null;
+    return blocks;
+}
+
+/// Whether any instruction in `func` references an AST node (`RegisterClass`,
+/// `BuildObject`, `AstLambda`). Such a function's `blocks` cannot be encoded
+/// self-contained — the AST pointee lives in the eager skeleton — so it stays
+/// eager rather than being deferred to the lazy-IR section.
+fn funcRefsAst(func: *const ir.Func) bool {
+    for (func.blocks) |blk| {
+        for (blk.insts) |inst| switch (inst) {
+            .RegisterClass, .BuildObject, .AstLambda => return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
 const InlineIdImage = struct { id: u32, f: *const ast.Function };
 
 // -------------------------------------------------------------------------
@@ -729,6 +756,26 @@ pub fn bake(
     }
     root.deferred_bodies = body_enc.out.items;
 
+    // Defer AST-free function `blocks` into a second self-contained section,
+    // recording each function's `offset + 1` in `deferred_offset` and emptying
+    // its live blocks. Restored after the encode, like the AST bodies.
+    var fn_blk_enc = Encoder.init(gpa);
+    defer fn_blk_enc.deinit();
+    var fn_saved: std.ArrayList(struct { f: *ir.Func, blocks: []ir.Block }) = .empty;
+    defer fn_saved.deinit(a);
+    {
+        for (root.module.funcs) |*f| {
+            if (f.blocks.len == 0 or funcRefsAst(f)) continue;
+            const offset: u32 = @intCast(fn_blk_enc.out.items.len);
+            fn_blk_enc.resetRegistry();
+            try encodeValue([]ir.Block, &fn_blk_enc, &f.blocks);
+            try fn_saved.append(a, .{ .f = f, .blocks = f.blocks });
+            f.deferred_offset = offset + 1;
+            f.blocks = &.{};
+        }
+        root.module.deferred_func_section = fn_blk_enc.out.items;
+    }
+
     var e = Encoder.init(gpa);
     defer e.deinit();
 
@@ -743,8 +790,12 @@ pub fn bake(
     @memcpy(e.out.items[len_slot .. len_slot + 8], &std.mem.toBytes(std.mem.nativeToLittle(u64, payload_len)));
     try e.bytes(TRAILER);
 
-    // Restore the live base's bodies before handing back the bytes.
+    // Restore the live base's bodies and func blocks before handing back bytes.
     for (saved.items) |s| s.f.body = s.body;
+    for (fn_saved.items) |s| {
+        s.f.blocks = s.blocks;
+        s.f.deferred_offset = 0;
+    }
 
     return try e.out.toOwnedSlice(e.gpa);
 }
@@ -812,6 +863,8 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
     out.func_index = m.func_index.items;
     out.package = m.package;
     out.tailrec_fn_names = m.tailrec_fn_names.items;
+    // The lazy-IR deferral runs in `bake` after this; default to eager.
+    out.deferred_func_section = &.{};
 
     out.decl_user_params = try autoMapToSlice(u32, u32, a, &m.decl_user_params);
     out.decl_user_arity = try autoMapToSlice(u32, Module.DeclArity, a, &m.decl_user_arity);
@@ -1438,6 +1491,11 @@ fn sliceToSet(a: Allocator, items: []const []const u8) Allocator.Error!std.Strin
 
 fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocator.Error!void {
     try out.funcs.appendSlice(a, img.funcs);
+    // Lazy IR: a deferred function (its `deferred_offset` set in `img.funcs`)
+    // materialises its blocks on first execution from this section.
+    out.deferred_func_section = img.deferred_func_section;
+    out.deferred_func_arena = a;
+    out.deferred_func_decode = decodeFuncBlocks;
     try out.classes.appendSlice(a, img.classes);
     try out.consts.appendSlice(a, img.consts);
     try out.top_level.appendSlice(a, img.top_level);

@@ -1011,6 +1011,10 @@ fn runFrameInner(
     var pending_rethrow: ?struct { key: BlockId, exc: Value } = null;
     var pending_return: ?struct { key: BlockId, val: Value } = null;
     const func: *const Func = frame.func;
+    // Lazy IR: materialise a deferred function's blocks before the dispatch
+    // loop reads them. `TailCallFunc` is self-recursive (same func), so `func`
+    // stays current for the whole loop.
+    if (func.deferred_offset != 0) frame.module.ensureFuncBody(@constCast(func));
     while (true) {
         // Daemon abandonment: a dispatcher pool task still running at the
         // run boundary stops at its next block instead of completing (or

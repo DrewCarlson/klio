@@ -292,14 +292,14 @@ pub const ProgramImage = struct {
         // arity picks among them at the call), falling back to the
         // exact-FQN embedded native, else the bare-name map's native.
         for (module.funcs.items) |*f| {
-            if (f.blocks.len != 0) continue;
+            if (f.hasBody()) continue;
             if (self.resolved_native.contains(f.id.int())) continue;
             var sibs: std.ArrayList(FuncId) = .empty;
             errdefer sibs.deinit(self.allocator);
             for (module.funcsBySimpleName(f.name)) |cand| {
                 if (cand.int() == f.id.int()) continue;
                 if (cand.int() >= module.funcs.items.len) continue;
-                if (module.funcs.items[cand.int()].blocks.len == 0) continue;
+                if (!module.funcs.items[cand.int()].hasBody()) continue;
                 try sibs.append(self.allocator, cand);
             }
             if (sibs.items.len != 0) {

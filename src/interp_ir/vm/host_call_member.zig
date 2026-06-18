@@ -2925,7 +2925,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         for (mod.funcsBySimpleName(name)) |fid| {
             if (@intFromEnum(fid) < mod.funcs.items.len) {
                 const f = mod.funcs.items[@intFromEnum(fid)];
-                if (f.blocks.len != 0 and f.params.len > 0 and
+                if (f.hasBody() and f.params.len > 0 and
                     std.mem.eql(u8, f.params[0].name, "this") and recv_chain.contains(f.params[0].ty.name))
                 {
                     break :blk true;
