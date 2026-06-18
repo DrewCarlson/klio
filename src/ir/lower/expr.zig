@@ -1875,17 +1875,35 @@ fn lastArgIsLambda(args: []const Expr) bool {
     return args[args.len - 1] == .Lambda;
 }
 
-/// Whether any same-simple-name function is an extension (its first lowered
-/// parameter is the `this` receiver). Distinguishes a bare member/extension
-/// call on the spliced receiver (`receiveNullable(...)` — has a receiver
-/// candidate) from a bare top-level function call (`println(...)` — none),
-/// so only the former dispatches on the splice's bound `this`.
-fn nameHasReceiverCandidate(b: *FuncBuilder, name: []const u8) bool {
+/// Last `.`-separated segment of a (possibly qualified) type name.
+fn lastTypeSegment(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    return name;
+}
+
+/// Whether any same-simple-name function is an extension whose declared
+/// receiver type is compatible with the spliced receiver's type chain
+/// (`chain`, the receiver simple-name plus its supertypes). Distinguishes
+/// a bare member/extension call on the spliced receiver
+/// (`receiveNullable(...)` — applies to that receiver) from a bare call
+/// whose extension namesakes target unrelated types (`maxOf(a, b)` inside
+/// `Buffer.indexOf` — its only extension overloads are `Iterable.maxOf` /
+/// array `maxOf`, none applies to `Buffer`, so the call binds the
+/// package-level `maxOf(Int, Int)`). Only the former dispatches on the
+/// splice's bound `this`; the latter falls through to the bare-name path.
+/// A null `chain` (no receiver type narrowing available) admits any
+/// extension namesake, preserving the prior receiver-agnostic behavior.
+fn nameHasReceiverCandidate(b: *FuncBuilder, name: []const u8, chain: ?[]const []const u8) bool {
     for (b.module.funcsBySimpleName(name)) |fid| {
         const idx = fid.int();
         if (idx >= b.module.funcs.items.len) continue;
         const f = &b.module.funcs.items[idx];
-        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) return true;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        const recv_ty = lastTypeSegment(f.params[0].ty.name);
+        const ch = chain orelse return true;
+        for (ch) |c| {
+            if (std.mem.eql(u8, lastTypeSegment(c), recv_ty)) return true;
+        }
     }
     return false;
 }
@@ -2432,8 +2450,16 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.currentInlineFn() != null)
     {
         const nm = callee.Path.segments[0].name;
+        // Only route to the spliced receiver when the bare name is a member
+        // of it or names an extension whose declared receiver type is
+        // compatible with the spliced receiver's type chain. A bare call
+        // whose only extension namesakes target unrelated types (`maxOf(a,
+        // b)` inside `Buffer.indexOf`, whose extension overloads are
+        // `Iterable.maxOf` / array `maxOf`) is the package-level function,
+        // not a receiver member — it must fall through to the bare-name path.
+        const recv_chain = try narrowingRecvChain(b);
         if (b.resolve(nm) == null and !b.knowsOuter(nm) and
-            (b.hasOwnMember(nm) or nameHasReceiverCandidate(b, nm)))
+            (b.hasOwnMember(nm) or nameHasReceiverCandidate(b, nm, recv_chain)))
         {
             if (b.resolve("this")) |bound_this| {
                 const run = try lowerArgRun(b, args);
