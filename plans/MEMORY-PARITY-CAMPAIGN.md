@@ -45,11 +45,17 @@ fix is validated by a 200k-iter sawtooth that returns to baseline.
 
 ## Phase status
 
-- **Phase 1 — per-iteration leaks: DONE** (target 1 & 5). Committed.
-- **Phase 2 — bare runtime 43 -> ~25 MB: NOT STARTED.** Needs the lazy-forest flip.
-- **Phase 3 — ktor startup 136 -> ~45 MB: NOT STARTED.** Same lazy-forest flip.
-- **Phase 4 — steady-under-load << node: PARTIAL.** Server creep is ~0.4 KB/req
-  and ~flat after P1; absolute steady RSS falls out of P2/P3 (lower baseline).
+- **Phase 1 — per-iteration leaks: DONE** (target 1 & 5). Committed. MapBacking
+  residual also fixed this session.
+- **Phase 2 — bare runtime: LAZY-FOREST FLIP DONE.** 42 -> **32 MB** (ReleaseFast,
+  warm). The eager stdlib AST forest no longer decodes at startup. Target 25 needs
+  the "beyond forest" work (lazy `ir.Func` headers / lazy ClassDef) — the IR
+  module + ClassDef graph are now the dominant eager decode.
+- **Phase 3 — ktor startup: LAZY-FOREST FLIP DONE.** 124 -> **103 MB**. Same flip;
+  target 45 also needs beyond-forest (the ktor IR + ClassDef graph dominate now).
+- **Phase 4 — steady-under-load << node: PARTIAL.** Server creep ~flat after P1;
+  absolute steady RSS dropped with the lower P2/P3 baseline but ktor steady (~103)
+  is still ~node (~96); the gap is the eager IR/ClassDef graph (beyond-forest).
 
 Phases 2 and 3 are the *same underlying work* (lazy materialization of the stdlib
 forest); the only difference is which image (basic vs ktor) benefits.
@@ -349,10 +355,20 @@ eval-level tail (see Phase 1 residual) chased to zero.
       SAFETY NET: `lifted_decls` encodes first (ImageRoot field 2), so any forest
       pointer NOT converted falls back to inline-encode after I4 (correct, just
       no savings) — missing a field cannot corrupt, only under-save.
-- [ ] P2/P3 I3: bake `file_classes`/`collectInline`/`top_props` indices; replace
-      the three load traversals.
-- [ ] P2/P3 I4: drop eager `lifted_decls` decode; bump `FORMAT_VERSION`; measure
-      basic + ktor startup RSS.
-- [ ] (If needed) lazy `ir.Func` headers / lazy ClassDef construction.
-- [ ] P4: confirm steady-under-load << node; tune slab `reclaimDormant` if a
-      hard-flat idle profile is wanted.
+- [x] P2/P3 I3: baked `inline_by_name`/`file_classes`/`top_props` indices replace
+      the three load traversals; `inline_fn_ids`/`inline_fn_asts`/`FileClasses`
+      hold `ForestField` and resolve per-decl sections on demand. DONE.
+- [x] P2/P3 I4: eager `lifted_decls` dropped at bake (`root.lifted_decls = &.{}`
+      after the per-decl sections + indices); `FORMAT_VERSION` 5->6. DONE.
+      **Measured: bare 42->32 MB, ktor startup 124->103 MB, steady ktor flat at
+      ~103-122 MB across 2500 req (no per-request growth).** Suite green.
+- [ ] **BEYOND FOREST (next lever to hit 25/45):** the eager `ir.Func` headers
+      (decode-stats now top: ir.Inst/ir.Func/ir.Param/ir.TypeRef ~4 MB basic /
+      ~10 MB ktor) and the runtime ClassDef graph are decoded/built eagerly,
+      independent of the forest. Lazy func-header decode (on first FuncId lookup)
+      + lazy ClassDef construction (on first class use) are the remaining levers.
+      Larger, separate work touching the VM func/class resolution paths.
+- [ ] leaktrack fix (segfaults at exit-collect) — enables the P1 eval-tail
+      attribution; validate via RSS trajectory until then.
+- [ ] P4: ktor steady (~103-122) is ~node (~96); driving below node needs the
+      beyond-forest baseline drop. Per-request growth already flat.
