@@ -388,6 +388,21 @@ eval-level tail (see Phase 1 residual) chased to zero.
       `bodyless_func_ids` list (base) + user bodyless funcs. ~150-200 lines across
       image/ir/interp_ir; touches dispatch (resolved_native/redirect) so validate
       with full suite + ktor e2e + cross-mode. Payoff ~5 MB ktor (-> ~86).
+      **Phase B was IMPLEMENTED end-to-end then REVERTED (uncommitted) — it hit a
+      subtle lazy-decode bug.** Definitive isolation: with the per-func header
+      decode DISABLED at load (funcs kept eager, `base_n=0`) every program runs
+      correctly, so the routing + the link rewrite (resolved_native via bindings,
+      redirect via baked bodyless-ids, all counts matched) are SOUND. With the
+      lazy per-func header decode ON, `1.toString()` dispatches to the wrong func
+      (func id 0, a `.first`-reading toString) -> "get_field `first` on Unit",
+      broadly, on every program. funcById returned the requested id with matching
+      `.id`/name/params/deferred_offset, and bodies materialised (no empty-blocks),
+      yet the dispatched func differs from the eager path — i.e. the per-func
+      self-contained header encode/decode (or its interaction with the
+      method/name dispatch picking a func by id) yields a wrong func for some ids.
+      Root-causing needs byte-level eager-vs-lazy func compare — a dedicated
+      debugging pass, not safe auto-loop work; reverted to keep the tree green.
+      The ~70 func-lookup-site conversion + the link cascade are written and known.
 - [ ] (old framing) `Module.funcById`/`funcCount` choke point added
       (eager today; lazy fields `func_header_section/offsets/decode/cache` in
       place); all ir.zig func-by-id reads route through it. **The lazy flip is NOT
