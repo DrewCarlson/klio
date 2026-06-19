@@ -150,3 +150,88 @@ efforts, not bug fixes.
 `bench/memcompare/{klio,node,py}/` + `run.sh` — collections (object/GC), strings
 (string/hashmap), numeric (array). Cross-runtime CPU + RSS comparison; all
 workloads share a seeded LCG and print identical checksums.
+
+## Profiling tool — `KLIO_PROF`
+
+`src/runtime/prof.zig`: SIGPROF + ITIMER_PROF statistical PC sampler. Records the
+interrupted RIP into a signal-safe fixed buffer (one atomic add + one store, no
+alloc), symbolizes a by-function histogram at exit (`std.debug` DWARF). `KLIO_PROF=1`
+(default 1 kHz) or `KLIO_PROF=<usec>`. ReleaseFast inlines the interpreter core, so
+~half the samples land in `<unknown>` (inlined `execInst`/`runFrameInner`); the named
+remainder still attributes the constant-factor costs precisely.
+
+## Session — member-dispatch inline cache
+
+Profiling collections (41× CPython, member-call bound) showed the cost was NOT the
+two systemic O(n²) bugs (already fixed) but **per-call user-method resolution**:
+every `inst.method()` ran `irMethodWalk`, which re-walked the class hierarchy
+(linear `classIdByFqn` + class-by-name + method-by-name string scans) and
+heap-allocated a work queue + seen-set, *per call*. A method in a 1M-iteration loop
+(`rng.next()`) paid full resolution 1M times — `classHasUserMethod`/`classIdByFqn`/
+`eqlBytes` dominated the named profile.
+
+Fix (committed, green): an inline cache on `ProgramImage`,
+`instance_method_cache: (class identity, method-name ptr) → FuncId`, populated after
+an unambiguous resolve and consulted at the top of `irMethodWalk`. Restricted to
+**zero-arg calls**: with no args there is no overload/arg-type discrimination
+(`pickMethodOverload` declines a sole candidate only by arity or definite arg-type
+mismatch — neither applies), so the result is a pure function of the class. Covers
+the member-heavy hot path (getters, `next`, `hasNext`, `toString`, `hashCode`).
+`irMethodWalk` was split into `resolveInstanceMethod` + `invokeMethodFuncId` so the
+cold and cached paths share one invoke tail; the tail now builds the frame arg list
+directly (`[receiver]++args` in one alloc) for fully-applied non-vararg calls,
+dropping the `prependReceiver` scratch slice. collections ~11.9→~9.9 s, strings
+~6.5→~6.3 s. (Bug found + fixed during this: the first cut keyed on arity and
+short-circuited the per-instance binding/anon probes — broke ktor ContentNegotiation
+content-type, because `anonMethodDispatch` depends on instance state
+`__enum_entry_class__`. Zero-arg-only + caching inside the walk after the probes is
+the sound form.)
+
+## Measurement note — high variance environment
+
+Wall-time variance here is ~15% run-to-run (collections swings ~9.6–11.3 s). Wins
+below ~15% cannot be reliably distinguished from noise by single runs; validate with
+medians of several runs, and prefer levers whose payoff exceeds the noise floor.
+The `run.sh` RSS column reads ~1 MB (the /proc VmHWM sampler does not catch these
+short fast processes) — trust the prior campaign's RSS figures, not this column.
+
+## Costed roadmap to close the residual (the three big levers)
+
+The interpreter is at ~CPython class. The remaining gap (numeric ~8× CPython /
+~140× node; collections ~40× / ~180×; strings ~33× / ~60×) is constant-factor +
+architecture. Three levers, in dependency order:
+
+1. **Value shrink 64 B → ~40 B** (helps ALL general code: every copy, append,
+   register write, arg move). Max variant is `List` = 56 B, driven by
+   `enum_class: ?StringRef` and the `declared_*` slices. KEY FINDING: Zig 0.16 does
+   NOT niche-optimize `?ObjRef` (`?StringRef` = 16 B, not 8) — it adds a separate
+   tag word. To shrink: give `enum_class` a niche (store the cell pointer as
+   `?*Cell`, 8 B) and box the borrowed `declared_elem`/`declared_key`/`declared_value`
+   slices behind one niche'd `?*CollDeclared` pointer. `enum_class` is a GC ref, so
+   its trace site must move with it (the risk). ~69 access sites; mechanical but
+   touches the GC trace. Expected ~10–25% across all benches.
+2. **F5 packed primitive arrays** (`IntArray`/`BooleanArray`/… as a packed scalar
+   buffer instead of `ArrayList(Value)` = 64 B/elem). numeric peak RSS 1.2 GB → ~10
+   MB AND a large CPU win on numeric (64× less memory traffic → cache-resident,
+   no per-element retain/release, GC traces nothing). ~60+ element-access sites need
+   an accessor API (`elemAt`/`setElem`/`boxedItems`) that box/unbox at the boundary;
+   generic ops materialize. Mechanical + compiler-guided, but broad and
+   silent-corruption-prone if a site is missed (leaks into structuralEq/display/gc).
+   **Prerequisite for a JIT that touches arrays.**
+3. **JIT stage 3 — native hot loops** (`src/jit/jit.zig` encoder is done + tested:
+   ALU, `[base+disp32]` mem, labels, jumps, native-loop proof). The ONLY path to
+   node-class on hot loops. Design (matches JIT-DESIGN.md, keeps the "never poke the
+   Value union from machine code" rule): detect a hot loop via back-edge counting in
+   `runFrameInner` (seam: the `.Branch`/`.Goto` terminator switch); for a compilable
+   loop (supported insts only: Int/Long `BinOp`, comparisons, `Move`, `Const`,
+   internal branches; later array `Index`/`IndexSet` once F5 lands), unbox the live
+   regs Value→i64 into a scratch array **in safe Zig**, run native code over the i64
+   scratch (no Value-layout dependency), rebox in Zig on exit, deopt to the
+   interpreter on a guard miss. Gate behind `KLIO_JIT` (off → tree stays green) until
+   coverage is proven. First increment compiles pure-arithmetic loops; real benches
+   need F5 first.
+
+Honest bottom line: node/v8 parity for general code is a JIT problem — no
+interpreter (CPython included, itself ~15× node here) reaches it. Levers 1–2 are
+worth landing for the broad constant-factor + memory wins; lever 3 is the parity
+endgame and is multi-step.
