@@ -250,7 +250,10 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .host = intrinsic.intrinsicHost(),
         .allocator = allocator,
     };
+    const prev_fqn = runtime.leaktrack.current_fqn;
+    runtime.leaktrack.current_fqn = fqn;
     const r = try func(&ctx);
+    runtime.leaktrack.current_fqn = prev_fqn;
     return mapRuntimeResult(allocator, r);
 }
 

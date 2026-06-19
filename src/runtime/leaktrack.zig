@@ -16,7 +16,18 @@ const Record = struct {
     len: usize,
     addrs: [FRAMES]usize,
     n: usize,
+    /// The intrinsic fqn active when this allocation was made (a `back`-owned
+    /// copy), or "" for allocations outside any intrinsic. Lets `reportByFqn`
+    /// attribute leaked raw scratch to the specific stdlib op that made it —
+    /// the stack alone collapses every intrinsic to the `func(&ctx)` call site.
+    fqn: []const u8 = "",
 };
+
+/// Set by `dispatchIntrinsic` around `func(&ctx)`: the fqn of the intrinsic
+/// currently executing on this thread (innermost wins; nested intrinsic calls
+/// save/restore it). Read by `note` to tag each allocation. No-op overhead when
+/// leaktrack is not the backing allocator (just a threadlocal pointer write).
+pub threadlocal var current_fqn: ?[]const u8 = null;
 
 const Site = struct {
     addrs: [FRAMES]usize,
@@ -25,7 +36,10 @@ const Site = struct {
     count: usize,
 };
 
-const back = std.heap.page_allocator;
+// Caching allocator for the tracking metadata: `page_allocator` mmaps/munmaps
+// per hashmap grow and per fqn dupe, which dominates runtime in allocation-heavy
+// programs. `smp_allocator` caches pages, so the tracker keeps up with a hot loop.
+const back = std.heap.smp_allocator;
 
 var lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 fn acquire() void {
@@ -39,6 +53,11 @@ var live: std.AutoHashMapUnmanaged(usize, Record) = .empty;
 var child_alloc: Allocator = undefined;
 var initialized: bool = false;
 
+/// `KLIO_LEAK_BY_FQN`: attribute leaks by intrinsic fqn only. Capturing a stack
+/// trace per allocation dominates runtime in allocation-heavy programs, so the
+/// by-fqn report (which never reads `addrs`) skips it entirely.
+pub var by_fqn_only: bool = false;
+
 fn capture(ret: usize) Record {
     var r: Record = .{ .len = 0, .addrs = undefined, .n = 0 };
     const st = std.debug.captureCurrentStackTrace(.{ .first_address = ret }, &r.addrs);
@@ -49,15 +68,18 @@ fn capture(ret: usize) Record {
 fn note(ptr: [*]u8, len: usize, ret: usize) void {
     acquire();
     defer release();
-    var rec = capture(ret);
+    var rec: Record = if (by_fqn_only) .{ .len = len, .addrs = undefined, .n = 0 } else capture(ret);
     rec.len = len;
+    rec.fqn = if (current_fqn) |f| (back.dupe(u8, f) catch "") else "";
     live.put(back, @intFromPtr(ptr), rec) catch return;
 }
 
 fn forget(ptr: [*]u8) void {
     acquire();
     defer release();
-    _ = live.remove(@intFromPtr(ptr));
+    if (live.fetchRemove(@intFromPtr(ptr))) |kv| {
+        if (kv.value.fqn.len != 0) back.free(kv.value.fqn);
+    }
 }
 
 fn alloc(_: *anyopaque, len: usize, a: Alignment, ra: usize) ?[*]u8 {
@@ -111,6 +133,42 @@ pub fn installSignalDump() void {
     };
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
+
+/// Dump outstanding bytes grouped by the intrinsic fqn that allocated them
+/// (KLIO_LEAK_BY_FQN). After a final collect, GC-managed result cells are gone,
+/// so what remains under an fqn is the raw scratch that intrinsic leaks per call.
+pub fn reportByFqn() void {
+    if (!initialized) return;
+    const Bucket = struct { fqn: []const u8, bytes: usize, count: usize };
+    var buckets: std.ArrayListUnmanaged(Bucket) = .empty;
+    acquire();
+    var it = live.iterator();
+    outer: while (it.next()) |e| {
+        const rec = e.value_ptr;
+        for (buckets.items) |*b| {
+            if (std.mem.eql(u8, b.fqn, rec.fqn)) {
+                b.bytes += rec.len;
+                b.count += 1;
+                continue :outer;
+            }
+        }
+        buckets.append(back, .{ .fqn = rec.fqn, .bytes = rec.len, .count = 1 }) catch {};
+    }
+    release();
+    std.sort.pdq(Bucket, buckets.items, {}, struct {
+        fn lt(_: void, x: Bucket, y: Bucket) bool {
+            return x.bytes > y.bytes;
+        }
+    }.lt);
+    std.debug.print("\n[leaktrack-by-fqn] outstanding bytes per intrinsic:\n", .{});
+    var shown: usize = 0;
+    for (buckets.items) |*b| {
+        if (shown >= 40) break;
+        shown += 1;
+        const label = if (b.fqn.len == 0) "<non-intrinsic>" else b.fqn;
+        std.debug.print("  {d:>10} bytes  {d:>6} allocs  {s}\n", .{ b.bytes, b.count, label });
+    }
 }
 
 fn sameSite(a: *const Record, b: *const Site) bool {

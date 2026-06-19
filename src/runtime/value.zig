@@ -57,7 +57,19 @@ pub const MapViewKind = enum { Keys, Values, Entries };
 pub const MapBacking = struct {
     entries: MapEntries,
     kind: MapViewKind,
+
+    /// GC out-edge: keep the source map's entries cell reachable while a live
+    /// view references it. The handle is a non-owning write-through reference
+    /// (no `deinit`), so refcount teardown of this cell never releases the
+    /// borrowed entries; only the GC keeps it marked.
+    pub fn gcTrace(self: *const MapBacking, m: *objcell.gc.Marker) void {
+        m.shade(&self.entries.cell.hdr);
+    }
 };
+
+/// A heap-managed `MapBacking`: the view owns this cell (retained/released and
+/// GC-swept with the view) but not the entries it points at.
+pub const MapBackingRef = objcell.ObjRef(MapBacking);
 
 /// Distinguishes integer ranges (`IntRange`) from long/char ranges.
 pub const RangeKind = enum {
@@ -495,7 +507,7 @@ pub const Value = union(enum) {
         /// `Some(name)` for `EnumName.entries` / `.values()`.
         enum_class: ?StringRef,
         /// Set when this is a live `MutableMap.values` view.
-        backing: ?*MapBacking,
+        backing: ?MapBackingRef,
         /// Declared element-type head from an explicit call-site type
         /// argument on the creating stdlib function (`listOf<String>()`).
         /// Head name only; borrows the module's interned consts, which
@@ -513,7 +525,7 @@ pub const Value = union(enum) {
         items: ValueList,
         mutable: bool,
         /// Set when this is a live `MutableMap.keys`/`.entries` view.
-        backing: ?*MapBacking,
+        backing: ?MapBackingRef,
         /// Declared element-type head from an explicit call-site type
         /// argument on the creating stdlib function; see `List`.
         declared_elem: ?[]const u8 = null,
@@ -641,8 +653,14 @@ pub const Value = union(enum) {
             .Function => |f| visitor.visit(f.env),
             .IrClosure => |c| visitor.visit(c.captures),
             .Comparator => |c| visitor.visit(c.steps),
-            .List => |x| visitor.visit(x.items),
-            .Set => |x| visitor.visit(x.items),
+            .List => |x| {
+                visitor.visit(x.items);
+                if (x.backing) |b| visitor.visit(b);
+            },
+            .Set => |x| {
+                visitor.visit(x.items);
+                if (x.backing) |b| visitor.visit(b);
+            },
             .Array => |x| visitor.visit(x.items),
             .Map => |x| visitor.visit(x.entries),
             .Iterator => |x| {
@@ -709,8 +727,8 @@ pub const Value = union(enum) {
     pub fn gcMark(self: Value, m: *objcell.gc.Marker) void {
         self.forEachChildCell(MarkVisitor{ .m = m });
         switch (self) {
-            .List => |x| if (x.backing) |b| m.shade(&b.entries.cell.hdr),
-            .Set => |x| if (x.backing) |b| m.shade(&b.entries.cell.hdr),
+            // `List`/`Set` view `backing` is shaded by `forEachChildCell` above
+            // (the `MapBacking` cell's own `gcTrace` reaches the source entries).
             .MapEntry => |e| if (e.backing) |b| m.shade(&b.cell.hdr),
             // Keep the side-table's canonical capture store + receiver chain for
             // this closure alive (the dup'd `captures` ValueSlice is already
@@ -742,8 +760,16 @@ pub const Value = union(enum) {
             // `slice.deinit()`); do not deinit it again.
             .IrClosure => |c| releaseSliceElems(c.captures, allocator),
             .Comparator => |c| c.steps.deinit(),
-            .List => |x| releaseValueList(x.items, allocator),
-            .Set => |x| releaseValueList(x.items, allocator),
+            .List => |x| {
+                releaseValueList(x.items, allocator);
+                // Drop the view's owned `MapBacking` cell (the borrowed entries
+                // it points at are owned by the source map, not released here).
+                if (x.backing) |b| b.deinit();
+            },
+            .Set => |x| {
+                releaseValueList(x.items, allocator);
+                if (x.backing) |b| b.deinit();
+            },
             .Array => |x| releaseValueList(x.items, allocator),
             .Map => |x| {
                 // Last owner: release each entry's key and value.

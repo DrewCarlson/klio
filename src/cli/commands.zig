@@ -357,7 +357,9 @@ fn runBuiltModule(
     };
 
     var stdout = io.StdoutSink{};
+    runtime.prof.maybeStart();
     const res = runMainBigStack(&vm, main, stdout.output());
+    runtime.prof.maybeReport();
     return switch (res) {
         .ok => 0,
         .err => |e| blk: {
