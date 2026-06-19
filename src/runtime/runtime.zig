@@ -41,6 +41,7 @@ pub const gc = objcell.gc;
 pub const slab = @import("slab.zig");
 pub const leaktrack = @import("leaktrack.zig");
 pub const forest = @import("forest.zig");
+pub const prof = @import("prof.zig");
 // Host-op temporary keepalive (a GC root for accumulators/snapshots held across
 // a re-entrant user callable). No-ops unless the GC is active.
 pub const keepaliveMark = value_mod.keepaliveMark;
