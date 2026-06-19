@@ -203,7 +203,7 @@ fn makeList(items: ValueList, mutable: bool) Value {
     return .{ .List = .{
         .items = items,
         .mutable = mutable,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } };
 }

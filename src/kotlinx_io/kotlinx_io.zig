@@ -334,7 +334,7 @@ fn fsList(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .List = .{
         .items = try ValueList.init(ctx.allocator, names),
         .mutable = false,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } });
 }

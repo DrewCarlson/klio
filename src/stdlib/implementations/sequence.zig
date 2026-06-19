@@ -56,7 +56,7 @@ fn makeList(allocator: std.mem.Allocator, items: []Value, mutable: bool) std.mem
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(allocator, items);
     const ref = try ValueList.init(allocator, list);
-    return .{ .List = .{ .items = ref, .mutable = mutable, .enum_class = null, .backing = null } };
+    return .{ .List = .{ .items = ref, .mutable = mutable, .enum_entries = false, .backing = null } };
 }
 
 fn makeSet(allocator: std.mem.Allocator, items: []Value, mutable: bool) std.mem.Allocator.Error!Value {
@@ -164,7 +164,7 @@ fn runSeqBuilder(ctx: *CallCtx, who: []const u8) std.mem.Allocator.Error!Builder
         .{ .name = "__seq_buffer", .value = .{ .List = .{
             .items = buffer.clone(),
             .mutable = true,
-            .enum_class = null,
+            .enum_entries = false,
             .backing = null,
         } } },
     };

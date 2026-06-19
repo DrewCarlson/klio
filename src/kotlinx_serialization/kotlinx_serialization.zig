@@ -349,7 +349,7 @@ fn decodeField(
             return .{ .ok = .{ .List = .{
                 .items = try ValueList.init(a, items),
                 .mutable = false,
-                .enum_class = null,
+                .enum_entries = false,
                 .backing = null,
             } } };
         },
@@ -545,7 +545,7 @@ fn ctorParamNames(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .List = .{
         .items = try ValueList.init(a, items),
         .mutable = false,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } });
 }
@@ -734,7 +734,7 @@ test "valueToJson encodes scalars and collections" {
         const v = Value{ .List = .{
             .items = try ValueList.init(a, items),
             .mutable = false,
-            .enum_class = null,
+            .enum_entries = false,
             .backing = null,
         } };
         const r = try valueToJson(&v, &ctx, a);

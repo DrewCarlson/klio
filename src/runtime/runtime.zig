@@ -283,7 +283,7 @@ test "enum entries is_runtime_type matches both" {
     const entries = Value{ .List = .{
         .items = entry_items,
         .mutable = false,
-        .enum_class = try StringRef.init(a, "Color"),
+        .enum_entries = true,
         .backing = null,
     } };
     try testing.expect(entries.isRuntimeType("List"));
@@ -299,7 +299,7 @@ test "enum entries is_runtime_type matches both" {
     const plain = Value{ .List = .{
         .items = plain_items,
         .mutable = false,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } };
     try testing.expect(plain.isRuntimeType("List"));
@@ -320,7 +320,7 @@ test "enum entries keeps list type fqn for dispatch" {
     const entries = Value{ .List = .{
         .items = items,
         .mutable = false,
-        .enum_class = try StringRef.init(a, "Color"),
+        .enum_entries = true,
         .backing = null,
     } };
     try testing.expectEqualStrings("kotlin.collections.List", entries.typeFqn());

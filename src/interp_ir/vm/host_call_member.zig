@@ -1449,7 +1449,7 @@ fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const Val
     return .{ .ok = .{ .List = .{
         .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
         .mutable = false,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } } };
 }
@@ -2047,7 +2047,7 @@ fn listOf(allocator: Allocator, items: std.ArrayList(Value), mutable: bool) Allo
     return .{ .List = .{
         .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
         .mutable = mutable,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } };
 }
@@ -3304,12 +3304,11 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
             e.value.retain();
             try items.append(allocator, e.value);
         }
-        const enum_name = try StringRef.init(allocator, cg.get().name);
         cg.deinit();
         return .{ .ok = .{ .List = .{
             .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
             .mutable = false,
-            .enum_class = enum_name,
+            .enum_entries = true,
             .backing = null,
         } } };
     }

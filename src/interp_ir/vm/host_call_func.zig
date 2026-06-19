@@ -1037,12 +1037,11 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
                                     entry.value.retain();
                                     items.append(allocator, entry.value) catch {};
                                 }
-                                const enum_class = try StringRef.init(allocator, cd.get().name);
                                 cd.deinit();
                                 return .{ .ok = .{ .List = .{
                                     .items = try ValueList.init(allocator, items),
                                     .mutable = false,
-                                    .enum_class = enum_class,
+                                    .enum_entries = true,
                                     .backing = null,
                                 } } };
                             }

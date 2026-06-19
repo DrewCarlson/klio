@@ -157,7 +157,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     if (std.mem.eql(u8, ty.name, "KClass")) return value.* == .Class;
     if (std.mem.eql(u8, ty.name, "EnumEntries")) {
         return switch (value.*) {
-            .List => |l| l.enum_class != null,
+            .List => |l| l.enum_entries,
             else => false,
         };
     }
