@@ -745,6 +745,9 @@ pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
             try groups.append(a, .{ .key = key, .vs = vs });
         }
     }
+    // The `groups` spine is scratch — each `vs` is adopted by `makeListBorrowed`
+    // and each `key` moves into `entries`, but the `Group` array itself is freed.
+    defer if (runtime.freeScratch()) groups.deinit(a);
     var entries: std.ArrayList(MapPair) = .empty;
     for (groups.items) |g| {
         try entries.append(a, .{ .key = g.key, .value = try makeListBorrowed(a, g.vs, false) });
@@ -2068,6 +2071,9 @@ fn joinToStringImpl(ctx: *CallCtx, items: []const Value, allow_instance_to_strin
             break :blk try display(a, v);
         } else try display(a, v);
         try out.appendSlice(a, piece);
+        // `piece` is always a fresh `dupe`/`display` allocation, copied into
+        // `out`; free it per element rather than leaking one per joined value.
+        if (runtime.freeScratch()) a.free(piece);
     }
     if (limit >= 0 and n > take) {
         if (take > 0) try out.appendSlice(a, sep);
@@ -2914,6 +2920,7 @@ pub fn coll_list_sorted(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     const copy = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(copy);
     if (try sortListHostAware(ctx, copy)) |e| return e;
     return ok(try makeList(a, copy, false));
 }
@@ -2923,6 +2930,7 @@ pub fn coll_list_sorted_descending(ctx: *CallCtx) Error!EvalResult {
     const v = try coll_list_sorted(ctx);
     if (v == .err) return v;
     const items = try snapshotItems(a, v.ok.List.items);
+    defer if (runtime.freeScratch()) a.free(items);
     std.mem.reverse(Value, items);
     return ok(try makeList(a, items, false));
 }

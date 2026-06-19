@@ -154,6 +154,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 return cli.run(std.heap.c_allocator, init.args);
             }
             if (std.mem.eql(u8, alloc_mode, "leaktrack")) {
+                if (runtime.getenvSlice("KLIO_LEAK_BY_FQN")) |_| runtime.leaktrack.by_fqn_only = true;
                 const a = runtime.leaktrack.wrap(runtime.slab.allocator);
                 runtime.leaktrack.installSignalDump();
                 const rc = cli.run(a, init.args);

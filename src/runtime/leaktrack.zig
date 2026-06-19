@@ -36,7 +36,10 @@ const Site = struct {
     count: usize,
 };
 
-const back = std.heap.page_allocator;
+// Caching allocator for the tracking metadata: `page_allocator` mmaps/munmaps
+// per hashmap grow and per fqn dupe, which dominates runtime in allocation-heavy
+// programs. `smp_allocator` caches pages, so the tracker keeps up with a hot loop.
+const back = std.heap.smp_allocator;
 
 var lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 fn acquire() void {
@@ -50,6 +53,11 @@ var live: std.AutoHashMapUnmanaged(usize, Record) = .empty;
 var child_alloc: Allocator = undefined;
 var initialized: bool = false;
 
+/// `KLIO_LEAK_BY_FQN`: attribute leaks by intrinsic fqn only. Capturing a stack
+/// trace per allocation dominates runtime in allocation-heavy programs, so the
+/// by-fqn report (which never reads `addrs`) skips it entirely.
+pub var by_fqn_only: bool = false;
+
 fn capture(ret: usize) Record {
     var r: Record = .{ .len = 0, .addrs = undefined, .n = 0 };
     const st = std.debug.captureCurrentStackTrace(.{ .first_address = ret }, &r.addrs);
@@ -60,7 +68,7 @@ fn capture(ret: usize) Record {
 fn note(ptr: [*]u8, len: usize, ret: usize) void {
     acquire();
     defer release();
-    var rec = capture(ret);
+    var rec: Record = if (by_fqn_only) .{ .len = len, .addrs = undefined, .n = 0 } else capture(ret);
     rec.len = len;
     rec.fqn = if (current_fqn) |f| (back.dupe(u8, f) catch "") else "";
     live.put(back, @intFromPtr(ptr), rec) catch return;
