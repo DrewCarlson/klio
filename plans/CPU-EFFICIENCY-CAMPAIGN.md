@@ -85,9 +85,14 @@ collections — pure loop + array), bound by the F3 per-instruction constant fac
 2. F2 — `Map` O(1) hash index. DONE.
 3. release-gate under GC (the dominant systemic O(n²)). DONE.
 4. probe-FQN stack buffers (kill per-call allocPrint churn). DONE.
-5. F4 — `iterableItems` snapshot copies the whole list per call. PENDING (makes
-   `last`/`first` O(n), and any such op O(n²) in a loop).
-6. F3 — core per-instruction constant factor (~150-200 ns/IR-inst). The
+5. member-resolution cache — memoize `(type,name,args-empty)→intrinsic` on the
+   shared `ProgramImage`, skipping the per-call probe build + ~6 `lookupIntrinsic`
+   borrows. DONE. numeric 14.5→9.4s, strings 7.9→6.7s.
+6. stack-buffer dispatch args — `prependReceiver` heap-allocated per call; stack
+   buffer for small arities. DONE. collections 12.5→10.6s.
+7. F4 — `iterableItems` snapshot copies the whole list per call. PENDING (makes
+   `last`/`first` O(n); low value — only hurts those-in-loops).
+8. F3 — core per-instruction constant factor (~150-200 ns/IR-inst). The
    remaining gap is the tree/register interpreter's dispatch loop itself:
    `execInst` returns a 72-byte `EvalResult` by value per instruction, the big
    `switch (inst.*)`, and 64-byte `Value` copies through `frame.read`/`write`.
@@ -101,14 +106,19 @@ collections — pure loop + array), bound by the F3 per-instruction constant fac
 
 | workload | start | now | speedup | python | node |
 |---|---|---|---|---|---|
-| numeric | 16.5 s | 14.5 s | 1.1× | 1.0 s | 0.06 s |
-| collections | >180 s (timeout) | 13 s | >14× | 0.25 s | 0.06 s |
-| strings | 69 s | 7.9 s | 8.7× | 0.19 s | 0.11 s |
+| numeric | 16.5 s | ~9.4 s | 1.8× | 1.0 s | 0.06–0.1 s |
+| collections | >180 s (timeout) | ~11–12 s | >15× | 0.25–0.30 s | 0.06 s |
+| strings | 69 s | ~6.5 s | 10.6× | 0.18 s | 0.10 s |
 
 The two systemic O(n²) bugs (ungated `release`, linear-scan `Map`) are fixed —
-those were what made map/collection code pathological. Array subscript and probe
-churn fixed too. The residual is interpreter constant factor (F3) + the
-`iterableItems` snapshot (F4); both are bounded/known, not pathological.
+those were what made map/collection code pathological. Array subscript, probe
+churn, member-resolution, and per-call arg allocation fixed too. Remaining gap:
+~9× CPython (numeric), ~35–45× (map/string), ~100–200× node. That residual is the
+interpreter constant factor (F3) — a tree/register interpreter vs a JIT. Node
+parity is not reachable without a bytecode-VM / register-machine + (ultimately)
+JIT rewrite; getting within a few× of CPython needs shrinking `Value`/
+`EvalResult` + computed-goto dispatch. Both are large, separate architecture
+efforts, not bug fixes.
 
 ## Bench suite
 
