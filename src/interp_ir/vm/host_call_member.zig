@@ -133,7 +133,7 @@ fn checkFuncInRange(self: *VmHost, site: []const u8, fid: FuncId) void {
     if (!trace.invariantsEnabled()) return;
     const mg = self.module.borrow();
     defer mg.deinit();
-    const n = mg.get().funcs.items.len;
+    const n = mg.get().funcCount();
     if (@intFromEnum(fid) >= n) {
         trace.invariant(
             "kind=funcid_oob site={s} fid={d} func_count={d}",
@@ -2926,8 +2926,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         defer mg.deinit();
         const mod = mg.get();
         for (mod.funcsBySimpleName(name)) |fid| {
-            if (@intFromEnum(fid) < mod.funcs.items.len) {
-                const f = mod.funcs.items[@intFromEnum(fid)];
+            if (mod.funcById(fid)) |f| {
                 if (f.hasBody() and f.params.len > 0 and
                     std.mem.eql(u8, f.params[0].name, "this") and recv_chain.contains(f.params[0].ty.name))
                 {
@@ -3075,8 +3074,7 @@ fn extWithThisLongerThanArgs(self: *VmHost, name: []const u8, argc: usize) bool 
     defer mg.deinit();
     const mod = mg.get();
     for (mod.funcsBySimpleName(name)) |fid| {
-        if (@intFromEnum(fid) < mod.funcs.items.len) {
-            const f = mod.funcs.items[@intFromEnum(fid)];
+        if (mod.funcById(fid)) |f| {
             if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this") and f.params.len > argc) return true;
         }
     }
@@ -3444,8 +3442,7 @@ fn kfunctionReflection(self: *VmHost, allocator: Allocator, receiver: *const Val
     const mg = self.module.borrow();
     defer mg.deinit();
     const mod = info.module orelse mg.get();
-    if (@intFromEnum(info.body_func) >= mod.funcs.items.len) return null;
-    const f = mod.funcs.items[@intFromEnum(info.body_func)];
+    const f = mod.funcById(info.body_func) orelse return null;
     if (std.mem.eql(u8, name, "name")) {
         return .{ .ok = .{ .String = try StringRef.init(allocator, f.name) } };
     }
@@ -3984,9 +3981,7 @@ fn rangeIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 }
 
 fn funcAt(module: *const Module, fid: FuncId) ?Func {
-    const i = @intFromEnum(fid);
-    if (i >= module.funcs.items.len) return null;
-    return module.funcs.items[i];
+    return if (module.funcById(fid)) |f| f.* else null;
 }
 
 fn argsListFromSlice(allocator: Allocator, slice: []const Value) Allocator.Error!std.ArrayList(Value) {
@@ -5996,9 +5991,8 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
             for (m.classes.items) |*cls_ir| {
                 if (!std.mem.eql(u8, cls_ir.name, cname)) continue;
                 for (cls_ir.methods) |fid| {
-                    const i = @intFromEnum(fid);
-                    if (i >= m.funcs.items.len) continue;
-                    if (std.mem.eql(u8, m.funcs.items[i].name, name)) {
+                    const cf = m.funcById(fid) orelse continue;
+                    if (std.mem.eql(u8, cf.name, name)) {
                         found_fid = fid;
                         break;
                     }
@@ -6006,7 +6000,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                 break;
             }
             if (found_fid) |fid| {
-                const func = m.funcs.items[@intFromEnum(fid)];
+                const func = m.funcById(fid).?;
                 mg.deinit();
                 var all: std.ArrayList(Value) = .empty;
                 try all.append(allocator, receiver.*);
@@ -6014,7 +6008,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                 const module_ref = self.module.clone();
                 defer module_ref.deinit();
                 emitSuperPath(allocator, func.fqn, fid, cname, args);
-                return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), &func, all, self);
+                return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), func, all, self);
             }
             mg.deinit();
         }
@@ -6029,18 +6023,16 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                 break :blk pg.get().instance_prop_getters.get(.{ .a = cname, .b = name });
             };
             if (getter_fid) |fid| {
-                const i = @intFromEnum(fid);
                 const mg = self.module.borrow();
                 const m = mg.get();
-                if (i < m.funcs.items.len) {
-                    const func = m.funcs.items[i];
+                if (m.funcById(fid)) |func| {
                     mg.deinit();
                     var all: std.ArrayList(Value) = .empty;
                     try all.append(allocator, receiver.*);
                     const module_ref = self.module.clone();
                     defer module_ref.deinit();
                     emitSuperPath(allocator, func.fqn, fid, cname, args);
-                    return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), &func, all, self);
+                    return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), func, all, self);
                 }
                 mg.deinit();
             }

@@ -905,7 +905,7 @@ pub fn resumeContinuation(
         // nested class, the passed-in (main) module otherwise.
         const snap_module = snap.module;
         const m: *const Module = snap_module orelse module;
-        const func = &m.funcs.items[snap.func.int()];
+        const func = m.funcById(snap.func).?;
         var params: std.ArrayList(Value) = .empty;
         try params.appendSlice(allocator, snap.params);
         var caps: std.ArrayList(Value) = .empty;
@@ -1340,8 +1340,8 @@ fn runFrameInner(
                 while (k < tc.n_args) : (k += 1) {
                     try new_params.append(allocator, frame.read(Reg.from(tc.args.int() + @as(u32, k))));
                 }
-                const new_func = &module.funcs.items[tc.func.int()];
-                coerceIntArgsToLong(new_func, new_params.items);
+                const new_func = module.funcById(tc.func).?;
+                coerceIntArgsToLong(@constCast(new_func), new_params.items);
                 frame.func = new_func;
                 frame.params.deinit(allocator);
                 frame.params = new_params;
@@ -1728,8 +1728,8 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
 
             const bakedExt = struct {
                 fn f(m: *const Module, id: FuncId) bool {
-                    if (id.int() >= m.funcs.items.len) return false;
-                    const fp = m.funcs.items[id.int()].params;
+                    const ff = m.funcById(id) orelse return false;
+                    const fp = ff.params;
                     return fp.len > 0 and std.mem.eql(u8, fp[0].name, "this");
                 }
             }.f;
@@ -1785,10 +1785,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // Invoking an extension / member-extension function from
             // inside a method: keep the caller's instance `this`
             // reachable as the enclosing receiver.
-            const callee_fn: ?*const Func = if (eff_func.int() < frame.module.funcs.items.len)
-                &frame.module.funcs.items[eff_func.int()]
-            else
-                null;
+            const callee_fn: ?*const Func = frame.module.funcById(eff_func);
             const callee_is_ext = callee_fn != null and callee_fn.?.params.len > 0 and
                 std.mem.eql(u8, callee_fn.?.params[0].name, "this");
             var pushed_enclosing = false;
@@ -3666,11 +3663,10 @@ pub const NullHost = struct {
 
     pub fn callFunc(self: *NullHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value) Allocator.Error!EvalResult {
         _ = self;
-        if (func.int() >= module.funcs.items.len) {
+        const f = module.funcById(func) orelse {
             const msg = try std.fmt.allocPrint(allocator, "unknown FuncId {d}", .{func.int()});
             return errResult(.{ .Type = msg });
-        }
-        const f = &module.funcs.items[func.int()];
+        };
         var args_list: std.ArrayList(Value) = .empty;
         try args_list.appendSlice(allocator, args);
         return eval(allocator, module, f, args_list);

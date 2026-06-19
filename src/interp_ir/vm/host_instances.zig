@@ -193,10 +193,9 @@ fn funcAt(self: *VmHost, fid: FuncId, comptime ctx: []const u8) Allocator.Error!
     const mg = self.module.borrow();
     defer mg.deinit();
     const m = mg.get();
-    if (fid.int() >= m.funcs.items.len) {
+    return .{ .ok = m.funcById(fid) orelse {
         return .{ .err = try typeErr(self.allocator, ctx ++ " FuncId {d} out of range", .{fid.int()}) };
-    }
-    return .{ .ok = &m.funcs.items[fid.int()] };
+    } };
 }
 
 /// Evaluate `func` against `args`, returning its result. The module
@@ -1360,8 +1359,7 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
         var best_fid: ?FuncId = null;
         var best_score: i64 = std.math.minInt(i64);
         for (m.funcsBySimpleName(class_name)) |fid| {
-            if (fid.int() >= m.funcs.items.len) continue;
-            const f = &m.funcs.items[fid.int()];
+            const f = m.funcById(fid) orelse continue;
             if (!f.hasBody()) continue;
             if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
             const vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
@@ -1850,8 +1848,7 @@ fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args
     var best_fid: ?FuncId = null;
     var best_score: i32 = std.math.minInt(i32);
     for (m.funcsBySimpleName(class_name)) |fid| {
-        if (fid.int() >= m.funcs.items.len) continue;
-        const f = &m.funcs.items[fid.int()];
+        const f = m.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
         if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
         const vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
@@ -2443,8 +2440,8 @@ fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u
         for (m.classes.items) |*c| {
             if (!std.mem.eql(u8, c.name, dcls_name)) continue;
             for (c.methods) |fid| {
-                if (fid.int() < m.funcs.items.len and std.mem.eql(u8, m.funcs.items[fid.int()].name, "provideDelegate")) {
-                    break :blk true;
+                if (m.funcById(fid)) |pf| {
+                    if (std.mem.eql(u8, pf.name, "provideDelegate")) break :blk true;
                 }
             }
         }
@@ -2747,9 +2744,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         const mg = self.module.borrow();
         const m = mg.get();
         for (m.funcsBySimpleName(n)) |fid| {
-            const i = @intFromEnum(fid);
-            if (i < m.funcs.items.len) {
-                const f = &m.funcs.items[i];
+            if (m.funcById(fid)) |f| {
                 if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) {
                     names_extension = true;
                     break;
@@ -3171,18 +3166,17 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             const fid = bodyPropInit(self, cls_fqn, cls_name, p.name) orelse continue;
             const mg = self.module.borrow();
             const m = mg.get();
-            if (@intFromEnum(fid) >= m.funcs.items.len) {
+            const func = m.funcById(fid) orelse {
                 mg.deinit();
                 continue;
-            }
-            const func = m.funcs.items[@intFromEnum(fid)];
+            };
             mg.deinit();
             var all: std.ArrayList(Value) = .empty;
             try all.append(allocator, inst_value);
             try all.appendSlice(allocator, cls_args);
             const module_ref = self.module.clone();
             vmhost.emitPath(allocator, "object_build", func.fqn, fid, &inst_value, cls_args);
-            const r = try ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), &func, all, self);
+            const r = try ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), func, all, self);
             module_ref.deinit();
             switch (r) {
                 .ok => |v| {
@@ -3263,14 +3257,12 @@ fn runAnonThunk(
     inst_value: *const Value,
     capture_pairs: []const NameValue,
 ) Allocator.Error!EvalResult {
-    const i = @intFromEnum(fid);
     const mg = mref.borrow();
     const sub_mod = mg.get();
-    if (i >= sub_mod.funcs.items.len) {
+    const func = sub_mod.funcById(fid) orelse {
         mg.deinit();
         return .{ .ok = .Unit };
-    }
-    const func = sub_mod.funcs.items[i];
+    };
     const prev = self.globals.clone();
     if (capture_pairs.len != 0) {
         const scoped = try ObjRef(Env).init(allocator, Env.withParent(allocator, self.globals.clone()));
@@ -3301,7 +3293,7 @@ fn runAnonThunk(
     var all: std.ArrayList(Value) = .empty;
     try all.append(allocator, inst_value.*);
     vmhost.emitPath(allocator, "object_build", func.fqn, fid, inst_value, &.{});
-    const r = try ir.eval.evalWithCaptures(VmHost, allocator, sub_mod, &func, all, cap_vec, self);
+    const r = try ir.eval.evalWithCaptures(VmHost, allocator, sub_mod, func, all, cap_vec, self);
     mg.deinit();
     self.globals.deinit();
     self.globals = prev;

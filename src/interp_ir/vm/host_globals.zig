@@ -454,7 +454,7 @@ fn runtimeErrorMessage(allocator: Allocator, e: RuntimeError) []const u8 {
 /// Whether the function at `fid` is an extension (its first lowered
 /// param is the synthetic `this`).
 fn isExtFid(fid: FuncId, m: *const Module) bool {
-    const f = idGet(m.funcs.items, fid.int()) orelse return false;
+    const f = m.funcById(fid) orelse return false;
     if (f.params.len == 0) return false;
     return std.mem.eql(u8, f.params[0].name, "this");
 }
@@ -561,7 +561,7 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
     const mg = self.module.borrow();
     defer mg.deinit();
     const m = mg.get();
-    const func = idGet(m.funcs.items, fid.int()) orelse return null;
+    const func = m.funcById(fid) orelse return null;
     if (func.hasBody()) {
         const caps = ObjRef(std.ArrayList(Value)).init(allocator, .empty) catch return null;
         const id = self.closures.push(.{
@@ -755,11 +755,13 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
         // segment in `Func.fqn`), and a value reference cannot supply
         // its receiver — so the non-extension declaration under the FQN
         // is the only candidate.
-        const by_fqn: ?FuncId = if (std.mem.indexOfScalar(u8, name, '.') != null) pick: {
-            for (m.funcs.items) |f| {
+        const by_fqn: ?FuncId = if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| pick: {
+            // Match by simple name (lazy-friendly), then confirm the full fqn.
+            for (m.funcsBySimpleName(name[dot + 1 ..])) |fid| {
+                const f = m.funcById(fid) orelse continue;
                 if (!std.mem.eql(u8, f.fqn, name)) continue;
-                if (isExtFid(f.id, m)) continue;
-                break :pick f.id;
+                if (isExtFid(fid, m)) continue;
+                break :pick fid;
             }
             break :pick null;
         } else null;
@@ -767,7 +769,7 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
             if (isExtFid(fid, m)) {
                 for (m.funcsBySimpleName(name)) |c| {
                     if (!isExtFid(c, m)) {
-                        if (idGet(m.funcs.items, c.int())) |f| {
+                        if (m.funcById(c)) |f| {
                             if (f.hasBody()) break :pick c;
                         }
                     }

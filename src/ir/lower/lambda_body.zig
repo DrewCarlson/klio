@@ -286,7 +286,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     const captured = try b.allocator.dupe([]const u8, b.capturesTaken());
     var func = try b.finish("<lambda>", "<lambda>", build.typeUnit());
     // Function count is bounded well below u32::MAX; the index is the new FuncId.
-    const id = FuncId.from(@intCast(module.funcs.items.len));
+    const id = module.nextFuncId();
     func.id = id;
     func.is_lambda = is_lambda;
     // Declared parameter annotations (`{ s: String -> … }`, an anonymous

@@ -790,6 +790,12 @@ pub const Module = struct {
     func_header_decode: ?*const fn (Allocator, []const u8, u32) ?Func = null,
     func_cache: []?*Func = &.{},
     func_header_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// First fqn segment of every lazy base func (distinct) — the lazy-friendly
+    /// `packageHeadDeclared` source. Borrowed from the image; empty when eager.
+    func_fqn_heads: []const []const u8 = &.{},
+    /// Ids of the lazy base's bodyless funcs — the lazy-friendly replacement for
+    /// the link-phase scan over all funcs. Borrowed from the image; empty eager.
+    bodyless_func_ids: []const u32 = &.{},
     classes: std.ArrayList(Class) = .empty,
     consts: std.ArrayList(Const) = .empty,
     /// Top-level (file-scope) function ids, in declaration order.
@@ -1061,7 +1067,17 @@ pub const Module = struct {
     /// never call `deinit` on one outside an arena teardown.
     pub fn cloneForExtend(self: *const Module, a: Allocator) Allocator.Error!Module {
         var out = Module.init(a);
+        // Base funcs are delegated by id through the shared lazy header section
+        // (ids 0..base_n); with lazy headers `self.funcs.items` is empty so this
+        // copies nothing, and this run's own funcs append past the base id range.
+        // (Eager base — no header section — copies them; base_n stays 0.)
         try out.funcs.appendSlice(a, self.funcs.items);
+        out.func_header_section = self.func_header_section;
+        out.func_header_offsets = self.func_header_offsets;
+        out.func_header_decode = self.func_header_decode;
+        out.func_cache = self.func_cache;
+        out.func_fqn_heads = self.func_fqn_heads;
+        out.bodyless_func_ids = self.bodyless_func_ids;
         // Carry the lazy-IR section so a deferred base function materialises
         // when the extending run executes it. Decode into the base's own
         // process-lifetime arena (not this run's `a`, which a freeing/gc backend
@@ -1225,8 +1241,13 @@ pub const Module = struct {
     /// FQN so a same-simple-name pack function in a different package
     /// can't shadow the intended target.
     pub fn funcIdByFqn(self: *const Module, fqn: []const u8) ?FuncId {
-        for (self.funcs.items) |f| {
-            if (std.mem.eql(u8, f.fqn, fqn)) return f.id;
+        // Match by simple name (lazy-friendly via the name index), then confirm
+        // the full fqn — decoding only same-simple-name candidates rather than
+        // sweeping the (possibly lazy) func table.
+        const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
+        for (self.funcsBySimpleName(simple)) |id| {
+            const f = self.funcById(id) orelse continue;
+            if (std.mem.eql(u8, f.fqn, fqn)) return id;
         }
         return null;
     }
@@ -1242,6 +1263,9 @@ pub const Module = struct {
     /// and of whether the reference is lexically inside a lambda.
     pub fn packageHeadDeclared(self: *const Module, head: []const u8) bool {
         if (head.len == 0) return false;
+        for (self.func_fqn_heads) |h| {
+            if (std.mem.eql(u8, h, head)) return true;
+        }
         for (self.funcs.items) |f| {
             if (fqnHasHeadSegment(f.fqn, head)) return true;
         }

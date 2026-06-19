@@ -182,7 +182,7 @@ fn overloadPickByCast(
     var best: ?FuncId = null;
     var best_score: i32 = 0;
     for (cands) |fid| {
-        const f = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
+        const f = b.module.funcById(fid) orelse continue;
         if (!f.hasBody() or (f.params.len != 0 and f.params[f.params.len - 1].is_vararg)) continue;
         const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         if (f.params.len -| base != want) continue;
@@ -456,7 +456,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cid } });
             } else if (ref_pick) |fid| {
                 const n = blk: {
-                    if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                    if (b.module.funcById(fid)) |f| {
                         break :blk try b.module.internConst(b.allocator, .{ .String = f.fqn });
                     }
                     break :blk nm;
@@ -1017,7 +1017,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const ref_pick = b.module.resolveBareRefIndexed(name0, b.self_package, segments[0].span.file);
             refAudit(b, name0, ref_pick);
             if (ref_pick) |fid| {
-                if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                if (b.module.funcById(fid)) |f| {
                     _ = try recordOutOfScopeRef(b, name0, segments[0].span, f.fqn, b.module.bareRefTier(name0, b.self_package, segments[0].span.file));
                     const dst = b.allocReg();
                     const n = try b.module.internConst(b.allocator, .{ .String = f.fqn });
@@ -1535,14 +1535,14 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Record the implicit label.
     if (b.pending_lambda_label) |label| {
         b.pending_lambda_label = null;
-        if (idGetMut(Func, b.module.funcs.items, body_func.int())) |f| {
+        if (b.module.funcByIdMut(body_func)) |f| {
             f.implicit_label = label;
         }
     }
     // A `suspend { … }` literal: the body is a suspend function value.
     if (b.pending_suspend_lambda) {
         b.pending_suspend_lambda = false;
-        if (idGetMut(Func, b.module.funcs.items, body_func.int())) |f| {
+        if (b.module.funcByIdMut(body_func)) |f| {
             f.is_suspend = true;
         }
     }
@@ -1713,7 +1713,7 @@ fn reifiedNeedsLambdaArity(b: *FuncBuilder, f: *const ast.Function, lambda_arity
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
     const list = b.module.func_name_index.get(name) orelse return null;
     for (list.items) |fid| {
-        const f = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
+        const f = b.module.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
         if (!(f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
         if (userParams(f) != user_arg_count) continue;
@@ -1896,8 +1896,7 @@ fn lastTypeSegment(name: []const u8) []const u8 {
 fn nameHasReceiverCandidate(b: *FuncBuilder, name: []const u8, chain: ?[]const []const u8) bool {
     for (b.module.funcsBySimpleName(name)) |fid| {
         const idx = fid.int();
-        if (idx >= b.module.funcs.items.len) continue;
-        const f = &b.module.funcs.items[idx];
+        const f = b.module.funcById(FuncId.from(idx)) orelse continue;
         if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
         const recv_ty = lastTypeSegment(f.params[0].ty.name);
         const ch = chain orelse return true;
@@ -2273,7 +2272,7 @@ fn lowerCallWithWritebackPath(
         }
         var needs_this = false;
         if (bound_id) |fid| {
-            if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+            if (b.module.funcById(fid)) |f| {
                 needs_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
             }
         }
@@ -2724,7 +2723,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 /// True when a bodied same-name function already accepts this call's arity.
 fn aFuncFits(b: *FuncBuilder, nm: []const u8, want: usize) bool {
     for (b.module.funcsBySimpleName(nm)) |fid| {
-        const mf = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
+        const mf = b.module.funcById(fid) orelse continue;
         if (!mf.hasBody()) continue;
         const has_this = mf.params.len != 0 and std.mem.eql(u8, mf.params[0].name, "this");
         const base: usize = if (has_this) 1 else 0;
@@ -3137,7 +3136,7 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
         var factory_takes_lambda = false;
         for (b.module.func_index.items) |entry| {
             if (!std.mem.eql(u8, entry.name, name)) continue;
-            const f = idGet(Func, b.module.funcs.items, entry.id.int()) orelse continue;
+            const f = b.module.funcById(entry.id) orelse continue;
             const last_vararg = f.params.len != 0 and f.params[f.params.len - 1].is_vararg;
             const arity_ok = last_vararg or nargs <= f.params.len;
             if (arity_ok and anyFunctionParam(f.params)) {
@@ -3151,7 +3150,7 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
     // or no same-named factory is applicable to the positional count.
     var canonical_cant_take = false;
     if (b.module.funcId(name)) |fid| {
-        if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+        if (b.module.funcById(fid)) |f| {
             const last_vararg = f.params.len != 0 and f.params[f.params.len - 1].is_vararg;
             canonical_cant_take = !last_vararg and nargs > f.params.len;
         }
@@ -3237,7 +3236,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     if (imported_func_id) |func_id| {
         if (!shadowed_by_class) {
             const needs_this = blk: {
-                if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
+                if (b.module.funcById(func_id)) |f| {
                     break :blk f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
                 }
                 break :blk false;
@@ -3713,7 +3712,7 @@ fn resolveAudit(
 /// candidate, so a same-tier divergence onto such a heuristic pick is
 /// the index correcting a fallback shape, not a mis-bind.
 fn heurPickInexact(b: *FuncBuilder, fid: FuncId, want: usize) bool {
-    const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return true;
+    const f = b.module.funcById(fid) orelse return true;
     if (!f.hasBody()) {
         const da = b.module.decl_user_arity.get(fid.int()) orelse return true;
         return da.has_vararg or da.required != da.total or da.total != want;
@@ -3840,12 +3839,12 @@ fn resolveAuditLog(b: *FuncBuilder, name: []const u8, heuristic: ?FuncId, index:
 }
 
 fn fqnOf(b: *FuncBuilder, id: FuncId) []const u8 {
-    if (idGet(Func, b.module.funcs.items, id.int())) |f| return f.fqn;
+    if (b.module.funcById(id)) |f| return f.fqn;
     return "<invalid>";
 }
 
 fn matchesRecv(b: *FuncBuilder, fid: FuncId, recv: []const u8) bool {
-    const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return false;
+    const f = b.module.funcById(fid) orelse return false;
     if (!f.hasBody()) return false;
     if (f.params.len == 0) return false;
     return std.mem.eql(u8, f.params[0].name, "this") and std.mem.eql(u8, f.params[0].ty.name, recv);
@@ -3893,13 +3892,13 @@ fn userParams(f: *const Func) usize {
 }
 
 fn arityMatch(b: *FuncBuilder, fid: FuncId, want: usize) bool {
-    const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return false;
+    const f = b.module.funcById(fid) orelse return false;
     const last_not_vararg = f.params.len == 0 or !f.params[f.params.len - 1].is_vararg;
     return f.hasBody() and last_not_vararg and userParams(f) == want;
 }
 
 fn arityMatchTl(b: *FuncBuilder, fid: FuncId, want: usize) bool {
-    const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return false;
+    const f = b.module.funcById(fid) orelse return false;
     const up = userParams(f);
     const last_is_fn = f.params.len != 0 and std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
     if (!f.hasBody() or !last_is_fn or up < want or want < 1) return false;
@@ -3914,12 +3913,12 @@ fn arityMatchTl(b: *FuncBuilder, fid: FuncId, want: usize) bool {
 }
 
 fn isNonExt(b: *FuncBuilder, fid: FuncId) bool {
-    const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return true;
+    const f = b.module.funcById(fid) orelse return true;
     return f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this");
 }
 
 fn isNotLow(b: *FuncBuilder, fid: FuncId) bool {
-    const f = idGet(Func, b.module.funcs.items, fid.int()) orelse return false;
+    const f = b.module.funcById(fid) orelse return false;
     return !f.low_priority;
 }
 
@@ -4006,7 +4005,7 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
     const ast_type_args = call.type_args;
 
     const needs_this = blk: {
-        if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
+        if (b.module.funcById(func_id)) |f| {
             break :blk f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
         }
         break :blk false;
@@ -4020,7 +4019,7 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
     }
 
     const callee_is_tailrec = blk: {
-        if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
+        if (b.module.funcById(func_id)) |f| {
             if (f.is_tailrec) break :blk true;
         }
         for (b.module.tailrec_fn_names.items) |n| {
@@ -4067,7 +4066,7 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         }
     }
     const arg_arity: ?[]const i16 = blk: {
-        if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
+        if (b.module.funcById(func_id)) |f| {
             const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
             break :blk try argFnArities(b, f, args, ast_arg_names, recv_off);
         }
@@ -4106,7 +4105,7 @@ fn trailingLambdaArgNames(
     ast_arg_names: []const ?[]const u8,
 ) Allocator.Error![]?ConstId {
     if (args.len != 0 and allNull(ast_arg_names) and lastArgIsLambda(args)) {
-        if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
+        if (b.module.funcById(func_id)) |f| {
             const last_is_fn = f.params.len != 0 and
                 std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
             var has_vararg = false;
@@ -4161,7 +4160,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
             else
                 func_id;
             if (arity_fid) |fid| {
-                if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                if (b.module.funcById(fid)) |f| {
                     // `all` leads with the synthesized `this`, aligned with
                     // the function's own leading `this` parameter, so no
                     // offset.
@@ -4175,7 +4174,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
 
     // Target params for trailing-lambda arg-name synthesis.
     var target_params: [][]const u8 = &.{};
-    if (idGet(Func, b.module.funcs.items, func_id.int())) |f| {
+    if (b.module.funcById(func_id)) |f| {
         target_params = try b.allocator.alloc([]const u8, f.params.len);
         for (f.params, target_params) |p, *tp| tp.* = p.name;
     }
@@ -4207,7 +4206,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
         const uarg_arity: ?[]const i16 = ablk: {
             if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
                 if (overloadHostingTrailingLambda(b, callee.Path.segments[0].name, args.len)) |fid| {
-                    if (idGet(Func, b.module.funcs.items, fid.int())) |f| {
+                    if (b.module.funcById(fid)) |f| {
                         break :ablk try argFnArities(b, f, args, &.{}, 1);
                     }
                 }
@@ -4537,7 +4536,7 @@ fn lowerFqnFlattenCall(
         const cands = b.module.funcsBySimpleName(tail);
         var pick: ?FuncId = null;
         for (cands) |fid| {
-            const f = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
+            const f = b.module.funcById(fid) orelse continue;
             if (std.mem.eql(u8, f.fqn, fqn) and f.params.len == want) {
                 pick = fid;
                 break;
@@ -4545,7 +4544,7 @@ fn lowerFqnFlattenCall(
         }
         if (pick == null) {
             for (cands) |fid| {
-                const f = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
+                const f = b.module.funcById(fid) orelse continue;
                 const first_is_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
                 if (!first_is_this and f.params.len == want) {
                     pick = fid;
@@ -4703,7 +4702,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         const want_user = args.len;
         var chosen: ?FuncId = null;
         for (b.module.funcsBySimpleName(name.name)) |fid| {
-            const f = idGet(Func, b.module.funcs.items, fid.int()) orelse continue;
+            const f = b.module.funcById(fid) orelse continue;
             if (!f.hasBody()) continue;
             if (f.params.len == 0) continue;
             const p0 = f.params[0];
