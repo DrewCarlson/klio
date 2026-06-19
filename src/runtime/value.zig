@@ -709,8 +709,10 @@ pub const Value = union(enum) {
     List: struct {
         items: ValueList,
         mutable: bool,
-        /// `Some(name)` for `EnumName.entries` / `.values()`.
-        enum_class: ?StringRef,
+        /// Set for `EnumName.entries` / `.values()` lists. Only ever queried as
+        /// a boolean ("is this the enum-entries list"), so a flag suffices — no
+        /// StringRef allocation, and it keeps the `List` payload small.
+        enum_entries: bool = false,
         /// Set when this is a live `MutableMap.values` view.
         backing: ?*MapBackingCell,
         /// Declared element-type head from an explicit call-site type
@@ -1337,7 +1339,7 @@ pub const Value = union(enum) {
                 .Char => matchesAny(name, &.{ "CharRange", "CharProgression", "ClosedRange", "Iterable", "Any" }),
             },
             .List => |l| blk: {
-                if (std.mem.eql(u8, name, "EnumEntries")) break :blk l.enum_class != null;
+                if (std.mem.eql(u8, name, "EnumEntries")) break :blk l.enum_entries;
                 if (l.mutable) {
                     break :blk matchesAny(name, &.{ "MutableList", "List", "Collection", "MutableCollection", "Iterable", "MutableIterable", "RandomAccess", "Any" });
                 } else {
@@ -2097,3 +2099,4 @@ test "display produces an owned string" {
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("42", s);
 }
+

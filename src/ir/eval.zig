@@ -2376,7 +2376,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             try frame.write(nl.dst, .{ .List = .{
                 .items = try ValueList.init(allocator, list),
                 .mutable = false,
-                .enum_class = null,
+                .enum_entries = false,
                 .backing = null,
             } });
         },

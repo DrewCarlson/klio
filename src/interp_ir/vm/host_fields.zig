@@ -144,13 +144,13 @@ fn utf16Len(s: []const u8) usize {
     return std.unicode.calcUtf16LeLen(s) catch s.len;
 }
 
-/// Build a frozen `List` value over `items` with the given enum-class
-/// tag. Consumes `items` into the backing cell.
-fn frozenList(allocator: Allocator, items: std.ArrayList(Value), enum_class: ?StringRef) Allocator.Error!Value {
+/// Build a frozen `List` value over `items`. `enum_entries` marks the
+/// `EnumName.entries` list. Consumes `items` into the backing cell.
+fn frozenList(allocator: Allocator, items: std.ArrayList(Value), enum_entries: bool) Allocator.Error!Value {
     return .{ .List = .{
         .items = try ValueList.init(allocator, items),
         .mutable = false,
-        .enum_class = enum_class,
+        .enum_entries = enum_entries,
         .backing = null,
     } };
 }
@@ -510,16 +510,15 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (std.mem.eql(u8, name, "entries")) {
                 var items: std.ArrayList(Value) = .empty;
                 errdefer items.deinit(allocator);
-                const enum_name = blk: {
+                {
                     const g = receiver.Class.borrow();
                     defer g.deinit();
                     for (g.get().enum_entries) |e| {
                         e.value.retain();
                         try items.append(allocator, e.value);
                     }
-                    break :blk g.get().name;
-                };
-                return ok(try frozenList(allocator, items, try StringRef.init(allocator, enum_name)));
+                }
+                return ok(try frozenList(allocator, items, true));
             }
             const g = receiver.Class.borrow();
             defer g.deinit();
@@ -556,7 +555,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     for (f.params) |p| {
                         try items.append(allocator, .{ .String = try StringRef.init(allocator, p.name) });
                     }
-                    return ok(try frozenList(allocator, items, null));
+                    return ok(try frozenList(allocator, items, false));
                 }
             }
         }
@@ -1151,7 +1150,7 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         for (cd.body_properties) |p| {
             try items.append(allocator, .{ .PropertyRef = .{ .name = try StringRef.init(allocator, p.name) } });
         }
-        return ok(try frozenList(allocator, items, null));
+        return ok(try frozenList(allocator, items, false));
     }
     if (std.mem.eql(u8, name, "supertypes")) {
         var items: std.ArrayList(Value) = .empty;
@@ -1168,7 +1167,7 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
                 try items.append(allocator, .{ .String = try StringRef.init(allocator, n) });
             }
         }
-        return ok(try frozenList(allocator, items, null));
+        return ok(try frozenList(allocator, items, false));
     }
     if (std.mem.eql(u8, name, "sealedSubclasses")) {
         var items: std.ArrayList(Value) = .empty;
@@ -1188,7 +1187,7 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
             }
             if (matches) try items.append(allocator, .{ .Class = c.* });
         }
-        return ok(try frozenList(allocator, items, null));
+        return ok(try frozenList(allocator, items, false));
     }
     return null;
 }
@@ -1428,11 +1427,9 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     e.value.retain();
                     try items.append(allocator, e.value);
                 }
-                const ename = cg.get().name;
-                const enum_class = try StringRef.init(allocator, ename);
                 cg.deinit();
                 g.deinit();
-                return ok(try frozenList(allocator, items, enum_class));
+                return ok(try frozenList(allocator, items, true));
             }
         }
         cg.deinit();
@@ -2175,7 +2172,7 @@ test "collectionLen reports list and string lengths" {
     const lv = Value{ .List = .{
         .items = try ValueList.init(a, list),
         .mutable = false,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } };
     defer lv.List.items.deinit();

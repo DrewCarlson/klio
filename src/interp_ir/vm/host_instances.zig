@@ -245,7 +245,7 @@ fn emptyList(allocator: Allocator, mutable: bool) Allocator.Error!Value {
     return Value{ .List = .{
         .items = try ObjRef(std.ArrayList(Value)).init(allocator, .empty),
         .mutable = mutable,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } };
 }
@@ -1327,7 +1327,7 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
             return .{ .ok = .{ .List = .{
                 .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
                 .mutable = std.mem.eql(u8, class_name, "MutableList"),
-                .enum_class = null,
+                .enum_entries = false,
                 .backing = null,
             } } };
         }

@@ -94,7 +94,7 @@ fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     return .{ .List = .{
         .items = try ValueList.init(a, list),
         .mutable = mutable,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } };
 }
@@ -104,7 +104,7 @@ fn makeListFromArrayList(a: Allocator, list: std.ArrayList(Value), mutable: bool
     return .{ .List = .{
         .items = try ValueList.init(a, list),
         .mutable = mutable,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } };
 }
@@ -3926,7 +3926,7 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Values });
-    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_class = null, .backing = backing.cell } });
+    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_entries = false, .backing = backing.cell } });
 }
 pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;

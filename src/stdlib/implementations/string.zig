@@ -64,7 +64,7 @@ fn thrownOwned(allocator: Allocator, fqn: []const u8, message: []const u8) Alloc
 fn makeList(allocator: Allocator, items: []Value, mutable: bool) Allocator.Error!Value {
     const list = std.ArrayList(Value).fromOwnedSlice(items);
     const items_ref = try ValueList.init(allocator, list);
-    return .{ .List = .{ .items = items_ref, .mutable = mutable, .enum_class = null, .backing = null } };
+    return .{ .List = .{ .items = items_ref, .mutable = mutable, .enum_entries = false, .backing = null } };
 }
 
 /// Build an items-only `Sequence` from an owned slice. Mirrors

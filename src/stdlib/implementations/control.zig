@@ -31,7 +31,7 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const buildable = Value{ .List = .{
         .items = try ValueList.init(ctx.allocator, .empty),
         .mutable = true,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } };
     {
@@ -44,7 +44,7 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .List = .{
         .items = buildable.List.items,
         .mutable = false,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } });
 }
@@ -57,7 +57,7 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const buildable = Value{ .List = .{
         .items = try ValueList.init(ctx.allocator, .empty),
         .mutable = true,
-        .enum_class = null,
+        .enum_entries = false,
         .backing = null,
     } };
     {

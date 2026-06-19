@@ -72,7 +72,7 @@ fn makeList(allocator: std.mem.Allocator, items: []const Value, mutable: bool) !
         defer g.deinit();
         try g.get().appendSlice(allocator, items);
     }
-    return .{ .List = .{ .items = list, .mutable = mutable, .enum_class = null, .backing = null } };
+    return .{ .List = .{ .items = list, .mutable = mutable, .enum_entries = false, .backing = null } };
 }
 
 fn makeSequence(allocator: std.mem.Allocator, items: []const Value) !Value {
