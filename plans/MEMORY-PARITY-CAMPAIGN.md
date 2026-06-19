@@ -432,13 +432,23 @@ eval-level tail (see Phase 1 residual) chased to zero.
       2528-2545, lower/expr.zig ~30 idGet sites) that index by id; with `base_n>0`
       they hit the wrong slot. Converting them all fixed it. **bare 30->27,
       ktor 91->84.**
-- [ ] **BEYOND FOREST step 3 (largest):** lazy ClassDef construction — ktor's
-      ~84 MB non-decode is dominated by the runtime ClassDef graph + baked
-      registry side-tables (hierarchy_methods/class_super_names/... for hundreds
-      of classes). Build ClassDef shells lazily on first class use; riskiest
-      (dispatch/instance/two-phase-link paths read ClassDefs). Same `cloneForExtend`
-      delegation problem as step 2 (classes are also copied by value at 1050) plus
-      the two-phase parent/interface backpatch assumes all shells exist.
+- [ ] **BEYOND FOREST step 3 (largest, the remaining ktor lever):** lazy ClassDef.
+      ktor's ~57 MB framework overhead (84 - 27 bare) is the runtime ClassDef graph
+      (hundreds of classes built eagerly in `builtFromImage`) + side-tables + GC.
+      DESIGN (adapt the proven lazy-func pattern; no clean id-choke-point since
+      ClassDefs are referenced via `ObjRef(ClassDef)` cells directly + two-phase
+      linked): build a ClassDef on first **ClassTable lookup (classByName)**,
+      recursively building its parent/interfaces (lookup-by-name -> build); store
+      the built ObjRef in the table. Classes never looked up stay unbuilt. This
+      works because all access reaches a class through the name lookup first
+      (instances/parents then hold the already-built ObjRef). Pieces: bake per-class
+      ClassDefImage sections + offsets; ClassTable entry becomes built-ObjRef OR
+      to-build marker (section offset); `classByName`/companion/nested lookups
+      build-on-demand; `cloneForExtend` delegates base classes (shares the section,
+      builds into the run's table on demand); bake any class-sweep registry results
+      (like the func link). Riskiest VM change (dispatch/instance/init), but the
+      lazy-func flip proved the per-section + delegation mechanism + that the real
+      hazard is id/ref-indexed sites, found exhaustively via grep + an A/B compare.
 
 ### Architectural conclusion (why the targets need a dedicated rearchitecture)
 Bare (30 MB) is at the interpreter's own code+data floor (binary text 29 MB /
