@@ -152,7 +152,7 @@ fn valueToJson(v: *const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!Js
             var map: JsonObjectMap = .empty;
             const g = m.entries.borrow();
             // Snapshot the pairs to avoid holding the borrow across recursion.
-            const pairs = try a.dupe(MapPair, g.get().items);
+            const pairs = try a.dupe(MapPair, g.get().pairs.items);
             g.deinit();
             for (pairs) |pair| {
                 const jv_r = try valueToJson(&pair.value, ctx, tree);
@@ -394,7 +394,7 @@ fn decodeMap(map: JsonObjectMap, val_shape: ?*const TypeShape, ctx: *CallCtx) Er
         });
     }
     return .{ .ok = .{ .Map = .{
-        .entries = try MapEntries.init(a, entries),
+        .entries = try MapEntries.init(a, .{ .pairs = entries }),
         .mutable = false,
     } } };
 }
@@ -758,7 +758,7 @@ test "jsonEncode emits compact and pretty JSON for a map" {
         .value = .{ .Int = 1 },
     });
     const map = Value{ .Map = .{
-        .entries = try MapEntries.init(a, entries),
+        .entries = try MapEntries.init(a, .{ .pairs = entries }),
         .mutable = false,
     } };
 
@@ -844,7 +844,7 @@ test "decodeField decodes an unknown object to a string-keyed map" {
     try testing.expect(r.ok == .Map);
     const g = r.ok.Map.entries.borrow();
     defer g.deinit();
-    try testing.expectEqual(@as(usize, 2), g.get().items.len);
+    try testing.expectEqual(@as(usize, 2), g.get().pairs.items.len);
 }
 
 test "ctorParamNames returns property names in declaration order" {

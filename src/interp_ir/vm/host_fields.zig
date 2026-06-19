@@ -708,7 +708,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             .Map => |m| {
                 const g = m.entries.borrow();
                 defer g.deinit();
-                return ok(Value.newInt(@intCast(g.get().items.len)));
+                return ok(Value.newInt(@intCast(g.get().pairs.items.len)));
             },
             else => {},
         }

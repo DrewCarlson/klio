@@ -520,7 +520,7 @@ fn kotlinHashCode(v: *const Value) i32 {
             const g = m.entries.borrow();
             defer g.deinit();
             var h: i32 = 0;
-            for (g.get().items) |kv| h = h +% (kotlinHashCode(&kv.key) ^ kotlinHashCode(&kv.value));
+            for (g.get().pairs.items) |kv| h = h +% (kotlinHashCode(&kv.key) ^ kotlinHashCode(&kv.value));
             break :blk h;
         },
         .Array => |arr| blk: {
@@ -677,11 +677,11 @@ pub fn inheritedMemberDefaults(self: *VmHost, allocator: Allocator, supertypes: 
 }
 
 /// `map.containsKey(needle)` honoring a key instance's custom `equals`.
-fn mapContainsKeyEq(self: *VmHost, allocator: Allocator, entries: ObjRef(std.ArrayList(MapPair)), needle: *const Value) Allocator.Error!union(enum) { ok: bool, err: EvalError } {
+fn mapContainsKeyEq(self: *VmHost, allocator: Allocator, entries: runtime.MapEntries, needle: *const Value) Allocator.Error!union(enum) { ok: bool, err: EvalError } {
     if (needle.* != .Instance) {
         const g = entries.borrow();
         defer g.deinit();
-        for (g.get().items) |kv| {
+        for (g.get().pairs.items) |kv| {
             if (Value.structuralEqBoxed(&kv.key, needle)) return .{ .ok = true };
         }
         return .{ .ok = false };
@@ -692,7 +692,7 @@ fn mapContainsKeyEq(self: *VmHost, allocator: Allocator, entries: ObjRef(std.Arr
     {
         const g = entries.borrow();
         defer g.deinit();
-        for (g.get().items) |kv| try keys.append(allocator, kv.key);
+        for (g.get().pairs.items) |kv| try keys.append(allocator, kv.key);
     }
     for (keys.items) |k| {
         const r = try callMemberRec(self, allocator, &k, "equals", &.{needle.*});
@@ -765,7 +765,7 @@ fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) A
             },
         }
     }
-    return .{ .ok = .{ .Map = .{ .entries = try ObjRef(std.ArrayList(MapPair)).init(allocator, pairs), .mutable = false } } };
+    return .{ .ok = .{ .Map = .{ .entries = try runtime.MapEntries.init(allocator, .{ .pairs = pairs }), .mutable = false } } };
 }
 
 /// Extract `(key, value)` from a map-entry value.
@@ -1080,7 +1080,7 @@ fn elementsProveArgs(self: *VmHost, allocator: Allocator, receiver: *const Value
         if (receiver.* != .Map or ty_args.len < 2) return false;
         const g = receiver.Map.entries.borrow();
         defer g.deinit();
-        const entries = g.get().items;
+        const entries = g.get().pairs.items;
         if (entries.len == 0) {
             return overload_match.declaredElemProves(self, &ty_args[0], receiver.Map.declared_key) and
                 overload_match.declaredElemProves(self, &ty_args[1], receiver.Map.declared_value);
@@ -2072,6 +2072,24 @@ fn prependReceiver(allocator: Allocator, receiver: *const Value, args: []const V
     return all;
 }
 
+/// Dispatch an intrinsic with the receiver prepended to `args`, using a stack
+/// buffer for the common small-arity case so a member call needs no heap
+/// allocation for its argument vector. The prepended slice never outlives the
+/// call (`dispatchIntrinsic` is synchronous and intrinsics read their args
+/// during the call — the heap path here freed it immediately too), so the stack
+/// buffer is exactly as safe. Falls back to the heap for large arities.
+fn dispatchWithReceiver(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, receiver: *const Value, args: []const Value) Allocator.Error!EvalResult {
+    var stackbuf: [16]Value = undefined;
+    if (args.len + 1 <= stackbuf.len) {
+        stackbuf[0] = receiver.*;
+        @memcpy(stackbuf[1 .. 1 + args.len], args);
+        return dispatchIntrinsic(self, allocator, fqn, func, stackbuf[0 .. 1 + args.len]);
+    }
+    const all_args = try prependReceiver(allocator, receiver, args);
+    defer if (runtime.freeScratch()) allocator.free(all_args);
+    return dispatchIntrinsic(self, allocator, fqn, func, all_args);
+}
+
 // -------------------------------------------------------------------------
 // `callMember` — the central dispatch.
 // -------------------------------------------------------------------------
@@ -2430,7 +2448,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             const g = receiver.Map.entries.borrow();
             defer g.deinit();
             var has = false;
-            for (g.get().items) |kv| {
+            for (g.get().pairs.items) |kv| {
                 if (Value.structuralEqBoxed(&kv.value, &args[0])) {
                     has = true;
                     break;
@@ -3003,7 +3021,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             const g = m.entries.borrow();
             defer g.deinit();
             var items: std.ArrayList(Value) = .empty;
-            for (g.get().items) |kv| {
+            for (g.get().pairs.items) |kv| {
                 kv.key.retain();
                 kv.value.retain();
                 const k = try Value.boxRef(allocator, kv.key);
@@ -3782,7 +3800,7 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                         defer og.deinit();
                         // Entries are borrowed from `other`; the destination map
                         // owns its own ref per key+value, so retain each.
-                        for (og.get().items) |kv| {
+                        for (og.get().pairs.items) |kv| {
                             if (runtime.reclaimEnabled()) {
                                 kv.key.retain();
                                 kv.value.retain();
@@ -3798,7 +3816,7 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                 defer g.deinit();
                 for (to_put.items) |kv| {
                     var found = false;
-                    for (g.get().items) |*slot| {
+                    for (g.get().pairs.items) |*slot| {
                         if (Value.structuralEq(&slot.key, &kv.key)) {
                             // Overwrite: release the displaced value and the
                             // staged (now-orphaned) key; transfer the staged value.
@@ -3811,7 +3829,10 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                             break;
                         }
                     }
-                    if (!found) try g.get().append(allocator, kv);
+                    if (!found) {
+                        try g.get().pairs.append(allocator, kv);
+                        try g.get().noteAppended(allocator, g.get().pairs.items.len - 1);
+                    }
                 }
                 return .{ .ok = .Unit };
             }
@@ -3857,7 +3878,7 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
                 if (me.backing) |entries| {
                     const g = entries.borrowMut();
                     defer g.deinit();
-                    for (g.get().items) |*slot| {
+                    for (g.get().pairs.items) |*slot| {
                         if (Value.structuralEq(&slot.key, me.key.asPtr())) {
                             // The slot owns its value: release the old, retain the new.
                             if (runtime.reclaimEnabled()) {
@@ -4400,7 +4421,13 @@ fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Modul
     return .{ .ok = try call_args.toOwnedSlice(allocator) };
 }
 
-fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+const ResolvedMethod = struct { fid: FuncId, unambiguous: bool };
+
+/// Walk the receiver's class hierarchy resolving `name` to a user method
+/// `FuncId`. `unambiguous` is set when the resolving class had exactly one
+/// method of that name (so the choice does not depend on argument types and the
+/// resolution may be cached for the inline dispatch cache).
+fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?ResolvedMethod {
     const inst = receiver.Instance;
     var class_name: []const u8 = undefined;
     var recv_fqn: []const u8 = undefined;
@@ -4428,6 +4455,7 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         var ir_class: ?ir.Class = null;
         {
             const mg = self.module.borrow();
+            defer mg.deinit();
             const mod = mg.get();
             if (first) {
                 if (mod.classIdByFqn(recv_fqn)) |cid| {
@@ -4453,50 +4481,9 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                     }
                 }
                 if (pickMethodOverload(self, candidates.items, args)) |f| {
-                    var all = try prependReceiver(allocator, receiver, args);
-                    // Pad defaults.
-                    const defaults = blk: {
-                        const pg = self.prog.borrow();
-                        defer pg.deinit();
-                        if (pg.get().func_defaults.get(@intFromEnum(f.id))) |d| break :blk try allocator.dupe(?FuncId, d);
-                        break :blk null;
-                    };
-                    defer if (defaults) |d| if (runtime.freeScratch()) allocator.free(d);
-                    if (defaults != null and all.len < f.params.len) {
-                        const padded = try padArgsWithDefaults(self, allocator, mod, f.params.len, all, defaults);
-                        switch (padded) {
-                            .ok => |p| {
-                                // `padArgsWithDefaults` builds a fresh slice and does
-                                // not free its input; the original prepend buffer is dead.
-                                if (runtime.freeScratch()) allocator.free(all);
-                                all = p;
-                            },
-                            .err => |e| {
-                                if (runtime.freeScratch()) allocator.free(all);
-                                mg.deinit();
-                                return .{ .err = e };
-                            },
-                        }
-                    }
-                    // `packVarargArgs` returns `all` as-is when there is no vararg, or
-                    // frees `all` and returns a fresh buffer when packing one. Either
-                    // way `packed_args` is the live buffer to free; `argsListFromSlice`
-                    // copies it into a frame-owned list, so it is dead afterward.
-                    const packed_args = try packVarargArgs(self, allocator, &f, all);
-                    var packed_list = try argsListFromSlice(allocator, packed_args);
-                    if (runtime.freeScratch()) allocator.free(packed_args);
-                    _ = &packed_list;
-                    if (trace.invariantsEnabled()) {
-                        checkFuncInRange(self, "irMethodWalk", f.id);
-                        checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
-                    }
-                    vmhost.emitPath(allocator, "member_ir_walk", f.fqn, f.id, receiver, args);
-                    const r = try ir.eval.evalWith(VmHost, allocator, mod, &f, packed_list, self);
-                    mg.deinit();
-                    return r;
+                    return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
                 }
             }
-            mg.deinit();
         }
         const cg = self.classes.borrow();
         if (cg.get().get(cur_name)) |def| {
@@ -4507,6 +4494,119 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         cg.deinit();
     }
     return null;
+}
+
+/// Invoke an already-resolved user method by `FuncId`: prepend the receiver,
+/// pad defaults, pack varargs, and run the body. Shared by the cold resolve
+/// path (`irMethodWalk`) and the inline-cache fast path.
+fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    const f = funcAt(mod, fid) orelse return null;
+
+    // Fast path: no vararg tail and the call is fully applied (no default
+    // padding), so the frame argument list is exactly `[receiver] ++ args`.
+    // Build it in one allocation directly into the frame-owned list, skipping
+    // the `prependReceiver` scratch slice + its copy/free (a per-call win on the
+    // hot member-dispatch path).
+    const has_vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
+    if (!has_vararg and args.len + 1 >= f.params.len) {
+        var list: std.ArrayList(Value) = .empty;
+        try list.ensureTotalCapacityPrecise(allocator, args.len + 1);
+        list.appendAssumeCapacity(receiver.*);
+        list.appendSliceAssumeCapacity(args);
+        if (trace.invariantsEnabled()) {
+            checkFuncInRange(self, "irMethodWalk", f.id);
+            checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
+        }
+        vmhost.emitPath(allocator, "member_ir_walk", f.fqn, f.id, receiver, args);
+        return try ir.eval.evalWith(VmHost, allocator, mod, &f, list, self);
+    }
+
+    var all = try prependReceiver(allocator, receiver, args);
+    const defaults = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (pg.get().func_defaults.get(@intFromEnum(fid))) |d| break :blk try allocator.dupe(?FuncId, d);
+        break :blk null;
+    };
+    defer if (defaults) |d| if (runtime.freeScratch()) allocator.free(d);
+    if (defaults != null and all.len < f.params.len) {
+        const padded = try padArgsWithDefaults(self, allocator, mod, f.params.len, all, defaults);
+        switch (padded) {
+            .ok => |p| {
+                if (runtime.freeScratch()) allocator.free(all);
+                all = p;
+            },
+            .err => |e| {
+                if (runtime.freeScratch()) allocator.free(all);
+                return .{ .err = e };
+            },
+        }
+    }
+    const packed_args = try packVarargArgs(self, allocator, &f, all);
+    var packed_list = try argsListFromSlice(allocator, packed_args);
+    if (runtime.freeScratch()) allocator.free(packed_args);
+    _ = &packed_list;
+    if (trace.invariantsEnabled()) {
+        checkFuncInRange(self, "irMethodWalk", f.id);
+        checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
+    }
+    vmhost.emitPath(allocator, "member_ir_walk", f.fqn, f.id, receiver, args);
+    return try ir.eval.evalWith(VmHost, allocator, mod, &f, packed_list, self);
+}
+
+/// Build the inline-cache key for an instance method call, or `null` for a
+/// non-Instance receiver. Keyed by class-cell identity + interned method-name
+/// pointer + arity (all stable for the program lifetime).
+fn instanceMethodKey(receiver: *const Value, name: []const u8, n_args: usize) ?root_mod.ProgramImage.InstanceMethodKey {
+    if (receiver.* != .Instance) return null;
+    const inst = receiver.Instance;
+    const g = inst.borrow();
+    defer g.deinit();
+    return .{
+        .class_p = g.get().class.identity(),
+        .name_p = @intFromPtr(name.ptr),
+        .n_args = @intCast(n_args),
+    };
+}
+
+fn instanceMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?FuncId {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    if (pg.get().instance_method_cache.get(key)) |raw| return @enumFromInt(raw);
+    return null;
+}
+
+fn instanceMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: FuncId) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    pg.get().instance_method_cache.put(key, @intFromEnum(fid)) catch {};
+}
+
+fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    // Inline cache: memoize the (class, method-name) → FuncId resolution for
+    // ZERO-ARG calls only. With no arguments there is no overload/arg-type
+    // discrimination (`pickMethodOverload` declines a sole candidate only by
+    // arity or definite arg-type mismatch — neither applies to a 0-arg call to a
+    // 0-param method), so the resolution is a pure function of the class and is
+    // safe to cache. Consulted at exactly the point the hierarchy walk would run
+    // (after the per-instance binding/anon probes), so dispatch is unchanged —
+    // only the linear class/method scans and per-call work-queue allocations are
+    // skipped. Zero-arg covers the member-heavy hot path (getters, `next`,
+    // `hasNext`, `toString`, `hashCode`, …).
+    const key = if (args.len == 0) instanceMethodKey(receiver, name, args.len) else null;
+    if (key) |k| {
+        if (instanceMethodCacheGet(self, k)) |fid| {
+            return try invokeMethodFuncId(self, allocator, receiver, fid, args);
+        }
+    }
+    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args)) orelse return null;
+    if (resolved.unambiguous) {
+        if (key) |k| instanceMethodCachePut(self, k, resolved.fid);
+    }
+    return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
 }
 
 fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
@@ -4567,29 +4667,68 @@ fn renderStructuralLocked(allocator: Allocator, inst: *const InstanceData, cls: 
     return .{ .String = try StringRef.initOwned(allocator, try buf.toOwnedSlice(allocator)) };
 }
 
+/// Format `"{prefix}.{name}"` into `buf` (stack scratch), returning the slice.
+/// Probe FQNs are short and bounded, so this avoids the per-call heap churn of
+/// `allocPrint` — member dispatch builds up to ~6 of these on every call.
+inline fn probeFqn(buf: []u8, prefix: []const u8, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}.{s}", .{ prefix, name }) catch buf[0..0];
+}
+
 fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const type_fqn = receiver.typeFqn();
-    var probes: std.ArrayList([]const u8) = .empty;
-    // Probe FQNs are per-call scratch (all `allocPrint`ed below); free them and
-    // the list. No-op under the arena; reclaims under a freeing allocator.
-    defer {
-        if (runtime.freeScratch()) for (probes.items) |p| allocator.free(p);
-        probes.deinit(allocator);
+    // Resolution cache: for a non-`Instance`, non-array-builder receiver, the
+    // winning intrinsic (or "none") is a pure function of (type, name,
+    // args-empty), so memoize it and skip the per-call probe building + repeated
+    // `lookupIntrinsic` borrows. Instance receivers vary by `hostHasMember` per
+    // instance and are not cached; array builders use a different (no-prepend)
+    // dispatch and are excluded.
+    const cacheable = receiver.* != .Instance and !stdlib.isArrayBuilder(name);
+    if (cacheable) {
+        const key: root_mod.ProgramImage.MemberResolveKey = .{
+            .type_p = @intFromPtr(type_fqn.ptr),
+            .name_p = @intFromPtr(name.ptr),
+            .args_empty = args.len == 0,
+        };
+        const hit: ?root_mod.ProgramImage.MemberResolveEntry = blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().member_resolve_cache.get(key);
+        };
+        if (hit) |entry| {
+            const func = entry.func orelse return null;
+            return try dispatchWithReceiver(self, allocator, entry.fqn, func, receiver, args);
+        }
+        return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, key);
     }
+    return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, null);
+}
+
+fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, type_fqn: []const u8, cache_key: ?root_mod.ProgramImage.MemberResolveKey) Allocator.Error!?EvalResult {
+    // Probe FQNs in priority order, formatted into per-call stack buffers (no
+    // heap traffic). `kotlin.<name>` etc. are formatted too so one code path
+    // builds them all; the storage outlives the loop below.
+    var bufs: [8][128]u8 = undefined;
+    var probes: [8][]const u8 = undefined;
+    var n: usize = 0;
+    const type_probe = probeFqn(&bufs[0], type_fqn, name);
     if (args.len == 0) {
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.text.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.ranges.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name}));
+        probes[0] = type_probe;
+        probes[1] = probeFqn(&bufs[1], "kotlin.collections", name);
+        probes[2] = probeFqn(&bufs[2], "kotlin.text", name);
+        probes[3] = probeFqn(&bufs[3], "kotlin.ranges", name);
+        probes[4] = probeFqn(&bufs[4], "kotlin", name);
+        n = 5;
     } else {
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.ranges.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.text.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name}));
+        probes[0] = probeFqn(&bufs[0], "kotlin.ranges", name);
+        probes[1] = probeFqn(&bufs[1], "kotlin.collections", name);
+        probes[2] = probeFqn(&bufs[2], "kotlin.text", name);
+        probes[3] = probeFqn(&bufs[3], type_fqn, name);
+        probes[4] = probeFqn(&bufs[4], "kotlin", name);
+        n = 5;
     }
-    // Sibling read-only/mutable collection type.
+    // Sibling read-only/mutable collection type, inserted right after the
+    // receiver-type probe so a `MutableList` op can resolve a `List`-declared
+    // intrinsic (and vice versa).
     const sibling: ?[]const u8 = blk: {
         if (std.mem.eql(u8, type_fqn, "kotlin.collections.MutableList")) break :blk "kotlin.collections.List";
         if (std.mem.eql(u8, type_fqn, "kotlin.collections.MutableSet")) break :blk "kotlin.collections.Set";
@@ -4600,23 +4739,25 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
         break :blk null;
     };
     if (sibling) |sib| {
-        const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ sib, name });
-        const anchor = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name });
-        defer if (runtime.freeScratch()) allocator.free(anchor);
-        var inserted = false;
-        for (probes.items, 0..) |p, idx| {
-            if (std.mem.eql(u8, p, anchor)) {
-                try probes.insert(allocator, idx + 1, probe);
-                inserted = true;
+        const sib_probe = probeFqn(&bufs[5], sib, name);
+        // Find the receiver-type probe and insert the sibling right after it.
+        var at: usize = n;
+        for (probes[0..n], 0..) |p, idx| {
+            if (std.mem.eql(u8, p, type_probe)) {
+                at = idx + 1;
                 break;
             }
         }
-        if (!inserted) try probes.append(allocator, probe);
+        var k: usize = n;
+        while (k > at) : (k -= 1) probes[k] = probes[k - 1];
+        probes[at] = sib_probe;
+        n += 1;
     }
     // Throwable family probe.
     if (receiver.* == .Instance) {
         if (instanceIsThrowable(self, allocator, receiver.Instance)) {
-            try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.Throwable.{s}", .{name}));
+            probes[n] = probeFqn(&bufs[6], "kotlin.Throwable", name);
+            n += 1;
         }
     }
 
@@ -4625,23 +4766,41 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
 
     // Array builder global factory direct dispatch.
     if (stdlib.isArrayBuilder(name) and !hostHasMember(self, receiver, name)) {
-        const probe = try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name});
-        defer if (runtime.freeScratch()) allocator.free(probe);
+        const probe = probeFqn(&bufs[7], "kotlin", name);
         if (lookupIntrinsic(self, probe)) |func| {
             return try dispatchIntrinsic(self, allocator, probe, func, args);
         }
     }
 
     if (!member_shadows_stdlib and !user_member_ext_shadows and !stdlib.isToplevelFunction(name)) {
-        for (probes.items) |probe| {
+        for (probes[0..n]) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
-                const all_args = try prependReceiver(allocator, receiver, args);
-                defer if (runtime.freeScratch()) allocator.free(all_args);
-                return try dispatchIntrinsic(self, allocator, probe, func, all_args);
+                if (cache_key) |key| memberCachePut(self, key, func, probe);
+                return try dispatchWithReceiver(self, allocator, probe, func, receiver, args);
             }
         }
     }
+    // No intrinsic resolved: memoize the miss so the next identical call skips
+    // the probe build + lookups and falls straight through to extension/global.
+    if (cache_key) |key| memberCachePut(self, key, null, "");
     return null;
+}
+
+/// Store a member-resolution result on the shared program image. `func == null`
+/// records a confirmed miss; a non-empty `fqn` is duped into the program's
+/// allocator (lives for the program; bounded by distinct resolved members).
+fn memberCachePut(self: *VmHost, key: root_mod.ProgramImage.MemberResolveKey, func: ?StdlibFn, fqn: []const u8) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    const cache = &pg.get().member_resolve_cache;
+    if (cache.contains(key)) return;
+    const stored_fqn: []const u8 = if (func != null and fqn.len != 0)
+        (cache.allocator.dupe(u8, fqn) catch return)
+    else
+        "";
+    cache.put(key, .{ .func = func, .fqn = stored_fqn }) catch {
+        if (stored_fqn.len != 0) cache.allocator.free(stored_fqn);
+    };
 }
 
 fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) bool {
