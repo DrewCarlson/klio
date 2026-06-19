@@ -82,8 +82,33 @@ collections — pure loop + array), bound by the F3 per-instruction constant fac
 ## Plan
 
 1. F1 — array/list subscript fast path. DONE.
-2. F2 — give `Map` an O(1) hash index (the biggest remaining lever).
-3. F3 — trim core dispatch constant factor (return-by-value, hot-prong order).
+2. F2 — `Map` O(1) hash index. DONE.
+3. release-gate under GC (the dominant systemic O(n²)). DONE.
+4. probe-FQN stack buffers (kill per-call allocPrint churn). DONE.
+5. F4 — `iterableItems` snapshot copies the whole list per call. PENDING (makes
+   `last`/`first` O(n), and any such op O(n²) in a loop).
+6. F3 — core per-instruction constant factor (~150-200 ns/IR-inst). The
+   remaining gap is the tree/register interpreter's dispatch loop itself:
+   `execInst` returns a 72-byte `EvalResult` by value per instruction, the big
+   `switch (inst.*)`, and 64-byte `Value` copies through `frame.read`/`write`.
+   The pure-arithmetic mod loop is ~780 ns/iter (3 BinOps) — no bug left, just
+   constant factor. Closing the gap to node (a JIT) needs a bytecode VM /
+   register-machine rewrite, not local tweaks; getting within a few× of CPython
+   would mean shrinking `Value`/`EvalResult` and a computed-goto dispatch. Large,
+   separate effort.
+
+## Status (vs start of campaign)
+
+| workload | start | now | speedup | python | node |
+|---|---|---|---|---|---|
+| numeric | 16.5 s | 14.5 s | 1.1× | 1.0 s | 0.06 s |
+| collections | >180 s (timeout) | 13 s | >14× | 0.25 s | 0.06 s |
+| strings | 69 s | 7.9 s | 8.7× | 0.19 s | 0.11 s |
+
+The two systemic O(n²) bugs (ungated `release`, linear-scan `Map`) are fixed —
+those were what made map/collection code pathological. Array subscript and probe
+churn fixed too. The residual is interpreter constant factor (F3) + the
+`iterableItems` snapshot (F4); both are bounded/known, not pathological.
 
 ## Bench suite
 
