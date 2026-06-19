@@ -368,17 +368,41 @@ eval-level tail (see Phase 1 residual) chased to zero.
       /`BuildObject.ast` -> `ForestField`, `funcRefsAst` retired, so object/lambda
       bodies defer to the lazy-IR section. **bare 32->30, ktor 103->91**
       (eager decode basic 5.9->3.2 MB, ktor 18.5->7.0 MB). Suite green.
-- [ ] **BEYOND FOREST step 2 (next, larger):** the eager `ir.Func` HEADERS remain
-      (~13586 Func structs resident for ktor; ir.Func/ir.Param/ir.TypeRef decode).
-      Lazy func-header decode needs per-func sections + decode-on-`idGet` (the
-      `idGet` is `*const` — needs a side cache `[]?*Func` + offsets) + baked
-      `fqn->id` index and package-head set to avoid the `funcIdByFqn`/
-      `packageHeadDeclared` sweeps over `funcs.items` (ir.zig:1167/1184).
+- [~] **BEYOND FOREST step 2 — lazy func headers (foundation landed; flip blocked
+      on a VM rearchitecture):** `Module.funcById`/`funcCount` choke point added
+      (eager today; lazy fields `func_header_section/offsets/decode/cache` in
+      place); all ir.zig func-by-id reads route through it. **The lazy flip is NOT
+      a bounded change** — `cloneForExtend` (ir.zig:1042) copies ALL base funcs by
+      value into every extending run with a CONTIGUOUS id-space (`FuncId ==
+      funcs.items index`), and many sites assign `FuncId.from(funcs.items.len)`.
+      Making base funcs lazy means base funcs must NOT be copied — the run module
+      must DELEGATE base ids to the base module (`funcById(id<base_count)` ->
+      base lazy section; user funcs appended at ids >= base_count, items indexed
+      by `id-base_count`), rewriting cloneForExtend + every id assignment + the
+      VM's ~30 `module.funcs.items[id]` sites + the `funcIdByFqn`/
+      `packageHeadDeclared` sweeps (need baked `fqn->id` + package-head indices).
+      Payoff is modest (~5 MB ktor: ~4 MB base func decode + ~1.4 MB clone copy;
+      params/blocks are already shared, not re-copied). ARCHITECTURE-SCALE.
 - [ ] **BEYOND FOREST step 3 (largest):** lazy ClassDef construction — ktor's
       ~84 MB non-decode is dominated by the runtime ClassDef graph + baked
       registry side-tables (hierarchy_methods/class_super_names/... for hundreds
       of classes). Build ClassDef shells lazily on first class use; riskiest
-      (dispatch/instance/two-phase-link paths read ClassDefs).
+      (dispatch/instance/two-phase-link paths read ClassDefs). Same `cloneForExtend`
+      delegation problem as step 2 (classes are also copied by value at 1050) plus
+      the two-phase parent/interface backpatch assumes all shells exist.
+
+### Architectural conclusion (why the targets need a dedicated rearchitecture)
+Bare (30 MB) is at the interpreter's own code+data floor (binary text 29 MB /
+data 7.7 MB incl. embedded stdlib pack; ~25-28 MB resident before any program) —
+target 25 is essentially that floor; further wins need binary shrink (strip debug,
+less code), not laziness. The ktor gap (91->45) is the framework's eagerly-built
+runtime graph, and the only levers (lazy funcs + lazy ClassDefs) are blocked on
+the `cloneForExtend` copy-by-value + contiguous-id model: closing the gap requires
+converting the extend model from COPY to DELEGATION across funcs AND classes — a
+VM rearchitecture touching the hottest paths (call dispatch, instance creation,
+two-phase linking). That is a dedicated, reviewable effort, not a safe auto-loop
+increment; a subtle bug would silently miscompile dispatch on programs the (broad
+but not exhaustive) suite doesn't cover.
 - [ ] leaktrack fix (segfaults at exit-collect) — enables the P1 eval-tail
       attribution; validate via RSS trajectory until then.
 - [ ] P4: ktor steady (~103-122) is ~node (~96); driving below node needs the
