@@ -40,6 +40,7 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const ast = @import("ast");
+const FF = runtime.forest.ForestField;
 const span = @import("span");
 
 const build = @import("build.zig");
@@ -88,6 +89,60 @@ fn isWatched(comptime T: type) bool {
         if (T == W) return true;
     }
     return false;
+}
+
+/// A `forest.ForestField(T)` union — the codec encodes it as a forest reference
+/// (or an inline fallback) instead of via the generic union path.
+fn isForestField(comptime T: type) bool {
+    return @typeInfo(T) == .@"union" and @hasDecl(T, "is_forest_field");
+}
+
+/// Bake-time map from a forest AST node address to its `(decl, ord)` reference,
+/// built while emitting the per-decl sections. Set for the duration of the final
+/// `ImageRoot` encode so a `ForestField.ptr` into the forest encodes lazily.
+/// Null outside a bake (and in the self-contained per-decl/body encodes, which
+/// must stay inline).
+var bake_forest_map: ?*const std.AutoHashMap(usize, runtime.forest.ForestRef) = null;
+
+/// Encode a `ForestField`: tag 0 + `(decl, ord)` when the pointer resolves to a
+/// forest node (the lazy path), else tag 1 + the node encoded inline (synthetic
+/// nodes outside `lifted_decls`, and any encode with no forest map installed —
+/// e.g. the per-decl sections themselves). `.ref` re-encodes verbatim.
+fn encodeForestField(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!void {
+    const Child = T.Child;
+    switch (value.*) {
+        .ref => |r| {
+            try e.varint(0);
+            try e.varint(r.decl);
+            try e.varint(r.ord);
+        },
+        .ptr => |p| {
+            if (bake_forest_map) |map| {
+                if (map.get(@intFromPtr(p))) |r| {
+                    try e.varint(0);
+                    try e.varint(r.decl);
+                    try e.varint(r.ord);
+                    return;
+                }
+            }
+            try e.varint(1);
+            try encodeValue(Child, e, p);
+        },
+    }
+}
+
+fn decodeForestField(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
+    const Child = T.Child;
+    const tag = try d.varint();
+    if (tag == 0) {
+        const decl: u32 = @intCast(try d.varint());
+        const ord: u32 = @intCast(try d.varint());
+        out.* = .{ .ref = .{ .decl = decl, .ord = ord } };
+    } else {
+        const ptr = try d.a.create(Child);
+        try decodeInto(Child, d, ptr);
+        out.* = .{ .ptr = ptr };
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -174,6 +229,10 @@ fn encodeInt(comptime T: type, e: *Encoder, value: T) Allocator.Error!void {
 /// Encode one value, traversing by const pointer so registered addresses
 /// are the original object addresses (interior pointers included).
 fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!void {
+    if (comptime isForestField(T)) {
+        try encodeForestField(T, e, value);
+        return;
+    }
     if (comptime isWatched(T)) {
         const key = NodeKey{ .addr = @intFromPtr(value), .ty = typeId(T) };
         const gop = try e.nodes.getOrPut(key);
@@ -356,6 +415,10 @@ pub fn dumpDecodeStats() void {
 /// resting address of every watched node / defined slice is registered,
 /// mirroring the encoder's traversal exactly.
 fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
+    if (comptime isForestField(T)) {
+        try decodeForestField(T, d, out);
+        return;
+    }
     if (comptime isWatched(T)) {
         try d.nodes.append(d.a, @intFromPtr(out));
     }
@@ -577,7 +640,7 @@ const FieldImage = struct { name: []const u8, value: ValueImage };
 
 const MethodImage = struct {
     name: []const u8,
-    decl: *const ast.Function,
+    decl: FF(ast.Function),
     is_operator: bool,
     is_open: bool,
     is_override: bool,
@@ -589,10 +652,10 @@ const MethodImage = struct {
 const PropertyImage = struct {
     name: []const u8,
     mutable: bool,
-    init: ?*const ast.Expr,
-    getter: ?*const ast.Accessor,
-    setter: ?*const ast.Accessor,
-    delegate: ?*const ast.Expr,
+    init: ?FF(ast.Expr),
+    getter: ?FF(ast.Accessor),
+    setter: ?FF(ast.Accessor),
+    delegate: ?FF(ast.Expr),
     is_abstract: bool,
     is_lateinit: bool,
     primitive_zero: ?ValueImage,
@@ -601,7 +664,7 @@ const PropertyImage = struct {
 const ClassParamImage = struct {
     property: ?bool,
     name: []const u8,
-    default: ?*const ast.Expr,
+    default: ?FF(ast.Expr),
     declared_type: ?[]const u8,
     declared_shape: ?TypeShape,
 };
@@ -609,7 +672,7 @@ const ClassParamImage = struct {
 const DelegateImage = struct {
     interface_name: []const u8,
     interface: ?u32,
-    expr: *const ast.Expr,
+    expr: FF(ast.Expr),
     field_key: []const u8,
 };
 
@@ -620,7 +683,7 @@ const ClassDefImage = struct {
     primary_params: []ClassParamImage,
     methods: []MethodImage,
     body_properties: []PropertyImage,
-    init_blocks: []*const ast.Block,
+    init_blocks: []const FF(ast.Block),
     init_block_property_positions: []usize,
     is_data: bool,
     is_value: bool,
@@ -632,12 +695,12 @@ const ClassDefImage = struct {
     interfaces: []u32,
     is_interface: bool,
     is_fun_interface: bool,
-    parent_ctor_args: []*const ast.Expr,
+    parent_ctor_args: []const FF(ast.Expr),
     is_open: bool,
     is_abstract: bool,
     is_inner: bool,
     is_anonymous: bool,
-    secondary_ctors: []*const ast.SecondaryCtor,
+    secondary_ctors: []const FF(ast.SecondaryCtor),
     enum_entries: []struct { name: []const u8, value: ValueImage },
     enclosing: ?u32,
     nested_classes: []struct { name: []const u8, idx: u32 },
@@ -684,6 +747,9 @@ const ImageRoot = struct {
     param_type_names: []const []const u8,
     type_names: []const []const u8,
     inline_ids: []InlineIdImage,
+    /// Simple-name -> base inline-fn forest refs, the lazy replacement for the
+    /// load-time `collectInline` walk over `lifted_decls`.
+    inline_by_name: []InlineNamesImage = &.{},
     enum_id_next: u64,
     /// CLI replay data: packages registered while loading the dependency
     /// sources and the host-binding FQNs installed alongside them.
@@ -802,7 +868,8 @@ fn funcRefsAst(func: *const ir.Func) bool {
     return false;
 }
 
-const InlineIdImage = struct { id: u32, f: *const ast.Function };
+const InlineIdImage = struct { id: u32, f: FF(ast.Function) };
+const InlineNamesImage = struct { k: []const u8, v: []const runtime.forest.ForestRef };
 
 // -------------------------------------------------------------------------
 // Bake: StdlibBase -> bytes
@@ -886,15 +953,50 @@ pub fn bake(
     // default; the loader picks one.
     var decl_enc = Encoder.init(gpa);
     defer decl_enc.deinit();
+    // Map every forest node's address to its `(decl, ord)` reference as each
+    // decl's self-contained section is emitted, so a `ForestField.ptr` into the
+    // forest encodes as a lazy ref (the decoder reads the same ordinals back).
+    var forest_map = std.AutoHashMap(usize, runtime.forest.ForestRef).init(gpa);
+    defer forest_map.deinit();
     {
         const offsets = try a.alloc(u32, root.lifted_decls.len);
         for (root.lifted_decls, 0..) |*d, i| {
             offsets[i] = @intCast(decl_enc.out.items.len);
             decl_enc.resetRegistry();
             try encodeValue(ast.Decl, &decl_enc, d);
+            var it = decl_enc.nodes.iterator();
+            while (it.next()) |kv| {
+                try forest_map.put(kv.key_ptr.addr, .{ .decl = @intCast(i), .ord = kv.value_ptr.* });
+            }
         }
         root.lifted_decl_section = decl_enc.out.items;
         root.lifted_decl_offsets = offsets;
+    }
+
+    // Bake the base inline-fn name index as forest refs, so load installs it
+    // without walking lifted_decls (the lazy replacement for collectInline).
+    {
+        var by_name = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(gpa);
+        defer {
+            var dit = by_name.valueIterator();
+            while (dit.next()) |v| v.deinit(gpa);
+            by_name.deinit();
+        }
+        for (root.lifted_decls) |*d| try build.collectInline(gpa, d, &by_name);
+        var list: std.ArrayList(InlineNamesImage) = .empty;
+        var it = by_name.iterator();
+        while (it.next()) |e| {
+            const refs = try a.alloc(runtime.forest.ForestRef, e.value_ptr.items.len);
+            var n: usize = 0;
+            for (e.value_ptr.items) |ff| {
+                if (forest_map.get(@intFromPtr(ff.get()))) |r| {
+                    refs[n] = r;
+                    n += 1;
+                }
+            }
+            if (n != 0) try list.append(a, .{ .k = e.key_ptr.*, .v = refs[0..n] });
+        }
+        root.inline_by_name = try list.toOwnedSlice(a);
     }
 
     var e = Encoder.init(gpa);
@@ -906,6 +1008,8 @@ pub fn bake(
     const len_slot = e.out.items.len;
     try e.bytes(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
     const payload_start = e.out.items.len;
+    bake_forest_map = &forest_map;
+    defer bake_forest_map = null;
     try encodeValue(ImageRoot, &e, root);
     const payload_len: u64 = e.out.items.len - payload_start;
     @memcpy(e.out.items[len_slot .. len_slot + 8], &std.mem.toBytes(std.mem.nativeToLittle(u64, payload_len)));
@@ -1352,7 +1456,7 @@ fn methodToImage(m: *const runtime.MethodDef, out: *MethodImage) bool {
     if (m.sam_lambda != null) return false;
     out.* = .{
         .name = m.name,
-        .decl = m.decl.get(),
+        .decl = m.decl,
         .is_operator = m.is_operator,
         .is_open = m.is_open,
         .is_override = m.is_override,
@@ -1564,6 +1668,11 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
 }
 
 fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
+    // Install the lazy-forest resolver first: building the base below resolves
+    // forest refs (e.g. `inline_ids`), so the section/offset table and decode
+    // hook must be live before any `ForestField.get()`.
+    runtime.forest.setSection(root.lifted_decl_section, root.lifted_decl_offsets, a, decodeLiftedDeclReg);
+
     const map = try a.create(SourceMap);
     map.* = SourceMap.init(a);
     // The image's file paths/sources are borrows of the process-lifetime mmap,
@@ -1594,6 +1703,13 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
             }
             break :blk ids;
         },
+        .inline_by_name = blk: {
+            const out = try a.alloc(StdlibBase.InlineNames, root.inline_by_name.len);
+            for (root.inline_by_name, 0..) |entry, i| {
+                out[i] = .{ .k = entry.k, .v = entry.v };
+            }
+            break :blk out;
+        },
         .user_file_start = @intCast(root.files.len),
         .enum_id_next = root.enum_id_next,
         .deferred_bodies = root.deferred_bodies,
@@ -1601,11 +1717,6 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
         .lifted_decl_offsets = root.lifted_decl_offsets,
         .arena = a,
     };
-
-    // Install the lazy-forest resolver (decode-on-touch). Harmless while the
-    // eager `lifted_decls` is the active path — nothing resolves a ForestRef
-    // yet; the flip routes built/module's forest pointers through it.
-    runtime.forest.setSection(root.lifted_decl_section, root.lifted_decl_offsets, a, decodeLiftedDeclReg);
 
     return .{
         .base = base,
@@ -1865,9 +1976,9 @@ fn methodsFromImage(a: Allocator, imgs: []const MethodImage) Allocator.Error![]r
     for (imgs, 0..) |m, i| {
         out[i] = .{
             .name = m.name,
-            // Phase A: eager `.ptr` (still resolving the forest backref at
-            // load); Phase B flips this to a lazy `.ref`.
-            .decl = .{ .ptr = m.decl },
+            // The image stores `decl` as a `ForestField` already (lazy `.ref`
+            // for forest methods, inline `.ptr` for synthetic ones); copy it.
+            .decl = m.decl,
             .is_operator = m.is_operator,
             .is_open = m.is_open,
             .is_override = m.is_override,

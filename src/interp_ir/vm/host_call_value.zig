@@ -183,8 +183,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             // classes — literal-only inits, since there's no
             // lowered thunk on a non-IR class.
             for (cdef.body_properties) |p| {
-                if (p.init) |init_expr| {
-                    const v = simpleLiteral(allocator, init_expr) orelse Value.Null;
+                if (p.init) |init_field| {
+                    const v = simpleLiteral(allocator, init_field.get()) orelse Value.Null;
                     try fields.append(allocator, .{ .name = p.name, .value = v });
                 } else if (p.getter == null and p.delegate == null) {
                     const v = p.primitive_zero orelse Value.Null;

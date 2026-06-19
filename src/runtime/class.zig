@@ -25,7 +25,7 @@ pub const ClassDef = struct {
     methods: []MethodDef,
     /// Body `val`/`var` properties (not primary-ctor properties).
     body_properties: []PropertyDef,
-    init_blocks: []*const ast.Block,
+    init_blocks: []const forest.ForestField(ast.Block),
     /// For each entry in `init_blocks`, the index of `body_properties` it
     /// runs before — matching Kotlin's source-order init rule.
     init_block_property_positions: []usize,
@@ -57,7 +57,7 @@ pub const ClassDef = struct {
     /// `true` for a `fun interface`.
     is_fun_interface: bool,
     /// Constructor argument expressions for the parent class.
-    parent_ctor_args: []*const ast.Expr,
+    parent_ctor_args: []const forest.ForestField(ast.Expr),
     /// `true` when the declaration carried the `open` modifier.
     is_open: bool,
     /// `true` for an `abstract class`.
@@ -67,7 +67,7 @@ pub const ClassDef = struct {
     /// `true` for the synthetic `ClassDef` built from an `object { … }`.
     is_anonymous: bool,
     /// Secondary constructors in source-declared order.
-    secondary_ctors: []*const ast.SecondaryCtor,
+    secondary_ctors: []const forest.ForestField(ast.SecondaryCtor),
     /// Eagerly-constructed enum entries in source order. Arena slice filled
     /// once during linking; immutable and lock-free thereafter.
     enum_entries: []const EnumEntry,
@@ -207,7 +207,7 @@ pub const SupertypeDelegate = struct {
     /// Resolved interface class, if it resolves at registration time.
     interface: ?ObjRef(ClassDef),
     /// Delegate expression — evaluated in the primary-ctor parameter scope.
-    expr: *const ast.Expr,
+    expr: forest.ForestField(ast.Expr),
     /// Field key on the instance where the resolved delegate value lives.
     field_key: []const u8,
 };
@@ -216,7 +216,7 @@ pub const ClassParamDef = struct {
     /// `true` for `var`, `false` for `val`, `null` if not a property.
     property: ?bool,
     name: []const u8,
-    default: ?*const ast.Expr,
+    default: ?forest.ForestField(ast.Expr),
     /// Declared type's simple name (e.g. `"Long"`).
     declared_type: ?[]const u8,
     /// The full declared-type shape, including generic args and nullability.
@@ -269,13 +269,17 @@ pub const MethodDef = struct {
 pub const PropertyDef = struct {
     name: []const u8,
     mutable: bool,
-    init: ?*const ast.Expr,
+    /// Initializer / accessor / delegate AST — eager (`.ptr`, build/bake) or lazy
+    /// (`.ref`, image-backed forest). A loaded image never reads these (the
+    /// lowered side-tables come from the built program), so the `.ref` form keeps
+    /// them out of the eager forest decode. Read via `.get()`.
+    init: ?forest.ForestField(ast.Expr),
     /// Custom getter body, if declared.
-    getter: ?*const ast.Accessor,
+    getter: ?forest.ForestField(ast.Accessor),
     /// Custom setter body, if declared.
-    setter: ?*const ast.Accessor,
+    setter: ?forest.ForestField(ast.Accessor),
     /// `val foo by expr` — the delegate expression.
-    delegate: ?*const ast.Expr,
+    delegate: ?forest.ForestField(ast.Expr),
     /// `true` when the property was declared `abstract`.
     is_abstract: bool,
     /// `true` for a `lateinit var`.

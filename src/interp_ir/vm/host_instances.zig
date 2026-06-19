@@ -20,6 +20,7 @@ const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
 const build = @import("../build.zig");
+const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -984,7 +985,7 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
                         const dg = d.borrow();
                         defer dg.deinit();
                         if (idx < dg.get().primary_params.len) {
-                            dflt = dg.get().primary_params[idx].default;
+                            if (dg.get().primary_params[idx].default) |ff| dflt = ff.get();
                         }
                     }
                     if (dflt) |e| {
@@ -1709,7 +1710,9 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
             {
                 const dg = class_def.borrow();
                 defer dg.deinit();
-                if (idx < dg.get().primary_params.len) dflt_expr = dg.get().primary_params[idx].default;
+                if (idx < dg.get().primary_params.len) {
+                    if (dg.get().primary_params[idx].default) |ff| dflt_expr = ff.get();
+                }
             }
             var v: Value = .Null;
             var resolved = false;
@@ -1788,7 +1791,9 @@ fn padParentCtorDefaults(
         {
             const dg = parent_def.borrow();
             defer dg.deinit();
-            if (idx < dg.get().primary_params.len) dflt_expr = dg.get().primary_params[idx].default;
+            if (idx < dg.get().primary_params.len) {
+                if (dg.get().primary_params[idx].default) |ff| dflt_expr = ff.get();
+            }
         }
         var v: Value = .Null;
         var resolved = false;
@@ -2379,7 +2384,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                         break :blk g.get().body_properties[prop_idx].init;
                     };
                     if (init_expr) |ie| {
-                        const v = (try simpleLiteral(allocator, ie)) orelse Value.Null;
+                        const v = (try simpleLiteral(allocator, ie.get())) orelse Value.Null;
                         const g = inst.borrowMut();
                         try g.get().define(allocator, prop_name, v);
                         g.deinit();
@@ -2931,10 +2936,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             try body_props.append(allocator, .{
                 .name = p.name.name,
                 .mutable = p.mutable,
-                .init = if (p.init) |*e| e else null,
-                .getter = if (p.getter) |g| g else null,
-                .setter = if (p.setter) |s| s else null,
-                .delegate = if (p.delegate) |e| e else null,
+                .init = if (p.init) |*e| FF(ast.Expr).fromPtr(e) else null,
+                .getter = if (p.getter) |g| FF(ast.Accessor).fromPtr(g) else null,
+                .setter = if (p.setter) |s| FF(ast.Accessor).fromPtr(s) else null,
+                .delegate = if (p.delegate) |e| FF(ast.Expr).fromPtr(e) else null,
                 .is_abstract = p.is_abstract,
                 .is_lateinit = p.is_lateinit,
                 .primitive_zero = build.primitiveZeroFor(p),
@@ -3018,7 +3023,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         defer cg.deinit();
         for (cg.get().body_properties) |p| {
             var v: Value = .Null;
-            if (p.init) |init_expr| {
+            if (p.init) |init_field| {
+                const init_expr = init_field.get();
                 if (try simpleLiteral(allocator, init_expr)) |lit| {
                     v = lit;
                 } else if (init_expr.* == .Path and init_expr.Path.segments.len == 1) {

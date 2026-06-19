@@ -13,6 +13,7 @@ const std = @import("std");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
+const FF = runtime.forest.ForestField;
 const ast = @import("ast");
 const span = @import("span");
 const stdlib = @import("stdlib");
@@ -1253,14 +1254,24 @@ fn buildModuleWithOverrides(
     // arena reclaims them and no growing leak accumulates.
     const tl = std.heap.page_allocator;
     {
-        var inline_fns = std.StringHashMap(std.ArrayList(*const ast.Function)).init(a);
+        var inline_fns = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(a);
         // Base inline fns first, preserving the whole-program declaration
-        // order of each overload list (base decls precede user decls).
+        // order of each overload list (base decls precede user decls). A loaded
+        // base carries the lazy `inline_by_name` refs (its `lifted_decls` may be
+        // empty); a freshly-built base walks its decls.
         if (base) |bs| {
-            for (bs.lifted_decls) |*d| try collectInline(a, d, &inline_fns);
+            if (bs.inline_by_name.len != 0) {
+                for (bs.inline_by_name) |kv| {
+                    const gop = try inline_fns.getOrPut(kv.k);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    for (kv.v) |r| try gop.value_ptr.append(a, FF(ast.Function).fromRef(r));
+                }
+            } else {
+                for (bs.lifted_decls) |*d| try collectInline(a, d, &inline_fns);
+            }
         }
         for (decls) |*d| try collectInline(a, d, &inline_fns);
-        var frozen = std.StringHashMap([]const *const ast.Function).init(tl);
+        var frozen = std.StringHashMap([]const FF(ast.Function)).init(tl);
         var it = inline_fns.iterator();
         while (it.next()) |e| {
             try frozen.put(e.key_ptr.*, try e.value_ptr.toOwnedSlice(a));
@@ -1476,7 +1487,7 @@ fn buildModuleWithOverrides(
             // bare call the symbol index resolves to this declaration
             // splices exactly this declaration.
             if (f.is_inline and f.body != null) {
-                try ir.lower.registerInlineFnId(id.int(), f);
+                try ir.lower.registerInlineFnId(id.int(), FF(ast.Function).fromPtr(f));
             }
             try stub_ids.append(a, id);
         }
@@ -2321,12 +2332,12 @@ fn collectConsts(module: *Module, cls_name: []const u8, members: []const Decl) A
     }
 }
 
-fn collectInline(allocator: Allocator, d: *const Decl, out: *std.StringHashMap(std.ArrayList(*const ast.Function))) Allocator.Error!void {
+pub fn collectInline(allocator: Allocator, d: *const Decl, out: *std.StringHashMap(std.ArrayList(FF(ast.Function)))) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| if (f.is_inline and f.body != null) {
             const gop = try out.getOrPut(f.name.name);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(allocator, f);
+            try gop.value_ptr.append(allocator, FF(ast.Function).fromPtr(f));
         },
         .Class => |*c| for (c.members) |*m| try collectInline(allocator, m, out),
         .Object => |*o| for (o.members) |*m| try collectInline(allocator, m, out),
@@ -2366,7 +2377,7 @@ fn buildClassDef(
         primary_params[i] = .{
             .property = p.property,
             .name = p.name.name,
-            .default = if (p.default) |*e| e else null,
+            .default = if (p.default) |*e| FF(ast.Expr).fromPtr(e) else null,
             .declared_type = p.ty.name.name,
             .declared_shape = try TypeShape.fromTypeRef(a, &p.ty),
         };
@@ -2378,10 +2389,10 @@ fn buildClassDef(
         try body_props.append(a, .{
             .name = p.name.name,
             .mutable = p.mutable,
-            .init = if (p.init) |*e| e else null,
-            .getter = if (p.getter) |g| g else null,
-            .setter = if (p.setter) |s| s else null,
-            .delegate = if (p.delegate) |e| e else null,
+            .init = if (p.init) |*e| FF(ast.Expr).fromPtr(e) else null,
+            .getter = if (p.getter) |g| FF(ast.Accessor).fromPtr(g) else null,
+            .setter = if (p.setter) |s| FF(ast.Accessor).fromPtr(s) else null,
+            .delegate = if (p.delegate) |e| FF(ast.Expr).fromPtr(e) else null,
             .is_abstract = p.is_abstract,
             .is_lateinit = p.is_lateinit,
             .primitive_zero = primitiveZeroFor(p),
@@ -2409,11 +2420,11 @@ fn buildClassDef(
         init_block_positions[i] = count;
     }
 
-    var init_blocks_ast = try a.alloc(*const ast.Block, c.init_blocks.len);
-    for (c.init_blocks, 0..) |*blk, i| init_blocks_ast[i] = blk;
+    var init_blocks_ast = try a.alloc(FF(ast.Block), c.init_blocks.len);
+    for (c.init_blocks, 0..) |*blk, i| init_blocks_ast[i] = FF(ast.Block).fromPtr(blk);
 
-    var secondary = try a.alloc(*const ast.SecondaryCtor, c.secondary_ctors.len);
-    for (c.secondary_ctors, 0..) |*sc, i| secondary[i] = sc;
+    var secondary = try a.alloc(FF(ast.SecondaryCtor), c.secondary_ctors.len);
+    for (c.secondary_ctors, 0..) |*sc, i| secondary[i] = FF(ast.SecondaryCtor).fromPtr(sc);
 
     var supertype_names = try a.alloc([]const u8, c.supertypes.len);
     var supertype_paths = try a.alloc(?[]const u8, c.supertypes.len);
@@ -2684,6 +2695,12 @@ pub const StdlibBase = struct {
     /// (FuncId, AST) pairs replayed into the per-build inline-fn registry
     /// so user calls resolving to base inline fns still splice.
     inline_ids: []const InlineId,
+    /// Simple-name -> base inline-fn forest refs (overloads in declaration
+    /// order), the lazy replacement for walking `lifted_decls` with
+    /// `collectInline` at load. Empty for a freshly-built base (which walks its
+    /// own decls); populated only when loaded from an image. Includes class /
+    /// object member inline fns, which carry no `inline_ids` stub.
+    inline_by_name: []const InlineNames = &.{},
     /// Base SourceMap files occupy ids [0..user_file_start).
     user_file_start: u32,
     /// Next enum-entry identity, continuing the base build's sequence so
@@ -2706,7 +2723,9 @@ pub const StdlibBase = struct {
     /// it is decoded here, not into a per-build arena.
     arena: Allocator = undefined,
 
-    pub const InlineId = struct { id: u32, f: *const ast.Function };
+    pub const InlineId = struct { id: u32, f: FF(ast.Function) };
+    /// One simple name's base inline-fn forest refs (overloads in order).
+    pub const InlineNames = struct { k: []const u8, v: []const runtime.forest.ForestRef };
 };
 
 /// Build the dependency snapshot from already-parsed base files. The
@@ -2763,7 +2782,7 @@ pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocato
             for (f.params) |*p| try base.param_type_names.put(p.ty.name, {});
             if (f.is_inline) {
                 if (ir.lower.inline_state.inlineAstById(f.id.int())) |fn_ast| {
-                    try inline_ids.append(allocator, .{ .id = f.id.int(), .f = fn_ast });
+                    try inline_ids.append(allocator, .{ .id = f.id.int(), .f = FF(ast.Function).fromPtr(fn_ast) });
                 }
             }
         }

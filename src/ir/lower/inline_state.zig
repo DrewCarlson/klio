@@ -11,9 +11,11 @@
 const std = @import("std");
 const ast = @import("ast");
 const span = @import("span");
+const runtime = @import("runtime");
 
 const Allocator = std.mem.Allocator;
 const StringSet = std.StringHashMap(void);
+const FnField = runtime.forest.ForestField(ast.Function);
 
 // --- Deferred inline-body decode --------------------------------------------
 //
@@ -73,7 +75,12 @@ pub const CallShape = struct {
 /// Non-suspend inline fns keep the normal call path and klio's
 /// frame-kind non-local-return mechanism, so the inline blast radius
 /// stays minimal.
-threadlocal var inline_fn_asts: ?std.StringHashMap([]const *const ast.Function) = null;
+threadlocal var inline_fn_asts: ?std.StringHashMap([]const FnField) = null;
+
+/// Lazy per-name cache of `inline_fn_asts` candidates resolved to plain
+/// pointers, so the picking logic stays pointer-based and a name's forest decls
+/// decode only on first lookup of that name.
+threadlocal var inline_fn_asts_resolved: ?std.StringHashMap([]const *const ast.Function) = null;
 
 /// Function-typed `typealias` tags by alias name (`RoutingHandler` ->
 /// `"Function0"`), borrowed from `module.registry.type_aliases`. Lets the
@@ -112,7 +119,13 @@ threadlocal var shadowed_inline_names: ?StringSet = null;
 /// stay reachable only through the simple-name candidate table (the
 /// index never resolves them, so a member splice always goes through
 /// the receiver/shape narrowing).
-threadlocal var inline_fn_ids: ?std.AutoHashMap(u32, *const ast.Function) = null;
+threadlocal var inline_fn_ids: ?std.AutoHashMap(u32, FnField) = null;
+
+/// Reverse index `fn-address -> id`, filled lazily as `inlineAstById` resolves a
+/// `FnField`. Lets `inlineIdByAst` answer from an already-resolved fn pointer
+/// without iterating + resolving every registered inline fn (which would decode
+/// the whole inline forest under the lazy path).
+threadlocal var inline_id_by_fn: ?std.AutoHashMap(usize, u32) = null;
 
 /// Hard ceiling on combined inline nesting (fn-body + lambda-arg
 /// splices) so transitive expansion cannot recurse without bound; past
@@ -148,11 +161,15 @@ pub fn isTopLevelProp(name: []const u8) bool {
 /// value-param one by the trailing-arg shape. Takes ownership of `m`.
 /// Also drops the previous build's `FuncId`-keyed entries; the driver
 /// re-registers them while emitting the new build's header stubs.
-pub fn setInlineFnAsts(m: std.StringHashMap([]const *const ast.Function)) void {
+pub fn setInlineFnAsts(m: std.StringHashMap([]const FnField)) void {
     if (inline_fn_asts) |*old| old.deinit();
     inline_fn_asts = m;
+    if (inline_fn_asts_resolved) |*old| old.deinit();
+    inline_fn_asts_resolved = null;
     if (inline_fn_ids) |*old| old.deinit();
     inline_fn_ids = null;
+    if (inline_id_by_fn) |*old| old.deinit();
+    inline_id_by_fn = null;
 }
 
 /// Record one top-level `inline fun`'s AST under its phase-1 header
@@ -163,32 +180,40 @@ pub fn setInlineFnAsts(m: std.StringHashMap([]const *const ast.Function)) void {
 /// map container outlives the build arena (same process-lifetime
 /// backing as the other tables here); the AST pointers share the build
 /// arena's lifetime exactly like `inline_fn_asts`.
-pub fn registerInlineFnId(id: u32, f: *const ast.Function) std.mem.Allocator.Error!void {
+pub fn registerInlineFnId(id: u32, f: FnField) std.mem.Allocator.Error!void {
     if (inline_fn_ids == null) {
-        inline_fn_ids = std.AutoHashMap(u32, *const ast.Function).init(std.heap.page_allocator);
+        inline_fn_ids = std.AutoHashMap(u32, FnField).init(std.heap.page_allocator);
     }
     try inline_fn_ids.?.put(id, f);
 }
 
 /// The inline-fn AST registered under a resolved top-level `FuncId`, or
 /// null when the id's target is not an inline fn (or carries no stub —
-/// a member fn the index never resolves).
+/// a member fn the index never resolves). Resolves the (possibly lazy)
+/// `FnField` and records the reverse `fn-addr -> id` mapping for
+/// `inlineIdByAst`.
 pub fn inlineAstById(id: u32) ?*const ast.Function {
-    if (inline_fn_ids) |*m| return m.get(id);
+    if (inline_fn_ids) |*m| {
+        if (m.get(id)) |ff| {
+            const f = ff.get();
+            if (inline_id_by_fn == null) {
+                inline_id_by_fn = std.AutoHashMap(usize, u32).init(std.heap.page_allocator);
+            }
+            inline_id_by_fn.?.put(@intFromPtr(f), id) catch {};
+            return f;
+        }
+    }
     return null;
 }
 
 /// The phase-1 stub `FuncId` under which `f` was registered, or null
 /// for a member inline fn (no stub, never index-resolved). The reverse
 /// of `inlineAstById`; lets the resolve audit rank a simple-name pick
-/// in the same scope tiers the index ranks its candidates in.
+/// in the same scope tiers the index ranks its candidates in. `f` is an
+/// already-resolved fn pointer (from a prior `inlineAstById`/candidate
+/// lookup), so the reverse map already holds it.
 pub fn inlineIdByAst(f: *const ast.Function) ?u32 {
-    if (inline_fn_ids) |*m| {
-        var it = m.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.* == f) return e.key_ptr.*;
-        }
-    }
+    if (inline_id_by_fn) |*m| return m.get(@intFromPtr(f));
     return null;
 }
 
@@ -212,8 +237,22 @@ fn isShadowed(name: []const u8) bool {
 }
 
 fn candidatesFor(name: []const u8) ?[]const *const ast.Function {
-    if (inline_fn_asts) |*c| return c.get(name);
-    return null;
+    if (inline_fn_asts_resolved) |*r| {
+        if (r.get(name)) |cached| return cached;
+    }
+    const fields = (if (inline_fn_asts) |*c| c.get(name) else null) orelse return null;
+    // Resolve this name's candidates once (decoding only their forest decls) and
+    // cache the pointer slice; the picking logic stays pointer-based. Also record
+    // the reverse fn-addr -> id map entries via inlineAstById-style population is
+    // not needed here (ids come from the id registry).
+    const a = std.heap.page_allocator;
+    const resolved = a.alloc(*const ast.Function, fields.len) catch return null;
+    for (fields, 0..) |ff, i| resolved[i] = ff.get();
+    if (inline_fn_asts_resolved == null) {
+        inline_fn_asts_resolved = std.StringHashMap([]const *const ast.Function).init(a);
+    }
+    inline_fn_asts_resolved.?.put(name, resolved) catch return resolved;
+    return resolved;
 }
 
 pub fn inlineFnAst(name: []const u8) ?*const ast.Function {
@@ -489,9 +528,17 @@ pub fn resetForTest() void {
         m.deinit();
         inline_fn_asts = null;
     }
+    if (inline_fn_asts_resolved) |*m| {
+        m.deinit();
+        inline_fn_asts_resolved = null;
+    }
     if (inline_fn_ids) |*m| {
         m.deinit();
         inline_fn_ids = null;
+    }
+    if (inline_id_by_fn) |*m| {
+        m.deinit();
+        inline_id_by_fn = null;
     }
     if (shadowed_inline_names) |*s| {
         s.deinit();
@@ -536,12 +583,12 @@ test "shadowed name suppresses inline lookup" {
 test "inline fn ids register, look up, and reset with the table" {
     defer resetForTest();
     var f: ast.Function = undefined;
-    try registerInlineFnId(7, &f);
+    try registerInlineFnId(7, FnField.fromPtr(&f));
     try testing.expect(inlineAstById(7) == @as(?*const ast.Function, &f));
     try testing.expect(inlineAstById(8) == null);
     // Installing the next build's simple-name table drops the previous
     // build's FuncId entries.
-    setInlineFnAsts(std.StringHashMap([]const *const ast.Function).init(testing.allocator));
+    setInlineFnAsts(std.StringHashMap([]const FnField).init(testing.allocator));
     try testing.expect(inlineAstById(7) == null);
 }
 
