@@ -306,7 +306,7 @@ fn containerArgsMatch(self: *VmHost, head: []const u8, ty_args: []const TypeRef,
         const declared_v: ?[]const u8 = v.Map.declared_value;
         const g = v.Map.entries.borrow();
         defer g.deinit();
-        const entries = g.get().items;
+        const entries = g.get().pairs.items;
         if (entries.len == 0) {
             const km = declaredHeadMatch(self, &ty_args[0], declared_k);
             const vm = declaredHeadMatch(self, &ty_args[1], declared_v);

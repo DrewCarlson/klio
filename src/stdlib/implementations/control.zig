@@ -98,7 +98,7 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     const block = ctx.args[ctx.args.len - 1];
     const buildable = Value{ .Map = .{
-        .entries = try MapEntries.init(ctx.allocator, .empty),
+        .entries = try MapEntries.init(ctx.allocator, .{}),
         .mutable = true,
     } };
     {
@@ -228,7 +228,10 @@ const RecordingHost = struct {
             .Map => |m| {
                 const g = m.entries.borrowMut();
                 defer g.deinit();
-                for (self.append_entries) |e| try g.get().append(self.allocator, e);
+                for (self.append_entries) |e| {
+                    try g.get().pairs.append(self.allocator, e);
+                    try g.get().noteAppended(self.allocator, g.get().pairs.items.len - 1);
+                }
             },
             .StringBuilder => |sb| {
                 const g = sb.borrowMut();
@@ -354,9 +357,9 @@ test "buildMap freezes the produced entries" {
     try testing.expect(!r.ok.Map.mutable);
     const g = r.ok.Map.entries.borrow();
     defer g.deinit();
-    try testing.expectEqual(@as(usize, 1), g.get().items.len);
-    try testing.expectEqual(@as(i32, 1), g.get().items[0].key.Int);
-    try testing.expectEqual(@as(i32, 10), g.get().items[0].value.Int);
+    try testing.expectEqual(@as(usize, 1), g.get().pairs.items.len);
+    try testing.expectEqual(@as(i32, 1), g.get().pairs.items[0].key.Int);
+    try testing.expectEqual(@as(i32, 10), g.get().pairs.items[0].value.Int);
 }
 
 test "buildString returns the accumulated buffer" {

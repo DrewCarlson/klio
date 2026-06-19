@@ -206,11 +206,11 @@ fn makeMap(a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
             try out.append(a, kv);
         }
     }
-    return .{ .Map = .{ .entries = try MapEntries.init(a, out), .mutable = mutable } };
+    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = out }), .mutable = mutable } };
 }
 
 fn makeMapFromArrayList(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool) Error!Value {
-    return .{ .Map = .{ .entries = try MapEntries.init(a, entries), .mutable = mutable } };
+    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = entries }), .mutable = mutable } };
 }
 
 /// `makeMapFromArrayList` for entries whose key+value are *borrowed*: the new
@@ -268,14 +268,14 @@ fn listLen(items: ValueList) usize {
 fn mapLen(entries: MapEntries) usize {
     const g = entries.borrow();
     defer g.deinit();
-    return g.get().items.len;
+    return g.get().pairs.items.len;
 }
 
 /// Snapshot a `MapEntries` into a freshly allocated slice of pairs.
 fn snapshotEntries(a: Allocator, entries: MapEntries) Error![]MapPair {
     const g = entries.borrow();
     defer g.deinit();
-    return a.dupe(MapPair, g.get().items);
+    return a.dupe(MapPair, g.get().pairs.items);
 }
 
 // =====================================================================
@@ -570,7 +570,7 @@ fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcome {
         .Map => |m| {
             const g = m.entries.borrow();
             defer g.deinit();
-            const src = g.get().items;
+            const src = g.get().pairs.items;
             var out = try a.alloc(Value, src.len);
             for (src, 0..) |kv, i| {
                 kv.key.retain();
@@ -1324,9 +1324,12 @@ pub fn map_get_or_else(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 3) return arityErr("getOrElse expects (receiver, key, block)");
     if (ctx.args[0] != .Map) return typeErr("getOrElse requires a Map receiver");
-    const entries = try snapshotEntries(a, ctx.args[0].Map.entries);
     const key = ctx.args[1];
-    if (findKeyIndexBoxed(entries, &key)) |i| return okElem(entries[i].value);
+    {
+        const g = ctx.args[0].Map.entries.borrowMut();
+        defer g.deinit();
+        if (try g.get().find(a, &key)) |i| return okElem(g.get().pairs.items[i].value);
+    }
     const block = ctx.args[2];
     return try ctx.host.invokeCallable(&block, &.{}, ctx.out);
 }
@@ -1338,9 +1341,9 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     const entries_rc = ctx.args[0].Map.entries;
     const key = ctx.args[1];
     {
-        const g = entries_rc.borrow();
+        const g = entries_rc.borrowMut();
         defer g.deinit();
-        if (findKeyIndexBoxed(g.get().items, &key)) |i| return okElem(g.get().items[i].value);
+        if (try g.get().find(a, &key)) |i| return okElem(g.get().pairs.items[i].value);
     }
     const block = ctx.args[2];
     const new_v = switch (try invoke(ctx, &block, &.{})) {
@@ -1357,7 +1360,8 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
             key.retain();
             new_v.retain();
         }
-        try g.get().append(a, .{ .key = key, .value = new_v });
+        try g.get().pairs.append(a, .{ .key = key, .value = new_v });
+        try g.get().noteAppended(a, g.get().pairs.items.len - 1);
     }
     return ok(new_v);
 }
@@ -1752,7 +1756,11 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
         1 => {
             const arg = ctx.args[0];
             switch (arg) {
-                .Int => return ok(try makeList(a, &.{}, true)),
+                .Int => {
+                    var list: std.ArrayList(Value) = .empty;
+                    if (arg.Int > 0) try list.ensureTotalCapacityPrecise(a, @intCast(arg.Int));
+                    return ok(try makeListFromArrayList(a, list, true));
+                },
                 .List => |l| return ok(try makeListVL(a, l.items, true)),
                 .Set => |s| return ok(try makeListVL(a, s.items, true)),
                 .Instance => {
@@ -2261,8 +2269,8 @@ fn syncMapView(a: Allocator, receiver: Value) void {
     var j: usize = 0;
     var w: usize = 0;
     var r: usize = 0;
-    while (r < entries.items.len) : (r += 1) {
-        const kv = entries.items[r];
+    while (r < entries.pairs.items.len) : (r += 1) {
+        const kv = entries.pairs.items[r];
         const proj = switch (kind) {
             .Values => kv.value,
             else => kv.key,
@@ -2277,12 +2285,13 @@ fn syncMapView(a: Allocator, receiver: Value) void {
             matched = eqBoxed(&proj, &target);
         }
         if (matched) {
-            entries.items[w] = kv;
+            entries.pairs.items[w] = kv;
             w += 1;
             j += 1;
         }
     }
-    entries.shrinkRetainingCapacity(w);
+    entries.pairs.shrinkRetainingCapacity(w);
+    entries.invalidate();
 }
 
 // =====================================================================
@@ -3794,15 +3803,17 @@ pub fn coll_map_is_not_empty(ctx: *CallCtx) Error!EvalResult {
 /// Index of `key`, honoring a class-instance key's custom `equals`.
 fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!?usize {
     if (key != .Instance) {
-        const g = entries.borrow();
+        // `find` builds/uses the hash index (O(1) for large maps), falling back
+        // to a linear scan for small maps or non-hashable keys.
+        const g = entries.borrowMut();
         defer g.deinit();
-        return findKeyIndexBoxed(g.get().items, &key);
+        return try g.get().find(ctx.allocator, &key);
     }
     const keys = blk: {
         const g = entries.borrow();
         defer g.deinit();
-        var ks = try ctx.allocator.alloc(Value, g.get().items.len);
-        for (g.get().items, 0..) |kv, i| ks[i] = kv.key;
+        var ks = try ctx.allocator.alloc(Value, g.get().pairs.items.len);
+        for (g.get().pairs.items, 0..) |kv, i| ks[i] = kv.key;
         break :blk ks;
     };
     // Scratch key snapshot (the key Values themselves stay owned by the map).
@@ -3830,7 +3841,7 @@ pub fn coll_map_get(ctx: *CallCtx) Error!EvalResult {
     if (try mapKeyIndex(ctx, entries, key)) |i| {
         const g = entries.borrow();
         defer g.deinit();
-        if (i < g.get().items.len) return okElem(g.get().items[i].value);
+        if (i < g.get().pairs.items.len) return okElem(g.get().pairs.items[i].value);
     }
     return ok(Value.Null);
 }
@@ -3854,7 +3865,7 @@ pub fn coll_map_contains_value(ctx: *CallCtx) Error!EvalResult {
     const value = ctx.args[1];
     const g = entries.borrow();
     defer g.deinit();
-    for (g.get().items) |kv| {
+    for (g.get().pairs.items) |kv| {
         if (eqBoxed(&kv.value, &value)) return ok(.{ .Bool = true });
     }
     return ok(.{ .Bool = false });
@@ -3873,7 +3884,7 @@ pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
         // The keys view owns one ref per element (its teardown releases them
         // via releaseValueList regardless of `backing`); retain each borrowed
         // key, mirroring `coll_map_entries`.
-        for (g.get().items) |kv| {
+        for (g.get().pairs.items) |kv| {
             if (runtime.reclaimEnabled()) kv.key.retain();
             try keys.append(a, kv.key);
         }
@@ -3892,7 +3903,7 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
         const g = entries.borrow();
         defer g.deinit();
         // The values view owns one ref per element; retain each borrowed value.
-        for (g.get().items) |kv| {
+        for (g.get().pairs.items) |kv| {
             if (runtime.reclaimEnabled()) kv.value.retain();
             try values.append(a, kv.value);
         }
@@ -3910,7 +3921,7 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        for (g.get().items) |kv| {
+        for (g.get().pairs.items) |kv| {
             kv.key.retain();
             kv.value.retain();
             try map_entries.append(a, .{ .MapEntry = .{
@@ -3943,8 +3954,8 @@ pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
         // The map owns the new value; the replaced value's ownership transfers
         // to the returned `prev` (Kotlin `put` returns the previous value).
         if (runtime.reclaimEnabled()) value.retain();
-        const prev = g.get().items[i].value;
-        g.get().items[i].value = value;
+        const prev = g.get().pairs.items[i].value;
+        g.get().pairs.items[i].value = value;
         return ok(prev);
     }
     const g = entries.borrowMut();
@@ -3954,7 +3965,8 @@ pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
         key.retain();
         value.retain();
     }
-    try g.get().append(a, .{ .key = key, .value = value });
+    try g.get().pairs.append(a, .{ .key = key, .value = value });
+    try g.get().noteAppended(a, g.get().pairs.items.len - 1);
     return ok(Value.Null);
 }
 pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
@@ -3968,7 +3980,8 @@ pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
     if (try mapKeyIndex(ctx, entries, key)) |pos| {
         const g = entries.borrowMut();
         defer g.deinit();
-        const kv = g.get().orderedRemove(pos);
+        const kv = g.get().pairs.orderedRemove(pos);
+        g.get().invalidate();
         // `remove` transfers the entry out of the map: the value's owned ref
         // moves to the returned result (no retain), and the removed key — which
         // the map owned and which is not returned — must be released.
@@ -3984,7 +3997,8 @@ pub fn coll_mut_map_clear(ctx: *CallCtx) Error!EvalResult {
     };
     const g = entries.borrowMut();
     defer g.deinit();
-    g.get().clearRetainingCapacity();
+    g.get().pairs.clearRetainingCapacity();
+    g.get().invalidate();
     return ok(Value.Unit);
 }
 
@@ -3998,7 +4012,7 @@ fn mutMapEntriesRc(a: Allocator, recv: Value, who: []const u8) Error!MapEntriesO
 fn mapFind(entries: MapEntries, key: Value) ?Value {
     const g = entries.borrow();
     defer g.deinit();
-    for (g.get().items) |kv| {
+    for (g.get().pairs.items) |kv| {
         if (eqBoxed(&kv.key, &key)) return kv.value;
     }
     return null;
@@ -4007,7 +4021,7 @@ fn mapFind(entries: MapEntries, key: Value) ?Value {
 fn mapSet(a: Allocator, entries: MapEntries, key: Value, value: Value) Error!void {
     const g = entries.borrowMut();
     defer g.deinit();
-    for (g.get().items) |*kv| {
+    for (g.get().pairs.items) |*kv| {
         if (eqBoxed(&kv.key, &key)) {
             // Replace: the map owns the new value and drops the replaced one
             // (the existing key is kept; the new key arg is discarded).
@@ -4024,15 +4038,17 @@ fn mapSet(a: Allocator, entries: MapEntries, key: Value, value: Value) Error!voi
         key.retain();
         value.retain();
     }
-    try g.get().append(a, .{ .key = key, .value = value });
+    try g.get().pairs.append(a, .{ .key = key, .value = value });
+    try g.get().noteAppended(a, g.get().pairs.items.len - 1);
 }
 
 fn mapRemoveKey(entries: MapEntries, key: Value) void {
     const g = entries.borrowMut();
     defer g.deinit();
-    for (g.get().items, 0..) |kv, i| {
+    for (g.get().pairs.items, 0..) |kv, i| {
         if (eqBoxed(&kv.key, &key)) {
-            _ = g.get().orderedRemove(i);
+            _ = g.get().pairs.orderedRemove(i);
+            g.get().invalidate();
             return;
         }
     }
@@ -4600,9 +4616,9 @@ pub fn coll_map_get_or_default(ctx: *CallCtx) Error!EvalResult {
     const key = ctx.args[1];
     if (ctx.args.len < 3) return arityErr("getOrDefault requires (key, default)");
     const default = ctx.args[2];
-    const g = entries.borrow();
+    const g = entries.borrowMut();
     defer g.deinit();
-    if (findKeyIndexBoxed(g.get().items, &key)) |i| return okElem(g.get().items[i].value);
+    if (try g.get().find(a, &key)) |i| return okElem(g.get().pairs.items[i].value);
     return ok(default);
 }
 
@@ -4615,9 +4631,9 @@ pub fn coll_map_get_value(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("getValue requires a key");
     const key = ctx.args[1];
     {
-        const g = entries.borrow();
+        const g = entries.borrowMut();
         defer g.deinit();
-        if (findKeyIndexBoxed(g.get().items, &key)) |i| return okElem(g.get().items[i].value);
+        if (try g.get().find(a, &key)) |i| return okElem(g.get().pairs.items[i].value);
     }
     const kd = try display(a, key);
     const msg = try fmt(a, "Key {s} is missing in the map.", .{kd});
@@ -4636,7 +4652,7 @@ pub fn coll_map_to_list(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        for (g.get().items) |kv| {
+        for (g.get().pairs.items) |kv| {
             kv.key.retain();
             kv.value.retain();
             try pairs.append(a, try makePair(a, kv.key, kv.value));
@@ -4735,7 +4751,7 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
     // Pair-component reads); the destination owns one ref per key+value.
     for (to_add) |kv| {
         var found = false;
-        for (g.get().items) |*slot| {
+        for (g.get().pairs.items) |*slot| {
             if (eqBoxed(&slot.key, &kv.key)) {
                 if (runtime.reclaimEnabled()) {
                     kv.value.retain();
@@ -4751,7 +4767,8 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
                 kv.key.retain();
                 kv.value.retain();
             }
-            try g.get().append(a, kv);
+            try g.get().pairs.append(a, kv);
+            try g.get().noteAppended(a, g.get().pairs.items.len - 1);
         }
     }
     return ok(Value.Unit);

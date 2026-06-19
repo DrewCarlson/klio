@@ -39,8 +39,209 @@ pub const MapPair = struct {
         self.value.gcMark(m);
     }
 };
-/// `ObjRef<Vec<(Value, Value)>>` — shared, growable map entry storage.
-pub const MapEntries = ObjRef(std.ArrayList(MapPair));
+/// Backing store for a `Map`/`MutableMap`: the insertion-ordered entry list
+/// (Kotlin `LinkedHashMap` semantics) plus an optional hash index over the keys.
+///
+/// The list alone gives O(n) `get`/`put`/`containsKey` — quadratic for any
+/// map-heavy loop. The index is a chained hash over entry positions: `head`
+/// maps a key hash to the first entry index (+1; 0 = empty) and `chain[i]` links
+/// to the next entry sharing `pairs[i]`'s hash bucket (+1; 0 = end). It holds no
+/// `Value`s (the pairs own the keys/values), so it needs no refcount or GC
+/// tracing — only freeing. Small maps skip the index entirely (linear scan is
+/// cheaper than a hash table below `index_threshold`). A non-hashable key
+/// (Instance / collection / etc.) disables the index and falls back to linear
+/// scan, preserving exact `equals` semantics.
+pub const MapStore = struct {
+    pairs: std.ArrayList(MapPair) = .empty,
+    head: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    chain: std.ArrayListUnmanaged(u32) = .empty,
+    /// Entry count the index currently reflects. A mismatch with `pairs.len`
+    /// means entries were appended without incremental maintenance (a non-hot
+    /// path), so `find` rebuilds — keeping the index correct everywhere while the
+    /// hot put path stays O(1) via `noteAppended`.
+    indexed_len: usize = 0,
+    built: bool = false,
+    indexable: bool = true,
+
+    /// Below this entry count, a linear scan beats a hash table (and avoids the
+    /// table's allocation), so the index is not built.
+    pub const index_threshold: usize = 16;
+
+    pub fn deinit(self: *MapStore, a: std.mem.Allocator) void {
+        self.pairs.deinit(a);
+        self.head.deinit(a);
+        self.chain.deinit(a);
+    }
+
+    /// GC teardown (no allocator-bound buffers escape the cell): free the same
+    /// backing the refcount `deinit` frees.
+    pub fn gcFinalize(self: *MapStore, a: std.mem.Allocator) void {
+        self.deinit(a);
+    }
+
+    /// Out-edges: only the entry list owns `Value`s; the index is index-only.
+    pub fn gcTrace(self: *const MapStore, m: *objcell.gc.Marker) void {
+        for (self.pairs.items) |*kv| kv.gcTrace(m);
+    }
+
+    /// Hash for a key, consistent with `Value.structuralEqBoxed` (equal keys
+    /// hash equal; types are kept distinct so `5` (Int) and `5L` (Long) differ).
+    /// `null` for a key that is not simple-hashable (caller disables the index).
+    fn keyHash(k: *const Value) ?u64 {
+        var h = std.hash.Wyhash.init(0);
+        switch (k.*) {
+            .Int => |x| {
+                h.update("i");
+                h.update(std.mem.asBytes(&x));
+            },
+            .Long => |x| {
+                h.update("l");
+                h.update(std.mem.asBytes(&x));
+            },
+            .Short => |x| {
+                h.update("s");
+                h.update(std.mem.asBytes(&x));
+            },
+            .Byte => |x| {
+                h.update("b");
+                h.update(std.mem.asBytes(&x));
+            },
+            .UInt => |x| {
+                h.update("ui");
+                h.update(std.mem.asBytes(&x));
+            },
+            .ULong => |x| {
+                h.update("ul");
+                h.update(std.mem.asBytes(&x));
+            },
+            .UShort => |x| {
+                h.update("us");
+                h.update(std.mem.asBytes(&x));
+            },
+            .UByte => |x| {
+                h.update("ub");
+                h.update(std.mem.asBytes(&x));
+            },
+            .Bool => |x| {
+                h.update("o");
+                h.update(std.mem.asBytes(&x));
+            },
+            .Char => |x| {
+                h.update("c");
+                h.update(std.mem.asBytes(&x));
+            },
+            .Double => |x| {
+                h.update("d");
+                const bits: u64 = @bitCast(x);
+                h.update(std.mem.asBytes(&bits));
+            },
+            .Float => |x| {
+                h.update("f");
+                const bits: u32 = @bitCast(x);
+                h.update(std.mem.asBytes(&bits));
+            },
+            .String => |sref| {
+                h.update("S");
+                const sg = sref.borrow();
+                defer sg.deinit();
+                h.update(sg.get().*);
+            },
+            .Null => h.update("z"),
+            else => return null,
+        }
+        return h.final();
+    }
+
+    fn linearFind(self: *const MapStore, key: *const Value) ?usize {
+        for (self.pairs.items, 0..) |*kv, i| {
+            if (Value.structuralEqBoxed(&kv.key, key)) return i;
+        }
+        return null;
+    }
+
+    /// (Re)build the hash index from the entry list. Disables indexing if any
+    /// key is not simple-hashable.
+    fn build(self: *MapStore, a: std.mem.Allocator) std.mem.Allocator.Error!void {
+        self.head.clearRetainingCapacity();
+        self.chain.clearRetainingCapacity();
+        try self.chain.ensureTotalCapacity(a, self.pairs.items.len);
+        self.chain.items.len = self.pairs.items.len;
+        for (self.pairs.items, 0..) |*kv, i| {
+            const hsh = keyHash(&kv.key) orelse {
+                self.indexable = false;
+                self.head.clearRetainingCapacity();
+                self.chain.clearRetainingCapacity();
+                return;
+            };
+            const gop = try self.head.getOrPut(a, hsh);
+            if (gop.found_existing) {
+                self.chain.items[i] = gop.value_ptr.*;
+            } else {
+                self.chain.items[i] = 0;
+            }
+            gop.value_ptr.* = @intCast(i + 1);
+        }
+        self.built = true;
+        self.indexed_len = self.pairs.items.len;
+    }
+
+    /// Find the entry index for `key`, or null. O(1) amortized for large maps
+    /// with hashable keys; linear for small maps or non-hashable keys.
+    pub fn find(self: *MapStore, a: std.mem.Allocator, key: *const Value) std.mem.Allocator.Error!?usize {
+        if (!self.indexable or self.pairs.items.len < index_threshold) return self.linearFind(key);
+        if (!self.built or self.indexed_len != self.pairs.items.len) {
+            try self.build(a);
+            if (!self.indexable) return self.linearFind(key);
+        }
+        const hsh = keyHash(key) orelse return self.linearFind(key);
+        var slot = self.head.get(hsh) orelse return null;
+        while (slot != 0) {
+            const i = slot - 1;
+            if (Value.structuralEqBoxed(&self.pairs.items[i].key, key)) return i;
+            slot = self.chain.items[i];
+        }
+        return null;
+    }
+
+    /// Record that `pairs[i]` was just appended (a new key). Maintains the index
+    /// incrementally when it is live so a put-heavy loop stays O(1); otherwise a
+    /// no-op (the index builds lazily on the next `find`).
+    pub fn noteAppended(self: *MapStore, a: std.mem.Allocator, i: usize) std.mem.Allocator.Error!void {
+        if (!self.built or !self.indexable) return;
+        // Only maintain incrementally when `i` is exactly the next uncovered
+        // entry; a gap means other entries were appended without maintenance, so
+        // drop to a lazy rebuild rather than silently miss them.
+        if (self.indexed_len != i) {
+            self.invalidate();
+            return;
+        }
+        const hsh = keyHash(&self.pairs.items[i].key) orelse {
+            self.indexable = false;
+            self.head.clearRetainingCapacity();
+            self.chain.clearRetainingCapacity();
+            return;
+        };
+        if (self.chain.items.len <= i) {
+            try self.chain.resize(a, i + 1);
+        }
+        const gop = try self.head.getOrPut(a, hsh);
+        self.chain.items[i] = if (gop.found_existing) gop.value_ptr.* else 0;
+        gop.value_ptr.* = @intCast(i + 1);
+        self.indexed_len = self.pairs.items.len;
+    }
+
+    /// Invalidate the index after a structural change that shifts entry indices
+    /// (removal / clear); it rebuilds lazily on the next `find`.
+    pub fn invalidate(self: *MapStore) void {
+        self.built = false;
+        self.indexed_len = 0;
+        self.head.clearRetainingCapacity();
+        self.chain.clearRetainingCapacity();
+    }
+};
+
+/// `ObjRef<MapStore>` — shared, growable map entry storage with a hash index.
+pub const MapEntries = ObjRef(MapStore);
 /// A refcounted box holding a single `Value` (Rust `Box<Value>` mapped to a
 /// shared handle). Used for the component slots of `Pair`/`Triple`/`MapEntry`/
 /// `Result`/`Exception.cause`/`BoundMethod.receiver`/`Sequence` generators so a
@@ -749,6 +950,12 @@ pub const Value = union(enum) {
     /// `retain`; primitives, `Class`, and the not-yet-refcounted
     /// owning-`*Value` variants are no-ops.
     pub fn release(self: Value, allocator: std.mem.Allocator) void {
+        // Gated identically to `retain`: under reclaim-off (the arena and the
+        // tracing GC) both are skipped — the arena frees en masse and the GC
+        // reclaims by reachability, so refcount teardown is not just wasted but
+        // actively O(n) here (releasing a collection whose `strongCount` reads 1
+        // walks every element). Only the reference-counting modes run it.
+        if (!objcell.reclaimEnabled()) return;
         switch (self) {
             .String => |s| s.deinit(),
             .Instance => |i| i.deinit(),
@@ -779,7 +986,7 @@ pub const Value = union(enum) {
                 // Last owner: release each entry's key and value.
                 if (x.entries.strongCount() == 1) {
                     const g = x.entries.borrow();
-                    for (g.get().items) |pair| {
+                    for (g.get().pairs.items) |pair| {
                         pair.key.release(allocator);
                         pair.value.release(allocator);
                     }
@@ -1404,7 +1611,7 @@ pub const Value = union(enum) {
                 const g = m.entries.borrow();
                 defer g.deinit();
                 try writer.writeByte('{');
-                for (g.get().items, 0..) |e, i| {
+                for (g.get().pairs.items, 0..) |e, i| {
                     if (i > 0) try writer.writeAll(", ");
                     try e.key.writeTo(writer);
                     try writer.writeByte('=');
@@ -1687,8 +1894,8 @@ fn mapEqBoxed(a: MapEntries, b: MapEntries) bool {
     defer ga.deinit();
     const gb = b.borrow();
     defer gb.deinit();
-    const xs = ga.get().items;
-    const ys = gb.get().items;
+    const xs = ga.get().pairs.items;
+    const ys = gb.get().pairs.items;
     if (xs.len != ys.len) return false;
     for (xs) |*kv| {
         var found = false;

@@ -520,7 +520,7 @@ fn kotlinHashCode(v: *const Value) i32 {
             const g = m.entries.borrow();
             defer g.deinit();
             var h: i32 = 0;
-            for (g.get().items) |kv| h = h +% (kotlinHashCode(&kv.key) ^ kotlinHashCode(&kv.value));
+            for (g.get().pairs.items) |kv| h = h +% (kotlinHashCode(&kv.key) ^ kotlinHashCode(&kv.value));
             break :blk h;
         },
         .Array => |arr| blk: {
@@ -677,11 +677,11 @@ pub fn inheritedMemberDefaults(self: *VmHost, allocator: Allocator, supertypes: 
 }
 
 /// `map.containsKey(needle)` honoring a key instance's custom `equals`.
-fn mapContainsKeyEq(self: *VmHost, allocator: Allocator, entries: ObjRef(std.ArrayList(MapPair)), needle: *const Value) Allocator.Error!union(enum) { ok: bool, err: EvalError } {
+fn mapContainsKeyEq(self: *VmHost, allocator: Allocator, entries: runtime.MapEntries, needle: *const Value) Allocator.Error!union(enum) { ok: bool, err: EvalError } {
     if (needle.* != .Instance) {
         const g = entries.borrow();
         defer g.deinit();
-        for (g.get().items) |kv| {
+        for (g.get().pairs.items) |kv| {
             if (Value.structuralEqBoxed(&kv.key, needle)) return .{ .ok = true };
         }
         return .{ .ok = false };
@@ -692,7 +692,7 @@ fn mapContainsKeyEq(self: *VmHost, allocator: Allocator, entries: ObjRef(std.Arr
     {
         const g = entries.borrow();
         defer g.deinit();
-        for (g.get().items) |kv| try keys.append(allocator, kv.key);
+        for (g.get().pairs.items) |kv| try keys.append(allocator, kv.key);
     }
     for (keys.items) |k| {
         const r = try callMemberRec(self, allocator, &k, "equals", &.{needle.*});
@@ -765,7 +765,7 @@ fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) A
             },
         }
     }
-    return .{ .ok = .{ .Map = .{ .entries = try ObjRef(std.ArrayList(MapPair)).init(allocator, pairs), .mutable = false } } };
+    return .{ .ok = .{ .Map = .{ .entries = try runtime.MapEntries.init(allocator, .{ .pairs = pairs }), .mutable = false } } };
 }
 
 /// Extract `(key, value)` from a map-entry value.
@@ -1080,7 +1080,7 @@ fn elementsProveArgs(self: *VmHost, allocator: Allocator, receiver: *const Value
         if (receiver.* != .Map or ty_args.len < 2) return false;
         const g = receiver.Map.entries.borrow();
         defer g.deinit();
-        const entries = g.get().items;
+        const entries = g.get().pairs.items;
         if (entries.len == 0) {
             return overload_match.declaredElemProves(self, &ty_args[0], receiver.Map.declared_key) and
                 overload_match.declaredElemProves(self, &ty_args[1], receiver.Map.declared_value);
@@ -2430,7 +2430,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             const g = receiver.Map.entries.borrow();
             defer g.deinit();
             var has = false;
-            for (g.get().items) |kv| {
+            for (g.get().pairs.items) |kv| {
                 if (Value.structuralEqBoxed(&kv.value, &args[0])) {
                     has = true;
                     break;
@@ -3003,7 +3003,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             const g = m.entries.borrow();
             defer g.deinit();
             var items: std.ArrayList(Value) = .empty;
-            for (g.get().items) |kv| {
+            for (g.get().pairs.items) |kv| {
                 kv.key.retain();
                 kv.value.retain();
                 const k = try Value.boxRef(allocator, kv.key);
@@ -3782,7 +3782,7 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                         defer og.deinit();
                         // Entries are borrowed from `other`; the destination map
                         // owns its own ref per key+value, so retain each.
-                        for (og.get().items) |kv| {
+                        for (og.get().pairs.items) |kv| {
                             if (runtime.reclaimEnabled()) {
                                 kv.key.retain();
                                 kv.value.retain();
@@ -3798,7 +3798,7 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                 defer g.deinit();
                 for (to_put.items) |kv| {
                     var found = false;
-                    for (g.get().items) |*slot| {
+                    for (g.get().pairs.items) |*slot| {
                         if (Value.structuralEq(&slot.key, &kv.key)) {
                             // Overwrite: release the displaced value and the
                             // staged (now-orphaned) key; transfer the staged value.
@@ -3811,7 +3811,10 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                             break;
                         }
                     }
-                    if (!found) try g.get().append(allocator, kv);
+                    if (!found) {
+                        try g.get().pairs.append(allocator, kv);
+                        try g.get().noteAppended(allocator, g.get().pairs.items.len - 1);
+                    }
                 }
                 return .{ .ok = .Unit };
             }
@@ -3857,7 +3860,7 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
                 if (me.backing) |entries| {
                     const g = entries.borrowMut();
                     defer g.deinit();
-                    for (g.get().items) |*slot| {
+                    for (g.get().pairs.items) |*slot| {
                         if (Value.structuralEq(&slot.key, me.key.asPtr())) {
                             // The slot owns its value: release the old, retain the new.
                             if (runtime.reclaimEnabled()) {

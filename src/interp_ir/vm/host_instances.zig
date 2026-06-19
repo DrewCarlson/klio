@@ -260,7 +260,7 @@ fn emptySet(allocator: Allocator, mutable: bool) Allocator.Error!Value {
 
 fn emptyMap(allocator: Allocator, mutable: bool) Allocator.Error!Value {
     return Value{ .Map = .{
-        .entries = try ObjRef(std.ArrayList(runtime.MapPair)).init(allocator, .empty),
+        .entries = try runtime.MapEntries.init(allocator, .{}),
         .mutable = mutable,
     } };
 }
