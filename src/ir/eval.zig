@@ -407,6 +407,19 @@ pub const EvalResult = union(enum) {
     err: EvalError,
 };
 
+/// Per-instruction control signal from `execInst`. `cont` = the instruction
+/// completed (its result, if any, was written to a register); `raised` = a
+/// control-flow event occurred and its `EvalError` is in `frame.step_err`.
+/// A 1-byte return keeps the hot dispatch loop from copying an `EvalResult` per
+/// instruction (whose `.ok` is always the ignored `.Unit`).
+pub const Step = enum { cont, raised };
+
+/// Stash a control-flow `EvalError` on the frame and signal `Step.raised`.
+inline fn raiseStep(frame: *Frame, e: EvalError) Step {
+    frame.step_err = e;
+    return .raised;
+}
+
 inline fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
@@ -603,6 +616,12 @@ const Frame = struct {
     /// under a body that spans a collection (a long-running coroutine). The frame
     /// re-roots the slot via `markClosureHook` for as long as it runs.
     closure_id: ?u64 = null,
+    /// Out-of-band control-flow payload for the per-instruction executor (see
+    /// `Step`): `execInst` stashes any error/throw/return/suspend here and
+    /// returns the 1-byte `Step.raised`, instead of returning the ~80-byte
+    /// `EvalResult` by value on every instruction (its `.ok` is always the
+    /// ignored `.Unit`). Read by the dispatch loop only on `.raised`.
+    step_err: ?EvalError = null,
 
     fn newWithCaptures(
         allocator: Allocator,
@@ -1086,9 +1105,10 @@ fn runFrameInner(
             if (idx < start_idx) continue;
             const inst = &insts[idx];
             const r = try execInst(H, allocator, frame, inst, host);
-            switch (r) {
-                .ok => {},
-                .err => |e| switch (e) {
+            if (r == .raised) {
+                const e = frame.step_err.?;
+                frame.step_err = null;
+                switch (e) {
                     .Throw => |v| {
                         thrown = v;
                         break;
@@ -1137,7 +1157,7 @@ fn runFrameInner(
                         return errResult(.{ .Suspended = state });
                     },
                     else => return errResult(e),
-                },
+                }
             }
         }
         if (thrown) |exc| {
@@ -1433,7 +1453,7 @@ fn constStr(module: *const Module, id: ConstId) ?[]const u8 {
     };
 }
 
-fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!EvalResult {
+fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
     switch (inst.*) {
         .SuspendResumePoint => {
             // No runtime effect on its own.
@@ -1489,14 +1509,14 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 switch (try result) {
                     .ok => |rv| {
                         try frame.write(n.dst, rv);
-                        return ok(.Unit);
+                        return .cont;
                     },
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             }
             const b = switch (v) {
                 .Bool => |bv| !bv,
-                else => return errResult(.{ .Type = "Not on non-bool" }),
+                else => return raiseStep(frame, .{ .Type = "Not on non-bool" }),
             };
             try frame.write(n.dst, .{ .Bool = b });
         },
@@ -1514,9 +1534,9 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 switch (try host.callMember(allocator, &v, method, &.{})) {
                     .ok => |rv| {
                         try frame.write(u.dst, rv);
-                        return ok(.Unit);
+                        return .cont;
                     },
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             }
             // Member-extension operator on a primitive receiver. The
@@ -1533,16 +1553,16 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             switch (extension_result) {
                 .ok => |rv| {
                     try frame.write(u.dst, rv);
-                    return ok(.Unit);
+                    return .cont;
                 },
                 .err => |e| switch (e) {
                     .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
-                    else => return errResult(e),
+                    else => return raiseStep(frame, e),
                 },
             }
             switch (try applyUnop(allocator, u.op, &v)) {
                 .ok => |out| try frame.write(u.dst, out),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .BinOp => |bo| {
@@ -1553,11 +1573,11 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             if (bo.op == .StringConcat) {
                 const ls = switch (try stringify(H, allocator, host, &l)) {
                     .ok => |s| s,
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 };
                 const rs = switch (try stringify(H, allocator, host, &r)) {
                     .ok => |s| s,
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 };
                 const combined = try std.mem.concat(allocator, u8, &.{ ls, rs });
                 // `ls`/`rs` are owned renderings (stringify/renderValue allocate
@@ -1568,7 +1588,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     allocator.free(rs);
                 }
                 try frame.write(bo.dst, .{ .String = try StringRef.initOwned(allocator, combined) });
-                return ok(.Unit);
+                return .cont;
             }
             // Collection `+` / `-` operators are stdlib operator
             // functions on the left collection.
@@ -1580,9 +1600,9 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 switch (try host.callMember(allocator, &l, method, &.{r})) {
                     .ok => |rv| {
                         try frame.write(bo.dst, rv);
-                        return ok(.Unit);
+                        return .cont;
                     },
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             }
             // Arrays define `+` (`plus`) but no `-`.
@@ -1590,9 +1610,9 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 switch (try host.callMember(allocator, &l, "plus", &.{r})) {
                     .ok => |rv| {
                         try frame.write(bo.dst, rv);
-                        return ok(.Unit);
+                        return .cont;
                     },
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             }
             // Referential identity (`===` / `!==`): pure pointer
@@ -1601,7 +1621,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 const same = Value.referenceEq(&l, &r);
                 const b = if (bo.op == .IdentNeq) !same else same;
                 try frame.write(bo.dst, .{ .Bool = b });
-                return ok(.Unit);
+                return .cont;
             }
             // COROUTINE_SUSPENDED and Result have no user `equals`
             // surface: any equality against them is structural /
@@ -1612,7 +1632,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 const eq = Value.structuralEq(&l, &r);
                 const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
                 try frame.write(bo.dst, .{ .Bool = b });
-                return ok(.Unit);
+                return .cont;
             }
             if (operatorMethod(bo.op)) |method| {
                 if (l == .Instance or r == .Instance) {
@@ -1633,14 +1653,14 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                                     const assign = compoundAssignMethod(bo.op).?;
                                     switch (try host.callMember(allocator, &l, assign, &.{r})) {
                                         .ok => {},
-                                        .err => |e2| return errResult(e2),
+                                        .err => |e2| return raiseStep(frame, e2),
                                     }
                                     result = l;
                                 } else {
-                                    return errResult(e);
+                                    return raiseStep(frame, e);
                                 }
                             },
-                            else => return errResult(e),
+                            else => return raiseStep(frame, e),
                         },
                     }
                     // compareTo wrappers need to be reduced to a Bool.
@@ -1652,12 +1672,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                         else => result,
                     };
                     try frame.write(bo.dst, final_val);
-                    return ok(.Unit);
+                    return .cont;
                 }
             }
             switch (try applyBinop(allocator, bo.op, &l, &r)) {
                 .ok => |out| try frame.write(bo.dst, out),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .Trace => {},
@@ -1674,7 +1694,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     .message = null,
                     .cause = null,
                 } };
-                return errResult(.{ .Throw = exc });
+                return raiseStep(frame, .{ .Throw = exc });
             }
             v.retain();
             try frame.write(nn.dst, v);
@@ -1682,7 +1702,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .GetField => |gf| {
             const recv = frame.read(gf.receiver);
             const name = constStr(frame.module, gf.field) orelse
-                return errResult(.{ .Type = "GetField: name not a string const" });
+                return raiseStep(frame, .{ .Type = "GetField: name not a string const" });
             // Keep the executing function's receiver reachable as the
             // enclosing `this` while the field/property is resolved.
             var pushed_enclosing = false;
@@ -1702,17 +1722,17 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     v.retain();
                     try frame.write(gf.dst, v);
                 },
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .SetField => |sf| {
             const recv = frame.read(sf.receiver);
             const v = frame.read(sf.value);
             const name = constStr(frame.module, sf.field) orelse
-                return errResult(.{ .Type = "SetField: name not a string const" });
+                return raiseStep(frame, .{ .Type = "SetField: name not a string const" });
             switch (try host.setField(allocator, &recv, name, v)) {
                 .ok => {},
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .Call => |call| {
@@ -1816,7 +1836,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             if (pushed_enclosing) popEnclosing();
             switch (try res) {
                 .ok => |result| try frame.write(call.dst, result),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .CallValue => |cv| {
@@ -1875,7 +1895,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     }
                     try frame.write(cv.dst, out);
                 },
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .CallValueWithThis => |cvt| {
@@ -1887,7 +1907,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             defer allocator.free(names);
             switch (try host.callValueWithThis(allocator, &callee_v, &recv, arg_values, names)) {
                 .ok => |rv| try frame.write(cvt.dst, rv),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .CallSpread => |cs| {
@@ -1910,7 +1930,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                                 try effective_names.append(allocator, null);
                             }
                         },
-                        .err => |e| return errResult(e),
+                        .err => |e| return raiseStep(frame, e),
                     }
                 } else {
                     try arg_values.append(allocator, v);
@@ -1919,7 +1939,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             }
             switch (try host.callValueNamed(allocator, &callee_v, arg_values.items, effective_names.items)) {
                 .ok => |rv| try frame.write(cs.dst, rv),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .CallSuper => |csup| {
@@ -1927,24 +1947,24 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             recv.retain();
             defer recv.release(allocator);
             const owner_str = constStr(frame.module, csup.owner_class) orelse
-                return errResult(.{ .Type = "CallSuper: owner not a string const" });
+                return raiseStep(frame, .{ .Type = "CallSuper: owner not a string const" });
             const qual_str: ?[]const u8 = if (csup.qualifier) |id| constStr(frame.module, id) else null;
             const name_str = constStr(frame.module, csup.name) orelse
-                return errResult(.{ .Type = "CallSuper: name not a string const" });
+                return raiseStep(frame, .{ .Type = "CallSuper: name not a string const" });
             const arg_values = try readArgRun(allocator, frame, csup.args, csup.n_args);
             defer allocator.free(arg_values);
             const names = try resolveArgNames(allocator, frame.module, csup.arg_names);
             defer allocator.free(names);
             switch (try host.callSuper(allocator, &recv, owner_str, qual_str, name_str, arg_values, names)) {
                 .ok => |rv| try frame.write(csup.dst, rv),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |cm| {
             if (fastSubscript(allocator, frame, cm)) |rv| {
                 try frame.write(cm.dst, rv);
-                return ok(.Unit);
+                return .cont;
             }
             const recv = frame.read(cm.receiver);
             // A method borrows its receiver for the call's whole duration.
@@ -1956,7 +1976,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             recv.retain();
             defer recv.release(allocator);
             const name_str = constStr(frame.module, cm.name) orelse
-                return errResult(.{ .Type = "CallMember: name not a string const" });
+                return raiseStep(frame, .{ .Type = "CallMember: name not a string const" });
             const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
             defer allocator.free(arg_values);
             const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
@@ -1983,7 +2003,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             if (pushed_enclosing) popEnclosing();
             switch (try res) {
                 .ok => |rv| try frame.write(cm.dst, rv),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .CallMemberOrValue => |cmv| {
@@ -1995,7 +2015,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const names = try resolveArgNames(allocator, frame.module, cmv.arg_names);
             defer allocator.free(names);
             const name_str = constStr(frame.module, cmv.name) orelse
-                return errResult(.{ .Type = "CallMemberOrValue: name not a string const" });
+                return raiseStep(frame, .{ .Type = "CallMemberOrValue: name not a string const" });
             const fb = frame.read(cmv.fallback);
             // The local/captured fallback only wins when the receiver has no
             // such member AND the fallback is actually invocable (a function
@@ -2011,13 +2031,13 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
                 switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
                     .ok => |rv| try frame.write(cmv.dst, rv),
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             } else {
                 orAudit("CallMemberOrValue", name_str, "member", 0, &recv);
                 switch (try host.callMemberNamed(allocator, &recv, name_str, user_args, names)) {
                     .ok => |rv| try frame.write(cmv.dst, rv),
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             }
         },
@@ -2049,16 +2069,16 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 }
                 switch (try host.callValueNamed(allocator, &callee_v, arg_values, names)) {
                     .ok => |rv| try frame.write(cvm.dst, rv),
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             } else {
                 const recv = frame.read(cvm.this_recv);
                 const name_str = constStr(frame.module, cvm.name) orelse
-                    return errResult(.{ .Type = "CallValueOrMember: name not a string const" });
+                    return raiseStep(frame, .{ .Type = "CallValueOrMember: name not a string const" });
                 orAudit("CallValueOrMember", name_str, "member", 0, &recv);
                 switch (try host.callMemberNamed(allocator, &recv, name_str, arg_values, names)) {
                     .ok => |rv| try frame.write(cvm.dst, rv),
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             }
         },
@@ -2078,7 +2098,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const hint_ptr: ?*const Value = if (outer_hint) |*h| h else null;
             const result = switch (try host.newInstanceNamed(allocator, ni.class, arg_values, names, hint_ptr)) {
                 .ok => |v| v,
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             };
             if (result == .Instance) {
                 const inst_ref = result.Instance;
@@ -2129,7 +2149,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     .message = try StringRef.initOwned(allocator, msg),
                     .cause = null,
                 } };
-                return errResult(.{ .Throw = exc });
+                return raiseStep(frame, .{ .Throw = exc });
             }
         },
         .Lambda => |lam| {
@@ -2137,7 +2157,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             defer allocator.free(cap_values);
             switch (try host.buildClosure(allocator, frame.module, lam.body_func, cap_values)) {
                 .ok => |v| try frame.write(lam.dst, v),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .AstLambda => |al| {
@@ -2145,7 +2165,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             defer allocator.free(cap_values);
             switch (try host.buildAstLambdaWithFlagFuncid(allocator, frame.module, al.params, &al.body_ast, al.captured_names, cap_values, al.absorb_return, al.body_func)) {
                 .ok => |v| try frame.write(al.dst, v),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .RegisterClass => |rc| {
@@ -2153,7 +2173,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             defer allocator.free(cap_values);
             switch (try host.registerClassCaptured(allocator, rc.class.get(), rc.captured_names, cap_values)) {
                 .ok => {},
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .BuildObject => |bobj| {
@@ -2161,21 +2181,21 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             defer allocator.free(cap_values);
             switch (try host.buildObject(allocator, bobj.ast.get(), bobj.captured_names, cap_values, bobj.scope_renames)) {
                 .ok => |v| try frame.write(bobj.dst, v),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .StoreGlobal => |sg| {
             const name_str = constStr(frame.module, sg.name) orelse
-                return errResult(.{ .Type = "StoreGlobal: name not a string const" });
+                return raiseStep(frame, .{ .Type = "StoreGlobal: name not a string const" });
             const v = frame.read(sg.value);
             switch (try host.storeGlobal(allocator, name_str, v)) {
                 .ok => {},
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .StoreToThisOrGlobal => |stg| {
             const name_str = constStr(frame.module, stg.name) orelse
-                return errResult(.{ .Type = "StoreToThisOrGlobal: name not a string const" });
+                return raiseStep(frame, .{ .Type = "StoreToThisOrGlobal: name not a string const" });
             const v = frame.read(stg.value);
             // Kotlin scoping for a bare-name write mirrors the read side:
             // the innermost implicit receiver owning a *property* of this
@@ -2202,7 +2222,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     orAudit("StoreToThisOrGlobal", name_str, "member", c.depth, &c.v);
                     switch (try host.setField(allocator, &c.v, name_str, v)) {
                         .ok => {},
-                        .err => |e| return errResult(e),
+                        .err => |e| return raiseStep(frame, e),
                     }
                     routed = true;
                     break;
@@ -2212,13 +2232,13 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 orAudit("StoreToThisOrGlobal", name_str, "global", -1, null);
                 switch (try host.storeGlobal(allocator, name_str, v)) {
                     .ok => {},
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             }
         },
         .LoadGlobal => |lg| {
             const name_str = constStr(frame.module, lg.name) orelse
-                return errResult(.{ .Type = "LoadGlobal: name not a string const" });
+                return raiseStep(frame, .{ .Type = "LoadGlobal: name not a string const" });
             // A lowering-resolved identity binds that exact declaration;
             // the name string is only the unresolved-shape fallback.
             const by_id: ?Value = if (lg.func != null or lg.class != null)
@@ -2228,7 +2248,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const lg_r: MaybeValueResult = if (by_id != null) .{ .ok = by_id } else try host.lookupGlobalThrowing(allocator, name_str);
             const found = switch (lg_r) {
                 .ok => |maybe| maybe,
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             };
             // No receiver probe here: a `LoadGlobal` is emitted only where
             // no implicit receiver can shadow the name, and kotlinc
@@ -2239,7 +2259,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 v = fv;
             } else {
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                return errResult(.{ .Unbound = msg });
+                return raiseStep(frame, .{ .Unbound = msg });
             }
             v.retain();
             try frame.write(lg.dst, v);
@@ -2251,7 +2271,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .LoadFromThisOrGlobal => |lt| {
             const name_str = constStr(frame.module, lt.name) orelse
-                return errResult(.{ .Type = "LoadFromThisOrGlobal: name not a string const" });
+                return raiseStep(frame, .{ .Type = "LoadFromThisOrGlobal: name not a string const" });
             var resolved: ?Value = null;
             {
                 // `consult_param = true`: in a method / extension body the
@@ -2311,10 +2331,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                             v = gv;
                         } else {
                             const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
-                            return errResult(.{ .Unbound = msg });
+                            return raiseStep(frame, .{ .Unbound = msg });
                         }
                     },
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             }
             v.retain();
@@ -2325,11 +2345,11 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const i = frame.read(ix.index);
             if (fastIndexGet(&recv, &i)) |rv| {
                 try frame.write(ix.dst, rv);
-                return ok(.Unit);
+                return .cont;
             }
             switch (try host.callMember(allocator, &recv, "get", &.{i})) {
                 .ok => |rv| try frame.write(ix.dst, rv),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .IndexSet => |ixs| {
@@ -2337,11 +2357,11 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const i = frame.read(ixs.index);
             const v = frame.read(ixs.value);
             if (fastIndexSet(allocator, &recv, &i, v)) {
-                return ok(.Unit);
+                return .cont;
             }
             switch (try host.callMember(allocator, &recv, "set", &.{ i, v })) {
                 .ok => {},
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .NewList => |nl| {
@@ -2363,31 +2383,31 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .QualifiedThis => |qt| {
             const recv = frame.read(qt.receiver);
             const qual_str = constStr(frame.module, qt.qualifier) orelse
-                return errResult(.{ .Type = "QualifiedThis: qualifier not a string const" });
+                return raiseStep(frame, .{ .Type = "QualifiedThis: qualifier not a string const" });
             switch (try host.qualifiedThis(allocator, &recv, qual_str)) {
                 .ok => |v| {
                     v.retain();
                     try frame.write(qt.dst, v);
                 },
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
         .PropertyRef => |pr| {
             const name_str = constStr(frame.module, pr.name) orelse
-                return errResult(.{ .Type = "PropertyRef: name not a string const" });
+                return raiseStep(frame, .{ .Type = "PropertyRef: name not a string const" });
             try frame.write(pr.dst, .{ .PropertyRef = .{ .name = try StringRef.init(allocator, name_str) } });
         },
         .MemberRef => |mr| {
             const recv = frame.read(mr.receiver);
             const name_str = constStr(frame.module, mr.name) orelse
-                return errResult(.{ .Type = "MemberRef: name not a string const" });
+                return raiseStep(frame, .{ .Type = "MemberRef: name not a string const" });
             switch (try host.memberRef(allocator, &recv, name_str)) {
                 .ok => |v| try frame.write(mr.dst, v),
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             }
         },
     }
-    return ok(.Unit);
+    return .cont;
 }
 
 /// `name(args)` where lowering could not classify the bare callee as
@@ -2417,9 +2437,9 @@ fn freeMissErr(allocator: Allocator, e: EvalError) void {
     if (e == .Unimplemented) freeDispatchMissMsg(allocator, e.Unimplemented);
 }
 
-fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!EvalResult {
+fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!Step {
     const name_str = constStr(frame.module, cmg.name) orelse
-        return errResult(.{ .Type = "CallMemberOrGlobal: name not a string const" });
+        return raiseStep(frame, .{ .Type = "CallMemberOrGlobal: name not a string const" });
     const arg_values = try readArgRun(allocator, frame, cmg.args, cmg.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cmg.arg_names);
@@ -2472,13 +2492,13 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     break;
                 },
                 .err => |e| switch (e) {
-                    .Suspended, .CalleeFailed => return errResult(e),
+                    .Suspended, .CalleeFailed => return raiseStep(frame, e),
                     // Control flow out of a body that RAN: the candidate
                     // was the real callee (a `synchronized { return x }`
                     // non-local return, a thrown exception). Walking on
                     // would re-execute its side effects on an outer
                     // receiver — same doctrine as `CalleeFailed`.
-                    .Throw, .NonLocalReturn, .LabeledReturn => return errResult(e),
+                    .Throw, .NonLocalReturn, .LabeledReturn => return raiseStep(frame, e),
                     .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
                     else => if (first_real_err == null) {
                         first_real_err = e;
@@ -2498,10 +2518,10 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                         break;
                     },
                     .err => |e| switch (e) {
-                        .Suspended, .CalleeFailed => return errResult(e),
+                        .Suspended, .CalleeFailed => return raiseStep(frame, e),
                         // Same as the strict pass: a body that ran owns
                         // its control flow; never re-probe.
-                        .Throw, .NonLocalReturn, .LabeledReturn => return errResult(e),
+                        .Throw, .NonLocalReturn, .LabeledReturn => return raiseStep(frame, e),
                         .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
                         else => if (first_real_err == null) {
                             first_real_err = e;
@@ -2520,7 +2540,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // lower time.
         const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names)) {
             .ok => |maybe| maybe,
-            .err => |e| return errResult(e),
+            .err => |e| return raiseStep(frame, e),
         };
         if (overload) |v| {
             orAudit("CallMemberOrGlobal", name_str, "overload", -1, null);
@@ -2538,23 +2558,23 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 null;
             const global = if (by_id != null) by_id else switch (try host.lookupGlobalThrowing(allocator, name_str)) {
                 .ok => |maybe| maybe,
-                .err => |e| return errResult(e),
+                .err => |e| return raiseStep(frame, e),
             };
             if (global) |callee| {
                 orAudit("CallMemberOrGlobal", name_str, if (by_id != null) "global_id" else "global", -1, null);
                 switch (try host.callValueNamed(allocator, &callee, arg_values, names)) {
                     .ok => |v| result = v,
-                    .err => |e| return errResult(e),
+                    .err => |e| return raiseStep(frame, e),
                 }
             } else {
-                if (first_real_err) |fre| return errResult(fre);
+                if (first_real_err) |fre| return raiseStep(frame, fre);
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                return errResult(.{ .Unbound = msg });
+                return raiseStep(frame, .{ .Unbound = msg });
             }
         }
     }
     try frame.write(cmg.dst, result);
-    return ok(.Unit);
+    return .cont;
 }
 
 /// The enclosing-chain entry a method / extension frame contributes for
