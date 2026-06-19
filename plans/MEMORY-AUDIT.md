@@ -103,3 +103,38 @@ added for future root-completeness work.
 Both blockers (the UAF and the server leak) are now closed. Remaining before the
 flip: re-run the full suite + ktor itests under gc-as-default and fix any further
 UAF it surfaces, then flip `allocChoice()`'s unset default to `.gc`.
+
+## Phase campaign vs Python (baseline: klio 43/136 MB, node 35/55, python 8/27)
+
+### Phase 1 — per-iteration leaks (DONE)
+A `KLIO_LEAK_BY_FQN` attributor (leaktrack keyed by the intrinsic fqn active at
+each alloc; ~40x faster after moving its metadata off page_allocator and skipping
+stack capture; all six intrinsic dispatch sites tagged) drove the per-iteration
+leak of two moderately-complex loops to ~zero:
+- collections+closures+strings: ~2 KB/iter -> flat (returns to ~46 MB baseline).
+- 40-op comprehensive: ~20 KB/iter -> ~180 B/iter.
+Fixes: sorted/groupBy/joinToString/zip/windowed/reversed/chunked/min-maxOrNull/
+in-place sorts/set intersect+subtract, plus a blanket `snapshotItems`-scratch
+free (results are always copied, never adopted — one grouping-key escape aside)
+and the zip/set scratch accumulators. Residual ~180 B/iter = the map-view
+`MapBacking` raw struct (not GC-owned) + a tiny eval-level tail.
+
+### Phase 2/3 — startup & bare-runtime (lazy-forest flip)
+Decode breakdown (KLIO_DECODE_STATS): basic 13.5 MB, ktor 34 MB. The AST forest
+(`ast.Decl`+`Expr`+`Stmt`+`Property`+`Param`+`Ident`) is ~8-9 MB basic / ~21 MB
+ktor — 5880 decls / 12534 decls eagerly materialized though a program touches a
+handful. Startup allocations are `alloc_perm` (never swept), so the rest of the
+136 MB ktor RSS is the eagerly-built runtime graph (ClassDefs/IR/globals), all
+genuinely live — no high-water shortcut.
+
+The fix is the lazy-forest flip (`plans/LAZY-IMAGE.md`). Foundation landed: the
+per-decl self-contained sections + offset table are baked, the `forest.zig`
+resolver (`ForestRef{decl,ord}`, `ForestField`, `resolveNode/Expr/Function/...`)
+exists, `setSection` is called at load, and `MethodDef.decl` is a `ForestField`.
+Remaining (I2/I4): convert the other forest backrefs to `ForestRef` —
+`PropertyDef.init/getter/setter/delegate`, `ClassDef.init_blocks/
+parent_ctor_args/secondary_ctors`, `Inst.BuildObject.ast`, inline ids — then drop
+the eager `lifted_decls` decode and replace the three load-time forest traversals
+(file_classes/collectInline/top_props) with baked indices. Estimated win: the
+~8-21 MB forest decode plus the share of the runtime graph that a given program
+never reaches.
