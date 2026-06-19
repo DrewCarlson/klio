@@ -1969,6 +1969,23 @@ pub fn coll_list_reduce_right_or_null(ctx: *CallCtx) Error!EvalResult {
 }
 fn listLastImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
     const a = ctx.allocator;
+    // Fast path: no predicate on a List/Array — index the last element directly
+    // instead of snapshotting the whole collection (which made `last()` O(n)).
+    if (ctx.args.len < 2) {
+        const items_ref: ?ValueList = switch (ctx.args[0]) {
+            .List => |l| l.items,
+            .Array => |ar| ar.items,
+            else => null,
+        };
+        if (items_ref) |ir| {
+            const g = ir.borrow();
+            defer g.deinit();
+            const items = g.get().items;
+            if (items.len > 0) return okElem(items[items.len - 1]);
+            if (or_null) return ok(Value.Null);
+            return try thrown(a, "kotlin.NoSuchElementException", "Collection is empty.");
+        }
+    }
     const items = switch (try iterableItems(a, ctx.args[0], "last")) {
         .items => |x| x,
         .err => |e| return e,
