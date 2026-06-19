@@ -147,17 +147,16 @@ pub fn reclaimRequested() bool {
 /// reclaim OFF.
 pub const AllocChoice = enum { arena, smp, debug, gc };
 pub fn allocChoice() AllocChoice {
-    // Default (unset): `arena`. The tracing GC (`gc`) is the goal default — it
-    // is the only mode that bounds memory for long-running processes — but it is
-    // not yet safe as the universal default: heavy coroutine I/O (e.g. a 1 MB+
-    // channel write) can trigger a collection mid-host-call that reclaims a live
-    // value not yet covered by host keepalive (a use-after-free; see the
-    // host-keepalive work). Until that is closed, `arena` (never-free, correct)
-    // stays the default; every mode is explicitly selectable for testing.
-    const v = getenvSlice("KLIO_RECLAIM") orelse return .arena;
-    if (v.len == 0 or std.mem.eql(u8, v, "arena") or std.mem.eql(u8, v, "0")) return .arena;
+    // Default (unset): the tracing GC (`gc`) — the only mode that bounds memory
+    // for a long-running process, and now safe as the universal default: the
+    // coroutine GC-root gaps that let a mid-host-call collection reclaim a live
+    // value (the channel-write use-after-free) are closed, and the per-request
+    // raw-temp leaks that ballooned ktor RSS are fixed. `arena` (never-free) and
+    // the freeing `smp`/`debug` modes stay explicitly selectable for testing.
+    const v = getenvSlice("KLIO_RECLAIM") orelse return .gc;
+    if (v.len == 0 or std.mem.eql(u8, v, "gc")) return .gc; // tracing GC (KGC)
+    if (std.mem.eql(u8, v, "arena") or std.mem.eql(u8, v, "0")) return .arena;
     if (std.mem.eql(u8, v, "debug")) return .debug;
-    if (std.mem.eql(u8, v, "gc")) return .gc; // tracing GC (KGC)
     return .smp; // "free", "smp", "1", or any other non-zero value
 }
 
