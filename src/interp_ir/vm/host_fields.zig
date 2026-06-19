@@ -159,11 +159,10 @@ fn frozenList(allocator: Allocator, items: std.ArrayList(Value), enum_class: ?St
 /// sole positional argument (custom getter / extension prop invocation).
 fn evalGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value) Allocator.Error!EvalResult {
     const mptr: *const Module = self.module.asPtr();
-    if (fid.int() >= mptr.funcs.items.len) {
+    const func = mptr.funcById(fid) orelse {
         const msg = try std.fmt.allocPrint(allocator, "getter FuncId {d} out of range", .{fid.int()});
         return errRes(.{ .Type = msg });
-    }
-    const func = &mptr.funcs.items[fid.int()];
+    };
     var args: std.ArrayList(Value) = .empty;
     defer args.deinit(allocator);
     try args.append(allocator, receiver);
@@ -368,7 +367,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             pg.deinit();
             if (fid_opt) |fid| {
                 const mptr: *const Module = self.module.asPtr();
-                if (fid.int() < mptr.funcs.items.len) {
+                if (fid.int() < mptr.funcCount()) {
                     return evalGetter(self, allocator, fid, receiver.*);
                 }
             }
@@ -547,8 +546,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         const id = receiver.IrClosure.id;
         if (self.closures.get(@intCast(id))) |info| {
             const mptr: *const Module = info.module orelse self.module.asPtr();
-            if (info.body_func.int() < mptr.funcs.items.len) {
-                const f = &mptr.funcs.items[info.body_func.int()];
+            if (mptr.funcById(info.body_func)) |f| {
                 if (std.mem.eql(u8, name, "name")) {
                     return ok(.{ .String = try StringRef.init(allocator, f.name) });
                 }
@@ -624,7 +622,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         const ext_fid = try resolveExtensionProp(self, allocator, receiver, recv_simple, name);
         if (ext_fid) |fid| {
             const mptr: *const Module = self.module.asPtr();
-            if (fid.int() >= mptr.funcs.items.len) {
+            if (fid.int() >= mptr.funcCount()) {
                 const msg = try std.fmt.allocPrint(allocator, "extension prop FuncId {d} out of range", .{fid.int()});
                 return errRes(.{ .Type = msg });
             }
@@ -996,7 +994,7 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
                 };
                 if (getter) |fid| {
                     const mptr: *const Module = self.module.asPtr();
-                    if (fid.int() < mptr.funcs.items.len) {
+                    if (fid.int() < mptr.funcCount()) {
                         return try evalGetter(self, allocator, fid, s);
                     }
                 }
@@ -1138,8 +1136,7 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
             for (mg.get().classes.items) |c| {
                 if (!std.mem.eql(u8, c.name, cd.name)) continue;
                 for (c.methods) |fid| {
-                    if (fid.int() < mg.get().funcs.items.len) {
-                        const f = &mg.get().funcs.items[fid.int()];
+                    if (mg.get().funcById(fid)) |f| {
                         try items.append(allocator, .{ .PropertyRef = .{ .name = try StringRef.init(allocator, f.name) } });
                     }
                 }
@@ -1360,7 +1357,7 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     const getter_fid = try resolveInstanceGetter(self, allocator, inst, class_name, recv_fqn, name);
     if (getter_fid) |fid| {
         const mptr: *const Module = self.module.asPtr();
-        if (fid.int() >= mptr.funcs.items.len) {
+        if (fid.int() >= mptr.funcCount()) {
             const msg = try std.fmt.allocPrint(allocator, "getter FuncId {d} out of range", .{fid.int()});
             return errRes(.{ .Type = msg });
         }
@@ -1788,7 +1785,7 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         const fid: ?FuncId = try resolveExtensionPropSetter(self, allocator, receiver, recv_simple, real_name);
         if (fid) |f| {
             const mptr: *const Module = self.module.asPtr();
-            if (f.int() >= mptr.funcs.items.len) {
+            if (f.int() >= mptr.funcCount()) {
                 const msg = try std.fmt.allocPrint(allocator, "ext setter FuncId {d} out of range", .{f.int()});
                 return .{ .err = .{ .Type = msg } };
             }
@@ -1868,7 +1865,7 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             };
             if (setter_fid) |fid| {
                 const mptr: *const Module = self.module.asPtr();
-                if (fid.int() >= mptr.funcs.items.len) {
+                if (fid.int() >= mptr.funcCount()) {
                     const msg = try std.fmt.allocPrint(allocator, "setter FuncId {d} out of range", .{fid.int()});
                     return .{ .err = .{ .Type = msg } };
                 }
@@ -1986,7 +1983,7 @@ fn setCompanionParentWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(Inst
 /// Run an IR-lowered setter `fid` with `(receiver, value)` bound.
 fn evalSetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value, value: Value) Allocator.Error!UnitResult {
     const mptr: *const Module = self.module.asPtr();
-    const func = &mptr.funcs.items[fid.int()];
+    const func = mptr.funcById(fid) orelse return .{ .err = .{ .Type = "setter FuncId out of range" } };
     var args: std.ArrayList(Value) = .empty;
     try args.append(allocator, receiver);
     try args.append(allocator, value);

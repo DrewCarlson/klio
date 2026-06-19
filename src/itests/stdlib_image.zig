@@ -488,8 +488,11 @@ test "bake/load round-trips the lowered base tables" {
         defer mg1.deinit();
         const m0 = mg0.get();
         const m1 = mg1.get();
-        try std.testing.expectEqual(m0.funcs.items.len, m1.funcs.items.len);
-        for (m0.funcs.items, m1.funcs.items) |*f0, *f1| {
+        // The loaded module's funcs are lazy (per-func header sections); decode
+        // each through funcById and compare to the eager fresh-built func.
+        try std.testing.expectEqual(m0.funcCount(), m1.funcCount());
+        for (m0.funcs.items) |*f0| {
+            const f1 = m1.funcById(f0.id).?;
             try std.testing.expectEqualStrings(f0.name, f1.name);
             try std.testing.expectEqualStrings(f0.fqn, f1.fqn);
             try std.testing.expectEqual(f0.id, f1.id);
@@ -597,7 +600,7 @@ test "bake/load round-trips the lowered base tables" {
         defer bg0.deinit();
         const bg1 = built1.module.borrow();
         defer bg1.deinit();
-        try std.testing.expectEqual(bg0.get().funcs.items.len, bg1.get().funcs.items.len);
+        try std.testing.expectEqual(bg0.get().funcCount(), bg1.get().funcCount());
         try std.testing.expectEqual(@as(usize, 0), bg0.get().resolve_diags.items.len);
         try std.testing.expectEqual(@as(usize, 0), bg1.get().resolve_diags.items.len);
     }

@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -771,6 +771,13 @@ const ImageRoot = struct {
     /// deferral form of `lifted_decls` (inline bodies are markers).
     lifted_decl_section: []const u8 = &.{},
     lifted_decl_offsets: []const u32 = &.{},
+    /// Per-func self-contained header encodings, decoded on first `funcById`.
+    func_header_section: []const u8 = &.{},
+    func_header_offsets: []const u32 = &.{},
+    /// Ids of bodyless funcs (no blocks, not deferred) — the lazy link input.
+    bodyless_func_ids: []const u32 = &.{},
+    /// Distinct first fqn segments of the funcs (for packageHeadDeclared).
+    func_fqn_heads: []const []const u8 = &.{},
 };
 
 const DEFERRED_MAGIC: u32 = span.DEFERRED_BODY_FILE;
@@ -829,6 +836,15 @@ inline fn blockCacheLock() void {
 }
 inline fn blockCacheUnlock() void {
     block_cache_lock.store(false, .release);
+}
+
+/// Decode one func HEADER from the per-func section at `offset` (blocks stay
+/// body-deferred). Self-contained (fresh registry), allocating into `a`.
+pub fn decodeFuncHeader(a: Allocator, section: []const u8, offset: u32) ?ir.Func {
+    var d = Decoder{ .a = a, .buf = section, .pos = offset };
+    var f: ir.Func = undefined;
+    decodeInto(ir.Func, &d, &f) catch return null;
+    return f;
 }
 
 /// Decode a deferred function's `blocks` from the lazy-IR section at `offset`,
@@ -946,6 +962,36 @@ pub fn bake(
             f.blocks = &.{};
         }
         root.module.deferred_func_section = fn_blk_enc.out.items;
+    }
+
+    // Per-func HEADER sections: each func encoded self-contained (blocks already
+    // body-deferred, so the header carries only its deferred_offset marker),
+    // decoded on first `funcById`. Also bake the bodyless-id list + fqn-head set
+    // (the lazy-friendly link/packageHeadDeclared inputs), then null the eager
+    // funcs so the whole table no longer materialises at load.
+    var fn_hdr_enc = Encoder.init(gpa);
+    defer fn_hdr_enc.deinit();
+    {
+        const offs = try a.alloc(u32, root.module.funcs.len);
+        var bodyless: std.ArrayList(u32) = .empty;
+        var heads = std.StringHashMap(void).init(gpa);
+        defer heads.deinit();
+        for (root.module.funcs, 0..) |*f, i| {
+            offs[i] = @intCast(fn_hdr_enc.out.items.len + 1);
+            fn_hdr_enc.resetRegistry();
+            try encodeValue(ir.Func, &fn_hdr_enc, f);
+            if (f.deferred_offset == 0 and f.blocks.len == 0) try bodyless.append(a, @intCast(i));
+            const h = if (std.mem.indexOfScalar(u8, f.fqn, '.')) |dot| f.fqn[0..dot] else f.fqn;
+            if (h.len != 0) try heads.put(h, {});
+        }
+        root.func_header_section = fn_hdr_enc.out.items;
+        root.func_header_offsets = offs;
+        root.bodyless_func_ids = try bodyless.toOwnedSlice(a);
+        var head_list: std.ArrayList([]const u8) = .empty;
+        var hit = heads.keyIterator();
+        while (hit.next()) |k| try head_list.append(a, k.*);
+        root.func_fqn_heads = try head_list.toOwnedSlice(a);
+        root.module.funcs = &.{};
     }
 
     // Per-decl self-contained sections: each top-level decl encoded with a
@@ -1723,6 +1769,17 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
 
     var module = Module.default(a);
     try moduleFromImage(a, &root.module, &module);
+    // Install lazy func headers: the eager `funcs` slice is empty in the image;
+    // a func decodes from its per-func section on first `funcById`.
+    if (root.func_header_offsets.len != 0) {
+        module.func_header_section = root.func_header_section;
+        module.func_header_offsets = root.func_header_offsets;
+        module.func_header_decode = decodeFuncHeader;
+        module.func_cache = try a.alloc(?*ir.Func, root.func_header_offsets.len);
+        @memset(module.func_cache, null);
+        module.func_fqn_heads = root.func_fqn_heads;
+        module.bodyless_func_ids = root.bodyless_func_ids;
+    }
     const module_ref = try ObjRef(Module).init(a, module);
     var built = build.emptyBuiltShell(a, module_ref, null);
     if (!try builtFromImage(a, &root.built, &built)) return null;

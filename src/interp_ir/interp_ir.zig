@@ -278,38 +278,61 @@ pub const ProgramImage = struct {
         }
 
         if (!bindings.isEmpty()) {
-            for (module.funcs.items) |*f| {
-                if (bindings.resolve(f.fqn)) |intrinsic| {
-                    try self.resolved_native.put(f.id.int(), intrinsic);
+            // Mark every func under an installed binding's fqn native — iterate
+            // the bindings and resolve each fqn to its funcs (all overloads share
+            // the receiverless fqn), touching the lazy func table only for
+            // same-simple-name candidates instead of sweeping it whole.
+            var bk = bindings.table.keyIterator();
+            while (bk.next()) |fqn_k| {
+                const fqn = fqn_k.*;
+                const intrinsic = bindings.resolve(fqn) orelse continue;
+                const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
+                for (module.funcsBySimpleName(simple)) |cand| {
+                    const cf = module.funcById(cand) orelse continue;
+                    if (std.mem.eql(u8, cf.fqn, fqn)) {
+                        try self.resolved_native.put(cand.int(), intrinsic);
+                    }
                 }
             }
         }
 
-        // Bodyless decls (`expect` / header-only): settle the executable
-        // form in the dispatcher's order — an overlay binding under the
-        // declared FQN dispatches directly (recorded above); otherwise a
-        // same-simple-name body sibling redirect (declaration order;
-        // arity picks among them at the call), falling back to the
-        // exact-FQN embedded native, else the bare-name map's native.
-        for (module.funcs.items) |*f| {
+        // Bodyless decls (`expect` / header-only): settle the executable form in
+        // the dispatcher's order. Base bodyless funcs come from the baked id list
+        // (no full-table scan under the lazy path); this run's own funcs are
+        // scanned directly (eager `funcs.items`, ids past the base range).
+        for (module.bodyless_func_ids) |bid| {
+            try self.linkBodyless(module, bindings, FuncId.from(bid));
+        }
+        const base_n: u32 = @intCast(module.func_header_offsets.len);
+        for (module.funcs.items, 0..) |*f, j| {
             if (f.hasBody()) continue;
-            if (self.resolved_native.contains(f.id.int())) continue;
-            var sibs: std.ArrayList(FuncId) = .empty;
-            errdefer sibs.deinit(self.allocator);
-            for (module.funcsBySimpleName(f.name)) |cand| {
-                if (cand.int() == f.id.int()) continue;
-                const cf = module.funcById(cand) orelse continue;
-                if (!cf.hasBody()) continue;
-                try sibs.append(self.allocator, cand);
-            }
-            if (sibs.items.len != 0) {
-                try self.resolved_redirect.put(f.id.int(), try sibs.toOwnedSlice(self.allocator));
-            }
-            if (self.bodylessNativeForm(bindings, f.fqn, f.name)) |intrinsic| {
-                try self.resolved_native.put(f.id.int(), intrinsic);
-            }
+            try self.linkBodyless(module, bindings, FuncId.from(base_n + @as(u32, @intCast(j))));
         }
         self.resolved_linked = true;
+    }
+
+    /// Settle one bodyless func's executable form: a same-simple-name body
+    /// sibling redirect (declaration order; arity picks at the call) plus the
+    /// exact-fqn / bare-name native fallback. Shared by the base (baked-id) and
+    /// user (table-scan) bodyless passes.
+    fn linkBodyless(self: *ProgramImage, module: *const Module, bindings: anytype, fid: FuncId) !void {
+        const f = module.funcById(fid) orelse return;
+        if (f.hasBody()) return;
+        if (self.resolved_native.contains(fid.int())) return;
+        var sibs: std.ArrayList(FuncId) = .empty;
+        errdefer sibs.deinit(self.allocator);
+        for (module.funcsBySimpleName(f.name)) |cand| {
+            if (cand.int() == fid.int()) continue;
+            const cf = module.funcById(cand) orelse continue;
+            if (!cf.hasBody()) continue;
+            try sibs.append(self.allocator, cand);
+        }
+        if (sibs.items.len != 0) {
+            try self.resolved_redirect.put(fid.int(), try sibs.toOwnedSlice(self.allocator));
+        }
+        if (self.bodylessNativeForm(bindings, f.fqn, f.name)) |intrinsic| {
+            try self.resolved_native.put(fid.int(), intrinsic);
+        }
     }
 
     /// The native form a bodyless decl's per-call ladder would have
@@ -1097,6 +1120,9 @@ test "linkResolvedForms binds one form per symbol from the installed overlay" {
     // Two body-bearing funcs; only the first's FQN has a native binding.
     const shimmed = try pushLinkTestFunc(&m, a, "now", "kotlinx.datetime.now");
     const plain = try pushLinkTestFunc(&m, a, "plain", "app.plain");
+    // The link resolves natives by simple name through the name index (as the
+    // real build does after a `rebuildFuncNameIndex`); build it for the test.
+    try m.rebuildFuncNameIndex(a);
 
     var prog = try ProgramImage.init(a);
     defer prog.deinit();

@@ -1439,7 +1439,7 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* == .Function) {
             const f = &d.Function;
-            const id = FuncId.from(@intCast(module.funcs.items.len));
+            const id = module.nextFuncId();
             const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
             var stub_params: []Param = &.{};
             if (f.receiver_type) |rt| {
@@ -1520,7 +1520,7 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* == .Function) {
             const f = &d.Function;
-            const stub_pkg = module.funcs.items[stub_ids.items[stub_cursor].int()].package;
+            const stub_pkg = module.funcByIdMut(stub_ids.items[stub_cursor]).?.package;
             const prev_pkg = ir.lower.decl.setLowerSelfPackage(stub_pkg);
             const func = try ir.lower.lowerFunctionBodyInto(module, f, &file_classes);
             _ = ir.lower.decl.setLowerSelfPackage(prev_pkg);
@@ -1529,9 +1529,9 @@ fn buildModuleWithOverrides(
             var placed = func;
             placed.id = id;
             // Preserve the stub's FQN + package (carry the package prefix).
-            placed.fqn = module.funcs.items[id.int()].fqn;
-            placed.package = module.funcs.items[id.int()].package;
-            module.funcs.items[id.int()] = placed;
+            placed.fqn = module.funcByIdMut(id).?.fqn;
+            placed.package = module.funcByIdMut(id).?.package;
+            module.funcByIdMut(id).?.* = placed;
             if (std.mem.eql(u8, f.name.name, "main")) main_id = id;
             try module.top_level.append(a, id);
 
@@ -1562,9 +1562,9 @@ fn buildModuleWithOverrides(
                 if (p.default != null) any_default = true;
             }
             if (any_default) {
-                const thunk_pkg = ir.lower.decl.setLowerSelfPackage(module.funcs.items[id.int()].package);
+                const thunk_pkg = ir.lower.decl.setLowerSelfPackage(module.funcByIdMut(id).?.package);
                 defer _ = ir.lower.decl.setLowerSelfPackage(thunk_pkg);
-                const lowered_names = module.funcs.items[id.int()].params;
+                const lowered_names = module.funcByIdMut(id).?.params;
                 const offset = if (lowered_names.len > f.params.len) lowered_names.len - f.params.len else 0;
                 var name_refs: std.ArrayList([]const u8) = .empty;
                 defer name_refs.deinit(a);
@@ -2525,8 +2525,7 @@ fn propagateInheritedDefaults(a: Allocator, module: *Module, func_defaults: *std
         }
 
         for (c.methods) |m| {
-            if (m.int() >= module.funcs.items.len) continue;
-            const mf = &module.funcs.items[m.int()];
+            const mf = module.funcById(m) orelse continue;
             const mname = mf.name;
             const marity = mf.params.len;
 
@@ -2541,8 +2540,7 @@ fn propagateInheritedDefaults(a: Allocator, module: *Module, func_defaults: *std
             for (anc.items) |ai| {
                 for (module.classes.items[ai].methods) |am| {
                     if (am.int() == m.int()) continue;
-                    if (am.int() >= module.funcs.items.len) continue;
-                    const af = &module.funcs.items[am.int()];
+                    const af = module.funcById(am) orelse continue;
                     if (!std.mem.eql(u8, af.name, mname) or af.params.len != marity) continue;
                     const bslots = func_defaults.get(am.int()) orelse continue;
                     if (merged == null) {
