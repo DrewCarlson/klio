@@ -62,9 +62,7 @@ fn argsFromSlice(allocator: Allocator, items: []const Value) Allocator.Error!std
 /// Look up a `Func` by id, returning a borrowed pointer into the module's
 /// `funcs` (the module outlives the call). `null` when out of range.
 fn funcAt(module: *const Module, id: FuncId) ?*const Func {
-    const idx = id.int();
-    if (idx >= module.funcs.items.len) return null;
-    return &module.funcs.items[idx];
+    return module.funcById(id);
 }
 
 fn paramIsThis(params: []const ir.Param) bool {

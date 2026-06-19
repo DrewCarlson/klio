@@ -409,14 +409,13 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
         vmhost.host_impl.setStartupInitsActive(true);
         defer vmhost.host_impl.setStartupInitsActive(false);
         for (self.top_level_props.items) |nf| {
-            if (nf.func.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
+            const init_func = module.funcById(nf.func) orelse return .{ .err = .InvalidMain };
             {
                 const g = self.globals.borrow();
                 const exists = g.get().lookup(nf.name) != null;
                 g.deinit();
                 if (exists) continue;
             }
-            const init_func = &module.funcs.items[nf.func.int()];
             var host = vmMakeHost(self, sink);
             const r = try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host);
             switch (r) {
@@ -467,8 +466,7 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
         const inst = entry_inst orelse continue;
         defer inst.deinit();
         for (entry.funcs, 0..) |fid, idx| {
-            if (fid.int() >= module.funcs.items.len) continue;
-            const init_func = &module.funcs.items[fid.int()];
+            const init_func = module.funcById(fid) orelse continue;
             const v = blk: {
                 var host = vmMakeHost(self, sink);
                 switch (try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host)) {
@@ -484,8 +482,7 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
         }
     }
 
-    if (main.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
-    const func = &module.funcs.items[main.int()];
+    const func = module.funcById(main) orelse return .{ .err = .InvalidMain };
     // A `suspend fun main` is driven through the cooperative coroutine pump
     // (kotlinc wraps it in `runSuspend`), so a real suspension such as
     // `delay` parks and resumes instead of escaping as a "suspended outside a
@@ -698,7 +695,7 @@ test "vm runs a simple main returning an int const" {
     b.terminate(.{ .Return = r });
     const main_func = try b.finish("main", "main", ir.build.typeInt());
     b.deinit();
-    const main_id = FuncId.from(@intCast(module.funcs.items.len));
+    const main_id = module.nextFuncId();
     var placed = main_func;
     placed.id = main_id;
     try module.funcs.append(testing.allocator, placed);

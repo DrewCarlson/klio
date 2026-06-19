@@ -38,7 +38,7 @@ fn moduleAllocator(module: *Module) Allocator {
 /// Assign the next `FuncId` to `func` and append it to the module.
 fn pushFunc(module: *Module, func_in: Func) Allocator.Error!FuncId {
     // FuncId indexes module.funcs; the IR caps the func count at u32.
-    const id = FuncId.from(@intCast(module.funcs.items.len));
+    const id = module.nextFuncId();
     var func = func_in;
     func.id = id;
     try module.funcs.append(moduleAllocator(module), func);

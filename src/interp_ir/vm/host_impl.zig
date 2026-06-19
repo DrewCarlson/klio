@@ -172,11 +172,10 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
         const mg = self.module.borrow();
         defer mg.deinit();
         const m = mg.get();
-        if (fid.int() >= m.funcs.items.len) {
+        break :blk m.funcById(fid) orelse {
             const msg = try std.fmt.allocPrint(self.allocator, "top-level prop init FuncId {d} out of range", .{fid.int()});
             return .{ .err = .{ .Type = msg } };
-        }
-        break :blk &m.funcs.items[fid.int()];
+        };
     };
     const module_ref = self.module.clone();
     defer module_ref.deinit();

@@ -58,9 +58,7 @@ fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocator.Er
             var tally = std.StringHashMap(usize).init(b.allocator);
             defer tally.deinit();
             for (b.module.funcsBySimpleName(name)) |fid| {
-                const idx = fid.int();
-                if (idx >= b.module.funcs.items.len) continue;
-                const f = &b.module.funcs.items[idx];
+                const f = b.module.funcById(fid) orelse continue;
                 const rt = f.return_ty.name;
                 const is_type_param = rt.len <= 2 and allAsciiUppercase(rt);
                 if (rt.len == 0 or std.mem.eql(u8, rt, "Unit") or is_type_param) {
