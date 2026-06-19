@@ -37,11 +37,22 @@ klio is heaviest, dominated by eager stdlib/ktor image materialization at startu
 
 Re-measured this session (ReleaseFast `zig build -Doptimize=ReleaseFast`, warm
 image cache, all packs reinstalled from the freshly-checked-out submodules):
-**bare runtime 42 MB**, **ktor startup 124 MB** — consistent with the table.
-Debug builds and cold (first-run, cache-miss) bakes inflate peak RSS markedly
-(bare ~54 MB Debug / ~104 MB cold; ktor ~195-219 MB cold), so always measure
-ReleaseFast + warm. The map-view `MapBacking` leak (P1 residual) is fixed and the
-fix is validated by a 200k-iter sawtooth that returns to baseline.
+started at **bare 42 MB**, **ktor startup 124 MB**. After the full campaign:
+**bare 27 MB** (target 25; the residual ~2 MB is the binary/GC floor) and
+**ktor startup 49 MB** (target 45 — and below node's 55), **ktor steady ~61 MB
+flat** (target: < node ~96). Always measure ReleaseFast + warm; Debug and cold
+(first-run, cache-miss) bakes inflate peak RSS markedly (bare ~54 MB Debug /
+~104 MB cold; ktor cold higher) — those are transient build peaks, not the
+steady floor the targets track. The map-view `MapBacking` leak (P1 residual) is
+fixed and validated by a 200k-iter sawtooth that returns to baseline.
+
+| target | start | now | goal | status |
+|---|---|---|---|---|
+| per-iter leak -> baseline on GC | leak | flat | flat | MET |
+| bare runtime | 43 | 27 | ~25 | ~MET (binary floor) |
+| ktor startup (0 req) | 136 | 49 | ~45 | MET (< node 55) |
+| ktor steady under load | ~142 | ~61 flat | << node 96 | MET |
+| per-request growth | ~0.4 KB/req | flat plateau | flat | MET |
 
 ## Phase status
 
@@ -51,13 +62,20 @@ fix is validated by a 200k-iter sawtooth that returns to baseline.
   object/lambda body-deferral + **lazy func headers (DONE)**. Gap 2 to target 25;
   the residual is the runtime stdlib ClassDef graph + GC/binary floor. Lazy
   ClassDef would close it.
-- **Phase 3 — ktor startup: 124 -> 84 MB.** Same flips + lazy func headers. Decode
-  is now only 3 MB; the ~57 MB framework overhead is the runtime ClassDef graph +
-  non-deferred IR insts + registry side-tables. Lazy ClassDef is the remaining
-  lever (same per-section + delegation pattern as lazy funcs, now proven).
-- **Phase 4 — steady-under-load << node: PARTIAL.** Server creep ~flat after P1;
-  absolute steady RSS dropped with the lower P2/P3 baseline but ktor steady (~103)
-  is still ~node (~96); the gap is the eager IR/ClassDef graph (beyond-forest).
+- **Phase 3 — ktor startup: 124 -> 49 MB (target 45, MET).** The startup anon
+  bulk was NOT the ClassDef graph (~2 MB) or decode (3 MB) — it was the **pack
+  ASTs**. Packs are re-parsed every run for their host bindings + selection
+  identity, but their lowered form already comes from the baked image; the parsed
+  ktor AST + source (tens of MB) was being retained for the process's whole life.
+  Fix (`cli/stdlib_image.zig` `tryPrepare`): parse packs into a scratch arena,
+  copy out only the bindings table (owned keys) + selection, drop the arena before
+  the program runs. ktor 0-req server: RSS 84->49 (anon 67->32, file 14 — the
+  shared mmap'd image). 49 < node's 55 at startup. Targets 1/3/4/5 met; bare 27
+  (~target 25, binary/GC floor).
+- **Phase 4 — steady-under-load << node: DONE (target 4 & 5).** ktor server with a
+  sane GC threshold plateaus flat at ~60-65 MB across 5000+ mixed GET/POST
+  requests (start 48 -> 61 -> 61 -> 60 -> 65 -> 63) — no unbounded per-request
+  growth, and well under node's ~96 MB plateau.
 
 Phases 2 and 3 are the *same underlying work* (lazy materialization of the stdlib
 forest); the only difference is which image (basic vs ktor) benefits.
@@ -432,23 +450,21 @@ eval-level tail (see Phase 1 residual) chased to zero.
       2528-2545, lower/expr.zig ~30 idGet sites) that index by id; with `base_n>0`
       they hit the wrong slot. Converting them all fixed it. **bare 30->27,
       ktor 91->84.**
-- [ ] **BEYOND FOREST step 3 (largest, the remaining ktor lever):** lazy ClassDef.
-      ktor's ~57 MB framework overhead (84 - 27 bare) is the runtime ClassDef graph
-      (hundreds of classes built eagerly in `builtFromImage`) + side-tables + GC.
-      DESIGN (adapt the proven lazy-func pattern; no clean id-choke-point since
-      ClassDefs are referenced via `ObjRef(ClassDef)` cells directly + two-phase
-      linked): build a ClassDef on first **ClassTable lookup (classByName)**,
-      recursively building its parent/interfaces (lookup-by-name -> build); store
-      the built ObjRef in the table. Classes never looked up stay unbuilt. This
-      works because all access reaches a class through the name lookup first
-      (instances/parents then hold the already-built ObjRef). Pieces: bake per-class
-      ClassDefImage sections + offsets; ClassTable entry becomes built-ObjRef OR
-      to-build marker (section offset); `classByName`/companion/nested lookups
-      build-on-demand; `cloneForExtend` delegates base classes (shares the section,
-      builds into the run's table on demand); bake any class-sweep registry results
-      (like the func link). Riskiest VM change (dispatch/instance/init), but the
-      lazy-func flip proved the per-section + delegation mechanism + that the real
-      hazard is id/ref-indexed sites, found exhaustively via grep + an A/B compare.
+- [x] **ktor startup gap ROOT-CAUSED + FIXED — it was pack-AST retention, not the
+      ClassDef graph.** The earlier "anon is live, gc==arena, lazy ClassDef saves
+      only ~2 MB" reading was a measurement artifact (cold/early sample). Clean
+      re-measure: ktor server gc=84 MB vs arena(no-reclaim)=178 MB, so GC *does*
+      reclaim ~94 MB of build churn; the 67 MB anon floor was not GC garbage. A
+      `KLIO_PERM_TRACE` pass (cell tracer with the `program_started` gate removed)
+      showed the perm-gen bulk was dominated by the **parser** — i.e. the ktor pack
+      (1.4 MB source) was re-parsed every run and its AST + source retained for the
+      process's life. The image already holds the lowered form; the parse only
+      feeds host bindings + the selection identity (binding keys are explicitly
+      duped, none borrow from the AST/source — see `loadPackCandidate`). Fix: parse
+      packs into a scratch arena in `tryPrepare`, copy out only the bindings +
+      selection, drop the arena before the program runs. **ktor 84->49 MB, steady
+      ~61 flat.** The ClassDef graph (~1-2 MB) was never the lever; no VM
+      rearchitecture was needed.
 
 ### Architectural conclusion (why the targets need a dedicated rearchitecture)
 Bare (30 MB) is at the interpreter's own code+data floor (binary text 29 MB /
