@@ -113,6 +113,17 @@ collections — pure loop + array), bound by the F3 per-instruction constant fac
    the rare large variants) + computed-goto/labeled-switch dispatch. Large,
    separate efforts.
 
+## Tried and reverted (don't re-attempt)
+
+- **Borrowing the intrinsic host instead of cloning** (`makeIntrinsicHost` does 11
+  `clone()` + 11 `deinit()` refcount atomics per intrinsic dispatch). Switching to
+  the non-owning `VmIntrinsicHost.borrowed(SharedHandles.fromHost(self))` sped
+  strings 6.5→5.7s BUT **broke concurrency** (ktor channel `Truncated`, a
+  ConcurrentMap thread-hammer integer-overflow panic): a worker thread's intrinsic
+  host must hold its own refs so the shared handles outlive the call independent of
+  the spawning thread. The clones are load-bearing. A conditional clone (only when
+  worker threads exist) is possible but subtle/risky — left.
+
 ## Status (vs start of campaign)
 
 | workload | start | now | speedup | python | node |
