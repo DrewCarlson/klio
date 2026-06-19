@@ -278,11 +278,10 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // A closure created inside a sub-module-lowered body resolves its
         // `FuncId` against that sub-module, never the main func table.
         const module = info.module orelse module_ref.asPtr();
-        if (info.body_func.int() >= module.funcs.items.len) {
+        const func = module.funcById(info.body_func) orelse {
             const msg = try std.fmt.allocPrint(allocator, "closure body FuncId {d} out of range", .{info.body_func.int()});
             return .{ .err = .{ .Type = msg } };
-        }
-        const func = &module.funcs.items[info.body_func.int()];
+        };
         // One executable form per symbol: when the wrapped top-level fn's
         // single form was resolved to a native binding at link time
         // (e.g. a closure-of `kotlinx.datetime.__kxdt_*`), dispatch that
@@ -573,8 +572,8 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 const module_g = self.module.borrow();
                 defer module_g.deinit();
                 const m = info.module orelse module_g.get();
-                if (info.body_func.int() >= m.funcs.items.len) break :blk false;
-                const fp = m.funcs.items[info.body_func.int()].params;
+                const f = m.funcById(info.body_func) orelse break :blk false;
+                const fp = f.params;
                 break :blk fp.len != 0 and std.mem.eql(u8, fp[0].name, "this");
             };
             // Explicit-receiver call shape on a body that never captured
@@ -625,9 +624,7 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
     // func so `LoadCapture` reads the right snapshot per closure.
     var n_params: usize = 0;
     var capture_names: [][]const u8 = &.{};
-    const i = @intFromEnum(body_func);
-    if (i < module.funcs.items.len) {
-        const f = &module.funcs.items[i];
+    if (module.funcById(body_func)) |f| {
         n_params = f.params.len;
         capture_names = try allocator.dupe([]const u8, f.capture_order);
     }
@@ -837,14 +834,13 @@ fn padArgsWithDefaults(
             var args_copy: std.ArrayList(Value) = .empty;
             try args_copy.appendSlice(allocator, call_args.items);
             const module = module_ref.asPtr();
-            if (fid.int() >= module.funcs.items.len) {
+            const dfunc = module.funcById(fid) orelse {
                 args_copy.deinit(allocator);
                 captures.deinit(allocator);
                 call_args.deinit(allocator);
                 const msg = try std.fmt.allocPrint(allocator, "default-arg FuncId {d} out of range", .{fid.int()});
                 return .{ .err = .{ .Type = msg } };
-            }
-            const dfunc = &module.funcs.items[fid.int()];
+            };
             vmhost.emitPath(allocator, "default_thunk", dfunc.fqn, fid, null, provided);
             const r = try ir.eval.evalWithCaptures(VmHost, allocator, module, dfunc, args_copy, captures, self);
             switch (r) {

@@ -455,7 +455,7 @@ pub fn lowerFunctionWithFile(
 ) Allocator.Error!Func {
     const a = module.registry.allocator;
     const func = try lowerFunctionBody(module, f, file_classes);
-    const id = FuncId.from(@intCast(module.funcs.items.len));
+    const id = module.nextFuncId();
     var placed = func;
     placed.id = id;
     const nm = f.name.name;
@@ -719,7 +719,7 @@ pub fn lowerMethodWithPrivate(
     if (f.receiver_type != null) {
         const implicit = [_][]const u8{"this"};
         const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, null, null, enclosing_members, null);
-        const id = FuncId.from(@intCast(module.funcs.items.len));
+        const id = module.nextFuncId();
         var placed = func;
         placed.id = id;
         placed.kind = .member_extension;
@@ -747,7 +747,7 @@ pub fn lowerMethodWithPrivate(
         enclosing_members,
         private_method_fids,
     );
-    const id = FuncId.from(@intCast(module.funcs.items.len));
+    const id = module.nextFuncId();
     var placed = func;
     placed.id = id;
     placed.kind = .instance_method;

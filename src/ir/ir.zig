@@ -978,7 +978,12 @@ pub const Module = struct {
     /// The returned `*const Func` lives for the module's life.
     pub fn funcById(self: *const Module, id: FuncId) ?*const Func {
         const i = id.int();
-        if (self.func_header_offsets.len == 0) return idGet(Func, self.funcs.items, i);
+        const base_n: u32 = @intCast(self.func_header_offsets.len);
+        // Ids at/after the lazy base range are this module's own appended funcs,
+        // stored densely in `funcs.items` starting at id == base_n.
+        if (i >= base_n) return idGet(Func, self.funcs.items, i - base_n);
+        // i < base_n: a base func owned by the lazy header section (this module,
+        // or the base it was cloned from, shares the section). Decode + memoise.
         if (i >= self.func_cache.len) return null;
         if (self.func_cache[i]) |f| return f;
         const off = self.func_header_offsets[i];
@@ -994,10 +999,27 @@ pub const Module = struct {
         return f;
     }
 
+    /// A mutable handle to one of THIS module's own appended funcs (id >= the
+    /// lazy base range). Build-time only — base funcs are immutable/lazy.
+    pub fn funcByIdMut(self: *Module, id: FuncId) ?*Func {
+        const i = id.int();
+        const base_n: u32 = @intCast(self.func_header_offsets.len);
+        if (i < base_n) return null;
+        const j = i - base_n;
+        if (j >= self.funcs.items.len) return null;
+        return &self.funcs.items[j];
+    }
+
+    /// The id the next appended func will take (first id past the lazy base
+    /// range + already-appended funcs).
+    pub fn nextFuncId(self: *const Module) FuncId {
+        return FuncId.from(@intCast(self.func_header_offsets.len + self.funcs.items.len));
+    }
+
     /// Number of functions addressable by id (eager table length, or the lazy
     /// offset-table length when loaded from an image).
     pub fn funcCount(self: *const Module) usize {
-        return if (self.func_header_offsets.len == 0) self.funcs.items.len else self.func_header_offsets.len;
+        return self.func_header_offsets.len + self.funcs.items.len;
     }
 
     pub fn deinit(self: *Module, allocator: Allocator) void {
@@ -2520,7 +2542,7 @@ const TestFuncOpts = struct {
 /// Push a top-level func with the given simple name, FQN, package, and
 /// user-parameter count, returning its id. Used by the symbol-index tests.
 fn pushTestFuncOpts(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, package: []const u8, user_params: usize, opts: TestFuncOpts) !FuncId {
-    const id = FuncId.from(@intCast(m.funcs.items.len));
+    const id = m.nextFuncId();
     const n_params = user_params + @as(usize, if (opts.extension) 1 else 0);
     const params = try a.alloc(Param, n_params);
     for (params, 0..) |*p, i| {
@@ -2978,7 +3000,7 @@ test "symbol index defers a default-bearing body exactly like its stub" {
     // `required != total`, so the verdict cannot flip with declaration
     // order once the body lowers.
     const body = try pushTestFuncOpts(&m, a, "d", "app.d", "app", 2, .{});
-    m.funcs.items[body.int()].params[1].has_default = true;
+    m.funcByIdMut(body).?.params[1].has_default = true;
     try m.rebuildFuncNameIndex(a);
 
     const got = m.resolveBareCallIndexed("d", "app", FileId.from(0), 2, false);

@@ -206,15 +206,14 @@ pub fn evalClosureRaw(
     const module_g = self.module.borrow();
     defer module_g.deinit();
     const module = info.module orelse module_g.get();
-    if (info.body_func.int() >= module.funcs.items.len) {
+    const func = module.funcById(info.body_func) orelse {
         const msg = try std.fmt.allocPrint(
             self.allocator,
             "closure body FuncId {d} out of range",
             .{info.body_func.int()},
         );
         return .{ .err = .{ .Type = msg } };
-    }
-    const func = &module.funcs.items[info.body_func.int()];
+    };
 
     // Fill the call args. With a receiver, prepend it (when the body
     // declares at least one param); otherwise pad to `n_params`.
@@ -284,10 +283,9 @@ pub fn evalFuncRaw(self: *VmIntrinsicHost, func_id: ir.FuncId, out: Output) Allo
     const module_g = self.module.borrow();
     defer module_g.deinit();
     const module = module_g.get();
-    if (func_id.int() >= module.funcs.items.len) {
+    const func = module.funcById(func_id) orelse {
         return .{ .err = .{ .Type = "invalid main FuncId" } };
-    }
-    const func = &module.funcs.items[func_id.int()];
+    };
     const state = vmhost.SharedHandles.fromIntrinsic(self);
     var host = VmHost.borrowed(state, state.globals, out);
     const empty: std.ArrayList(Value) = .empty;
@@ -411,15 +409,14 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         const module_g = self.module.borrow();
         defer module_g.deinit();
         const module = info.module orelse module_g.get();
-        if (info.body_func.int() >= module.funcs.items.len) {
+        const func = module.funcById(info.body_func) orelse {
             const msg = try std.fmt.allocPrint(
                 self.allocator,
                 "closure body FuncId {d} out of range",
                 .{info.body_func.int()},
             );
             return .{ .err = .{ .Type = msg } };
-        }
-        const func = &module.funcs.items[info.body_func.int()];
+        };
 
         var caps_owned: std.ArrayList(Value) = .empty;
         {

@@ -298,8 +298,8 @@ pub const ProgramImage = struct {
             errdefer sibs.deinit(self.allocator);
             for (module.funcsBySimpleName(f.name)) |cand| {
                 if (cand.int() == f.id.int()) continue;
-                if (cand.int() >= module.funcs.items.len) continue;
-                if (!module.funcs.items[cand.int()].hasBody()) continue;
+                const cf = module.funcById(cand) orelse continue;
+                if (!cf.hasBody()) continue;
                 try sibs.append(self.allocator, cand);
             }
             if (sibs.items.len != 0) {
@@ -375,8 +375,7 @@ pub const ProgramImage = struct {
     /// testable against synthetic modules.
     pub fn resolvedRedirectTarget(self: *const ProgramImage, module: *const Module, func: FuncId, argc: usize) ?FuncId {
         for (self.resolvedRedirects(func)) |cand| {
-            if (cand.int() >= module.funcs.items.len) continue;
-            const g = &module.funcs.items[cand.int()];
+            const g = module.funcById(cand) orelse continue;
             const has_this = g.params.len != 0 and std.mem.eql(u8, g.params[0].name, "this");
             const user = if (has_this) g.params.len - 1 else g.params.len;
             const last_vararg = g.params.len != 0 and g.params[g.params.len - 1].is_vararg;
@@ -1062,12 +1061,12 @@ fn pushLinkTestFuncParams(m: *Module, a: Allocator, name: []const u8, fqn: []con
             .is_vararg = last_vararg and i == n_params - 1,
         };
     }
-    m.funcs.items[id.int()].params = params;
+    m.funcByIdMut(id).?.params = params;
     return id;
 }
 
 fn pushLinkTestFuncOpts(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, bodyless: bool) Allocator.Error!FuncId {
-    const id = FuncId.from(@intCast(m.funcs.items.len));
+    const id = m.nextFuncId();
     const blocks = try a.alloc(ir.Block, if (bodyless) 0 else 1);
     if (!bodyless) {
         blocks[0] = .{ .id = ir.BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };

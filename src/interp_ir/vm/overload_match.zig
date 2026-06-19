@@ -397,16 +397,12 @@ const ClosureBody = struct { is_suspend: bool, params: []const ir.Param };
 fn closureBodyFunc(self: *VmHost, id: u64) ?ClosureBody {
     const info = self.closures.get(@intCast(id)) orelse return null;
     if (info.module) |m| {
-        const idx = info.body_func.int();
-        if (idx >= m.funcs.items.len) return null;
-        const f = &m.funcs.items[idx];
+        const f = m.funcById(info.body_func) orelse return null;
         return .{ .is_suspend = f.is_suspend, .params = f.params };
     }
     const mg = self.module.borrow();
     defer mg.deinit();
-    const idx = info.body_func.int();
-    if (idx >= mg.get().funcs.items.len) return null;
-    const f = &mg.get().funcs.items[idx];
+    const f = mg.get().funcById(info.body_func) orelse return null;
     return .{ .is_suspend = f.is_suspend, .params = f.params };
 }
 
