@@ -154,10 +154,21 @@ pub const ProgramImage = struct {
     /// is a pure function of the key); the keys are stable string pointers
     /// (static type FQNs, interned method names), so this is keyed by identity.
     member_resolve_cache: std.AutoHashMap(MemberResolveKey, MemberResolveEntry),
+    /// Monomorphic inline cache for user-class instance-method dispatch. Without
+    /// it, every `inst.method()` re-walks the class hierarchy (linear class +
+    /// method scans, string compares) and heap-allocates a work queue + seen-set
+    /// per call — the dominant cost for member-heavy code (a method called in a
+    /// 1M-iteration loop pays full resolution 1M times). The resolved `FuncId`
+    /// for `(class identity, method-name pointer, arity)` is invariant when the
+    /// name is unambiguous at that arity, so cache it and dispatch straight to
+    /// the method body. Keyed by identity: the class cell pointer and interned
+    /// method-name pointer are stable for the program's lifetime.
+    instance_method_cache: std.AutoHashMap(InstanceMethodKey, u32),
     allocator: Allocator,
 
     pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool };
     pub const MemberResolveEntry = struct { func: ?StdlibFn, fqn: []const u8 };
+    pub const InstanceMethodKey = struct { class_p: usize, name_p: usize, n_args: u32 };
 
     /// Packages a bare global name may bind into implicitly, in
     /// preference order — the prefix order of the deleted `lookupGlobal`
@@ -215,6 +226,7 @@ pub const ProgramImage = struct {
             .any_member_globals = std.StringHashMap([]const u8).init(allocator),
             .resolved_linked = false,
             .member_resolve_cache = std.AutoHashMap(MemberResolveKey, MemberResolveEntry).init(allocator),
+            .instance_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
             .allocator = allocator,
         };
     }
@@ -245,6 +257,7 @@ pub const ProgramImage = struct {
             while (it.next()) |e| if (e.fqn.len != 0) self.allocator.free(e.fqn);
         }
         self.member_resolve_cache.deinit();
+        self.instance_method_cache.deinit();
     }
 
     fn clearResolvedRedirects(self: *ProgramImage) void {

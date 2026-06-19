@@ -4421,7 +4421,13 @@ fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Modul
     return .{ .ok = try call_args.toOwnedSlice(allocator) };
 }
 
-fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+const ResolvedMethod = struct { fid: FuncId, unambiguous: bool };
+
+/// Walk the receiver's class hierarchy resolving `name` to a user method
+/// `FuncId`. `unambiguous` is set when the resolving class had exactly one
+/// method of that name (so the choice does not depend on argument types and the
+/// resolution may be cached for the inline dispatch cache).
+fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?ResolvedMethod {
     const inst = receiver.Instance;
     var class_name: []const u8 = undefined;
     var recv_fqn: []const u8 = undefined;
@@ -4449,6 +4455,7 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         var ir_class: ?ir.Class = null;
         {
             const mg = self.module.borrow();
+            defer mg.deinit();
             const mod = mg.get();
             if (first) {
                 if (mod.classIdByFqn(recv_fqn)) |cid| {
@@ -4474,50 +4481,9 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                     }
                 }
                 if (pickMethodOverload(self, candidates.items, args)) |f| {
-                    var all = try prependReceiver(allocator, receiver, args);
-                    // Pad defaults.
-                    const defaults = blk: {
-                        const pg = self.prog.borrow();
-                        defer pg.deinit();
-                        if (pg.get().func_defaults.get(@intFromEnum(f.id))) |d| break :blk try allocator.dupe(?FuncId, d);
-                        break :blk null;
-                    };
-                    defer if (defaults) |d| if (runtime.freeScratch()) allocator.free(d);
-                    if (defaults != null and all.len < f.params.len) {
-                        const padded = try padArgsWithDefaults(self, allocator, mod, f.params.len, all, defaults);
-                        switch (padded) {
-                            .ok => |p| {
-                                // `padArgsWithDefaults` builds a fresh slice and does
-                                // not free its input; the original prepend buffer is dead.
-                                if (runtime.freeScratch()) allocator.free(all);
-                                all = p;
-                            },
-                            .err => |e| {
-                                if (runtime.freeScratch()) allocator.free(all);
-                                mg.deinit();
-                                return .{ .err = e };
-                            },
-                        }
-                    }
-                    // `packVarargArgs` returns `all` as-is when there is no vararg, or
-                    // frees `all` and returns a fresh buffer when packing one. Either
-                    // way `packed_args` is the live buffer to free; `argsListFromSlice`
-                    // copies it into a frame-owned list, so it is dead afterward.
-                    const packed_args = try packVarargArgs(self, allocator, &f, all);
-                    var packed_list = try argsListFromSlice(allocator, packed_args);
-                    if (runtime.freeScratch()) allocator.free(packed_args);
-                    _ = &packed_list;
-                    if (trace.invariantsEnabled()) {
-                        checkFuncInRange(self, "irMethodWalk", f.id);
-                        checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
-                    }
-                    vmhost.emitPath(allocator, "member_ir_walk", f.fqn, f.id, receiver, args);
-                    const r = try ir.eval.evalWith(VmHost, allocator, mod, &f, packed_list, self);
-                    mg.deinit();
-                    return r;
+                    return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
                 }
             }
-            mg.deinit();
         }
         const cg = self.classes.borrow();
         if (cg.get().get(cur_name)) |def| {
@@ -4528,6 +4494,99 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         cg.deinit();
     }
     return null;
+}
+
+/// Invoke an already-resolved user method by `FuncId`: prepend the receiver,
+/// pad defaults, pack varargs, and run the body. Shared by the cold resolve
+/// path (`irMethodWalk`) and the inline-cache fast path.
+fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    const f = funcAt(mod, fid) orelse return null;
+    var all = try prependReceiver(allocator, receiver, args);
+    const defaults = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (pg.get().func_defaults.get(@intFromEnum(fid))) |d| break :blk try allocator.dupe(?FuncId, d);
+        break :blk null;
+    };
+    defer if (defaults) |d| if (runtime.freeScratch()) allocator.free(d);
+    if (defaults != null and all.len < f.params.len) {
+        const padded = try padArgsWithDefaults(self, allocator, mod, f.params.len, all, defaults);
+        switch (padded) {
+            .ok => |p| {
+                if (runtime.freeScratch()) allocator.free(all);
+                all = p;
+            },
+            .err => |e| {
+                if (runtime.freeScratch()) allocator.free(all);
+                return .{ .err = e };
+            },
+        }
+    }
+    const packed_args = try packVarargArgs(self, allocator, &f, all);
+    var packed_list = try argsListFromSlice(allocator, packed_args);
+    if (runtime.freeScratch()) allocator.free(packed_args);
+    _ = &packed_list;
+    if (trace.invariantsEnabled()) {
+        checkFuncInRange(self, "irMethodWalk", f.id);
+        checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
+    }
+    vmhost.emitPath(allocator, "member_ir_walk", f.fqn, f.id, receiver, args);
+    return try ir.eval.evalWith(VmHost, allocator, mod, &f, packed_list, self);
+}
+
+/// Build the inline-cache key for an instance method call, or `null` for a
+/// non-Instance receiver. Keyed by class-cell identity + interned method-name
+/// pointer + arity (all stable for the program lifetime).
+fn instanceMethodKey(receiver: *const Value, name: []const u8, n_args: usize) ?root_mod.ProgramImage.InstanceMethodKey {
+    if (receiver.* != .Instance) return null;
+    const inst = receiver.Instance;
+    const g = inst.borrow();
+    defer g.deinit();
+    return .{
+        .class_p = g.get().class.identity(),
+        .name_p = @intFromPtr(name.ptr),
+        .n_args = @intCast(n_args),
+    };
+}
+
+fn instanceMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?FuncId {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    if (pg.get().instance_method_cache.get(key)) |raw| return @enumFromInt(raw);
+    return null;
+}
+
+fn instanceMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: FuncId) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    pg.get().instance_method_cache.put(key, @intFromEnum(fid)) catch {};
+}
+
+fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    // Inline cache: memoize the (class, method-name) → FuncId resolution for
+    // ZERO-ARG calls only. With no arguments there is no overload/arg-type
+    // discrimination (`pickMethodOverload` declines a sole candidate only by
+    // arity or definite arg-type mismatch — neither applies to a 0-arg call to a
+    // 0-param method), so the resolution is a pure function of the class and is
+    // safe to cache. Consulted at exactly the point the hierarchy walk would run
+    // (after the per-instance binding/anon probes), so dispatch is unchanged —
+    // only the linear class/method scans and per-call work-queue allocations are
+    // skipped. Zero-arg covers the member-heavy hot path (getters, `next`,
+    // `hasNext`, `toString`, `hashCode`, …).
+    const key = if (args.len == 0) instanceMethodKey(receiver, name, args.len) else null;
+    if (key) |k| {
+        if (instanceMethodCacheGet(self, k)) |fid| {
+            return try invokeMethodFuncId(self, allocator, receiver, fid, args);
+        }
+    }
+    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args)) orelse return null;
+    if (resolved.unambiguous) {
+        if (key) |k| instanceMethodCachePut(self, k, resolved.fid);
+    }
+    return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
 }
 
 fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
