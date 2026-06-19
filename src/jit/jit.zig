@@ -122,13 +122,52 @@ pub const Emitter = struct {
         try self.imm64(v);
     }
 
-    /// `add <dst64>, <src64>`.
-    pub fn addReg(self: *Emitter, dst: Reg, src: Reg) JitError!void {
-        const rex_r: u8 = if (@intFromEnum(src) >= 8) 0x04 else 0;
-        const rex_b: u8 = if (@intFromEnum(dst) >= 8) 0x01 else 0;
+    /// REX.W for a two-operand op: `reg` is the ModRM.reg field (REX.R),
+    /// `rm` the ModRM.r/m field (REX.B).
+    fn rexWrr(self: *Emitter, reg: Reg, rm: Reg) JitError!void {
+        const rex_r: u8 = if (@intFromEnum(reg) >= 8) 0x04 else 0;
+        const rex_b: u8 = if (@intFromEnum(rm) >= 8) 0x01 else 0;
         try self.byte(0x48 | rex_r | rex_b);
-        try self.byte(0x01);
-        try self.byte(0xC0 | (low3(src) << 3) | low3(dst));
+    }
+    /// ModRM byte for register-direct (mod=11): `reg`/`rm` fields.
+    fn modrmRR(self: *Emitter, reg: Reg, rm: Reg) JitError!void {
+        try self.byte(0xC0 | (low3(reg) << 3) | low3(rm));
+    }
+
+    /// `add <dst64>, <src64>` (dst += src).
+    pub fn addReg(self: *Emitter, dst: Reg, src: Reg) JitError!void {
+        try self.rexWrr(src, dst);
+        try self.byte(0x01); // ADD r/m64, r64
+        try self.modrmRR(src, dst);
+    }
+
+    /// `sub <dst64>, <src64>` (dst -= src).
+    pub fn subReg(self: *Emitter, dst: Reg, src: Reg) JitError!void {
+        try self.rexWrr(src, dst);
+        try self.byte(0x29); // SUB r/m64, r64
+        try self.modrmRR(src, dst);
+    }
+
+    /// `mov <dst64>, <src64>`.
+    pub fn movReg(self: *Emitter, dst: Reg, src: Reg) JitError!void {
+        try self.rexWrr(src, dst);
+        try self.byte(0x89); // MOV r/m64, r64
+        try self.modrmRR(src, dst);
+    }
+
+    /// `imul <dst64>, <src64>` (dst *= src).
+    pub fn imulReg(self: *Emitter, dst: Reg, src: Reg) JitError!void {
+        try self.rexWrr(dst, src);
+        try self.byte(0x0F);
+        try self.byte(0xAF); // IMUL r64, r/m64
+        try self.modrmRR(dst, src);
+    }
+
+    /// `cmp <a64>, <b64>` (sets flags for a - b).
+    pub fn cmpReg(self: *Emitter, a: Reg, b: Reg) JitError!void {
+        try self.rexWrr(b, a);
+        try self.byte(0x39); // CMP r/m64, r64
+        try self.modrmRR(b, a);
     }
 
     /// `ret`.
@@ -173,4 +212,35 @@ test "movImm64 encodes the documented bytes" {
     try em.movImm64(.rax, 42);
     // 48 B8 2A 00 00 00 00 00 00 00
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xB8, 0x2A, 0, 0, 0, 0, 0, 0, 0 }, em.code());
+}
+
+test "register ALU ops compute the same as native" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    // f(a=rdi, b=rsi): rax = ((a - b) * b) ... then return; verifies sub/mov/imul.
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.movReg(.rax, .rdi); // rax = a
+    try em.subReg(.rax, .rsi); // rax = a - b
+    try em.imulReg(.rax, .rsi); // rax = (a - b) * b
+    try em.ret();
+    var buf = try finalize(em.code());
+    defer buf.deinit();
+    const f = buf.entry(*const fn (i64, i64) callconv(.c) i64);
+    try std.testing.expectEqual(@as(i64, (10 - 3) * 3), f(10, 3));
+    try std.testing.expectEqual(@as(i64, (100 - 7) * 7), f(100, 7));
+}
+
+test "ALU encodings match documented bytes" {
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.movReg(.rax, .rdi); // 48 89 F8 (mov rax, rdi)
+    try em.subReg(.rax, .rsi); // 48 29 F0 (sub rax, rsi)
+    try em.imulReg(.rax, .rsi); // 48 0F AF C6 (imul rax, rsi)
+    try em.cmpReg(.rax, .rcx); // 48 39 C8 (cmp rax, rcx)
+    try std.testing.expectEqualSlices(u8, &.{
+        0x48, 0x89, 0xF8,
+        0x48, 0x29, 0xF0,
+        0x48, 0x0F, 0xAF, 0xC6,
+        0x48, 0x39, 0xC8,
+    }, em.code());
 }
