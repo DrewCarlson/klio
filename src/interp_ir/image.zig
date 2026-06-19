@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -750,6 +750,10 @@ const ImageRoot = struct {
     /// Simple-name -> base inline-fn forest refs, the lazy replacement for the
     /// load-time `collectInline` walk over `lifted_decls`.
     inline_by_name: []InlineNamesImage = &.{},
+    /// Class simple-name -> base class forest ref (lazy `file_classes` seed).
+    file_classes: []ClassRefImage = &.{},
+    /// Base top-level property scope data (lazy `notePropScope` replay).
+    top_props: []TopPropImage = &.{},
     enum_id_next: u64,
     /// CLI replay data: packages registered while loading the dependency
     /// sources and the host-binding FQNs installed alongside them.
@@ -870,6 +874,8 @@ fn funcRefsAst(func: *const ir.Func) bool {
 
 const InlineIdImage = struct { id: u32, f: FF(ast.Function) };
 const InlineNamesImage = struct { k: []const u8, v: []const runtime.forest.ForestRef };
+const ClassRefImage = struct { k: []const u8, v: runtime.forest.ForestRef };
+const TopPropImage = struct { name: []const u8, fqn: []const u8, package: []const u8 };
 
 // -------------------------------------------------------------------------
 // Bake: StdlibBase -> bytes
@@ -998,6 +1004,42 @@ pub fn bake(
         }
         root.inline_by_name = try list.toOwnedSlice(a);
     }
+
+    // Bake the base class index (simple-name -> class forest ref), the lazy
+    // replacement for seeding `file_classes` from lifted_decls at load.
+    {
+        var list: std.ArrayList(ClassRefImage) = .empty;
+        for (root.lifted_decls) |*d| {
+            if (d.* == .Class) {
+                if (forest_map.get(@intFromPtr(&d.Class))) |r|
+                    try list.append(a, .{ .k = d.Class.name.name, .v = r });
+            }
+        }
+        root.file_classes = try list.toOwnedSlice(a);
+    }
+
+    // Bake the base top-level property scope data from the base's registry (it
+    // was populated by notePropScope when the base was first built), so load
+    // replays it without walking lifted_decls.
+    {
+        var list: std.ArrayList(TopPropImage) = .empty;
+        const mg = base.built.module.borrow();
+        defer mg.deinit();
+        var it = mg.get().registry.top_level_prop_pkgs.iterator();
+        while (it.next()) |e| {
+            for (e.value_ptr.items) |pd| {
+                try list.append(a, .{ .name = e.key_ptr.*, .fqn = pd.fqn, .package = pd.package });
+            }
+        }
+        root.top_props = try list.toOwnedSlice(a);
+    }
+
+    // Drop the eager forest from the payload: the per-decl sections (lazy
+    // `ForestField.get()`) plus the baked `inline_by_name` / `file_classes` /
+    // `top_props` indices now cover everything load reads, so the whole AST
+    // forest no longer materialises at startup. Any still-raw forest pointer in
+    // built/module finds no global-registry entry and inline-encodes (correct).
+    root.lifted_decls = &.{};
 
     var e = Encoder.init(gpa);
     defer e.deinit();
@@ -1707,6 +1749,20 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
             const out = try a.alloc(StdlibBase.InlineNames, root.inline_by_name.len);
             for (root.inline_by_name, 0..) |entry, i| {
                 out[i] = .{ .k = entry.k, .v = entry.v };
+            }
+            break :blk out;
+        },
+        .file_classes = blk: {
+            const out = try a.alloc(StdlibBase.ClassRef, root.file_classes.len);
+            for (root.file_classes, 0..) |entry, i| {
+                out[i] = .{ .k = entry.k, .v = entry.v };
+            }
+            break :blk out;
+        },
+        .top_props = blk: {
+            const out = try a.alloc(StdlibBase.TopProp, root.top_props.len);
+            for (root.top_props, 0..) |entry, i| {
+                out[i] = .{ .name = entry.name, .fqn = entry.fqn, .package = entry.package };
             }
             break :blk out;
         },

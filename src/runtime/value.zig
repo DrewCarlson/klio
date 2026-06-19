@@ -70,6 +70,10 @@ pub const MapBacking = struct {
 /// A heap-managed `MapBacking`: the view owns this cell (retained/released and
 /// GC-swept with the view) but not the entries it points at.
 pub const MapBackingRef = objcell.ObjRef(MapBacking);
+/// The control block behind a `MapBackingRef`. `List`/`Set` store `?*Cell`
+/// (a single pointer, so `?` is null-optimized to 8 bytes — keeping `Value`
+/// pinned at 64) and reconstruct the `MapBackingRef` at each use.
+pub const MapBackingCell = MapBackingRef.Cell;
 
 /// Distinguishes integer ranges (`IntRange`) from long/char ranges.
 pub const RangeKind = enum {
@@ -507,7 +511,7 @@ pub const Value = union(enum) {
         /// `Some(name)` for `EnumName.entries` / `.values()`.
         enum_class: ?StringRef,
         /// Set when this is a live `MutableMap.values` view.
-        backing: ?MapBackingRef,
+        backing: ?*MapBackingCell,
         /// Declared element-type head from an explicit call-site type
         /// argument on the creating stdlib function (`listOf<String>()`).
         /// Head name only; borrows the module's interned consts, which
@@ -525,7 +529,7 @@ pub const Value = union(enum) {
         items: ValueList,
         mutable: bool,
         /// Set when this is a live `MutableMap.keys`/`.entries` view.
-        backing: ?MapBackingRef,
+        backing: ?*MapBackingCell,
         /// Declared element-type head from an explicit call-site type
         /// argument on the creating stdlib function; see `List`.
         declared_elem: ?[]const u8 = null,
@@ -655,11 +659,11 @@ pub const Value = union(enum) {
             .Comparator => |c| visitor.visit(c.steps),
             .List => |x| {
                 visitor.visit(x.items);
-                if (x.backing) |b| visitor.visit(b);
+                if (x.backing) |b| visitor.visit(MapBackingRef{ .cell = b });
             },
             .Set => |x| {
                 visitor.visit(x.items);
-                if (x.backing) |b| visitor.visit(b);
+                if (x.backing) |b| visitor.visit(MapBackingRef{ .cell = b });
             },
             .Array => |x| visitor.visit(x.items),
             .Map => |x| visitor.visit(x.entries),
@@ -764,11 +768,11 @@ pub const Value = union(enum) {
                 releaseValueList(x.items, allocator);
                 // Drop the view's owned `MapBacking` cell (the borrowed entries
                 // it points at are owned by the source map, not released here).
-                if (x.backing) |b| b.deinit();
+                if (x.backing) |b| (MapBackingRef{ .cell = b }).deinit();
             },
             .Set => |x| {
                 releaseValueList(x.items, allocator);
-                if (x.backing) |b| b.deinit();
+                if (x.backing) |b| (MapBackingRef{ .cell = b }).deinit();
             },
             .Array => |x| releaseValueList(x.items, allocator),
             .Map => |x| {

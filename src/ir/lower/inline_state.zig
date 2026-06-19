@@ -213,7 +213,18 @@ pub fn inlineAstById(id: u32) ?*const ast.Function {
 /// already-resolved fn pointer (from a prior `inlineAstById`/candidate
 /// lookup), so the reverse map already holds it.
 pub fn inlineIdByAst(f: *const ast.Function) ?u32 {
-    if (inline_id_by_fn) |*m| return m.get(@intFromPtr(f));
+    if (inline_id_by_fn) |*m| {
+        if (m.get(@intFromPtr(f))) |id| return id;
+    }
+    // Miss: `f` was resolved by name (not through `inlineAstById`). Only the
+    // resolve audit / strict mode (both off by default) calls this, so the
+    // one-time resolve of the id registry is acceptable here.
+    if (inline_fn_ids) |*m| {
+        var it = m.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.get() == f) return e.key_ptr.*;
+        }
+    }
     return null;
 }
 

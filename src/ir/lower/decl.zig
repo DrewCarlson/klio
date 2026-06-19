@@ -8,6 +8,8 @@ const ast = @import("ast");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
 const mod = @import("mod.zig");
+const runtime = @import("runtime");
+const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
 const FuncBuilder = build.FuncBuilder;
@@ -25,7 +27,7 @@ const StringFuncIdMap = std.StringHashMap(FuncId);
 
 /// File-scoped class registry: simple name → AST class. Threaded through
 /// the public lowering entry points so cross-class member lookups resolve.
-pub const FileClasses = std.StringHashMap(*const ast.Class);
+pub const FileClasses = std.StringHashMap(FF(ast.Class));
 
 /// Bind function parameters into the current scope. Each param is loaded
 /// into a fresh register via `Inst.LoadParam` so subsequent `Path { name }`
@@ -192,7 +194,7 @@ fn collectMembers(
     }
     for (c.supertypes) |*sup| {
         if (file_classes.get(sup.name.name)) |parent| {
-            try collectMembers(parent, file_classes, out, seen);
+            try collectMembers(parent.get(), file_classes, out, seen);
         }
     }
 }
@@ -573,7 +575,7 @@ fn collectRecvMembers(
     }
     for (c.supertypes) |*sup| {
         if (file_classes.get(sup.name.name)) |parent| {
-            try collectRecvMembers(parent, file_classes, out, seen);
+            try collectRecvMembers(parent.get(), file_classes, out, seen);
         }
     }
 }
@@ -595,7 +597,7 @@ pub fn lowerFunctionBody(
         if (file_classes.get(recv.name.name)) |parent_cls| {
             var seen = StringSet.init(a);
             defer seen.deinit();
-            try collectRecvMembers(parent_cls, file_classes, &members, &seen);
+            try collectRecvMembers(parent_cls.get(), file_classes, &members, &seen);
         }
         // The receiver type is usually declared in another file (a pack
         // declares the interface in one file and its extensions in

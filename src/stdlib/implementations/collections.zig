@@ -2247,8 +2247,8 @@ const MapViewRef = struct { items: ValueList, backing: *MapBacking };
 fn syncMapView(a: Allocator, receiver: Value) void {
     _ = a;
     const view: MapViewRef = switch (receiver) {
-        .Set => |s| if (s.backing) |b| .{ .items = s.items, .backing = &b.cell.data } else return,
-        .List => |l| if (l.backing) |b| .{ .items = l.items, .backing = &b.cell.data } else return,
+        .Set => |s| if (s.backing) |b| .{ .items = s.items, .backing = &b.data } else return,
+        .List => |l| if (l.backing) |b| .{ .items = l.items, .backing = &b.data } else return,
         else => return,
     };
     const items_g = view.items.borrow();
@@ -3879,7 +3879,7 @@ pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Keys });
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = true, .backing = backing } });
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = true, .backing = backing.cell } });
 }
 pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -3898,7 +3898,7 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Values });
-    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_class = null, .backing = backing } });
+    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_class = null, .backing = backing.cell } });
 }
 pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -3921,7 +3921,7 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Entries });
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = true, .backing = backing } });
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = true, .backing = backing.cell } });
 }
 pub fn coll_map_to_string(ctx: *CallCtx) Error!EvalResult {
     return collToString(ctx, "Map.toString");

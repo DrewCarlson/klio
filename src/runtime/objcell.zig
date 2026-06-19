@@ -418,7 +418,7 @@ pub const BorrowMutError = error{AlreadyBorrowed};
 pub fn ObjRef(comptime T: type) type {
     return struct {
         const Self = @This();
-        const Cell = ControlBlock(T);
+        pub const Cell = ControlBlock(T);
 
         cell: *Cell,
 

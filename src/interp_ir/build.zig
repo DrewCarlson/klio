@@ -330,7 +330,7 @@ const SpanContext = struct {
 const SpanStrMap = std.HashMap(Span, []const u8, SpanContext, std.hash_map.default_max_load_percentage);
 
 /// File-scoped class registry: simple name → AST class.
-const FileClasses = std.StringHashMap(*const ast.Class);
+const FileClasses = std.StringHashMap(FF(ast.Class));
 
 /// Lower a single file's declarations into an IR module.
 pub fn buildModule(allocator: Allocator, file: *const KotlinFile) Allocator.Error!BuiltModule {
@@ -726,7 +726,7 @@ fn collectClassMemberNamesInto(out: *StringSet, primary_params: []const ast.Clas
 fn collectHierarchyMethodNames(start: []const u8, by_name: *const FileClasses, out: *StringSet, seen: *StringSet) Allocator.Error!void {
     const gop = try seen.getOrPut(start);
     if (gop.found_existing) return;
-    const c = by_name.get(start) orelse return;
+    const c = (by_name.get(start) orelse return).get();
     for (c.members) |*m| {
         if (m.* == .Function) try out.put(m.Function.name.name, {});
     }
@@ -745,7 +745,7 @@ fn collectHierarchySuperNames(a: Allocator, c: *const ast.Class, by_name: *const
         if (gop.found_existing) continue;
         try out.append(a, nm);
         if (by_name.get(nm)) |parent| {
-            try collectHierarchySuperNames(a, parent, by_name, out, seen);
+            try collectHierarchySuperNames(a, parent.get(), by_name, out, seen);
         }
     }
 }
@@ -753,7 +753,7 @@ fn collectHierarchySuperNames(a: Allocator, c: *const ast.Class, by_name: *const
 fn collectHierarchyMemberNames(start: []const u8, by_name: *const FileClasses, out: *StringSet, seen: *StringSet) Allocator.Error!void {
     const gop = try seen.getOrPut(start);
     if (gop.found_existing) return;
-    const c = by_name.get(start) orelse return;
+    const c = (by_name.get(start) orelse return).get();
     for (c.primary_params) |*p| {
         if (p.property != null) try out.put(p.name.name, {});
     }
@@ -1141,12 +1141,16 @@ fn buildModuleWithOverrides(
     var file_classes = FileClasses.init(a);
     defer file_classes.deinit();
     if (base) |bs| {
-        for (bs.lifted_decls) |*d| {
-            if (d.* == .Class) try file_classes.put(d.Class.name.name, &d.Class);
+        if (bs.file_classes.len != 0) {
+            for (bs.file_classes) |kv| try file_classes.put(kv.k, FF(ast.Class).fromRef(kv.v));
+        } else {
+            for (bs.lifted_decls) |*d| {
+                if (d.* == .Class) try file_classes.put(d.Class.name.name, FF(ast.Class).fromPtr(&d.Class));
+            }
         }
     }
     for (decls) |*d| {
-        if (d.* == .Class) try file_classes.put(d.Class.name.name, &d.Class);
+        if (d.* == .Class) try file_classes.put(d.Class.name.name, FF(ast.Class).fromPtr(&d.Class));
     }
 
     // Collect class / companion / top-level `const val name = <literal>`.
@@ -1202,7 +1206,7 @@ fn buildModuleWithOverrides(
             var seen = StringSet.init(a);
             defer seen.deinit();
             try seen.put(e.key_ptr.*, {});
-            try collectHierarchySuperNames(a, e.value_ptr.*, &file_classes, &chain, &seen);
+            try collectHierarchySuperNames(a, e.value_ptr.get(), &file_classes, &chain, &seen);
             try module.registry.class_super_names.put(e.key_ptr.*, try chain.toOwnedSlice(a));
         }
     }
@@ -1313,10 +1317,23 @@ fn buildModuleWithOverrides(
     {
         var top_props = StringSet.init(tl);
         if (base) |bs| {
-            for (bs.lifted_decls) |*d| {
-                if (d.* == .Property and d.Property.receiver_type == null) {
-                    try top_props.put(d.Property.name.name, {});
-                    try notePropScope(a, module, func_fqn_overrides, decl_pkg, package_prefix, d.Property);
+            if (bs.top_props.len != 0) {
+                for (bs.top_props) |tp| {
+                    try top_props.put(tp.name, {});
+                    const gop = try module.registry.top_level_prop_pkgs.getOrPut(tp.name);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    var dup = false;
+                    for (gop.value_ptr.items) |existing| {
+                        if (std.mem.eql(u8, existing.fqn, tp.fqn)) dup = true;
+                    }
+                    if (!dup) try gop.value_ptr.append(a, .{ .fqn = tp.fqn, .package = tp.package });
+                }
+            } else {
+                for (bs.lifted_decls) |*d| {
+                    if (d.* == .Property and d.Property.receiver_type == null) {
+                        try top_props.put(d.Property.name.name, {});
+                        try notePropScope(a, module, func_fqn_overrides, decl_pkg, package_prefix, d.Property);
+                    }
                 }
             }
         }
@@ -2701,6 +2718,15 @@ pub const StdlibBase = struct {
     /// own decls); populated only when loaded from an image. Includes class /
     /// object member inline fns, which carry no `inline_ids` stub.
     inline_by_name: []const InlineNames = &.{},
+    /// Class simple-name -> base class forest ref, the lazy replacement for
+    /// walking `lifted_decls` to seed `file_classes` at load. Empty for a
+    /// freshly-built base. Used for hierarchy walks when a USER class reaches
+    /// into a base class.
+    file_classes: []const ClassRef = &.{},
+    /// Base top-level (file-scope) property scope data — the lazy replacement for
+    /// re-running `notePropScope` over `lifted_decls` at load. Empty for a
+    /// freshly-built base. Strings only (no AST).
+    top_props: []const TopProp = &.{},
     /// Base SourceMap files occupy ids [0..user_file_start).
     user_file_start: u32,
     /// Next enum-entry identity, continuing the base build's sequence so
@@ -2726,6 +2752,10 @@ pub const StdlibBase = struct {
     pub const InlineId = struct { id: u32, f: FF(ast.Function) };
     /// One simple name's base inline-fn forest refs (overloads in order).
     pub const InlineNames = struct { k: []const u8, v: []const runtime.forest.ForestRef };
+    /// One class simple name -> its base-class forest ref.
+    pub const ClassRef = struct { k: []const u8, v: runtime.forest.ForestRef };
+    /// One base top-level property's scope identity.
+    pub const TopProp = struct { name: []const u8, fqn: []const u8, package: []const u8 };
 };
 
 /// Build the dependency snapshot from already-parsed base files. The
