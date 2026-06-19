@@ -747,6 +747,9 @@ const ImageRoot = struct {
     param_type_names: []const []const u8,
     type_names: []const []const u8,
     inline_ids: []InlineIdImage,
+    /// Simple-name -> base inline-fn forest refs, the lazy replacement for the
+    /// load-time `collectInline` walk over `lifted_decls`.
+    inline_by_name: []InlineNamesImage = &.{},
     enum_id_next: u64,
     /// CLI replay data: packages registered while loading the dependency
     /// sources and the host-binding FQNs installed alongside them.
@@ -866,6 +869,7 @@ fn funcRefsAst(func: *const ir.Func) bool {
 }
 
 const InlineIdImage = struct { id: u32, f: FF(ast.Function) };
+const InlineNamesImage = struct { k: []const u8, v: []const runtime.forest.ForestRef };
 
 // -------------------------------------------------------------------------
 // Bake: StdlibBase -> bytes
@@ -967,6 +971,32 @@ pub fn bake(
         }
         root.lifted_decl_section = decl_enc.out.items;
         root.lifted_decl_offsets = offsets;
+    }
+
+    // Bake the base inline-fn name index as forest refs, so load installs it
+    // without walking lifted_decls (the lazy replacement for collectInline).
+    {
+        var by_name = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(gpa);
+        defer {
+            var dit = by_name.valueIterator();
+            while (dit.next()) |v| v.deinit(gpa);
+            by_name.deinit();
+        }
+        for (root.lifted_decls) |*d| try build.collectInline(gpa, d, &by_name);
+        var list: std.ArrayList(InlineNamesImage) = .empty;
+        var it = by_name.iterator();
+        while (it.next()) |e| {
+            const refs = try a.alloc(runtime.forest.ForestRef, e.value_ptr.items.len);
+            var n: usize = 0;
+            for (e.value_ptr.items) |ff| {
+                if (forest_map.get(@intFromPtr(ff.get()))) |r| {
+                    refs[n] = r;
+                    n += 1;
+                }
+            }
+            if (n != 0) try list.append(a, .{ .k = e.key_ptr.*, .v = refs[0..n] });
+        }
+        root.inline_by_name = try list.toOwnedSlice(a);
     }
 
     var e = Encoder.init(gpa);
@@ -1672,6 +1702,13 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
                 ids[i] = .{ .id = entry.id, .f = entry.f };
             }
             break :blk ids;
+        },
+        .inline_by_name = blk: {
+            const out = try a.alloc(StdlibBase.InlineNames, root.inline_by_name.len);
+            for (root.inline_by_name, 0..) |entry, i| {
+                out[i] = .{ .k = entry.k, .v = entry.v };
+            }
+            break :blk out;
         },
         .user_file_start = @intCast(root.files.len),
         .enum_id_next = root.enum_id_next,

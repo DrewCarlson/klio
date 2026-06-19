@@ -75,7 +75,12 @@ pub const CallShape = struct {
 /// Non-suspend inline fns keep the normal call path and klio's
 /// frame-kind non-local-return mechanism, so the inline blast radius
 /// stays minimal.
-threadlocal var inline_fn_asts: ?std.StringHashMap([]const *const ast.Function) = null;
+threadlocal var inline_fn_asts: ?std.StringHashMap([]const FnField) = null;
+
+/// Lazy per-name cache of `inline_fn_asts` candidates resolved to plain
+/// pointers, so the picking logic stays pointer-based and a name's forest decls
+/// decode only on first lookup of that name.
+threadlocal var inline_fn_asts_resolved: ?std.StringHashMap([]const *const ast.Function) = null;
 
 /// Function-typed `typealias` tags by alias name (`RoutingHandler` ->
 /// `"Function0"`), borrowed from `module.registry.type_aliases`. Lets the
@@ -156,9 +161,11 @@ pub fn isTopLevelProp(name: []const u8) bool {
 /// value-param one by the trailing-arg shape. Takes ownership of `m`.
 /// Also drops the previous build's `FuncId`-keyed entries; the driver
 /// re-registers them while emitting the new build's header stubs.
-pub fn setInlineFnAsts(m: std.StringHashMap([]const *const ast.Function)) void {
+pub fn setInlineFnAsts(m: std.StringHashMap([]const FnField)) void {
     if (inline_fn_asts) |*old| old.deinit();
     inline_fn_asts = m;
+    if (inline_fn_asts_resolved) |*old| old.deinit();
+    inline_fn_asts_resolved = null;
     if (inline_fn_ids) |*old| old.deinit();
     inline_fn_ids = null;
     if (inline_id_by_fn) |*old| old.deinit();
@@ -230,8 +237,22 @@ fn isShadowed(name: []const u8) bool {
 }
 
 fn candidatesFor(name: []const u8) ?[]const *const ast.Function {
-    if (inline_fn_asts) |*c| return c.get(name);
-    return null;
+    if (inline_fn_asts_resolved) |*r| {
+        if (r.get(name)) |cached| return cached;
+    }
+    const fields = (if (inline_fn_asts) |*c| c.get(name) else null) orelse return null;
+    // Resolve this name's candidates once (decoding only their forest decls) and
+    // cache the pointer slice; the picking logic stays pointer-based. Also record
+    // the reverse fn-addr -> id map entries via inlineAstById-style population is
+    // not needed here (ids come from the id registry).
+    const a = std.heap.page_allocator;
+    const resolved = a.alloc(*const ast.Function, fields.len) catch return null;
+    for (fields, 0..) |ff, i| resolved[i] = ff.get();
+    if (inline_fn_asts_resolved == null) {
+        inline_fn_asts_resolved = std.StringHashMap([]const *const ast.Function).init(a);
+    }
+    inline_fn_asts_resolved.?.put(name, resolved) catch return resolved;
+    return resolved;
 }
 
 pub fn inlineFnAst(name: []const u8) ?*const ast.Function {
@@ -507,9 +528,17 @@ pub fn resetForTest() void {
         m.deinit();
         inline_fn_asts = null;
     }
+    if (inline_fn_asts_resolved) |*m| {
+        m.deinit();
+        inline_fn_asts_resolved = null;
+    }
     if (inline_fn_ids) |*m| {
         m.deinit();
         inline_fn_ids = null;
+    }
+    if (inline_id_by_fn) |*m| {
+        m.deinit();
+        inline_id_by_fn = null;
     }
     if (shadowed_inline_names) |*s| {
         s.deinit();
@@ -554,12 +583,12 @@ test "shadowed name suppresses inline lookup" {
 test "inline fn ids register, look up, and reset with the table" {
     defer resetForTest();
     var f: ast.Function = undefined;
-    try registerInlineFnId(7, &f);
+    try registerInlineFnId(7, FnField.fromPtr(&f));
     try testing.expect(inlineAstById(7) == @as(?*const ast.Function, &f));
     try testing.expect(inlineAstById(8) == null);
     // Installing the next build's simple-name table drops the previous
     // build's FuncId entries.
-    setInlineFnAsts(std.StringHashMap([]const *const ast.Function).init(testing.allocator));
+    setInlineFnAsts(std.StringHashMap([]const FnField).init(testing.allocator));
     try testing.expect(inlineAstById(7) == null);
 }
 

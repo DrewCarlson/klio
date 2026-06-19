@@ -1254,14 +1254,24 @@ fn buildModuleWithOverrides(
     // arena reclaims them and no growing leak accumulates.
     const tl = std.heap.page_allocator;
     {
-        var inline_fns = std.StringHashMap(std.ArrayList(*const ast.Function)).init(a);
+        var inline_fns = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(a);
         // Base inline fns first, preserving the whole-program declaration
-        // order of each overload list (base decls precede user decls).
+        // order of each overload list (base decls precede user decls). A loaded
+        // base carries the lazy `inline_by_name` refs (its `lifted_decls` may be
+        // empty); a freshly-built base walks its decls.
         if (base) |bs| {
-            for (bs.lifted_decls) |*d| try collectInline(a, d, &inline_fns);
+            if (bs.inline_by_name.len != 0) {
+                for (bs.inline_by_name) |kv| {
+                    const gop = try inline_fns.getOrPut(kv.k);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    for (kv.v) |r| try gop.value_ptr.append(a, FF(ast.Function).fromRef(r));
+                }
+            } else {
+                for (bs.lifted_decls) |*d| try collectInline(a, d, &inline_fns);
+            }
         }
         for (decls) |*d| try collectInline(a, d, &inline_fns);
-        var frozen = std.StringHashMap([]const *const ast.Function).init(tl);
+        var frozen = std.StringHashMap([]const FF(ast.Function)).init(tl);
         var it = inline_fns.iterator();
         while (it.next()) |e| {
             try frozen.put(e.key_ptr.*, try e.value_ptr.toOwnedSlice(a));
@@ -2322,12 +2332,12 @@ fn collectConsts(module: *Module, cls_name: []const u8, members: []const Decl) A
     }
 }
 
-fn collectInline(allocator: Allocator, d: *const Decl, out: *std.StringHashMap(std.ArrayList(*const ast.Function))) Allocator.Error!void {
+pub fn collectInline(allocator: Allocator, d: *const Decl, out: *std.StringHashMap(std.ArrayList(FF(ast.Function)))) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| if (f.is_inline and f.body != null) {
             const gop = try out.getOrPut(f.name.name);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(allocator, f);
+            try gop.value_ptr.append(allocator, FF(ast.Function).fromPtr(f));
         },
         .Class => |*c| for (c.members) |*m| try collectInline(allocator, m, out),
         .Object => |*o| for (o.members) |*m| try collectInline(allocator, m, out),
@@ -2685,6 +2695,12 @@ pub const StdlibBase = struct {
     /// (FuncId, AST) pairs replayed into the per-build inline-fn registry
     /// so user calls resolving to base inline fns still splice.
     inline_ids: []const InlineId,
+    /// Simple-name -> base inline-fn forest refs (overloads in declaration
+    /// order), the lazy replacement for walking `lifted_decls` with
+    /// `collectInline` at load. Empty for a freshly-built base (which walks its
+    /// own decls); populated only when loaded from an image. Includes class /
+    /// object member inline fns, which carry no `inline_ids` stub.
+    inline_by_name: []const InlineNames = &.{},
     /// Base SourceMap files occupy ids [0..user_file_start).
     user_file_start: u32,
     /// Next enum-entry identity, continuing the base build's sequence so
@@ -2708,6 +2724,8 @@ pub const StdlibBase = struct {
     arena: Allocator = undefined,
 
     pub const InlineId = struct { id: u32, f: FF(ast.Function) };
+    /// One simple name's base inline-fn forest refs (overloads in order).
+    pub const InlineNames = struct { k: []const u8, v: []const runtime.forest.ForestRef };
 };
 
 /// Build the dependency snapshot from already-parsed base files. The
