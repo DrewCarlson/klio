@@ -52,14 +52,30 @@ raw host-temporary that the process arena used to reclaim for free:
   leaked one. Fixed by `makeListVL`/`makeSetVL`/`appendVL`, which copy once under
   the `ValueList` borrow with no dangling intermediate (31 call sites).
 
-The remaining residual is a long tail of **per-intrinsic scratch**: stdlib host
-ops that allocate transient buffers on the run allocator and rely on the arena
-to reclaim them (the arena-era pattern). Each leaks a small amount under gc on
-the request path it sits on. The server's steady creep after warmup is ~0.7 KB/
-request — three orders of magnitude under the original decode leak. Fully
-closing it is a stdlib-wide pass making every intrinsic free its scratch (gate
-on `freeScratch()`), a separate broad effort from these two tasks. Closure
-metadata and the closure side-table spine are bounded (`leaktrack` constant).
+A fqn-attributed leaktrack pass (`KLIO_LEAK_BY_FQN`, `reportByFqn`) then named
+the per-intrinsic scratch leaks directly — each takes a snapshot/dupe scratch
+array, copies or reads it, and orphans the spine. Fixed `MutableList.addAll`,
+`List.last`, `ByteArray.copyInto`, `List.sumOf` (free the scratch on exit).
+
+Server RSS, gc, mixed load, steady slope after warmup:
+
+| | decode memo only | + collections/intrinsic fixes |
+|---|---|---|
+| per-request creep | ~7.5 KB/req | ~0.4 KB/req |
+
+The residual ~0.4 KB/request has no single dominant source: the intrinsics,
+coroutine suspend/resume, member dispatch, closure invoke, serve loop and string
+concat are all audited clean or fixed. What remains is a diffuse floor (many
+sub-100-byte allocations plus slab high-water), three orders of magnitude under
+the original decode leak.
+
+## gc is the default
+
+With both blockers closed and the per-request leak down ~2700×, the tracing GC
+is now the **unset default** (`allocChoice()` returns `.gc`). The full suite
+passes under gc-default. `KLIO_RECLAIM=arena|smp|debug` stay selectable. gc is
+the only mode that bounds memory for a long-running process, so it is the right
+universal default; a basic program is ~42 MB (vs 47.5 MB arena).
 
 ## gc-as-default blocker (FIXED: coroutine GC-root completeness)
 
