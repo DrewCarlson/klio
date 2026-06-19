@@ -620,6 +620,7 @@ pub fn coll_iter_sum_of(ctx: *CallCtx) Error!EvalResult {
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var acc_int: ?i64 = 0;
     var acc_dbl: ?f64 = null;
@@ -1940,6 +1941,9 @@ fn listLastImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    // `iterableItems` returns a scratch snapshot/array; the returned element is
+    // copied out, so free the snapshot spine on exit.
+    defer if (runtime.freeScratch()) a.free(items);
     if (ctx.args.len >= 2) {
         const block = ctx.args[1];
         var i = items.len;
@@ -4373,6 +4377,9 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
             return typeErr(try fmt(a, "addAll requires a collection, got {s}", .{ad}));
         },
     }
+    // `to_add` is a shallow `snapshotItems` dupe; `appendSlice` copies its
+    // elements into the list, so the dupe spine is scratch — free it on exit.
+    defer if (runtime.freeScratch()) a.free(to_add);
     const changed = to_add.len != 0;
     const g = it.borrowMut();
     defer g.deinit();
@@ -5069,6 +5076,8 @@ pub fn array_copy_into(ctx: *CallCtx) Error!EvalResult {
         defer g.deinit();
         break :blk try a.dupe(Value, g.get().items[@intCast(start)..@intCast(end)]);
     };
+    // The dupe bridges src->dest under separate borrows; free the spine on exit.
+    defer if (runtime.freeScratch()) a.free(slice);
     {
         const g = dest.borrowMut();
         defer g.deinit();

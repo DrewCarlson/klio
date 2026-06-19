@@ -161,7 +161,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 // uncollected (not leaked) are freed before the report; what
                 // remains outstanding is the genuine raw host-temporary leak.
                 runtime.gc.collect();
-                runtime.leaktrack.report();
+                if (runtime.getenvSlice("KLIO_LEAK_BY_FQN")) |_|
+                    runtime.leaktrack.reportByFqn()
+                else
+                    runtime.leaktrack.report();
                 return rc;
             }
             if (runtime.getenvSlice("KLIO_SLAB_TRACE")) |_| {
