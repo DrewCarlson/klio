@@ -388,21 +388,26 @@ eval-level tail (see Phase 1 residual) chased to zero.
       `bodyless_func_ids` list (base) + user bodyless funcs. ~150-200 lines across
       image/ir/interp_ir; touches dispatch (resolved_native/redirect) so validate
       with full suite + ktor e2e + cross-mode. Payoff ~5 MB ktor (-> ~86).
-      **Phase B was IMPLEMENTED end-to-end then REVERTED (uncommitted) — it hit a
-      subtle lazy-decode bug.** Definitive isolation: with the per-func header
-      decode DISABLED at load (funcs kept eager, `base_n=0`) every program runs
-      correctly, so the routing + the link rewrite (resolved_native via bindings,
-      redirect via baked bodyless-ids, all counts matched) are SOUND. With the
-      lazy per-func header decode ON, `1.toString()` dispatches to the wrong func
-      (func id 0, a `.first`-reading toString) -> "get_field `first` on Unit",
-      broadly, on every program. funcById returned the requested id with matching
-      `.id`/name/params/deferred_offset, and bodies materialised (no empty-blocks),
-      yet the dispatched func differs from the eager path — i.e. the per-func
-      self-contained header encode/decode (or its interaction with the
-      method/name dispatch picking a func by id) yields a wrong func for some ids.
-      Root-causing needs byte-level eager-vs-lazy func compare — a dedicated
-      debugging pass, not safe auto-loop work; reverted to keep the tree green.
-      The ~70 func-lookup-site conversion + the link cascade are written and known.
+      **Phase B was IMPLEMENTED end-to-end then REVERTED — root cause now pinned to
+      the LINK layer, NOT the decode.** Symptom: with the flip on, `1.toString()`
+      dispatched to the wrong func (id 0, a `.first`-reading toString) ->
+      "get_field `first` on Unit" broadly. Isolation: disabling the lazy path
+      (`base_n=0`, funcs eager) fixed everything. CORRECTED analysis: the per-func
+      header has no AST refs, so its self-contained encode produces BYTE-IDENTICAL
+      bytes to the global encode -> the decode is sound (funcById returned correct
+      id/name/params/deferred_offset, bodies materialised). The bug is that the
+      load-time LINK (`linkResolvedForms`, interp_ir.zig:281/294) inherently needs
+      per-func info, and the lazy rewrite (`resolved_native` via binding-iteration,
+      `resolved_redirect` via baked bodyless-ids) is SUBTLY NON-EQUIVALENT to the
+      eager func-sweep — a native/redirect that the eager sweep set is missed, so a
+      call falls through to the wrong same-name func. The CORRECT fix is to BAKE the
+      link results for base funcs (resolved_native as func_id -> intrinsic-registry
+      INDEX, resolved_redirect as func_id -> []func_id) at bake time where funcs
+      are eager + the stdlib default bindings are known, install them at load, and
+      have the link compute only USER funcs + the user binding overlay. So lazy
+      func headers cascades into baking the link layer too (the deepest cascade).
+      Per-func sections + delegation + ~70 sites are written/known; the link-result
+      baking is the remaining (and the load-bearing) piece. Reverted to keep green.
 - [ ] (old framing) `Module.funcById`/`funcCount` choke point added
       (eager today; lazy fields `func_header_section/offsets/decode/cache` in
       place); all ir.zig func-by-id reads route through it. **The lazy flip is NOT
