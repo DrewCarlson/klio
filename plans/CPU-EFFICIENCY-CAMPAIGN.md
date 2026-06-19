@@ -31,11 +31,17 @@ magnitude and localized to specific interpreter paths, not raw loop speed.
   with the entries cell (shared across `Value.Map` copies), preserving
   LinkedHashMap insertion order.
 - **F3 — core per-instruction dispatch is a heavy constant factor.** A pure
-  `while (i<n){ s+=i; i++ }` at 10M = 8.8 s (~880 ns/iter, ~150-200 ns per IR
+  `while (i<n){ s+=i; i++ }` at 10M = ~9-10 s (~900 ns/iter, ~150-200 ns per IR
   instruction) — ~15x slower than CPython on the same loop, ~170x slower than V8.
-  Suspect: `execInst` returns a 72-byte `EvalResult` by value per instruction +
-  large switch + 64-byte `Value` copies through `frame.read`/`write`. Lower
-  priority than F2 (algorithmic) but broadly applicable.
+  Reordering the `BinOp` prong to fast-path two plain scalars straight to
+  `applyBinop` (skipping the ~6 operator-overload/collection/concat checks) was
+  MEASURED to be neutral-to-slightly-negative — the cost is not the BinOp branch
+  count but the per-instruction machinery itself: `execInst` returns a 72-byte
+  `EvalResult` by value per instruction, the big `switch (inst.*)`, and 64-byte
+  `Value` copies through `frame.read`/`write`. A real win needs a dispatch-loop
+  rework (shrink/elide the per-inst return value, inline the hottest prongs into
+  `runFrameInner`, possibly a narrower `Value`), not local prong tweaks. Deferred:
+  larger, GC/ownership-sensitive surgery.
 
 ## Baseline comparison (ReleaseFast klio, warm; node 20; cpython 3.14)
 
