@@ -531,10 +531,10 @@ fn mmapImage(path: []const u8) ?[]const u8 {
     const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY });
     if (fd < 0) return null;
     defer _ = std.c.close(fd);
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return null;
-    if (st.size <= 0) return null;
-    const len: usize = @intCast(st.size);
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end <= 0) return null;
+    _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
+    const len: usize = @intCast(end);
     const mapped = std.posix.mmap(
         null,
         len,
