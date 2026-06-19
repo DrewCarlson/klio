@@ -865,7 +865,7 @@ fn funcRefsAst(func: *const ir.Func) bool {
     return false;
 }
 
-const InlineIdImage = struct { id: u32, f: *const ast.Function };
+const InlineIdImage = struct { id: u32, f: FF(ast.Function) };
 
 // -------------------------------------------------------------------------
 // Bake: StdlibBase -> bytes

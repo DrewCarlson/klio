@@ -1477,7 +1477,7 @@ fn buildModuleWithOverrides(
             // bare call the symbol index resolves to this declaration
             // splices exactly this declaration.
             if (f.is_inline and f.body != null) {
-                try ir.lower.registerInlineFnId(id.int(), f);
+                try ir.lower.registerInlineFnId(id.int(), FF(ast.Function).fromPtr(f));
             }
             try stub_ids.append(a, id);
         }
@@ -2707,7 +2707,7 @@ pub const StdlibBase = struct {
     /// it is decoded here, not into a per-build arena.
     arena: Allocator = undefined,
 
-    pub const InlineId = struct { id: u32, f: *const ast.Function };
+    pub const InlineId = struct { id: u32, f: FF(ast.Function) };
 };
 
 /// Build the dependency snapshot from already-parsed base files. The
@@ -2764,7 +2764,7 @@ pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocato
             for (f.params) |*p| try base.param_type_names.put(p.ty.name, {});
             if (f.is_inline) {
                 if (ir.lower.inline_state.inlineAstById(f.id.int())) |fn_ast| {
-                    try inline_ids.append(allocator, .{ .id = f.id.int(), .f = fn_ast });
+                    try inline_ids.append(allocator, .{ .id = f.id.int(), .f = FF(ast.Function).fromPtr(fn_ast) });
                 }
             }
         }
