@@ -606,6 +606,7 @@ pub fn coll_iter_filter_not_null(ctx: *CallCtx) Error!EvalResult {
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     var result: std.ArrayList(Value) = .empty;
     for (items) |v| {
         if (v != .Null) try result.append(a, v);
@@ -660,6 +661,7 @@ fn iterMaxMinOfOrNull(ctx: *CallCtx, want_max: bool, what: []const u8) Error!Eva
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var best: ?Value = null;
     for (items) |v| {
@@ -696,6 +698,7 @@ pub fn coll_iter_distinct_by(ctx: *CallCtx) Error!EvalResult {
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var keys: std.ArrayList(Value) = .empty;
     var result: std.ArrayList(Value) = .empty;
@@ -719,6 +722,7 @@ pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     const Group = struct { key: Value, vs: std.ArrayList(Value) };
     var groups: std.ArrayList(Group) = .empty;
@@ -755,6 +759,7 @@ pub fn coll_iter_grouping_by(ctx: *CallCtx) Error!EvalResult {
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     const id = ctx.host.allocInstanceId();
     const src = try makeList(a, items, false);
@@ -890,6 +895,7 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var entries: std.ArrayList(MapPair) = .empty;
     for (items) |v| {
@@ -930,6 +936,7 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var entries: std.ArrayList(MapPair) = .empty;
     for (items) |v| {
@@ -960,6 +967,7 @@ pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var entries: std.ArrayList(MapPair) = .empty;
     for (items) |v| {
@@ -1020,6 +1028,7 @@ fn iterSortedByImpl(ctx: *CallCtx, descending: bool, what: []const u8) Error!Eva
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     if (try sortByKeyInsertion(ctx, items, block, descending)) |e| return e;
     return ok(try makeList(a, items, false));
@@ -1040,6 +1049,7 @@ fn iterMaxMinByImpl(ctx: *CallCtx, descending: bool, what: []const u8) Error!Eva
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) return ok(Value.Null);
     const block = ctx.args[1];
     var best_key = switch (try invoke(ctx, &block, &.{items[0]})) {
@@ -1231,6 +1241,7 @@ fn iterExtreme(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var best: ?Value = null;
     for (items) |v| {
@@ -1267,6 +1278,7 @@ pub fn coll_iter_on_each(ctx: *CallCtx) Error!EvalResult {
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     for (items) |v| {
         switch (try invoke(ctx, &block, &.{v})) {
@@ -1284,6 +1296,7 @@ pub fn coll_iter_map_not_null(ctx: *CallCtx) Error!EvalResult {
         .items => |xs| xs,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var result: std.ArrayList(Value) = .empty;
     for (items) |v| {
@@ -1857,6 +1870,7 @@ pub fn coll_iter_index_of_first(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     if (ctx.args.len < 2) return arityErr("indexOfFirst requires a block");
     const block = ctx.args[1];
     for (items, 0..) |v, i| {
@@ -1874,6 +1888,7 @@ pub fn coll_iter_index_of_last(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     if (ctx.args.len < 2) return arityErr("indexOfLast requires a block");
     const block = ctx.args[1];
     var found: i64 = -1;
@@ -1892,6 +1907,7 @@ pub fn coll_list_fold_right(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     if (ctx.args.len < 2) return arityErr("foldRight requires an initial value");
     var acc = ctx.args[1];
     if (ctx.args.len < 3) return arityErr("foldRight requires a block");
@@ -1912,6 +1928,7 @@ fn reduceRightImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     if (ctx.args.len < 2) return arityErr("reduceRight requires a block");
     const block = ctx.args[1];
     if (items.len == 0) {
@@ -2070,6 +2087,7 @@ pub fn coll_list_join_to_string(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     return joinToStringImpl(ctx, items, true);
 }
 
@@ -2080,6 +2098,7 @@ pub fn coll_array_join_to_string(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     return joinToStringImpl(ctx, items, false);
 }
 
@@ -3209,6 +3228,7 @@ pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
                 .items => |x| x,
                 .err => |e| return e,
             };
+    defer if (runtime.freeScratch()) a.free(xs);
             try out.appendSlice(a, xs);
         },
         else => try out.append(a, arg),
@@ -3233,6 +3253,7 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
                 .items => |x| x,
                 .err => |e| return e,
             };
+    defer if (runtime.freeScratch()) a.free(xs);
             try removals.appendSlice(a, xs);
         },
         else => try removals.append(a, arg),
@@ -4355,6 +4376,7 @@ pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     return ok(try withIndexImpl(a, items));
 }
 
@@ -4628,6 +4650,7 @@ pub fn coll_map_count_no_pred(ctx: *CallCtx) Error!EvalResult {
             .items => |x| x,
             .err => |e| return e,
         };
+    defer if (runtime.freeScratch()) a.free(items);
         const block = ctx.args[1];
         var n: i64 = 0;
         for (items) |v| {
@@ -4792,10 +4815,12 @@ pub fn array_content_equals(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(xa);
     const xb = switch (try iterableItems(a, other, "contentEquals")) {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(xb);
     if (xa.len != xb.len) return ok(.{ .Bool = false });
     for (xa, xb) |*x, *y| {
         if (!eqBoxed(x, y)) return ok(.{ .Bool = false });
@@ -4812,6 +4837,7 @@ pub fn array_content_to_string(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     var out: std.ArrayList(u8) = .empty;
     try out.append(a, '[');
     for (items, 0..) |v, i| {
@@ -4892,6 +4918,7 @@ pub fn array_content_hash_code(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     var result: i32 = 1;
     for (items) |e| {
         result = result *% 31 +% kotlinValueHash(e);
@@ -4989,6 +5016,7 @@ pub fn array_element_at(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const index = switch (try arrayOptIndex(a, ctx, 1, -1, "elementAt")) {
         .idx => |v| v,
         .err => |e| return e,
@@ -5011,6 +5039,7 @@ pub fn array_plus(ctx: *CallCtx) Error!EvalResult {
             .items => |x| x,
             .err => |e| return e,
         };
+    defer if (runtime.freeScratch()) a.free(xs);
         try items.appendSlice(a, xs);
     }
     switch (other) {
@@ -5019,6 +5048,7 @@ pub fn array_plus(ctx: *CallCtx) Error!EvalResult {
                 .items => |x| x,
                 .err => |e| return e,
             };
+    defer if (runtime.freeScratch()) a.free(xs);
             try items.appendSlice(a, xs);
         },
         else => try items.append(a, other),
@@ -5037,6 +5067,7 @@ pub fn array_plus_element(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(xs);
     try items.appendSlice(a, xs);
     try items.append(a, other);
     return ok(try makeArrayBorrowed(a, items, arrayPrimOf(recv)));
@@ -5234,6 +5265,7 @@ fn arraySumImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     var int_acc: i64 = 0;
     var dbl_acc: f64 = 0.0;
     var as_double = false;
@@ -5272,6 +5304,7 @@ pub fn array_average_impl(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) return ok(.{ .Double = std.math.nan(f64) });
     var acc: f64 = 0.0;
     for (items) |v| {
@@ -5292,6 +5325,7 @@ fn arrayMaxMinImpl(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalRe
         .items => |x| x,
         .err => |e| return e,
     };
+    defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) {
         const msg = try fmt(a, "{s}: empty", .{what});
         const e = try thrown(a, "kotlin.NoSuchElementException", msg);
