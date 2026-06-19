@@ -24,6 +24,7 @@ const ValueList = runtime.ValueList;
 const MapEntries = runtime.MapEntries;
 const MapPair = runtime.MapPair;
 const MapBacking = runtime.MapBacking;
+const MapBackingRef = runtime.MapBackingRef;
 const MapViewKind = runtime.MapViewKind;
 const PrimitiveArrayKind = runtime.PrimitiveArrayKind;
 const RangeKind = runtime.RangeKind;
@@ -2246,8 +2247,8 @@ const MapViewRef = struct { items: ValueList, backing: *MapBacking };
 fn syncMapView(a: Allocator, receiver: Value) void {
     _ = a;
     const view: MapViewRef = switch (receiver) {
-        .Set => |s| if (s.backing) |b| .{ .items = s.items, .backing = b } else return,
-        .List => |l| if (l.backing) |b| .{ .items = l.items, .backing = b } else return,
+        .Set => |s| if (s.backing) |b| .{ .items = s.items, .backing = &b.cell.data } else return,
+        .List => |l| if (l.backing) |b| .{ .items = l.items, .backing = &b.cell.data } else return,
         else => return,
     };
     const items_g = view.items.borrow();
@@ -3877,8 +3878,7 @@ pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
             try keys.append(a, kv.key);
         }
     }
-    const backing = try a.create(MapBacking);
-    backing.* = .{ .entries = entries, .kind = .Keys };
+    const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Keys });
     return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = true, .backing = backing } });
 }
 pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
@@ -3897,8 +3897,7 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
             try values.append(a, kv.value);
         }
     }
-    const backing = try a.create(MapBacking);
-    backing.* = .{ .entries = entries, .kind = .Values };
+    const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Values });
     return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_class = null, .backing = backing } });
 }
 pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
@@ -3921,8 +3920,7 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
             } });
         }
     }
-    const backing = try a.create(MapBacking);
-    backing.* = .{ .entries = entries, .kind = .Entries };
+    const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Entries });
     return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = true, .backing = backing } });
 }
 pub fn coll_map_to_string(ctx: *CallCtx) Error!EvalResult {

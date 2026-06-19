@@ -68,6 +68,7 @@ pub const EvalResult = value_mod.EvalResult;
 pub const attachDeclaredElemTypes = value_mod.attachDeclaredElemTypes;
 pub const MapViewKind = value_mod.MapViewKind;
 pub const MapBacking = value_mod.MapBacking;
+pub const MapBackingRef = value_mod.MapBackingRef;
 pub const MapPair = value_mod.MapPair;
 pub const MapEntries = value_mod.MapEntries;
 pub const RangeKind = value_mod.RangeKind;
