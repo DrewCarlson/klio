@@ -2072,6 +2072,24 @@ fn prependReceiver(allocator: Allocator, receiver: *const Value, args: []const V
     return all;
 }
 
+/// Dispatch an intrinsic with the receiver prepended to `args`, using a stack
+/// buffer for the common small-arity case so a member call needs no heap
+/// allocation for its argument vector. The prepended slice never outlives the
+/// call (`dispatchIntrinsic` is synchronous and intrinsics read their args
+/// during the call — the heap path here freed it immediately too), so the stack
+/// buffer is exactly as safe. Falls back to the heap for large arities.
+fn dispatchWithReceiver(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, receiver: *const Value, args: []const Value) Allocator.Error!EvalResult {
+    var stackbuf: [16]Value = undefined;
+    if (args.len + 1 <= stackbuf.len) {
+        stackbuf[0] = receiver.*;
+        @memcpy(stackbuf[1 .. 1 + args.len], args);
+        return dispatchIntrinsic(self, allocator, fqn, func, stackbuf[0 .. 1 + args.len]);
+    }
+    const all_args = try prependReceiver(allocator, receiver, args);
+    defer if (runtime.freeScratch()) allocator.free(all_args);
+    return dispatchIntrinsic(self, allocator, fqn, func, all_args);
+}
+
 // -------------------------------------------------------------------------
 // `callMember` — the central dispatch.
 // -------------------------------------------------------------------------
@@ -4599,9 +4617,7 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
         };
         if (hit) |entry| {
             const func = entry.func orelse return null;
-            const all_args = try prependReceiver(allocator, receiver, args);
-            defer if (runtime.freeScratch()) allocator.free(all_args);
-            return try dispatchIntrinsic(self, allocator, entry.fqn, func, all_args);
+            return try dispatchWithReceiver(self, allocator, entry.fqn, func, receiver, args);
         }
         return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, key);
     }
@@ -4681,9 +4697,7 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
         for (probes[0..n]) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
                 if (cache_key) |key| memberCachePut(self, key, func, probe);
-                const all_args = try prependReceiver(allocator, receiver, args);
-                defer if (runtime.freeScratch()) allocator.free(all_args);
-                return try dispatchIntrinsic(self, allocator, probe, func, all_args);
+                return try dispatchWithReceiver(self, allocator, probe, func, receiver, args);
             }
         }
     }
