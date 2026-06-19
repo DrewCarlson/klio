@@ -13,6 +13,7 @@ const std = @import("std");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
+const FF = runtime.forest.ForestField;
 const ast = @import("ast");
 const span = @import("span");
 const stdlib = @import("stdlib");
@@ -2366,7 +2367,7 @@ fn buildClassDef(
         primary_params[i] = .{
             .property = p.property,
             .name = p.name.name,
-            .default = if (p.default) |*e| e else null,
+            .default = if (p.default) |*e| FF(ast.Expr).fromPtr(e) else null,
             .declared_type = p.ty.name.name,
             .declared_shape = try TypeShape.fromTypeRef(a, &p.ty),
         };
@@ -2378,10 +2379,10 @@ fn buildClassDef(
         try body_props.append(a, .{
             .name = p.name.name,
             .mutable = p.mutable,
-            .init = if (p.init) |*e| e else null,
-            .getter = if (p.getter) |g| g else null,
-            .setter = if (p.setter) |s| s else null,
-            .delegate = if (p.delegate) |e| e else null,
+            .init = if (p.init) |*e| FF(ast.Expr).fromPtr(e) else null,
+            .getter = if (p.getter) |g| FF(ast.Accessor).fromPtr(g) else null,
+            .setter = if (p.setter) |s| FF(ast.Accessor).fromPtr(s) else null,
+            .delegate = if (p.delegate) |e| FF(ast.Expr).fromPtr(e) else null,
             .is_abstract = p.is_abstract,
             .is_lateinit = p.is_lateinit,
             .primitive_zero = primitiveZeroFor(p),
@@ -2409,11 +2410,11 @@ fn buildClassDef(
         init_block_positions[i] = count;
     }
 
-    var init_blocks_ast = try a.alloc(*const ast.Block, c.init_blocks.len);
-    for (c.init_blocks, 0..) |*blk, i| init_blocks_ast[i] = blk;
+    var init_blocks_ast = try a.alloc(FF(ast.Block), c.init_blocks.len);
+    for (c.init_blocks, 0..) |*blk, i| init_blocks_ast[i] = FF(ast.Block).fromPtr(blk);
 
-    var secondary = try a.alloc(*const ast.SecondaryCtor, c.secondary_ctors.len);
-    for (c.secondary_ctors, 0..) |*sc, i| secondary[i] = sc;
+    var secondary = try a.alloc(FF(ast.SecondaryCtor), c.secondary_ctors.len);
+    for (c.secondary_ctors, 0..) |*sc, i| secondary[i] = FF(ast.SecondaryCtor).fromPtr(sc);
 
     var supertype_names = try a.alloc([]const u8, c.supertypes.len);
     var supertype_paths = try a.alloc(?[]const u8, c.supertypes.len);

@@ -13,6 +13,7 @@ const ast = @import("ast");
 
 const root = @import("../interp_ir.zig");
 const build = @import("../build.zig");
+const FF = runtime.forest.ForestField;
 const VmHost = @import("vmhost.zig").VmHost;
 
 const Allocator = std.mem.Allocator;
@@ -448,7 +449,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         primary_params[i] = .{
             .property = p.property,
             .name = p.name.name,
-            .default = if (p.default) |*e| e else null,
+            .default = if (p.default) |*e| FF(ast.Expr).fromPtr(e) else null,
             .declared_type = p.ty.name.name,
             .declared_shape = try TypeShape.fromTypeRef(allocator, &p.ty),
         };
@@ -460,10 +461,10 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         try body_props.append(allocator, .{
             .name = p.name.name,
             .mutable = p.mutable,
-            .init = if (p.init) |*e| e else null,
-            .getter = if (p.getter) |g| g else null,
-            .setter = if (p.setter) |s| s else null,
-            .delegate = if (p.delegate) |e| e else null,
+            .init = if (p.init) |*e| FF(ast.Expr).fromPtr(e) else null,
+            .getter = if (p.getter) |g| FF(ast.Accessor).fromPtr(g) else null,
+            .setter = if (p.setter) |s| FF(ast.Accessor).fromPtr(s) else null,
+            .delegate = if (p.delegate) |e| FF(ast.Expr).fromPtr(e) else null,
             .is_abstract = p.is_abstract,
             .is_lateinit = p.is_lateinit,
             .primitive_zero = build.primitiveZeroFor(p),

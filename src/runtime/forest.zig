@@ -30,6 +30,11 @@ pub fn ForestField(comptime T: type) type {
         ref: ForestRef,
 
         const Self = @This();
+        /// Marker + element type read by the image codec to encode/decode this
+        /// union as a forest reference (or an inline fallback) rather than via
+        /// the generic union path.
+        pub const is_forest_field = true;
+        pub const Child = T;
 
         pub fn fromPtr(p: *const T) Self {
             return .{ .ptr = p };
