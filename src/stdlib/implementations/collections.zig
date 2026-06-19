@@ -783,6 +783,7 @@ fn groupingParts(a: Allocator, v: Value) Error!GroupingParts {
         if (inst.get("__grouping_src")) |src| {
             if (src == .List) {
                 if (inst.get("__grouping_key")) |key| {
+                    // Escapes to the caller via `parts.items`; freed there.
                     const items = try snapshotItems(a, src.List.items);
                     return .{ .parts = .{ .items = items, .key = key } };
                 }
@@ -1110,6 +1111,7 @@ pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     const copy = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(copy);
     if (try sortValuesNatural(a, copy)) |e| return e;
     writeBackItems(it, a, copy) catch return error.OutOfMemory;
     return ok(Value.Unit);
@@ -1124,6 +1126,7 @@ pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len <= 1) return arityErr("sortWith expects (comparator)");
     const cmp = ctx.args[1];
     const copy = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(copy);
     // Insertion sort so the comparator callback can dispatch through host.
     var i: usize = 1;
     while (i < copy.len) : (i += 1) {
@@ -2942,6 +2945,7 @@ pub fn coll_list_reversed(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     const out = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(out);
     std.mem.reverse(Value, out);
     return ok(try makeList(a, out, false));
 }
@@ -3031,6 +3035,7 @@ pub fn coll_list_max_or_null(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) return ok(Value.Null);
     var best = items[0];
     for (items[1..]) |v| {
@@ -3050,6 +3055,7 @@ pub fn coll_list_min_or_null(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) return ok(Value.Null);
     var best = items[0];
     for (items[1..]) |v| {
@@ -3268,6 +3274,7 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     }
     var out: std.ArrayList(Value) = .empty;
     const src = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
         if (indexOfBoxed(removals.items, &v)) |pos| {
             _ = removals.orderedRemove(pos);
@@ -3295,6 +3302,7 @@ pub fn coll_list_chunked(ctx: *CallCtx) Error!EvalResult {
     const size: usize = @intCast(size_i);
     const transform: ?Value = if (ctx.args.len > 2 and ctx.args[2] != .Null) ctx.args[2] else null;
     const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
     var groups: std.ArrayList(Value) = .empty;
     var i: usize = 0;
     while (i < items.len) {
@@ -3337,6 +3345,7 @@ pub fn coll_list_windowed(ctx: *CallCtx) Error!EvalResult {
     }
     const partial_windows: bool = if (ctx.args.len <= 3) false else (if (ctx.args[3] == .Bool) ctx.args[3].Bool else return typeErr("windowed partialWindows must be Bool"));
     const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
     const size: usize = @intCast(size_i);
     const step: usize = @intCast(step_i);
     var out: std.ArrayList(Value) = .empty;
@@ -3363,6 +3372,7 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
     const rhs_val = ctx.args[1];
     const transform: ?Value = if (ctx.args.len > 2 and isZipTransform(ctx.args[2])) ctx.args[2] else null;
     var rhs: std.ArrayList(Value) = .empty;
+    defer if (runtime.freeScratch()) rhs.deinit(a);
     switch (rhs_val) {
         .List => |l| try appendVL(&rhs, a, l.items),
         .Set => |s| try appendVL(&rhs, a, s.items),
@@ -3377,6 +3387,7 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
         },
     }
     const lhs_items = try snapshotItems(a, lhs);
+    defer if (runtime.freeScratch()) a.free(lhs_items);
     var result: std.ArrayList(Value) = .empty;
     const n = @min(lhs_items.len, rhs.items.len);
     var i: usize = 0;
@@ -3458,6 +3469,7 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("minus requires an argument");
     const arg = ctx.args[1];
     var removals: std.ArrayList(Value) = .empty;
+    defer if (runtime.freeScratch()) removals.deinit(a);
     switch (arg) {
         .List => |l| try appendVL(&removals, a, l.items),
         .Set => |s| try appendVL(&removals, a, s.items),
@@ -3465,6 +3477,7 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     }
     var out: std.ArrayList(Value) = .empty;
     const src = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
         if (!containsBoxed(removals.items, &v)) try out.append(a, v);
     }
@@ -3486,6 +3499,7 @@ pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("intersect requires an argument");
     const arg = ctx.args[1];
     var other: std.ArrayList(Value) = .empty;
+    defer if (runtime.freeScratch()) other.deinit(a);
     switch (arg) {
         .List => |l| try appendVL(&other, a, l.items),
         .Set => |s| try appendVL(&other, a, s.items),
@@ -3493,6 +3507,7 @@ pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
     }
     var out: std.ArrayList(Value) = .empty;
     const src = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
         if (containsBoxed(other.items, &v)) try out.append(a, v);
     }
@@ -3542,6 +3557,7 @@ pub fn coll_set_sorted(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     const copy = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(copy);
     if (try sortValuesNatural(a, copy)) |e| return e;
     return ok(try makeList(a, copy, false));
 }
@@ -3550,6 +3566,7 @@ pub fn coll_set_sorted_descending(ctx: *CallCtx) Error!EvalResult {
     const v = try coll_set_sorted(ctx);
     if (v == .err) return v;
     const items = try snapshotItems(a, v.ok.List.items);
+    defer if (runtime.freeScratch()) a.free(items);
     std.mem.reverse(Value, items);
     return ok(try makeList(a, items, false));
 }
@@ -4281,6 +4298,7 @@ pub fn coll_list_flatten(ctx: *CallCtx) Error!EvalResult {
     };
     var out: std.ArrayList(Value) = .empty;
     const src = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
         switch (v) {
             .List => |l| try appendVL(&out, a, l.items),
@@ -4303,6 +4321,7 @@ pub fn coll_list_unzip(ctx: *CallCtx) Error!EvalResult {
     var firsts: std.ArrayList(Value) = .empty;
     var seconds: std.ArrayList(Value) = .empty;
     const src = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
         if (v != .Pair) return typeErr("unzip requires List<Pair<A, B>>");
         try firsts.append(a, v.Pair.first.asPtr().*);
@@ -5222,6 +5241,7 @@ pub fn array_sort(ctx: *CallCtx) Error!EvalResult {
         return indexOob(a, try fmt(a, "sort: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
     }
     const buf = try snapshotItems(a, items);
+    defer if (runtime.freeScratch()) a.free(buf);
     const sub = buf[@intCast(from)..@intCast(to)];
     if (try sortListHostAware(ctx, sub)) |e| return e;
     try writeBackItems(items, a, buf);
@@ -5247,6 +5267,7 @@ pub fn array_sort_with(ctx: *CallCtx) Error!EvalResult {
         return indexOob(a, try fmt(a, "sortWith: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
     }
     const buf = try snapshotItems(a, items);
+    defer if (runtime.freeScratch()) a.free(buf);
     const sub = buf[@intCast(from)..@intCast(to)];
     var i: usize = 1;
     while (i < sub.len) : (i += 1) {
