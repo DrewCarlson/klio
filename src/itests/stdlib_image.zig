@@ -550,11 +550,13 @@ test "bake/load round-trips the lowered base tables" {
     try std.testing.expectEqual(base.inline_ids.len, got.inline_ids.len);
     for (base.inline_ids, got.inline_ids) |x0, x1| {
         try std.testing.expectEqual(x0.id, x1.id);
-        try std.testing.expectEqualStrings(x0.f.name.name, x1.f.name.name);
+        try std.testing.expectEqualStrings(x0.f.get().name.name, x1.f.get().name.name);
     }
     try std.testing.expectEqual(base.enum_id_next, got.enum_id_next);
     try std.testing.expectEqual(base.user_file_start, got.user_file_start);
-    try std.testing.expectEqual(base.lifted_decls.len, got.lifted_decls.len);
+    // The loaded image drops the eager forest: decls decode lazily from the
+    // per-decl sections on first `ForestField.get()`, so `lifted_decls` is empty.
+    try std.testing.expectEqual(@as(usize, 0), got.lifted_decls.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.known_packages.len);
     try std.testing.expectEqualStrings("dep.lib", loaded.known_packages[0]);
     try std.testing.expectEqual(@as(usize, 1), loaded.binding_fqns.len);

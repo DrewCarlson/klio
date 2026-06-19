@@ -2150,7 +2150,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .RegisterClass => |rc| {
             const cap_values = try readRegSlice(allocator, frame, rc.captures);
             defer allocator.free(cap_values);
-            switch (try host.registerClassCaptured(allocator, rc.class, rc.captured_names, cap_values)) {
+            switch (try host.registerClassCaptured(allocator, rc.class.get(), rc.captured_names, cap_values)) {
                 .ok => {},
                 .err => |e| return errResult(e),
             }
@@ -2158,7 +2158,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .BuildObject => |bobj| {
             const cap_values = try readRegSlice(allocator, frame, bobj.captures);
             defer allocator.free(cap_values);
-            switch (try host.buildObject(allocator, bobj.ast, bobj.captured_names, cap_values, bobj.scope_renames)) {
+            switch (try host.buildObject(allocator, bobj.ast.get(), bobj.captured_names, cap_values, bobj.scope_renames)) {
                 .ok => |v| try frame.write(bobj.dst, v),
                 .err => |e| return errResult(e),
             }

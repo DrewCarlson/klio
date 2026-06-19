@@ -4,6 +4,8 @@
 const std = @import("std");
 const ast = @import("ast");
 const ir = @import("../ir.zig");
+const runtime = @import("runtime");
+const FF = runtime.forest.ForestField;
 const build = @import("../build.zig");
 
 const expr_mod = @import("expr.zig");
@@ -684,7 +686,7 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
     const captures = try b.allocator.alloc(Reg, captured_names.len);
     for (captured_names, captures) |n, *slot| slot.* = try resolveCapture(b, n);
     try b.push(.{ .RegisterClass = .{
-        .class = @constCast(c),
+        .class = FF(ast.Class).fromPtr(c),
         .captured_names = captured_names,
         .captures = captures,
     } });
