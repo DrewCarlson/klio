@@ -4,6 +4,23 @@ Goal: drive klio interpreter throughput up the same way the memory campaign drov
 RSS down — measure, attribute to a hot path, root-cause, fix, re-verify. No
 symptom hiding; match Kotlin semantics exactly.
 
+## THE big fix — `Value.release` ungated under GC (systemic O(n²))
+
+`Value.release` was NOT gated on `reclaimEnabled()` (unlike `retain`). Under the
+default tracing GC (reclaim off), it still ran refcount teardown: releasing a
+collection whose `strongCount` reads 1 (counts are never decremented under GC, so
+they read as their init value) walked and released EVERY element. Every member
+call releases its borrowed receiver (`CallMember` prong's deferred
+`recv.release`), so a call on an N-element list/map/set did O(N) work — `.add` in
+a loop was O(n²), `last()`/`first()` O(n) each. Found with a SIGPROF sampler
+(internal `clockMonotonicNanos` is useless for profiling — it spins up a
+`std.Io.Threaded` per call). Fix: gate `release` to a no-op under reclaim-off,
+the exact dual of `retain`. List build 5013→506 ms (60k); collections benchmark
+timeout→12.9 s. This was the dominant CPU bug for all default-mode programs.
+
+Lesson: under GC, `retain`/`release` must BOTH be no-ops. A one-sided gate turned
+every value drop into a deep O(size) walk.
+
 ## Baseline (ReleaseFast, warm image)
 
 - Empty `for i in 0 until 1_000_000 { s += i }` loop: **< 1 s**. Raw loop +
@@ -24,12 +41,18 @@ magnitude and localized to specific interpreter paths, not raw loop speed.
   Fix (`ir/eval.zig` `fastIndexGet`/`fastIndexSet`/`fastSubscript`): serve the
   in-bounds Int-index common case with a direct indexed load/store; fall through
   for every other shape. **1M array write+read: >90 s -> 3 s (~30x).**
-- **F2 — `Map` is a flat `ArrayList(MapPair)` with linear-scan lookup.** Every
-  `get`/`put`/`containsKey` is O(n) (`findKeyIndexBoxed`), so any map-heavy loop
-  is O(n²). collections (1000 keys, 1M ops) times out; strings (5000 keys, 500k
-  ops) takes 69 s. This is the next big lever — needs a hash index co-located
-  with the entries cell (shared across `Value.Map` copies), preserving
-  LinkedHashMap insertion order.
+- **F2 — `Map` linear-scan lookup. FIXED.** Was a flat `ArrayList(MapPair)`;
+  every `get`/`put`/`containsKey` O(n). `MapStore` now carries a chained hash
+  index over the keys (lazy above a small-map threshold, incremental on put,
+  rebuilt after removal; non-hashable keys fall back to scan), preserving
+  LinkedHashMap order. The hot lookups (`get`/`getOrPut`/`getOrElse`/
+  `getOrDefault`/`getValue`/`containsKey`/`put`) route through `MapStore.find`.
+  strings 69→8.4 s.
+- **F4 — `iterableItems` snapshots the whole list/set per call** (`snapshotItems`
+  = full `dupe`), used by ~39 ops (`last`, `first`, `map`, `filter`, `forEach`,
+  …). Makes O(1) ops O(n) and any such op in a loop O(n²). Fix pending: read
+  under borrow for the non-callback ops; only snapshot when a user callback runs
+  mid-iteration.
 - **F3 — core per-instruction dispatch is a heavy constant factor.** A pure
   `while (i<n){ s+=i; i++ }` at 10M = ~9-10 s (~900 ns/iter, ~150-200 ns per IR
   instruction) — ~15x slower than CPython on the same loop, ~170x slower than V8.
@@ -45,14 +68,16 @@ magnitude and localized to specific interpreter paths, not raw loop speed.
 
 ## Baseline comparison (ReleaseFast klio, warm; node 20; cpython 3.14)
 
-| workload | klio | node | python |
-|---|---|---|---|
-| numeric (10M sieve) | 16.5 s | 0.05 s | 1.2 s |
-| collections (1M group) | >180 s (timeout) | 0.06 s | 0.25 s |
-| strings (500k wordcount) | 69 s | 0.12 s | 0.19 s |
+| workload | klio start | klio now | node | python |
+|---|---|---|---|---|
+| numeric (10M sieve) | 16.5 s | 15.9 s | 0.05 s | 1.0 s |
+| collections (1M group) | >180 s (timeout) | 12.9 s | 0.06 s | 0.25 s |
+| strings (500k wordcount) | 69 s | 8.4 s | 0.12 s | 0.18 s |
 
-(numeric post-F1; all three produce byte-identical output.) Memory was tiny and
-flat for all three on these — the gap here is CPU, not RSS.
+(all three produce byte-identical output.) Memory tiny and flat — the gap is CPU.
+After F1 (array subscript) + F2 (map index) + the release-gate fix, collections
+and strings dropped 14–21×. numeric is now the worst relative gap (no maps/
+collections — pure loop + array), bound by the F3 per-instruction constant factor.
 
 ## Plan
 
