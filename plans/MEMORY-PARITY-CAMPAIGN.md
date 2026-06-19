@@ -47,14 +47,14 @@ fix is validated by a 200k-iter sawtooth that returns to baseline.
 
 - **Phase 1 — per-iteration leaks: DONE** (target 1 & 5). Committed. MapBacking
   residual also fixed this session.
-- **Phase 2 — bare runtime: 42 -> 30 MB** (ReleaseFast, warm). Lazy-forest flip +
-  beyond-forest step 1 (defer object/lambda func bodies). Near target 25; the
-  residual is the IR func headers + the runtime stdlib ClassDef graph + GC/binary
-  floor. Lazy func-headers (~1.5 MB) + lazy ClassDef would approach 25.
-- **Phase 3 — ktor startup: 124 -> 91 MB.** Same flips. Target 45 needs lazy
-  ClassDef: ktor's ~84 MB non-decode (eager decode is now only 7 MB) is dominated
-  by the framework's runtime ClassDef graph + runtime-read registry side-tables.
-  Lazy ClassDef is the only lever big enough, and the highest-risk VM change.
+- **Phase 2 — bare runtime: 42 -> 27 MB** (ReleaseFast, warm). Lazy-forest flip +
+  object/lambda body-deferral + **lazy func headers (DONE)**. Gap 2 to target 25;
+  the residual is the runtime stdlib ClassDef graph + GC/binary floor. Lazy
+  ClassDef would close it.
+- **Phase 3 — ktor startup: 124 -> 84 MB.** Same flips + lazy func headers. Decode
+  is now only 3 MB; the ~57 MB framework overhead is the runtime ClassDef graph +
+  non-deferred IR insts + registry side-tables. Lazy ClassDef is the remaining
+  lever (same per-section + delegation pattern as lazy funcs, now proven).
 - **Phase 4 — steady-under-load << node: PARTIAL.** Server creep ~flat after P1;
   absolute steady RSS dropped with the lower P2/P3 baseline but ktor steady (~103)
   is still ~node (~96); the gap is the eager IR/ClassDef graph (beyond-forest).
@@ -422,6 +422,16 @@ eval-level tail (see Phase 1 residual) chased to zero.
       `packageHeadDeclared` sweeps (need baked `fqn->id` + package-head indices).
       Payoff is modest (~5 MB ktor: ~4 MB base func decode + ~1.4 MB clone copy;
       params/blocks are already shared, not re-copied). ARCHITECTURE-SCALE.
+- [x] **BEYOND FOREST step 2 — lazy func headers: DONE** (committed, suite green).
+      Per-func header sections decoded on first `funcById`; cloneForExtend
+      delegates base ids; all build/VM/link sites route through
+      funcById/funcByIdMut/nextFuncId; link uses binding-iteration +
+      baked-bodyless-ids; funcIdByFqn/packageHeadDeclared lazy. The earlier
+      "subtle decode bug" was NOT the decode (byte-identical, A/B-verified) — it
+      was the build-time `funcs.items[id.int()]` sites (build.zig 1442/1523-1567/
+      2528-2545, lower/expr.zig ~30 idGet sites) that index by id; with `base_n>0`
+      they hit the wrong slot. Converting them all fixed it. **bare 30->27,
+      ktor 91->84.**
 - [ ] **BEYOND FOREST step 3 (largest):** lazy ClassDef construction — ktor's
       ~84 MB non-decode is dominated by the runtime ClassDef graph + baked
       registry side-tables (hierarchy_methods/class_super_names/... for hundreds
