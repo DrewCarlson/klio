@@ -4570,29 +4570,40 @@ fn renderStructuralLocked(allocator: Allocator, inst: *const InstanceData, cls: 
     return .{ .String = try StringRef.initOwned(allocator, try buf.toOwnedSlice(allocator)) };
 }
 
+/// Format `"{prefix}.{name}"` into `buf` (stack scratch), returning the slice.
+/// Probe FQNs are short and bounded, so this avoids the per-call heap churn of
+/// `allocPrint` — member dispatch builds up to ~6 of these on every call.
+inline fn probeFqn(buf: []u8, prefix: []const u8, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}.{s}", .{ prefix, name }) catch buf[0..0];
+}
+
 fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const type_fqn = receiver.typeFqn();
-    var probes: std.ArrayList([]const u8) = .empty;
-    // Probe FQNs are per-call scratch (all `allocPrint`ed below); free them and
-    // the list. No-op under the arena; reclaims under a freeing allocator.
-    defer {
-        if (runtime.freeScratch()) for (probes.items) |p| allocator.free(p);
-        probes.deinit(allocator);
-    }
+    // Probe FQNs in priority order, formatted into per-call stack buffers (no
+    // heap traffic). `kotlin.<name>` etc. are formatted too so one code path
+    // builds them all; the storage outlives the loop below.
+    var bufs: [8][128]u8 = undefined;
+    var probes: [8][]const u8 = undefined;
+    var n: usize = 0;
+    const type_probe = probeFqn(&bufs[0], type_fqn, name);
     if (args.len == 0) {
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.text.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.ranges.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name}));
+        probes[0] = type_probe;
+        probes[1] = probeFqn(&bufs[1], "kotlin.collections", name);
+        probes[2] = probeFqn(&bufs[2], "kotlin.text", name);
+        probes[3] = probeFqn(&bufs[3], "kotlin.ranges", name);
+        probes[4] = probeFqn(&bufs[4], "kotlin", name);
+        n = 5;
     } else {
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.ranges.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.text.{s}", .{name}));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }));
-        try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name}));
+        probes[0] = probeFqn(&bufs[0], "kotlin.ranges", name);
+        probes[1] = probeFqn(&bufs[1], "kotlin.collections", name);
+        probes[2] = probeFqn(&bufs[2], "kotlin.text", name);
+        probes[3] = probeFqn(&bufs[3], type_fqn, name);
+        probes[4] = probeFqn(&bufs[4], "kotlin", name);
+        n = 5;
     }
-    // Sibling read-only/mutable collection type.
+    // Sibling read-only/mutable collection type, inserted right after the
+    // receiver-type probe so a `MutableList` op can resolve a `List`-declared
+    // intrinsic (and vice versa).
     const sibling: ?[]const u8 = blk: {
         if (std.mem.eql(u8, type_fqn, "kotlin.collections.MutableList")) break :blk "kotlin.collections.List";
         if (std.mem.eql(u8, type_fqn, "kotlin.collections.MutableSet")) break :blk "kotlin.collections.Set";
@@ -4603,23 +4614,25 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
         break :blk null;
     };
     if (sibling) |sib| {
-        const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ sib, name });
-        const anchor = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name });
-        defer if (runtime.freeScratch()) allocator.free(anchor);
-        var inserted = false;
-        for (probes.items, 0..) |p, idx| {
-            if (std.mem.eql(u8, p, anchor)) {
-                try probes.insert(allocator, idx + 1, probe);
-                inserted = true;
+        const sib_probe = probeFqn(&bufs[5], sib, name);
+        // Find the receiver-type probe and insert the sibling right after it.
+        var at: usize = n;
+        for (probes[0..n], 0..) |p, idx| {
+            if (std.mem.eql(u8, p, type_probe)) {
+                at = idx + 1;
                 break;
             }
         }
-        if (!inserted) try probes.append(allocator, probe);
+        var k: usize = n;
+        while (k > at) : (k -= 1) probes[k] = probes[k - 1];
+        probes[at] = sib_probe;
+        n += 1;
     }
     // Throwable family probe.
     if (receiver.* == .Instance) {
         if (instanceIsThrowable(self, allocator, receiver.Instance)) {
-            try probes.append(allocator, try std.fmt.allocPrint(allocator, "kotlin.Throwable.{s}", .{name}));
+            probes[n] = probeFqn(&bufs[6], "kotlin.Throwable", name);
+            n += 1;
         }
     }
 
@@ -4628,15 +4641,14 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
 
     // Array builder global factory direct dispatch.
     if (stdlib.isArrayBuilder(name) and !hostHasMember(self, receiver, name)) {
-        const probe = try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name});
-        defer if (runtime.freeScratch()) allocator.free(probe);
+        const probe = probeFqn(&bufs[7], "kotlin", name);
         if (lookupIntrinsic(self, probe)) |func| {
             return try dispatchIntrinsic(self, allocator, probe, func, args);
         }
     }
 
     if (!member_shadows_stdlib and !user_member_ext_shadows and !stdlib.isToplevelFunction(name)) {
-        for (probes.items) |probe| {
+        for (probes[0..n]) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
                 const all_args = try prependReceiver(allocator, receiver, args);
                 defer if (runtime.freeScratch()) allocator.free(all_args);
