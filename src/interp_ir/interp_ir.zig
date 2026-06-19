@@ -144,7 +144,20 @@ pub const ProgramImage = struct {
     /// Whether `linkResolvedForms` has run for the current
     /// `installed_bindings` snapshot.
     resolved_linked: bool,
+    /// Memoized builtin member-call resolution: `(receiver type, method name,
+    /// args-empty)` → the intrinsic it resolves to (or `null` = no intrinsic,
+    /// fall through to extension/global dispatch). Filled lazily on first call.
+    /// `stdlibMemberDispatch` otherwise rebuilds ~6 probe FQNs and does ~6
+    /// `lookupIntrinsic`s (each a double `prog`/bindings borrow) on EVERY member
+    /// call — the dominant constant-factor cost for member-heavy code. Only
+    /// non-`Instance`, non-array-builder receivers are cached (their resolution
+    /// is a pure function of the key); the keys are stable string pointers
+    /// (static type FQNs, interned method names), so this is keyed by identity.
+    member_resolve_cache: std.AutoHashMap(MemberResolveKey, MemberResolveEntry),
     allocator: Allocator,
+
+    pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool };
+    pub const MemberResolveEntry = struct { func: ?StdlibFn, fqn: []const u8 };
 
     /// Packages a bare global name may bind into implicitly, in
     /// preference order — the prefix order of the deleted `lookupGlobal`
@@ -201,6 +214,7 @@ pub const ProgramImage = struct {
             .pack_bare_aliases = std.StringHashMap([]const u8).init(allocator),
             .any_member_globals = std.StringHashMap([]const u8).init(allocator),
             .resolved_linked = false,
+            .member_resolve_cache = std.AutoHashMap(MemberResolveKey, MemberResolveEntry).init(allocator),
             .allocator = allocator,
         };
     }
@@ -226,6 +240,11 @@ pub const ProgramImage = struct {
         self.default_import_globals.deinit();
         self.pack_bare_aliases.deinit();
         self.any_member_globals.deinit();
+        {
+            var it = self.member_resolve_cache.valueIterator();
+            while (it.next()) |e| if (e.fqn.len != 0) self.allocator.free(e.fqn);
+        }
+        self.member_resolve_cache.deinit();
     }
 
     fn clearResolvedRedirects(self: *ProgramImage) void {

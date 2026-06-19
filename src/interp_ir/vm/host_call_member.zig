@@ -4579,6 +4579,36 @@ inline fn probeFqn(buf: []u8, prefix: []const u8, name: []const u8) []const u8 {
 
 fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const type_fqn = receiver.typeFqn();
+    // Resolution cache: for a non-`Instance`, non-array-builder receiver, the
+    // winning intrinsic (or "none") is a pure function of (type, name,
+    // args-empty), so memoize it and skip the per-call probe building + repeated
+    // `lookupIntrinsic` borrows. Instance receivers vary by `hostHasMember` per
+    // instance and are not cached; array builders use a different (no-prepend)
+    // dispatch and are excluded.
+    const cacheable = receiver.* != .Instance and !stdlib.isArrayBuilder(name);
+    if (cacheable) {
+        const key: root_mod.ProgramImage.MemberResolveKey = .{
+            .type_p = @intFromPtr(type_fqn.ptr),
+            .name_p = @intFromPtr(name.ptr),
+            .args_empty = args.len == 0,
+        };
+        const hit: ?root_mod.ProgramImage.MemberResolveEntry = blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().member_resolve_cache.get(key);
+        };
+        if (hit) |entry| {
+            const func = entry.func orelse return null;
+            const all_args = try prependReceiver(allocator, receiver, args);
+            defer if (runtime.freeScratch()) allocator.free(all_args);
+            return try dispatchIntrinsic(self, allocator, entry.fqn, func, all_args);
+        }
+        return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, key);
+    }
+    return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, null);
+}
+
+fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, type_fqn: []const u8, cache_key: ?root_mod.ProgramImage.MemberResolveKey) Allocator.Error!?EvalResult {
     // Probe FQNs in priority order, formatted into per-call stack buffers (no
     // heap traffic). `kotlin.<name>` etc. are formatted too so one code path
     // builds them all; the storage outlives the loop below.
@@ -4650,13 +4680,34 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     if (!member_shadows_stdlib and !user_member_ext_shadows and !stdlib.isToplevelFunction(name)) {
         for (probes[0..n]) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
+                if (cache_key) |key| memberCachePut(self, key, func, probe);
                 const all_args = try prependReceiver(allocator, receiver, args);
                 defer if (runtime.freeScratch()) allocator.free(all_args);
                 return try dispatchIntrinsic(self, allocator, probe, func, all_args);
             }
         }
     }
+    // No intrinsic resolved: memoize the miss so the next identical call skips
+    // the probe build + lookups and falls straight through to extension/global.
+    if (cache_key) |key| memberCachePut(self, key, null, "");
     return null;
+}
+
+/// Store a member-resolution result on the shared program image. `func == null`
+/// records a confirmed miss; a non-empty `fqn` is duped into the program's
+/// allocator (lives for the program; bounded by distinct resolved members).
+fn memberCachePut(self: *VmHost, key: root_mod.ProgramImage.MemberResolveKey, func: ?StdlibFn, fqn: []const u8) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    const cache = &pg.get().member_resolve_cache;
+    if (cache.contains(key)) return;
+    const stored_fqn: []const u8 = if (func != null and fqn.len != 0)
+        (cache.allocator.dupe(u8, fqn) catch return)
+    else
+        "";
+    cache.put(key, .{ .func = func, .fqn = stored_fqn }) catch {
+        if (stored_fqn.len != 0) cache.allocator.free(stored_fqn);
+    };
 }
 
 fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) bool {
