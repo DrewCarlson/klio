@@ -865,7 +865,7 @@ fn funcRefsAst(func: *const ir.Func) bool {
     return false;
 }
 
-const InlineIdImage = struct { id: u32, f: FF(ast.Function) };
+const InlineIdImage = struct { id: u32, f: *const ast.Function };
 
 // -------------------------------------------------------------------------
 // Bake: StdlibBase -> bytes
@@ -1030,7 +1030,7 @@ fn rootFromBase(
     {
         const ids = try a.alloc(InlineIdImage, base.inline_ids.len);
         for (base.inline_ids, 0..) |entry, i| {
-            ids[i] = .{ .id = entry.id, .f = FF(ast.Function).fromPtr(entry.f) };
+            ids[i] = .{ .id = entry.id, .f = entry.f };
         }
         root.inline_ids = ids;
     }
@@ -1669,7 +1669,7 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
         .inline_ids = blk: {
             const ids = try a.alloc(StdlibBase.InlineId, root.inline_ids.len);
             for (root.inline_ids, 0..) |entry, i| {
-                ids[i] = .{ .id = entry.id, .f = entry.f.get() };
+                ids[i] = .{ .id = entry.id, .f = entry.f };
             }
             break :blk ids;
         },
