@@ -368,8 +368,27 @@ eval-level tail (see Phase 1 residual) chased to zero.
       /`BuildObject.ast` -> `ForestField`, `funcRefsAst` retired, so object/lambda
       bodies defer to the lazy-IR section. **bare 32->30, ktor 103->91**
       (eager decode basic 5.9->3.2 MB, ktor 18.5->7.0 MB). Suite green.
-- [~] **BEYOND FOREST step 2 — lazy func headers (foundation landed; flip blocked
-      on a VM rearchitecture):** `Module.funcById`/`funcCount` choke point added
+- [~] **BEYOND FOREST step 2 — lazy func headers. Phase A DONE; Phase B mapped:**
+      Phase A (committed, green, behaviour-preserving with `base_n=0`): every
+      func-by-id access across ir/lower + the VM now routes through
+      `Module.funcById`/`funcByIdMut`/`nextFuncId` (id-split: base funcs delegated
+      to ids `0..base_n` via the lazy header section; this module's own funcs in
+      `funcs.items` at ids `>= base_n`). Phase B (the lazy flip) — concrete steps:
+      (1) bake per-func HEADER sections + offsets (like the per-decl forest
+      sections; a header has empty/deferred blocks so it encodes self-contained);
+      (2) `moduleFromImage` sets `func_header_section/offsets/decode` + allocates
+      `func_cache`, leaves `funcs.items` empty; (3) `cloneForExtend` (ir.zig:1042)
+      stops copying base funcs — shares the base's header section/offsets/cache,
+      user funcs append at `base_n`; (4) `funcIdByFqn` + the host_globals fqn sweep
+      become simple-name lookups (`funcsBySimpleName` + `funcById(cand).fqn` match
+      — decodes only same-name candidates, not all funcs); (5) `packageHeadDeclared`
+      uses a baked func-fqn-head set; (6) **LINK LAYER (the deeper cascade,
+      interp_ir.zig:281/294):** `resolved_native` by iterating the host BINDINGS
+      through `funcIdByFqn` (not funcs); `resolved_redirect` over a baked
+      `bodyless_func_ids` list (base) + user bodyless funcs. ~150-200 lines across
+      image/ir/interp_ir; touches dispatch (resolved_native/redirect) so validate
+      with full suite + ktor e2e + cross-mode. Payoff ~5 MB ktor (-> ~86).
+- [ ] (old framing) `Module.funcById`/`funcCount` choke point added
       (eager today; lazy fields `func_header_section/offsets/decode/cache` in
       place); all ir.zig func-by-id reads route through it. **The lazy flip is NOT
       a bounded change** — `cloneForExtend` (ir.zig:1042) copies ALL base funcs by
