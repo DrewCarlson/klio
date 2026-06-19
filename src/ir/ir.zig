@@ -781,6 +781,15 @@ pub const Module = struct {
     deferred_func_arena: Allocator = undefined,
     /// Injected decoder (`image.decodeFuncBlocks`), null until installed.
     deferred_func_decode: ?*const fn (Allocator, []const u8, u32) ?[]Block = null,
+    /// Lazy IR func HEADERS: per-func self-contained sections + offsets
+    /// (`id -> offset+1`, 0 = absent), decoded on first `funcById`. `func_cache`
+    /// memoises the decoded `*Func`. All empty/eager unless loaded from an image;
+    /// then `funcs.items` is empty and lookups go through the lazy path.
+    func_header_section: []const u8 = &.{},
+    func_header_offsets: []const u32 = &.{},
+    func_header_decode: ?*const fn (Allocator, []const u8, u32) ?Func = null,
+    func_cache: []?*Func = &.{},
+    func_header_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     classes: std.ArrayList(Class) = .empty,
     consts: std.ArrayList(Const) = .empty,
     /// Top-level (file-scope) function ids, in declaration order.
@@ -963,6 +972,34 @@ pub const Module = struct {
         }
     }
 
+    /// Look up a function by id. Eager path (fresh build): direct table index.
+    /// Lazy path (loaded image, `func_header_offsets` installed): decode the
+    /// per-func header section on first touch and memoise it in `func_cache`.
+    /// The returned `*const Func` lives for the module's life.
+    pub fn funcById(self: *const Module, id: FuncId) ?*const Func {
+        const i = id.int();
+        if (self.func_header_offsets.len == 0) return idGet(Func, self.funcs.items, i);
+        if (i >= self.func_cache.len) return null;
+        if (self.func_cache[i]) |f| return f;
+        const off = self.func_header_offsets[i];
+        if (off == 0) return null;
+        const decode = self.func_header_decode orelse return null;
+        const mut: *Module = @constCast(self);
+        while (mut.func_header_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+        defer mut.func_header_lock.store(false, .release);
+        if (self.func_cache[i]) |f| return f; // lost the race
+        const f = self.deferred_func_arena.create(Func) catch return null;
+        f.* = decode(self.deferred_func_arena, self.func_header_section, off - 1) orelse return null;
+        mut.func_cache[i] = f;
+        return f;
+    }
+
+    /// Number of functions addressable by id (eager table length, or the lazy
+    /// offset-table length when loaded from an image).
+    pub fn funcCount(self: *const Module) usize {
+        return if (self.func_header_offsets.len == 0) self.funcs.items.len else self.func_header_offsets.len;
+    }
+
     pub fn deinit(self: *Module, allocator: Allocator) void {
         self.funcs.deinit(allocator);
         self.classes.deinit(allocator);
@@ -1141,7 +1178,7 @@ pub const Module = struct {
         var first_body: ?FuncId = null;
         for (candidates) |id| {
             if (first == null) first = id;
-            if (idGet(Func, self.funcs.items, id.int())) |f| {
+            if (self.funcById(id)) |f| {
                 if (first_body == null and f.hasBody()) first_body = id;
                 if (first_user != null) continue;
                 if (!isShippedPackage(f.package)) first_user = id;
@@ -1420,7 +1457,7 @@ pub const Module = struct {
     /// index's: a divergence where the index pick ranks strictly better
     /// is a package-preference correction, not a mis-bind.
     pub fn bareCallTierOf(self: *const Module, id: FuncId, name: []const u8, caller_pkg: []const u8, caller_file: FileId) ?u8 {
-        const f = idGet(Func, self.funcs.items, id.int()) orelse return null;
+        const f = self.funcById(id) orelse return null;
         return self.bareCallTier(f, name, caller_pkg, caller_file);
     }
 
@@ -1558,7 +1595,7 @@ pub const Module = struct {
         var all_ext = true;
         var ext_in_scope = false;
         for (cands) |id| {
-            const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
+            const f = self.funcById(id) orelse continue;
             if (funcHasImplicitThis(f)) {
                 if (self.bareCallTier(f, name, caller_pkg, caller_file) < other_package_tier) {
                     ext_in_scope = true;
@@ -1601,7 +1638,7 @@ pub const Module = struct {
         var saw_low = false;
         var saw_bodyless = false;
         for (cands) |id| {
-            const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
+            const f = self.funcById(id) orelse continue;
             if (funcHasImplicitThis(f)) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
             const is_stub = !f.hasBody();
@@ -1659,7 +1696,7 @@ pub const Module = struct {
                 // the phase-1 declared record for stubs; a candidate
                 // with neither forfeits the proof.
                 if (sigs_identical) {
-                    const first_f = idGet(Func, self.funcs.items, first_id.int());
+                    const first_f = self.funcById(first_id);
                     const first_view: ?SigView = if (first_f) |ff| self.sigViewOf(first_id, ff) else null;
                     const this_view = self.sigViewOf(id, f);
                     if (first_view == null or this_view == null or
@@ -1734,7 +1771,7 @@ pub const Module = struct {
         if (cands.len == 0) return null;
         var best_tier: u8 = 255;
         for (cands) |id| {
-            const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
+            const f = self.funcById(id) orelse continue;
             if (funcHasImplicitThis(f)) continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             const t = self.bareCallTier(f, name, caller_pkg, caller_file);
@@ -1744,7 +1781,7 @@ pub const Module = struct {
         var chosen: ?FuncId = null;
         var count: usize = 0;
         for (cands) |id| {
-            const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
+            const f = self.funcById(id) orelse continue;
             if (funcHasImplicitThis(f)) continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
@@ -1776,7 +1813,7 @@ pub const Module = struct {
         if (cands.len == 0) return null;
         var best_tier: u8 = 255;
         for (cands) |id| {
-            const f = idGet(Func, self.funcs.items, id.int()) orelse continue;
+            const f = self.funcById(id) orelse continue;
             if (funcHasImplicitThis(f)) continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             const t = self.bareCallTier(f, name, caller_pkg, caller_file);
