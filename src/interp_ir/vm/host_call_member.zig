@@ -4504,6 +4504,26 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     defer mg.deinit();
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
+
+    // Fast path: no vararg tail and the call is fully applied (no default
+    // padding), so the frame argument list is exactly `[receiver] ++ args`.
+    // Build it in one allocation directly into the frame-owned list, skipping
+    // the `prependReceiver` scratch slice + its copy/free (a per-call win on the
+    // hot member-dispatch path).
+    const has_vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
+    if (!has_vararg and args.len + 1 >= f.params.len) {
+        var list: std.ArrayList(Value) = .empty;
+        try list.ensureTotalCapacityPrecise(allocator, args.len + 1);
+        list.appendAssumeCapacity(receiver.*);
+        list.appendSliceAssumeCapacity(args);
+        if (trace.invariantsEnabled()) {
+            checkFuncInRange(self, "irMethodWalk", f.id);
+            checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
+        }
+        vmhost.emitPath(allocator, "member_ir_walk", f.fqn, f.id, receiver, args);
+        return try ir.eval.evalWith(VmHost, allocator, mod, &f, list, self);
+    }
+
     var all = try prependReceiver(allocator, receiver, args);
     const defaults = blk: {
         const pg = self.prog.borrow();
