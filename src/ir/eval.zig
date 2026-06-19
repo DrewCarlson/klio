@@ -1942,6 +1942,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |cm| {
+            if (fastSubscript(allocator, frame, cm)) |rv| {
+                try frame.write(cm.dst, rv);
+                return ok(.Unit);
+            }
             const recv = frame.read(cm.receiver);
             // A method borrows its receiver for the call's whole duration.
             // Pin it: the dispatched body may, via the coroutine machinery,
@@ -2319,6 +2323,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .Index => |ix| {
             const recv = frame.read(ix.receiver);
             const i = frame.read(ix.index);
+            if (fastIndexGet(&recv, &i)) |rv| {
+                try frame.write(ix.dst, rv);
+                return ok(.Unit);
+            }
             switch (try host.callMember(allocator, &recv, "get", &.{i})) {
                 .ok => |rv| try frame.write(ix.dst, rv),
                 .err => |e| return errResult(e),
@@ -2328,6 +2336,9 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const recv = frame.read(ixs.receiver);
             const i = frame.read(ixs.index);
             const v = frame.read(ixs.value);
+            if (fastIndexSet(allocator, &recv, &i, v)) {
+                return ok(.Unit);
+            }
             switch (try host.callMember(allocator, &recv, "set", &.{ i, v })) {
                 .ok => {},
                 .err => |e| return errResult(e),
@@ -2825,6 +2836,75 @@ fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u8)
         out[i] = frame.read(Reg.from(args_start.int() + i));
     }
     return out;
+}
+
+/// Indexed-load fast path shared by the `get` subscript forms. Serves the
+/// in-bounds, `Int`-index read on an `Array`/`List` directly — a plain indexed
+/// load with the intrinsics' ownership (`coll_array_get`/`coll_list_get`:
+/// retain the borrowed element). Returns `null` (fall through to the slow path,
+/// which reproduces the exact diagnostic) for any other shape.
+inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
+    if (idx_v.* != .Int) return null;
+    const idx = idx_v.Int;
+    if (idx < 0) return null;
+    const ui: usize = @intCast(idx);
+    const items_ref = switch (recv.*) {
+        .Array => |arr| arr.items,
+        .List => |l| l.items,
+        else => return null,
+    };
+    const g = items_ref.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    if (ui >= items.len) return null;
+    const elem = items[ui];
+    elem.retain();
+    return elem;
+}
+
+/// Indexed-store fast path for `a[i] = v` on an `Array` (mirrors the
+/// `coll_array_set` intrinsic: release the overwritten element, retain the
+/// incoming one under a reclaiming backend). `List.set` returns the previous
+/// element, so it is left to the slow path. Returns `true` when handled.
+inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const Value, new_val: Value) bool {
+    if (idx_v.* != .Int) return false;
+    const idx = idx_v.Int;
+    if (idx < 0) return false;
+    const ui: usize = @intCast(idx);
+    switch (recv.*) {
+        .Array => |arr| {
+            const g = arr.items.borrowMut();
+            defer g.deinit();
+            const items = g.get().items;
+            if (ui >= items.len) return false;
+            if (runtime.reclaimEnabled()) {
+                items[ui].release(allocator);
+                new_val.retain();
+            }
+            items[ui] = new_val;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Subscript fast path: `a[i]` / `a[i] = v` lower to `a.get(i)` / `a.set(i, v)`
+/// member calls. Dispatching those through the full member-call machinery for
+/// every array element dominates the cost of any loop-heavy program, so the
+/// common case is served by the indexed-load/store primitives above. Returns
+/// the value to write to `dst`, or `null` when not handled.
+inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anytype) ?Value {
+    if (cm.arg_names.len != 0 or cm.n_args == 0) return null;
+    const nm = constStr(frame.module, cm.name) orelse return null;
+    const is_get = cm.n_args == 1 and std.mem.eql(u8, nm, "get");
+    const is_set = cm.n_args == 2 and std.mem.eql(u8, nm, "set");
+    if (!is_get and !is_set) return null;
+    const idx_v = frame.read(Reg.from(cm.args.int()));
+    const recv = frame.read(cm.receiver);
+    if (is_get) return fastIndexGet(&recv, &idx_v);
+    const new_val = frame.read(Reg.from(cm.args.int() + 1));
+    if (fastIndexSet(allocator, &recv, &idx_v, new_val)) return Value.Unit;
+    return null;
 }
 
 /// Snapshot the live values of a `[]Reg`. Caller frees.
