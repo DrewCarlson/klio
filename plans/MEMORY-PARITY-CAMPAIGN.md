@@ -362,12 +362,21 @@ eval-level tail (see Phase 1 residual) chased to zero.
       after the per-decl sections + indices); `FORMAT_VERSION` 5->6. DONE.
       **Measured: bare 42->32 MB, ktor startup 124->103 MB, steady ktor flat at
       ~103-122 MB across 2500 req (no per-request growth).** Suite green.
-- [ ] **BEYOND FOREST (next lever to hit 25/45):** the eager `ir.Func` headers
-      (decode-stats now top: ir.Inst/ir.Func/ir.Param/ir.TypeRef ~4 MB basic /
-      ~10 MB ktor) and the runtime ClassDef graph are decoded/built eagerly,
-      independent of the forest. Lazy func-header decode (on first FuncId lookup)
-      + lazy ClassDef construction (on first class use) are the remaining levers.
-      Larger, separate work touching the VM func/class resolution paths.
+- [x] BEYOND FOREST step 1 — defer AST-referencing func bodies: `RegisterClass.class`
+      /`BuildObject.ast` -> `ForestField`, `funcRefsAst` retired, so object/lambda
+      bodies defer to the lazy-IR section. **bare 32->30, ktor 103->91**
+      (eager decode basic 5.9->3.2 MB, ktor 18.5->7.0 MB). Suite green.
+- [ ] **BEYOND FOREST step 2 (next, larger):** the eager `ir.Func` HEADERS remain
+      (~13586 Func structs resident for ktor; ir.Func/ir.Param/ir.TypeRef decode).
+      Lazy func-header decode needs per-func sections + decode-on-`idGet` (the
+      `idGet` is `*const` — needs a side cache `[]?*Func` + offsets) + baked
+      `fqn->id` index and package-head set to avoid the `funcIdByFqn`/
+      `packageHeadDeclared` sweeps over `funcs.items` (ir.zig:1167/1184).
+- [ ] **BEYOND FOREST step 3 (largest):** lazy ClassDef construction — ktor's
+      ~84 MB non-decode is dominated by the runtime ClassDef graph + baked
+      registry side-tables (hierarchy_methods/class_super_names/... for hundreds
+      of classes). Build ClassDef shells lazily on first class use; riskiest
+      (dispatch/instance/two-phase-link paths read ClassDefs).
 - [ ] leaktrack fix (segfaults at exit-collect) — enables the P1 eval-tail
       attribution; validate via RSS trajectory until then.
 - [ ] P4: ktor steady (~103-122) is ~node (~96); driving below node needs the
