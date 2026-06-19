@@ -10,6 +10,8 @@
 const std = @import("std");
 const span = @import("span");
 const ast = @import("ast");
+const runtime = @import("runtime");
+const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
 
@@ -402,7 +404,7 @@ pub const Inst = union(enum) {
     /// Register a class declaration encountered inside a function
     /// body. Local classes live for the duration of the call.
     RegisterClass: struct {
-        class: *ast.Class,
+        class: FF(ast.Class),
         /// Capture-name slots so the class methods see the enclosing
         /// function's locals.
         captured_names: [][]const u8,
@@ -415,7 +417,7 @@ pub const Inst = union(enum) {
     /// the `Value.Instance`.
     BuildObject: struct {
         dst: Reg,
-        ast: *ast.Expr,
+        ast: FF(ast.Expr),
         captured_names: [][]const u8,
         captures: []Reg,
         /// Scope-true type renames visible at the object expression's

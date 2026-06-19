@@ -507,7 +507,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             ast_box.* = expr.*;
             try b.push(.{ .BuildObject = .{
                 .dst = dst,
-                .ast = ast_box,
+                .ast = runtime.forest.ForestField(Expr).fromPtr(ast_box),
                 .captured_names = captured_names,
                 .captures = captures,
                 .scope_renames = try collectScopeRenames(b, expr.ObjectExpr.span.file.int()),

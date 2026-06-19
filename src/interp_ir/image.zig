@@ -858,17 +858,14 @@ pub fn decodeFuncBlocks(a: Allocator, section: []const u8, offset: u32) ?[]ir.Bl
     return blocks;
 }
 
-/// Whether any instruction in `func` references an AST node (`RegisterClass`,
-/// `BuildObject`, `AstLambda`). Such a function's `blocks` cannot be encoded
-/// self-contained — the AST pointee lives in the eager skeleton — so it stays
-/// eager rather than being deferred to the lazy-IR section.
+/// Whether a function's `blocks` must stay eager (cannot be deferred to the
+/// self-contained lazy-IR section). Now always false: the AST-referencing insts
+/// carry their AST self-contained — `RegisterClass.class`/`BuildObject.ast` are
+/// `ForestField` (encode as a forest ref, or inline when no forest map is
+/// installed, as in the deferred-body section), and `AstLambda.body_ast` is an
+/// inline `ast.Block` value — so every body decodes standalone on first call.
 fn funcRefsAst(func: *const ir.Func) bool {
-    for (func.blocks) |blk| {
-        for (blk.insts) |inst| switch (inst) {
-            .RegisterClass, .BuildObject, .AstLambda => return true,
-            else => {},
-        };
-    }
+    _ = func;
     return false;
 }
 
