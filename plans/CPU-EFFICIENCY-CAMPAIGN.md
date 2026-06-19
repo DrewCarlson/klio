@@ -90,25 +90,39 @@ collections — pure loop + array), bound by the F3 per-instruction constant fac
    borrows. DONE. numeric 14.5→9.4s, strings 7.9→6.7s.
 6. stack-buffer dispatch args — `prependReceiver` heap-allocated per call; stack
    buffer for small arities. DONE. collections 12.5→10.6s.
-7. F4 — `iterableItems` snapshot copies the whole list per call. PENDING (makes
+7. slim per-instruction return — `execInst` returned an ~80-byte `EvalResult` by
+   value per instruction (its `.ok` always the ignored `.Unit`); now a 1-byte
+   `Step{cont,raised}` with control-flow errors stashed on `frame.step_err`.
+   DONE. numeric 9.4→8.3s.
+8. **F5 — primitive arrays are 64× too big (NEW, MEASURED).** `BooleanArray`/
+   `IntArray`/… are stored as `ArrayList(Value)` — 64 bytes per element. A
+   `BooleanArray(10M)` is ~1.2 GB (measured numeric peak RSS = 1231 MB; node's
+   `Uint8Array(10M)` is 10 MB). Catastrophic for any primitive-array code: huge
+   alloc + zero + GC-trace. FIX: a packed primitive backing (real `[]u8/i32/f64`
+   …) behind `Value.Array` when `prim != null`; `fastIndexGet/Set` + the array
+   intrinsics box/unbox at the boundary; GC traces nothing (no `Value`
+   out-edges). Large (threads through ~30 array intrinsics) but the single
+   highest-value remaining change for array workloads — memory AND cpu.
+9. F4 — `iterableItems` snapshot copies the whole list per call. PENDING (makes
    `last`/`first` O(n); low value — only hurts those-in-loops).
-8. F3 — core per-instruction constant factor (~150-200 ns/IR-inst). The
-   remaining gap is the tree/register interpreter's dispatch loop itself:
-   `execInst` returns a 72-byte `EvalResult` by value per instruction, the big
-   `switch (inst.*)`, and 64-byte `Value` copies through `frame.read`/`write`.
-   The pure-arithmetic mod loop is ~780 ns/iter (3 BinOps) — no bug left, just
-   constant factor. Closing the gap to node (a JIT) needs a bytecode VM /
-   register-machine rewrite, not local tweaks; getting within a few× of CPython
-   would mean shrinking `Value`/`EvalResult` and a computed-goto dispatch. Large,
-   separate effort.
+10. F3 — core per-instruction constant factor (~150-200 ns/IR-inst). After the
+   slim return, the residual is the `execInst` call itself + 64-byte `Value`
+   copies through `frame.read`/`write` + the `switch (inst.*)`. The pure mod loop
+   is ~780 ns/iter. Closing to node (a JIT) needs a bytecode-VM/register-machine
+   rewrite; within a few× of CPython needs shrinking `Value` (64→~16B by boxing
+   the rare large variants) + computed-goto/labeled-switch dispatch. Large,
+   separate efforts.
 
 ## Status (vs start of campaign)
 
 | workload | start | now | speedup | python | node |
 |---|---|---|---|---|---|
-| numeric | 16.5 s | ~9.4 s | 1.8× | 1.0 s | 0.06–0.1 s |
-| collections | >180 s (timeout) | ~11–12 s | >15× | 0.25–0.30 s | 0.06 s |
+| numeric | 16.5 s | ~8.3 s | 2.0× | 1.0 s | 0.06–0.1 s |
+| collections | >180 s (timeout) | ~10.7 s | >17× | 0.25–0.30 s | 0.06 s |
 | strings | 69 s | ~6.5 s | 10.6× | 0.18 s | 0.10 s |
+
+numeric also has a **1.2 GB peak RSS** (F5: primitive arrays as boxed `Value`s);
+fixing F5 cuts that to ~10 MB and speeds construction/access.
 
 The two systemic O(n²) bugs (ungated `release`, linear-scan `Map`) are fixed —
 those were what made map/collection code pathological. Array subscript, probe
