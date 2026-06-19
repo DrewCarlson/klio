@@ -47,12 +47,14 @@ fix is validated by a 200k-iter sawtooth that returns to baseline.
 
 - **Phase 1 — per-iteration leaks: DONE** (target 1 & 5). Committed. MapBacking
   residual also fixed this session.
-- **Phase 2 — bare runtime: LAZY-FOREST FLIP DONE.** 42 -> **32 MB** (ReleaseFast,
-  warm). The eager stdlib AST forest no longer decodes at startup. Target 25 needs
-  the "beyond forest" work (lazy `ir.Func` headers / lazy ClassDef) — the IR
-  module + ClassDef graph are now the dominant eager decode.
-- **Phase 3 — ktor startup: LAZY-FOREST FLIP DONE.** 124 -> **103 MB**. Same flip;
-  target 45 also needs beyond-forest (the ktor IR + ClassDef graph dominate now).
+- **Phase 2 — bare runtime: 42 -> 30 MB** (ReleaseFast, warm). Lazy-forest flip +
+  beyond-forest step 1 (defer object/lambda func bodies). Near target 25; the
+  residual is the IR func headers + the runtime stdlib ClassDef graph + GC/binary
+  floor. Lazy func-headers (~1.5 MB) + lazy ClassDef would approach 25.
+- **Phase 3 — ktor startup: 124 -> 91 MB.** Same flips. Target 45 needs lazy
+  ClassDef: ktor's ~84 MB non-decode (eager decode is now only 7 MB) is dominated
+  by the framework's runtime ClassDef graph + runtime-read registry side-tables.
+  Lazy ClassDef is the only lever big enough, and the highest-risk VM change.
 - **Phase 4 — steady-under-load << node: PARTIAL.** Server creep ~flat after P1;
   absolute steady RSS dropped with the lower P2/P3 baseline but ktor steady (~103)
   is still ~node (~96); the gap is the eager IR/ClassDef graph (beyond-forest).
