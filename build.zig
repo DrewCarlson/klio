@@ -19,6 +19,7 @@ const mod_list = [_]Mod{
     .{ .name = "lexer", .deps = &.{ "diagnostics", "span" }, .tested = true },
     .{ .name = "pack", .deps = &.{ "ast", "span", "types" }, .tested = true },
     .{ .name = "parser", .deps = &.{ "ast", "diagnostics", "lexer", "span" }, .tested = true },
+    .{ .name = "jit", .tested = true },
     .{ .name = "ir", .deps = &.{ "span", "ast", "types", "runtime", "diagnostics" }, .tested = true },
     .{ .name = "stdlib", .deps = &.{ "runtime", "pack" }, .tested = true },
     .{ .name = "cfa", .deps = &.{ "ast", "diagnostics", "lexer", "parser", "span", "types" }, .tested = true },
