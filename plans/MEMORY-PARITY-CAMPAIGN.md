@@ -155,7 +155,71 @@ the win requires lazy materialization.
   called at load** (image.zig:1608, 2184) — the resolver is live.
 - `MethodDef.decl` is already a `ForestField` (the one converted backref).
 
-### What remains (the flip — this is the actual Phase 2/3 work)
+### I2 DONE (this session) — codec is forest-field-aware
+The runtime-graph forest backrefs are now `forest.ForestField` and the image
+codec encodes any `ForestField` as a `(decl, ord)` ref (tag 0) resolved lazily on
+first `.get()`, with an **inline-encode fallback (tag 1)** for a `.ptr` whose node
+is not in the bake-time forest map (synthetic nodes; any encode with no map
+installed). Converted: `PropertyDef.init/getter/setter/delegate`,
+`ClassDef.init_blocks/parent_ctor_args/secondary_ctors`, `ClassParamDef.default`,
+`SupertypeDelegate.expr`, `MethodDef.decl`. The bake builds `forest_map`
+(node-addr -> `ForestRef`) while emitting per-decl sections and installs it for
+the final `ImageRoot` encode (`image.zig` `bake_forest_map`). `setSection` is now
+called at the TOP of `baseFromRoot` (before the base is built, since building it
+resolves refs). **`inline_ids` was reverted to eager** (raw forest pointer) — as
+`ForestField` it `.get()`s at load and re-decodes inline-fn decls on top of the
+still-eager `lifted_decls` (+6 MB); it must stay eager until I4 drops the eager
+decode, then become a `ForestField`. Net: I2 is behaviour-preserving and
+RSS-neutral (42 MB bare), but gives NO win yet — the eager `lifted_decls` is still
+decoded. The win is I3+I4.
+
+### What remains (the flip — the actual Phase 2/3 win)
+With I2's codec in place, the eager `lifted_decls` decode (~8 MB basic / ~21 MB
+ktor) is still in the payload AND the load-time `buildModuleFilesExtend`
+traversals iterate `base.lifted_decls`. To drop it (I4) every forest pointer must
+not require the eager forest, AND the three traversals must get their base data
+without it (I3). NOTE the safety net: with `lifted_decls` nulled at bake, any
+still-raw forest pointer (e.g. IR `BuildObject.ast`/`RegisterClass.class`) finds
+no global-registry entry and **inline-encodes** (eager, correct, just no savings)
+— so I4 cannot corrupt, only under-save; convert those to `ForestField` later for
+the full win.
+
+REMAINING I3 SUB-CHANGES (each large; full-suite + bake-determinism per piece):
+- **I3-A inline-by-id lazy:** `inline_fn_ids: id -> ForestField`;
+  `inlineAstById` resolves `.get()` and records a reverse `ptr -> id` map so
+  `inlineIdByAst` (expr.zig:2898, called with an already-resolved fn) is a map
+  lookup, NOT an iterate-and-`.get()`-all (which would resolve the whole inline
+  forest). `registerInlineFnId` takes a `ForestField`. `inline_ids` becomes a
+  `ForestField` again; load installs WITHOUT `.get()`.
+- **I3-B inline-by-name lazy:** `inline_fn_asts: name -> []ForestField`; bake a new
+  `base.inline_by_name: []KV(name, []ForestRef)` (the base half of
+  `collectInline`); at load+build install the baked base refs, then add USER
+  `collectInline` results (`.ptr`). Candidate readers (`inlineFnAst`,
+  `inlineFnAstForRecv`, `candidatesFor`) resolve `.get()` per candidate.
+- **I3-C file_classes lazy:** `FileClasses` value -> `ForestField(ast.Class)`; bake
+  `base.file_classes: []KV(name, ForestRef)`; consumers (hierarchy walks / member
+  collection for USER classes extending base classes) `.get()` on use. Audit ALL
+  `FileClasses` readers.
+- **I3-D top_props:** bake the base's top-level property names + `notePropScope`
+  inputs (name/fqn/package strings) so the scope replay needs no AST.
+Then **I4:** null `root.lifted_decls` between the per-decl-section build and the
+final `ImageRoot` encode; re-make `inline_ids` a `ForestField`; bump
+`FORMAT_VERSION`; measure.
+
+ALTERNATIVE to I3 (free-after-lower): decode eager `lifted_decls` into a dedicated
+page-backed arena, free it after the one `buildModuleFilesExtend`. REJECTED as
+simpler: `built`/`module` still hold raw global-registry backrefs into
+`lifted_decls` (the un-converted IR-inst pointers), so freeing dangles them — it
+needs the SAME full `ForestField` conversion as I4, and the decode peak still
+spikes during build. Only the "listening, 0 req" sample would drop, and only if
+the arena is page-backed (munmap on deinit).
+
+REALITY CHECK: even a complete I3+I4 reaches only ~34 MB bare / ~103 MB ktor.
+The 25/45 targets additionally require the "Beyond the forest" work (lazy
+`ir.Func` headers + lazy ClassDef construction), each a comparable change. The
+forest flip is the necessary first lever, not sufficient alone.
+
+### Original I-plan (superseded by the I2-done note above; kept for reference)
 The eager `lifted_decls` forest is still decoded because most `built`/`module`
 backrefs are still raw `*const ast.X` pointing into it. Convert them to
 `ForestRef`, drop the eager decode, bake indices for the load traversals:
