@@ -35,6 +35,14 @@ Python is flat+lowest (refcount frees eagerly, tiny heap). Node sawtooths but th
 V8 heap high-water grows to ~96 MB then plateaus and is never returned to the OS.
 klio is heaviest, dominated by eager stdlib/ktor image materialization at startup.
 
+Re-measured this session (ReleaseFast `zig build -Doptimize=ReleaseFast`, warm
+image cache, all packs reinstalled from the freshly-checked-out submodules):
+**bare runtime 42 MB**, **ktor startup 124 MB** — consistent with the table.
+Debug builds and cold (first-run, cache-miss) bakes inflate peak RSS markedly
+(bare ~54 MB Debug / ~104 MB cold; ktor ~195-219 MB cold), so always measure
+ReleaseFast + warm. The map-view `MapBacking` leak (P1 residual) is fixed and the
+fix is validated by a 200k-iter sawtooth that returns to baseline.
+
 ## Phase status
 
 - **Phase 1 — per-iteration leaks: DONE** (target 1 & 5). Committed.
@@ -255,12 +263,28 @@ eval-level tail (see Phase 1 residual) chased to zero.
 
 ## Remaining-work checklist
 
-- [ ] P1 residual: GC-own the map-view `MapBacking`; chase the eval-level
-      `<non-intrinsic>` tail to zero (extend `current_fqn` to eval Call sites).
+- [x] P1 residual: GC-own the map-view `MapBacking` — DONE. It is now an
+      `ObjRef(MapBacking)` cell the view owns (retained/released + swept with the
+      view); its `gcTrace` keeps the borrowed source entries reachable. Validated
+      cross-mode (gc/arena/smp identical) + a 200k-iter bounded sawtooth.
+- [ ] P1 residual: chase the eval-level `<non-intrinsic>` tail to zero (extend
+      `current_fqn` to eval Call sites). BLOCKED: `KLIO_GC_ALLOC=leaktrack`
+      segfaults at the exit-time `gc.collect()` (`markThreadRoots` walks a stale
+      thread-root after `cli.run` returns) — a Zig-0.16-drift regression in the
+      diagnostic path, not the campaign code. Fix leaktrack first (it is the
+      attribution workhorse) or validate via RSS trajectory only.
 - [ ] P2/P3 I2: convert `PropertyDef.init/getter/setter/delegate`,
       `ClassDef.init_blocks/parent_ctor_args/secondary_ctors`,
+      `ClassParamDef.default`, `SupertypeDelegate.expr` (these last two were
+      missing from the original list — they are forest exprs too),
       `Inst.BuildObject.ast`/`RegisterClass.class`, inline ids to `ForestRef`;
-      route readers through `.get()`. Green per increment.
+      route readers through `.get()`. Green per increment. NOTE: these
+      runtime-graph AST fields are read only at build/bake time (the lowered
+      side-tables come from `BuiltImage`), so a loaded image never `.get()`s
+      them — that is exactly why making them lazy frees the forest decode.
+      SAFETY NET: `lifted_decls` encodes first (ImageRoot field 2), so any forest
+      pointer NOT converted falls back to inline-encode after I4 (correct, just
+      no savings) — missing a field cannot corrupt, only under-save.
 - [ ] P2/P3 I3: bake `file_classes`/`collectInline`/`top_props` indices; replace
       the three load traversals.
 - [ ] P2/P3 I4: drop eager `lifted_decls` decode; bump `FORMAT_VERSION`; measure
