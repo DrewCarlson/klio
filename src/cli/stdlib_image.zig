@@ -430,14 +430,41 @@ pub fn tryPrepare(
     for (user.asts) |f| {
         if (f.imports.len != 0) any_refs = true;
     }
-    var packs_map = SourceMap.init(gpa);
-    const pack_bindings = if (any_refs)
-        pack_cache.loadInstalledPacksOpts(gpa, user.asts, &packs_map, features, .{
+    // Packs are parsed only to read their bindings + selection identity; the
+    // image already holds their lowered form. Parse the (large, e.g. ktor)
+    // pack ASTs and source into a scratch arena and drop it before the program
+    // runs — keeping only the bindings table and the selection, copied into
+    // process-lifetime storage. This avoids retaining tens of MB of pack AST
+    // for a server's whole life.
+    var pack_arena = std.heap.ArenaAllocator.init(gpa);
+    defer pack_arena.deinit();
+    const paa = pack_arena.allocator();
+    var packs_map = SourceMap.init(paa);
+    const pack_bindings = if (any_refs) blk: {
+        var sel_tmp = pack_cache.Selection{};
+        const tmp = pack_cache.loadInstalledPacksOpts(paa, user.asts, &packs_map, features, .{
             .include_stdlib = false,
-            .selection = &selection,
-        }).bindings
-    else
-        pack_cache.mergedHostBindings(gpa);
+            .selection = &sel_tmp,
+        }).bindings;
+        for (sel_tmp.packs.items) |p| {
+            const feats = gpa.alloc([]const u8, p.features.len) catch return null;
+            for (p.features, 0..) |f, i| feats[i] = gpa.dupe(u8, f) catch return null;
+            selection.packs.append(gpa, .{
+                .path = gpa.dupe(u8, p.path) catch return null,
+                .hash = p.hash,
+                .features = feats,
+            }) catch return null;
+        }
+        for (sel_tmp.final_prefixes.items) |pfx|
+            selection.final_prefixes.append(gpa, gpa.dupe(u8, pfx) catch return null) catch return null;
+        var out = HostBindings.init(gpa);
+        var it = tmp.table.iterator();
+        while (it.next()) |e| {
+            const k = gpa.dupe(u8, e.key_ptr.*) catch continue;
+            out.register(k, e.value_ptr.*) catch {};
+        }
+        break :blk out;
+    } else pack_cache.mergedHostBindings(gpa);
     const t_packs = runtime.clockMonotonicNanos();
 
     // Load gate from the meta sidecar; missing meta means cold path.
