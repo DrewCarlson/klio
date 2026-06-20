@@ -805,6 +805,16 @@ pub const Module = struct {
     /// lowering pass populates this so `Foo(args)` Calls become
     /// `NewInstance` instructions when `Foo` resolves to a class.
     class_index: std.ArrayList(ClassIndexEntry) = .empty,
+    /// Simple name → first `ClassId`, an O(1) overlay on `class_index`'s linear
+    /// scan. Built once after the module is finalized (`buildClassIdMap`, at the
+    /// link step) and read lock-free at run time; null until then (`classId`
+    /// falls back to the scan, e.g. during lowering). First-entry-wins to match
+    /// the scan's duplicate-name behavior.
+    class_id_map: ?std.StringHashMap(ClassId) = null,
+    /// FQN → `ClassId` overlay on `classIdByFqn`'s linear scan. A duplicated FQN
+    /// maps to `class_id_ambiguous` so the lookup returns null (the scan's
+    /// ambiguity guard). Built with `class_id_map`; null until then.
+    class_fqn_map: ?std.StringHashMap(ClassId) = null,
     /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
     /// to `Inst.Call { func }` instead of LoadGlobal+CallValue.
@@ -1038,6 +1048,8 @@ pub const Module = struct {
         self.consts.deinit(allocator);
         self.top_level.deinit(allocator);
         self.class_index.deinit(allocator);
+        if (self.class_id_map) |*m| m.deinit();
+        if (self.class_fqn_map) |*m| m.deinit();
         self.func_index.deinit(allocator);
         var it = self.func_name_index.valueIterator();
         while (it.next()) |list| list.deinit(allocator);
@@ -1124,10 +1136,34 @@ pub const Module = struct {
 
     /// Look up a class by simple name.
     pub fn classId(self: *const Module, name: []const u8) ?ClassId {
+        if (self.class_id_map) |*m| return m.get(name);
         for (self.class_index.items) |entry| {
             if (std.mem.eql(u8, entry.name, name)) return entry.id;
         }
         return null;
+    }
+
+    /// Build the `class_id_map` overlay from `class_index` (first entry wins on a
+    /// duplicate simple name, matching the linear scan). Idempotent; call once
+    /// after the module is finalized and before concurrent execution.
+    pub fn buildClassIdMap(self: *Module, allocator: Allocator) Allocator.Error!void {
+        var m = std.StringHashMap(ClassId).init(allocator);
+        try m.ensureTotalCapacity(@intCast(self.class_index.items.len));
+        for (self.class_index.items) |entry| {
+            const gop = m.getOrPutAssumeCapacity(entry.name);
+            if (!gop.found_existing) gop.value_ptr.* = entry.id;
+        }
+        if (self.class_id_map) |*old| old.deinit();
+        self.class_id_map = m;
+
+        var fm = std.StringHashMap(ClassId).init(allocator);
+        try fm.ensureTotalCapacity(@intCast(self.classes.items.len));
+        for (self.classes.items) |c| {
+            const gop = fm.getOrPutAssumeCapacity(c.fqn);
+            gop.value_ptr.* = if (gop.found_existing) class_id_ambiguous else c.id;
+        }
+        if (self.class_fqn_map) |*old| old.deinit();
+        self.class_fqn_map = fm;
     }
 
     /// Resolve a class written with a dotted qualifier (`Outer.Inner`) by
@@ -1965,7 +2001,15 @@ pub const Module = struct {
     /// Resolve a class by its fully-qualified name. Distinguishes
     /// same-simple-name classes from different packages that
     /// `addClass` keeps as separate definitions.
+    /// Sentinel stored in `class_fqn_map` for a duplicated FQN — the lookup
+    /// returns null so an ambiguous FQN never silently binds the wrong class.
+    const class_id_ambiguous: ClassId = @enumFromInt(std.math.maxInt(u32));
+
     pub fn classIdByFqn(self: *const Module, fqn: []const u8) ?ClassId {
+        if (self.class_fqn_map) |*m| {
+            const id = m.get(fqn) orelse return null;
+            return if (id == class_id_ambiguous) null else id;
+        }
         // Only resolve when the FQN is unambiguous. A residual
         // collision must not silently bind the wrong class.
         var found: ?ClassId = null;

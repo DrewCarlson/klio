@@ -2125,6 +2125,24 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+    // Fast path: a previously-resolved zero-arg user instance method bypasses the
+    // whole probe ladder. The cache is only populated by `irMethodWalk` *after*
+    // the per-instance binding probe and every builtin check declined, and those
+    // decisions are a pure function of (class, name) — stable across calls — so
+    // consulting the cache here is identical to letting them decline again, just
+    // without the per-call FQN building, supertype walk, and ~35 type checks.
+    if (receiver.* == .Instance) {
+        if (instanceMethodKey(receiver, name, args)) |k| {
+            if (instanceMethodCacheGetRaw(self, k)) |raw| {
+                if (raw != METHOD_MISS) {
+                    if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
+                }
+                // A cached miss falls through to the probe ladder (stdlib /
+                // extension / field), but `irMethodWalk` will skip the walk.
+            }
+        }
+    }
+
     // `Throwable.printStackTrace()` / `.stackTraceToString()` over the trace
     // captured when the throwable was thrown.
     if (try throwableStackMember(self, allocator, receiver, name, args)) |r| return r;
@@ -4023,6 +4041,17 @@ fn argsListFromSlice(allocator: Allocator, slice: []const Value) Allocator.Error
 /// Whether the class `name` (or any supertype, breadth-first) declares an
 /// IR method named `mname`.
 fn classHasUserMethod(self: *VmHost, allocator: Allocator, start: []const u8, mname: []const u8) bool {
+    // Fast path: the precomputed per-class hierarchy method-name set answers
+    // this in O(1). It collects the same user-declared method names up the
+    // supertype chain the walk below would. Built for every source class; a
+    // class with no entry (a synthesized/anon shape) falls back to the walk.
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().registry.hierarchy_methods.get(start)) |set| {
+            return set.contains(mname);
+        }
+    }
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
@@ -4573,51 +4602,82 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
 /// Build the inline-cache key for an instance method call, or `null` for a
 /// non-Instance receiver. Keyed by class-cell identity + interned method-name
 /// pointer + arity (all stable for the program lifetime).
-fn instanceMethodKey(receiver: *const Value, name: []const u8, n_args: usize) ?root_mod.ProgramImage.InstanceMethodKey {
+/// Compact signature of an argument run's primitive types, distinguishing the
+/// overloads a method-name resolution can depend on. Returns null for a
+/// non-primitive arg (or > 12 args), which means "do not cache this call" — the
+/// resolution then re-runs each time rather than risk a wrong cross-type hit.
+fn methodArgSig(args: []const Value) ?u64 {
+    if (args.len == 0) return 0;
+    if (args.len > 12) return null;
+    var sig: u64 = @as(u64, args.len) << 56;
+    for (args, 0..) |*a, i| {
+        const tag: u64 = switch (a.*) {
+            .Int => 1,    .Long => 2,   .Double => 3, .Float => 4,
+            .Short => 5,  .Byte => 6,   .Char => 7,   .Bool => 8,
+            .UInt => 9,   .ULong => 10, .UShort => 11, .UByte => 12,
+            else => return null,
+        };
+        sig |= tag << @intCast(i * 4);
+    }
+    return sig;
+}
+
+fn instanceMethodKey(receiver: *const Value, name: []const u8, args: []const Value) ?root_mod.ProgramImage.InstanceMethodKey {
     if (receiver.* != .Instance) return null;
+    const sig = methodArgSig(args) orelse return null;
     const inst = receiver.Instance;
     const g = inst.borrow();
     defer g.deinit();
     return .{
         .class_p = g.get().class.identity(),
         .name_p = @intFromPtr(name.ptr),
-        .n_args = @intCast(n_args),
+        .n_args = @intCast(args.len),
+        .sig = sig,
     };
 }
 
-fn instanceMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?FuncId {
+/// Sentinel cache value: this (class, name, arg-sig) is known to resolve to NO
+/// user instance method, so the next call skips the resolution walk and falls
+/// straight to the stdlib/extension/field paths. Sound because the resolution is
+/// a pure function of the key (classes are static).
+const METHOD_MISS: u32 = std.math.maxInt(u32);
+
+fn instanceMethodCacheGetRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
     const pg = self.prog.borrow();
     defer pg.deinit();
-    if (pg.get().instance_method_cache.get(key)) |raw| return @enumFromInt(raw);
-    return null;
+    return pg.get().instance_method_cache.get(key);
 }
 
-fn instanceMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: FuncId) void {
+fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, raw: u32) void {
     const pg = self.prog.borrowMut();
     defer pg.deinit();
-    pg.get().instance_method_cache.put(key, @intFromEnum(fid)) catch {};
+    pg.get().instance_method_cache.put(key, raw) catch {};
 }
 
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    // Inline cache: memoize the (class, method-name) → FuncId resolution for
-    // ZERO-ARG calls only. With no arguments there is no overload/arg-type
-    // discrimination (`pickMethodOverload` declines a sole candidate only by
-    // arity or definite arg-type mismatch — neither applies to a 0-arg call to a
-    // 0-param method), so the resolution is a pure function of the class and is
-    // safe to cache. Consulted at exactly the point the hierarchy walk would run
-    // (after the per-instance binding/anon probes), so dispatch is unchanged —
-    // only the linear class/method scans and per-call work-queue allocations are
-    // skipped. Zero-arg covers the member-heavy hot path (getters, `next`,
-    // `hasNext`, `toString`, `hashCode`, …).
-    const key = if (args.len == 0) instanceMethodKey(receiver, name, args.len) else null;
+    // Inline cache: memoize the (class, method-name, arg-type-signature) →
+    // FuncId resolution. The signature captures the argument primitive types the
+    // overload pick depends on, so a hit returns the same target the full walk
+    // would (a non-primitive arg yields no key, so those calls re-resolve rather
+    // than risk a wrong cross-type hit). Only an unambiguous resolution is
+    // cached; a call that declines to an extension is never stored. The fast
+    // path at `callMemberInnerStatic`'s entry consults this same cache before the
+    // probe ladder, so a repeat call skips the binding/builtin probes too.
+    const key = instanceMethodKey(receiver, name, args);
     if (key) |k| {
-        if (instanceMethodCacheGet(self, k)) |fid| {
-            return try invokeMethodFuncId(self, allocator, receiver, fid, args);
+        if (instanceMethodCacheGetRaw(self, k)) |raw| {
+            if (raw == METHOD_MISS) return null;
+            return try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args);
         }
     }
-    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args)) orelse return null;
+    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args)) orelse {
+        // Cache the miss: a member-accessed field (`obj.field`) re-runs this
+        // walk every read otherwise. Only a proven, key-stable miss is stored.
+        if (key) |k| instanceMethodCachePutRaw(self, k, METHOD_MISS);
+        return null;
+    };
     if (resolved.unambiguous) {
-        if (key) |k| instanceMethodCachePut(self, k, resolved.fid);
+        if (key) |k| instanceMethodCachePutRaw(self, k, @intFromEnum(resolved.fid));
     }
     return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
 }
@@ -4825,50 +4885,22 @@ fn throwableStackMember(self: *VmHost, allocator: Allocator, receiver: *const Va
     if (args.len != 0) return null;
     const is_print = std.mem.eql(u8, name, "printStackTrace");
     const is_tostr = std.mem.eql(u8, name, "stackTraceToString");
-    if (!is_print and !is_tostr) return null;
+    const is_elems = std.mem.eql(u8, name, "getStackTrace") or std.mem.eql(u8, name, "stackTrace");
+    if (!is_print and !is_tostr and !is_elems) return null;
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    var stk: ?runtime.StackRef = null;
     switch (receiver.*) {
-        .Exception => |e| {
-            const fg = e.fqn.borrow();
-            defer fg.deinit();
-            try buf.appendSlice(allocator, fg.get().bytes);
-            if (e.message) |m| {
-                const mg = m.borrow();
-                defer mg.deinit();
-                try buf.appendSlice(allocator, ": ");
-                try buf.appendSlice(allocator, mg.get().bytes);
-            }
-            stk = e.stack;
-        },
+        .Exception => {},
         .Instance => |inst| {
             if (!instanceIsThrowable(self, allocator, inst)) return null;
-            const g = inst.borrow();
-            defer g.deinit();
-            {
-                const cg = g.get().class.borrow();
-                defer cg.deinit();
-                try buf.appendSlice(allocator, cg.get().fqn);
-            }
-            if (g.get().get("message")) |mv| {
-                if (mv == .String) {
-                    const sg = mv.String.borrow();
-                    defer sg.deinit();
-                    try buf.appendSlice(allocator, ": ");
-                    try buf.appendSlice(allocator, sg.get().bytes);
-                }
-            }
-            stk = g.get().stack;
         },
         else => return null,
     }
-    if (stk) |s| {
-        const sg = s.borrow();
-        defer sg.deinit();
-        try ir.eval.formatStackTrace(allocator, sg.get(), &buf);
+    if (is_elems) {
+        return .{ .ok = (try ir.eval.stackTraceArray(allocator, receiver)) orelse runtime.ArrayData.fromBoxedList(try runtime.ValueList.initOwned(allocator, .empty)) };
     }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try ir.eval.formatThrowable(allocator, receiver, &buf, false, 0);
     if (is_print) {
         std.debug.print("{s}\n", .{buf.items});
         return .{ .ok = .Unit };
@@ -4879,7 +4911,7 @@ fn throwableStackMember(self: *VmHost, allocator: Allocator, receiver: *const Va
     return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, owned) } };
 }
 
-fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) bool {
+pub fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) bool {
     var stack: std.ArrayList([]const u8) = .empty;
     defer stack.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);

@@ -342,6 +342,24 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             return ok(.{ .Bool = false });
         }
     }
+    // `Throwable.stackTrace`: the captured frames as an `Array` of rendered
+    // elements. A user throwable that declares its own `stackTrace` field keeps
+    // that field (handled by the normal lookup before this point).
+    if (std.mem.eql(u8, name, "stackTrace")) {
+        const is_throwable = switch (receiver.*) {
+            .Exception => true,
+            .Instance => |inst| blk: {
+                const g = inst.borrow();
+                defer g.deinit();
+                break :blk g.get().get("stackTrace") == null and
+                    vmhost.host_call_member.instanceIsThrowable(self, allocator, inst);
+            },
+            else => false,
+        };
+        if (is_throwable) {
+            if (try ir.eval.stackTraceArray(allocator, receiver)) |arr| return ok(arr);
+        }
+    }
     // `e::class.simpleName`/`.qualifiedName` for a builtin exception.
     if ((std.mem.eql(u8, name, "simpleName") or std.mem.eql(u8, name, "qualifiedName")) and receiver.* == .Exception) {
         const g = receiver.Exception.fqn.borrow();
@@ -1316,6 +1334,14 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     const class_name = className(inst);
     // Delegated body property: route through the delegate's `getValue`.
     const delegate_owner: bool = blk: {
+        // Almost every program declares zero `by`-delegated body properties;
+        // skip the per-access supertype walk + scratch allocation entirely then.
+        {
+            const g = self.module.borrow();
+            const none = g.get().registry.delegated_body_props.count() == 0;
+            g.deinit();
+            if (none) break :blk false;
+        }
         var cur: ?[]const u8 = class_name;
         var seen: std.ArrayList([]const u8) = .empty;
         defer seen.deinit(allocator);

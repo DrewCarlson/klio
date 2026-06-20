@@ -328,28 +328,129 @@ fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
 /// source map. Frames with no recorded position (or an unknown file) render
 /// without the location suffix. Works uniformly for user, pack, and stdlib
 /// frames — every source file is registered in the same map.
-pub fn formatStackTrace(allocator: Allocator, trace: *const runtime.StackTraceData, out: *std.ArrayList(u8)) Allocator.Error!void {
-    for (trace.frames) |fr| {
-        try out.appendSlice(allocator, "\n    at ");
-        try out.appendSlice(allocator, fr.fqn);
-        if (fr.has_pos) {
-            if (span.active_map) |m| {
-                if (m.getChecked(span.FileId.from(fr.file_id))) |sf| {
-                    const lc = sf.lineCol(fr.offset);
-                    const loc = try std.fmt.allocPrint(allocator, " ({s}:{d})", .{ sf.path, lc.line });
-                    defer allocator.free(loc);
-                    try out.appendSlice(allocator, loc);
-                }
+/// Render one captured frame as `<fqn> (<file>:<line>)`, or `<fqn> (native)`
+/// when its position does not resolve (a runtime-internal / host dispatch point
+/// — marked so the gap is intelligible rather than reading as a truncated line).
+/// Caller owns the returned slice.
+fn frameToString(allocator: Allocator, fr: runtime.StackFrame) Allocator.Error![]u8 {
+    if (fr.has_pos) {
+        if (span.active_map) |m| {
+            if (m.getChecked(span.FileId.from(fr.file_id))) |sf| {
+                const lc = sf.lineCol(fr.offset);
+                return std.fmt.allocPrint(allocator, "{s} ({s}:{d})", .{ fr.fqn, sf.path, lc.line });
             }
         }
     }
+    return std.fmt.allocPrint(allocator, "{s} (native)", .{fr.fqn});
 }
 
-/// Attach a freshly-captured stack trace to a thrown value the first time it is
-/// thrown (`fillInStackTrace`): once a throwable carries a trace, re-throws and
-/// the outward unwind leave it untouched. Only `Throwable`-shaped values carry
-/// one — a builtin `Exception` value or a user `Throwable`-subclass instance.
-fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
+pub fn formatStackTrace(allocator: Allocator, trace: *const runtime.StackTraceData, out: *std.ArrayList(u8)) Allocator.Error!void {
+    for (trace.frames) |fr| {
+        try out.appendSlice(allocator, "\n    at ");
+        const s = try frameToString(allocator, fr);
+        defer allocator.free(s);
+        try out.appendSlice(allocator, s);
+    }
+}
+
+/// Build the `Throwable.stackTrace` value: an `Array` whose elements are the
+/// rendered frames (each a `String`, its `StackTraceElement.toString()` form).
+/// Returns null for a receiver that carries no captured trace.
+pub fn stackTraceArray(allocator: Allocator, v: *const Value) Allocator.Error!?Value {
+    const stk: ?runtime.StackRef = switch (v.*) {
+        .Exception => |e| e.stack,
+        .Instance => |inst| blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            break :blk g.get().stack;
+        },
+        else => null,
+    };
+    const s = stk orelse return null;
+    const sg = s.borrow();
+    defer sg.deinit();
+    const frames = sg.get().frames;
+    var list: std.ArrayList(Value) = .empty;
+    errdefer list.deinit(allocator);
+    for (frames) |fr| {
+        const str = try frameToString(allocator, fr);
+        list.append(allocator, .{ .String = try runtime.strInitOwned(allocator, str) }) catch {
+            allocator.free(str);
+            return error.OutOfMemory;
+        };
+    }
+    return runtime.ArrayData.fromBoxedList(try runtime.ValueList.initOwned(allocator, list));
+}
+
+/// Render a throwable — its `type: message` header, captured stack trace, and
+/// (recursively) its `Caused by:` chain — into `out`. `is_cause` prefixes the
+/// `Caused by:` line; `depth` bounds a self-referential cause cycle.
+pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayList(u8), is_cause: bool, depth: u8) Allocator.Error!void {
+    if (depth > 16) return;
+    if (is_cause) try out.appendSlice(allocator, "\nCaused by: ");
+    var stk: ?runtime.StackRef = null;
+    var cause: ?Value = null;
+    switch (v.*) {
+        .Exception => |e| {
+            {
+                const fg = e.fqn.borrow();
+                defer fg.deinit();
+                try out.appendSlice(allocator, fg.get().bytes);
+            }
+            if (e.message) |m| {
+                const mg = m.borrow();
+                defer mg.deinit();
+                try out.appendSlice(allocator, ": ");
+                try out.appendSlice(allocator, mg.get().bytes);
+            }
+            stk = e.stack;
+            if (e.cause) |c| {
+                const cg = c.borrow();
+                defer cg.deinit();
+                cause = cg.get().*;
+            }
+        },
+        .Instance => |inst| {
+            const g = inst.borrow();
+            defer g.deinit();
+            {
+                const cg = g.get().class.borrow();
+                defer cg.deinit();
+                try out.appendSlice(allocator, cg.get().fqn);
+            }
+            if (g.get().get("message")) |mv| {
+                if (mv == .String) {
+                    const sg = mv.String.borrow();
+                    defer sg.deinit();
+                    try out.appendSlice(allocator, ": ");
+                    try out.appendSlice(allocator, sg.get().bytes);
+                }
+            }
+            stk = g.get().stack;
+            if (g.get().get("cause")) |cv| {
+                if (cv != .Null) cause = cv;
+            }
+        },
+        else => {
+            try out.appendSlice(allocator, "<thrown value>");
+            return;
+        },
+    }
+    if (stk) |s| {
+        const sg = s.borrow();
+        defer sg.deinit();
+        try formatStackTrace(allocator, sg.get(), out);
+    }
+    if (cause) |c| try formatThrowable(allocator, &c, out, true, depth + 1);
+}
+
+/// Attach a freshly-captured stack trace to a throwable the first time it needs
+/// one (`fillInStackTrace`): called at construction (matching the JVM) and again
+/// at the throw seam as a fallback for host-created throwables. Attach-once, so
+/// the construction-site trace wins and a re-throw keeps it. Only
+/// `Throwable`-shaped values carry one — a builtin `Exception` value or a user
+/// `Throwable`-subclass instance.
+pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
     switch (v.*) {
         .Exception => |*e| {
             if (e.stack != null) return;
@@ -449,7 +550,12 @@ pub fn captureChainAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry 
 /// a `FrameSnapshot` on suspend), so it is backed by the same per-call
 /// allocator the frame's regs/params/captures use.
 fn chainAllocator() Allocator {
-    return runtime.slab.tracedPage();
+    // The process-wide slab (NOT `page_allocator`): the enclosing-`this` chain is
+    // (re)allocated on every method/extension call that seeds its own receiver,
+    // and `page_allocator` would mmap+munmap a page per call — a syscall pair
+    // that dominated instance-method dispatch. The slab is global and stable
+    // (the chain can outlive a per-call arena via a suspend snapshot) yet fast.
+    return runtime.slab.allocator;
 }
 
 fn maxEvalDepth() usize {
@@ -1730,6 +1836,18 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             {
                 const eq = Value.structuralEq(&l, &r);
                 const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
+                try frame.write(bo.dst, .{ .Bool = b });
+                return .cont;
+            }
+            // `x == null` / `x != null` is a null check, never a user `equals`
+            // dispatch (Kotlin compares against the null literal by identity).
+            // Without this, every `?.` safe-call's null guard dispatched
+            // `x.equals(null)` — a full member resolution per access.
+            if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+                (l == .Null or r == .Null))
+            {
+                const both_null = l == .Null and r == .Null;
+                const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !both_null else both_null;
                 try frame.write(bo.dst, .{ .Bool = b });
                 return .cont;
             }

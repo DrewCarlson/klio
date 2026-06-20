@@ -595,6 +595,10 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
     if (isBuiltinThrowableName(class_name)) {
         if (leaf.* == .Instance) {
             try bindThrowableArgs(self, leaf.Instance, args, true);
+            // fillInStackTrace at construction (JVM order): the throwable's
+            // super-chain just established it as a Throwable, so capture here.
+            var tv = leaf.*;
+            try ir.eval.attachStackTrace(self.allocator, &tv);
         }
         return .{ .ok = {} };
     }
@@ -1146,7 +1150,11 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     // Builtin Throwable hierarchy: host-backed via the intrinsic.
     if (root.isBuiltinThrowableFqn(ir_fqn)) {
         if (lookupIntrinsic(self, ir_fqn)) |intrinsic| {
-            return dispatchIntrinsic(self, ir_fqn, intrinsic, args);
+            // fillInStackTrace at construction: a builtin throwable
+            // (`RuntimeException(msg)`) captures the stack when constructed.
+            var r = try dispatchIntrinsic(self, ir_fqn, intrinsic, args);
+            if (r == .ok) try ir.eval.attachStackTrace(allocator, &r.ok);
+            return r;
         }
     }
     // Builtin tuple classes (`kotlin.Pair` / `kotlin.Triple`) have a
@@ -2027,12 +2035,14 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
 
     var throwable_message: ?Value = null;
     var throwable_cause: ?Value = null;
+    var is_throwable = false;
 
     // Direct-parent Throwable message/cause recovery.
     {
         const parent_ref = firstNonInterfaceSuper(self, class_def);
         if (parent_ref) |pref| {
             if (isThrowableDirectName(pref.name)) {
+                is_throwable = true;
                 if (parentCtorArgThunks(self, cur_fqn, cur_class)) |thunks| {
                     for (thunks, 0..) |fid, idx| {
                         const fr = try funcAt(self, fid, "parent ctor arg");
@@ -2086,6 +2096,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         }
 
         if (isThrowableChainName(pname)) {
+            is_throwable = true;
             if (throwable_message == null and parent_args.items.len > 0) throwable_message = parent_args.items[0];
             if (throwable_cause == null and parent_args.items.len > 1) throwable_cause = parent_args.items[1];
             parent_args.deinit(allocator);
@@ -2304,6 +2315,12 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         const g = inst.borrowMut();
         try g.get().fields.append(allocator, .{ .name = "cause", .value = c });
         g.deinit();
+    }
+    // fillInStackTrace at construction (JVM order) for a user Throwable
+    // subclass: its parent chain bottomed out at a builtin Throwable.
+    if (is_throwable) {
+        var tv = Value{ .Instance = inst };
+        try ir.eval.attachStackTrace(allocator, &tv);
     }
 
     // Body properties: walk the parent chain bottom-up.

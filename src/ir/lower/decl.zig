@@ -894,6 +894,10 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         switch (body) {
             .Block => |*blk| result = try mod.lowerBlock(&b, blk),
             .Expr => |*e| {
+                // An expression body has no statements, so mark its source
+                // position here (stack-trace support) — without this a frame
+                // running `fun f() = g()` would report no line.
+                try b.push(.{ .Trace = .{ .span = e.span() } });
                 const prev = b.pushExpected(f.return_type);
                 result = try mod.lowerExpr(&b, e);
                 b.restoreExpected(prev);
