@@ -176,6 +176,13 @@ pub const Emitter = struct {
         try self.modrmRR(b, a);
     }
 
+    /// `neg <dst64>` (two's-complement negate).
+    pub fn negReg(self: *Emitter, dst: Reg) JitError!void {
+        try self.rexW(dst);
+        try self.byte(0xF7);
+        try self.byte(0xD8 | low3(dst)); // /3, mod=11
+    }
+
     /// `add <dst64>, imm32` (sign-extended).
     pub fn addImm32(self: *Emitter, dst: Reg, v: i32) JitError!void {
         try self.rexWrr(.rax, dst); // reg field unused (=/0), only REX.B for dst

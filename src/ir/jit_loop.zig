@@ -213,6 +213,7 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
             break :blk null;
         },
         .Not => |n| .{ .r = n.dst, .t = .boolean },
+        .UnOp => |u| .{ .r = u.dst, .t = typeOf(types, u.operand) },
         else => null,
     };
     if (dst_t) |d| return setType(types, d.r, d.t);
@@ -434,6 +435,11 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
             reads[0] = n.src;
             n_reads.* = 1;
             def.* = n.dst;
+        },
+        .UnOp => |u| {
+            reads[0] = u.operand;
+            n_reads.* = 1;
+            def.* = u.dst;
         },
         else => {},
     }
@@ -680,6 +686,18 @@ const Compiler = struct {
                 try self.em.setccReg(.e, T0);
                 try self.storeSlot(n.dst, T0);
             },
+            .UnOp => |u| {
+                if (!isNumeric(typeOf(self.types, u.operand))) return jit.JitError.Unsupported;
+                try self.loadSlot(T0, u.operand);
+                switch (u.op) {
+                    .Neg => try self.em.negReg(T0),
+                    .Inc => try self.em.addImm32(T0, 1),
+                    .Dec => try self.em.addImm32(T0, -1),
+                    .Plus => {},
+                }
+                if (typeOf(self.types, u.dst) == .i32) try self.em.movsxd(T0, T0);
+                try self.storeSlot(u.dst, T0);
+            },
             .Trace => {},
             else => return jit.JitError.Unsupported,
         }
@@ -745,7 +763,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         for (blk.insts) |*inst| {
             if (arrayOpOf(module, inst) != null) continue;
             switch (inst.*) {
-                .Const, .Move, .BinOp, .Not, .Trace => {},
+                .Const, .Move, .BinOp, .Not, .UnOp, .Trace => {},
                 else => {
                     if (debugEnabled()) std.debug.print("[jit]   uncompilable inst {s} in {s} b{d}\n", .{ @tagName(inst.*), func.name, bid.int() });
                     return null;
