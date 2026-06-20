@@ -250,11 +250,24 @@ and per-instruction interpreter overhead.
 - **Register model**: each IR register is an i64 slot in a scratch file; emitted
   code uses rax/rcx/rdx scratch per op (no register allocator). The win is from
   killing boxing/dispatch, not from allocation.
-- **Supported**: `Const`/`Move`/`BinOp` (Int/Long +,−,*, comparisons; Int results
-  `movsxd`-normalized for 32-bit wraparound), packed-array subscripts (get/set on
-  the F5 scalar buffer, SIB load/store + bounds check), `Goto`/`Branch`, `Trace`.
-  Subscripts match both the `CallMember "get"/"set"` lowering (how `a[i]` actually
-  lowers) and `Index`/`IndexSet`.
+- **Supported**: `Const`/`Move`/`BinOp` (Int/Long +,−,*,/,%, comparisons; Int
+  results `movsxd`-normalized for 32-bit wraparound), `Not`, `UnOp`
+  (Neg/Inc/Dec/Plus), packed-array subscripts (get/set on the F5 scalar buffer,
+  SIB load/store + bounds check), capture cells (`CellGet`/`CellSet` on a `var`
+  boxed by closure), `Goto`/`Branch`, `Trace`. Subscripts match both the
+  `CallMember "get"/"set"` lowering (how `a[i]` actually lowers) and
+  `Index`/`IndexSet`.
+- **Capture cells**: a `var` captured by a nested lambda is a boxed `Value.Cell`.
+  The loop body's `CellGet`/`CellSet` are compiled by caching the box's scalar in
+  the cell register's own slot for the native run (unboxed at entry, written back
+  through the box at exit). Sound because no call or GC runs inside a JITted loop,
+  so the box is unobserved by anyone else; aliased boxes and cells touched as a
+  plain scalar are rejected. This unblocked the numeric sieve's outer prime-scan
+  (its `count`/`acc` vars).
+- **Div/Mod**: `cqo`+`idiv`; divide-by-zero deopts to the faulting instruction
+  (interpreter throws the same `ArithmeticException`); divisor `-1` is
+  special-cased to dodge the x86 `INT_MIN/-1` `#DE` while matching Kotlin's
+  wrapping result.
 - **Types**: whole-function static inference (i32/i64/bool/unit/null); arrays
   specialized on the kind observed at first compile. A runtime entry guard bails
   to the interpreter if a live-in register type / array kind mismatches, so
@@ -268,14 +281,16 @@ and per-instruction interpreter overhead.
   resumes at the faulting instruction, throwing identically. Loop blocks in a
   try-region are rejected (deopt resumes mid-block).
 - **Results** (`KLIO_JIT=1`, min): 100M-iter Long arithmetic 12.4 s → 0.21 s
-  (60×); 1e9 IntArray increment 104 s → 1.3 s (79×); numeric sieve bench 6.6 s →
-  4.3 s (the inner marking loop JITs; the prime-scan's `!a[i]`/Cell vars and the
-  reduction's `toLong()` member call still interpret). On the JIT-amenable
-  arithmetic/array loops klio is now within a small factor of node.
-- **Validated**: full `zig build test` green with the JIT OFF and ON (differential
-  parity vs kotlinc); 88 examples + 728 corpus fixtures produce identical output
-  with the JIT on vs off.
-- **Next coverage** (not blocking): `Not` and `UnOp` (Inc/Dec) for the sieve scan
-  loop; `Div`/`Mod` with a divide-by-zero deopt; float arrays; calls via a
-  trampoline. Each widens the compiled set; the harness (guard + deopt + bail) is
-  in place.
+  (60×); 1e9 IntArray increment 104 s → 1.3 s (79×); numeric sieve bench 7.0 s →
+  0.75 s (9.3×) — both the inner marking loop and the outer prime-scan now JIT
+  (capture-cell support unblocked the scan's `count`/`acc`). On the JIT-amenable
+  arithmetic/array/scan loops klio is now within a small factor of node.
+- **Validated**: full `zig build test` green with the JIT OFF and ON. The e2e
+  corpus test runs every example through the native tier (JIT forced on via a
+  test-only toggle) and asserts the same checked-in expected output. The full
+  program set (examples + corpus + fixtures, 800+ programs) produces byte-
+  identical output with the JIT on vs off, including divide-by-zero, `MIN/-1`
+  wrap, and OOB deopts.
+- **Next coverage** (not blocking): float/double arrays; calls via a trampoline
+  (stage 4 — collections/strings are call-bound). Each widens the compiled set;
+  the harness (guard + deopt + bail) is in place.
