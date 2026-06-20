@@ -4073,6 +4073,10 @@ fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
         cg.deinit();
         g.deinit();
     }
+    // Auto members are only synthesized for data/value/object classes; a plain
+    // class has none, so skip the per-call hierarchy walk (which allocates a
+    // queue + seen-set) that only feeds the `has_user_override` guards below.
+    if (!is_data and !is_value and !is_object) return null;
     const has_user_override = classHasUserMethod(self, allocator, class_name, name);
 
     if (is_data and is_object and !has_user_override and std.mem.eql(u8, name, "toString")) {
