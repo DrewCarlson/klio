@@ -503,10 +503,10 @@ fn kotlinHashCode(v: *const Value) i32 {
             break :blk h;
         },
         .List => |l| blk: {
-            const g = l.items.borrow();
+            const g = l.buf.borrow();
             defer g.deinit();
             var h: i32 = 1;
-            for (g.get().items) |e| h = h *% 31 +% kotlinHashCode(&e);
+            for (g.get().boxed.items) |e| h = h *% 31 +% kotlinHashCode(&e);
             break :blk h;
         },
         .Set => |s| blk: {
@@ -734,9 +734,9 @@ fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) A
             try entry_items.appendSlice(allocator, g.get().items);
         },
         .List => |l| {
-            const g = l.items.borrow();
+            const g = l.buf.borrow();
             defer g.deinit();
-            try entry_items.appendSlice(allocator, g.get().items);
+            try entry_items.appendSlice(allocator, g.get().boxed.items);
         },
         .Instance => {
             const dr = try drainIterableToList(self, allocator, &entries_val);
@@ -745,9 +745,9 @@ fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) A
                     drained = dv; // released after the pairs loop (see defer)
                     switch (dv) {
                         .List => |l| {
-                            const g = l.items.borrow();
+                            const g = l.buf.borrow();
                             defer g.deinit();
-                            try entry_items.appendSlice(allocator, g.get().items);
+                            try entry_items.appendSlice(allocator, g.get().boxed.items);
                         },
                         else => {},
                     }
@@ -1094,19 +1094,30 @@ fn elementsProveArgs(self: *VmHost, allocator: Allocator, receiver: *const Value
         }
         return true;
     }
-    const items: ?runtime.ValueList = switch (receiver.*) {
-        .List => |l| if (isListHead(pn)) l.items else null,
-        .Set => |st| if (isSetHead(pn)) st.items else null,
-        .Array => |arr| if (std.mem.eql(u8, pn, "Array")) arr.boxedList() else null,
-        else => null,
-    };
-    const list = items orelse return false;
     if (ty_args.len < 1) return false;
     const declared_elem: ?[]const u8 = switch (receiver.*) {
         .List => |l| l.declared_elem,
         .Set => |st| st.declared_elem,
         else => null,
     };
+    if (receiver.* == .List) {
+        const l = receiver.List;
+        if (!isListHead(pn)) return false;
+        const g = l.buf.borrow();
+        defer g.deinit();
+        const elems = g.get().boxed.items;
+        if (elems.len == 0) return overload_match.declaredElemProves(self, &ty_args[0], declared_elem);
+        for (elems) |*e| {
+            if (!try elementSatisfies(self, allocator, e, fid, &ty_args[0], fuel)) return false;
+        }
+        return true;
+    }
+    const items: ?runtime.ValueList = switch (receiver.*) {
+        .Set => |st| if (isSetHead(pn)) st.items else null,
+        .Array => |arr| if (std.mem.eql(u8, pn, "Array")) arr.boxedList() else null,
+        else => null,
+    };
+    const list = items orelse return false;
     const g = list.borrow();
     defer g.deinit();
     const elems = g.get().items;
@@ -1449,12 +1460,7 @@ fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const Val
             },
         }
     }
-    return .{ .ok = .{ .List = .{
-        .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
-        .mutable = false,
-        .enum_entries = false,
-        .backing = null,
-    } } };
+    return .{ .ok = .{ .List = try runtime.ListData.fromArrayList(allocator, items, false) } };
 }
 
 // -------------------------------------------------------------------------
@@ -2047,12 +2053,7 @@ fn materialiseSequence(self: *VmHost, allocator: Allocator, seq_val: *const Valu
 // -------------------------------------------------------------------------
 
 fn listOf(allocator: Allocator, items: std.ArrayList(Value), mutable: bool) Allocator.Error!Value {
-    return .{ .List = .{
-        .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
-        .mutable = mutable,
-        .enum_entries = false,
-        .backing = null,
-    } };
+    return .{ .List = try runtime.ListData.fromArrayList(allocator, items, mutable) };
 }
 
 fn cloneItemsList(allocator: Allocator, src: runtime.ValueList) Allocator.Error!std.ArrayList(Value) {
@@ -2063,6 +2064,16 @@ fn cloneItemsList(allocator: Allocator, src: runtime.ValueList) Allocator.Error!
     // An owned copy: every wrapper built from this list (a new List/Array/Set/
     // Iterator, or a `sorted` list that escapes) takes one reference per element,
     // so retain each. The source still owns its own refs. No-op under the arena.
+    if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
+    return out;
+}
+
+/// `cloneItemsList` for a `ListData` receiver.
+fn cloneItemsListLD(allocator: Allocator, src: runtime.ListData) Allocator.Error!std.ArrayList(Value) {
+    const snap = try src.snapshot(allocator);
+    defer if (runtime.freeScratch()) allocator.free(snap);
+    var out: std.ArrayList(Value) = .empty;
+    try out.appendSlice(allocator, snap);
     if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
     return out;
 }
@@ -2215,7 +2226,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 else => 0,
             };
         } else 0;
-        const items = try cloneItemsList(allocator, receiver.List.items);
+        const items = try cloneItemsListLD(allocator, receiver.List);
         return .{ .ok = .{ .Iterator = .{
             .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
             .pos = try ObjRef(usize).init(allocator, start),
@@ -2474,7 +2485,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // Array shape ops.
     if (receiver.* == .List and std.mem.eql(u8, name, "toTypedArray") and args.len == 0) {
-        const items = try cloneItemsList(allocator, receiver.List.items);
+        const items = try cloneItemsListLD(allocator, receiver.List);
         return .{ .ok = runtime.ArrayData.fromBoxedList(try ObjRef(std.ArrayList(Value)).init(allocator, items)) };
     }
     if (receiver.* == .Array) {
@@ -3011,13 +3022,20 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
     _ = self;
     switch (receiver.*) {
         .List => |l| {
-            // A mutable list shares its backing so `MutableIterator.remove()`
-            // mutates the source (and the iterating loop observes it); an
-            // immutable list snapshots, as before.
+            // A mutable, non-view list shares its live backing so
+            // `MutableIterator.remove()` writes through to the source; an
+            // immutable list (or a map-values view) snapshots.
             if (l.mutable and l.backing == null) {
-                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
+                try l.materialize(allocator); // iterate/remove against a boxed backing
+                const empty: std.ArrayList(Value) = .empty;
+                return .{ .ok = .{ .Iterator = .{
+                    .items = try ObjRef(std.ArrayList(Value)).init(allocator, empty),
+                    .pos = try ObjRef(usize).init(allocator, 0),
+                    .prim = null,
+                    .list_src = l.buf.clone(),
+                } } };
             }
-            const items = try cloneItemsList(allocator, l.items);
+            const items = try cloneItemsListLD(allocator, l);
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
         },
         .Set => |s| {
@@ -3312,11 +3330,10 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
             try items.append(allocator, e.value);
         }
         cg.deinit();
-        return .{ .ok = .{ .List = .{
-            .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
-            .mutable = false,
-            .enum_entries = true,
-            .backing = null,
+        return .{ .ok = .{ .List = blk: {
+            var ld = try runtime.ListData.fromArrayList(allocator, items, false);
+            ld.enum_entries = true;
+            break :blk ld;
         } } };
     }
     // Enum.valueOf("X")
@@ -3510,7 +3527,7 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
 }
 
 fn sortedInstances(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
-    var snap = try cloneItemsList(allocator, receiver.List.items);
+    var snap = try cloneItemsListLD(allocator, receiver.List);
     defer snap.deinit(allocator);
     var has_inst = false;
     for (snap.items) |v| {
@@ -3745,17 +3762,17 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
         .List => |l| {
             if (!l.mutable) return null;
             if (std.mem.eql(u8, name, "plusAssign") and args.len == 1) {
-                const g = l.items.borrowMut();
+                const g = l.buf.borrowMut();
                 defer g.deinit();
-                try g.get().append(allocator, args[0]);
+                try g.get().boxed.append(allocator, args[0]);
                 return .{ .ok = .Unit };
             }
             if (std.mem.eql(u8, name, "minusAssign") and args.len == 1) {
-                const g = l.items.borrowMut();
+                const g = l.buf.borrowMut();
                 defer g.deinit();
-                for (g.get().items, 0..) |x, idx| {
+                for (g.get().boxed.items, 0..) |x, idx| {
                     if (Value.structuralEq(&x, &args[0])) {
-                        _ = g.get().orderedRemove(idx);
+                        _ = g.get().boxed.orderedRemove(idx);
                         break;
                     }
                 }
@@ -3813,7 +3830,7 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                             try to_put.append(allocator, kv);
                         }
                     },
-                    .List => |lst| try collectPairs(allocator, &to_put, lst.items),
+                    .List => |lst| try collectPairsLD(allocator, &to_put, lst),
                     .Set => |st| try collectPairs(allocator, &to_put, st.items),
                     else => {},
                 }
@@ -3850,7 +3867,17 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
 fn collectPairs(allocator: Allocator, out: *std.ArrayList(MapPair), items: runtime.ValueList) Allocator.Error!void {
     const g = items.borrow();
     defer g.deinit();
-    for (g.get().items) |v| {
+    try collectPairsSlice(allocator, out, g.get().items);
+}
+
+fn collectPairsLD(allocator: Allocator, out: *std.ArrayList(MapPair), ld: runtime.ListData) Allocator.Error!void {
+    const snap = try ld.snapshot(allocator);
+    defer if (runtime.freeScratch()) allocator.free(snap);
+    try collectPairsSlice(allocator, out, snap);
+}
+
+fn collectPairsSlice(allocator: Allocator, out: *std.ArrayList(MapPair), items: []const Value) Allocator.Error!void {
+    for (items) |v| {
         if (v == .Pair) {
             const k = v.Pair.first.asPtr().*;
             const val = v.Pair.second.asPtr().*;
@@ -3921,6 +3948,19 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
     return null;
 }
 
+/// Live element count of an iterator: its shared mutable-list backing if it has
+/// one, else its own snapshot.
+fn iterLiveLen(it: anytype) usize {
+    if (it.list_src) |b| {
+        const g = b.borrow();
+        defer g.deinit();
+        return g.get().len();
+    }
+    const ig = it.items.borrow();
+    defer ig.deinit();
+    return ig.get().items.len;
+}
+
 fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     _ = self;
     const it = receiver.Iterator;
@@ -3928,25 +3968,30 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const pg = it.pos.borrow();
         const p = pg.get().*;
         pg.deinit();
-        const ig = it.items.borrow();
-        const len = ig.get().items.len;
-        ig.deinit();
+        const len = iterLiveLen(it);
         return .{ .ok = boolVal(p < len) };
     }
     if (isIteratorNext(name) and args.len == 0) {
         const pg = it.pos.borrow();
         const p = pg.get().*;
         pg.deinit();
-        const ig = it.items.borrow();
-        if (p >= ig.get().items.len) {
-            ig.deinit();
+        if (p >= iterLiveLen(it)) {
             return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator exhausted") };
         }
-        const v = ig.get().items[p];
-        // Borrowed element: the backing list still owns it, so retain before
-        // handing it to the register that will own the iteration result.
+        // Read element `p` from the live source (a shared mutable-list backing or
+        // the iterator's own snapshot). Borrowed — the source still owns it — so
+        // retain before handing it to the owning register.
+        const v = blk: {
+            if (it.list_src) |b| {
+                const g = b.borrow();
+                defer g.deinit();
+                break :blk g.get().get(p);
+            }
+            const ig = it.items.borrow();
+            defer ig.deinit();
+            break :blk ig.get().items[p];
+        };
         if (runtime.reclaimEnabled()) v.retain();
-        ig.deinit();
         const pmg = it.pos.borrowMut();
         pmg.get().* = p + 1;
         pmg.deinit();
@@ -3955,15 +4000,29 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // `MutableIterator.remove()` — drop the element last returned by `next()`
     // (at `pos - 1`) from the backing list and rewind the cursor so the
     // following `next()` resumes correctly. A no-op before the first `next()`.
+    // For a shared mutable-list iterator this removes from the source list.
     if (std.mem.eql(u8, name, "remove") and args.len == 0) {
         const pg = it.pos.borrow();
         const p = pg.get().*;
         pg.deinit();
         if (p == 0) return .{ .ok = .Unit };
-        const g = it.items.borrowMut();
-        defer g.deinit();
-        if (p - 1 < g.get().items.len) {
-            _ = g.get().orderedRemove(p - 1);
+        var removed = false;
+        if (it.list_src) |b| {
+            const g = b.borrowMut();
+            defer g.deinit();
+            if (g.get().* == .boxed and p - 1 < g.get().boxed.items.len) {
+                _ = g.get().boxed.orderedRemove(p - 1);
+                removed = true;
+            }
+        } else {
+            const g = it.items.borrowMut();
+            defer g.deinit();
+            if (p - 1 < g.get().items.len) {
+                _ = g.get().orderedRemove(p - 1);
+                removed = true;
+            }
+        }
+        if (removed) {
             const pmg = it.pos.borrowMut();
             pmg.get().* = p - 1;
             pmg.deinit();
