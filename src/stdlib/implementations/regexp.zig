@@ -44,22 +44,22 @@ fn arityErr(msg: []const u8) EvalResult {
 
 fn makeString(allocator: std.mem.Allocator, bytes: []const u8) !Value {
     const owned = try allocator.dupe(u8, bytes);
-    return .{ .String = try StringRef.initOwned(allocator, owned) };
+    return .{ .String = try runtime.strInitOwned(allocator, owned) };
 }
 
 /// Wrap an already-owned byte slice as a `String` without re-copying.
 fn makeStringOwned(allocator: std.mem.Allocator, owned: []const u8) !Value {
-    return .{ .String = try StringRef.initOwned(allocator, owned) };
+    return .{ .String = try runtime.strInitOwned(allocator, owned) };
 }
 
 fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]const u8) !Value {
     const owned_fqn = try allocator.dupe(u8, fqn);
     const msg_ref: ?StringRef = if (message) |m|
-        try StringRef.initOwned(allocator, try allocator.dupe(u8, m))
+        try runtime.strInitOwned(allocator, try allocator.dupe(u8, m))
     else
         null;
     return .{ .Exception = .{
-        .fqn = try StringRef.initOwned(allocator, owned_fqn),
+        .fqn = try runtime.strInitOwned(allocator, owned_fqn),
         .message = msg_ref,
         .cause = null,
     } };
@@ -88,7 +88,7 @@ fn makeSequence(allocator: std.mem.Allocator, items: []const Value) !Value {
 /// Borrow the bytes behind a `Value::String`.
 fn stringBytes(v: Value) ?[]const u8 {
     return switch (v) {
-        .String => |s| s.asPtr().*,
+        .String => |s| s.asPtr().bytes,
         else => null,
     };
 }
@@ -874,7 +874,7 @@ fn compileRegex(allocator: std.mem.Allocator, pattern: []const u8) !EvalResult {
     };
     const owned_pat = try allocator.dupe(u8, pattern);
     const data = RegexData{
-        .pattern = try StringRef.initOwned(allocator, owned_pat),
+        .pattern = try runtime.strInitOwned(allocator, owned_pat),
         .engine = @ptrCast(prog),
     };
     return ok(.{ .Regex = try ObjRef(RegexData).init(allocator, data) });
@@ -972,7 +972,7 @@ fn buildMatch(
     input: StringRef,
     caps: []const Capture,
 ) !MatchData {
-    const s = input.asPtr().*;
+    const s = input.asPtr().bytes;
     var groups = try allocator.alloc(?MatchGroupData, caps.len);
     for (caps, 0..) |c, i| {
         if (c.start) |start_b| {
@@ -986,7 +986,7 @@ fn buildMatch(
                 end_char - 1;
             const owned = try allocator.dupe(u8, value_bytes);
             groups[i] = .{
-                .value = try StringRef.initOwned(allocator, owned),
+                .value = try runtime.strInitOwned(allocator, owned),
                 .start = start,
                 .end_inclusive = end_inclusive,
             };
@@ -1036,7 +1036,7 @@ fn expandKotlinReplacement(
     const groupText = struct {
         fn get(gs: []const ?MatchGroupData, idx: usize) []const u8 {
             if (idx < gs.len) {
-                if (gs[idx]) |g| return g.value.asPtr().*;
+                if (gs[idx]) |g| return g.value.asPtr().bytes;
             }
             return "";
         }
@@ -1173,7 +1173,7 @@ pub fn regex_find(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Regex.find requires a String");
     }
     const sr = ctx.args[1].String;
-    const s = sr.asPtr().*;
+    const s = sr.asPtr().bytes;
     var start: usize = 0;
     if (ctx.args.len > 2) {
         const v = ctx.args[2];
@@ -1202,7 +1202,7 @@ pub fn regex_find_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Regex.findAll requires a String");
     }
     const sr = ctx.args[1].String;
-    const s = sr.asPtr().*;
+    const s = sr.asPtr().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.findAll requires a Regex receiver");
 
     var items: std.ArrayList(Value) = .empty;
@@ -1236,7 +1236,7 @@ pub fn regex_match_entire(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Regex.matchEntire requires a String");
     }
     const sr = ctx.args[1].String;
-    const s = sr.asPtr().*;
+    const s = sr.asPtr().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.matchEntire requires a Regex receiver");
     if (try runMatch(ctx.allocator, prog, s, 0)) |caps| {
         defer ctx.allocator.free(caps);
@@ -1257,7 +1257,7 @@ pub fn regex_match_at(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Regex.matchAt requires a String");
     }
     const sr = ctx.args[1].String;
-    const s = sr.asPtr().*;
+    const s = sr.asPtr().bytes;
     const idx = if (ctx.args.len > 2) ctx.args[2].asI64() else null;
     if (idx == null) return typeErr("Regex.matchAt requires Int index");
     const byte = charIndexToByte(s, idx.?);
@@ -1293,7 +1293,7 @@ fn performRegexReplace(
     repl: ?Value,
     cfg: RegexReplace,
 ) std.mem.Allocator.Error!EvalResult {
-    const s = sr.asPtr().*;
+    const s = sr.asPtr().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.replace requires a Regex receiver");
     const allocator = ctx.allocator;
 
@@ -1302,7 +1302,7 @@ fn performRegexReplace(
     }
 
     if (repl.? == .String) {
-        const template = repl.?.String.asPtr().*;
+        const template = repl.?.String.asPtr().bytes;
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
         var last: usize = 0;
@@ -1364,7 +1364,7 @@ fn performRegexReplace(
         switch (rv) {
             .err => return rv,
             .ok => |val| switch (val) {
-                .String => |rs| try out.appendSlice(allocator, rs.asPtr().*),
+                .String => |rs| try out.appendSlice(allocator, rs.asPtr().bytes),
                 .Char => |c| {
                     const cs = try charUnitToString(allocator, c);
                     defer allocator.free(cs);
@@ -1413,7 +1413,7 @@ pub fn regex_split(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Regex.split requires a String");
     }
     const sr = ctx.args[1].String;
-    const s = sr.asPtr().*;
+    const s = sr.asPtr().bytes;
     var limit: i64 = 0;
     if (ctx.args.len > 2) {
         const v = ctx.args[2];
@@ -1477,7 +1477,7 @@ pub fn stringRegexSplitItems(
     limit: i64,
 ) std.mem.Allocator.Error!union(enum) { ok: []Value, err: RuntimeError } {
     const prog = progFromRegex(r) orelse return .{ .err = .{ .Type = "split requires a Regex" } };
-    const parts = try splitItems(ctx.allocator, prog, sr.asPtr().*, limit);
+    const parts = try splitItems(ctx.allocator, prog, sr.asPtr().bytes, limit);
     return .{ .ok = parts };
 }
 
@@ -1597,7 +1597,7 @@ pub fn match_result_next(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .err => |e| return e,
     };
     const md = m.asPtr();
-    const input = md.input.asPtr().*;
+    const input = md.input.asPtr().bytes;
     var start = md.end_byte;
     // Avoid infinite loops on zero-width matches: advance one codepoint.
     if (md.groups.len > 0) {
@@ -1853,7 +1853,7 @@ test "expand kotlin replacement by index and name" {
     for (caps, 0..) |c, i| {
         if (c.start) |st| {
             const en = c.end.?;
-            groups[i] = .{ .value = try StringRef.initOwned(a, try a.dupe(u8, "hi"[st..en])), .start = 0, .end_inclusive = 1 };
+            groups[i] = .{ .value = try runtime.strInitOwned(a, try a.dupe(u8, "hi"[st..en])), .start = 0, .end_inclusive = 1 };
         } else groups[i] = null;
     }
     const out1 = try expandKotlinReplacement(a, "[$1]", prog, groups);

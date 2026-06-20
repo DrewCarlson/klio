@@ -67,7 +67,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             const name = blk: {
                 const g = name_v.?.String.borrow();
                 defer g.deinit();
-                break :blk g.get().*;
+                break :blk g.get().bytes;
             };
             if (rv == .Class and args.len != 0) {
                 const first = args[0];
@@ -217,7 +217,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         const name = blk: {
             const g = callee.PropertyRef.name.borrow();
             defer g.deinit();
-            break :blk g.get().*;
+            break :blk g.get().bytes;
         };
         const is_fn = blk: {
             {
@@ -257,7 +257,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             const name = blk: {
                 const g = name_v.?.String.borrow();
                 defer g.deinit();
-                break :blk g.get().*;
+                break :blk g.get().bytes;
             };
             if (rv == .Class and args.len == 1) {
                 return host_fields.getField(self, allocator, &args[0], name);
@@ -875,7 +875,7 @@ fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) ?Value {
                 buf.appendSlice(allocator, p.Text) catch return null;
             }
             const owned = buf.toOwnedSlice(allocator) catch return null;
-            const ref = runtime.StringRef.initOwned(allocator, owned) catch return null;
+            const ref = runtime.strInitOwned(allocator, owned) catch return null;
             return .{ .String = ref };
         },
         else => return null,

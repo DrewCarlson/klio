@@ -1518,7 +1518,7 @@ fn valueToImage(a: Allocator, def_index: *const std.AutoHashMap(usize, u32), v: 
         .String => |sref| {
             const g = sref.borrow();
             defer g.deinit();
-            return .{ .Str = g.get().* };
+            return .{ .Str = g.get().bytes };
         },
         .Instance => |inst| {
             const g = inst.borrow();
@@ -2123,7 +2123,7 @@ fn scalarFromImage(v: ValueImage) Allocator.Error!?Value {
 
 fn valueFromImage(a: Allocator, defs: []const ObjRef(ClassDef), v: ValueImage) Allocator.Error!?Value {
     switch (v) {
-        .Str => |s| return Value{ .String = try ObjRef([]const u8).init(a, s) },
+        .Str => |s| return Value{ .String = try runtime.strInit(a, s) },
         .Instance => |inst| {
             if (inst.class >= defs.len) return null;
             var fields: std.ArrayList(InstanceData.Field) = .empty;

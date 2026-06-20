@@ -48,8 +48,8 @@ fn errResult(e: RuntimeError) EvalResult {
 /// `fqn` is a static slice; `message`, when present, is owned by `allocator`.
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
     return .{ .Exception = .{
-        .fqn = try StringRef.init(allocator, fqn),
-        .message = if (message) |m| try StringRef.init(allocator, m) else null,
+        .fqn = try runtime.strInit(allocator, fqn),
+        .message = if (message) |m| try runtime.strInit(allocator, m) else null,
         .cause = null,
     } };
 }
@@ -132,7 +132,7 @@ fn appendValue(buf: *Buffer, allocator: Allocator, v: Value) Allocator.Error!voi
         .String => |s| {
             const g = s.borrow();
             defer g.deinit();
-            try buf.appendSlice(allocator, g.get().*);
+            try buf.appendSlice(allocator, g.get().bytes);
         },
         .Char => |c| {
             const piece = try charUnitToString(allocator, c);
@@ -154,7 +154,7 @@ fn valueToUtf16(allocator: Allocator, v: Value) Allocator.Error!?[]u16 {
         .String => |s| {
             const g = s.borrow();
             defer g.deinit();
-            return try encodeUtf16(allocator, g.get().*);
+            return try encodeUtf16(allocator, g.get().bytes);
         },
         .StringBuilder => |sb| {
             const g = sb.borrow();
@@ -215,7 +215,7 @@ fn sbCharByte(buf: []const u8, idx: i64) ?usize {
 pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) {
-        return ok(.{ .String = try StringRef.initOwned(a, try a.dupe(u8, "")) });
+        return ok(.{ .String = try runtime.strInitOwned(a, try a.dupe(u8, "")) });
     }
     switch (ctx.args[0]) {
         // CharArray is a Value.Array, but some producers (e.g. toCharArray)
@@ -272,7 +272,7 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                     try bytes.append(a, b);
                 }
                 const s = try utf8Lossy(a, bytes.items);
-                return ok(.{ .String = try StringRef.initOwned(a, s) });
+                return ok(.{ .String = try runtime.strInitOwned(a, s) });
             } else {
                 var units = try a.alloc(u16, end - start);
                 defer a.free(units);
@@ -283,24 +283,24 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                     };
                 }
                 const s = try fromUtf16Lossy(a, units);
-                return ok(.{ .String = try StringRef.initOwned(a, s) });
+                return ok(.{ .String = try runtime.strInitOwned(a, s) });
             }
         },
         .String => |s| {
             const sg = s.borrow();
             defer sg.deinit();
-            const dup = try a.dupe(u8, sg.get().*);
-            return ok(.{ .String = try StringRef.initOwned(a, dup) });
+            const dup = try a.dupe(u8, sg.get().bytes);
+            return ok(.{ .String = try runtime.strInitOwned(a, dup) });
         },
         .StringBuilder => |sb| {
             const sg = sb.borrow();
             defer sg.deinit();
             const dup = try a.dupe(u8, sg.get().items);
-            return ok(.{ .String = try StringRef.initOwned(a, dup) });
+            return ok(.{ .String = try runtime.strInitOwned(a, dup) });
         },
         else => {
             const s = try displayValue(a, ctx.args[0]);
-            return ok(.{ .String = try StringRef.initOwned(a, s) });
+            return ok(.{ .String = try runtime.strInitOwned(a, s) });
         },
     }
 }
@@ -353,7 +353,7 @@ pub fn string_builder_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
             .String => |s| {
                 const g = s.borrow();
                 defer g.deinit();
-                try buf.appendSlice(a, g.get().*);
+                try buf.appendSlice(a, g.get().bytes);
             },
             .Int => |n| {
                 if (n < 0) {
@@ -583,7 +583,7 @@ pub fn string_builder_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrow();
     defer g.deinit();
     const dup = try a.dupe(u8, g.get().items);
-    return ok(.{ .String = try StringRef.initOwned(a, dup) });
+    return ok(.{ .String = try runtime.strInitOwned(a, dup) });
 }
 
 pub fn string_builder_get(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -787,7 +787,7 @@ pub fn string_builder_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb_byte = sbCharByte(buf, start.?).?;
     const eb_byte = sbCharByte(buf, end).?;
     const dup = try a.dupe(u8, buf[sb_byte..eb_byte]);
-    return ok(.{ .String = try StringRef.initOwned(a, dup) });
+    return ok(.{ .String = try runtime.strInitOwned(a, dup) });
 }
 
 pub fn string_builder_set_char_at(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -831,7 +831,7 @@ pub fn string_builder_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
         .String => |s| blk: {
             const sg = s.borrow();
             defer sg.deinit();
-            break :blk try a.dupe(u8, sg.get().*);
+            break :blk try a.dupe(u8, sg.get().bytes);
         },
         else => try displayValue(a, ctx.args[3]),
     };
@@ -915,7 +915,7 @@ test "string builder ctor seeds from string" {
     const a = testing.allocator;
     var tc = TestCtx.init(a);
     defer tc.deinit();
-    const seed = try StringRef.init(a, "hi");
+    const seed = try runtime.strInit(a, "hi");
     defer seed.deinit();
     var args = [_]Value{.{ .String = seed }};
     var c = tc.ctx(a, &args);
@@ -992,7 +992,7 @@ test "appendLine adds newline" {
     defer tc.deinit();
     const sb = try newSb(a, "");
     defer freeSb(sb, a);
-    const s = try StringRef.init(a, "hi");
+    const s = try runtime.strInit(a, "hi");
     defer s.deinit();
     var args = [_]Value{ sb, .{ .String = s } };
     var c = tc.ctx(a, &args);
@@ -1009,7 +1009,7 @@ test "append subrange overload appends slice" {
     defer tc.deinit();
     const sb = try newSb(a, "");
     defer freeSb(sb, a);
-    const s = try StringRef.init(a, "abcdef");
+    const s = try runtime.strInit(a, "abcdef");
     defer s.deinit();
     var args = [_]Value{ sb, .{ .String = s }, .{ .Int = 1 }, .{ .Int = 4 } };
     var c = tc.ctx(a, &args);
@@ -1048,7 +1048,7 @@ test "toString produces a string" {
     defer freeSb(r.ok, a);
     const g = r.ok.String.borrow();
     defer g.deinit();
-    try testing.expectEqualStrings("data", g.get().*);
+    try testing.expectEqualStrings("data", g.get().bytes);
 }
 
 test "get returns char and bounds-checks" {
@@ -1225,7 +1225,7 @@ test "substring extracts range" {
     defer freeSb(r.ok, a);
     const g = r.ok.String.borrow();
     defer g.deinit();
-    try testing.expectEqualStrings("bcd", g.get().*);
+    try testing.expectEqualStrings("bcd", g.get().bytes);
 }
 
 test "setCharAt replaces a char in place" {
@@ -1267,7 +1267,7 @@ test "replace splices a string" {
     defer tc.deinit();
     const sb = try newSb(a, "abcdef");
     defer freeSb(sb, a);
-    const repl = try StringRef.init(a, "XY");
+    const repl = try runtime.strInit(a, "XY");
     defer repl.deinit();
     var args = [_]Value{ sb, .{ .Int = 1 }, .{ .Int = 4 }, .{ .String = repl } };
     var c = tc.ctx(a, &args);
@@ -1285,7 +1285,7 @@ test "setRange replaces utf16 units" {
     defer tc.deinit();
     const sb = try newSb(a, "abcdef");
     defer freeSb(sb, a);
-    const val = try StringRef.init(a, "Z");
+    const val = try runtime.strInit(a, "Z");
     defer val.deinit();
     var args = [_]Value{ sb, .{ .Int = 1 }, .{ .Int = 4 }, .{ .String = val } };
     var c = tc.ctx(a, &args);
@@ -1303,7 +1303,7 @@ test "appendRange appends a slice of a string" {
     defer tc.deinit();
     const sb = try newSb(a, "x");
     defer freeSb(sb, a);
-    const val = try StringRef.init(a, "abcdef");
+    const val = try runtime.strInit(a, "abcdef");
     defer val.deinit();
     var args = [_]Value{ sb, .{ .String = val }, .{ .Int = 2 }, .{ .Int = 5 } };
     var c = tc.ctx(a, &args);
@@ -1321,7 +1321,7 @@ test "insertRange inserts a slice" {
     defer tc.deinit();
     const sb = try newSb(a, "XY");
     defer freeSb(sb, a);
-    const val = try StringRef.init(a, "abcdef");
+    const val = try runtime.strInit(a, "abcdef");
     defer val.deinit();
     var args = [_]Value{ sb, .{ .Int = 1 }, .{ .String = val }, .{ .Int = 1 }, .{ .Int = 3 } };
     var c = tc.ctx(a, &args);
@@ -1344,10 +1344,10 @@ test "string ctor empty and from string" {
         defer freeSb(r.ok, a);
         const g = r.ok.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("", g.get().*);
+        try testing.expectEqualStrings("", g.get().bytes);
     }
     {
-        const s = try StringRef.init(a, "hello");
+        const s = try runtime.strInit(a, "hello");
         defer s.deinit();
         var args = [_]Value{.{ .String = s }};
         var c = tc.ctx(a, &args);
@@ -1355,7 +1355,7 @@ test "string ctor empty and from string" {
         defer freeSb(r.ok, a);
         const g = r.ok.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("hello", g.get().*);
+        try testing.expectEqualStrings("hello", g.get().bytes);
     }
 }
 
@@ -1384,7 +1384,7 @@ test "string ctor from char array builds from code units" {
     defer freeSb(r.ok, a);
     const g = r.ok.String.borrow();
     defer g.deinit();
-    try testing.expectEqualStrings("hi", g.get().*);
+    try testing.expectEqualStrings("hi", g.get().bytes);
 }
 
 test "string ctor from byte array decodes utf8" {
@@ -1412,7 +1412,7 @@ test "string ctor from byte array decodes utf8" {
     defer freeSb(r.ok, a);
     const g = r.ok.String.borrow();
     defer g.deinit();
-    try testing.expectEqualStrings("hi", g.get().*);
+    try testing.expectEqualStrings("hi", g.get().bytes);
 }
 
 test "non-receiver argument is a type error" {

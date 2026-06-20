@@ -32,8 +32,8 @@ fn typeErr(msg: []const u8) EvalResult {
 /// modules the way Rust's `super::make_exception` is shared.
 pub fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]const u8) std.mem.Allocator.Error!Value {
     return .{ .Exception = .{
-        .fqn = try StringRef.init(allocator, fqn),
-        .message = if (message) |m| try StringRef.init(allocator, m) else null,
+        .fqn = try runtime.strInit(allocator, fqn),
+        .message = if (message) |m| try runtime.strInit(allocator, m) else null,
         .cause = null,
     } };
 }
@@ -77,7 +77,7 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
     }
 
     return ok(.{ .Exception = .{
-        .fqn = try StringRef.init(ctx.allocator, fqn),
+        .fqn = try runtime.strInit(ctx.allocator, fqn),
         .message = message,
         .cause = cause,
     } });
@@ -90,7 +90,7 @@ fn messageOf(allocator: std.mem.Allocator, v: *const Value) std.mem.Allocator.Er
         .Null => null,
         else => blk: {
             const s = try v.display(allocator);
-            break :blk try StringRef.initOwned(allocator, s);
+            break :blk try runtime.strInitOwned(allocator, s);
         },
     };
 }
@@ -168,7 +168,7 @@ pub fn throwable_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("toString requires a Throwable receiver");
     }
     const s = try ctx.args[0].display(ctx.allocator);
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
 /// `Throwable.addSuppressed(other)` — klio does not surface
@@ -237,13 +237,13 @@ test "build exception with no arguments" {
     defer freeException(exc);
     const fg = exc.fqn.borrow();
     defer fg.deinit();
-    try testing.expectEqualStrings("kotlin.IllegalStateException", fg.get().*);
+    try testing.expectEqualStrings("kotlin.IllegalStateException", fg.get().bytes);
     try testing.expect(exc.message == null);
     try testing.expect(exc.cause == null);
 }
 
 test "single string argument becomes the message" {
-    const msg = try StringRef.init(testing.allocator, "boom");
+    const msg = try runtime.strInit(testing.allocator, "boom");
     defer msg.deinit();
     const args = [_]Value{.{ .String = msg }};
     var ctx = noopCtx(&args);
@@ -253,10 +253,10 @@ test "single string argument becomes the message" {
     defer freeException(exc);
     const fg = exc.fqn.borrow();
     defer fg.deinit();
-    try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().*);
+    try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().bytes);
     const mg = exc.message.?.borrow();
     defer mg.deinit();
-    try testing.expectEqualStrings("boom", mg.get().*);
+    try testing.expectEqualStrings("boom", mg.get().bytes);
     try testing.expect(exc.cause == null);
 }
 
@@ -280,7 +280,7 @@ test "single non-string argument is rendered into the message" {
     defer freeException(exc);
     const mg = exc.message.?.borrow();
     defer mg.deinit();
-    try testing.expectEqualStrings("42", mg.get().*);
+    try testing.expectEqualStrings("42", mg.get().bytes);
 }
 
 test "single throwable argument is treated as the cause" {
@@ -300,13 +300,13 @@ test "single throwable argument is treated as the cause" {
     try testing.expect(exc.cause.?.asPtr().* == .Exception);
     const ig = exc.cause.?.asPtr().Exception.fqn.borrow();
     defer ig.deinit();
-    try testing.expectEqualStrings("kotlin.IllegalStateException", ig.get().*);
+    try testing.expectEqualStrings("kotlin.IllegalStateException", ig.get().bytes);
 }
 
 test "message and cause arguments" {
     const cause = try makeException(testing.allocator, "kotlin.Throwable", null);
     defer cause.Exception.fqn.deinit();
-    const msg = try StringRef.init(testing.allocator, "outer");
+    const msg = try runtime.strInit(testing.allocator, "outer");
     defer msg.deinit();
     const args = [_]Value{ .{ .String = msg }, cause };
     var ctx = noopCtx(&args);
@@ -316,12 +316,12 @@ test "message and cause arguments" {
     defer freeException(exc);
     const mg = exc.message.?.borrow();
     defer mg.deinit();
-    try testing.expectEqualStrings("outer", mg.get().*);
+    try testing.expectEqualStrings("outer", mg.get().bytes);
     try testing.expect(exc.cause != null);
 }
 
 test "non-throwable cause argument is rejected" {
-    const msg = try StringRef.init(testing.allocator, "outer");
+    const msg = try runtime.strInit(testing.allocator, "outer");
     defer msg.deinit();
     const args = [_]Value{ .{ .String = msg }, .{ .Int = 7 } };
     var ctx = noopCtx(&args);
@@ -331,7 +331,7 @@ test "non-throwable cause argument is rejected" {
 }
 
 test "null cause argument is accepted as no cause" {
-    const msg = try StringRef.init(testing.allocator, "outer");
+    const msg = try runtime.strInit(testing.allocator, "outer");
     defer msg.deinit();
     const args = [_]Value{ .{ .String = msg }, .Null };
     var ctx = noopCtx(&args);
@@ -349,7 +349,7 @@ test "instance cause argument is accepted" {
     // and confirm the dedicated Instance branch compiles by type.
     const cause = try makeException(testing.allocator, "kotlin.RuntimeException", null);
     defer cause.Exception.fqn.deinit();
-    const msg = try StringRef.init(testing.allocator, "m");
+    const msg = try runtime.strInit(testing.allocator, "m");
     defer msg.deinit();
     const args = [_]Value{ .{ .String = msg }, cause };
     var ctx = noopCtx(&args);
@@ -376,7 +376,7 @@ test "throwable message accessor returns the message" {
         g.deinit();
         r.ok.String.deinit();
     }
-    try testing.expectEqualStrings("hi", g.get().*);
+    try testing.expectEqualStrings("hi", g.get().bytes);
 }
 
 test "throwable message accessor yields null when absent" {
@@ -412,7 +412,7 @@ test "throwable toString renders fqn and message" {
         g.deinit();
         r.ok.String.deinit();
     }
-    try testing.expectEqualStrings("kotlin.IllegalStateException: bad", g.get().*);
+    try testing.expectEqualStrings("kotlin.IllegalStateException: bad", g.get().bytes);
 }
 
 test "throwable toString renders fqn alone when message is absent" {
@@ -427,7 +427,7 @@ test "throwable toString renders fqn alone when message is absent" {
         g.deinit();
         r.ok.String.deinit();
     }
-    try testing.expectEqualStrings("kotlin.Throwable", g.get().*);
+    try testing.expectEqualStrings("kotlin.Throwable", g.get().bytes);
 }
 
 test "addSuppressed records nothing and returns Unit" {
@@ -457,7 +457,7 @@ test "cause accessor returns the cause value" {
     const cause = try makeException(testing.allocator, "kotlin.IllegalStateException", null);
     const cause_box = try Value.boxRef(testing.allocator, cause);
     const outer = Value{ .Exception = .{
-        .fqn = try StringRef.init(testing.allocator, "kotlin.RuntimeException"),
+        .fqn = try runtime.strInit(testing.allocator, "kotlin.RuntimeException"),
         .message = null,
         .cause = cause_box,
     } };
@@ -473,7 +473,7 @@ test "cause accessor returns the cause value" {
     defer r.ok.release(testing.allocator);
     const g = r.ok.Exception.fqn.borrow();
     defer g.deinit();
-    try testing.expectEqualStrings("kotlin.IllegalStateException", g.get().*);
+    try testing.expectEqualStrings("kotlin.IllegalStateException", g.get().bytes);
 }
 
 test "cause accessor yields null when absent" {
@@ -502,8 +502,8 @@ test "make exception copies fqn and message into fresh handles" {
     }
     const fg = exc.Exception.fqn.borrow();
     defer fg.deinit();
-    try testing.expectEqualStrings("kotlin.Error", fg.get().*);
+    try testing.expectEqualStrings("kotlin.Error", fg.get().bytes);
     const mg = exc.Exception.message.?.borrow();
     defer mg.deinit();
-    try testing.expectEqualStrings("oops", mg.get().*);
+    try testing.expectEqualStrings("oops", mg.get().bytes);
 }

@@ -82,8 +82,8 @@ pub const FILE_INIT_FAILED_FQN = "kotlin.native.internal.FileFailedToInitializeE
 const FILE_INIT_FAILED_MSG = "There was an error during file or class initialization";
 
 fn fileInitFailedThrow(allocator: Allocator, cause: ?Value) Allocator.Error!EvalError {
-    const fqn = try StringRef.init(allocator, FILE_INIT_FAILED_FQN);
-    const msg = try StringRef.init(allocator, FILE_INIT_FAILED_MSG);
+    const fqn = try runtime.strInit(allocator, FILE_INIT_FAILED_FQN);
+    const msg = try runtime.strInit(allocator, FILE_INIT_FAILED_MSG);
     const cause_box = if (cause) |c| try Value.boxRef(allocator, c) else null;
     return .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = cause_box } } };
 }
@@ -992,9 +992,9 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name: []const u
                 break :blk2 (g.get().* == .NotNull and g.get().NotNull.value == null);
             };
             if (is_uninit_notnull) {
-                const fqn = try StringRef.init(allocator, "kotlin.IllegalStateException");
+                const fqn = try runtime.strInit(allocator, "kotlin.IllegalStateException");
                 const msg_text = try std.fmt.allocPrint(allocator, "Property {s} should be initialized before get.", .{name});
-                const msg = try StringRef.initOwned(allocator, msg_text);
+                const msg = try runtime.strInitOwned(allocator, msg_text);
                 return .{ .err = .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = null } } } };
             }
         }
@@ -1080,7 +1080,7 @@ fn registryHasDelegatedProp(self: *VmHost, name: []const u8) bool {
 }
 
 fn makePropertyRef(allocator: Allocator, name: []const u8) Allocator.Error!Value {
-    return .{ .PropertyRef = .{ .name = try StringRef.init(allocator, name) } };
+    return .{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
 }
 
 // -------------------------------------------------------------------------
@@ -1246,7 +1246,7 @@ test "object init gate: failed state throws the no-cause wrapper" {
     try testing.expect(exc == .Exception);
     const fg = exc.Exception.fqn.borrow();
     defer fg.deinit();
-    try testing.expectEqualStrings(FILE_INIT_FAILED_FQN, fg.get().*);
+    try testing.expectEqualStrings(FILE_INIT_FAILED_FQN, fg.get().bytes);
     try testing.expect(exc.Exception.cause == null);
 }
 

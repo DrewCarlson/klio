@@ -86,7 +86,7 @@ fn arg_string(allocator: Allocator, ctx: *const CallCtx, idx: usize) Allocator.E
             .String => |s| {
                 const g = s.borrow();
                 defer g.deinit();
-                return .{ .ok = try allocator.dupe(u8, g.get().*) };
+                return .{ .ok = try allocator.dupe(u8, g.get().bytes) };
             },
             else => {},
         }
@@ -109,7 +109,7 @@ fn arg_string_array(allocator: Allocator, ctx: *const CallCtx, idx: usize) Alloc
                         .String => |s| {
                             const sg = s.borrow();
                             defer sg.deinit();
-                            out[i] = try allocator.dupe(u8, sg.get().*);
+                            out[i] = try allocator.dupe(u8, sg.get().bytes);
                         },
                         else => out[i] = try allocator.dupe(u8, ""),
                     }
@@ -129,7 +129,7 @@ fn make_string_array(allocator: Allocator, values: [][]const u8) Allocator.Error
     errdefer list.deinit(allocator);
     try list.ensureTotalCapacityPrecise(allocator, values.len);
     for (values) |s| {
-        list.appendAssumeCapacity(.{ .String = try StringRef.init(allocator, s) });
+        list.appendAssumeCapacity(.{ .String = try runtime.strInit(allocator, s) });
     }
     const items = try ValueList.init(allocator, list);
     return runtime.ArrayData.fromBoxedList(items);
@@ -835,12 +835,12 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
         // Request array: [method, path, body, hk1, hv1, hk2, hv2, ...] — the
         // shim reads the fixed head and the trailing header key/value pairs.
         var items: std.ArrayList(Value) = .empty;
-        try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, parsed.method)) });
-        try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, parsed.path)) });
-        try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, parsed.body)) });
+        try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, parsed.method)) });
+        try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, parsed.path)) });
+        try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, parsed.body)) });
         for (parsed.headers) |h| {
-            try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, h.key)) });
-            try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, h.value)) });
+            try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, h.key)) });
+            try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, h.value)) });
         }
         const req = runtime.ArrayData.fromBoxedList(try ValueList.init(a, items));
         // serve owns `req`; invokeCallable BORROWS its args, so release it per
@@ -910,7 +910,7 @@ fn decode_response(allocator: Allocator, v: *const Value) Allocator.Error!Decode
             .String => |s| blk: {
                 const sg = s.borrow();
                 defer sg.deinit();
-                break :blk std.fmt.parseInt(i64, sg.get().*, 10) catch 200;
+                break :blk std.fmt.parseInt(i64, sg.get().bytes, 10) catch 200;
             },
             .Int => |i| @intCast(i),
             .Long => |l| l,
@@ -947,7 +947,7 @@ fn strAt(allocator: Allocator, slice: []const Value, i: usize) Allocator.Error![
             .String => |s| {
                 const g = s.borrow();
                 defer g.deinit();
-                return allocator.dupe(u8, g.get().*);
+                return allocator.dupe(u8, g.get().bytes);
             },
             else => {},
         }
@@ -1030,7 +1030,7 @@ test "arg_string reads a String and rejects others" {
     const a = arena.allocator();
     var h = runtime.NoopHost.init(a);
     var cap = runtime.CaptureOutput.init(a);
-    const s = Value{ .String = try StringRef.init(a, "hello") };
+    const s = Value{ .String = try runtime.strInit(a, "hello") };
     var ctx = makeCtx(a, h.host(), cap.output(), &.{s});
     switch (try arg_string(a, &ctx, 0)) {
         .ok => |v| try testing.expectEqualStrings("hello", v),
@@ -1052,7 +1052,7 @@ test "arg_string_array reads strings and maps non-strings to empty" {
     var h = runtime.NoopHost.init(a);
     var cap = runtime.CaptureOutput.init(a);
     var items: std.ArrayList(Value) = .empty;
-    try items.append(a, .{ .String = try StringRef.init(a, "k") });
+    try items.append(a, .{ .String = try runtime.strInit(a, "k") });
     try items.append(a, .{ .Int = 7 });
     const arr = runtime.ArrayData.fromBoxedList(try ValueList.init(a, items));
     var ctx = makeCtx(a, h.host(), cap.output(), &.{arr});
@@ -1106,9 +1106,9 @@ test "decode_response pulls status, content type and body from an Array" {
     defer arena.deinit();
     const a = arena.allocator();
     var items: std.ArrayList(Value) = .empty;
-    try items.append(a, .{ .String = try StringRef.init(a, "201") });
-    try items.append(a, .{ .String = try StringRef.init(a, "application/json") });
-    try items.append(a, .{ .String = try StringRef.init(a, "{}") });
+    try items.append(a, .{ .String = try runtime.strInit(a, "201") });
+    try items.append(a, .{ .String = try runtime.strInit(a, "application/json") });
+    try items.append(a, .{ .String = try runtime.strInit(a, "{}") });
     const arr = runtime.ArrayData.fromBoxedList(try ValueList.init(a, items));
     const d = try decode_response(a, &arr);
     try testing.expectEqual(@as(i64, 201), d.status);
@@ -1122,8 +1122,8 @@ test "decode_response accepts an Int status and a List backing" {
     const a = arena.allocator();
     var items: std.ArrayList(Value) = .empty;
     try items.append(a, .{ .Int = 404 });
-    try items.append(a, .{ .String = try StringRef.init(a, "text/plain") });
-    try items.append(a, .{ .String = try StringRef.init(a, "nope") });
+    try items.append(a, .{ .String = try runtime.strInit(a, "text/plain") });
+    try items.append(a, .{ .String = try runtime.strInit(a, "nope") });
     const list = Value{ .List = .{ .items = try ValueList.init(a, items), .mutable = false, .enum_entries = false, .backing = null } };
     const d = try decode_response(a, &list);
     try testing.expectEqual(@as(i64, 404), d.status);

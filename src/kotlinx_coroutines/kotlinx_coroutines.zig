@@ -549,8 +549,8 @@ fn channelIterNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     return .{ .err = .{ .Thrown = .{ .Exception = .{
-        .fqn = try StringRef.init(ctx.allocator, "kotlin.NoSuchElementException"),
-        .message = try StringRef.init(ctx.allocator, "ChannelIterator.next called before hasNext"),
+        .fqn = try runtime.strInit(ctx.allocator, "kotlin.NoSuchElementException"),
+        .message = try runtime.strInit(ctx.allocator, "ChannelIterator.next called before hasNext"),
         .cause = null,
     } } } };
 }
@@ -567,16 +567,16 @@ fn channelIsEmpty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 fn closedReceiveExc(allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
     return .{ .Exception = .{
-        .fqn = try StringRef.init(allocator, "kotlinx.coroutines.channels.ClosedReceiveChannelException"),
-        .message = try StringRef.init(allocator, "Channel was closed"),
+        .fqn = try runtime.strInit(allocator, "kotlinx.coroutines.channels.ClosedReceiveChannelException"),
+        .message = try runtime.strInit(allocator, "Channel was closed"),
         .cause = null,
     } };
 }
 
 fn closedSendExc(allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
     return .{ .Exception = .{
-        .fqn = try StringRef.init(allocator, "kotlinx.coroutines.channels.ClosedSendChannelException"),
-        .message = try StringRef.init(allocator, "Channel was closed"),
+        .fqn = try runtime.strInit(allocator, "kotlinx.coroutines.channels.ClosedSendChannelException"),
+        .message = try runtime.strInit(allocator, "Channel was closed"),
         .cause = null,
     } };
 }
@@ -612,7 +612,7 @@ fn rbPump(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// lets the process continue; klio prints the same shape to stderr.
 fn reportUncaught(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const msg: []const u8 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
-        .String => |s| s.asPtr().*,
+        .String => |s| s.asPtr().bytes,
         else => "exception",
     };
     const name = runtime.threadName(ctx.allocator, std.Thread.getCurrentId()) orelse "main";
@@ -692,11 +692,11 @@ fn schedulerEnqueue(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// first, then a `.` → `_` alias.
 fn kxcoSystemProp(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const key: []const u8 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
-        .String => |s| s.asPtr().*,
+        .String => |s| s.asPtr().bytes,
         else => return .{ .ok = .Null },
     };
     if (lookupEnv(ctx.allocator, key)) |v| {
-        return .{ .ok = .{ .String = try StringRef.initOwned(ctx.allocator, v) } };
+        return .{ .ok = .{ .String = try runtime.strInitOwned(ctx.allocator, v) } };
     }
     // `.` → `_` alias.
     var alias_buf = try ctx.allocator.alloc(u8, key.len);
@@ -712,7 +712,7 @@ fn kxcoSystemProp(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     if (differs) {
         if (lookupEnv(ctx.allocator, alias_buf)) |v| {
-            return .{ .ok = .{ .String = try StringRef.initOwned(ctx.allocator, v) } };
+            return .{ .ok = .{ .String = try runtime.strInitOwned(ctx.allocator, v) } };
         }
     }
     return .{ .ok = .Null };
@@ -1085,7 +1085,7 @@ test "channel iter next without pending throws NoSuchElementException" {
     var ctx: CallCtx = .{ .args = &args, .out = cap.output(), .host = host.host(), .allocator = a };
     const r = try channelIterNext(&ctx);
     try testing.expect(r == .err and r.err == .Thrown);
-    try testing.expectEqualStrings("kotlin.NoSuchElementException", r.err.Thrown.Exception.fqn.asPtr().*);
+    try testing.expectEqualStrings("kotlin.NoSuchElementException", r.err.Thrown.Exception.fqn.asPtr().bytes);
 }
 
 test "bad receiver arities and types" {

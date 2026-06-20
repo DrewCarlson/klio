@@ -94,6 +94,10 @@ pub const MatchData = value_mod.MatchData;
 pub const MatchGroupData = value_mod.MatchGroupData;
 pub const ComparatorStep = value_mod.ComparatorStep;
 pub const StringRef = value_mod.StringRef;
+pub const StringData = value_mod.StringData;
+pub const strInit = value_mod.strInit;
+pub const strInitOwned = value_mod.strInitOwned;
+pub const strMeta = value_mod.strMeta;
 pub const ValueList = value_mod.ValueList;
 pub const ValueSlice = value_mod.ValueSlice;
 

@@ -80,14 +80,14 @@ fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloca
 
 fn throwExc(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!EvalError {
     return .{ .Throw = .{ .Exception = .{
-        .fqn = try StringRef.init(allocator, fqn),
-        .message = if (message) |m| try StringRef.init(allocator, m) else null,
+        .fqn = try runtime.strInit(allocator, fqn),
+        .message = if (message) |m| try runtime.strInit(allocator, m) else null,
         .cause = null,
     } } };
 }
 
 fn strVal(allocator: Allocator, s: []const u8) Allocator.Error!Value {
-    return .{ .String = try StringRef.init(allocator, s) };
+    return .{ .String = try runtime.strInit(allocator, s) };
 }
 
 fn boolVal(b: bool) Value {
@@ -482,7 +482,7 @@ fn kotlinHashCode(v: *const Value) i32 {
         .String => |s| blk: {
             const g = s.borrow();
             defer g.deinit();
-            const bytes = g.get().*;
+            const bytes = g.get().bytes;
             var h: i32 = 0;
             const view = std.unicode.Utf8View.init(bytes) catch {
                 for (bytes) |ch| h = h *% 31 +% @as(i32, ch);
@@ -606,7 +606,7 @@ fn valueStructuralHash(v: *const Value) i32 {
             h.update(std.mem.asBytes(&@as(i32, 6)));
             const g = s.borrow();
             defer g.deinit();
-            h.update(g.get().*);
+            h.update(g.get().bytes);
         },
         else => h.update(std.mem.asBytes(&@as(i32, 7))),
     }
@@ -2155,10 +2155,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 // A dispatcher pool worker reports its registered
                 // upstream-shaped name (`DefaultDispatcher-worker-N`).
                 if (runtime.threadName(allocator, id)) |overridden| {
-                    return .{ .ok = .{ .String = try StringRef.initOwned(allocator, overridden) } };
+                    return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, overridden) } };
                 }
                 const s = try std.fmt.allocPrint(allocator, "klio-thread-{d}", .{id});
-                return .{ .ok = .{ .String = try StringRef.initOwned(allocator, s) } };
+                return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
             } else if (std.mem.eql(u8, name, "start") or std.mem.eql(u8, name, "interrupt")) {
                 return .{ .ok = .Unit };
             }
@@ -3048,8 +3048,8 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             const g = s.borrow();
             defer g.deinit();
             var items: std.ArrayList(Value) = .empty;
-            const view = std.unicode.Utf8View.init(g.get().*) catch {
-                for (g.get().*) |b| try items.append(allocator, .{ .Char = b });
+            const view = std.unicode.Utf8View.init(g.get().bytes) catch {
+                for (g.get().bytes) |b| try items.append(allocator, .{ .Char = b });
                 return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
             };
             var it = view.iterator();
@@ -3080,9 +3080,9 @@ fn eqIgnoreCase(allocator: Allocator, a: StringRef, b: StringRef) bool {
     defer ag.deinit();
     const bg = b.borrow();
     defer bg.deinit();
-    const la = std.ascii.allocLowerString(allocator, ag.get().*) catch return false;
+    const la = std.ascii.allocLowerString(allocator, ag.get().bytes) catch return false;
     defer if (runtime.freeScratch()) allocator.free(la);
-    const lb = std.ascii.allocLowerString(allocator, bg.get().*) catch return false;
+    const lb = std.ascii.allocLowerString(allocator, bg.get().bytes) catch return false;
     defer if (runtime.freeScratch()) allocator.free(lb);
     return std.mem.eql(u8, la, lb);
 }
@@ -3323,7 +3323,7 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
     if (is_enum and std.mem.eql(u8, name, "valueOf") and args.len == 1 and args[0] == .String) {
         const cg = cls.borrow();
         const sg = args[0].String.borrow();
-        const want = sg.get().*;
+        const want = sg.get().bytes;
         for (cg.get().enum_entries) |e| {
             if (std.mem.eql(u8, e.name, want)) {
                 const v = e.value;
@@ -3384,7 +3384,7 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
         if (g.get().get("__bound_name__")) |nv| {
             if (nv == .String) {
                 const sg = nv.String.borrow();
-                n_str = sg.get().*;
+                n_str = sg.get().bytes;
                 sg.deinit();
             }
         }
@@ -3456,7 +3456,7 @@ fn kclassMembers(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     }
     if (std.mem.eql(u8, name, "toString") and args.len == 0) {
         const s = try std.fmt.allocPrint(allocator, "class {s}", .{a_name});
-        return .{ .ok = .{ .String = try StringRef.initOwned(allocator, s) } };
+        return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
     }
     return null;
 }
@@ -3468,11 +3468,11 @@ fn kfunctionReflection(self: *VmHost, allocator: Allocator, receiver: *const Val
     const mod = info.module orelse mg.get();
     const f = mod.funcById(info.body_func) orelse return null;
     if (std.mem.eql(u8, name, "name")) {
-        return .{ .ok = .{ .String = try StringRef.init(allocator, f.name) } };
+        return .{ .ok = .{ .String = try runtime.strInit(allocator, f.name) } };
     }
     if (std.mem.eql(u8, name, "parameters")) {
         var items: std.ArrayList(Value) = .empty;
-        for (f.params) |p| try items.append(allocator, .{ .String = try StringRef.init(allocator, p.name) });
+        for (f.params) |p| try items.append(allocator, .{ .String = try runtime.strInit(allocator, p.name) });
         return .{ .ok = try listOf(allocator, items, false) };
     }
     return null;
@@ -3480,7 +3480,7 @@ fn kfunctionReflection(self: *VmHost, allocator: Allocator, receiver: *const Val
 
 fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const pg = receiver.PropertyRef.name.borrow();
-    const pname = pg.get().*;
+    const pname = pg.get().bytes;
     pg.deinit();
     if (std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) {
         const has_fn = self.module.borrow().get().hasFuncNamed(pname);
@@ -3504,7 +3504,7 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
     }
     if (std.mem.eql(u8, name, "toString") and args.len == 0) {
         const s = try std.fmt.allocPrint(allocator, "property {s}", .{pname});
-        return .{ .ok = .{ .String = try StringRef.initOwned(allocator, s) } };
+        return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
     }
     return null;
 }
@@ -3570,7 +3570,7 @@ fn compareValuesBuiltin(a: *const Value, b: *const Value) ?Ordering {
         defer ag.deinit();
         const bg = b.String.borrow();
         defer bg.deinit();
-        return switch (std.mem.order(u8, ag.get().*, bg.get().*)) {
+        return switch (std.mem.order(u8, ag.get().bytes, bg.get().bytes)) {
             .lt => .lt,
             .eq => .eq,
             .gt => .gt,
@@ -3734,7 +3734,7 @@ fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (chars[i] == .Char) try units.append(allocator, chars[i].Char);
         }
         const s = try runtime.charUnitsToString(allocator, units.items);
-        return .{ .ok = .{ .String = try StringRef.initOwned(allocator, s) } };
+        return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
     }
     return null;
 }
@@ -4218,7 +4218,7 @@ fn renderStructural(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceDa
     }
     try buf.append(allocator, ')');
     _ = self;
-    return .{ .String = try StringRef.initOwned(allocator, try buf.toOwnedSlice(allocator)) };
+    return .{ .String = try runtime.strInitOwned(allocator, try buf.toOwnedSlice(allocator)) };
 }
 
 fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
@@ -4233,7 +4233,7 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
         if (g.get().get("__enum_entry_class__")) |t| {
             if (t == .String) {
                 const sg = t.String.borrow();
-                entry_tag = sg.get().*;
+                entry_tag = sg.get().bytes;
                 sg.deinit();
             }
         }
@@ -4644,7 +4644,7 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             return .{ .ok = try renderStructuralLocked(allocator, g.get(), cg.get()) };
         }
         const s = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ cg.get().fqn, g.get().identity });
-        return .{ .ok = .{ .String = try StringRef.initOwned(allocator, s) } };
+        return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
     }
     if (args.len == 0 and std.mem.eql(u8, name, "hashCode")) {
         const g = inst.borrow();
@@ -4673,7 +4673,7 @@ fn renderStructuralLocked(allocator: Allocator, inst: *const InstanceData, cls: 
         try buf.appendSlice(allocator, try v.display(allocator));
     }
     try buf.append(allocator, ')');
-    return .{ .String = try StringRef.initOwned(allocator, try buf.toOwnedSlice(allocator)) };
+    return .{ .String = try runtime.strInitOwned(allocator, try buf.toOwnedSlice(allocator)) };
 }
 
 /// Format `"{prefix}.{name}"` into `buf` (stack scratch), returning the slice.
@@ -6070,7 +6070,7 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     var fields: std.ArrayList(InstanceData.Field) = .empty;
     try fields.append(allocator, .{ .name = "__bound_receiver__", .value = receiver.* });
     const name_dup = try allocator.dupe(u8, name);
-    try fields.append(allocator, .{ .name = "__bound_name__", .value = .{ .String = try ObjRef([]const u8).initOwned(allocator, name_dup) } });
+    try fields.append(allocator, .{ .name = "__bound_name__", .value = .{ .String = try runtime.strInitOwned(allocator, name_dup) } });
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = synth_class,
         .fields = fields,
@@ -6237,7 +6237,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                     .String => |s| blk2: {
                         const sg = s.borrow();
                         defer sg.deinit();
-                        break :blk2 try allocator.dupe(u8, sg.get().*);
+                        break :blk2 try allocator.dupe(u8, sg.get().bytes);
                     },
                     else => null,
                 } else null;
@@ -6245,10 +6245,10 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                     try std.fmt.allocPrint(allocator, "{s}: {s}", .{ fqn, m })
                 else
                     try allocator.dupe(u8, fqn);
-                return .{ .ok = .{ .String = try ObjRef([]const u8).initOwned(allocator, s) } };
+                return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
             }
             const s = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ fqn, ig.get().identity });
-            return .{ .ok = .{ .String = try ObjRef([]const u8).initOwned(allocator, s) } };
+            return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
         }
         if (std.mem.eql(u8, name, "hashCode") and args.len == 0) {
             const ig = inst.borrow();
@@ -6418,7 +6418,7 @@ test "kotlinHashCode matches Kotlin for builtins" {
 }
 
 test "kotlinHashCode of a String uses the polynomial hash" {
-    const s = try StringRef.init(testing.allocator, "ABC");
+    const s = try runtime.strInit(testing.allocator, "ABC");
     defer s.deinit();
     // 'A'*31^2 + 'B'*31 + 'C' = 65*961 + 66*31 + 67 = 64578.
     try testing.expectEqual(@as(i32, 64578), kotlinHashCode(&.{ .String = s }));
@@ -6448,9 +6448,9 @@ test "materialiseRangeItems builds inclusive progressions" {
 test "compareValuesBuiltin orders scalars and strings" {
     try testing.expectEqual(Ordering.lt, compareValuesBuiltin(&.{ .Int = 1 }, &.{ .Int = 2 }).?);
     try testing.expectEqual(Ordering.gt, compareValuesBuiltin(&.{ .Double = 2.5 }, &.{ .Int = 2 }).?);
-    const a = try StringRef.init(testing.allocator, "abc");
+    const a = try runtime.strInit(testing.allocator, "abc");
     defer a.deinit();
-    const b = try StringRef.init(testing.allocator, "abd");
+    const b = try runtime.strInit(testing.allocator, "abd");
     defer b.deinit();
     try testing.expectEqual(Ordering.lt, compareValuesBuiltin(&.{ .String = a }, &.{ .String = b }).?);
 }

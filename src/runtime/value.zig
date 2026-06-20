@@ -23,8 +23,65 @@ const Env = env_mod.Env;
 
 const StdlibFn = @import("host.zig").StdlibFn;
 
-/// `Arc<String>` — a shared, refcounted, immutable string.
-pub const StringRef = ObjRef([]const u8);
+/// Backing of a `String`: the owned UTF-8 `bytes` plus metadata computed once at
+/// creation — `u16_len` (Kotlin `String.length`, in UTF-16 code units) and
+/// `ascii` (no byte ≥ 0x80). Because a Kotlin string is immutable, these never
+/// change, so caching them turns `length`/indexing/`substring` from per-call
+/// O(n) UTF-16 walks into O(1) reads (and ASCII indexing into a direct byte
+/// load), at the cost of one scan when the string is built.
+pub const StringData = struct {
+    bytes: []const u8,
+    u16_len: u32,
+    ascii: bool,
+
+    /// The cell owns its bytes (see `ObjRef.init`/`initOwned` for `[]const u8`),
+    /// so teardown frees them — same contract the bare `[]const u8` payload had.
+    pub fn gcFinalize(self: *StringData, a: std.mem.Allocator) void {
+        a.free(self.bytes);
+    }
+    pub fn deinit(self: *StringData, a: std.mem.Allocator) void {
+        a.free(self.bytes);
+    }
+    pub fn gcExternalBytes(self: *const StringData) usize {
+        return self.bytes.len;
+    }
+};
+
+/// `Arc<String>` — a shared, refcounted, immutable string (UTF-8 + cached meta).
+pub const StringRef = ObjRef(StringData);
+
+/// UTF-16 length + ASCII flag for `bytes` (computed once per string).
+pub fn strMeta(bytes: []const u8) struct { u16_len: u32, ascii: bool } {
+    for (bytes) |b| {
+        if (b >= 0x80) break;
+    } else return .{ .u16_len = @intCast(bytes.len), .ascii = true };
+    var n: u32 = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 1;
+        const end = @min(i + len, bytes.len);
+        const cp = std.unicode.utf8Decode(bytes[i..end]) catch bytes[i];
+        n += if (cp > 0xFFFF) 2 else 1;
+        i = end;
+    }
+    return .{ .u16_len = n, .ascii = false };
+}
+
+/// `StringRef` constructor mirroring `ObjRef([]const u8).init`: under the GC /
+/// reclaim backends the cell owns a private copy of `bytes` (duped); under the
+/// pure-arena fast path the slice is adopted as-is (the arena reclaims it).
+pub fn strInit(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!StringRef {
+    const owned = if (objcell.reclaimEnabled() or objcell.gc.gc_enabled) try allocator.dupe(u8, bytes) else bytes;
+    const m = strMeta(owned);
+    return StringRef.initOwned(allocator, .{ .bytes = owned, .u16_len = m.u16_len, .ascii = m.ascii });
+}
+
+/// `StringRef` constructor mirroring `ObjRef([]const u8).initOwned`: adopt `bytes`
+/// verbatim (caller transfers ownership; freed on teardown under reclaim/GC).
+pub fn strInitOwned(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!StringRef {
+    const m = strMeta(bytes);
+    return StringRef.initOwned(allocator, .{ .bytes = bytes, .u16_len = m.u16_len, .ascii = m.ascii });
+}
 /// `ObjRef<Vec<Value>>` — shared, growable element storage.
 pub const ValueList = ObjRef(std.ArrayList(Value));
 /// `Arc<Vec<Value>>` — shared, frozen element storage.
@@ -144,7 +201,7 @@ pub const MapStore = struct {
                 h.update("S");
                 const sg = sref.borrow();
                 defer sg.deinit();
-                h.update(sg.get().*);
+                h.update(sg.get().bytes);
             },
             .Null => h.update("z"),
             else => return null,
@@ -1562,7 +1619,7 @@ pub const Value = union(enum) {
             .Exception => |e| {
                 const g = e.fqn.borrow();
                 defer g.deinit();
-                return g.get().*;
+                return g.get().bytes;
             },
             else => null,
         };
@@ -1638,7 +1695,7 @@ pub const Value = union(enum) {
             .Exception => |e| blk: {
                 const g = e.fqn.borrow();
                 defer g.deinit();
-                const fqn = g.get().*;
+                const fqn = g.get().bytes;
                 const tail = lastSegment(fqn);
                 break :blk std.mem.eql(u8, tail, name) or
                     matchesAny(name, &.{ "Throwable", "Exception", "Any" }) or
@@ -1827,7 +1884,7 @@ pub const Value = union(enum) {
             .String => |s| {
                 const g = s.borrow();
                 defer g.deinit();
-                try writer.writeAll(g.get().*);
+                try writer.writeAll(g.get().bytes);
             },
             .Char => |v| try writeChar(writer, v),
             .Null => try writer.writeAll("null"),
@@ -1857,9 +1914,9 @@ pub const Value = union(enum) {
                 if (e.message) |m| {
                     const mg = m.borrow();
                     defer mg.deinit();
-                    try writer.print("{s}: {s}", .{ fg.get().*, mg.get().* });
+                    try writer.print("{s}: {s}", .{ fg.get().bytes, mg.get().bytes });
                 } else {
-                    try writer.writeAll(fg.get().*);
+                    try writer.writeAll(fg.get().bytes);
                 }
             },
             .List => |coll| try writeElements(writer, coll.items),
@@ -1931,14 +1988,14 @@ pub const Value = union(enum) {
             .PropertyRef => |p| {
                 const g = p.name.borrow();
                 defer g.deinit();
-                try writer.print("property {s} (Kotlin reflection is not available)", .{g.get().*});
+                try writer.print("property {s} (Kotlin reflection is not available)", .{g.get().bytes});
             },
             .Regex => |r| {
                 const rg = r.borrow();
                 defer rg.deinit();
                 const pg = rg.get().pattern.borrow();
                 defer pg.deinit();
-                try writer.writeAll(pg.get().*);
+                try writer.writeAll(pg.get().bytes);
             },
             .Match => |m| {
                 const mg = m.borrow();
@@ -1948,14 +2005,14 @@ pub const Value = union(enum) {
                     if (groups[0]) |g0| {
                         const vg = g0.value.borrow();
                         defer vg.deinit();
-                        try writer.writeAll(vg.get().*);
+                        try writer.writeAll(vg.get().bytes);
                     }
                 }
             },
             .MatchGroup => |g| {
                 const vg = g.value.borrow();
                 defer vg.deinit();
-                try writer.writeAll(vg.get().*);
+                try writer.writeAll(vg.get().bytes);
             },
             .StringBuilder => |s| {
                 const g = s.borrow();
@@ -2008,7 +2065,7 @@ fn writeInstance(writer: *std.Io.Writer, inst_ref: ObjRef(InstanceData)) std.Io.
             if (nv == .String) {
                 const sg = nv.String.borrow();
                 defer sg.deinit();
-                try writer.writeAll(sg.get().*);
+                try writer.writeAll(sg.get().bytes);
                 return;
             }
         }
@@ -2104,7 +2161,8 @@ fn strEq(a: StringRef, b: StringRef) bool {
     defer ga.deinit();
     const gb = b.borrow();
     defer gb.deinit();
-    return std.mem.eql(u8, ga.get().*, gb.get().*);
+    if (ga.get().u16_len != gb.get().u16_len) return false; // cheap length pre-check
+    return std.mem.eql(u8, ga.get().bytes, gb.get().bytes);
 }
 
 fn classFqnEq(a: ObjRef(ClassDef), b: ObjRef(ClassDef)) bool {
@@ -2342,7 +2400,7 @@ test "range display forms" {
 }
 
 test "string value round-trips through a refcounted handle" {
-    const s = try StringRef.init(testing.allocator, "hi");
+    const s = try strInit(testing.allocator, "hi");
     defer s.deinit();
     const v = Value{ .String = s };
     var buf: [16]u8 = undefined;

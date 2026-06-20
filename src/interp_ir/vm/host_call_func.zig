@@ -1104,7 +1104,7 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
                             // enumValueOf<T>(name)
                             if (args.len > 0 and args[0] == .String) {
                                 const sg = args[0].String.borrow();
-                                const want = sg.get().*;
+                                const want = sg.get().bytes;
                                 for (cd.get().enum_entries) |entry| {
                                     if (std.mem.eql(u8, entry.name, want)) {
                                         const out = entry.value;
@@ -1116,8 +1116,8 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
                                         return .{ .ok = out };
                                     }
                                 }
-                                const fqn = try StringRef.init(allocator, "kotlin.IllegalArgumentException");
-                                const msg = try StringRef.initOwned(allocator, try std.fmt.allocPrint(allocator, "No enum constant {s}.{s}", .{ cd.get().fqn, want }));
+                                const fqn = try runtime.strInit(allocator, "kotlin.IllegalArgumentException");
+                                const msg = try runtime.strInitOwned(allocator, try std.fmt.allocPrint(allocator, "No enum constant {s}.{s}", .{ cd.get().fqn, want }));
                                 sg.deinit();
                                 cd.deinit();
                                 return .{ .err = .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = null } } } };

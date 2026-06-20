@@ -83,7 +83,7 @@ fn currentNanosOfSecond(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 fn currentSystemTzId(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const id = systemTimeZoneId(ctx.allocator) catch try ctx.allocator.dupe(u8, "UTC");
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, id) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, id) });
 }
 
 /// Best-effort detection of the host IANA tz id. Honors `$TZ` when it
@@ -142,7 +142,7 @@ fn argStr(ctx: *CallCtx, idx: usize) ArgError![]const u8 {
             .String => |s| {
                 const g = s.borrow();
                 defer g.deinit();
-                return try ctx.allocator.dupe(u8, g.get().*);
+                return try ctx.allocator.dupe(u8, g.get().bytes);
             },
             else => {},
         }
@@ -498,7 +498,7 @@ fn instantToString(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     else
         try std.fmt.allocPrint(ctx.allocator, "{s}.{d:0>9}Z", .{ head, p.nano });
 
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, owned) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, owned) });
 }
 
 fn parseInstant(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -761,7 +761,7 @@ test "civil-day round trip across the epoch and a leap day" {
 test "instantToLocalParts decomposes a UTC instant" {
     var hh = Harness.init();
     defer hh.deinit();
-    var tz = try StringRef.init(testing.allocator, "UTC");
+    var tz = try runtime.strInit(testing.allocator, "UTC");
     defer tz.deinit();
     const args = [_]Value{ .{ .Long = 1_700_000_000 }, .{ .Int = 0 }, .{ .String = tz } };
     var ctx = hh.ctx(&args);
@@ -782,7 +782,7 @@ test "instantToLocalParts decomposes a UTC instant" {
 test "localToInstant is the inverse in UTC" {
     var hh = Harness.init();
     defer hh.deinit();
-    var tz = try StringRef.init(testing.allocator, "UTC");
+    var tz = try runtime.strInit(testing.allocator, "UTC");
     defer tz.deinit();
     const args = [_]Value{
         .{ .Int = 2023 }, .{ .Int = 11 }, .{ .Int = 14 },
@@ -802,7 +802,7 @@ test "localToInstant is the inverse in UTC" {
 test "localToInstant rejects an impossible date" {
     var hh = Harness.init();
     defer hh.deinit();
-    var tz = try StringRef.init(testing.allocator, "UTC");
+    var tz = try runtime.strInit(testing.allocator, "UTC");
     defer tz.deinit();
     const args = [_]Value{
         .{ .Int = 2023 }, .{ .Int = 2 },  .{ .Int = 30 },
@@ -827,7 +827,7 @@ test "instantToString renders RFC-3339 with AutoSi fractions" {
         defer freeString(r.ok);
         const g = r.ok.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("2023-11-14T22:13:20Z", g.get().*);
+        try testing.expectEqualStrings("2023-11-14T22:13:20Z", g.get().bytes);
     }
     {
         const args = [_]Value{ .{ .Long = 0 }, .{ .Int = 123_000_000 } };
@@ -837,7 +837,7 @@ test "instantToString renders RFC-3339 with AutoSi fractions" {
         defer freeString(r.ok);
         const g = r.ok.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("1970-01-01T00:00:00.123Z", g.get().*);
+        try testing.expectEqualStrings("1970-01-01T00:00:00.123Z", g.get().bytes);
     }
     {
         const args = [_]Value{ .{ .Long = 0 }, .{ .Int = 1 } };
@@ -847,7 +847,7 @@ test "instantToString renders RFC-3339 with AutoSi fractions" {
         defer freeString(r.ok);
         const g = r.ok.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("1970-01-01T00:00:00.000000001Z", g.get().*);
+        try testing.expectEqualStrings("1970-01-01T00:00:00.000000001Z", g.get().bytes);
     }
 }
 
@@ -855,7 +855,7 @@ test "parseInstant round-trips and normalizes offsets" {
     var hh = Harness.init();
     defer hh.deinit();
     {
-        var s = try StringRef.init(testing.allocator, "2023-11-14T22:13:20Z");
+        var s = try runtime.strInit(testing.allocator, "2023-11-14T22:13:20Z");
         defer s.deinit();
         const args = [_]Value{.{ .String = s }};
         var ctx = hh.ctx(&args);
@@ -869,7 +869,7 @@ test "parseInstant round-trips and normalizes offsets" {
     }
     {
         // +02:00 wall clock is the same instant two hours earlier in UTC.
-        var s = try StringRef.init(testing.allocator, "2023-11-15T00:13:20+02:00");
+        var s = try runtime.strInit(testing.allocator, "2023-11-15T00:13:20+02:00");
         defer s.deinit();
         const args = [_]Value{.{ .String = s }};
         var ctx = hh.ctx(&args);
@@ -885,7 +885,7 @@ test "parseInstant round-trips and normalizes offsets" {
 test "parseInstant rejects malformed input" {
     var hh = Harness.init();
     defer hh.deinit();
-    var s = try StringRef.init(testing.allocator, "not-a-date");
+    var s = try runtime.strInit(testing.allocator, "not-a-date");
     defer s.deinit();
     const args = [_]Value{.{ .String = s }};
     var ctx = hh.ctx(&args);
@@ -899,7 +899,7 @@ test "validateTimeZone accepts UTC and Z, rejects garbage" {
     var hh = Harness.init();
     defer hh.deinit();
     inline for (.{ "UTC", "Z" }) |id| {
-        var s = try StringRef.init(testing.allocator, id);
+        var s = try runtime.strInit(testing.allocator, id);
         defer s.deinit();
         const args = [_]Value{.{ .String = s }};
         var ctx = hh.ctx(&args);
@@ -908,7 +908,7 @@ test "validateTimeZone accepts UTC and Z, rejects garbage" {
         try testing.expectEqual(true, r.ok.Bool);
     }
     {
-        var s = try StringRef.init(testing.allocator, "Not/AZone");
+        var s = try runtime.strInit(testing.allocator, "Not/AZone");
         defer s.deinit();
         const args = [_]Value{.{ .String = s }};
         var ctx = hh.ctx(&args);
@@ -921,7 +921,7 @@ test "validateTimeZone accepts UTC and Z, rejects garbage" {
 test "addPeriod adds calendar months with day clamping in UTC" {
     var hh = Harness.init();
     defer hh.deinit();
-    var tz = try StringRef.init(testing.allocator, "UTC");
+    var tz = try runtime.strInit(testing.allocator, "UTC");
     defer tz.deinit();
     // 2023-01-31 + 1 month clamps to 2023-02-28.
     const start = epochFromCivil(.{
@@ -949,7 +949,7 @@ test "addPeriod adds calendar months with day clamping in UTC" {
 test "addPeriod applies a time delta with nano carry" {
     var hh = Harness.init();
     defer hh.deinit();
-    var tz = try StringRef.init(testing.allocator, "UTC");
+    var tz = try runtime.strInit(testing.allocator, "UTC");
     defer tz.deinit();
     const args = [_]Value{
         .{ .Long = 1_000 },       .{ .Int = 500_000_000 }, .{ .Int = 0 }, .{ .Int = 0 },

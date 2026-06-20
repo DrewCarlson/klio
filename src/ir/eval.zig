@@ -42,7 +42,7 @@ const UnOp = ir.UnOp;
 
 /// Make a heap `StringRef` from a borrowed slice (mirrors `Arc<String>`).
 fn strVal(allocator: Allocator, s: []const u8) Allocator.Error!Value {
-    return .{ .String = try StringRef.init(allocator, s) };
+    return .{ .String = try runtime.strInit(allocator, s) };
 }
 
 fn displayThrow(allocator: Allocator, v: *const Value) Allocator.Error![]u8 {
@@ -50,11 +50,11 @@ fn displayThrow(allocator: Allocator, v: *const Value) Allocator.Error![]u8 {
         .Exception => |e| {
             const fg = e.fqn.borrow();
             defer fg.deinit();
-            const fqn = fg.get().*;
+            const fqn = fg.get().bytes;
             if (e.message) |m| {
                 const mg = m.borrow();
                 defer mg.deinit();
-                return std.fmt.allocPrint(allocator, "{s}({s})", .{ fqn, mg.get().* });
+                return std.fmt.allocPrint(allocator, "{s}({s})", .{ fqn, mg.get().bytes });
             }
             return allocator.dupe(u8, fqn);
         },
@@ -69,7 +69,7 @@ fn displayThrow(allocator: Allocator, v: *const Value) Allocator.Error![]u8 {
                 if (mv == .String) {
                     const sg = mv.String.borrow();
                     defer sg.deinit();
-                    return std.fmt.allocPrint(allocator, "{s}({s})", .{ name, sg.get().* });
+                    return std.fmt.allocPrint(allocator, "{s}({s})", .{ name, sg.get().bytes });
                 }
             }
             return allocator.dupe(u8, name);
@@ -1599,7 +1599,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     allocator.free(ls);
                     allocator.free(rs);
                 }
-                try frame.write(bo.dst, .{ .String = try StringRef.initOwned(allocator, combined) });
+                try frame.write(bo.dst, .{ .String = try runtime.strInitOwned(allocator, combined) });
                 return .cont;
             }
             // Collection `+` / `-` operators are stdlib operator
@@ -1702,7 +1702,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const v = frame.read(nn.src);
             if (v == .Null) {
                 const exc = Value{ .Exception = .{
-                    .fqn = try StringRef.init(allocator, "kotlin.NullPointerException"),
+                    .fqn = try runtime.strInit(allocator, "kotlin.NullPointerException"),
                     .message = null,
                     .cause = null,
                 } };
@@ -2157,8 +2157,8 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 }
                 const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
                 const exc = Value{ .Exception = .{
-                    .fqn = try StringRef.init(allocator, "kotlin.ClassCastException"),
-                    .message = try StringRef.initOwned(allocator, msg),
+                    .fqn = try runtime.strInit(allocator, "kotlin.ClassCastException"),
+                    .message = try runtime.strInitOwned(allocator, msg),
                     .cause = null,
                 } };
                 return raiseStep(frame, .{ .Throw = exc });
@@ -2407,7 +2407,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         .PropertyRef => |pr| {
             const name_str = constStr(frame.module, pr.name) orelse
                 return raiseStep(frame, .{ .Type = "PropertyRef: name not a string const" });
-            try frame.write(pr.dst, .{ .PropertyRef = .{ .name = try StringRef.init(allocator, name_str) } });
+            try frame.write(pr.dst, .{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name_str) } });
         },
         .MemberRef => |mr| {
             const recv = frame.read(mr.receiver);
@@ -3024,7 +3024,7 @@ fn constMatches(module: *const Module, id: ConstId, v: *const Value) bool {
         if (v.* != .String) return false;
         const g = v.String.borrow();
         defer g.deinit();
-        return std.mem.eql(u8, c.String, g.get().*);
+        return std.mem.eql(u8, c.String, g.get().bytes);
     }
     var lhs = constToValueNoAlloc(c);
     return Value.structuralEq(&lhs, v);
@@ -3116,7 +3116,7 @@ fn stringify(comptime H: type, allocator: Allocator, host: *H, v: *const Value) 
                 if (result == .String) {
                     const g = result.String.borrow();
                     defer g.deinit();
-                    return .{ .ok = try allocator.dupe(u8, g.get().*) };
+                    return .{ .ok = try allocator.dupe(u8, g.get().bytes) };
                 }
                 return .{ .ok = try renderValue(allocator, &result) };
             },
@@ -3206,7 +3206,7 @@ fn renderValue(allocator: Allocator, v: *const Value) Allocator.Error![]const u8
         .String => |s| blk: {
             const g = s.borrow();
             defer g.deinit();
-            break :blk allocator.dupe(u8, g.get().*);
+            break :blk allocator.dupe(u8, g.get().bytes);
         },
         .Char => |c| runtime.charUnitToString(allocator, c),
         .Null => allocator.dupe(u8, "null"),
@@ -3256,8 +3256,8 @@ fn utf16Cmp(left: []const u8, right: []const u8) std.math.Order {
 
 fn arithExc(allocator: Allocator, msg: []const u8) Allocator.Error!EvalError {
     return .{ .Throw = .{ .Exception = .{
-        .fqn = try StringRef.init(allocator, "kotlin.ArithmeticException"),
-        .message = try StringRef.init(allocator, msg),
+        .fqn = try runtime.strInit(allocator, "kotlin.ArithmeticException"),
+        .message = try runtime.strInit(allocator, msg),
         .cause = null,
     } } };
 }
@@ -3309,16 +3309,16 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
                 defer g.deinit();
                 const rs = try renderValue(allocator, r);
                 defer allocator.free(rs);
-                const s = try std.mem.concat(allocator, u8, &.{ g.get().*, rs });
-                return ok(.{ .String = try StringRef.initOwned(allocator, s) });
+                const s = try std.mem.concat(allocator, u8, &.{ g.get().bytes, rs });
+                return ok(.{ .String = try runtime.strInitOwned(allocator, s) });
             }
             if (r.* == .String) {
                 const ls = try renderValue(allocator, l);
                 defer allocator.free(ls);
                 const g = r.String.borrow();
                 defer g.deinit();
-                const s = try std.mem.concat(allocator, u8, &.{ ls, g.get().* });
-                return ok(.{ .String = try StringRef.initOwned(allocator, s) });
+                const s = try std.mem.concat(allocator, u8, &.{ ls, g.get().bytes });
+                return ok(.{ .String = try runtime.strInitOwned(allocator, s) });
             }
         },
         .Sub => {
@@ -3447,7 +3447,7 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
             const rs = try renderValue(allocator, r);
             defer allocator.free(rs);
             const s = try std.mem.concat(allocator, u8, &.{ ls, rs });
-            return ok(.{ .String = try StringRef.initOwned(allocator, s) });
+            return ok(.{ .String = try runtime.strInitOwned(allocator, s) });
         },
         else => {},
     }
@@ -3506,7 +3506,7 @@ fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?b
         defer lg.deinit();
         const rg = r.String.borrow();
         defer rg.deinit();
-        return Pair.cmpOrder(op, utf16Cmp(lg.get().*, rg.get().*));
+        return Pair.cmpOrder(op, utf16Cmp(lg.get().bytes, rg.get().bytes));
     }
     return null;
 }

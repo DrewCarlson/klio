@@ -32,7 +32,7 @@ pub fn renderViaUserToString(ctx: *CallCtx, v: *const Value) std.mem.Allocator.E
         if (try ctx.host.invokeMethod(v, "toString", &.{}, ctx.out)) |res| {
             if (res == .ok and res.ok == .String) {
                 const g = res.ok.String.borrow();
-                const rendered = try ctx.allocator.dupe(u8, g.get().*);
+                const rendered = try ctx.allocator.dupe(u8, g.get().bytes);
                 g.deinit();
                 res.ok.String.deinit();
                 return rendered;
@@ -126,7 +126,7 @@ pub fn io_read_line(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
 
     const owned = try buf.toOwnedSlice(ctx.allocator);
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, owned) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, owned) });
 }
 
 /// `readlnOrNull()` — identical to `readLine()` (String, or null at EOF).
@@ -141,8 +141,8 @@ pub fn io_readln(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| {
             if (v == .Null) {
                 return .{ .err = .{ .Thrown = .{ .Exception = .{
-                    .fqn = try StringRef.init(ctx.allocator, "kotlin.RuntimeException"),
-                    .message = try StringRef.init(ctx.allocator, "EOF has been reached"),
+                    .fqn = try runtime.strInit(ctx.allocator, "kotlin.RuntimeException"),
+                    .message = try runtime.strInit(ctx.allocator, "EOF has been reached"),
                     .cause = null,
                 } } } };
             }

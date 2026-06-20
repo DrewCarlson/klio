@@ -81,7 +81,7 @@ fn display(a: Allocator, v: Value) Error![]u8 {
 
 /// `Arc::new(string)` — wrap an already-owned slice in a `StringRef`.
 fn makeStringOwned(a: Allocator, s: []const u8) Error!Value {
-    return .{ .String = try StringRef.init(a, s) };
+    return .{ .String = try runtime.strInit(a, s) };
 }
 
 /// `make_list(items, mutable)` — wrap a slice of values into a `List`.
@@ -254,8 +254,8 @@ fn makeTriple(a: Allocator, first: Value, second: Value, third: Value) Error!Val
 
 /// `make_exception(fqn, message)` -> a thrown-ready `Value::Exception`.
 fn makeException(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!Value {
-    const fqn_ref = try StringRef.init(a, fqn);
-    const msg_ref: ?StringRef = if (message) |m| try StringRef.init(a, m) else null;
+    const fqn_ref = try runtime.strInit(a, fqn);
+    const msg_ref: ?StringRef = if (message) |m| try runtime.strInit(a, m) else null;
     return .{ .Exception = .{ .fqn = fqn_ref, .message = msg_ref, .cause = null } };
 }
 
@@ -397,7 +397,7 @@ fn compareValues(a: Allocator, x: Value, y: Value) Error!CompareOutcome {
             defer gx.deinit();
             const gy = y.String.borrow();
             defer gy.deinit();
-            return .{ .order = text.compareUtf16(gx.get().*, gy.get().*) };
+            return .{ .order = text.compareUtf16(gx.get().bytes, gy.get().bytes) };
         },
         .Char => |cx| if (y == .Char) return .{ .order = std.math.order(cx, y.Char) },
         .Bool => |bx| if (y == .Bool) return .{ .order = std.math.order(@intFromBool(bx), @intFromBool(y.Bool)) },
@@ -2089,7 +2089,7 @@ fn joinOptStr(a: Allocator, args: []const Value, idx: usize, default: []const u8
         .String => |s| blk: {
             const g = s.borrow();
             defer g.deinit();
-            break :blk g.get().*;
+            break :blk g.get().bytes;
         },
         else => |other| try display(a, other),
     };
@@ -2131,7 +2131,7 @@ fn joinToStringImpl(ctx: *CallCtx, items: []const Value, allow_instance_to_strin
                 .String => |s| sblk: {
                     const g = s.borrow();
                     defer g.deinit();
-                    break :sblk try a.dupe(u8, g.get().*);
+                    break :sblk try a.dupe(u8, g.get().bytes);
                 },
                 else => try display(a, r),
             };
@@ -2141,7 +2141,7 @@ fn joinToStringImpl(ctx: *CallCtx, items: []const Value, allow_instance_to_strin
                 if (mr == .ok and mr.ok == .String) {
                     const g = mr.ok.String.borrow();
                     defer g.deinit();
-                    break :blk try a.dupe(u8, g.get().*);
+                    break :blk try a.dupe(u8, g.get().bytes);
                 }
             }
             break :blk try display(a, v);
@@ -4983,7 +4983,7 @@ fn kotlinValueHash(v: Value) i32 {
             const g = s.borrow();
             defer g.deinit();
             var h: i32 = 0;
-            const str = g.get().*;
+            const str = g.get().bytes;
             var i: usize = 0;
             while (i < str.len) {
                 const cp_len = std.unicode.utf8ByteSequenceLength(str[i]) catch {

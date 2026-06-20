@@ -51,7 +51,7 @@ fn compareValues(a: *const Value, b: *const Value) CmpResult {
                 defer gx.deinit();
                 const gy = y.borrow();
                 defer gy.deinit();
-                break :blk .{ .ord = text.compareUtf16(gx.get().*, gy.get().*) };
+                break :blk .{ .ord = text.compareUtf16(gx.get().bytes, gy.get().bytes) };
             },
             else => notComparable(a, b),
         },

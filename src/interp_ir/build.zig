@@ -1778,7 +1778,7 @@ fn buildModuleWithOverrides(
             const id = next_id;
             next_id += 1;
             var fields: std.ArrayList(InstanceData.Field) = .empty;
-            try fields.append(a, .{ .name = "name", .value = .{ .String = try ObjRef([]const u8).init(a, entry.name.name) } });
+            try fields.append(a, .{ .name = "name", .value = .{ .String = try runtime.strInit(a, entry.name.name) } });
             try fields.append(a, .{ .name = "ordinal", .value = Value.newInt(@intCast(ordinal)) });
 
             if (entry.body_members.len != 0) {
@@ -1796,7 +1796,7 @@ fn buildModuleWithOverrides(
                     const module_rc = try ObjRef(Module).init(a, sub_module);
                     try enum_entry_methods.put(.{ .a = synth_class_name, .b = f.name.name }, .{ .module = module_rc, .func = fid });
                 }
-                try fields.append(a, .{ .name = "__enum_entry_class__", .value = .{ .String = try ObjRef([]const u8).init(a, synth_class_name) } });
+                try fields.append(a, .{ .name = "__enum_entry_class__", .value = .{ .String = try runtime.strInit(a, synth_class_name) } });
             }
 
             const inst = try ObjRef(InstanceData).init(a, .{
