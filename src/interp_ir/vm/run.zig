@@ -202,6 +202,14 @@ pub fn vmSetInstalledBindings(self: *Vm, bindings: stdlib.HostBindings) Allocato
 fn linkProgramForms(self: *Vm) Allocator.Error!void {
     const module_ref = self.module.clone();
     defer module_ref.deinit();
+    {
+        // Build the name->ClassId overlay once here (single-threaded setup), so
+        // `classId` is O(1) at run time instead of a linear scan over every
+        // class (the dominant cost of `is`/`when` type checks).
+        const mm = module_ref.borrowMut();
+        defer mm.deinit();
+        try mm.get().buildClassIdMap(self.allocator);
+    }
     const mg = module_ref.borrow();
     defer mg.deinit();
     const g = self.prog.borrowMut();

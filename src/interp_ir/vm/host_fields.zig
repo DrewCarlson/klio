@@ -1334,6 +1334,14 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     const class_name = className(inst);
     // Delegated body property: route through the delegate's `getValue`.
     const delegate_owner: bool = blk: {
+        // Almost every program declares zero `by`-delegated body properties;
+        // skip the per-access supertype walk + scratch allocation entirely then.
+        {
+            const g = self.module.borrow();
+            const none = g.get().registry.delegated_body_props.count() == 0;
+            g.deinit();
+            if (none) break :blk false;
+        }
         var cur: ?[]const u8 = class_name;
         var seen: std.ArrayList([]const u8) = .empty;
         defer seen.deinit(allocator);

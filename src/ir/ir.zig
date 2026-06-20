@@ -805,6 +805,12 @@ pub const Module = struct {
     /// lowering pass populates this so `Foo(args)` Calls become
     /// `NewInstance` instructions when `Foo` resolves to a class.
     class_index: std.ArrayList(ClassIndexEntry) = .empty,
+    /// Simple name → first `ClassId`, an O(1) overlay on `class_index`'s linear
+    /// scan. Built once after the module is finalized (`buildClassIdMap`, at the
+    /// link step) and read lock-free at run time; null until then (`classId`
+    /// falls back to the scan, e.g. during lowering). First-entry-wins to match
+    /// the scan's duplicate-name behavior.
+    class_id_map: ?std.StringHashMap(ClassId) = null,
     /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
     /// to `Inst.Call { func }` instead of LoadGlobal+CallValue.
@@ -1038,6 +1044,7 @@ pub const Module = struct {
         self.consts.deinit(allocator);
         self.top_level.deinit(allocator);
         self.class_index.deinit(allocator);
+        if (self.class_id_map) |*m| m.deinit();
         self.func_index.deinit(allocator);
         var it = self.func_name_index.valueIterator();
         while (it.next()) |list| list.deinit(allocator);
@@ -1124,10 +1131,25 @@ pub const Module = struct {
 
     /// Look up a class by simple name.
     pub fn classId(self: *const Module, name: []const u8) ?ClassId {
+        if (self.class_id_map) |*m| return m.get(name);
         for (self.class_index.items) |entry| {
             if (std.mem.eql(u8, entry.name, name)) return entry.id;
         }
         return null;
+    }
+
+    /// Build the `class_id_map` overlay from `class_index` (first entry wins on a
+    /// duplicate simple name, matching the linear scan). Idempotent; call once
+    /// after the module is finalized and before concurrent execution.
+    pub fn buildClassIdMap(self: *Module, allocator: Allocator) Allocator.Error!void {
+        var m = std.StringHashMap(ClassId).init(allocator);
+        try m.ensureTotalCapacity(@intCast(self.class_index.items.len));
+        for (self.class_index.items) |entry| {
+            const gop = m.getOrPutAssumeCapacity(entry.name);
+            if (!gop.found_existing) gop.value_ptr.* = entry.id;
+        }
+        if (self.class_id_map) |*old| old.deinit();
+        self.class_id_map = m;
     }
 
     /// Resolve a class written with a dotted qualifier (`Outer.Inner`) by

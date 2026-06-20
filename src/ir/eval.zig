@@ -1839,6 +1839,18 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 try frame.write(bo.dst, .{ .Bool = b });
                 return .cont;
             }
+            // `x == null` / `x != null` is a null check, never a user `equals`
+            // dispatch (Kotlin compares against the null literal by identity).
+            // Without this, every `?.` safe-call's null guard dispatched
+            // `x.equals(null)` — a full member resolution per access.
+            if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+                (l == .Null or r == .Null))
+            {
+                const both_null = l == .Null and r == .Null;
+                const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !both_null else both_null;
+                try frame.write(bo.dst, .{ .Bool = b });
+                return .cont;
+            }
             if (operatorMethod(bo.op)) |method| {
                 if (l == .Instance or r == .Instance) {
                     // Strict extension dispatch: an operator extension whose

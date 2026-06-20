@@ -2133,8 +2133,12 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // without the per-call FQN building, supertype walk, and ~35 type checks.
     if (receiver.* == .Instance) {
         if (instanceMethodKey(receiver, name, args)) |k| {
-            if (instanceMethodCacheGet(self, k)) |fid| {
-                if (try invokeMethodFuncId(self, allocator, receiver, fid, args)) |r| return r;
+            if (instanceMethodCacheGetRaw(self, k)) |raw| {
+                if (raw != METHOD_MISS) {
+                    if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
+                }
+                // A cached miss falls through to the probe ladder (stdlib /
+                // extension / field), but `irMethodWalk` will skip the walk.
             }
         }
     }
@@ -4621,17 +4625,22 @@ fn instanceMethodKey(receiver: *const Value, name: []const u8, args: []const Val
     };
 }
 
-fn instanceMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?FuncId {
+/// Sentinel cache value: this (class, name, arg-sig) is known to resolve to NO
+/// user instance method, so the next call skips the resolution walk and falls
+/// straight to the stdlib/extension/field paths. Sound because the resolution is
+/// a pure function of the key (classes are static).
+const METHOD_MISS: u32 = std.math.maxInt(u32);
+
+fn instanceMethodCacheGetRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
     const pg = self.prog.borrow();
     defer pg.deinit();
-    if (pg.get().instance_method_cache.get(key)) |raw| return @enumFromInt(raw);
-    return null;
+    return pg.get().instance_method_cache.get(key);
 }
 
-fn instanceMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: FuncId) void {
+fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, raw: u32) void {
     const pg = self.prog.borrowMut();
     defer pg.deinit();
-    pg.get().instance_method_cache.put(key, @intFromEnum(fid)) catch {};
+    pg.get().instance_method_cache.put(key, raw) catch {};
 }
 
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
@@ -4645,13 +4654,19 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     // probe ladder, so a repeat call skips the binding/builtin probes too.
     const key = instanceMethodKey(receiver, name, args);
     if (key) |k| {
-        if (instanceMethodCacheGet(self, k)) |fid| {
-            return try invokeMethodFuncId(self, allocator, receiver, fid, args);
+        if (instanceMethodCacheGetRaw(self, k)) |raw| {
+            if (raw == METHOD_MISS) return null;
+            return try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args);
         }
     }
-    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args)) orelse return null;
+    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args)) orelse {
+        // Cache the miss: a member-accessed field (`obj.field`) re-runs this
+        // walk every read otherwise. Only a proven, key-stable miss is stored.
+        if (key) |k| instanceMethodCachePutRaw(self, k, METHOD_MISS);
+        return null;
+    };
     if (resolved.unambiguous) {
-        if (key) |k| instanceMethodCachePut(self, k, resolved.fid);
+        if (key) |k| instanceMethodCachePutRaw(self, k, @intFromEnum(resolved.fid));
     }
     return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
 }
