@@ -294,3 +294,37 @@ and per-instruction interpreter overhead.
 - **Next coverage** (not blocking): float/double arrays; calls via a trampoline
   (stage 4 — collections/strings are call-bound). Each widens the compiled set;
   the harness (guard + deopt + bail) is in place.
+
+## collections/strings gap — data-driven analysis (not a quick fix)
+
+The loop JIT makes pure compute/array/scan loops node-class. The residual gap is
+the object-graph benches (`collections` ~9.5 s vs node 0.07 s, ~140×). Five
+experiments pinpoint the cost as **architectural**, with no incremental win:
+
+- **Slab free-cache** (retain emptied 256 KB slabs instead of `munmap`): no help
+  — during the build the live set grows monotonically, so slabs are not emptied/
+  refilled. Reverted.
+- **Large-region (`>MAX_SMALL`) mmap cache** (a `ValueList` backing is 56 B/elem,
+  so a >146-elem list lives on the direct-`mmap` path and `munmap`s on each
+  growth doubling): clean min-of-3 A/B showed it *slower* (9.5 → 10.3 s) — the
+  mmap/munmap churn is not the bottleneck. Reverted.
+- **Dispatch auto-member early-out**: removed `classHasUserMethod` from the hot
+  path (confirmed gone from the profile) but wall unchanged — the dispatch chain
+  is ~5 % spread, not a dominant cost. Kept (correct cleanup), not a perf win.
+- **GC threshold → 1 GB** (GC ~never runs): wall did **not** drop — GC marking is
+  not the dominant cost, so a generational GC is not the high-leverage lever.
+- **Profile** (`KLIO_PROF`): no single dominant hotspot. ~43 % inlined
+  `<unknown>`, then `addOneAssumeCapacity` ~11 % (copying 56 B `Value`s per list
+  append), dispatch ~5 %, GC cell init/atomics ~5 %. High `sys` is fresh-growth
+  `mmap` as the heap grows to hold 1M retained records.
+
+Conclusion: node's advantage here is the sum of unboxed values + native
+collections + a bump-allocated generational heap — i.e. an object-model + GC
+rewrite, not a tuning tweak. The tractable architectural lever that attacks the
+measured top cost is **F6 — packed primitive lists** (extend F5's packed backing
+from `Array` to `List`/`MutableList` of a homogeneous primitive element, boxing
+on read and deopting to a boxed `ValueList` on a heterogeneous add). It cuts the
+56 B/elem append copy to 8 B and removes per-element GC tracing, but lists are
+far more polymorphic than arrays (created empty, typed by first add, used
+everywhere), so it is a large, deopt-carrying change — a multi-session campaign,
+not a one-off.
