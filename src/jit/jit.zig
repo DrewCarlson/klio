@@ -268,6 +268,98 @@ pub const Emitter = struct {
         try self.modrmRR(reg, reg);
     }
 
+    /// Element access width + signedness for `[base + index*scale]`.
+    pub const ElemW = enum { b8s, b8u, b16s, b16u, b32s, b32u, b64 };
+
+    /// REX byte for a SIB-addressed op. `w` selects 64-bit operand size.
+    fn rexSib(self: *Emitter, reg: Reg, base: Reg, index: Reg, w: bool) JitError!void {
+        var b: u8 = 0x40;
+        if (w) b |= 0x08;
+        if (@intFromEnum(reg) >= 8) b |= 0x04;
+        if (@intFromEnum(index) >= 8) b |= 0x02;
+        if (@intFromEnum(base) >= 8) b |= 0x01;
+        try self.byte(b);
+    }
+    fn sibScale(scale: u8) u8 {
+        return switch (scale) {
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            else => 0, // scale 1
+        };
+    }
+    /// ModRM (mod=01, rm=100=SIB) + SIB + disp8=0 for `[base + index*scale]`.
+    fn sibOperand(self: *Emitter, reg: Reg, base: Reg, index: Reg, scale: u8) JitError!void {
+        try self.byte(0x44 | (low3(reg) << 3));
+        try self.byte((sibScale(scale) << 6) | (low3(index) << 3) | low3(base));
+        try self.byte(0x00);
+    }
+
+    /// `mov <dst64>, [<base> + <index>*scale]` with the given element width,
+    /// sign- or zero-extending into the 64-bit destination.
+    pub fn loadSib(self: *Emitter, dst: Reg, base: Reg, index: Reg, scale: u8, w: ElemW) JitError!void {
+        switch (w) {
+            .b8s => {
+                try self.rexSib(dst, base, index, true);
+                try self.byte(0x0F);
+                try self.byte(0xBE);
+            },
+            .b8u => {
+                try self.rexSib(dst, base, index, true);
+                try self.byte(0x0F);
+                try self.byte(0xB6);
+            },
+            .b16s => {
+                try self.rexSib(dst, base, index, true);
+                try self.byte(0x0F);
+                try self.byte(0xBF);
+            },
+            .b16u => {
+                try self.rexSib(dst, base, index, true);
+                try self.byte(0x0F);
+                try self.byte(0xB7);
+            },
+            .b32s => {
+                try self.rexSib(dst, base, index, true);
+                try self.byte(0x63); // MOVSXD r64, r/m32
+            },
+            .b32u => {
+                try self.rexSib(dst, base, index, false);
+                try self.byte(0x8B); // MOV r32 (zero-extends to r64)
+            },
+            .b64 => {
+                try self.rexSib(dst, base, index, true);
+                try self.byte(0x8B);
+            },
+        }
+        try self.sibOperand(dst, base, index, scale);
+    }
+
+    /// `mov [<base> + <index>*scale], <src>` storing the low `w` bytes of `src`.
+    pub fn storeSib(self: *Emitter, base: Reg, index: Reg, scale: u8, src: Reg, w: ElemW) JitError!void {
+        switch (w) {
+            .b8s, .b8u => {
+                try self.rexSib(src, base, index, false);
+                try self.byte(0x88); // MOV r/m8, r8
+            },
+            .b16s, .b16u => {
+                try self.byte(0x66); // operand-size prefix
+                try self.rexSib(src, base, index, false);
+                try self.byte(0x89);
+            },
+            .b32s, .b32u => {
+                try self.rexSib(src, base, index, false);
+                try self.byte(0x89);
+            },
+            .b64 => {
+                try self.rexSib(src, base, index, true);
+                try self.byte(0x89);
+            },
+        }
+        try self.sibOperand(src, base, index, scale);
+    }
+
+    /// `cmp <a64>, 0` then deopt-jump if signed-less (a < 0).
     /// `ret`.
     pub fn ret(self: *Emitter) JitError!void {
         try self.byte(0xC3);
@@ -474,6 +566,39 @@ test "movsxd normalizes a 32-bit overflowed result" {
     const f = buf.entry(*const fn (i64) callconv(.c) i64);
     // 2_000_000_000 + 2_000_000_000 = 4_000_000_000, wraps as i32 to -294967296.
     try std.testing.expectEqual(@as(i64, -294967296), f(2_000_000_000));
+}
+
+test "SIB load/store indexes a byte buffer" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    // f(buf=rdi, i=rsi): buf[i] = 1; return buf[i] (zero-extended byte).
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.movImm64(.rax, 1);
+    try em.storeSib(.rdi, .rsi, 1, .rax, .b8u);
+    try em.loadSib(.rax, .rdi, .rsi, 1, .b8u);
+    try em.ret();
+    var buf = try finalize(em.code());
+    defer buf.deinit();
+    const f = buf.entry(*const fn ([*]u8, i64) callconv(.c) i64);
+    var arr = [_]u8{ 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(@as(i64, 1), f(&arr, 3));
+    try std.testing.expectEqual(@as(u8, 1), arr[3]);
+    try std.testing.expectEqual(@as(u8, 0), arr[2]);
+}
+
+test "SIB load with scale and sign extension" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    // f(buf=rdi, i=rsi): return (i32)buf[i] sign-extended, scale 4.
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.loadSib(.rax, .rdi, .rsi, 4, .b32s);
+    try em.ret();
+    var buf = try finalize(em.code());
+    defer buf.deinit();
+    const f = buf.entry(*const fn ([*]i32, i64) callconv(.c) i64);
+    var arr = [_]i32{ 10, -7, 999 };
+    try std.testing.expectEqual(@as(i64, -7), f(&arr, 1));
+    try std.testing.expectEqual(@as(i64, 999), f(&arr, 2));
 }
 
 test "ALU encodings match documented bytes" {
