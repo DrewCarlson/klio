@@ -320,11 +320,20 @@ experiments pinpoint the cost as **architectural**, with no incremental win:
 
 Conclusion: node's advantage here is the sum of unboxed values + native
 collections + a bump-allocated generational heap — i.e. an object-model + GC
-rewrite, not a tuning tweak. The tractable architectural lever that attacks the
-measured top cost is **F6 — packed primitive lists** (extend F5's packed backing
-from `Array` to `List`/`MutableList` of a homogeneous primitive element, boxing
-on read and deopting to a boxed `ValueList` on a heterogeneous add). It cuts the
-56 B/elem append copy to 8 B and removes per-element GC tracing, but lists are
-far more polymorphic than arrays (created empty, typed by first add, used
-everywhere), so it is a large, deopt-carrying change — a multi-session campaign,
-not a one-off.
+rewrite, not a tuning tweak.
+
+**F6 (packed primitive lists) was built and measured — no win; reverted.** The
+sound design (shared-backing `ListData` → `ObjRef(ListBuf)`, `ListBuf =
+union{ boxed: ArrayList(Value), scalars: PrimBuf }`, upgrade-on-first-add packing,
+`MutableIterator.remove` write-through via an `Iterator.list_src`) was implemented
+behind a measurement gate. Result: collections best 9.2 s vs 9.5 s baseline —
+within noise. Root cause the premise was wrong: a boxed list of a primitive
+ALREADY stores its scalars inline in the `ArrayList` (`.Int`/`.Long` are inline
+`Value`s, not heap cells), so GC tracing is already ~free per element and packing
+only saves minor memcpy bandwidth — offset by per-read boxing on the packed
+`get()` path. `addOneAssumeCapacity` (11 % of samples) is call-count + small-copy
+overhead, not heap-cell churn. So list packing is not the lever; the collections
+gap is the cumulative alloc + dispatch + GC-pass-over-the-growing-live-set cost,
+which only an unboxed-value + native-collection + generational-heap runtime
+closes. The `MutableIterator.remove()` write-through example added during the work
+is kept as coverage.
