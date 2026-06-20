@@ -2623,7 +2623,12 @@ fn retainDecl(
         .Function => |*f| {
             if (!f.is_expect and std.mem.eql(u8, f.name.name, "suspendCoroutineUninterceptedOrReturn") and f.is_inline and f.is_suspend) return false;
             if (!f.is_expect and f.params.len == 0 and
-                (std.mem.eql(u8, f.name.name, "emptyList") or std.mem.eql(u8, f.name.name, "emptySet") or std.mem.eql(u8, f.name.name, "emptyMap"))) return false;
+                (std.mem.eql(u8, f.name.name, "emptyList") or std.mem.eql(u8, f.name.name, "emptySet") or std.mem.eql(u8, f.name.name, "emptyMap")))
+            {
+                const expected = try std.fmt.allocPrint(a, "kotlin.collections.{s}", .{f.name.name});
+                const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
+                if (std.mem.eql(u8, fqn, expected) and stdlib.implementation(expected) != null) return false;
+            }
             if (!f.is_expect and isSequenceFactoryName(f.name.name)) {
                 const expected = try std.fmt.allocPrint(a, "kotlin.sequences.{s}", .{f.name.name});
                 const fqn = func_fqn_overrides.get(f.span);
