@@ -5401,8 +5401,10 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // A user-program extension outranks a shipped (stdlib / installed-pack)
         // namesake of equal applicability: a same-package declaration sits at a
         // higher resolution tier than a default- or import-visible one, so it
-        // wins before receiver/argument specificity is even weighed.
-        const is_user: i32 = @intFromBool(!stdlib.isKnownPackage(f.package));
+        // wins before receiver/argument specificity is even weighed. The empty
+        // package is always user code (every shipped/pack symbol is packaged),
+        // so the common default-package case skips the registry scan.
+        const is_user: i32 = @intFromBool(f.package.len == 0 or !stdlib.isKnownPackage(f.package));
         const key: ExtKey = .{ applicable, is_user, recv_match, score, owner_rank, spec, param_spec, neg_fid };
         if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
             tied.append(self.allocator, f) catch {};
