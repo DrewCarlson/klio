@@ -5,3 +5,7 @@ middle
 outer
 main
 has source positions: true
+frame count: 4
+outer: config failed
+cause: bad int
+renders caused-by: true

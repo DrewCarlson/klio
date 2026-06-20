@@ -608,48 +608,14 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
     switch (e) {
         .Throw => |v| {
             var buf: std.ArrayList(u8) = .empty;
-            var stack: ?runtime.StackRef = null;
             switch (v) {
-                .Exception => |ex| {
-                    const fqn_g = ex.fqn.borrow();
-                    defer fqn_g.deinit();
+                .Exception, .Instance => {
                     buf.appendSlice(allocator, "uncaught ") catch return .{ .Eval = "uncaught exception" };
-                    buf.appendSlice(allocator, fqn_g.get().bytes) catch {};
-                    buf.appendSlice(allocator, ": ") catch {};
-                    if (ex.message) |m| {
-                        const mg = m.borrow();
-                        defer mg.deinit();
-                        buf.appendSlice(allocator, mg.get().bytes) catch {};
-                    } else {
-                        buf.appendSlice(allocator, "<no message>") catch {};
-                    }
-                    stack = ex.stack;
-                },
-                .Instance => |inst| {
-                    const g = inst.borrow();
-                    defer g.deinit();
-                    const cg = g.get().class.borrow();
-                    defer cg.deinit();
-                    buf.appendSlice(allocator, "uncaught ") catch return .{ .Eval = "uncaught exception" };
-                    buf.appendSlice(allocator, cg.get().fqn) catch {};
-                    if (g.get().get("message")) |mv| {
-                        if (mv == .String) {
-                            const sg = mv.String.borrow();
-                            defer sg.deinit();
-                            buf.appendSlice(allocator, ": ") catch {};
-                            buf.appendSlice(allocator, sg.get().bytes) catch {};
-                        }
-                    }
-                    stack = g.get().stack;
+                    ir.eval.formatThrowable(allocator, &v, &buf, false, 0) catch {};
                 },
                 else => {
                     buf.appendSlice(allocator, "uncaught throw") catch return .{ .Eval = "uncaught throw" };
                 },
-            }
-            if (stack) |s| {
-                const sg = s.borrow();
-                defer sg.deinit();
-                ir.eval.formatStackTrace(allocator, sg.get(), &buf) catch {};
             }
             const out = buf.toOwnedSlice(allocator) catch "uncaught exception";
             return .{ .Eval = out };

@@ -4825,50 +4825,22 @@ fn throwableStackMember(self: *VmHost, allocator: Allocator, receiver: *const Va
     if (args.len != 0) return null;
     const is_print = std.mem.eql(u8, name, "printStackTrace");
     const is_tostr = std.mem.eql(u8, name, "stackTraceToString");
-    if (!is_print and !is_tostr) return null;
+    const is_elems = std.mem.eql(u8, name, "getStackTrace") or std.mem.eql(u8, name, "stackTrace");
+    if (!is_print and !is_tostr and !is_elems) return null;
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    var stk: ?runtime.StackRef = null;
     switch (receiver.*) {
-        .Exception => |e| {
-            const fg = e.fqn.borrow();
-            defer fg.deinit();
-            try buf.appendSlice(allocator, fg.get().bytes);
-            if (e.message) |m| {
-                const mg = m.borrow();
-                defer mg.deinit();
-                try buf.appendSlice(allocator, ": ");
-                try buf.appendSlice(allocator, mg.get().bytes);
-            }
-            stk = e.stack;
-        },
+        .Exception => {},
         .Instance => |inst| {
             if (!instanceIsThrowable(self, allocator, inst)) return null;
-            const g = inst.borrow();
-            defer g.deinit();
-            {
-                const cg = g.get().class.borrow();
-                defer cg.deinit();
-                try buf.appendSlice(allocator, cg.get().fqn);
-            }
-            if (g.get().get("message")) |mv| {
-                if (mv == .String) {
-                    const sg = mv.String.borrow();
-                    defer sg.deinit();
-                    try buf.appendSlice(allocator, ": ");
-                    try buf.appendSlice(allocator, sg.get().bytes);
-                }
-            }
-            stk = g.get().stack;
         },
         else => return null,
     }
-    if (stk) |s| {
-        const sg = s.borrow();
-        defer sg.deinit();
-        try ir.eval.formatStackTrace(allocator, sg.get(), &buf);
+    if (is_elems) {
+        return .{ .ok = (try ir.eval.stackTraceArray(allocator, receiver)) orelse runtime.ArrayData.fromBoxedList(try runtime.ValueList.initOwned(allocator, .empty)) };
     }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try ir.eval.formatThrowable(allocator, receiver, &buf, false, 0);
     if (is_print) {
         std.debug.print("{s}\n", .{buf.items});
         return .{ .ok = .Unit };
@@ -4879,7 +4851,7 @@ fn throwableStackMember(self: *VmHost, allocator: Allocator, receiver: *const Va
     return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, owned) } };
 }
 
-fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) bool {
+pub fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) bool {
     var stack: std.ArrayList([]const u8) = .empty;
     defer stack.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
