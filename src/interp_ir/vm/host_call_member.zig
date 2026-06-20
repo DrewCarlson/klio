@@ -4781,7 +4781,9 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
         }
     }
 
-    if (!member_shadows_stdlib and !user_member_ext_shadows and !stdlib.isToplevelFunction(name)) {
+    if (!member_shadows_stdlib and !user_member_ext_shadows and !stdlib.isToplevelFunction(name) and
+        !(try userToplevelExtShadows(self, allocator, receiver, name, args.len)))
+    {
         for (probes[0..n]) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
                 if (cache_key) |key| memberCachePut(self, key, func, probe);
@@ -4892,6 +4894,38 @@ fn userMemberExtShadows(self: *VmHost, allocator: Allocator, name: []const u8, a
         if (funcAt(mod, fid)) |f| {
             if (f.params.len != 0 and f.params.len >= want) return true;
         }
+    }
+    return false;
+}
+
+/// A visible USER (non-shipped) top-level extension whose declared
+/// receiver type provably holds for this receiver shadows the stdlib
+/// type-name probe: a same-package extension (`fun Int.to(o: Int)`)
+/// outranks an implicitly imported stdlib extension of the same name
+/// (`kotlin.to`), so the stdlib probe ladder must stand down and let the
+/// extension fallback bind the user's declaration.
+fn userToplevelExtShadows(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, argc: usize) Allocator.Error!bool {
+    const want = argc + 1;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    for (mod.funcsBySimpleName(name)) |fid| {
+        const f = funcAt(mod, fid) orelse continue;
+        // A top-level extension carries `this` as its leading param and is
+        // not a member-extension (those go through userMemberExtShadows).
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (isMemberExt(mod, fid)) continue;
+        // Only the user's own program shadows the stdlib: a package the
+        // stdlib registry or an installed pack owns (kotlin.*, io.ktor.*,
+        // …) is the very surface the probe ladder dispatches, so its
+        // same-named extensions must not pre-empt it. A user declaration
+        // lives in a package no registry knows.
+        if (stdlib.isKnownPackage(f.package)) continue;
+        if (f.params.len < want) continue;
+        if (!extArityApplicable(self, &f, want)) continue;
+        // Only a proven receiver match shadows: an inapplicable namesake
+        // (a `String.to` against an `Int` receiver) leaves the stdlib path.
+        if (try strictReceiverProven(self, allocator, receiver, fid, &f.params[0].ty)) return true;
     }
     return false;
 }
