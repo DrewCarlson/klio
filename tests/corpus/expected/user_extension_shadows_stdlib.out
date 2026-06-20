@@ -1,6 +1,10 @@
 Sum(3)
 Sum(15)
 Sum(2)
+until(1,5)
+downTo(5,1)
+until(3,9)
 (k, 7)
 k
 7
+10

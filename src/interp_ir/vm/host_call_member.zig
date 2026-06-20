@@ -5325,7 +5325,7 @@ fn instanceOuterLink(v: *const Value) ?Value {
 ///   4. parameter specificity — the most-specific declared parameter types
 ///      for the supplied value args;
 ///   5. a stable key (lowest `FuncId`) so the winner is always unique.
-const ExtKey = [7]i32;
+const ExtKey = [8]i32;
 
 fn extKeyGreater(a: ExtKey, b: ExtKey) bool {
     inline for (0..a.len) |i| {
@@ -5342,7 +5342,7 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
     var tied: std.ArrayList(Func) = .empty;
     defer tied.deinit(self.allocator);
     var best: ?Candidate = null;
-    var best_key: ExtKey = .{std.math.minInt(i32)} ** 7;
+    var best_key: ExtKey = .{std.math.minInt(i32)} ** 8;
     for (candidates, 0..) |c, idx| {
         const f = c.func;
         const recv_score = overloadScoreArg(self, &f.params[0].ty, receiver) orelse -1;
@@ -5398,7 +5398,12 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // Stable final discriminator: lowest FuncId. Negated so a smaller id
         // ranks higher, guaranteeing a unique winner.
         const neg_fid: i32 = -@as(i32, @intCast(@intFromEnum(c.fid) & 0x7fff_ffff));
-        const key: ExtKey = .{ applicable, recv_match, score, owner_rank, spec, param_spec, neg_fid };
+        // A user-program extension outranks a shipped (stdlib / installed-pack)
+        // namesake of equal applicability: a same-package declaration sits at a
+        // higher resolution tier than a default- or import-visible one, so it
+        // wins before receiver/argument specificity is even weighed.
+        const is_user: i32 = @intFromBool(!stdlib.isKnownPackage(f.package));
+        const key: ExtKey = .{ applicable, is_user, recv_match, score, owner_rank, spec, param_spec, neg_fid };
         if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
             tied.append(self.allocator, f) catch {};
         }

@@ -10,11 +10,19 @@ class Sum(val total: Int) {
 }
 
 infix fun Int.to(other: Int): Sum = Sum(this + other)
+infix fun Int.until(other: Int): String = "until($this,$other)"
+infix fun Int.downTo(other: Int): String = "downTo($this,$other)"
 
 fun main() {
     println(1 to 2)        // user Int.to -> Sum(3)
     println(10.to(5))      // explicit call, same extension -> Sum(15)
     println(1 combine 2)   // a non-colliding extension still resolves
+
+    // `until` / `downTo` resolve to the user's extensions, not the stdlib
+    // range builders of the same name.
+    println(1 until 5)
+    println(5 downTo 1)
+    println(3.until(9))
 
     // A receiver the user extension does not cover keeps the stdlib `to`,
     // which builds a Pair.
@@ -22,6 +30,13 @@ fun main() {
     println(p)
     println(p.first)
     println(p.second)
+
+    // The stdlib range builders stay reachable on receivers the user
+    // extensions do not shadow (here through the `for` range, which lowers
+    // to the range operator rather than the infix call).
+    var sum = 0
+    for (i in 1..4) sum += i
+    println(sum)
 }
 
 infix fun Int.combine(other: Int): Sum = Sum(this * other)
