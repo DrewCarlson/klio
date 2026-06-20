@@ -78,6 +78,10 @@ pub const PrimitiveArrayKind = value_mod.PrimitiveArrayKind;
 pub const PrimBuf = value_mod.PrimBuf;
 pub const ArrayData = value_mod.ArrayData;
 pub const ArrayStore = value_mod.ArrayStore;
+pub const ListData = value_mod.ListData;
+pub const ListBuf = value_mod.ListBuf;
+pub const ListBacking = value_mod.ListBacking;
+pub const primKindOf = value_mod.primKindOf;
 pub const DelegateKind = value_mod.DelegateKind;
 pub const SuspendBody = value_mod.SuspendBody;
 pub const SuspendState = value_mod.SuspendState;
@@ -277,34 +281,18 @@ test "enum entries is_runtime_type matches both" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var entry_items = try ValueList.init(a, .empty);
-    {
-        const g = entry_items.borrowMut();
-        defer g.deinit();
-        try g.get().append(a, .{ .Int = 1 });
-    }
-    const entries = Value{ .List = .{
-        .items = entry_items,
-        .mutable = false,
-        .enum_entries = true,
-        .backing = null,
-    } };
+    var entry_arr: std.ArrayList(Value) = .empty;
+    try entry_arr.append(a, .{ .Int = 1 });
+    var entry_ld = try value_mod.ListData.fromArrayList(a, entry_arr, false);
+    entry_ld.enum_entries = true;
+    const entries = Value{ .List = entry_ld };
     try testing.expect(entries.isRuntimeType("List"));
     try testing.expect(entries.isRuntimeType("EnumEntries"));
     try testing.expect(entries.isRuntimeType("Collection"));
 
-    var plain_items = try ValueList.init(a, .empty);
-    {
-        const g = plain_items.borrowMut();
-        defer g.deinit();
-        try g.get().append(a, .{ .Int = 1 });
-    }
-    const plain = Value{ .List = .{
-        .items = plain_items,
-        .mutable = false,
-        .enum_entries = false,
-        .backing = null,
-    } };
+    var plain_arr: std.ArrayList(Value) = .empty;
+    try plain_arr.append(a, .{ .Int = 1 });
+    const plain = Value{ .List = try value_mod.ListData.fromArrayList(a, plain_arr, false) };
     try testing.expect(plain.isRuntimeType("List"));
     try testing.expect(!plain.isRuntimeType("EnumEntries"));
 }
@@ -314,17 +302,10 @@ test "enum entries keeps list type fqn for dispatch" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var items = try ValueList.init(a, .empty);
-    {
-        const g = items.borrowMut();
-        defer g.deinit();
-        try g.get().append(a, .{ .Int = 1 });
-    }
-    const entries = Value{ .List = .{
-        .items = items,
-        .mutable = false,
-        .enum_entries = true,
-        .backing = null,
-    } };
+    var entry_arr2: std.ArrayList(Value) = .empty;
+    try entry_arr2.append(a, .{ .Int = 1 });
+    var entry_ld2 = try value_mod.ListData.fromArrayList(a, entry_arr2, false);
+    entry_ld2.enum_entries = true;
+    const entries = Value{ .List = entry_ld2 };
     try testing.expectEqualStrings("kotlin.collections.List", entries.typeFqn());
 }

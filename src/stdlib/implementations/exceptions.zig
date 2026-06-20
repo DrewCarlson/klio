@@ -182,8 +182,7 @@ pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
 /// `Throwable.suppressedExceptions` / `getSuppressed()` — always empty (see
 /// `throwable_add_suppressed`).
 pub fn throwable_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const items = try ValueList.init(ctx.allocator, .empty);
-    return ok(makeList(items, false));
+    return ok(try makeList(ctx.allocator, .empty, false));
 }
 
 pub fn throwable_cause(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -199,13 +198,8 @@ pub fn throwable_cause(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.Null);
 }
 
-fn makeList(items: ValueList, mutable: bool) Value {
-    return .{ .List = .{
-        .items = items,
-        .mutable = mutable,
-        .enum_entries = false,
-        .backing = null,
-    } };
+fn makeList(a: std.mem.Allocator, list: std.ArrayList(Value), mutable: bool) std.mem.Allocator.Error!Value {
+    return .{ .List = try runtime.ListData.fromArrayList(a, list, mutable) };
 }
 
 // ============================================================
@@ -446,10 +440,10 @@ test "suppressed returns an empty list" {
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .List);
     // The ObjRef's last `deinit` frees the inner ArrayList.
-    defer r.ok.List.items.deinit();
-    const g = r.ok.List.items.borrow();
+    defer r.ok.List.buf.deinit();
+    const g = r.ok.List.buf.borrow();
     defer g.deinit();
-    try testing.expectEqual(@as(usize, 0), g.get().items.len);
+    try testing.expectEqual(@as(usize, 0), g.get().boxed.items.len);
     try testing.expect(!r.ok.List.mutable);
 }
 

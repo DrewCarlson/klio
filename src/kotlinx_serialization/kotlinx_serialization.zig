@@ -145,7 +145,7 @@ fn valueToJson(v: *const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!Js
             }
             return .{ .ok = .{ .object = map } };
         },
-        .List => |l| return listToJson(l.items, ctx, tree),
+        .List => |l| return listToJsonLD(l, ctx, tree),
         .Array => |arr| return arrayToJson(arr, ctx, tree),
         .Set => |s| return listToJson(s.items, ctx, tree),
         .Map => |m| {
@@ -176,6 +176,10 @@ fn listToJson(items: ValueList, ctx: *CallCtx, tree: std.mem.Allocator) Error!Js
     const elems = try tree.dupe(Value, g.get().items);
     g.deinit();
     return elemsToJson(elems, ctx, tree);
+}
+
+fn listToJsonLD(ld: runtime.ListData, ctx: *CallCtx, tree: std.mem.Allocator) Error!JsonResult {
+    return elemsToJson(try ld.snapshot(tree), ctx, tree);
 }
 
 fn arrayToJson(arr: runtime.ArrayData, ctx: *CallCtx, tree: std.mem.Allocator) Error!JsonResult {
@@ -353,12 +357,7 @@ fn decodeField(
                     .err => |er| return .{ .err = er },
                 }
             }
-            return .{ .ok = .{ .List = .{
-                .items = try ValueList.init(a, items),
-                .mutable = false,
-                .enum_entries = false,
-                .backing = null,
-            } } };
+            return .{ .ok = .{ .List = try runtime.ListData.fromArrayList(a, items, false) } };
         },
         .object => |map| {
             if (ty) |t| {
@@ -549,12 +548,7 @@ fn ctorParamNames(ctx: *CallCtx) Error!EvalResult {
         if (p.property == null) continue;
         try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, p.name)) });
     }
-    return ok(.{ .List = .{
-        .items = try ValueList.init(a, items),
-        .mutable = false,
-        .enum_entries = false,
-        .backing = null,
-    } });
+    return ok(.{ .List = try runtime.ListData.fromArrayList(a, items, false) });
 }
 
 /// Read property `name` off instance `obj`. Routes through
@@ -601,8 +595,8 @@ fn construct(ctx: *CallCtx) Error!EvalResult {
         const arg1 = ctx.args[1];
         switch (arg1) {
             .List => |l| {
-                const g = l.items.borrow();
-                try args.appendSlice(a, g.get().items);
+                const g = l.buf.borrow();
+                try args.appendSlice(a, g.get().boxed.items);
                 g.deinit();
             },
             .Array => |arr| {
@@ -738,12 +732,7 @@ test "valueToJson encodes scalars and collections" {
         var items: std.ArrayList(Value) = .empty;
         try items.append(a, .{ .Int = 1 });
         try items.append(a, .{ .Int = 2 });
-        const v = Value{ .List = .{
-            .items = try ValueList.init(a, items),
-            .mutable = false,
-            .enum_entries = false,
-            .backing = null,
-        } };
+        const v = Value{ .List = try runtime.ListData.fromArrayList(a, items, false) };
         const r = try valueToJson(&v, &ctx, a);
         try testing.expect(r.ok == .array);
         try testing.expectEqual(@as(usize, 2), r.ok.array.items.len);
@@ -830,9 +819,9 @@ test "decodeField decodes scalars and arrays without a target type" {
         const j = try std.json.parseFromSliceLeaky(Json, a, "[1,2,3]", .{});
         const r = try decodeField(&j, null, &ctx);
         try testing.expect(r.ok == .List);
-        const g = r.ok.List.items.borrow();
+        const g = r.ok.List.buf.borrow();
         defer g.deinit();
-        try testing.expectEqual(@as(usize, 3), g.get().items.len);
+        try testing.expectEqual(@as(usize, 3), g.get().boxed.items.len);
     }
 }
 
@@ -870,10 +859,10 @@ test "ctorParamNames returns property names in declaration order" {
 
     const r = try ctorParamNames(&ctx);
     try testing.expect(r == .ok);
-    const g = r.ok.List.items.borrow();
+    const g = r.ok.List.buf.borrow();
     defer g.deinit();
-    try testing.expectEqual(@as(usize, 2), g.get().items.len);
-    const n0 = g.get().items[0].String.borrow();
+    try testing.expectEqual(@as(usize, 2), g.get().boxed.items.len);
+    const n0 = g.get().boxed.items[0].String.borrow();
     defer n0.deinit();
     try testing.expectEqualStrings("id", n0.get().*);
 }

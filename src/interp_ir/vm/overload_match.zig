@@ -322,18 +322,32 @@ fn containerArgsMatch(self: *VmHost, head: []const u8, ty_args: []const TypeRef,
         return acc;
     }
     const elems: ?runtime.ValueList = switch (v.*) {
-        .List => |l| if (isListFamily(head)) l.items else null,
         .Set => |s| if (isSetFamily(head)) s.items else null,
         .Array => |arr| if (std.mem.eql(u8, head, "Array")) arr.boxedList() else null,
         else => null,
     };
-    const list = elems orelse return .unknown;
     if (ty_args.len < 1) return .unknown;
     const declared_elem: ?[]const u8 = switch (v.*) {
         .List => |l| l.declared_elem,
         .Set => |s| s.declared_elem,
         else => null,
     };
+    if (v.* == .List) {
+        const l = v.List;
+        if (!isListFamily(head)) return .unknown;
+        const g = l.buf.borrow();
+        defer g.deinit();
+        const items = g.get().boxed.items;
+        if (items.len == 0) return declaredHeadMatch(self, &ty_args[0], declared_elem);
+        var acc: Match = .proven;
+        for (items, 0..) |*e, i| {
+            if (i >= SCORER_ELEM_CAP) break;
+            acc = combine(acc, valueMatches(self, &ty_args[0], e, fuel + 1));
+            if (acc == .disproven) return .disproven;
+        }
+        return acc;
+    }
+    const list = elems orelse return .unknown;
     const g = list.borrow();
     defer g.deinit();
     const items = g.get().items;

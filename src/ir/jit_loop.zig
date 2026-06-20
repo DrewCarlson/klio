@@ -33,9 +33,13 @@ const REGS: E = .rbx;
 const T0: E = .rax; // index / lhs / result
 const T1: E = .rcx; // rhs / len / ptr
 const T2: E = .rdx; // array element scratch
+// SSE scratch for `f64` arithmetic. A double IR register keeps its bit pattern
+// in its i64 slot and is moved in/out with `movsd`.
+const X0: jit.Emitter.Xmm = .xmm0;
+const X1: jit.Emitter.Xmm = .xmm1;
 
 /// Static type of an IR register, for normalization and reboxing.
-pub const RegType = enum(u8) { i32, i64, boolean, unit, null_, unknown };
+pub const RegType = enum(u8) { i32, i64, f64, f32, boolean, unit, null_, unknown };
 
 /// The native loop returns `(block_id << 32) | inst_index` — the interpreter
 /// resume point. A normal loop exit resumes at the target block's first
@@ -92,10 +96,22 @@ fn constType(c: ir.Const) RegType {
     return switch (c) {
         .Int, .Char, .Short, .Byte => .i32,
         .Long => .i64,
+        .Double => .f64,
+        .Float => .f32,
         .Bool => .boolean,
         .Unit => .unit,
         .Null => .null_,
         else => .unknown,
+    };
+}
+
+/// The float bit pattern a `Double`/`Float` const carries (raw in its slot;
+/// an f32 occupies the low 32 bits).
+fn constFloatBits(c: ir.Const) i64 {
+    return switch (c) {
+        .Double => |x| @bitCast(x),
+        .Float => |x| @as(u32, @bitCast(x)),
+        else => 0,
     };
 }
 
@@ -114,6 +130,9 @@ fn constI64(c: ir.Const) i64 {
 fn isNumeric(t: RegType) bool {
     return t == .i32 or t == .i64;
 }
+fn isFloat(t: RegType) bool {
+    return t == .f64 or t == .f32;
+}
 
 /// The scalar `RegType` a capture cell holds, or null for kinds the integer JIT
 /// does not cache (the cell stays interpreter-only).
@@ -121,6 +140,8 @@ fn cellScalarType(v: Value) ?RegType {
     return switch (v) {
         .Int, .Char, .Short, .Byte => .i32,
         .Long => .i64,
+        .Double => .f64,
+        .Float => .f32,
         .Bool => .boolean,
         else => null,
     };
@@ -169,8 +190,39 @@ fn arrayOpOf(module: *const Module, inst: *const Inst) ?ArrayOp {
     }
 }
 
+/// A zero-arg numeric conversion (`x.toDouble()`/`toLong()`/`toInt()`), which
+/// lowers to `CallMember`. The JIT compiles the always-exact directions
+/// (int→double, int width changes); double→int is left to the interpreter
+/// because `cvttsd2si` diverges from Kotlin on NaN/overflow (it clamps).
+const NumConv = struct { dst: Reg, src: Reg, to: RegType };
+
+fn numericConvOf(module: *const Module, inst: *const Inst) ?NumConv {
+    switch (inst.*) {
+        .CallMember => |cm| {
+            if (cm.arg_names.len != 0 or cm.n_args != 0) return null;
+            if (cm.name.int() >= module.consts.items.len) return null;
+            const name = module.consts.items[cm.name.int()];
+            if (name != .String) return null;
+            const to: RegType = if (std.mem.eql(u8, name.String, "toDouble"))
+                .f64
+            else if (std.mem.eql(u8, name.String, "toFloat"))
+                .f32
+            else if (std.mem.eql(u8, name.String, "toLong"))
+                .i64
+            else if (std.mem.eql(u8, name.String, "toInt"))
+                .i32
+            else
+                return null;
+            return .{ .dst = cm.dst, .src = cm.receiver, .to = to };
+        },
+        else => return null,
+    }
+}
+
 /// Element register type + native access width for a packed array kind, or null
-/// for kinds the integer JIT does not compile (Float/Double).
+/// for kinds the JIT does not compile (Float). A `Double` element is moved as a
+/// raw 8-byte (`b64`) value — its f64 bits live in the slot and are consumed by
+/// the SSE arithmetic path.
 fn arrayElemShape(kind: runtime.PrimitiveArrayKind) ?struct { rt: RegType, w: jit.Emitter.ElemW, esize: u8 } {
     return switch (kind) {
         .Boolean => .{ .rt = .boolean, .w = .b8u, .esize = 1 },
@@ -183,7 +235,8 @@ fn arrayElemShape(kind: runtime.PrimitiveArrayKind) ?struct { rt: RegType, w: ji
         .UInt => .{ .rt = .i32, .w = .b32u, .esize = 4 },
         .Long => .{ .rt = .i64, .w = .b64, .esize = 8 },
         .ULong => .{ .rt = .i64, .w = .b64, .esize = 8 },
-        .Float, .Double => null,
+        .Double => .{ .rt = .f64, .w = .b64, .esize = 8 },
+        .Float => .{ .rt = .f32, .w = .b32u, .esize = 4 },
     };
 }
 
@@ -224,6 +277,10 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
             break :blk .unknown;
         };
         return setType(types, op.dst, t);
+    }
+    // Numeric conversion (`x.toDouble()` etc.) yields the named target type.
+    if (numericConvOf(module, inst)) |nc| {
+        return setType(types, nc.dst, nc.to);
     }
     // CellGet yields the cell's scalar type; CellSet has no def.
     if (inst.* == .CellGet) {
@@ -449,6 +506,12 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
         def.* = op.dst;
         return;
     }
+    if (numericConvOf(module, inst)) |nc| {
+        reads[0] = nc.src;
+        n_reads.* = 1;
+        def.* = nc.dst;
+        return;
+    }
     switch (inst.*) {
         .Const => |c| def.* = c.dst,
         .Move => |m| {
@@ -619,6 +682,96 @@ const Compiler = struct {
         const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
         try self.em.storeMem(REGS, d, native);
     }
+    /// Load/store an f64 register's slot through an xmm (the slot holds the bits).
+    fn loadF64Slot(self: *Compiler, x: jit.Emitter.Xmm, r: Reg) !void {
+        const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
+        try self.em.movsdLoad(x, REGS, d);
+    }
+    fn storeF64Slot(self: *Compiler, r: Reg, x: jit.Emitter.Xmm) !void {
+        const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
+        try self.em.movsdStore(REGS, d, x);
+    }
+    /// Load/store an f32 register's slot (f32 bits in the low 4 bytes).
+    fn loadF32Slot(self: *Compiler, x: jit.Emitter.Xmm, r: Reg) !void {
+        const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
+        try self.em.movssLoad(x, REGS, d);
+    }
+    fn storeF32Slot(self: *Compiler, r: Reg, x: jit.Emitter.Xmm) !void {
+        const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
+        try self.em.movssStore(REGS, d, x);
+    }
+
+    fn loadFloat(self: *Compiler, x: jit.Emitter.Xmm, r: Reg, is32: bool) !void {
+        if (is32) try self.loadF32Slot(x, r) else try self.loadF64Slot(x, r);
+    }
+    fn ucomiFloat(self: *Compiler, x: jit.Emitter.Xmm, y: jit.Emitter.Xmm, is32: bool) !void {
+        if (is32) try self.em.ucomiss(x, y) else try self.em.ucomisd(x, y);
+    }
+
+    /// Emit an `f64`/`f32` BinOp (arithmetic or NaN-aware comparison). Operands
+    /// and result move through their slots as raw bits; comparisons yield a 0/1
+    /// boolean in `T0`. `is32` selects single- vs double-precision SSE.
+    fn emitFloatBinOp(self: *Compiler, b: anytype, is32: bool) !void {
+        if (b.op == .Mod) return jit.JitError.Unsupported; // no float remainder
+        try self.loadFloat(X0, b.lhs, is32);
+        try self.loadFloat(X1, b.rhs, is32);
+        if (isCmpBinOp(b.op)) {
+            // IEEE/Kotlin: any comparison with NaN is false except `!=`.
+            switch (b.op) {
+                // a<b ≡ b>a, a<=b ≡ b>=a: `seta`/`setae` give 0 on unordered.
+                .Less => {
+                    try self.ucomiFloat(X1, X0, is32);
+                    try self.em.setccReg(.a, T0);
+                },
+                .LessEq => {
+                    try self.ucomiFloat(X1, X0, is32);
+                    try self.em.setccReg(.ae, T0);
+                },
+                .Greater => {
+                    try self.ucomiFloat(X0, X1, is32);
+                    try self.em.setccReg(.a, T0);
+                },
+                .GreaterEq => {
+                    try self.ucomiFloat(X0, X1, is32);
+                    try self.em.setccReg(.ae, T0);
+                },
+                .Eq => {
+                    try self.ucomiFloat(X0, X1, is32);
+                    try self.em.setccReg(.e, T0); // ZF=1
+                    try self.em.setccReg(.np, T1); // ordered
+                    try self.em.andReg(T0, T1);
+                },
+                .NotEq => {
+                    try self.ucomiFloat(X0, X1, is32);
+                    try self.em.setccReg(.ne, T0); // ZF=0
+                    try self.em.setccReg(.p, T1); // unordered ⇒ !=
+                    try self.em.orReg(T0, T1);
+                },
+                else => return jit.JitError.Unsupported,
+            }
+            try self.storeSlot(b.dst, T0);
+            return;
+        }
+        if (is32) {
+            switch (b.op) {
+                .Add => try self.em.addss(X0, X1),
+                .Sub => try self.em.subss(X0, X1),
+                .Mul => try self.em.mulss(X0, X1),
+                .Div => try self.em.divss(X0, X1),
+                else => return jit.JitError.Unsupported,
+            }
+            try self.storeF32Slot(b.dst, X0);
+        } else {
+            switch (b.op) {
+                .Add => try self.em.addsd(X0, X1),
+                .Sub => try self.em.subsd(X0, X1),
+                .Mul => try self.em.mulsd(X0, X1),
+                .Div => try self.em.divsd(X0, X1),
+                else => return jit.JitError.Unsupported,
+            }
+            try self.storeF64Slot(b.dst, X0);
+        }
+    }
 
     fn exitLabel(self: *Compiler, blk: BlockId) !jit.Emitter.Label {
         for (self.exit_targets.items, 0..) |t, i| {
@@ -705,11 +858,57 @@ const Compiler = struct {
             }
             return;
         }
+        if (numericConvOf(self.module, inst)) |nc| {
+            const from = typeOf(self.types, nc.src);
+            switch (nc.to) {
+                .f64 => {
+                    if (from == .f64) { // identity
+                        try self.loadSlot(T0, nc.src);
+                        try self.storeSlot(nc.dst, T0);
+                    } else if (from == .f32) { // f32 -> f64 (exact)
+                        try self.loadF32Slot(X0, nc.src);
+                        try self.em.cvtss2sd(X0, X0);
+                        try self.storeF64Slot(nc.dst, X0);
+                    } else if (isNumeric(from)) { // int -> double (always exact)
+                        try self.loadSlot(T0, nc.src);
+                        try self.em.cvtsi2sd(X0, T0);
+                        try self.storeF64Slot(nc.dst, X0);
+                    } else return jit.JitError.Unsupported;
+                },
+                .f32 => {
+                    if (from == .f32) { // identity
+                        try self.loadSlot(T0, nc.src);
+                        try self.storeSlot(nc.dst, T0);
+                    } else if (from == .f64) { // f64 -> f32 (round to nearest)
+                        try self.loadF64Slot(X0, nc.src);
+                        try self.em.cvtsd2ss(X0, X0);
+                        try self.storeF32Slot(nc.dst, X0);
+                    } else if (isNumeric(from)) { // int -> float
+                        try self.loadSlot(T0, nc.src);
+                        try self.em.cvtsi2ss(X0, T0);
+                        try self.storeF32Slot(nc.dst, X0);
+                    } else return jit.JitError.Unsupported;
+                },
+                // int width change: copy the (sign-extended) bits — i32→i64 is a
+                // no-op, i64→i32 truncates at rebox (Kotlin `Long.toInt` = low 32).
+                // float→int diverges from Kotlin on NaN/overflow, so bail.
+                .i64, .i32 => {
+                    if (!isNumeric(from)) return jit.JitError.Unsupported;
+                    try self.loadSlot(T0, nc.src);
+                    try self.storeSlot(nc.dst, T0);
+                },
+                else => return jit.JitError.Unsupported,
+            }
+            return;
+        }
         switch (inst.*) {
             .Const => |c| {
-                const t = constType(self.module.consts.items[c.value.int()]);
+                const cv = self.module.consts.items[c.value.int()];
+                const t = constType(cv);
                 if (t == .unknown) return jit.JitError.Unsupported;
-                try self.em.movImm64(T0, @bitCast(constI64(self.module.consts.items[c.value.int()])));
+                // float and integer consts both land as raw bits in the slot.
+                const bits = if (isFloat(t)) constFloatBits(cv) else constI64(cv);
+                try self.em.movImm64(T0, @bitCast(bits));
                 try self.storeSlot(c.dst, T0);
             },
             .Move => |m| {
@@ -721,7 +920,17 @@ const Compiler = struct {
                 const is_arith = isArithBinOp(b.op);
                 const is_div = isDivBinOp(b.op);
                 if (!is_cmp and !is_arith and !is_div) return jit.JitError.Unsupported;
-                if (!isNumeric(typeOf(self.types, b.lhs)) or !isNumeric(typeOf(self.types, b.rhs)))
+                const lt = typeOf(self.types, b.lhs);
+                const rt = typeOf(self.types, b.rhs);
+                // float path: both operands must be the SAME float width (a mixed
+                // int/float or f32/f64 op needs a conversion the fast paths don't
+                // emit inline).
+                if (isFloat(lt) or isFloat(rt)) {
+                    if (lt != rt) return jit.JitError.Unsupported;
+                    try self.emitFloatBinOp(b, lt == .f32);
+                    return;
+                }
+                if (!isNumeric(lt) or !isNumeric(rt))
                     return jit.JitError.Unsupported;
                 try self.loadSlot(T0, b.lhs);
                 try self.loadSlot(T1, b.rhs);
@@ -847,6 +1056,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         }
         for (blk.insts) |*inst| {
             if (arrayOpOf(module, inst) != null) continue;
+            if (numericConvOf(module, inst) != null) continue;
             switch (inst.*) {
                 .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .CellGet, .CellSet => {},
                 else => {
@@ -1049,6 +1259,14 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64) RunResult
                 .Long => |x| slots[r] = x,
                 else => return .bail,
             },
+            .f64 => switch (v) {
+                .Double => |x| slots[r] = @bitCast(x),
+                else => return .bail,
+            },
+            .f32 => switch (v) {
+                .Float => |x| slots[r] = @as(u32, @bitCast(x)),
+                else => return .bail,
+            },
             .boolean => switch (v) {
                 .Bool => |b| slots[r] = if (b) 1 else 0,
                 else => return .bail,
@@ -1098,6 +1316,8 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64) RunResult
         regs[r] = switch (self.reg_types[r]) {
             .i32 => .{ .Int = @truncate(slots[r]) },
             .i64 => .{ .Long = slots[r] },
+            .f64 => .{ .Double = @bitCast(slots[r]) },
+            .f32 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(slots[r]))))) },
             .boolean => .{ .Bool = slots[r] != 0 },
             .unit => .Unit,
             .null_ => .Null,
@@ -1133,6 +1353,14 @@ fn cellSlotIn(rt: RegType, v: Value) ?i64 {
             .Long => |x| x,
             else => null,
         },
+        .f64 => switch (v) {
+            .Double => |x| @bitCast(x),
+            else => null,
+        },
+        .f32 => switch (v) {
+            .Float => |x| @as(u32, @bitCast(x)),
+            else => null,
+        },
         .boolean => switch (v) {
             .Bool => |b| if (b) 1 else 0,
             else => null,
@@ -1145,6 +1373,8 @@ fn valueFromSlot(rt: RegType, s: i64) Value {
     return switch (rt) {
         .i32 => .{ .Int = @truncate(s) },
         .i64 => .{ .Long = s },
+        .f64 => .{ .Double = @bitCast(s) },
+        .f32 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(s))))) },
         .boolean => .{ .Bool = s != 0 },
         else => .Unit,
     };

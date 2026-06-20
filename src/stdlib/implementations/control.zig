@@ -28,25 +28,17 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return arityErr("buildList expects (block) or (capacity, block)");
     }
     const block = ctx.args[ctx.args.len - 1];
-    const buildable = Value{ .List = .{
-        .items = try ValueList.init(ctx.allocator, .empty),
-        .mutable = true,
-        .enum_entries = false,
-        .backing = null,
-    } };
+    const buildable = Value{ .List = try runtime.ListData.fromArrayList(ctx.allocator, .empty, true) };
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
         if (r == .err) {
-            buildable.List.items.deinit();
+            buildable.List.buf.deinit();
             return r;
         }
     }
-    return ok(.{ .List = .{
-        .items = buildable.List.items,
-        .mutable = false,
-        .enum_entries = false,
-        .backing = null,
-    } });
+    var result = buildable.List;
+    result.mutable = false;
+    return ok(.{ .List = result });
 }
 
 pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -54,26 +46,21 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return arityErr("buildSet expects (block) or (capacity, block)");
     }
     const block = ctx.args[ctx.args.len - 1];
-    const buildable = Value{ .List = .{
-        .items = try ValueList.init(ctx.allocator, .empty),
-        .mutable = true,
-        .enum_entries = false,
-        .backing = null,
-    } };
+    const buildable = Value{ .List = try runtime.ListData.fromArrayList(ctx.allocator, .empty, true) };
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
         if (r == .err) {
-            buildable.List.items.deinit();
+            buildable.List.buf.deinit();
             return r;
         }
     }
     var deduped = try ValueList.init(ctx.allocator, .empty);
     {
-        const src = buildable.List.items.borrow();
+        const src = buildable.List.buf.borrow();
         defer src.deinit();
         const dst = deduped.borrowMut();
         defer dst.deinit();
-        for (src.get().items) |*v| {
+        for (src.get().boxed.items) |*v| {
             var seen = false;
             for (dst.get().items) |*x| {
                 if (Value.structuralEqBoxed(x, v)) {
@@ -84,7 +71,7 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             if (!seen) try dst.get().append(ctx.allocator, v.*);
         }
     }
-    buildable.List.items.deinit();
+    buildable.List.buf.deinit();
     return ok(.{ .Set = .{
         .items = deduped,
         .mutable = false,
@@ -221,9 +208,9 @@ const RecordingHost = struct {
         if (self.fail_with) |e| return .{ .err = e };
         switch (this_value.*) {
             .List => |l| {
-                const g = l.items.borrowMut();
+                const g = l.buf.borrowMut();
                 defer g.deinit();
-                for (self.append_values) |v| try g.get().append(self.allocator, v);
+                for (self.append_values) |v| try g.get().boxed.append(self.allocator, v);
             },
             .Map => |m| {
                 const g = m.entries.borrowMut();
@@ -257,7 +244,7 @@ fn freeListResult(v: Value) void {
     // The element/entry storage is an `ObjRef` over an `ArrayList`; releasing
     // the final handle runs the list's own `deinit`, so no manual clear here.
     switch (v) {
-        .List => |l| l.items.deinit(),
+        .List => |l| l.buf.deinit(),
         .Set => |s| s.items.deinit(),
         .Map => |m| m.entries.deinit(),
         else => {},
@@ -287,11 +274,11 @@ test "buildList freezes a populated list" {
     try testing.expect(r == .ok);
     defer freeListResult(r.ok);
     try testing.expect(!r.ok.List.mutable);
-    const g = r.ok.List.items.borrow();
+    const g = r.ok.List.buf.borrow();
     defer g.deinit();
-    try testing.expectEqual(@as(usize, 2), g.get().items.len);
-    try testing.expectEqual(@as(i32, 1), g.get().items[0].Int);
-    try testing.expectEqual(@as(i32, 2), g.get().items[1].Int);
+    try testing.expectEqual(@as(usize, 2), g.get().boxed.items.len);
+    try testing.expectEqual(@as(i32, 1), g.get().boxed.items[0].Int);
+    try testing.expectEqual(@as(i32, 2), g.get().boxed.items[1].Int);
 }
 
 test "buildList accepts a capacity hint argument" {
