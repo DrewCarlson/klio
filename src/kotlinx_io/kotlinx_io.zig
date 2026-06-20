@@ -72,7 +72,7 @@ fn argString(ctx: *CallCtx, idx: usize) std.mem.Allocator.Error!ArgResult([]cons
     if (idx < ctx.args.len and ctx.args[idx] == .String) {
         const g = ctx.args[idx].String.borrow();
         defer g.deinit();
-        return .{ .val = try ctx.allocator.dupe(u8, g.get().*) };
+        return .{ .val = try ctx.allocator.dupe(u8, g.get().bytes) };
     }
     return .{ .err = try typeErr(ctx, "kotlinx.io: argument {d} must be a String", .{idx}) };
 }
@@ -89,7 +89,7 @@ fn argBytes(ctx: *CallCtx, idx: usize) std.mem.Allocator.Error!ArgResult([]u8) {
         .String => |s| {
             const g = s.borrow();
             defer g.deinit();
-            return .{ .val = try ctx.allocator.dupe(u8, g.get().*) };
+            return .{ .val = try ctx.allocator.dupe(u8, g.get().bytes) };
         },
         .Array => |a| {
             const elems = try a.snapshot(ctx.allocator);
@@ -122,8 +122,8 @@ fn bytesValue(ctx: *CallCtx, bytes: []const u8) std.mem.Allocator.Error!Value {
 fn ioError(ctx: *CallCtx, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!EvalResult {
     const msg = try std.fmt.allocPrint(ctx.allocator, fmt, args);
     return .{ .err = .{ .Thrown = .{ .Exception = .{
-        .fqn = try StringRef.init(ctx.allocator, "kotlinx.io.IOException"),
-        .message = try StringRef.initOwned(ctx.allocator, msg),
+        .fqn = try runtime.strInit(ctx.allocator, "kotlinx.io.IOException"),
+        .message = try runtime.strInitOwned(ctx.allocator, msg),
         .cause = null,
     } } } };
 }
@@ -298,7 +298,7 @@ fn fsResolve(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const n = std.Io.Dir.cwd().realPathFile(io, path, &buf) catch |e|
         return ioError(ctx, "resolve {s}: {s}", .{ path, @errorName(e) });
     const owned = try ctx.allocator.dupe(u8, buf[0..n]);
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, owned) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, owned) });
 }
 
 fn fsList(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -322,7 +322,7 @@ fn fsList(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         const owned = try ctx.allocator.dupe(u8, entry.name);
-        try names.append(ctx.allocator, .{ .String = try StringRef.initOwned(ctx.allocator, owned) });
+        try names.append(ctx.allocator, .{ .String = try runtime.strInitOwned(ctx.allocator, owned) });
     }
     return ok(.{ .List = .{
         .items = try ValueList.init(ctx.allocator, names),
@@ -340,7 +340,7 @@ fn fsTempDir(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .windows => "C:\\Windows\\Temp",
         else => "/tmp",
     };
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, try ctx.allocator.dupe(u8, dir)) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, try ctx.allocator.dupe(u8, dir)) });
 }
 
 fn base64Encode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -352,7 +352,7 @@ fn base64Encode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const enc = std.base64.standard.Encoder;
     const out = try ctx.allocator.alloc(u8, enc.calcSize(data.len));
     _ = enc.encode(out, data);
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, out) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, out) });
 }
 
 fn base64Decode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -386,7 +386,7 @@ fn hexEncode(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         out.appendAssumeCapacity("0123456789abcdef"[byte & 0xf]);
     }
     const owned = try out.toOwnedSlice(ctx.allocator);
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, owned) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, owned) });
 }
 
 // Each nibble is a 4-bit hex digit, so the packed byte fits u8; the raw
@@ -495,7 +495,7 @@ test "host bindings registers the codec and filesystem entries" {
 }
 
 test "base64 round-trips" {
-    const src = try StringRef.init(testing.allocator, "hello");
+    const src = try runtime.strInit(testing.allocator, "hello");
     defer src.deinit();
     const enc_args = [_]Value{.{ .String = src }};
     var ctx = testCtx(&enc_args);
@@ -503,7 +503,7 @@ test "base64 round-trips" {
     defer freeResult(enc);
     try testing.expect(enc == .ok);
     const g = enc.ok.String.borrow();
-    try testing.expectEqualStrings("aGVsbG8=", g.get().*);
+    try testing.expectEqualStrings("aGVsbG8=", g.get().bytes);
     g.deinit();
 
     const dec_args = [_]Value{enc.ok};
@@ -520,7 +520,7 @@ test "base64 round-trips" {
 }
 
 test "base64 decode rejects invalid input" {
-    const s = try StringRef.init(testing.allocator, "not base64!!!");
+    const s = try runtime.strInit(testing.allocator, "not base64!!!");
     defer s.deinit();
     const args = [_]Value{.{ .String = s }};
     var ctx = testCtx(&args);
@@ -544,7 +544,7 @@ test "hex encodes lowercase and decodes back" {
     defer freeResult(enc);
     try testing.expect(enc == .ok);
     const g = enc.ok.String.borrow();
-    try testing.expectEqualStrings("dead", g.get().*);
+    try testing.expectEqualStrings("dead", g.get().bytes);
     g.deinit();
 
     const dec_args = [_]Value{enc.ok};
@@ -560,7 +560,7 @@ test "hex encodes lowercase and decodes back" {
 }
 
 test "hex decode rejects odd length" {
-    const s = try StringRef.init(testing.allocator, "abc");
+    const s = try runtime.strInit(testing.allocator, "abc");
     defer s.deinit();
     const args = [_]Value{.{ .String = s }};
     var ctx = testCtx(&args);
@@ -572,7 +572,7 @@ test "hex decode rejects odd length" {
 }
 
 test "hex decode rejects an invalid digit" {
-    const s = try StringRef.init(testing.allocator, "zz");
+    const s = try runtime.strInit(testing.allocator, "zz");
     defer s.deinit();
     const args = [_]Value{.{ .String = s }};
     var ctx = testCtx(&args);
@@ -601,7 +601,7 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
     const file_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "data.bin" });
     defer testing.allocator.free(file_path);
 
-    const path_ref = try StringRef.init(testing.allocator, file_path);
+    const path_ref = try runtime.strInit(testing.allocator, file_path);
     defer path_ref.deinit();
 
     // write "hi"
@@ -654,7 +654,7 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
 
     // list the directory finds data.bin
     {
-        const dir_ref = try StringRef.init(testing.allocator, dir_path);
+        const dir_ref = try runtime.strInit(testing.allocator, dir_path);
         defer dir_ref.deinit();
         const args = [_]Value{.{ .String = dir_ref }};
         var ctx = testCtx(&args);
@@ -664,7 +664,7 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
         var found = false;
         for (g.get().items) |entry| {
             const eg = entry.String.borrow();
-            if (std.mem.eql(u8, eg.get().*, "data.bin")) found = true;
+            if (std.mem.eql(u8, eg.get().bytes, "data.bin")) found = true;
             eg.deinit();
         }
         g.deinit();
@@ -688,12 +688,12 @@ test "append concatenates to an existing file" {
     defer testing.allocator.free(dir_path);
     const file_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "log.txt" });
     defer testing.allocator.free(file_path);
-    const path_ref = try StringRef.init(testing.allocator, file_path);
+    const path_ref = try runtime.strInit(testing.allocator, file_path);
     defer path_ref.deinit();
 
-    const ab = try StringRef.init(testing.allocator, "ab");
+    const ab = try runtime.strInit(testing.allocator, "ab");
     defer ab.deinit();
-    const cd = try StringRef.init(testing.allocator, "cd");
+    const cd = try runtime.strInit(testing.allocator, "cd");
     defer cd.deinit();
 
     {
@@ -730,7 +730,7 @@ test "create directories reports its outcome codes" {
     defer testing.allocator.free(dir_path);
     const nested = try std.fs.path.join(testing.allocator, &.{ dir_path, "a", "b", "c" });
     defer testing.allocator.free(nested);
-    const nested_ref = try StringRef.init(testing.allocator, nested);
+    const nested_ref = try runtime.strInit(testing.allocator, nested);
     defer nested_ref.deinit();
 
     {
@@ -751,7 +751,7 @@ test "create directories reports its outcome codes" {
 }
 
 test "metadata for an absent path is kind 0" {
-    const s = try StringRef.init(testing.allocator, "/definitely/not/a/real/path/xyzzy");
+    const s = try runtime.strInit(testing.allocator, "/definitely/not/a/real/path/xyzzy");
     defer s.deinit();
     const args = [_]Value{.{ .String = s }};
     var ctx = testCtx(&args);
@@ -769,6 +769,6 @@ test "temp dir returns a non-empty path" {
     defer freeResult(r);
     try testing.expect(r == .ok);
     const g = r.ok.String.borrow();
-    try testing.expect(g.get().*.len > 0);
+    try testing.expect(g.get().bytes.len > 0);
     g.deinit();
 }

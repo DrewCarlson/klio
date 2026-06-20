@@ -1778,7 +1778,7 @@ fn buildModuleWithOverrides(
             const id = next_id;
             next_id += 1;
             var fields: std.ArrayList(InstanceData.Field) = .empty;
-            try fields.append(a, .{ .name = "name", .value = .{ .String = try ObjRef([]const u8).init(a, entry.name.name) } });
+            try fields.append(a, .{ .name = "name", .value = .{ .String = try runtime.strInit(a, entry.name.name) } });
             try fields.append(a, .{ .name = "ordinal", .value = Value.newInt(@intCast(ordinal)) });
 
             if (entry.body_members.len != 0) {
@@ -1796,7 +1796,7 @@ fn buildModuleWithOverrides(
                     const module_rc = try ObjRef(Module).init(a, sub_module);
                     try enum_entry_methods.put(.{ .a = synth_class_name, .b = f.name.name }, .{ .module = module_rc, .func = fid });
                 }
-                try fields.append(a, .{ .name = "__enum_entry_class__", .value = .{ .String = try ObjRef([]const u8).init(a, synth_class_name) } });
+                try fields.append(a, .{ .name = "__enum_entry_class__", .value = .{ .String = try runtime.strInit(a, synth_class_name) } });
             }
 
             const inst = try ObjRef(InstanceData).init(a, .{
@@ -2623,7 +2623,12 @@ fn retainDecl(
         .Function => |*f| {
             if (!f.is_expect and std.mem.eql(u8, f.name.name, "suspendCoroutineUninterceptedOrReturn") and f.is_inline and f.is_suspend) return false;
             if (!f.is_expect and f.params.len == 0 and
-                (std.mem.eql(u8, f.name.name, "emptyList") or std.mem.eql(u8, f.name.name, "emptySet") or std.mem.eql(u8, f.name.name, "emptyMap"))) return false;
+                (std.mem.eql(u8, f.name.name, "emptyList") or std.mem.eql(u8, f.name.name, "emptySet") or std.mem.eql(u8, f.name.name, "emptyMap")))
+            {
+                const expected = try std.fmt.allocPrint(a, "kotlin.collections.{s}", .{f.name.name});
+                const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
+                if (std.mem.eql(u8, fqn, expected) and stdlib.implementation(expected) != null) return false;
+            }
             if (!f.is_expect and isSequenceFactoryName(f.name.name)) {
                 const expected = try std.fmt.allocPrint(a, "kotlin.sequences.{s}", .{f.name.name});
                 const fqn = func_fqn_overrides.get(f.span);

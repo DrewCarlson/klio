@@ -611,12 +611,12 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
                 const ex = v.Exception;
                 const fqn_g = ex.fqn.borrow();
                 defer fqn_g.deinit();
-                const fqn = fqn_g.get().*;
+                const fqn = fqn_g.get().bytes;
                 var msg: []const u8 = "<no message>";
                 if (ex.message) |m| {
                     const mg = m.borrow();
                     defer mg.deinit();
-                    msg = mg.get().*;
+                    msg = mg.get().bytes;
                 }
                 const out = std.fmt.allocPrint(allocator, "uncaught {s}: {s}", .{ fqn, msg }) catch "uncaught exception";
                 return .{ .Eval = out };

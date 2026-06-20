@@ -372,7 +372,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
                 if (nv == .String) {
                     const sg = nv.String.borrow();
                     defer sg.deinit();
-                    name = sg.get().*;
+                    name = sg.get().bytes;
                 }
             }
         }

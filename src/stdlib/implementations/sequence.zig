@@ -277,7 +277,7 @@ pub fn seq_from_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     const sg = sval.String.borrow();
     defer sg.deinit();
-    const bytes = sg.get().*;
+    const bytes = sg.get().bytes;
     var chars: std.ArrayList(Value) = .empty;
     var view = std.unicode.Utf8View.initUnchecked(bytes);
     var it = view.iterator();
@@ -542,7 +542,7 @@ pub fn seq_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // Stable parity for that string is meaningless (it embeds the heap
     // address), so we emit a deterministic placeholder. Programs that need a
     // useful value should call `.toList()` before printing.
-    const s = try runtime.StringRef.init(ctx.allocator, "kotlin.sequences.Sequence");
+    const s = try runtime.strInit(ctx.allocator, "kotlin.sequences.Sequence");
     return ok(.{ .String = s });
 }
 
@@ -573,7 +573,7 @@ pub fn map_entry_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return err(.{ .Type = "Map.Entry.toString requires a Map.Entry receiver" });
     }
     const s = try ctx.args[0].display(ctx.allocator);
-    const ref = try runtime.StringRef.initOwned(ctx.allocator, s);
+    const ref = try runtime.strInitOwned(ctx.allocator, s);
     return ok(.{ .String = ref });
 }
 
@@ -1196,8 +1196,8 @@ fn cloneSlice(allocator: std.mem.Allocator, ref: ValueSlice) std.mem.Allocator.E
 }
 
 fn noSuchElement(allocator: std.mem.Allocator, message: []const u8) std.mem.Allocator.Error!RuntimeError {
-    const fqn = try runtime.StringRef.init(allocator, "kotlin.NoSuchElementException");
-    const msg = try runtime.StringRef.init(allocator, message);
+    const fqn = try runtime.strInit(allocator, "kotlin.NoSuchElementException");
+    const msg = try runtime.strInit(allocator, message);
     return .{ .Thrown = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = null } } };
 }
 
@@ -1235,7 +1235,7 @@ fn compareValues(a: *const Value, b: *const Value) CmpResult {
         defer ga.deinit();
         const gb = b.String.borrow();
         defer gb.deinit();
-        return .{ .order = compareUtf16(ga.get().*, gb.get().*) };
+        return .{ .order = compareUtf16(ga.get().bytes, gb.get().bytes) };
     }
     if (a.* == .Char and b.* == .Char) {
         return .{ .order = std.math.order(a.Char, b.Char) };
@@ -1456,7 +1456,7 @@ test "asSequence from a string yields utf-16 code units" {
     var h = Harness.init();
     defer h.deinit();
 
-    const s = try runtime.StringRef.init(h.allocator(), "ab");
+    const s = try runtime.strInit(h.allocator(), "ab");
     var args = [_]Value{.{ .String = s }};
     var ctx = h.ctx(&args);
     const r = try seq_from_string(&ctx);
@@ -1529,7 +1529,7 @@ test "Sequence.last on an empty items source throws NoSuchElementException" {
     const e = r.err.Thrown.Exception;
     const fg = e.fqn.borrow();
     defer fg.deinit();
-    try testing.expectEqualStrings("kotlin.NoSuchElementException", fg.get().*);
+    try testing.expectEqualStrings("kotlin.NoSuchElementException", fg.get().bytes);
 }
 
 test "Sequence.first on a streaming items source pulls the first element" {
@@ -1597,7 +1597,7 @@ test "Sequence.toString is a stable placeholder" {
     const r = try seq_to_string(&ctx);
     const g = r.ok.String.borrow();
     defer g.deinit();
-    try testing.expectEqualStrings("kotlin.sequences.Sequence", g.get().*);
+    try testing.expectEqualStrings("kotlin.sequences.Sequence", g.get().bytes);
 }
 
 test "Map.Entry key and value accessors" {
@@ -1620,7 +1620,7 @@ test "Map.Entry key and value accessors" {
     const s = try map_entry_to_string(&ctx);
     const g = s.ok.String.borrow();
     defer g.deinit();
-    try testing.expectEqualStrings("3=9", g.get().*);
+    try testing.expectEqualStrings("3=9", g.get().bytes);
 }
 
 test "Map.Entry accessors reject a non-entry receiver" {

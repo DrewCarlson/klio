@@ -315,7 +315,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (br == .Instance) {
                 const ng = bn.borrow();
                 defer ng.deinit();
-                const bname = ng.get().*;
+                const bname = ng.get().bytes;
                 const g = br.Instance.borrow();
                 defer g.deinit();
                 const b = g.get();
@@ -346,9 +346,9 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if ((std.mem.eql(u8, name, "simpleName") or std.mem.eql(u8, name, "qualifiedName")) and receiver.* == .Exception) {
         const g = receiver.Exception.fqn.borrow();
         defer g.deinit();
-        const fqn = g.get().*;
+        const fqn = g.get().bytes;
         const v = if (std.mem.eql(u8, name, "simpleName")) lastSegment(fqn) else fqn;
-        return ok(.{ .String = try StringRef.init(allocator, v) });
+        return ok(.{ .String = try runtime.strInit(allocator, v) });
     }
     // Explicit `recv.coroutineContext` (lowered to this sentinel):
     // bypass the bare-`coroutineContext` redirect for this one read.
@@ -492,10 +492,10 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 // A dispatcher pool worker reports its registered
                 // upstream-shaped name (`DefaultDispatcher-worker-N`).
                 if (runtime.threadName(allocator, id)) |overridden| {
-                    return ok(.{ .String = try StringRef.initOwned(allocator, overridden) });
+                    return ok(.{ .String = try runtime.strInitOwned(allocator, overridden) });
                 }
                 const s = try std.fmt.allocPrint(allocator, "klio-thread-{d}", .{id});
-                return ok(.{ .String = try StringRef.initOwned(allocator, s) });
+                return ok(.{ .String = try runtime.strInitOwned(allocator, s) });
             }
         }
     }
@@ -547,13 +547,13 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             const mptr: *const Module = info.module orelse self.module.asPtr();
             if (mptr.funcById(info.body_func)) |f| {
                 if (std.mem.eql(u8, name, "name")) {
-                    return ok(.{ .String = try StringRef.init(allocator, f.name) });
+                    return ok(.{ .String = try runtime.strInit(allocator, f.name) });
                 }
                 if (std.mem.eql(u8, name, "parameters")) {
                     var items: std.ArrayList(Value) = .empty;
                     errdefer items.deinit(allocator);
                     for (f.params) |p| {
-                        try items.append(allocator, .{ .String = try StringRef.init(allocator, p.name) });
+                        try items.append(allocator, .{ .String = try runtime.strInit(allocator, p.name) });
                     }
                     return ok(try frozenList(allocator, items, false));
                 }
@@ -653,7 +653,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 const prop_name = blk: {
                     const g = pr.name.borrow();
                     defer g.deinit();
-                    break :blk g.get().*;
+                    break :blk g.get().bytes;
                 };
                 const chain = try ir.eval.enclosingThisChainAlloc(allocator);
                 defer allocator.free(chain);
@@ -1091,8 +1091,8 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     const g = cls.borrow();
     defer g.deinit();
     const cd = g.get();
-    if (std.mem.eql(u8, name, "simpleName")) return ok(.{ .String = try StringRef.init(allocator, cd.name) });
-    if (std.mem.eql(u8, name, "qualifiedName")) return ok(.{ .String = try StringRef.init(allocator, cd.fqn) });
+    if (std.mem.eql(u8, name, "simpleName")) return ok(.{ .String = try runtime.strInit(allocator, cd.name) });
+    if (std.mem.eql(u8, name, "qualifiedName")) return ok(.{ .String = try runtime.strInit(allocator, cd.fqn) });
     if (std.mem.eql(u8, name, "isData")) return ok(.{ .Bool = cd.is_data });
     if (std.mem.eql(u8, name, "isOpen")) return ok(.{ .Bool = cd.is_open });
     if (std.mem.eql(u8, name, "isAbstract")) return ok(.{ .Bool = cd.is_abstract });
@@ -1136,7 +1136,7 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
                 if (!std.mem.eql(u8, c.name, cd.name)) continue;
                 for (c.methods) |fid| {
                     if (mg.get().funcById(fid)) |f| {
-                        try items.append(allocator, .{ .PropertyRef = .{ .name = try StringRef.init(allocator, f.name) } });
+                        try items.append(allocator, .{ .PropertyRef = .{ .name = try runtime.strInit(allocator, f.name) } });
                     }
                 }
                 break;
@@ -1144,11 +1144,11 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         }
         for (cd.primary_params) |p| {
             if (p.property != null) {
-                try items.append(allocator, .{ .PropertyRef = .{ .name = try StringRef.init(allocator, p.name) } });
+                try items.append(allocator, .{ .PropertyRef = .{ .name = try runtime.strInit(allocator, p.name) } });
             }
         }
         for (cd.body_properties) |p| {
-            try items.append(allocator, .{ .PropertyRef = .{ .name = try StringRef.init(allocator, p.name) } });
+            try items.append(allocator, .{ .PropertyRef = .{ .name = try runtime.strInit(allocator, p.name) } });
         }
         return ok(try frozenList(allocator, items, false));
     }
@@ -1164,7 +1164,7 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
             if (resolved) |c| {
                 try items.append(allocator, .{ .Class = c });
             } else {
-                try items.append(allocator, .{ .String = try StringRef.init(allocator, n) });
+                try items.append(allocator, .{ .String = try runtime.strInit(allocator, n) });
             }
         }
         return ok(try frozenList(allocator, items, false));
@@ -1340,7 +1340,7 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             break :blk g.get().get(name);
         };
         if (raw) |d| {
-            const prop_ref = Value{ .PropertyRef = .{ .name = try StringRef.init(allocator, name) } };
+            const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
             return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
         }
     }
@@ -1383,8 +1383,8 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (is_lateinit) {
                 const m = try std.fmt.allocPrint(allocator, "lateinit property {s} has not been initialized", .{name});
                 return errRes(.{ .Throw = .{ .Exception = .{
-                    .fqn = try StringRef.init(allocator, "kotlin.UninitializedPropertyAccessException"),
-                    .message = try StringRef.initOwned(allocator, m),
+                    .fqn = try runtime.strInit(allocator, "kotlin.UninitializedPropertyAccessException"),
+                    .message = try runtime.strInitOwned(allocator, m),
                     .cause = null,
                 } } });
             }
@@ -1575,8 +1575,8 @@ fn unwrapDelegate(self: *VmHost, allocator: Allocator, d: ObjRef(runtime.Delegat
             if (nn.value) |x| return ok(x);
             const m = try std.fmt.allocPrint(allocator, "Property {s} should be initialized before get.", .{name});
             return errRes(.{ .Throw = .{ .Exception = .{
-                .fqn = try StringRef.init(allocator, "kotlin.IllegalStateException"),
-                .message = try StringRef.initOwned(allocator, m),
+                .fqn = try runtime.strInit(allocator, "kotlin.IllegalStateException"),
+                .message = try runtime.strInitOwned(allocator, m),
                 .cause = null,
             } } });
         },
@@ -1834,7 +1834,7 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                     break :blk g.get().get(real_name);
                 };
                 if (raw) |d| {
-                    const prop_ref = Value{ .PropertyRef = .{ .name = try StringRef.init(allocator, real_name) } };
+                    const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, real_name) } };
                     switch (try self.callMember(allocator, &d, "setValue", &.{ receiver.*, prop_ref, value })) {
                         .ok => return .{ .ok = {} },
                         .err => |e| return .{ .err = e },
@@ -2049,7 +2049,7 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     });
     var fields: std.ArrayList(InstanceData.Field) = .empty;
     try fields.append(allocator, .{ .name = "__bound_receiver__", .value = receiver.* });
-    try fields.append(allocator, .{ .name = "__bound_name__", .value = .{ .String = try StringRef.init(allocator, name) } });
+    try fields.append(allocator, .{ .name = "__bound_name__", .value = .{ .String = try runtime.strInit(allocator, name) } });
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = synth_class,
         .fields = fields,
@@ -2133,7 +2133,7 @@ fn collectionLen(receiver: *const Value) ?i64 {
         .String => |s| blk: {
             const g = s.borrow();
             defer g.deinit();
-            break :blk @intCast(utf16Len(g.get().*));
+            break :blk @intCast(utf16Len(g.get().bytes));
         },
         else => null,
     };
@@ -2178,7 +2178,7 @@ test "collectionLen reports list and string lengths" {
     defer lv.List.items.deinit();
     try testing.expectEqual(@as(i64, 2), collectionLen(&lv).?);
 
-    const s = try StringRef.init(a, "hello");
+    const s = try runtime.strInit(a, "hello");
     defer s.deinit();
     const sv = Value{ .String = s };
     try testing.expectEqual(@as(i64, 5), collectionLen(&sv).?);

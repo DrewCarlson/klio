@@ -1055,7 +1055,7 @@ pub fn isCancellationException(v: *const Value) bool {
         .Exception => |e| {
             const g = e.fqn.borrow();
             defer g.deinit();
-            const s = g.get().*;
+            const s = g.get().bytes;
             return std.mem.endsWith(u8, s, "CancellationException") or
                 std.mem.endsWith(u8, s, "TimeoutCancellationException");
         },
@@ -1089,7 +1089,7 @@ test "value_is_callable / value_is_builtin classification" {
     const i: Value = .{ .Int = 1 };
     try testing.expect(valueIsBuiltin(&i));
     try testing.expect(!valueIsCallable(&i));
-    const p: Value = .{ .PropertyRef = .{ .name = try ObjRef([]const u8).init(testing.allocator, "x") } };
+    const p: Value = .{ .PropertyRef = .{ .name = try runtime.strInit(testing.allocator, "x") } };
     defer p.PropertyRef.name.deinit();
     try testing.expect(valueIsCallable(&p));
     try testing.expect(!valueIsBuiltin(&p));

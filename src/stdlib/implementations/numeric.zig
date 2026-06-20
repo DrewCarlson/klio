@@ -45,8 +45,8 @@ fn arityErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloc
 /// lifetime (the arena), matching Rust's `Arc<String>`.
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
     return .{ .Exception = .{
-        .fqn = try StringRef.init(allocator, fqn),
-        .message = if (message) |m| try StringRef.init(allocator, m) else null,
+        .fqn = try runtime.strInit(allocator, fqn),
+        .message = if (message) |m| try runtime.strInit(allocator, m) else null,
         .cause = null,
     } };
 }
@@ -103,7 +103,7 @@ pub fn int_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         return .{ .err = .{ .Thrown = exc } };
     }
     const s = try intToRadixString(ctx.allocator, n, @intCast(radix));
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
 /// Render `n` in `radix`. Kotlin prefixes a `-` and renders the absolute
@@ -313,7 +313,7 @@ pub fn unsigned_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     const s = try std.fmt.allocPrint(ctx.allocator, "{d}", .{v});
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
 // ============================================================
@@ -369,7 +369,7 @@ pub fn float_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     const s = try runtime.kotlinFloatToString(ctx.allocator, d);
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 pub fn float_is_nan(ctx: *CallCtx) Allocator.Error!EvalResult {
     const f = switch (try recvFloat(ctx.allocator, ctx.args, "Float.isNaN")) {
@@ -594,7 +594,7 @@ pub fn long_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         return .{ .err = .{ .Thrown = exc } };
     }
     const s = try intToRadixString(ctx.allocator, n, @intCast(radix));
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
 pub fn long_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -648,7 +648,7 @@ pub fn double_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     const s = try runtime.kotlinDoubleToString(ctx.allocator, d);
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 pub fn double_to_int(ctx: *CallCtx) Allocator.Error!EvalResult {
     const d = switch (try recvDouble(ctx.allocator, ctx.args, "Double.toInt")) {
@@ -813,7 +813,7 @@ pub fn bool_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         return .{ .err = .{ .Type = "Boolean.toString requires a Boolean" } };
     }
     const b = ctx.args[0].Bool;
-    return ok(.{ .String = try StringRef.init(ctx.allocator, if (b) "true" else "false") });
+    return ok(.{ .String = try runtime.strInit(ctx.allocator, if (b) "true" else "false") });
 }
 
 // ============================================================
@@ -1201,10 +1201,10 @@ test "int_to_string rejects out-of-range radix" {
                 try testing.expect(v == .Exception);
                 const g = v.Exception.fqn.borrow();
                 defer g.deinit();
-                try testing.expectEqualStrings("kotlin.IllegalArgumentException", g.get().*);
+                try testing.expectEqualStrings("kotlin.IllegalArgumentException", g.get().bytes);
                 const mg = v.Exception.message.?.borrow();
                 defer mg.deinit();
-                try testing.expectEqualStrings("radix 1 was not in valid range 2..36", mg.get().*);
+                try testing.expectEqualStrings("radix 1 was not in valid range 2..36", mg.get().bytes);
             },
             else => return error.WrongError,
         },
@@ -1218,7 +1218,7 @@ test "int_to_string renders in base" {
     const res = try int_to_string(&ctx);
     const g = res.ok.String.borrow();
     defer g.deinit();
-    try testing.expectEqualStrings("ff", g.get().*);
+    try testing.expectEqualStrings("ff", g.get().bytes);
 }
 
 test "int conversions widen and narrow" {
@@ -1361,7 +1361,7 @@ test "bool_to_string" {
         const res = try bool_to_string(&ctx);
         const g = res.ok.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("true", g.get().*);
+        try testing.expectEqualStrings("true", g.get().bytes);
     }
     {
         var ctx = h.ctx(&.{Value.newInt(1)});

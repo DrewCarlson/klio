@@ -235,7 +235,7 @@ fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) Allocator.Error!?Valu
                 try buf.appendSlice(allocator, p.Text);
             }
             const owned = try buf.toOwnedSlice(allocator);
-            return Value{ .String = try ObjRef([]const u8).initOwned(allocator, owned) };
+            return Value{ .String = try runtime.strInitOwned(allocator, owned) };
         },
         else => return null,
     }
@@ -1297,8 +1297,8 @@ fn throwInstantiation(self: *VmHost, allocator: Allocator, comptime fmt: []const
     _ = self;
     const msg = try std.fmt.allocPrint(allocator, fmt, .{name});
     return .{ .err = .{ .Throw = .{ .Exception = .{
-        .fqn = try ObjRef([]const u8).initOwned(allocator, try allocator.dupe(u8, "kotlin.InstantiationError")),
-        .message = try ObjRef([]const u8).initOwned(allocator, msg),
+        .fqn = try runtime.strInitOwned(allocator, try allocator.dupe(u8, "kotlin.InstantiationError")),
+        .message = try runtime.strInitOwned(allocator, msg),
         .cause = null,
     } } } };
 }
@@ -2445,7 +2445,7 @@ fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u
         break :blk false;
     };
     if (!has_provide) return v;
-    const prop_ref = Value{ .PropertyRef = .{ .name = try ObjRef([]const u8).initOwned(allocator, try allocator.dupe(u8, prop_name)) } };
+    const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInitOwned(allocator, try allocator.dupe(u8, prop_name)) } };
     switch (try self.callMember(allocator, &v, "provideDelegate", &.{ inst_value.*, prop_ref })) {
         .ok => |rep| return rep,
         .err => return v,

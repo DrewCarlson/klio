@@ -274,7 +274,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         .Exception => |e| {
             const g = e.fqn.borrow();
             defer g.deinit();
-            const fqn = g.get().*;
+            const fqn = g.get().bytes;
             const tail = lastSegment(fqn);
             if (std.mem.eql(u8, tail, ty.name)) return true;
             if (matchesAny(ty.name, &.{ "Throwable", "Any" })) return true;

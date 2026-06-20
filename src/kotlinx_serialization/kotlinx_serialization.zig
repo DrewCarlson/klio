@@ -106,7 +106,7 @@ fn valueToJson(v: *const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!Js
         .String => |s| {
             const g = s.borrow();
             defer g.deinit();
-            return .{ .ok = try jsonString(a, g.get().*) };
+            return .{ .ok = try jsonString(a, g.get().bytes) };
         },
         .Instance => |inst| {
             const ig = inst.borrow();
@@ -122,7 +122,7 @@ fn valueToJson(v: *const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!Js
                     if (nv == .String) {
                         const sg = nv.String.borrow();
                         defer sg.deinit();
-                        return .{ .ok = try jsonString(a, sg.get().*) };
+                        return .{ .ok = try jsonString(a, sg.get().bytes) };
                     }
                 }
                 return .{ .ok = try jsonString(a, cls.name) };
@@ -220,7 +220,7 @@ fn mapKey(allocator: std.mem.Allocator, k: *const Value) Error![]u8 {
         .String => |s| {
             const g = s.borrow();
             defer g.deinit();
-            return allocator.dupe(u8, g.get().*);
+            return allocator.dupe(u8, g.get().bytes);
         },
         .Int => |i| return std.fmt.allocPrint(allocator, "{d}", .{i}),
         .Long => |l| return std.fmt.allocPrint(allocator, "{d}", .{l}),
@@ -249,7 +249,7 @@ fn jsonEncode(ctx: *CallCtx) Error!EvalResult {
         .{};
     const s = std.json.Stringify.valueAlloc(ctx.allocator, jv, opts) catch
         return error.OutOfMemory;
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
 // ----- JSON decode (driven by the target class's declared types) -----
@@ -335,7 +335,7 @@ fn decodeField(
                     }
                 }
             }
-            return .{ .ok = .{ .String = try StringRef.initOwned(a, try a.dupe(u8, s)) } };
+            return .{ .ok = .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, s)) } };
         },
         .array => |arr| {
             // The element type is the first generic argument of the
@@ -396,7 +396,7 @@ fn decodeMap(map: JsonObjectMap, val_shape: ?*const TypeShape, ctx: *CallCtx) Er
             .err => |er| return .{ .err = er },
         };
         entries.appendAssumeCapacity(.{
-            .key = .{ .String = try StringRef.initOwned(a, try a.dupe(u8, entry.key_ptr.*)) },
+            .key = .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, entry.key_ptr.*)) },
             .value = v,
         });
     }
@@ -476,7 +476,7 @@ fn jsonDecode(ctx: *CallCtx) Error!EvalResult {
     const pa = arena.allocator();
 
     const sg = ctx.args[0].String.borrow();
-    const src = try pa.dupe(u8, sg.get().*);
+    const src = try pa.dupe(u8, sg.get().bytes);
     sg.deinit();
 
     const cls_val: Value = if (ctx.args.len > 1) ctx.args[1] else .Null;
@@ -547,7 +547,7 @@ fn ctorParamNames(ctx: *CallCtx) Error!EvalResult {
     var items: std.ArrayList(Value) = .empty;
     for (cls.primary_params) |p| {
         if (p.property == null) continue;
-        try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, p.name)) });
+        try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, p.name)) });
     }
     return ok(.{ .List = .{
         .items = try ValueList.init(a, items),
@@ -567,7 +567,7 @@ fn propGet(ctx: *CallCtx) Error!EvalResult {
         return typeErr("__klsx_get: name must be String");
     }
     const ng = ctx.args[1].String.borrow();
-    const name = try ctx.allocator.dupe(u8, ng.get().*);
+    const name = try ctx.allocator.dupe(u8, ng.get().bytes);
     ng.deinit();
 
     if (obj == .Instance) {
@@ -729,7 +729,7 @@ test "valueToJson encodes scalars and collections" {
     }
     {
         var ctx = noopCtx(a, &.{}, cap.output(), noop.host());
-        const v = Value{ .String = try StringRef.init(a, "hi") };
+        const v = Value{ .String = try runtime.strInit(a, "hi") };
         const r = try valueToJson(&v, &ctx, a);
         try testing.expectEqualStrings("hi", r.ok.string);
     }
@@ -761,7 +761,7 @@ test "jsonEncode emits compact and pretty JSON for a map" {
 
     var entries: std.ArrayList(MapPair) = .empty;
     try entries.append(a, .{
-        .key = .{ .String = try StringRef.init(a, "a") },
+        .key = .{ .String = try runtime.strInit(a, "a") },
         .value = .{ .Int = 1 },
     });
     const map = Value{ .Map = .{
@@ -776,7 +776,7 @@ test "jsonEncode emits compact and pretty JSON for a map" {
         try testing.expect(r == .ok);
         const g = r.ok.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("{\"a\":1}", g.get().*);
+        try testing.expectEqualStrings("{\"a\":1}", g.get().bytes);
     }
     {
         const args = [_]Value{ map, .{ .Bool = true } };
@@ -784,7 +784,7 @@ test "jsonEncode emits compact and pretty JSON for a map" {
         const r = try jsonEncode(&ctx);
         const g = r.ok.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("{\n  \"a\": 1\n}", g.get().*);
+        try testing.expectEqualStrings("{\n  \"a\": 1\n}", g.get().bytes);
     }
 }
 
@@ -824,7 +824,7 @@ test "decodeField decodes scalars and arrays without a target type" {
         try testing.expect(r.ok == .String);
         const g = r.ok.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("hi", g.get().*);
+        try testing.expectEqualStrings("hi", g.get().bytes);
     }
     {
         const j = try std.json.parseFromSliceLeaky(Json, a, "[1,2,3]", .{});
@@ -875,7 +875,7 @@ test "ctorParamNames returns property names in declaration order" {
     try testing.expectEqual(@as(usize, 2), g.get().items.len);
     const n0 = g.get().items[0].String.borrow();
     defer n0.deinit();
-    try testing.expectEqualStrings("id", n0.get().*);
+    try testing.expectEqualStrings("id", n0.get().bytes);
 }
 
 test "ctorParamNames rejects a non-class argument" {
@@ -912,7 +912,7 @@ test "propGet reads a raw instance field" {
         .identity = 1,
         .native_state = null,
     });
-    const args = [_]Value{ .{ .Instance = inst }, .{ .String = try StringRef.init(a, "v") } };
+    const args = [_]Value{ .{ .Instance = inst }, .{ .String = try runtime.strInit(a, "v") } };
     var ctx = noopCtx(a, &args, cap.output(), noop.host());
 
     const r = try propGet(&ctx);

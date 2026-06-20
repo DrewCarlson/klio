@@ -53,8 +53,8 @@ pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         if (n <= 0) {
             const msg = try std.fmt.allocPrint(ctx.allocator, "Step must be positive, was: {d}.", .{n});
             return .{ .err = .{ .Thrown = .{ .Exception = .{
-                .fqn = try StringRef.init(ctx.allocator, "kotlin.IllegalArgumentException"),
-                .message = try StringRef.initOwned(ctx.allocator, msg),
+                .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
+                .message = try runtime.strInitOwned(ctx.allocator, msg),
                 .cause = null,
             } } } };
         }
@@ -201,7 +201,7 @@ pub fn range_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .kind = view.kind,
     } };
     const s = try r.display(ctx.allocator);
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, s) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
 pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -428,12 +428,12 @@ test "step throws on non-positive step" {
     {
         const mg = exc.message.?.borrow();
         defer mg.deinit();
-        try testing.expectEqualStrings("Step must be positive, was: 0.", mg.get().*);
+        try testing.expectEqualStrings("Step must be positive, was: 0.", mg.get().bytes);
     }
     {
         const fg = exc.fqn.borrow();
         defer fg.deinit();
-        try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().*);
+        try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().bytes);
     }
     exc.message.?.deinit();
     exc.fqn.deinit();
@@ -560,7 +560,7 @@ test "to string renders the range form" {
         g.deinit();
         r.ok.String.deinit();
     }
-    try testing.expectEqualStrings("1..10 step 2", g.get().*);
+    try testing.expectEqualStrings("1..10 step 2", g.get().bytes);
 }
 
 test "range view rejects a non-range receiver" {

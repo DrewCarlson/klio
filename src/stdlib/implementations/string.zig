@@ -41,8 +41,8 @@ fn errArity(msg: []const u8) EvalResult {
 /// Build a thrown Kotlin Throwable value. `message` is owned by the
 /// allocator (or null). Mirrors `exceptions::make_exception`.
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
-    const fqn_ref = try StringRef.initOwned(allocator, try allocator.dupe(u8, fqn));
-    const msg_ref: ?StringRef = if (message) |m| try StringRef.init(allocator, m) else null;
+    const fqn_ref = try runtime.strInitOwned(allocator, try allocator.dupe(u8, fqn));
+    const msg_ref: ?StringRef = if (message) |m| try runtime.strInit(allocator, m) else null;
     return .{ .Exception = .{ .fqn = fqn_ref, .message = msg_ref, .cause = null } };
 }
 
@@ -79,7 +79,7 @@ fn makeSequence(allocator: Allocator, items: []Value) Allocator.Error!Value {
 
 /// Wrap an owned `[]const u8` in a fresh `String` value.
 fn newString(allocator: Allocator, owned: []const u8) Allocator.Error!Value {
-    return .{ .String = try StringRef.initOwned(allocator, owned) };
+    return .{ .String = try runtime.strInitOwned(allocator, owned) };
 }
 
 /// Default radix (10) or the Int radix in `v`. Mirrors `numeric::recv_int_radix`.
@@ -114,7 +114,7 @@ fn recvString(allocator: Allocator, args: []const Value, what: []const u8) Alloc
         .String => |s| {
             const g = s.borrow();
             defer g.deinit();
-            return .{ .ok = g.get().* };
+            return .{ .ok = g.get().bytes };
         },
         else => |other| {
             const od = try other.display(allocator);
@@ -131,7 +131,7 @@ fn argAsString(allocator: Allocator, v: Value, what: []const u8) Allocator.Error
         .String => |s| {
             const g = s.borrow();
             defer g.deinit();
-            return .{ .ok = try allocator.dupe(u8, g.get().*) };
+            return .{ .ok = try allocator.dupe(u8, g.get().bytes) };
         },
         .Char => |c| return .{ .ok = try charUnitToString(allocator, c) },
         .Int => |n| return .{ .ok = try std.fmt.allocPrint(allocator, "{d}", .{n}) },
@@ -210,12 +210,17 @@ fn utf16Slice(allocator: Allocator, s: []const u8, start: usize, end: usize) All
 }
 
 pub fn string_length(ctx: *CallCtx) Allocator.Error!EvalResult {
+    // O(1): the UTF-16 length is cached on the string at creation.
+    if (ctx.args.len > 0 and ctx.args[0] == .String) {
+        const g = ctx.args[0].String.borrow();
+        defer g.deinit();
+        return .{ .ok = Value.newInt(@intCast(g.get().u16_len)) };
+    }
     const r = try recvString(ctx.allocator, ctx.args, "String.length");
-    const s = switch (r) {
-        .ok => |v| v,
-        .err => |e| return .{ .err = e },
+    return switch (r) {
+        .ok => unreachable, // a String receiver was handled above
+        .err => |e| .{ .err = e },
     };
-    return .{ .ok = Value.newInt(@intCast(utf16Len(s))) };
 }
 
 /// `String.toString()` — the receiver itself.
@@ -316,7 +321,7 @@ pub fn string_plus(ctx: *CallCtx) Allocator.Error!EvalResult {
                     if (val == .String) {
                         const g = val.String.borrow();
                         defer g.deinit();
-                        try joined.appendSlice(ctx.allocator, g.get().*);
+                        try joined.appendSlice(ctx.allocator, g.get().bytes);
                         return .{ .ok = try newString(ctx.allocator, try joined.toOwnedSlice(ctx.allocator)) };
                     }
                 },
@@ -331,11 +336,13 @@ pub fn string_plus(ctx: *CallCtx) Allocator.Error!EvalResult {
 }
 
 pub fn string_get(ctx: *CallCtx) Allocator.Error!EvalResult {
-    const r = try recvString(ctx.allocator, ctx.args, "String.get");
-    const s = switch (r) {
-        .ok => |v| v,
-        .err => |e| return .{ .err = e },
-    };
+    if (ctx.args.len == 0 or ctx.args[0] != .String) {
+        const r = try recvString(ctx.allocator, ctx.args, "String.get");
+        return switch (r) {
+            .ok => unreachable, // a String receiver is handled below
+            .err => |e| .{ .err = e },
+        };
+    }
     if (ctx.args.len < 2 or ctx.args[1] != .Int) {
         return errType("String.get requires an Int index");
     }
@@ -344,10 +351,23 @@ pub fn string_get(ctx: *CallCtx) Allocator.Error!EvalResult {
         const msg = try std.fmt.allocPrint(ctx.allocator, "index {d} out of bounds", .{idx});
         return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
     }
-    if (utf16UnitAt(s, @intCast(idx))) |c| {
-        return .{ .ok = .{ .Char = c } };
+    const ui: usize = @intCast(idx);
+    var unit: ?u16 = null;
+    var u16len: usize = 0;
+    {
+        const g = ctx.args[0].String.borrow();
+        defer g.deinit();
+        const sd = g.get();
+        u16len = sd.u16_len;
+        // ASCII: the UTF-16 unit at `ui` is just byte `ui` — O(1), no walk (this
+        // is what makes `for (i in indices) s[i]` linear instead of quadratic).
+        unit = if (sd.ascii)
+            (if (ui < sd.bytes.len) @as(u16, sd.bytes[ui]) else null)
+        else
+            utf16UnitAt(sd.bytes, ui);
     }
-    const msg = try std.fmt.allocPrint(ctx.allocator, "index {d} out of bounds (length {d})", .{ idx, utf16Len(s) });
+    if (unit) |c| return .{ .ok = .{ .Char = c } };
+    const msg = try std.fmt.allocPrint(ctx.allocator, "index {d} out of bounds (length {d})", .{ idx, u16len });
     return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
 }
 
@@ -671,7 +691,7 @@ pub fn string_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len > 1 and ctx.args[1] == .String) {
         const g = ctx.args[1].String.borrow();
         defer g.deinit();
-        const o = g.get().*;
+        const o = g.get().bytes;
         if (ignore_case) {
             eq = try eqIgnoreCaseUnicode(ctx.allocator, s, o);
         } else {
@@ -983,7 +1003,7 @@ pub fn string_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const g = ctx.args[1].String.borrow();
     defer g.deinit();
-    const order = text.compareUtf16(s, g.get().*);
+    const order = text.compareUtf16(s, g.get().bytes);
     const v: i32 = switch (order) {
         .lt => -1,
         .eq => 0,
@@ -1186,7 +1206,7 @@ fn delimToString(allocator: Allocator, v: Value) Allocator.Error!?[]const u8 {
         .String => |s| {
             const g = s.borrow();
             defer g.deinit();
-            return try allocator.dupe(u8, g.get().*);
+            return try allocator.dupe(u8, g.get().bytes);
         },
         .Char => |c| return try charUnitToString(allocator, c),
         else => return null,
@@ -1458,7 +1478,7 @@ fn missingArg(allocator: Allocator, v: ?Value, s: []const u8) Allocator.Error![]
             .String => |sr| {
                 const g = sr.borrow();
                 defer g.deinit();
-                return allocator.dupe(u8, g.get().*);
+                return allocator.dupe(u8, g.get().bytes);
             },
             .Char => |c| return charUnitToString(allocator, c),
             else => {},
@@ -1631,7 +1651,7 @@ pub fn string_trim_margin(ctx: *CallCtx) Allocator.Error!EvalResult {
             .String => |p| {
                 const g = p.borrow();
                 defer g.deinit();
-                prefix_owned = try ctx.allocator.dupe(u8, g.get().*);
+                prefix_owned = try ctx.allocator.dupe(u8, g.get().bytes);
                 prefix_buf = prefix_owned.?;
             },
             .Char => |c| {
@@ -1774,7 +1794,7 @@ pub fn string_format_static(ctx: *CallCtx) Allocator.Error!EvalResult {
         return errType("format requires a format String");
     }
     const g = ctx.args[0].String.borrow();
-    const fmt = g.get().*;
+    const fmt = g.get().bytes;
     const args = ctx.args[1..];
     const out = try formatKotlin(ctx.allocator, fmt, args);
     g.deinit();
@@ -1980,7 +2000,7 @@ fn formatConv(
                 .String => |v| blk: {
                     const g = v.borrow();
                     defer g.deinit();
-                    break :blk try allocator.dupe(u8, g.get().*);
+                    break :blk try allocator.dupe(u8, g.get().bytes);
                 },
                 .Null => try allocator.dupe(u8, "null"),
                 else => try arg.display(allocator),
@@ -2503,7 +2523,7 @@ fn ctxFor(allocator: Allocator, args: []const Value) CallCtx {
 }
 
 fn strVal(allocator: Allocator, s: []const u8) !Value {
-    return .{ .String = try StringRef.initOwned(allocator, try allocator.dupe(u8, s)) };
+    return .{ .String = try runtime.strInitOwned(allocator, try allocator.dupe(u8, s)) };
 }
 
 fn expectStr(allocator: Allocator, res: EvalResult, want: []const u8) !void {
@@ -2512,7 +2532,7 @@ fn expectStr(allocator: Allocator, res: EvalResult, want: []const u8) !void {
             try testing.expect(v == .String);
             const g = v.String.borrow();
             defer g.deinit();
-            try testing.expectEqualStrings(want, g.get().*);
+            try testing.expectEqualStrings(want, g.get().bytes);
         },
         .err => return error.UnexpectedError,
     }
@@ -2773,12 +2793,12 @@ test "split on delimiters" {
     {
         const gg = items[0].String.borrow();
         defer gg.deinit();
-        try testing.expectEqualStrings("a", gg.get().*);
+        try testing.expectEqualStrings("a", gg.get().bytes);
     }
     {
         const gg = items[2].String.borrow();
         defer gg.deinit();
-        try testing.expectEqualStrings("c", gg.get().*);
+        try testing.expectEqualStrings("c", gg.get().bytes);
     }
 }
 
@@ -2794,7 +2814,7 @@ test "split honors limit" {
     try testing.expectEqual(@as(usize, 2), items.len);
     const gg = items[1].String.borrow();
     defer gg.deinit();
-    try testing.expectEqualStrings("b,c", gg.get().*);
+    try testing.expectEqualStrings("b,c", gg.get().bytes);
 }
 
 test "padStart and padEnd" {
@@ -2828,7 +2848,7 @@ test "chunked splits into pieces" {
     try testing.expectEqual(@as(usize, 3), items.len);
     const gg = items[2].String.borrow();
     defer gg.deinit();
-    try testing.expectEqualStrings("e", gg.get().*);
+    try testing.expectEqualStrings("e", gg.get().bytes);
 }
 
 test "windowed produces sliding windows" {
@@ -2843,7 +2863,7 @@ test "windowed produces sliding windows" {
     try testing.expectEqual(@as(usize, 3), items.len);
     const gg = items[0].String.borrow();
     defer gg.deinit();
-    try testing.expectEqualStrings("ab", gg.get().*);
+    try testing.expectEqualStrings("ab", gg.get().bytes);
 }
 
 test "equals with ignoreCase" {

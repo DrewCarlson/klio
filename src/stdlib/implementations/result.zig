@@ -379,7 +379,7 @@ pub fn result_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         try std.fmt.allocPrint(ctx.allocator, "Success({s})", .{inner})
     else
         try std.fmt.allocPrint(ctx.allocator, "Failure({s})", .{inner});
-    return .{ .ok = .{ .String = try StringRef.initOwned(ctx.allocator, s) } };
+    return .{ .ok = .{ .String = try runtime.strInitOwned(ctx.allocator, s) } };
 }
 
 // -------------------------------------------------------------------------
@@ -613,14 +613,14 @@ test "result_to_string renders Success/Failure" {
     {
         const g = s1.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("Success(42)", g.get().*);
+        try testing.expectEqualStrings("Success(42)", g.get().bytes);
     }
     var c2 = ctxWith(&failure, noop.host(), cap.output(), a);
     const s2 = (try result_to_string(&c2)).ok;
     {
         const g = s2.String.borrow();
         defer g.deinit();
-        try testing.expectEqualStrings("Failure(42)", g.get().*);
+        try testing.expectEqualStrings("Failure(42)", g.get().bytes);
     }
 }
 

@@ -338,7 +338,25 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
             b.switchTo(body_blk);
             try b.pushLoop(null, body_blk, exit);
-            if (w.body) |body| _ = try lowerExpr(b, body);
+            // Kotlin scopes the do-body's declarations into the `while`
+            // condition; when the body is a block, lower its statements and the
+            // condition in one shared scope so `do { val x = … } while (x …)`
+            // resolves `x` instead of treating it as a stray global.
+            if (w.body) |body| {
+                if (body.* == .Block) {
+                    const block = &body.Block;
+                    try b.pushScope();
+                    try hoistMutualLocalFns(b, block);
+                    for (block.stmts) |*stmt| _ = try lowerStmt(b, stmt);
+                    b.popLoop();
+                    const c = try lowerExpr(b, w.cond);
+                    try b.popScope();
+                    b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
+                    b.switchTo(exit);
+                    return b.emitConst(.Unit);
+                }
+                _ = try lowerExpr(b, body);
+            }
             b.popLoop();
             const c = try lowerExpr(b, w.cond);
             b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
@@ -1847,7 +1865,26 @@ fn lowerLabeled(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.terminate(.{ .Goto = body_blk });
             b.switchTo(body_blk);
             try b.pushLoop(label.name, body_blk, exit);
-            if (w.body) |body| _ = try lowerExpr(b, body);
+            // Kotlin scopes the do-body's declarations into the `while`
+            // condition, so when the body is a block, lower its statements and
+            // the condition in one shared scope; otherwise the block's own
+            // scope closes first and a `do { val x = … } while (x …)` local
+            // resolves as a stray global.
+            if (w.body) |body| {
+                if (body.* == .Block) {
+                    const block = &body.Block;
+                    try b.pushScope();
+                    try hoistMutualLocalFns(b, block);
+                    for (block.stmts) |*stmt| _ = try lowerStmt(b, stmt);
+                    b.popLoop();
+                    const c = try lowerExpr(b, w.cond);
+                    try b.popScope();
+                    b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
+                    b.switchTo(exit);
+                    return b.emitConst(.Unit);
+                }
+                _ = try lowerExpr(b, body);
+            }
             b.popLoop();
             const c = try lowerExpr(b, w.cond);
             b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
@@ -4534,22 +4571,18 @@ fn lowerFqnFlattenCall(
     {
         const want = args.len;
         const cands = b.module.funcsBySimpleName(tail);
+        // A fully-qualified callee binds the one declaration whose FQN
+        // matches exactly. It must never fall back to a same-tail-named
+        // function in another package (a user `println` cannot answer a
+        // `kotlin.io.println` call) — when no lowered declaration owns the
+        // FQN the call belongs to global/intrinsic resolution, so decline
+        // the flatten and let `lowerFqnGlobalCall` load it by FQN.
         var pick: ?FuncId = null;
         for (cands) |fid| {
             const f = b.module.funcById(fid) orelse continue;
             if (std.mem.eql(u8, f.fqn, fqn) and f.params.len == want) {
                 pick = fid;
                 break;
-            }
-        }
-        if (pick == null) {
-            for (cands) |fid| {
-                const f = b.module.funcById(fid) orelse continue;
-                const first_is_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
-                if (!first_is_this and f.params.len == want) {
-                    pick = fid;
-                    break;
-                }
             }
         }
         if (pick) |func_id| {

@@ -137,7 +137,7 @@ pub fn builders_build_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         break :blk try ctx.allocator.dupe(u8, g.get().items);
     };
     sb.StringBuilder.deinit();
-    return ok(.{ .String = try StringRef.initOwned(ctx.allocator, owned) });
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, owned) });
 }
 
 pub fn contract_error(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -146,13 +146,13 @@ pub fn contract_error(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .String => |s| blk: {
             const g = s.borrow();
             defer g.deinit();
-            break :blk try ctx.allocator.dupe(u8, g.get().*);
+            break :blk try ctx.allocator.dupe(u8, g.get().bytes);
         },
         else => try v.display(ctx.allocator),
     };
     return .{ .err = .{ .Thrown = .{ .Exception = .{
-        .fqn = try StringRef.init(ctx.allocator, "kotlin.IllegalStateException"),
-        .message = try StringRef.initOwned(ctx.allocator, msg),
+        .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalStateException"),
+        .message = try runtime.strInitOwned(ctx.allocator, msg),
         .cause = null,
     } } } };
 }
@@ -162,7 +162,7 @@ pub fn contract_todo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .String => |s| blk: {
             const g = s.borrow();
             defer g.deinit();
-            break :blk try std.fmt.allocPrint(ctx.allocator, "An operation is not implemented: {s}", .{g.get().*});
+            break :blk try std.fmt.allocPrint(ctx.allocator, "An operation is not implemented: {s}", .{g.get().bytes});
         },
         else => blk: {
             const rendered = try ctx.args[0].display(ctx.allocator);
@@ -171,8 +171,8 @@ pub fn contract_todo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         },
     } else try ctx.allocator.dupe(u8, "An operation is not implemented.");
     return .{ .err = .{ .Thrown = .{ .Exception = .{
-        .fqn = try StringRef.init(ctx.allocator, "kotlin.NotImplementedError"),
-        .message = try StringRef.initOwned(ctx.allocator, msg),
+        .fqn = try runtime.strInit(ctx.allocator, "kotlin.NotImplementedError"),
+        .message = try runtime.strInitOwned(ctx.allocator, msg),
         .cause = null,
     } } } };
 }
@@ -379,7 +379,7 @@ test "buildString returns the accumulated buffer" {
         g.deinit();
         r.ok.String.deinit();
     }
-    try testing.expectEqualStrings("hello", g.get().*);
+    try testing.expectEqualStrings("hello", g.get().bytes);
 }
 
 test "buildString rejects bad arity" {
@@ -412,7 +412,7 @@ test "error throws IllegalStateException with the message string" {
     defer rec.deinit();
     var cap = runtime.CaptureOutput.init(testing.allocator);
     defer cap.deinit();
-    const sref = try StringRef.init(testing.allocator, "boom");
+    const sref = try runtime.strInit(testing.allocator, "boom");
     defer sref.deinit();
     const args = [_]Value{.{ .String = sref }};
     var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
@@ -423,10 +423,10 @@ test "error throws IllegalStateException with the message string" {
     defer freeException(exc);
     const fg = exc.fqn.borrow();
     defer fg.deinit();
-    try testing.expectEqualStrings("kotlin.IllegalStateException", fg.get().*);
+    try testing.expectEqualStrings("kotlin.IllegalStateException", fg.get().bytes);
     const mg = exc.message.?.borrow();
     defer mg.deinit();
-    try testing.expectEqualStrings("boom", mg.get().*);
+    try testing.expectEqualStrings("boom", mg.get().bytes);
 }
 
 test "error renders a non-string argument via display" {
@@ -442,7 +442,7 @@ test "error renders a non-string argument via display" {
     defer freeException(exc);
     const mg = exc.message.?.borrow();
     defer mg.deinit();
-    try testing.expectEqualStrings("42", mg.get().*);
+    try testing.expectEqualStrings("42", mg.get().bytes);
 }
 
 test "TODO throws NotImplementedError with a message" {
@@ -450,7 +450,7 @@ test "TODO throws NotImplementedError with a message" {
     defer rec.deinit();
     var cap = runtime.CaptureOutput.init(testing.allocator);
     defer cap.deinit();
-    const sref = try StringRef.init(testing.allocator, "later");
+    const sref = try runtime.strInit(testing.allocator, "later");
     defer sref.deinit();
     const args = [_]Value{.{ .String = sref }};
     var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
@@ -460,10 +460,10 @@ test "TODO throws NotImplementedError with a message" {
     defer freeException(exc);
     const fg = exc.fqn.borrow();
     defer fg.deinit();
-    try testing.expectEqualStrings("kotlin.NotImplementedError", fg.get().*);
+    try testing.expectEqualStrings("kotlin.NotImplementedError", fg.get().bytes);
     const mg = exc.message.?.borrow();
     defer mg.deinit();
-    try testing.expectEqualStrings("An operation is not implemented: later", mg.get().*);
+    try testing.expectEqualStrings("An operation is not implemented: later", mg.get().bytes);
 }
 
 test "TODO without an argument uses the default message" {
@@ -478,5 +478,5 @@ test "TODO without an argument uses the default message" {
     defer freeException(exc);
     const mg = exc.message.?.borrow();
     defer mg.deinit();
-    try testing.expectEqualStrings("An operation is not implemented.", mg.get().*);
+    try testing.expectEqualStrings("An operation is not implemented.", mg.get().bytes);
 }

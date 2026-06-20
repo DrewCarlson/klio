@@ -58,40 +58,84 @@ pub const DeclReg = struct { decl: *const ast.Decl, nodes: []const usize };
 
 const DecodeFn = *const fn (std.mem.Allocator, []const u8, u32) ?DeclReg;
 
-var section: []const u8 = &.{};
-var offsets: []const u32 = &.{};
-var arena: std.mem.Allocator = undefined;
-var decode_fn: ?DecodeFn = null;
-var memo: []?DeclReg = &.{};
+/// One loaded image's forest: its per-decl section, offsets, the process-
+/// lifetime arena decoded decls live in, the decode hook, and the memo.
+const Section = struct {
+    bytes: []const u8,
+    offsets: []const u32,
+    arena: std.mem.Allocator,
+    decode: DecodeFn,
+    memo: []?DeclReg,
+};
+
+/// A ref's `decl` index carries its owning image's slot in the top byte
+/// (`(slot << SLOT_SHIFT) | local`), so bases loaded from several images
+/// coexist in one process — the parity harness loads both stdlib gate
+/// variants; the CLI loads one. Slot 0's refs are numerically identical to
+/// the single-image encoding, and refs are rebased from image-local form at
+/// image load, never at bake.
+pub const SLOT_SHIFT: u5 = 24;
+const LOCAL_MASK: u32 = (@as(u32, 1) << SLOT_SHIFT) - 1;
+const MAX_SECTIONS = 64;
+
+var sections: [MAX_SECTIONS]?Section = @splat(null);
+var next_slot: u32 = 0;
 var mutex: SpinMutex = .{};
 
-/// Install the loaded image's forest section, offset table, the process-
-/// lifetime arena decoded decls live in, and the decode function. Allocates the
-/// memo table (one slot per decl). Safe to call with an empty section (the
-/// resolver then never resolves — the eager path is in use).
-pub fn setSection(sec: []const u8, offs: []const u32, a: std.mem.Allocator, decode: DecodeFn) void {
-    section = sec;
-    offsets = offs;
-    arena = a;
-    decode_fn = decode;
-    memo = a.alloc(?DeclReg, offs.len) catch &.{};
-    for (memo) |*m| m.* = null;
+/// Claim the next image slot. The loader reserves before decoding its root so
+/// refs can be rebased as they decode, and fills the slot once the section
+/// tables are known. Null when the registry is full — the load then fails and
+/// the caller falls back to the source build.
+pub fn reserveSlot() ?u32 {
+    mutex.lock();
+    defer mutex.unlock();
+    if (next_slot >= MAX_SECTIONS) return null;
+    const s = next_slot;
+    next_slot += 1;
+    return s;
 }
 
-/// Whether a forest section is installed (the lazy path is active).
+/// The `decl`-index base for refs owned by `slot`.
+pub fn slotBase(slot: u32) u32 {
+    return slot << SLOT_SHIFT;
+}
+
+/// Install a reserved slot's forest section, offset table, arena, and decode
+/// function. Allocates the memo table (one entry per decl).
+pub fn fillSlot(slot: u32, sec: []const u8, offs: []const u32, a: std.mem.Allocator, decode: DecodeFn) void {
+    std.debug.assert(offs.len <= LOCAL_MASK);
+    const m: []?DeclReg = a.alloc(?DeclReg, offs.len) catch &.{};
+    for (m) |*e| e.* = null;
+    mutex.lock();
+    defer mutex.unlock();
+    sections[slot] = .{ .bytes = sec, .offsets = offs, .arena = a, .decode = decode, .memo = m };
+}
+
+/// Reserve + fill in one step for callers that need no rebase window (tests,
+/// single-image tools). Returns the slot's decl-index base.
+pub fn setSection(sec: []const u8, offs: []const u32, a: std.mem.Allocator, decode: DecodeFn) u32 {
+    const slot = reserveSlot() orelse return 0;
+    fillSlot(slot, sec, offs, a, decode);
+    return slotBase(slot);
+}
+
+/// Whether any forest section is installed (some lazy path is active).
 pub fn active() bool {
-    return decode_fn != null and offsets.len != 0;
+    return next_slot != 0;
 }
 
 fn ensureDecl(idx: u32) ?DeclReg {
-    if (idx >= memo.len) return null;
-    if (memo[idx]) |dr| return dr;
+    const slot = idx >> SLOT_SHIFT;
+    const local = idx & LOCAL_MASK;
+    if (slot >= MAX_SECTIONS) return null;
+    const sec = if (sections[slot]) |*s| s else return null;
+    if (local >= sec.memo.len) return null;
+    if (sec.memo[local]) |dr| return dr;
     mutex.lock();
     defer mutex.unlock();
-    if (memo[idx]) |dr| return dr; // lost the race; another thread decoded it
-    const decode = decode_fn orelse return null;
-    const dr = decode(arena, section, offsets[idx]) orelse return null;
-    memo[idx] = dr;
+    if (sec.memo[local]) |dr| return dr; // lost the race; another thread decoded it
+    const dr = sec.decode(sec.arena, sec.bytes, sec.offsets[local]) orelse return null;
+    sec.memo[local] = dr;
     return dr;
 }
 

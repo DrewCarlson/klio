@@ -294,7 +294,7 @@ test "recvLabel coarse variant tags" {
     defer freeLabel(a, int_val, int_label);
     try testing.expectEqualStrings("Int", int_label);
 
-    const str = try runtime.StringRef.init(a, "hi");
+    const str = try runtime.strInit(a, "hi");
     defer str.deinit();
     const str_val: Value = .{ .String = str };
     const str_label = try recvLabel(a, str_val);
