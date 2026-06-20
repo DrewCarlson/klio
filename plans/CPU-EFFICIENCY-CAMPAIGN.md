@@ -210,14 +210,18 @@ architecture. Three levers, in dependency order:
    slices behind one niche'd `?*CollDeclared` pointer. `enum_class` is a GC ref, so
    its trace site must move with it (the risk). ~69 access sites; mechanical but
    touches the GC trace. Expected ~10–25% across all benches.
-2. **F5 packed primitive arrays** (`IntArray`/`BooleanArray`/… as a packed scalar
-   buffer instead of `ArrayList(Value)` = 64 B/elem). numeric peak RSS 1.2 GB → ~10
-   MB AND a large CPU win on numeric (64× less memory traffic → cache-resident,
-   no per-element retain/release, GC traces nothing). ~60+ element-access sites need
-   an accessor API (`elemAt`/`setElem`/`boxedItems`) that box/unbox at the boundary;
-   generic ops materialize. Mechanical + compiler-guided, but broad and
-   silent-corruption-prone if a site is missed (leaks into structuralEq/display/gc).
-   **Prerequisite for a JIT that touches arrays.**
+2. **F5 packed primitive arrays — DONE** (committed, full suite green). The `Array`
+   variant is now a union `ArrayStore{ boxed: ValueList, scalars: ObjRef(PrimBuf) }`
+   (`PrimBuf` = a flat scalar byte buffer, 1–8 B/elem; GC traces it as a leaf). A
+   union (not two fields) so every access site is compiler-flagged — no silent
+   "read packed as empty boxed". Element access goes through `ArrayData`
+   (`len`/`get`/`set`/`snapshot`/`writeBack`/`deinitStorage`); subscript fast paths
+   read/write the scalar buffer in place; constructors build packed directly (zeroed
+   buffer = the Kotlin default for every primitive) so a 10M `IntArray` never
+   materializes a boxed list. Result on numeric: **peak RSS 1231 MB → 114 MB
+   (−91%), wall 8.8 s → 6.6 s min (−24%)** (cache-resident, no per-element
+   retain/release). This is also the **prerequisite for a JIT that indexes arrays
+   natively** (it can now read a flat `[*]u8`/`[*]i32`, not a 56-byte Value).
 3. **JIT stage 3 — native hot loops** (`src/jit/jit.zig` encoder is done + tested:
    ALU, `[base+disp32]` mem, labels, jumps, native-loop proof). The ONLY path to
    node-class on hot loops. Design (matches JIT-DESIGN.md, keeps the "never poke the
