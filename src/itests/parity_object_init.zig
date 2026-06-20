@@ -96,6 +96,66 @@ test "uncaught exception reports a stack trace with source positions" {
     }
 }
 
+// The trace is captured at construction (JVM `fillInStackTrace`), not at the
+// throw: an exception built in one function and thrown from another reports the
+// construction site, and the (later) throw site is absent.
+test "stack trace is captured at construction, not at throw" {
+    const src =
+        \\
+        \\fun make(): RuntimeException = RuntimeException("x")
+        \\fun thrower(e: RuntimeException) { throw e }
+        \\fun main() { val e = make(); thrower(e) }
+        \\
+    ;
+    const res = try runProgram("stack_trace_construct", src);
+    switch (res) {
+        .ok => |got| {
+            std.debug.print("expected a failing run, got:\n{s}\n", .{got});
+            return error.ExpectedRunFailure;
+        },
+        .err => |m| {
+            if (std.mem.indexOf(u8, m, "at make (") == null) {
+                std.debug.print("trace missing construction frame `at make (`:\n{s}\n", .{m});
+                return error.MissingConstructionFrame;
+            }
+            if (std.mem.indexOf(u8, m, "thrower") != null) {
+                std.debug.print("trace should not contain the throw site `thrower`:\n{s}\n", .{m});
+                return error.CapturedAtThrowNotConstruction;
+            }
+        },
+    }
+}
+
+// A user Throwable subclass also captures at construction (its parent chain
+// bottoms out at a builtin Throwable), not at the later throw site.
+test "user exception subclass captures at construction" {
+    const src =
+        \\
+        \\class AppError(msg: String) : RuntimeException(msg)
+        \\fun make(): AppError = AppError("x")
+        \\fun thrower(e: AppError) { throw e }
+        \\fun main() { val e = make(); thrower(e) }
+        \\
+    ;
+    const res = try runProgram("stack_trace_user_construct", src);
+    switch (res) {
+        .ok => |got| {
+            std.debug.print("expected a failing run, got:\n{s}\n", .{got});
+            return error.ExpectedRunFailure;
+        },
+        .err => |m| {
+            if (std.mem.indexOf(u8, m, "at make (") == null) {
+                std.debug.print("trace missing construction frame `at make (`:\n{s}\n", .{m});
+                return error.MissingConstructionFrame;
+            }
+            if (std.mem.indexOf(u8, m, "thrower") != null) {
+                std.debug.print("trace should not contain the throw site `thrower`:\n{s}\n", .{m});
+                return error.CapturedAtThrowNotConstruction;
+            }
+        },
+    }
+}
+
 // A wrapped exception reports its cause chain in the uncaught render.
 test "uncaught exception reports the cause chain" {
     const src =

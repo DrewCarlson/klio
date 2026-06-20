@@ -48,7 +48,12 @@ pub fn lowerStmt(b: *FuncBuilder, stmt: *const Stmt) Allocator.Error!?Reg {
         .Expr => |*e| try b.push(.{ .Trace = .{ .span = helpers.exprSpan(e) } }),
         .Assign => |a| try b.push(.{ .Trace = .{ .span = a.span } }),
         .DestructuringDecl => |dd| try b.push(.{ .Trace = .{ .span = dd.span } }),
-        .Decl => {},
+        // A `val x = expr` initializer can throw (or call something that does),
+        // so mark its line too; other declarations carry no executable head.
+        .Decl => |*d| switch (d.*) {
+            .Property => |p| try b.push(.{ .Trace = .{ .span = p.span } }),
+            else => {},
+        },
     }
     switch (stmt.*) {
         .Expr => |*e| return try lowerExpr(b, e),
@@ -852,8 +857,9 @@ test "var declaration gets a mutable home slot" {
     b.terminate(.{ .Return = null });
     const func = try b.finish("f", "test.f", build.typeUnit());
     defer freeFunc(func);
-    // const + move into the home slot.
-    try testing.expect(func.blocks[0].insts[1] == .Move);
+    // Trace position marker, then const + move into the home slot.
+    try testing.expect(func.blocks[0].insts[0] == .Trace);
+    try testing.expect(func.blocks[0].insts[2] == .Move);
 }
 
 test "any-typed val is marked" {
