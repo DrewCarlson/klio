@@ -1081,8 +1081,9 @@ fn runFrameInner(
         // success the loop runs natively and we resume at its exit block with
         // registers reboxed. Only at a fresh, non-resumed block entry.
         if (jit_on and resume_idx == 0 and resume_throw == null) {
-            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur)) |rb| {
-                cur = rb;
+            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur)) |res| {
+                cur = res.block;
+                resume_idx = res.inst;
                 continue;
             }
         }
