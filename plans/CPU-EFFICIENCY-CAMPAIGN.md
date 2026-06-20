@@ -187,6 +187,21 @@ content-type, because `anonMethodDispatch` depends on instance state
 `__enum_entry_class__`. Zero-arg-only + caching inside the walk after the probes is
 the sound form.)
 
+## Global-function overload-resolution cache
+
+The sibling cost for *global* generic calls: a `maxOf`/`minOf`/math call in a hot
+loop runs `pickOverload` per call, which scans every same-name candidate and
+type-scores each (`overloadScore`/`overloadScoreArg` → `eqlBytes`/`typeFqn`/
+`builtinSupersFor`). A profile of a 3M-call `maxOf` loop was **~60 %+** in that
+resolution. Its result is a pure function of `(module, base func, arg types)`, so
+`pickOverloadCached` (host_call_func.zig) memoizes it on `ProgramImage.overload_cache`,
+keyed `(module ptr, func id, primitive-arg-type signature)`. The signature
+(`argSigPrimitive`) packs 4 bits/arg of the scalar tag and is computed only when
+every arg is a primitive scalar — where the tag fully determines numeric overload
+selection, so a hit always equals what `pickOverload` would return. Result: a
+`maxOf`/`minOf` loop **8.02 → 0.98 s (~8.2×)**; full suite green. Non-primitive
+args fall through to the live scan (correctness preserved).
+
 ## Measurement note — high variance environment
 
 Wall-time variance here is ~15% run-to-run (collections swings ~9.6–11.3 s). Wins

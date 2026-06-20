@@ -566,6 +566,62 @@ fn overloadScore(self: *VmHost, module: *const Module, cand: FuncId, args: []con
 
 /// When the target function shares its name with siblings, pick the best
 /// match for the runtime arg types. `null` when there is nothing better.
+/// Pack each arg's primitive scalar tag into a 64-bit signature (4 bits/arg,
+/// arity in the top byte), or null if any arg is not a primitive scalar (or there
+/// are too many). For primitive args the tag fully determines overload selection,
+/// so `(module, func, sig)` is a sound key for memoizing `pickOverload`.
+fn argSigPrimitive(args: []const Value) ?u64 {
+    if (args.len > 12) return null;
+    var sig: u64 = @as(u64, args.len) << 56;
+    for (args, 0..) |*a, i| {
+        const tag: u64 = switch (a.*) {
+            .Int => 1,
+            .Long => 2,
+            .Double => 3,
+            .Float => 4,
+            .Short => 5,
+            .Byte => 6,
+            .Char => 7,
+            .Bool => 8,
+            .UInt => 9,
+            .ULong => 10,
+            .UShort => 11,
+            .UByte => 12,
+            else => return null,
+        };
+        sig |= tag << @intCast(i * 4);
+    }
+    return sig;
+}
+
+fn overloadCacheGet(self: *VmHost, key: root.ProgramImage.OverloadKey) ?FuncId {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    if (pg.get().overload_cache.get(key)) |raw| return @enumFromInt(raw);
+    return null;
+}
+
+fn overloadCachePut(self: *VmHost, key: root.ProgramImage.OverloadKey, fid: FuncId) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    pg.get().overload_cache.put(key, @intFromEnum(fid)) catch {};
+}
+
+/// `pickOverload` with a `(module, func, primitive-arg-signature)` memo, consulted
+/// only for all-primitive args (where the result is invariant).
+fn pickOverloadCached(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
+    if (argSigPrimitive(args)) |sig| {
+        const key = root.ProgramImage.OverloadKey{ .module_p = @intFromPtr(module), .func_p = func.int(), .sig = sig };
+        if (overloadCacheGet(self, key)) |cached| return cached;
+        const r = pickOverload(self, module, func, args);
+        // Memoize the effective target (base func when no better overload won) so
+        // repeat calls skip the candidate scan entirely.
+        overloadCachePut(self, key, r orelse func);
+        return r;
+    }
+    return pickOverload(self, module, func, args);
+}
+
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
     const f = funcAt(module, func) orelse return null;
     const name = f.name;
@@ -1076,7 +1132,7 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
 
     // Overload resolution. Skipped for an `exact` call: the lowering
     // already resolved the overload from an explicit argument cast.
-    const resolved: FuncId = if (exact) func else (pickOverload(self, module, func, args) orelse func);
+    const resolved: FuncId = if (exact) func else (pickOverloadCached(self, module, func, args) orelse func);
 
     // Incompatible-receiver guard: a bare call baked to a top-level
     // extension whose declared receiver is a user/pack class, with an
