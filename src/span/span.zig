@@ -157,7 +157,20 @@ pub const SourceMap = struct {
     pub fn get(self: *const SourceMap, id: FileId) *const SourceFile {
         return &self.files.items[id.int()];
     }
+
+    /// `get` guarded against an out-of-range id (a stale/zeroed span captured
+    /// before a frame ran). Returns null instead of indexing past the end.
+    pub fn getChecked(self: *const SourceMap, id: FileId) ?*const SourceFile {
+        if (id.int() >= self.files.items.len) return null;
+        return &self.files.items[id.int()];
+    }
 };
+
+/// The SourceMap for the program currently running, installed by the CLI before
+/// `main` runs so the interpreter can resolve a captured stack-trace span to a
+/// file path + line from deep inside the VM (uncaught render, `printStackTrace`)
+/// where the map is not otherwise threaded. Null outside a run.
+pub var active_map: ?*const SourceMap = null;
 
 test "span join extends range" {
     const f = FileId.from(0);

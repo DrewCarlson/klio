@@ -40,6 +40,16 @@ const lowerExprAsParamThunk = thunks.lowerExprAsParamThunk;
 /// Lower a statement. Returns the register holding the statement's value
 /// when it is an expression statement in tail position, else `null`.
 pub fn lowerStmt(b: *FuncBuilder, stmt: *const Stmt) Allocator.Error!?Reg {
+    // Record the executing source position for stack-trace capture: a `Trace`
+    // marks each statement so a throw (here or in any call it makes) reports the
+    // line each frame is on. Cheap (a single span store at eval time); the JIT
+    // hot loops bypass the eval dispatch entirely.
+    switch (stmt.*) {
+        .Expr => |*e| try b.push(.{ .Trace = .{ .span = helpers.exprSpan(e) } }),
+        .Assign => |a| try b.push(.{ .Trace = .{ .span = a.span } }),
+        .DestructuringDecl => |dd| try b.push(.{ .Trace = .{ .span = dd.span } }),
+        .Decl => {},
+    }
     switch (stmt.*) {
         .Expr => |*e| return try lowerExpr(b, e),
         .Decl => |*d| switch (d.*) {
@@ -767,7 +777,10 @@ test "expr statement returns its register" {
     b.terminate(.{ .Return = r.? });
     const func = try b.finish("f", "test.f", build.typeInt());
     defer freeFunc(func);
-    try testing.expect(func.blocks[0].insts[0] == .Const);
+    // The statement is preceded by a `Trace` position marker (stack-trace
+    // support); the value materializes in the following `Const`.
+    try testing.expect(func.blocks[0].insts[0] == .Trace);
+    try testing.expect(func.blocks[0].insts[1] == .Const);
 }
 
 test "val without annotation binds directly" {

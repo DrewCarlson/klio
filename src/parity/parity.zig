@@ -1827,6 +1827,10 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
 
     var out = CaptureOutput.init(allocator);
     defer out.deinit();
+    // Make the source map reachable from inside the VM so a thrown exception's
+    // captured frames resolve to file paths + lines (same as the CLI run path).
+    span.active_map = prog_map;
+    defer span.active_map = null;
     const result = runMainBigStack(&vm, main_id, out.output());
     switch (result) {
         .ok => {},

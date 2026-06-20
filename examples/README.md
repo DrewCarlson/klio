@@ -115,6 +115,7 @@ Run any program with:
 | `jit_float_loop.kt`        | Hot `Float` (f32) arithmetic/comparison over a `FloatArray` + `Int→Float` conversion (loop JIT → single-precision SSE2); identical output JIT off or on. |
 | `generic_stdlib_calls.kt`  | Repeated `maxOf`/`minOf` calls in a loop; overload resolution is cached per `(function, argument-type)` so the hot path skips re-scanning overloads. |
 | `jit_float_to_int.kt`      | `Float`/`Double` → `Int`/`Long` in a hot loop with Kotlin clamping (NaN→0, overflow→MIN/MAX); loop JIT compiles the conversion; identical output JIT off or on. |
+| `jit_bitwise_loop.kt`      | Hot loop of bitwise infix ops (`and`/`or`/`xor`/`shl`/`shr`) on `Int` and `Long`; loop JIT emits native bitwise/shift ops with correct width-based count masking and sign-extension; identical output JIT off or on. |
 | `string_ascii_fastpath.kt` | String `length`/`indexOf`/`substring`/indexing on ASCII vs non-ASCII text (ASCII takes a byte-length fast path; non-ASCII falls back to a UTF-16 walk). |
 
 ## Integration showcases
@@ -130,3 +131,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `complex_lambdas_generics.kt`| Deeply nested lambdas/closures, function composition and currying, memoization via a captured map, a recursive closure through a `lateinit var`, a generic recursive `Tree` with `fold`/`map`, tail recursion, lambda pipelines via `fold`, closure-over-mutable, generic `zipWith`. |
 | `user_shadows_stdlib.kt`   | A same-file top-level function (`emptyList`/`emptySet`/`emptyMap`/`error`/`listOf`) shadows the implicitly imported stdlib function of the same name; the canonical `kotlin.collections.*` form stays reachable. |
 | `user_extension_shadows_stdlib.kt`| A same-file top-level extension (`infix fun Int.to`) shadows the implicitly imported stdlib extension of the same name on the same receiver; a receiver type the user extension does not cover keeps the stdlib `to` (Pair). |
+| `stack_trace.kt`           | A thrown exception captures the call stack at the throw site; `stackTraceToString` renders each frame with its function and source position (file:line) for user, stdlib, and pack frames. |
