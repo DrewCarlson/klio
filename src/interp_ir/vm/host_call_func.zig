@@ -1038,10 +1038,11 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
                                     items.append(allocator, entry.value) catch {};
                                 }
                                 cd.deinit();
-                                return .{ .ok = .{ .List = blk: {
-                                    var ld = try runtime.ListData.fromArrayList(allocator, items, false);
-                                    ld.enum_entries = true;
-                                    break :blk ld;
+                                return .{ .ok = .{ .List = .{
+                                    .items = try ValueList.init(allocator, items),
+                                    .mutable = false,
+                                    .enum_entries = true,
+                                    .backing = null,
                                 } } };
                             }
                             // enumValueOf<T>(name)

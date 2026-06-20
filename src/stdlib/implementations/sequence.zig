@@ -55,7 +55,8 @@ fn makeSequence(allocator: std.mem.Allocator, items: []Value) std.mem.Allocator.
 fn makeList(allocator: std.mem.Allocator, items: []Value, mutable: bool) std.mem.Allocator.Error!Value {
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(allocator, items);
-    return .{ .List = try runtime.ListData.fromArrayList(allocator, list, mutable) };
+    const ref = try ValueList.init(allocator, list);
+    return .{ .List = .{ .items = ref, .mutable = mutable, .enum_entries = false, .backing = null } };
 }
 
 fn makeSet(allocator: std.mem.Allocator, items: []Value, mutable: bool) std.mem.Allocator.Error!Value {
@@ -74,9 +75,9 @@ fn makeSet(allocator: std.mem.Allocator, items: []Value, mutable: bool) std.mem.
     return .{ .Set = .{ .items = ref, .mutable = mutable, .backing = null } };
 }
 
-fn recvListItems(args: []const Value, what: []const u8) union(enum) { items: runtime.ListData, err: RuntimeError } {
+fn recvListItems(args: []const Value, what: []const u8) union(enum) { items: ValueList, err: RuntimeError } {
     if (args.len > 0 and args[0] == .List) {
-        return .{ .items = args[0].List };
+        return .{ .items = args[0].List.items.clone() };
     }
     return .{ .err = .{ .Type = typeMsg(what, "a List receiver") } };
 }
@@ -135,19 +136,19 @@ fn rangeIterInt(allocator: std.mem.Allocator, start: i64, end: i64, step: i64) s
 /// `Value::Sequence`. Faithful for finite builders (the common case); an
 /// unbounded `while (true) { yield(..) }` would grow the buffer and is
 /// bounded by the dev memory guard rather than truly lazy.
-fn seqScopeBuffer(scope: *const Value) ?runtime.ListData {
+fn seqScopeBuffer(scope: *const Value) ?ValueList {
     if (scope.* == .Instance) {
         const g = scope.Instance.borrow();
         defer g.deinit();
         if (g.get().get("__seq_buffer")) |v| {
-            if (v == .List) return v.List;
+            if (v == .List) return v.List.items;
         }
     }
     return null;
 }
 
 const BuilderResult = union(enum) {
-    items: runtime.ListData,
+    items: ValueList,
     err: RuntimeError,
 };
 
@@ -157,12 +158,14 @@ fn runSeqBuilder(ctx: *CallCtx, who: []const u8) std.mem.Allocator.Error!Builder
         return .{ .err = .{ .Arity = "sequence builder expects a block" } };
     }
     const block = ctx.args[0];
-    const buffer = try runtime.ListData.fromArrayList(ctx.allocator, .empty, true);
+    const buffer = try ValueList.init(ctx.allocator, .empty);
     const id = ctx.host.allocInstanceId();
     const fields = [_]InstanceData.Field{
         .{ .name = "__seq_buffer", .value = .{ .List = .{
-            .buf = buffer.buf.clone(),
+            .items = buffer.clone(),
             .mutable = true,
+            .enum_entries = false,
+            .backing = null,
         } } },
     };
     const scope = try ctx.host.newSynthInstance("kotlin.sequences.SequenceScope", id, &fields);
@@ -180,7 +183,7 @@ pub fn seq_builder(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .items => |b| b,
         .err => |e| return err(e),
     };
-    const items = try buffer.snapshot(ctx.allocator);
+    const items = try cloneItems(ctx.allocator, buffer);
     return ok(try makeSequence(ctx.allocator, items));
 }
 
@@ -190,7 +193,7 @@ pub fn seq_iterator_builder(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .items => |b| b,
         .err => |e| return err(e),
     };
-    const items = try buffer.snapshot(ctx.allocator);
+    const items = try cloneItems(ctx.allocator, buffer);
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(ctx.allocator, items);
     const ref = try ValueList.init(ctx.allocator, list);
@@ -202,9 +205,9 @@ pub fn seq_scope_yield(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const buffer = seqScopeBuffer(&ctx.args[0]) orelse
         return err(.{ .Type = "yield: not a SequenceScope" });
     if (ctx.args.len > 1) {
-        const g = buffer.buf.borrowMut();
+        const g = buffer.borrowMut();
         defer g.deinit();
-        try g.get().boxed.append(ctx.allocator, ctx.args[1]);
+        try g.get().append(ctx.allocator, ctx.args[1]);
     }
     return ok(.Unit);
 }
@@ -217,18 +220,10 @@ pub fn seq_scope_yield_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     var elems: []Value = undefined;
     var owned_elems = false;
     switch (arg) {
-        .List => |l| elems = try l.snapshot(ctx.allocator),
+        .List => |l| elems = try cloneItems(ctx.allocator, l.items),
         .Set => |s| elems = try cloneItems(ctx.allocator, s.items),
         .Array => |a| elems = try a.snapshot(ctx.allocator),
-        .Iterator => |it| elems = if (it.list_src) |b| blk: {
-            const g = b.borrow();
-            defer g.deinit();
-            const n = g.get().len();
-            const out = try ctx.allocator.alloc(Value, n);
-            var i: usize = 0;
-            while (i < n) : (i += 1) out[i] = g.get().get(i);
-            break :blk out;
-        } else try cloneItems(ctx.allocator, it.items),
+        .Iterator => |it| elems = try cloneItems(ctx.allocator, it.items),
         .Sequence => {
             const m = try materialiseSequence(ctx.allocator, ctx.host, ctx.out, &arg);
             switch (m) {
@@ -242,9 +237,9 @@ pub fn seq_scope_yield_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         else => return err(.{ .Type = "yieldAll: expected an Iterable/Iterator/Sequence" }),
     }
     {
-        const g = buffer.buf.borrowMut();
+        const g = buffer.borrowMut();
         defer g.deinit();
-        try g.get().boxed.appendSlice(ctx.allocator, elems);
+        try g.get().appendSlice(ctx.allocator, elems);
     }
     if (owned_elems) ctx.allocator.free(elems);
     return ok(.Unit);
@@ -260,7 +255,7 @@ pub fn seq_from_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .items => |it| it,
         .err => |e| return err(e),
     };
-    const items = try items_ref.snapshot(ctx.allocator);
+    const items = try cloneItems(ctx.allocator, items_ref);
     return ok(try makeSequence(ctx.allocator, items));
 }
 
@@ -901,9 +896,9 @@ fn applyBufferedOp(
                 };
                 switch (mapped) {
                     .List => |xs| {
-                        const g = xs.buf.borrow();
+                        const g = xs.items.borrow();
                         defer g.deinit();
-                        try nx.appendSlice(allocator, g.get().boxed.items);
+                        try nx.appendSlice(allocator, g.get().items);
                     },
                     .Set => |xs| {
                         const g = xs.items.borrow();
@@ -1484,9 +1479,9 @@ test "Sequence.toList on an items source returns the elements" {
     var ctx = h.ctx(&args);
     const r = try seq_to_list(&ctx);
     const list = r.ok;
-    const lg = list.List.buf.borrow();
+    const lg = list.List.items.borrow();
     defer lg.deinit();
-    try testing.expectEqual(@as(usize, 2), lg.get().boxed.items.len);
+    try testing.expectEqual(@as(usize, 2), lg.get().items.len);
     try testing.expect(!list.List.mutable);
 }
 

@@ -855,7 +855,8 @@ test "list release recursively frees retained instance elements" {
     var arr: std.ArrayList(Value) = .empty;
     inst_val.retain(); // storing into the list retains the element (count 2)
     try arr.append(allocator, inst_val);
-    const list_val = Value{ .List = try value_mod.ListData.fromArrayList(allocator, arr, true) };
+    const items = try ObjRef(std.ArrayList(Value)).init(allocator, arr);
+    const list_val = Value{ .List = .{ .items = items, .mutable = true, .enum_entries = false, .backing = null } };
 
     // Releasing the list (its last owner) releases the element (2 → 1) and
     // frees the backing array; releasing the local handle frees the instance.

@@ -147,10 +147,11 @@ fn utf16Len(s: []const u8) usize {
 /// Build a frozen `List` value over `items`. `enum_entries` marks the
 /// `EnumName.entries` list. Consumes `items` into the backing cell.
 fn frozenList(allocator: Allocator, items: std.ArrayList(Value), enum_entries: bool) Allocator.Error!Value {
-    return .{ .List = blk: {
-        var ld = try runtime.ListData.fromArrayList(allocator, items, false);
-        ld.enum_entries = enum_entries;
-        break :blk ld;
+    return .{ .List = .{
+        .items = try ValueList.init(allocator, items),
+        .mutable = false,
+        .enum_entries = enum_entries,
+        .backing = null,
     } };
 }
 
@@ -701,7 +702,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if (std.mem.eql(u8, name, "size")) {
         switch (receiver.*) {
             .Array => |a| return ok(Value.newInt(@intCast(a.len()))),
-            .List => |l| return ok(Value.newInt(@intCast(l.len()))),
+            .List => |l| return ok(Value.newInt(@intCast(listLen(l.items)))),
             .Set => |s| return ok(Value.newInt(@intCast(listLen(s.items)))),
             .Map => |m| {
                 const g = m.entries.borrow();
@@ -2128,7 +2129,7 @@ fn listLen(items: ValueList) usize {
 fn collectionLen(receiver: *const Value) ?i64 {
     return switch (receiver.*) {
         .Array => |a| @intCast(a.len()),
-        .List => |l| @intCast(l.len()),
+        .List => |l| @intCast(listLen(l.items)),
         .String => |s| blk: {
             const g = s.borrow();
             defer g.deinit();
@@ -2168,8 +2169,13 @@ test "collectionLen reports list and string lengths" {
     var list: std.ArrayList(Value) = .empty;
     try list.append(a, .{ .Int = 1 });
     try list.append(a, .{ .Int = 2 });
-    const lv = Value{ .List = try runtime.ListData.fromArrayList(a, list, false) };
-    defer lv.List.buf.deinit();
+    const lv = Value{ .List = .{
+        .items = try ValueList.init(a, list),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    } };
+    defer lv.List.items.deinit();
     try testing.expectEqual(@as(i64, 2), collectionLen(&lv).?);
 
     const s = try StringRef.init(a, "hello");

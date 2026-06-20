@@ -324,7 +324,12 @@ fn fsList(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const owned = try ctx.allocator.dupe(u8, entry.name);
         try names.append(ctx.allocator, .{ .String = try StringRef.initOwned(ctx.allocator, owned) });
     }
-    return ok(.{ .List = try runtime.ListData.fromArrayList(ctx.allocator, names, false) });
+    return ok(.{ .List = .{
+        .items = try ValueList.init(ctx.allocator, names),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    } });
 }
 
 fn fsTempDir(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -455,10 +460,10 @@ fn freeValue(v: Value) void {
         .String => |s| freeString(s),
         .Array => |a| a.deinitStorage(),
         .List => |l| {
-            const g = l.buf.borrow();
-            for (g.get().boxed.items) |e| freeValue(e);
+            const g = l.items.borrow();
+            for (g.get().items) |e| freeValue(e);
             g.deinit();
-            l.buf.deinit();
+            l.items.deinit();
         },
         .Exception => |e| {
             // The fqn is a string literal (not heap); only the message is.
@@ -655,9 +660,9 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
         var ctx = testCtx(&args);
         const r = try fsList(&ctx);
         defer freeResult(r);
-        const g = r.ok.List.buf.borrow();
+        const g = r.ok.List.items.borrow();
         var found = false;
-        for (g.get().boxed.items) |entry| {
+        for (g.get().items) |entry| {
             const eg = entry.String.borrow();
             if (std.mem.eql(u8, eg.get().*, "data.bin")) found = true;
             eg.deinit();

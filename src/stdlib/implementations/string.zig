@@ -63,7 +63,8 @@ fn thrownOwned(allocator: Allocator, fqn: []const u8, message: []const u8) Alloc
 /// `collections::make_list`.
 fn makeList(allocator: Allocator, items: []Value, mutable: bool) Allocator.Error!Value {
     const list = std.ArrayList(Value).fromOwnedSlice(items);
-    return .{ .List = try runtime.ListData.fromArrayList(allocator, list, mutable) };
+    const items_ref = try ValueList.init(allocator, list);
+    return .{ .List = .{ .items = items_ref, .mutable = mutable, .enum_entries = false, .backing = null } };
 }
 
 /// Build an items-only `Sequence` from an owned slice. Mirrors
@@ -1139,9 +1140,9 @@ fn stringSplitItems(ctx: *CallCtx, who: []const u8) Allocator.Error!union(enum) 
                 }
             },
             .List => |l| {
-                const g = l.buf.borrow();
+                const g = l.items.borrow();
                 defer g.deinit();
-                for (g.get().boxed.items) |it| {
+                for (g.get().items) |it| {
                     if (try delimToString(ctx.allocator, it)) |d| {
                         try delims.append(ctx.allocator, d);
                     } else {
@@ -2752,9 +2753,9 @@ test "split on delimiters" {
     const a = arena.allocator();
     var ctx = ctxFor(a, &.{ try strVal(a, "a,b,c"), try strVal(a, ",") });
     const r = try string_split(&ctx);
-    const g = r.ok.List.buf.borrow();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    const items = g.get().boxed.items;
+    const items = g.get().items;
     try testing.expectEqual(@as(usize, 3), items.len);
     {
         const gg = items[0].String.borrow();
@@ -2774,9 +2775,9 @@ test "split honors limit" {
     const a = arena.allocator();
     var ctx = ctxFor(a, &.{ try strVal(a, "a,b,c"), try strVal(a, ","), .{ .Int = 2 } });
     const r = try string_split(&ctx);
-    const g = r.ok.List.buf.borrow();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    const items = g.get().boxed.items;
+    const items = g.get().items;
     try testing.expectEqual(@as(usize, 2), items.len);
     const gg = items[1].String.borrow();
     defer gg.deinit();
@@ -2808,9 +2809,9 @@ test "chunked splits into pieces" {
     const a = arena.allocator();
     var ctx = ctxFor(a, &.{ try strVal(a, "abcde"), .{ .Int = 2 } });
     const r = try string_chunked(&ctx);
-    const g = r.ok.List.buf.borrow();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    const items = g.get().boxed.items;
+    const items = g.get().items;
     try testing.expectEqual(@as(usize, 3), items.len);
     const gg = items[2].String.borrow();
     defer gg.deinit();
@@ -2823,9 +2824,9 @@ test "windowed produces sliding windows" {
     const a = arena.allocator();
     var ctx = ctxFor(a, &.{ try strVal(a, "abcd"), .{ .Int = 2 } });
     const r = try string_windowed(&ctx);
-    const g = r.ok.List.buf.borrow();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    const items = g.get().boxed.items;
+    const items = g.get().items;
     try testing.expectEqual(@as(usize, 3), items.len);
     const gg = items[0].String.borrow();
     defer gg.deinit();
@@ -2871,9 +2872,9 @@ test "lines splits on newlines" {
     const a = arena.allocator();
     var ctx = ctxFor(a, &.{try strVal(a, "a\r\nb\nc")});
     const r = try string_lines(&ctx);
-    const g = r.ok.List.buf.borrow();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    try testing.expectEqual(@as(usize, 3), g.get().boxed.items.len);
+    try testing.expectEqual(@as(usize, 3), g.get().items.len);
 }
 
 test "trimIndent and trimMargin" {
@@ -2914,9 +2915,9 @@ test "toCharArray and toList" {
     {
         var ctx = ctxFor(a, &.{try strVal(a, "ab")});
         const r = try string_to_list(&ctx);
-        const g = r.ok.List.buf.borrow();
+        const g = r.ok.List.items.borrow();
         defer g.deinit();
-        try testing.expectEqual(@as(u16, 'a'), g.get().boxed.items[0].Char);
+        try testing.expectEqual(@as(u16, 'a'), g.get().items[0].Char);
     }
 }
 

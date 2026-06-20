@@ -240,14 +240,16 @@ pub fn range_reversed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn range_to_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "toList") orelse return typeErr("toList requires a Range receiver");
-    var items: std.ArrayList(Value) = .empty;
+    var items = try ValueList.init(ctx.allocator, .empty);
     {
+        const g = items.borrowMut();
+        defer g.deinit();
         var it = rangeIterInt(view.start, view.end, view.step);
         while (it.next()) |v| {
-            try items.append(ctx.allocator, rangeEndpoint(view.kind, v));
+            try g.get().append(ctx.allocator, rangeEndpoint(view.kind, v));
         }
     }
-    return ok(try makeList(ctx.allocator, items, false));
+    return ok(makeList(items, false));
 }
 
 // The element count is a Kotlin Int; range sizes never exceed i64::MAX.
@@ -278,8 +280,13 @@ pub fn range_sum(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 // Local helpers re-exported by the Rust `super::` import.
 // ============================================================
 
-fn makeList(a: std.mem.Allocator, list: std.ArrayList(Value), mutable: bool) std.mem.Allocator.Error!Value {
-    return .{ .List = try runtime.ListData.fromArrayList(a, list, mutable) };
+fn makeList(items: ValueList, mutable: bool) Value {
+    return .{ .List = .{
+        .items = items,
+        .mutable = mutable,
+        .enum_entries = false,
+        .backing = null,
+    } };
 }
 
 /// Lazy iterator over an inclusive integer progression with a signed step.
@@ -510,10 +517,10 @@ test "to list enumerates elements" {
     const r = try range_to_list(&ctx);
     try testing.expect(r == .ok);
     // The ObjRef owns the backing ArrayList and frees it on the final drop.
-    defer r.ok.List.buf.deinit();
-    const g = r.ok.List.buf.borrow();
+    defer r.ok.List.items.deinit();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    const items = g.get().boxed.items;
+    const items = g.get().items;
     try testing.expectEqual(@as(usize, 3), items.len);
     try testing.expectEqual(@as(i32, 1), items[0].Int);
     try testing.expectEqual(@as(i32, 3), items[1].Int);
