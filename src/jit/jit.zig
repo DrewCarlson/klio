@@ -299,21 +299,30 @@ pub const Emitter = struct {
         }
     }
 
+    /// scalar mem load/store: `prefix 0F op` with an xmm reg field and a memory
+    /// operand (`op` = 0x10 load, 0x11 store; prefix 0xF2 for sd, 0xF3 for ss).
+    fn sseMem(self: *Emitter, prefix: u8, op: u8, reg: Xmm, base: Reg, disp: i32) JitError!void {
+        try self.byte(prefix);
+        try self.sseRex(@intFromEnum(reg) >= 8, @intFromEnum(base) >= 8);
+        try self.byte(0x0F);
+        try self.byte(op);
+        try self.memOperandX(reg, base, disp);
+    }
     /// `movsd <xdst>, [<base64> + disp32]` — load an f64 from a frame slot.
     pub fn movsdLoad(self: *Emitter, dst: Xmm, base: Reg, disp: i32) JitError!void {
-        try self.byte(0xF2);
-        try self.sseRex(@intFromEnum(dst) >= 8, @intFromEnum(base) >= 8);
-        try self.byte(0x0F);
-        try self.byte(0x10);
-        try self.memOperandX(dst, base, disp);
+        try self.sseMem(0xF2, 0x10, dst, base, disp);
     }
     /// `movsd [<base64> + disp32], <xsrc>` — store an f64 to a frame slot.
     pub fn movsdStore(self: *Emitter, base: Reg, disp: i32, src: Xmm) JitError!void {
-        try self.byte(0xF2);
-        try self.sseRex(@intFromEnum(src) >= 8, @intFromEnum(base) >= 8);
-        try self.byte(0x0F);
-        try self.byte(0x11);
-        try self.memOperandX(src, base, disp);
+        try self.sseMem(0xF2, 0x11, src, base, disp);
+    }
+    /// `movss <xdst>, [<base64> + disp32]` — load an f32 (low 4 bytes of a slot).
+    pub fn movssLoad(self: *Emitter, dst: Xmm, base: Reg, disp: i32) JitError!void {
+        try self.sseMem(0xF3, 0x10, dst, base, disp);
+    }
+    /// `movss [<base64> + disp32], <xsrc>` — store an f32 (low 4 bytes).
+    pub fn movssStore(self: *Emitter, base: Reg, disp: i32, src: Xmm) JitError!void {
+        try self.sseMem(0xF3, 0x11, src, base, disp);
     }
     /// ModRM+SIB+disp32 for `[base + disp32]` with ModRM.reg = an xmm register.
     fn memOperandX(self: *Emitter, reg: Xmm, base: Reg, disp: i32) JitError!void {
@@ -323,8 +332,9 @@ pub const Emitter = struct {
         try self.imm32(@bitCast(disp));
     }
 
-    fn sseArith(self: *Emitter, op: u8, dst: Xmm, src: Xmm) JitError!void {
-        try self.byte(0xF2);
+    /// xmm,xmm op: `prefix 0F op /r` (mod=11). prefix 0 emits none (e.g. ucomiss).
+    fn sseRR(self: *Emitter, prefix: u8, op: u8, dst: Xmm, src: Xmm) JitError!void {
+        if (prefix != 0) try self.byte(prefix);
         try self.sseRex(@intFromEnum(dst) >= 8, @intFromEnum(src) >= 8);
         try self.byte(0x0F);
         try self.byte(op);
@@ -332,44 +342,72 @@ pub const Emitter = struct {
     }
     /// `addsd <xdst>, <xsrc>` (dst += src, IEEE double).
     pub fn addsd(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
-        try self.sseArith(0x58, dst, src);
+        try self.sseRR(0xF2, 0x58, dst, src);
     }
     pub fn subsd(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
-        try self.sseArith(0x5C, dst, src);
+        try self.sseRR(0xF2, 0x5C, dst, src);
     }
     pub fn mulsd(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
-        try self.sseArith(0x59, dst, src);
+        try self.sseRR(0xF2, 0x59, dst, src);
     }
     pub fn divsd(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
-        try self.sseArith(0x5E, dst, src);
+        try self.sseRR(0xF2, 0x5E, dst, src);
     }
-    /// `ucomisd <a>, <b>` — unordered compare, sets ZF/PF/CF (PF=1 on NaN).
+    /// `addss`/etc — single-precision (f32) arithmetic.
+    pub fn addss(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseRR(0xF3, 0x58, dst, src);
+    }
+    pub fn subss(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseRR(0xF3, 0x5C, dst, src);
+    }
+    pub fn mulss(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseRR(0xF3, 0x59, dst, src);
+    }
+    pub fn divss(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseRR(0xF3, 0x5E, dst, src);
+    }
+    /// `ucomisd <a>, <b>` — unordered double compare, sets ZF/PF/CF (PF=1 on NaN).
     pub fn ucomisd(self: *Emitter, a: Xmm, b: Xmm) JitError!void {
-        try self.byte(0x66);
-        try self.sseRex(@intFromEnum(a) >= 8, @intFromEnum(b) >= 8);
+        try self.sseRR(0x66, 0x2E, a, b);
+    }
+    /// `ucomiss <a>, <b>` — unordered single compare (no prefix).
+    pub fn ucomiss(self: *Emitter, a: Xmm, b: Xmm) JitError!void {
+        try self.sseRR(0x00, 0x2E, a, b);
+    }
+    /// `cvtss2sd <xdst>, <xsrc>` — f32 -> f64 (exact).
+    pub fn cvtss2sd(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseRR(0xF3, 0x5A, dst, src);
+    }
+    /// `cvtsd2ss <xdst>, <xsrc>` — f64 -> f32 (round to nearest).
+    pub fn cvtsd2ss(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseRR(0xF2, 0x5A, dst, src);
+    }
+
+    /// REX.W conversion between an xmm and a gpr (`reg` field / `rm` field per op).
+    fn cvtIntXmm(self: *Emitter, prefix: u8, op: u8, reg_num: u4, rm_num: u4) JitError!void {
+        try self.byte(prefix);
+        const r: u8 = if (reg_num >= 8) 0x04 else 0;
+        const b: u8 = if (rm_num >= 8) 0x01 else 0;
+        try self.byte(0x48 | r | b); // REX.W
         try self.byte(0x0F);
-        try self.byte(0x2E);
-        try self.byte(0xC0 | (xlow3(a) << 3) | xlow3(b));
+        try self.byte(op);
+        try self.byte(0xC0 | (@as(u8, reg_num & 7) << 3) | (rm_num & 7));
     }
     /// `cvtsi2sd <xdst>, <src64>` — signed i64 -> f64.
     pub fn cvtsi2sd(self: *Emitter, dst: Xmm, src: Reg) JitError!void {
-        try self.byte(0xF2);
-        const r: u8 = if (@intFromEnum(dst) >= 8) 0x04 else 0;
-        const b: u8 = if (@intFromEnum(src) >= 8) 0x01 else 0;
-        try self.byte(0x48 | r | b); // REX.W
-        try self.byte(0x0F);
-        try self.byte(0x2A);
-        try self.byte(0xC0 | (xlow3(dst) << 3) | low3(src));
+        try self.cvtIntXmm(0xF2, 0x2A, @intFromEnum(dst), @intFromEnum(src));
     }
     /// `cvttsd2si <dst64>, <xsrc>` — f64 -> signed i64 (truncating).
     pub fn cvttsd2si(self: *Emitter, dst: Reg, src: Xmm) JitError!void {
-        try self.byte(0xF2);
-        const r: u8 = if (@intFromEnum(dst) >= 8) 0x04 else 0;
-        const b: u8 = if (@intFromEnum(src) >= 8) 0x01 else 0;
-        try self.byte(0x48 | r | b); // REX.W
-        try self.byte(0x0F);
-        try self.byte(0x2C);
-        try self.byte(0xC0 | (low3(dst) << 3) | xlow3(src));
+        try self.cvtIntXmm(0xF2, 0x2C, @intFromEnum(dst), @intFromEnum(src));
+    }
+    /// `cvtsi2ss <xdst>, <src64>` — signed i64 -> f32.
+    pub fn cvtsi2ss(self: *Emitter, dst: Xmm, src: Reg) JitError!void {
+        try self.cvtIntXmm(0xF3, 0x2A, @intFromEnum(dst), @intFromEnum(src));
+    }
+    /// `cvttss2si <dst64>, <xsrc>` — f32 -> signed i64 (truncating).
+    pub fn cvttss2si(self: *Emitter, dst: Reg, src: Xmm) JitError!void {
+        try self.cvtIntXmm(0xF3, 0x2C, @intFromEnum(dst), @intFromEnum(src));
     }
 
     pub const SetCc = enum(u8) {
@@ -852,6 +890,51 @@ test "emitted double arithmetic over a slot file matches native" {
     try std.testing.expectEqual(@as(f64, 15.0), f(&slots)); // 3*4 + 3
     slots = .{ 2.5, -2.0 };
     try std.testing.expectEqual(@as(f64, -2.5), f(&slots)); // 2.5*-2 + 2.5
+}
+
+test "SSE single (f32) op encodings match documented bytes" {
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.movssLoad(.xmm0, .rbx, 8); // F3 0F 10 83 08000000
+    try em.movssStore(.rbx, 4, .xmm1); // F3 0F 11 8B 04000000
+    try em.addss(.xmm0, .xmm1); // F3 0F 58 C1
+    try em.divss(.xmm0, .xmm1); // F3 0F 5E C1
+    try em.ucomiss(.xmm0, .xmm1); // 0F 2E C1  (no prefix)
+    try em.cvtss2sd(.xmm0, .xmm1); // F3 0F 5A C1
+    try em.cvtsd2ss(.xmm0, .xmm1); // F2 0F 5A C1
+    try em.cvtsi2ss(.xmm0, .rax); // F3 48 0F 2A C0
+    try em.cvttss2si(.rax, .xmm0); // F3 48 0F 2C C0
+    try std.testing.expectEqualSlices(u8, &.{
+        0xF3, 0x0F, 0x10, 0x83, 0x08, 0x00, 0x00, 0x00,
+        0xF3, 0x0F, 0x11, 0x8B, 0x04, 0x00, 0x00, 0x00,
+        0xF3, 0x0F, 0x58, 0xC1,
+        0xF3, 0x0F, 0x5E, 0xC1,
+        0x0F, 0x2E, 0xC1,
+        0xF3, 0x0F, 0x5A, 0xC1,
+        0xF2, 0x0F, 0x5A, 0xC1,
+        0xF3, 0x48, 0x0F, 0x2A, 0xC0,
+        0xF3, 0x48, 0x0F, 0x2C, 0xC0,
+    }, em.code());
+}
+
+test "emitted f32 arithmetic over a slot file matches native" {
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    // fn(rdi = *[2]f32 packed in 8-byte slots) -> f32 : slots[0]*slots[1] + slots[0]
+    try em.push(.rbx);
+    try em.movReg(.rbx, .rdi);
+    try em.movssLoad(.xmm0, .rbx, 0);
+    try em.movssLoad(.xmm1, .rbx, 8);
+    try em.mulss(.xmm0, .xmm1);
+    try em.movssLoad(.xmm1, .rbx, 0);
+    try em.addss(.xmm0, .xmm1);
+    try em.pop(.rbx);
+    try em.ret();
+    var exec = try finalize(em.code());
+    defer exec.deinit();
+    const f = exec.entry(*const fn ([*]i64) callconv(.c) f32);
+    var slots = [_]i64{ @as(u32, @bitCast(@as(f32, 3.0))), @as(u32, @bitCast(@as(f32, 4.0))) };
+    try std.testing.expectEqual(@as(f32, 15.0), f(&slots)); // 3*4+3
 }
 
 test "cvtsi2sd / cvttsd2si round-trip int<->double" {

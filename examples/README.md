@@ -112,6 +112,7 @@ Run any program with:
 | `mutable_iterator_remove.kt` | `MutableIterator.remove()` over a `MutableList` writes through to the source list. |
 | `jit_double_loop.kt`       | Hot `Double` arithmetic + comparison over a `DoubleArray` (loop JIT → SSE2); identical output JIT off or on, incl. NaN comparison semantics. |
 | `jit_int_double_mix.kt`    | Hot loop mixing an `Int` counter with `Double` math via `i.toDouble()` (loop JIT compiles the int→double conversion inline). |
+| `jit_float_loop.kt`        | Hot `Float` (f32) arithmetic/comparison over a `FloatArray` + `Int→Float` conversion (loop JIT → single-precision SSE2); identical output JIT off or on. |
 
 ## Integration showcases
 

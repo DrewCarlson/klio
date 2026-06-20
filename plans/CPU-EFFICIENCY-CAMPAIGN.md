@@ -258,6 +258,11 @@ and per-instruction interpreter overhead.
   cells (`CellGet`/`CellSet` on a `var` boxed by closure, incl. `Double`),
   `Goto`/`Branch`, `Trace`. Subscripts match both the `CallMember "get"/"set"`
   lowering (how `a[i]` actually lowers) and `Index`/`IndexSet`.
+- **Float (f32)**: the single-precision mirror of the Double path — `movss`,
+  `addss`/`subss`/`mulss`/`divss`, `ucomiss`, and `cvtsi2ss`/`cvtss2sd`/`cvtsd2ss`
+  conversions. An f32 register keeps its bits in the low 32 of its slot;
+  `FloatArray` elements ride the `b32u` SIB path. Result on a FloatArray
+  arithmetic/compare/convert mix: **7.6 s → 0.23 s (≈32×)**.
 - **Double (f64)**: an f64 IR register keeps its bit pattern in its i64 slot and
   moves in/out with `movsd`; arithmetic is `addsd`/`subsd`/`mulsd`/`divsd`
   (IEEE — `/0.0` yields ±Inf/NaN, no deopt). Comparisons use `ucomisd` with
@@ -307,11 +312,10 @@ and per-instruction interpreter overhead.
   program set (examples + corpus + fixtures, 800+ programs) produces byte-
   identical output with the JIT on vs off, including divide-by-zero, `MIN/-1`
   wrap, and OOB deopts.
-- **Next coverage** (not blocking): `Float` (f32) arithmetic/arrays (needs the
-  `ss` SSE forms + f32↔f64 conversions); sound `Double.toInt()`/`toLong()` (range
-  + NaN clamping to match Kotlin); calls via a trampoline (stage 4 —
-  collections/strings are call-bound). The harness (guard + deopt + bail) is in
-  place.
+- **Next coverage** (not blocking): sound `Double`/`Float`.`toInt()`/`toLong()`
+  (range + NaN clamping to match Kotlin — currently bails to the interpreter);
+  calls via a trampoline (stage 4 — collections/strings are call-bound). The
+  harness (guard + deopt + bail) is in place.
 
 ## collections/strings gap — data-driven analysis (not a quick fix)
 
