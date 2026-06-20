@@ -147,7 +147,19 @@ fn argAsString(allocator: Allocator, v: Value, what: []const u8) Allocator.Error
 
 /// Number of UTF-16 code units in `s` — Kotlin's `String.length` /
 /// indexing unit (an astral scalar counts as 2).
+/// True if `s` is pure ASCII (no byte has the high bit set). For an ASCII string
+/// the UTF-16 length and indices coincide with byte offsets, so the per-codepoint
+/// `utf8Decode` walks collapse to direct byte access. The scan itself is a simple
+/// byte loop the compiler vectorizes — far cheaper than decoding each codepoint.
+fn asciiScan(s: []const u8) bool {
+    for (s) |b| {
+        if (b >= 0x80) return false;
+    }
+    return true;
+}
+
 fn utf16Len(s: []const u8) usize {
+    if (asciiScan(s)) return s.len; // ASCII: one unit per byte
     var n: usize = 0;
     var it = Utf16View{ .bytes = s };
     while (it.next()) |_| n += 1;
@@ -767,6 +779,7 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
 /// index — the inverse of `byteToCharIndex`'s unit.
 fn utf16IndexToByte(s: []const u8, target: usize) usize {
     if (target == 0) return 0;
+    if (asciiScan(s)) return @min(target, s.len); // ASCII: unit index == byte index
     var u16count: usize = 0;
     var i: usize = 0;
     while (i < s.len) {
