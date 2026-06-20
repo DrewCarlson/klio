@@ -15,6 +15,7 @@
 const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("ir.zig");
+const span = @import("span");
 const jit_loop = @import("jit_loop.zig");
 
 const Allocator = std.mem.Allocator;
@@ -230,13 +231,14 @@ threadlocal var frame_troot: runtime.gc.ThreadRoot = undefined;
 threadlocal var frame_troot_inited: bool = false;
 
 inline fn gcPushFrame(f: *Frame) void {
-    if (!runtime.gc.gc_enabled) return;
-    gcInstallFrameRoot();
+    // The chain is maintained in every allocator mode (it backs stack-trace
+    // capture, not only GC marking); only the GC root registration is gated on
+    // the collector being active.
+    if (runtime.gc.gc_enabled) gcInstallFrameRoot();
     f.gc_link = frame_chain;
     frame_chain = f;
 }
 inline fn gcPopFrame(f: *Frame) void {
-    if (!runtime.gc.gc_enabled) return;
     frame_chain = f.gc_link;
 }
 
@@ -294,6 +296,73 @@ pub fn gcUninstallFrameRoot() void {
     if (!frame_troot_inited) return;
     runtime.gc.unregisterThreadRoot(&frame_troot);
     frame_troot_inited = false;
+}
+
+/// Capture the live call stack (innermost-first) as `StackFrame`s. Each entry
+/// records the running function's display label and the source position it is
+/// executing (the per-statement `Trace`). Returns null when there is no active
+/// frame. The labels borrow program-lifetime module memory; only the frame
+/// slice is owned by the returned cell.
+fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
+    var n: usize = 0;
+    var cur = frame_chain;
+    while (cur) |f| : (cur = f.gc_link) n += 1;
+    if (n == 0) return null;
+    const frames = try allocator.alloc(runtime.StackFrame, n);
+    var i: usize = 0;
+    cur = frame_chain;
+    while (cur) |f| : (cur = f.gc_link) {
+        const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
+        if (f.cur_span) |sp| {
+            frames[i] = .{ .fqn = label, .file_id = @intFromEnum(sp.file), .offset = sp.start, .has_pos = true };
+        } else {
+            frames[i] = .{ .fqn = label, .file_id = 0, .offset = 0, .has_pos = false };
+        }
+        i += 1;
+    }
+    return try runtime.StackRef.init(allocator, .{ .frames = frames });
+}
+
+/// Append a captured stack trace to `out` as Kotlin-style `\n    at <fqn>
+/// (<file>:<line>)` lines, resolving each frame's position through the active
+/// source map. Frames with no recorded position (or an unknown file) render
+/// without the location suffix. Works uniformly for user, pack, and stdlib
+/// frames — every source file is registered in the same map.
+pub fn formatStackTrace(allocator: Allocator, trace: *const runtime.StackTraceData, out: *std.ArrayList(u8)) Allocator.Error!void {
+    for (trace.frames) |fr| {
+        try out.appendSlice(allocator, "\n    at ");
+        try out.appendSlice(allocator, fr.fqn);
+        if (fr.has_pos) {
+            if (span.active_map) |m| {
+                if (m.getChecked(span.FileId.from(fr.file_id))) |sf| {
+                    const lc = sf.lineCol(fr.offset);
+                    const loc = try std.fmt.allocPrint(allocator, " ({s}:{d})", .{ sf.path, lc.line });
+                    defer allocator.free(loc);
+                    try out.appendSlice(allocator, loc);
+                }
+            }
+        }
+    }
+}
+
+/// Attach a freshly-captured stack trace to a thrown value the first time it is
+/// thrown (`fillInStackTrace`): once a throwable carries a trace, re-throws and
+/// the outward unwind leave it untouched. Only `Throwable`-shaped values carry
+/// one — a builtin `Exception` value or a user `Throwable`-subclass instance.
+fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
+    switch (v.*) {
+        .Exception => |*e| {
+            if (e.stack != null) return;
+            e.stack = try captureStack(allocator);
+        },
+        .Instance => |inst| {
+            const g = inst.borrowMut();
+            defer g.deinit();
+            if (g.get().stack != null) return;
+            g.get().stack = try captureStack(allocator);
+        },
+        else => {},
+    }
 }
 
 /// Push `v` as an enclosing implicit receiver for the about-to-be-invoked
@@ -623,6 +692,11 @@ const Frame = struct {
     /// `EvalResult` by value on every instruction (its `.ok` is always the
     /// ignored `.Unit`). Read by the dispatch loop only on `.raised`.
     step_err: ?EvalError = null,
+    /// Source span of the statement this frame is currently executing, set by
+    /// the `Trace` instruction the lowerer emits per statement. Read when a
+    /// throw captures the call stack so each frame reports its in-progress
+    /// source position (file + line) rather than only its declaration site.
+    cur_span: ?ir.Span = null,
 
     fn newWithCaptures(
         allocator: Allocator,
@@ -1122,7 +1196,14 @@ fn runFrameInner(
                 frame.step_err = null;
                 switch (e) {
                     .Throw => |v| {
-                        thrown = v;
+                        // Capture the call stack at the throw seam: the
+                        // innermost frame to surface this value records the
+                        // full chain (frame_chain is intact and innermost-first
+                        // here); the attach is once-only, so the outward unwind
+                        // through enclosing frames leaves it untouched.
+                        var tv = v;
+                        try attachStackTrace(allocator, &tv);
+                        thrown = tv;
                         break;
                     },
                     .NonLocalReturn => |v| {
@@ -1322,8 +1403,14 @@ fn runFrameInner(
                 return errResult(.{ .LabeledReturn = .{ .label = lr.label, .value = v } });
             },
             .Throw => |r| {
-                const exc = frame.read(r);
+                var exc = frame.read(r);
                 exc.retain();
+                // Capture the call stack here, in the throwing frame, before it
+                // unwinds (`fillInStackTrace`): the instruction-loop seam only
+                // sees the value once it has already surfaced into the caller,
+                // by which point this frame is gone. Attach-once, so a re-throw
+                // keeps the original trace.
+                try attachStackTrace(allocator, &exc);
                 if (envVarSet("KLIO_THROW_TRACE")) {
                     const s = displayThrow(allocator, &exc) catch "";
                     std.debug.print("[throw-trace] from fn {s} (fqn={s}): {s}\n", .{ frame.func.name, frame.func.fqn, s });
@@ -1692,7 +1779,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 .err => |e| return raiseStep(frame, e),
             }
         },
-        .Trace => {},
+        .Trace => |t| frame.cur_span = t.span,
         .LoadParam => |lp| {
             const v = if (lp.idx < frame.params.items.len) frame.params.items[lp.idx] else Value.Unit;
             v.retain();

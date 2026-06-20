@@ -62,6 +62,40 @@ fn assertKlioError(name: []const u8, src: []const u8, expected_fragment: []const
     }
 }
 
+// A thrown exception captures the call stack at the throw site: the uncaught
+// report names each frame and resolves its source position to a file + line.
+test "uncaught exception reports a stack trace with source positions" {
+    const src =
+        \\
+        \\fun inner() { throw RuntimeException("boom") }
+        \\fun outer() { inner() }
+        \\fun main() { outer() }
+        \\
+    ;
+    const res = try runProgram("stack_trace_capture", src);
+    switch (res) {
+        .ok => |got| {
+            std.debug.print("expected a failing run, got:\n{s}\n", .{got});
+            return error.ExpectedRunFailure;
+        },
+        .err => |m| {
+            const needles = [_][]const u8{
+                "uncaught kotlin.RuntimeException: boom",
+                "at inner (",
+                "at outer (",
+                "at main (",
+                ".kt:",
+            };
+            for (needles) |n| {
+                if (std.mem.indexOf(u8, m, n) == null) {
+                    std.debug.print("trace missing `{s}`:\n{s}\n", .{ n, m });
+                    return error.MissingTraceFragment;
+                }
+            }
+        },
+    }
+}
+
 // kotlinc-native: an object the program never references never runs its
 // init blocks or property initializers; a referenced one initializes at
 // its first access, after `main` has already started.

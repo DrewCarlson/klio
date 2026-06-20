@@ -82,6 +82,36 @@ pub fn strInitOwned(allocator: std.mem.Allocator, bytes: []const u8) std.mem.All
     const m = strMeta(bytes);
     return StringRef.initOwned(allocator, .{ .bytes = bytes, .u16_len = m.u16_len, .ascii = m.ascii });
 }
+/// One captured call-stack entry: the function's display label plus the
+/// source position the frame was executing. `file_id`/`offset` are the raw
+/// `Span` components (kept as plain integers so this module need not depend on
+/// `span`); they resolve to a path + line through the `SourceMap` at render
+/// time, which works uniformly for user, pack, and stdlib frames. `has_pos` is
+/// false when the frame had no recorded position yet (e.g. before its first
+/// statement ran). `fqn` borrows program-lifetime module memory — never freed.
+pub const StackFrame = struct {
+    fqn: []const u8,
+    file_id: u32,
+    offset: u32,
+    has_pos: bool,
+};
+
+/// A captured throwable stack trace: the frames innermost-first. Owns only the
+/// `frames` slice; each frame's `fqn` borrows the module.
+pub const StackTraceData = struct {
+    frames: []StackFrame,
+
+    pub fn gcFinalize(self: *StackTraceData, a: std.mem.Allocator) void {
+        a.free(self.frames);
+    }
+    pub fn deinit(self: *StackTraceData, a: std.mem.Allocator) void {
+        a.free(self.frames);
+    }
+};
+
+/// Shared, refcounted captured stack trace attached to a thrown value.
+pub const StackRef = ObjRef(StackTraceData);
+
 /// `ObjRef<Vec<Value>>` — shared, growable element storage.
 pub const ValueList = ObjRef(std.ArrayList(Value));
 /// `Arc<Vec<Value>>` — shared, frozen element storage.
@@ -1017,6 +1047,10 @@ pub const Value = union(enum) {
         fqn: StringRef,
         message: ?StringRef,
         cause: ?ValueBox,
+        /// The call stack captured when this throwable was first thrown
+        /// (`fillInStackTrace`). Null until thrown. Borrows program-lifetime
+        /// frame labels; the frame slice is owned by the `StackRef` cell.
+        stack: ?StackRef = null,
     },
     /// `kotlin.collections.List` / `MutableList`.
     List: struct {
@@ -1194,6 +1228,7 @@ pub const Value = union(enum) {
                 visitor.visit(e.fqn);
                 if (e.message) |m| visitor.visit(m);
                 if (e.cause) |c| visitor.visit(c);
+                if (e.stack) |s| visitor.visit(s);
             },
             .Pair => |p| {
                 visitor.visit(p.first);

@@ -357,6 +357,11 @@ fn runBuiltModule(
     };
 
     var stdout = io.StdoutSink{};
+    // Make the source map reachable from inside the VM so a thrown exception's
+    // captured frames resolve to file paths + lines (uncaught render and
+    // `printStackTrace`). Cleared after the run.
+    span.active_map = map;
+    defer span.active_map = null;
     runtime.prof.maybeStart();
     const res = runMainBigStack(&vm, main, stdout.output());
     runtime.prof.maybeReport();

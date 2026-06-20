@@ -2125,6 +2125,10 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+    // `Throwable.printStackTrace()` / `.stackTraceToString()` over the trace
+    // captured when the throwable was thrown.
+    if (try throwableStackMember(self, allocator, receiver, name, args)) |r| return r;
+
     // Built-in delegate protocol.
     if (receiver.* == .Delegate) {
         if (try delegateMember(self, allocator, receiver.Delegate, name, args)) |r| return r;
@@ -4812,6 +4816,67 @@ fn memberCachePut(self: *VmHost, key: root_mod.ProgramImage.MemberResolveKey, fu
     cache.put(key, .{ .func = func, .fqn = stored_fqn }) catch {
         if (stored_fqn.len != 0) cache.allocator.free(stored_fqn);
     };
+}
+
+/// `Throwable.printStackTrace()` / `.stackTraceToString()` rendered from the
+/// stack captured at throw time. Returns null for a name these do not handle or
+/// a receiver that is not a throwable, so normal dispatch proceeds.
+fn throwableStackMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    if (args.len != 0) return null;
+    const is_print = std.mem.eql(u8, name, "printStackTrace");
+    const is_tostr = std.mem.eql(u8, name, "stackTraceToString");
+    if (!is_print and !is_tostr) return null;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var stk: ?runtime.StackRef = null;
+    switch (receiver.*) {
+        .Exception => |e| {
+            const fg = e.fqn.borrow();
+            defer fg.deinit();
+            try buf.appendSlice(allocator, fg.get().bytes);
+            if (e.message) |m| {
+                const mg = m.borrow();
+                defer mg.deinit();
+                try buf.appendSlice(allocator, ": ");
+                try buf.appendSlice(allocator, mg.get().bytes);
+            }
+            stk = e.stack;
+        },
+        .Instance => |inst| {
+            if (!instanceIsThrowable(self, allocator, inst)) return null;
+            const g = inst.borrow();
+            defer g.deinit();
+            {
+                const cg = g.get().class.borrow();
+                defer cg.deinit();
+                try buf.appendSlice(allocator, cg.get().fqn);
+            }
+            if (g.get().get("message")) |mv| {
+                if (mv == .String) {
+                    const sg = mv.String.borrow();
+                    defer sg.deinit();
+                    try buf.appendSlice(allocator, ": ");
+                    try buf.appendSlice(allocator, sg.get().bytes);
+                }
+            }
+            stk = g.get().stack;
+        },
+        else => return null,
+    }
+    if (stk) |s| {
+        const sg = s.borrow();
+        defer sg.deinit();
+        try ir.eval.formatStackTrace(allocator, sg.get(), &buf);
+    }
+    if (is_print) {
+        std.debug.print("{s}\n", .{buf.items});
+        return .{ .ok = .Unit };
+    }
+    // Adopt a private copy: `buf` is freed on return, and `strInit`'s
+    // arena fast path would otherwise alias (then dangle) `buf.items`.
+    const owned = try allocator.dupe(u8, buf.items);
+    return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, owned) } };
 }
 
 fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) bool {

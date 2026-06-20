@@ -64,6 +64,9 @@ pub const allocTrackReportPageStderr = alloc_track_mod.reportPageStderr;
 
 // value
 pub const Value = value_mod.Value;
+pub const StackFrame = value_mod.StackFrame;
+pub const StackTraceData = value_mod.StackTraceData;
+pub const StackRef = value_mod.StackRef;
 pub const RuntimeError = value_mod.RuntimeError;
 pub const EvalResult = value_mod.EvalResult;
 pub const attachDeclaredElemTypes = value_mod.attachDeclaredElemTypes;

@@ -307,6 +307,10 @@ pub const InstanceData = struct {
     /// site-stable and shared across instances. Names are borrowed
     /// (program-lifetime); the slice and the values are owned by the instance.
     anon_captures: []Capture = &.{},
+    /// For a user `Throwable` subclass instance, the call stack captured when it
+    /// was first thrown (`fillInStackTrace`). Null for every non-throwable
+    /// instance and until the throwable is thrown.
+    stack: ?value_mod.StackRef = null,
 
     pub const Field = struct { name: []const u8, value: Value };
     pub const Capture = struct { name: []const u8, value: Value };
@@ -356,6 +360,7 @@ pub const InstanceData = struct {
         if (self.outer) |o| o.release(allocator);
         for (self.anon_captures) |c| c.value.release(allocator);
         if (self.anon_captures.len != 0) allocator.free(self.anon_captures);
+        if (self.stack) |*s| s.deinit();
         self.fields.deinit(allocator);
         self.class.deinit();
     }
@@ -367,6 +372,7 @@ pub const InstanceData = struct {
         for (self.fields.items) |f| f.value.gcMark(m);
         if (self.outer) |o| o.gcMark(m);
         for (self.anon_captures) |c| c.value.gcMark(m);
+        if (self.stack) |s| m.shade(&s.cell.hdr);
         // `native_state` is host-owned; value-bearing bindings install a
         // NativeBox gc_trace (none today — kotlinx.io.Buffer is value-free).
     }

@@ -1,0 +1,7 @@
+kotlin.IllegalStateException
+deliberate
+innermost
+middle
+outer
+main
+has source positions: true
