@@ -15,6 +15,7 @@
 const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("ir.zig");
+const jit_loop = @import("jit_loop.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1064,6 +1065,7 @@ fn runFrameInner(
     // loop reads them. `TailCallFunc` is self-recursive (same func), so `func`
     // stays current for the whole loop.
     if (func.deferred_offset != 0) frame.module.ensureFuncBody(@constCast(func));
+    const jit_on = jit_loop.enabled();
     while (true) {
         // Daemon abandonment: a dispatcher pool task still running at the
         // run boundary stops at its next block instead of completing (or
@@ -1075,6 +1077,15 @@ fn runFrameInner(
         // GC safe point: at an opcode boundary all live Values are in registered
         // frames/globals (no host op mid-flight), so the collector can run.
         if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();
+        // Loop JIT (KLIO_JIT): a hot loop header compiles to native code; on
+        // success the loop runs natively and we resume at its exit block with
+        // registers reboxed. Only at a fresh, non-resumed block entry.
+        if (jit_on and resume_idx == 0 and resume_throw == null) {
+            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur)) |rb| {
+                cur = rb;
+                continue;
+            }
+        }
         const block = &func.blocks[cur.int()];
         const insts: []const Inst = block.insts;
         const term = block.terminator;

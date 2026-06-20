@@ -215,6 +215,59 @@ pub const Emitter = struct {
         try self.imm32(@bitCast(disp));
     }
 
+    /// `push <reg64>`.
+    pub fn push(self: *Emitter, r: Reg) JitError!void {
+        if (@intFromEnum(r) >= 8) try self.byte(0x41);
+        try self.byte(0x50 | low3(r));
+    }
+    /// `pop <reg64>`.
+    pub fn pop(self: *Emitter, r: Reg) JitError!void {
+        if (@intFromEnum(r) >= 8) try self.byte(0x41);
+        try self.byte(0x58 | low3(r));
+    }
+
+    /// `test <a64>, <b64>` (sets flags for a & b).
+    pub fn testReg(self: *Emitter, a: Reg, b: Reg) JitError!void {
+        try self.rexWrr(b, a);
+        try self.byte(0x85); // TEST r/m64, r64
+        try self.modrmRR(b, a);
+    }
+
+    /// `movsxd <dst64>, <src32>` — sign-extend the low 32 bits of `src` into
+    /// `dst` (normalizes a 32-bit Kotlin `Int` result held in a 64-bit slot).
+    pub fn movsxd(self: *Emitter, dst: Reg, src: Reg) JitError!void {
+        try self.rexWrr(dst, src);
+        try self.byte(0x63); // MOVSXD r64, r/m32
+        try self.modrmRR(dst, src);
+    }
+
+    pub const SetCc = enum(u8) {
+        e = 0x94,
+        ne = 0x95,
+        l = 0x9C,
+        ge = 0x9D,
+        le = 0x9E,
+        g = 0x9F,
+        b = 0x92, // unsigned below
+        ae = 0x93, // unsigned above-or-equal
+    };
+    /// `setcc <reg8>` then zero-extend to 64 bits — materialize a 0/1 boolean
+    /// from the flags into `reg`. Only the low byte is set, so it is zeroed
+    /// first via `xor reg,reg` semantics handled by the caller; here we set the
+    /// byte then `movzx` it.
+    pub fn setccReg(self: *Emitter, cc: SetCc, reg: Reg) JitError!void {
+        // setcc r/m8
+        if (@intFromEnum(reg) >= 8) try self.byte(0x41) else if (low3(reg) >= 4) try self.byte(0x40); // REX for spl/bpl/sil/dil byte access
+        try self.byte(0x0F);
+        try self.byte(@intFromEnum(cc));
+        try self.byte(0xC0 | low3(reg)); // /0, mod=11
+        // movzx reg64, reg8
+        try self.rexWrr(reg, reg);
+        try self.byte(0x0F);
+        try self.byte(0xB6); // MOVZX r64, r/m8
+        try self.modrmRR(reg, reg);
+    }
+
     /// `ret`.
     pub fn ret(self: *Emitter) JitError!void {
         try self.byte(0xC3);
@@ -372,6 +425,55 @@ test "jit memory load/store through a base register" {
     try std.testing.expectEqual(@as(i64, 42), f(&arr));
     try std.testing.expectEqual(@as(i64, 42), arr[1]); // stored back
     try std.testing.expectEqual(@as(i64, 111), arr[0]); // untouched
+}
+
+test "push/pop/test/movsxd encode the documented bytes" {
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.push(.rbx); // 53
+    try em.pop(.rbx); // 5B
+    try em.push(.r12); // 41 54
+    try em.testReg(.rax, .rax); // 48 85 C0
+    try em.movsxd(.rax, .rax); // 48 63 C0
+    try std.testing.expectEqualSlices(u8, &.{
+        0x53,
+        0x5B,
+        0x41, 0x54,
+        0x48, 0x85, 0xC0,
+        0x48, 0x63, 0xC0,
+    }, em.code());
+}
+
+test "setcc materializes a boolean from a comparison" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    // f(a=rdi, b=rsi) = (a < b) ? 1 : 0
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.cmpReg(.rdi, .rsi); // a - b
+    try em.setccReg(.l, .rax); // rax = (a < b)
+    try em.ret();
+    var buf = try finalize(em.code());
+    defer buf.deinit();
+    const f = buf.entry(*const fn (i64, i64) callconv(.c) i64);
+    try std.testing.expectEqual(@as(i64, 1), f(3, 4));
+    try std.testing.expectEqual(@as(i64, 0), f(4, 3));
+    try std.testing.expectEqual(@as(i64, 0), f(5, 5));
+}
+
+test "movsxd normalizes a 32-bit overflowed result" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    // f(a=rdi) = sign_extend_i32(a + a) — emulates Kotlin Int wraparound.
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.movReg(.rax, .rdi);
+    try em.addReg(.rax, .rdi);
+    try em.movsxd(.rax, .rax);
+    try em.ret();
+    var buf = try finalize(em.code());
+    defer buf.deinit();
+    const f = buf.entry(*const fn (i64) callconv(.c) i64);
+    // 2_000_000_000 + 2_000_000_000 = 4_000_000_000, wraps as i32 to -294967296.
+    try std.testing.expectEqual(@as(i64, -294967296), f(2_000_000_000));
 }
 
 test "ALU encodings match documented bytes" {
