@@ -341,6 +341,7 @@ fn isSlice(comptime U: type) bool {
 /// backing would accumulate uncollected.
 fn externalBytes(comptime U: type, data: *const U) usize {
     if (comptime U == []const u8) return data.len;
+    if (comptime hasDeclSafe(U, "gcExternalBytes")) return data.gcExternalBytes();
     if (comptime isArrayListLike(U)) {
         const Elem = @typeInfo(@TypeOf(data.items)).pointer.child;
         return data.capacity * @sizeOf(Elem);

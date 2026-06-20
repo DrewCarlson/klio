@@ -101,9 +101,8 @@ fn arg_string_array(allocator: Allocator, ctx: *const CallCtx, idx: usize) Alloc
     if (idx < ctx.args.len) {
         switch (ctx.args[idx]) {
             .Array => |a| {
-                const g = a.items.borrow();
-                defer g.deinit();
-                const items = g.get().items;
+                const items = try a.snapshot(allocator);
+                defer if (runtime.freeScratch()) allocator.free(items);
                 var out = try allocator.alloc([]const u8, items.len);
                 for (items, 0..) |v, i| {
                     switch (v) {
@@ -133,7 +132,7 @@ fn make_string_array(allocator: Allocator, values: [][]const u8) Allocator.Error
         list.appendAssumeCapacity(.{ .String = try StringRef.init(allocator, s) });
     }
     const items = try ValueList.init(allocator, list);
-    return .{ .Array = .{ .items = items, .prim = null } };
+    return runtime.ArrayData.fromBoxedList(items);
 }
 
 /// Free an owned slice of owned strings produced by `perform`. The strings
@@ -843,7 +842,7 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
             try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, h.key)) });
             try items.append(a, .{ .String = try StringRef.initOwned(a, try a.dupe(u8, h.value)) });
         }
-        const req = Value{ .Array = .{ .items = try ValueList.init(a, items), .prim = null } };
+        const req = runtime.ArrayData.fromBoxedList(try ValueList.init(a, items));
         // serve owns `req`; invokeCallable BORROWS its args, so release it per
         // iteration. No-op under the arena fast path.
         defer if (runtime.reclaimEnabled()) req.release(a);
@@ -899,7 +898,7 @@ const DecodedResponse = struct {
 /// key/value pairs are response headers. Strings are owned by `allocator`.
 fn decode_response(allocator: Allocator, v: *const Value) Allocator.Error!DecodedResponse {
     const items_ref: ?ValueList = switch (v.*) {
-        .Array => |a| a.items,
+        .Array => |a| a.boxedList(),
         .List => |l| l.items,
         else => null,
     };
@@ -1055,7 +1054,7 @@ test "arg_string_array reads strings and maps non-strings to empty" {
     var items: std.ArrayList(Value) = .empty;
     try items.append(a, .{ .String = try StringRef.init(a, "k") });
     try items.append(a, .{ .Int = 7 });
-    const arr = Value{ .Array = .{ .items = try ValueList.init(a, items), .prim = null } };
+    const arr = runtime.ArrayData.fromBoxedList(try ValueList.init(a, items));
     var ctx = makeCtx(a, h.host(), cap.output(), &.{arr});
     switch (try arg_string_array(a, &ctx, 0)) {
         .ok => |v| {
@@ -1084,9 +1083,8 @@ test "make_string_array wraps values in a non-prim Array" {
     const v = try make_string_array(a, vals);
     try testing.expect(v == .Array);
     try testing.expect(v.Array.prim == null);
-    const g = v.Array.items.borrow();
-    defer g.deinit();
-    const items = g.get().items;
+    const items = try v.Array.snapshot(a);
+    defer a.free(items);
     try testing.expectEqual(@as(usize, 2), items.len);
     try testing.expect(items[0] == .String);
 }
@@ -1111,7 +1109,7 @@ test "decode_response pulls status, content type and body from an Array" {
     try items.append(a, .{ .String = try StringRef.init(a, "201") });
     try items.append(a, .{ .String = try StringRef.init(a, "application/json") });
     try items.append(a, .{ .String = try StringRef.init(a, "{}") });
-    const arr = Value{ .Array = .{ .items = try ValueList.init(a, items), .prim = null } };
+    const arr = runtime.ArrayData.fromBoxedList(try ValueList.init(a, items));
     const d = try decode_response(a, &arr);
     try testing.expectEqual(@as(i64, 201), d.status);
     try testing.expectEqualStrings("application/json", d.content_type);

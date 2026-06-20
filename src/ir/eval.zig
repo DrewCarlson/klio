@@ -15,6 +15,7 @@
 const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("ir.zig");
+const jit_loop = @import("jit_loop.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1064,6 +1065,7 @@ fn runFrameInner(
     // loop reads them. `TailCallFunc` is self-recursive (same func), so `func`
     // stays current for the whole loop.
     if (func.deferred_offset != 0) frame.module.ensureFuncBody(@constCast(func));
+    const jit_on = jit_loop.enabled();
     while (true) {
         // Daemon abandonment: a dispatcher pool task still running at the
         // run boundary stops at its next block instead of completing (or
@@ -1075,6 +1077,16 @@ fn runFrameInner(
         // GC safe point: at an opcode boundary all live Values are in registered
         // frames/globals (no host op mid-flight), so the collector can run.
         if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();
+        // Loop JIT (KLIO_JIT): a hot loop header compiles to native code; on
+        // success the loop runs natively and we resume at its exit block with
+        // registers reboxed. Only at a fresh, non-resumed block entry.
+        if (jit_on and resume_idx == 0 and resume_throw == null) {
+            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur)) |res| {
+                cur = res.block;
+                resume_idx = res.inst;
+                continue;
+            }
+        }
         const block = &func.blocks[cur.int()];
         const insts: []const Inst = block.insts;
         const term = block.terminator;
@@ -2868,18 +2880,35 @@ inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
     const idx = idx_v.Int;
     if (idx < 0) return null;
     const ui: usize = @intCast(idx);
-    const items_ref = switch (recv.*) {
-        .Array => |arr| arr.items,
-        .List => |l| l.items,
+    switch (recv.*) {
+        .Array => |arr| switch (arr.storage) {
+            .scalars => |pb| {
+                const g = pb.borrow();
+                defer g.deinit();
+                if (ui >= g.get().len()) return null;
+                return g.get().get(ui); // fresh scalar; no retain needed
+            },
+            .boxed => |vl| {
+                const g = vl.borrow();
+                defer g.deinit();
+                const items = g.get().items;
+                if (ui >= items.len) return null;
+                const elem = items[ui];
+                elem.retain();
+                return elem;
+            },
+        },
+        .List => |l| {
+            const g = l.items.borrow();
+            defer g.deinit();
+            const items = g.get().items;
+            if (ui >= items.len) return null;
+            const elem = items[ui];
+            elem.retain();
+            return elem;
+        },
         else => return null,
-    };
-    const g = items_ref.borrow();
-    defer g.deinit();
-    const items = g.get().items;
-    if (ui >= items.len) return null;
-    const elem = items[ui];
-    elem.retain();
-    return elem;
+    }
 }
 
 /// Indexed-store fast path for `a[i] = v` on an `Array` (mirrors the
@@ -2892,17 +2921,26 @@ inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const V
     if (idx < 0) return false;
     const ui: usize = @intCast(idx);
     switch (recv.*) {
-        .Array => |arr| {
-            const g = arr.items.borrowMut();
-            defer g.deinit();
-            const items = g.get().items;
-            if (ui >= items.len) return false;
-            if (runtime.reclaimEnabled()) {
-                items[ui].release(allocator);
-                new_val.retain();
-            }
-            items[ui] = new_val;
-            return true;
+        .Array => |arr| switch (arr.storage) {
+            .scalars => |pb| {
+                const g = pb.borrowMut();
+                defer g.deinit();
+                if (ui >= g.get().len()) return false;
+                g.get().set(ui, new_val);
+                return true;
+            },
+            .boxed => |vl| {
+                const g = vl.borrowMut();
+                defer g.deinit();
+                const items = g.get().items;
+                if (ui >= items.len) return false;
+                if (runtime.reclaimEnabled()) {
+                    items[ui].release(allocator);
+                    new_val.retain();
+                }
+                items[ui] = new_val;
+                return true;
+            },
         },
         else => return false,
     }
@@ -2938,9 +2976,9 @@ fn readRegSlice(allocator: Allocator, frame: *const Frame, regs: []const Reg) Al
 /// spread-arg dispatch. Caller frees the returned slice.
 fn spreadItems(allocator: Allocator, v: *const Value) Allocator.Error!union(enum) { ok: []Value, err: EvalError } {
     switch (v.*) {
-        .Array, .List, .Set => {
+        .Array => |a| return .{ .ok = try a.snapshot(allocator) },
+        .List, .Set => {
             const items_ref = switch (v.*) {
-                .Array => |a| a.items,
                 .List => |l| l.items,
                 .Set => |s| s.items,
                 else => unreachable,

@@ -347,6 +347,262 @@ pub const PrimitiveArrayKind = enum {
             .UByte => "UByte",
         };
     }
+
+    /// Byte width of one packed element of this kind.
+    pub fn elemSize(self: PrimitiveArrayKind) usize {
+        return switch (self) {
+            .Byte, .UByte, .Boolean => 1,
+            .Short, .UShort, .Char => 2,
+            .Int, .UInt, .Float => 4,
+            .Long, .ULong, .Double => 8,
+        };
+    }
+};
+
+/// Packed scalar storage for a Kotlin primitive array (`IntArray`,
+/// `BooleanArray`, `ByteArray`, …). Replaces the 64-byte-per-element boxed
+/// `ArrayList(Value)` with a flat byte buffer (1–8 bytes/element): ~8–64× less
+/// memory, cache-resident, no per-element retain/release, and the GC traces
+/// nothing (scalars have no out-edges). Elements box/unbox at the boundary.
+pub const PrimBuf = struct {
+    kind: PrimitiveArrayKind,
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+    pub fn len(self: *const PrimBuf) usize {
+        return self.bytes.items.len / self.kind.elemSize();
+    }
+
+    fn scalarPtr(self: anytype, i: usize) [*]u8 {
+        return self.bytes.items.ptr + i * self.kind.elemSize();
+    }
+
+    fn readAs(comptime T: type, p: [*]const u8) T {
+        var v: T = undefined;
+        @memcpy(std.mem.asBytes(&v), p[0..@sizeOf(T)]);
+        return v;
+    }
+    fn writeAs(comptime T: type, p: [*]u8, v: T) void {
+        @memcpy(p[0..@sizeOf(T)], std.mem.asBytes(&v));
+    }
+
+    /// Box element `i` into the `Value` the boxed array would have held.
+    pub fn get(self: *const PrimBuf, i: usize) Value {
+        const p: [*]const u8 = self.bytes.items.ptr + i * self.kind.elemSize();
+        return switch (self.kind) {
+            .Int => .{ .Int = readAs(i32, p) },
+            .Long => .{ .Long = readAs(i64, p) },
+            .Double => .{ .Double = readAs(f64, p) },
+            .Float => .{ .Float = readAs(f32, p) },
+            .Short => .{ .Short = readAs(i16, p) },
+            .Byte => .{ .Byte = readAs(i8, p) },
+            .Boolean => .{ .Bool = readAs(u8, p) != 0 },
+            .Char => .{ .Char = readAs(u16, p) },
+            .UInt => .{ .UInt = readAs(u32, p) },
+            .ULong => .{ .ULong = readAs(u64, p) },
+            .UShort => .{ .UShort = readAs(u16, p) },
+            .UByte => .{ .UByte = readAs(u8, p) },
+        };
+    }
+
+    /// Unbox `v` into element `i`. `i` must be in bounds. Numeric values are
+    /// read through the widening accessors so a coerced argument still stores
+    /// correctly; the destination kind defines the stored width.
+    pub fn set(self: *PrimBuf, i: usize, v: Value) void {
+        const p: [*]u8 = self.bytes.items.ptr + i * self.kind.elemSize();
+        switch (self.kind) {
+            .Int => writeAs(i32, p, @truncate(v.asI64() orelse 0)),
+            .Long => writeAs(i64, p, v.asI64() orelse 0),
+            .Double => writeAs(f64, p, v.asF64() orelse 0),
+            .Float => writeAs(f32, p, @floatCast(v.asF64() orelse 0)),
+            .Short => writeAs(i16, p, @truncate(v.asI64() orelse 0)),
+            .Byte => writeAs(i8, p, @truncate(v.asI64() orelse 0)),
+            .Boolean => writeAs(u8, p, if (v == .Bool and v.Bool) 1 else 0),
+            .Char => writeAs(u16, p, if (v == .Char) v.Char else @truncate(@as(u64, @bitCast(v.asI64() orelse 0)))),
+            .UInt => writeAs(u32, p, @truncate(@as(u64, @bitCast(v.asI64() orelse 0)))),
+            .ULong => writeAs(u64, p, @bitCast(v.asI64() orelse 0)),
+            .UShort => writeAs(u16, p, @truncate(@as(u64, @bitCast(v.asI64() orelse 0)))),
+            .UByte => writeAs(u8, p, @truncate(@as(u64, @bitCast(v.asI64() orelse 0)))),
+        }
+    }
+
+    pub fn append(self: *PrimBuf, a: std.mem.Allocator, v: Value) std.mem.Allocator.Error!void {
+        const es = self.kind.elemSize();
+        try self.bytes.appendNTimes(a, 0, es);
+        self.set(self.len() - 1, v);
+    }
+
+    /// GC: scalars have no out-edges, so tracing is a no-op (the decl makes the
+    /// generic tracer treat this as a leaf rather than guessing).
+    pub fn gcTrace(self: *const PrimBuf, m: *objcell.gc.Marker) void {
+        _ = self;
+        _ = m;
+    }
+    pub fn gcFinalize(self: *PrimBuf, a: std.mem.Allocator) void {
+        self.bytes.deinit(a);
+    }
+    /// Bytes owned beyond the control block (for the GC collection threshold).
+    pub fn gcExternalBytes(self: *const PrimBuf) usize {
+        return self.bytes.capacity;
+    }
+    pub fn deinit(self: *PrimBuf, a: std.mem.Allocator) void {
+        self.bytes.deinit(a);
+    }
+};
+
+/// Storage for `kotlin.Array<T>` and the primitive-array siblings. `boxed`
+/// holds reference types and `Array<T>`; `packed` holds primitive scalars. A
+/// union (not two fields) so every access site is compiler-flagged when the
+/// representation changes — primitive arrays must never be silently read as an
+/// empty boxed list.
+pub const ArrayStore = union(enum) {
+    boxed: ValueList,
+    scalars: ObjRef(PrimBuf),
+};
+
+/// `kotlin.Array<T>` and the primitive-array siblings. `prim` is the element
+/// kind (`null` for a reference `Array<T>`) and matches `storage`: `.boxed`
+/// when `prim == null`, `.scalars` when `prim != null`.
+pub const ArrayData = struct {
+    storage: ArrayStore,
+    prim: ?PrimitiveArrayKind,
+
+    pub fn len(self: ArrayData) usize {
+        switch (self.storage) {
+            .boxed => |vl| {
+                const g = vl.borrow();
+                defer g.deinit();
+                return g.get().items.len;
+            },
+            .scalars => |pb| {
+                const g = pb.borrow();
+                defer g.deinit();
+                return g.get().len();
+            },
+        }
+    }
+
+    /// Box element `i` (0-based, must be in bounds). Boxed elements are returned
+    /// as stored (caller retains if it keeps a copy); packed elements are fresh
+    /// scalars with no out-edges.
+    pub fn get(self: ArrayData, i: usize) Value {
+        switch (self.storage) {
+            .boxed => |vl| {
+                const g = vl.borrow();
+                defer g.deinit();
+                return g.get().items[i];
+            },
+            .scalars => |pb| {
+                const g = pb.borrow();
+                defer g.deinit();
+                return g.get().get(i);
+            },
+        }
+    }
+
+    /// Write element `i` (must be in bounds). For a boxed array the previous
+    /// element is released and the new one retained under a reclaiming backend;
+    /// packed elements are plain scalars.
+    pub fn set(self: ArrayData, allocator: std.mem.Allocator, i: usize, v: Value) void {
+        switch (self.storage) {
+            .boxed => |vl| {
+                const g = vl.borrowMut();
+                defer g.deinit();
+                const items = g.get().items;
+                if (objcell.reclaimEnabled()) {
+                    items[i].release(allocator);
+                    v.retain();
+                }
+                items[i] = v;
+            },
+            .scalars => |pb| {
+                const g = pb.borrowMut();
+                defer g.deinit();
+                g.get().set(i, v);
+            },
+        }
+    }
+
+    /// A freshly allocated boxed copy of every element (caller owns the slice;
+    /// elements are NOT retained — matches the prior `a.dupe(Value, items)` of
+    /// boxed arrays). For packed arrays the scalars are boxed into the copy; the
+    /// array stays packed.
+    pub fn snapshot(self: ArrayData, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Value {
+        switch (self.storage) {
+            .boxed => |vl| {
+                const g = vl.borrow();
+                defer g.deinit();
+                return allocator.dupe(Value, g.get().items);
+            },
+            .scalars => |pb| {
+                const g = pb.borrow();
+                defer g.deinit();
+                const n = g.get().len();
+                const out = try allocator.alloc(Value, n);
+                var i: usize = 0;
+                while (i < n) : (i += 1) out[i] = g.get().get(i);
+                return out;
+            },
+        }
+    }
+
+    /// The boxed `ValueList` ObjRef when this is a reference array, else `null`.
+    /// For sites that genuinely need to alias the backing list (iterators); a
+    /// packed array has no such list (use `snapshot`).
+    pub fn boxedList(self: ArrayData) ?ValueList {
+        return switch (self.storage) {
+            .boxed => |vl| vl,
+            .scalars => null,
+        };
+    }
+
+    /// Drop one reference to the backing storage (boxed list or packed buffer).
+    pub fn deinitStorage(self: ArrayData) void {
+        switch (self.storage) {
+            .boxed => |vl| vl.deinit(),
+            .scalars => |pb| pb.deinit(),
+        }
+    }
+
+    /// Identity (backing-cell address) for reference equality and `===`.
+    pub fn identity(self: ArrayData) usize {
+        return switch (self.storage) {
+            .boxed => |vl| vl.identity(),
+            .scalars => |pb| pb.identity(),
+        };
+    }
+
+    /// Build a primitive (packed) array Value from boxed `items` (unboxed into
+    /// the scalar buffer; the caller still owns/relinquishes `items`).
+    pub fn initPacked(a: std.mem.Allocator, kind: PrimitiveArrayKind, items: []const Value) std.mem.Allocator.Error!Value {
+        var pb = PrimBuf{ .kind = kind };
+        try pb.bytes.appendNTimes(a, 0, items.len * kind.elemSize());
+        for (items, 0..) |v, i| pb.set(i, v);
+        return .{ .Array = .{ .storage = .{ .scalars = try ObjRef(PrimBuf).initOwned(a, pb) }, .prim = kind } };
+    }
+
+    /// Build a reference `Array<T>` Value from a boxed `ValueList`.
+    pub fn fromBoxedList(vl: ValueList) Value {
+        return .{ .Array = .{ .storage = .{ .boxed = vl }, .prim = null } };
+    }
+
+    /// Overwrite every element from `src` (length must equal `len()`). Mirrors a
+    /// snapshot→reorder→write-back (no net refcount change for a permutation):
+    /// boxed elements are replaced as-is, packed scalars are unboxed.
+    pub fn writeBack(self: ArrayData, a: std.mem.Allocator, src: []const Value) std.mem.Allocator.Error!void {
+        switch (self.storage) {
+            .boxed => |vl| {
+                const g = vl.borrowMut();
+                defer g.deinit();
+                g.get().clearRetainingCapacity();
+                try g.get().appendSlice(a, src);
+            },
+            .scalars => |pb| {
+                const g = pb.borrowMut();
+                defer g.deinit();
+                for (src, 0..) |v, i| g.get().set(i, v);
+            },
+        }
+    }
 };
 
 /// Built-in property delegates (`lazy`, `Delegates.observable`,
@@ -723,10 +979,7 @@ pub const Value = union(enum) {
         declared_elem: ?[]const u8 = null,
     },
     /// `kotlin.Array<T>` and primitive-array siblings.
-    Array: struct {
-        items: ValueList,
-        prim: ?PrimitiveArrayKind,
-    },
+    Array: ArrayData,
     /// `kotlin.collections.Set` / `MutableSet`.
     Set: struct {
         items: ValueList,
@@ -868,7 +1121,10 @@ pub const Value = union(enum) {
                 visitor.visit(x.items);
                 if (x.backing) |b| visitor.visit(MapBackingRef{ .cell = b });
             },
-            .Array => |x| visitor.visit(x.items),
+            .Array => |x| switch (x.storage) {
+                .boxed => |vl| visitor.visit(vl),
+                .scalars => |pb| visitor.visit(pb),
+            },
             .Map => |x| visitor.visit(x.entries),
             .Iterator => |x| {
                 visitor.visit(x.items);
@@ -983,7 +1239,10 @@ pub const Value = union(enum) {
                 releaseValueList(x.items, allocator);
                 if (x.backing) |b| (MapBackingRef{ .cell = b }).deinit();
             },
-            .Array => |x| releaseValueList(x.items, allocator),
+            .Array => |x| switch (x.storage) {
+                .boxed => |vl| releaseValueList(vl, allocator),
+                .scalars => |pb| pb.deinit(),
+            },
             .Map => |x| {
                 // Last owner: release each entry's key and value.
                 if (x.entries.strongCount() == 1) {
@@ -1517,7 +1776,7 @@ pub const Value = union(enum) {
             .List => |x| if (b.* == .List) return ValueList.ptrEq(x.items, b.List.items),
             .Set => |x| if (b.* == .Set) return ValueList.ptrEq(x.items, b.Set.items),
             .Map => |x| if (b.* == .Map) return MapEntries.ptrEq(x.entries, b.Map.entries),
-            .Array => |x| if (b.* == .Array) return ValueList.ptrEq(x.items, b.Array.items),
+            .Array => |x| if (b.* == .Array) return x.identity() == b.Array.identity(),
             .Intrinsic => |x| {
                 if (b.* == .Intrinsic) return std.mem.eql(u8, x.fqn, b.Intrinsic.fqn);
                 if (b.* == .CoroutineSuspended) return std.mem.eql(u8, x.fqn, "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED");
@@ -1534,7 +1793,7 @@ pub const Value = union(enum) {
         return switch (self) {
             .Instance => |i| i.identity(),
             .List => |l| l.items.identity(),
-            .Array => |a| a.items.identity(),
+            .Array => |a| a.identity(),
             .Set => |s| s.items.identity(),
             .Map => |m| m.entries.identity(),
             .Cell => |c| c.identity(),

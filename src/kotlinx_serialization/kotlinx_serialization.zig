@@ -146,7 +146,7 @@ fn valueToJson(v: *const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!Js
             return .{ .ok = .{ .object = map } };
         },
         .List => |l| return listToJson(l.items, ctx, tree),
-        .Array => |arr| return listToJson(arr.items, ctx, tree),
+        .Array => |arr| return arrayToJson(arr, ctx, tree),
         .Set => |s| return listToJson(s.items, ctx, tree),
         .Map => |m| {
             var map: JsonObjectMap = .empty;
@@ -172,11 +172,18 @@ fn valueToJson(v: *const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!Js
 }
 
 fn listToJson(items: ValueList, ctx: *CallCtx, tree: std.mem.Allocator) Error!JsonResult {
-    const a = tree;
     const g = items.borrow();
-    const elems = try a.dupe(Value, g.get().items);
+    const elems = try tree.dupe(Value, g.get().items);
     g.deinit();
-    var arr = JsonArray.init(a);
+    return elemsToJson(elems, ctx, tree);
+}
+
+fn arrayToJson(arr: runtime.ArrayData, ctx: *CallCtx, tree: std.mem.Allocator) Error!JsonResult {
+    return elemsToJson(try arr.snapshot(tree), ctx, tree);
+}
+
+fn elemsToJson(elems: []const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!JsonResult {
+    var arr = JsonArray.init(tree);
     try arr.ensureTotalCapacity(elems.len);
     for (elems) |*e| {
         const jv_r = try valueToJson(e, ctx, tree);
@@ -599,9 +606,9 @@ fn construct(ctx: *CallCtx) Error!EvalResult {
                 g.deinit();
             },
             .Array => |arr| {
-                const g = arr.items.borrow();
-                try args.appendSlice(a, g.get().items);
-                g.deinit();
+                const snap = try arr.snapshot(a);
+                defer if (runtime.freeScratch()) a.free(snap);
+                try args.appendSlice(a, snap);
             },
             else => try args.append(a, arg1),
         }

@@ -92,9 +92,8 @@ fn argBytes(ctx: *CallCtx, idx: usize) std.mem.Allocator.Error!ArgResult([]u8) {
             return .{ .val = try ctx.allocator.dupe(u8, g.get().*) };
         },
         .Array => |a| {
-            const g = a.items.borrow();
-            defer g.deinit();
-            const elems = g.get().items;
+            const elems = try a.snapshot(ctx.allocator);
+            defer if (runtime.freeScratch()) ctx.allocator.free(elems);
             const out = try ctx.allocator.alloc(u8, elems.len);
             for (elems, 0..) |v, i| {
                 out[i] = switch (v) {
@@ -113,13 +112,10 @@ fn argBytes(ctx: *CallCtx, idx: usize) std.mem.Allocator.Error!ArgResult([]u8) {
 // A Kotlin `ByteArray` from raw bytes (u8 reinterpreted as signed Byte).
 fn bytesValue(ctx: *CallCtx, bytes: []const u8) std.mem.Allocator.Error!Value {
     var items: std.ArrayList(Value) = .empty;
-    errdefer items.deinit(ctx.allocator);
+    defer items.deinit(ctx.allocator);
     try items.ensureTotalCapacityPrecise(ctx.allocator, bytes.len);
     for (bytes) |byte| items.appendAssumeCapacity(.{ .Byte = @bitCast(byte) });
-    return .{ .Array = .{
-        .items = try ValueList.init(ctx.allocator, items),
-        .prim = .Byte,
-    } };
+    return try runtime.ArrayData.initPacked(ctx.allocator, .Byte, items.items);
 }
 
 // A thrown `kotlinx.io.IOException` the Kotlin `try/catch` can catch.
@@ -283,13 +279,10 @@ fn fsMetadata(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     } else |_| {}
     var items: std.ArrayList(Value) = .empty;
-    errdefer items.deinit(ctx.allocator);
+    defer items.deinit(ctx.allocator);
     try items.append(ctx.allocator, .{ .Long = kind });
     try items.append(ctx.allocator, .{ .Long = size });
-    return ok(.{ .Array = .{
-        .items = try ValueList.init(ctx.allocator, items),
-        .prim = .Long,
-    } });
+    return ok(try runtime.ArrayData.initPacked(ctx.allocator, .Long, items.items));
 }
 
 fn fsResolve(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -465,7 +458,7 @@ fn freeString(s: StringRef) void {
 fn freeValue(v: Value) void {
     switch (v) {
         .String => |s| freeString(s),
-        .Array => |a| a.items.deinit(),
+        .Array => |a| a.deinitStorage(),
         .List => |l| {
             const g = l.items.borrow();
             for (g.get().items) |e| freeValue(e);
@@ -519,12 +512,11 @@ test "base64 round-trips" {
     defer freeResult(dec);
     try testing.expect(dec == .ok);
     try testing.expect(dec.ok == .Array);
-    const dg = dec.ok.Array.items.borrow();
-    const items = dg.get().items;
+    const items = try dec.ok.Array.snapshot(testing.allocator);
+    defer testing.allocator.free(items);
     try testing.expectEqual(@as(usize, 5), items.len);
     try testing.expectEqual(@as(i8, 'h'), items[0].Byte);
     try testing.expectEqual(@as(i8, 'o'), items[4].Byte);
-    dg.deinit();
 }
 
 test "base64 decode rejects invalid input" {
@@ -540,13 +532,11 @@ test "base64 decode rejects invalid input" {
 
 test "hex encodes lowercase and decodes back" {
     var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(testing.allocator);
     try items.append(testing.allocator, .{ .Byte = @bitCast(@as(u8, 0xde)) });
     try items.append(testing.allocator, .{ .Byte = @bitCast(@as(u8, 0xad)) });
-    const arr = Value{ .Array = .{
-        .items = try ValueList.init(testing.allocator, items),
-        .prim = .Byte,
-    } };
-    defer arr.Array.items.deinit();
+    const arr = try runtime.ArrayData.initPacked(testing.allocator, .Byte, items.items);
+    defer arr.Array.deinitStorage();
 
     const enc_args = [_]Value{arr};
     var ctx = testCtx(&enc_args);
@@ -562,12 +552,11 @@ test "hex encodes lowercase and decodes back" {
     const dec = try hexDecode(&ctx2);
     defer freeResult(dec);
     try testing.expect(dec == .ok);
-    const dg = dec.ok.Array.items.borrow();
-    const out = dg.get().items;
+    const out = try dec.ok.Array.snapshot(testing.allocator);
+    defer testing.allocator.free(out);
     try testing.expectEqual(@as(usize, 2), out.len);
     try testing.expectEqual(@as(i8, @bitCast(@as(u8, 0xde))), out[0].Byte);
     try testing.expectEqual(@as(i8, @bitCast(@as(u8, 0xad))), out[1].Byte);
-    dg.deinit();
 }
 
 test "hex decode rejects odd length" {
@@ -618,13 +607,11 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
     // write "hi"
     {
         var items: std.ArrayList(Value) = .empty;
+        defer items.deinit(testing.allocator);
         try items.append(testing.allocator, .{ .Byte = 'h' });
         try items.append(testing.allocator, .{ .Byte = 'i' });
-        const data = Value{ .Array = .{
-            .items = try ValueList.init(testing.allocator, items),
-            .prim = .Byte,
-        } };
-        defer data.Array.items.deinit();
+        const data = try runtime.ArrayData.initPacked(testing.allocator, .Byte, items.items);
+        defer data.Array.deinitStorage();
         const args = [_]Value{ .{ .String = path_ref }, data, .{ .Bool = false } };
         var ctx = testCtx(&args);
         const r = try fsWriteBytes(&ctx);
@@ -647,10 +634,10 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
         var ctx = testCtx(&args);
         const r = try fsReadAllBytes(&ctx);
         defer freeResult(r);
-        const g = r.ok.Array.items.borrow();
-        try testing.expectEqual(@as(usize, 2), g.get().items.len);
-        try testing.expectEqual(@as(i8, 'h'), g.get().items[0].Byte);
-        g.deinit();
+        const items = try r.ok.Array.snapshot(testing.allocator);
+        defer testing.allocator.free(items);
+        try testing.expectEqual(@as(usize, 2), items.len);
+        try testing.expectEqual(@as(i8, 'h'), items[0].Byte);
     }
 
     // metadata: regular file, size 2
@@ -659,10 +646,10 @@ test "filesystem round-trip: write, exists, read, metadata, list, delete" {
         var ctx = testCtx(&args);
         const r = try fsMetadata(&ctx);
         defer freeResult(r);
-        const g = r.ok.Array.items.borrow();
-        try testing.expectEqual(@as(i64, 1), g.get().items[0].Long);
-        try testing.expectEqual(@as(i64, 2), g.get().items[1].Long);
-        g.deinit();
+        const items = try r.ok.Array.snapshot(testing.allocator);
+        defer testing.allocator.free(items);
+        try testing.expectEqual(@as(i64, 1), items[0].Long);
+        try testing.expectEqual(@as(i64, 2), items[1].Long);
     }
 
     // list the directory finds data.bin
@@ -728,12 +715,11 @@ test "append concatenates to an existing file" {
         var ctx = testCtx(&args);
         const r = try fsReadAllBytes(&ctx);
         defer freeResult(r);
-        const g = r.ok.Array.items.borrow();
-        const items = g.get().items;
+        const items = try r.ok.Array.snapshot(testing.allocator);
+        defer testing.allocator.free(items);
         try testing.expectEqual(@as(usize, 4), items.len);
         try testing.expectEqual(@as(i8, 'a'), items[0].Byte);
         try testing.expectEqual(@as(i8, 'd'), items[3].Byte);
-        g.deinit();
     }
 }
 
@@ -771,10 +757,10 @@ test "metadata for an absent path is kind 0" {
     var ctx = testCtx(&args);
     const r = try fsMetadata(&ctx);
     defer freeResult(r);
-    const g = r.ok.Array.items.borrow();
-    try testing.expectEqual(@as(i64, 0), g.get().items[0].Long);
-    try testing.expectEqual(@as(i64, -1), g.get().items[1].Long);
-    g.deinit();
+    const items = try r.ok.Array.snapshot(testing.allocator);
+    defer testing.allocator.free(items);
+    try testing.expectEqual(@as(i64, 0), items[0].Long);
+    try testing.expectEqual(@as(i64, -1), items[1].Long);
 }
 
 test "temp dir returns a non-empty path" {

@@ -409,13 +409,10 @@ fn tzifOffsetLocal(data: []const u8, local_epoch: i64) ?i32 {
 
 fn makeLongArray(allocator: std.mem.Allocator, values: []const i64) std.mem.Allocator.Error!Value {
     var list: std.ArrayList(Value) = .empty;
-    errdefer list.deinit(allocator);
+    defer list.deinit(allocator);
     try list.ensureTotalCapacity(allocator, values.len);
     for (values) |v| list.appendAssumeCapacity(.{ .Long = v });
-    return .{ .Array = .{
-        .items = try ValueList.init(allocator, list),
-        .prim = PrimitiveArrayKind.Long,
-    } };
+    return try runtime.ArrayData.initPacked(allocator, PrimitiveArrayKind.Long, list.items);
 }
 
 // -------------------------------------------------------------------------
@@ -735,9 +732,9 @@ const Harness = struct {
 };
 
 fn freeArray(v: Value) void {
-    // Releasing the last handle deinits the backing ArrayList via the cell's
-    // own allocator; no manual inner deinit.
-    v.Array.items.deinit();
+    // Releasing the last handle deinits the backing buffer via the cell's own
+    // allocator; no manual inner deinit.
+    v.Array.deinitStorage();
 }
 
 fn freeString(v: Value) void {
@@ -771,9 +768,8 @@ test "instantToLocalParts decomposes a UTC instant" {
     const r = try instantToLocalParts(&ctx);
     try testing.expect(r == .ok);
     defer freeArray(r.ok);
-    const g = r.ok.Array.items.borrow();
-    defer g.deinit();
-    const items = g.get().items;
+    const items = try r.ok.Array.snapshot(testing.allocator);
+    defer testing.allocator.free(items);
     try testing.expectEqual(@as(i64, 2023), items[0].Long);
     try testing.expectEqual(@as(i64, 11), items[1].Long);
     try testing.expectEqual(@as(i64, 14), items[2].Long);
@@ -797,10 +793,10 @@ test "localToInstant is the inverse in UTC" {
     const r = try localToInstant(&ctx);
     try testing.expect(r == .ok);
     defer freeArray(r.ok);
-    const g = r.ok.Array.items.borrow();
-    defer g.deinit();
-    try testing.expectEqual(@as(i64, 1_700_000_000), g.get().items[0].Long);
-    try testing.expectEqual(@as(i64, 0), g.get().items[1].Long);
+    const items = try r.ok.Array.snapshot(testing.allocator);
+    defer testing.allocator.free(items);
+    try testing.expectEqual(@as(i64, 1_700_000_000), items[0].Long);
+    try testing.expectEqual(@as(i64, 0), items[1].Long);
 }
 
 test "localToInstant rejects an impossible date" {
@@ -866,10 +862,10 @@ test "parseInstant round-trips and normalizes offsets" {
         const r = try parseInstant(&ctx);
         try testing.expect(r == .ok);
         defer freeArray(r.ok);
-        const g = r.ok.Array.items.borrow();
-        defer g.deinit();
-        try testing.expectEqual(@as(i64, 1_700_000_000), g.get().items[0].Long);
-        try testing.expectEqual(@as(i64, 0), g.get().items[1].Long);
+        const items = try r.ok.Array.snapshot(testing.allocator);
+        defer testing.allocator.free(items);
+        try testing.expectEqual(@as(i64, 1_700_000_000), items[0].Long);
+        try testing.expectEqual(@as(i64, 0), items[1].Long);
     }
     {
         // +02:00 wall clock is the same instant two hours earlier in UTC.
@@ -880,9 +876,9 @@ test "parseInstant round-trips and normalizes offsets" {
         const r = try parseInstant(&ctx);
         try testing.expect(r == .ok);
         defer freeArray(r.ok);
-        const g = r.ok.Array.items.borrow();
-        defer g.deinit();
-        try testing.expectEqual(@as(i64, 1_700_000_000), g.get().items[0].Long);
+        const items = try r.ok.Array.snapshot(testing.allocator);
+        defer testing.allocator.free(items);
+        try testing.expectEqual(@as(i64, 1_700_000_000), items[0].Long);
     }
 }
 
@@ -942,9 +938,9 @@ test "addPeriod adds calendar months with day clamping in UTC" {
     const r = try addPeriod(&ctx);
     try testing.expect(r == .ok);
     defer freeArray(r.ok);
-    const g = r.ok.Array.items.borrow();
-    defer g.deinit();
-    const p = partsFromEpoch(g.get().items[0].Long, 0);
+    const items = try r.ok.Array.snapshot(testing.allocator);
+    defer testing.allocator.free(items);
+    const p = partsFromEpoch(items[0].Long, 0);
     try testing.expectEqual(@as(i64, 2023), p.year);
     try testing.expectEqual(@as(u32, 2), p.month);
     try testing.expectEqual(@as(u32, 28), p.day);
@@ -964,11 +960,11 @@ test "addPeriod applies a time delta with nano carry" {
     const r = try addPeriod(&ctx);
     try testing.expect(r == .ok);
     defer freeArray(r.ok);
-    const g = r.ok.Array.items.borrow();
-    defer g.deinit();
+    const items = try r.ok.Array.snapshot(testing.allocator);
+    defer testing.allocator.free(items);
     // +5s plus 0.6s nano on top of 0.5s carries one second.
-    try testing.expectEqual(@as(i64, 1_006), g.get().items[0].Long);
-    try testing.expectEqual(@as(i64, 100_000_000), g.get().items[1].Long);
+    try testing.expectEqual(@as(i64, 1_006), items[0].Long);
+    try testing.expectEqual(@as(i64, 100_000_000), items[1].Long);
 }
 
 test "argument type errors surface as RuntimeError.Type" {

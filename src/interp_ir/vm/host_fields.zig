@@ -701,7 +701,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // `size` on arrays + collections.
     if (std.mem.eql(u8, name, "size")) {
         switch (receiver.*) {
-            .Array => |a| return ok(Value.newInt(@intCast(listLen(a.items)))),
+            .Array => |a| return ok(Value.newInt(@intCast(a.len()))),
             .List => |l| return ok(Value.newInt(@intCast(listLen(l.items)))),
             .Set => |s| return ok(Value.newInt(@intCast(listLen(s.items)))),
             .Map => |m| {
@@ -2128,7 +2128,7 @@ fn listLen(items: ValueList) usize {
 /// `len` (as `i64`) of an array / list / string receiver, or `null`.
 fn collectionLen(receiver: *const Value) ?i64 {
     return switch (receiver.*) {
-        .Array => |a| @intCast(listLen(a.items)),
+        .Array => |a| @intCast(a.len()),
         .List => |l| @intCast(listLen(l.items)),
         .String => |s| blk: {
             const g = s.borrow();
