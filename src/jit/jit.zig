@@ -370,6 +370,10 @@ pub const Emitter = struct {
     pub fn ucomisd(self: *Emitter, a: Xmm, b: Xmm) JitError!void {
         try self.sseRR(0x66, 0x2E, a, b);
     }
+    /// `xorps <dst>, <src>` — bitwise xor of packed singles. `xorps x, x` zeroes x.
+    pub fn xorps(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseRR(0x00, 0x57, dst, src);
+    }
     /// `ucomiss <a>, <b>` — unordered single compare (no prefix).
     pub fn ucomiss(self: *Emitter, a: Xmm, b: Xmm) JitError!void {
         try self.sseRR(0x00, 0x2E, a, b);
@@ -559,6 +563,12 @@ pub const Emitter = struct {
         ne = 0x85,
         le = 0x8E,
         g = 0x8F,
+        a = 0x87, // unsigned > (CF=0 & ZF=0)
+        ae = 0x83, // unsigned >= (CF=0)
+        b = 0x82, // unsigned < (CF=1)
+        be = 0x86, // unsigned <= (CF=1 | ZF=1)
+        p = 0x8A, // parity (ucomi unordered / NaN)
+        np = 0x8B, // not parity (ucomi ordered)
     };
     pub const Label = usize;
 
@@ -915,6 +925,14 @@ test "SSE single (f32) op encodings match documented bytes" {
         0xF3, 0x48, 0x0F, 0x2A, 0xC0,
         0xF3, 0x48, 0x0F, 0x2C, 0xC0,
     }, em.code());
+}
+
+test "xorps encodes the documented bytes" {
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.xorps(.xmm1, .xmm1); // 0F 57 C9
+    try em.xorps(.xmm0, .xmm2); // 0F 57 C2
+    try std.testing.expectEqualSlices(u8, &.{ 0x0F, 0x57, 0xC9, 0x0F, 0x57, 0xC2 }, em.code());
 }
 
 test "emitted f32 arithmetic over a slot file matches native" {
