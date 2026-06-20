@@ -251,12 +251,21 @@ and per-instruction interpreter overhead.
   code uses rax/rcx/rdx scratch per op (no register allocator). The win is from
   killing boxing/dispatch, not from allocation.
 - **Supported**: `Const`/`Move`/`BinOp` (Int/Long +,−,*,/,%, comparisons; Int
-  results `movsxd`-normalized for 32-bit wraparound), `Not`, `UnOp`
-  (Neg/Inc/Dec/Plus), packed-array subscripts (get/set on the F5 scalar buffer,
-  SIB load/store + bounds check), capture cells (`CellGet`/`CellSet` on a `var`
-  boxed by closure), `Goto`/`Branch`, `Trace`. Subscripts match both the
-  `CallMember "get"/"set"` lowering (how `a[i]` actually lowers) and
-  `Index`/`IndexSet`.
+  results `movsxd`-normalized for 32-bit wraparound; **Double +,−,*,/ and
+  comparisons via SSE2**), `Not`, `UnOp` (Neg/Inc/Dec/Plus on integers),
+  packed-array subscripts (get/set on the F5 scalar buffer, SIB load/store +
+  bounds check; **`DoubleArray` elements move as raw 8-byte `b64`**), capture
+  cells (`CellGet`/`CellSet` on a `var` boxed by closure, incl. `Double`),
+  `Goto`/`Branch`, `Trace`. Subscripts match both the `CallMember "get"/"set"`
+  lowering (how `a[i]` actually lowers) and `Index`/`IndexSet`.
+- **Double (f64)**: an f64 IR register keeps its bit pattern in its i64 slot and
+  moves in/out with `movsd`; arithmetic is `addsd`/`subsd`/`mulsd`/`divsd`
+  (IEEE — `/0.0` yields ±Inf/NaN, no deopt). Comparisons use `ucomisd` with
+  NaN-correct `setcc`: `<`/`<=` via operand-swap + `seta`/`setae`, `>`/`>=`
+  direct, `==` = `sete && setnp`, `!=` = `setne || setp` — so any comparison with
+  NaN is false except `!=` (matches Kotlin). Mixed int/double in one op bails
+  (no conversion emitted yet). Result on a `DoubleArray` sum/scale loop: **8.9 s
+  → 0.30 s (≈30×)**, node-class.
 - **Capture cells**: a `var` captured by a nested lambda is a boxed `Value.Cell`.
   The loop body's `CellGet`/`CellSet` are compiled by caching the box's scalar in
   the cell register's own slot for the native run (unboxed at entry, written back
@@ -291,9 +300,11 @@ and per-instruction interpreter overhead.
   program set (examples + corpus + fixtures, 800+ programs) produces byte-
   identical output with the JIT on vs off, including divide-by-zero, `MIN/-1`
   wrap, and OOB deopts.
-- **Next coverage** (not blocking): float/double arrays; calls via a trampoline
-  (stage 4 — collections/strings are call-bound). Each widens the compiled set;
-  the harness (guard + deopt + bail) is in place.
+- **Next coverage** (not blocking): `Float` (f32) arithmetic/arrays (needs the
+  `ss` SSE forms + f32/f64 conversions); int↔double conversions (`cvtsi2sd`/
+  `cvttsd2si` are in the emitter) to JIT mixed int/double loops; calls via a
+  trampoline (stage 4 — collections/strings are call-bound). The harness (guard +
+  deopt + bail) is in place.
 
 ## collections/strings gap — data-driven analysis (not a quick fix)
 

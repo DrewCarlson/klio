@@ -263,6 +263,115 @@ pub const Emitter = struct {
         try self.modrmRR(dst, src);
     }
 
+    /// SSE register, by encoding number (parallels `Reg`). The loop compiler
+    /// uses xmm0–xmm2 as per-instruction scratch for `f64` arithmetic; an IR
+    /// `f64` register keeps its bit pattern in its i64 slot and is moved in/out
+    /// with `movsd` (so no integer<->xmm round-trip on the hot path).
+    pub const Xmm = enum(u4) {
+        xmm0 = 0,
+        xmm1 = 1,
+        xmm2 = 2,
+        xmm3 = 3,
+        xmm4 = 4,
+        xmm5 = 5,
+        xmm6 = 6,
+        xmm7 = 7,
+        xmm8 = 8,
+        xmm9 = 9,
+        xmm10 = 10,
+        xmm11 = 11,
+        xmm12 = 12,
+        xmm13 = 13,
+        xmm14 = 14,
+        xmm15 = 15,
+    };
+    fn xlow3(x: Xmm) u8 {
+        return @as(u8, @intFromEnum(x)) & 0x7;
+    }
+    /// Optional REX for an SSE op with xmm `reg` field and `rm` (xmm or gpr):
+    /// REX.R for an extended xmm reg, REX.B for an extended rm. Emitted only when
+    /// an extended register is used (low regs need no REX, keeping encodings tight).
+    fn sseRex(self: *Emitter, reg_ext: bool, rm_ext: bool) JitError!void {
+        if (reg_ext or rm_ext) {
+            const r: u8 = if (reg_ext) 0x04 else 0;
+            const b: u8 = if (rm_ext) 0x01 else 0;
+            try self.byte(0x40 | r | b);
+        }
+    }
+
+    /// `movsd <xdst>, [<base64> + disp32]` — load an f64 from a frame slot.
+    pub fn movsdLoad(self: *Emitter, dst: Xmm, base: Reg, disp: i32) JitError!void {
+        try self.byte(0xF2);
+        try self.sseRex(@intFromEnum(dst) >= 8, @intFromEnum(base) >= 8);
+        try self.byte(0x0F);
+        try self.byte(0x10);
+        try self.memOperandX(dst, base, disp);
+    }
+    /// `movsd [<base64> + disp32], <xsrc>` — store an f64 to a frame slot.
+    pub fn movsdStore(self: *Emitter, base: Reg, disp: i32, src: Xmm) JitError!void {
+        try self.byte(0xF2);
+        try self.sseRex(@intFromEnum(src) >= 8, @intFromEnum(base) >= 8);
+        try self.byte(0x0F);
+        try self.byte(0x11);
+        try self.memOperandX(src, base, disp);
+    }
+    /// ModRM+SIB+disp32 for `[base + disp32]` with ModRM.reg = an xmm register.
+    fn memOperandX(self: *Emitter, reg: Xmm, base: Reg, disp: i32) JitError!void {
+        const rm = low3(base);
+        try self.byte(0x80 | (xlow3(reg) << 3) | rm); // mod=10
+        if (rm == 0x4) try self.byte(0x24); // SIB for rsp/r12 base
+        try self.imm32(@bitCast(disp));
+    }
+
+    fn sseArith(self: *Emitter, op: u8, dst: Xmm, src: Xmm) JitError!void {
+        try self.byte(0xF2);
+        try self.sseRex(@intFromEnum(dst) >= 8, @intFromEnum(src) >= 8);
+        try self.byte(0x0F);
+        try self.byte(op);
+        try self.byte(0xC0 | (xlow3(dst) << 3) | xlow3(src)); // mod=11
+    }
+    /// `addsd <xdst>, <xsrc>` (dst += src, IEEE double).
+    pub fn addsd(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseArith(0x58, dst, src);
+    }
+    pub fn subsd(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseArith(0x5C, dst, src);
+    }
+    pub fn mulsd(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseArith(0x59, dst, src);
+    }
+    pub fn divsd(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
+        try self.sseArith(0x5E, dst, src);
+    }
+    /// `ucomisd <a>, <b>` — unordered compare, sets ZF/PF/CF (PF=1 on NaN).
+    pub fn ucomisd(self: *Emitter, a: Xmm, b: Xmm) JitError!void {
+        try self.byte(0x66);
+        try self.sseRex(@intFromEnum(a) >= 8, @intFromEnum(b) >= 8);
+        try self.byte(0x0F);
+        try self.byte(0x2E);
+        try self.byte(0xC0 | (xlow3(a) << 3) | xlow3(b));
+    }
+    /// `cvtsi2sd <xdst>, <src64>` — signed i64 -> f64.
+    pub fn cvtsi2sd(self: *Emitter, dst: Xmm, src: Reg) JitError!void {
+        try self.byte(0xF2);
+        const r: u8 = if (@intFromEnum(dst) >= 8) 0x04 else 0;
+        const b: u8 = if (@intFromEnum(src) >= 8) 0x01 else 0;
+        try self.byte(0x48 | r | b); // REX.W
+        try self.byte(0x0F);
+        try self.byte(0x2A);
+        try self.byte(0xC0 | (xlow3(dst) << 3) | low3(src));
+    }
+    /// `cvttsd2si <dst64>, <xsrc>` — f64 -> signed i64 (truncating).
+    pub fn cvttsd2si(self: *Emitter, dst: Reg, src: Xmm) JitError!void {
+        try self.byte(0xF2);
+        const r: u8 = if (@intFromEnum(dst) >= 8) 0x04 else 0;
+        const b: u8 = if (@intFromEnum(src) >= 8) 0x01 else 0;
+        try self.byte(0x48 | r | b); // REX.W
+        try self.byte(0x0F);
+        try self.byte(0x2C);
+        try self.byte(0xC0 | (low3(dst) << 3) | xlow3(src));
+    }
+
     pub const SetCc = enum(u8) {
         e = 0x94,
         ne = 0x95,
@@ -270,9 +379,25 @@ pub const Emitter = struct {
         ge = 0x9D,
         le = 0x9E,
         g = 0x9F,
-        b = 0x92, // unsigned below
-        ae = 0x93, // unsigned above-or-equal
+        b = 0x92, // unsigned below (CF=1)
+        a = 0x97, // unsigned above (CF=0 and ZF=0)
+        ae = 0x93, // unsigned above-or-equal (CF=0)
+        p = 0x9A, // parity (PF=1 — ucomisd unordered/NaN)
+        np = 0x9B, // not parity (PF=0 — ucomisd ordered)
     };
+
+    /// `and <dst64>, <src64>` (dst &= src).
+    pub fn andReg(self: *Emitter, dst: Reg, src: Reg) JitError!void {
+        try self.rexWrr(src, dst);
+        try self.byte(0x21); // AND r/m64, r64
+        try self.modrmRR(src, dst);
+    }
+    /// `or <dst64>, <src64>` (dst |= src).
+    pub fn orReg(self: *Emitter, dst: Reg, src: Reg) JitError!void {
+        try self.rexWrr(src, dst);
+        try self.byte(0x09); // OR r/m64, r64
+        try self.modrmRR(src, dst);
+    }
     /// `setcc <reg8>` then zero-extend to 64 bits — materialize a 0/1 boolean
     /// from the flags into `reg`. Only the low byte is set, so it is zeroed
     /// first via `xor reg,reg` semantics handled by the caller; here we set the
@@ -679,4 +804,66 @@ test "emitted signed divide and remainder match native" {
     const g = exec2.entry(*const fn (i64, i64) callconv(.c) i64);
     try std.testing.expectEqual(@as(i64, 5), g(47, 6));
     try std.testing.expectEqual(@as(i64, -5), g(-47, 6));
+}
+
+test "SSE double op encodings match documented bytes" {
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.movsdLoad(.xmm0, .rbx, 8); // F2 0F 10 43 08
+    try em.movsdStore(.rbx, 16, .xmm1); // F2 0F 11 4B 10
+    try em.addsd(.xmm0, .xmm1); // F2 0F 58 C1
+    try em.subsd(.xmm0, .xmm1); // F2 0F 5C C1
+    try em.mulsd(.xmm0, .xmm1); // F2 0F 59 C1
+    try em.divsd(.xmm0, .xmm1); // F2 0F 5E C1
+    try em.ucomisd(.xmm0, .xmm1); // 66 0F 2E C1
+    try em.cvtsi2sd(.xmm0, .rax); // F2 48 0F 2A C0
+    try em.cvttsd2si(.rax, .xmm0); // F2 48 0F 2C C0
+    try std.testing.expectEqualSlices(u8, &.{
+        0xF2, 0x0F, 0x10, 0x83, 0x08, 0x00, 0x00, 0x00,
+        0xF2, 0x0F, 0x11, 0x8B, 0x10, 0x00, 0x00, 0x00,
+        0xF2, 0x0F, 0x58, 0xC1,
+        0xF2, 0x0F, 0x5C, 0xC1,
+        0xF2, 0x0F, 0x59, 0xC1,
+        0xF2, 0x0F, 0x5E, 0xC1,
+        0x66, 0x0F, 0x2E, 0xC1,
+        0xF2, 0x48, 0x0F, 0x2A, 0xC0,
+        0xF2, 0x48, 0x0F, 0x2C, 0xC0,
+    }, em.code());
+}
+
+test "emitted double arithmetic over a slot file matches native" {
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    // fn(rdi = *[2]f64) -> f64 : slots[0]*slots[1] + slots[0]
+    try em.push(.rbx);
+    try em.movReg(.rbx, .rdi);
+    try em.movsdLoad(.xmm0, .rbx, 0); // a
+    try em.movsdLoad(.xmm1, .rbx, 8); // b
+    try em.mulsd(.xmm0, .xmm1); // a*b
+    try em.movsdLoad(.xmm1, .rbx, 0); // a
+    try em.addsd(.xmm0, .xmm1); // a*b + a
+    // return in xmm0 already (System V f64 return). Move result to slot 0 then load is unnecessary.
+    try em.pop(.rbx);
+    try em.ret();
+    var exec = try finalize(em.code());
+    defer exec.deinit();
+    const f = exec.entry(*const fn ([*]f64) callconv(.c) f64);
+    var slots = [_]f64{ 3.0, 4.0 };
+    try std.testing.expectEqual(@as(f64, 15.0), f(&slots)); // 3*4 + 3
+    slots = .{ 2.5, -2.0 };
+    try std.testing.expectEqual(@as(f64, -2.5), f(&slots)); // 2.5*-2 + 2.5
+}
+
+test "cvtsi2sd / cvttsd2si round-trip int<->double" {
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    // fn(rdi=i64) -> i64 : trunc(double(rdi) * 1.5 ... ) ; use cvt both ways
+    try em.cvtsi2sd(.xmm0, .rdi); // (double)rdi
+    try em.cvttsd2si(.rax, .xmm0); // back to int
+    try em.ret();
+    var exec = try finalize(em.code());
+    defer exec.deinit();
+    const f = exec.entry(*const fn (i64) callconv(.c) i64);
+    try std.testing.expectEqual(@as(i64, 42), f(42));
+    try std.testing.expectEqual(@as(i64, -7), f(-7));
 }

@@ -33,9 +33,13 @@ const REGS: E = .rbx;
 const T0: E = .rax; // index / lhs / result
 const T1: E = .rcx; // rhs / len / ptr
 const T2: E = .rdx; // array element scratch
+// SSE scratch for `f64` arithmetic. A double IR register keeps its bit pattern
+// in its i64 slot and is moved in/out with `movsd`.
+const X0: jit.Emitter.Xmm = .xmm0;
+const X1: jit.Emitter.Xmm = .xmm1;
 
 /// Static type of an IR register, for normalization and reboxing.
-pub const RegType = enum(u8) { i32, i64, boolean, unit, null_, unknown };
+pub const RegType = enum(u8) { i32, i64, f64, boolean, unit, null_, unknown };
 
 /// The native loop returns `(block_id << 32) | inst_index` — the interpreter
 /// resume point. A normal loop exit resumes at the target block's first
@@ -92,10 +96,19 @@ fn constType(c: ir.Const) RegType {
     return switch (c) {
         .Int, .Char, .Short, .Byte => .i32,
         .Long => .i64,
+        .Double => .f64,
         .Bool => .boolean,
         .Unit => .unit,
         .Null => .null_,
         else => .unknown,
+    };
+}
+
+/// The f64 bit pattern a `Double` const carries (stored raw in its i64 slot).
+fn constF64Bits(c: ir.Const) i64 {
+    return switch (c) {
+        .Double => |x| @bitCast(x),
+        else => 0,
     };
 }
 
@@ -114,6 +127,9 @@ fn constI64(c: ir.Const) i64 {
 fn isNumeric(t: RegType) bool {
     return t == .i32 or t == .i64;
 }
+fn isFloat(t: RegType) bool {
+    return t == .f64;
+}
 
 /// The scalar `RegType` a capture cell holds, or null for kinds the integer JIT
 /// does not cache (the cell stays interpreter-only).
@@ -121,6 +137,7 @@ fn cellScalarType(v: Value) ?RegType {
     return switch (v) {
         .Int, .Char, .Short, .Byte => .i32,
         .Long => .i64,
+        .Double => .f64,
         .Bool => .boolean,
         else => null,
     };
@@ -170,7 +187,9 @@ fn arrayOpOf(module: *const Module, inst: *const Inst) ?ArrayOp {
 }
 
 /// Element register type + native access width for a packed array kind, or null
-/// for kinds the integer JIT does not compile (Float/Double).
+/// for kinds the JIT does not compile (Float). A `Double` element is moved as a
+/// raw 8-byte (`b64`) value — its f64 bits live in the slot and are consumed by
+/// the SSE arithmetic path.
 fn arrayElemShape(kind: runtime.PrimitiveArrayKind) ?struct { rt: RegType, w: jit.Emitter.ElemW, esize: u8 } {
     return switch (kind) {
         .Boolean => .{ .rt = .boolean, .w = .b8u, .esize = 1 },
@@ -183,7 +202,8 @@ fn arrayElemShape(kind: runtime.PrimitiveArrayKind) ?struct { rt: RegType, w: ji
         .UInt => .{ .rt = .i32, .w = .b32u, .esize = 4 },
         .Long => .{ .rt = .i64, .w = .b64, .esize = 8 },
         .ULong => .{ .rt = .i64, .w = .b64, .esize = 8 },
-        .Float, .Double => null,
+        .Double => .{ .rt = .f64, .w = .b64, .esize = 8 },
+        .Float => null,
     };
 }
 
@@ -619,6 +639,69 @@ const Compiler = struct {
         const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
         try self.em.storeMem(REGS, d, native);
     }
+    /// Load/store an f64 register's slot through an xmm (the slot holds the bits).
+    fn loadF64Slot(self: *Compiler, x: jit.Emitter.Xmm, r: Reg) !void {
+        const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
+        try self.em.movsdLoad(x, REGS, d);
+    }
+    fn storeF64Slot(self: *Compiler, r: Reg, x: jit.Emitter.Xmm) !void {
+        const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
+        try self.em.movsdStore(REGS, d, x);
+    }
+
+    /// Emit an `f64` BinOp (arithmetic or NaN-aware comparison). Operands and
+    /// result move through their i64 slots as raw bits; comparisons yield a 0/1
+    /// boolean in `T0`.
+    fn emitF64BinOp(self: *Compiler, b: anytype) !void {
+        if (b.op == .Mod) return jit.JitError.Unsupported; // no double remainder
+        try self.loadF64Slot(X0, b.lhs);
+        try self.loadF64Slot(X1, b.rhs);
+        if (isCmpBinOp(b.op)) {
+            // IEEE/Kotlin: any comparison with NaN is false except `!=`.
+            switch (b.op) {
+                // a<b ≡ b>a, a<=b ≡ b>=a: `seta`/`setae` give 0 on unordered.
+                .Less => {
+                    try self.em.ucomisd(X1, X0);
+                    try self.em.setccReg(.a, T0);
+                },
+                .LessEq => {
+                    try self.em.ucomisd(X1, X0);
+                    try self.em.setccReg(.ae, T0);
+                },
+                .Greater => {
+                    try self.em.ucomisd(X0, X1);
+                    try self.em.setccReg(.a, T0);
+                },
+                .GreaterEq => {
+                    try self.em.ucomisd(X0, X1);
+                    try self.em.setccReg(.ae, T0);
+                },
+                .Eq => {
+                    try self.em.ucomisd(X0, X1);
+                    try self.em.setccReg(.e, T0); // ZF=1
+                    try self.em.setccReg(.np, T1); // ordered
+                    try self.em.andReg(T0, T1);
+                },
+                .NotEq => {
+                    try self.em.ucomisd(X0, X1);
+                    try self.em.setccReg(.ne, T0); // ZF=0
+                    try self.em.setccReg(.p, T1); // unordered ⇒ !=
+                    try self.em.orReg(T0, T1);
+                },
+                else => return jit.JitError.Unsupported,
+            }
+            try self.storeSlot(b.dst, T0);
+            return;
+        }
+        switch (b.op) {
+            .Add => try self.em.addsd(X0, X1),
+            .Sub => try self.em.subsd(X0, X1),
+            .Mul => try self.em.mulsd(X0, X1),
+            .Div => try self.em.divsd(X0, X1),
+            else => return jit.JitError.Unsupported,
+        }
+        try self.storeF64Slot(b.dst, X0);
+    }
 
     fn exitLabel(self: *Compiler, blk: BlockId) !jit.Emitter.Label {
         for (self.exit_targets.items, 0..) |t, i| {
@@ -707,9 +790,12 @@ const Compiler = struct {
         }
         switch (inst.*) {
             .Const => |c| {
-                const t = constType(self.module.consts.items[c.value.int()]);
+                const cv = self.module.consts.items[c.value.int()];
+                const t = constType(cv);
                 if (t == .unknown) return jit.JitError.Unsupported;
-                try self.em.movImm64(T0, @bitCast(constI64(self.module.consts.items[c.value.int()])));
+                // f64 and integer consts both land as raw bits in the slot.
+                const bits = if (t == .f64) constF64Bits(cv) else constI64(cv);
+                try self.em.movImm64(T0, @bitCast(bits));
                 try self.storeSlot(c.dst, T0);
             },
             .Move => |m| {
@@ -721,7 +807,16 @@ const Compiler = struct {
                 const is_arith = isArithBinOp(b.op);
                 const is_div = isDivBinOp(b.op);
                 if (!is_cmp and !is_arith and !is_div) return jit.JitError.Unsupported;
-                if (!isNumeric(typeOf(self.types, b.lhs)) or !isNumeric(typeOf(self.types, b.rhs)))
+                const lt = typeOf(self.types, b.lhs);
+                const rt = typeOf(self.types, b.rhs);
+                // f64 path: both operands must be f64 (mixed int/float would need a
+                // conversion the integer fast paths don't emit).
+                if (isFloat(lt) or isFloat(rt)) {
+                    if (!isFloat(lt) or !isFloat(rt)) return jit.JitError.Unsupported;
+                    try self.emitF64BinOp(b);
+                    return;
+                }
+                if (!isNumeric(lt) or !isNumeric(rt))
                     return jit.JitError.Unsupported;
                 try self.loadSlot(T0, b.lhs);
                 try self.loadSlot(T1, b.rhs);
@@ -1049,6 +1144,10 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64) RunResult
                 .Long => |x| slots[r] = x,
                 else => return .bail,
             },
+            .f64 => switch (v) {
+                .Double => |x| slots[r] = @bitCast(x),
+                else => return .bail,
+            },
             .boolean => switch (v) {
                 .Bool => |b| slots[r] = if (b) 1 else 0,
                 else => return .bail,
@@ -1098,6 +1197,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64) RunResult
         regs[r] = switch (self.reg_types[r]) {
             .i32 => .{ .Int = @truncate(slots[r]) },
             .i64 => .{ .Long = slots[r] },
+            .f64 => .{ .Double = @bitCast(slots[r]) },
             .boolean => .{ .Bool = slots[r] != 0 },
             .unit => .Unit,
             .null_ => .Null,
@@ -1133,6 +1233,10 @@ fn cellSlotIn(rt: RegType, v: Value) ?i64 {
             .Long => |x| x,
             else => null,
         },
+        .f64 => switch (v) {
+            .Double => |x| @bitCast(x),
+            else => null,
+        },
         .boolean => switch (v) {
             .Bool => |b| if (b) 1 else 0,
             else => null,
@@ -1145,6 +1249,7 @@ fn valueFromSlot(rt: RegType, s: i64) Value {
     return switch (rt) {
         .i32 => .{ .Int = @truncate(s) },
         .i64 => .{ .Long = s },
+        .f64 => .{ .Double = @bitCast(s) },
         .boolean => .{ .Bool = s != 0 },
         else => .Unit,
     };
