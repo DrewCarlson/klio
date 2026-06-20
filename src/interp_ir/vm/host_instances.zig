@@ -242,7 +242,12 @@ fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) Allocator.Error!?Valu
 }
 
 fn emptyList(allocator: Allocator, mutable: bool) Allocator.Error!Value {
-    return Value{ .List = try runtime.ListData.fromArrayList(allocator, .empty, mutable) };
+    return Value{ .List = .{
+        .items = try ObjRef(std.ArrayList(Value)).init(allocator, .empty),
+        .mutable = mutable,
+        .enum_entries = false,
+        .backing = null,
+    } };
 }
 
 fn emptySet(allocator: Allocator, mutable: bool) Allocator.Error!Value {
@@ -1316,7 +1321,12 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
                     .err => |e| return .{ .err = e },
                 }
             }
-            return .{ .ok = .{ .List = try runtime.ListData.fromArrayList(allocator, items, std.mem.eql(u8, class_name, "MutableList")) } };
+            return .{ .ok = .{ .List = .{
+                .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
+                .mutable = std.mem.eql(u8, class_name, "MutableList"),
+                .enum_entries = false,
+                .backing = null,
+            } } };
         }
     }
     // SAM conversion: `FunInterface(lambda)`.

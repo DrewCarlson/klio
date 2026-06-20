@@ -63,7 +63,8 @@ fn thrownOwned(allocator: Allocator, fqn: []const u8, message: []const u8) Alloc
 /// `collections::make_list`.
 fn makeList(allocator: Allocator, items: []Value, mutable: bool) Allocator.Error!Value {
     const list = std.ArrayList(Value).fromOwnedSlice(items);
-    return .{ .List = try runtime.ListData.fromArrayList(allocator, list, mutable) };
+    const items_ref = try ValueList.init(allocator, list);
+    return .{ .List = .{ .items = items_ref, .mutable = mutable, .enum_entries = false, .backing = null } };
 }
 
 /// Build an items-only `Sequence` from an owned slice. Mirrors
@@ -146,7 +147,19 @@ fn argAsString(allocator: Allocator, v: Value, what: []const u8) Allocator.Error
 
 /// Number of UTF-16 code units in `s` — Kotlin's `String.length` /
 /// indexing unit (an astral scalar counts as 2).
+/// True if `s` is pure ASCII (no byte has the high bit set). For an ASCII string
+/// the UTF-16 length and indices coincide with byte offsets, so the per-codepoint
+/// `utf8Decode` walks collapse to direct byte access. The scan itself is a simple
+/// byte loop the compiler vectorizes — far cheaper than decoding each codepoint.
+fn asciiScan(s: []const u8) bool {
+    for (s) |b| {
+        if (b >= 0x80) return false;
+    }
+    return true;
+}
+
 fn utf16Len(s: []const u8) usize {
+    if (asciiScan(s)) return s.len; // ASCII: one unit per byte
     var n: usize = 0;
     var it = Utf16View{ .bytes = s };
     while (it.next()) |_| n += 1;
@@ -766,6 +779,7 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
 /// index — the inverse of `byteToCharIndex`'s unit.
 fn utf16IndexToByte(s: []const u8, target: usize) usize {
     if (target == 0) return 0;
+    if (asciiScan(s)) return @min(target, s.len); // ASCII: unit index == byte index
     var u16count: usize = 0;
     var i: usize = 0;
     while (i < s.len) {
@@ -1139,9 +1153,9 @@ fn stringSplitItems(ctx: *CallCtx, who: []const u8) Allocator.Error!union(enum) 
                 }
             },
             .List => |l| {
-                const g = l.buf.borrow();
+                const g = l.items.borrow();
                 defer g.deinit();
-                for (g.get().boxed.items) |it| {
+                for (g.get().items) |it| {
                     if (try delimToString(ctx.allocator, it)) |d| {
                         try delims.append(ctx.allocator, d);
                     } else {
@@ -2752,9 +2766,9 @@ test "split on delimiters" {
     const a = arena.allocator();
     var ctx = ctxFor(a, &.{ try strVal(a, "a,b,c"), try strVal(a, ",") });
     const r = try string_split(&ctx);
-    const g = r.ok.List.buf.borrow();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    const items = g.get().boxed.items;
+    const items = g.get().items;
     try testing.expectEqual(@as(usize, 3), items.len);
     {
         const gg = items[0].String.borrow();
@@ -2774,9 +2788,9 @@ test "split honors limit" {
     const a = arena.allocator();
     var ctx = ctxFor(a, &.{ try strVal(a, "a,b,c"), try strVal(a, ","), .{ .Int = 2 } });
     const r = try string_split(&ctx);
-    const g = r.ok.List.buf.borrow();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    const items = g.get().boxed.items;
+    const items = g.get().items;
     try testing.expectEqual(@as(usize, 2), items.len);
     const gg = items[1].String.borrow();
     defer gg.deinit();
@@ -2808,9 +2822,9 @@ test "chunked splits into pieces" {
     const a = arena.allocator();
     var ctx = ctxFor(a, &.{ try strVal(a, "abcde"), .{ .Int = 2 } });
     const r = try string_chunked(&ctx);
-    const g = r.ok.List.buf.borrow();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    const items = g.get().boxed.items;
+    const items = g.get().items;
     try testing.expectEqual(@as(usize, 3), items.len);
     const gg = items[2].String.borrow();
     defer gg.deinit();
@@ -2823,9 +2837,9 @@ test "windowed produces sliding windows" {
     const a = arena.allocator();
     var ctx = ctxFor(a, &.{ try strVal(a, "abcd"), .{ .Int = 2 } });
     const r = try string_windowed(&ctx);
-    const g = r.ok.List.buf.borrow();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    const items = g.get().boxed.items;
+    const items = g.get().items;
     try testing.expectEqual(@as(usize, 3), items.len);
     const gg = items[0].String.borrow();
     defer gg.deinit();
@@ -2871,9 +2885,9 @@ test "lines splits on newlines" {
     const a = arena.allocator();
     var ctx = ctxFor(a, &.{try strVal(a, "a\r\nb\nc")});
     const r = try string_lines(&ctx);
-    const g = r.ok.List.buf.borrow();
+    const g = r.ok.List.items.borrow();
     defer g.deinit();
-    try testing.expectEqual(@as(usize, 3), g.get().boxed.items.len);
+    try testing.expectEqual(@as(usize, 3), g.get().items.len);
 }
 
 test "trimIndent and trimMargin" {
@@ -2914,9 +2928,9 @@ test "toCharArray and toList" {
     {
         var ctx = ctxFor(a, &.{try strVal(a, "ab")});
         const r = try string_to_list(&ctx);
-        const g = r.ok.List.buf.borrow();
+        const g = r.ok.List.items.borrow();
         defer g.deinit();
-        try testing.expectEqual(@as(u16, 'a'), g.get().boxed.items[0].Char);
+        try testing.expectEqual(@as(u16, 'a'), g.get().items[0].Char);
     }
 }
 

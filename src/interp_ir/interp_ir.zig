@@ -164,11 +164,19 @@ pub const ProgramImage = struct {
     /// the method body. Keyed by identity: the class cell pointer and interned
     /// method-name pointer are stable for the program's lifetime.
     instance_method_cache: std.AutoHashMap(InstanceMethodKey, u32),
+    /// Overload-resolution cache for global function calls. `pickOverload` scans
+    /// and type-scores every same-name candidate per call — the dominant cost for
+    /// generic stdlib calls (`maxOf`/`minOf`/math) in a hot loop. Its result is a
+    /// pure function of `(module, base func, arg types)`, so memoize it keyed by
+    /// the primitive-arg-type signature (computed only when every arg is a
+    /// primitive scalar, where the tag fully determines selection).
+    overload_cache: std.AutoHashMap(OverloadKey, u32),
     allocator: Allocator,
 
     pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool };
     pub const MemberResolveEntry = struct { func: ?StdlibFn, fqn: []const u8 };
     pub const InstanceMethodKey = struct { class_p: usize, name_p: usize, n_args: u32 };
+    pub const OverloadKey = struct { module_p: usize, func_p: u32, sig: u64 };
 
     /// Packages a bare global name may bind into implicitly, in
     /// preference order — the prefix order of the deleted `lookupGlobal`
@@ -227,6 +235,7 @@ pub const ProgramImage = struct {
             .resolved_linked = false,
             .member_resolve_cache = std.AutoHashMap(MemberResolveKey, MemberResolveEntry).init(allocator),
             .instance_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
+            .overload_cache = std.AutoHashMap(OverloadKey, u32).init(allocator),
             .allocator = allocator,
         };
     }
@@ -258,6 +267,7 @@ pub const ProgramImage = struct {
         }
         self.member_resolve_cache.deinit();
         self.instance_method_cache.deinit();
+        self.overload_cache.deinit();
     }
 
     fn clearResolvedRedirects(self: *ProgramImage) void {

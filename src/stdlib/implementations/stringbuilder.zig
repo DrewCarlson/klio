@@ -227,7 +227,11 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
             };
             const elems: []Value = switch (ctx.args[0]) {
                 .Array => |arr| try arr.snapshot(a),
-                .List => |l| try l.snapshot(a),
+                .List => |l| blk: {
+                    const g = l.items.borrow();
+                    defer g.deinit();
+                    break :blk try a.dupe(Value, g.get().items);
+                },
                 else => unreachable,
             };
             defer if (runtime.freeScratch()) a.free(elems);

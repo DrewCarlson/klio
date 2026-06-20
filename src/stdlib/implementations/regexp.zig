@@ -66,9 +66,13 @@ fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]cons
 }
 
 fn makeList(allocator: std.mem.Allocator, items: []const Value, mutable: bool) !Value {
-    var list: std.ArrayList(Value) = .empty;
-    try list.appendSlice(allocator, items);
-    return .{ .List = try runtime.ListData.fromArrayList(allocator, list, mutable) };
+    var list = try ValueList.init(allocator, .empty);
+    {
+        const g = list.borrowMut();
+        defer g.deinit();
+        try g.get().appendSlice(allocator, items);
+    }
+    return .{ .List = .{ .items = list, .mutable = mutable, .enum_entries = false, .backing = null } };
 }
 
 fn makeSequence(allocator: std.mem.Allocator, items: []const Value) !Value {

@@ -897,13 +897,15 @@ const DecodedResponse = struct {
 /// lambda's returned `Array<String>`, with lenient fallbacks. The trailing
 /// key/value pairs are response headers. Strings are owned by `allocator`.
 fn decode_response(allocator: Allocator, v: *const Value) Allocator.Error!DecodedResponse {
-    const maybe_slice: ?[]Value = switch (v.*) {
-        .Array => |a| try a.snapshot(allocator),
-        .List => |l| try l.snapshot(allocator),
+    const items_ref: ?ValueList = switch (v.*) {
+        .Array => |a| a.boxedList(),
+        .List => |l| l.items,
         else => null,
     };
-    if (maybe_slice) |slice| {
-        defer if (runtime.freeScratch()) allocator.free(slice);
+    if (items_ref) |items| {
+        const g = items.borrow();
+        defer g.deinit();
+        const slice = g.get().items;
         const status: i64 = if (slice.len > 0) switch (slice[0]) {
             .String => |s| blk: {
                 const sg = s.borrow();
@@ -1122,7 +1124,7 @@ test "decode_response accepts an Int status and a List backing" {
     try items.append(a, .{ .Int = 404 });
     try items.append(a, .{ .String = try StringRef.init(a, "text/plain") });
     try items.append(a, .{ .String = try StringRef.init(a, "nope") });
-    const list = Value{ .List = try runtime.ListData.fromArrayList(a, items, false) };
+    const list = Value{ .List = .{ .items = try ValueList.init(a, items), .mutable = false, .enum_entries = false, .backing = null } };
     const d = try decode_response(a, &list);
     try testing.expectEqual(@as(i64, 404), d.status);
     try testing.expectEqualStrings("text/plain", d.content_type);

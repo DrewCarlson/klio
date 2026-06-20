@@ -113,6 +113,9 @@ Run any program with:
 | `jit_double_loop.kt`       | Hot `Double` arithmetic + comparison over a `DoubleArray` (loop JIT → SSE2); identical output JIT off or on, incl. NaN comparison semantics. |
 | `jit_int_double_mix.kt`    | Hot loop mixing an `Int` counter with `Double` math via `i.toDouble()` (loop JIT compiles the int→double conversion inline). |
 | `jit_float_loop.kt`        | Hot `Float` (f32) arithmetic/comparison over a `FloatArray` + `Int→Float` conversion (loop JIT → single-precision SSE2); identical output JIT off or on. |
+| `generic_stdlib_calls.kt`  | Repeated `maxOf`/`minOf` calls in a loop; overload resolution is cached per `(function, argument-type)` so the hot path skips re-scanning overloads. |
+| `jit_float_to_int.kt`      | `Float`/`Double` → `Int`/`Long` in a hot loop with Kotlin clamping (NaN→0, overflow→MIN/MAX); loop JIT compiles the conversion; identical output JIT off or on. |
+| `string_ascii_fastpath.kt` | String `length`/`indexOf`/`substring`/indexing on ASCII vs non-ASCII text (ASCII takes a byte-length fast path; non-ASCII falls back to a UTF-16 walk). |
 
 ## Integration showcases
 

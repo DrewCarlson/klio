@@ -2385,7 +2385,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // releases them); `readArgRun` handed back borrows of the source
             // registers, so retain each. No-op under the arena fast path.
             if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
-            try frame.write(nl.dst, .{ .List = try runtime.ListData.fromArrayList(allocator, list, false) });
+            try frame.write(nl.dst, .{ .List = .{
+                .items = try ValueList.init(allocator, list),
+                .mutable = false,
+                .enum_entries = false,
+                .backing = null,
+            } });
         },
         .QualifiedThis => |qt| {
             const recv = frame.read(qt.receiver);
@@ -2894,9 +2899,9 @@ inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
             },
         },
         .List => |l| {
-            const g = l.buf.borrow();
+            const g = l.items.borrow();
             defer g.deinit();
-            const items = g.get().boxed.items;
+            const items = g.get().items;
             if (ui >= items.len) return null;
             const elem = items[ui];
             elem.retain();
@@ -2972,9 +2977,13 @@ fn readRegSlice(allocator: Allocator, frame: *const Frame, regs: []const Reg) Al
 fn spreadItems(allocator: Allocator, v: *const Value) Allocator.Error!union(enum) { ok: []Value, err: EvalError } {
     switch (v.*) {
         .Array => |a| return .{ .ok = try a.snapshot(allocator) },
-        .List => |l| return .{ .ok = try l.snapshot(allocator) },
-        .Set => |s| {
-            const g = s.items.borrow();
+        .List, .Set => {
+            const items_ref = switch (v.*) {
+                .List => |l| l.items,
+                .Set => |s| s.items,
+                else => unreachable,
+            };
+            const g = items_ref.borrow();
             defer g.deinit();
             const src = g.get().items;
             return .{ .ok = try allocator.dupe(Value, src) };

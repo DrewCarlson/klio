@@ -704,6 +704,49 @@ const Compiler = struct {
     fn loadFloat(self: *Compiler, x: jit.Emitter.Xmm, r: Reg, is32: bool) !void {
         if (is32) try self.loadF32Slot(x, r) else try self.loadF64Slot(x, r);
     }
+
+    /// `x.toInt()`/`toLong()` on a float, matching Kotlin's clamping: NaN→0,
+    /// overflow→Int/Long.MIN/MAX, else truncate toward zero. `cvtt*2si` already
+    /// truncates in range and yields the i64-min sentinel on NaN/overflow, so the
+    /// common path is one convert + a sentinel check; only the rare sentinel case
+    /// is fixed up. Result left in `T0`. `from_f32`/`to_i32` select precision.
+    fn emitFloatToInt(self: *Compiler, src: Reg, dst: Reg, from_f32: bool, to_i32: bool) !void {
+        try self.loadFloat(X0, src, from_f32);
+        if (from_f32) try self.em.cvttss2si(T0, X0) else try self.em.cvttsd2si(T0, X0);
+        const done64 = try self.em.newLabel();
+        const not_nan = try self.em.newLabel();
+        // Sentinel (i64 min) means NaN or out-of-i64-range.
+        try self.em.movImm64(T1, 0x8000_0000_0000_0000);
+        try self.em.cmpReg(T0, T1);
+        try self.em.jcc(.ne, done64); // common: in range, T0 correct
+        try self.ucomiFloat(X0, X0, from_f32); // PF set iff NaN
+        try self.em.jcc(.np, not_nan);
+        try self.em.movImm64(T0, 0); // NaN -> 0
+        try self.em.jmp(done64);
+        try self.em.bind(not_nan);
+        // Overflow: positive -> i64 max, negative -> i64 min (T0 already = min).
+        try self.em.xorps(X1, X1);
+        try self.ucomiFloat(X0, X1, from_f32);
+        try self.em.jcc(.be, done64); // x <= 0 -> i64 min (already in T0)
+        try self.em.movImm64(T0, 0x7FFF_FFFF_FFFF_FFFF); // x > 0 -> i64 max
+        try self.em.bind(done64);
+        if (to_i32) {
+            // Clamp the (already i64-clamped) value into the Int range.
+            const lo = try self.em.newLabel();
+            const done32 = try self.em.newLabel();
+            try self.em.movImm64(T1, 0x7FFF_FFFF); // Int.MAX
+            try self.em.cmpReg(T0, T1);
+            try self.em.jcc(.le, lo);
+            try self.em.movReg(T0, T1);
+            try self.em.bind(lo);
+            try self.em.movImm64(T1, 0xFFFF_FFFF_8000_0000); // Int.MIN (sign-extended)
+            try self.em.cmpReg(T0, T1);
+            try self.em.jcc(.ge, done32);
+            try self.em.movReg(T0, T1);
+            try self.em.bind(done32);
+        }
+        try self.storeSlot(dst, T0);
+    }
     fn ucomiFloat(self: *Compiler, x: jit.Emitter.Xmm, y: jit.Emitter.Xmm, is32: bool) !void {
         if (is32) try self.em.ucomiss(x, y) else try self.em.ucomisd(x, y);
     }
@@ -889,13 +932,17 @@ const Compiler = struct {
                         try self.storeF32Slot(nc.dst, X0);
                     } else return jit.JitError.Unsupported;
                 },
-                // int width change: copy the (sign-extended) bits — i32→i64 is a
-                // no-op, i64→i32 truncates at rebox (Kotlin `Long.toInt` = low 32).
-                // float→int diverges from Kotlin on NaN/overflow, so bail.
                 .i64, .i32 => {
-                    if (!isNumeric(from)) return jit.JitError.Unsupported;
-                    try self.loadSlot(T0, nc.src);
-                    try self.storeSlot(nc.dst, T0);
+                    if (isFloat(from)) {
+                        // float -> int with Kotlin clamping (NaN→0, overflow→MIN/MAX).
+                        try self.emitFloatToInt(nc.src, nc.dst, from == .f32, nc.to == .i32);
+                    } else if (isNumeric(from)) {
+                        // int width change: copy the (sign-extended) bits — i32→i64
+                        // is a no-op, i64→i32 truncates at rebox (Kotlin `Long.toInt`
+                        // = low 32).
+                        try self.loadSlot(T0, nc.src);
+                        try self.storeSlot(nc.dst, T0);
+                    } else return jit.JitError.Unsupported;
                 },
                 else => return jit.JitError.Unsupported,
             }

@@ -605,196 +605,6 @@ pub const ArrayData = struct {
     }
 };
 
-/// Shared boxed-or-packed backing for a `List`/`MutableList`. Unlike `Array`
-/// (whose element kind is fixed at creation), a list is dynamically typed: it is
-/// created boxed, may be packed once it is provably a homogeneous primitive, and
-/// is materialized back to boxed in place by any operation without a packed fast
-/// path. Because the discriminant lives in this one cell — reached through a
-/// single `ListBacking` `ObjRef` shared by every copy of the list Value — a
-/// transition is visible to all holders (an inline union would diverge across
-/// copies). `boxed` owns one ref per element under a reclaiming backend; the
-/// packed buffer is a leaf.
-pub const ListBuf = union(enum) {
-    boxed: std.ArrayList(Value),
-    scalars: PrimBuf,
-
-    pub fn len(self: *const ListBuf) usize {
-        return switch (self.*) {
-            .boxed => |*b| b.items.len,
-            .scalars => |*p| p.len(),
-        };
-    }
-    pub fn get(self: *const ListBuf, i: usize) Value {
-        return switch (self.*) {
-            .boxed => |*b| b.items[i],
-            .scalars => |*p| p.get(i),
-        };
-    }
-    /// GC: a boxed list owns its elements; a packed buffer has no out-edges.
-    pub fn gcTrace(self: *const ListBuf, m: *objcell.gc.Marker) void {
-        switch (self.*) {
-            .boxed => |*b| for (b.items) |*e| e.gcMark(m),
-            .scalars => {},
-        }
-    }
-    pub fn gcFinalize(self: *ListBuf, a: std.mem.Allocator) void {
-        switch (self.*) {
-            .boxed => |*b| b.deinit(a),
-            .scalars => |*p| p.deinit(a),
-        }
-    }
-    pub fn gcExternalBytes(self: *const ListBuf) usize {
-        return switch (self.*) {
-            .boxed => |*b| b.capacity * @sizeOf(Value),
-            .scalars => |*p| p.bytes.capacity,
-        };
-    }
-    pub fn deinit(self: *ListBuf, a: std.mem.Allocator) void {
-        self.gcFinalize(a);
-    }
-};
-
-/// Shared `ObjRef` to a list's backing (see `ListBuf`).
-pub const ListBacking = ObjRef(ListBuf);
-
-/// `kotlin.collections.List` / `MutableList`. The element storage lives behind
-/// `buf` (a shared `ListBacking`); `mutable`, the `MutableMap.values` `backing`
-/// view, the enum-entries flag, and the declared element-type head are list
-/// metadata carried inline (cheap to copy, no transitions).
-pub const ListData = struct {
-    buf: ListBacking,
-    mutable: bool,
-    enum_entries: bool = false,
-    backing: ?*MapBackingCell = null,
-    declared_elem: ?[]const u8 = null,
-
-    /// Wrap an owned boxed `ArrayList` as a fresh list backing.
-    pub fn fromArrayList(a: std.mem.Allocator, list: std.ArrayList(Value), mutable: bool) std.mem.Allocator.Error!ListData {
-        return .{ .buf = try ListBacking.initOwned(a, .{ .boxed = list }), .mutable = mutable };
-    }
-
-    pub fn len(self: ListData) usize {
-        const g = self.buf.borrow();
-        defer g.deinit();
-        return g.get().len();
-    }
-    pub fn get(self: ListData, i: usize) Value {
-        const g = self.buf.borrow();
-        defer g.deinit();
-        return g.get().get(i);
-    }
-    pub fn isBoxed(self: ListData) bool {
-        const g = self.buf.borrow();
-        defer g.deinit();
-        return g.get().* == .boxed;
-    }
-    pub fn identity(self: ListData) usize {
-        return self.buf.identity();
-    }
-
-    /// A freshly allocated boxed copy of every element (caller owns the slice;
-    /// elements are NOT retained — matches `dupe` of the boxed items).
-    pub fn snapshot(self: ListData, a: std.mem.Allocator) std.mem.Allocator.Error![]Value {
-        const g = self.buf.borrow();
-        defer g.deinit();
-        switch (g.get().*) {
-            .boxed => |*b| return a.dupe(Value, b.items),
-            .scalars => |*p| {
-                const n = p.len();
-                const out = try a.alloc(Value, n);
-                var i: usize = 0;
-                while (i < n) : (i += 1) out[i] = p.get(i);
-                return out;
-            },
-        }
-    }
-
-    /// Write element `i` (in bounds). The boxed previous element is released and
-    /// the new one retained under a reclaiming backend; packed elements are
-    /// plain scalars (a non-matching kind is impossible — `set` never repacks).
-    pub fn setAt(self: ListData, a: std.mem.Allocator, i: usize, v: Value) void {
-        const g = self.buf.borrowMut();
-        defer g.deinit();
-        switch (g.get().*) {
-            .boxed => |*b| {
-                if (objcell.reclaimEnabled()) {
-                    b.items[i].release(a);
-                    v.retain();
-                }
-                b.items[i] = v;
-            },
-            .scalars => |*p| p.set(i, v),
-        }
-    }
-
-    /// Append `v`, retaining it under a reclaiming backend. A packed list takes
-    /// the scalar fast path while `v` matches its kind; otherwise it materializes
-    /// to boxed first. (Packing itself is decided elsewhere; this just preserves
-    /// an already-packed list when it can.)
-    pub fn appendVal(self: ListData, a: std.mem.Allocator, v: Value) std.mem.Allocator.Error!void {
-        {
-            const g = self.buf.borrowMut();
-            defer g.deinit();
-            switch (g.get().*) {
-                .boxed => |*b| {
-                    if (objcell.reclaimEnabled()) v.retain();
-                    try b.append(a, v);
-                    return;
-                },
-                .scalars => |*p| {
-                    if (primKindOf(v)) |k| if (k == p.kind) {
-                        try p.append(a, v);
-                        return;
-                    };
-                },
-            }
-        }
-        // Packed list, non-matching element: deopt to boxed, then append boxed.
-        try self.materialize(a);
-        const g = self.buf.borrowMut();
-        defer g.deinit();
-        if (objcell.reclaimEnabled()) v.retain();
-        try g.get().boxed.append(a, v);
-    }
-
-    /// Ensure the backing is boxed, converting a packed buffer in place (visible
-    /// to every holder through the shared cell). A no-op for an already-boxed
-    /// list. Used by every operation without a packed fast path.
-    pub fn materialize(self: ListData, a: std.mem.Allocator) std.mem.Allocator.Error!void {
-        const g = self.buf.borrowMut();
-        defer g.deinit();
-        if (g.get().* == .boxed) return;
-        const p = &g.get().scalars;
-        const n = p.len();
-        var list: std.ArrayList(Value) = .empty;
-        try list.ensureTotalCapacity(a, n);
-        var i: usize = 0;
-        while (i < n) : (i += 1) list.appendAssumeCapacity(p.get(i));
-        p.deinit(a);
-        g.get().* = .{ .boxed = list };
-    }
-};
-
-/// The packed-array element kind a scalar `Value` maps to, or null if the value
-/// is not a packable primitive (so a list holding it must stay boxed).
-pub fn primKindOf(v: Value) ?PrimitiveArrayKind {
-    return switch (v) {
-        .Int => .Int,
-        .Long => .Long,
-        .Double => .Double,
-        .Float => .Float,
-        .Short => .Short,
-        .Byte => .Byte,
-        .Bool => .Boolean,
-        .Char => .Char,
-        .UInt => .UInt,
-        .ULong => .ULong,
-        .UShort => .UShort,
-        .UByte => .UByte,
-        else => null,
-    };
-}
-
 /// Built-in property delegates (`lazy`, `Delegates.observable`,
 /// `Delegates.notNull`).
 pub const DelegateKind = union(enum) {
@@ -1152,12 +962,22 @@ pub const Value = union(enum) {
         cause: ?ValueBox,
     },
     /// `kotlin.collections.List` / `MutableList`.
-    /// `kotlin.collections.List` / `MutableList`. See `ListData`: `buf` is the
-    /// shared boxed/packed backing; `enum_entries` flags an `EnumName.entries`/
-    /// `.values()` list, `backing` a live `MutableMap.values` view, and
-    /// `declared_elem` the element-type head from an explicit creation-site type
-    /// argument (borrows interned consts).
-    List: ListData,
+    List: struct {
+        items: ValueList,
+        mutable: bool,
+        /// Set for `EnumName.entries` / `.values()` lists. Only ever queried as
+        /// a boolean ("is this the enum-entries list"), so a flag suffices — no
+        /// StringRef allocation, and it keeps the `List` payload small.
+        enum_entries: bool = false,
+        /// Set when this is a live `MutableMap.values` view.
+        backing: ?*MapBackingCell,
+        /// Declared element-type head from an explicit call-site type
+        /// argument on the creating stdlib function (`listOf<String>()`).
+        /// Head name only; borrows the module's interned consts, which
+        /// outlive every value. Dispatch reads it to type an empty list;
+        /// `null` everywhere the creation site carried no annotation.
+        declared_elem: ?[]const u8 = null,
+    },
     /// `kotlin.Array<T>` and primitive-array siblings.
     Array: ArrayData,
     /// `kotlin.collections.Set` / `MutableSet`.
@@ -1216,11 +1036,6 @@ pub const Value = union(enum) {
         items: ValueList,
         pos: ObjRef(usize),
         prim: ?PrimitiveArrayKind,
-        /// When set, this iterator was opened over a mutable, non-view `List`
-        /// and shares that list's live backing: `next`/`hasNext`/`remove` read
-        /// and mutate it directly so `MutableIterator.remove()` writes through to
-        /// the source (Kotlin semantics). `items` is unused in that case.
-        list_src: ?ListBacking = null,
     },
     /// Lazy O(1)-memory iterator over a `Range`/progression.
     RangeIter: struct {
@@ -1299,7 +1114,7 @@ pub const Value = union(enum) {
             .IrClosure => |c| visitor.visit(c.captures),
             .Comparator => |c| visitor.visit(c.steps),
             .List => |x| {
-                visitor.visit(x.buf);
+                visitor.visit(x.items);
                 if (x.backing) |b| visitor.visit(MapBackingRef{ .cell = b });
             },
             .Set => |x| {
@@ -1314,7 +1129,6 @@ pub const Value = union(enum) {
             .Iterator => |x| {
                 visitor.visit(x.items);
                 visitor.visit(x.pos);
-                if (x.list_src) |b| visitor.visit(b);
             },
             .RangeIter => |x| visitor.visit(x.cur),
             .PropertyRef => |p| visitor.visit(p.name),
@@ -1416,7 +1230,7 @@ pub const Value = union(enum) {
             .IrClosure => |c| releaseSliceElems(c.captures, allocator),
             .Comparator => |c| c.steps.deinit(),
             .List => |x| {
-                releaseListBacking(x.buf, allocator);
+                releaseValueList(x.items, allocator);
                 // Drop the view's owned `MapBacking` cell (the borrowed entries
                 // it points at are owned by the source map, not released here).
                 if (x.backing) |b| (MapBackingRef{ .cell = b }).deinit();
@@ -1444,7 +1258,6 @@ pub const Value = union(enum) {
             .Iterator => |x| {
                 releaseValueList(x.items, allocator);
                 x.pos.deinit();
-                if (x.list_src) |b| releaseListBacking(b, allocator);
             },
             .RangeIter => |x| x.cur.deinit(),
             .PropertyRef => |p| p.name.deinit(),
@@ -1485,21 +1298,6 @@ pub const Value = union(enum) {
             g.deinit();
         }
         items.deinit();
-    }
-
-    /// `releaseValueList` for a shared list backing: release each boxed element
-    /// on the last owner (a packed buffer has no element refs), then drop the
-    /// handle.
-    fn releaseListBacking(buf: ListBacking, allocator: std.mem.Allocator) void {
-        if (buf.strongCount() == 1) {
-            const g = buf.borrow();
-            switch (g.get().*) {
-                .boxed => |*b| for (b.items) |e| e.release(allocator),
-                .scalars => {},
-            }
-            g.deinit();
-        }
-        buf.deinit();
     }
 
     /// `releaseValueList` for an `ObjRef([]Value)` capture slice.
@@ -1906,7 +1704,7 @@ pub const Value = union(enum) {
             .ULong => |x| if (b.* == .ULong) return x == b.ULong,
             .UShort => |x| if (b.* == .UShort) return x == b.UShort,
             .UByte => |x| if (b.* == .UByte) return x == b.UByte,
-            .List => |x| if (b.* == .List) return listDataEq(x, b.List),
+            .List => |x| if (b.* == .List) return listEqBoxed(x.items, b.List.items),
             .Set => |x| if (b.* == .Set) return setEqBoxed(x.items, b.Set.items),
             .Map => |x| if (b.* == .Map) return mapEqBoxed(x.entries, b.Map.entries),
             .Pair => |x| if (b.* == .Pair)
@@ -1950,7 +1748,7 @@ pub const Value = union(enum) {
             .Range => |x| b.* == .Range and
                 x.start == b.Range.start and x.end == b.Range.end and
                 x.step == b.Range.step and x.kind == b.Range.kind,
-            .List => |x| b.* == .List and listDataEq(x, b.List),
+            .List => |x| b.* == .List and listEqBoxed(x.items, b.List.items),
             .Set => |x| b.* == .Set and setEqBoxed(x.items, b.Set.items),
             .Map => |x| b.* == .Map and mapEqBoxed(x.entries, b.Map.entries),
             .Pair => |x| b.* == .Pair and
@@ -1975,7 +1773,7 @@ pub const Value = union(enum) {
         switch (a.*) {
             .Instance => |x| return b.* == .Instance and ObjRef(InstanceData).ptrEq(x, b.Instance),
             .Cell => |x| if (b.* == .Cell) return ObjRef(Value).ptrEq(x, b.Cell),
-            .List => |x| if (b.* == .List) return x.identity() == b.List.identity(),
+            .List => |x| if (b.* == .List) return ValueList.ptrEq(x.items, b.List.items),
             .Set => |x| if (b.* == .Set) return ValueList.ptrEq(x.items, b.Set.items),
             .Map => |x| if (b.* == .Map) return MapEntries.ptrEq(x.entries, b.Map.entries),
             .Array => |x| if (b.* == .Array) return x.identity() == b.Array.identity(),
@@ -1994,7 +1792,7 @@ pub const Value = union(enum) {
     pub fn lockIdentity(self: Value) ?usize {
         return switch (self) {
             .Instance => |i| i.identity(),
-            .List => |l| l.identity(),
+            .List => |l| l.items.identity(),
             .Array => |a| a.identity(),
             .Set => |s| s.items.identity(),
             .Map => |m| m.entries.identity(),
@@ -2064,7 +1862,7 @@ pub const Value = union(enum) {
                     try writer.writeAll(fg.get().*);
                 }
             },
-            .List => |coll| try writeListData(writer, coll),
+            .List => |coll| try writeElements(writer, coll.items),
             .Set => |coll| try writeElements(writer, coll.items),
             .Array => |a| {
                 const tag = if (a.prim) |k| k.typeFqn() else "kotlin.Array";
@@ -2193,18 +1991,6 @@ fn writeElements(writer: *std.Io.Writer, items: ValueList) std.Io.Writer.Error!v
     try writer.writeByte('[');
     for (g.get().items, 0..) |v, i| {
         if (i > 0) try writer.writeAll(", ");
-        try v.writeTo(writer);
-    }
-    try writer.writeByte(']');
-}
-
-fn writeListData(writer: *std.Io.Writer, list: ListData) std.Io.Writer.Error!void {
-    try writer.writeByte('[');
-    const n = list.len();
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        if (i > 0) try writer.writeAll(", ");
-        const v = list.get(i);
         try v.writeTo(writer);
     }
     try writer.writeByte(']');
@@ -2339,20 +2125,6 @@ fn listEqBoxed(a: ValueList, b: ValueList) bool {
     if (xs.len != ys.len) return false;
     for (xs, ys) |*x, *y| {
         if (!Value.structuralEqBoxed(x, y)) return false;
-    }
-    return true;
-}
-
-/// Structural element-wise equality of two lists, packed-aware (elements
-/// compared as boxed scalars).
-fn listDataEq(a: ListData, b: ListData) bool {
-    const n = a.len();
-    if (n != b.len()) return false;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        var x = a.get(i);
-        var y = b.get(i);
-        if (!Value.structuralEqBoxed(&x, &y)) return false;
     }
     return true;
 }
