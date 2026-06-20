@@ -239,3 +239,43 @@ Honest bottom line: node/v8 parity for general code is a JIT problem — no
 interpreter (CPython included, itself ~15× node here) reaches it. Levers 1–2 are
 worth landing for the broad constant-factor + memory wins; lever 3 is the parity
 endgame and is multi-step.
+
+## Stage-3 JIT — DONE (hot loops compile to native; KLIO_JIT)
+
+`src/ir/jit_loop.zig` (+ encoder in `src/jit/jit.zig`), wired into `runFrameInner`
+behind `KLIO_JIT` (off by default). A hot natural loop (header entered ≥64×)
+compiles to x86-64 and runs natively, eliminating Value boxing, member dispatch,
+and per-instruction interpreter overhead.
+
+- **Register model**: each IR register is an i64 slot in a scratch file; emitted
+  code uses rax/rcx/rdx scratch per op (no register allocator). The win is from
+  killing boxing/dispatch, not from allocation.
+- **Supported**: `Const`/`Move`/`BinOp` (Int/Long +,−,*, comparisons; Int results
+  `movsxd`-normalized for 32-bit wraparound), packed-array subscripts (get/set on
+  the F5 scalar buffer, SIB load/store + bounds check), `Goto`/`Branch`, `Trace`.
+  Subscripts match both the `CallMember "get"/"set"` lowering (how `a[i]` actually
+  lowers) and `Index`/`IndexSet`.
+- **Types**: whole-function static inference (i32/i64/bool/unit/null); arrays
+  specialized on the kind observed at first compile. A runtime entry guard bails
+  to the interpreter if a live-in register type / array kind mismatches, so
+  correctness never depends on the inference.
+- **Loop finding**: natural loop of true back-edges only — the header must
+  **dominate** the source (computed as "unreachable from entry while avoiding the
+  header"). Without this, an inner loop was widened to include its enclosing
+  loop's pre-header, and OSR-entering mid-iteration re-ran the outer prefix
+  (the +63 bug). Fixed.
+- **Deopt**: an out-of-bounds index returns `(block,inst)` and the interpreter
+  resumes at the faulting instruction, throwing identically. Loop blocks in a
+  try-region are rejected (deopt resumes mid-block).
+- **Results** (`KLIO_JIT=1`, min): 100M-iter Long arithmetic 12.4 s → 0.21 s
+  (60×); 1e9 IntArray increment 104 s → 1.3 s (79×); numeric sieve bench 6.6 s →
+  4.3 s (the inner marking loop JITs; the prime-scan's `!a[i]`/Cell vars and the
+  reduction's `toLong()` member call still interpret). On the JIT-amenable
+  arithmetic/array loops klio is now within a small factor of node.
+- **Validated**: full `zig build test` green with the JIT OFF and ON (differential
+  parity vs kotlinc); 88 examples + 728 corpus fixtures produce identical output
+  with the JIT on vs off.
+- **Next coverage** (not blocking): `Not` and `UnOp` (Inc/Dec) for the sieve scan
+  loop; `Div`/`Mod` with a divide-by-zero deopt; float arrays; calls via a
+  trampoline. Each widens the compiled set; the harness (guard + deopt + bail) is
+  in place.
