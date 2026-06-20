@@ -106,7 +106,7 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
     while (j < args.items.len) : (j += 1) {
         try rest.append(allocator, args.items[j]);
     }
-    try out.append(allocator, .{ .Array = .{ .items = try ValueList.init(allocator, rest), .prim = null } });
+    try out.append(allocator, runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, rest)));
     args.deinit(allocator);
     return out;
 }
@@ -964,10 +964,10 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                 if (hit_vararg) {
                     var acc: std.ArrayList(Value) = .empty;
                     try acc.appendSlice(allocator, vararg_acc.items);
-                    slots[vp] = .{ .Array = .{ .items = try ValueList.init(allocator, acc), .prim = null } };
+                    slots[vp] = runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, acc));
                 } else if (slots[vp] == null) {
                     const empty_acc: std.ArrayList(Value) = .empty;
-                    slots[vp] = .{ .Array = .{ .items = try ValueList.init(allocator, empty_acc), .prim = null } };
+                    slots[vp] = runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, empty_acc));
                 }
             }
 

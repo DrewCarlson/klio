@@ -228,10 +228,9 @@ pub fn string_to_byte_array(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     var items = try ctx.allocator.alloc(Value, s.len);
+    defer ctx.allocator.free(items);
     for (s, 0..) |b, i| items[i] = .{ .Byte = @bitCast(b) };
-    const list = std.ArrayList(Value).fromOwnedSlice(items);
-    const items_ref = try ValueList.init(ctx.allocator, list);
-    return .{ .ok = .{ .Array = .{ .items = items_ref, .prim = .Byte } } };
+    return .{ .ok = try runtime.ArrayData.initPacked(ctx.allocator, .Byte, items) };
 }
 
 /// `ByteArray.decodeToString(startIndex = 0, endIndex = size,
@@ -242,10 +241,8 @@ pub fn byte_array_decode_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .Array) {
         return errType("decodeToString requires a ByteArray receiver");
     }
-    const items_ref = ctx.args[0].Array.items;
-    const g = items_ref.borrow();
-    defer g.deinit();
-    const elems = g.get().items;
+    const elems = try ctx.args[0].Array.snapshot(ctx.allocator);
+    defer if (runtime.freeScratch()) ctx.allocator.free(elems);
     var bytes = try ctx.allocator.alloc(u8, elems.len);
     defer ctx.allocator.free(bytes);
     for (elems, 0..) |v, i| {
@@ -1131,13 +1128,19 @@ fn stringSplitItems(ctx: *CallCtx, who: []const u8) Allocator.Error!union(enum) 
                 if (try delimToString(ctx.allocator, a)) |d| try delims.append(ctx.allocator, d);
             },
             .Bool => |b| ignore_case = b,
-            .Array, .List => {
-                const items_ref = switch (a) {
-                    .Array => |arr| arr.items,
-                    .List => |l| l.items,
-                    else => unreachable,
-                };
-                const g = items_ref.borrow();
+            .Array => |arr| {
+                const sn = try arr.snapshot(ctx.allocator);
+                defer if (runtime.freeScratch()) ctx.allocator.free(sn);
+                for (sn) |it| {
+                    if (try delimToString(ctx.allocator, it)) |d| {
+                        try delims.append(ctx.allocator, d);
+                    } else {
+                        return .{ .err = .{ .Type = "String.split delimiters must be String or Char" } };
+                    }
+                }
+            },
+            .List => |l| {
+                const g = l.items.borrow();
                 defer g.deinit();
                 for (g.get().items) |it| {
                     if (try delimToString(ctx.allocator, it)) |d| {
@@ -1673,12 +1676,10 @@ pub fn string_to_char_array(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     var items: std.ArrayList(Value) = .empty;
-    errdefer items.deinit(ctx.allocator);
+    defer items.deinit(ctx.allocator);
     var it = Utf16View{ .bytes = s };
     while (it.next()) |u| try items.append(ctx.allocator, .{ .Char = u });
-    const list = std.ArrayList(Value).fromOwnedSlice(try items.toOwnedSlice(ctx.allocator));
-    const items_ref = try ValueList.init(ctx.allocator, list);
-    return .{ .ok = .{ .Array = .{ .items = items_ref, .prim = .Char } } };
+    return .{ .ok = try runtime.ArrayData.initPacked(ctx.allocator, .Char, items.items) };
 }
 
 pub fn string_to_long(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -2909,9 +2910,7 @@ test "toCharArray and toList" {
         var ctx = ctxFor(a, &.{try strVal(a, "ab")});
         const r = try string_to_char_array(&ctx);
         try testing.expect(r.ok == .Array and r.ok.Array.prim.? == .Char);
-        const g = r.ok.Array.items.borrow();
-        defer g.deinit();
-        try testing.expectEqual(@as(usize, 2), g.get().items.len);
+        try testing.expectEqual(@as(usize, 2), r.ok.Array.len());
     }
     {
         var ctx = ctxFor(a, &.{try strVal(a, "ab")});

@@ -222,7 +222,7 @@ pub fn seq_scope_yield_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     switch (arg) {
         .List => |l| elems = try cloneItems(ctx.allocator, l.items),
         .Set => |s| elems = try cloneItems(ctx.allocator, s.items),
-        .Array => |a| elems = try cloneItems(ctx.allocator, a.items),
+        .Array => |a| elems = try a.snapshot(ctx.allocator),
         .Iterator => |it| elems = try cloneItems(ctx.allocator, it.items),
         .Sequence => {
             const m = try materialiseSequence(ctx.allocator, ctx.host, ctx.out, &arg);

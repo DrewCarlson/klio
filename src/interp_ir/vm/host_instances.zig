@@ -345,10 +345,7 @@ fn packPrimaryCtorVarargs(self: *VmHost, class_fqn: ?[]const u8, class_name: []c
     while (j < args.len) : (j += 1) {
         try rest.append(self.allocator, args[j]);
     }
-    try out.append(self.allocator, .{ .Array = .{
-        .items = try ObjRef(std.ArrayList(Value)).init(self.allocator, rest),
-        .prim = null,
-    } });
+    try out.append(self.allocator, runtime.ArrayData.fromBoxedList(try ObjRef(std.ArrayList(Value)).init(self.allocator, rest)));
     self.allocator.free(args);
     return out.toOwnedSlice(self.allocator);
 }

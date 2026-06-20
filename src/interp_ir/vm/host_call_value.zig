@@ -420,7 +420,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 const fixed = info.n_params -| 1;
                 try packed_args.appendSlice(allocator, args[fixed..]);
                 const items = try ValueList.init(allocator, packed_args);
-                call_args.items[info.n_params - 1] = .{ .Array = .{ .items = items, .prim = null } };
+                call_args.items[info.n_params - 1] = runtime.ArrayData.fromBoxedList(items);
             } else if (last.is_vararg and !(call_args.items.len != 0 and call_args.items[call_args.items.len - 1] == .Array)) {
                 const fixed = info.n_params -| 1;
                 var packed_args: std.ArrayList(Value) = .empty;
@@ -428,7 +428,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     try packed_args.appendSlice(allocator, args[fixed..]);
                 }
                 const items = try ValueList.init(allocator, packed_args);
-                call_args.items[info.n_params - 1] = .{ .Array = .{ .items = items, .prim = null } };
+                call_args.items[info.n_params - 1] = runtime.ArrayData.fromBoxedList(items);
             }
         }
         var capture_values: std.ArrayList(Value) = .empty;

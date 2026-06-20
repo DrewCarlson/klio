@@ -373,7 +373,7 @@ fn packVarargArgs(self: *VmHost, allocator: Allocator, func: *const Func, args: 
     var rest_list: std.ArrayList(Value) = .empty;
     try rest_list.appendSlice(allocator, rest[0..rest_len]);
     allocator.free(rest);
-    out[fixed] = .{ .Array = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, rest_list), .prim = null } };
+    out[fixed] = runtime.ArrayData.fromBoxedList(try ObjRef(std.ArrayList(Value)).init(allocator, rest_list));
     allocator.free(args);
     return out[0 .. fixed + 1];
 }
@@ -524,10 +524,13 @@ fn kotlinHashCode(v: *const Value) i32 {
             break :blk h;
         },
         .Array => |arr| blk: {
-            const g = arr.items.borrow();
-            defer g.deinit();
             var h: i32 = 1;
-            for (g.get().items) |e| h = h *% 31 +% kotlinHashCode(&e);
+            const n = arr.len();
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                var e = arr.get(i);
+                h = h *% 31 +% kotlinHashCode(&e);
+            }
             break :blk h;
         },
         .Range => |r| blk: {
@@ -1094,7 +1097,7 @@ fn elementsProveArgs(self: *VmHost, allocator: Allocator, receiver: *const Value
     const items: ?runtime.ValueList = switch (receiver.*) {
         .List => |l| if (isListHead(pn)) l.items else null,
         .Set => |st| if (isSetHead(pn)) st.items else null,
-        .Array => |arr| if (std.mem.eql(u8, pn, "Array")) arr.items else null,
+        .Array => |arr| if (std.mem.eql(u8, pn, "Array")) arr.boxedList() else null,
         else => null,
     };
     const list = items orelse return false;
@@ -2064,6 +2067,17 @@ fn cloneItemsList(allocator: Allocator, src: runtime.ValueList) Allocator.Error!
     return out;
 }
 
+/// `cloneItemsList` for an `Array` receiver (boxed or packed): an owned,
+/// element-retained `ArrayList` copy for a new wrapper (iterator, list, …).
+fn cloneArrayItems(allocator: Allocator, arr: runtime.ArrayData) Allocator.Error!std.ArrayList(Value) {
+    const snap = try arr.snapshot(allocator);
+    defer if (runtime.freeScratch()) allocator.free(snap);
+    var out: std.ArrayList(Value) = .empty;
+    try out.appendSlice(allocator, snap);
+    if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
+    return out;
+}
+
 /// Prepend `receiver` to `args`, returning a freshly-allocated slice.
 fn prependReceiver(allocator: Allocator, receiver: *const Value, args: []const Value) Allocator.Error![]Value {
     var all = try allocator.alloc(Value, args.len + 1);
@@ -2461,7 +2475,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Array shape ops.
     if (receiver.* == .List and std.mem.eql(u8, name, "toTypedArray") and args.len == 0) {
         const items = try cloneItemsList(allocator, receiver.List.items);
-        return .{ .ok = .{ .Array = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = null } } };
+        return .{ .ok = runtime.ArrayData.fromBoxedList(try ObjRef(std.ArrayList(Value)).init(allocator, items)) };
     }
     if (receiver.* == .Array) {
         if (try arrayShapeOps(self, allocator, receiver, name, args)) |r| return r;
@@ -2470,37 +2484,30 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Indexed get/set on Array.
     if (std.mem.eql(u8, name, "get") and args.len == 1 and receiver.* == .Array) {
         if (args[0].asI64()) |idx| {
-            const g = receiver.Array.items.borrow();
-            defer g.deinit();
-            const items = g.get().items;
-            if (idx >= 0 and @as(usize, @intCast(idx)) < items.len) {
-                const elem = items[@intCast(idx)];
+            const arr = receiver.Array;
+            const n = arr.len();
+            if (idx >= 0 and @as(usize, @intCast(idx)) < n) {
+                const elem = arr.get(@intCast(idx));
                 // Borrowed element: the array still owns it, so retain before
-                // handing it to the register that will own the result.
+                // handing it to the register that will own the result (packed
+                // scalars are fresh, so the retain is a no-op).
                 elem.retain();
                 return .{ .ok = elem };
             }
-            const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, items.len });
+            const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, n });
             defer if (runtime.freeScratch()) allocator.free(msg);
             return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
         }
     }
     if (std.mem.eql(u8, name, "set") and args.len == 2 and receiver.* == .Array) {
         if (args[0].asI64()) |idx| {
-            const g = receiver.Array.items.borrowMut();
-            defer g.deinit();
-            const items = g.get().items;
-            if (idx >= 0 and @as(usize, @intCast(idx)) < items.len) {
-                // The array owns one ref per element: release the value being
-                // overwritten and retain the incoming borrow. No-op under arena.
-                if (runtime.reclaimEnabled()) {
-                    items[@intCast(idx)].release(allocator);
-                    args[1].retain();
-                }
-                items[@intCast(idx)] = args[1];
+            const arr = receiver.Array;
+            const n = arr.len();
+            if (idx >= 0 and @as(usize, @intCast(idx)) < n) {
+                arr.set(allocator, @intCast(idx), args[1]);
                 return .{ .ok = .Unit };
             }
-            const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, items.len });
+            const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, n });
             defer if (runtime.freeScratch()) allocator.free(msg);
             return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
         }
@@ -3034,7 +3041,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind } } };
         },
         .Array => |arr| {
-            const items = try cloneItemsList(allocator, arr.items);
+            const items = try cloneArrayItems(allocator, arr);
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = arr.prim } } };
         },
         .String => |s| {
@@ -3690,29 +3697,28 @@ fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     _ = self;
     const arr = receiver.Array;
     if (std.mem.eql(u8, name, "toList") and args.len == 0) {
-        const items = try cloneItemsList(allocator, arr.items);
+        const items = try cloneArrayItems(allocator, arr);
         return .{ .ok = try listOf(allocator, items, false) };
     }
     if (std.mem.eql(u8, name, "toMutableList") and args.len == 0) {
-        const items = try cloneItemsList(allocator, arr.items);
+        const items = try cloneArrayItems(allocator, arr);
         return .{ .ok = try listOf(allocator, items, true) };
     }
     if (std.mem.eql(u8, name, "asList") and args.len == 0) {
-        const items = try cloneItemsList(allocator, arr.items);
+        const items = try cloneArrayItems(allocator, arr);
         return .{ .ok = try listOf(allocator, items, false) };
     }
     if (std.mem.eql(u8, name, "toTypedArray") and args.len == 0) {
-        const items = try cloneItemsList(allocator, arr.items);
-        return .{ .ok = .{ .Array = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = null } } };
+        const items = try cloneArrayItems(allocator, arr);
+        return .{ .ok = runtime.ArrayData.fromBoxedList(try ObjRef(std.ArrayList(Value)).init(allocator, items)) };
     }
     if (std.mem.eql(u8, name, "toSet") and args.len == 0) {
-        const items = try cloneItemsList(allocator, arr.items);
+        const items = try cloneArrayItems(allocator, arr);
         return .{ .ok = .{ .Set = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .mutable = false, .backing = null } } };
     }
     if (std.mem.eql(u8, name, "concatToString") and (args.len == 0 or args.len == 2)) {
-        const g = arr.items.borrow();
-        defer g.deinit();
-        const chars = g.get().items;
+        const chars = try arr.snapshot(allocator);
+        defer if (runtime.freeScratch()) allocator.free(chars);
         var start: usize = 0;
         var end: usize = chars.len;
         if (args.len == 2) {

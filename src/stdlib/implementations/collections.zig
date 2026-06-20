@@ -148,6 +148,13 @@ fn appendVL(dst: *std.ArrayList(Value), a: Allocator, vl: ValueList) Error!void 
     try dst.appendSlice(a, g.get().items);
 }
 
+/// `appendVL` for an `Array` receiver (boxed or packed).
+fn appendArrItems(dst: *std.ArrayList(Value), a: Allocator, arr: runtime.ArrayData) Error!void {
+    const snap = try arr.snapshot(a);
+    defer if (runtime.freeScratch()) a.free(snap);
+    try dst.appendSlice(a, snap);
+}
+
 /// `make_set(items, mutable)` — dedupe by boxed structural equality.
 fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var deduped: std.ArrayList(Value) = .empty;
@@ -166,15 +173,24 @@ fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
 }
 
 fn makeArray(a: Allocator, items: []const Value, prim: ?PrimitiveArrayKind) Error!Value {
+    if (prim) |k| return runtime.ArrayData.initPacked(a, k, items);
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(a, items);
     // Borrowed input slice; the array owns one ref per element.
     if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
-    return .{ .Array = .{ .items = try ValueList.init(a, list), .prim = prim } };
+    return runtime.ArrayData.fromBoxedList(try ValueList.init(a, list));
 }
 
-fn makeArrayFromArrayList(a: Allocator, list: std.ArrayList(Value), prim: ?PrimitiveArrayKind) Error!Value {
-    return .{ .Array = .{ .items = try ValueList.init(a, list), .prim = prim } };
+fn makeArrayFromArrayList(a: Allocator, list_in: std.ArrayList(Value), prim: ?PrimitiveArrayKind) Error!Value {
+    if (prim) |k| {
+        var list = list_in;
+        const v = try runtime.ArrayData.initPacked(a, k, list.items);
+        // Packed copy owns the scalars now; drop the boxed input buffer.
+        if (runtime.reclaimEnabled()) for (list.items) |e| e.release(a);
+        list.deinit(a);
+        return v;
+    }
+    return runtime.ArrayData.fromBoxedList(try ValueList.init(a, list_in));
 }
 
 /// `makeArrayFromArrayList` for a backing whose elements are *borrowed* (see
@@ -560,12 +576,12 @@ fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcome {
     switch (v) {
         .List, .Set, .Array => {
             const items = switch (v) {
-                .List => |l| l.items,
-                .Set => |s| s.items,
-                .Array => |arr| arr.items,
+                .List => |l| try snapshotItems(a, l.items),
+                .Set => |s| try snapshotItems(a, s.items),
+                .Array => |arr| try arr.snapshot(a),
                 else => unreachable,
             };
-            return .{ .items = try snapshotItems(a, items) };
+            return .{ .items = items };
         },
         .Map => |m| {
             const g = m.entries.borrow();
@@ -1372,7 +1388,7 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
 
 fn arrayLen(recv: Value) ?usize {
     return switch (recv) {
-        .Array => |arr| listLen(arr.items),
+        .Array => |arr| arr.len(),
         .List => |l| listLen(l.items),
         else => null,
     };
@@ -1407,11 +1423,38 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
         .n => |v| v,
         .err => |e| return e,
     };
+
+    // Primitive arrays store packed scalars directly — never materialize a boxed
+    // `Value` list (a 10M `IntArray` would otherwise transiently allocate ~560MB
+    // of 56-byte Values just to convert them away). The zeroed byte buffer is
+    // already the Kotlin default for every primitive (0, false, 0.0, NUL char).
+    if (prim) |k| {
+        const un: usize = @intCast(n);
+        var pb = runtime.PrimBuf{ .kind = k };
+        errdefer pb.bytes.deinit(a);
+        try pb.bytes.appendNTimes(a, 0, un * k.elemSize());
+        if (ctx.args.len == 2) {
+            const block = ctx.args[1];
+            var i: usize = 0;
+            while (i < un) : (i += 1) {
+                const v = switch (try invoke(ctx, &block, &.{Value.newInt(@intCast(i))})) {
+                    .value => |x| x,
+                    .err => |e| return e,
+                };
+                pb.set(i, v);
+            }
+        }
+        return ok(.{ .Array = .{
+            .storage = .{ .scalars = try ObjRef(runtime.PrimBuf).initOwned(a, pb) },
+            .prim = k,
+        } });
+    }
+
     if (ctx.args.len == 1) {
         var list: std.ArrayList(Value) = .empty;
         var i: i64 = 0;
         while (i < n) : (i += 1) try list.append(a, default);
-        return ok(try makeArrayFromArrayList(a, list, prim));
+        return ok(try makeArrayFromArrayList(a, list, null));
     }
     const block = ctx.args[1];
     var list: std.ArrayList(Value) = .empty;
@@ -1431,7 +1474,7 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
         };
         try list.append(a, v);
     }
-    return ok(try makeArrayFromArrayList(a, list, prim));
+    return ok(try makeArrayFromArrayList(a, list, null));
 }
 
 pub fn array_ctor_generic(ctx: *CallCtx) Error!EvalResult {
@@ -1571,7 +1614,7 @@ pub fn coll_mutable_list_of(ctx: *CallCtx) Error!EvalResult {
 fn arrayRecvItems(a: Allocator, ctx: *CallCtx, who: []const u8) Error!ItemsOutcome {
     if (ctx.args.len > 0) {
         switch (ctx.args[0]) {
-            .Array => |arr| return .{ .items = try snapshotItems(a, arr.items) },
+            .Array => |arr| return .{ .items = try arr.snapshot(a) },
             .List => |l| return .{ .items = try snapshotItems(a, l.items) },
             .Set => |s| return .{ .items = try snapshotItems(a, s.items) },
             else => {},
@@ -1972,18 +2015,22 @@ fn listLastImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
     // Fast path: no predicate on a List/Array — index the last element directly
     // instead of snapshotting the whole collection (which made `last()` O(n)).
     if (ctx.args.len < 2) {
-        const items_ref: ?ValueList = switch (ctx.args[0]) {
-            .List => |l| l.items,
-            .Array => |ar| ar.items,
-            else => null,
-        };
-        if (items_ref) |ir| {
-            const g = ir.borrow();
-            defer g.deinit();
-            const items = g.get().items;
-            if (items.len > 0) return okElem(items[items.len - 1]);
-            if (or_null) return ok(Value.Null);
-            return try thrown(a, "kotlin.NoSuchElementException", "Collection is empty.");
+        switch (ctx.args[0]) {
+            .List => |l| {
+                const g = l.items.borrow();
+                defer g.deinit();
+                const items = g.get().items;
+                if (items.len > 0) return okElem(items[items.len - 1]);
+                if (or_null) return ok(Value.Null);
+                return try thrown(a, "kotlin.NoSuchElementException", "Collection is empty.");
+            },
+            .Array => |ar| {
+                const n = ar.len();
+                if (n > 0) return okElem(ar.get(n - 1));
+                if (or_null) return ok(Value.Null);
+                return try thrown(a, "kotlin.NoSuchElementException", "Collection is empty.");
+            },
+            else => {},
         }
     }
     const items = switch (try iterableItems(a, ctx.args[0], "last")) {
@@ -3115,7 +3162,7 @@ fn pairsFromValues(a: Allocator, items: []const Value, who: []const u8) Error!un
 pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const items = if (ctx.args.len > 0 and ctx.args[0] == .Array)
-        try snapshotItems(a, ctx.args[0].Array.items)
+        try ctx.args[0].Array.snapshot(a)
     else switch (try recvListItems(a, ctx.args, "toMap")) {
         .items => |x| try snapshotItems(a, x),
         .err => |e| return e,
@@ -3403,7 +3450,7 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
     switch (rhs_val) {
         .List => |l| try appendVL(&rhs, a, l.items),
         .Set => |s| try appendVL(&rhs, a, s.items),
-        .Array => |arr| try appendVL(&rhs, a, arr.items),
+        .Array => |arr| try appendArrItems(&rhs, a, arr),
         .Range => |r| {
             var rit = RangeIter.init(r.start, r.end, r.step);
             while (rit.next()) |n| try rhs.append(a, Value.newInt(n));
@@ -3662,7 +3709,7 @@ fn collectColl(a: Allocator, v: ?Value) Error!?[]Value {
         switch (val) {
             .List => |l| return try snapshotItems(a, l.items),
             .Set => |s| return try snapshotItems(a, s.items),
-            .Array => |arr| return try snapshotItems(a, arr.items),
+            .Array => |arr| return try arr.snapshot(a),
             else => {},
         }
     }
@@ -3676,7 +3723,7 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
         switch (arg) {
             .List => |l| break :blk try snapshotItems(a, l.items),
             .Set => |s| break :blk try snapshotItems(a, s.items),
-            .Array => |arr| if (allow_array) break :blk try snapshotItems(a, arr.items) else return typeErr(try fmt(a, "{s} requires a collection", .{what})),
+            .Array => |arr| if (allow_array) break :blk try arr.snapshot(a) else return typeErr(try fmt(a, "{s} requires a collection", .{what})),
             else => return typeErr(try fmt(a, "{s} requires a collection", .{what})),
         }
     };
@@ -4451,7 +4498,7 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
         .List => |l| to_add = try snapshotItems(a, l.items),
         .Set => |s| to_add = try snapshotItems(a, s.items),
         // `MutableCollection<in T>.addAll(elements: Array<out T>)`.
-        .Array => |arr| to_add = try snapshotItems(a, arr.items),
+        .Array => |arr| to_add = try arr.snapshot(a),
         else => {
             const ad = try display(a, arg);
             return typeErr(try fmt(a, "addAll requires a collection, got {s}", .{ad}));
@@ -4738,7 +4785,7 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
     var to_add: []MapPair = undefined;
     switch (arg) {
         .Map => |m| to_add = try snapshotEntries(a, m.entries),
-        .Array => |arr| to_add = (switch (try pairsFromValues(a, try snapshotItems(a, arr.items), "putAll")) {
+        .Array => |arr| to_add = (switch (try pairsFromValues(a, try arr.snapshot(a), "putAll")) {
             .entries => |x| x,
             .err => |e| return e,
         }).items,
@@ -4846,15 +4893,14 @@ pub fn array_slice_impl(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return typeErr("sliceArray requires a receiver");
     const recv = ctx.args[0];
     if (recv != .Array) return typeErr("sliceArray requires an array receiver");
-    const items = recv.Array.items;
-    const prim = recv.Array.prim;
+    const arr = recv.Array;
+    const prim = arr.prim;
     if (ctx.args.len < 2) return arityErr("sliceArray expects (receiver, range)");
     if (ctx.args[1] != .Range) return typeErr("sliceArray expects an IntRange argument");
     const start: usize = @intCast(@max(ctx.args[1].Range.start, 0));
     const end_excl: usize = @intCast(@max(ctx.args[1].Range.end + 1, 0));
-    const g = items.borrow();
-    defer g.deinit();
-    const src = g.get().items;
+    const src = try arr.snapshot(a);
+    defer if (runtime.freeScratch()) a.free(src);
     const lo = @min(start, src.len);
     const hi = @min(end_excl, src.len);
     const slice: []const Value = if (lo <= hi) src[lo..hi] else &.{};
@@ -4996,11 +5042,11 @@ fn deepToString(a: Allocator, v: Value) Error![]u8 {
         .Array => |arr| {
             var out: std.ArrayList(u8) = .empty;
             try out.append(a, '[');
-            const g = arr.items.borrow();
-            defer g.deinit();
-            for (g.get().items, 0..) |e, i| {
+            const n = arr.len();
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
                 if (i > 0) try out.appendSlice(a, ", ");
-                try out.appendSlice(a, try deepToString(a, e));
+                try out.appendSlice(a, try deepToString(a, arr.get(i)));
             }
             try out.append(a, ']');
             return out.toOwnedSlice(a);
@@ -5023,15 +5069,13 @@ pub fn array_content_deep_to_string(ctx: *CallCtx) Error!EvalResult {
 
 fn deepEq(x: Value, y: Value) bool {
     if (x == .Array and y == .Array) {
-        const gx = x.Array.items.borrow();
-        defer gx.deinit();
-        const gy = y.Array.items.borrow();
-        defer gy.deinit();
-        const xs = gx.get().items;
-        const ys = gy.get().items;
-        if (xs.len != ys.len) return false;
-        for (xs, ys) |a, b| {
-            if (!deepEq(a, b)) return false;
+        const xa = x.Array;
+        const ya = y.Array;
+        const n = xa.len();
+        if (n != ya.len()) return false;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (!deepEq(xa.get(i), ya.get(i))) return false;
         }
         return true;
     }
@@ -5050,10 +5094,10 @@ fn deepHashElement(v: Value) i32 {
     switch (v) {
         .Array => |arr| {
             var result: i32 = 1;
-            const g = arr.items.borrow();
-            defer g.deinit();
-            for (g.get().items) |e| {
-                result = result *% 31 +% deepHashElement(e);
+            const n = arr.len();
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                result = result *% 31 +% deepHashElement(arr.get(i));
             }
             return result;
         },
@@ -5135,12 +5179,12 @@ pub fn array_plus_element(ctx: *CallCtx) Error!EvalResult {
 pub fn array_copy_into(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("copyInto requires an array receiver");
-    const src = ctx.args[0].Array.items;
+    const src_arr = ctx.args[0].Array;
     if (ctx.args.len < 2) return arityErr("copyInto expects (destination, ...)");
     const dest_val = ctx.args[1];
     if (dest_val != .Array) return typeErr("copyInto destination must be an array");
-    const dest = dest_val.Array.items;
-    const src_len: i64 = @intCast(listLen(src));
+    const dest_arr = dest_val.Array;
+    const src_len: i64 = @intCast(src_arr.len());
     const dest_offset = switch (try arrayOptIndex(a, ctx, 2, 0, "copyInto")) {
         .idx => |v| v,
         .err => |e| return e,
@@ -5157,40 +5201,26 @@ pub fn array_copy_into(ctx: *CallCtx) Error!EvalResult {
         return indexOob(a, try fmt(a, "copyInto: source range [{d}, {d}) out of bounds for length {d}", .{ start, end, src_len }));
     }
     const count = end - start;
-    const dest_len: i64 = @intCast(listLen(dest));
+    const dest_len: i64 = @intCast(dest_arr.len());
     if (dest_offset < 0 or dest_offset + count > dest_len) {
         return indexOob(a, try fmt(a, "copyInto: destination range [{d}, {d}) out of bounds for length {d}", .{ dest_offset, dest_offset + count, dest_len }));
     }
-    const slice = blk: {
-        const g = src.borrow();
-        defer g.deinit();
-        break :blk try a.dupe(Value, g.get().items[@intCast(start)..@intCast(end)]);
-    };
-    // The dupe bridges src->dest under separate borrows; free the spine on exit.
-    defer if (runtime.freeScratch()) a.free(slice);
-    {
-        const g = dest.borrowMut();
-        defer g.deinit();
-        const base: usize = @intCast(dest_offset);
-        // Overwriting a slot: the destination array owns one ref per element, so
-        // release the displaced value and retain the incoming (borrowed) one.
-        for (slice, 0..) |v, i| {
-            if (runtime.reclaimEnabled()) {
-                g.get().items[base + i].release(a);
-                v.retain();
-            }
-            g.get().items[base + i] = v;
-        }
-    }
+    const snap = try src_arr.snapshot(a);
+    // The snapshot bridges src->dest; free the spine on exit (`set` retains into
+    // the destination under a reclaiming backend).
+    defer if (runtime.freeScratch()) a.free(snap);
+    const sub = snap[@intCast(start)..@intCast(end)];
+    const base: usize = @intCast(dest_offset);
+    for (sub, 0..) |v, i| dest_arr.set(a, base + i, v);
     return ok(dest_val);
 }
 
 pub fn array_copy_of(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("copyOf requires an array receiver");
-    const items = ctx.args[0].Array.items;
-    const prim = ctx.args[0].Array.prim;
-    const cur_len: i64 = @intCast(listLen(items));
+    const arr = ctx.args[0].Array;
+    const prim = arr.prim;
+    const cur_len: i64 = @intCast(arr.len());
     const new_size = switch (try arrayOptIndex(a, ctx, 1, cur_len, "copyOf")) {
         .idx => |v| v,
         .err => |e| return e,
@@ -5198,10 +5228,9 @@ pub fn array_copy_of(ctx: *CallCtx) Error!EvalResult {
     if (new_size < 0) return typeErr(try fmt(a, "copyOf: negative new size {d}", .{new_size}));
     const n: usize = @intCast(new_size);
     const default = arrayPrimDefault(prim);
+    const cur = try arr.snapshot(a);
+    defer if (runtime.freeScratch()) a.free(cur);
     var out: std.ArrayList(Value) = .empty;
-    const g = items.borrow();
-    defer g.deinit();
-    const cur = g.get().items;
     var i: usize = 0;
     while (i < n) : (i += 1) {
         try out.append(a, if (i < cur.len) cur[i] else default);
@@ -5212,9 +5241,9 @@ pub fn array_copy_of(ctx: *CallCtx) Error!EvalResult {
 pub fn array_copy_of_range(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("copyOfRange requires an array receiver");
-    const items = ctx.args[0].Array.items;
-    const prim = ctx.args[0].Array.prim;
-    const len: i64 = @intCast(listLen(items));
+    const arr = ctx.args[0].Array;
+    const prim = arr.prim;
+    const len: i64 = @intCast(arr.len());
     const from = switch (try arrayOptIndex(a, ctx, 1, 0, "copyOfRange")) {
         .idx => |v| v,
         .err => |e| return e,
@@ -5226,18 +5255,18 @@ pub fn array_copy_of_range(ctx: *CallCtx) Error!EvalResult {
     if (from < 0 or to > len or from > to) {
         return indexOob(a, try fmt(a, "copyOfRange: [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
     }
-    const g = items.borrow();
-    defer g.deinit();
-    return ok(try makeArray(a, g.get().items[@intCast(from)..@intCast(to)], prim));
+    const snap = try arr.snapshot(a);
+    defer if (runtime.freeScratch()) a.free(snap);
+    return ok(try makeArray(a, snap[@intCast(from)..@intCast(to)], prim));
 }
 
 pub fn array_fill(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("fill requires an array receiver");
-    const items = ctx.args[0].Array.items;
+    const arr = ctx.args[0].Array;
     if (ctx.args.len < 2) return arityErr("fill expects (element, ...)");
     const element = ctx.args[1];
-    const len: i64 = @intCast(listLen(items));
+    const len: i64 = @intCast(arr.len());
     const from = switch (try arrayOptIndex(a, ctx, 2, 0, "fill")) {
         .idx => |v| v,
         .err => |e| return e,
@@ -5249,18 +5278,16 @@ pub fn array_fill(ctx: *CallCtx) Error!EvalResult {
     if (from < 0 or to > len or from > to) {
         return indexOob(a, try fmt(a, "fill: [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
     }
-    const g = items.borrowMut();
-    defer g.deinit();
     var i: usize = @intCast(from);
-    while (i < @as(usize, @intCast(to))) : (i += 1) g.get().items[i] = element;
+    while (i < @as(usize, @intCast(to))) : (i += 1) arr.set(a, i, element);
     return ok(Value.Unit);
 }
 
 pub fn array_sort(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sort requires an array receiver");
-    const items = ctx.args[0].Array.items;
-    const len: i64 = @intCast(listLen(items));
+    const arr = ctx.args[0].Array;
+    const len: i64 = @intCast(arr.len());
     const from = switch (try arrayOptIndex(a, ctx, 1, 0, "sort")) {
         .idx => |v| v,
         .err => |e| return e,
@@ -5272,21 +5299,21 @@ pub fn array_sort(ctx: *CallCtx) Error!EvalResult {
     if (from < 0 or to > len or from > to) {
         return indexOob(a, try fmt(a, "sort: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
     }
-    const buf = try snapshotItems(a, items);
+    const buf = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(buf);
     const sub = buf[@intCast(from)..@intCast(to)];
     if (try sortListHostAware(ctx, sub)) |e| return e;
-    try writeBackItems(items, a, buf);
+    try arr.writeBack(a, buf);
     return ok(Value.Unit);
 }
 
 pub fn array_sort_with(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sortWith requires an array receiver");
-    const items = ctx.args[0].Array.items;
+    const arr = ctx.args[0].Array;
     if (ctx.args.len < 2) return arityErr("sortWith expects (comparator, ...)");
     const comparator = ctx.args[1];
-    const len: i64 = @intCast(listLen(items));
+    const len: i64 = @intCast(arr.len());
     const from = switch (try arrayOptIndex(a, ctx, 2, 0, "sortWith")) {
         .idx => |v| v,
         .err => |e| return e,
@@ -5298,7 +5325,7 @@ pub fn array_sort_with(ctx: *CallCtx) Error!EvalResult {
     if (from < 0 or to > len or from > to) {
         return indexOob(a, try fmt(a, "sortWith: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
     }
-    const buf = try snapshotItems(a, items);
+    const buf = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(buf);
     const sub = buf[@intCast(from)..@intCast(to)];
     var i: usize = 1;
@@ -5315,7 +5342,7 @@ pub fn array_sort_with(ctx: *CallCtx) Error!EvalResult {
             } else break;
         }
     }
-    try writeBackItems(items, a, buf);
+    try arr.writeBack(a, buf);
     return ok(Value.Unit);
 }
 

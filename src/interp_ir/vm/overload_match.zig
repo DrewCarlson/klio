@@ -324,7 +324,7 @@ fn containerArgsMatch(self: *VmHost, head: []const u8, ty_args: []const TypeRef,
     const elems: ?runtime.ValueList = switch (v.*) {
         .List => |l| if (isListFamily(head)) l.items else null,
         .Set => |s| if (isSetFamily(head)) s.items else null,
-        .Array => |arr| if (std.mem.eql(u8, head, "Array")) arr.items else null,
+        .Array => |arr| if (std.mem.eql(u8, head, "Array")) arr.boxedList() else null,
         else => null,
     };
     const list = elems orelse return .unknown;

@@ -167,9 +167,8 @@ fn valueToUtf16(allocator: Allocator, v: Value) Allocator.Error!?[]u16 {
             return out;
         },
         .Array => |a| {
-            const g = a.items.borrow();
-            defer g.deinit();
-            const elems = g.get().items;
+            const elems = try a.snapshot(allocator);
+            defer if (runtime.freeScratch()) allocator.free(elems);
             var out = try allocator.alloc(u16, elems.len);
             for (elems, 0..) |e, i| {
                 if (e == .Char) {
@@ -222,18 +221,20 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
         // CharArray is a Value.Array, but some producers (e.g. toCharArray)
         // yield a Value.List of chars — accept either.
         .Array, .List => {
-            const items_ref: ValueList = switch (ctx.args[0]) {
-                .Array => |arr| arr.items,
-                .List => |l| l.items,
-                else => unreachable,
-            };
             const prim_is_byte: bool = switch (ctx.args[0]) {
                 .Array => |arr| if (arr.prim) |p| (p == .Byte or p == .UByte) else false,
                 else => false,
             };
-            const g = items_ref.borrow();
-            defer g.deinit();
-            const elems = g.get().items;
+            const elems: []Value = switch (ctx.args[0]) {
+                .Array => |arr| try arr.snapshot(a),
+                .List => |l| blk: {
+                    const g = l.items.borrow();
+                    defer g.deinit();
+                    break :blk try a.dupe(Value, g.get().items);
+                },
+                else => unreachable,
+            };
+            defer if (runtime.freeScratch()) a.free(elems);
 
             var start: usize = 0;
             var count: usize = elems.len;
@@ -1370,7 +1371,13 @@ test "string ctor from char array builds from code units" {
         try g.get().append(a, .{ .Char = 'h' });
         try g.get().append(a, .{ .Char = 'i' });
     }
-    var args = [_]Value{.{ .Array = .{ .items = list, .prim = .Char } }};
+    const char_arr = blk: {
+        const g = list.borrow();
+        defer g.deinit();
+        break :blk try runtime.ArrayData.initPacked(a, .Char, g.get().items);
+    };
+    defer char_arr.Array.deinitStorage();
+    var args = [_]Value{char_arr};
     var c = tc.ctx(a, &args);
     const r = try string_ctor(&c);
     try testing.expect(r == .ok);
@@ -1392,7 +1399,13 @@ test "string ctor from byte array decodes utf8" {
         try g.get().append(a, .{ .Byte = 'h' });
         try g.get().append(a, .{ .Byte = 'i' });
     }
-    var args = [_]Value{.{ .Array = .{ .items = list, .prim = .Byte } }};
+    const byte_arr = blk: {
+        const g = list.borrow();
+        defer g.deinit();
+        break :blk try runtime.ArrayData.initPacked(a, .Byte, g.get().items);
+    };
+    defer byte_arr.Array.deinitStorage();
+    var args = [_]Value{byte_arr};
     var c = tc.ctx(a, &args);
     const r = try string_ctor(&c);
     try testing.expect(r == .ok);
