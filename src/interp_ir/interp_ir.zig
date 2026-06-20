@@ -175,7 +175,7 @@ pub const ProgramImage = struct {
 
     pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool };
     pub const MemberResolveEntry = struct { func: ?StdlibFn, fqn: []const u8 };
-    pub const InstanceMethodKey = struct { class_p: usize, name_p: usize, n_args: u32 };
+    pub const InstanceMethodKey = struct { class_p: usize, name_p: usize, n_args: u32, sig: u64 };
     pub const OverloadKey = struct { module_p: usize, func_p: u32, sig: u64 };
 
     /// Packages a bare global name may bind into implicitly, in

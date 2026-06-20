@@ -2125,6 +2125,20 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+    // Fast path: a previously-resolved zero-arg user instance method bypasses the
+    // whole probe ladder. The cache is only populated by `irMethodWalk` *after*
+    // the per-instance binding probe and every builtin check declined, and those
+    // decisions are a pure function of (class, name) — stable across calls — so
+    // consulting the cache here is identical to letting them decline again, just
+    // without the per-call FQN building, supertype walk, and ~35 type checks.
+    if (receiver.* == .Instance) {
+        if (instanceMethodKey(receiver, name, args)) |k| {
+            if (instanceMethodCacheGet(self, k)) |fid| {
+                if (try invokeMethodFuncId(self, allocator, receiver, fid, args)) |r| return r;
+            }
+        }
+    }
+
     // `Throwable.printStackTrace()` / `.stackTraceToString()` over the trace
     // captured when the throwable was thrown.
     if (try throwableStackMember(self, allocator, receiver, name, args)) |r| return r;
@@ -4573,15 +4587,37 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
 /// Build the inline-cache key for an instance method call, or `null` for a
 /// non-Instance receiver. Keyed by class-cell identity + interned method-name
 /// pointer + arity (all stable for the program lifetime).
-fn instanceMethodKey(receiver: *const Value, name: []const u8, n_args: usize) ?root_mod.ProgramImage.InstanceMethodKey {
+/// Compact signature of an argument run's primitive types, distinguishing the
+/// overloads a method-name resolution can depend on. Returns null for a
+/// non-primitive arg (or > 12 args), which means "do not cache this call" — the
+/// resolution then re-runs each time rather than risk a wrong cross-type hit.
+fn methodArgSig(args: []const Value) ?u64 {
+    if (args.len == 0) return 0;
+    if (args.len > 12) return null;
+    var sig: u64 = @as(u64, args.len) << 56;
+    for (args, 0..) |*a, i| {
+        const tag: u64 = switch (a.*) {
+            .Int => 1,    .Long => 2,   .Double => 3, .Float => 4,
+            .Short => 5,  .Byte => 6,   .Char => 7,   .Bool => 8,
+            .UInt => 9,   .ULong => 10, .UShort => 11, .UByte => 12,
+            else => return null,
+        };
+        sig |= tag << @intCast(i * 4);
+    }
+    return sig;
+}
+
+fn instanceMethodKey(receiver: *const Value, name: []const u8, args: []const Value) ?root_mod.ProgramImage.InstanceMethodKey {
     if (receiver.* != .Instance) return null;
+    const sig = methodArgSig(args) orelse return null;
     const inst = receiver.Instance;
     const g = inst.borrow();
     defer g.deinit();
     return .{
         .class_p = g.get().class.identity(),
         .name_p = @intFromPtr(name.ptr),
-        .n_args = @intCast(n_args),
+        .n_args = @intCast(args.len),
+        .sig = sig,
     };
 }
 
@@ -4599,17 +4635,15 @@ fn instanceMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMeth
 }
 
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    // Inline cache: memoize the (class, method-name) → FuncId resolution for
-    // ZERO-ARG calls only. With no arguments there is no overload/arg-type
-    // discrimination (`pickMethodOverload` declines a sole candidate only by
-    // arity or definite arg-type mismatch — neither applies to a 0-arg call to a
-    // 0-param method), so the resolution is a pure function of the class and is
-    // safe to cache. Consulted at exactly the point the hierarchy walk would run
-    // (after the per-instance binding/anon probes), so dispatch is unchanged —
-    // only the linear class/method scans and per-call work-queue allocations are
-    // skipped. Zero-arg covers the member-heavy hot path (getters, `next`,
-    // `hasNext`, `toString`, `hashCode`, …).
-    const key = if (args.len == 0) instanceMethodKey(receiver, name, args.len) else null;
+    // Inline cache: memoize the (class, method-name, arg-type-signature) →
+    // FuncId resolution. The signature captures the argument primitive types the
+    // overload pick depends on, so a hit returns the same target the full walk
+    // would (a non-primitive arg yields no key, so those calls re-resolve rather
+    // than risk a wrong cross-type hit). Only an unambiguous resolution is
+    // cached; a call that declines to an extension is never stored. The fast
+    // path at `callMemberInnerStatic`'s entry consults this same cache before the
+    // probe ladder, so a repeat call skips the binding/builtin probes too.
+    const key = instanceMethodKey(receiver, name, args);
     if (key) |k| {
         if (instanceMethodCacheGet(self, k)) |fid| {
             return try invokeMethodFuncId(self, allocator, receiver, fid, args);

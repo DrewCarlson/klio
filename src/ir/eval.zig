@@ -444,11 +444,13 @@ pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayLis
     if (cause) |c| try formatThrowable(allocator, &c, out, true, depth + 1);
 }
 
-/// Attach a freshly-captured stack trace to a thrown value the first time it is
-/// thrown (`fillInStackTrace`): once a throwable carries a trace, re-throws and
-/// the outward unwind leave it untouched. Only `Throwable`-shaped values carry
-/// one — a builtin `Exception` value or a user `Throwable`-subclass instance.
-fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
+/// Attach a freshly-captured stack trace to a throwable the first time it needs
+/// one (`fillInStackTrace`): called at construction (matching the JVM) and again
+/// at the throw seam as a fallback for host-created throwables. Attach-once, so
+/// the construction-site trace wins and a re-throw keeps it. Only
+/// `Throwable`-shaped values carry one — a builtin `Exception` value or a user
+/// `Throwable`-subclass instance.
+pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
     switch (v.*) {
         .Exception => |*e| {
             if (e.stack != null) return;
@@ -548,7 +550,12 @@ pub fn captureChainAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry 
 /// a `FrameSnapshot` on suspend), so it is backed by the same per-call
 /// allocator the frame's regs/params/captures use.
 fn chainAllocator() Allocator {
-    return runtime.slab.tracedPage();
+    // The process-wide slab (NOT `page_allocator`): the enclosing-`this` chain is
+    // (re)allocated on every method/extension call that seeds its own receiver,
+    // and `page_allocator` would mmap+munmap a page per call — a syscall pair
+    // that dominated instance-method dispatch. The slab is global and stable
+    // (the chain can outlive a per-call arena via a suspend snapshot) yet fast.
+    return runtime.slab.allocator;
 }
 
 fn maxEvalDepth() usize {
