@@ -56,6 +56,15 @@ pub const ArrayUnbox = struct {
     len_slot: u32,
 };
 
+/// One capture cell a compiled loop reads/writes: the register holding the
+/// `Value.Cell`, and the scalar type its box holds. The cached inner scalar
+/// lives in the cell register's own slot (`reg.int()`) for the native run; it
+/// is unboxed from the box at entry and written back through the box at exit.
+pub const CellUnbox = struct {
+    reg: Reg,
+    rt: RegType,
+};
+
 pub const CompiledLoop = struct {
     exec: jit.ExecBuf,
     n_regs: u32,
@@ -64,6 +73,7 @@ pub const CompiledLoop = struct {
     read_set: []bool, // reg is read somewhere in the loop (must unbox at entry)
     def_set: []bool, // reg is written somewhere in the loop (rebox at exit)
     arrays: []ArrayUnbox,
+    cells: []CellUnbox,
     allocator: Allocator,
 
     pub fn deinit(self: *CompiledLoop) void {
@@ -72,6 +82,7 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.read_set);
         self.allocator.free(self.def_set);
         self.allocator.free(self.arrays);
+        self.allocator.free(self.cells);
     }
 };
 
@@ -104,11 +115,25 @@ fn isNumeric(t: RegType) bool {
     return t == .i32 or t == .i64;
 }
 
+/// The scalar `RegType` a capture cell holds, or null for kinds the integer JIT
+/// does not cache (the cell stays interpreter-only).
+fn cellScalarType(v: Value) ?RegType {
+    return switch (v) {
+        .Int, .Char, .Short, .Byte => .i32,
+        .Long => .i64,
+        .Bool => .boolean,
+        else => null,
+    };
+}
+
 fn isArithBinOp(op: ir.BinOp) bool {
     return switch (op) {
         .Add, .Sub, .Mul => true,
         else => false,
     };
+}
+fn isDivBinOp(op: ir.BinOp) bool {
+    return op == .Div or op == .Mod;
 }
 fn isCmpBinOp(op: ir.BinOp) bool {
     return switch (op) {
@@ -173,7 +198,7 @@ const ArrayInfo = struct {
 
 // --- whole-function static type inference -----------------------------------
 
-fn inferTypes(a: Allocator, module: *const Module, func: *const Func, n_regs: u32, array_info: []const ?ArrayInfo) Allocator.Error![]RegType {
+fn inferTypes(a: Allocator, module: *const Module, func: *const Func, n_regs: u32, array_info: []const ?ArrayInfo, cell_info: []const ?RegType) Allocator.Error![]RegType {
     const types = try a.alloc(RegType, n_regs);
     @memset(types, .unknown);
     var changed = true;
@@ -182,14 +207,14 @@ fn inferTypes(a: Allocator, module: *const Module, func: *const Func, n_regs: u3
         changed = false;
         for (func.blocks) |*blk| {
             for (blk.insts) |*inst| {
-                if (setDefType(types, module, inst, array_info)) changed = true;
+                if (setDefType(types, module, inst, array_info, cell_info)) changed = true;
             }
         }
     }
     return types;
 }
 
-fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_info: []const ?ArrayInfo) bool {
+fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_info: []const ?ArrayInfo, cell_info: []const ?RegType) bool {
     // Array subscripts: a get yields the element type, a set yields Unit.
     if (arrayOpOf(module, inst)) |op| {
         const t: RegType = if (op.is_set) .unit else blk: {
@@ -200,12 +225,18 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
         };
         return setType(types, op.dst, t);
     }
+    // CellGet yields the cell's scalar type; CellSet has no def.
+    if (inst.* == .CellGet) {
+        const cg = inst.CellGet;
+        const t: RegType = if (cg.cell.int() < cell_info.len) (cell_info[cg.cell.int()] orelse .unknown) else .unknown;
+        return setType(types, cg.dst, t);
+    }
     const dst_t: ?struct { r: Reg, t: RegType } = switch (inst.*) {
         .Const => |c| .{ .r = c.dst, .t = constType(module.consts.items[c.value.int()]) },
         .Move => |m| .{ .r = m.dst, .t = typeOf(types, m.src) },
         .BinOp => |b| blk: {
             if (isCmpBinOp(b.op)) break :blk .{ .r = b.dst, .t = .boolean };
-            if (isArithBinOp(b.op)) {
+            if (isArithBinOp(b.op) or isDivBinOp(b.op)) {
                 const lt = typeOf(types, b.lhs);
                 const rt = typeOf(types, b.rhs);
                 break :blk .{ .r = b.dst, .t = if (lt != .unknown) lt else rt };
@@ -441,6 +472,13 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
             n_reads.* = 1;
             def.* = u.dst;
         },
+        // The cell register is unboxed at entry / reboxed at exit by the cell
+        // machinery (not the scalar read/def sets), so it is not reported here.
+        .CellGet => |cg| def.* = cg.dst,
+        .CellSet => |cs| {
+            reads[0] = cs.value;
+            n_reads.* = 1;
+        },
         else => {},
     }
 }
@@ -550,6 +588,7 @@ const Compiler = struct {
     body: []const BlockId,
     types: []const RegType,
     array_info: []const ?ArrayInfo,
+    cell_info: []const ?RegType,
     n_regs: u32,
     em: jit.Emitter,
     block_label: []?jit.Emitter.Label,
@@ -628,6 +667,31 @@ const Compiler = struct {
         try self.em.loadMem(T1, REGS, @intCast(@as(u64, ai.ptr_slot) * 8)); // rcx = ptr
     }
 
+    /// Signed divide/remainder of T0 (dividend) by T1 (divisor), result in T0.
+    /// Divide-by-zero deopts to the current instruction (the interpreter throws
+    /// the same `ArithmeticException`). Divisor == -1 is special-cased to avoid
+    /// the x86 INT_MIN/-1 #DE while matching Kotlin's wrapping semantics.
+    fn emitDivMod(self: *Compiler, is_mod: bool, is_i32: bool) !void {
+        try self.em.cmpImm32(T1, 0);
+        try self.em.jcc(.e, try self.deoptLabel());
+        const neg1 = try self.em.newLabel();
+        const done = try self.em.newLabel();
+        try self.em.cmpImm32(T1, -1);
+        try self.em.jcc(.e, neg1);
+        try self.em.cqo(); // sign-extend rax into rdx:rax
+        try self.em.idivReg(T1); // quotient->rax, remainder->rdx
+        if (is_mod) try self.em.movReg(T0, T2);
+        try self.em.jmp(done);
+        try self.em.bind(neg1);
+        if (is_mod) {
+            try self.em.movImm64(T0, 0); // a % -1 == 0
+        } else {
+            try self.em.negReg(T0); // a / -1 == -a (wraps for MIN; fixed below)
+        }
+        try self.em.bind(done);
+        if (is_i32) try self.em.movsxd(T0, T0);
+    }
+
     fn emitInst(self: *Compiler, inst: *const Inst) !void {
         if (arrayOpOf(self.module, inst)) |op| {
             const ai = try self.arrayOf(op.recv);
@@ -653,12 +717,15 @@ const Compiler = struct {
                 try self.storeSlot(m.dst, T0);
             },
             .BinOp => |b| {
-                if (!isArithBinOp(b.op) and !isCmpBinOp(b.op)) return jit.JitError.Unsupported;
+                const is_cmp = isCmpBinOp(b.op);
+                const is_arith = isArithBinOp(b.op);
+                const is_div = isDivBinOp(b.op);
+                if (!is_cmp and !is_arith and !is_div) return jit.JitError.Unsupported;
                 if (!isNumeric(typeOf(self.types, b.lhs)) or !isNumeric(typeOf(self.types, b.rhs)))
                     return jit.JitError.Unsupported;
                 try self.loadSlot(T0, b.lhs);
                 try self.loadSlot(T1, b.rhs);
-                if (isCmpBinOp(b.op)) {
+                if (is_cmp) {
                     try self.em.cmpReg(T0, T1);
                     try self.em.setccReg(switch (b.op) {
                         .Eq => .e,
@@ -669,7 +736,7 @@ const Compiler = struct {
                         .GreaterEq => .ge,
                         else => unreachable,
                     }, T0);
-                } else {
+                } else if (is_arith) {
                     switch (b.op) {
                         .Add => try self.em.addReg(T0, T1),
                         .Sub => try self.em.subReg(T0, T1),
@@ -677,6 +744,8 @@ const Compiler = struct {
                         else => unreachable,
                     }
                     if (typeOf(self.types, b.dst) == .i32) try self.em.movsxd(T0, T0);
+                } else {
+                    try self.emitDivMod(b.op == .Mod, typeOf(self.types, b.dst) == .i32);
                 }
                 try self.storeSlot(b.dst, T0);
             },
@@ -697,6 +766,22 @@ const Compiler = struct {
                 }
                 if (typeOf(self.types, u.dst) == .i32) try self.em.movsxd(T0, T0);
                 try self.storeSlot(u.dst, T0);
+            },
+            // The cell's live scalar is cached in the cell register's own slot:
+            // CellGet copies it out, CellSet copies a value in. Entry/exit move
+            // it through the box (see runLoop).
+            .CellGet => |cg| {
+                if (cg.cell.int() >= self.cell_info.len or self.cell_info[cg.cell.int()] == null)
+                    return jit.JitError.Unsupported;
+                try self.loadSlot(T0, cg.cell);
+                try self.storeSlot(cg.dst, T0);
+            },
+            .CellSet => |cs| {
+                if (cs.cell.int() >= self.cell_info.len) return jit.JitError.Unsupported;
+                const crt = self.cell_info[cs.cell.int()] orelse return jit.JitError.Unsupported;
+                if (typeOf(self.types, cs.value) != crt) return jit.JitError.Unsupported;
+                try self.loadSlot(T0, cs.value);
+                try self.storeSlot(cs.cell, T0);
             },
             .Trace => {},
             else => return jit.JitError.Unsupported,
@@ -763,7 +848,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         for (blk.insts) |*inst| {
             if (arrayOpOf(module, inst) != null) continue;
             switch (inst.*) {
-                .Const, .Move, .BinOp, .Not, .UnOp, .Trace => {},
+                .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .CellGet, .CellSet => {},
                 else => {
                     if (debugEnabled()) std.debug.print("[jit]   uncompilable inst {s} in {s} b{d}\n", .{ @tagName(inst.*), func.name, bid.int() });
                     return null;
@@ -804,7 +889,65 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     }
     const n_slots: u32 = n_regs + 2 * @as(u32, @intCast(arrays.items.len));
 
-    const types = try inferTypes(a, module, func, n_regs, array_info);
+    // Discover capture cells, specializing on the scalar kind each box holds in
+    // the live frame. The cached scalar reuses the cell register's own slot, so
+    // no extra slots are needed. Reject if two cell registers alias the same box
+    // (caching + write-back would diverge from the shared-box interpreter).
+    const cell_info = try a.alloc(?RegType, n_regs);
+    defer a.free(cell_info);
+    @memset(cell_info, null);
+    var cells: std.ArrayListUnmanaged(CellUnbox) = .empty;
+    defer cells.deinit(a);
+    var cell_ptrs: std.ArrayListUnmanaged(usize) = .empty;
+    defer cell_ptrs.deinit(a);
+    for (body) |bid| {
+        for (func.blocks[bid.int()].insts) |*inst| {
+            const cr: Reg = switch (inst.*) {
+                .CellGet => |cg| cg.cell,
+                .CellSet => |cs| cs.cell,
+                else => continue,
+            };
+            if (cr.int() >= n_regs or cr.int() >= regs.len) return null;
+            if (cell_info[cr.int()] != null) continue;
+            if (array_info[cr.int()] != null) return null; // can't be both
+            const v = regs[cr.int()];
+            if (v != .Cell) return null;
+            const g = v.Cell.borrow();
+            const inner = g.get().*;
+            g.deinit();
+            const rt = cellScalarType(inner) orelse return null;
+            const box_ptr = v.Cell.identity();
+            for (cell_ptrs.items) |p| if (p == box_ptr) return null; // aliased box
+            cell_ptrs.append(a, box_ptr) catch return null;
+            cell_info[cr.int()] = rt;
+            cells.append(a, .{ .reg = cr, .rt = rt }) catch return null;
+        }
+    }
+
+    // A cell register's slot caches a scalar, so it must not be read or written
+    // as a plain scalar anywhere in the loop (only via CellGet/CellSet). Reject
+    // if any other instruction (or a branch cond) touches a cell register.
+    {
+        var reads: [3]Reg = undefined;
+        var nr: usize = 0;
+        var df: ?Reg = null;
+        for (body) |bid| {
+            const blk = &func.blocks[bid.int()];
+            for (blk.insts) |*inst| {
+                instReadsDef(module, inst, &reads, &nr, &df);
+                for (reads[0..nr]) |rr| {
+                    if (rr.int() < n_regs and cell_info[rr.int()] != null) return null;
+                }
+                if (df) |dd| if (dd.int() < n_regs and cell_info[dd.int()] != null) return null;
+            }
+            switch (blk.terminator) {
+                .Branch => |br| if (br.cond.int() < n_regs and cell_info[br.cond.int()] != null) return null,
+                else => {},
+            }
+        }
+    }
+
+    const types = try inferTypes(a, module, func, n_regs, array_info, cell_info);
     const sets = try computeSets(a, module, func, body, header, n_regs);
     var ok = false;
     defer if (!ok) {
@@ -819,6 +962,11 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         sets.read[au.reg.int()] = false;
         sets.def[au.reg.int()] = false;
     }
+    // Cell regs are unboxed/reboxed through their box, not the scalar sets.
+    for (cells.items) |cu| {
+        sets.read[cu.reg.int()] = false;
+        sets.def[cu.reg.int()] = false;
+    }
     for (0..n_regs) |r| {
         if ((sets.read[r] or sets.def[r]) and types[r] == .unknown) return null;
     }
@@ -830,6 +978,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .body = body,
         .types = types,
         .array_info = array_info,
+        .cell_info = cell_info,
         .n_regs = n_regs,
         .em = jit.Emitter.init(a),
         .block_label = try a.alloc(?jit.Emitter.Label, func.blocks.len),
@@ -854,6 +1003,10 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
 
     const exec = jit.finalize(c.em.code()) catch return null;
     const arrays_owned = arrays.toOwnedSlice(a) catch return null;
+    const cells_owned = cells.toOwnedSlice(a) catch {
+        a.free(arrays_owned);
+        return null;
+    };
     ok = true;
     return CompiledLoop{
         .exec = exec,
@@ -863,6 +1016,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .read_set = sets.read,
         .def_set = sets.def,
         .arrays = arrays_owned,
+        .cells = cells_owned,
         .allocator = a,
     };
 }
@@ -919,6 +1073,19 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64) RunResult
         g.deinit();
     }
 
+    // Unbox each capture cell's scalar into the cell register's own slot. No
+    // calls or GC run inside the loop, so the box is unobserved by anyone else;
+    // the cached scalar is written back through the box at exit.
+    for (self.cells) |cu| {
+        if (cu.reg.int() >= regs.len) return .bail;
+        const v = regs[cu.reg.int()];
+        if (v != .Cell) return .bail;
+        const g = v.Cell.borrow();
+        const inner = g.get().*;
+        g.deinit();
+        slots[cu.reg.int()] = cellSlotIn(cu.rt, inner) orelse return .bail;
+    }
+
     const fnptr = self.exec.entry(*const fn ([*]i64) callconv(.c) u64);
     const code = fnptr(slots.ptr);
     const target = BlockId.from(@intCast(code >> 32));
@@ -937,7 +1104,50 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64) RunResult
             .unknown => regs[r],
         };
     }
+
+    // Write each cell's final cached scalar back through its box. The old inner
+    // value is a primitive of the same kind, so its release is a no-op.
+    for (self.cells) |cu| {
+        if (cu.reg.int() >= regs.len) continue;
+        const v = regs[cu.reg.int()];
+        if (v != .Cell) continue;
+        const g = v.Cell.borrowMut();
+        g.get().* = valueFromSlot(cu.rt, slots[cu.reg.int()]);
+        g.deinit();
+    }
     return .{ .resume_at = .{ .block = target, .inst = inst } };
+}
+
+/// Read the cell's inner scalar into an i64 slot, or null if the box no longer
+/// holds the specialized kind (deopt to interpreter).
+fn cellSlotIn(rt: RegType, v: Value) ?i64 {
+    return switch (rt) {
+        .i32 => switch (v) {
+            .Int => |x| x,
+            .Char => |x| x,
+            .Short => |x| x,
+            .Byte => |x| x,
+            else => null,
+        },
+        .i64 => switch (v) {
+            .Long => |x| x,
+            else => null,
+        },
+        .boolean => switch (v) {
+            .Bool => |b| if (b) 1 else 0,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn valueFromSlot(rt: RegType, s: i64) Value {
+    return switch (rt) {
+        .i32 => .{ .Int = @truncate(s) },
+        .i64 => .{ .Long = s },
+        .boolean => .{ .Bool = s != 0 },
+        else => .Unit,
+    };
 }
 
 // --- per-function JIT state + the interpreter hook --------------------------
@@ -959,6 +1169,12 @@ pub const FuncJit = struct {
 
 var jit_enabled_cache: ?bool = null;
 var jit_debug_cache: ?bool = null;
+
+/// Test-only: force the JIT on or off, bypassing the `KLIO_JIT` env probe, so
+/// the corpus can be run through the native tier inside `zig build test`.
+pub fn setEnabledForTest(on: bool) void {
+    jit_enabled_cache = on;
+}
 
 pub fn enabled() bool {
     if (jit_enabled_cache) |e| return e;

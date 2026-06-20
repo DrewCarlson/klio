@@ -169,6 +169,21 @@ pub const Emitter = struct {
         try self.modrmRR(dst, src);
     }
 
+    /// `cqo` — sign-extend rax into rdx:rax (for a signed 64-bit divide).
+    pub fn cqo(self: *Emitter) JitError!void {
+        try self.byte(0x48);
+        try self.byte(0x99);
+    }
+
+    /// `idiv <src64>` — signed divide rdx:rax by `src`; quotient in rax,
+    /// remainder in rdx. Caller must `cqo` first and guard divide-by-zero and
+    /// the INT_MIN/-1 overflow (both raise #DE on x86).
+    pub fn idivReg(self: *Emitter, src: Reg) JitError!void {
+        try self.rexW(src);
+        try self.byte(0xF7);
+        try self.byte(0xF8 | low3(src)); // /7, mod=11
+    }
+
     /// `cmp <a64>, <b64>` (sets flags for a - b).
     pub fn cmpReg(self: *Emitter, a: Reg, b: Reg) JitError!void {
         try self.rexWrr(b, a);
@@ -621,4 +636,47 @@ test "ALU encodings match documented bytes" {
         0x48, 0x0F, 0xAF, 0xC6,
         0x48, 0x39, 0xC8,
     }, em.code());
+}
+
+test "cqo + idiv encode the documented bytes" {
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    try em.cqo(); // 48 99
+    try em.idivReg(.rcx); // 48 F7 F9 (idiv rcx)
+    try em.idivReg(.rsi); // 48 F7 FE (idiv rsi)
+    try std.testing.expectEqualSlices(u8, &.{
+        0x48, 0x99,
+        0x48, 0xF7, 0xF9,
+        0x48, 0xF7, 0xFE,
+    }, em.code());
+}
+
+test "emitted signed divide and remainder match native" {
+    var em = Emitter.init(std.testing.allocator);
+    defer em.deinit();
+    // fn(rdi=a, rsi=b) -> a / b
+    try em.movReg(.rax, .rdi);
+    try em.cqo();
+    try em.idivReg(.rsi); // quotient in rax
+    try em.ret();
+    var exec = try finalize(em.code());
+    defer exec.deinit();
+    const f = exec.entry(*const fn (i64, i64) callconv(.c) i64);
+    try std.testing.expectEqual(@as(i64, 7), f(47, 6));
+    try std.testing.expectEqual(@as(i64, -7), f(-47, 6));
+    try std.testing.expectEqual(@as(i64, 0), f(5, 6));
+
+    var em2 = Emitter.init(std.testing.allocator);
+    defer em2.deinit();
+    // fn(rdi=a, rsi=b) -> a % b  (remainder in rdx)
+    try em2.movReg(.rax, .rdi);
+    try em2.cqo();
+    try em2.idivReg(.rsi);
+    try em2.movReg(.rax, .rdx);
+    try em2.ret();
+    var exec2 = try finalize(em2.code());
+    defer exec2.deinit();
+    const g = exec2.entry(*const fn (i64, i64) callconv(.c) i64);
+    try std.testing.expectEqual(@as(i64, 5), g(47, 6));
+    try std.testing.expectEqual(@as(i64, -5), g(-47, 6));
 }
