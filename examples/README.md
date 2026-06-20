@@ -111,6 +111,7 @@ Run any program with:
 | `jit_capture_cell_loop.kt` | A hot loop mutating `var`s captured by a nested lambda (boxed cells); output is identical with the loop JIT off or on. |
 | `mutable_iterator_remove.kt` | `MutableIterator.remove()` over a `MutableList` writes through to the source list. |
 | `jit_double_loop.kt`       | Hot `Double` arithmetic + comparison over a `DoubleArray` (loop JIT → SSE2); identical output JIT off or on, incl. NaN comparison semantics. |
+| `jit_int_double_mix.kt`    | Hot loop mixing an `Int` counter with `Double` math via `i.toDouble()` (loop JIT compiles the int→double conversion inline). |
 
 ## Integration showcases
 

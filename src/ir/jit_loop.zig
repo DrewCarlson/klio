@@ -186,6 +186,33 @@ fn arrayOpOf(module: *const Module, inst: *const Inst) ?ArrayOp {
     }
 }
 
+/// A zero-arg numeric conversion (`x.toDouble()`/`toLong()`/`toInt()`), which
+/// lowers to `CallMember`. The JIT compiles the always-exact directions
+/// (int→double, int width changes); double→int is left to the interpreter
+/// because `cvttsd2si` diverges from Kotlin on NaN/overflow (it clamps).
+const NumConv = struct { dst: Reg, src: Reg, to: RegType };
+
+fn numericConvOf(module: *const Module, inst: *const Inst) ?NumConv {
+    switch (inst.*) {
+        .CallMember => |cm| {
+            if (cm.arg_names.len != 0 or cm.n_args != 0) return null;
+            if (cm.name.int() >= module.consts.items.len) return null;
+            const name = module.consts.items[cm.name.int()];
+            if (name != .String) return null;
+            const to: RegType = if (std.mem.eql(u8, name.String, "toDouble"))
+                .f64
+            else if (std.mem.eql(u8, name.String, "toLong"))
+                .i64
+            else if (std.mem.eql(u8, name.String, "toInt"))
+                .i32
+            else
+                return null;
+            return .{ .dst = cm.dst, .src = cm.receiver, .to = to };
+        },
+        else => return null,
+    }
+}
+
 /// Element register type + native access width for a packed array kind, or null
 /// for kinds the JIT does not compile (Float). A `Double` element is moved as a
 /// raw 8-byte (`b64`) value — its f64 bits live in the slot and are consumed by
@@ -244,6 +271,10 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
             break :blk .unknown;
         };
         return setType(types, op.dst, t);
+    }
+    // Numeric conversion (`x.toDouble()` etc.) yields the named target type.
+    if (numericConvOf(module, inst)) |nc| {
+        return setType(types, nc.dst, nc.to);
     }
     // CellGet yields the cell's scalar type; CellSet has no def.
     if (inst.* == .CellGet) {
@@ -467,6 +498,12 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
             n_reads.* = 1;
         }
         def.* = op.dst;
+        return;
+    }
+    if (numericConvOf(module, inst)) |nc| {
+        reads[0] = nc.src;
+        n_reads.* = 1;
+        def.* = nc.dst;
         return;
     }
     switch (inst.*) {
@@ -788,6 +825,31 @@ const Compiler = struct {
             }
             return;
         }
+        if (numericConvOf(self.module, inst)) |nc| {
+            const from = typeOf(self.types, nc.src);
+            switch (nc.to) {
+                .f64 => {
+                    if (from == .f64) { // identity
+                        try self.loadSlot(T0, nc.src);
+                        try self.storeSlot(nc.dst, T0);
+                    } else if (isNumeric(from)) { // int -> double (always exact)
+                        try self.loadSlot(T0, nc.src);
+                        try self.em.cvtsi2sd(X0, T0);
+                        try self.storeF64Slot(nc.dst, X0);
+                    } else return jit.JitError.Unsupported;
+                },
+                // int width change: copy the (sign-extended) bits — i32→i64 is a
+                // no-op, i64→i32 truncates at rebox (Kotlin `Long.toInt` = low 32).
+                // double→int diverges from Kotlin on NaN/overflow, so bail.
+                .i64, .i32 => {
+                    if (!isNumeric(from)) return jit.JitError.Unsupported;
+                    try self.loadSlot(T0, nc.src);
+                    try self.storeSlot(nc.dst, T0);
+                },
+                else => return jit.JitError.Unsupported,
+            }
+            return;
+        }
         switch (inst.*) {
             .Const => |c| {
                 const cv = self.module.consts.items[c.value.int()];
@@ -942,6 +1004,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         }
         for (blk.insts) |*inst| {
             if (arrayOpOf(module, inst) != null) continue;
+            if (numericConvOf(module, inst) != null) continue;
             switch (inst.*) {
                 .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .CellGet, .CellSet => {},
                 else => {

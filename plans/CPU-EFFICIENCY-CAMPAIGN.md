@@ -263,9 +263,16 @@ and per-instruction interpreter overhead.
   (IEEE — `/0.0` yields ±Inf/NaN, no deopt). Comparisons use `ucomisd` with
   NaN-correct `setcc`: `<`/`<=` via operand-swap + `seta`/`setae`, `>`/`>=`
   direct, `==` = `sete && setnp`, `!=` = `setne || setp` — so any comparison with
-  NaN is false except `!=` (matches Kotlin). Mixed int/double in one op bails
-  (no conversion emitted yet). Result on a `DoubleArray` sum/scale loop: **8.9 s
-  → 0.30 s (≈30×)**, node-class.
+  NaN is false except `!=` (matches Kotlin). Result on a `DoubleArray` sum/scale
+  loop: **8.9 s → 0.30 s (≈30×)**, node-class.
+- **Numeric conversions** (`x.toDouble()`/`toLong()`/`toInt()`, which lower to a
+  zero-arg `CallMember`): int→double via `cvtsi2sd` (always exact — matches
+  Kotlin), and int width changes via a bit copy (i32→i64 no-op; i64→i32 truncates
+  at rebox = `Long.toInt`'s low-32 semantics). **double→int is left to the
+  interpreter** (`cvttsd2si` clamps differently from Kotlin on NaN/overflow). A
+  non-numeric receiver (e.g. `"123".toInt()` string parsing) is typed `unknown`
+  and bails. This unblocks mixed int/double loops — `sum += i.toDouble()*0.5`
+  goes **11.9 s → 0.21 s (≈57×)**.
 - **Capture cells**: a `var` captured by a nested lambda is a boxed `Value.Cell`.
   The loop body's `CellGet`/`CellSet` are compiled by caching the box's scalar in
   the cell register's own slot for the native run (unboxed at entry, written back
@@ -301,10 +308,10 @@ and per-instruction interpreter overhead.
   identical output with the JIT on vs off, including divide-by-zero, `MIN/-1`
   wrap, and OOB deopts.
 - **Next coverage** (not blocking): `Float` (f32) arithmetic/arrays (needs the
-  `ss` SSE forms + f32/f64 conversions); int↔double conversions (`cvtsi2sd`/
-  `cvttsd2si` are in the emitter) to JIT mixed int/double loops; calls via a
-  trampoline (stage 4 — collections/strings are call-bound). The harness (guard +
-  deopt + bail) is in place.
+  `ss` SSE forms + f32↔f64 conversions); sound `Double.toInt()`/`toLong()` (range
+  + NaN clamping to match Kotlin); calls via a trampoline (stage 4 —
+  collections/strings are call-bound). The harness (guard + deopt + bail) is in
+  place.
 
 ## collections/strings gap — data-driven analysis (not a quick fix)
 
