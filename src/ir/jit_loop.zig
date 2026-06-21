@@ -368,6 +368,93 @@ fn bitwiseOpOf(module: *const Module, inst: *const Inst) ?BitOp {
     }
 }
 
+const INLINE_MAX_INSTS: usize = 24;
+
+/// Whether a top-level callee can be inlined into the native loop: a single block
+/// returning a value, made only of scalar instructions (no nested calls, object
+/// ops, arrays, cells, or fields), with all-scalar required parameters and a
+/// scalar return. Such a body is spliced into the caller's code with its registers
+/// remapped, eliminating the call entirely.
+fn inlinableCallee(module: *const Module, f: *const Func) bool {
+    if (f.is_suspend or f.has_receiver_param) return false;
+    if (f.blocks.len != 1) return false; // single block, not deferred
+    const blk = &f.blocks[0];
+    switch (blk.terminator) {
+        .Return => |r| if (r == null) return false,
+        else => return false,
+    }
+    for (f.params) |p| {
+        if (p.is_vararg or p.default != null) return false;
+        if (retRegType(p.ty) == .unknown) return false;
+    }
+    if (funcReturnRegType(module, f) == .unknown) return false;
+    if (blk.insts.len > INLINE_MAX_INSTS) return false;
+    for (blk.insts) |*inst| {
+        if (numericConvOf(module, inst) != null) continue;
+        if (bitwiseOpOf(module, inst) != null) continue;
+        if (arrayOpOf(module, inst) != null) return false;
+        switch (inst.*) {
+            .Const, .Move, .BinOp, .Not, .UnOp, .Trace => {},
+            // A parameter load binds to the matching caller argument at inline time.
+            .LoadParam => |lp| if (lp.idx >= f.params.len) return false,
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// One inlined call: the callee's single block is emitted in place of the call,
+/// with its registers shifted by `base` into the caller's extended register space.
+/// `args_reg`/`dst` are caller registers; deopts inside the body resume at the
+/// original call instruction (`block`,`inst`) so the interpreter re-runs the call.
+const InlineSite = struct {
+    block: BlockId,
+    inst: u32,
+    callee: *const Func,
+    base: u32,
+    args_reg: u32,
+    n_args: u8,
+    dst: Reg,
+};
+
+/// Copy an instruction with every register reference shifted by `base` — used to
+/// emit an inlined callee body in the caller's extended register space. Only the
+/// scalar instruction shapes an inlinable callee can contain are remapped.
+fn remapInst(inst: Inst, base: u32) Inst {
+    const b = base;
+    var out = inst;
+    switch (out) {
+        .Const => |*c| c.dst = Reg.from(c.dst.int() + b),
+        .Move => |*m| {
+            m.dst = Reg.from(m.dst.int() + b);
+            m.src = Reg.from(m.src.int() + b);
+        },
+        .BinOp => |*x| {
+            x.dst = Reg.from(x.dst.int() + b);
+            x.lhs = Reg.from(x.lhs.int() + b);
+            x.rhs = Reg.from(x.rhs.int() + b);
+        },
+        .Not => |*n| {
+            n.dst = Reg.from(n.dst.int() + b);
+            n.src = Reg.from(n.src.int() + b);
+        },
+        .UnOp => |*u| {
+            u.dst = Reg.from(u.dst.int() + b);
+            u.operand = Reg.from(u.operand.int() + b);
+        },
+        .CallMember => |*cm| {
+            // Bitwise / numeric-conversion infix ops (the only CallMembers an
+            // inlinable callee may contain): remap receiver, args base, dst.
+            cm.dst = Reg.from(cm.dst.int() + b);
+            cm.receiver = Reg.from(cm.receiver.int() + b);
+            cm.args = Reg.from(cm.args.int() + b);
+        },
+        .Trace => {},
+        else => {},
+    }
+    return out;
+}
+
 /// A top-level `Call` the loop JIT can trampoline: a native call site invokes the
 /// host, which reboxes the scalar args, runs the callee interpreted, and reboxes a
 /// scalar result. v1 handles only the bare positional form (no named args, no
@@ -554,6 +641,39 @@ fn promoteArith(lt: RegType, rt: RegType) RegType {
     if (lt == .i64 or rt == .i64) return .i64;
     if (lt == .i32 or rt == .i32) return .i32;
     return if (lt != .unknown) lt else rt;
+}
+
+/// Fill `ext[site.base .. site.base + callee.n_locals]` with the inlined callee's
+/// register types: parameters seeded from the caller's argument types, then the
+/// scalar propagation run over the callee's single block.
+fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite, caller_types: []const RegType, ext: []RegType) Allocator.Error!void {
+    const callee = site.callee;
+    const n = callee.n_locals;
+    if (n == 0) return;
+    const t = ext[site.base .. site.base + n];
+    @memset(t, .unknown);
+    const eai = try a.alloc(?ArrayInfo, n);
+    defer a.free(eai);
+    @memset(eai, null);
+    const eci = try a.alloc(?RegType, n);
+    defer a.free(eci);
+    @memset(eci, null);
+    var changed = true;
+    var iters: usize = 0;
+    while (changed and iters < 16) : (iters += 1) {
+        changed = false;
+        for (callee.blocks[0].insts) |*inst| {
+            // A parameter load takes the caller argument's type.
+            if (inst.* == .LoadParam) {
+                const lp = inst.LoadParam;
+                const ar = site.args_reg + lp.idx;
+                const at: RegType = if (ar < caller_types.len) caller_types[ar] else .unknown;
+                if (lp.dst.int() < n and setType(t, lp.dst, at)) changed = true;
+                continue;
+            }
+            if (setDefType(t, module, inst, eai, eci)) changed = true;
+        }
+    }
 }
 
 fn isScalarRt(t: RegType) bool {
@@ -1151,12 +1271,16 @@ const Compiler = struct {
     array_info: []const ?ArrayInfo,
     cell_info: []const ?RegType,
     call_sites: []const CallSite,
+    inline_sites: []const InlineSite,
     /// Per-register: is this a nullable-scalar register, and its null-flag slot.
     nullable: []const bool,
     null_flag_slot: []const u32,
     uc_slot: u32,
     tramp_slot: u32,
     n_regs: u32,
+    /// Total register-slot count (caller registers plus inlined-callee registers);
+    /// the upper bound for `slotDisp`.
+    reg_slots: u32,
     em: jit.Emitter,
     block_label: []?jit.Emitter.Label,
     exit_targets: std.ArrayListUnmanaged(BlockId),
@@ -1184,8 +1308,16 @@ const Compiler = struct {
 
     fn slotDisp(self: *Compiler, r: Reg) ?i32 {
         const off: u64 = @as(u64, r.int()) * 8;
-        if (off > std.math.maxInt(i32) or r.int() >= self.n_regs) return null;
+        if (off > std.math.maxInt(i32) or r.int() >= self.reg_slots) return null;
         return @intCast(off);
+    }
+
+    /// The inline expansion at the current (block, inst), if any.
+    fn inlineSiteAt(self: *Compiler) ?*const InlineSite {
+        for (self.inline_sites) |*s| {
+            if (s.block.int() == self.cur_block.int() and s.inst == self.cur_inst) return s;
+        }
+        return null;
     }
 
     fn isNullable(self: *Compiler, r: Reg) bool {
@@ -1471,6 +1603,28 @@ const Compiler = struct {
     /// results to the frame registers, and returns 0 to continue native or a
     /// non-zero resume code (deopt / throw) which exits straight through the
     /// epilogue with rax intact.
+    /// Emit an inlined call: copy each scalar arg into the callee's (remapped)
+    /// parameter slot, emit the callee's single block remapped into the caller's
+    /// extended register space, then copy the (remapped) return value to the dst.
+    fn emitInlinedCall(self: *Compiler, site: *const InlineSite) !void {
+        const callee_blk = &site.callee.blocks[0];
+        for (callee_blk.insts) |*ci| {
+            // A parameter load binds to the caller argument; everything else is the
+            // callee's own (remapped) scalar instruction.
+            if (ci.* == .LoadParam) {
+                const lp = ci.LoadParam;
+                try self.loadSlot(T0, Reg.from(site.args_reg + lp.idx));
+                try self.storeSlot(Reg.from(site.base + lp.dst.int()), T0);
+                continue;
+            }
+            const rinst = remapInst(ci.*, site.base);
+            try self.emitInstBody(&rinst);
+        }
+        const ret = callee_blk.terminator.Return.?;
+        try self.loadSlot(T0, Reg.from(site.base + ret.int()));
+        try self.storeSlot(site.dst, T0);
+    }
+
     fn emitCallSite(self: *Compiler, si: u32) !void {
         try self.em.loadMem(.rdi, REGS, @intCast(@as(u64, self.uc_slot) * 8));
         try self.em.movImm64(.rsi, @intCast(si));
@@ -1481,6 +1635,14 @@ const Compiler = struct {
     }
 
     fn emitInst(self: *Compiler, inst: *const Inst) !void {
+        // An inlined call splices the callee's body in place: bind params, emit the
+        // remapped callee instructions, copy the return value to the call's dst.
+        // `cur_inst` stays the call's instruction, so any deopt inside the body
+        // resumes there and the interpreter re-runs the (pure) call.
+        if (self.inlineSiteAt()) |site| {
+            try self.emitInlinedCall(site);
+            return;
+        }
         // A trampolined site (call / member / field / object op / subscript) is a
         // host callback; checked first so an object-collection subscript is not
         // mistaken for a native packed-array access.
@@ -1491,6 +1653,13 @@ const Compiler = struct {
         // A move into, or null test of, a nullable-scalar register manages its
         // companion null flag natively.
         if (try self.emitNullable(inst)) return;
+        try self.emitInstBody(inst);
+    }
+
+    /// The native codegen for a single instruction, without the site / inline /
+    /// nullable dispatch — so a remapped inlined-callee instruction (which never
+    /// contains a call or object op) can be emitted directly.
+    fn emitInstBody(self: *Compiler, inst: *const Inst) !void {
         if (arrayOpOf(self.module, inst)) |op| {
             const ai = try self.arrayOf(op.recv);
             try self.emitBoundsAndPtr(ai, op.index); // rax=index, rcx=ptr
@@ -1781,7 +1950,36 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             arrays.append(a, .{ .reg = rr, .kind = kind, .ptr_slot = n_regs + 2 * k, .len_slot = n_regs + 2 * k + 1 }) catch return null;
         }
     }
-    const arr_slots: u32 = n_regs + 2 * @as(u32, @intCast(arrays.items.len));
+
+    // Inline small pure-scalar top-level callees: their single block is spliced in
+    // place of the call, with registers shifted into an extended register space
+    // [n_regs .. total_regs). Restricted to array-free loops so the slot layout
+    // stays a simple register range followed by the call/nullable slots.
+    var inline_sites: std.ArrayListUnmanaged(InlineSite) = .empty;
+    defer inline_sites.deinit(a);
+    var total_regs: u32 = n_regs;
+    if (arrays.items.len == 0) {
+        for (body) |bid| {
+            for (func.blocks[bid.int()].insts, 0..) |*inst, ii| {
+                const tc = trampolinableCallOf(inst) orelse continue;
+                const callee = module.funcById(tc.func) orelse continue;
+                if (!inlinableCallee(module, callee)) continue;
+                if (callee.params.len != tc.n_args) continue;
+                inline_sites.append(a, .{
+                    .block = bid,
+                    .inst = @intCast(ii),
+                    .callee = callee,
+                    .base = total_regs,
+                    .args_reg = tc.args_reg,
+                    .n_args = tc.n_args,
+                    .dst = tc.dst,
+                }) catch return null;
+                total_regs += callee.n_locals;
+                if (total_regs > 4096) return null;
+            }
+        }
+    }
+    const arr_slots: u32 = total_regs + 2 * @as(u32, @intCast(arrays.items.len));
 
     // Discover capture cells, specializing on the scalar kind each box holds in
     // the live frame. The cached scalar reuses the cell register's own slot, so
@@ -1931,7 +2129,17 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
 
     // Whole-function type inference must run before liveness so the read/def sets
     // can recognize object registers (held in `regs`, not slots) and exclude them.
-    const types = try inferTypes(a, module, func, n_regs, array_info, cell_info, regs, member_ret);
+    const types = if (total_regs == n_regs)
+        try inferTypes(a, module, func, n_regs, array_info, cell_info, regs, member_ret)
+    else ext_blk: {
+        const caller_types = try inferTypes(a, module, func, n_regs, array_info, cell_info, regs, member_ret);
+        defer a.free(caller_types);
+        const ext = a.alloc(RegType, total_regs) catch return null;
+        @memset(ext, .unknown);
+        @memcpy(ext[0..n_regs], caller_types);
+        for (inline_sites.items) |*site| try fillInlineTypes(a, module, site, caller_types, ext);
+        break :ext_blk ext;
+    };
     var ok = false;
     defer if (!ok) a.free(types);
 
@@ -1958,7 +2166,24 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         }
     }
 
-    const sets = try computeSets(a, module, func, body, header, n_regs, types);
+    const sets = if (total_regs == n_regs)
+        try computeSets(a, module, func, body, header, n_regs, types)
+    else sets_blk: {
+        const s = try computeSets(a, module, func, body, header, n_regs, types);
+        defer {
+            a.free(s.read);
+            a.free(s.def);
+        }
+        // Extend with the inlined-callee registers (always scratch: never unboxed
+        // from or reboxed to the frame's register array).
+        const rd = a.alloc(bool, total_regs) catch return null;
+        @memset(rd, false);
+        @memcpy(rd[0..n_regs], s.read);
+        const df = a.alloc(bool, total_regs) catch return null;
+        @memset(df, false);
+        @memcpy(df[0..n_regs], s.def);
+        break :sets_blk LoopSets{ .read = rd, .def = df };
+    };
     defer if (!ok) {
         a.free(sets.read);
         a.free(sets.def);
@@ -2214,6 +2439,15 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .recv_varies = recv_varies,
                 }) catch return null;
             } else if (is_call) {
+                // An inlined call is emitted in place, not trampolined.
+                var inlined = false;
+                for (inline_sites.items) |s| {
+                    if (s.block.int() == bid.int() and s.inst == i) {
+                        inlined = true;
+                        break;
+                    }
+                }
+                if (inlined) continue;
                 const tc = trampolinableCallOf(inst).?;
                 const f = module.funcById(tc.func) orelse return null;
                 // The callee must run as a plain interpreted call: no suspend
@@ -2276,6 +2510,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         null_flag_slot[nu.reg.int()] = nu.flag_slot;
     }
     const n_slots: u32 = calls_base + @as(u32, @intCast(nullables.items.len));
+    if (debugEnabled() and inline_sites.items.len != 0) std.debug.print("[jit]   inlined {d} call(s) in {s}\n", .{ inline_sites.items.len, func.name });
     // A map-get site writes the nullable result; record its dst's flag slot.
     for (call_sites.items) |*site| {
         if (site.is_map_get) site.map_flag_slot = null_flag_slot[site.dst_reg];
@@ -2290,11 +2525,13 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .array_info = array_info,
         .cell_info = cell_info,
         .call_sites = call_sites.items,
+        .inline_sites = inline_sites.items,
         .nullable = nullable,
         .null_flag_slot = null_flag_slot,
         .uc_slot = uc_slot,
         .tramp_slot = tramp_slot,
         .n_regs = n_regs,
+        .reg_slots = total_regs,
         .em = jit.Emitter.init(a),
         .block_label = try a.alloc(?jit.Emitter.Label, func.blocks.len),
         .exit_targets = .empty,
@@ -2339,7 +2576,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     ok = true;
     return CompiledLoop{
         .exec = exec,
-        .n_regs = n_regs,
+        // Inlined-callee registers extend the register space; the unbox/rebox
+        // loops range over all of them (the inline ones are scratch — skipped).
+        .n_regs = total_regs,
         .n_slots = n_slots,
         .reg_types = types,
         .read_set = sets.read,
