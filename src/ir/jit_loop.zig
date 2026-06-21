@@ -128,6 +128,9 @@ pub const CallSite = struct {
     is_obj_move: bool = false,
     neg: bool = false,
     src_reg: u32 = 0,
+    /// Object collection subscript: `regs[dst] = regs[recv_reg].get(slot[args_reg])`
+    /// where the element is a boxed object. The index is a scalar slot register.
+    is_obj_index: bool = false,
 };
 
 /// One packed array a compiled loop indexes: the register holding it, the
@@ -444,6 +447,25 @@ fn liveValueRegType(v: Value) ?RegType {
         .Instance => .object,
         else => null,
     };
+}
+
+/// The live element at `idx` of a `List` or reference `Array`, or null for an
+/// out-of-range index or an unsupported container. Used to sample an object
+/// collection's element type at compile time (a packed primitive array is handled
+/// by the native array path, not here).
+pub fn liveElementAt(recv: Value, idx: i64) ?Value {
+    if (idx < 0) return null;
+    const u: usize = @intCast(idx);
+    switch (recv) {
+        .List => |l| {
+            const g = l.items.borrow();
+            defer g.deinit();
+            const items = g.get().items;
+            return if (u < items.len) items[u] else null;
+        },
+        .Array => |arr| return if (arr.prim == null and u < arr.len()) arr.get(u) else null,
+        else => return null,
+    }
 }
 
 /// The class-cell identity of an `Instance` value, used as the loop-entry guard
@@ -785,6 +807,9 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
         } else {
             n_reads.* = 1;
         }
+        // An object-collection subscript writes a boxed register (in `regs`), not
+        // a scalar slot — only a packed-array element is a scalar def.
+        if (!op.is_set and typeAt(types, op.dst) == .object) return;
         def.* = op.dst;
         return;
     }
@@ -1226,7 +1251,29 @@ const Compiler = struct {
         if (is_i32) try self.em.movsxd(T0, T0);
     }
 
+    /// Host call trampoline: rdi = *TrampCtx, rsi = site index, rax = the host
+    /// callback. It performs the site's operation (call / member / field / object
+    /// move / null test / subscript), writing scalar results to slots and object
+    /// results to the frame registers, and returns 0 to continue native or a
+    /// non-zero resume code (deopt / throw) which exits straight through the
+    /// epilogue with rax intact.
+    fn emitCallSite(self: *Compiler, si: u32) !void {
+        try self.em.loadMem(.rdi, REGS, @intCast(@as(u64, self.uc_slot) * 8));
+        try self.em.movImm64(.rsi, @intCast(si));
+        try self.em.loadMem(.rax, REGS, @intCast(@as(u64, self.tramp_slot) * 8));
+        try self.em.callReg(.rax);
+        try self.em.testReg(.rax, .rax);
+        try self.em.jcc(.ne, self.epilogue);
+    }
+
     fn emitInst(self: *Compiler, inst: *const Inst) !void {
+        // A trampolined site (call / member / field / object op / subscript) is a
+        // host callback; checked first so an object-collection subscript is not
+        // mistaken for a native packed-array access.
+        if (self.siteIndexAt()) |si| {
+            try self.emitCallSite(si);
+            return;
+        }
         if (arrayOpOf(self.module, inst)) |op| {
             const ai = try self.arrayOf(op.recv);
             try self.emitBoundsAndPtr(ai, op.index); // rax=index, rcx=ptr
@@ -1307,20 +1354,6 @@ const Compiler = struct {
             // shift already cleared the high half; and/or/xor used the 64-bit op).
             if (typeOf(self.types, bo.dst) == .i32) try self.em.movsxd(T0, T0);
             try self.storeSlot(bo.dst, T0);
-            return;
-        }
-        if (self.siteIndexAt()) |si| {
-            // Host call trampoline: rdi = *TrampCtx, rsi = site index, rax = the
-            // host callback. It reads the scalar args from the slots, runs the
-            // callee, writes a scalar result back to the dst slot, and returns 0
-            // to continue native or a non-zero resume code (deopt / throw) which
-            // exits the loop straight through the epilogue with rax intact.
-            try self.em.loadMem(.rdi, REGS, @intCast(@as(u64, self.uc_slot) * 8));
-            try self.em.movImm64(.rsi, @intCast(si));
-            try self.em.loadMem(.rax, REGS, @intCast(@as(u64, self.tramp_slot) * 8));
-            try self.em.callReg(.rax);
-            try self.em.testReg(.rax, .rax);
-            try self.em.jcc(.ne, self.epilogue);
             return;
         }
         switch (inst.*) {
@@ -1508,9 +1541,16 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (rr.int() >= n_regs or rr.int() >= regs.len) return null;
             if (array_info[rr.int()] != null) continue;
             const v = regs[rr.int()];
-            if (v != .Array) return null;
-            const kind = v.Array.prim orelse return null;
-            if (v.Array.storage != .scalars) return null;
+            // Only a packed primitive array gets the native indexed path. A
+            // non-packed receiver (a `List` or reference `Array` of objects) is
+            // left for the object-subscript path — but only for a `get`; a
+            // non-packed `set` is not compilable here.
+            const packed_ok = v == .Array and v.Array.prim != null and v.Array.storage == .scalars;
+            if (!packed_ok) {
+                if (op.is_set) return null;
+                continue;
+            }
+            const kind = v.Array.prim.?;
             const shape = arrayElemShape(kind) orelse return null;
             const k: u32 = @intCast(arrays.items.len);
             array_info[rr.int()] = .{
@@ -1623,6 +1663,30 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 if (fld.dst.int() >= n_regs) return null;
                 member_ret[fld.dst.int()] = rt;
                 field_idx_of[fld.dst.int()] = idx;
+                continue;
+            }
+            // Object collection subscript: a `get` on a non-packed receiver whose
+            // live element is an instance. Types the dst `.object`; the element is
+            // fetched at run time through the normal `get` dispatch.
+            if (arrayOpOf(module, inst)) |op| {
+                if (op.is_set) continue;
+                if (op.recv.int() >= n_regs or array_info[op.recv.int()] != null) continue; // packed -> native
+                if (op.recv.int() >= regs.len or op.index.int() >= regs.len or op.dst.int() >= n_regs) return null;
+                const idx_v = regs[op.index.int()];
+                const idx_i: i64 = switch (idx_v) {
+                    .Int => |x| x,
+                    .Long => |x| x,
+                    else => {
+                        transient.* = true;
+                        return null;
+                    },
+                };
+                const elem = liveElementAt(regs[op.recv.int()], idx_i) orelse {
+                    transient.* = true;
+                    return null;
+                };
+                if (liveValueRegType(elem) != .object) return null;
+                member_ret[op.dst.int()] = .object;
             }
         }
     }
@@ -1709,7 +1773,8 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 .BinOp => |b| isNullCheckBinOp(types, b),
                 else => false,
             };
-            if (!is_call and !is_member and !is_field and !is_obj_move and !is_null_check) continue;
+            const is_obj_index = if (arrayOpOf(module, inst)) |op| (!op.is_set and typeAt(types, op.dst) == .object) else false;
+            if (!is_call and !is_member and !is_field and !is_obj_move and !is_null_check and !is_obj_index) continue;
             if (arrays.items.len != 0) {
                 if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
                 return null;
@@ -1735,7 +1800,25 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     break;
                 }
             }
-            if (is_obj_move) {
+            if (is_obj_index) {
+                // Object collection subscript: a `get` whose element is a boxed
+                // object. The collection is the (loop-invariant) receiver; the
+                // index is a scalar slot register.
+                const op = arrayOpOf(module, inst).?;
+                if (op.recv.int() >= n_regs or op.index.int() >= n_regs or op.dst.int() >= n_regs) return null;
+                if (!isScalarRt(typeAt(types, op.index))) return null;
+                call_sites.append(a, .{
+                    .dst_reg = op.dst.int(),
+                    .recv_reg = op.recv.int(),
+                    .args_reg = op.index.int(),
+                    .n_args = 1,
+                    .has_result = true,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .is_obj_index = true,
+                }) catch return null;
+            } else if (is_obj_move) {
                 // Copy a boxed register into another (both live in `regs`).
                 const m = inst.Move;
                 if (m.dst.int() >= n_regs or m.src.int() >= n_regs) return null;

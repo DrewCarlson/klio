@@ -1294,6 +1294,32 @@ fn LoopTramp(comptime H: type) type {
                 lc.pending_deopt_inst = site.inst;
                 return jit_loop.deoptCode(site.block);
             }
+            // Object collection subscript: read element `recv[idx]` directly (no
+            // `get` dispatch) and write it into the register. Out-of-range or an
+            // unsupported container deopts; the interpreter re-runs the subscript
+            // (a side-effect-free read) and raises the proper exception on OOB.
+            if (site.is_obj_index) {
+                const recv = lc.frame.regs.items[site.recv_reg];
+                const idx_v = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                const idx: i64 = switch (idx_v) {
+                    .Int => |x| x,
+                    .Long => |x| x,
+                    else => {
+                        lc.pending_deopt_inst = site.inst;
+                        return jit_loop.deoptCode(site.block);
+                    },
+                };
+                if (jit_loop.liveElementAt(recv, idx)) |v| {
+                    v.retain();
+                    lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                        lc.pending = .{ .Type = "out of memory in JIT subscript" };
+                        return jit_loop.throwCode(site.block);
+                    };
+                    return 0;
+                }
+                lc.pending_deopt_inst = site.inst;
+                return jit_loop.deoptCode(site.block);
+            }
             // The native loop does not run `.Trace`; refresh the calling frame's
             // position so a throw from the callee reports this call's line.
             if (site.span) |sp| lc.frame.cur_span = sp;
