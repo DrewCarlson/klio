@@ -122,6 +122,7 @@ Run any program with:
 | `jit_field_read_loop.kt`   | Hot loop reading scalar fields (`Int`/`Long`/`Double`) of a loop-invariant object, including a field mutated through a method then read back; loop JIT trampolines the read as a direct stored-field load (a custom getter falls back to the interpreter); identical output JIT off or on. |
 | `jit_object_traversal_loop.kt` | Hot loop walking a linked structure: a boxed cursor reassigned through an object field, an object-vs-null loop guard, a scalar field read and a method call per node; loop JIT keeps the cursor in the register array (a GC root) and drives the traversal natively; identical output JIT off or on. |
 | `jit_object_subscript_loop.kt` | Hot loop indexing a polymorphic `List` of objects and dispatching a method on each element; loop JIT reads the element with a direct subscript into a boxed register and dispatches dynamically, re-checking the receiver class each call; identical output JIT off or on. |
+| `jit_inferred_return_loop.kt` | Hot loops calling functions/methods with inferred (expression-body) return types; loop JIT infers each callee's scalar return type from its body (params carry declared types, arithmetic promotes per Kotlin) so the result is slot-typed and the call trampolined; identical output JIT off or on. |
 | `string_ascii_fastpath.kt` | String `length`/`indexOf`/`substring`/indexing on ASCII vs non-ASCII text (ASCII takes a byte-length fast path; non-ASCII falls back to a UTF-16 walk). |
 
 ## Integration showcases

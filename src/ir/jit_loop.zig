@@ -430,6 +430,84 @@ fn retRegType(ty: ir.TypeRef) RegType {
     return .unknown;
 }
 
+threadlocal var ret_type_cache: std.AutoHashMapUnmanaged(usize, RegType) = .empty;
+
+/// The scalar `RegType` a callee returns. Uses the declared return type when it
+/// names a scalar; otherwise (an inferred expression-body return, recorded as
+/// `Unit` in the IR) infers it from the callee's own body. Cached per function.
+fn funcReturnRegType(module: *const Module, func: *const Func) RegType {
+    const explicit = retRegType(func.return_ty);
+    if (explicit != .unknown) return explicit;
+    const key = @intFromPtr(func);
+    if (ret_type_cache.get(key)) |c| return c;
+    // Seed `.unknown` before inferring so a recursive (or mutually recursive)
+    // callee re-entering here sees the in-progress entry and stops, instead of
+    // looping forever; the real result overwrites it below.
+    ret_type_cache.put(std.heap.page_allocator, key, .unknown) catch {};
+    const inferred = inferScalarReturnType(std.heap.page_allocator, module, func) orelse .unknown;
+    ret_type_cache.put(std.heap.page_allocator, key, inferred) catch {};
+    return inferred;
+}
+
+/// Infer a callee's scalar return type from its IR body: seed the parameter
+/// registers from their declared types, propagate scalar types forward, and read
+/// the type of the value(s) flowing into the `Return` terminator. Returns null
+/// unless every value-return agrees on one scalar type (so a non-scalar or
+/// ambiguous return stays uncompilable). A nested call to another inferred-return
+/// function does not recurse — it simply stays `.unknown` here.
+fn inferScalarReturnType(a: Allocator, module: *const Module, func: *const Func) ?RegType {
+    if (func.blocks.len == 0) return null;
+    const n = func.n_locals;
+    if (n == 0) return null;
+    const types = a.alloc(RegType, n) catch return null;
+    defer a.free(types);
+    @memset(types, .unknown);
+    const empty_ai = a.alloc(?ArrayInfo, n) catch return null;
+    defer a.free(empty_ai);
+    @memset(empty_ai, null);
+    const empty_ci = a.alloc(?RegType, n) catch return null;
+    defer a.free(empty_ci);
+    @memset(empty_ci, null);
+    for (func.params, 0..) |p, i| {
+        if (i >= n) break;
+        types[i] = retRegType(p.ty);
+    }
+    var changed = true;
+    var iters: usize = 0;
+    while (changed and iters < 16) : (iters += 1) {
+        changed = false;
+        for (func.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                if (setDefType(types, module, inst, empty_ai, empty_ci)) changed = true;
+            }
+        }
+    }
+    var result: RegType = .unknown;
+    for (func.blocks) |*blk| {
+        const r = switch (blk.terminator) {
+            .Return => |maybe_r| maybe_r orelse continue,
+            else => continue,
+        };
+        if (r.int() >= n) return null;
+        const t = types[r.int()];
+        if (!isScalarRt(t)) return null;
+        if (result == .unknown) result = t else if (result != t) return null;
+    }
+    return if (result == .unknown) null else result;
+}
+
+/// The scalar result type of an arithmetic/division op on the two operand types,
+/// following Kotlin's numeric promotion (`Double > Float > Long > Int`; the
+/// narrower Byte/Short/Char already map to `i32`). A still-unknown operand yields
+/// the other (partial inference); both unknown stays unknown.
+fn promoteArith(lt: RegType, rt: RegType) RegType {
+    if (lt == .f64 or rt == .f64) return .f64;
+    if (lt == .f32 or rt == .f32) return .f32;
+    if (lt == .i64 or rt == .i64) return .i64;
+    if (lt == .i32 or rt == .i32) return .i32;
+    return if (lt != .unknown) lt else rt;
+}
+
 fn isScalarRt(t: RegType) bool {
     return switch (t) {
         .i32, .i64, .f64, .f32, .boolean => true,
@@ -570,7 +648,7 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
     // type (`.unknown` for Unit/non-scalar — its result is then never reboxed).
     if (trampolinableCallOf(inst)) |tc| {
         const f = module.funcById(tc.func) orelse return false;
-        return setType(types, tc.dst, retRegType(f.return_ty));
+        return setType(types, tc.dst, funcReturnRegType(module, f));
     }
     // CellGet yields the cell's scalar type; CellSet has no def.
     if (inst.* == .CellGet) {
@@ -584,9 +662,7 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
         .BinOp => |b| blk: {
             if (isCmpBinOp(b.op)) break :blk .{ .r = b.dst, .t = .boolean };
             if (isArithBinOp(b.op) or isDivBinOp(b.op)) {
-                const lt = typeOf(types, b.lhs);
-                const rt = typeOf(types, b.rhs);
-                break :blk .{ .r = b.dst, .t = if (lt != .unknown) lt else rt };
+                break :blk .{ .r = b.dst, .t = promoteArith(typeOf(types, b.lhs), typeOf(types, b.rhs)) };
             }
             break :blk null;
         },
@@ -1633,7 +1709,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 if (resolver.?(resolver_user.?, &regs[mc.recv.int()], mc.name, av[0..mc.n_args])) |fid| {
                     if (module.funcById(fid)) |f| {
                         if (f.is_suspend) return null;
-                        if (mc.dst.int() < n_regs) member_ret[mc.dst.int()] = retRegType(f.return_ty);
+                        if (mc.dst.int() < n_regs) member_ret[mc.dst.int()] = funcReturnRegType(module, f);
                     }
                 }
                 continue;
@@ -1887,7 +1963,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     if (debugEnabled()) std.debug.print("[jit]   bail: callee {s} suspend/receiver in {s}\n", .{ f.name, func.name });
                     return null;
                 }
-                const rrt = retRegType(f.return_ty);
+                const rrt = funcReturnRegType(module, f);
                 const has_result = rrt != .unknown;
                 if (has_result and (tc.dst.int() >= n_regs or types[tc.dst.int()] != rrt)) {
                     if (debugEnabled()) std.debug.print("[jit]   bail: call dst type mismatch in {s}\n", .{func.name});
