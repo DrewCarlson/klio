@@ -152,6 +152,18 @@ pub const CellUnbox = struct {
     rt: RegType,
 };
 
+/// One nullable-scalar register: it holds a scalar of kind `rt` or null. The
+/// scalar value lives in the register's own slot (`reg.int()`); a separate
+/// `flag_slot` holds 1 when the register is null. Both are synced with the boxed
+/// `Value` in `regs` at loop entry/exit; all in-loop reads/writes are native.
+pub const NullableUnbox = struct {
+    reg: Reg,
+    rt: RegType,
+    flag_slot: u32,
+    live_in: bool,
+    live_out: bool,
+};
+
 pub const CompiledLoop = struct {
     exec: jit.ExecBuf,
     n_regs: u32,
@@ -161,6 +173,7 @@ pub const CompiledLoop = struct {
     def_set: []bool, // reg is written somewhere in the loop (rebox at exit)
     arrays: []ArrayUnbox,
     cells: []CellUnbox,
+    nullables: []NullableUnbox,
     /// Trampolined call sites, indexed by the site index the native code passes
     /// the host callback. Empty when the loop makes no calls.
     call_sites: []CallSite,
@@ -178,6 +191,7 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.def_set);
         self.allocator.free(self.arrays);
         self.allocator.free(self.cells);
+        self.allocator.free(self.nullables);
         self.allocator.free(self.call_sites);
     }
 };
@@ -675,11 +689,14 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
 }
 
 fn setType(types: []RegType, r: Reg, t: RegType) bool {
-    if (r.int() < types.len and types[r.int()] != t and t != .unknown) {
-        types[r.int()] = t;
-        return true;
-    }
-    return false;
+    if (r.int() >= types.len or t == .unknown or types[r.int()] == t) return false;
+    // `.null_` is the bottom of a nullable merge (one branch assigns null, the
+    // other a concrete value): never let it downgrade an already-known concrete
+    // type, so a register merged from `{null, scalar}` settles on the scalar
+    // (and one merged from `{null, object}` on the object) instead of oscillating.
+    if (t == .null_ and types[r.int()] != .unknown) return false;
+    types[r.int()] = t;
+    return true;
 }
 
 fn typeOf(types: []const RegType, r: Reg) RegType {
@@ -1079,6 +1096,9 @@ const Compiler = struct {
     array_info: []const ?ArrayInfo,
     cell_info: []const ?RegType,
     call_sites: []const CallSite,
+    /// Per-register: is this a nullable-scalar register, and its null-flag slot.
+    nullable: []const bool,
+    null_flag_slot: []const u32,
     uc_slot: u32,
     tramp_slot: u32,
     n_regs: u32,
@@ -1111,6 +1131,69 @@ const Compiler = struct {
         const off: u64 = @as(u64, r.int()) * 8;
         if (off > std.math.maxInt(i32) or r.int() >= self.n_regs) return null;
         return @intCast(off);
+    }
+
+    fn isNullable(self: *Compiler, r: Reg) bool {
+        return r.int() < self.nullable.len and self.nullable[r.int()];
+    }
+    fn loadFlag(self: *Compiler, native: E, r: Reg) !void {
+        try self.em.loadMem(native, REGS, @intCast(@as(u64, self.null_flag_slot[r.int()]) * 8));
+    }
+    fn storeFlag(self: *Compiler, r: Reg, native: E) !void {
+        try self.em.storeMem(REGS, @intCast(@as(u64, self.null_flag_slot[r.int()]) * 8), native);
+    }
+
+    /// Emit a register-writing instruction whose destination (or an operand) is a
+    /// nullable-scalar register. Returns true when handled, false to fall through
+    /// to the normal scalar path. Unsupported nullable shapes raise `Unsupported`.
+    fn emitNullable(self: *Compiler, inst: *const Inst) !bool {
+        switch (inst.*) {
+            .Move => |m| {
+                if (!self.isNullable(m.dst)) return false;
+                if (typeOf(self.types, m.src) == .null_) {
+                    // dst = null: value slot cleared, flag set.
+                    try self.em.movImm64(T0, 0);
+                    try self.storeSlot(m.dst, T0);
+                    try self.em.movImm64(T0, 1);
+                    try self.storeFlag(m.dst, T0);
+                } else if (self.isNullable(m.src)) {
+                    // dst = src: copy value + flag.
+                    try self.loadSlot(T0, m.src);
+                    try self.storeSlot(m.dst, T0);
+                    try self.loadFlag(T0, m.src);
+                    try self.storeFlag(m.dst, T0);
+                } else {
+                    // dst = scalar: value from src, flag cleared.
+                    try self.loadSlot(T0, m.src);
+                    try self.storeSlot(m.dst, T0);
+                    try self.em.movImm64(T0, 0);
+                    try self.storeFlag(m.dst, T0);
+                }
+                return true;
+            },
+            .BinOp => |b| {
+                const ln = self.isNullable(b.lhs);
+                const rn = self.isNullable(b.rhs);
+                if (!ln and !rn) return false;
+                // Only `nullable == null` / `nullable != null` is compiled (a test
+                // of the flag); any other op on a nullable operand bails.
+                if (b.op != .Eq and b.op != .NotEq) return jit.JitError.Unsupported;
+                const nreg: Reg = if (ln and typeOf(self.types, b.rhs) == .null_)
+                    b.lhs
+                else if (rn and typeOf(self.types, b.lhs) == .null_)
+                    b.rhs
+                else
+                    return jit.JitError.Unsupported;
+                try self.loadFlag(T0, nreg); // T0 = 1 iff null
+                if (b.op == .NotEq) {
+                    try self.em.movImm64(T1, 1);
+                    try self.em.xorReg(T0, T1); // != null -> 1 iff non-null
+                }
+                try self.storeSlot(b.dst, T0);
+                return true;
+            },
+            else => return false,
+        }
     }
 
     fn loadSlot(self: *Compiler, native: E, r: Reg) !void {
@@ -1350,6 +1433,9 @@ const Compiler = struct {
             try self.emitCallSite(si);
             return;
         }
+        // A move into, or null test of, a nullable-scalar register manages its
+        // companion null flag natively.
+        if (try self.emitNullable(inst)) return;
         if (arrayOpOf(self.module, inst)) |op| {
             const ai = try self.arrayOf(op.recv);
             try self.emitBoundsAndPtr(ai, op.index); // rax=index, rcx=ptr
@@ -1820,6 +1906,45 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             sets.def[r] = false;
         }
     }
+
+    // Nullable-scalar registers: a register merged from a `null` literal and a
+    // scalar value. It is typed as its scalar kind but may hold null at run time,
+    // tracked by a companion flag slot. Detect them (a `Move` from a `Const null`
+    // into a scalar-typed register) and exclude from the scalar read/def sets —
+    // a flag-aware unbox/rebox replaces the plain scalar one.
+    const nullable = try a.alloc(bool, n_regs);
+    defer a.free(nullable);
+    @memset(nullable, false);
+    {
+        const is_null_const = try a.alloc(bool, n_regs);
+        defer a.free(is_null_const);
+        @memset(is_null_const, false);
+        for (body) |bid| for (func.blocks[bid.int()].insts) |*inst| {
+            if (inst.* == .Const) {
+                const c = inst.Const;
+                if (c.dst.int() < n_regs and module.consts.items[c.value.int()] == .Null) is_null_const[c.dst.int()] = true;
+            }
+        };
+        for (body) |bid| for (func.blocks[bid.int()].insts) |*inst| {
+            if (inst.* == .Move) {
+                const m = inst.Move;
+                if (m.dst.int() < n_regs and m.src.int() < n_regs and is_null_const[m.src.int()] and isScalarRt(types[m.dst.int()]))
+                    nullable[m.dst.int()] = true;
+            }
+        };
+    }
+    var nullables: std.ArrayListUnmanaged(NullableUnbox) = .empty;
+    defer nullables.deinit(a);
+    const null_flag_slot = try a.alloc(u32, n_regs);
+    defer a.free(null_flag_slot);
+    @memset(null_flag_slot, 0);
+    for (0..n_regs) |r| {
+        if (!nullable[r]) continue;
+        nullables.append(a, .{ .reg = Reg.from(@intCast(r)), .rt = types[r], .flag_slot = 0, .live_in = sets.read[r], .live_out = sets.def[r] }) catch return null;
+        sets.read[r] = false;
+        sets.def[r] = false;
+    }
+
     for (0..n_regs) |r| {
         if ((sets.read[r] or sets.def[r]) and types[r] == .unknown) {
             if (debugEnabled()) std.debug.print("[jit]   bail: reg {d} read/def but unknown type in {s}\n", .{ r, func.name });
@@ -2010,7 +2135,13 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     const has_calls = call_sites.items.len != 0;
     const uc_slot: u32 = arr_slots; // arrays.len == 0 when has_calls, so == n_regs
     const tramp_slot: u32 = arr_slots + 1;
-    const n_slots: u32 = arr_slots + (if (has_calls) @as(u32, 2) else 0);
+    const calls_base: u32 = arr_slots + (if (has_calls) @as(u32, 2) else 0);
+    // One null-flag slot per nullable-scalar register, after the array and call slots.
+    for (nullables.items, 0..) |*nu, i| {
+        nu.flag_slot = calls_base + @as(u32, @intCast(i));
+        null_flag_slot[nu.reg.int()] = nu.flag_slot;
+    }
+    const n_slots: u32 = calls_base + @as(u32, @intCast(nullables.items.len));
 
     var c = Compiler{
         .a = a,
@@ -2021,6 +2152,8 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .array_info = array_info,
         .cell_info = cell_info,
         .call_sites = call_sites.items,
+        .nullable = nullable,
+        .null_flag_slot = null_flag_slot,
         .uc_slot = uc_slot,
         .tramp_slot = tramp_slot,
         .n_regs = n_regs,
@@ -2059,6 +2192,12 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         a.free(cells_owned);
         return null;
     };
+    const nullables_owned = nullables.toOwnedSlice(a) catch {
+        a.free(arrays_owned);
+        a.free(cells_owned);
+        a.free(sites_owned);
+        return null;
+    };
     ok = true;
     return CompiledLoop{
         .exec = exec,
@@ -2069,6 +2208,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .def_set = sets.def,
         .arrays = arrays_owned,
         .cells = cells_owned,
+        .nullables = nullables_owned,
         .call_sites = sites_owned,
         .uc_slot = uc_slot,
         .tramp_slot = tramp_slot,
@@ -2152,6 +2292,21 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
         slots[cu.reg.int()] = cellSlotIn(cu.rt, inner) orelse return .bail;
     }
 
+    // Unbox each loop-carried nullable-scalar register: a null value sets its
+    // flag slot, otherwise the scalar lands in the value slot with the flag clear.
+    for (self.nullables) |nu| {
+        if (!nu.live_in) continue;
+        if (nu.reg.int() >= regs.len) return .bail;
+        const v = regs[nu.reg.int()];
+        if (v == .Null) {
+            slots[nu.reg.int()] = 0;
+            slots[nu.flag_slot] = 1;
+        } else {
+            slots[nu.reg.int()] = cellSlotIn(nu.rt, v) orelse return .bail;
+            slots[nu.flag_slot] = 0;
+        }
+    }
+
     // A loop with trampolined calls needs its reserved slots wired before entry:
     // one holds the `*TrampCtx` the native call sites load into rdi, the other the
     // host callback. `tctx` is a stack local live across the whole native run.
@@ -2207,6 +2362,13 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
         const g = v.Cell.borrowMut();
         g.get().* = valueFromSlot(cu.rt, slots[cu.reg.int()]);
         g.deinit();
+    }
+
+    // Rebox each written nullable-scalar register: a set flag slot restores null,
+    // otherwise the scalar value is reboxed.
+    for (self.nullables) |nu| {
+        if (!nu.live_out or nu.reg.int() >= regs.len) continue;
+        regs[nu.reg.int()] = if (slots[nu.flag_slot] != 0) .Null else valueFromSlot(nu.rt, slots[nu.reg.int()]);
     }
     return .{ .resume_at = .{ .block = target, .inst = inst } };
 }
