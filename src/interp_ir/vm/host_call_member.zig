@@ -4041,6 +4041,17 @@ fn argsListFromSlice(allocator: Allocator, slice: []const Value) Allocator.Error
 /// Whether the class `name` (or any supertype, breadth-first) declares an
 /// IR method named `mname`.
 fn classHasUserMethod(self: *VmHost, allocator: Allocator, start: []const u8, mname: []const u8) bool {
+    // Fast path: the precomputed per-class hierarchy method-name set answers
+    // this in O(1). It collects the same user-declared method names up the
+    // supertype chain the walk below would. Built for every source class; a
+    // class with no entry (a synthesized/anon shape) falls back to the walk.
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().registry.hierarchy_methods.get(start)) |set| {
+            return set.contains(mname);
+        }
+    }
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);

@@ -811,6 +811,10 @@ pub const Module = struct {
     /// falls back to the scan, e.g. during lowering). First-entry-wins to match
     /// the scan's duplicate-name behavior.
     class_id_map: ?std.StringHashMap(ClassId) = null,
+    /// FQN → `ClassId` overlay on `classIdByFqn`'s linear scan. A duplicated FQN
+    /// maps to `class_id_ambiguous` so the lookup returns null (the scan's
+    /// ambiguity guard). Built with `class_id_map`; null until then.
+    class_fqn_map: ?std.StringHashMap(ClassId) = null,
     /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
     /// to `Inst.Call { func }` instead of LoadGlobal+CallValue.
@@ -1045,6 +1049,7 @@ pub const Module = struct {
         self.top_level.deinit(allocator);
         self.class_index.deinit(allocator);
         if (self.class_id_map) |*m| m.deinit();
+        if (self.class_fqn_map) |*m| m.deinit();
         self.func_index.deinit(allocator);
         var it = self.func_name_index.valueIterator();
         while (it.next()) |list| list.deinit(allocator);
@@ -1150,6 +1155,15 @@ pub const Module = struct {
         }
         if (self.class_id_map) |*old| old.deinit();
         self.class_id_map = m;
+
+        var fm = std.StringHashMap(ClassId).init(allocator);
+        try fm.ensureTotalCapacity(@intCast(self.classes.items.len));
+        for (self.classes.items) |c| {
+            const gop = fm.getOrPutAssumeCapacity(c.fqn);
+            gop.value_ptr.* = if (gop.found_existing) class_id_ambiguous else c.id;
+        }
+        if (self.class_fqn_map) |*old| old.deinit();
+        self.class_fqn_map = fm;
     }
 
     /// Resolve a class written with a dotted qualifier (`Outer.Inner`) by
@@ -1987,7 +2001,15 @@ pub const Module = struct {
     /// Resolve a class by its fully-qualified name. Distinguishes
     /// same-simple-name classes from different packages that
     /// `addClass` keeps as separate definitions.
+    /// Sentinel stored in `class_fqn_map` for a duplicated FQN — the lookup
+    /// returns null so an ambiguous FQN never silently binds the wrong class.
+    const class_id_ambiguous: ClassId = @enumFromInt(std.math.maxInt(u32));
+
     pub fn classIdByFqn(self: *const Module, fqn: []const u8) ?ClassId {
+        if (self.class_fqn_map) |*m| {
+            const id = m.get(fqn) orelse return null;
+            return if (id == class_id_ambiguous) null else id;
+        }
         // Only resolve when the FQN is unambiguous. A residual
         // collision must not silently bind the wrong class.
         var found: ?ClassId = null;
