@@ -583,6 +583,15 @@ pub const Emitter = struct {
         try self.byte(0xC3);
     }
 
+    /// `call <reg>` — indirect near call through a register holding the absolute
+    /// target address (load it with `movImm64` first). Used to invoke the host
+    /// trampoline from a JIT'd loop.
+    pub fn callReg(self: *Emitter, target: Reg) JitError!void {
+        if (@intFromEnum(target) >= 8) try self.byte(0x41); // REX.B
+        try self.byte(0xFF);
+        try self.byte(0xD0 | low3(target)); // /2, mod=11
+    }
+
     // --- labels & jumps ------------------------------------------------------
 
     pub const Cond = enum(u8) {

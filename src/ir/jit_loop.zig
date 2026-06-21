@@ -24,6 +24,7 @@ const Func = ir.Func;
 const Inst = ir.Inst;
 const Reg = ir.Reg;
 const BlockId = ir.BlockId;
+const FuncId = ir.FuncId;
 const Allocator = std.mem.Allocator;
 const E = jit.Reg;
 
@@ -49,6 +50,47 @@ pub const RegType = enum(u8) { i32, i64, f64, f32, boolean, unit, null_, unknown
 fn encodeResume(blk: BlockId, inst: u32) u64 {
     return (@as(u64, blk.int()) << 32) | inst;
 }
+/// Public resume encoder for the host call trampoline (a deopt that re-executes
+/// the call in the interpreter — used when the callee yields a non-throw error
+/// or a non-scalar result the slot cannot hold).
+pub fn encodeResumePub(blk: BlockId, inst: u32) u64 {
+    return encodeResume(blk, inst);
+}
+/// Sentinel inst index marking "the trampolined call threw"; the host stashed
+/// the exception in its loop ctx and the interpreter must re-raise it at the
+/// call's block (via `resume_throw`) rather than re-execute the call.
+pub const THROW_INST: u32 = 0xffff_ffff;
+pub fn throwCode(blk: BlockId) u64 {
+    return encodeResume(blk, THROW_INST);
+}
+
+/// Runtime context the JIT'd loop hands its trampoline: the live slot file, the
+/// compiled loop (for per-site descriptors + reg types), and the host's opaque
+/// loop ctx. Its address sits in a reserved slot the native call site loads.
+pub const TrampCtx = extern struct {
+    slots: [*]i64,
+    compiled: *const CompiledLoop,
+    user: *anyopaque,
+};
+/// `fn(trampctx, call_site_index) -> 0 to continue native, else a resume code`.
+pub const TrampFn = *const fn (*anyopaque, u64) callconv(.c) u64;
+
+/// One trampolined call site in a compiled loop. Arg/result types come from the
+/// loop's `reg_types` (a slot index == its reg index).
+pub const CallSite = struct {
+    func: FuncId,
+    args_reg: u32,
+    n_args: u8,
+    dst_reg: u32,
+    has_result: bool,
+    block: BlockId,
+    inst: u32,
+    /// Source span of the call (from the nearest preceding `.Trace`), so the
+    /// trampoline can refresh the calling frame's position before dispatch — the
+    /// native loop does not execute `.Trace`, so the frame's span is otherwise
+    /// stale when a trampolined call throws.
+    span: ?ir.Span = null,
+};
 
 /// One packed array a compiled loop indexes: the register holding it, the
 /// element kind specialized at compile time, and the scratch slots where the
@@ -78,6 +120,14 @@ pub const CompiledLoop = struct {
     def_set: []bool, // reg is written somewhere in the loop (rebox at exit)
     arrays: []ArrayUnbox,
     cells: []CellUnbox,
+    /// Trampolined call sites, indexed by the site index the native code passes
+    /// the host callback. Empty when the loop makes no calls.
+    call_sites: []CallSite,
+    /// Reserved slot holding the `*TrampCtx` the native call sites load into rdi,
+    /// and the slot holding the host `TrampFn` pointer. Only valid when
+    /// `call_sites.len != 0`.
+    uc_slot: u32,
+    tramp_slot: u32,
     allocator: Allocator,
 
     pub fn deinit(self: *CompiledLoop) void {
@@ -87,6 +137,7 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.def_set);
         self.allocator.free(self.arrays);
         self.allocator.free(self.cells);
+        self.allocator.free(self.call_sites);
     }
 };
 
@@ -252,6 +303,45 @@ fn bitwiseOpOf(module: *const Module, inst: *const Inst) ?BitOp {
     }
 }
 
+/// A top-level `Call` the loop JIT can trampoline: a native call site invokes the
+/// host, which reboxes the scalar args, runs the callee interpreted, and reboxes a
+/// scalar result. v1 handles only the bare positional form (no named args, no
+/// reified type args) with at most three args.
+const TrampCall = struct { func: FuncId, args_reg: u32, n_args: u8, dst: Reg };
+
+fn trampolinableCallOf(inst: *const Inst) ?TrampCall {
+    switch (inst.*) {
+        .Call => |c| {
+            if (c.arg_names.len != 0 or c.type_args.len != 0) return null;
+            if (c.n_args > 3) return null;
+            return .{ .func = c.func, .args_reg = c.args.int(), .n_args = c.n_args, .dst = c.dst };
+        },
+        else => return null,
+    }
+}
+
+/// The scalar `RegType` a callee's declared return type maps to, or `.unknown`
+/// for a non-scalar / nullable / `Unit` return (the call's result is then not
+/// reboxed; a used non-scalar result makes the loop uncompilable).
+fn retRegType(ty: ir.TypeRef) RegType {
+    if (ty.nullable) return .unknown;
+    const n = ty.name;
+    if (std.mem.eql(u8, n, "Int") or std.mem.eql(u8, n, "Char") or
+        std.mem.eql(u8, n, "Short") or std.mem.eql(u8, n, "Byte")) return .i32;
+    if (std.mem.eql(u8, n, "Long")) return .i64;
+    if (std.mem.eql(u8, n, "Double")) return .f64;
+    if (std.mem.eql(u8, n, "Float")) return .f32;
+    if (std.mem.eql(u8, n, "Boolean")) return .boolean;
+    return .unknown;
+}
+
+fn isScalarRt(t: RegType) bool {
+    return switch (t) {
+        .i32, .i64, .f64, .f32, .boolean => true,
+        else => false,
+    };
+}
+
 /// Element register type + native access width for a packed array kind, or null
 /// for kinds the JIT does not compile (Float). A `Double` element is moved as a
 /// raw 8-byte (`b64`) value — its f64 bits live in the slot and are consumed by
@@ -284,9 +374,24 @@ const ArrayInfo = struct {
 
 // --- whole-function static type inference -----------------------------------
 
-fn inferTypes(a: Allocator, module: *const Module, func: *const Func, n_regs: u32, array_info: []const ?ArrayInfo, cell_info: []const ?RegType) Allocator.Error![]RegType {
+fn inferTypes(a: Allocator, module: *const Module, func: *const Func, n_regs: u32, array_info: []const ?ArrayInfo, cell_info: []const ?RegType, regs: []const Value) Allocator.Error![]RegType {
     const types = try a.alloc(RegType, n_regs);
     @memset(types, .unknown);
+    // Seed parameter registers from their live scalar kind: a function whose hot
+    // loop only reads its parameters has no in-body instruction to infer their
+    // type from. This is sound because the entry unbox re-checks each read reg
+    // against its cached type and bails to the interpreter on any mismatch (e.g.
+    // a later activation of a generic function called with a different type). A
+    // param the loop writes is overridden by `setDefType`; a non-scalar param is
+    // left unknown (and bails if read).
+    {
+        const nparams = @min(func.params.len, n_regs);
+        var p: usize = 0;
+        while (p < nparams and p < regs.len) : (p += 1) {
+            if (array_info[p] != null or cell_info[p] != null) continue;
+            if (cellScalarType(regs[p])) |rt| types[p] = rt;
+        }
+    }
     var changed = true;
     var iters: usize = 0;
     while (changed and iters < 16) : (iters += 1) {
@@ -318,6 +423,12 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
     // Bitwise infix op yields its left operand's integer type.
     if (bitwiseOpOf(module, inst)) |bo| {
         return setType(types, bo.dst, typeOf(types, bo.lhs));
+    }
+    // A trampolined top-level call yields its callee's declared scalar return
+    // type (`.unknown` for Unit/non-scalar — its result is then never reboxed).
+    if (trampolinableCallOf(inst)) |tc| {
+        const f = module.funcById(tc.func) orelse return false;
+        return setType(types, tc.dst, retRegType(f.return_ty));
     }
     // CellGet yields the cell's scalar type; CellSet has no def.
     if (inst.* == .CellGet) {
@@ -556,6 +667,18 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
         def.* = bo.dst;
         return;
     }
+    // A trampolined call reads its (≤3) consecutive arg registers; its dst is a
+    // def only when the callee returns a scalar (an unused/Unit result is not
+    // tracked, so it does not force the dst into the scalar type requirement).
+    if (trampolinableCallOf(inst)) |tc| {
+        var k: u8 = 0;
+        while (k < tc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(tc.args_reg + k);
+        n_reads.* = tc.n_args;
+        if (module.funcById(tc.func)) |f| {
+            if (retRegType(f.return_ty) != .unknown) def.* = tc.dst;
+        }
+        return;
+    }
     switch (inst.*) {
         .Const => |c| def.* = c.dst,
         .Move => |m| {
@@ -696,6 +819,9 @@ const Compiler = struct {
     types: []const RegType,
     array_info: []const ?ArrayInfo,
     cell_info: []const ?RegType,
+    call_sites: []const CallSite,
+    uc_slot: u32,
+    tramp_slot: u32,
     n_regs: u32,
     em: jit.Emitter,
     block_label: []?jit.Emitter.Label,
@@ -710,6 +836,16 @@ const Compiler = struct {
     fn inBody(self: *Compiler, b: BlockId) bool {
         for (self.body) |x| if (x.int() == b.int()) return true;
         return false;
+    }
+
+    /// The compiled call-site index for the instruction at the current
+    /// (block, inst), or null if that instruction is not a trampolined call.
+    fn siteIndexAt(self: *Compiler) ?u32 {
+        for (self.call_sites, 0..) |s, i| {
+            if (s.block.int() == self.cur_block.int() and s.inst == self.cur_inst)
+                return @intCast(i);
+        }
+        return null;
     }
 
     fn slotDisp(self: *Compiler, r: Reg) ?i32 {
@@ -1015,6 +1151,20 @@ const Compiler = struct {
             try self.storeSlot(bo.dst, T0);
             return;
         }
+        if (self.siteIndexAt()) |si| {
+            // Host call trampoline: rdi = *TrampCtx, rsi = site index, rax = the
+            // host callback. It reads the scalar args from the slots, runs the
+            // callee, writes a scalar result back to the dst slot, and returns 0
+            // to continue native or a non-zero resume code (deopt / throw) which
+            // exits the loop straight through the epilogue with rax intact.
+            try self.em.loadMem(.rdi, REGS, @intCast(@as(u64, self.uc_slot) * 8));
+            try self.em.movImm64(.rsi, @intCast(si));
+            try self.em.loadMem(.rax, REGS, @intCast(@as(u64, self.tramp_slot) * 8));
+            try self.em.callReg(.rax);
+            try self.em.testReg(.rax, .rax);
+            try self.em.jcc(.ne, self.epilogue);
+            return;
+        }
         switch (inst.*) {
             .Const => |c| {
                 const cv = self.module.consts.items[c.value.int()];
@@ -1172,6 +1322,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (arrayOpOf(module, inst) != null) continue;
             if (numericConvOf(module, inst) != null) continue;
             if (bitwiseOpOf(module, inst) != null) continue;
+            if (trampolinableCallOf(inst) != null) continue;
             switch (inst.*) {
                 .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .CellGet, .CellSet => {},
                 else => {
@@ -1212,7 +1363,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             arrays.append(a, .{ .reg = rr, .kind = kind, .ptr_slot = n_regs + 2 * k, .len_slot = n_regs + 2 * k + 1 }) catch return null;
         }
     }
-    const n_slots: u32 = n_regs + 2 * @as(u32, @intCast(arrays.items.len));
+    const arr_slots: u32 = n_regs + 2 * @as(u32, @intCast(arrays.items.len));
 
     // Discover capture cells, specializing on the scalar kind each box holds in
     // the live frame. The cached scalar reuses the cell register's own slot, so
@@ -1272,7 +1423,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         }
     }
 
-    const types = try inferTypes(a, module, func, n_regs, array_info, cell_info);
+    const types = try inferTypes(a, module, func, n_regs, array_info, cell_info, regs);
     const sets = try computeSets(a, module, func, body, header, n_regs);
     var ok = false;
     defer if (!ok) {
@@ -1293,8 +1444,77 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         sets.def[cu.reg.int()] = false;
     }
     for (0..n_regs) |r| {
-        if ((sets.read[r] or sets.def[r]) and types[r] == .unknown) return null;
+        if ((sets.read[r] or sets.def[r]) and types[r] == .unknown) {
+            if (debugEnabled()) std.debug.print("[jit]   bail: reg {d} read/def but unknown type in {s}\n", .{ r, func.name });
+            return null;
+        }
     }
+
+    // Collect and validate trampolined call sites. A call may run arbitrary code
+    // (and a GC), so a loop that also indexes arrays is rejected: the array buffer
+    // pointer is cached in a slot and a callee could resize the backing store,
+    // leaving the cache stale. Capture cells are safe to combine with calls — the
+    // callee receives reboxed scalar args, never a reference to the caller's box,
+    // and the cached scalar lives in a slot written back only at loop exit.
+    var call_sites: std.ArrayListUnmanaged(CallSite) = .empty;
+    defer call_sites.deinit(a);
+    for (body) |bid| {
+        for (func.blocks[bid.int()].insts, 0..) |*inst, i| {
+            const tc = trampolinableCallOf(inst) orelse continue;
+            if (arrays.items.len != 0) {
+                if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
+                return null;
+            }
+            const f = module.funcById(tc.func) orelse return null;
+            // The callee must run as a plain interpreted call: no suspend
+            // machinery, no implicit receiver to thread, body present (or
+            // deferred/native — `callFunc` settles those).
+            if (f.is_suspend or f.has_receiver_param) {
+                if (debugEnabled()) std.debug.print("[jit]   bail: callee {s} suspend/receiver in {s}\n", .{ f.name, func.name });
+                return null;
+            }
+            // Every scalar arg must already live in a typed slot.
+            var k: u8 = 0;
+            while (k < tc.n_args) : (k += 1) {
+                const ar = tc.args_reg + k;
+                if (ar >= n_regs or !isScalarRt(types[ar])) {
+                    if (debugEnabled()) std.debug.print("[jit]   bail: call arg reg {d} type {s} in {s}\n", .{ ar, @tagName(types[ar]), func.name });
+                    return null;
+                }
+            }
+            const rrt = retRegType(f.return_ty);
+            const has_result = rrt != .unknown;
+            if (has_result and (tc.dst.int() >= n_regs or types[tc.dst.int()] != rrt)) {
+                if (debugEnabled()) std.debug.print("[jit]   bail: call dst type mismatch in {s}\n", .{func.name});
+                return null;
+            }
+            // Nearest preceding `.Trace` gives the call's source span.
+            var span: ?ir.Span = null;
+            var bj: usize = i;
+            const blk_insts = func.blocks[bid.int()].insts;
+            while (bj > 0) {
+                bj -= 1;
+                if (blk_insts[bj] == .Trace) {
+                    span = blk_insts[bj].Trace.span;
+                    break;
+                }
+            }
+            call_sites.append(a, .{
+                .func = tc.func,
+                .args_reg = tc.args_reg,
+                .n_args = tc.n_args,
+                .dst_reg = tc.dst.int(),
+                .has_result = has_result,
+                .block = bid,
+                .inst = @intCast(i),
+                .span = span,
+            }) catch return null;
+        }
+    }
+    const has_calls = call_sites.items.len != 0;
+    const uc_slot: u32 = arr_slots; // arrays.len == 0 when has_calls, so == n_regs
+    const tramp_slot: u32 = arr_slots + 1;
+    const n_slots: u32 = arr_slots + (if (has_calls) @as(u32, 2) else 0);
 
     var c = Compiler{
         .a = a,
@@ -1304,6 +1524,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .types = types,
         .array_info = array_info,
         .cell_info = cell_info,
+        .call_sites = call_sites.items,
+        .uc_slot = uc_slot,
+        .tramp_slot = tramp_slot,
         .n_regs = n_regs,
         .em = jit.Emitter.init(a),
         .block_label = try a.alloc(?jit.Emitter.Label, func.blocks.len),
@@ -1332,6 +1555,11 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         a.free(arrays_owned);
         return null;
     };
+    const sites_owned = call_sites.toOwnedSlice(a) catch {
+        a.free(arrays_owned);
+        a.free(cells_owned);
+        return null;
+    };
     ok = true;
     return CompiledLoop{
         .exec = exec,
@@ -1342,6 +1570,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .def_set = sets.def,
         .arrays = arrays_owned,
         .cells = cells_owned,
+        .call_sites = sites_owned,
+        .uc_slot = uc_slot,
+        .tramp_slot = tramp_slot,
         .allocator = a,
     };
 }
@@ -1355,7 +1586,7 @@ pub const RunResult = union(enum) {
     bail,
 };
 
-pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64) RunResult {
+pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?TrampFn, user: ?*anyopaque) RunResult {
     var r: usize = 0;
     while (r < self.n_regs) : (r += 1) {
         slots[r] = 0;
@@ -1419,6 +1650,17 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64) RunResult
         slots[cu.reg.int()] = cellSlotIn(cu.rt, inner) orelse return .bail;
     }
 
+    // A loop with trampolined calls needs its reserved slots wired before entry:
+    // one holds the `*TrampCtx` the native call sites load into rdi, the other the
+    // host callback. `tctx` is a stack local live across the whole native run.
+    var tctx: TrampCtx = undefined;
+    if (self.call_sites.len != 0) {
+        if (tramp == null or user == null) return .bail;
+        tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.? };
+        slots[self.uc_slot] = @bitCast(@intFromPtr(&tctx));
+        slots[self.tramp_slot] = @bitCast(@intFromPtr(tramp.?));
+    }
+
     const fnptr = self.exec.entry(*const fn ([*]i64) callconv(.c) u64);
     const code = fnptr(slots.ptr);
     const target = BlockId.from(@intCast(code >> 32));
@@ -1455,7 +1697,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64) RunResult
 
 /// Read the cell's inner scalar into an i64 slot, or null if the box no longer
 /// holds the specialized kind (deopt to interpreter).
-fn cellSlotIn(rt: RegType, v: Value) ?i64 {
+pub fn cellSlotIn(rt: RegType, v: Value) ?i64 {
     return switch (rt) {
         .i32 => switch (v) {
             .Int => |x| x,
@@ -1484,7 +1726,7 @@ fn cellSlotIn(rt: RegType, v: Value) ?i64 {
     };
 }
 
-fn valueFromSlot(rt: RegType, s: i64) Value {
+pub fn valueFromSlot(rt: RegType, s: i64) Value {
     return switch (rt) {
         .i32 => .{ .Int = @truncate(s) },
         .i64 => .{ .Long = s },
@@ -1538,7 +1780,6 @@ fn debugEnabled() bool {
 }
 
 threadlocal var states: std.AutoHashMapUnmanaged(usize, *FuncJit) = .empty;
-threadlocal var scratch: std.ArrayListUnmanaged(i64) = .empty;
 
 fn forFunc(func: *const Func) ?*FuncJit {
     const a = std.heap.page_allocator;
@@ -1562,7 +1803,7 @@ fn forFunc(func: *const Func) ?*FuncJit {
 /// Interpreter hook: at the start of block `cur`, count the entry and — once
 /// hot — compile and run the natural loop with that header. Returns the resume
 /// point (registers reboxed) when a compiled loop ran, else null. KLIO_JIT only.
-pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId) ?Resume {
+pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque) ?Resume {
     const fj = forFunc(func) orelse return null;
     const bi = cur.int();
     if (bi >= fj.counts.len) return null;
@@ -1582,9 +1823,20 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
     if (regs.items.len < cl.n_regs) {
         regs.appendNTimes(allocator, .Unit, cl.n_regs - regs.items.len) catch return null;
     }
-    scratch.ensureTotalCapacity(std.heap.page_allocator, cl.n_slots) catch return null;
-    scratch.items.len = cl.n_slots;
-    return switch (runLoop(cl, regs.items, scratch.items[0..cl.n_slots])) {
+    // Slots live in a per-activation buffer, never a shared one: a trampolined
+    // call can re-enter this hook for a nested hot loop, and that inner run must
+    // not alias (or reallocate) the outer loop's live slots. Small loops use a
+    // stack buffer; the rare larger loop falls back to a freed heap allocation.
+    var stack_slots: [128]i64 = undefined;
+    var heap_slots: ?[]i64 = null;
+    defer if (heap_slots) |hs| std.heap.page_allocator.free(hs);
+    const slots: []i64 = if (cl.n_slots <= stack_slots.len)
+        stack_slots[0..cl.n_slots]
+    else blk: {
+        heap_slots = std.heap.page_allocator.alloc(i64, cl.n_slots) catch return null;
+        break :blk heap_slots.?;
+    };
+    return switch (runLoop(cl, regs.items, slots, tramp, user)) {
         .resume_at => |res| res,
         .bail => null,
     };
