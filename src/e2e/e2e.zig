@@ -38,6 +38,9 @@ fn runCorpus(jit_on: bool) !void {
 
     var failures: usize = 0;
     for (files) |kt| {
+        // Drop the previous program's JIT state: its module memory is about to be
+        // recycled, so a reused `*Func` address must not inherit stale native code.
+        jit.resetForTest();
         _ = run_arena.reset(.retain_capacity);
         const a = run_arena.allocator();
         const base = std.fs.path.basename(kt);
@@ -106,6 +109,9 @@ test "e2e corpus matches expected output" {
 
     var failures: usize = 0;
     for (files) |kt| {
+        // Drop the previous program's JIT state: its module memory is about to be
+        // recycled, so a reused `*Func` address must not inherit stale native code.
+        jit.resetForTest();
         _ = run_arena.reset(.retain_capacity);
         const a = run_arena.allocator();
         const base = std.fs.path.basename(kt);
@@ -139,5 +145,48 @@ test "e2e corpus matches expected output" {
     if (failures != 0) {
         std.debug.print("e2e: {d}/{d} corpus programs failed\n", .{ failures, files.len });
         return error.CorpusMismatch;
+    }
+}
+
+// The whole-function JIT (native recursion) is opt-in (`KLIO_FUNC_JIT`), so the
+// corpus passes above never exercise it. Run the recursion example through it
+// here — a small, main-thread-only set, so the per-thread compiled-code retention
+// that keeps it out of the full corpus run cannot accumulate.
+test "function-JIT recursion matches the interpreter" {
+    jit.setEnabledForTest(true);
+    jit.setFuncEnabledForTest(true);
+    defer jit.setEnabledForTest(false);
+    defer jit.setFuncEnabledForTest(false);
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cases = [_][]const u8{ "jit_recursion", "jit_inline_call_loop" };
+    for (cases) |stem| {
+        jit.resetForTest();
+        const kt = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ EXAMPLES, stem });
+        const exp_path = try std.fmt.allocPrint(a, "{s}/{s}.out", .{ EXPECTED, stem });
+        const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |e| {
+            std.debug.print("func-jit SKIP {s}: no expected ({s})\n", .{ stem, @errorName(e) });
+            continue;
+        };
+        const res = parity.runWithPacks(a, io, kt) catch |e| {
+            std.debug.print("func-jit FAIL {s}: run error {s}\n", .{ stem, @errorName(e) });
+            return error.FuncJitMismatch;
+        };
+        switch (res) {
+            .ok => |got| if (!std.mem.eql(u8, got, expected)) {
+                std.debug.print("func-jit FAIL {s}:\n  got:  {s}\n  want: {s}\n", .{ stem, got, expected });
+                return error.FuncJitMismatch;
+            },
+            .err => |msg| {
+                std.debug.print("func-jit FAIL {s}: klio error: {s}\n", .{ stem, msg });
+                return error.FuncJitMismatch;
+            },
+        }
     }
 }

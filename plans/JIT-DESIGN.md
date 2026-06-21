@@ -51,3 +51,46 @@ slower than node on the numeric workload. An interpreter cannot reach a JIT;
 native code generation with type specialization is required. This document is the
 deliberate, multi-session plan to build it incrementally without regressing the
 working interpreter.
+
+## Whole-function mode (native recursion)
+
+The loop tier covers hot loops; recursion and call-bound code with no enclosing
+loop (e.g. `fib`) stayed in the interpreter, bound by per-instruction dispatch.
+Function mode closes that gap: when a function entry is hot, its **whole body**
+(entry → `Return`) compiles to native code.
+
+- **Opt-in.** Enabled with `KLIO_FUNC_JIT=1` on top of `KLIO_JIT=1`. It compiles
+  whole bodies (including recursion) per thread with no cross-thread eviction
+  path — correct and bounded for a normal single-program process, but the
+  in-process multi-program test harness would accumulate per-worker compiled
+  code, so it is off unless explicitly requested.
+- **Trigger.** A per-function entry counter; at the threshold, `tryCompileFunc`
+  compiles the body. Coexists with the loop tier — function mode fires at the
+  entry block, the loop tier at inner loop headers; whichever applies first wins,
+  and either bails to the interpreter on an unsupported shape.
+- **Shape.** User-code only (stdlib / kotlinx-pack bodies stay interpreted so the
+  tier never alters the runtime machinery cooperative scheduling relies on);
+  scalar params/locals/return (exactly `Int`/`Long`/`Double`/`Float`/`Boolean`,
+  or `Unit`); terminators `Goto`/`Branch`/`Return`; instructions limited to scalar
+  arithmetic, `LoadParam`, and positional top-level calls. `/` and `%` are
+  excluded (a divide-by-zero is the only deopt a body could raise, and a frameless
+  callee has no frame to resume into).
+- **Param/return ABI.** Scalar params are packed into reserved slots at entry
+  (specialized on the first hot call's kinds; a later mismatch deopts to the
+  interpreter); a `Return` writes the scalar result to a result slot and exits.
+- **Native recursion.** A compiled body calling a compiled callee runs the
+  callee's body directly through the call trampoline — no interpreter frame, no
+  dispatch — bounded by a native-recursion depth limit (beyond it, the
+  frame-based path takes over so deep recursion raises a catchable
+  `StackOverflowError` instead of faulting the native stack). A callee throw
+  propagates out without re-running (no double effects); scalar callees are pure,
+  so the rare fallback re-run is observably identical.
+- **Result.** `fib(34)` ~6× over the interpreter; identical output JIT off/on.
+
+## Interpreter call fast path
+
+Independent of the JIT: a plain top-level user function (single overload, has
+body, non-extension, no varargs/defaults/type-params/native-binding) caches an
+eligibility plan on its `Func` and dispatches straight to its body, skipping the
+per-call overload re-resolution, extension-receiver handling, reified-type
+binding, and redundant argument copies. Positional, exact-arity calls only.

@@ -137,6 +137,13 @@ const DEFAULT_MAX_EVAL_DEPTH: usize = 2_000;
 /// `runFrame` and decremented on exit, so it counts native recursion across
 /// the host call-back boundary (every nested Kotlin call re-enters here).
 threadlocal var eval_depth: usize = 0;
+/// Native-recursion depth for the whole-function JIT: a compiled body recursing
+/// into a compiled callee runs it frameless (no interpreter frame), so each level
+/// costs a few C-stack frames. Bounded so deep recursion falls back to the
+/// frame-based path (whose `eval_depth` bound raises a catchable StackOverflow)
+/// before the native stack faults.
+threadlocal var jit_native_depth: usize = 0;
+const JIT_NATIVE_DEPTH_LIMIT: usize = 1500;
 
 /// Resolved depth cap for the current thread. `0` means "not yet read"; the
 /// first `runFrame` reads the env once and caches the result.
@@ -1477,6 +1484,39 @@ fn LoopTramp(comptime H: type) type {
                 const ar = @as(usize, site.args_reg) + k;
                 argbuf[k] = jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]);
             }
+            // Native recursion: a compiled body calling a compiled (scalar)
+            // callee runs its body directly — no interpreter frame, no dispatch.
+            // The callee is pure (scalar in, scalar out), so a deopt/throw can
+            // safely fall back to the frame-based path by re-running it below.
+            if (!site.is_member and !runtime.shouldAbandon()) {
+                if (lc.module.funcById(site.func)) |callee| {
+                    if (jit_loop.compiledFunc(callee)) |callee_cl| {
+                        if (jit_native_depth < JIT_NATIVE_DEPTH_LIMIT and callee_cl.n_slots <= 192) {
+                            var fslots: [192]i64 = undefined;
+                            jit_native_depth += 1;
+                            const fo = jit_loop.runFunc(callee_cl, &.{}, argbuf[0..site.n_args], fslots[0..callee_cl.n_slots], &call, tctx.user);
+                            jit_native_depth -= 1;
+                            if (fo) |o| {
+                                if (o.code.inst == jit_loop.RETURN_INST) {
+                                    if (site.has_result) {
+                                        tctx.slots[site.dst_reg] = jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], o.value) orelse {
+                                            lc.pending = .{ .Type = "JIT function returned a non-scalar result" };
+                                            return jit_loop.throwCode(site.block);
+                                        };
+                                    }
+                                    return 0;
+                                }
+                                // A deeper call threw: `lc.pending` is already set —
+                                // propagate it out (do NOT re-run; the callee may have
+                                // had effects), unwinding this native frame too.
+                                if (o.code.inst == jit_loop.THROW_INST) return jit_loop.throwCode(site.block);
+                            }
+                            // Not run (param-kind mismatch / depth / oversized): the
+                            // callee never executed, so the frame path runs it once.
+                        }
+                    }
+                }
+            }
             const res = if (site.is_member) member: {
                 if (comptime !@hasDecl(H, "callMemberNamed")) break :member EvalResult{ .err = .{ .Type = "host cannot dispatch member calls" } };
                 const recv = lc.frame.regs.items[site.recv_reg];
@@ -1643,6 +1683,33 @@ fn runFrameInner(
                 cur = res.block;
                 resume_idx = res.inst;
                 continue;
+            }
+            // Whole-function JIT: at the function entry, run the entire body
+            // natively (scalar functions; recursion stays native through the call
+            // trampoline). A `Return` yields the value; a callee throw / div-by-
+            // zero deopt resumes interpretation with registers reboxed.
+            if (comptime tramp_ok) {
+                if (cur.int() == func.entry.int()) {
+                    if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, allocator, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |fo| {
+                        if (fo.code.inst == jit_loop.RETURN_INST) return ok(fo.value);
+                        if (fo.code.inst == jit_loop.THROW_INST) {
+                            const e = loop_ctx.pending.?;
+                            loop_ctx.pending = null;
+                            switch (e) {
+                                .Throw => |exc| {
+                                    resume_throw = exc;
+                                    cur = fo.code.block;
+                                    continue;
+                                },
+                                else => return errResult(e),
+                            }
+                        }
+                        // A div-by-zero deopt: re-execute that instruction.
+                        cur = fo.code.block;
+                        resume_idx = fo.code.inst;
+                        continue;
+                    }
+                }
             }
         }
         const block = &func.blocks[cur.int()];
