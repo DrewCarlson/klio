@@ -34,6 +34,9 @@ pub const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 /// run boundary. Called by `Vm.deinit` and by the public runners so leaked
 /// cross-run state is a loud Debug failure.
 pub const resetReceiverThreadLocals = vmhost.resetReceiverThreadLocals;
+/// Drop this thread's per-function JIT state between programs (the test/parity
+/// harness runs many programs in one process on recycled module memory).
+pub const resetJitForTest = ir.jit_loop.resetForTest;
 
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;

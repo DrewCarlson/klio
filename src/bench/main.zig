@@ -258,6 +258,10 @@ fn hostString(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
 }
 
 fn printErr(comptime fmt: []const u8, args: anytype) void {
+    // Silent under the test runner: arg-parsing tests exercise the usage/error
+    // paths for their exit codes, and stray stderr makes `zig build test` flag
+    // the test command as failed even though the unit passed.
+    if (@import("builtin").is_test) return;
     std.debug.print(fmt, args);
 }
 

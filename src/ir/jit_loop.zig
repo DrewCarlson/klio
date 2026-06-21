@@ -63,8 +63,8 @@ const T1: E = .rcx; // rhs / len / ptr
 const T2: E = .rdx; // array element scratch
 // SSE scratch for `f64` arithmetic. A double IR register keeps its bit pattern
 // in its i64 slot and is moved in/out with `movsd`.
-const X0: jit.Emitter.Xmm = .xmm0;
-const X1: jit.Emitter.Xmm = .xmm1;
+const X0: jit.Xmm = .xmm0;
+const X1: jit.Xmm = .xmm1;
 
 /// Static type of an IR register, for normalization and reboxing. `object` marks
 /// a register that holds a full `Value` reference (an instance, null, or other
@@ -102,6 +102,13 @@ pub fn throwCode(blk: BlockId) u64 {
 pub const DEOPT_INST: u32 = 0xffff_fffe;
 pub fn deoptCode(blk: BlockId) u64 {
     return encodeResume(blk, DEOPT_INST);
+}
+/// Sentinel inst index marking "the compiled function returned" (function-JIT
+/// mode only): the scalar return value is in the compiled loop's `result_slot`.
+/// Always non-zero, so it is never mistaken for "continue native".
+pub const RETURN_INST: u32 = 0xffff_fffd;
+pub fn returnCode() u64 {
+    return encodeResume(BlockId.from(0), RETURN_INST);
 }
 
 /// Runtime context the JIT'd loop hands its trampoline: the live slot file, the
@@ -237,6 +244,18 @@ pub const CompiledLoop = struct {
     /// `call_sites.len != 0`.
     uc_slot: u32,
     tramp_slot: u32,
+    /// Function-JIT mode: this compiled unit is a whole function body (entry to
+    /// `Return`), not a natural loop. `n_params` scalar params are loaded into the
+    /// slots at `param_slot_base` before entry; a `Return` writes the scalar
+    /// result of kind `result_rt` into `result_slot` and exits with `RETURN_INST`.
+    func_mode: bool = false,
+    n_params: u32 = 0,
+    param_slot_base: u32 = 0,
+    result_slot: u32 = 0,
+    result_rt: RegType = .unit,
+    /// Function-JIT: the scalar kind each param was specialized on. A later call
+    /// whose arg is a different kind deopts to the interpreter.
+    param_rt: []RegType = &.{},
     allocator: Allocator,
 
     pub fn deinit(self: *CompiledLoop) void {
@@ -249,6 +268,7 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.nullables);
         self.allocator.free(self.field_bases);
         self.allocator.free(self.call_sites);
+        if (self.param_rt.len != 0) self.allocator.free(self.param_rt);
     }
 };
 
@@ -724,6 +744,10 @@ pub const FieldResolver = *const fn (*anyopaque, *const Value, []const u8) ?u32;
 /// The scalar `RegType` a callee's declared return type maps to, or `.unknown`
 /// for a non-scalar / nullable / `Unit` return (the call's result is then not
 /// reboxed; a used non-scalar result makes the loop uncompilable).
+fn isUnitReturn(ty: ir.TypeRef) bool {
+    return !ty.nullable and (std.mem.eql(u8, ty.name, "Unit") or ty.name.len == 0);
+}
+
 fn retRegType(ty: ir.TypeRef) RegType {
     if (ty.nullable) return .unknown;
     const n = ty.name;
@@ -942,7 +966,7 @@ pub fn instanceClassIdentity(v: Value) usize {
 /// for kinds the JIT does not compile (Float). A `Double` element is moved as a
 /// raw 8-byte (`b64`) value — its f64 bits live in the slot and are consumed by
 /// the SSE arithmetic path.
-fn arrayElemShape(kind: runtime.PrimitiveArrayKind) ?struct { rt: RegType, w: jit.Emitter.ElemW, esize: u8 } {
+fn arrayElemShape(kind: runtime.PrimitiveArrayKind) ?struct { rt: RegType, w: jit.ElemW, esize: u8 } {
     return switch (kind) {
         .Boolean => .{ .rt = .boolean, .w = .b8u, .esize = 1 },
         .Byte => .{ .rt = .i32, .w = .b8s, .esize = 1 },
@@ -962,7 +986,7 @@ fn arrayElemShape(kind: runtime.PrimitiveArrayKind) ?struct { rt: RegType, w: ji
 /// Per-array compile-time shape, indexed by the IR register holding the array.
 const ArrayInfo = struct {
     rt: RegType,
-    w: jit.Emitter.ElemW,
+    w: jit.ElemW,
     esize: u8,
     ptr_slot: u32,
     len_slot: u32,
@@ -1493,13 +1517,19 @@ const Compiler = struct {
     reg_slots: u32,
     val_payload_off: u32,
     val_tag_off: u32,
+    /// Function-JIT mode (whole-function compile): enables `LoadParam` (reads a
+    /// param slot) and the `Return` terminator (writes `result_slot`, exits).
+    func_mode: bool = false,
+    param_slot_base: u32 = 0,
+    n_params: u32 = 0,
+    result_slot: u32 = 0,
     em: jit.Emitter,
-    block_label: []?jit.Emitter.Label,
+    block_label: []?jit.Label,
     exit_targets: std.ArrayListUnmanaged(BlockId),
-    exit_labels: std.ArrayListUnmanaged(jit.Emitter.Label),
+    exit_labels: std.ArrayListUnmanaged(jit.Label),
     deopt_codes: std.ArrayListUnmanaged(u64),
-    deopt_labels: std.ArrayListUnmanaged(jit.Emitter.Label),
-    epilogue: jit.Emitter.Label,
+    deopt_labels: std.ArrayListUnmanaged(jit.Label),
+    epilogue: jit.Label,
     cur_block: BlockId = undefined,
     cur_inst: u32 = 0,
 
@@ -1604,25 +1634,25 @@ const Compiler = struct {
         try self.em.storeMem(REGS, d, native);
     }
     /// Load/store an f64 register's slot through an xmm (the slot holds the bits).
-    fn loadF64Slot(self: *Compiler, x: jit.Emitter.Xmm, r: Reg) !void {
+    fn loadF64Slot(self: *Compiler, x: jit.Xmm, r: Reg) !void {
         const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
         try self.em.movsdLoad(x, REGS, d);
     }
-    fn storeF64Slot(self: *Compiler, r: Reg, x: jit.Emitter.Xmm) !void {
+    fn storeF64Slot(self: *Compiler, r: Reg, x: jit.Xmm) !void {
         const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
         try self.em.movsdStore(REGS, d, x);
     }
     /// Load/store an f32 register's slot (f32 bits in the low 4 bytes).
-    fn loadF32Slot(self: *Compiler, x: jit.Emitter.Xmm, r: Reg) !void {
+    fn loadF32Slot(self: *Compiler, x: jit.Xmm, r: Reg) !void {
         const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
         try self.em.movssLoad(x, REGS, d);
     }
-    fn storeF32Slot(self: *Compiler, r: Reg, x: jit.Emitter.Xmm) !void {
+    fn storeF32Slot(self: *Compiler, r: Reg, x: jit.Xmm) !void {
         const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
         try self.em.movssStore(REGS, d, x);
     }
 
-    fn loadFloat(self: *Compiler, x: jit.Emitter.Xmm, r: Reg, is32: bool) !void {
+    fn loadFloat(self: *Compiler, x: jit.Xmm, r: Reg, is32: bool) !void {
         if (is32) try self.loadF32Slot(x, r) else try self.loadF64Slot(x, r);
     }
 
@@ -1668,7 +1698,7 @@ const Compiler = struct {
         }
         try self.storeSlot(dst, T0);
     }
-    fn ucomiFloat(self: *Compiler, x: jit.Emitter.Xmm, y: jit.Emitter.Xmm, is32: bool) !void {
+    fn ucomiFloat(self: *Compiler, x: jit.Xmm, y: jit.Xmm, is32: bool) !void {
         if (is32) try self.em.ucomiss(x, y) else try self.em.ucomisd(x, y);
     }
 
@@ -1737,7 +1767,7 @@ const Compiler = struct {
         }
     }
 
-    fn exitLabel(self: *Compiler, blk: BlockId) !jit.Emitter.Label {
+    fn exitLabel(self: *Compiler, blk: BlockId) !jit.Label {
         for (self.exit_targets.items, 0..) |t, i| {
             if (t.int() == blk.int()) return self.exit_labels.items[i];
         }
@@ -1747,13 +1777,13 @@ const Compiler = struct {
         return l;
     }
 
-    fn edgeLabel(self: *Compiler, target: BlockId) !jit.Emitter.Label {
+    fn edgeLabel(self: *Compiler, target: BlockId) !jit.Label {
         if (self.inBody(target)) return self.block_label[target.int()].?;
         return self.exitLabel(target);
     }
 
     /// A deopt stub for resuming the interpreter at the current instruction.
-    fn deoptLabel(self: *Compiler) !jit.Emitter.Label {
+    fn deoptLabel(self: *Compiler) !jit.Label {
         const code = encodeResume(self.cur_block, self.cur_inst);
         for (self.deopt_codes.items, 0..) |c, i| {
             if (c == code) return self.deopt_labels.items[i];
@@ -2124,6 +2154,12 @@ const Compiler = struct {
                 try self.loadSlot(T0, cs.value);
                 try self.storeSlot(cs.cell, T0);
             },
+            // Function-JIT: copy a scalar param from its entry-filled slot.
+            .LoadParam => |lp| {
+                if (!self.func_mode or lp.idx >= self.n_params) return jit.JitError.Unsupported;
+                try self.em.loadMem(T0, REGS, @intCast(@as(u64, self.param_slot_base + lp.idx) * 8));
+                try self.storeSlot(lp.dst, T0);
+            },
             .Trace => {},
             else => return jit.JitError.Unsupported,
         }
@@ -2142,6 +2178,18 @@ const Compiler = struct {
                 try self.em.testReg(T0, T0);
                 try self.em.jcc(.ne, try self.edgeLabel(br.t));
                 try self.em.jmp(try self.edgeLabel(br.f));
+            },
+            // Function-JIT: write the scalar return value (if any) to the result
+            // slot, then exit with the RETURN sentinel. The bit pattern copies for
+            // any scalar kind; `runFunc` reboxes it to the declared return type.
+            .Return => |maybe_reg| {
+                if (!self.func_mode) return jit.JitError.Unsupported;
+                if (maybe_reg) |r| {
+                    try self.loadSlot(T0, r);
+                    try self.em.storeMem(REGS, @intCast(@as(u64, self.result_slot) * 8), T0);
+                }
+                try self.em.movImm64(.rax, returnCode());
+                try self.em.jmp(self.epilogue);
             },
             else => return jit.JitError.Unsupported,
         }
@@ -3008,7 +3056,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .val_payload_off = valuePayloadOffset(),
         .val_tag_off = valueTagOffset(),
         .em = jit.Emitter.init(a),
-        .block_label = try a.alloc(?jit.Emitter.Label, func.blocks.len),
+        .block_label = try a.alloc(?jit.Label, func.blocks.len),
         .exit_targets = .empty,
         .exit_labels = .empty,
         .deopt_codes = .empty,
@@ -3295,9 +3343,22 @@ const MAX_COMPILE_ATTEMPTS: u8 = 6;
 const RETRY_GAP: u32 = 8;
 
 pub const FuncJit = struct {
+    /// Fingerprint of the function this state was built for: its `blocks` slice
+    /// pointer. The `states` map is keyed by the `*Func` address, which a freed
+    /// module's reallocation can reuse for a different function; on a hit whose
+    /// fingerprint no longer matches, the stale state (and its compiled code) is
+    /// discarded and rebuilt, so a reused address never runs another function's
+    /// native body.
+    blocks_fp: usize,
     counts: []u32,
     attempts: []u8,
     loops: std.AutoHashMapUnmanaged(u32, ?CompiledLoop) = .empty,
+    /// Whole-function JIT (function-mode): a separate hot counter and compiled
+    /// unit for the function entry. `func_tried` latches once the compile has
+    /// been attempted (success leaves `func_jit` set, failure leaves it null).
+    func_count: u32 = 0,
+    func_tried: bool = false,
+    func_jit: ?CompiledLoop = null,
     a: Allocator,
 
     pub fn deinit(self: *FuncJit) void {
@@ -3306,6 +3367,7 @@ pub const FuncJit = struct {
         var it = self.loops.valueIterator();
         while (it.next()) |v| if (v.*) |*cl| cl.deinit();
         self.loops.deinit(self.a);
+        if (self.func_jit) |*cl| cl.deinit();
     }
 };
 
@@ -3334,13 +3396,96 @@ fn debugEnabled() bool {
     return on;
 }
 
+var func_jit_cache: ?bool = null;
+
+/// Whole-function JIT (function mode / native recursion). Opt-in on top of the
+/// loop JIT via `KLIO_FUNC_JIT`, because it compiles whole bodies (including
+/// recursion) per thread without a cross-thread eviction path — fine for a normal
+/// single-program process, but the in-process multi-program test harness would
+/// accumulate per-worker compiled code. Off unless explicitly requested.
+pub fn funcEnabled() bool {
+    if (!enabled()) return false;
+    if (func_jit_cache) |f| return f;
+    const v = runtime.getenvSlice("KLIO_FUNC_JIT");
+    const on = v != null and v.?.len > 0 and !std.mem.eql(u8, v.?, "0");
+    func_jit_cache = on;
+    return on;
+}
+
+/// Test-only: force function mode on/off, bypassing the env probe.
+pub fn setFuncEnabledForTest(on: bool) void {
+    func_jit_cache = on;
+}
+
 threadlocal var states: std.AutoHashMapUnmanaged(usize, *FuncJit) = .empty;
+
+/// Total compiled native units (loops + function bodies) cached on this thread.
+/// Bounds the per-thread cache so a long-running process — or a worker that runs
+/// many programs in the in-process test harness — does not retain compiled code
+/// without limit. Eviction happens only at a safe point (`evictIfOverBudget`,
+/// called when no native frame is on the stack).
+threadlocal var compiled_units: usize = 0;
+/// Compiled-unit ceiling per thread before the cache is dropped wholesale at the
+/// next safe point. High enough that an ordinary program never trips it; a
+/// pathological generator or a long-lived multi-program worker recompiles its hot
+/// code after a clear instead of growing unbounded.
+const COMPILED_UNIT_CAP: usize = 2048;
+
+fn noteCompiled() void {
+    compiled_units += 1;
+}
+
+/// Drop this thread's JIT cache if it has grown past the ceiling. MUST be called
+/// only at a safe point — no compiled code on the stack (the interpreter at
+/// `eval_depth == 0`) — since it frees the mmap'd exec buffers.
+pub fn evictIfOverBudget() void {
+    if (compiled_units <= COMPILED_UNIT_CAP) return;
+    if (debugEnabled()) std.debug.print("[jit] evicting {d} compiled unit(s)\n", .{compiled_units});
+    clearStates();
+}
+
+fn clearStates() void {
+    var it = states.valueIterator();
+    while (it.next()) |s| {
+        s.*.deinit();
+        std.heap.page_allocator.destroy(s.*);
+    }
+    states.clearAndFree(std.heap.page_allocator);
+    compiled_units = 0;
+}
+
+/// The compiled whole-function body for `func`, if one was built (function-JIT
+/// mode). Used by the call trampoline to recurse natively into a compiled callee
+/// without rebuilding an interpreter frame.
+pub fn compiledFunc(func: *const Func) ?*const CompiledLoop {
+    if (!funcEnabled()) return null;
+    const fj = states.get(@intFromPtr(func)) orelse return null;
+    if (func.blocks.len == 0 or fj.blocks_fp != @intFromPtr(func.blocks.ptr)) return null;
+    if (fj.func_jit) |*cl| return cl;
+    return null;
+}
+
+/// Free and clear all per-function JIT state on this thread. Called between
+/// programs by the in-process test harness so compiled code (and its mmap'd exec
+/// buffers) from a finished program is not retained — and a reallocated module's
+/// reused `*Func` address cannot inherit a stale compiled body.
+pub fn resetForTest() void {
+    clearStates();
+}
 
 fn forFunc(func: *const Func) ?*FuncJit {
     const a = std.heap.page_allocator;
     const key = @intFromPtr(func);
-    if (states.get(key)) |s| return s;
     if (func.blocks.len == 0) return null;
+    const fp = @intFromPtr(func.blocks.ptr);
+    if (states.get(key)) |s| {
+        if (s.blocks_fp == fp) return s;
+        // Address reused for a different function (a freed module's storage):
+        // drop the stale state (and its compiled code) and rebuild.
+        s.deinit();
+        a.destroy(s);
+        _ = states.remove(key);
+    }
     const s = a.create(FuncJit) catch return null;
     const counts = a.alloc(u32, func.blocks.len) catch {
         a.destroy(s);
@@ -3351,7 +3496,7 @@ fn forFunc(func: *const Func) ?*FuncJit {
         a.destroy(s);
         return null;
     };
-    s.* = .{ .counts = counts, .attempts = attempts, .a = a };
+    s.* = .{ .blocks_fp = fp, .counts = counts, .attempts = attempts, .a = a };
     @memset(s.counts, 0);
     @memset(s.attempts, 0);
     states.put(a, key, s) catch {
@@ -3361,6 +3506,359 @@ fn forFunc(func: *const Func) ?*FuncJit {
         return null;
     };
     return s;
+}
+
+// --- whole-function JIT (function mode) -------------------------------------
+
+/// Every block reachable from the function entry (the compile covers the whole
+/// body, entry to `Return`). Caller frees.
+fn collectFunc(a: Allocator, func: *const Func) Allocator.Error!?[]BlockId {
+    const nb = func.blocks.len;
+    if (nb == 0) return null;
+    const reach = try a.alloc(bool, nb);
+    defer a.free(reach);
+    @memset(reach, false);
+    var order: std.ArrayListUnmanaged(BlockId) = .empty;
+    errdefer order.deinit(a);
+    var succ: std.ArrayListUnmanaged(BlockId) = .empty;
+    defer succ.deinit(a);
+    const entry = func.entry.int();
+    if (entry >= nb) return null;
+    reach[entry] = true;
+    try order.append(a, func.entry);
+    var i: usize = 0;
+    while (i < order.items.len) : (i += 1) {
+        succ.clearRetainingCapacity();
+        try succEach(func.blocks[order.items[i].int()].terminator, &succ, a);
+        for (succ.items) |s| {
+            if (s.int() < nb and !reach[s.int()]) {
+                reach[s.int()] = true;
+                try order.append(a, s);
+            }
+        }
+    }
+    return try order.toOwnedSlice(a);
+}
+
+/// Type inference for a whole function: seed `LoadParam` dsts from the live
+/// argument kinds, then propagate (`setDefType`) over every block to a fixpoint.
+fn inferFuncTypes(a: Allocator, module: *const Module, func: *const Func, n_regs: u32, params: []const Value) Allocator.Error![]RegType {
+    const types = try a.alloc(RegType, n_regs);
+    @memset(types, .unknown);
+    var changed = true;
+    var iters: usize = 0;
+    while (changed and iters < 16) : (iters += 1) {
+        changed = false;
+        for (func.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                if (inst.* == .LoadParam) {
+                    const lp = inst.LoadParam;
+                    if (lp.idx < params.len) {
+                        if (cellScalarType(params[lp.idx])) |rt| {
+                            if (setType(types, lp.dst, rt)) changed = true;
+                        }
+                    }
+                    continue;
+                }
+                if (setDefType(types, module, inst, &.{}, &.{})) changed = true;
+            }
+        }
+    }
+    return types;
+}
+
+/// Try to compile the whole body of `func` to native code (function mode): a
+/// scalar function whose params/locals/return are scalar and whose only calls
+/// are positional top-level calls (so direct recursion stays native through the
+/// call trampoline). `params` are the live arguments at the hot call, used to
+/// specialize param kinds. Returns null for any unsupported shape.
+pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
+    _ = resolver;
+    _ = field_resolver;
+    _ = field_nn_resolver;
+    _ = resolver_user;
+    if (func.blocks.len == 0) return null;
+    if (func.is_suspend or func.is_lambda or func.is_inline) return null;
+    // Only user-code functions: stdlib / kotlinx-pack bodies are left to the
+    // interpreter so the whole-function tier never alters the runtime machinery
+    // (coroutine dispatch, cancellation) that cooperative scheduling relies on.
+    if (std.mem.startsWith(u8, func.package, "kotlin")) return null;
+    const n_params: u32 = @intCast(func.params.len);
+    if (n_params > 16 or params.len < n_params) return null;
+    // Result must be scalar or Unit.
+    const result_rt: RegType = retRegType(func.return_ty);
+    // Only a return type whose boxed form `valueFromSlot` reproduces exactly:
+    // `Char`/`Short`/`Byte` map to `.i32` but rebox to `.Int`, so a function
+    // returning one would hand back a wrong-tagged value. Restrict to the exact
+    // kinds (or Unit).
+    const exact_ret = !func.return_ty.nullable and (std.mem.eql(u8, func.return_ty.name, "Int") or
+        std.mem.eql(u8, func.return_ty.name, "Long") or std.mem.eql(u8, func.return_ty.name, "Double") or
+        std.mem.eql(u8, func.return_ty.name, "Float") or std.mem.eql(u8, func.return_ty.name, "Boolean"));
+    const result_scalar = isScalarRt(result_rt) and exact_ret;
+    if (!result_scalar and !(result_rt == .unknown and isUnitReturn(func.return_ty))) return null;
+
+    const body = (try collectFunc(a, func)) orelse return null;
+    defer a.free(body);
+
+    // Validate shape: no try-regions; Goto/Branch/Return terminators; only scalar
+    // ops + positional top-level calls.
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        if (blk.catches.len != 0 or blk.finally != null) return null;
+        switch (blk.terminator) {
+            .Goto, .Branch, .Return => {},
+            else => return null,
+        }
+        for (blk.insts) |*inst| {
+            if (numericConvOf(module, inst) != null) continue;
+            if (bitwiseOpOf(module, inst) != null) continue;
+            if (trampolinableCallOf(inst)) |tc| {
+                if (tc.n_args > 3) return null;
+                continue;
+            }
+            switch (inst.*) {
+                // `/` and `%` are excluded: a divide-by-zero is the only deopt a
+                // function-mode body could raise, and a native recursive callee has
+                // no frame to resume into — so without this the deopt fallback would
+                // re-run a (possibly impure) callee. Functions using `/`/`%` stay on
+                // the interpreter / loop-JIT path.
+                .BinOp => |b| if (isDivBinOp(b.op)) return null,
+                .Const, .Move, .Not, .UnOp, .Trace, .LoadParam => {},
+                else => return null,
+            }
+        }
+    }
+
+    const n_regs: u32 = func.n_locals;
+
+    // Each param must be a scalar value; record its kind for the entry guard.
+    const param_rt = try a.alloc(RegType, n_params);
+    var ok = false;
+    defer if (!ok) a.free(param_rt);
+    {
+        var p: u32 = 0;
+        while (p < n_params) : (p += 1) {
+            param_rt[p] = cellScalarType(params[p]) orelse return null;
+        }
+    }
+
+    const types = try inferFuncTypes(a, module, func, n_regs, params);
+    defer if (!ok) a.free(types);
+
+    // The return register must carry the declared scalar kind.
+    if (result_scalar) {
+        for (body) |bid| {
+            const blk = &func.blocks[bid.int()];
+            if (blk.terminator == .Return) {
+                if (blk.terminator.Return) |rr| {
+                    if (rr.int() >= n_regs or typeAt(types, rr) != result_rt) return null;
+                }
+            }
+        }
+    }
+
+    // Def set: every register written somewhere in the body (reboxed on deopt).
+    const def = try a.alloc(bool, n_regs);
+    defer if (!ok) a.free(def);
+    @memset(def, false);
+    // read set is unused in function mode (no entry unbox); allocate an empty.
+    const read = try a.alloc(bool, n_regs);
+    defer if (!ok) a.free(read);
+    @memset(read, false);
+
+    var call_sites: std.ArrayListUnmanaged(CallSite) = .empty;
+    defer if (!ok) call_sites.deinit(a);
+
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        for (blk.insts, 0..) |*inst, i| {
+            if (instAnyDst(inst)) |d| {
+                if (d.int() < n_regs) def[d.int()] = true;
+            }
+            const tc = trampolinableCallOf(inst) orelse continue;
+            // Args must already live in typed scalar slots.
+            var k: u8 = 0;
+            while (k < tc.n_args) : (k += 1) {
+                const ar = tc.args_reg + k;
+                if (ar >= n_regs or !isScalarRt(types[ar])) return null;
+            }
+            var span: ?ir.Span = null;
+            var bj: usize = i;
+            while (bj > 0) {
+                bj -= 1;
+                if (blk.insts[bj] == .Trace) {
+                    span = blk.insts[bj].Trace.span;
+                    break;
+                }
+            }
+            const has_result = tc.dst.int() < n_regs and isScalarRt(typeAt(types, tc.dst));
+            call_sites.append(a, .{
+                .func = tc.func,
+                .args_reg = tc.args_reg,
+                .n_args = tc.n_args,
+                .dst_reg = tc.dst.int(),
+                .has_result = has_result,
+                .block = bid,
+                .inst = @intCast(i),
+                .span = span,
+            }) catch return null;
+        }
+    }
+
+    const has_calls = call_sites.items.len != 0;
+    const param_slot_base: u32 = n_regs;
+    const after_params: u32 = n_regs + n_params;
+    const uc_slot: u32 = after_params;
+    const tramp_slot: u32 = after_params + 1;
+    const calls_base: u32 = after_params + (if (has_calls) @as(u32, 2) else 0);
+    const result_slot: u32 = calls_base;
+    const n_slots: u32 = calls_base + 1;
+
+    var c = Compiler{
+        .a = a,
+        .module = module,
+        .func = func,
+        .body = body,
+        .types = types,
+        .array_info = &.{},
+        .cell_info = &.{},
+        .call_sites = call_sites.items,
+        .inline_sites = &.{},
+        .nullable = &.{},
+        .null_flag_slot = &.{},
+        .uc_slot = uc_slot,
+        .tramp_slot = tramp_slot,
+        .n_regs = n_regs,
+        .reg_slots = n_slots,
+        .val_payload_off = valuePayloadOffset(),
+        .val_tag_off = valueTagOffset(),
+        .func_mode = true,
+        .param_slot_base = param_slot_base,
+        .n_params = n_params,
+        .result_slot = result_slot,
+        .em = jit.Emitter.init(a),
+        .block_label = try a.alloc(?jit.Label, func.blocks.len),
+        .exit_targets = .empty,
+        .exit_labels = .empty,
+        .deopt_codes = .empty,
+        .deopt_labels = .empty,
+        .epilogue = undefined,
+    };
+    defer c.em.deinit();
+    defer a.free(c.block_label);
+    defer c.exit_targets.deinit(a);
+    defer c.exit_labels.deinit(a);
+    defer c.deopt_codes.deinit(a);
+    defer c.deopt_labels.deinit(a);
+    @memset(c.block_label, null);
+
+    for (body) |bid| c.block_label[bid.int()] = c.em.newLabel() catch return null;
+    c.epilogue = c.em.newLabel() catch return null;
+
+    c.run() catch |e| {
+        if (debugEnabled()) std.debug.print("[jit]   bail: func codegen {s} in {s}\n", .{ @errorName(e), func.name });
+        return null;
+    };
+
+    const exec = jit.finalize(c.em.code()) catch return null;
+    const sites_owned = call_sites.toOwnedSlice(a) catch return null;
+    ok = true;
+    return CompiledLoop{
+        .exec = exec,
+        .n_regs = n_regs,
+        .n_slots = n_slots,
+        .reg_types = types,
+        .read_set = read,
+        .def_set = def,
+        .arrays = &.{},
+        .cells = &.{},
+        .nullables = &.{},
+        .field_bases = &.{},
+        .call_sites = sites_owned,
+        .uc_slot = uc_slot,
+        .tramp_slot = tramp_slot,
+        .func_mode = true,
+        .n_params = n_params,
+        .param_slot_base = param_slot_base,
+        .result_slot = result_slot,
+        .result_rt = result_rt,
+        .param_rt = param_rt,
+        .allocator = a,
+    };
+}
+
+/// A whole-function native run's outcome. `code.inst == RETURN_INST` → the
+/// function returned `value`; otherwise `code` is an interpreter resume point
+/// (a div-by-zero deopt or a callee throw) with the frame's registers reboxed.
+pub const FuncOutcome = struct { code: Resume, value: Value };
+
+/// Run a compiled function body. Fills the param slots from `params` (deopting if
+/// a kind no longer matches), runs the native code, and returns its outcome.
+pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, slots: []i64, tramp: ?TrampFn, user: ?*anyopaque) ?FuncOutcome {
+    @memset(slots[0..self.n_slots], 0);
+    var i: u32 = 0;
+    while (i < self.n_params) : (i += 1) {
+        if (i >= params.len) return null;
+        const sv = cellSlotIn(self.param_rt[i], params[i]) orelse return null; // kind changed: interpret
+        slots[self.param_slot_base + i] = sv;
+    }
+    var tctx: TrampCtx = undefined;
+    if (self.call_sites.len != 0) {
+        if (tramp == null or user == null) return null;
+        tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.? };
+        slots[self.uc_slot] = @bitCast(@intFromPtr(&tctx));
+        slots[self.tramp_slot] = @bitCast(@intFromPtr(tramp.?));
+    }
+    const fnptr = self.exec.entry(*const fn ([*]i64) callconv(.c) u64);
+    const code = fnptr(slots.ptr);
+    const target = BlockId.from(@intCast(code >> 32));
+    const inst: u32 = @truncate(code & 0xffff_ffff);
+    if (inst == RETURN_INST) {
+        return .{ .code = .{ .block = target, .inst = inst }, .value = valueFromSlot(self.result_rt, slots[self.result_slot]) };
+    }
+    // Deopt / throw: rebox written scalar registers so the interpreter resumes.
+    var r: u32 = 0;
+    while (r < self.n_regs) : (r += 1) {
+        if (!self.def_set[r] or r >= regs.len) continue;
+        switch (self.reg_types[r]) {
+            .i32, .i64, .f64, .f32, .boolean => regs[r] = valueFromSlot(self.reg_types[r], slots[r]),
+            else => {},
+        }
+    }
+    return .{ .code = .{ .block = target, .inst = inst }, .value = .Unit };
+}
+
+/// Interpreter hook at function entry: once the function is hot, compile its
+/// whole body and run it natively. Returns the outcome, or null to interpret.
+pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
+    if (!funcEnabled()) return null;
+    const fj = forFunc(func) orelse return null;
+    if (!fj.func_tried) {
+        fj.func_count += 1;
+        if (fj.func_count < HOT_THRESHOLD) return null;
+        fj.func_tried = true;
+        const compiled = tryCompileFunc(std.heap.page_allocator, module, func, params, resolver, field_resolver, field_nn_resolver, user) catch null;
+        if (compiled == null) return null;
+        if (debugEnabled()) std.debug.print("[jit] compiled function {s}\n", .{func.name});
+        fj.func_jit = compiled;
+        noteCompiled();
+    }
+    if (fj.func_jit == null) return null;
+    const cl = &fj.func_jit.?;
+    if (params.len < cl.n_params) return null;
+    if (regs.items.len < cl.n_regs) {
+        regs.appendNTimes(allocator, .Unit, cl.n_regs - regs.items.len) catch return null;
+    }
+    var stack_slots: [128]i64 = undefined;
+    var heap_slots: ?[]i64 = null;
+    defer if (heap_slots) |hs| std.heap.page_allocator.free(hs);
+    const slots: []i64 = if (cl.n_slots <= stack_slots.len)
+        stack_slots[0..cl.n_slots]
+    else blk: {
+        heap_slots = std.heap.page_allocator.alloc(i64, cl.n_slots) catch return null;
+        break :blk heap_slots.?;
+    };
+    return runFunc(cl, regs.items, params, slots, tramp, user);
 }
 
 /// Interpreter hook: at the start of block `cur`, count the entry and — once
@@ -3389,6 +3887,7 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
         }
         if (debugEnabled()) std.debug.print("[jit] compiled {s} block {d}\n", .{ func.name, bi });
         fj.loops.put(fj.a, bi, compiled) catch return null;
+        noteCompiled();
     }
 
     const entry = fj.loops.get(bi).?;

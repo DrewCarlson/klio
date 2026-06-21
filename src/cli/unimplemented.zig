@@ -300,7 +300,9 @@ pub fn runCheckUnimplemented(
     features: *const RequestedFeatures,
 ) u8 {
     if (files.len == 0) {
-        io.writeStderr("usage: klio check --unimplemented <file.kt> [...]\n");
+        // Silent under the test runner: the usage test checks the exit code, and
+        // stray stderr makes `zig build test` flag the passing command as failed.
+        if (!@import("builtin").is_test) io.writeStderr("usage: klio check --unimplemented <file.kt> [...]\n");
         return 2;
     }
 
