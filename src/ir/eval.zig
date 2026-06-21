@@ -1249,7 +1249,31 @@ fn LoopTramp(comptime H: type) type {
                 const ar = @as(usize, site.args_reg) + k;
                 argbuf[k] = jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]);
             }
-            const res = lc.host.callFunc(lc.allocator, lc.module, site.func, argbuf[0..site.n_args]) catch {
+            const res = if (site.is_member) member: {
+                if (comptime !@hasDecl(H, "callMemberNamed")) break :member EvalResult{ .err = .{ .Type = "host cannot dispatch member calls" } };
+                const recv = lc.frame.regs.items[site.recv_reg];
+                recv.retain();
+                defer recv.release(lc.allocator);
+                // Keep the caller's instance `this` reachable for member-extension
+                // visibility, exactly as the interpreted CallMember path does.
+                var pushed = false;
+                if (lc.frame.params.items.len > 0 and lc.frame.params.items[0] == .Instance) {
+                    const pi = lc.frame.params.items[0].Instance;
+                    const same = recv == .Instance and ObjRef(InstanceData).ptrEq(pi, recv.Instance);
+                    if (!same) {
+                        pushEnclosingAccess(&lc.frame.params.items[0]);
+                        pushed = true;
+                    }
+                }
+                var names: [3]?[]const u8 = .{ null, null, null };
+                const r = lc.host.callMemberNamed(lc.allocator, &recv, site.name, argbuf[0..site.n_args], names[0..site.n_args]) catch {
+                    if (pushed) popEnclosing();
+                    lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
+                    return jit_loop.throwCode(site.block);
+                };
+                if (pushed) popEnclosing();
+                break :member r;
+            } else lc.host.callFunc(lc.allocator, lc.module, site.func, argbuf[0..site.n_args]) catch {
                 lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
                 return jit_loop.throwCode(site.block);
             };
@@ -1269,6 +1293,16 @@ fn LoopTramp(comptime H: type) type {
                     return jit_loop.throwCode(site.block);
                 },
             }
+        }
+
+        /// Compile-time member resolver: resolve `receiver.name(args)` to the
+        /// method `FuncId` so the loop JIT can learn its return type. Run time
+        /// still dispatches through `callMemberNamed`, so this never alters
+        /// behavior — it only informs the slot's static type.
+        fn resolveMember(user: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value) ?FuncId {
+            if (comptime !@hasDecl(H, "resolveMemberFuncId")) return null;
+            const lc: *Ctx = @ptrCast(@alignCast(user));
+            return lc.host.resolveMemberFuncId(lc.allocator, receiver, name, args);
         }
     };
 }
@@ -1307,6 +1341,8 @@ fn runFrameInner(
         if (tramp_ok) .{ .host = host, .allocator = allocator, .module = frame.module, .frame = frame } else {};
     const tramp_fn: ?jit_loop.TrampFn = if (comptime tramp_ok) &LoopTramp(H).call else null;
     const tramp_user: ?*anyopaque = if (comptime tramp_ok) @ptrCast(&loop_ctx) else null;
+    const member_resolver: ?jit_loop.MemberResolver =
+        if (comptime tramp_ok and @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
     while (true) {
         // Daemon abandonment: a dispatcher pool task still running at the
         // run boundary stops at its next block instead of completing (or
@@ -1322,7 +1358,7 @@ fn runFrameInner(
         // success the loop runs natively and we resume at its exit block with
         // registers reboxed. Only at a fresh, non-resumed block entry.
         if (jit_on and resume_idx == 0 and resume_throw == null) {
-            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user)) |res| {
+            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver)) |res| {
                 if (res.inst == jit_loop.THROW_INST) {
                     // A trampolined call left an error pending: re-raise it. A
                     // throw resumes through the try-stack at the call's block;

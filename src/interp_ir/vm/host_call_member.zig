@@ -4465,6 +4465,19 @@ fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Modul
 
 const ResolvedMethod = struct { fid: FuncId, unambiguous: bool };
 
+/// Resolve `receiver.name(args)` to the user method `FuncId` it would dispatch,
+/// or null for a non-`Instance` receiver or a name that resolves to an intrinsic
+/// / extension / unresolved member. The loop JIT calls this at compile time to
+/// learn a trampolined member call's return type; the call still dispatches
+/// through normal member resolution at run time, so this never changes behavior.
+/// Member methods take precedence over extensions in Kotlin, so a resolved member
+/// is also what runs — its (override-invariant, for a scalar) return type is sound.
+pub fn resolveMemberFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) ?FuncId {
+    if (receiver.* != .Instance) return null;
+    const rm = resolveInstanceMethod(self, allocator, receiver, name, args) catch return null;
+    return if (rm) |m| m.fid else null;
+}
+
 /// Walk the receiver's class hierarchy resolving `name` to a user method
 /// `FuncId`. `unambiguous` is set when the resolving class had exactly one
 /// method of that name (so the choice does not depend on argument types and the
