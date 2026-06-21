@@ -1218,6 +1218,61 @@ fn typeRefName(name: []const u8) TypeRef {
     return .{ .name = name, .nullable = false, .args = &.{} };
 }
 
+/// The loop JIT's call trampoline, specialized per host. A compiled loop's native
+/// call site invokes `call` with the loop's `TrampCtx` and a site index; it reboxes
+/// the scalar args from the slot file, runs the callee through `host.callFunc`, and
+/// reboxes a scalar result back into the dst slot. Returns 0 to continue the native
+/// loop, or `THROW_INST`'s resume code with the error stashed in `Ctx.pending` for
+/// the interpreter to re-raise (a throw routes through the try-stack; any other
+/// error propagates out of the frame, matching the interpreted call exactly).
+fn LoopTramp(comptime H: type) type {
+    return struct {
+        const Ctx = struct {
+            host: *H,
+            allocator: Allocator,
+            module: *const Module,
+            frame: *Frame,
+            pending: ?EvalError = null,
+        };
+
+        fn call(ctx_opaque: *anyopaque, site_idx: u64) callconv(.c) u64 {
+            const tctx: *jit_loop.TrampCtx = @ptrCast(@alignCast(ctx_opaque));
+            const lc: *Ctx = @ptrCast(@alignCast(tctx.user));
+            const cl = tctx.compiled;
+            const site = cl.call_sites[@intCast(site_idx)];
+            // The native loop does not run `.Trace`; refresh the calling frame's
+            // position so a throw from the callee reports this call's line.
+            if (site.span) |sp| lc.frame.cur_span = sp;
+            var argbuf: [3]Value = undefined;
+            var k: usize = 0;
+            while (k < site.n_args) : (k += 1) {
+                const ar = @as(usize, site.args_reg) + k;
+                argbuf[k] = jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]);
+            }
+            const res = lc.host.callFunc(lc.allocator, lc.module, site.func, argbuf[0..site.n_args]) catch {
+                lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
+                return jit_loop.throwCode(site.block);
+            };
+            switch (res) {
+                .ok => |v| {
+                    if (site.has_result) {
+                        const s = jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v) orelse {
+                            lc.pending = .{ .Type = "JIT-compiled call returned a non-scalar result" };
+                            return jit_loop.throwCode(site.block);
+                        };
+                        tctx.slots[site.dst_reg] = s;
+                    }
+                    return 0;
+                },
+                .err => |e| {
+                    lc.pending = e;
+                    return jit_loop.throwCode(site.block);
+                },
+            }
+        }
+    };
+}
+
 /// `resume_throw`: when a continuation is resumed with
 /// `Result.failure(e)` (Kotlin's `resumeWith(failure)` = "resume by
 /// throwing at the suspension point"), the exception is routed through
@@ -1246,6 +1301,12 @@ fn runFrameInner(
     // stays current for the whole loop.
     if (func.deferred_offset != 0) frame.module.ensureFuncBody(@constCast(func));
     const jit_on = jit_loop.enabled();
+    // Loop-JIT call trampoline wiring (only hosts that can run a callee qualify).
+    const tramp_ok = comptime @hasDecl(H, "callFunc");
+    var loop_ctx: if (tramp_ok) LoopTramp(H).Ctx else void =
+        if (tramp_ok) .{ .host = host, .allocator = allocator, .module = frame.module, .frame = frame } else {};
+    const tramp_fn: ?jit_loop.TrampFn = if (comptime tramp_ok) &LoopTramp(H).call else null;
+    const tramp_user: ?*anyopaque = if (comptime tramp_ok) @ptrCast(&loop_ctx) else null;
     while (true) {
         // Daemon abandonment: a dispatcher pool task still running at the
         // run boundary stops at its next block instead of completing (or
@@ -1261,7 +1322,24 @@ fn runFrameInner(
         // success the loop runs natively and we resume at its exit block with
         // registers reboxed. Only at a fresh, non-resumed block entry.
         if (jit_on and resume_idx == 0 and resume_throw == null) {
-            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur)) |res| {
+            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user)) |res| {
+                if (res.inst == jit_loop.THROW_INST) {
+                    // A trampolined call left an error pending: re-raise it. A
+                    // throw resumes through the try-stack at the call's block;
+                    // any other error propagates straight out of the frame.
+                    if (comptime tramp_ok) {
+                        const e = loop_ctx.pending.?;
+                        loop_ctx.pending = null;
+                        switch (e) {
+                            .Throw => |exc| {
+                                resume_throw = exc;
+                                cur = res.block;
+                                continue;
+                            },
+                            else => return errResult(e),
+                        }
+                    } else unreachable;
+                }
                 cur = res.block;
                 resume_idx = res.inst;
                 continue;

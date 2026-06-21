@@ -116,6 +116,8 @@ Run any program with:
 | `generic_stdlib_calls.kt`  | Repeated `maxOf`/`minOf` calls in a loop; overload resolution is cached per `(function, argument-type)` so the hot path skips re-scanning overloads. |
 | `jit_float_to_int.kt`      | `Float`/`Double` → `Int`/`Long` in a hot loop with Kotlin clamping (NaN→0, overflow→MIN/MAX); loop JIT compiles the conversion; identical output JIT off or on. |
 | `jit_bitwise_loop.kt`      | Hot loop of bitwise infix ops (`and`/`or`/`xor`/`shl`/`shr`) on `Int` and `Long`; loop JIT emits native bitwise/shift ops with correct width-based count masking and sign-extension; identical output JIT off or on. |
+| `jit_call_loop.kt`         | Hot loop calling a top-level function each iteration; loop JIT trampolines the call (reboxes scalar args, runs the callee interpreted, reboxes the scalar result) for `Int`/`Long`/`Double`-returning and `Unit` side-effecting callees; identical output JIT off or on. |
+| `jit_nested_call_loop.kt`  | Hot outer loop trampolining a call to a function that runs its own hot inner loop (the callee's parameter type is seeded from the live argument); the inner loop runs natively while re-entered from inside the outer native loop; identical output JIT off or on. |
 | `string_ascii_fastpath.kt` | String `length`/`indexOf`/`substring`/indexing on ASCII vs non-ASCII text (ASCII takes a byte-length fast path; non-ASCII falls back to a UTF-16 walk). |
 
 ## Integration showcases
