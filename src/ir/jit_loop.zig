@@ -418,7 +418,105 @@ const InlineSite = struct {
     args_reg: u32,
     n_args: u8,
     dst: Reg,
+    /// Member inline: the call's receiver register (the callee's `this`), the
+    /// callee register `LoadParam 0` writes (mapped to `recv_reg`, not `base`), and
+    /// the contiguous range of field-access call sites the body's GetField/SetField
+    /// on `this` were registered as (emitted in body order).
+    is_member: bool = false,
+    recv_reg: u32 = 0,
+    this_reg: u32 = 0,
+    field_site_base: u32 = 0,
+    n_field_sites: u32 = 0,
+    /// Has a value return (false for a `Unit` method invoked for its effect).
+    has_result: bool = true,
 };
+
+/// The destination register an instruction writes, if any (covering every shape
+/// that can appear in a compiled loop body, including object-producing ops that
+/// `instReadsDef` deliberately omits). Used to confirm a register is loop-
+/// invariant — defined outside the loop, never written inside.
+fn instAnyDst(inst: *const Inst) ?Reg {
+    return switch (inst.*) {
+        .Const => |x| x.dst,
+        .Move => |x| x.dst,
+        .BinOp => |x| x.dst,
+        .Not => |x| x.dst,
+        .UnOp => |x| x.dst,
+        .LoadParam => |x| x.dst,
+        .LoadCapture => |x| x.dst,
+        .LoadGlobal => |x| x.dst,
+        .GetField => |x| x.dst,
+        .Index => |x| x.dst,
+        .CallMember => |x| x.dst,
+        .Call => |x| x.dst,
+        .CallValue => |x| x.dst,
+        .CellGet => |x| x.dst,
+        .MakeCell => |x| x.dst,
+        .NewInstance => |x| x.dst,
+        .NewList => |x| x.dst,
+        else => null,
+    };
+}
+
+fn regWrittenInBody(func: *const Func, body: []const BlockId, r: Reg) bool {
+    for (body) |bid| {
+        for (func.blocks[bid.int()].insts) |*inst| {
+            if (instAnyDst(inst)) |d| if (d.int() == r.int()) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether a member method can be inlined: a single block, all instructions are
+/// scalar ops, parameter loads, or `this`-field accesses (get/set of a scalar
+/// field on the `LoadParam 0` register), with scalar required parameters and a
+/// scalar-or-`Unit` return. `this_reg` receives the register `LoadParam 0` binds.
+fn inlinableMemberCallee(module: *const Module, f: *const Func, this_reg_out: *u32) bool {
+    if (f.is_suspend) return false;
+    if (f.blocks.len != 1) return false;
+    if (!f.has_receiver_param) return false; // params[0] is the synthesized `this`
+    const blk = &f.blocks[0];
+    switch (blk.terminator) {
+        .Return => {},
+        else => return false,
+    }
+    // Parameters after the receiver must be plain scalars.
+    for (f.params, 0..) |p, i| {
+        if (i == 0) continue; // the receiver
+        if (p.is_vararg or p.default != null or retRegType(p.ty) == .unknown) return false;
+    }
+    if (blk.insts.len > INLINE_MAX_INSTS) return false;
+    var this_reg: ?u32 = null;
+    for (blk.insts) |*inst| {
+        switch (inst.*) {
+            .LoadParam => |lp| {
+                if (lp.idx == 0) this_reg = lp.dst.int();
+            },
+            else => {},
+        }
+    }
+    const tr = this_reg orelse return false; // must bind `this`
+    this_reg_out.* = tr;
+    for (blk.insts) |*inst| {
+        if (numericConvOf(module, inst) != null) continue;
+        if (bitwiseOpOf(module, inst) != null) continue;
+        if (trampolinableFieldOf(module, inst)) |fld| {
+            if (fld.recv.int() != tr) return false; // only `this`-field reads
+            continue;
+        }
+        if (trampolinableFieldSetOf(module, inst)) |fs| {
+            if (fs.recv.int() != tr) return false;
+            continue;
+        }
+        if (arrayOpOf(module, inst) != null) return false;
+        switch (inst.*) {
+            .Const, .Move, .BinOp, .Not, .UnOp, .Trace => {},
+            .LoadParam => |lp| if (lp.idx >= f.params.len) return false,
+            else => return false,
+        }
+    }
+    return true;
+}
 
 /// Copy an instruction with every register reference shifted by `base` — used to
 /// emit an inlined callee body in the caller's extended register space. Only the
@@ -547,6 +645,17 @@ fn trampolinableFieldOf(module: *const Module, inst: *const Inst) ?TrampField {
     }
 }
 
+/// Inside a method body, an own-field access lowers to a scope-qualified
+/// getter/setter sentinel `$sgetter$<owner>\u{1f}<field>` (resp. `$ssetter$`).
+/// Return the bare field name for such a sentinel (so it can be resolved as a
+/// plain stored field), or the name unchanged when it is already plain.
+fn memberFieldName(name: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, name, "$sgetter$") or std.mem.startsWith(u8, name, "$ssetter$")) {
+        if (std.mem.lastIndexOfScalar(u8, name, 0x1f)) |i| return name[i + 1 ..];
+    }
+    return name;
+}
+
 /// A `SetField` the loop JIT can compile: a write of a scalar value to a plain
 /// stored field of a loop-invariant (or class-stable) boxed object.
 const TrampFieldSet = struct { recv: Reg, name: []const u8, value: Reg };
@@ -665,7 +774,7 @@ fn promoteArith(lt: RegType, rt: RegType) RegType {
 /// Fill `ext[site.base .. site.base + callee.n_locals]` with the inlined callee's
 /// register types: parameters seeded from the caller's argument types, then the
 /// scalar propagation run over the callee's single block.
-fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite, caller_types: []const RegType, ext: []RegType) Allocator.Error!void {
+fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite, caller_types: []const RegType, ext: []RegType, field_resolver: ?FieldResolver, resolver_user: ?*anyopaque, regs: []const Value) Allocator.Error!void {
     const callee = site.callee;
     const n = callee.n_locals;
     if (n == 0) return;
@@ -677,18 +786,38 @@ fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite,
     const eci = try a.alloc(?RegType, n);
     defer a.free(eci);
     @memset(eci, null);
+    // For a member inline, parameter index 1 maps to the first call argument (index
+    // 0 is the receiver); a top-level inline maps index 0 to the first argument.
+    const arg_base: i64 = if (site.is_member) @as(i64, site.args_reg) - 1 else @as(i64, site.args_reg);
     var changed = true;
     var iters: usize = 0;
     while (changed and iters < 16) : (iters += 1) {
         changed = false;
         for (callee.blocks[0].insts) |*inst| {
-            // A parameter load takes the caller argument's type.
             if (inst.* == .LoadParam) {
                 const lp = inst.LoadParam;
-                const ar = site.args_reg + lp.idx;
-                const at: RegType = if (ar < caller_types.len) caller_types[ar] else .unknown;
+                if (site.is_member and lp.idx == 0) continue; // receiver: not a scalar
+                const ar = arg_base + lp.idx;
+                const at: RegType = if (ar >= 0 and ar < caller_types.len) caller_types[@intCast(ar)] else .unknown;
                 if (lp.dst.int() < n and setType(t, lp.dst, at)) changed = true;
                 continue;
+            }
+            // A member body's `this`-field read types its dst from the live field.
+            if (site.is_member) {
+                if (trampolinableFieldOf(module, inst)) |fld| {
+                    if (field_resolver) |fr| {
+                        if (fr(resolver_user.?, &regs[site.recv_reg], memberFieldName(fld.name))) |idx| {
+                            const g = regs[site.recv_reg].Instance.borrow();
+                            const fv: ?Value = if (idx < g.get().fields.items.len) g.get().fields.items[idx].value else null;
+                            g.deinit();
+                            if (fv) |v| if (cellScalarType(v)) |rt| {
+                                if (fld.dst.int() < n and setType(t, fld.dst, rt)) changed = true;
+                            };
+                        }
+                    }
+                    continue;
+                }
+                if (trampolinableFieldSetOf(module, inst) != null) continue;
             }
             if (setDefType(t, module, inst, eai, eci)) changed = true;
         }
@@ -1633,21 +1762,34 @@ const Compiler = struct {
     /// extended register space, then copy the (remapped) return value to the dst.
     fn emitInlinedCall(self: *Compiler, site: *const InlineSite) !void {
         const callee_blk = &site.callee.blocks[0];
+        // Member inline: argument i is the (i-1)-th call argument (index 0 is the
+        // receiver); a `this`-field access is one of the registered field sites,
+        // emitted in body order.
+        var field_n: u32 = 0;
         for (callee_blk.insts) |*ci| {
-            // A parameter load binds to the caller argument; everything else is the
-            // callee's own (remapped) scalar instruction.
             if (ci.* == .LoadParam) {
                 const lp = ci.LoadParam;
-                try self.loadSlot(T0, Reg.from(site.args_reg + lp.idx));
+                if (site.is_member and lp.idx == 0) continue; // receiver: field sites read it
+                const arg_i: u32 = if (site.is_member) lp.idx - 1 else lp.idx;
+                try self.loadSlot(T0, Reg.from(site.args_reg + arg_i));
                 try self.storeSlot(Reg.from(site.base + lp.dst.int()), T0);
                 continue;
+            }
+            if (site.is_member) {
+                if (trampolinableFieldOf(self.module, ci) != null or trampolinableFieldSetOf(self.module, ci) != null) {
+                    try self.emitCallSite(site.field_site_base + field_n);
+                    field_n += 1;
+                    continue;
+                }
             }
             const rinst = remapInst(ci.*, site.base);
             try self.emitInstBody(&rinst);
         }
-        const ret = callee_blk.terminator.Return.?;
-        try self.loadSlot(T0, Reg.from(site.base + ret.int()));
-        try self.storeSlot(site.dst, T0);
+        if (site.has_result) {
+            const ret = callee_blk.terminator.Return.?;
+            try self.loadSlot(T0, Reg.from(site.base + ret.int()));
+            try self.storeSlot(site.dst, T0);
+        }
     }
 
     fn emitCallSite(self: *Compiler, si: u32) !void {
@@ -1987,21 +2129,62 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     if (arrays.items.len == 0) {
         for (body) |bid| {
             for (func.blocks[bid.int()].insts, 0..) |*inst, ii| {
-                const tc = trampolinableCallOf(inst) orelse continue;
-                const callee = module.funcById(tc.func) orelse continue;
-                if (!inlinableCallee(module, callee)) continue;
-                if (callee.params.len != tc.n_args) continue;
-                inline_sites.append(a, .{
-                    .block = bid,
-                    .inst = @intCast(ii),
-                    .callee = callee,
-                    .base = total_regs,
-                    .args_reg = tc.args_reg,
-                    .n_args = tc.n_args,
-                    .dst = tc.dst,
-                }) catch return null;
-                total_regs += callee.n_locals;
-                if (total_regs > 4096) return null;
+                if (trampolinableCallOf(inst)) |tc| {
+                    const callee = module.funcById(tc.func) orelse continue;
+                    if (!inlinableCallee(module, callee)) continue;
+                    if (callee.params.len != tc.n_args) continue;
+                    inline_sites.append(a, .{
+                        .block = bid,
+                        .inst = @intCast(ii),
+                        .callee = callee,
+                        .base = total_regs,
+                        .args_reg = tc.args_reg,
+                        .n_args = tc.n_args,
+                        .dst = tc.dst,
+                    }) catch return null;
+                    total_regs += callee.n_locals;
+                    if (total_regs > 4096) return null;
+                    continue;
+                }
+                // Member call to a small `this`-field/scalar method: inline it.
+                // Only for a loop-invariant receiver — inlining resolves one method
+                // body, so a varying (polymorphic) receiver must keep dynamic dispatch.
+                if (trampolinableMemberOf(module, inst)) |mc| {
+                    if (resolver == null or field_resolver == null) continue;
+                    if (mc.recv.int() >= regs.len or regs[mc.recv.int()] != .Instance) continue;
+                    if (regWrittenInBody(func, body, mc.recv)) continue;
+                    var av: [3]Value = undefined;
+                    var k: u8 = 0;
+                    while (k < mc.n_args and k < 3) : (k += 1) {
+                        if (mc.args_reg + k >= regs.len) break;
+                        av[k] = regs[mc.args_reg + k];
+                    }
+                    const fid = resolver.?(resolver_user.?, &regs[mc.recv.int()], mc.name, av[0..mc.n_args]) orelse continue;
+                    const callee = module.funcById(fid) orelse continue;
+                    var this_reg: u32 = 0;
+                    if (!inlinableMemberCallee(module, callee, &this_reg)) {
+                        if (debugEnabled()) std.debug.print("[jit]   member {s} not inlinable (blocks={d})\n", .{ callee.name, callee.blocks.len });
+                        continue;
+                    }
+                    if (callee.params.len != @as(usize, mc.n_args) + 1) continue; // receiver + args
+                    if (debugEnabled()) std.debug.print("[jit]   inlining member {s}\n", .{callee.name});
+                    const has_result = callee.blocks[0].terminator.Return != null;
+                    inline_sites.append(a, .{
+                        .block = bid,
+                        .inst = @intCast(ii),
+                        .callee = callee,
+                        .base = total_regs,
+                        .args_reg = mc.args_reg,
+                        .n_args = mc.n_args,
+                        .dst = mc.dst,
+                        .is_member = true,
+                        .recv_reg = mc.recv.int(),
+                        .this_reg = this_reg,
+                        .has_result = has_result,
+                    }) catch return null;
+                    total_regs += callee.n_locals;
+                    if (total_regs > 4096) return null;
+                }
             }
         }
     }
@@ -2163,7 +2346,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         const ext = a.alloc(RegType, total_regs) catch return null;
         @memset(ext, .unknown);
         @memcpy(ext[0..n_regs], caller_types);
-        for (inline_sites.items) |*site| try fillInlineTypes(a, module, site, caller_types, ext);
+        for (inline_sites.items) |*site| try fillInlineTypes(a, module, site, caller_types, ext, field_resolver, resolver_user, regs);
         break :ext_blk ext;
     };
     var ok = false;
@@ -2522,6 +2705,15 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .span = span,
                 }) catch return null;
             } else {
+                // An inlined member call is emitted in place, not trampolined.
+                var inlined_m = false;
+                for (inline_sites.items) |s| {
+                    if (s.block.int() == bid.int() and s.inst == i) {
+                        inlined_m = true;
+                        break;
+                    }
+                }
+                if (inlined_m) continue;
                 const mc = trampolinableMemberOf(module, inst).?;
                 if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len or regs[mc.recv.int()] != .Instance) return null;
                 // A loop-invariant receiver is validated once by the entry guard; a
@@ -2549,6 +2741,54 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             }
         }
     }
+    // Register the field-access call sites for each member inline (the body's
+    // `this`-field reads/writes), contiguously, so the inline emit can reference
+    // them by index. They share the call's (block, inst) — a field mismatch deopts
+    // to re-run the call.
+    for (inline_sites.items) |*site| {
+        if (!site.is_member) continue;
+        site.field_site_base = @intCast(call_sites.items.len);
+        var nf: u32 = 0;
+        const recv_varies = typeAt(types, Reg.from(site.recv_reg)) == .object;
+        const recv_class = instanceClassIdentity(regs[site.recv_reg]);
+        for (site.callee.blocks[0].insts) |*ci| {
+            if (trampolinableFieldOf(module, ci)) |fld| {
+                const idx = field_resolver.?(resolver_user.?, &regs[site.recv_reg], memberFieldName(fld.name)) orelse return null;
+                const dst = site.base + fld.dst.int();
+                if (dst >= total_regs or !isScalarRt(types[dst])) return null;
+                call_sites.append(a, .{
+                    .dst_reg = dst,
+                    .has_result = true,
+                    .block = site.block,
+                    .inst = site.inst,
+                    .recv_reg = site.recv_reg,
+                    .recv_class = recv_class,
+                    .is_field = true,
+                    .field_idx = idx,
+                    .recv_varies = recv_varies,
+                }) catch return null;
+                nf += 1;
+            } else if (trampolinableFieldSetOf(module, ci)) |fs| {
+                const idx = field_resolver.?(resolver_user.?, &regs[site.recv_reg], memberFieldName(fs.name)) orelse return null;
+                const src = site.base + fs.value.int();
+                if (src >= total_regs or !isScalarRt(types[src])) return null;
+                call_sites.append(a, .{
+                    .dst_reg = 0,
+                    .src_reg = src,
+                    .block = site.block,
+                    .inst = site.inst,
+                    .recv_reg = site.recv_reg,
+                    .recv_class = recv_class,
+                    .is_field_set = true,
+                    .field_idx = idx,
+                    .recv_varies = recv_varies,
+                }) catch return null;
+                nf += 1;
+            }
+        }
+        site.n_field_sites = nf;
+    }
+
     const has_calls = call_sites.items.len != 0;
     const uc_slot: u32 = arr_slots; // arrays.len == 0 when has_calls, so == n_regs
     const tramp_slot: u32 = arr_slots + 1;
