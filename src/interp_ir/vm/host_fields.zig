@@ -260,15 +260,16 @@ pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Valu
 }
 
 /// For the loop JIT: the index of `name` in the receiver's instance field list,
-/// but only when `name` is a plain stored property — an Instance receiver, a
-/// stored field of that name, and no custom getter for it anywhere in the class
-/// hierarchy. Returns null otherwise (a computed getter, delegated, or extension
-/// property is not a direct field read and must stay interpreted). The field
-/// order is fixed per class, so the index is stable for any instance of the class
-/// the call site was compiled against (re-checked by the entry class guard).
+/// but only when `name` is a fully plain stored property — an Instance receiver, a
+/// stored field of that name, and no custom getter *or setter* for it anywhere in
+/// the class hierarchy. Returns null otherwise (a computed getter/setter,
+/// delegated, or extension property is not a direct field access and must stay
+/// interpreted), so the index is safe for both direct reads and direct writes. The
+/// field order is fixed per class, so the index is stable for any instance of the
+/// class the call site was compiled against (re-checked by the entry class guard).
 pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) ?u32 {
     if (receiver.* != .Instance) return null;
-    // Reject if any class in the hierarchy declares a custom getter for `name`.
+    // Reject if any class in the hierarchy declares a custom getter or setter.
     {
         var cur: ?[]const u8 = className(receiver.Instance);
         var seen: std.ArrayList([]const u8) = .empty;
@@ -279,7 +280,8 @@ pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *con
             seen.append(allocator, cn) catch return null;
             {
                 const pg = self.prog.borrow();
-                const hit = lookupPairFunc(pg.get().instance_prop_getters, cn, name) != null;
+                const hit = lookupPairFunc(pg.get().instance_prop_getters, cn, name) != null or
+                    lookupPairFunc(pg.get().instance_prop_setters, cn, name) != null;
                 pg.deinit();
                 if (hit) return null;
             }

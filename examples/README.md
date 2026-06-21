@@ -127,6 +127,7 @@ Run any program with:
 | `jit_closure_call_loop.kt` | Hot loop invoking a loop-invariant closure (which captures and mutates an outer variable); loop JIT keeps the closure boxed in the register array and trampolines the call while the loop control runs natively; identical output JIT off or on. |
 | `jit_map_ops_loop.kt`      | Hot loops storing into and loading from a loop-invariant map; loop JIT trampolines `map[k] = v` and `map[k]` (a nullable scalar folded with `?:`, a missing key reading back as null) while keys, the Elvis default, and accumulation run natively; identical output JIT off or on. |
 | `jit_inline_call_loop.kt`  | Hot loop calling small pure functions; loop JIT inlines a single-block scalar callee directly into the native code (registers remapped into an extended space) so the calls become native arithmetic with no dispatch — covering `Int`/`Long`/`Double` results, conversions, and a callee inlined at multiple sites; identical output JIT off or on. |
+| `jit_field_store_loop.kt`  | Hot loop reading, computing, and writing back scalar fields (`Int`/`Long`) of a loop-invariant object; loop JIT compiles the stores as direct writes into the boxed receiver's stored fields (plain properties — no custom setter); identical output JIT off or on. |
 | `string_ascii_fastpath.kt` | String `length`/`indexOf`/`substring`/indexing on ASCII vs non-ASCII text (ASCII takes a byte-length fast path; non-ASCII falls back to a UTF-16 walk). |
 
 ## Integration showcases

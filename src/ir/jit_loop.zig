@@ -119,6 +119,9 @@ pub const CallSite = struct {
     /// re-checks the receiver's class each call instead of relying on the entry
     /// guard. No side effects.
     is_field: bool = false,
+    /// A scalar field store `recv.field = slot[src_reg]` to the stored field at
+    /// `field_idx` of the boxed receiver.
+    is_field_set: bool = false,
     field_idx: u32 = 0,
     recv_varies: bool = false,
     /// Object-vs-null test: read boxed register `recv_reg`, write `0`/`1` (negated
@@ -539,6 +542,22 @@ fn trampolinableFieldOf(module: *const Module, inst: *const Inst) ?TrampField {
             const name = module.consts.items[gf.field.int()];
             if (name != .String) return null;
             return .{ .recv = gf.receiver, .name = name.String, .dst = gf.dst };
+        },
+        else => return null,
+    }
+}
+
+/// A `SetField` the loop JIT can compile: a write of a scalar value to a plain
+/// stored field of a loop-invariant (or class-stable) boxed object.
+const TrampFieldSet = struct { recv: Reg, name: []const u8, value: Reg };
+
+fn trampolinableFieldSetOf(module: *const Module, inst: *const Inst) ?TrampFieldSet {
+    switch (inst.*) {
+        .SetField => |sf| {
+            if (sf.field.int() >= module.consts.items.len) return null;
+            const name = module.consts.items[sf.field.int()];
+            if (name != .String) return null;
+            return .{ .recv = sf.receiver, .name = name.String, .value = sf.value };
         },
         else => return null,
     }
@@ -1112,6 +1131,12 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
     if (trampolinableFieldOf(module, inst)) |fld| {
         n_reads.* = 0;
         if (isScalarRt(typeAt(types, fld.dst))) def.* = fld.dst;
+        return;
+    }
+    // A field store reads the scalar value (the receiver stays boxed); no def.
+    if (trampolinableFieldSetOf(module, inst)) |fs| {
+        reads[0] = fs.value;
+        n_reads.* = 1;
         return;
     }
     // A trampolined value call reads its scalar args (the callee stays boxed in a
@@ -1902,6 +1927,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (trampolinableCallOf(inst) != null) continue;
             if (trampolinableMemberOf(module, inst) != null) continue;
             if (trampolinableFieldOf(module, inst) != null) continue;
+            if (trampolinableFieldSetOf(module, inst) != null) continue;
             if (trampolinableCallValueOf(inst) != null) continue;
             switch (inst.*) {
                 .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .CellGet, .CellSet => {},
@@ -2284,7 +2310,8 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             const is_map_get = if (arrayOpOf(module, inst)) |op| (map_op and !op.is_set) else false;
             const is_map_set = if (arrayOpOf(module, inst)) |op| (map_op and op.is_set) else false;
             const is_call_value = trampolinableCallValueOf(inst) != null;
-            if (!is_call and !is_member and !is_field and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value and !is_map_get and !is_map_set) continue;
+            const is_field_set = trampolinableFieldSetOf(module, inst) != null;
+            if (!is_call and !is_member and !is_field and !is_field_set and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value and !is_map_get and !is_map_set) continue;
             if (arrays.items.len != 0) {
                 if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
                 return null;
@@ -2436,6 +2463,28 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .recv_class = instanceClassIdentity(regs[fld.recv.int()]),
                     .is_field = true,
                     .field_idx = field_idx_of[fld.dst.int()],
+                    .recv_varies = recv_varies,
+                }) catch return null;
+            } else if (is_field_set) {
+                const fs = trampolinableFieldSetOf(module, inst).?;
+                if (fs.recv.int() >= n_regs or fs.recv.int() >= regs.len or regs[fs.recv.int()] != .Instance) {
+                    transient.* = true;
+                    return null;
+                }
+                if (fs.value.int() >= n_regs or !isScalarRt(typeAt(types, fs.value))) return null;
+                if (field_resolver == null) return null;
+                const idx = field_resolver.?(resolver_user.?, &regs[fs.recv.int()], fs.name) orelse return null;
+                const recv_varies = typeAt(types, fs.recv) == .object;
+                call_sites.append(a, .{
+                    .dst_reg = 0,
+                    .src_reg = fs.value.int(),
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .recv_reg = fs.recv.int(),
+                    .recv_class = instanceClassIdentity(regs[fs.recv.int()]),
+                    .is_field_set = true,
+                    .field_idx = idx,
                     .recv_varies = recv_varies,
                 }) catch return null;
             } else if (is_call) {
@@ -2696,7 +2745,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
         for (self.call_sites) |site| {
             // Loop-invariant member / field receivers are validated once here; a
             // varying receiver is re-checked by its callback each iteration.
-            if (site.recv_varies or !(site.is_member or site.is_field)) continue;
+            if (site.recv_varies or !(site.is_member or site.is_field or site.is_field_set)) continue;
             if (site.recv_reg >= regs.len) return .bail;
             const rv = regs[site.recv_reg];
             if (rv != .Instance or instanceClassIdentity(rv) != site.recv_class) return .bail;

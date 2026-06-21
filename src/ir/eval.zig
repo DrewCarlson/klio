@@ -1294,6 +1294,28 @@ fn LoopTramp(comptime H: type) type {
                 lc.pending_deopt_inst = site.inst;
                 return jit_loop.deoptCode(site.block);
             }
+            // Scalar field store: write the value directly into the boxed receiver's
+            // stored field (a plain stored property — no custom setter).
+            if (site.is_field_set) {
+                const recv = lc.frame.regs.items[site.recv_reg];
+                if (recv != .Instance or (site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                }
+                const v = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
+                const g = recv.Instance.borrowMut();
+                if (site.field_idx < g.get().fields.items.len) {
+                    const old = g.get().fields.items[site.field_idx].value;
+                    g.get().fields.items[site.field_idx].value = v;
+                    g.deinit();
+                    old.release(lc.allocator);
+                } else {
+                    g.deinit();
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                }
+                return 0;
+            }
             // Object collection subscript: read element `recv[idx]` directly (no
             // `get` dispatch) and write it into the register. Out-of-range or an
             // unsupported container deopts; the interpreter re-runs the subscript
