@@ -124,6 +124,7 @@ Run any program with:
 | `jit_object_subscript_loop.kt` | Hot loop indexing a polymorphic `List` of objects and dispatching a method on each element; loop JIT reads the element with a direct subscript into a boxed register and dispatches dynamically, re-checking the receiver class each call; identical output JIT off or on. |
 | `jit_inferred_return_loop.kt` | Hot loops calling functions/methods with inferred (expression-body) return types; loop JIT infers each callee's scalar return type from its body (params carry declared types, arithmetic promotes per Kotlin) so the result is slot-typed and the call trampolined; identical output JIT off or on. |
 | `jit_nullable_scalar_loop.kt` | Null-safe chains whose result is a nullable scalar (`Int?` from `?.` on a scalar field) folded with `?:`; loop JIT carries the nullable scalar as a value slot plus a companion null-flag slot, running the null tests, Elvis default, and arithmetic natively; identical output JIT off or on. |
+| `jit_closure_call_loop.kt` | Hot loop invoking a loop-invariant closure (which captures and mutates an outer variable); loop JIT keeps the closure boxed in the register array and trampolines the call while the loop control runs natively; identical output JIT off or on. |
 | `string_ascii_fastpath.kt` | String `length`/`indexOf`/`substring`/indexing on ASCII vs non-ASCII text (ASCII takes a byte-length fast path; non-ASCII falls back to a UTF-16 walk). |
 
 ## Integration showcases

@@ -131,6 +131,9 @@ pub const CallSite = struct {
     /// Object collection subscript: `regs[dst] = regs[recv_reg].get(slot[args_reg])`
     /// where the element is a boxed object. The index is a scalar slot register.
     is_obj_index: bool = false,
+    /// Call a loop-invariant callable value held in `recv_reg` with the scalar
+    /// args at `args_reg`; the result is discarded.
+    is_call_value: bool = false,
 };
 
 /// One packed array a compiled loop indexes: the register holding it, the
@@ -373,6 +376,30 @@ fn trampolinableCallOf(inst: *const Inst) ?TrampCall {
         },
         else => return null,
     }
+}
+
+/// A `CallValue` the loop JIT can trampoline: invocation of a loop-invariant
+/// callable value (a closure/function/bound reference) held in a register. v1
+/// handles the bare positional form with at most three scalar args and a result
+/// that is discarded (a side-effecting call).
+const TrampCallValue = struct { callee: Reg, args_reg: u32, n_args: u8, dst: Reg };
+
+fn trampolinableCallValueOf(inst: *const Inst) ?TrampCallValue {
+    switch (inst.*) {
+        .CallValue => |cv| {
+            if (cv.arg_names.len != 0 or cv.type_args.len != 0) return null;
+            if (cv.n_args > 3) return null;
+            return .{ .callee = cv.callee, .args_reg = cv.args.int(), .n_args = cv.n_args, .dst = cv.dst };
+        },
+        else => return null,
+    }
+}
+
+fn isCallableValue(v: Value) bool {
+    return switch (v) {
+        .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod => true,
+        else => false,
+    };
 }
 
 /// A `CallMember` the loop JIT can trampoline: an instance-method call whose
@@ -945,6 +972,14 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
     if (trampolinableFieldOf(module, inst)) |fld| {
         n_reads.* = 0;
         if (isScalarRt(typeAt(types, fld.dst))) def.* = fld.dst;
+        return;
+    }
+    // A trampolined value call reads its scalar args (the callee stays boxed in a
+    // register); its result is discarded, so it has no scalar def.
+    if (trampolinableCallValueOf(inst)) |cvc| {
+        var k: u8 = 0;
+        while (k < cvc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(cvc.args_reg + k);
+        n_reads.* = cvc.n_args;
         return;
     }
     switch (inst.*) {
@@ -1678,6 +1713,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (trampolinableCallOf(inst) != null) continue;
             if (trampolinableMemberOf(module, inst) != null) continue;
             if (trampolinableFieldOf(module, inst) != null) continue;
+            if (trampolinableCallValueOf(inst) != null) continue;
             switch (inst.*) {
                 .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .CellGet, .CellSet => {},
                 else => {
@@ -1975,14 +2011,15 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 else => false,
             };
             const is_obj_index = if (arrayOpOf(module, inst)) |op| (!op.is_set and typeAt(types, op.dst) == .object) else false;
-            if (!is_call and !is_member and !is_field and !is_obj_move and !is_null_check and !is_obj_index) continue;
+            const is_call_value = trampolinableCallValueOf(inst) != null;
+            if (!is_call and !is_member and !is_field and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value) continue;
             if (arrays.items.len != 0) {
                 if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
                 return null;
             }
             // Every scalar arg must already live in a typed slot (field reads have none).
-            const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else if (is_member) trampolinableMemberOf(module, inst).?.args_reg else 0;
-            const n_args: u8 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else 0;
+            const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else if (is_member) trampolinableMemberOf(module, inst).?.args_reg else if (is_call_value) trampolinableCallValueOf(inst).?.args_reg else 0;
+            const n_args: u8 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else if (is_call_value) trampolinableCallValueOf(inst).?.n_args else 0;
             var k: u8 = 0;
             while (k < n_args) : (k += 1) {
                 const ar = args_reg + k;
@@ -2001,7 +2038,25 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     break;
                 }
             }
-            if (is_obj_index) {
+            if (is_call_value) {
+                // Invoke a loop-invariant callable value; the result is discarded.
+                const cvc = trampolinableCallValueOf(inst).?;
+                if (cvc.callee.int() >= n_regs or cvc.callee.int() >= regs.len) return null;
+                if (!isCallableValue(regs[cvc.callee.int()])) return null;
+                // The callable must be loop-invariant: never written in the body.
+                if (sets.def[cvc.callee.int()] or typeAt(types, cvc.callee) != .unknown) return null;
+                call_sites.append(a, .{
+                    .recv_reg = cvc.callee.int(),
+                    .args_reg = cvc.args_reg,
+                    .n_args = cvc.n_args,
+                    .dst_reg = cvc.dst.int(),
+                    .has_result = false,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .is_call_value = true,
+                }) catch return null;
+            } else if (is_obj_index) {
                 // Object collection subscript: a `get` whose element is a boxed
                 // object. The collection is the (loop-invariant) receiver; the
                 // index is a scalar slot register.

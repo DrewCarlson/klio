@@ -1320,6 +1320,29 @@ fn LoopTramp(comptime H: type) type {
                 lc.pending_deopt_inst = site.inst;
                 return jit_loop.deoptCode(site.block);
             }
+            // Invoke a loop-invariant callable value; the result is discarded.
+            if (site.is_call_value) {
+                if (comptime !@hasDecl(H, "callValue")) return jit_loop.deoptCode(site.block);
+                if (site.span) |sp| lc.frame.cur_span = sp;
+                const callee = lc.frame.regs.items[site.recv_reg];
+                var argbuf2: [3]Value = undefined;
+                var k2: usize = 0;
+                while (k2 < site.n_args) : (k2 += 1) {
+                    const ar = @as(usize, site.args_reg) + k2;
+                    argbuf2[k2] = jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]);
+                }
+                const r = lc.host.callValue(lc.allocator, &callee, argbuf2[0..site.n_args]) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT value call" };
+                    return jit_loop.throwCode(site.block);
+                };
+                switch (r) {
+                    .ok => return 0,
+                    .err => |e| {
+                        lc.pending = e;
+                        return jit_loop.throwCode(site.block);
+                    },
+                }
+            }
             // The native loop does not run `.Trace`; refresh the calling frame's
             // position so a throw from the callee reports this call's line.
             if (site.span) |sp| lc.frame.cur_span = sp;
