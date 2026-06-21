@@ -271,6 +271,7 @@ pub const VmHost = struct {
     pub const callMemberNamed = host_call_member.callMemberNamed;
     pub const callMemberNamedStatic = host_call_member.callMemberNamedStatic;
     pub const callMemberStrictExt = host_call_member.callMemberStrictExt;
+    pub const resolveMemberFuncId = host_call_member.resolveMemberFuncId;
     pub const hostHasMember = host_call_member.hostHasMember;
     pub const hostHasProperty = host_call_member.hostHasProperty;
     pub const hostHasExtPropSetter = host_fields.hostHasExtPropSetter;
