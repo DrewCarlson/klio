@@ -653,6 +653,12 @@ pub const Func = struct {
     /// or top-level extension.
     kind: FuncKind = .plain,
     is_tailrec: bool = false,
+    /// Monomorphic call fast-path plan, cached on first call (the evaluator
+    /// fills it via the host). `0` = not yet computed, `1` = ineligible (use the
+    /// full dispatch), `>= 2` = eligible with `fast_call - 2` parameters: a plain
+    /// top-level user function a positional, exact-arity call dispatches straight
+    /// to its body. See `eval`'s `.Call` fast path.
+    fast_call: u16 = 0,
     /// True when `params[0]` is a *synthesized* `this` receiver — an
     /// instance method's / extension's / local-extension's dispatch
     /// receiver, a constructor's or init thunk's instance under

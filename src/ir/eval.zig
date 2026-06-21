@@ -203,6 +203,58 @@ threadlocal var active_chain_base: usize = 0;
 // -------------------------------------------------------------------------
 threadlocal var frame_chain: ?*Frame = null;
 
+/// Per-thread free-list of register buffers, reused across calls so a freeing
+/// backend pays no per-call alloc/free for the `regs` array. Only used under the
+/// reference-counting (freeing) backends: under the tracing GC the buffer memory
+/// is GC-owned and must not be hand-recycled; under the arena nothing is freed.
+/// Bounded so a deep-then-shallow call profile cannot retain buffers unboundedly.
+threadlocal var regs_pool: std.ArrayListUnmanaged([]Value) = .empty;
+const REGS_POOL_MAX: usize = 128;
+
+/// Take a zeroed (`.Unit`) register buffer of length `n`, reusing a pooled
+/// buffer when one is large enough. The returned list owns its backing. Pooled
+/// buffers only ever come from the current top-level evaluation (drained when it
+/// unwinds), so they share its allocator.
+fn acquireRegs(allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
+    if (regs_pool.items.len > 0) {
+        const buf = regs_pool.items[regs_pool.items.len - 1];
+        if (buf.len >= n) {
+            regs_pool.items.len -= 1;
+            var list: std.ArrayList(Value) = .{ .items = buf[0..0], .capacity = buf.len };
+            list.appendNTimes(allocator, .Unit, n) catch unreachable; // capacity already fits
+            return list;
+        }
+    }
+    var regs: std.ArrayList(Value) = .empty;
+    try regs.appendNTimes(allocator, .Unit, n);
+    return regs;
+}
+
+/// Return a frame's register buffer. A nested frame's buffer (`eval_depth > 0`)
+/// is recycled into the pool for a sibling call; the outermost frame's teardown
+/// (`eval_depth == 0`) frees its own buffer and drains the pool, so no recycled
+/// buffer ever outlives the top-level evaluation that produced it (or crosses an
+/// allocator). Only under a freeing backend — the tracing GC owns this memory and
+/// the arena never frees, so neither pools.
+fn releaseRegs(allocator: Allocator, regs: *std.ArrayList(Value)) void {
+    if (runtime.reclaimEnabled() and eval_depth > 0 and regs.capacity > 0 and regs_pool.items.len < REGS_POOL_MAX) {
+        const buf = regs.allocatedSlice();
+        regs.* = .empty;
+        regs_pool.append(allocator, buf) catch {
+            allocator.free(buf);
+        };
+        return;
+    }
+    regs.deinit(allocator);
+    if (eval_depth == 0 and regs_pool.items.len > 0) drainRegsPool(allocator);
+}
+
+/// Free every pooled register buffer. Called when the outermost frame unwinds.
+fn drainRegsPool(allocator: Allocator) void {
+    for (regs_pool.items) |buf| allocator.free(buf);
+    regs_pool.clearRetainingCapacity();
+}
+
 /// An in-flight `resumeContinuation` on this thread: while it rebuilds a parked
 /// activation one frame at a time, the not-yet-rebuilt snapshots live only in
 /// its Zig-local `frames` list (already taken out of the park registry, not yet
@@ -813,8 +865,7 @@ const Frame = struct {
     ) Allocator.Error!Frame {
         const params = params_in;
         coerceIntArgsToLong(func, params.items);
-        var regs: std.ArrayList(Value) = .empty;
-        try regs.appendNTimes(allocator, .Unit, func.n_locals);
+        const regs = try acquireRegs(allocator, func.n_locals);
         return .{
             .module = module,
             .func = func,
@@ -894,7 +945,7 @@ const Frame = struct {
                 for (self.captures.items) |v| v.release(self.allocator);
             }
         }
-        self.regs.deinit(self.allocator);
+        releaseRegs(self.allocator, &self.regs);
         self.params.deinit(self.allocator);
         self.captures.deinit(self.allocator);
         self.enclosing_this.deinit(chainAllocator());
@@ -2280,6 +2331,34 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             }
         },
         .Call => |call| {
+            // Monomorphic fast path: a plain top-level user function (single
+            // overload, has body, non-extension, no varargs / defaults / type
+            // params / native binding) called positionally at exact arity needs
+            // none of the overload re-resolution, extension-receiver handling,
+            // reified-type binding, or redundant arg copying below. Dispatch it
+            // straight to the body with the arg buffer transferred as params.
+            if (comptime @hasDecl(H, "callFuncFast")) {
+                if (call.type_args.len == 0 and argNamesAllNull(call.arg_names)) {
+                    if (frame.module.funcById(call.func)) |cf| {
+                        var plan = cf.fast_call;
+                        if (plan == 0) {
+                            plan = host.fastCallPlan(frame.module, call.func);
+                            @constCast(cf).fast_call = plan;
+                        }
+                        // `plan - 2` is the eligible arity; a positional, exact-arity
+                        // call dispatches straight to the body.
+                        if (plan >= 2 and plan - 2 == call.n_args) {
+                            const buf = try readArgRun(allocator, frame, call.args, call.n_args);
+                            const args_list: std.ArrayList(Value) = .{ .items = buf, .capacity = buf.len };
+                            switch (try host.callFuncFast(allocator, frame.module, call.func, args_list)) {
+                                .ok => |result| try frame.write(call.dst, result),
+                                .err => |e| return raiseStep(frame, e),
+                            }
+                            return .cont;
+                        }
+                    }
+                }
+            }
             var arg_values = try readArgRun(allocator, frame, call.args, call.n_args);
             defer allocator.free(arg_values);
             var names = try resolveArgNames(allocator, frame.module, call.arg_names);
@@ -3393,6 +3472,12 @@ fn stripScopeGetter(name: []const u8) []const u8 {
 
 /// Pull `n_args` register values starting at `args_start` into a fresh
 /// owned slice. Caller frees.
+/// A positional call: no entry carries an argument name.
+fn argNamesAllNull(names: []const ?ConstId) bool {
+    for (names) |n| if (n != null) return false;
+    return true;
+}
+
 fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u8) Allocator.Error![]Value {
     const out = try allocator.alloc(Value, n);
     var i: u32 = 0;

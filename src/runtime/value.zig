@@ -1255,12 +1255,23 @@ pub const Value = union(enum) {
         }
     };
 
+    /// A non-owning leaf value: no cell to retain/release. Listed conservatively
+    /// (only the unambiguous primitives) so a heap variant accidentally omitted
+    /// still takes the full path — never the reverse, which would leak.
+    pub inline fn isPrimitive(self: Value) bool {
+        return switch (self) {
+            .Unit, .CoroutineSuspended, .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char, .Null => true,
+            else => false,
+        };
+    }
+
     pub fn retain(self: Value) void {
         // Gated to match `release` (whose `ObjRef.deinit` is a no-op under the
         // arena fast path): under reclaim-off retains and releases are both
         // skipped, so the arena reclaims everything and production pays no
         // refcount traffic. Under reclaim-on both run and stay balanced.
         if (!objcell.reclaimEnabled()) return;
+        if (self.isPrimitive()) return;
         self.forEachChildCell(RetainVisitor{});
     }
 
@@ -1306,6 +1317,7 @@ pub const Value = union(enum) {
         // actively O(n) here (releasing a collection whose `strongCount` reads 1
         // walks every element). Only the reference-counting modes run it.
         if (!objcell.reclaimEnabled()) return;
+        if (self.isPrimitive()) return;
         switch (self) {
             .String => |s| s.deinit(),
             .Instance => |i| i.deinit(),
