@@ -28,6 +28,33 @@ const FuncId = ir.FuncId;
 const Allocator = std.mem.Allocator;
 const E = jit.Reg;
 
+// --- instance field memory layout (for native field access) ------------------
+// An instance's fields are a contiguous `[]Field` (name + Value); a scalar field
+// is read/written directly out of the boxed receiver's field buffer. The Value's
+// scalar payload sits at offset 0; its 1-byte tag at `value_tag_offset`. These are
+// computed from the real types so the codegen tracks any layout change.
+const FIELD_STRIDE: u32 = @sizeOf(runtime.InstanceData.Field);
+const FIELD_VALUE_OFF: u32 = @offsetOf(runtime.InstanceData.Field, "value");
+
+fn valuePayloadOffset() u32 {
+    var v: Value = .{ .Long = 0 };
+    return @intCast(@intFromPtr(&v.Long) - @intFromPtr(&v));
+}
+fn valueTagOffset() u32 {
+    // A zeroed Value with a distinctive tag: the only byte equal to that tag value
+    // (outside the cleared payload area) is the tag.
+    var v: Value = undefined;
+    @memset(std.mem.asBytes(&v), 0);
+    v = .{ .Char = 0 };
+    const tagv: u8 = @intFromEnum(@as(std.meta.Tag(Value), .Char));
+    const bytes = std.mem.asBytes(&v);
+    var off: usize = @sizeOf(u64);
+    while (off < bytes.len) : (off += 1) {
+        if (bytes[off] == tagv) return @intCast(off);
+    }
+    return 0;
+}
+
 // Native register assignment. `REGS` (callee-saved) holds the slot-file base
 // pointer; `T0`-`T3` are per-instruction scratch.
 const REGS: E = .rbx;
@@ -124,6 +151,13 @@ pub const CallSite = struct {
     is_field_set: bool = false,
     field_idx: u32 = 0,
     recv_varies: bool = false,
+    /// Native field access: a loop-invariant scalar field read/write emitted as a
+    /// direct memory access (no callback). `fbase_slot` holds the receiver's field
+    /// buffer pointer (cached at loop entry); `tag` is the field value's expected
+    /// `Value` tag (a read deopts on a mismatch — e.g. a nullable field gone null).
+    native: bool = false,
+    fbase_slot: u32 = 0,
+    tag: u8 = 0,
     /// Object-vs-null test: read boxed register `recv_reg`, write `0`/`1` (negated
     /// when `neg`) to the scalar `dst_reg` slot. `is_obj_move` instead copies boxed
     /// register `src_reg` into `dst_reg` (both frame registers).
@@ -177,6 +211,13 @@ pub const NullableUnbox = struct {
     live_out: bool,
 };
 
+/// A loop-invariant Instance receiver whose field buffer pointer is cached in
+/// `ptr_slot` at loop entry, so native field reads/writes index it directly.
+pub const FieldBase = struct {
+    recv_reg: u32,
+    ptr_slot: u32,
+};
+
 pub const CompiledLoop = struct {
     exec: jit.ExecBuf,
     n_regs: u32,
@@ -187,6 +228,7 @@ pub const CompiledLoop = struct {
     arrays: []ArrayUnbox,
     cells: []CellUnbox,
     nullables: []NullableUnbox,
+    field_bases: []FieldBase,
     /// Trampolined call sites, indexed by the site index the native code passes
     /// the host callback. Empty when the loop makes no calls.
     call_sites: []CallSite,
@@ -205,6 +247,7 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.arrays);
         self.allocator.free(self.cells);
         self.allocator.free(self.nullables);
+        self.allocator.free(self.field_bases);
         self.allocator.free(self.call_sites);
     }
 };
@@ -831,6 +874,19 @@ fn isScalarRt(t: RegType) bool {
     };
 }
 
+/// The `Value` union tag a native field store stamps for a scalar register kind.
+fn tagForRt(t: RegType) ?u8 {
+    const T = std.meta.Tag(Value);
+    return switch (t) {
+        .i32 => @intFromEnum(@as(T, .Int)),
+        .i64 => @intFromEnum(@as(T, .Long)),
+        .f64 => @intFromEnum(@as(T, .Double)),
+        .f32 => @intFromEnum(@as(T, .Float)),
+        .boolean => @intFromEnum(@as(T, .Bool)),
+        else => null,
+    };
+}
+
 /// The `RegType` for a live register value: a scalar kind, `.object` for a class
 /// instance (the JIT holds it in `regs`, where it stays a GC root, and at run time
 /// the register may also hold null), or null when it cannot be classified (a bare
@@ -1435,6 +1491,8 @@ const Compiler = struct {
     /// Total register-slot count (caller registers plus inlined-callee registers);
     /// the upper bound for `slotDisp`.
     reg_slots: u32,
+    val_payload_off: u32,
+    val_tag_off: u32,
     em: jit.Emitter,
     block_label: []?jit.Emitter.Label,
     exit_targets: std.ArrayListUnmanaged(BlockId),
@@ -1792,7 +1850,73 @@ const Compiler = struct {
         }
     }
 
+    /// Native scalar field read/write on a loop-invariant receiver: the field
+    /// buffer pointer is cached in `site.fbase_slot` at loop entry, so this is a
+    /// direct memory access with no host callback. A read guards the field value's
+    /// `Value` tag and deopts (re-runs the instruction in the interpreter) on a
+    /// mismatch — the field's scalar shape changed under the loop.
+    fn emitNativeField(self: *Compiler, site: *const CallSite) !void {
+        const byte_off: i32 = @intCast(site.field_idx * FIELD_STRIDE + FIELD_VALUE_OFF);
+        const payload_off: i32 = byte_off + @as(i32, @intCast(self.val_payload_off));
+        const tag_off: i32 = byte_off + @as(i32, @intCast(self.val_tag_off));
+        // T1 = receiver field buffer pointer.
+        try self.em.loadMem(T1, REGS, @intCast(@as(u64, site.fbase_slot) * 8));
+        if (site.is_field) {
+            const rt = typeOf(self.types, Reg.from(site.dst_reg));
+            // Tag guard: the field value must still hold the expected scalar kind.
+            try self.em.loadMemB(T0, T1, tag_off);
+            try self.em.cmpImm32(T0, site.tag);
+            try self.em.jcc(.ne, try self.deoptLabel());
+            switch (rt) {
+                .f64 => {
+                    try self.em.movsdLoad(X0, T1, payload_off);
+                    try self.storeF64Slot(Reg.from(site.dst_reg), X0);
+                },
+                .f32 => {
+                    try self.em.movssLoad(X0, T1, payload_off);
+                    try self.storeF32Slot(Reg.from(site.dst_reg), X0);
+                },
+                .boolean => {
+                    try self.em.loadMemB(T0, T1, payload_off);
+                    try self.storeSlot(Reg.from(site.dst_reg), T0);
+                },
+                .i32 => {
+                    try self.em.loadMem(T0, T1, payload_off);
+                    try self.em.movsxd(T0, T0);
+                    try self.storeSlot(Reg.from(site.dst_reg), T0);
+                },
+                else => { // .i64
+                    try self.em.loadMem(T0, T1, payload_off);
+                    try self.storeSlot(Reg.from(site.dst_reg), T0);
+                },
+            }
+            return;
+        }
+        // Field store: write the source scalar payload, then stamp the field's tag
+        // to the source's scalar kind (correct even if the field was previously null).
+        const rt = typeOf(self.types, Reg.from(site.src_reg));
+        switch (rt) {
+            .f64 => {
+                try self.loadF64Slot(X0, Reg.from(site.src_reg));
+                try self.em.movsdStore(T1, payload_off, X0);
+            },
+            .f32 => {
+                try self.loadF32Slot(X0, Reg.from(site.src_reg));
+                try self.em.movssStore(T1, payload_off, X0);
+            },
+            else => {
+                try self.loadSlot(T0, Reg.from(site.src_reg));
+                try self.em.storeMem(T1, payload_off, T0);
+            },
+        }
+        try self.em.storeMemBImm(T1, tag_off, tagForRt(rt) orelse return jit.JitError.Unsupported);
+    }
+
     fn emitCallSite(self: *Compiler, si: u32) !void {
+        if (self.call_sites[si].native) {
+            try self.emitNativeField(&self.call_sites[si]);
+            return;
+        }
         try self.em.loadMem(.rdi, REGS, @intCast(@as(u64, self.uc_slot) * 8));
         try self.em.movImm64(.rsi, @intCast(si));
         try self.em.loadMem(.rax, REGS, @intCast(@as(u64, self.tramp_slot) * 8));
@@ -2049,7 +2173,7 @@ const Compiler = struct {
 /// Try to compile the natural loop whose header is `header`, specializing array
 /// accesses on the kinds observed in `regs` (the live frame). Returns a compiled
 /// loop, or null if the loop is not a supported shape.
-pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, field_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
+pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
     const body = (try collectLoop(a, func, header)) orelse return null;
     defer a.free(body);
 
@@ -2162,11 +2286,28 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     const fid = resolver.?(resolver_user.?, &regs[mc.recv.int()], mc.name, av[0..mc.n_args]) orelse continue;
                     const callee = module.funcById(fid) orelse continue;
                     var this_reg: u32 = 0;
-                    if (!inlinableMemberCallee(module, callee, &this_reg)) {
-                        if (debugEnabled()) std.debug.print("[jit]   member {s} not inlinable (blocks={d})\n", .{ callee.name, callee.blocks.len });
-                        continue;
-                    }
+                    if (!inlinableMemberCallee(module, callee, &this_reg)) continue;
                     if (callee.params.len != @as(usize, mc.n_args) + 1) continue; // receiver + args
+                    // If the method writes a field, every field it reads must be a
+                    // non-nullable scalar so the read can never deopt — otherwise a
+                    // deopt would re-run the call and double an already-applied write.
+                    var has_write = false;
+                    for (callee.blocks[0].insts) |*ci| {
+                        if (trampolinableFieldSetOf(module, ci) != null) has_write = true;
+                    }
+                    if (has_write) {
+                        if (field_nn_resolver == null) continue;
+                        var read_ok = true;
+                        for (callee.blocks[0].insts) |*ci| {
+                            if (trampolinableFieldOf(module, ci)) |fld| {
+                                if (field_nn_resolver.?(resolver_user.?, &regs[mc.recv.int()], memberFieldName(fld.name)) == null) {
+                                    read_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!read_ok) continue;
+                    }
                     if (debugEnabled()) std.debug.print("[jit]   inlining member {s}\n", .{callee.name});
                     const has_result = callee.blocks[0].terminator.Return != null;
                     inline_sites.append(a, .{
@@ -2798,12 +2939,55 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         nu.flag_slot = calls_base + @as(u32, @intCast(i));
         null_flag_slot[nu.reg.int()] = nu.flag_slot;
     }
-    const n_slots: u32 = calls_base + @as(u32, @intCast(nullables.items.len));
+    const nullable_end: u32 = calls_base + @as(u32, @intCast(nullables.items.len));
     if (debugEnabled() and inline_sites.items.len != 0) std.debug.print("[jit]   inlined {d} call(s) in {s}\n", .{ inline_sites.items.len, func.name });
     // A map-get site writes the nullable result; record its dst's flag slot.
     for (call_sites.items) |*site| {
         if (site.is_map_get) site.map_flag_slot = null_flag_slot[site.dst_reg];
     }
+
+    // Native field access: a loop-invariant scalar field read/write is emitted as a
+    // direct memory access instead of a callback. One field-base pointer slot is
+    // cached per receiver (after the nullable slots); the field's expected Value tag
+    // is sampled from the live instance (a read deopts on a tag mismatch).
+    var field_bases: std.ArrayListUnmanaged(FieldBase) = .empty;
+    defer field_bases.deinit(a);
+    for (call_sites.items) |*site| {
+        if (!(site.is_field or site.is_field_set) or site.recv_varies) continue;
+        if (site.recv_reg >= regs.len or regs[site.recv_reg] != .Instance) continue;
+        const vreg: u32 = if (site.is_field) site.dst_reg else site.src_reg;
+        const rt = typeAt(types, Reg.from(vreg));
+        if (!isScalarRt(rt)) continue;
+        // A nullable-scalar value uses a companion null-flag the native path does
+        // not manage; keep it on the callback (which syncs the flag).
+        if (vreg < nullable.len and nullable[vreg]) continue;
+        const tag: u8 = blk: {
+            const g = regs[site.recv_reg].Instance.borrow();
+            defer g.deinit();
+            if (site.field_idx >= g.get().fields.items.len) break :blk 0xff;
+            break :blk @intFromEnum(@as(std.meta.Tag(Value), g.get().fields.items[site.field_idx].value));
+        };
+        if (tag == 0xff) continue;
+        // Reuse an existing base slot for the same receiver.
+        var ptr_slot: u32 = 0;
+        var found = false;
+        for (field_bases.items) |fb| {
+            if (fb.recv_reg == site.recv_reg) {
+                ptr_slot = fb.ptr_slot;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            ptr_slot = nullable_end + @as(u32, @intCast(field_bases.items.len));
+            field_bases.append(a, .{ .recv_reg = site.recv_reg, .ptr_slot = ptr_slot }) catch return null;
+        }
+        site.native = true;
+        site.fbase_slot = ptr_slot;
+        site.tag = tag;
+    }
+    const n_slots: u32 = nullable_end + @as(u32, @intCast(field_bases.items.len));
+    if (debugEnabled() and field_bases.items.len != 0) std.debug.print("[jit]   native field access on {d} receiver(s) in {s}\n", .{ field_bases.items.len, func.name });
 
     var c = Compiler{
         .a = a,
@@ -2821,6 +3005,8 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .tramp_slot = tramp_slot,
         .n_regs = n_regs,
         .reg_slots = total_regs,
+        .val_payload_off = valuePayloadOffset(),
+        .val_tag_off = valueTagOffset(),
         .em = jit.Emitter.init(a),
         .block_label = try a.alloc(?jit.Emitter.Label, func.blocks.len),
         .exit_targets = .empty,
@@ -2862,6 +3048,13 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         a.free(sites_owned);
         return null;
     };
+    const fbases_owned = field_bases.toOwnedSlice(a) catch {
+        a.free(arrays_owned);
+        a.free(cells_owned);
+        a.free(sites_owned);
+        a.free(nullables_owned);
+        return null;
+    };
     ok = true;
     return CompiledLoop{
         .exec = exec,
@@ -2875,6 +3068,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .arrays = arrays_owned,
         .cells = cells_owned,
         .nullables = nullables_owned,
+        .field_bases = fbases_owned,
         .call_sites = sites_owned,
         .uc_slot = uc_slot,
         .tramp_slot = tramp_slot,
@@ -2989,6 +3183,15 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
             if (site.recv_reg >= regs.len) return .bail;
             const rv = regs[site.recv_reg];
             if (rv != .Instance or instanceClassIdentity(rv) != site.recv_class) return .bail;
+        }
+        // Cache each native-field receiver's field buffer pointer. The receiver is
+        // an already-validated loop-invariant Instance; the buffer does not move or
+        // resize inside the native run, so the pointer stays valid throughout.
+        for (self.field_bases) |fb| {
+            if (fb.recv_reg >= regs.len or regs[fb.recv_reg] != .Instance) return .bail;
+            const g = regs[fb.recv_reg].Instance.borrow();
+            slots[fb.ptr_slot] = @bitCast(@intFromPtr(g.get().fields.items.ptr));
+            g.deinit();
         }
         tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.? };
         slots[self.uc_slot] = @bitCast(@intFromPtr(&tctx));
@@ -3163,7 +3366,7 @@ fn forFunc(func: *const Func) ?*FuncJit {
 /// Interpreter hook: at the start of block `cur`, count the entry and — once
 /// hot — compile and run the natural loop with that header. Returns the resume
 /// point (registers reboxed) when a compiled loop ran, else null. KLIO_JIT only.
-pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver) ?Resume {
+pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
     const fj = forFunc(func) orelse return null;
     const bi = cur.int();
     if (bi >= fj.counts.len) return null;
@@ -3172,7 +3375,7 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
         fj.counts[bi] += 1;
         if (fj.counts[bi] < HOT_THRESHOLD) return null;
         var transient = false;
-        const compiled = tryCompile(std.heap.page_allocator, module, func, cur, regs.items, resolver, field_resolver, user, &transient) catch null;
+        const compiled = tryCompile(std.heap.page_allocator, module, func, cur, regs.items, resolver, field_resolver, field_nn_resolver, user, &transient) catch null;
         if (compiled == null) {
             // A transient bail (an object register snapshot held null) is worth
             // retrying a few times; a permanent bail is cached immediately.

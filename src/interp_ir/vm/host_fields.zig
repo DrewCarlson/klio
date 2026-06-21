@@ -297,6 +297,53 @@ pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *con
     return null;
 }
 
+fn isScalarTypeName(n: []const u8) bool {
+    const names = [_][]const u8{ "Int", "Long", "Double", "Float", "Boolean", "Byte", "Short", "Char" };
+    for (names) |s| if (std.mem.eql(u8, n, s)) return true;
+    return false;
+}
+
+/// Like `plainStoredFieldIndex`, but only when the field's declared type is a
+/// non-nullable scalar. The loop JIT requires this before inlining a method that
+/// also writes a field: a non-nullable scalar read never deopts, so a re-run of
+/// the inlined call (on some other deopt) can never double an already-applied
+/// write. Returns null for a nullable or non-scalar field (keep it interpreted).
+pub fn plainStoredScalarFieldNN(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) ?u32 {
+    const idx = plainStoredFieldIndex(self, allocator, receiver, name) orelse return null;
+    var cur: ?[]const u8 = className(receiver.Instance);
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(allocator);
+    while (cur) |cn| {
+        cur = null;
+        if (containsStr(seen.items, cn)) break;
+        seen.append(allocator, cn) catch return null;
+        const cg = self.classes.borrow();
+        const def = cg.get().get(cn);
+        if (def) |d| {
+            const dg = d.borrow();
+            defer dg.deinit();
+            for (dg.get().primary_params) |p| {
+                if (p.property != null and std.mem.eql(u8, p.name, name)) {
+                    const nn = if (p.declared_shape) |sh| (!sh.nullable and isScalarTypeName(sh.name)) else false;
+                    cg.deinit();
+                    return if (nn) idx else null;
+                }
+            }
+            for (dg.get().body_properties) |p| {
+                if (std.mem.eql(u8, p.name, name)) {
+                    // A non-nullable primitive property carries a primitive zero.
+                    const nn = p.primitive_zero != null;
+                    cg.deinit();
+                    return if (nn) idx else null;
+                }
+            }
+        }
+        cg.deinit();
+        cur = firstSupertype(self, cn);
+    }
+    return null;
+}
+
 /// `suppress_cc_redirect` skips the suspend-implicit `coroutineContext`
 /// redirect for this one resolution (an explicit `recv.coroutineContext`
 /// read, lowered to the `$coroutineContext$explicit` sentinel). A

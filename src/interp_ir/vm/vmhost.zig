@@ -285,6 +285,7 @@ pub const VmHost = struct {
     pub const getField = host_fields.getField;
     pub const getMemberField = host_fields.getMemberField;
     pub const plainStoredFieldIndex = host_fields.plainStoredFieldIndex;
+    pub const plainStoredScalarFieldNN = host_fields.plainStoredScalarFieldNN;
     pub const setField = host_fields.setField;
     pub const instanceOf = host_classes.instanceOf;
     pub const isConcreteCastTarget = host_classes.isConcreteCastTarget;

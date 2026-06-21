@@ -228,6 +228,26 @@ pub const Emitter = struct {
         try self.memOperand(src, base, disp);
     }
 
+    /// `movzx <dst64>, byte [<base64> + disp32]` — zero-extend the byte at
+    /// `base+disp` into `dst` (used to read a `Value`'s 1-byte tag).
+    pub fn loadMemB(self: *Emitter, dst: Reg, base: Reg, disp: i32) JitError!void {
+        try self.rexWrr(dst, base);
+        try self.byte(0x0F);
+        try self.byte(0xB6); // MOVZX r64, r/m8
+        try self.memOperand(dst, base, disp);
+    }
+
+    /// `mov byte [<base64> + disp32], imm8` — write a `Value`'s 1-byte tag.
+    pub fn storeMemBImm(self: *Emitter, base: Reg, disp: i32, v: u8) JitError!void {
+        if (@intFromEnum(base) >= 8) try self.byte(0x41); // REX.B for base
+        try self.byte(0xC6); // MOV r/m8, imm8 (/0)
+        const rm = low3(base);
+        try self.byte(0x80 | rm); // mod=10, reg=/0
+        if (rm == 0x4) try self.byte(0x24); // SIB: base=rsp/r12
+        try self.imm32(@bitCast(disp));
+        try self.byte(v);
+    }
+
     /// ModRM+SIB+disp32 for `[base + disp32]` with ModRM.reg = `reg`. `rsp`/`r12`
     /// bases require a SIB byte; mod=10 always emits a 32-bit displacement.
     fn memOperand(self: *Emitter, reg: Reg, base: Reg, disp: i32) JitError!void {

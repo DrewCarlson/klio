@@ -1496,6 +1496,15 @@ fn LoopTramp(comptime H: type) type {
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.plainStoredFieldIndex(lc.allocator, receiver, name);
         }
+
+        /// Like `resolveField`, but only for a non-nullable scalar stored field —
+        /// the index where a member-inlined field read can never observe null (so
+        /// the loop can inline a method that also writes a field).
+        fn resolveFieldNN(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
+            if (comptime !@hasDecl(H, "plainStoredScalarFieldNN")) return null;
+            const lc: *Ctx = @ptrCast(@alignCast(user));
+            return lc.host.plainStoredScalarFieldNN(lc.allocator, receiver, name);
+        }
     };
 }
 
@@ -1537,6 +1546,8 @@ fn runFrameInner(
         if (comptime tramp_ok and @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
     const field_resolver: ?jit_loop.FieldResolver =
         if (comptime tramp_ok and @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
+    const field_nn_resolver: ?jit_loop.FieldResolver =
+        if (comptime tramp_ok and @hasDecl(H, "plainStoredScalarFieldNN")) &LoopTramp(H).resolveFieldNN else null;
     while (true) {
         // Daemon abandonment: a dispatcher pool task still running at the
         // run boundary stops at its next block instead of completing (or
@@ -1552,7 +1563,7 @@ fn runFrameInner(
         // success the loop runs natively and we resume at its exit block with
         // registers reboxed. Only at a fresh, non-resumed block entry.
         if (jit_on and resume_idx == 0 and resume_throw == null) {
-            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver)) |res| {
+            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |res| {
                 if (res.inst == jit_loop.THROW_INST) {
                     // A trampolined call left an error pending: re-raise it. A
                     // throw resumes through the try-stack at the call's block;
