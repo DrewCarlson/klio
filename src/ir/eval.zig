@@ -1233,6 +1233,7 @@ fn LoopTramp(comptime H: type) type {
             module: *const Module,
             frame: *Frame,
             pending: ?EvalError = null,
+            pending_deopt_inst: u32 = 0,
         };
 
         fn call(ctx_opaque: *anyopaque, site_idx: u64) callconv(.c) u64 {
@@ -1240,6 +1241,24 @@ fn LoopTramp(comptime H: type) type {
             const lc: *Ctx = @ptrCast(@alignCast(tctx.user));
             const cl = tctx.compiled;
             const site = cl.call_sites[@intCast(site_idx)];
+            // A field read is a direct stored-field load — no host call, no side
+            // effect, so a type mismatch (impossible for a guarded class) can
+            // safely deopt and let the interpreter re-read the field.
+            if (site.is_field) {
+                const recv = lc.frame.regs.items[site.recv_reg];
+                const g = recv.Instance.borrow();
+                const fv: ?Value = if (site.field_idx < g.get().fields.items.len) g.get().fields.items[site.field_idx].value else null;
+                g.deinit();
+                const s = if (fv) |v| jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v) else null;
+                if (s) |sv| {
+                    tctx.slots[site.dst_reg] = sv;
+                    return 0;
+                }
+                // Field no longer the cached scalar (e.g. a nullable field went
+                // null): deopt and let the interpreter re-read it.
+                lc.pending_deopt_inst = site.inst;
+                return jit_loop.deoptCode(site.block);
+            }
             // The native loop does not run `.Trace`; refresh the calling frame's
             // position so a throw from the callee reports this call's line.
             if (site.span) |sp| lc.frame.cur_span = sp;
@@ -1304,6 +1323,15 @@ fn LoopTramp(comptime H: type) type {
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.resolveMemberFuncId(lc.allocator, receiver, name, args);
         }
+
+        /// Compile-time field resolver: the stored-field index of `name` on the
+        /// receiver, or null if it is not a plain stored property (so the read
+        /// stays interpreted).
+        fn resolveField(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
+            if (comptime !@hasDecl(H, "plainStoredFieldIndex")) return null;
+            const lc: *Ctx = @ptrCast(@alignCast(user));
+            return lc.host.plainStoredFieldIndex(lc.allocator, receiver, name);
+        }
     };
 }
 
@@ -1343,6 +1371,8 @@ fn runFrameInner(
     const tramp_user: ?*anyopaque = if (comptime tramp_ok) @ptrCast(&loop_ctx) else null;
     const member_resolver: ?jit_loop.MemberResolver =
         if (comptime tramp_ok and @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
+    const field_resolver: ?jit_loop.FieldResolver =
+        if (comptime tramp_ok and @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
     while (true) {
         // Daemon abandonment: a dispatcher pool task still running at the
         // run boundary stops at its next block instead of completing (or
@@ -1358,7 +1388,7 @@ fn runFrameInner(
         // success the loop runs natively and we resume at its exit block with
         // registers reboxed. Only at a fresh, non-resumed block entry.
         if (jit_on and resume_idx == 0 and resume_throw == null) {
-            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver)) |res| {
+            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver)) |res| {
                 if (res.inst == jit_loop.THROW_INST) {
                     // A trampolined call left an error pending: re-raise it. A
                     // throw resumes through the try-stack at the call's block;
@@ -1374,6 +1404,14 @@ fn runFrameInner(
                             },
                             else => return errResult(e),
                         }
+                    } else unreachable;
+                }
+                if (res.inst == jit_loop.DEOPT_INST) {
+                    // A field read deopted: re-execute it in the interpreter.
+                    if (comptime tramp_ok) {
+                        cur = res.block;
+                        resume_idx = loop_ctx.pending_deopt_inst;
+                        continue;
                     } else unreachable;
                 }
                 cur = res.block;

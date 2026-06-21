@@ -63,6 +63,14 @@ pub const THROW_INST: u32 = 0xffff_ffff;
 pub fn throwCode(blk: BlockId) u64 {
     return encodeResume(blk, THROW_INST);
 }
+/// Sentinel inst index marking "deopt and re-execute at the stashed instruction"
+/// — used by a field read whose value is no longer the cached scalar (e.g. a
+/// nullable field became null). Always non-zero, so the native call site's
+/// "non-zero return = exit the loop" test never mistakes it for "continue".
+pub const DEOPT_INST: u32 = 0xffff_fffe;
+pub fn deoptCode(blk: BlockId) u64 {
+    return encodeResume(blk, DEOPT_INST);
+}
 
 /// Runtime context the JIT'd loop hands its trampoline: the live slot file, the
 /// compiled loop (for per-site descriptors + reg types), and the host's opaque
@@ -98,6 +106,11 @@ pub const CallSite = struct {
     recv_reg: u32 = 0,
     name: []const u8 = "",
     recv_class: usize = 0,
+    /// Field-read fields. `is_field` selects a direct stored-field read from the
+    /// boxed receiver at `field_idx` (the field's stable position in the instance,
+    /// valid for the guarded receiver class). No host call, no side effects.
+    is_field: bool = false,
+    field_idx: u32 = 0,
 };
 
 /// One packed array a compiled loop indexes: the register holding it, the
@@ -358,6 +371,29 @@ fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember 
 /// trampolined member call's return type; null means unresolvable/intrinsic, so
 /// the call is not trampolined.
 pub const MemberResolver = *const fn (*anyopaque, *const Value, []const u8, []const Value) ?FuncId;
+
+/// A `GetField` the loop JIT can trampoline: a property read on a loop-invariant
+/// boxed object, handled as a direct stored-field read (the receiver stays boxed
+/// in the frame's registers, exactly like a member call's receiver).
+const TrampField = struct { recv: Reg, name: []const u8, dst: Reg };
+
+fn trampolinableFieldOf(module: *const Module, inst: *const Inst) ?TrampField {
+    switch (inst.*) {
+        .GetField => |gf| {
+            if (gf.field.int() >= module.consts.items.len) return null;
+            const name = module.consts.items[gf.field.int()];
+            if (name != .String) return null;
+            return .{ .recv = gf.receiver, .name = name.String, .dst = gf.dst };
+        },
+        else => return null,
+    }
+}
+
+/// `fn(user, receiver, field_name) -> stored field index | null`. The loop JIT
+/// calls this at compile time; a non-null index means `name` is a plain stored
+/// property (no custom getter) the trampoline can read directly. Null means the
+/// read must stay interpreted (computed getter / delegated / extension property).
+pub const FieldResolver = *const fn (*anyopaque, *const Value, []const u8) ?u32;
 
 /// The scalar `RegType` a callee's declared return type maps to, or `.unknown`
 /// for a non-scalar / nullable / `Unit` return (the call's result is then not
@@ -763,6 +799,13 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
         while (k < mc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(mc.args_reg + k);
         n_reads.* = mc.n_args;
         if (mc.dst.int() < member_ret.len and member_ret[mc.dst.int()] != .unknown) def.* = mc.dst;
+        return;
+    }
+    // A trampolined field read takes no scalar inputs (the receiver stays boxed);
+    // its dst is a scalar def when the resolved field is a scalar.
+    if (trampolinableFieldOf(module, inst)) |fld| {
+        n_reads.* = 0;
+        if (fld.dst.int() < member_ret.len and member_ret[fld.dst.int()] != .unknown) def.* = fld.dst;
         return;
     }
     switch (inst.*) {
@@ -1391,7 +1434,7 @@ const Compiler = struct {
 /// Try to compile the natural loop whose header is `header`, specializing array
 /// accesses on the kinds observed in `regs` (the live frame). Returns a compiled
 /// loop, or null if the loop is not a supported shape.
-pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
+pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, field_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
     const body = (try collectLoop(a, func, header)) orelse return null;
     defer a.free(body);
 
@@ -1410,6 +1453,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (bitwiseOpOf(module, inst) != null) continue;
             if (trampolinableCallOf(inst) != null) continue;
             if (trampolinableMemberOf(module, inst) != null) continue;
+            if (trampolinableFieldOf(module, inst) != null) continue;
             switch (inst.*) {
                 .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .CellGet, .CellSet => {},
                 else => {
@@ -1488,30 +1532,50 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     }
 
     // Resolve each trampolined member call's result type against its live receiver
-    // (the IR cannot name the dispatched method). Member calls require Instance
-    // receivers and a member resolver; a callee that suspends, or a loop that also
-    // indexes arrays (a method could resize the backing store), is rejected.
+    // (the IR cannot name the dispatched method) and each trampolined field read's
+    // type + stable index. Both require Instance receivers and the matching
+    // resolver; a suspend method, or a loop that also indexes arrays (a method
+    // could resize the backing store), is rejected. `field_idx_of` records the
+    // stored-field index per field-read dst for the collection pass.
     const member_ret = try a.alloc(RegType, n_regs);
     defer a.free(member_ret);
     @memset(member_ret, .unknown);
+    const field_idx_of = try a.alloc(u32, n_regs);
+    defer a.free(field_idx_of);
+    @memset(field_idx_of, 0);
     for (body) |bid| {
         for (func.blocks[bid.int()].insts) |*inst| {
-            const mc = trampolinableMemberOf(module, inst) orelse continue;
-            if (resolver == null or arrays.items.len != 0) return null;
-            if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len) return null;
-            if (regs[mc.recv.int()] != .Instance) return null;
-            var av: [3]Value = undefined;
-            var k: u8 = 0;
-            while (k < mc.n_args) : (k += 1) {
-                const ar = mc.args_reg + k;
-                if (ar >= regs.len) return null;
-                av[k] = regs[ar];
-            }
-            if (resolver.?(resolver_user.?, &regs[mc.recv.int()], mc.name, av[0..mc.n_args])) |fid| {
-                if (module.funcById(fid)) |f| {
-                    if (f.is_suspend) return null;
-                    if (mc.dst.int() < n_regs) member_ret[mc.dst.int()] = retRegType(f.return_ty);
+            if (trampolinableMemberOf(module, inst)) |mc| {
+                if (resolver == null or arrays.items.len != 0) return null;
+                if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len) return null;
+                if (regs[mc.recv.int()] != .Instance) return null;
+                var av: [3]Value = undefined;
+                var k: u8 = 0;
+                while (k < mc.n_args) : (k += 1) {
+                    const ar = mc.args_reg + k;
+                    if (ar >= regs.len) return null;
+                    av[k] = regs[ar];
                 }
+                if (resolver.?(resolver_user.?, &regs[mc.recv.int()], mc.name, av[0..mc.n_args])) |fid| {
+                    if (module.funcById(fid)) |f| {
+                        if (f.is_suspend) return null;
+                        if (mc.dst.int() < n_regs) member_ret[mc.dst.int()] = retRegType(f.return_ty);
+                    }
+                }
+                continue;
+            }
+            if (trampolinableFieldOf(module, inst)) |fld| {
+                if (field_resolver == null or arrays.items.len != 0) return null;
+                if (fld.recv.int() >= n_regs or fld.recv.int() >= regs.len) return null;
+                if (regs[fld.recv.int()] != .Instance) return null;
+                const idx = field_resolver.?(resolver_user.?, &regs[fld.recv.int()], fld.name) orelse return null;
+                const g = regs[fld.recv.int()].Instance.borrow();
+                const fv: ?Value = if (idx < g.get().fields.items.len) g.get().fields.items[idx].value else null;
+                g.deinit();
+                const rt = if (fv) |v| (cellScalarType(v) orelse return null) else return null;
+                if (fld.dst.int() >= n_regs) return null;
+                member_ret[fld.dst.int()] = rt;
+                field_idx_of[fld.dst.int()] = idx;
             }
         }
     }
@@ -1579,14 +1643,15 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         for (blk_insts, 0..) |*inst, i| {
             const is_call = trampolinableCallOf(inst) != null;
             const is_member = trampolinableMemberOf(module, inst) != null;
-            if (!is_call and !is_member) continue;
+            const is_field = trampolinableFieldOf(module, inst) != null;
+            if (!is_call and !is_member and !is_field) continue;
             if (arrays.items.len != 0) {
                 if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
                 return null;
             }
-            // Every scalar arg must already live in a typed slot.
-            const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else trampolinableMemberOf(module, inst).?.args_reg;
-            const n_args: u8 = if (is_call) trampolinableCallOf(inst).?.n_args else trampolinableMemberOf(module, inst).?.n_args;
+            // Every scalar arg must already live in a typed slot (field reads have none).
+            const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else if (is_member) trampolinableMemberOf(module, inst).?.args_reg else 0;
+            const n_args: u8 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else 0;
             var k: u8 = 0;
             while (k < n_args) : (k += 1) {
                 const ar = args_reg + k;
@@ -1605,7 +1670,31 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     break;
                 }
             }
-            if (is_call) {
+            if (is_field) {
+                const fld = trampolinableFieldOf(module, inst).?;
+                // Loop-invariant boxed Instance receiver, same constraints as a member call.
+                if (fld.recv.int() >= n_regs or fld.recv.int() >= regs.len or regs[fld.recv.int()] != .Instance) return null;
+                if (sets.def[fld.recv.int()] or regDefinedInBody(module, func, body, fld.recv)) {
+                    if (debugEnabled()) std.debug.print("[jit]   bail: field receiver reg {d} not loop-invariant in {s}\n", .{ fld.recv.int(), func.name });
+                    return null;
+                }
+                const rrt = member_ret[fld.dst.int()];
+                if (rrt == .unknown or fld.dst.int() >= n_regs or types[fld.dst.int()] != rrt) return null;
+                call_sites.append(a, .{
+                    .func = @enumFromInt(0),
+                    .args_reg = 0,
+                    .n_args = 0,
+                    .dst_reg = fld.dst.int(),
+                    .has_result = true,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .recv_reg = fld.recv.int(),
+                    .recv_class = instanceClassIdentity(regs[fld.recv.int()]),
+                    .is_field = true,
+                    .field_idx = field_idx_of[fld.dst.int()],
+                }) catch return null;
+            } else if (is_call) {
                 const tc = trampolinableCallOf(inst).?;
                 const f = module.funcById(tc.func) orelse return null;
                 // The callee must run as a plain interpreted call: no suspend
@@ -1809,7 +1898,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
         // site was compiled against; otherwise its method (and return type) could
         // differ this activation — deopt to the interpreter.
         for (self.call_sites) |site| {
-            if (!site.is_member) continue;
+            if (!site.is_member and !site.is_field) continue;
             if (site.recv_reg >= regs.len) return .bail;
             const rv = regs[site.recv_reg];
             if (rv != .Instance or instanceClassIdentity(rv) != site.recv_class) return .bail;
@@ -1961,7 +2050,7 @@ fn forFunc(func: *const Func) ?*FuncJit {
 /// Interpreter hook: at the start of block `cur`, count the entry and — once
 /// hot — compile and run the natural loop with that header. Returns the resume
 /// point (registers reboxed) when a compiled loop ran, else null. KLIO_JIT only.
-pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver) ?Resume {
+pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver) ?Resume {
     const fj = forFunc(func) orelse return null;
     const bi = cur.int();
     if (bi >= fj.counts.len) return null;
@@ -1969,7 +2058,7 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
     if (!fj.loops.contains(bi)) {
         fj.counts[bi] += 1;
         if (fj.counts[bi] < HOT_THRESHOLD) return null;
-        const compiled = tryCompile(std.heap.page_allocator, module, func, cur, regs.items, resolver, user) catch null;
+        const compiled = tryCompile(std.heap.page_allocator, module, func, cur, regs.items, resolver, field_resolver, user) catch null;
         if (debugEnabled() and compiled != null) std.debug.print("[jit] compiled {s} block {d}\n", .{ func.name, bi });
         fj.loops.put(fj.a, bi, compiled) catch return null;
     }

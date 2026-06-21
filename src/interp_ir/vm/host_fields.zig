@@ -259,6 +259,42 @@ pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Valu
     return getFieldInner(self, allocator, receiver, name, false, true);
 }
 
+/// For the loop JIT: the index of `name` in the receiver's instance field list,
+/// but only when `name` is a plain stored property — an Instance receiver, a
+/// stored field of that name, and no custom getter for it anywhere in the class
+/// hierarchy. Returns null otherwise (a computed getter, delegated, or extension
+/// property is not a direct field read and must stay interpreted). The field
+/// order is fixed per class, so the index is stable for any instance of the class
+/// the call site was compiled against (re-checked by the entry class guard).
+pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) ?u32 {
+    if (receiver.* != .Instance) return null;
+    // Reject if any class in the hierarchy declares a custom getter for `name`.
+    {
+        var cur: ?[]const u8 = className(receiver.Instance);
+        var seen: std.ArrayList([]const u8) = .empty;
+        defer seen.deinit(allocator);
+        while (cur) |cn| {
+            cur = null;
+            if (containsStr(seen.items, cn)) break;
+            seen.append(allocator, cn) catch return null;
+            {
+                const pg = self.prog.borrow();
+                const hit = lookupPairFunc(pg.get().instance_prop_getters, cn, name) != null;
+                pg.deinit();
+                if (hit) return null;
+            }
+            cur = firstSupertype(self, cn);
+        }
+    }
+    const g = receiver.Instance.borrow();
+    defer g.deinit();
+    const b = g.get();
+    for (b.fields.items, 0..) |f, i| {
+        if (std.mem.eql(u8, f.name, name)) return @intCast(i);
+    }
+    return null;
+}
+
 /// `suppress_cc_redirect` skips the suspend-implicit `coroutineContext`
 /// redirect for this one resolution (an explicit `recv.coroutineContext`
 /// read, lowered to the `$coroutineContext$explicit` sentinel). A
