@@ -440,6 +440,35 @@ pub const Emitter = struct {
         try self.byte(0x09); // OR r/m64, r64
         try self.modrmRR(src, dst);
     }
+    /// `xor <dst64>, <src64>` (dst ^= src).
+    pub fn xorReg(self: *Emitter, dst: Reg, src: Reg) JitError!void {
+        try self.rexWrr(src, dst);
+        try self.byte(0x31); // XOR r/m64, r64
+        try self.modrmRR(src, dst);
+    }
+    /// `shl`/`sar <dst>, cl` — shift `dst` by the count in CL. `ext` is the
+    /// opcode extension (4 = shl, 7 = sar/arithmetic, 5 = shr/logical). `w64`
+    /// selects the 64-bit operand (count masked to 0x3f); otherwise the 32-bit
+    /// form (count masked to 0x1f, high 32 of the dest cleared) — which matches
+    /// Kotlin's `Int` vs `Long` shift-count masking exactly.
+    fn shiftCl(self: *Emitter, dst: Reg, ext: u8, w64: bool) JitError!void {
+        if (w64) {
+            try self.rexW(dst);
+        } else if (@intFromEnum(dst) >= 8) {
+            try self.byte(0x41); // REX.B for r8-r15 in the 32-bit form
+        }
+        try self.byte(0xD3);
+        try self.byte(0xC0 | (ext << 3) | low3(dst));
+    }
+    pub fn shlCl(self: *Emitter, dst: Reg, w64: bool) JitError!void {
+        try self.shiftCl(dst, 4, w64);
+    }
+    pub fn sarCl(self: *Emitter, dst: Reg, w64: bool) JitError!void {
+        try self.shiftCl(dst, 7, w64);
+    }
+    pub fn shrCl(self: *Emitter, dst: Reg, w64: bool) JitError!void {
+        try self.shiftCl(dst, 5, w64);
+    }
     /// `setcc <reg8>` then zero-extend to 64 bits — materialize a 0/1 boolean
     /// from the flags into `reg`. Only the low byte is set, so it is zeroed
     /// first via `xor reg,reg` semantics handled by the caller; here we set the

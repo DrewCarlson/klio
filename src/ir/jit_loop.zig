@@ -219,6 +219,39 @@ fn numericConvOf(module: *const Module, inst: *const Inst) ?NumConv {
     }
 }
 
+/// A bitwise infix operation (`a and b`, `a shl n`, …), which Kotlin lowers to a
+/// `CallMember` (these are infix member functions on `Int`/`Long`). The JIT
+/// emits a native bitwise/shift op. `ushr` (logical right shift) and `inv` are
+/// left to the interpreter — `ushr` needs width-aware zero-extension this fast
+/// path does not do.
+const BitKind = enum { @"and", @"or", xor, shl, sar };
+const BitOp = struct { dst: Reg, lhs: Reg, rhs: Reg, kind: BitKind };
+
+fn bitwiseOpOf(module: *const Module, inst: *const Inst) ?BitOp {
+    switch (inst.*) {
+        .CallMember => |cm| {
+            if (cm.arg_names.len != 0 or cm.n_args != 1) return null;
+            if (cm.name.int() >= module.consts.items.len) return null;
+            const name = module.consts.items[cm.name.int()];
+            if (name != .String) return null;
+            const kind: BitKind = if (std.mem.eql(u8, name.String, "and"))
+                .@"and"
+            else if (std.mem.eql(u8, name.String, "or"))
+                .@"or"
+            else if (std.mem.eql(u8, name.String, "xor"))
+                .xor
+            else if (std.mem.eql(u8, name.String, "shl"))
+                .shl
+            else if (std.mem.eql(u8, name.String, "shr"))
+                .sar
+            else
+                return null;
+            return .{ .dst = cm.dst, .lhs = cm.receiver, .rhs = Reg.from(cm.args.int()), .kind = kind };
+        },
+        else => return null,
+    }
+}
+
 /// Element register type + native access width for a packed array kind, or null
 /// for kinds the JIT does not compile (Float). A `Double` element is moved as a
 /// raw 8-byte (`b64`) value — its f64 bits live in the slot and are consumed by
@@ -281,6 +314,10 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
     // Numeric conversion (`x.toDouble()` etc.) yields the named target type.
     if (numericConvOf(module, inst)) |nc| {
         return setType(types, nc.dst, nc.to);
+    }
+    // Bitwise infix op yields its left operand's integer type.
+    if (bitwiseOpOf(module, inst)) |bo| {
+        return setType(types, bo.dst, typeOf(types, bo.lhs));
     }
     // CellGet yields the cell's scalar type; CellSet has no def.
     if (inst.* == .CellGet) {
@@ -510,6 +547,13 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
         reads[0] = nc.src;
         n_reads.* = 1;
         def.* = nc.dst;
+        return;
+    }
+    if (bitwiseOpOf(module, inst)) |bo| {
+        reads[0] = bo.lhs;
+        reads[1] = bo.rhs;
+        n_reads.* = 2;
+        def.* = bo.dst;
         return;
     }
     switch (inst.*) {
@@ -948,6 +992,29 @@ const Compiler = struct {
             }
             return;
         }
+        if (bitwiseOpOf(self.module, inst)) |bo| {
+            const lt = typeOf(self.types, bo.lhs);
+            const rt = typeOf(self.types, bo.rhs);
+            // Integer operands only — a float (or a user-typed receiver whose
+            // `and`/`shl` is a user operator) falls back to the interpreter.
+            if (!isNumeric(lt) or isFloat(lt) or !isNumeric(rt) or isFloat(rt))
+                return jit.JitError.Unsupported;
+            const w64 = lt == .i64;
+            try self.loadSlot(T0, bo.lhs);
+            try self.loadSlot(T1, bo.rhs); // shift count lands in cl (T1 == rcx)
+            switch (bo.kind) {
+                .@"and" => try self.em.andReg(T0, T1),
+                .@"or" => try self.em.orReg(T0, T1),
+                .xor => try self.em.xorReg(T0, T1),
+                .shl => try self.em.shlCl(T0, w64),
+                .sar => try self.em.sarCl(T0, w64),
+            }
+            // Re-normalize a 32-bit result to a sign-extended slot (the 32-bit
+            // shift already cleared the high half; and/or/xor used the 64-bit op).
+            if (typeOf(self.types, bo.dst) == .i32) try self.em.movsxd(T0, T0);
+            try self.storeSlot(bo.dst, T0);
+            return;
+        }
         switch (inst.*) {
             .Const => |c| {
                 const cv = self.module.consts.items[c.value.int()];
@@ -1104,6 +1171,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         for (blk.insts) |*inst| {
             if (arrayOpOf(module, inst) != null) continue;
             if (numericConvOf(module, inst) != null) continue;
+            if (bitwiseOpOf(module, inst) != null) continue;
             switch (inst.*) {
                 .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .CellGet, .CellSet => {},
                 else => {
