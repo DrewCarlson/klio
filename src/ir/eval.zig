@@ -203,6 +203,58 @@ threadlocal var active_chain_base: usize = 0;
 // -------------------------------------------------------------------------
 threadlocal var frame_chain: ?*Frame = null;
 
+/// Per-thread free-list of register buffers, reused across calls so a freeing
+/// backend pays no per-call alloc/free for the `regs` array. Only used under the
+/// reference-counting (freeing) backends: under the tracing GC the buffer memory
+/// is GC-owned and must not be hand-recycled; under the arena nothing is freed.
+/// Bounded so a deep-then-shallow call profile cannot retain buffers unboundedly.
+threadlocal var regs_pool: std.ArrayListUnmanaged([]Value) = .empty;
+const REGS_POOL_MAX: usize = 128;
+
+/// Take a zeroed (`.Unit`) register buffer of length `n`, reusing a pooled
+/// buffer when one is large enough. The returned list owns its backing. Pooled
+/// buffers only ever come from the current top-level evaluation (drained when it
+/// unwinds), so they share its allocator.
+fn acquireRegs(allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
+    if (regs_pool.items.len > 0) {
+        const buf = regs_pool.items[regs_pool.items.len - 1];
+        if (buf.len >= n) {
+            regs_pool.items.len -= 1;
+            var list: std.ArrayList(Value) = .{ .items = buf[0..0], .capacity = buf.len };
+            list.appendNTimes(allocator, .Unit, n) catch unreachable; // capacity already fits
+            return list;
+        }
+    }
+    var regs: std.ArrayList(Value) = .empty;
+    try regs.appendNTimes(allocator, .Unit, n);
+    return regs;
+}
+
+/// Return a frame's register buffer. A nested frame's buffer (`eval_depth > 0`)
+/// is recycled into the pool for a sibling call; the outermost frame's teardown
+/// (`eval_depth == 0`) frees its own buffer and drains the pool, so no recycled
+/// buffer ever outlives the top-level evaluation that produced it (or crosses an
+/// allocator). Only under a freeing backend — the tracing GC owns this memory and
+/// the arena never frees, so neither pools.
+fn releaseRegs(allocator: Allocator, regs: *std.ArrayList(Value)) void {
+    if (runtime.reclaimEnabled() and eval_depth > 0 and regs.capacity > 0 and regs_pool.items.len < REGS_POOL_MAX) {
+        const buf = regs.allocatedSlice();
+        regs.* = .empty;
+        regs_pool.append(allocator, buf) catch {
+            allocator.free(buf);
+        };
+        return;
+    }
+    regs.deinit(allocator);
+    if (eval_depth == 0 and regs_pool.items.len > 0) drainRegsPool(allocator);
+}
+
+/// Free every pooled register buffer. Called when the outermost frame unwinds.
+fn drainRegsPool(allocator: Allocator) void {
+    for (regs_pool.items) |buf| allocator.free(buf);
+    regs_pool.clearRetainingCapacity();
+}
+
 /// An in-flight `resumeContinuation` on this thread: while it rebuilds a parked
 /// activation one frame at a time, the not-yet-rebuilt snapshots live only in
 /// its Zig-local `frames` list (already taken out of the park registry, not yet
@@ -813,8 +865,7 @@ const Frame = struct {
     ) Allocator.Error!Frame {
         const params = params_in;
         coerceIntArgsToLong(func, params.items);
-        var regs: std.ArrayList(Value) = .empty;
-        try regs.appendNTimes(allocator, .Unit, func.n_locals);
+        const regs = try acquireRegs(allocator, func.n_locals);
         return .{
             .module = module,
             .func = func,
@@ -894,7 +945,7 @@ const Frame = struct {
                 for (self.captures.items) |v| v.release(self.allocator);
             }
         }
-        self.regs.deinit(self.allocator);
+        releaseRegs(self.allocator, &self.regs);
         self.params.deinit(self.allocator);
         self.captures.deinit(self.allocator);
         self.enclosing_this.deinit(chainAllocator());
@@ -1233,6 +1284,7 @@ fn LoopTramp(comptime H: type) type {
             module: *const Module,
             frame: *Frame,
             pending: ?EvalError = null,
+            pending_deopt_inst: u32 = 0,
         };
 
         fn call(ctx_opaque: *anyopaque, site_idx: u64) callconv(.c) u64 {
@@ -1240,6 +1292,182 @@ fn LoopTramp(comptime H: type) type {
             const lc: *Ctx = @ptrCast(@alignCast(tctx.user));
             const cl = tctx.compiled;
             const site = cl.call_sites[@intCast(site_idx)];
+            // Object move: copy one boxed register into another (both in `regs`).
+            // A `.null_`-typed source is the null literal, not a live register, so
+            // write `.Null` directly (its slot-backed register is not maintained
+            // during the native run).
+            if (site.is_obj_move) {
+                const v = if (cl.reg_types[site.src_reg] == .null_) Value.Null else lc.frame.regs.items[site.src_reg];
+                v.retain();
+                lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT object move" };
+                    return jit_loop.throwCode(site.block);
+                };
+                return 0;
+            }
+            // Object-vs-null test: write a boolean to the dst slot.
+            if (site.is_null_check) {
+                const is_null = lc.frame.regs.items[site.recv_reg] == .Null;
+                const r = if (site.neg) !is_null else is_null;
+                tctx.slots[site.dst_reg] = if (r) 1 else 0;
+                return 0;
+            }
+            // A field read is a direct stored-field load — no host call, no side
+            // effect, so a deopt is safe (the interpreter re-reads).
+            if (site.is_field) {
+                const recv = lc.frame.regs.items[site.recv_reg];
+                // A varying boxed receiver may be a different class this iteration
+                // (or null after a `?.` chain step); deopt unless it matches.
+                if (recv != .Instance or (site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                }
+                const g = recv.Instance.borrow();
+                const fv: ?Value = if (site.field_idx < g.get().fields.items.len) g.get().fields.items[site.field_idx].value else null;
+                g.deinit();
+                if (cl.reg_types[site.dst_reg] == .object) {
+                    // Object field: write the boxed value straight into the frame.
+                    const v = fv orelse .Null;
+                    v.retain();
+                    lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                        lc.pending = .{ .Type = "out of memory in JIT field read" };
+                        return jit_loop.throwCode(site.block);
+                    };
+                    return 0;
+                }
+                const s = if (fv) |v| jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v) else null;
+                if (s) |sv| {
+                    tctx.slots[site.dst_reg] = sv;
+                    return 0;
+                }
+                // Field no longer the cached scalar (e.g. a nullable field went
+                // null): deopt and let the interpreter re-read it.
+                lc.pending_deopt_inst = site.inst;
+                return jit_loop.deoptCode(site.block);
+            }
+            // Scalar field store: write the value directly into the boxed receiver's
+            // stored field (a plain stored property — no custom setter).
+            if (site.is_field_set) {
+                const recv = lc.frame.regs.items[site.recv_reg];
+                if (recv != .Instance or (site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                }
+                const v = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
+                const g = recv.Instance.borrowMut();
+                if (site.field_idx < g.get().fields.items.len) {
+                    const old = g.get().fields.items[site.field_idx].value;
+                    g.get().fields.items[site.field_idx].value = v;
+                    g.deinit();
+                    old.release(lc.allocator);
+                } else {
+                    g.deinit();
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                }
+                return 0;
+            }
+            // Object collection subscript: read element `recv[idx]` directly (no
+            // `get` dispatch) and write it into the register. Out-of-range or an
+            // unsupported container deopts; the interpreter re-runs the subscript
+            // (a side-effect-free read) and raises the proper exception on OOB.
+            if (site.is_obj_index) {
+                const recv = lc.frame.regs.items[site.recv_reg];
+                const idx_v = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                const idx: i64 = switch (idx_v) {
+                    .Int => |x| x,
+                    .Long => |x| x,
+                    else => {
+                        lc.pending_deopt_inst = site.inst;
+                        return jit_loop.deoptCode(site.block);
+                    },
+                };
+                if (jit_loop.liveElementAt(recv, idx)) |v| {
+                    v.retain();
+                    lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                        lc.pending = .{ .Type = "out of memory in JIT subscript" };
+                        return jit_loop.throwCode(site.block);
+                    };
+                    return 0;
+                }
+                lc.pending_deopt_inst = site.inst;
+                return jit_loop.deoptCode(site.block);
+            }
+            // Invoke a loop-invariant callable value; the result is discarded.
+            if (site.is_call_value) {
+                if (comptime !@hasDecl(H, "callValue")) return jit_loop.deoptCode(site.block);
+                if (site.span) |sp| lc.frame.cur_span = sp;
+                const callee = lc.frame.regs.items[site.recv_reg];
+                var argbuf2: [3]Value = undefined;
+                var k2: usize = 0;
+                while (k2 < site.n_args) : (k2 += 1) {
+                    const ar = @as(usize, site.args_reg) + k2;
+                    argbuf2[k2] = jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]);
+                }
+                const r = lc.host.callValue(lc.allocator, &callee, argbuf2[0..site.n_args]) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT value call" };
+                    return jit_loop.throwCode(site.block);
+                };
+                switch (r) {
+                    .ok => return 0,
+                    .err => |e| {
+                        lc.pending = e;
+                        return jit_loop.throwCode(site.block);
+                    },
+                }
+            }
+            // Map store `map[key] = value`; result discarded.
+            if (site.is_map_set) {
+                if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
+                if (site.span) |sp| lc.frame.cur_span = sp;
+                const m = lc.frame.regs.items[site.recv_reg];
+                const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                const val = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
+                var names: [2]?[]const u8 = .{ null, null };
+                const r = lc.host.callMemberNamed(lc.allocator, &m, "set", &.{ key, val }, names[0..2]) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT map store" };
+                    return jit_loop.throwCode(site.block);
+                };
+                switch (r) {
+                    .ok => return 0,
+                    .err => |e| {
+                        lc.pending = e;
+                        return jit_loop.throwCode(site.block);
+                    },
+                }
+            }
+            // Map load `map[key]` -> nullable scalar (value slot + flag slot).
+            if (site.is_map_get) {
+                if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
+                if (site.span) |sp| lc.frame.cur_span = sp;
+                const m = lc.frame.regs.items[site.recv_reg];
+                const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                var names: [1]?[]const u8 = .{null};
+                const r = lc.host.callMemberNamed(lc.allocator, &m, "get", &.{key}, names[0..1]) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT map load" };
+                    return jit_loop.throwCode(site.block);
+                };
+                switch (r) {
+                    .ok => |v| {
+                        if (v == .Null) {
+                            tctx.slots[site.dst_reg] = 0;
+                            tctx.slots[site.map_flag_slot] = 1;
+                        } else if (jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v)) |sv| {
+                            tctx.slots[site.dst_reg] = sv;
+                            tctx.slots[site.map_flag_slot] = 0;
+                        } else {
+                            // Value is not the cached scalar kind: deopt and re-read.
+                            lc.pending_deopt_inst = site.inst;
+                            return jit_loop.deoptCode(site.block);
+                        }
+                        return 0;
+                    },
+                    .err => |e| {
+                        lc.pending = e;
+                        return jit_loop.throwCode(site.block);
+                    },
+                }
+            }
             // The native loop does not run `.Trace`; refresh the calling frame's
             // position so a throw from the callee reports this call's line.
             if (site.span) |sp| lc.frame.cur_span = sp;
@@ -1252,6 +1480,12 @@ fn LoopTramp(comptime H: type) type {
             const res = if (site.is_member) member: {
                 if (comptime !@hasDecl(H, "callMemberNamed")) break :member EvalResult{ .err = .{ .Type = "host cannot dispatch member calls" } };
                 const recv = lc.frame.regs.items[site.recv_reg];
+                // A varying boxed receiver may be a different class this iteration;
+                // deopt unless it matches the class the return type was resolved for.
+                if (site.recv_varies and (recv != .Instance or jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                }
                 recv.retain();
                 defer recv.release(lc.allocator);
                 // Keep the caller's instance `this` reachable for member-extension
@@ -1304,6 +1538,24 @@ fn LoopTramp(comptime H: type) type {
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.resolveMemberFuncId(lc.allocator, receiver, name, args);
         }
+
+        /// Compile-time field resolver: the stored-field index of `name` on the
+        /// receiver, or null if it is not a plain stored property (so the read
+        /// stays interpreted).
+        fn resolveField(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
+            if (comptime !@hasDecl(H, "plainStoredFieldIndex")) return null;
+            const lc: *Ctx = @ptrCast(@alignCast(user));
+            return lc.host.plainStoredFieldIndex(lc.allocator, receiver, name);
+        }
+
+        /// Like `resolveField`, but only for a non-nullable scalar stored field —
+        /// the index where a member-inlined field read can never observe null (so
+        /// the loop can inline a method that also writes a field).
+        fn resolveFieldNN(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
+            if (comptime !@hasDecl(H, "plainStoredScalarFieldNN")) return null;
+            const lc: *Ctx = @ptrCast(@alignCast(user));
+            return lc.host.plainStoredScalarFieldNN(lc.allocator, receiver, name);
+        }
     };
 }
 
@@ -1343,6 +1595,10 @@ fn runFrameInner(
     const tramp_user: ?*anyopaque = if (comptime tramp_ok) @ptrCast(&loop_ctx) else null;
     const member_resolver: ?jit_loop.MemberResolver =
         if (comptime tramp_ok and @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
+    const field_resolver: ?jit_loop.FieldResolver =
+        if (comptime tramp_ok and @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
+    const field_nn_resolver: ?jit_loop.FieldResolver =
+        if (comptime tramp_ok and @hasDecl(H, "plainStoredScalarFieldNN")) &LoopTramp(H).resolveFieldNN else null;
     while (true) {
         // Daemon abandonment: a dispatcher pool task still running at the
         // run boundary stops at its next block instead of completing (or
@@ -1358,7 +1614,7 @@ fn runFrameInner(
         // success the loop runs natively and we resume at its exit block with
         // registers reboxed. Only at a fresh, non-resumed block entry.
         if (jit_on and resume_idx == 0 and resume_throw == null) {
-            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver)) |res| {
+            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |res| {
                 if (res.inst == jit_loop.THROW_INST) {
                     // A trampolined call left an error pending: re-raise it. A
                     // throw resumes through the try-stack at the call's block;
@@ -1374,6 +1630,14 @@ fn runFrameInner(
                             },
                             else => return errResult(e),
                         }
+                    } else unreachable;
+                }
+                if (res.inst == jit_loop.DEOPT_INST) {
+                    // A field read deopted: re-execute it in the interpreter.
+                    if (comptime tramp_ok) {
+                        cur = res.block;
+                        resume_idx = loop_ctx.pending_deopt_inst;
+                        continue;
                     } else unreachable;
                 }
                 cur = res.block;
@@ -2067,6 +2331,34 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             }
         },
         .Call => |call| {
+            // Monomorphic fast path: a plain top-level user function (single
+            // overload, has body, non-extension, no varargs / defaults / type
+            // params / native binding) called positionally at exact arity needs
+            // none of the overload re-resolution, extension-receiver handling,
+            // reified-type binding, or redundant arg copying below. Dispatch it
+            // straight to the body with the arg buffer transferred as params.
+            if (comptime @hasDecl(H, "callFuncFast")) {
+                if (call.type_args.len == 0 and argNamesAllNull(call.arg_names)) {
+                    if (frame.module.funcById(call.func)) |cf| {
+                        var plan = cf.fast_call;
+                        if (plan == 0) {
+                            plan = host.fastCallPlan(frame.module, call.func);
+                            @constCast(cf).fast_call = plan;
+                        }
+                        // `plan - 2` is the eligible arity; a positional, exact-arity
+                        // call dispatches straight to the body.
+                        if (plan >= 2 and plan - 2 == call.n_args) {
+                            const buf = try readArgRun(allocator, frame, call.args, call.n_args);
+                            const args_list: std.ArrayList(Value) = .{ .items = buf, .capacity = buf.len };
+                            switch (try host.callFuncFast(allocator, frame.module, call.func, args_list)) {
+                                .ok => |result| try frame.write(call.dst, result),
+                                .err => |e| return raiseStep(frame, e),
+                            }
+                            return .cont;
+                        }
+                    }
+                }
+            }
             var arg_values = try readArgRun(allocator, frame, call.args, call.n_args);
             defer allocator.free(arg_values);
             var names = try resolveArgNames(allocator, frame.module, call.arg_names);
@@ -3180,6 +3472,12 @@ fn stripScopeGetter(name: []const u8) []const u8 {
 
 /// Pull `n_args` register values starting at `args_start` into a fresh
 /// owned slice. Caller frees.
+/// A positional call: no entry carries an argument name.
+fn argNamesAllNull(names: []const ?ConstId) bool {
+    for (names) |n| if (n != null) return false;
+    return true;
+}
+
 fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u8) Allocator.Error![]Value {
     const out = try allocator.alloc(Value, n);
     var i: u32 = 0;

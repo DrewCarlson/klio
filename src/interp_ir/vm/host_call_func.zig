@@ -658,6 +658,41 @@ const valueIsBuiltin = root.valueIsBuiltin;
 // -------------------------------------------------------------------------
 
 /// Single function-call dispatch flow.
+/// Compute the monomorphic call fast-path plan for `func`, encoded for caching on
+/// the `Func`: `1` = ineligible (use full dispatch), `n_params + 2` = eligible. A
+/// plain top-level user function a call site can dispatch straight to its body.
+/// Excludes anything needing the slow path's per-call work — bodyless /
+/// native-bound / suspend / inline funcs, extensions and receiver methods,
+/// varargs, default args, reified type params, and any name with sibling
+/// overloads (which need runtime re-resolution). The evaluator caches the result
+/// on the `Func` and consults the host only once per function.
+pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
+    const f = funcAt(module, func) orelse return 1;
+    if (!f.hasBody()) return 1;
+    if (f.is_suspend or f.is_inline) return 1;
+    if (f.params.len > 253) return 1;
+    if (paramIsThis(f.params) or f.has_receiver_param) return 1;
+    if (lastIsVararg(f.params)) return 1;
+    if (funcDefaults(self, func) != null) return 1;
+    if (resolvedNativeForm(self, func) != null) return 1;
+    if (module.funcsBySimpleName(f.name).len != 1) return 1;
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().registry.func_type_params.get(func) != null) return 1;
+    }
+    return @as(u16, @intCast(f.params.len)) + 2;
+}
+
+/// Lean dispatch for a fast-path call: run the body directly with `args_list`
+/// transferred as the frame's params (one buffer, no copy). The eligibility
+/// guarantees no overload re-resolution, extension push, reified binding, or
+/// vararg/default handling is needed.
+pub fn callFuncFast(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args_list: std.ArrayList(Value)) Allocator.Error!EvalResult {
+    const f = funcAt(module, func).?;
+    return ir.eval.evalWith(VmHost, allocator, module, f, args_list, self);
+}
+
 pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args_in: []const Value) Allocator.Error!EvalResult {
     const f = funcAt(module, func) orelse
         return .{ .err = typeErr(allocator, "unknown FuncId {d}", .{func.int()}) };
