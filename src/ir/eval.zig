@@ -1241,14 +1241,49 @@ fn LoopTramp(comptime H: type) type {
             const lc: *Ctx = @ptrCast(@alignCast(tctx.user));
             const cl = tctx.compiled;
             const site = cl.call_sites[@intCast(site_idx)];
+            // Object move: copy one boxed register into another (both in `regs`).
+            // A `.null_`-typed source is the null literal, not a live register, so
+            // write `.Null` directly (its slot-backed register is not maintained
+            // during the native run).
+            if (site.is_obj_move) {
+                const v = if (cl.reg_types[site.src_reg] == .null_) Value.Null else lc.frame.regs.items[site.src_reg];
+                v.retain();
+                lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT object move" };
+                    return jit_loop.throwCode(site.block);
+                };
+                return 0;
+            }
+            // Object-vs-null test: write a boolean to the dst slot.
+            if (site.is_null_check) {
+                const is_null = lc.frame.regs.items[site.recv_reg] == .Null;
+                const r = if (site.neg) !is_null else is_null;
+                tctx.slots[site.dst_reg] = if (r) 1 else 0;
+                return 0;
+            }
             // A field read is a direct stored-field load — no host call, no side
-            // effect, so a type mismatch (impossible for a guarded class) can
-            // safely deopt and let the interpreter re-read the field.
+            // effect, so a deopt is safe (the interpreter re-reads).
             if (site.is_field) {
                 const recv = lc.frame.regs.items[site.recv_reg];
+                // A varying boxed receiver may be a different class this iteration
+                // (or null after a `?.` chain step); deopt unless it matches.
+                if (recv != .Instance or (site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                }
                 const g = recv.Instance.borrow();
                 const fv: ?Value = if (site.field_idx < g.get().fields.items.len) g.get().fields.items[site.field_idx].value else null;
                 g.deinit();
+                if (cl.reg_types[site.dst_reg] == .object) {
+                    // Object field: write the boxed value straight into the frame.
+                    const v = fv orelse .Null;
+                    v.retain();
+                    lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                        lc.pending = .{ .Type = "out of memory in JIT field read" };
+                        return jit_loop.throwCode(site.block);
+                    };
+                    return 0;
+                }
                 const s = if (fv) |v| jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v) else null;
                 if (s) |sv| {
                     tctx.slots[site.dst_reg] = sv;
@@ -1271,6 +1306,12 @@ fn LoopTramp(comptime H: type) type {
             const res = if (site.is_member) member: {
                 if (comptime !@hasDecl(H, "callMemberNamed")) break :member EvalResult{ .err = .{ .Type = "host cannot dispatch member calls" } };
                 const recv = lc.frame.regs.items[site.recv_reg];
+                // A varying boxed receiver may be a different class this iteration;
+                // deopt unless it matches the class the return type was resolved for.
+                if (site.recv_varies and (recv != .Instance or jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                }
                 recv.retain();
                 defer recv.release(lc.allocator);
                 // Keep the caller's instance `this` reachable for member-extension

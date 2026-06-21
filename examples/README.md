@@ -120,6 +120,7 @@ Run any program with:
 | `jit_nested_call_loop.kt`  | Hot outer loop trampolining a call to a function that runs its own hot inner loop (the callee's parameter type is seeded from the live argument); the inner loop runs natively while re-entered from inside the outer native loop; identical output JIT off or on. |
 | `jit_member_call_loop.kt`  | Hot loop calling methods on a loop-invariant object; loop JIT trampolines the member call (receiver stays boxed and its class is re-checked at loop entry, scalar args/result move through slots) for `Int`/`Long`-returning and `Unit` side-effecting methods; identical output JIT off or on. |
 | `jit_field_read_loop.kt`   | Hot loop reading scalar fields (`Int`/`Long`/`Double`) of a loop-invariant object, including a field mutated through a method then read back; loop JIT trampolines the read as a direct stored-field load (a custom getter falls back to the interpreter); identical output JIT off or on. |
+| `jit_object_traversal_loop.kt` | Hot loop walking a linked structure: a boxed cursor reassigned through an object field, an object-vs-null loop guard, a scalar field read and a method call per node; loop JIT keeps the cursor in the register array (a GC root) and drives the traversal natively; identical output JIT off or on. |
 | `string_ascii_fastpath.kt` | String `length`/`indexOf`/`substring`/indexing on ASCII vs non-ASCII text (ASCII takes a byte-length fast path; non-ASCII falls back to a UTF-16 walk). |
 
 ## Integration showcases

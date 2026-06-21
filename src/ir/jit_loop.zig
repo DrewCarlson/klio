@@ -39,8 +39,13 @@ const T2: E = .rdx; // array element scratch
 const X0: jit.Emitter.Xmm = .xmm0;
 const X1: jit.Emitter.Xmm = .xmm1;
 
-/// Static type of an IR register, for normalization and reboxing.
-pub const RegType = enum(u8) { i32, i64, f64, f32, boolean, unit, null_, unknown };
+/// Static type of an IR register, for normalization and reboxing. `object` marks
+/// a register that holds a full `Value` reference (an instance, null, or other
+/// boxed object): it lives in the frame's register array (a GC root), never in a
+/// scalar slot, and is read/written only by host callbacks — so the native loop
+/// can drive object field navigation and null tests without putting a reference
+/// in an untracked slot.
+pub const RegType = enum(u8) { i32, i64, f64, f32, boolean, unit, null_, object, unknown };
 
 /// The native loop returns `(block_id << 32) | inst_index` — the interpreter
 /// resume point. A normal loop exit resumes at the target block's first
@@ -86,11 +91,11 @@ pub const TrampFn = *const fn (*anyopaque, u64) callconv(.c) u64;
 /// One trampolined call site in a compiled loop. Arg/result types come from the
 /// loop's `reg_types` (a slot index == its reg index).
 pub const CallSite = struct {
-    func: FuncId,
-    args_reg: u32,
-    n_args: u8,
+    func: FuncId = @enumFromInt(0),
+    args_reg: u32 = 0,
+    n_args: u8 = 0,
     dst_reg: u32,
-    has_result: bool,
+    has_result: bool = false,
     block: BlockId,
     inst: u32,
     /// Source span of the call (from the nearest preceding `.Trace`), so the
@@ -108,9 +113,21 @@ pub const CallSite = struct {
     recv_class: usize = 0,
     /// Field-read fields. `is_field` selects a direct stored-field read from the
     /// boxed receiver at `field_idx` (the field's stable position in the instance,
-    /// valid for the guarded receiver class). No host call, no side effects.
+    /// valid for the guarded receiver class). When `dst_reg`'s type is `.object`
+    /// the read writes the boxed value into the frame register; otherwise a scalar
+    /// slot. `recv_varies` marks a non-loop-invariant boxed receiver, so the read
+    /// re-checks the receiver's class each call instead of relying on the entry
+    /// guard. No side effects.
     is_field: bool = false,
     field_idx: u32 = 0,
+    recv_varies: bool = false,
+    /// Object-vs-null test: read boxed register `recv_reg`, write `0`/`1` (negated
+    /// when `neg`) to the scalar `dst_reg` slot. `is_obj_move` instead copies boxed
+    /// register `src_reg` into `dst_reg` (both frame registers).
+    is_null_check: bool = false,
+    is_obj_move: bool = false,
+    neg: bool = false,
+    src_reg: u32 = 0,
 };
 
 /// One packed array a compiled loop indexes: the register holding it, the
@@ -417,34 +434,25 @@ fn isScalarRt(t: RegType) bool {
     };
 }
 
+/// The `RegType` for a live register value: a scalar kind, `.object` for a class
+/// instance (the JIT holds it in `regs`, where it stays a GC root, and at run time
+/// the register may also hold null), or null when it cannot be classified (a bare
+/// `Null`/`Unit`, whose register would have an ambiguous static type).
+fn liveValueRegType(v: Value) ?RegType {
+    if (cellScalarType(v)) |s| return s;
+    return switch (v) {
+        .Instance => .object,
+        else => null,
+    };
+}
+
 /// The class-cell identity of an `Instance` value, used as the loop-entry guard
 /// for a trampolined member call (a later activation whose receiver is a different
 /// class deopts rather than dispatching against a stale return-type assumption).
-fn instanceClassIdentity(v: Value) usize {
+pub fn instanceClassIdentity(v: Value) usize {
     const g = v.Instance.borrow();
     defer g.deinit();
     return g.get().class.identity();
-}
-
-/// Whether any instruction in the loop body writes register `r` as its
-/// destination (covers the non-scalar call/member results that `instReadsDef`
-/// deliberately does not report). Used to confirm a member call's receiver is
-/// loop-invariant — defined outside the loop, so its boxed value in the frame's
-/// registers stays valid for the whole native run.
-fn regDefinedInBody(module: *const Module, func: *const Func, body: []const BlockId, r: Reg) bool {
-    for (body) |bid| {
-        for (func.blocks[bid.int()].insts) |*inst| {
-            if (trampolinableCallOf(inst)) |tc| {
-                if (tc.dst.int() == r.int()) return true;
-                continue;
-            }
-            if (trampolinableMemberOf(module, inst)) |mc| {
-                if (mc.dst.int() == r.int()) return true;
-                continue;
-            }
-        }
-    }
-    return false;
 }
 
 /// Element register type + native access width for a packed array kind, or null
@@ -752,7 +760,21 @@ fn buildPreds(a: Allocator, func: *const Func, nb: usize, reach: []const bool) A
 
 // --- liveness ---------------------------------------------------------------
 
-fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_reads: *usize, def: *?Reg, member_ret: []const RegType) void {
+fn typeAt(types: []const RegType, r: Reg) RegType {
+    return if (r.int() < types.len) types[r.int()] else .unknown;
+}
+
+/// Whether a `BinOp` is an object-vs-null comparison — recognized so the JIT
+/// emits a null-test callback (reading the boxed register) instead of a native
+/// scalar compare.
+fn isNullCheckBinOp(types: []const RegType, b: anytype) bool {
+    if (b.op != .Eq and b.op != .NotEq) return false;
+    const lt = typeAt(types, b.lhs);
+    const rt = typeAt(types, b.rhs);
+    return (lt == .object and rt == .null_) or (lt == .null_ and rt == .object) or (lt == .object and rt == .object);
+}
+
+fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_reads: *usize, def: *?Reg, types: []const RegType) void {
     n_reads.* = 0;
     def.* = null;
     if (arrayOpOf(module, inst)) |op| {
@@ -786,9 +808,7 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
         var k: u8 = 0;
         while (k < tc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(tc.args_reg + k);
         n_reads.* = tc.n_args;
-        if (module.funcById(tc.func)) |f| {
-            if (retRegType(f.return_ty) != .unknown) def.* = tc.dst;
-        }
+        if (isScalarRt(typeAt(types, tc.dst))) def.* = tc.dst;
         return;
     }
     // A trampolined member call reads its scalar args (the receiver stays boxed in
@@ -798,24 +818,33 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
         var k: u8 = 0;
         while (k < mc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(mc.args_reg + k);
         n_reads.* = mc.n_args;
-        if (mc.dst.int() < member_ret.len and member_ret[mc.dst.int()] != .unknown) def.* = mc.dst;
+        if (isScalarRt(typeAt(types, mc.dst))) def.* = mc.dst;
         return;
     }
     // A trampolined field read takes no scalar inputs (the receiver stays boxed);
-    // its dst is a scalar def when the resolved field is a scalar.
+    // its dst is a scalar def only for a scalar field (an object field's dst is a
+    // boxed register, not in the scalar sets).
     if (trampolinableFieldOf(module, inst)) |fld| {
         n_reads.* = 0;
-        if (fld.dst.int() < member_ret.len and member_ret[fld.dst.int()] != .unknown) def.* = fld.dst;
+        if (isScalarRt(typeAt(types, fld.dst))) def.* = fld.dst;
         return;
     }
     switch (inst.*) {
         .Const => |c| def.* = c.dst,
         .Move => |m| {
+            // An object move copies a boxed register; neither side is a scalar.
+            if (typeAt(types, m.dst) == .object or typeAt(types, m.src) == .object) return;
             reads[0] = m.src;
             n_reads.* = 1;
             def.* = m.dst;
         },
         .BinOp => |b| {
+            // An object null test reads boxed registers (not scalars); only its
+            // boolean dst is a scalar def.
+            if (isNullCheckBinOp(types, b)) {
+                def.* = b.dst;
+                return;
+            }
             reads[0] = b.lhs;
             reads[1] = b.rhs;
             n_reads.* = 2;
@@ -844,7 +873,7 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
 
 const LoopSets = struct { read: []bool, def: []bool };
 
-fn computeSets(a: Allocator, module: *const Module, func: *const Func, body: []const BlockId, header: BlockId, n_regs: u32, member_ret: []const RegType) Allocator.Error!LoopSets {
+fn computeSets(a: Allocator, module: *const Module, func: *const Func, body: []const BlockId, header: BlockId, n_regs: u32, types: []const RegType) Allocator.Error!LoopSets {
     const nb = func.blocks.len;
     const in_body = try a.alloc(bool, nb);
     defer a.free(in_body);
@@ -874,7 +903,7 @@ fn computeSets(a: Allocator, module: *const Module, func: *const Func, body: []c
         var nr: usize = 0;
         var df: ?Reg = null;
         for (blk.insts) |*inst| {
-            instReadsDef(module, inst, &reads, &nr, &df, member_ret);
+            instReadsDef(module, inst, &reads, &nr, &df, types);
             for (reads[0..nr]) |rr| {
                 if (rr.int() < n_regs and !d[rr.int()]) u[rr.int()] = true;
             }
@@ -1434,7 +1463,7 @@ const Compiler = struct {
 /// Try to compile the natural loop whose header is `header`, specializing array
 /// accesses on the kinds observed in `regs` (the live frame). Returns a compiled
 /// loop, or null if the loop is not a supported shape.
-pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, field_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
+pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, field_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
     const body = (try collectLoop(a, func, header)) orelse return null;
     defer a.free(body);
 
@@ -1548,7 +1577,12 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (trampolinableMemberOf(module, inst)) |mc| {
                 if (resolver == null or arrays.items.len != 0) return null;
                 if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len) return null;
-                if (regs[mc.recv.int()] != .Instance) return null;
+                if (regs[mc.recv.int()] != .Instance) {
+                    // Receiver snapshot was null/non-instance; a later snapshot may
+                    // have a usable sample, so this bail is worth retrying.
+                    transient.* = true;
+                    return null;
+                }
                 var av: [3]Value = undefined;
                 var k: u8 = 0;
                 while (k < mc.n_args) : (k += 1) {
@@ -1567,18 +1601,37 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (trampolinableFieldOf(module, inst)) |fld| {
                 if (field_resolver == null or arrays.items.len != 0) return null;
                 if (fld.recv.int() >= n_regs or fld.recv.int() >= regs.len) return null;
-                if (regs[fld.recv.int()] != .Instance) return null;
+                if (regs[fld.recv.int()] != .Instance) {
+                    // Receiver snapshot null/non-instance — retry on a later snapshot.
+                    transient.* = true;
+                    return null;
+                }
                 const idx = field_resolver.?(resolver_user.?, &regs[fld.recv.int()], fld.name) orelse return null;
                 const g = regs[fld.recv.int()].Instance.borrow();
                 const fv: ?Value = if (idx < g.get().fields.items.len) g.get().fields.items[idx].value else null;
                 g.deinit();
-                const rt = if (fv) |v| (cellScalarType(v) orelse return null) else return null;
+                // A scalar field types its dst as that scalar; an instance field
+                // types it `.object` (the read writes the boxed value into regs). A
+                // null/unclassifiable snapshot is transient — retry later.
+                const rt = if (fv) |v| (liveValueRegType(v) orelse {
+                    transient.* = true;
+                    return null;
+                }) else {
+                    transient.* = true;
+                    return null;
+                };
                 if (fld.dst.int() >= n_regs) return null;
                 member_ret[fld.dst.int()] = rt;
                 field_idx_of[fld.dst.int()] = idx;
             }
         }
     }
+
+    // Whole-function type inference must run before liveness so the read/def sets
+    // can recognize object registers (held in `regs`, not slots) and exclude them.
+    const types = try inferTypes(a, module, func, n_regs, array_info, cell_info, regs, member_ret);
+    var ok = false;
+    defer if (!ok) a.free(types);
 
     // A cell register's slot caches a scalar, so it must not be read or written
     // as a plain scalar anywhere in the loop (only via CellGet/CellSet). Reject
@@ -1590,7 +1643,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         for (body) |bid| {
             const blk = &func.blocks[bid.int()];
             for (blk.insts) |*inst| {
-                instReadsDef(module, inst, &reads, &nr, &df, member_ret);
+                instReadsDef(module, inst, &reads, &nr, &df, types);
                 for (reads[0..nr]) |rr| {
                     if (rr.int() < n_regs and cell_info[rr.int()] != null) return null;
                 }
@@ -1603,11 +1656,8 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         }
     }
 
-    const types = try inferTypes(a, module, func, n_regs, array_info, cell_info, regs, member_ret);
-    const sets = try computeSets(a, module, func, body, header, n_regs, member_ret);
-    var ok = false;
+    const sets = try computeSets(a, module, func, body, header, n_regs, types);
     defer if (!ok) {
-        a.free(types);
         a.free(sets.read);
         a.free(sets.def);
     };
@@ -1622,6 +1672,13 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     for (cells.items) |cu| {
         sets.read[cu.reg.int()] = false;
         sets.def[cu.reg.int()] = false;
+    }
+    // Object regs live in `regs` (a GC root), never in a slot — exclude them.
+    for (0..n_regs) |r| {
+        if (types[r] == .object) {
+            sets.read[r] = false;
+            sets.def[r] = false;
+        }
     }
     for (0..n_regs) |r| {
         if ((sets.read[r] or sets.def[r]) and types[r] == .unknown) {
@@ -1644,7 +1701,15 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             const is_call = trampolinableCallOf(inst) != null;
             const is_member = trampolinableMemberOf(module, inst) != null;
             const is_field = trampolinableFieldOf(module, inst) != null;
-            if (!is_call and !is_member and !is_field) continue;
+            const is_obj_move = switch (inst.*) {
+                .Move => |m| typeAt(types, m.dst) == .object or typeAt(types, m.src) == .object,
+                else => false,
+            };
+            const is_null_check = switch (inst.*) {
+                .BinOp => |b| isNullCheckBinOp(types, b),
+                else => false,
+            };
+            if (!is_call and !is_member and !is_field and !is_obj_move and !is_null_check) continue;
             if (arrays.items.len != 0) {
                 if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
                 return null;
@@ -1670,14 +1735,49 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     break;
                 }
             }
-            if (is_field) {
-                const fld = trampolinableFieldOf(module, inst).?;
-                // Loop-invariant boxed Instance receiver, same constraints as a member call.
-                if (fld.recv.int() >= n_regs or fld.recv.int() >= regs.len or regs[fld.recv.int()] != .Instance) return null;
-                if (sets.def[fld.recv.int()] or regDefinedInBody(module, func, body, fld.recv)) {
-                    if (debugEnabled()) std.debug.print("[jit]   bail: field receiver reg {d} not loop-invariant in {s}\n", .{ fld.recv.int(), func.name });
+            if (is_obj_move) {
+                // Copy a boxed register into another (both live in `regs`).
+                const m = inst.Move;
+                if (m.dst.int() >= n_regs or m.src.int() >= n_regs) return null;
+                call_sites.append(a, .{
+                    .dst_reg = m.dst.int(),
+                    .src_reg = m.src.int(),
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .is_obj_move = true,
+                }) catch return null;
+            } else if (is_null_check) {
+                // Object-vs-null test -> boolean slot. Identify the boxed operand;
+                // an object-vs-object identity test is not supported.
+                const b = inst.BinOp;
+                const obj_reg: Reg = if (typeAt(types, b.lhs) == .object and typeAt(types, b.rhs) == .null_)
+                    b.lhs
+                else if (typeAt(types, b.rhs) == .object and typeAt(types, b.lhs) == .null_)
+                    b.rhs
+                else
                     return null;
-                }
+                if (obj_reg.int() >= n_regs or b.dst.int() >= n_regs) return null;
+                call_sites.append(a, .{
+                    .dst_reg = b.dst.int(),
+                    .recv_reg = obj_reg.int(),
+                    .has_result = true,
+                    .neg = b.op == .NotEq,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .is_null_check = true,
+                }) catch return null;
+            } else if (is_field) {
+                const fld = trampolinableFieldOf(module, inst).?;
+                if (fld.recv.int() >= n_regs or fld.recv.int() >= regs.len or regs[fld.recv.int()] != .Instance) return null;
+                // A loop-invariant receiver is covered by the entry class guard; a
+                // boxed receiver that varies (a chain intermediate) re-checks its
+                // class on every read.
+                // A receiver typed `.object` is a boxed register that may be
+                // reassigned in the loop (a chain cursor); re-check its class on
+                // every read. A loop-invariant receiver is covered by the entry guard.
+                const recv_varies = typeAt(types, fld.recv) == .object;
                 const rrt = member_ret[fld.dst.int()];
                 if (rrt == .unknown or fld.dst.int() >= n_regs or types[fld.dst.int()] != rrt) return null;
                 call_sites.append(a, .{
@@ -1693,6 +1793,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .recv_class = instanceClassIdentity(regs[fld.recv.int()]),
                     .is_field = true,
                     .field_idx = field_idx_of[fld.dst.int()],
+                    .recv_varies = recv_varies,
                 }) catch return null;
             } else if (is_call) {
                 const tc = trampolinableCallOf(inst).?;
@@ -1721,14 +1822,11 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 }) catch return null;
             } else {
                 const mc = trampolinableMemberOf(module, inst).?;
-                // The receiver must be a loop-invariant boxed Instance: never
-                // written in the body (its register stays the same object every
-                // iteration), so the host reads it straight from the frame.
                 if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len or regs[mc.recv.int()] != .Instance) return null;
-                if (sets.def[mc.recv.int()] or regDefinedInBody(module, func, body, mc.recv)) {
-                    if (debugEnabled()) std.debug.print("[jit]   bail: member receiver reg {d} not loop-invariant in {s}\n", .{ mc.recv.int(), func.name });
-                    return null;
-                }
+                // A loop-invariant receiver is validated once by the entry guard; a
+                // boxed receiver that varies (a chain cursor) re-checks its class on
+                // every call. Either way the host reads it straight from the frame.
+                const recv_varies = typeAt(types, mc.recv) == .object;
                 const rrt = member_ret[mc.dst.int()];
                 const has_result = rrt != .unknown;
                 if (has_result and (mc.dst.int() >= n_regs or types[mc.dst.int()] != rrt)) return null;
@@ -1745,6 +1843,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .recv_reg = mc.recv.int(),
                     .name = mc.name,
                     .recv_class = instanceClassIdentity(regs[mc.recv.int()]),
+                    .recv_varies = recv_varies,
                 }) catch return null;
             }
         }
@@ -1785,7 +1884,10 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     for (body) |bid| c.block_label[bid.int()] = c.em.newLabel() catch return null;
     c.epilogue = c.em.newLabel() catch return null;
 
-    c.run() catch return null;
+    c.run() catch |e| {
+        if (debugEnabled()) std.debug.print("[jit]   bail: codegen {s} in {s}\n", .{ @errorName(e), func.name });
+        return null;
+    };
 
     const exec = jit.finalize(c.em.code()) catch return null;
     const arrays_owned = arrays.toOwnedSlice(a) catch return null;
@@ -1857,6 +1959,9 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
             },
             .unit => if (v != .Unit) return .bail,
             .null_ => if (v != .Null) return .bail,
+            // Object registers are never slot-backed (excluded from read_set);
+            // they stay in `regs`. Reaching here would be a bug, but it is safe.
+            .object => {},
             .unknown => return .bail,
         }
     }
@@ -1898,7 +2003,9 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
         // site was compiled against; otherwise its method (and return type) could
         // differ this activation — deopt to the interpreter.
         for (self.call_sites) |site| {
-            if (!site.is_member and !site.is_field) continue;
+            // Loop-invariant member / field receivers are validated once here; a
+            // varying receiver is re-checked by its callback each iteration.
+            if (site.recv_varies or !(site.is_member or site.is_field)) continue;
             if (site.recv_reg >= regs.len) return .bail;
             const rv = regs[site.recv_reg];
             if (rv != .Instance or instanceClassIdentity(rv) != site.recv_class) return .bail;
@@ -1925,6 +2032,9 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
             .boolean => .{ .Bool = slots[r] != 0 },
             .unit => .Unit,
             .null_ => .Null,
+            // Object registers were written straight to `regs` by callbacks
+            // (never slot-backed); keep the current value.
+            .object => regs[r],
             .unknown => regs[r],
         };
     }
@@ -1987,14 +2097,22 @@ pub fn valueFromSlot(rt: RegType, s: i64) Value {
 // --- per-function JIT state + the interpreter hook --------------------------
 
 const HOT_THRESHOLD: u32 = 64;
+/// A loop whose receiver/field types are read from the live frame can bail when
+/// the snapshot catches an object register holding null (between traversals).
+/// Such a bail is transient, so retry a few times (spaced by re-reaching the
+/// threshold) before giving up — a later snapshot usually has a non-null sample.
+const MAX_COMPILE_ATTEMPTS: u8 = 6;
+const RETRY_GAP: u32 = 8;
 
 pub const FuncJit = struct {
     counts: []u32,
+    attempts: []u8,
     loops: std.AutoHashMapUnmanaged(u32, ?CompiledLoop) = .empty,
     a: Allocator,
 
     pub fn deinit(self: *FuncJit) void {
         self.a.free(self.counts);
+        self.a.free(self.attempts);
         var it = self.loops.valueIterator();
         while (it.next()) |v| if (v.*) |*cl| cl.deinit();
         self.loops.deinit(self.a);
@@ -2034,13 +2152,21 @@ fn forFunc(func: *const Func) ?*FuncJit {
     if (states.get(key)) |s| return s;
     if (func.blocks.len == 0) return null;
     const s = a.create(FuncJit) catch return null;
-    s.* = .{ .counts = a.alloc(u32, func.blocks.len) catch {
+    const counts = a.alloc(u32, func.blocks.len) catch {
         a.destroy(s);
         return null;
-    }, .a = a };
+    };
+    const attempts = a.alloc(u8, func.blocks.len) catch {
+        a.free(counts);
+        a.destroy(s);
+        return null;
+    };
+    s.* = .{ .counts = counts, .attempts = attempts, .a = a };
     @memset(s.counts, 0);
+    @memset(s.attempts, 0);
     states.put(a, key, s) catch {
-        a.free(s.counts);
+        a.free(counts);
+        a.free(attempts);
         a.destroy(s);
         return null;
     };
@@ -2058,8 +2184,20 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
     if (!fj.loops.contains(bi)) {
         fj.counts[bi] += 1;
         if (fj.counts[bi] < HOT_THRESHOLD) return null;
-        const compiled = tryCompile(std.heap.page_allocator, module, func, cur, regs.items, resolver, field_resolver, user) catch null;
-        if (debugEnabled() and compiled != null) std.debug.print("[jit] compiled {s} block {d}\n", .{ func.name, bi });
+        var transient = false;
+        const compiled = tryCompile(std.heap.page_allocator, module, func, cur, regs.items, resolver, field_resolver, user, &transient) catch null;
+        if (compiled == null) {
+            // A transient bail (an object register snapshot held null) is worth
+            // retrying a few times; a permanent bail is cached immediately.
+            fj.attempts[bi] += 1;
+            if (transient and fj.attempts[bi] < MAX_COMPILE_ATTEMPTS) {
+                fj.counts[bi] = HOT_THRESHOLD - RETRY_GAP;
+                return null;
+            }
+            fj.loops.put(fj.a, bi, null) catch return null;
+            return null;
+        }
+        if (debugEnabled()) std.debug.print("[jit] compiled {s} block {d}\n", .{ func.name, bi });
         fj.loops.put(fj.a, bi, compiled) catch return null;
     }
 
