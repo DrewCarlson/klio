@@ -1343,6 +1343,58 @@ fn LoopTramp(comptime H: type) type {
                     },
                 }
             }
+            // Map store `map[key] = value`; result discarded.
+            if (site.is_map_set) {
+                if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
+                if (site.span) |sp| lc.frame.cur_span = sp;
+                const m = lc.frame.regs.items[site.recv_reg];
+                const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                const val = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
+                var names: [2]?[]const u8 = .{ null, null };
+                const r = lc.host.callMemberNamed(lc.allocator, &m, "set", &.{ key, val }, names[0..2]) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT map store" };
+                    return jit_loop.throwCode(site.block);
+                };
+                switch (r) {
+                    .ok => return 0,
+                    .err => |e| {
+                        lc.pending = e;
+                        return jit_loop.throwCode(site.block);
+                    },
+                }
+            }
+            // Map load `map[key]` -> nullable scalar (value slot + flag slot).
+            if (site.is_map_get) {
+                if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
+                if (site.span) |sp| lc.frame.cur_span = sp;
+                const m = lc.frame.regs.items[site.recv_reg];
+                const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                var names: [1]?[]const u8 = .{null};
+                const r = lc.host.callMemberNamed(lc.allocator, &m, "get", &.{key}, names[0..1]) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT map load" };
+                    return jit_loop.throwCode(site.block);
+                };
+                switch (r) {
+                    .ok => |v| {
+                        if (v == .Null) {
+                            tctx.slots[site.dst_reg] = 0;
+                            tctx.slots[site.map_flag_slot] = 1;
+                        } else if (jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v)) |sv| {
+                            tctx.slots[site.dst_reg] = sv;
+                            tctx.slots[site.map_flag_slot] = 0;
+                        } else {
+                            // Value is not the cached scalar kind: deopt and re-read.
+                            lc.pending_deopt_inst = site.inst;
+                            return jit_loop.deoptCode(site.block);
+                        }
+                        return 0;
+                    },
+                    .err => |e| {
+                        lc.pending = e;
+                        return jit_loop.throwCode(site.block);
+                    },
+                }
+            }
             // The native loop does not run `.Trace`; refresh the calling frame's
             // position so a throw from the callee reports this call's line.
             if (site.span) |sp| lc.frame.cur_span = sp;

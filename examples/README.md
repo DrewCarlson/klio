@@ -125,6 +125,7 @@ Run any program with:
 | `jit_inferred_return_loop.kt` | Hot loops calling functions/methods with inferred (expression-body) return types; loop JIT infers each callee's scalar return type from its body (params carry declared types, arithmetic promotes per Kotlin) so the result is slot-typed and the call trampolined; identical output JIT off or on. |
 | `jit_nullable_scalar_loop.kt` | Null-safe chains whose result is a nullable scalar (`Int?` from `?.` on a scalar field) folded with `?:`; loop JIT carries the nullable scalar as a value slot plus a companion null-flag slot, running the null tests, Elvis default, and arithmetic natively; identical output JIT off or on. |
 | `jit_closure_call_loop.kt` | Hot loop invoking a loop-invariant closure (which captures and mutates an outer variable); loop JIT keeps the closure boxed in the register array and trampolines the call while the loop control runs natively; identical output JIT off or on. |
+| `jit_map_ops_loop.kt`      | Hot loops storing into and loading from a loop-invariant map; loop JIT trampolines `map[k] = v` and `map[k]` (a nullable scalar folded with `?:`, a missing key reading back as null) while keys, the Elvis default, and accumulation run natively; identical output JIT off or on. |
 | `string_ascii_fastpath.kt` | String `length`/`indexOf`/`substring`/indexing on ASCII vs non-ASCII text (ASCII takes a byte-length fast path; non-ASCII falls back to a UTF-16 walk). |
 
 ## Integration showcases

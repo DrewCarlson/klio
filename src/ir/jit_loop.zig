@@ -134,6 +134,13 @@ pub const CallSite = struct {
     /// Call a loop-invariant callable value held in `recv_reg` with the scalar
     /// args at `args_reg`; the result is discarded.
     is_call_value: bool = false,
+    /// Map subscript on the loop-invariant map in `recv_reg`. `is_map_get` reads
+    /// `map[slot[args_reg]]` and writes the nullable-scalar result into the value
+    /// slot `dst_reg` + `map_flag_slot`; `is_map_set` stores `slot[src_reg]` at
+    /// key `slot[args_reg]`.
+    is_map_get: bool = false,
+    is_map_set: bool = false,
+    map_flag_slot: u32 = 0,
 };
 
 /// One packed array a compiled loop indexes: the register holding it, the
@@ -572,6 +579,17 @@ fn liveValueRegType(v: Value) ?RegType {
 /// out-of-range index or an unsupported container. Used to sample an object
 /// collection's element type at compile time (a packed primitive array is handled
 /// by the native array path, not here).
+/// The scalar `RegType` of a `Map`'s values, sampled from any live entry (the
+/// value type is uniform), or null for an empty map / non-scalar value type.
+fn liveMapValueType(recv: Value) ?RegType {
+    if (recv != .Map) return null;
+    const g = recv.Map.entries.borrow();
+    defer g.deinit();
+    const pairs = g.get().pairs.items;
+    if (pairs.len == 0) return null;
+    return cellScalarType(pairs[0].value);
+}
+
 pub fn liveElementAt(recv: Value, idx: i64) ?Value {
     if (idx < 0) return null;
     const u: usize = @intCast(idx);
@@ -922,14 +940,16 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
     if (arrayOpOf(module, inst)) |op| {
         reads[0] = op.index;
         if (op.is_set) {
+            // A subscript store reads the index and value; its "dst" is a
+            // discarded result, never a scalar def.
             reads[1] = op.value;
             n_reads.* = 2;
-        } else {
-            n_reads.* = 1;
+            return;
         }
-        // An object-collection subscript writes a boxed register (in `regs`), not
-        // a scalar slot — only a packed-array element is a scalar def.
-        if (!op.is_set and typeAt(types, op.dst) == .object) return;
+        n_reads.* = 1;
+        // An object-collection / map subscript writes a boxed or nullable register,
+        // not a plain scalar slot — only a packed-array element is a scalar def.
+        if (typeAt(types, op.dst) == .object) return;
         def.* = op.dst;
         return;
     }
@@ -1740,12 +1760,12 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (array_info[rr.int()] != null) continue;
             const v = regs[rr.int()];
             // Only a packed primitive array gets the native indexed path. A
-            // non-packed receiver (a `List` or reference `Array` of objects) is
-            // left for the object-subscript path — but only for a `get`; a
-            // non-packed `set` is not compilable here.
+            // non-packed receiver (a `List`/reference `Array` of objects, or a
+            // `Map`) is left for the object-subscript / map paths; a non-packed
+            // `set` is compilable only for a `Map`.
             const packed_ok = v == .Array and v.Array.prim != null and v.Array.storage == .scalars;
             if (!packed_ok) {
-                if (op.is_set) return null;
+                if (op.is_set and v != .Map) return null;
                 continue;
             }
             const kind = v.Array.prim.?;
@@ -1810,6 +1830,11 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     const field_idx_of = try a.alloc(u32, n_regs);
     defer a.free(field_idx_of);
     @memset(field_idx_of, 0);
+    // Registers that are a `Map[key]` get result: a nullable scalar (the map's
+    // value type, or null when absent). Folded into the nullable set below.
+    const map_get_dst = try a.alloc(bool, n_regs);
+    defer a.free(map_get_dst);
+    @memset(map_get_dst, false);
     for (body) |bid| {
         for (func.blocks[bid.int()].insts) |*inst| {
             if (trampolinableMemberOf(module, inst)) |mc| {
@@ -1863,13 +1888,28 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 field_idx_of[fld.dst.int()] = idx;
                 continue;
             }
-            // Object collection subscript: a `get` on a non-packed receiver whose
-            // live element is an instance. Types the dst `.object`; the element is
-            // fetched at run time through the normal `get` dispatch.
+            // Object collection subscript / map subscript: a `get`/`set` on a
+            // non-packed receiver. A `Map` receiver routes to the map paths; a
+            // `List`/reference `Array` element that is an instance routes to the
+            // object subscript.
             if (arrayOpOf(module, inst)) |op| {
-                if (op.is_set) continue;
                 if (op.recv.int() >= n_regs or array_info[op.recv.int()] != null) continue; // packed -> native
-                if (op.recv.int() >= regs.len or op.index.int() >= regs.len or op.dst.int() >= n_regs) return null;
+                if (op.recv.int() >= regs.len) return null;
+                if (regs[op.recv.int()] == .Map) {
+                    // Map get types its dst as a nullable scalar (the value type);
+                    // map set has no result. Key/value must be scalar.
+                    const vt = liveMapValueType(regs[op.recv.int()]) orelse {
+                        transient.* = true; // empty map snapshot or non-scalar value
+                        return null;
+                    };
+                    if (op.is_set) continue; // validated in the collection pass
+                    if (op.dst.int() >= n_regs) return null;
+                    member_ret[op.dst.int()] = vt;
+                    map_get_dst[op.dst.int()] = true;
+                    continue;
+                }
+                if (op.is_set) continue;
+                if (op.index.int() >= regs.len or op.dst.int() >= n_regs) return null;
                 const idx_v = regs[op.index.int()];
                 const idx_i: i64 = switch (idx_v) {
                     .Int => |x| x,
@@ -1969,6 +2009,10 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             }
         };
     }
+    // A `Map[key]` result is also a nullable scalar.
+    for (0..n_regs) |r| {
+        if (map_get_dst[r] and isScalarRt(types[r])) nullable[r] = true;
+    }
     var nullables: std.ArrayListUnmanaged(NullableUnbox) = .empty;
     defer nullables.deinit(a);
     const null_flag_slot = try a.alloc(u32, n_regs);
@@ -2010,9 +2054,12 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 .BinOp => |b| isNullCheckBinOp(types, b),
                 else => false,
             };
-            const is_obj_index = if (arrayOpOf(module, inst)) |op| (!op.is_set and typeAt(types, op.dst) == .object) else false;
+            const map_op = if (arrayOpOf(module, inst)) |op| (op.recv.int() < regs.len and regs[op.recv.int()] == .Map) else false;
+            const is_obj_index = if (arrayOpOf(module, inst)) |op| (!op.is_set and !map_op and typeAt(types, op.dst) == .object) else false;
+            const is_map_get = if (arrayOpOf(module, inst)) |op| (map_op and !op.is_set) else false;
+            const is_map_set = if (arrayOpOf(module, inst)) |op| (map_op and op.is_set) else false;
             const is_call_value = trampolinableCallValueOf(inst) != null;
-            if (!is_call and !is_member and !is_field and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value) continue;
+            if (!is_call and !is_member and !is_field and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value and !is_map_get and !is_map_set) continue;
             if (arrays.items.len != 0) {
                 if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
                 return null;
@@ -2038,7 +2085,39 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     break;
                 }
             }
-            if (is_call_value) {
+            if (is_map_set) {
+                // Map store `map[key] = value` (loop-invariant map, scalar key+value).
+                const op = arrayOpOf(module, inst).?;
+                if (op.recv.int() >= n_regs or op.index.int() >= n_regs or op.value.int() >= n_regs) return null;
+                if (!isScalarRt(typeAt(types, op.index)) or !isScalarRt(typeAt(types, op.value))) return null;
+                if (sets.def[op.recv.int()]) return null; // map must be loop-invariant
+                call_sites.append(a, .{
+                    .dst_reg = 0,
+                    .recv_reg = op.recv.int(),
+                    .args_reg = op.index.int(),
+                    .src_reg = op.value.int(),
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .is_map_set = true,
+                }) catch return null;
+            } else if (is_map_get) {
+                // Map load `map[key]` -> nullable scalar (loop-invariant map, scalar key).
+                const op = arrayOpOf(module, inst).?;
+                if (op.recv.int() >= n_regs or op.index.int() >= n_regs or op.dst.int() >= n_regs) return null;
+                if (!isScalarRt(typeAt(types, op.index))) return null;
+                if (sets.def[op.recv.int()]) return null;
+                call_sites.append(a, .{
+                    .recv_reg = op.recv.int(),
+                    .args_reg = op.index.int(),
+                    .dst_reg = op.dst.int(),
+                    .has_result = true,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .is_map_get = true,
+                }) catch return null;
+            } else if (is_call_value) {
                 // Invoke a loop-invariant callable value; the result is discarded.
                 const cvc = trampolinableCallValueOf(inst).?;
                 if (cvc.callee.int() >= n_regs or cvc.callee.int() >= regs.len) return null;
@@ -2197,6 +2276,10 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         null_flag_slot[nu.reg.int()] = nu.flag_slot;
     }
     const n_slots: u32 = calls_base + @as(u32, @intCast(nullables.items.len));
+    // A map-get site writes the nullable result; record its dst's flag slot.
+    for (call_sites.items) |*site| {
+        if (site.is_map_get) site.map_flag_slot = null_flag_slot[site.dst_reg];
+    }
 
     var c = Compiler{
         .a = a,
