@@ -610,6 +610,18 @@ pub const Lexer = struct {
             }
         }
 
+        // A trailing `f`/`F` (not part of a longer identifier) makes this a Float
+        // literal even with no decimal point, e.g. `2f`. Require the next byte to
+        // not continue an identifier so `1foo` stays an error rather than `1f`+`oo`.
+        if (!is_float) {
+            switch (self.peekByte(0) orelse 0) {
+                'f', 'F' => {
+                    if (!isIdentContByte(self.peekByte(1) orelse 0)) is_float = true;
+                },
+                else => {},
+            }
+        }
+
         if (is_float) {
             const suffix: FloatSuffix = switch (self.peekByte(0) orelse 0) {
                 'f', 'F' => blk: {
@@ -1603,6 +1615,51 @@ test "numeric suffixes and bases" {
     try testing.expect(it[6] == .FloatLiteral and it[6].FloatLiteral.suffix == .None);
     try testing.expect(it[7] == .FloatLiteral and it[7].FloatLiteral.suffix == .None);
     try testing.expect(it[8] == .FloatLiteral and it[8].FloatLiteral.suffix == .Float);
+}
+
+test "integer-form float suffix" {
+    // `2f` / `16777218F` (no decimal point) are Float literals.
+    var ks = try kindsAlloc("2f 0F 16777218F");
+    defer ks.deinit(testing.allocator);
+    var fl: std.ArrayList(TokenKind) = .empty;
+    defer fl.deinit(testing.allocator);
+    for (ks.items) |k| switch (k) {
+        .IntLiteral, .FloatLiteral => try fl.append(testing.allocator, k),
+        else => {},
+    };
+    const it = fl.items;
+    try testing.expectEqual(@as(usize, 3), it.len);
+    for (it) |t| try testing.expect(t == .FloatLiteral and t.FloatLiteral.suffix == .Float);
+}
+
+test "digits then identifier is not a float suffix" {
+    // `1foo` must not lex as `1f` + `oo`: the trailing `f` continues an
+    // identifier, so the number stays an integer and `foo` follows.
+    var ks = try kindsAlloc("1foo");
+    defer ks.deinit(testing.allocator);
+    var sig: std.ArrayList(TokenKind) = .empty;
+    defer sig.deinit(testing.allocator);
+    for (ks.items) |k| {
+        if (!isTrivia(k) and k != .Eof) try sig.append(testing.allocator, k);
+    }
+    try testing.expectEqual(@as(usize, 2), sig.items.len);
+    try testing.expect(sig.items[0] == .IntLiteral);
+    try testing.expect(sig.items[1] == .Ident);
+}
+
+test "float range literal lexes" {
+    // `0f..3f` — float literals around a range operator.
+    var ks = try kindsAlloc("0f..3f");
+    defer ks.deinit(testing.allocator);
+    var sig: std.ArrayList(TokenKind) = .empty;
+    defer sig.deinit(testing.allocator);
+    for (ks.items) |k| {
+        if (!isTrivia(k) and k != .Eof) try sig.append(testing.allocator, k);
+    }
+    try testing.expectEqual(@as(usize, 3), sig.items.len);
+    try testing.expect(sig.items[0] == .FloatLiteral and sig.items[0].FloatLiteral.suffix == .Float);
+    try testing.expect(sig.items[1] == .DotDot);
+    try testing.expect(sig.items[2] == .FloatLiteral and sig.items[2].FloatLiteral.suffix == .Float);
 }
 
 test "ops lex greedily" {

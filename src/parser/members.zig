@@ -637,9 +637,10 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
         // A Companion-qualified receiver (`String.Companion.foo`, stdlib
         // TextH.kt's `String.Companion.CASE_INSENSITIVE_ORDER`): the receiver
         // type is `<Class>.Companion`, so consume the `Companion .` and keep
-        // the following ident as the property name. klio resolves the property
-        // against the class's companion, so the receiver collapses to the
-        // class type.
+        // the following ident as the property name. The receiver collapses to
+        // the class type, but the `qualified_path` records `<Class>.Companion`
+        // so registration keys it apart from a plain `val <Class>.foo` type
+        // extension (which targets instances of `<Class>`, not its companion).
         const next1 = kindAt(p, p.pos + 1);
         const is_companion = blk: {
             const t = peekIdentText(p) orelse break :blk false;
@@ -649,6 +650,9 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
             _ = bump(p); // `Companion`
             _ = bump(p); // `.`
             skipNl(p);
+            if (ty) |*t| {
+                t.qualified_path = std.fmt.allocPrint(p.allocator, "{s}.Companion", .{t.name.name}) catch @panic("OOM");
+            }
         }
         skipNl(p);
         return .{ .present = ty };

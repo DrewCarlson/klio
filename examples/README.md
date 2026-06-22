@@ -59,7 +59,7 @@ Run any program with:
 | `inline_modifiers.kt`         | `inline` / `crossinline` / `noinline`.                      |
 | `reified.kt`                  | Reified type parameters in `inline` functions.              |
 | `bounds.kt`, `variance.kt`    | Generic bounds and declaration-site variance.               |
-| `extension_functions.kt`, `extension_property.kt`, `extension_nullable_receiver.kt` | Extensions, incl. nullable receivers. |
+| `extension_functions.kt`, `extension_property.kt`, `extension_nullable_receiver.kt`, `companion_extension_property.kt` | Extensions, incl. nullable receivers and companion-object extension properties accessed via the class name. |
 | `infix_calls.kt`              | `infix` functions.                                          |
 | `scoping_fns_top_level.kt`    | `let` / `also` / `apply` / `run` / `with` / `takeIf`.       |
 | `receiver_member_precedence.kt` | Implicit-receiver precedence for bare reads, writes, and calls: innermost receiver first, member over extension within one receiver, receiver member over top-level binding, inner-class nesting tower. |

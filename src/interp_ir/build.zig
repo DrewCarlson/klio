@@ -2149,6 +2149,13 @@ fn buildModuleWithOverrides(
     for (ext_prop_decls.items) |epd| {
         const p = epd.p;
         const recv = p.receiver_type orelse continue;
+        // A `val X.Companion.foo` records `qualified_path = "X.Companion"`; key
+        // it under that path so it never collides with a plain `val X.foo` type
+        // extension (which applies to instances of `X`, not its companion).
+        const recv_key: []const u8 = if (recv.qualified_path) |qp|
+            (if (std.mem.endsWith(u8, qp, ".Companion")) qp else recv.name.name)
+        else
+            recv.name.name;
         const ep_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
         const prev_ep_pkg = ir.lower.decl.setLowerSelfPackage(ep_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_ep_pkg);
@@ -2160,7 +2167,7 @@ fn buildModuleWithOverrides(
                 .Expr => |body| try ir.lower.lowerAccessorExpr(module, recv.name.name, &empty_members, &.{"this"}, &body, nm),
                 .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv.name.name, &empty_members, &.{"this"}, &blk, nm),
             };
-            try extension_props.put(.{ .a = recv.name.name, .b = p.name.name }, fid);
+            try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
             // A member-extension property's accessor body has its
             // declaring class's `this` in lexical scope; tag the owner so
             // dispatch seeds the accessor frame with the owner instance.
@@ -2178,12 +2185,23 @@ fn buildModuleWithOverrides(
                 for (rg.get().body_properties) |*pp| try recv_members.put(pp.name, {});
                 rg.deinit();
             }
+            // A `var X.Companion.x` setter's bare-name writes target the
+            // companion's own members; fold them in so they lower as `this`
+            // field writes rather than top-level bindings.
+            if (companion_singletons.get(recv.name.name)) |comp_name| {
+                if (classes.get(comp_name)) |cdef| {
+                    const cgm = cdef.borrow();
+                    for (cgm.get().primary_params) |*pp| try recv_members.put(pp.name, {});
+                    for (cgm.get().body_properties) |*pp| try recv_members.put(pp.name, {});
+                    cgm.deinit();
+                }
+            }
             const nm = try std.fmt.allocPrint(a, "__ext_set_{s}_{s}", .{ recv.name.name, p.name.name });
             const fid = switch (setter.body) {
                 .Expr => |body| try ir.lower.lowerAccessorExpr(module, recv.name.name, &recv_members, &.{ "this", setter_param_name }, &body, nm),
                 .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv.name.name, &recv_members, &.{ "this", setter_param_name }, &blk, nm),
             };
-            try extension_prop_setters.put(.{ .a = recv.name.name, .b = p.name.name }, fid);
+            try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
             if (epd.owner) |owner| {
                 try module.registry.member_ext_owner_class.put(fid, owner);
             }

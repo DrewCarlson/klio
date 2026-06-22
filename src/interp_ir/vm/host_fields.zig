@@ -717,8 +717,16 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     };
     // Top-level / supertype / Any extension property.
     if (!member_getter_shadows) {
+        // For a class-value receiver (`X.name`), a `val X.Companion.name`
+        // extension registers under `X`'s simple name; the getter `this`
+        // is `X`'s companion instance, not the class value.
         const recv_simple: []const u8 = switch (receiver.*) {
             .Instance => |i| className(i),
+            .Class => |c| blk: {
+                const g = c.borrow();
+                defer g.deinit();
+                break :blk lastSegment(g.get().name);
+            },
             else => lastSegment(receiver.typeFqn()),
         };
         const ext_fid = try resolveExtensionProp(self, allocator, receiver, recv_simple, name);
@@ -728,17 +736,23 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 const msg = try std.fmt.allocPrint(allocator, "extension prop FuncId {d} out of range", .{fid.int()});
                 return errRes(.{ .Type = msg });
             }
+            // A companion extension's getter `this` is the class's
+            // companion instance; route the class value to it.
+            var getter_recv = receiver.*;
+            if (receiver.* == .Class) {
+                if (try companionInstanceForClass(self, recv_simple)) |comp| getter_recv = comp;
+            }
             // A member-extension property's getter body has its declaring
             // class's `this` in lexical scope; seed the getter frame with
             // the owner instance from the enclosing chain.
             var pushed_owner = false;
             if (mptr.registry.member_ext_owner_class.get(fid)) |owner| {
-                if (try host_call_member.memberExtOwnerInstance(self, allocator, receiver, owner)) |inst| {
+                if (try host_call_member.memberExtOwnerInstance(self, allocator, &getter_recv, owner)) |inst| {
                     ir.eval.pushEnclosing(&inst);
                     pushed_owner = true;
                 }
             }
-            const r = try evalGetter(self, allocator, fid, receiver.*);
+            const r = try evalGetter(self, allocator, fid, getter_recv);
             if (pushed_owner) ir.eval.popEnclosing();
             return r;
         }
@@ -1189,6 +1203,22 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
 
 /// Reflection-style accessors on a `Value::Class` value (`simpleName`,
 /// `isData`, `members`, `supertypes`, `sealedSubclasses`, …).
+/// The companion-object singleton instance for class `cls_simple`, or
+/// null when the class has no companion. Used to seed a companion
+/// extension property's getter `this`.
+fn companionInstanceForClass(self: *VmHost, cls_simple: []const u8) Allocator.Error!?Value {
+    const comp_name: ?[]const u8 = blk: {
+        const g = self.module.borrow();
+        defer g.deinit();
+        break :blk g.get().registry.companion_singletons.get(cls_simple);
+    };
+    const cn = comp_name orelse return null;
+    return switch (try host_globals.ensureObjectSingleton(self, cn)) {
+        .ok => |maybe| maybe,
+        .err => null,
+    };
+}
+
 fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
     const cls = receiver.Class;
     const g = cls.borrow();
@@ -1349,6 +1379,20 @@ fn resolveExtensionPropImpl(
             return if (setters) p.extension_prop_setters else p.extension_props;
         }
     };
+    // A class-value receiver (`X.name`) matches only a companion extension
+    // (`val X.Companion.name`, keyed `X.Companion`), never a plain type
+    // extension `val X.name` (which applies to instances of `X`). Falling back
+    // to the bare `X` key would invoke an instance extension's getter with the
+    // class/companion as `this` and recurse.
+    if (receiver.* == .Class) {
+        const comp_key = try std.fmt.allocPrint(allocator, "{s}.Companion", .{recv_simple});
+        defer allocator.free(comp_key);
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (lookupPairFunc(Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
+        if (lookupPairFunc(Pick.map(pg.get().*), "Any", name)) |fid| return fid;
+        return null;
+    }
     {
         const pg = self.prog.borrow();
         defer pg.deinit();
@@ -1390,15 +1434,18 @@ fn resolveExtensionPropImpl(
             }
         }
     }
-    // A `Type.Companion` extension property registers under the outer
-    // class name; key the lookup by the outer class.
+    // A `Type.Companion` extension property registers under `<outer>.Companion`;
+    // a companion-instance receiver (the synthetic `$Companion` class) keys the
+    // lookup by its outer class's companion path.
     if (receiver.* == .Instance) {
         const cls = className(receiver.Instance);
         if (std.mem.indexOf(u8, cls, "$Companion")) |i| {
             const outer = cls[0..i];
+            const comp_key = try std.fmt.allocPrint(allocator, "{s}.Companion", .{outer});
+            defer allocator.free(comp_key);
             const pg = self.prog.borrow();
             defer pg.deinit();
-            if (lookupPairFunc(Pick.map(pg.get().*), outer, name)) |fid| return fid;
+            if (lookupPairFunc(Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
         }
     }
     // An `Any` extension property applies to every receiver.
@@ -1886,8 +1933,15 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     const real_name = if (bypass_setter) name["__klio_field__".len..] else name;
     // Extension-property setter — `var T.x set(value) {…}`.
     if (!bypass_setter) {
+        // A `var X.Companion.x` setter registers under `X`'s simple name;
+        // its `this` is `X`'s companion instance, not the class value.
         const recv_simple: []const u8 = switch (receiver.*) {
             .Instance => |i| className(i),
+            .Class => |c| blk: {
+                const g = c.borrow();
+                defer g.deinit();
+                break :blk lastSegment(g.get().name);
+            },
             else => lastSegment(receiver.typeFqn()),
         };
         const fid: ?FuncId = try resolveExtensionPropSetter(self, allocator, receiver, recv_simple, real_name);
@@ -1897,17 +1951,21 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                 const msg = try std.fmt.allocPrint(allocator, "ext setter FuncId {d} out of range", .{f.int()});
                 return .{ .err = .{ .Type = msg } };
             }
+            var setter_recv = receiver.*;
+            if (receiver.* == .Class) {
+                if (try companionInstanceForClass(self, recv_simple)) |comp| setter_recv = comp;
+            }
             // A member-extension property's setter body has its declaring
             // class's `this` in lexical scope; seed the setter frame with
             // the owner instance from the enclosing chain.
             var pushed_owner = false;
             if (mptr.registry.member_ext_owner_class.get(f)) |owner| {
-                if (try host_call_member.memberExtOwnerInstance(self, allocator, receiver, owner)) |inst| {
+                if (try host_call_member.memberExtOwnerInstance(self, allocator, &setter_recv, owner)) |inst| {
                     ir.eval.pushEnclosing(&inst);
                     pushed_owner = true;
                 }
             }
-            const r = try evalSetter(self, allocator, f, receiver.*, value);
+            const r = try evalSetter(self, allocator, f, setter_recv, value);
             if (pushed_owner) ir.eval.popEnclosing();
             switch (r) {
                 .ok => return .{ .ok = {} },

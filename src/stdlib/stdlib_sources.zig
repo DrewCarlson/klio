@@ -213,6 +213,10 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-io/encoding/Base64Actuals.kt",
     "kotlin-internal/SerializationActuals.kt",
     "kotlin-util/LazyActuals.kt",
+    "kotlin-random/RandomActuals.kt",
+    "kotlin-text/TextActuals.kt",
+    "kotlin-collections/MapActuals.kt",
+    "kotlin-internal/ThrowableActuals.kt",
 };
 
 /// The local upstream Kotlin checkout's `libraries/stdlib` directory, relative

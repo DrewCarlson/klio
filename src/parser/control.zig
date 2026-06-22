@@ -249,7 +249,14 @@ pub fn parseWhile(p: *Parser) ?Expr {
     support.skipNl(p);
     _ = support.expect(p, .RParen, "`)`") orelse return null;
     support.skipNl(p);
-    const body = parseControlStructureBody(p) orelse return null;
+    // An empty body (`while (cond) ;`) is a valid loop with no statements.
+    const body: Expr = switch (support.peekKind(p).*) {
+        .Semicolon => blk: {
+            const semi = support.bump(p);
+            break :blk Expr{ .Block = .{ .stmts = &.{}, .span = semi.span } };
+        },
+        else => parseControlStructureBody(p) orelse return null,
+    };
     return Expr{ .While = .{
         .cond = box(p, cond),
         .body = box(p, body),
@@ -727,7 +734,19 @@ pub fn parseLambdaLiteral(p: *Parser) ?Expr {
     // We're at `{`. Header is `params ->` (optional). Body is a
     // statement list.
     const lbrace = support.bump(p);
-    const header = parseLambdaHeader(p);
+    var header = parseLambdaHeader(p);
+    // A header-less lambda (`{ … }`) gets the implicit single `it` parameter,
+    // exactly as a trailing lambda does — otherwise a non-trailing lambda
+    // argument (`f({ it.x }, y)` / `Op("d", { member() }, …)`) loses both its
+    // `it` and the arity-0 receiver-lambda treatment.
+    var implicit_it = false;
+    if (header.params.len == 0) {
+        implicit_it = true;
+        header.params = singleIdent(p, .{
+            .name = "it",
+            .span = lbrace.span,
+        });
+    }
     var stmts: std.ArrayList(Stmt) = .empty;
     for (header.dest_stmts) |s| stmts.append(p.allocator, s) catch @panic("OOM in parser");
     while (true) {
@@ -757,7 +776,7 @@ pub fn parseLambdaLiteral(p: *Parser) ?Expr {
         .stmts = stmts.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
         .span = sp,
     };
-    return Expr{ .Lambda = .{ .params = header.params, .param_tys = header.param_tys, .body = body, .span = sp } };
+    return Expr{ .Lambda = .{ .params = header.params, .param_tys = header.param_tys, .body = body, .span = sp, .implicit_it = implicit_it } };
 }
 
 pub fn parseTrailingLambda(p: *Parser) ?Expr {
