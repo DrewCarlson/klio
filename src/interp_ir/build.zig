@@ -1712,7 +1712,7 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
-        const def = try buildClassDef(a, c, fqn_overrides, package_prefix, &object_spans, globals_for_capture);
+        const def = try buildClassDef(module, a, c, fqn_overrides, package_prefix, &object_spans, globals_for_capture);
         try new_defs.append(a, def);
         const fqn_g = def.borrow();
         const def_fqn = fqn_g.get().fqn;
@@ -2111,6 +2111,16 @@ fn buildModuleWithOverrides(
             const nm = try std.fmt.allocPrint(a, "__top_prop_delegate_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, delegate, nm);
             try top_level_props.append(a, .{ .name = p.name.name, .func = fid });
+        } else if (p.getter) |getter| {
+            // A top-level `val`/`var` with only a custom getter has no
+            // backing field, so it is not a startup initializer; its 0-arg
+            // getter re-runs on each read. Register it for `LoadGlobal`.
+            const nm = try std.fmt.allocPrint(a, "__top_prop_get_{s}", .{p.name.name});
+            const fid = switch (getter.body) {
+                .Expr => |body| try ir.lower.lowerExprAsThunk(module, &body, nm),
+                .Block => |blk| try ir.lower.lowerBlockAsThunk(module, &blk, nm),
+            };
+            try module.registry.top_level_prop_getters.put(p.name.name, fid);
         }
     }
 
@@ -2382,6 +2392,7 @@ fn collectCompanionOwnMembers(c: *const ast.Class, own: *StringSet) Allocator.Er
 }
 
 fn buildClassDef(
+    module: *Module,
     a: Allocator,
     c: *const ast.Class,
     fqn_overrides: *const SpanStrMap,
@@ -2461,7 +2472,7 @@ fn buildClassDef(
     return ObjRef(ClassDef).init(a, .{
         .name = c.name.name,
         .fqn = fqn,
-        .annotation_names = &.{},
+        .annotation_names = try ir.lower.resolveAnnotationNames(module, c.annotations),
         .primary_params = primary_params,
         .methods = &.{},
         .body_properties = try body_props.toOwnedSlice(a),

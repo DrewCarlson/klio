@@ -264,6 +264,9 @@ pub const MethodDef = struct {
     delegate_field: ?[]const u8,
     /// IR `FuncId` of the lowered method body, if lowered.
     ir_fn_id: ?u32,
+    /// Resolved fully-qualified candidate names for each source annotation
+    /// on this method, so a test runner can discover `@Test`/etc.
+    annotation_names: []const []const u8 = &.{},
 };
 
 pub const PropertyDef = struct {

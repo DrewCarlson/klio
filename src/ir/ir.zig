@@ -695,6 +695,11 @@ pub const Func = struct {
     /// applies. Overload selection skips it while any normal sibling
     /// fits.
     low_priority: bool = false,
+    /// Resolved fully-qualified candidate names for each source-level
+    /// annotation on this function (e.g. `kotlin.test.Test`), so a test
+    /// runner can discover `@Test`/`@Ignore`/etc. without re-parsing.
+    /// Populated by the in-memory build path; empty for the baked image.
+    annotation_names: []const []const u8 = &.{},
 
     /// True when this function has an IR body — present blocks, or blocks
     /// deferred to the image's lazy-IR section. Distinguishes a real function
@@ -2238,6 +2243,11 @@ pub const ModuleRegistry = struct {
     /// ranks the read's tier the same way it ranks a bare call: a read
     /// whose only declaration is in an unimported package is unresolved.
     top_level_prop_pkgs: std.StringHashMap(std.ArrayList(PropDecl)),
+    /// Top-level property simple name → 0-arg getter `FuncId`, for a
+    /// `val`/`var` declared with only a custom getter (no initializer,
+    /// no backing field, no delegate). A `LoadGlobal` of such a name
+    /// re-invokes the getter on every read.
+    top_level_prop_getters: std.StringHashMap(FuncId),
 
     allocator: Allocator,
 
@@ -2281,6 +2291,7 @@ pub const ModuleRegistry = struct {
             .mangled_nested = std.StringHashMap([]const u8).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
             .top_level_prop_pkgs = std.StringHashMap(std.ArrayList(PropDecl)).init(allocator),
+            .top_level_prop_getters = std.StringHashMap(FuncId).init(allocator),
             .allocator = allocator,
         };
     }
@@ -2360,6 +2371,7 @@ pub const ModuleRegistry = struct {
             while (it.next()) |list| list.deinit(a);
             self.top_level_prop_pkgs.deinit();
         }
+        self.top_level_prop_getters.deinit();
     }
 
     /// Clone for extension (see `Module.cloneForExtend`). Outer container
@@ -2463,6 +2475,10 @@ pub const ModuleRegistry = struct {
                 try list.appendSlice(a, e.value_ptr.items);
                 try out.top_level_prop_pkgs.put(e.key_ptr.*, list);
             }
+        }
+        {
+            var it = self.top_level_prop_getters.iterator();
+            while (it.next()) |e| try out.top_level_prop_getters.put(e.key_ptr.*, e.value_ptr.*);
         }
         return out;
     }

@@ -827,7 +827,17 @@ pub const Vm = struct {
     pub const run = run_mod.vmRun;
     pub const runInner = run_mod.vmRunInner;
     pub const deinit = run_mod.vmDeinit;
+    // Embedder entry points for driving non-`main` functions (the test
+    // runner): prepare startup, then invoke functions/methods/constructors.
+    pub const prepare = run_mod.vmPrepare;
+    pub const runCalls = run_mod.vmRunCalls;
+    pub const callNoArg = run_mod.vmCallNoArg;
+    pub const construct = run_mod.vmConstruct;
+    pub const callMethod = run_mod.vmCallMethod;
 };
+
+/// Outcome of a single embedder-driven call into a prepared Vm.
+pub const CallOutcome = run_mod.CallOutcome;
 
 /// `Send` capture of the shared program state for a new OS thread.
 /// Every field is an owned shared handle, so the seed outlives the

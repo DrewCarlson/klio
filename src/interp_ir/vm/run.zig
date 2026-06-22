@@ -364,6 +364,73 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     const module = mg.get();
     const sink = self.out_sink.output();
 
+    if (try vmPrepareInner(self, module, sink)) |verr| return .{ .err = verr };
+
+    const func = module.funcById(main) orelse return .{ .err = .InvalidMain };
+    // A `suspend fun main` is driven through the cooperative coroutine pump
+    // (kotlinc wraps it in `runSuspend`), so a real suspension such as
+    // `delay` parks and resumes instead of escaping as a "suspended outside a
+    // driver" error.
+    if (func.is_suspend) {
+        var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
+        const r = try vmhost.coroutines.driveSuspendMain(&intrinsic, main, sink);
+        return switch (r) {
+            .ok => |v| .{ .ok = v },
+            .err => |e| .{ .err = .{ .Eval = vmEvalMessage(self.allocator, e) } },
+        };
+    }
+    var host = vmMakeHost(self, sink);
+    const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, .empty, &host);
+    return switch (r) {
+        .ok => |v| .{ .ok = v },
+        .err => |e| .{ .err = vmErrorFromEval(self.allocator, e) },
+    };
+}
+
+/// Outcome of invoking a function/method/constructor into a prepared Vm.
+/// `ok` carries the return value, `threw` the uncaught Kotlin Throwable, and
+/// `failed` an interpreter-level error message (unbound symbol, arity, etc.).
+pub const CallOutcome = union(enum) {
+    ok: Value,
+    threw: Value,
+    failed: []const u8,
+};
+
+fn outcomeFromEval(self: *Vm, r: ir.eval.EvalResult) CallOutcome {
+    return switch (r) {
+        .ok => |v| .{ .ok = v },
+        .err => |e| switch (e) {
+            .Throw => |v| .{ .threw = v },
+            else => .{ .failed = evalErrMessage(self.allocator, e) },
+        },
+    };
+}
+
+/// Human-readable message for a non-throw `EvalError` (an interpreter-level
+/// failure surfaced as a test failure rather than an assertion failure).
+fn evalErrMessage(allocator: Allocator, e: EvalError) []const u8 {
+    return switch (e) {
+        .Unsupported, .Type, .Unbound, .Unimplemented, .CalleeFailed, .Arity, .StackOverflow => |s| s,
+        else => std.fmt.allocPrint(allocator, "{s}", .{@tagName(e)}) catch "evaluation error",
+    };
+}
+
+fn outcomeFromRuntime(self: *Vm, r: runtime.EvalResult) CallOutcome {
+    return switch (r) {
+        .ok => |v| .{ .ok = v },
+        .err => |e| switch (e) {
+            .Thrown => |v| .{ .threw = v },
+            else => .{ .failed = vmEvalMessage(self.allocator, e) },
+        },
+    };
+}
+
+/// The pre-main startup pipeline, factored out so an embedder (the test
+/// runner) can prepare a Vm and then invoke arbitrary entry points instead
+/// of `main`. Returns `null` on success, or the `VmError` of a failing
+/// top-level / enum-entry initializer. `module` and `sink` are already
+/// borrowed by the caller.
+fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Error!?VmError {
     // Settle each symbol's single executable form before any user code
     // runs. `setInstalledBindings` already links when a pack overlay is
     // installed; this covers the no-overlay configurations (the embedded
@@ -417,7 +484,7 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
         vmhost.host_impl.setStartupInitsActive(true);
         defer vmhost.host_impl.setStartupInitsActive(false);
         for (self.top_level_props.items) |nf| {
-            const init_func = module.funcById(nf.func) orelse return .{ .err = .InvalidMain };
+            const init_func = module.funcById(nf.func) orelse return .InvalidMain;
             {
                 const g = self.globals.borrow();
                 const exists = g.get().lookup(nf.name) != null;
@@ -440,7 +507,7 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
                 // window drive it rather than defaulting it.
                 .err => |e| switch (e) {
                     .Unbound, .Unimplemented, .CalleeFailed => vmhost.host_impl.noteStartupDeferred(nf.name),
-                    else => return .{ .err = vmErrorFromEval(self.allocator, e) },
+                    else => return vmErrorFromEval(self.allocator, e),
                 },
             }
         }
@@ -479,7 +546,7 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
                 var host = vmMakeHost(self, sink);
                 switch (try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host)) {
                     .ok => |val| break :blk val,
-                    .err => |e| return .{ .err = vmErrorFromEval(self.allocator, e) },
+                    .err => |e| return vmErrorFromEval(self.allocator, e),
                 }
             };
             if (idx < param_names.items.len) {
@@ -489,26 +556,70 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
             }
         }
     }
+    return null;
+}
 
-    const func = module.funcById(main) orelse return .{ .err = .InvalidMain };
-    // A `suspend fun main` is driven through the cooperative coroutine pump
-    // (kotlinc wraps it in `runSuspend`), so a real suspension such as
-    // `delay` parks and resumes instead of escaping as a "suspended outside a
-    // driver" error.
-    if (func.is_suspend) {
-        var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
-        const r = try vmhost.coroutines.driveSuspendMain(&intrinsic, main, sink);
-        return switch (r) {
-            .ok => |v| .{ .ok = v },
-            .err => |e| .{ .err = .{ .Eval = vmEvalMessage(self.allocator, e) } },
-        };
-    }
-    var host = vmMakeHost(self, sink);
+/// Run the pre-main startup pipeline against this Vm. Public entry for an
+/// embedder that drives entry points other than `main` (the test runner).
+pub fn vmPrepare(self: *Vm) Allocator.Error!?VmError {
+    const module_ref = self.module.clone();
+    defer module_ref.deinit();
+    const mg = module_ref.borrow();
+    defer mg.deinit();
+    return vmPrepareInner(self, mg.get(), self.out_sink.output());
+}
+
+/// Invoke a top-level, no-argument function (a test function) on a prepared
+/// Vm and classify the result.
+pub fn vmCallNoArg(self: *Vm, func_id: FuncId) Allocator.Error!CallOutcome {
+    const module_ref = self.module.clone();
+    defer module_ref.deinit();
+    const mg = module_ref.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    const func = module.funcById(func_id) orelse return .{ .failed = "test function not found" };
+    var host = vmMakeHost(self, self.out_sink.output());
     const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, .empty, &host);
-    return switch (r) {
-        .ok => |v| .{ .ok = v },
-        .err => |e| .{ .err = vmErrorFromEval(self.allocator, e) },
-    };
+    return outcomeFromEval(self, r);
+}
+
+/// Construct an instance of `class_id` via its no-argument constructor.
+pub fn vmConstruct(self: *Vm, class_id: ir.ClassId) Allocator.Error!CallOutcome {
+    var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
+    const r = try vmhost.intrinsic_host.construct(&intrinsic, class_id, &.{}, self.out_sink.output());
+    return outcomeFromEval(self, r);
+}
+
+/// Invoke the no-argument method `name` on `receiver` (a test class's
+/// `@BeforeTest`/`@Test`/`@AfterTest` method).
+pub fn vmCallMethod(self: *Vm, receiver: *const Value, name: []const u8) Allocator.Error!CallOutcome {
+    var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
+    const maybe = try vmhost.intrinsic_host.invokeMethod(&intrinsic, receiver, name, &.{}, self.out_sink.output());
+    const r = maybe orelse return .{ .failed = "method dispatch failed" };
+    return outcomeFromRuntime(self, r);
+}
+
+/// Prepare the Vm, run `body` (which invokes entry points via the call
+/// helpers above), then drain workers and replay buffered output into `out`.
+/// Returns a startup `VmError` if preparation failed (in which case `body`
+/// does not run). The shared output sink mirrors the `main` run path: writes
+/// during `body` accumulate and are replayed in order on completion.
+pub fn vmRunCalls(
+    self: *Vm,
+    out: Output,
+    comptime Ctx: type,
+    ctx: Ctx,
+    comptime body: fn (Ctx, *Vm) Allocator.Error!void,
+) Allocator.Error!?VmError {
+    gcRegisterVm(self);
+    runtime.gc.alloc_perm = false;
+    runtime.gc.program_started = true;
+    vmhost.coroutines.gcThreadEnter();
+    const prep = try vmPrepare(self);
+    if (prep == null) body(ctx, self) catch {};
+    _ = joinAllThreads(self, .{ .ok = .{ .Unit = {} } });
+    self.out_sink.replayInto(out);
+    return prep;
 }
 
 /// Join every outstanding spawned/dispatched worker thread, mirroring the

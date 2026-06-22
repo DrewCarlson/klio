@@ -557,6 +557,17 @@ pub fn parsePostfix(p: *Parser) ?Expr {
                     .span = sp,
                 } };
             },
+            .QuestNoWs, .QuestWs => {
+                // Nullable-receiver callable reference: `Any?::toString`,
+                // `ByteArray?::contentEquals`, `Array<*>?::contentToString`.
+                // The `?` makes the reference's receiver type nullable, which
+                // does not change member resolution; consume it and let the
+                // `::` branch build the reference. Only valid immediately
+                // before `::` — otherwise the chain ends here.
+                const after = kindAt(p, p.pos + 1);
+                if (after == null or std.meta.activeTag(after.?) != .ColonColon) break;
+                _ = support.bump(p);
+            },
             .ColonColon => {
                 _ = support.bump(p);
                 support.skipNl(p);

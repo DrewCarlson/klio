@@ -23,6 +23,7 @@ Run any program with:
 | `do_while.kt`            | `do`/`while` loops.                                              |
 | `labeled_jumps.kt`       | Labeled `break` / `continue` / `return`.                         |
 | `const_val.kt`           | `const val` and compile-time constants.                          |
+| `top_level_computed_val.kt` | Top-level `val` with a custom getter (no backing field) re-evaluating per read. |
 | `definite_assignment.kt` | Definite-assignment behavior for `val`.                          |
 | `visibility.kt`          | `private` / `internal` / `public` visibility.                    |
 

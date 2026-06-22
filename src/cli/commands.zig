@@ -46,6 +46,8 @@ const loadInstalledPacks = pack_cache.loadInstalledPacks;
 
 const stdlib_image = @import("stdlib_image.zig");
 
+const test_runner = @import("test_runner");
+
 /// Output format for `klio check`. Mirrors `commands::DiagFormat`.
 pub const DiagFormat = enum {
     Plain,
@@ -274,6 +276,148 @@ pub fn runFileIrVm(
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
 
     return runBuilt(gpa, all_asts.items, loaded.bindings, &map, "error: no main function found");
+}
+
+/// `klio test` — discover and run `kotlin.test` `@Test` functions in the
+/// given files/directories. Returns 1 if any test fails (or the module
+/// fails to build), 0 otherwise.
+pub fn runTestFiles(
+    gpa: std.mem.Allocator,
+    paths: []const []const u8,
+    features: *const RequestedFeatures,
+) u8 {
+    runtime.startMemoryWatchdog();
+    runtime.startRunDeadline();
+    interp_ir.resetReceiverThreadLocals();
+
+    var files: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f);
+        files.deinit(gpa);
+    }
+    for (paths) |p| collectKtFiles(gpa, p, &files) catch {
+        io.printStderr(gpa, "error: cannot read `{s}`\n", .{p});
+        return 1;
+    };
+    if (files.items.len == 0) {
+        io.writeStderr("error: no `.kt` files found\n");
+        return 1;
+    }
+
+    var map = SourceMap.init(gpa);
+    defer map.deinit();
+
+    var user_asts: std.ArrayList(KotlinFile) = .empty;
+    defer user_asts.deinit(gpa);
+    for (files.items) |path| {
+        const id = load(gpa, &map, path) orelse return 1;
+        const src = map.get(id).source;
+        var lx = Lexer.init(gpa, id, src) catch return 1;
+        var lexed = lx.tokenize() catch return 1;
+        defer lexed.deinit(gpa);
+        renderToStderr(gpa, &lexed.diagnostics, &map);
+        if (lexed.diagnostics.hasErrors()) return 1;
+        const p = Parser.new(gpa, id, src, lexed.tokens);
+        const file_ast = p.parseFile();
+        renderToStderr(gpa, &p.diagnostics, &map);
+        if (p.diagnostics.hasErrors()) return 1;
+        user_asts.append(gpa, file_ast) catch return 1;
+    }
+
+    const loaded = loadInstalledPacks(gpa, user_asts.items, &map, features);
+    var all_asts: std.ArrayList(KotlinFile) = .empty;
+    defer all_asts.deinit(gpa);
+    all_asts.appendSlice(gpa, loaded.asts) catch return 1;
+    all_asts.appendSlice(gpa, user_asts.items) catch return 1;
+
+    const prev_reclaim = runtime.reclaimEnabled();
+    if (!runtime.reclaimRequested()) runtime.setReclaim(false);
+    defer runtime.setReclaim(prev_reclaim);
+
+    var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
+    {
+        const mg = built.module.borrow();
+        defer mg.deinit();
+        const rdiags = mg.get().resolve_diags.items;
+        if (rdiags.len != 0) {
+            for (rdiags) |d| {
+                const msg = d.render(gpa, &map) catch return 1;
+                defer gpa.free(msg);
+                io.printStderr(gpa, "{s}\n", .{msg});
+            }
+            return 1;
+        }
+    }
+
+    const fb = Vm.fromBuilt(gpa, &built) catch return 1;
+    var vm = fb.vm;
+    defer vm.deinit();
+    vm.setInstalledBindings(loaded.bindings) catch return 1;
+
+    span.active_map = &map;
+    defer span.active_map = null;
+
+    var stdout = io.StdoutSink{};
+    var report = test_runner.runTests(gpa, &vm, user_asts.items, stdout.output()) catch return 1;
+    defer report.deinit(gpa);
+
+    for (report.results) |r| {
+        const tag = switch (r.outcome) {
+            .passed => "PASSED",
+            .failed => "FAILED",
+            .skipped => "SKIPPED",
+        };
+        io.printStdout(gpa, "{s} {s}\n", .{ r.display, tag });
+        if (r.detail) |d| io.printStdout(gpa, "    {s}\n", .{d});
+    }
+    io.printStdout(gpa, "\n{d} tests, {d} passed, {d} failed, {d} skipped\n", .{
+        report.results.len, report.passed, report.failed, report.skipped,
+    });
+    return if (report.failed > 0) 1 else 0;
+}
+
+/// Collect `.kt` files from `path`: a single file (added as-is) or a
+/// directory (walked recursively). Results are appended to `out` and sorted
+/// for deterministic test ordering.
+fn collectKtFiles(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    out: *std.ArrayList([]const u8),
+) !void {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    try collectKtDir(gpa, threaded.io(), path, out);
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+}
+
+fn collectKtDir(
+    gpa: std.mem.Allocator,
+    fio: std.Io,
+    path: []const u8,
+    out: *std.ArrayList([]const u8),
+) !void {
+    var dir = std.Io.Dir.cwd().openDir(fio, path, .{ .iterate = true }) catch {
+        // Not a directory: a directly-named source file.
+        if (std.mem.endsWith(u8, path, ".kt")) try out.append(gpa, try gpa.dupe(u8, path));
+        return;
+    };
+    defer dir.close(fio);
+    var it = dir.iterate();
+    while (it.next(fio) catch null) |entry| {
+        const child = try std.fs.path.join(gpa, &.{ path, entry.name });
+        if (entry.kind == .directory) {
+            defer gpa.free(child);
+            try collectKtDir(gpa, fio, child, out);
+        } else if (std.mem.endsWith(u8, entry.name, ".kt")) {
+            try out.append(gpa, child);
+        } else {
+            gpa.free(child);
+        }
+    }
 }
 
 /// Shared tail of the two `run*` paths: build the module, materialize a

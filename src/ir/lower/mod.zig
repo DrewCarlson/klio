@@ -124,6 +124,7 @@ pub const lowerFunctionBodyInto = decl.lowerFunctionBodyInto;
 pub const lowerMethod = decl.lowerMethod;
 pub const lowerMethodWithPrivate = decl.lowerMethodWithPrivate;
 pub const setLowerAnonCaptures = decl.setLowerAnonCaptures;
+pub const resolveAnnotationNames = decl.resolveAnnotationNames;
 
 // Expression / statement lowering surface — the central recursive
 // dispatch that every sibling calls back into.

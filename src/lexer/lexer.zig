@@ -840,7 +840,10 @@ pub const Lexer = struct {
             if (b0 == '.' and b1 == @as(?u8, '.')) break :blk .DotDot;
             if (b0 == ':' and b1 == @as(?u8, ':')) break :blk .ColonColon;
             if (b0 == '?' and b1 == @as(?u8, '.')) break :blk .QuestionDot;
-            if (b0 == '?' and b1 == @as(?u8, ':')) break :blk .QuestionColon;
+            // `?:` is the elvis operator, but `?::` is a `?` (nullable
+            // receiver) followed by `::` (callable reference), e.g.
+            // `Any?::toString` — do not swallow it as elvis.
+            if (b0 == '?' and b1 == @as(?u8, ':') and b2 != @as(?u8, ':')) break :blk .QuestionColon;
             if (b0 == '!' and b1 == @as(?u8, '!')) break :blk .BangBang;
             if (b0 == ';' and b1 == @as(?u8, ';')) break :blk .DoubleSemicolon;
             break :blk null;
