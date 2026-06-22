@@ -1175,6 +1175,63 @@ test "spread_arg_parsed" {
     try testing.expect(call.args[0] == .Spread);
 }
 
+test "integer_form_float_literal_parses" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(
+        arena.allocator(),
+        "val a = 2f\nval b = 16777218F\nval c = (0f..3f)\n",
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const a = out.file.decls[0].Property.init.?.FloatLit;
+    try testing.expectEqual(ast.FloatLitKind.Float, a.kind);
+    try testing.expectEqual(@as(f64, 2.0), a.value);
+}
+
+test "empty_while_body_via_semicolon" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(
+        arena.allocator(),
+        "fun f() { while (true); }\n",
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const b = out.file.decls[0].Function.body.?.Block;
+    const w = b.stmts[0].Expr.While;
+    try testing.expectEqual(@as(usize, 0), w.body.Block.stmts.len);
+}
+
+test "annotated_trailing_lambda_parses" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(
+        arena.allocator(),
+        "val a = run @Suppress(\"x\") { 1 }\n",
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const call = out.file.decls[0].Property.init.?.Call;
+    try testing.expect(call.args.len == 1);
+    try testing.expect(call.args[0] == .Lambda);
+}
+
+test "consecutive_local_class_declarations" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(
+        arena.allocator(),
+        "fun f() {\n    class A\n    class B\n    val x = 1\n}\n",
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const b = out.file.decls[0].Function.body.?.Block;
+    try testing.expectEqual(@as(usize, 3), b.stmts.len);
+    try testing.expectEqualStrings("A", b.stmts[0].Decl.Class.name.name);
+    try testing.expectEqualStrings("B", b.stmts[1].Decl.Class.name.name);
+}
+
 test {
     testing.refAllDecls(@This());
     _ = support;

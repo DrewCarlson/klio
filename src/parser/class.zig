@@ -69,12 +69,12 @@ pub fn parseClass(
     const is_interface = std.meta.activeTag(kw.kind) == .Keyword and
         kw.kind.Keyword == .Interface;
     const name = support.parseIdent(p, "class name") orelse return null;
-    support.skipNl(p);
+    skipNlIfHeaderContinues(p);
     var type_params: []ast.TypeParam = &.{};
     if (std.meta.activeTag(support.peekKind(p).*) == .Lt) {
         type_params = types.parseTypeParams(p, false);
     }
-    support.skipNl(p);
+    skipNlIfHeaderContinues(p);
     skipPrimaryCtorAnnotations(p);
     const primary_ctor_visibility = parsePrimaryCtorHeader(p);
     var primary_params: []ClassParam = &.{};
@@ -138,6 +138,36 @@ pub fn parseClass(
         .annotations = annotations,
         .span = kw.span.join(end),
     };
+}
+
+/// Skip newlines only when the first non-newline token continues the class
+/// header (`<`, `(`, `:`, `{`, a ctor annotation `@`, `where`, or a
+/// visibility/`constructor` keyword). A bodyless class (`class A`) must not
+/// swallow the newline that separates it from the next declaration, so a
+/// `class A` / `class B` pair on consecutive lines parses as two statements.
+fn skipNlIfHeaderContinues(p: *Parser) void {
+    if (std.meta.activeTag(support.peekKind(p).*) != .Newline) return;
+    var i = p.pos;
+    while (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .Newline) {
+        i += 1;
+    }
+    if (i >= p.tokens.len) return;
+    const k = p.tokens[i].kind;
+    const continues = switch (k) {
+        .Lt, .LParen, .Colon, .LBrace => true,
+        .AtNoWs, .AtPostWs, .AtPreWs, .AtBothWs => true,
+        .Ident => blk: {
+            const t = support.text(p, p.tokens[i].span);
+            break :blk std.mem.eql(u8, t, "where") or
+                std.mem.eql(u8, t, "constructor") or
+                std.mem.eql(u8, t, "public") or
+                std.mem.eql(u8, t, "private") or
+                std.mem.eql(u8, t, "protected") or
+                std.mem.eql(u8, t, "internal");
+        },
+        else => false,
+    };
+    if (continues) p.pos = i;
 }
 
 /// Consume an optional primary-constructor annotation run:
@@ -483,11 +513,16 @@ pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
             args_list.append(p.allocator, null) catch @panic("OOM");
             delegates.append(p.allocator, null) catch @panic("OOM");
         }
+        // A comma continues the supertype list and may sit on the next line,
+        // but a trailing newline with no comma is the statement separator and
+        // must be left for the caller (`class A : B()` then a sibling decl).
+        const comma_save = p.pos;
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
             _ = support.bump(p);
             continue;
         }
+        p.pos = comma_save;
         break;
     }
     return .{

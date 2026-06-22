@@ -249,7 +249,14 @@ pub fn parseWhile(p: *Parser) ?Expr {
     support.skipNl(p);
     _ = support.expect(p, .RParen, "`)`") orelse return null;
     support.skipNl(p);
-    const body = parseControlStructureBody(p) orelse return null;
+    // An empty body (`while (cond) ;`) is a valid loop with no statements.
+    const body: Expr = switch (support.peekKind(p).*) {
+        .Semicolon => blk: {
+            const semi = support.bump(p);
+            break :blk Expr{ .Block = .{ .stmts = &.{}, .span = semi.span } };
+        },
+        else => parseControlStructureBody(p) orelse return null,
+    };
     return Expr{ .While = .{
         .cond = box(p, cond),
         .body = box(p, body),

@@ -1,31 +1,29 @@
 //! Bootstrapping proof: run Kotlin's own stdlib `commonTest` sources through
-//! `klio test` against the installed `kotlin.test` pack. The curated list is
-//! the subset that currently passes end to end; it grows monotonically as the
-//! interpreter closes the remaining gaps. Each file is referenced in place
-//! from the `kotlin` submodule (`kotlin/libraries/stdlib/test`), unmodified.
+//! `klio test` against the installed `kotlin.test` pack.
 //!
-//! A child `klio` is spawned (its exit code is the pass/fail signal) so a
-//! crash in one program isolates instead of taking down this test process.
+//! The whole common test tree (`kotlin/libraries/stdlib/test`, minus the `js/`
+//! platform source set) is discovered automatically — there is no per-test
+//! include/exclude list. Files without `@Test` are shared fixtures (testUtils,
+//! the comparison DSLs); they are compiled into every test file's module. KLIO
+//! actuals for the test infrastructure's `expect` declarations live in
+//! `tests/stdlib_commontest_actuals`.
+//!
+//! Each test file runs in its own child `klio` (a crash isolates to one file),
+//! and the run asserts the total number of passing tests stays at or above a
+//! ratchet baseline. Raise `BASELINE` as interpreter gaps close; never lower it.
 
 const std = @import("std");
 const runtime = @import("runtime");
 
-/// Curated upstream stdlib commonTest files that pass through `klio test`.
-/// Add entries here as interpreter gaps close; never remove one to hide a
-/// regression.
-const PASSING = [_][]const u8{
-    "kotlin/libraries/stdlib/test/utils/HashCodeTest.kt",
-    "kotlin/libraries/stdlib/test/collections/IteratorsTest.kt",
-    "kotlin/libraries/stdlib/test/utils/LazyTest.kt",
-    "kotlin/libraries/stdlib/test/utils/TODOTest.kt",
-    "kotlin/libraries/stdlib/test/numbers/BuiltinCompanionTest.kt",
-    "kotlin/libraries/stdlib/test/time/TestTimeSourceTest.kt",
-    "kotlin/libraries/stdlib/test/ranges/ProgressionLastElementTest.kt",
-    "kotlin/libraries/stdlib/test/collections/HashMapCompactTest.kt",
-    "kotlin/libraries/stdlib/test/properties/delegation/lazy/LazyValuesTest.kt",
-    "kotlin/libraries/stdlib/test/comparisons/BooleanOrderingTest.kt",
-};
+/// Minimum number of stdlib commonTest cases that must pass. A ratchet: bump it
+/// up as fixes land, never down. (Total discovered today is ~1240; ~535 pass.)
+const BASELINE: usize = 525;
 
+const TEST_ROOT = "kotlin/libraries/stdlib/test";
+const ACTUALS = [_][]const u8{
+    "tests/stdlib_commontest_actuals/PlatformActuals.kt",
+    "tests/stdlib_commontest_actuals/EncodingActuals.kt",
+};
 const SCRATCH_HOME = "/tmp/klio_itest_stdlibtest_home";
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
@@ -45,7 +43,7 @@ fn runKlio(
     io: std.Io,
     env: *std.process.Environ.Map,
     argv: []const []const u8,
-) !struct { ok: bool, stdout: []u8, stderr: []u8 } {
+) !struct { term: std.process.Child.Term, stdout: []u8, stderr: []u8 } {
     const r = std.process.run(allocator, io, .{
         .argv = argv,
         .environ_map = env,
@@ -53,40 +51,65 @@ fn runKlio(
         std.debug.print("stdlib_commontest: spawn {s} failed: {s}\n", .{ argv[0], @errorName(e) });
         return error.SpawnFailed;
     };
-    const ok = switch (r.term) {
-        .exited => |c| c == 0,
-        else => false,
-    };
-    return .{ .ok = ok, .stdout = r.stdout, .stderr = r.stderr };
+    return .{ .term = r.term, .stdout = r.stdout, .stderr = r.stderr };
 }
 
-/// Build + install the `kotlin.test` pack into the scratch HOME.
 fn installKotlinTestPack(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
     std.Io.Dir.cwd().createDirPath(io, home) catch {};
-    const build_r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "build", "kotlin-klio/klio-kotlin-test" });
-    if (!build_r.ok) {
-        std.debug.print("stdlib_commontest: pack build failed:\n{s}\n", .{build_r.stderr});
+    const b = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "build", "kotlin-klio/klio-kotlin-test" });
+    if (b.term != .exited or b.term.exited != 0) {
+        std.debug.print("stdlib_commontest: pack build failed:\n{s}\n", .{b.stderr});
         return error.PackBuildFailed;
     }
-    const install_r = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "install", "target/packs/kotlin.test.klio-pack" });
-    if (!install_r.ok) {
-        std.debug.print("stdlib_commontest: pack install failed:\n{s}\n", .{install_r.stderr});
+    const i = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "install", "target/packs/kotlin.test.klio-pack" });
+    if (i.term != .exited or i.term.exited != 0) {
+        std.debug.print("stdlib_commontest: pack install failed:\n{s}\n", .{i.stderr});
         return error.PackInstallFailed;
     }
 }
 
-var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+/// Recursively collect every `.kt` under `dir`, skipping the `js/` platform
+/// source set. Paths are arena-owned.
+fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList([]u8)) !void {
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind == .directory) {
+            if (std.mem.eql(u8, entry.name, "js")) continue;
+            const sub = try std.fs.path.join(a, &.{ dir, entry.name });
+            try collectKt(a, io, sub, out);
+        } else if (std.mem.endsWith(u8, entry.name, ".kt")) {
+            try out.append(a, try std.fs.path.join(a, &.{ dir, entry.name }));
+        }
+    }
+}
 
-test "stdlib commonTest subset passes through klio test" {
-    _ = file_arena.reset(.retain_capacity);
-    const a = file_arena.allocator();
+fn fileHasTest(a: std.mem.Allocator, io: std.Io, path: []const u8) bool {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return false;
+    return std.mem.indexOf(u8, bytes, "@Test") != null;
+}
+
+/// Parse the "<n> tests, <p> passed, ..." summary line for the passed count.
+fn passedCount(stdout: []const u8) ?usize {
+    const idx = std.mem.indexOf(u8, stdout, " passed,") orelse return null;
+    var end = idx;
+    while (end > 0 and stdout[end - 1] == ' ') end -= 1;
+    var start = end;
+    while (start > 0 and std.ascii.isDigit(stdout[start - 1])) start -= 1;
+    if (start == end) return null;
+    return std.fmt.parseInt(usize, stdout[start..end], 10) catch null;
+}
+
+var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+
+test "stdlib commonTest pass count holds at or above the ratchet baseline" {
+    const a = arena_inst.allocator();
+    defer _ = arena_inst.reset(.free_all);
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    // The kotlin.test sources live in the sparse `kotlin` submodule. If it has
-    // not been populated (scripts/init-kotlin-submodule.sh), skip rather than
-    // fail spuriously.
     std.Io.Dir.cwd().access(io, "kotlin/libraries/kotlin.test", .{}) catch {
         std.debug.print("stdlib_commontest: kotlin.test submodule path missing; skipping\n", .{});
         return error.SkipZigTest;
@@ -95,13 +118,40 @@ test "stdlib commonTest subset passes through klio test" {
     var env = try envWithHome(a, SCRATCH_HOME);
     try installKotlinTestPack(a, io, &env, SCRATCH_HOME);
 
-    for (PASSING) |file| {
-        const r = try runKlio(a, io, &env, &.{ klioBin(&env), "test", file });
-        if (!r.ok) {
-            std.debug.print("stdlib_commontest: {s} did not pass:\n{s}\n{s}\n", .{ file, r.stdout, r.stderr });
-            return error.StdlibTestFailed;
+    var all: std.ArrayList([]u8) = .empty;
+    try collectKt(a, io, TEST_ROOT, &all);
+    std.mem.sort([]u8, all.items, {}, struct {
+        fn lt(_: void, x: []u8, y: []u8) bool {
+            return std.mem.lessThan(u8, x, y);
         }
-        // `klio test` exits 0 only with zero failures; confirm the summary too.
-        try std.testing.expect(std.mem.indexOf(u8, r.stdout, "0 failed") != null);
+    }.lt);
+
+    // Fixtures (no `@Test`) are compiled into every test file's module.
+    var support: std.ArrayList([]const u8) = .empty;
+    for (ACTUALS) |p| try support.append(a, p);
+    var targets: std.ArrayList([]const u8) = .empty;
+    for (all.items) |p| {
+        if (fileHasTest(a, io, p)) try targets.append(a, p) else try support.append(a, p);
     }
+
+    var total_passed: usize = 0;
+    var build_blocked: usize = 0;
+    for (targets.items) |target| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(a, klioBin(&env));
+        try argv.append(a, "test");
+        try argv.appendSlice(a, support.items);
+        try argv.append(a, target);
+        const r = try runKlio(a, io, &env, argv.items);
+        if (passedCount(r.stdout)) |p| {
+            total_passed += p;
+        } else {
+            build_blocked += 1;
+        }
+    }
+    std.debug.print(
+        "stdlib_commontest: {d} passed across {d} files, {d} build-blocked (baseline {d})\n",
+        .{ total_passed, targets.items.len, build_blocked, BASELINE },
+    );
+    try std.testing.expect(total_passed >= BASELINE);
 }

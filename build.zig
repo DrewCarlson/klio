@@ -173,6 +173,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlin-test",
         "kotlin/libraries/kotlin.test",
         "kotlin/libraries/stdlib/test",
+        "tests/stdlib_commontest_actuals",
     } },
 };
 

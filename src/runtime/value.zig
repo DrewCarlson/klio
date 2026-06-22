@@ -1966,8 +1966,8 @@ pub const Value = union(enum) {
                     try writer.writeAll(fg.get().bytes);
                 }
             },
-            .List => |coll| try writeElements(writer, coll.items),
-            .Set => |coll| try writeElements(writer, coll.items),
+            .List => |coll| try writeElements(writer, coll.items, &self),
+            .Set => |coll| try writeElements(writer, coll.items, &self),
             .Array => |a| {
                 const tag = if (a.prim) |k| k.typeFqn() else "kotlin.Array";
                 try writer.print("{s}@<…>", .{tag});
@@ -1978,9 +1978,17 @@ pub const Value = union(enum) {
                 try writer.writeByte('{');
                 for (g.get().pairs.items, 0..) |e, i| {
                     if (i > 0) try writer.writeAll(", ");
-                    try e.key.writeTo(writer);
+                    if (Value.referenceEq(&e.key, &self)) {
+                        try writer.writeAll("(this Map)");
+                    } else {
+                        try e.key.writeTo(writer);
+                    }
                     try writer.writeByte('=');
-                    try e.value.writeTo(writer);
+                    if (Value.referenceEq(&e.value, &self)) {
+                        try writer.writeAll("(this Map)");
+                    } else {
+                        try e.value.writeTo(writer);
+                    }
                 }
                 try writer.writeByte('}');
             },
@@ -2089,13 +2097,20 @@ pub const ComparatorStep = struct {
     }
 };
 
-fn writeElements(writer: *std.Io.Writer, items: ValueList) std.Io.Writer.Error!void {
+fn writeElements(writer: *std.Io.Writer, items: ValueList, container: *const Value) std.Io.Writer.Error!void {
     const g = items.borrow();
     defer g.deinit();
     try writer.writeByte('[');
     for (g.get().items, 0..) |v, i| {
         if (i > 0) try writer.writeAll(", ");
-        try v.writeTo(writer);
+        // Kotlin's AbstractCollection.toString prints `(this Collection)` for an
+        // element that is the collection itself; matching it avoids unbounded
+        // recursion on a self-referential collection.
+        if (Value.referenceEq(&v, container)) {
+            try writer.writeAll("(this Collection)");
+        } else {
+            try v.writeTo(writer);
+        }
     }
     try writer.writeByte(']');
 }

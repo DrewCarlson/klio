@@ -42,6 +42,52 @@ fn kindAt(p: *const Parser, i: usize) ?TokenKind {
     return p.tokens[i].kind;
 }
 
+/// Look ahead from index `i`, which must sit on an `@`, and skip one or more
+/// annotation forms (`@Foo`, `@Foo(...)`, `@Foo.Bar`, `@[Foo Bar]`), returning
+/// the index of the first token past them. Used to detect an annotation that
+/// prefixes a trailing lambda (`run @Suppress("x") { … }`).
+fn skipAnnotationTokens(p: *const Parser, i: usize) usize {
+    var j = i;
+    while (j < p.tokens.len and p.tokens[j].kind.isAt()) {
+        j += 1;
+        // `@[Foo Bar]` bracketed form: skip to matching `]`.
+        if (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .LBracket) {
+            var depth: i32 = 1;
+            j += 1;
+            while (j < p.tokens.len and depth > 0) : (j += 1) {
+                switch (p.tokens[j].kind) {
+                    .LBracket => depth += 1,
+                    .RBracket => depth -= 1,
+                    .Eof => break,
+                    else => {},
+                }
+            }
+        } else {
+            // `Foo`, dotted `Foo.Bar`, then optional `(...)` arg list.
+            while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Ident) {
+                j += 1;
+                if (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Dot) {
+                    j += 1;
+                } else break;
+            }
+            if (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .LParen) {
+                var depth: i32 = 1;
+                j += 1;
+                while (j < p.tokens.len and depth > 0) : (j += 1) {
+                    switch (p.tokens[j].kind) {
+                        .LParen => depth += 1,
+                        .RParen => depth -= 1,
+                        .Eof => break,
+                        else => {},
+                    }
+                }
+            }
+        }
+        while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Newline) j += 1;
+    }
+    return j;
+}
+
 // ---- cross-module helpers (resolved against sibling modules once ported) ----
 //
 // These functions live in sibling parse files (`types`, `file`, `control`,
@@ -710,6 +756,26 @@ pub fn parsePostfix(p: *Parser) ?Expr {
                 const extra_type_args = pending_type_args;
                 pending_type_args = &.{};
                 expr = appendTrailingLambda(p, expr, labeled, extra_type_args, sp);
+            },
+            // Annotated trailing lambda: `run @Suppress("x") { … }`. The
+            // annotation prefixes the lambda argument; it is a runtime no-op
+            // here, so consume and discard it, then parse the trailing lambda.
+            .AtNoWs, .AtPostWs, .AtPreWs, .AtBothWs => {
+                if (p.suppress_trailing_lambda or !root.isTrailingLambdaCallable(&expr)) {
+                    break;
+                }
+                const past = skipAnnotationTokens(p, p.pos);
+                const after = kindAt(p, past);
+                if (after == null or std.meta.activeTag(after.?) != .LBrace) {
+                    break;
+                }
+                _ = parseAnnotations(p);
+                support.skipNl(p);
+                const lam = parseTrailingLambda(p) orelse return null;
+                const sp = expr.span().join(lam.span());
+                const extra_type_args = pending_type_args;
+                pending_type_args = &.{};
+                expr = appendTrailingLambda(p, expr, lam, extra_type_args, sp);
             },
             .LBrace => {
                 if (!root.isTrailingLambdaCallable(&expr) or p.suppress_trailing_lambda) {
