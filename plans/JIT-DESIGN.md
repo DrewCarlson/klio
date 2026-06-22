@@ -94,3 +94,43 @@ body, non-extension, no varargs/defaults/type-params/native-binding) caches an
 eligibility plan on its `Func` and dispatches straight to its body, skipping the
 per-call overload re-resolution, extension-receiver handling, reified-type
 binding, and redundant argument copies. Positional, exact-arity calls only.
+
+## Architecture backends
+
+The emitter is split into per-target backends behind one method-level API, so
+the loop/function compiler in `ir/jit_loop.zig` is arch-neutral — it programs a
+fixed-role register machine (`T0`/`T1`/`T2` scratch, `REGS` base pointer, two
+float scratch, args in `rdi`/`rsi`, result in the `rax` role) and never branches
+on architecture. `jit.zig` exposes abstract `Reg`/`Xmm`/`Cond`/`SetCc`/`ElemW`
+types and selects the backend at compile time:
+
+- **x86-64 (System V)** — `X86Emitter` in `jit.zig`.
+- **AArch64 (AAPCS64)** — `arm64.zig`. Maps the role registers to ARM64 GPRs and
+  honors the same contract: `sdiv`/`msub` leave quotient and remainder in the
+  `T0`/`T2` roles, `ret` reconciles the `rax` role to `x0`, `push`/`pop` pair the
+  base-pointer save with the link register so a trampoline `blr` is transparent,
+  abstract conditions lower to `NZCV` (the `a`/`ae`/`be` forms only follow
+  `fcmp`), and `fcvtzs` gives Kotlin's NaN→0 / saturating float→int directly.
+
+Any architecture without a backend (e.g. riscv64) returns `Unsupported` from
+`finalize` and runs on the interpreter.
+
+### Executable memory (W^X)
+
+`finalize` writes code into fresh pages, seals them, and syncs the instruction
+cache (mandatory on AArch64; elided on x86):
+
+- **Apple platforms (`isDarwin()`)** — `MAP_JIT` pages with the per-thread
+  `pthread_jit_write_protect_np` write toggle, then `sys_icache_invalidate`. The
+  jit module links libc on Darwin targets for those entry points.
+- **Linux / Android** — `mmap` read+write, `mprotect` to read+execute, then a
+  `dc cvau` / `ic ivau` / `dsb` / `isb` cache-maintenance sequence on AArch64. No
+  libc dependency.
+
+### Verified targets
+
+macOS arm64 is the native host (full suite + example parity, JIT on and off).
+The AArch64 backend's execution tests also run green on a real Android arm64
+device via adb, exercising the Linux `mmap`/`mprotect`/icache path. The JIT
+cross-compiles for x86-64 and aarch64 Linux, Android (arm64 + x86-64), and
+aarch64 iOS; riscv64 builds and falls back to the interpreter.

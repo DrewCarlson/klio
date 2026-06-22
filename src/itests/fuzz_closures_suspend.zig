@@ -341,7 +341,9 @@ test "fuzz: nested capturing lambdas + suspend are crash-free and mode-stable" {
         }
     }
 
-    std.debug.print("fuzz: ran {d} seed(s) (base=0x{x}) across {d} modes each\n", .{ n_seeds, base_seed, MODES.len });
+    // Gated: an unconditional summary on stderr makes `zig build test` flag the
+    // passing test command as failed. The failure path below still reports.
+    if (FUZZ_TRACE) std.debug.print("fuzz: ran {d} seed(s) (base=0x{x}) across {d} modes each\n", .{ n_seeds, base_seed, MODES.len });
 
     if (first_failure) |f| {
         std.debug.print("fuzz: minimal failing seed = 0x{x} (persisted under {s})\n", .{ f.seed, FAILURE_CORPUS });
