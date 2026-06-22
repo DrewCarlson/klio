@@ -2424,6 +2424,26 @@ pub fn primitive_companion_const(ty: []const u8, name: []const u8) ?Value {
         if (T.eq(name, "MIN_VALUE")) return .{ .Char = 0 };
         if (T.eq(name, "SIZE_BITS")) return Value.newInt(16);
         if (T.eq(name, "SIZE_BYTES")) return Value.newInt(2);
+    } else if (T.eq(ty, "UInt")) {
+        if (T.eq(name, "MAX_VALUE")) return .{ .UInt = std.math.maxInt(u32) };
+        if (T.eq(name, "MIN_VALUE")) return .{ .UInt = 0 };
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(32);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(4);
+    } else if (T.eq(ty, "ULong")) {
+        if (T.eq(name, "MAX_VALUE")) return .{ .ULong = std.math.maxInt(u64) };
+        if (T.eq(name, "MIN_VALUE")) return .{ .ULong = 0 };
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(64);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(8);
+    } else if (T.eq(ty, "UShort")) {
+        if (T.eq(name, "MAX_VALUE")) return .{ .UShort = std.math.maxInt(u16) };
+        if (T.eq(name, "MIN_VALUE")) return .{ .UShort = 0 };
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(16);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(2);
+    } else if (T.eq(ty, "UByte")) {
+        if (T.eq(name, "MAX_VALUE")) return .{ .UByte = std.math.maxInt(u8) };
+        if (T.eq(name, "MIN_VALUE")) return .{ .UByte = 0 };
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(8);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(1);
     }
     return null;
 }
