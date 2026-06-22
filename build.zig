@@ -281,7 +281,7 @@ pub fn build(b: *std.Build) void {
     // The AArch64 JIT backend uses Darwin's per-thread MAP_JIT write toggle and
     // instruction-cache invalidate from libSystem. Link libc into every artifact
     // that pulls in the jit module so those externs resolve on Apple targets.
-    if (target.result.os.tag == .macos) mods.get("jit").?.link_libc = true;
+    if (target.result.os.tag.isDarwin()) mods.get("jit").?.link_libc = true;
 
     // Second per-(module, optimize) universe for the harness binaries.
     // Zig modules are keyed by (root source, optimize), so the harness
@@ -310,7 +310,7 @@ pub fn build(b: *std.Build) void {
         const pack_harness = harness_mods.get("pack").?;
         pack_harness.link_libc = true;
         pack_harness.linkLibrary(zstd_harness);
-        if (target.result.os.tag == .macos) harness_mods.get("jit").?.link_libc = true;
+        if (target.result.os.tag.isDarwin()) harness_mods.get("jit").?.link_libc = true;
     }
 
     // The stdlib pack is baked into the binary: embed_gen builds it from

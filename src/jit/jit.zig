@@ -84,7 +84,7 @@ pub const ExecBuf = struct {
 pub fn finalize(code: []const u8) JitError!ExecBuf {
     const arch = builtin.cpu.arch;
     if (comptime arch != .x86_64 and arch != .aarch64) return JitError.Unsupported;
-    if (comptime builtin.os.tag == .macos) return finalizeDarwin(code);
+    if (comptime builtin.os.tag.isDarwin()) return finalizeDarwin(code);
     return finalizePosix(code);
 }
 
@@ -136,7 +136,7 @@ fn finalizeDarwin(code: []const u8) JitError!ExecBuf {
 /// Make freshly written code visible to the instruction stream. Required on
 /// AArch64 (separate I/D caches); the x86 builtin compiles to nothing.
 fn syncICache(ptr: [*]u8, len: usize) void {
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.os.tag.isDarwin()) {
         sys_icache_invalidate(@ptrCast(ptr), len);
     } else if (comptime builtin.cpu.arch == .aarch64) {
         const start = @intFromPtr(ptr);
