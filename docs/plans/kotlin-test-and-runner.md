@@ -77,7 +77,8 @@ A subsystem module outside the core pipeline. Given test sources, it:
       Passing today (referenced in place from the submodule): `utils/HashCodeTest`,
       `collections/IteratorsTest`, `collections/HashMapCompactTest`, `utils/LazyTest`,
       `utils/TODOTest`, `numbers/BuiltinCompanionTest`, `time/TestTimeSourceTest`,
-      `ranges/ProgressionLastElementTest`, `properties/delegation/lazy/LazyValuesTest`.
+      `ranges/ProgressionLastElementTest`, `properties/delegation/lazy/LazyValuesTest`,
+      `comparisons/BooleanOrderingTest`.
       Grow the `PASSING` list in the itest as the interpreter closes the gaps below.
 
 ## Interpreter fixes surfaced while bootstrapping
@@ -97,6 +98,9 @@ A subsystem module outside the core pipeline. Given test sources, it:
   defaulted param, leaving a required param unfilled, so the splice was declined
   and the reified class id was lost. Fixed by applying Kotlin's trailing-lambda
   argument mapping in `tryInlineCallWithTypeArgs`.
+
+- `Boolean.compareTo` had no host binding and the common declaration is bodyless,
+  so it recursed; added the `kotlin.Boolean.compareTo` binding.
 
 ### Open (each blocks more of the stdlib commonTest suite)
 

@@ -816,6 +816,19 @@ pub fn bool_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInit(ctx.allocator, if (b) "true" else "false") });
 }
 
+/// `Boolean.compareTo`: `false` sorts before `true`.
+pub fn bool_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args[0] != .Bool) {
+        return .{ .err = .{ .Type = "Boolean.compareTo requires a Boolean receiver" } };
+    }
+    if (ctx.args.len < 2 or ctx.args[1] != .Bool) {
+        return .{ .err = .{ .Type = "Boolean.compareTo requires a Boolean" } };
+    }
+    const a: i64 = @intFromBool(ctx.args[0].Bool);
+    const b: i64 = @intFromBool(ctx.args[1].Bool);
+    return ok(.{ .Int = if (a < b) -1 else @intFromBool(a > b) });
+}
+
 // ============================================================
 // Additional Int
 // ============================================================

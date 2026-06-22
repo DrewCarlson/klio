@@ -23,6 +23,7 @@ const PASSING = [_][]const u8{
     "kotlin/libraries/stdlib/test/ranges/ProgressionLastElementTest.kt",
     "kotlin/libraries/stdlib/test/collections/HashMapCompactTest.kt",
     "kotlin/libraries/stdlib/test/properties/delegation/lazy/LazyValuesTest.kt",
+    "kotlin/libraries/stdlib/test/comparisons/BooleanOrderingTest.kt",
 };
 
 const SCRATCH_HOME = "/tmp/klio_itest_stdlibtest_home";

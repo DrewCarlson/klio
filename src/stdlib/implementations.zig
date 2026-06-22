@@ -336,6 +336,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Float.fromBits", .f = numeric.float_from_bits },
     .{ .fqn = "kotlin.Float.Companion.fromBits", .f = numeric.float_from_bits },
     .{ .fqn = "kotlin.Boolean.toString", .f = numeric.bool_to_string },
+    .{ .fqn = "kotlin.Boolean.compareTo", .f = numeric.bool_compare_to },
     .{ .fqn = "kotlin.ArithmeticException", .f = exceptions.excn_arithmetic },
     .{ .fqn = "kotlin.ClassCastException", .f = exceptions.excn_class_cast },
     .{ .fqn = "kotlin.Error", .f = exceptions.excn_error },
