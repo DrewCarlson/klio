@@ -167,6 +167,13 @@ const itests_files = [_]Itest{
     // corruption through a child `klio` against a scratch HOME, plus the
     // in-process bake/load round trip.
     .{ .name = "stdlib_image", .needs_exe = true },
+    // Bootstrapping proof: Kotlin's own stdlib commonTest sources run through
+    // a child `klio test` against the installed kotlin.test pack.
+    .{ .name = "stdlib_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlin-test",
+        "kotlin/libraries/kotlin.test",
+        "kotlin/libraries/stdlib/test",
+    } },
 };
 
 /// Read by every parity-pipeline run: the stdlib pack is built at runtime from

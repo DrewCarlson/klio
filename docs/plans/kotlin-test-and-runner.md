@@ -71,8 +71,12 @@ A subsystem module outside the core pipeline. Given test sources, it:
 - [x] annotation retention plumbed (`ir.Func` / `runtime.ClassDef` annotation FQNs)
 - [x] test_runner + `klio test` — discovers `@Test`/`@Ignore`/`@BeforeTest`/
       `@AfterTest`, fresh instance per test, Gradle-style report, non-zero exit.
-- [ ] runner unit/itests + corpus
-- [ ] stdlib commonTest subset green (bootstrap proof), expanding monotonically
+- [x] runner itest: `src/itests/stdlib_commontest.zig` runs a curated set of
+      upstream stdlib commonTest files through a child `klio test`.
+- [~] stdlib commonTest subset green (bootstrap proof), expanding monotonically.
+      Passing today (referenced in place from the submodule): `utils/HashCodeTest`,
+      `collections/IteratorsTest`, `utils/LazyTest`. Grow the `PASSING` list in
+      the itest as the interpreter closes the gaps below.
 
 ## Interpreter fixes surfaced while bootstrapping
 
@@ -82,9 +86,22 @@ A subsystem module outside the core pipeline. Given test sources, it:
 - Top-level computed `val` (getter-only) now resolves and re-evaluates per read
   (the `kotlin.test` `asserter` property).
 
-### Open
+- Reified `T::class.<member>(...)` for a builtin type bound the constructor
+  intrinsic instead of the `.Class` value (so `isInstance` mis-dispatched) —
+  fixed by carrying the resolved class id on the reified binding's `LoadGlobal`.
 
-- Reified `T::class.<member>(...)` member dispatch is broken: `assertFailsWith<T>`
-  and `assertIs<T>` route through `T::class.isInstance(...)`, which mis-dispatches
-  (returns the class value instead of invoking the member). Fix required before the
-  stdlib commonTest proof (heavy `assertFailsWith` usage).
+### Open (each blocks more of the stdlib commonTest suite)
+
+- `assertFailsWith<T>` through the pack: the reified type argument flows through
+  the pack's nested inline overloads (`assertFailsWith<T>` ->
+  `assertFailsWith(KClass<T>, ...)` -> `checkResultIsFailure`) and a builtin `T`
+  still reaches `isInstance` as the intrinsic. The single-inline-hop case works;
+  the cross-file nested-inline-hop case does not yet.
+- `klio run` (baked stdlib-image path) does not register top-level computed-val
+  getters, so the pack `asserter` is unresolved when a program is run via the
+  image fast-path. `klio test` (legacy build path) is unaffected, so the proof
+  is not blocked; the image path should carry `top_level_prop_getters`.
+- `Boolean.compareTo` recurses without terminating (e.g. `comparisons/
+  BooleanOrderingTest`).
+- Other per-file gaps surface as the `PASSING` list grows (enum entries,
+  unsigned math, string builder, abstract list).
