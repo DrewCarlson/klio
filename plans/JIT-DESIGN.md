@@ -15,8 +15,12 @@ The JIT is built **on top of** the existing IR interpreter, never replacing it:
   loop back-edge count). Then the JIT attempts to compile it. On success, future
   entries run native code; on any unsupported IR, the compile bails and the
   function stays interpreted.
-- Gated behind `KLIO_JIT` (off by default) until coverage + correctness are
-  proven against the full suite + corpus, then flipped on.
+- On by default for the `klio` binary via the `fast` performance profile
+  (`--opt fast` / `KLIO_OPT=fast`); `--opt safe` keeps the interpreter. The
+  in-process multi-program test harness uses the conservative default profile
+  (interpreter), so a hot loop never compiles per worker. The legacy `KLIO_JIT`
+  / `KLIO_FUNC_JIT` env vars remain as per-feature overrides on top of the
+  profile. See `src/runtime/perf.zig`.
 
 ## Stages
 
@@ -59,7 +63,8 @@ loop (e.g. `fib`) stayed in the interpreter, bound by per-instruction dispatch.
 Function mode closes that gap: when a function entry is hot, its **whole body**
 (entry → `Return`) compiles to native code.
 
-- **Opt-in.** Enabled with `KLIO_FUNC_JIT=1` on top of `KLIO_JIT=1`. It compiles
+- **Enabled by the `fast` profile** (default for the binary); `KLIO_FUNC_JIT`
+  remains a per-feature override. It compiles
   whole bodies (including recursion) per thread with no cross-thread eviction
   path — correct and bounded for a normal single-program process, but the
   in-process multi-program test harness would accumulate per-worker compiled

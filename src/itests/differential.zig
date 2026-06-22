@@ -18,6 +18,14 @@
 
 const std = @import("std");
 const parity = @import("parity");
+const runtime = @import("runtime");
+
+/// Progress summaries are silent by default: a passing `zig build test` step
+/// must not write to stderr, or the build runner renders it as a failed
+/// command. Set `KLIO_ITEST_VERBOSE` to surface them when running directly.
+fn verbose() bool {
+    return runtime.getenvSlice("KLIO_ITEST_VERBOSE") != null;
+}
 
 const EXAMPLES = "examples";
 const SMOKE_DIR = "tests/fixtures/coroutine_smoke";
@@ -114,7 +122,7 @@ fn checkCorpus(io: std.Io, files: []const []const u8) !usize {
             }
         }
     }
-    std.debug.print(
+    if (verbose()) std.debug.print(
         "differential: {d} programs, {d} pack-using (ran >=2 modes)\n",
         .{ files.len, pack_programs },
     );
@@ -229,6 +237,6 @@ test "corpus outputs are independent of program order" {
             );
         }
     }
-    std.debug.print("differential order: {d} (program, mode) outcomes re-checked in reverse\n", .{recorded.items.len});
+    if (verbose()) std.debug.print("differential order: {d} (program, mode) outcomes re-checked in reverse\n", .{recorded.items.len});
     if (failures != 0) return error.OrderDependentOutput;
 }

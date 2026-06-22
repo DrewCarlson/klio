@@ -70,8 +70,30 @@ fn guardAllocator(inner: std.mem.Allocator) std.mem.Allocator {
     return .{ .ptr = undefined, .vtable = &G.vtable };
 }
 
+/// Resolve the performance profile from argv (`--opt`/`-O`) and `KLIO_OPT`
+/// before the backing allocator is chosen, defaulting to `fast` for the binary.
+fn resolveProfile(args: std.process.Args) runtime.perf.Profile {
+    const pa = std.heap.page_allocator;
+    var it = args.iterateAllocator(pa) catch return runtime.perf.resolveBinaryProfile(&.{});
+    defer it.deinit();
+    var list: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (list.items) |s| pa.free(s);
+        list.deinit(pa);
+    }
+    while (it.next()) |a| {
+        const d = pa.dupe(u8, a) catch break;
+        list.append(pa, d) catch {
+            pa.free(d);
+            break;
+        };
+    }
+    return runtime.perf.resolveBinaryProfile(list.items);
+}
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
     if (runtime.getenvSlice("KLIO_SEGV_TRACE")) |_| std.debug.attachSegfaultHandler();
+    runtime.perf.setProfile(resolveProfile(init.args));
     const mode = runtime.allocChoice();
     switch (mode) {
         .arena => {

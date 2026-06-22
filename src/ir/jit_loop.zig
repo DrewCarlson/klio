@@ -3381,11 +3381,8 @@ pub fn setEnabledForTest(on: bool) void {
 }
 
 pub fn enabled() bool {
-    if (jit_enabled_cache) |e| return e;
-    const v = runtime.getenvSlice("KLIO_JIT");
-    const on = v != null and v.?.len > 0 and !std.mem.eql(u8, v.?, "0");
-    jit_enabled_cache = on;
-    return on;
+    if (jit_enabled_cache) |e| return e; // test override
+    return runtime.perf.get().jit_loop;
 }
 
 fn debugEnabled() bool {
@@ -3398,18 +3395,15 @@ fn debugEnabled() bool {
 
 var func_jit_cache: ?bool = null;
 
-/// Whole-function JIT (function mode / native recursion). Opt-in on top of the
-/// loop JIT via `KLIO_FUNC_JIT`, because it compiles whole bodies (including
-/// recursion) per thread without a cross-thread eviction path — fine for a normal
-/// single-program process, but the in-process multi-program test harness would
-/// accumulate per-worker compiled code. Off unless explicitly requested.
+/// Whole-function JIT (function mode / native recursion). It compiles whole
+/// bodies (including recursion) per thread without a cross-thread eviction path
+/// — fine for a normal single-program process (the `fast` profile enables it),
+/// but the in-process multi-program test harness keeps it off via the
+/// conservative default profile so per-worker compiled code never accumulates.
 pub fn funcEnabled() bool {
     if (!enabled()) return false;
-    if (func_jit_cache) |f| return f;
-    const v = runtime.getenvSlice("KLIO_FUNC_JIT");
-    const on = v != null and v.?.len > 0 and !std.mem.eql(u8, v.?, "0");
-    func_jit_cache = on;
-    return on;
+    if (func_jit_cache) |f| return f; // test override
+    return runtime.perf.get().jit_func;
 }
 
 /// Test-only: force function mode on/off, bypassing the env probe.
