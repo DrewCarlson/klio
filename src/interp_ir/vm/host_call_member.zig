@@ -2456,7 +2456,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 break :blk cv >= r.start and cv <= r.end and @rem(cv - r.start, r.step) == 0;
             }
             if (args[0].asI64()) |v| {
-                break :blk v >= r.start and v <= r.end and @rem(v - r.start, r.step) == 0;
+                // Widen the step-alignment difference: `v - r.start` overflows
+                // i64 for a range spanning most of the type (`MIN..MAX`), which
+                // Kotlin's `in` check tolerates.
+                const diff = @as(i128, v) - @as(i128, r.start);
+                break :blk v >= r.start and v <= r.end and @rem(diff, @as(i128, r.step)) == 0;
             }
             break :blk false;
         };
