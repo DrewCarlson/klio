@@ -127,7 +127,7 @@ pub const TrampFn = *const fn (*anyopaque, u64) callconv(.c) u64;
 pub const CallSite = struct {
     func: FuncId = @enumFromInt(0),
     args_reg: u32 = 0,
-    n_args: u8 = 0,
+    n_args: u32 = 0,
     dst_reg: u32,
     has_result: bool = false,
     block: BlockId,
@@ -479,7 +479,7 @@ const InlineSite = struct {
     callee: *const Func,
     base: u32,
     args_reg: u32,
-    n_args: u8,
+    n_args: u32,
     dst: Reg,
     /// Member inline: the call's receiver register (the callee's `this`), the
     /// callee register `LoadParam 0` writes (mapped to `recv_reg`, not `base`), and
@@ -623,7 +623,7 @@ fn remapInst(inst: Inst, base: u32) Inst {
 /// host, which reboxes the scalar args, runs the callee interpreted, and reboxes a
 /// scalar result. v1 handles only the bare positional form (no named args, no
 /// reified type args) with at most three args.
-const TrampCall = struct { func: FuncId, args_reg: u32, n_args: u8, dst: Reg };
+const TrampCall = struct { func: FuncId, args_reg: u32, n_args: u32, dst: Reg };
 
 fn trampolinableCallOf(inst: *const Inst) ?TrampCall {
     switch (inst.*) {
@@ -640,7 +640,7 @@ fn trampolinableCallOf(inst: *const Inst) ?TrampCall {
 /// callable value (a closure/function/bound reference) held in a register. v1
 /// handles the bare positional form with at most three scalar args and a result
 /// that is discarded (a side-effecting call).
-const TrampCallValue = struct { callee: Reg, args_reg: u32, n_args: u8, dst: Reg };
+const TrampCallValue = struct { callee: Reg, args_reg: u32, n_args: u32, dst: Reg };
 
 fn trampolinableCallValueOf(inst: *const Inst) ?TrampCallValue {
     switch (inst.*) {
@@ -664,7 +664,7 @@ fn isCallableValue(v: Value) bool {
 /// receiver is a loop-invariant boxed object (read by the host from the frame's
 /// registers, never unboxed into a slot). v1 handles only the bare positional form
 /// (no named args, no static-receiver pin) with at most three scalar args.
-const TrampMember = struct { recv: Reg, name: []const u8, args_reg: u32, n_args: u8, dst: Reg };
+const TrampMember = struct { recv: Reg, name: []const u8, args_reg: u32, n_args: u32, dst: Reg };
 
 fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember {
     // Subscripts / numeric conversions / bitwise infix ops also lower to
@@ -2690,7 +2690,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             }
             // Every scalar arg must already live in a typed slot (field reads have none).
             const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else if (is_member) trampolinableMemberOf(module, inst).?.args_reg else if (is_call_value) trampolinableCallValueOf(inst).?.args_reg else 0;
-            const n_args: u8 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else if (is_call_value) trampolinableCallValueOf(inst).?.n_args else 0;
+            const n_args: u32 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else if (is_call_value) trampolinableCallValueOf(inst).?.n_args else 0;
             var k: u8 = 0;
             while (k < n_args) : (k += 1) {
                 const ar = args_reg + k;

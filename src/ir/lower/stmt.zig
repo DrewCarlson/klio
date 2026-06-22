@@ -678,7 +678,7 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 .receiver = recv,
                 .name = nm,
                 .args = key_start,
-                .n_args = @as(u8, @intCast(n_keys)) + 1,
+                .n_args = @as(u32, @intCast(n_keys)) + 1,
                 .arg_names = &.{},
             } });
         },

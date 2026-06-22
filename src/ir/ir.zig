@@ -173,7 +173,7 @@ pub const Inst = union(enum) {
         dst: Reg,
         func: FuncId,
         args: Reg,
-        n_args: u8,
+        n_args: u32,
         arg_names: []?ConstId = &.{},
         /// Call-site type arguments, in declaration order. Each entry
         /// is the interned simple type name (or fully-qualified name)
@@ -195,7 +195,7 @@ pub const Inst = union(enum) {
         callee: Reg,
         receiver: Reg,
         args: Reg,
-        n_args: u8,
+        n_args: u32,
         arg_names: []?ConstId = &.{},
     },
     /// Call a callable value held in a register.
@@ -203,7 +203,7 @@ pub const Inst = union(enum) {
         dst: Reg,
         callee: Reg,
         args: Reg,
-        n_args: u8,
+        n_args: u32,
         arg_names: []?ConstId = &.{},
         /// Call-site type arguments (interned head names), recorded for
         /// the bare-call-to-global form so a stdlib container creator
@@ -234,7 +234,7 @@ pub const Inst = union(enum) {
         qualifier: ?ConstId = null,
         name: ConstId,
         args: Reg,
-        n_args: u8,
+        n_args: u32,
         arg_names: []?ConstId = &.{},
     },
     /// `name(args)` where `name` resolves to an in-scope value that
@@ -247,7 +247,7 @@ pub const Inst = union(enum) {
         this_recv: Reg,
         name: ConstId,
         args: Reg,
-        n_args: u8,
+        n_args: u32,
         arg_names: []?ConstId = &.{},
     },
     /// Explicit-receiver call `recv.name(args)` where `name` is also
@@ -260,7 +260,7 @@ pub const Inst = union(enum) {
         name: ConstId,
         fallback: Reg,
         args: Reg,
-        n_args: u8,
+        n_args: u32,
         arg_names: []?ConstId = &.{},
     },
     /// Member call on a receiver. The evaluator resolves the
@@ -270,7 +270,7 @@ pub const Inst = union(enum) {
         receiver: Reg,
         name: ConstId,
         args: Reg,
-        n_args: u8,
+        n_args: u32,
         arg_names: []?ConstId = &.{},
         /// The receiver's DECLARED type head when lowering knows it (a
         /// bare call on the implicit `this` of an extension body, whose
@@ -285,11 +285,11 @@ pub const Inst = union(enum) {
         dst: Reg,
         class: ClassId,
         args: Reg,
-        n_args: u8,
+        n_args: u32,
         arg_names: []?ConstId = &.{},
     },
     /// Build a `List` from a range of registers.
-    NewList: struct { dst: Reg, args: Reg, n_args: u8 },
+    NewList: struct { dst: Reg, args: Reg, n_args: u32 },
     /// `this@Qualifier` — walk the receiver's outer chain
     /// looking for an instance whose class matches `qualifier`,
     /// and write that instance into `dst`.
@@ -378,7 +378,7 @@ pub const Inst = union(enum) {
         this_idx: u16,
         name: ConstId,
         args: Reg,
-        n_args: u8,
+        n_args: u32,
         arg_names: []?ConstId,
         /// The scope-resolved class when the bare name is a constructor
         /// call the index bound; the global leg constructs exactly this
@@ -537,7 +537,7 @@ pub const Terminator = union(enum) {
     /// without pushing a new call frame.
     TailJump: struct {
         args: Reg,
-        n_args: u8,
+        n_args: u32,
     },
     /// Cross-function tail call: replace the current frame's function
     /// with `func`, rebind its params from the contiguous register run
@@ -545,7 +545,7 @@ pub const Terminator = union(enum) {
     TailCallFunc: struct {
         func: FuncId,
         args: Reg,
-        n_args: u8,
+        n_args: u32,
     },
     /// Non-local return — propagates an `EvalError.NonLocalReturn`
     /// up through enclosing lambda frames until a non-lambda fn

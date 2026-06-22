@@ -16,13 +16,14 @@ const std = @import("std");
 const runtime = @import("runtime");
 
 /// Minimum number of stdlib commonTest cases that must pass. A ratchet: bump it
-/// up as fixes land, never down. (Total discovered today is ~1240; ~664 pass.)
-const BASELINE: usize = 660;
+/// up as fixes land, never down. (Total discovered today is ~1240; ~1003 pass.)
+const BASELINE: usize = 995;
 
 const TEST_ROOT = "kotlin/libraries/stdlib/test";
 const ACTUALS = [_][]const u8{
     "tests/stdlib_commontest_actuals/PlatformActuals.kt",
     "tests/stdlib_commontest_actuals/EncodingActuals.kt",
+    "tests/stdlib_commontest_actuals/JsCollectionFactories.kt",
 };
 const SCRATCH_HOME = "/tmp/klio_itest_stdlibtest_home";
 

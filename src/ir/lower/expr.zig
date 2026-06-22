@@ -1818,7 +1818,7 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .receiver = recv,
                     .name = set_nm,
                     .args = key_start,
-                    .n_args = @as(u8, @intCast(n_keys)) + 1,
+                    .n_args = @as(u32, @intCast(n_keys)) + 1,
                     .arg_names = &.{},
                 } });
                 return old;
@@ -2319,7 +2319,7 @@ fn lowerCallWithWritebackPath(
         }
     }
     try run_regs.appendSlice(b.allocator, arg_regs);
-    const n_args: u8 = @intCast(run_regs.items.len);
+    const n_args: u32 = @intCast(run_regs.items.len);
     const args_start = try packContiguous(b, run_regs.items);
 
     var arg_names_list: std.ArrayList(?ConstId) = .empty;
@@ -2433,6 +2433,35 @@ fn lowerCallSpread(
 /// The general call path: inline expansion, infix, scope-fn markers, tailrec,
 /// value invocation, class constructors, member dispatch, and the long
 /// overload-selection ladder.
+/// True when the enclosing class declares a primary-ctor *property* param
+/// named `name` and also a same-named `vararg` method. In that case a bare
+/// call `name(args)` inside the class body (notably a field initializer, where
+/// the param is in scope as a local) must resolve by argument shape — the
+/// vararg method for several args, the property's `invoke` for one matching
+/// array — rather than blindly invoking the param's lambda. Routing such calls
+/// through member dispatch lets `varargShadowedFieldInvoke` make that pick.
+fn ctorParamShadowsVarargMethod(b: *FuncBuilder, name: []const u8) bool {
+    const owner = b.ownerClass() orelse return false;
+    const cid = b.module.classId(owner) orelse return false;
+    const idx = cid.int();
+    if (idx >= b.module.classes.items.len) return false;
+    const cls = &b.module.classes.items[idx];
+    var has_prop_param = false;
+    for (cls.primary_params) |p| {
+        if (p.is_property and std.mem.eql(u8, p.name, name)) {
+            has_prop_param = true;
+            break;
+        }
+    }
+    if (!has_prop_param) return false;
+    for (cls.methods) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (std.mem.eql(u8, f.name, name) and
+            f.params.len != 0 and f.params[f.params.len - 1].is_vararg) return true;
+    }
+    return false;
+}
+
 fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -2494,7 +2523,12 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // `Iterable.maxOf` / array `maxOf`) is the package-level function,
         // not a receiver member — it must fall through to the bare-name path.
         const recv_chain = try narrowingRecvChain(b);
-        if (b.resolve(nm) == null and !b.knowsOuter(nm)) {
+        // A captured crossinline param shadows a same-named member of the
+        // anonymous object being lowered (`object : Iterable<T> { override fun
+        // iterator() = iterator() }` — the bare `iterator()` is the captured
+        // lambda, not the override, which would recurse). Let it fall through
+        // to the anon-capture invocation below.
+        if (b.resolve(nm) == null and !b.knowsOuter(nm) and !isLowerAnonCapture(nm)) {
             // Confident the call binds to the spliced `this`: the name is a
             // member of its class, or an extension whose declared receiver is
             // compatible with the *known* receiver-type chain. Dispatch it
@@ -2649,6 +2683,32 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 b.switchTo(dead);
                 return b.emitConst(.Unit);
             }
+        }
+    }
+
+    // A ctor-property param shadowing a same-named vararg method must dispatch
+    // by argument shape: a field initializer `val data = createFrom("a", "b")`
+    // has the param in scope as a local, but the call belongs to the vararg
+    // method, not the property lambda invoked with two arguments. Route to
+    // member dispatch so `varargShadowedFieldInvoke` makes the pick.
+    if (callee.* == .Path and callee.Path.segments.len == 1 and
+        b.resolve(callee.Path.segments[0].name) != null and
+        ctorParamShadowsVarargMethod(b, callee.Path.segments[0].name))
+    {
+        if (b.resolve("this")) |this_reg| {
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            const nmc = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
+            try b.push(.{ .CallMember = .{
+                .dst = dst,
+                .receiver = this_reg,
+                .name = nmc,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
         }
     }
 
@@ -4343,7 +4403,7 @@ fn lowerImplicitThisCall(
             .dst = dst,
             .func = fid,
             .args = args_start,
-            .n_args = @as(u8, @intCast(args.len)) + 1,
+            .n_args = @as(u32, @intCast(args.len)) + 1,
             .arg_names = arg_names,
             .type_args = &.{},
             .exact = false,
@@ -4729,8 +4789,15 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     }
 
     // Statically rebind `(e as T).f(args)` to the `f` overload whose
-    // first-param type is `T`.
-    if (receiver.* == .As and !receiver.As.safe) {
+    // first-param type is `T`. The universal `Any` members are virtual and
+    // dispatch on the runtime type, so never rebind them to a declared-`T`
+    // namesake — `(x as Any).toString()` must reach `String.toString`, not a
+    // `fun Any?.toString()` namesake.
+    if (receiver.* == .As and !receiver.As.safe and
+        !std.mem.eql(u8, name.name, "toString") and
+        !std.mem.eql(u8, name.name, "equals") and
+        !std.mem.eql(u8, name.name, "hashCode"))
+    {
         const cast_ty = receiver.As.ty;
         const want_user = args.len;
         var chosen: ?FuncId = null;

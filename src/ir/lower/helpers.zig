@@ -144,7 +144,7 @@ pub fn calleeLabel(callee: *const Expr) ?[]const u8 {
 /// `args.len` contiguous registers up front (so the run [args_start,
 /// args_start + n_args) is dense), lower each arg into its own scratch
 /// reg, then `Move` the scratch into the matching arg slot.
-pub fn lowerArgRun(b: *FuncBuilder, args: []const Expr) Allocator.Error!struct { Reg, u8 } {
+pub fn lowerArgRun(b: *FuncBuilder, args: []const Expr) Allocator.Error!struct { Reg, u32 } {
     return lowerArgRunWithArity(b, args, null);
 }
 
@@ -154,7 +154,7 @@ pub fn lowerArgRun(b: *FuncBuilder, args: []const Expr) Allocator.Error!struct {
 /// lambda) the `it` reference resolves to an enclosing lambda. Passed
 /// explicitly rather than through builder state so a stale value can never
 /// leak into an unrelated call's arguments.
-pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]const i16) Allocator.Error!struct { Reg, u8 } {
+pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]const i16) Allocator.Error!struct { Reg, u32 } {
     const n = args.len;
     if (n == 0) {
         // Reserve a sentinel slot so the n_args=0 reads do not alias an

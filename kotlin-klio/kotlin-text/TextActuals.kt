@@ -27,12 +27,18 @@ public actual fun CharSequence.repeat(n: Int): String {
     return when (n) {
         0 -> ""
         1 -> this.toString()
-        else -> {
-            val sb = StringBuilder(n * length)
-            for (i in 1..n) {
-                sb.append(this)
+        else -> when (length) {
+            // An empty receiver repeats to empty; without this the loop below
+            // runs `n` (up to Int.MAX_VALUE) no-op appends.
+            0 -> ""
+            1 -> this[0].let { char -> String(CharArray(n) { char }) }
+            else -> {
+                val sb = StringBuilder(n * length)
+                for (i in 1..n) {
+                    sb.append(this)
+                }
+                sb.toString()
             }
-            sb.toString()
         }
     }
 }
