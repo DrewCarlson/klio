@@ -593,10 +593,11 @@ pub fn vmConstruct(self: *Vm, class_id: ir.ClassId) Allocator.Error!CallOutcome 
 /// Invoke the no-argument method `name` on `receiver` (a test class's
 /// `@BeforeTest`/`@Test`/`@AfterTest` method).
 pub fn vmCallMethod(self: *Vm, receiver: *const Value, name: []const u8) Allocator.Error!CallOutcome {
-    var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
-    const maybe = try vmhost.intrinsic_host.invokeMethod(&intrinsic, receiver, name, &.{}, self.out_sink.output());
-    const r = maybe orelse return .{ .failed = "method dispatch failed" };
-    return outcomeFromRuntime(self, r);
+    // Route through `callMember` directly (not `invokeMethod`, which flattens
+    // every non-throw error to null) so a test method's real failure surfaces.
+    var host = vmMakeHost(self, self.out_sink.output());
+    const r = try host.callMember(self.allocator, receiver, name, &.{});
+    return outcomeFromEval(self, r);
 }
 
 /// Prepare the Vm, run `body` (which invokes entry points via the call

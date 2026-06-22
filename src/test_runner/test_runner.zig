@@ -135,9 +135,25 @@ fn qualify(gpa: Allocator, pkg: []const u8, name: []const u8) []const u8 {
     return std.fmt.allocPrint(gpa, "{s}.{s}", .{ pkg, name }) catch "";
 }
 
+/// One class declaration plus the imports of its declaring file (needed to
+/// resolve `kotlin.test` annotations on its members).
+const ClassEntry = struct { cls: *const ast.Class, imports: []const ast.ImportDecl };
+
 fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.KotlinFile) Allocator.Error!Plan {
     var top: std.ArrayList(TopTest) = .empty;
     var classes: std.ArrayList(ClassTests) = .empty;
+
+    // Index every class by simple name so a concrete class can pull in the
+    // `@Test` methods it inherits from abstract base classes (the stdlib tests
+    // put the test bodies in abstract `…Tests` bases and run them through
+    // concrete subclasses).
+    var index = std.StringHashMap(ClassEntry).init(gpa);
+    defer index.deinit();
+    for (user_asts) |*file| {
+        for (file.decls) |*d| {
+            if (d.* == .Class) try index.put(d.Class.name.name, .{ .cls = &d.Class, .imports = file.imports });
+        }
+    }
 
     for (user_asts) |*file| {
         const pkg = filePackage(gpa, file);
@@ -155,7 +171,10 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
                     });
                 },
                 .Class => |*c| {
-                    const ct = try discoverClass(gpa, module, file, c, pkg);
+                    // An abstract class is never instantiated directly; its
+                    // tests run through concrete subclasses (below).
+                    if (c.is_abstract) continue;
+                    const ct = try discoverClass(gpa, module, &index, file, c, pkg);
                     if (ct) |found| try classes.append(gpa, found);
                 },
                 else => {},
@@ -168,9 +187,57 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
     };
 }
 
+/// Collect `@Test`/`@BeforeTest`/`@AfterTest` methods of `class_name` and,
+/// transitively, of its supertypes resolvable in `index`. Tests/befores/afters
+/// are de-duplicated by name (a most-derived declaration wins), so an override
+/// is not run twice. `display_class` is the concrete class the tests run under.
+fn collectClassMethods(
+    gpa: Allocator,
+    index: *const std.StringHashMap(ClassEntry),
+    class_name: []const u8,
+    display_class: []const u8,
+    methods: *std.ArrayList(Method),
+    befores: *std.ArrayList([]const u8),
+    afters: *std.ArrayList([]const u8),
+    seen: *std.StringHashMap(void),
+    visited: *std.StringHashMap(void),
+) Allocator.Error!void {
+    if (visited.contains(class_name)) return;
+    try visited.put(class_name, {});
+    const entry = index.get(class_name) orelse return;
+    const imports = entry.imports;
+    for (entry.cls.members) |*m| {
+        if (m.* != .Function) continue;
+        const f = &m.Function;
+        if (hasKotlinTestAnno(f.annotations, imports, "BeforeTest") and !seen.contains(f.name.name)) {
+            try befores.append(gpa, try gpa.dupe(u8, f.name.name));
+        }
+        if (hasKotlinTestAnno(f.annotations, imports, "AfterTest") and !seen.contains(f.name.name)) {
+            try afters.append(gpa, try gpa.dupe(u8, f.name.name));
+        }
+        if (hasKotlinTestAnno(f.annotations, imports, "Test") and !seen.contains(f.name.name)) {
+            try methods.append(gpa, .{
+                .display = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ display_class, f.name.name }),
+                .name = try gpa.dupe(u8, f.name.name),
+                .ignored = hasKotlinTestAnno(f.annotations, imports, "Ignore"),
+            });
+        }
+        if (hasKotlinTestAnno(f.annotations, imports, "Test") or
+            hasKotlinTestAnno(f.annotations, imports, "BeforeTest") or
+            hasKotlinTestAnno(f.annotations, imports, "AfterTest"))
+        {
+            try seen.put(f.name.name, {});
+        }
+    }
+    for (entry.cls.supertypes) |*st| {
+        try collectClassMethods(gpa, index, st.name.name, display_class, methods, befores, afters, seen, visited);
+    }
+}
+
 fn discoverClass(
     gpa: Allocator,
     module: *const ir.Module,
+    index: *const std.StringHashMap(ClassEntry),
     file: *const ast.KotlinFile,
     c: *const ast.Class,
     pkg: []const u8,
@@ -178,23 +245,11 @@ fn discoverClass(
     var methods: std.ArrayList(Method) = .empty;
     var befores: std.ArrayList([]const u8) = .empty;
     var afters: std.ArrayList([]const u8) = .empty;
-    for (c.members) |*m| {
-        if (m.* != .Function) continue;
-        const f = &m.Function;
-        if (hasKotlinTestAnno(f.annotations, file.imports, "BeforeTest")) {
-            try befores.append(gpa, try gpa.dupe(u8, f.name.name));
-        }
-        if (hasKotlinTestAnno(f.annotations, file.imports, "AfterTest")) {
-            try afters.append(gpa, try gpa.dupe(u8, f.name.name));
-        }
-        if (hasKotlinTestAnno(f.annotations, file.imports, "Test")) {
-            try methods.append(gpa, .{
-                .display = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ c.name.name, f.name.name }),
-                .name = try gpa.dupe(u8, f.name.name),
-                .ignored = hasKotlinTestAnno(f.annotations, file.imports, "Ignore"),
-            });
-        }
-    }
+    var seen = std.StringHashMap(void).init(gpa);
+    defer seen.deinit();
+    var visited = std.StringHashMap(void).init(gpa);
+    defer visited.deinit();
+    try collectClassMethods(gpa, index, c.name.name, c.name.name, &methods, &befores, &afters, &seen, &visited);
     if (methods.items.len == 0) {
         methods.deinit(gpa);
         befores.deinit(gpa);
