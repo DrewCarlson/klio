@@ -75,8 +75,10 @@ A subsystem module outside the core pipeline. Given test sources, it:
       upstream stdlib commonTest files through a child `klio test`.
 - [~] stdlib commonTest subset green (bootstrap proof), expanding monotonically.
       Passing today (referenced in place from the submodule): `utils/HashCodeTest`,
-      `collections/IteratorsTest`, `utils/LazyTest`. Grow the `PASSING` list in
-      the itest as the interpreter closes the gaps below.
+      `collections/IteratorsTest`, `collections/HashMapCompactTest`, `utils/LazyTest`,
+      `utils/TODOTest`, `numbers/BuiltinCompanionTest`, `time/TestTimeSourceTest`,
+      `ranges/ProgressionLastElementTest`, `properties/delegation/lazy/LazyValuesTest`.
+      Grow the `PASSING` list in the itest as the interpreter closes the gaps below.
 
 ## Interpreter fixes surfaced while bootstrapping
 
@@ -90,13 +92,14 @@ A subsystem module outside the core pipeline. Given test sources, it:
   intrinsic instead of the `.Class` value (so `isInstance` mis-dispatched) —
   fixed by carrying the resolved class id on the reified binding's `LoadGlobal`.
 
+- `assertFailsWith<T>` / `assertIs<T>` for a builtin: an inline call with a
+  defaulted leading param plus a trailing lambda mapped the lambda to the
+  defaulted param, leaving a required param unfilled, so the splice was declined
+  and the reified class id was lost. Fixed by applying Kotlin's trailing-lambda
+  argument mapping in `tryInlineCallWithTypeArgs`.
+
 ### Open (each blocks more of the stdlib commonTest suite)
 
-- `assertFailsWith<T>` through the pack: the reified type argument flows through
-  the pack's nested inline overloads (`assertFailsWith<T>` ->
-  `assertFailsWith(KClass<T>, ...)` -> `checkResultIsFailure`) and a builtin `T`
-  still reaches `isInstance` as the intrinsic. The single-inline-hop case works;
-  the cross-file nested-inline-hop case does not yet.
 - `klio run` (baked stdlib-image path) does not register top-level computed-val
   getters, so the pack `asserter` is unresolved when a program is run via the
   image fast-path. `klio test` (legacy build path) is unaffected, so the proof

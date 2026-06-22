@@ -17,6 +17,12 @@ const PASSING = [_][]const u8{
     "kotlin/libraries/stdlib/test/utils/HashCodeTest.kt",
     "kotlin/libraries/stdlib/test/collections/IteratorsTest.kt",
     "kotlin/libraries/stdlib/test/utils/LazyTest.kt",
+    "kotlin/libraries/stdlib/test/utils/TODOTest.kt",
+    "kotlin/libraries/stdlib/test/numbers/BuiltinCompanionTest.kt",
+    "kotlin/libraries/stdlib/test/time/TestTimeSourceTest.kt",
+    "kotlin/libraries/stdlib/test/ranges/ProgressionLastElementTest.kt",
+    "kotlin/libraries/stdlib/test/collections/HashMapCompactTest.kt",
+    "kotlin/libraries/stdlib/test/properties/delegation/lazy/LazyValuesTest.kt",
 };
 
 const SCRATCH_HOME = "/tmp/klio_itest_stdlibtest_home";
