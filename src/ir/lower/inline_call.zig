@@ -572,8 +572,26 @@ pub fn tryInlineCallWithTypeArgs(
     var ordered = try b.allocator.alloc(?*const Expr, f.params.len);
     defer b.allocator.free(ordered);
     for (ordered) |*slot| slot.* = null;
+    // A trailing lambda fills the last parameter even when earlier
+    // defaulted parameters are omitted (`assertFailsWith<T> { … }` skips
+    // the defaulted `message` and binds the lambda to `block`). Mapping it
+    // 1:1 from the front would land it on the first param and leave the
+    // last (function-typed, no default) one unfilled, declining the splice.
+    const last_is_trailing_lambda = args.len > 0 and
+        (args.len > arg_names.len or arg_names[args.len - 1] == null) and
+        switch (args[args.len - 1]) {
+            .Lambda, .AnonFun => true,
+            else => false,
+        };
+    const lambda_to_last = last_is_trailing_lambda and
+        args.len <= f.params.len and
+        f.params.len > 0;
+    if (lambda_to_last) {
+        ordered[f.params.len - 1] = &args[args.len - 1];
+    }
+    const positional_n = if (lambda_to_last) args.len - 1 else args.len;
     var next_pos: usize = 0;
-    for (args, 0..) |*a, i| {
+    for (args[0..positional_n], 0..) |*a, i| {
         const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
         if (nm) |name| {
             const idx = paramIndex(f, name) orelse return null;
@@ -805,7 +823,14 @@ pub fn tryInlineCallWithTypeArgs(
             } else {
                 const cls_reg = b.allocReg();
                 const arg_name = try b.module.internConst(b.allocator, .{ .String = a.name.name });
-                try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name } });
+                // Carry the resolved class identity so a builtin/stdlib type
+                // whose bare name otherwise resolves to a constructor
+                // intrinsic (an exception class) binds the `.Class` value
+                // instead, matching how a concrete `Type::class` receiver
+                // lowers. Without it `T::class` for such a type yields the
+                // intrinsic and member dispatch (`isInstance`) misses.
+                const cls_pick: ?ir.ClassId = b.module.classIdIndexed(a.name.name, b.self_package, a.name.span.file) orelse b.module.classId(a.name.name);
+                try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name, .class = cls_pick } });
                 cls_reg_opt = cls_reg;
             }
         } else if (callableRefParamFor(f, ordered, tp.name.name)) |pi| {
