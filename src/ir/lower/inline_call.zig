@@ -805,7 +805,14 @@ pub fn tryInlineCallWithTypeArgs(
             } else {
                 const cls_reg = b.allocReg();
                 const arg_name = try b.module.internConst(b.allocator, .{ .String = a.name.name });
-                try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name } });
+                // Carry the resolved class identity so a builtin/stdlib type
+                // whose bare name otherwise resolves to a constructor
+                // intrinsic (an exception class) binds the `.Class` value
+                // instead, matching how a concrete `Type::class` receiver
+                // lowers. Without it `T::class` for such a type yields the
+                // intrinsic and member dispatch (`isInstance`) misses.
+                const cls_pick: ?ir.ClassId = b.module.classIdIndexed(a.name.name, b.self_package, a.name.span.file) orelse b.module.classId(a.name.name);
+                try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name, .class = cls_pick } });
                 cls_reg_opt = cls_reg;
             }
         } else if (callableRefParamFor(f, ordered, tp.name.name)) |pi| {

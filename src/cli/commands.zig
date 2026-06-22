@@ -278,6 +278,24 @@ pub fn runFileIrVm(
     return runBuilt(gpa, all_asts.items, loaded.bindings, &map, "error: no main function found");
 }
 
+const TestRunCtx = struct {
+    gpa: std.mem.Allocator,
+    vm: *Vm,
+    user_asts: []const KotlinFile,
+    out: runtime.Output,
+    time_mode: interp_ir.TimeMode,
+    reclaim: bool,
+};
+
+/// Big-stack worker entry: re-establish the thread-local coroutine time mode
+/// and reclaim flag (a fresh OS thread), then discover and run the tests.
+fn testRunEntry(ctx: TestRunCtx) test_runner.Report {
+    interp_ir.setCoroutineTimeMode(ctx.time_mode);
+    runtime.setReclaim(ctx.reclaim);
+    return test_runner.runTests(ctx.gpa, ctx.vm, ctx.user_asts, ctx.out) catch
+        test_runner.Report{ .results = &.{}, .passed = 0, .failed = 1, .skipped = 0 };
+}
+
 /// `klio test` — discover and run `kotlin.test` `@Test` functions in the
 /// given files/directories. Returns 1 if any test fails (or the module
 /// fails to build), 0 otherwise.
@@ -358,7 +376,16 @@ pub fn runTestFiles(
     defer span.active_map = null;
 
     var stdout = io.StdoutSink{};
-    var report = test_runner.runTests(gpa, &vm, user_asts.items, stdout.output()) catch return 1;
+    // Run on the large interpreter stack: a test exercises arbitrary
+    // (possibly deep) program recursion, same as `main`.
+    var report = runtime.runOnBigStack(TestRunCtx, test_runner.Report, testRunEntry, .{
+        .gpa = gpa,
+        .vm = &vm,
+        .user_asts = user_asts.items,
+        .out = stdout.output(),
+        .time_mode = interp_ir.coroutineTimeMode(),
+        .reclaim = runtime.reclaimEnabled(),
+    });
     defer report.deinit(gpa);
 
     for (report.results) |r| {
