@@ -3419,6 +3419,41 @@ pub fn setFuncEnabledForTest(on: bool) void {
 
 threadlocal var states: std.AutoHashMapUnmanaged(usize, *FuncJit) = .empty;
 
+/// Total compiled native units (loops + function bodies) cached on this thread.
+/// Bounds the per-thread cache so a long-running process — or a worker that runs
+/// many programs in the in-process test harness — does not retain compiled code
+/// without limit. Eviction happens only at a safe point (`evictIfOverBudget`,
+/// called when no native frame is on the stack).
+threadlocal var compiled_units: usize = 0;
+/// Compiled-unit ceiling per thread before the cache is dropped wholesale at the
+/// next safe point. High enough that an ordinary program never trips it; a
+/// pathological generator or a long-lived multi-program worker recompiles its hot
+/// code after a clear instead of growing unbounded.
+const COMPILED_UNIT_CAP: usize = 2048;
+
+fn noteCompiled() void {
+    compiled_units += 1;
+}
+
+/// Drop this thread's JIT cache if it has grown past the ceiling. MUST be called
+/// only at a safe point — no compiled code on the stack (the interpreter at
+/// `eval_depth == 0`) — since it frees the mmap'd exec buffers.
+pub fn evictIfOverBudget() void {
+    if (compiled_units <= COMPILED_UNIT_CAP) return;
+    if (debugEnabled()) std.debug.print("[jit] evicting {d} compiled unit(s)\n", .{compiled_units});
+    clearStates();
+}
+
+fn clearStates() void {
+    var it = states.valueIterator();
+    while (it.next()) |s| {
+        s.*.deinit();
+        std.heap.page_allocator.destroy(s.*);
+    }
+    states.clearAndFree(std.heap.page_allocator);
+    compiled_units = 0;
+}
+
 /// The compiled whole-function body for `func`, if one was built (function-JIT
 /// mode). Used by the call trampoline to recurse natively into a compiled callee
 /// without rebuilding an interpreter frame.
@@ -3435,12 +3470,7 @@ pub fn compiledFunc(func: *const Func) ?*const CompiledLoop {
 /// buffers) from a finished program is not retained — and a reallocated module's
 /// reused `*Func` address cannot inherit a stale compiled body.
 pub fn resetForTest() void {
-    var it = states.valueIterator();
-    while (it.next()) |s| {
-        s.*.deinit();
-        std.heap.page_allocator.destroy(s.*);
-    }
-    states.clearAndFree(std.heap.page_allocator);
+    clearStates();
 }
 
 fn forFunc(func: *const Func) ?*FuncJit {
@@ -3811,6 +3841,7 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
         if (compiled == null) return null;
         if (debugEnabled()) std.debug.print("[jit] compiled function {s}\n", .{func.name});
         fj.func_jit = compiled;
+        noteCompiled();
     }
     if (fj.func_jit == null) return null;
     const cl = &fj.func_jit.?;
@@ -3856,6 +3887,7 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
         }
         if (debugEnabled()) std.debug.print("[jit] compiled {s} block {d}\n", .{ func.name, bi });
         fj.loops.put(fj.a, bi, compiled) catch return null;
+        noteCompiled();
     }
 
     const entry = fj.loops.get(bi).?;

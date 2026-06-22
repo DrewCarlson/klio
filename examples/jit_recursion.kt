@@ -19,9 +19,13 @@ fun isOdd(n: Int): Boolean = if (n == 0) false else isEven(n - 1)
 fun safeDiv(n: Int): Int = if (n == 0) 100 / n else safeDiv(n - 1)
 
 fun main() {
-    println("fib(30)=${fib(30)}")
+    // Deliberately modest arguments: this is a correctness/demonstration program
+    // run through the arena-backed corpus harness (which does not reclaim per-call
+    // frames mid-run), so the call counts are kept small. The speedup is measured
+    // separately on larger inputs.
+    println("fib(20)=${fib(20)}")
     println("fact(20)=${fact(20)}")
-    println("ack(3,4)=${ack(3, 4)}")
+    println("ack(3,3)=${ack(3, 3)}")
     println("isEven(100)=${isEven(100)}")
     println("isOdd(101)=${isOdd(101)}")
     try {

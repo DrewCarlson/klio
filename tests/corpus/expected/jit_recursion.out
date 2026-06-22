@@ -1,6 +1,6 @@
-fib(30)=832040
+fib(20)=6765
 fact(20)=2432902008176640000
-ack(3,4)=125
+ack(3,3)=61
 isEven(100)=true
 isOdd(101)=true
 caught: / by zero

@@ -1268,7 +1268,12 @@ fn runFrame(
         return errResult(.{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" });
     }
     eval_depth += 1;
-    defer eval_depth -= 1;
+    defer {
+        eval_depth -= 1;
+        // Safe point: back at the outermost activation, no native JIT frame is on
+        // the stack, so the JIT cache can be trimmed if it has grown past its cap.
+        if (eval_depth == 0) jit_loop.evictIfOverBudget();
+    }
     return runFrameInner(H, allocator, module, frame, try_stack, cur, resume_idx, null, host);
 }
 
