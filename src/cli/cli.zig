@@ -44,6 +44,10 @@ const USAGE =
     \\  repl                       Start an interactive REPL.
     \\  pack <subcommand>          Build or inspect a `.klio-pack` artifact.
     \\
+    \\Performance (any command; also via the KLIO_OPT env var):
+    \\  --opt <fast|safe|off>      fast (default): JIT + bounded GC. safe: no JIT.
+    \\                             off: interpreter + never-free arena.
+    \\
     \\Run options:
     \\  --ir-vm                    Accepted for compatibility (no-op).
     \\  --virtual-time             Use deterministic virtual time for coroutines.
@@ -147,7 +151,13 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, args[i]) catch return 2;
         } else if (optionValue(a, "--feature=")) |v| {
             feature_specs.append(gpa, v) catch return 2;
-        } else if (std.mem.startsWith(u8, a, "--")) {
+        } else if (perfOptValue(a, args, &i)) |v| {
+            // Applied at startup; validate here so a typo is rejected, not run.
+            if (runtime.perf.parseProfile(v) == null) {
+                printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
+                return 2;
+            }
+        } else if (std.mem.startsWith(u8, a, "--") or std.mem.startsWith(u8, a, "-O")) {
             printErr(gpa, "error: unknown option `{s}`\n", .{a});
             return 2;
         } else {
@@ -190,7 +200,13 @@ fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, args[i]) catch return 2;
         } else if (optionValue(a, "--feature=")) |v| {
             feature_specs.append(gpa, v) catch return 2;
-        } else if (std.mem.startsWith(u8, a, "--")) {
+        } else if (perfOptValue(a, args, &i)) |v| {
+            // Applied at startup; validate here so a typo is rejected, not run.
+            if (runtime.perf.parseProfile(v) == null) {
+                printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
+                return 2;
+            }
+        } else if (std.mem.startsWith(u8, a, "--") or std.mem.startsWith(u8, a, "-O")) {
             printErr(gpa, "error: unknown option `{s}`\n", .{a});
             return 2;
         } else {
@@ -240,7 +256,13 @@ fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, args[i]) catch return 2;
         } else if (optionValue(a, "--feature=")) |v| {
             feature_specs.append(gpa, v) catch return 2;
-        } else if (std.mem.startsWith(u8, a, "--")) {
+        } else if (perfOptValue(a, args, &i)) |v| {
+            // Applied at startup; validate here so a typo is rejected, not run.
+            if (runtime.perf.parseProfile(v) == null) {
+                printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
+                return 2;
+            }
+        } else if (std.mem.startsWith(u8, a, "--") or std.mem.startsWith(u8, a, "-O")) {
             printErr(gpa, "error: unknown option `{s}`\n", .{a});
             return 2;
         } else {
@@ -323,6 +345,24 @@ fn parseFormat(s: []const u8) ?DiagFormat {
 /// `--name=value` -> `value`, else null.
 fn optionValue(arg: []const u8, prefix: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, arg, prefix)) return arg[prefix.len..];
+    return null;
+}
+
+/// The performance profile flag (`--opt <p>` / `--opt=<p>` / `-O<p>` / `-O <p>`)
+/// is applied at process start (see `main.zig`), before the allocator is chosen.
+/// Subcommand parsers call this to consume it as a recognized no-op. Returns
+/// `null` if `a` is not the flag; otherwise the flag's value (empty if missing),
+/// advancing `i` past a separate value argument.
+fn perfOptValue(a: []const u8, args: []const []const u8, i: *usize) ?[]const u8 {
+    if (std.mem.eql(u8, a, "--opt") or std.mem.eql(u8, a, "-O")) {
+        if (i.* + 1 < args.len) {
+            i.* += 1;
+            return args[i.*];
+        }
+        return "";
+    }
+    if (optionValue(a, "--opt=")) |v| return v;
+    if (std.mem.startsWith(u8, a, "-O") and a.len > 2) return a[2..];
     return null;
 }
 

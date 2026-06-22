@@ -31,9 +31,13 @@ pub const setReclaim = objcell.setReclaim;
 pub const reclaimEnabled = objcell.reclaimEnabled;
 pub const freeScratch = objcell.freeScratch;
 pub const reclaimRequested = objcell.reclaimRequested;
-pub const AllocChoice = objcell.AllocChoice;
-pub const allocChoice = objcell.allocChoice;
 pub const getenvSlice = objcell.getenvSlice;
+
+/// Consolidated runtime performance configuration (`--opt` / `KLIO_OPT`): the
+/// JIT tiers and the memory backend, resolved once from a single profile.
+pub const perf = @import("perf.zig");
+pub const AllocChoice = perf.AllocChoice;
+pub const allocChoice = perf.allocChoice;
 // Tracing GC (KGC) — see gc.zig / plans/GC.md.
 pub const gc = objcell.gc;
 // Page-returning slab allocator for the GC backend (keeps RSS tracking the

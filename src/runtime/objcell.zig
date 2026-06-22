@@ -142,24 +142,6 @@ pub fn reclaimRequested() bool {
     return on;
 }
 
-/// Which backing allocator the process entry point should install. Distinct
-/// from `reclaimRequested` because `free` mode wants a freeing allocator with
-/// reclaim OFF.
-pub const AllocChoice = enum { arena, smp, debug, gc };
-pub fn allocChoice() AllocChoice {
-    // Default (unset): the tracing GC (`gc`) — the only mode that bounds memory
-    // for a long-running process, and now safe as the universal default: the
-    // coroutine GC-root gaps that let a mid-host-call collection reclaim a live
-    // value (the channel-write use-after-free) are closed, and the per-request
-    // raw-temp leaks that ballooned ktor RSS are fixed. `arena` (never-free) and
-    // the freeing `smp`/`debug` modes stay explicitly selectable for testing.
-    const v = getenvSlice("KLIO_RECLAIM") orelse return .gc;
-    if (v.len == 0 or std.mem.eql(u8, v, "gc")) return .gc; // tracing GC (KGC)
-    if (std.mem.eql(u8, v, "arena") or std.mem.eql(u8, v, "0")) return .arena;
-    if (std.mem.eql(u8, v, "debug")) return .debug;
-    return .smp; // "free", "smp", "1", or any other non-zero value
-}
-
 /// Reader/writer spin lock. `state` encodes the lock as `RefCell` does
 /// its flag: `0` free, `n > 0` n active readers, `WRITER` (the sign bit)
 /// exclusive writer. Many readers proceed concurrently; a writer is
