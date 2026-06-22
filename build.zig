@@ -188,6 +188,7 @@ const stdlib_data_dirs = [_][]const u8{
     "kotlin-klio/kotlin-time",
     "kotlin-klio/kotlin-util",
     "kotlin-klio/kotlin-random",
+    "kotlin-klio/kotlin-text",
 };
 
 /// Read by the SourcePacks/CompiledPacks load modes (each pack's klio.toml is
