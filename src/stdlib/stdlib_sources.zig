@@ -217,6 +217,7 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-text/TextActuals.kt",
     "kotlin-collections/MapActuals.kt",
     "kotlin-internal/ThrowableActuals.kt",
+    "kotlin-uuid/UuidActuals.kt",
 };
 
 /// The local upstream Kotlin checkout's `libraries/stdlib` directory, relative
