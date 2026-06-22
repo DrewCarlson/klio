@@ -102,6 +102,7 @@ pub const lowerFunctionBodyInto = mod.lowerFunctionBodyInto;
 pub const lowerMethod = mod.lowerMethod;
 pub const lowerMethodWithPrivate = mod.lowerMethodWithPrivate;
 pub const setLowerAnonCaptures = mod.setLowerAnonCaptures;
+pub const resolveAnnotationNames = mod.resolveAnnotationNames;
 
 // Expression / statement lowering surface.
 pub const lowerExpr = mod.lowerExpr;

@@ -1,0 +1,21 @@
+[library]
+id = "kotlin.test"
+version = "2.1.0"
+abi = 1
+implicit_packages = []
+auto_bindings = false
+
+# The common `kotlin.test` public API, consumed directly from the in-repo
+# `kotlin` submodule via the `upstream` symlink (no vendored copies). `kotlin.test`
+# is materialized from the submodule alongside `stdlib`. `klioMain` holds only the
+# platform actuals: the annotation classes and the `expect` functions
+# (`lookupAsserter`, `AssertionErrorWithCause`, `todo`, `checkResultIsFailure`).
+
+[[source]]
+root = "upstream/common/src/main/kotlin"
+
+[[source]]
+root = "klioMain"
+
+[[deps]]
+id = "stdlib"

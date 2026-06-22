@@ -29,6 +29,61 @@ const StringFuncIdMap = std.StringHashMap(FuncId);
 /// the public lowering entry points so cross-class member lookups resolve.
 pub const FileClasses = std.StringHashMap(FF(ast.Class));
 
+/// Resolve each source annotation to its fully-qualified candidate names
+/// using the declaring file's imports. A qualified annotation path
+/// (`@a.b.C`) yields the joined dotted path. A simple name `N` yields the
+/// FQN of every named import bound to `N` (the alias's import path when an
+/// alias matches), `A.B.N` for each `import A.B.*`, and always the bare
+/// `N` as a fallback. The returned slice is de-duplicated and owned by
+/// `module.registry.allocator`, matching the class/func side-table slices.
+pub fn resolveAnnotationNames(
+    module: *Module,
+    annotations: []const ast.Annotation,
+) Allocator.Error![]const []const u8 {
+    if (annotations.len == 0) return &.{};
+    const a = module.registry.allocator;
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(a);
+    for (annotations) |*ann| {
+        if (ann.path.len == 0) continue;
+        const file = ann.span.file;
+        if (ann.path.len > 1) {
+            const dotted = try joinIdents(a, ann.path, ".");
+            try appendUnique(a, &out, dotted);
+            continue;
+        }
+        const name = ann.path[0].name;
+        for (module.importAliasPathsIn(file, name)) |p| {
+            try appendUnique(a, &out, p.fqn);
+        }
+        if (module.registry.import_wildcards.get(file)) |list| {
+            for (list.items) |pkg| {
+                const fqn = try std.fmt.allocPrint(a, "{s}.{s}", .{ pkg, name });
+                try appendUnique(a, &out, fqn);
+            }
+        }
+        try appendUnique(a, &out, name);
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn joinIdents(a: Allocator, idents: []const ast.Ident, sep: []const u8) Allocator.Error![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(a);
+    for (idents, 0..) |id, i| {
+        if (i != 0) try buf.appendSlice(a, sep);
+        try buf.appendSlice(a, id.name);
+    }
+    return buf.toOwnedSlice(a);
+}
+
+fn appendUnique(a: Allocator, out: *std.ArrayList([]const u8), s: []const u8) Allocator.Error!void {
+    for (out.items) |e| {
+        if (std.mem.eql(u8, e, s)) return;
+    }
+    try out.append(a, s);
+}
+
 /// Bind function parameters into the current scope. Each param is loaded
 /// into a fresh register via `Inst.LoadParam` so subsequent `Path { name }`
 /// reads route through the same register.
@@ -965,6 +1020,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // that merely spells its name `this`.
     func.has_receiver_param = implicit_params.len != 0 and
         std.mem.eql(u8, implicit_params[0], "this");
+    func.annotation_names = try resolveAnnotationNames(module, f.annotations);
     return func;
 }
 
@@ -1064,6 +1120,64 @@ fn cloneStringFuncIdMap(allocator: Allocator, src: *const StringFuncIdMap) Alloc
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "resolveAnnotationNames yields fqn candidates from imports" {
+    // Arena-backed so the registry's import strings and the freshly joined
+    // result candidates (mixed-ownership) are reclaimed in one shot.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    const ra = m.registry.allocator;
+    const file: ir.FileId = @enumFromInt(0);
+
+    // import kotlin.test.Test ; import t.Skip as Ignore ; import org.junit.*
+    // The registry owns and frees every fqn/segs/wildcard string on deinit,
+    // so each is duped into the registry allocator.
+    {
+        var named = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(ra);
+        var test_paths: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
+        try test_paths.append(ra, .{ .fqn = try ra.dupe(u8, "kotlin.test.Test"), .segs = try ra.alloc([]const u8, 0) });
+        try named.put("Test", test_paths);
+        var ignore_paths: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
+        try ignore_paths.append(ra, .{ .fqn = try ra.dupe(u8, "t.Skip"), .segs = try ra.alloc([]const u8, 0) });
+        try named.put("Ignore", ignore_paths);
+        try m.registry.import_aliases.put(file, named);
+
+        var wild: std.ArrayList([]const u8) = .empty;
+        try wild.append(ra, try ra.dupe(u8, "org.junit"));
+        try m.registry.import_wildcards.put(file, wild);
+    }
+
+    const sp = ast.Span{ .file = file, .start = 0, .end = 0 };
+    var test_id = [_]ast.Ident{.{ .name = "Test", .span = sp }};
+    var ignore_id = [_]ast.Ident{.{ .name = "Ignore", .span = sp }};
+    var qual_ids = [_]ast.Ident{ .{ .name = "kotlin", .span = sp }, .{ .name = "test", .span = sp }, .{ .name = "AfterTest", .span = sp } };
+    const anns = [_]ast.Annotation{
+        .{ .use_site = null, .path = &test_id, .type_args = &.{}, .args = &.{}, .arg_names = &.{}, .span = sp },
+        .{ .use_site = null, .path = &ignore_id, .type_args = &.{}, .args = &.{}, .arg_names = &.{}, .span = sp },
+        .{ .use_site = null, .path = &qual_ids, .type_args = &.{}, .args = &.{}, .arg_names = &.{}, .span = sp },
+    };
+
+    const got = try resolveAnnotationNames(&m, &anns);
+    // @Test: named import + wildcard candidate + bare fallback.
+    try expectContains(got, "kotlin.test.Test");
+    try expectContains(got, "org.junit.Test");
+    try expectContains(got, "Test");
+    // @Ignore: aliased import path (the FQN behind the alias) + wildcard + bare.
+    try expectContains(got, "t.Skip");
+    try expectContains(got, "org.junit.Ignore");
+    try expectContains(got, "Ignore");
+    // Qualified path passes through verbatim.
+    try expectContains(got, "kotlin.test.AfterTest");
+}
+
+fn expectContains(haystack: []const []const u8, needle: []const u8) !void {
+    for (haystack) |s| {
+        if (std.mem.eql(u8, s, needle)) return;
+    }
+    return error.TestExpectedEqual;
 }
 
 test "bind params loads each param and marks it" {

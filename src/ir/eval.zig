@@ -2952,6 +2952,20 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             var v: Value = undefined;
             if (found) |fv| {
                 v = fv;
+            } else if (comptime @hasDecl(H, "callFunc")) {
+                // A top-level `val`/`var` declared with only a custom getter
+                // has no global binding; re-run its 0-arg getter on each read.
+                if (frame.module.registry.top_level_prop_getters.get(name_str)) |getter_fid| {
+                    switch (try host.callFunc(allocator, frame.module, getter_fid, &.{})) {
+                        .ok => |gv| {
+                            try frame.write(lg.dst, gv);
+                            return .cont;
+                        },
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
+                const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
+                return raiseStep(frame, .{ .Unbound = msg });
             } else {
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                 return raiseStep(frame, .{ .Unbound = msg });

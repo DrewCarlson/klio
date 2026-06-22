@@ -38,6 +38,7 @@ const USAGE =
     \\  lex <file>                 Lex a source file and print tokens.
     \\  parse <file>               Parse a source file and print the AST.
     \\  run <file...> [options]    Run one or more `.kt` source files.
+    \\  test <file|dir...>         Run `kotlin.test` `@Test` functions.
     \\  check <file...> [options]  Type-check `.kt` files and emit diagnostics.
     \\  bake [file...] [options]   Bake the stdlib image cache (`klio run` does
     \\                             this automatically on first use).
@@ -98,6 +99,8 @@ pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
         return runParseCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "run")) {
         return runRunCmd(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "test")) {
+        return runTestCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "check")) {
         return runCheckCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "repl")) {
@@ -180,6 +183,54 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         return commands.runFileIrVm(gpa, files.items[0], &requested);
     }
     return commands.runModuleFiles(gpa, files.items, &requested);
+}
+
+fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(gpa);
+    var feature_specs: std.ArrayList([]const u8) = .empty;
+    defer feature_specs.deinit(gpa);
+    var virtual_time = false;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--virtual-time")) {
+            virtual_time = true;
+        } else if (std.mem.eql(u8, a, "--feature")) {
+            i += 1;
+            if (i >= args.len) {
+                printErr(gpa, "error: --feature requires a `<pack>/<feature>` value\n", .{});
+                return 2;
+            }
+            feature_specs.append(gpa, args[i]) catch return 2;
+        } else if (optionValue(a, "--feature=")) |v| {
+            feature_specs.append(gpa, v) catch return 2;
+        } else if (perfOptValue(a, args, &i)) |v| {
+            if (runtime.perf.parseProfile(v) == null) {
+                printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
+                return 2;
+            }
+        } else if (std.mem.startsWith(u8, a, "--") or std.mem.startsWith(u8, a, "-O")) {
+            printErr(gpa, "error: unknown option `{s}`\n", .{a});
+            return 2;
+        } else {
+            paths.append(gpa, a) catch return 2;
+        }
+    }
+
+    if (virtual_time) {
+        interp_ir.setCoroutineTimeMode(.Virtual);
+    }
+
+    var requested = parseRequestedFeatures(gpa, feature_specs.items);
+    defer deinitRequestedFeatures(&requested);
+
+    if (paths.items.len == 0) {
+        printErr(gpa, "usage: klio test <file.kt | dir> [...]\n", .{});
+        return 2;
+    }
+    return commands.runTestFiles(gpa, paths.items, &requested);
 }
 
 fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {

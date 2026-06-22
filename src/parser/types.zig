@@ -362,11 +362,15 @@ pub fn parseType(p: *Parser) ?TypeRef {
     }
     // Receiver-typed function type: `T.(params) -> R`. We look for `.`
     // immediately followed by `(`; bare `.` after a type would be a path
-    // continuation handled elsewhere.
-    if (isKind(peekKind(p), .Dot) and
+    // continuation handled elsewhere. A nullable receiver `T?.(params) -> R`
+    // lexes its `?.` as a single `QuestionDot`; accept that form too and
+    // record the receiver as nullable.
+    const recv_qdot = isKind(peekKind(p), .QuestionDot);
+    if ((isKind(peekKind(p), .Dot) or recv_qdot) and
         p.pos + 1 < p.tokens.len and isKind(p.tokens[p.pos + 1].kind, .LParen))
     {
-        _ = support.bump(p); // '.'
+        if (recv_qdot) ty.nullable = true;
+        _ = support.bump(p); // '.' or '?.'
         const parsed = parseFunctionTypeParams(p) orelse return null;
         const params = parsed.params;
         const rp = parsed.rp;
@@ -661,6 +665,12 @@ pub fn trySkipGenericCallArgs(p: *const Parser) bool {
                     if (next) |n| {
                         return switch (n) {
                             .LParen, .LBrace, .Dot, .QuestionDot, .ColonColon => true,
+                            // `Array<*>?::member` — a nullable-receiver
+                            // callable reference: `>` then `?` then `::`.
+                            .QuestNoWs, .QuestWs => blk: {
+                                const after: ?TokenKind = if (i + 2 < p.tokens.len) p.tokens[i + 2].kind else null;
+                                break :blk after != null and std.meta.activeTag(after.?) == .ColonColon;
+                            },
                             else => false,
                         };
                     }
