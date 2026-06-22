@@ -88,24 +88,25 @@ pub fn finalize(code: []const u8) JitError!ExecBuf {
     return finalizePosix(code);
 }
 
-/// Linux/other: allocate writable, copy, seal as read+execute, then sync the
+/// Linux/Android: allocate writable, copy, seal as read+execute, then sync the
 /// instruction cache (a no-op-eliding builtin on x86, real maintenance on ARM).
 fn finalizePosix(code: []const u8) JitError!ExecBuf {
+    const linux = std.os.linux;
     const page = std.heap.pageSize();
     const sz = std.mem.alignForward(usize, @max(code.len, 1), page);
     const mem = std.posix.mmap(
         null,
         sz,
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{ .READ = true, .WRITE = true },
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
     ) catch return JitError.MapFailed;
     @memcpy(mem[0..code.len], code);
-    std.posix.mprotect(mem, std.posix.PROT.READ | std.posix.PROT.EXEC) catch {
+    if (linux.mprotect(mem.ptr, sz, .{ .READ = true, .EXEC = true }) != 0) {
         std.posix.munmap(mem);
         return JitError.ProtectFailed;
-    };
+    }
     syncICache(mem.ptr, sz);
     return .{ .mem = mem, .len = code.len };
 }
