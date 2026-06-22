@@ -364,6 +364,13 @@ pub fn string_builder_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                 }
                 try buf.ensureTotalCapacity(a, @intCast(n));
             },
+            // `StringBuilder(content: CharSequence)` — seed from another
+            // builder's current contents.
+            .StringBuilder => |sb| {
+                const g = sb.borrow();
+                defer g.deinit();
+                try buf.appendSlice(a, g.get().items);
+            },
             else => {
                 buf.deinit(a);
                 return errResult(.{ .Type = "StringBuilder takes 0 or 1 argument" });
