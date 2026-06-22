@@ -883,6 +883,7 @@ test "cqo + idiv encode the documented bytes" {
 }
 
 test "emitted signed divide and remainder match native" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     var em = Emitter.init(std.testing.allocator);
     defer em.deinit();
     // fn(rdi=a, rsi=b) -> a / b
@@ -938,6 +939,7 @@ test "SSE double op encodings match documented bytes" {
 }
 
 test "emitted double arithmetic over a slot file matches native" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     var em = Emitter.init(std.testing.allocator);
     defer em.deinit();
     // fn(rdi = *[2]f64) -> f64 : slots[0]*slots[1] + slots[0]
@@ -994,6 +996,7 @@ test "xorps encodes the documented bytes" {
 }
 
 test "emitted f32 arithmetic over a slot file matches native" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     var em = Emitter.init(std.testing.allocator);
     defer em.deinit();
     // fn(rdi = *[2]f32 packed in 8-byte slots) -> f32 : slots[0]*slots[1] + slots[0]
@@ -1014,6 +1017,7 @@ test "emitted f32 arithmetic over a slot file matches native" {
 }
 
 test "cvtsi2sd / cvttsd2si round-trip int<->double" {
+    if (comptime builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     var em = Emitter.init(std.testing.allocator);
     defer em.deinit();
     // fn(rdi=i64) -> i64 : trunc(double(rdi) * 1.5 ... ) ; use cvt both ways
