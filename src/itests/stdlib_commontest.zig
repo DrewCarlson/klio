@@ -16,8 +16,8 @@ const std = @import("std");
 const runtime = @import("runtime");
 
 /// Minimum number of stdlib commonTest cases that must pass. A ratchet: bump it
-/// up as fixes land, never down. (Total discovered today is ~1240; ~535 pass.)
-const BASELINE: usize = 525;
+/// up as fixes land, never down. (Total discovered today is ~1240; ~617 pass.)
+const BASELINE: usize = 600;
 
 const TEST_ROOT = "kotlin/libraries/stdlib/test";
 const ACTUALS = [_][]const u8{
@@ -44,10 +44,20 @@ fn runKlio(
     env: *std.process.Environ.Map,
     argv: []const []const u8,
 ) !struct { term: std.process.Child.Term, stdout: []u8, stderr: []u8 } {
-    const r = std.process.run(allocator, io, .{
+    _ = io;
+    // A fresh threaded io per spawn keeps each run's timeout timer clean.
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const r = std.process.run(allocator, threaded.io(), .{
         .argv = argv,
         .environ_map = env,
+        // A test file that makes the interpreter hang (infinite loop, not a
+        // crash) must not stall the suite; cap each child.
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(60_000), .clock = .awake } },
     }) catch |e| {
+        // A timed-out (hanging) child is reported as a blocked file, not a
+        // hard spawn failure.
+        if (e == error.Timeout) return .{ .term = .{ .exited = 124 }, .stdout = "", .stderr = "" };
         std.debug.print("stdlib_commontest: spawn {s} failed: {s}\n", .{ argv[0], @errorName(e) });
         return error.SpawnFailed;
     };
@@ -137,6 +147,9 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     var total_passed: usize = 0;
     var build_blocked: usize = 0;
     for (targets.items) |target| {
+        // Bound each child with `timeout`: a test file that makes the
+        // interpreter hang (infinite loop, not a crash) must not stall the
+        // whole suite. A killed child yields no summary -> counted as blocked.
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
