@@ -269,7 +269,10 @@ pub fn parseIntLiteral(p: *Parser, base: NumBase, suffix: IntSuffix) Expr {
     };
     const kind: ast.IntLitKind = switch (suffix) {
         .Long => .Long,
-        .UInt => .UInt,
+        // A bare `u`/`U` literal is `UInt` only when it fits in 32 bits;
+        // a larger magnitude is a `ULong` (Kotlin promotes by magnitude,
+        // `uL`/`UL` forces `ULong`).
+        .UInt => if (@as(u64, @bitCast(value)) > std.math.maxInt(u32)) .ULong else .UInt,
         .ULong => .ULong,
         .None => .Int,
     };
