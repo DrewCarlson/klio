@@ -249,9 +249,23 @@ pub fn parseIntLiteral(p: *Parser, base: NumBase, suffix: IntSuffix) Expr {
         },
     }
     const cleaned = filterOut(p, digits, '_');
-    const value: i64 = parseI64Radix(cleaned, radix) orelse blk: {
-        support.err(p, "E0010", "integer literal out of range", tok.span);
-        break :blk 0;
+    // An unsigned-suffixed literal (`u`/`uL`) ranges up to `u64::MAX`; parse the
+    // magnitude as `u64` and store its bit pattern in the `i64` value field
+    // (`kind` marks it unsigned so downstream reinterprets the bits). A signed
+    // literal stays bounded by `i64`.
+    const value: i64 = blk: {
+        if (suffix == .UInt or suffix == .ULong) {
+            if (std.fmt.parseInt(u64, cleaned, radix)) |u| {
+                break :blk @bitCast(u);
+            } else |_| {
+                support.err(p, "E0010", "integer literal out of range", tok.span);
+                break :blk 0;
+            }
+        }
+        break :blk parseI64Radix(cleaned, radix) orelse {
+            support.err(p, "E0010", "integer literal out of range", tok.span);
+            break :blk 0;
+        };
     };
     const kind: ast.IntLitKind = switch (suffix) {
         .Long => .Long,
