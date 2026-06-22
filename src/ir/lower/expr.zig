@@ -338,7 +338,25 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
             b.switchTo(body_blk);
             try b.pushLoop(null, body_blk, exit);
-            if (w.body) |body| _ = try lowerExpr(b, body);
+            // Kotlin scopes the do-body's declarations into the `while`
+            // condition; when the body is a block, lower its statements and the
+            // condition in one shared scope so `do { val x = … } while (x …)`
+            // resolves `x` instead of treating it as a stray global.
+            if (w.body) |body| {
+                if (body.* == .Block) {
+                    const block = &body.Block;
+                    try b.pushScope();
+                    try hoistMutualLocalFns(b, block);
+                    for (block.stmts) |*stmt| _ = try lowerStmt(b, stmt);
+                    b.popLoop();
+                    const c = try lowerExpr(b, w.cond);
+                    try b.popScope();
+                    b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
+                    b.switchTo(exit);
+                    return b.emitConst(.Unit);
+                }
+                _ = try lowerExpr(b, body);
+            }
             b.popLoop();
             const c = try lowerExpr(b, w.cond);
             b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
@@ -1847,7 +1865,26 @@ fn lowerLabeled(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.terminate(.{ .Goto = body_blk });
             b.switchTo(body_blk);
             try b.pushLoop(label.name, body_blk, exit);
-            if (w.body) |body| _ = try lowerExpr(b, body);
+            // Kotlin scopes the do-body's declarations into the `while`
+            // condition, so when the body is a block, lower its statements and
+            // the condition in one shared scope; otherwise the block's own
+            // scope closes first and a `do { val x = … } while (x …)` local
+            // resolves as a stray global.
+            if (w.body) |body| {
+                if (body.* == .Block) {
+                    const block = &body.Block;
+                    try b.pushScope();
+                    try hoistMutualLocalFns(b, block);
+                    for (block.stmts) |*stmt| _ = try lowerStmt(b, stmt);
+                    b.popLoop();
+                    const c = try lowerExpr(b, w.cond);
+                    try b.popScope();
+                    b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
+                    b.switchTo(exit);
+                    return b.emitConst(.Unit);
+                }
+                _ = try lowerExpr(b, body);
+            }
             b.popLoop();
             const c = try lowerExpr(b, w.cond);
             b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
