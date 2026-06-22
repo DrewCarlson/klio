@@ -63,8 +63,8 @@ const T1: E = .rcx; // rhs / len / ptr
 const T2: E = .rdx; // array element scratch
 // SSE scratch for `f64` arithmetic. A double IR register keeps its bit pattern
 // in its i64 slot and is moved in/out with `movsd`.
-const X0: jit.Emitter.Xmm = .xmm0;
-const X1: jit.Emitter.Xmm = .xmm1;
+const X0: jit.Xmm = .xmm0;
+const X1: jit.Xmm = .xmm1;
 
 /// Static type of an IR register, for normalization and reboxing. `object` marks
 /// a register that holds a full `Value` reference (an instance, null, or other
@@ -966,7 +966,7 @@ pub fn instanceClassIdentity(v: Value) usize {
 /// for kinds the JIT does not compile (Float). A `Double` element is moved as a
 /// raw 8-byte (`b64`) value — its f64 bits live in the slot and are consumed by
 /// the SSE arithmetic path.
-fn arrayElemShape(kind: runtime.PrimitiveArrayKind) ?struct { rt: RegType, w: jit.Emitter.ElemW, esize: u8 } {
+fn arrayElemShape(kind: runtime.PrimitiveArrayKind) ?struct { rt: RegType, w: jit.ElemW, esize: u8 } {
     return switch (kind) {
         .Boolean => .{ .rt = .boolean, .w = .b8u, .esize = 1 },
         .Byte => .{ .rt = .i32, .w = .b8s, .esize = 1 },
@@ -986,7 +986,7 @@ fn arrayElemShape(kind: runtime.PrimitiveArrayKind) ?struct { rt: RegType, w: ji
 /// Per-array compile-time shape, indexed by the IR register holding the array.
 const ArrayInfo = struct {
     rt: RegType,
-    w: jit.Emitter.ElemW,
+    w: jit.ElemW,
     esize: u8,
     ptr_slot: u32,
     len_slot: u32,
@@ -1524,12 +1524,12 @@ const Compiler = struct {
     n_params: u32 = 0,
     result_slot: u32 = 0,
     em: jit.Emitter,
-    block_label: []?jit.Emitter.Label,
+    block_label: []?jit.Label,
     exit_targets: std.ArrayListUnmanaged(BlockId),
-    exit_labels: std.ArrayListUnmanaged(jit.Emitter.Label),
+    exit_labels: std.ArrayListUnmanaged(jit.Label),
     deopt_codes: std.ArrayListUnmanaged(u64),
-    deopt_labels: std.ArrayListUnmanaged(jit.Emitter.Label),
-    epilogue: jit.Emitter.Label,
+    deopt_labels: std.ArrayListUnmanaged(jit.Label),
+    epilogue: jit.Label,
     cur_block: BlockId = undefined,
     cur_inst: u32 = 0,
 
@@ -1634,25 +1634,25 @@ const Compiler = struct {
         try self.em.storeMem(REGS, d, native);
     }
     /// Load/store an f64 register's slot through an xmm (the slot holds the bits).
-    fn loadF64Slot(self: *Compiler, x: jit.Emitter.Xmm, r: Reg) !void {
+    fn loadF64Slot(self: *Compiler, x: jit.Xmm, r: Reg) !void {
         const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
         try self.em.movsdLoad(x, REGS, d);
     }
-    fn storeF64Slot(self: *Compiler, r: Reg, x: jit.Emitter.Xmm) !void {
+    fn storeF64Slot(self: *Compiler, r: Reg, x: jit.Xmm) !void {
         const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
         try self.em.movsdStore(REGS, d, x);
     }
     /// Load/store an f32 register's slot (f32 bits in the low 4 bytes).
-    fn loadF32Slot(self: *Compiler, x: jit.Emitter.Xmm, r: Reg) !void {
+    fn loadF32Slot(self: *Compiler, x: jit.Xmm, r: Reg) !void {
         const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
         try self.em.movssLoad(x, REGS, d);
     }
-    fn storeF32Slot(self: *Compiler, r: Reg, x: jit.Emitter.Xmm) !void {
+    fn storeF32Slot(self: *Compiler, r: Reg, x: jit.Xmm) !void {
         const d = self.slotDisp(r) orelse return jit.JitError.Unsupported;
         try self.em.movssStore(REGS, d, x);
     }
 
-    fn loadFloat(self: *Compiler, x: jit.Emitter.Xmm, r: Reg, is32: bool) !void {
+    fn loadFloat(self: *Compiler, x: jit.Xmm, r: Reg, is32: bool) !void {
         if (is32) try self.loadF32Slot(x, r) else try self.loadF64Slot(x, r);
     }
 
@@ -1698,7 +1698,7 @@ const Compiler = struct {
         }
         try self.storeSlot(dst, T0);
     }
-    fn ucomiFloat(self: *Compiler, x: jit.Emitter.Xmm, y: jit.Emitter.Xmm, is32: bool) !void {
+    fn ucomiFloat(self: *Compiler, x: jit.Xmm, y: jit.Xmm, is32: bool) !void {
         if (is32) try self.em.ucomiss(x, y) else try self.em.ucomisd(x, y);
     }
 
@@ -1767,7 +1767,7 @@ const Compiler = struct {
         }
     }
 
-    fn exitLabel(self: *Compiler, blk: BlockId) !jit.Emitter.Label {
+    fn exitLabel(self: *Compiler, blk: BlockId) !jit.Label {
         for (self.exit_targets.items, 0..) |t, i| {
             if (t.int() == blk.int()) return self.exit_labels.items[i];
         }
@@ -1777,13 +1777,13 @@ const Compiler = struct {
         return l;
     }
 
-    fn edgeLabel(self: *Compiler, target: BlockId) !jit.Emitter.Label {
+    fn edgeLabel(self: *Compiler, target: BlockId) !jit.Label {
         if (self.inBody(target)) return self.block_label[target.int()].?;
         return self.exitLabel(target);
     }
 
     /// A deopt stub for resuming the interpreter at the current instruction.
-    fn deoptLabel(self: *Compiler) !jit.Emitter.Label {
+    fn deoptLabel(self: *Compiler) !jit.Label {
         const code = encodeResume(self.cur_block, self.cur_inst);
         for (self.deopt_codes.items, 0..) |c, i| {
             if (c == code) return self.deopt_labels.items[i];
@@ -3056,7 +3056,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .val_payload_off = valuePayloadOffset(),
         .val_tag_off = valueTagOffset(),
         .em = jit.Emitter.init(a),
-        .block_label = try a.alloc(?jit.Emitter.Label, func.blocks.len),
+        .block_label = try a.alloc(?jit.Label, func.blocks.len),
         .exit_targets = .empty,
         .exit_labels = .empty,
         .deopt_codes = .empty,
@@ -3737,7 +3737,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .n_params = n_params,
         .result_slot = result_slot,
         .em = jit.Emitter.init(a),
-        .block_label = try a.alloc(?jit.Emitter.Label, func.blocks.len),
+        .block_label = try a.alloc(?jit.Label, func.blocks.len),
         .exit_targets = .empty,
         .exit_labels = .empty,
         .deopt_codes = .empty,
