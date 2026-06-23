@@ -648,6 +648,13 @@ pub fn string_builder_length(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(@intCast(charCount(g.get().items))));
 }
 
+/// `StringBuilder.trimToSize()` — a capacity hint with no observable effect
+/// on the contents (klio's buffer has no separate capacity to shrink).
+pub fn string_builder_trim_to_size(ctx: *CallCtx) Allocator.Error!EvalResult {
+    _ = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.trimToSize"));
+    return ok(.Unit);
+}
+
 pub fn string_builder_indices(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.indices"));
     const g = sb.borrow();
