@@ -3974,6 +3974,12 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
         const nr = promoteByteShort(r) orelse r.*;
         return applyBinop(allocator, op, &nl, &nr);
     }
+    // Kotlin promotes UByte/UShort to UInt in arithmetic and comparison.
+    if ((promoteUByteUShort(l) != null or promoteUByteUShort(r) != null) and op != .StringConcat) {
+        const nl = promoteUByteUShort(l) orelse l.*;
+        const nr = promoteUByteUShort(r) orelse r.*;
+        return applyBinop(allocator, op, &nl, &nr);
+    }
     // Float comparisons widen the Float operand to Double and
     // re-dispatch.
     if ((op == .Less or op == .LessEq or op == .Greater or op == .GreaterEq) and
@@ -4260,6 +4266,14 @@ fn promoteByteShort(v: *const Value) ?Value {
     return switch (v.*) {
         .Byte => |b| .{ .Int = @as(i32, b) },
         .Short => |s| .{ .Int = @as(i32, s) },
+        else => null,
+    };
+}
+
+fn promoteUByteUShort(v: *const Value) ?Value {
+    return switch (v.*) {
+        .UByte => |b| .{ .UInt = @as(u32, b) },
+        .UShort => |s| .{ .UInt = @as(u32, s) },
         else => null,
     };
 }
