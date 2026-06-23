@@ -518,6 +518,8 @@ fn rangeEndpoint(kind: RangeKind, v: i64) Value {
         .Long => .{ .Long = v },
         .Int => .{ .Int = @truncate(v) },
         .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
+        .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(v))) },
+        .ULong => .{ .ULong = @bitCast(v) },
     };
 }
 

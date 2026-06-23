@@ -110,6 +110,8 @@ pub fn rangeEndpoint(kind: RangeKind, v: i64) Value {
         .Long => .{ .Long = v },
         .Int => .{ .Int = @truncate(v) },
         .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
+        .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(v))) },
+        .ULong => .{ .ULong = @bitCast(v) },
     };
 }
 
@@ -273,6 +275,8 @@ pub fn range_sum(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(switch (view.kind) {
         .Long => .{ .Long = s },
         .Int, .Char => Value.newInt(s),
+        .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(s))) },
+        .ULong => .{ .ULong = @bitCast(s) },
     });
 }
 

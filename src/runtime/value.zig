@@ -368,6 +368,8 @@ pub const RangeKind = enum {
     Int,
     Long,
     Char,
+    UInt,
+    ULong,
 
     pub const default: RangeKind = .Int;
 };
@@ -1623,6 +1625,8 @@ pub const Value = union(enum) {
                 .Int => if (r.step == 1) "kotlin.ranges.IntRange" else "kotlin.ranges.IntProgression",
                 .Long => if (r.step == 1) "kotlin.ranges.LongRange" else "kotlin.ranges.LongProgression",
                 .Char => if (r.step == 1) "kotlin.ranges.CharRange" else "kotlin.ranges.CharProgression",
+                .UInt => if (r.step == 1) "kotlin.ranges.UIntRange" else "kotlin.ranges.UIntProgression",
+                .ULong => if (r.step == 1) "kotlin.ranges.ULongRange" else "kotlin.ranges.ULongProgression",
             },
             .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => "kotlin.Function",
             .Exception => "kotlin.Throwable",
@@ -1654,6 +1658,8 @@ pub const Value = union(enum) {
                 .Int => "kotlin.collections.IntIterator",
                 .Long => "kotlin.collections.LongIterator",
                 .Char => "kotlin.collections.CharIterator",
+                .UInt => "kotlin.collections.UIntIterator",
+                .ULong => "kotlin.collections.ULongIterator",
             },
             .Class, .BoundInnerClass => "kotlin.reflect.KClass",
             .Instance => "<instance>",
@@ -1712,6 +1718,8 @@ pub const Value = union(enum) {
                 .Int => matchesAny(name, &.{ "IntRange", "IntProgression", "ClosedRange", "Iterable", "Any" }),
                 .Long => matchesAny(name, &.{ "LongRange", "LongProgression", "ClosedRange", "Iterable", "Any" }),
                 .Char => matchesAny(name, &.{ "CharRange", "CharProgression", "ClosedRange", "Iterable", "Any" }),
+                .UInt => matchesAny(name, &.{ "UIntRange", "UIntProgression", "ClosedRange", "Iterable", "Any" }),
+                .ULong => matchesAny(name, &.{ "ULongRange", "ULongProgression", "ClosedRange", "Iterable", "Any" }),
             },
             .List => |l| blk: {
                 if (std.mem.eql(u8, name, "EnumEntries")) break :blk l.enum_entries;
@@ -1747,6 +1755,8 @@ pub const Value = union(enum) {
                     .Int => std.mem.eql(u8, name, "IntIterator"),
                     .Long => std.mem.eql(u8, name, "LongIterator"),
                     .Char => std.mem.eql(u8, name, "CharIterator"),
+                    .UInt => std.mem.eql(u8, name, "UIntIterator"),
+                    .ULong => std.mem.eql(u8, name, "ULongIterator"),
                 };
             },
             .Comparator => matchesAny(name, &.{ "Comparator", "Any" }),
@@ -2040,6 +2050,8 @@ pub const Value = union(enum) {
                 .Int => try writer.writeAll("kotlin.ranges.IntProgressionIterator"),
                 .Long => try writer.writeAll("kotlin.ranges.LongProgressionIterator"),
                 .Char => try writer.writeAll("kotlin.ranges.CharProgressionIterator"),
+                .UInt => try writer.writeAll("kotlin.ranges.UIntProgressionIterator"),
+                .ULong => try writer.writeAll("kotlin.ranges.ULongProgressionIterator"),
             },
             .Class => |c| {
                 const g = c.borrow();

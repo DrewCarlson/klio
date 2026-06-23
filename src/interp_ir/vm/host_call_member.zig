@@ -638,6 +638,8 @@ fn rangeElem(cur: i64, kind: RangeKind) Value {
         .Int => Value.newInt(cur),
         .Long => .{ .Long = cur },
         .Char => .{ .Char = @truncate(@as(u64, @bitCast(cur))) },
+        .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(cur))) },
+        .ULong => .{ .ULong = @bitCast(cur) },
     };
 }
 
