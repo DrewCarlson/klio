@@ -1056,6 +1056,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.collections.MutableMap.toList", .f = collections.coll_map_to_list },
     .{ .fqn = "kotlin.collections.MutableMap.count", .f = collections.coll_map_count_no_pred },
     .{ .fqn = "kotlin.collections.MutableMap.putAll", .f = collections.coll_mut_map_put_all },
+    .{ .fqn = "kotlin.collections.MutableMap.plusAssign", .f = collections.coll_mut_map_put_all },
     .{ .fqn = "kotlin.collections.MutableMap.set", .f = collections.coll_mut_map_set },
     .{ .fqn = "kotlin.collections.MutableMap.merge", .f = collections.map_merge },
     .{ .fqn = "kotlin.collections.MutableMap.putIfAbsent", .f = collections.map_put_if_absent },

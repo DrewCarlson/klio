@@ -5044,6 +5044,11 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     var to_add: []MapPair = undefined;
     switch (arg) {
+        .Pair => |p| {
+            const one = try a.alloc(MapPair, 1);
+            one[0] = .{ .key = p.first.asPtr().*, .value = p.second.asPtr().* };
+            to_add = one;
+        },
         .Map => |m| to_add = try snapshotEntries(a, m.entries),
         .Array => |arr| to_add = (switch (try pairsFromValues(a, try arr.snapshot(a), "putAll")) {
             .entries => |x| x,
