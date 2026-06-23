@@ -1213,6 +1213,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.text.StringBuilder.subSequence", .f = stringbuilder.string_builder_substring },
     .{ .fqn = "kotlin.text.StringBuilder.delete", .f = stringbuilder.string_builder_delete_range },
     .{ .fqn = "kotlin.text.StringBuilder.setCharAt", .f = stringbuilder.string_builder_set_char_at },
+    .{ .fqn = "kotlin.text.StringBuilder.indices", .f = stringbuilder.string_builder_indices },
     .{ .fqn = "kotlin.text.StringBuilder.replace", .f = stringbuilder.string_builder_replace },
     .{ .fqn = "kotlin.text.StringBuilder.lastIndex", .f = stringbuilder.string_builder_last_index },
     .{ .fqn = "kotlin.text.String.format", .f = string.string_format_static },

@@ -584,6 +584,14 @@ pub fn string_builder_length(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(@intCast(charCount(g.get().items))));
 }
 
+pub fn string_builder_indices(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.indices"));
+    const g = sb.borrow();
+    defer g.deinit();
+    const len: i64 = @intCast(charCount(g.get().items));
+    return ok(.{ .Range = .{ .start = 0, .end = len - 1, .step = 1, .kind = .Int } });
+}
+
 pub fn string_builder_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.toString"));
