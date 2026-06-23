@@ -4784,8 +4784,15 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     }
 
     // Statically rebind `(e as T).f(args)` to the `f` overload whose
-    // first-param type is `T`.
-    if (receiver.* == .As and !receiver.As.safe) {
+    // first-param type is `T`. The universal `Any` members are virtual and
+    // dispatch on the runtime type, so never rebind them to a declared-`T`
+    // namesake — `(x as Any).toString()` must reach `String.toString`, not a
+    // `fun Any?.toString()` namesake.
+    if (receiver.* == .As and !receiver.As.safe and
+        !std.mem.eql(u8, name.name, "toString") and
+        !std.mem.eql(u8, name.name, "equals") and
+        !std.mem.eql(u8, name.name, "hashCode"))
+    {
         const cast_ty = receiver.As.ty;
         const want_user = args.len;
         var chosen: ?FuncId = null;
