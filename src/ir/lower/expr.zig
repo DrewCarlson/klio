@@ -4537,6 +4537,30 @@ fn lowerUnresolvedBareCall(
         } });
         return dst;
     }
+    // A known top-level stdlib function (`listOfNotNull`, `buildList`,
+    // `compareBy`, …) that no class declares as a member is never a member of
+    // the implicit receiver. Bind the global directly: routing it through
+    // `CallMemberOrGlobal` would let the member/extension probe treat it as an
+    // extension on `this` and prepend the receiver into its varargs.
+    if (isAliasName(name0) and !b.module.registry.class_member_names.contains(name0)) {
+        orEmitAudit(b, "unresolved_bare_call", "LoadGlobal", name0);
+        const callee_r = b.allocReg();
+        const nm0 = try b.module.internConst(b.allocator, .{ .String = name0 });
+        try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm0 } });
+        const run0 = try lowerArgRun(b, args);
+        const arg_names0 = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const type_args0 = try internTypeArgs(b.allocator, b.module, ast_type_args);
+        const dst0 = b.allocReg();
+        try b.push(.{ .CallValue = .{
+            .dst = dst0,
+            .callee = callee_r,
+            .args = run0[0],
+            .n_args = run0[1],
+            .arg_names = arg_names0,
+            .type_args = type_args0,
+        } });
+        return dst0;
+    }
     const this_idx = try b.recordCapture("this");
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
