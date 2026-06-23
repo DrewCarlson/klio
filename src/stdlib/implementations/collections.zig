@@ -5058,15 +5058,30 @@ pub fn array_or_empty(ctx: *CallCtx) Error!EvalResult {
 }
 
 fn deepToString(a: Allocator, v: Value) Error![]u8 {
+    var path: std.ArrayList(usize) = .empty;
+    defer path.deinit(a);
+    return deepToStringRec(a, v, &path);
+}
+
+/// `contentDeepToString`, tracking the array-backing identities on the current
+/// path so a reference cycle (`b[0] = a; a[0] = b`) renders as `[...]` instead
+/// of recursing forever.
+fn deepToStringRec(a: Allocator, v: Value, path: *std.ArrayList(usize)) Error![]u8 {
     switch (v) {
         .Array => |arr| {
+            const id = arr.identity();
+            for (path.items) |p| {
+                if (p == id) return a.dupe(u8, "[...]");
+            }
+            try path.append(a, id);
+            defer _ = path.pop();
             var out: std.ArrayList(u8) = .empty;
             try out.append(a, '[');
             const n = arr.len();
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 if (i > 0) try out.appendSlice(a, ", ");
-                try out.appendSlice(a, try deepToString(a, arr.get(i)));
+                try out.appendSlice(a, try deepToStringRec(a, arr.get(i), path));
             }
             try out.append(a, ']');
             return out.toOwnedSlice(a);
