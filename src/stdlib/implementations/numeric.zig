@@ -620,6 +620,69 @@ fn unsignedVal(v: Value) ?u64 {
     };
 }
 
+fn u32arg(v: Value) u32 {
+    return switch (v) {
+        .UInt => |x| x,
+        .UByte => |x| @as(u32, x),
+        .UShort => |x| @as(u32, x),
+        .Int => |x| @bitCast(x),
+        else => 0,
+    };
+}
+fn u64arg(v: Value) u64 {
+    return switch (v) {
+        .ULong => |x| x,
+        .UInt => |x| @as(u64, x),
+        .Long => |x| @bitCast(x),
+        .Int => |x| @as(u64, @as(u32, @bitCast(x))),
+        else => 0,
+    };
+}
+fn shiftCount(v: Value) u32 {
+    return switch (v) {
+        .Int => |x| @bitCast(x),
+        .Long => |x| @truncate(@as(u64, @bitCast(x))),
+        else => 0,
+    };
+}
+
+pub fn uint_and(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = u32arg(ctx.args[0]) & u32arg(ctx.args[1]) });
+}
+pub fn uint_or(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = u32arg(ctx.args[0]) | u32arg(ctx.args[1]) });
+}
+pub fn uint_xor(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = u32arg(ctx.args[0]) ^ u32arg(ctx.args[1]) });
+}
+pub fn uint_inv(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = ~u32arg(ctx.args[0]) });
+}
+pub fn uint_shl(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = u32arg(ctx.args[0]) << @truncate(shiftCount(ctx.args[1])) });
+}
+pub fn uint_shr(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = u32arg(ctx.args[0]) >> @truncate(shiftCount(ctx.args[1])) });
+}
+pub fn ulong_and(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = u64arg(ctx.args[0]) & u64arg(ctx.args[1]) });
+}
+pub fn ulong_or(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = u64arg(ctx.args[0]) | u64arg(ctx.args[1]) });
+}
+pub fn ulong_xor(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = u64arg(ctx.args[0]) ^ u64arg(ctx.args[1]) });
+}
+pub fn ulong_inv(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = ~u64arg(ctx.args[0]) });
+}
+pub fn ulong_shl(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = u64arg(ctx.args[0]) << @truncate(shiftCount(ctx.args[1])) });
+}
+pub fn ulong_shr(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = u64arg(ctx.args[0]) >> @truncate(shiftCount(ctx.args[1])) });
+}
+
 /// `compareTo` for the unsigned types — an unsigned comparison (the Kotlin
 /// default would recurse without a native binding).
 pub fn unsigned_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
