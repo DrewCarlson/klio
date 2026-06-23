@@ -4384,15 +4384,14 @@ fn lowerImplicitThisCall(
 
     // Private own-class methods bind statically.
     if (b.privateMethodFid(name0)) |fid| {
+        // Reserve the receiver slot first, then lower the arguments into a
+        // contiguous run immediately after it. `lowerArgRun` reserves every
+        // argument slot before lowering any argument, so an argument's own
+        // scratch registers can never clobber an already-lowered slot (a bug
+        // the previous hand-rolled loop had, dropping local-variable args).
         const args_start = b.allocReg();
+        const run = try lowerArgRun(b, args);
         try b.push(.{ .Move = .{ .dst = args_start, .src = this_reg } });
-        for (args, 0..) |*a, i| {
-            const r = try lowerExpr(b, a);
-            try b.push(.{ .Move = .{
-                .dst = Reg.from(args_start.int() + @as(u32, @intCast(i)) + 1),
-                .src = r,
-            } });
-        }
         var user_arg_names = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
         defer b.allocator.free(user_arg_names);
         user_arg_names[0] = null;
@@ -4403,7 +4402,7 @@ fn lowerImplicitThisCall(
             .dst = dst,
             .func = fid,
             .args = args_start,
-            .n_args = @as(u32, @intCast(args.len)) + 1,
+            .n_args = run[1] + 1,
             .arg_names = arg_names,
             .type_args = &.{},
             .exact = false,

@@ -312,8 +312,34 @@ pub fn unsigned_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |x| x,
         .err => |e| return .{ .err = e },
     };
-    const s = try std.fmt.allocPrint(ctx.allocator, "{d}", .{v});
+    const radix = switch (try recvIntRadix(ctx.allocator, argAt(ctx, 1), "toString")) {
+        .ok => |r| r,
+        .err => |e| return .{ .err = e },
+    };
+    if (!(radix >= 2 and radix <= 36)) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
+        const exc = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        if (runtime.freeScratch()) ctx.allocator.free(msg);
+        return .{ .err = .{ .Thrown = exc } };
+    }
+    const s = try uintToRadixString(ctx.allocator, v, @intCast(radix));
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
+}
+
+/// Render an unsigned magnitude in `radix` (no sign prefix).
+pub fn uintToRadixString(allocator: Allocator, n: u64, radix: u32) Allocator.Error![]u8 {
+    if (n == 0) return allocator.dupe(u8, "0");
+    var x = n;
+    var digits = std.ArrayList(u8).empty;
+    defer digits.deinit(allocator);
+    const r: u64 = @intCast(radix);
+    while (x > 0) {
+        const d: u32 = @intCast(x % r);
+        x /= r;
+        try digits.append(allocator, fromDigit(d));
+    }
+    std.mem.reverse(u8, digits.items);
+    return digits.toOwnedSlice(allocator);
 }
 
 // ============================================================

@@ -1048,7 +1048,12 @@ pub fn string_to_int_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => return .{ .ok = .Null },
     };
-    if (radix < 2 or radix > 36) return .{ .ok = .Null };
+    // An invalid radix is a programming error and throws even on the OrNull
+    // path (Kotlin's `checkRadix`); only an unparseable string yields null.
+    if (radix < 2 or radix > 36) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+    }
     const parsed = parseIntRadix(s, @intCast(radix));
     if (parsed) |v| {
         if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) {
@@ -1072,13 +1077,16 @@ fn parseIntRadix(raw: []const u8, radix: u32) ?i64 {
         body = s[1..];
     }
     if (body.len == 0) return null;
+    // Accumulate in the negative range so the most-negative value (e.g.
+    // Long.MIN_VALUE, whose magnitude is one past Long.MAX_VALUE) is
+    // representable; flip to positive at the end when not negative.
     var acc: i64 = 0;
     for (body) |ch| {
         const d = digitValue(ch, radix) orelse return null;
         acc = std.math.mul(i64, acc, @intCast(radix)) catch return null;
-        acc = std.math.add(i64, acc, @intCast(d)) catch return null;
+        acc = std.math.sub(i64, acc, @intCast(d)) catch return null;
     }
-    if (negative) {
+    if (!negative) {
         acc = std.math.negate(acc) catch return null;
     }
     return acc;
@@ -1748,11 +1756,105 @@ pub fn string_to_long_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => return .{ .ok = .Null },
     };
-    if (radix < 2 or radix > 36) return .{ .ok = .Null };
+    if (radix < 2 or radix > 36) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+    }
     if (parseIntRadix(s, @intCast(radix))) |v| {
         return .{ .ok = .{ .Long = v } };
     }
     return .{ .ok = .Null };
+}
+
+const UKind = enum { ubyte, ushort, uint, ulong };
+
+fn uLimit(kind: UKind) u64 {
+    return switch (kind) {
+        .ubyte => 0xFF,
+        .ushort => 0xFFFF,
+        .uint => 0xFFFFFFFF,
+        .ulong => 0xFFFFFFFFFFFFFFFF,
+    };
+}
+
+fn uMake(kind: UKind, v: u64) Value {
+    return switch (kind) {
+        .ubyte => .{ .UByte = @truncate(v) },
+        .ushort => .{ .UShort = @truncate(v) },
+        .uint => .{ .UInt = @truncate(v) },
+        .ulong => .{ .ULong = v },
+    };
+}
+
+/// Parse an unsigned magnitude in `radix`, capped at `limit`. Kotlin's
+/// unsigned parse accepts an optional leading `+` (never `-`) and yields
+/// null on any invalid digit or overflow past `limit`.
+fn parseUintRadix(raw: []const u8, radix: u32, limit: u64) ?u64 {
+    const s = std.mem.trim(u8, raw, " \t\n\r");
+    if (s.len == 0) return null;
+    var body = s;
+    if (s[0] == '+') {
+        body = s[1..];
+    } else if (s[0] < '0') {
+        return null;
+    }
+    if (body.len == 0) return null;
+    var acc: u64 = 0;
+    for (body) |ch| {
+        const d = digitValue(ch, radix) orelse return null;
+        acc = std.math.mul(u64, acc, @intCast(radix)) catch return null;
+        acc = std.math.add(u64, acc, @intCast(d)) catch return null;
+        if (acc > limit) return null;
+    }
+    return acc;
+}
+
+fn stringToUnsigned(ctx: *CallCtx, kind: UKind, or_null: bool, what: []const u8) Allocator.Error!EvalResult {
+    const r = try recvString(ctx.allocator, ctx.args, what);
+    const s = switch (r) {
+        .ok => |v| v,
+        .err => |e| return .{ .err = e },
+    };
+    const rr = try recvIntRadix(ctx.allocator, if (ctx.args.len > 1) ctx.args[1] else null, what);
+    const radix = switch (rr) {
+        .ok => |v| v,
+        .err => |e| return .{ .err = e },
+    };
+    if (radix < 2 or radix > 36) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+    }
+    if (parseUintRadix(s, @intCast(radix), uLimit(kind))) |m| {
+        return .{ .ok = uMake(kind, m) };
+    }
+    if (or_null) return .{ .ok = .Null };
+    const msg = try std.fmt.allocPrint(ctx.allocator, "For input string: \"{s}\"", .{s});
+    return try thrownOwned(ctx.allocator, "kotlin.NumberFormatException", msg);
+}
+
+pub fn string_to_ubyte(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return stringToUnsigned(ctx, .ubyte, false, "String.toUByte");
+}
+pub fn string_to_ubyte_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return stringToUnsigned(ctx, .ubyte, true, "String.toUByteOrNull");
+}
+pub fn string_to_ushort(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return stringToUnsigned(ctx, .ushort, false, "String.toUShort");
+}
+pub fn string_to_ushort_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return stringToUnsigned(ctx, .ushort, true, "String.toUShortOrNull");
+}
+pub fn string_to_uint(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return stringToUnsigned(ctx, .uint, false, "String.toUInt");
+}
+pub fn string_to_uint_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return stringToUnsigned(ctx, .uint, true, "String.toUIntOrNull");
+}
+pub fn string_to_ulong(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return stringToUnsigned(ctx, .ulong, false, "String.toULong");
+}
+pub fn string_to_ulong_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return stringToUnsigned(ctx, .ulong, true, "String.toULongOrNull");
 }
 
 pub fn string_to_double_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
