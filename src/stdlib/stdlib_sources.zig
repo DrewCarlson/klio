@@ -146,6 +146,8 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "src/kotlin/collections/UArraySorting.kt",
     "src/kotlin/collections/Sequences.kt",
     "src/kotlin/ranges/PrimitiveRanges.kt",
+    "unsigned/src/kotlin/UIntRange.kt",
+    "unsigned/src/kotlin/ULongRange.kt",
     "src/kotlin/util/KotlinVersion.kt",
     "src/kotlin/collections/PrimitiveIterators.kt",
     "src/kotlin/collections/Arrays.kt",
@@ -153,10 +155,14 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "common/src/kotlin/JvmAnnotationsH.kt",
     "src/kotlin/annotations/NativeAnnotations.kt",
     "src/kotlin/annotations/NativeConcurrentAnnotations.kt",
-    // `AtomicArrays.common.kt` is omitted: experimental array atomics with no
-    // klio actual whose bare names collided with kotlinx.atomicfu types. The
-    // scalar atomics stay.
+    // kotlin.concurrent.atomics: the common `expect`s carry the size+init
+    // factories and the increment/update extension family; the wasm `actual`s
+    // carry the cell/array-backing class shapes. RMW methods are made atomic by
+    // host bindings (see implementations/atomics.zig).
     "src/kotlin/concurrent/atomics/Atomics.common.kt",
+    "wasm/src/kotlin/concurrent/atomics/Atomics.wasm.kt",
+    "src/kotlin/concurrent/atomics/AtomicArrays.common.kt",
+    "wasm/src/kotlin/concurrent/atomics/AtomicArrays.wasm.kt",
     "src/kotlin/util/Lazy.kt",
     "common/src/kotlin/KotlinH.kt",
     "common/src/kotlin/ioH.kt",
@@ -180,7 +186,7 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
     "src/kotlin/text/HexFormat.kt",
-    "src/kotlin/text/CharCategory.kt",
+    "native-wasm/src/kotlin/text/CharCategory.kt",
     "src/kotlin/collections/AbstractIterator.kt",
     "src/kotlin/text/Appendable.kt",
     "src/kotlin/text/Char.kt",

@@ -189,6 +189,9 @@ const stdlib_data_dirs = [_][]const u8{
     "kotlin-klio/kotlin-util",
     "kotlin-klio/kotlin-random",
     "kotlin-klio/kotlin-text",
+    "kotlin/libraries/stdlib/native-wasm/src/generated",
+    "kotlin/libraries/stdlib/native-wasm/src/kotlin/text",
+    "kotlin/libraries/stdlib/wasm/src/kotlin/concurrent/atomics",
     "kotlin-klio/kotlin-uuid",
 };
 

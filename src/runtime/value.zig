@@ -444,6 +444,18 @@ pub const PrimitiveArrayKind = enum {
             .Long, .ULong, .Double => 8,
         };
     }
+
+    /// The signed array kind backing an unsigned array (`UByteArray.storage`
+    /// is a `ByteArray` over the same bytes), or null for a non-unsigned kind.
+    pub fn signedCounterpart(self: PrimitiveArrayKind) ?PrimitiveArrayKind {
+        return switch (self) {
+            .UByte => .Byte,
+            .UShort => .Short,
+            .UInt => .Int,
+            .ULong => .Long,
+            else => null,
+        };
+    }
 };
 
 /// Packed scalar storage for a Kotlin primitive array (`IntArray`,

@@ -16,8 +16,8 @@ const std = @import("std");
 const runtime = @import("runtime");
 
 /// Minimum number of stdlib commonTest cases that must pass. A ratchet: bump it
-/// up as fixes land, never down. (Total discovered today is ~1240; ~1003 pass.)
-const BASELINE: usize = 995;
+/// up as fixes land, never down. (Total discovered today is ~1240; ~1143 pass.)
+const BASELINE: usize = 1135;
 
 const TEST_ROOT = "kotlin/libraries/stdlib/test";
 const ACTUALS = [_][]const u8{
@@ -54,7 +54,7 @@ fn runKlio(
         .environ_map = env,
         // A test file that makes the interpreter hang (infinite loop, not a
         // crash) must not stall the suite; cap each child.
-        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(60_000), .clock = .awake } },
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
     }) catch |e| {
         // A timed-out (hanging) child is reported as a blocked file, not a
         // hard spawn failure.

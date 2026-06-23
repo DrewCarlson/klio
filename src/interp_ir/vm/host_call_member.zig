@@ -4037,6 +4037,56 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         pmg.deinit();
         return .{ .ok = v };
     }
+    // `ListIterator` navigation over the same `items`/`pos` cursor.
+    if (std.mem.eql(u8, name, "hasPrevious") and args.len == 0) {
+        const pg = it.pos.borrow();
+        defer pg.deinit();
+        return .{ .ok = boolVal(pg.get().* > 0) };
+    }
+    if (std.mem.eql(u8, name, "nextIndex") and args.len == 0) {
+        const pg = it.pos.borrow();
+        defer pg.deinit();
+        return .{ .ok = Value.newInt(@intCast(pg.get().*)) };
+    }
+    if (std.mem.eql(u8, name, "previousIndex") and args.len == 0) {
+        const pg = it.pos.borrow();
+        defer pg.deinit();
+        return .{ .ok = Value.newInt(@as(i64, @intCast(pg.get().*)) - 1) };
+    }
+    if (std.mem.eql(u8, name, "previous") and args.len == 0) {
+        const pg = it.pos.borrow();
+        const p = pg.get().*;
+        pg.deinit();
+        if (p == 0) {
+            return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator at start") };
+        }
+        const ig = it.items.borrow();
+        const v = ig.get().items[p - 1];
+        if (runtime.reclaimEnabled()) v.retain();
+        ig.deinit();
+        const pmg = it.pos.borrowMut();
+        pmg.get().* = p - 1;
+        pmg.deinit();
+        return .{ .ok = v };
+    }
+    // `MutableListIterator.set(x)` — overwrite the element last returned.
+    if (std.mem.eql(u8, name, "set") and args.len == 1) {
+        const pg = it.pos.borrow();
+        const p = pg.get().*;
+        pg.deinit();
+        if (p == 0) {
+            return .{ .err = try throwExc(allocator, "kotlin.IllegalStateException", "set() called before next()/previous()") };
+        }
+        const g = it.items.borrowMut();
+        defer g.deinit();
+        if (p - 1 < g.get().items.len) {
+            if (runtime.reclaimEnabled()) g.get().items[p - 1].release(allocator);
+            var nv = args[0];
+            if (runtime.reclaimEnabled()) nv.retain();
+            g.get().items[p - 1] = nv;
+        }
+        return .{ .ok = .Unit };
+    }
     // `MutableIterator.remove()` — drop the element last returned by `next()`
     // (at `pos - 1`) from the backing list and rewind the cursor so the
     // following `next()` resumes correctly. A no-op before the first `next()`.

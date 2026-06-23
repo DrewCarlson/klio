@@ -210,6 +210,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Char.toInt", .f = char.char_code },
     .{ .fqn = "kotlin.internal.getProgressionLastElement", .f = char.internal_get_progression_last_element },
     .{ .fqn = "kotlin.Char.digitToInt", .f = char.char_digit_to_int },
+    .{ .fqn = "kotlin.Char.getCategoryValue", .f = char.char_get_category_value },
+    .{ .fqn = "kotlin.text.getCategoryValue", .f = char.char_get_category_value },
     .{ .fqn = "kotlin.Char.isDigit", .f = char.char_is_digit },
     .{ .fqn = "kotlin.Char.isLetter", .f = char.char_is_letter },
     .{ .fqn = "kotlin.Char.isLetterOrDigit", .f = char.char_is_letter_or_digit },
