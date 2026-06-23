@@ -284,6 +284,21 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         if (is_ext) {
             try b.markLocalExtFn(f.name.name);
         }
+        // Record positional parameter type names (drop a leading `this`
+        // receiver) so a literal argument coerces to a numeric primitive
+        // parameter at the call site.
+        {
+            const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name.name, "this")) 1 else 0;
+            if (f.params.len > recv_off) {
+                const tys = try b.allocator.alloc(?[]const u8, f.params.len - recv_off);
+                defer b.allocator.free(tys);
+                for (tys, 0..) |*t, j| {
+                    const p = f.params[recv_off + j];
+                    t.* = if (p.is_vararg) null else p.ty.name.name;
+                }
+                try b.setLocalFnParamTys(f.name.name, tys);
+            }
+        }
     }
     return null;
 }

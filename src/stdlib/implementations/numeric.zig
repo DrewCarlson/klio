@@ -1051,6 +1051,11 @@ pub fn num_floor_div(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (divisor == 0) {
         return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero") } };
     }
+    // `MIN / -1` overflows the truncated quotient; Kotlin wraps it to MIN
+    // (and the remainder is 0, so floorDiv == MIN too).
+    if (dividend == std.math.minInt(i64) and divisor == -1) {
+        return ok(if (lhs == .Long or rhs == .Long) Value{ .Long = dividend } else Value.newInt(@truncate(dividend)));
+    }
     var quotient = @divTrunc(dividend, divisor);
     const rem = @rem(dividend, divisor);
     if (rem != 0 and ((rem < 0) != (divisor < 0))) {
@@ -1074,6 +1079,10 @@ pub fn num_mod(ctx: *CallCtx) Allocator.Error!EvalResult {
     const divisor = rhs.asI64() orelse return .{ .err = .{ .Type = "mod requires integers" } };
     if (divisor == 0) {
         return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero") } };
+    }
+    // `MIN % -1` is 0 mathematically but the raw `@rem` overflows; short-circuit.
+    if (dividend == std.math.minInt(i64) and divisor == -1) {
+        return ok(if (lhs == .Long or rhs == .Long) Value{ .Long = 0 } else Value.newInt(0));
     }
     var rem = @rem(dividend, divisor);
     if (rem != 0 and ((rem < 0) != (divisor < 0))) {

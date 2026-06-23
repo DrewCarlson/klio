@@ -260,6 +260,11 @@ pub const FuncBuilder = struct {
     /// local `val`/`var` of the same name must NOT hijack member-call
     /// syntax.
     local_fns: StringSet,
+    /// Per local function: the declared parameter type-name per positional
+    /// parameter (an extension's leading `this` is dropped), so a numeric
+    /// literal argument can coerce to a Byte/Short/Long/Float/Double parameter
+    /// at the call site, as it does for top-level functions.
+    local_fn_param_tys: std.StringHashMap([]const ?[]const u8),
     /// Subset of `local_fns` declared as extensions (`fun R.f(...)`);
     /// a bare call must prepend the implicit receiver as `this`.
     local_ext_fns: StringSet,
@@ -376,6 +381,7 @@ pub const FuncBuilder = struct {
             .private_method_fids = StringFuncIdMap.init(allocator),
             .param_names = StringSet.init(allocator),
             .local_fns = StringSet.init(allocator),
+            .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
             .local_decl_types = std.StringHashMap([]const u8).init(allocator),
             .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
             .local_ext_fns = StringSet.init(allocator),
@@ -419,6 +425,11 @@ pub const FuncBuilder = struct {
         self.enclosing_members.deinit();
         self.private_method_fids.deinit();
         self.param_names.deinit();
+        {
+            var it = self.local_fn_param_tys.valueIterator();
+            while (it.next()) |v| self.allocator.free(v.*);
+            self.local_fn_param_tys.deinit();
+        }
         self.local_fns.deinit();
         self.local_decl_types.deinit();
         self.local_init_exprs.deinit();
@@ -828,6 +839,15 @@ pub const FuncBuilder = struct {
 
     pub fn markLocalFn(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.local_fns.put(name, {});
+    }
+    /// Record a local function's per-parameter declared type names (caller
+    /// passes the positional list with any leading `this` already dropped).
+    pub fn setLocalFnParamTys(self: *FuncBuilder, name: []const u8, tys: []const ?[]const u8) Allocator.Error!void {
+        const owned = try self.allocator.dupe(?[]const u8, tys);
+        if (self.local_fn_param_tys.fetchPut(name, owned) catch null) |old| self.allocator.free(old.value);
+    }
+    pub fn localFnParamTys(self: *const FuncBuilder, name: []const u8) ?[]const ?[]const u8 {
+        return self.local_fn_param_tys.get(name);
     }
     pub fn isLocalFn(self: *const FuncBuilder, name: []const u8) bool {
         return self.local_fns.contains(name);

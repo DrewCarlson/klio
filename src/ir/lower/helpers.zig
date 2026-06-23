@@ -148,6 +148,74 @@ pub fn lowerArgRun(b: *FuncBuilder, args: []const Expr) Allocator.Error!struct {
     return lowerArgRunWithArity(b, args, null);
 }
 
+/// Emit the coerced constant for an integer/float literal (optionally negated)
+/// argument whose declared parameter type is a numeric primitive that differs
+/// from the literal's natural type (kotlinc literal typing). Only literals are
+/// touched, and the negated literal is folded to a constant (no runtime `Neg`).
+fn coerceNumericLiteralArg(b: *FuncBuilder, e: *const Expr, type_name: []const u8) Allocator.Error!?Reg {
+    var int_val: ?i64 = null;
+    var flt_val: ?f64 = null;
+    switch (e.*) {
+        .IntLit => |l| {
+            if (l.kind == .Int) int_val = l.value;
+        },
+        .FloatLit => |l| flt_val = l.value,
+        .Unary => |u| if (u.op == .Neg) switch (u.expr.*) {
+            .IntLit => |l| {
+                if (l.kind == .Int) int_val = -l.value;
+            },
+            .FloatLit => |l| flt_val = -l.value,
+            else => {},
+        },
+        else => {},
+    }
+    const eq = std.mem.eql;
+    if (int_val) |iv| {
+        if (eq(u8, type_name, "Byte")) return try b.emitConst(.{ .Byte = @truncate(iv) });
+        if (eq(u8, type_name, "Short")) return try b.emitConst(.{ .Short = @truncate(iv) });
+        if (eq(u8, type_name, "Long")) return try b.emitConst(.{ .Long = iv });
+        if (eq(u8, type_name, "Float")) return try b.emitConst(.{ .Float = @floatFromInt(iv) });
+        if (eq(u8, type_name, "Double")) return try b.emitConst(.{ .Double = @floatFromInt(iv) });
+    } else if (flt_val) |fv| {
+        if (eq(u8, type_name, "Float")) return try b.emitConst(.{ .Float = @floatCast(fv) });
+        if (eq(u8, type_name, "Double")) return try b.emitConst(.{ .Double = fv });
+    }
+    return null;
+}
+
+pub fn lowerArgRunFull(
+    b: *FuncBuilder,
+    args: []const Expr,
+    arg_arity: ?[]const i16,
+    param_ty_names: ?[]const ?[]const u8,
+) Allocator.Error!struct { Reg, u32 } {
+    const n = args.len;
+    if (n == 0) return .{ b.allocReg(), 0 };
+    const first = b.allocReg();
+    var slots = try b.allocator.alloc(Reg, n);
+    defer b.allocator.free(slots);
+    slots[0] = first;
+    var i: usize = 1;
+    while (i < n) : (i += 1) slots[i] = b.allocReg();
+    const call_label = b.pending_lambda_label;
+    b.pending_lambda_label = null;
+    const prev_expected = b.pushExpected(null);
+    for (slots, 0..) |slot, j| {
+        b.pending_lambda_label = call_label;
+        b.pending_lambda_arity = if (arg_arity) |aa| (if (j < aa.len) aa[j] else -1) else -1;
+        const coerced: ?Reg = if (param_ty_names) |pts|
+            (if (j < pts.len) (if (pts[j]) |tn| try coerceNumericLiteralArg(b, &args[j], tn) else null) else null)
+        else
+            null;
+        const r = coerced orelse try expr_mod.lowerExpr(b, &args[j]);
+        b.pending_lambda_label = null;
+        b.pending_lambda_arity = -1;
+        try b.push(.{ .Move = .{ .dst = slot, .src = r } });
+    }
+    b.restoreExpected(prev_expected);
+    return .{ first, @intCast(n) };
+}
+
 /// As `lowerArgRun`, with an optional per-argument expected lambda arity
 /// (parallel to `args`). A zero-`->` lambda in slot `j` binds its implicit
 /// `it` only when `arg_arity[j] == 1`; for `0` (a `() -> R` or receiver

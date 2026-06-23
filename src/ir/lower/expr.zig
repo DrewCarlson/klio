@@ -49,6 +49,7 @@ const boxedCellReg = helpers.boxedCellReg;
 const calleeLabel = helpers.calleeLabel;
 const lowerArgRun = helpers.lowerArgRun;
 const lowerArgRunWithArity = helpers.lowerArgRunWithArity;
+const lowerArgRunFull = helpers.lowerArgRunFull;
 const internArgNames = helpers.internArgNames;
 const internTypeArgs = helpers.internTypeArgs;
 const exprSpan = helpers.exprSpan;
@@ -3209,7 +3210,8 @@ fn lowerValueInvocation(
                 return dst;
             }
         }
-        const run = try lowerArgRun(b, args);
+        const lfp: ?[]const ?[]const u8 = if (allNull(ast_arg_names)) b.localFnParamTys(name0) else null;
+        const run = try lowerArgRunFull(b, args, null, lfp);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const dst = b.allocReg();
         try b.push(.{ .CallValue = .{
@@ -4173,7 +4175,19 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         }
         break :blk null;
     };
-    const run = try lowerArgRunWithArity(b, args, arg_arity);
+    const param_ty_names: ?[]const ?[]const u8 = blk: {
+        const f = b.module.funcById(func_id) orelse break :blk null;
+        if (!allNull(ast_arg_names)) break :blk null;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        const names = try b.allocator.alloc(?[]const u8, args.len);
+        for (names, 0..) |*t, j| {
+            const pidx = recv_off + j;
+            t.* = if (pidx < f.params.len and !f.params[pidx].is_vararg) f.params[pidx].ty.name else null;
+        }
+        break :blk names;
+    };
+    defer if (param_ty_names) |pt| b.allocator.free(pt);
+    const run = try lowerArgRunFull(b, args, arg_arity, param_ty_names);
     // A trailing lambda always binds the target's last (function-typed)
     // parameter. When a vararg parameter precedes it, positional binding
     // would otherwise pack the lambda into the vararg and leave the last
