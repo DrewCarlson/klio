@@ -1036,30 +1036,40 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             };
         }
     }
-    // Bare member of the enclosing class's companion accessed from inside
-    // an instance method. Skipped by the member probe (companions are
-    // candidates).
+    // Bare member of the receiver's class — or any lexically-enclosing
+    // class's — companion. A nested `Builder` referencing `Default` (a member
+    // of the enclosing class's companion) reaches it by walking the enclosing
+    // chain. Skipped by the member probe (companions are candidates).
     if (!member_probe and receiver.* == .Instance) {
-        const cls_name = className(receiver.Instance);
-        const comp_name: ?[]const u8 = blk: {
-            const g = self.module.borrow();
-            defer g.deinit();
-            break :blk g.get().registry.companion_singletons.get(cls_name);
-        };
-        if (comp_name) |cn| {
-            const comp: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
-                .ok => |maybe| maybe,
-                .err => |e| return errRes(e),
+        var cls_name = className(receiver.Instance);
+        var depth: usize = 0;
+        while (depth < 32) : (depth += 1) {
+            const comp_name: ?[]const u8 = blk: {
+                const g = self.module.borrow();
+                defer g.deinit();
+                break :blk g.get().registry.companion_singletons.get(cls_name);
             };
-            if (comp) |c| {
-                const same = c == .Instance and ObjRef(InstanceData).ptrEq(c.Instance, receiver.Instance);
-                if (!same) {
-                    switch (try getFieldInner(self, allocator, &c, name, suppress_cc_redirect, member_probe)) {
-                        .ok => |v| return ok(v),
-                        .err => |e| freeFieldMiss(allocator, e),
+            if (comp_name) |cn| {
+                const comp: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+                    .ok => |maybe| maybe,
+                    .err => |e| return errRes(e),
+                };
+                if (comp) |c| {
+                    const same = c == .Instance and ObjRef(InstanceData).ptrEq(c.Instance, receiver.Instance);
+                    if (!same) {
+                        switch (try getFieldInner(self, allocator, &c, name, suppress_cc_redirect, member_probe)) {
+                            .ok => |v| return ok(v),
+                            .err => |e| freeFieldMiss(allocator, e),
+                        }
                     }
                 }
             }
+            const enc: ?[]const u8 = blk: {
+                const g = self.module.borrow();
+                defer g.deinit();
+                break :blk g.get().registry.enclosing_class.get(cls_name);
+            };
+            cls_name = enc orelse break;
         }
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
