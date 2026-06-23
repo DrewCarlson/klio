@@ -23,6 +23,7 @@ const TEST_ROOT = "kotlin/libraries/stdlib/test";
 const ACTUALS = [_][]const u8{
     "tests/stdlib_commontest_actuals/PlatformActuals.kt",
     "tests/stdlib_commontest_actuals/EncodingActuals.kt",
+    "tests/stdlib_commontest_actuals/JsCollectionFactories.kt",
 };
 const SCRATCH_HOME = "/tmp/klio_itest_stdlibtest_home";
 
