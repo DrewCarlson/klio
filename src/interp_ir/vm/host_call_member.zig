@@ -2124,7 +2124,66 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     return callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, null);
 }
 
+/// An `IrClosure`/`Function` field's declared parameter count, or null when
+/// the value is not a closure-style callable.
+fn callableFieldArity(self: *VmHost, v: *const Value) ?usize {
+    switch (v.*) {
+        .IrClosure => |c| {
+            const info = self.closures.get(@intCast(c.id)) orelse return null;
+            const mr = self.module.clone();
+            defer mr.deinit();
+            const module = info.module orelse mr.asPtr();
+            const func = module.funcById(info.body_func) orelse return null;
+            return func.params.len;
+        },
+        .Function => |f| return f.decl.params.len,
+        else => return null,
+    }
+}
+
+/// A function-typed property can share its name with a vararg member method
+/// (`val createFrom: (Array<out String>) -> T` alongside
+/// `fun createFrom(vararg items: String): T = createFrom(items)`). Kotlin
+/// resolves `createFrom("a", "b")` (several args) to the vararg method and
+/// `createFrom(items)` (one array, matching the property's single parameter)
+/// to the property's `invoke`. KLIO dispatches members by name, so the method
+/// shadows the property and the method body recurses. When the receiver holds
+/// a callable field whose arity matches the call and the class also has a
+/// same-named vararg method, invoke the field: the property is the intended
+/// target for this argument shape.
+fn varargShadowedFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    if (receiver.* != .Instance) return null;
+    const field_val: Value = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const v = g.get().get(name) orelse return null;
+        v.retain();
+        break :blk v;
+    };
+    defer field_val.release(allocator);
+
+    const arity = callableFieldArity(self, &field_val) orelse return null;
+    if (arity != args.len) return null;
+
+    // Only intervene when a same-named vararg method would otherwise shadow
+    // the field; a plain function property keeps its ordinary dispatch.
+    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args)) orelse return null;
+    const is_vararg = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const f = mg.get().funcById(resolved.fid) orelse break :blk false;
+        break :blk f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
+    };
+    if (!is_vararg) return null;
+
+    return try callValueRec(self, allocator, &field_val, args);
+}
+
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+    // A function-typed property shadowed by a same-named vararg method: invoke
+    // the property when the call's argument shape matches it (see the helper).
+    if (try varargShadowedFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
+
     // Fast path: a previously-resolved zero-arg user instance method bypasses the
     // whole probe ladder. The cache is only populated by `irMethodWalk` *after*
     // the per-instance binding probe and every builtin check declined, and those
