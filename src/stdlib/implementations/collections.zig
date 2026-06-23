@@ -3292,13 +3292,9 @@ pub fn coll_list_average(ctx: *CallCtx) Error!EvalResult {
     var sum: f64 = 0.0;
     var n: i64 = 0;
     for (items) |v| {
-        sum += switch (v) {
-            .Int => |x| @floatFromInt(x),
-            .Double => |x| x,
-            else => {
-                const vd = try display(a, v);
-                return typeErr(try fmt(a, "List.average requires numeric elements, got {s}", .{vd}));
-            },
+        sum += v.asF64() orelse {
+            const vd = try display(a, v);
+            return typeErr(try fmt(a, "List.average requires numeric elements, got {s}", .{vd}));
         };
         n += 1;
     }
