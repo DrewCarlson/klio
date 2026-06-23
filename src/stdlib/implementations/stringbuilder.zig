@@ -147,6 +147,66 @@ fn appendValue(buf: *Buffer, allocator: Allocator, v: Value) Allocator.Error!voi
     }
 }
 
+/// The text `append(value)` / `insert(_, value)` writes for `value`. Owned by
+/// the caller. Unlike `appendValue` this renders a `StringBuilder` as its
+/// content, a `CharArray` as its characters, and any other object via its
+/// `toString()` (run through the host) — matching `append(CharSequence)` /
+/// `append(CharArray)` / `append(Any?)`. Rendered before the receiver buffer
+/// is borrowed so a user `toString()` can run without holding that borrow.
+fn renderPiece(ctx: *CallCtx, v: Value) Allocator.Error![]u8 {
+    const a = ctx.allocator;
+    switch (v) {
+        .Null => return a.dupe(u8, "null"),
+        .String => |s| {
+            const g = s.borrow();
+            defer g.deinit();
+            return a.dupe(u8, g.get().bytes);
+        },
+        .StringBuilder => |sb| {
+            const g = sb.borrow();
+            defer g.deinit();
+            return a.dupe(u8, g.get().items);
+        },
+        .Char => |c| return charUnitToString(a, c),
+        .Array => |arr| {
+            const elems = try arr.snapshot(a);
+            defer if (runtime.freeScratch()) a.free(elems);
+            var all_char = true;
+            for (elems) |e| {
+                if (e != .Char) {
+                    all_char = false;
+                    break;
+                }
+            }
+            if (all_char) {
+                var buf: Buffer = .empty;
+                errdefer buf.deinit(a);
+                for (elems) |e| {
+                    const piece = try charUnitToString(a, e.Char);
+                    defer a.free(piece);
+                    try buf.appendSlice(a, piece);
+                }
+                return buf.toOwnedSlice(a);
+            }
+        },
+        .Instance => {
+            // `append(Any?)` calls the object's `toString()`.
+            if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |res| {
+                switch (res) {
+                    .ok => |sv| if (sv == .String) {
+                        const g = sv.String.borrow();
+                        defer g.deinit();
+                        return a.dupe(u8, g.get().bytes);
+                    },
+                    .err => {},
+                }
+            }
+        },
+        else => {},
+    }
+    return displayValue(a, v);
+}
+
 /// The UTF-16 units of a `CharArray` / `CharSequence` / `Char` argument, for
 /// the range ops. Caller owns the result; `null` if `v` is not such a value.
 fn valueToUtf16(allocator: Allocator, v: Value) Allocator.Error!?[]u16 {
@@ -515,13 +575,14 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.append"));
-    {
+    // Render each argument before borrowing the buffer: a user `toString()`
+    // must not run while the receiver buffer is held mutably.
+    for (ctx.args[1..]) |v| {
+        const piece = try renderPiece(ctx, v);
+        defer a.free(piece);
         const g = sb.borrowMut();
         defer g.deinit();
-        const buf = g.get();
-        for (ctx.args[1..]) |v| {
-            try appendValue(buf, a, v);
-        }
+        try g.get().appendSlice(a, piece);
     }
     return okSb(sb);
 }
@@ -565,14 +626,17 @@ pub fn string_builder_set(ctx: *CallCtx) Allocator.Error!EvalResult {
 pub fn string_builder_append_line(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.appendLine"));
+    for (ctx.args[1..]) |v| {
+        const piece = try renderPiece(ctx, v);
+        defer a.free(piece);
+        const g = sb.borrowMut();
+        defer g.deinit();
+        try g.get().appendSlice(a, piece);
+    }
     {
         const g = sb.borrowMut();
         defer g.deinit();
-        const buf = g.get();
-        for (ctx.args[1..]) |v| {
-            try appendValue(buf, a, v);
-        }
-        try buf.append(a, '\n');
+        try g.get().append(a, '\n');
     }
     return okSb(sb);
 }
@@ -656,9 +720,11 @@ pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (idx == null) return errResult(.{ .Type = "insert index must be Int" });
     if (ctx.args.len < 3) return errResult(.{ .Arity = "insert requires a value" });
 
+    const piece_bytes = try renderPiece(ctx, ctx.args[2]);
+    defer a.free(piece_bytes);
     var piece: Buffer = .empty;
     defer piece.deinit(a);
-    try appendValue(&piece, a, ctx.args[2]);
+    try piece.appendSlice(a, piece_bytes);
 
     const g = sb.borrowMut();
     defer g.deinit();
