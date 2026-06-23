@@ -3434,6 +3434,40 @@ pub fn coll_list_drop_last(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeList(a, items[0..end], false));
 }
 
+/// True when a `plusAssign`/`minusAssign` argument is a multi-element
+/// collection (so it flattens via addAll/removeAll) rather than a single
+/// element to add/remove.
+fn isMultiElementArg(v: Value) bool {
+    return switch (v) {
+        .List, .Set, .Range, .Sequence, .Array => true,
+        else => false,
+    };
+}
+
+/// `MutableCollection += elements` — addAll for a collection argument, add
+/// for a single element; mutates the receiver in place.
+pub fn coll_mut_collection_plus_assign(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return arityErr("plusAssign requires an argument");
+    const multi = isMultiElementArg(ctx.args[1]);
+    return switch (ctx.args[0]) {
+        .List => if (multi) coll_mut_list_add_all(ctx) else coll_mut_list_add(ctx),
+        .Set => if (multi) coll_mut_set_add_all(ctx) else coll_mut_set_add(ctx),
+        else => typeErr("plusAssign requires a mutable collection receiver"),
+    };
+}
+
+/// `MutableCollection -= elements` — removeAll for a collection argument,
+/// remove for a single element; mutates the receiver in place.
+pub fn coll_mut_collection_minus_assign(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return arityErr("minusAssign requires an argument");
+    const multi = isMultiElementArg(ctx.args[1]);
+    return switch (ctx.args[0]) {
+        .List => if (multi) coll_mut_list_remove_all(ctx) else coll_mut_list_remove(ctx),
+        .Set => if (multi) coll_mut_set_remove_all(ctx) else coll_mut_set_remove(ctx),
+        else => typeErr("minusAssign requires a mutable collection receiver"),
+    };
+}
+
 pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "List.slice")) {

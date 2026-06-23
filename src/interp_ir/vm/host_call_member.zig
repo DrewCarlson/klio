@@ -3843,17 +3843,26 @@ fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value, na
 }
 
 fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    _ = self;
+    // `+= elements` / `-= elements` over a multi-element collection argument
+    // flattens (addAll / removeAll); a single element add/removes that one
+    // element. Delegate the collection case so dedup / element semantics stay
+    // in one place.
+    const arg_is_multi = args.len == 1 and switch (args[0]) {
+        .List, .Set, .Range, .Sequence, .Array => true,
+        else => false,
+    };
     switch (receiver.*) {
         .List => |l| {
             if (!l.mutable) return null;
             if (std.mem.eql(u8, name, "plusAssign") and args.len == 1) {
+                if (arg_is_multi) return try self.callMember(allocator, receiver, "addAll", args);
                 const g = l.items.borrowMut();
                 defer g.deinit();
                 try g.get().append(allocator, args[0]);
                 return .{ .ok = .Unit };
             }
             if (std.mem.eql(u8, name, "minusAssign") and args.len == 1) {
+                if (arg_is_multi) return try self.callMember(allocator, receiver, "removeAll", args);
                 const g = l.items.borrowMut();
                 defer g.deinit();
                 for (g.get().items, 0..) |x, idx| {
@@ -3868,6 +3877,7 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
         .Set => |s| {
             if (!s.mutable) return null;
             if (std.mem.eql(u8, name, "plusAssign") and args.len == 1) {
+                if (arg_is_multi) return try self.callMember(allocator, receiver, "addAll", args);
                 const g = s.items.borrowMut();
                 defer g.deinit();
                 var present = false;
@@ -3878,6 +3888,7 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                 return .{ .ok = .Unit };
             }
             if (std.mem.eql(u8, name, "minusAssign") and args.len == 1) {
+                if (arg_is_multi) return try self.callMember(allocator, receiver, "removeAll", args);
                 const g = s.items.borrowMut();
                 defer g.deinit();
                 for (g.get().items, 0..) |x, idx| {
