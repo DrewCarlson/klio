@@ -4233,13 +4233,27 @@ fn rangeValue(op: BinOp, l: *const Value, r: *const Value) ?Value {
     if (l.* == .Long and r.* == .Int) {
         return .{ .Range = .{ .start = l.Long, .end = @as(i64, r.Int) - minus_one, .step = 1, .kind = .Long } };
     }
-    if (l.* == .UInt and r.* == .UInt) {
-        return .{ .Range = .{ .start = @as(i64, l.UInt), .end = @as(i64, r.UInt) - minus_one, .step = 1, .kind = .UInt } };
+    // UInt and the smaller unsigned types (UByte/UShort promote to a UInt
+    // range, mirroring Kotlin's `UByte.rangeTo` etc.).
+    const lu = smallUnsigned(l);
+    const ru = smallUnsigned(r);
+    if (lu != null and ru != null) {
+        return .{ .Range = .{ .start = lu.?, .end = ru.? - minus_one, .step = 1, .kind = .UInt } };
     }
     if (l.* == .ULong and r.* == .ULong) {
         return .{ .Range = .{ .start = @bitCast(l.ULong), .end = @as(i64, @bitCast(r.ULong)) - minus_one, .step = 1, .kind = .ULong } };
     }
     return null;
+}
+
+/// A UByte/UShort/UInt value as an i64 (for forming a UInt range), else null.
+fn smallUnsigned(v: *const Value) ?i64 {
+    return switch (v.*) {
+        .UByte => |x| @as(i64, x),
+        .UShort => |x| @as(i64, x),
+        .UInt => |x| @as(i64, x),
+        else => null,
+    };
 }
 
 fn promoteByteShort(v: *const Value) ?Value {
