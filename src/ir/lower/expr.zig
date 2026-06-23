@@ -2806,6 +2806,9 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const callee_r = try lowerExpr(b, callee);
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    // Carry explicit call-site type arguments so an intrinsic container
+    // creator (`listOf<Byte>(…)`) stamps and coerces its element type.
+    const type_args = try internTypeArgs(b.allocator, b.module, call.type_args);
     const dst = b.allocReg();
     try b.push(.{ .CallValue = .{
         .dst = dst,
@@ -2813,6 +2816,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
+        .type_args = type_args,
     } });
     return dst;
 }
