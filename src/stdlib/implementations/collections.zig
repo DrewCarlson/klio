@@ -4949,7 +4949,14 @@ pub fn coll_map_get_value(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     if (ctx.args.len < 2) return arityErr("getValue requires a key");
-    const key = ctx.args[1];
+    // Property-delegation form `getValue(thisRef, property)` keys by the
+    // property name (`Map<String,V>.getValue` -> getOrImplicitDefault(name));
+    // the plain `getValue(key)` form keys by the argument itself.
+    const key: Value = if (ctx.args.len >= 3 and ctx.args[2] == .PropertyRef) blk: {
+        const g = ctx.args[2].PropertyRef.name.borrow();
+        defer g.deinit();
+        break :blk .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, g.get().bytes)) };
+    } else ctx.args[1];
     {
         const g = entries.borrowMut();
         defer g.deinit();
