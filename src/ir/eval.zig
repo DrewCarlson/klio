@@ -3783,6 +3783,9 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
             .Long => |l| return ok(.{ .Long = -%l }),
             .Double => |d| return ok(.{ .Double = -d }),
             .Float => |f| return ok(.{ .Float = -f }),
+            // `Byte`/`Short.unaryMinus()` widen to `Int` (Kotlin).
+            .Byte => |b| return ok(.{ .Int = -@as(i32, b) }),
+            .Short => |s| return ok(.{ .Int = -@as(i32, s) }),
             else => {},
         },
         .Plus => return ok(v.*),
@@ -3792,6 +3795,13 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
             .Float => |f| return ok(.{ .Float = f + 1.0 }),
             .Double => |d| return ok(.{ .Double = d + 1.0 }),
             .Char => |c| return ok(.{ .Char = c +% 1 }),
+            // `inc()`/`dec()` keep the receiver's type.
+            .Byte => |b| return ok(.{ .Byte = b +% 1 }),
+            .Short => |s| return ok(.{ .Short = s +% 1 }),
+            .UByte => |b| return ok(.{ .UByte = b +% 1 }),
+            .UShort => |s| return ok(.{ .UShort = s +% 1 }),
+            .UInt => |x| return ok(.{ .UInt = x +% 1 }),
+            .ULong => |x| return ok(.{ .ULong = x +% 1 }),
             else => {},
         },
         .Dec => switch (v.*) {
@@ -3800,6 +3810,12 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
             .Float => |f| return ok(.{ .Float = f - 1.0 }),
             .Double => |d| return ok(.{ .Double = d - 1.0 }),
             .Char => |c| return ok(.{ .Char = c -% 1 }),
+            .Byte => |b| return ok(.{ .Byte = b -% 1 }),
+            .Short => |s| return ok(.{ .Short = s -% 1 }),
+            .UByte => |b| return ok(.{ .UByte = b -% 1 }),
+            .UShort => |s| return ok(.{ .UShort = s -% 1 }),
+            .UInt => |x| return ok(.{ .UInt = x -% 1 }),
+            .ULong => |x| return ok(.{ .ULong = x -% 1 }),
             else => {},
         },
     }
