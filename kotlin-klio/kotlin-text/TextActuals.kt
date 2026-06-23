@@ -43,6 +43,9 @@ public actual fun CharSequence.repeat(n: Int): String {
     }
 }
 
+public actual fun String?.toBoolean(): Boolean =
+    this != null && this.lowercase() == "true"
+
 public actual fun CharArray.concatToString(): String {
     val sb = StringBuilder(size)
     for (c in this) sb.append(c)

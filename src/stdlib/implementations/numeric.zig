@@ -312,8 +312,34 @@ pub fn unsigned_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |x| x,
         .err => |e| return .{ .err = e },
     };
-    const s = try std.fmt.allocPrint(ctx.allocator, "{d}", .{v});
+    const radix = switch (try recvIntRadix(ctx.allocator, argAt(ctx, 1), "toString")) {
+        .ok => |r| r,
+        .err => |e| return .{ .err = e },
+    };
+    if (!(radix >= 2 and radix <= 36)) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
+        const exc = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        if (runtime.freeScratch()) ctx.allocator.free(msg);
+        return .{ .err = .{ .Thrown = exc } };
+    }
+    const s = try uintToRadixString(ctx.allocator, v, @intCast(radix));
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
+}
+
+/// Render an unsigned magnitude in `radix` (no sign prefix).
+pub fn uintToRadixString(allocator: Allocator, n: u64, radix: u32) Allocator.Error![]u8 {
+    if (n == 0) return allocator.dupe(u8, "0");
+    var x = n;
+    var digits = std.ArrayList(u8).empty;
+    defer digits.deinit(allocator);
+    const r: u64 = @intCast(radix);
+    while (x > 0) {
+        const d: u32 = @intCast(x % r);
+        x /= r;
+        try digits.append(allocator, fromDigit(d));
+    }
+    std.mem.reverse(u8, digits.items);
+    return digits.toOwnedSlice(allocator);
 }
 
 // ============================================================
@@ -610,6 +636,88 @@ pub fn long_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     return ok(.{ .Int = if (a < b) -1 else @intFromBool(a > b) });
 }
+fn unsignedVal(v: Value) ?u64 {
+    return switch (v) {
+        .UByte => |x| @as(u64, x),
+        .UShort => |x| @as(u64, x),
+        .UInt => |x| @as(u64, x),
+        .ULong => |x| x,
+        else => null,
+    };
+}
+
+fn u32arg(v: Value) u32 {
+    return switch (v) {
+        .UInt => |x| x,
+        .UByte => |x| @as(u32, x),
+        .UShort => |x| @as(u32, x),
+        .Int => |x| @bitCast(x),
+        else => 0,
+    };
+}
+fn u64arg(v: Value) u64 {
+    return switch (v) {
+        .ULong => |x| x,
+        .UInt => |x| @as(u64, x),
+        .Long => |x| @bitCast(x),
+        .Int => |x| @as(u64, @as(u32, @bitCast(x))),
+        else => 0,
+    };
+}
+fn shiftCount(v: Value) u32 {
+    return switch (v) {
+        .Int => |x| @bitCast(x),
+        .Long => |x| @truncate(@as(u64, @bitCast(x))),
+        else => 0,
+    };
+}
+
+pub fn uint_and(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = u32arg(ctx.args[0]) & u32arg(ctx.args[1]) });
+}
+pub fn uint_or(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = u32arg(ctx.args[0]) | u32arg(ctx.args[1]) });
+}
+pub fn uint_xor(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = u32arg(ctx.args[0]) ^ u32arg(ctx.args[1]) });
+}
+pub fn uint_inv(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = ~u32arg(ctx.args[0]) });
+}
+pub fn uint_shl(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = u32arg(ctx.args[0]) << @truncate(shiftCount(ctx.args[1])) });
+}
+pub fn uint_shr(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .UInt = u32arg(ctx.args[0]) >> @truncate(shiftCount(ctx.args[1])) });
+}
+pub fn ulong_and(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = u64arg(ctx.args[0]) & u64arg(ctx.args[1]) });
+}
+pub fn ulong_or(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = u64arg(ctx.args[0]) | u64arg(ctx.args[1]) });
+}
+pub fn ulong_xor(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = u64arg(ctx.args[0]) ^ u64arg(ctx.args[1]) });
+}
+pub fn ulong_inv(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = ~u64arg(ctx.args[0]) });
+}
+pub fn ulong_shl(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = u64arg(ctx.args[0]) << @truncate(shiftCount(ctx.args[1])) });
+}
+pub fn ulong_shr(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return ok(.{ .ULong = u64arg(ctx.args[0]) >> @truncate(shiftCount(ctx.args[1])) });
+}
+
+/// `compareTo` for the unsigned types — an unsigned comparison (the Kotlin
+/// default would recurse without a native binding).
+pub fn unsigned_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Type = "compareTo requires an argument" } };
+    const a = unsignedVal(ctx.args[0]) orelse return .{ .err = .{ .Type = "unsigned compareTo: bad receiver" } };
+    const b = unsignedVal(ctx.args[1]) orelse return .{ .err = .{ .Type = "unsigned compareTo: bad argument" } };
+    return ok(.{ .Int = if (a < b) @as(i32, -1) else @intFromBool(a > b) });
+}
+
 pub fn int_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = switch (try recvInt(ctx.allocator, ctx.args, "Int.compareTo")) {
         .ok => |v| v,

@@ -4384,15 +4384,14 @@ fn lowerImplicitThisCall(
 
     // Private own-class methods bind statically.
     if (b.privateMethodFid(name0)) |fid| {
+        // Reserve the receiver slot first, then lower the arguments into a
+        // contiguous run immediately after it. `lowerArgRun` reserves every
+        // argument slot before lowering any argument, so an argument's own
+        // scratch registers can never clobber an already-lowered slot (a bug
+        // the previous hand-rolled loop had, dropping local-variable args).
         const args_start = b.allocReg();
+        const run = try lowerArgRun(b, args);
         try b.push(.{ .Move = .{ .dst = args_start, .src = this_reg } });
-        for (args, 0..) |*a, i| {
-            const r = try lowerExpr(b, a);
-            try b.push(.{ .Move = .{
-                .dst = Reg.from(args_start.int() + @as(u32, @intCast(i)) + 1),
-                .src = r,
-            } });
-        }
         var user_arg_names = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
         defer b.allocator.free(user_arg_names);
         user_arg_names[0] = null;
@@ -4403,7 +4402,7 @@ fn lowerImplicitThisCall(
             .dst = dst,
             .func = fid,
             .args = args_start,
-            .n_args = @as(u32, @intCast(args.len)) + 1,
+            .n_args = run[1] + 1,
             .arg_names = arg_names,
             .type_args = &.{},
             .exact = false,
@@ -4537,6 +4536,30 @@ fn lowerUnresolvedBareCall(
             .type_args = type_args,
         } });
         return dst;
+    }
+    // A known top-level stdlib function (`listOfNotNull`, `buildList`,
+    // `compareBy`, …) that no class declares as a member is never a member of
+    // the implicit receiver. Bind the global directly: routing it through
+    // `CallMemberOrGlobal` would let the member/extension probe treat it as an
+    // extension on `this` and prepend the receiver into its varargs.
+    if (isAliasName(name0) and !b.module.registry.class_member_names.contains(name0)) {
+        orEmitAudit(b, "unresolved_bare_call", "LoadGlobal", name0);
+        const callee_r = b.allocReg();
+        const nm0 = try b.module.internConst(b.allocator, .{ .String = name0 });
+        try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm0 } });
+        const run0 = try lowerArgRun(b, args);
+        const arg_names0 = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const type_args0 = try internTypeArgs(b.allocator, b.module, ast_type_args);
+        const dst0 = b.allocReg();
+        try b.push(.{ .CallValue = .{
+            .dst = dst0,
+            .callee = callee_r,
+            .args = run0[0],
+            .n_args = run0[1],
+            .arg_names = arg_names0,
+            .type_args = type_args0,
+        } });
+        return dst0;
     }
     const this_idx = try b.recordCapture("this");
     const run = try lowerArgRun(b, args);
@@ -4676,6 +4699,38 @@ fn lowerFqnGlobalCall(
     defer b.allocator.free(fqn);
     const head = firstSegment(fqn);
     const head_is_real_pkg = isPkgRoot(head);
+    // A fully-qualified property access followed by a member call
+    // (`kotlin.math.PI.toFloat()`): the prefix names a top-level property, so
+    // the call is a member call on that property's value, not a global
+    // function whose FQN is the whole dotted path. Decline and let the
+    // member-call fallback lower the property load + `CallMember`.
+    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
+        const prefix = fqn[0..dot];
+        const prefix_name = rsplitLast(prefix, '.');
+        if (b.module.topLevelPropFqn(prefix_name)) |pfqn| {
+            if (std.mem.eql(u8, pfqn, prefix)) {
+                // Load the property value by its package-qualified FQN, then
+                // member-call the trailing segment on it.
+                const recv = b.allocReg();
+                const pn = try b.module.internConst(b.allocator, .{ .String = prefix });
+                try b.push(.{ .LoadGlobal = .{ .dst = recv, .name = pn } });
+                const last = fqn[dot + 1 ..];
+                const run = try lowerArgRun(b, args);
+                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                const dst = b.allocReg();
+                const mname = try b.module.internConst(b.allocator, .{ .String = last });
+                try b.push(.{ .CallMember = .{
+                    .dst = dst,
+                    .receiver = recv,
+                    .name = mname,
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                } });
+                return dst;
+            }
+        }
+    }
     if (isPackageHead(head) and
         headIsPackage(b, head) and
         b.resolve(head) == null and
