@@ -194,6 +194,13 @@ pub fn range_step_field(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(rangeEndpoint(view.kind, intAbs(view.step)));
 }
 
+/// `OpenEndRange.endExclusive` — one past the last element. A `..<` range is
+/// stored as the closed `start..(end-1)`, so the exclusive bound is `end + 1`.
+pub fn range_end_exclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const view = rangeViewArg(ctx, "endExclusive") orelse return typeErr("endExclusive requires a Range receiver");
+    return ok(rangeEndpoint(view.kind, view.end + 1));
+}
+
 pub fn range_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "toString") orelse return typeErr("toString requires a Range receiver");
     const r = Value{ .Range = .{

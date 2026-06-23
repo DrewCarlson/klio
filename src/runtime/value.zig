@@ -1816,6 +1816,13 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Whether a range/progression value covers no elements (Kotlin
+    /// `isEmpty()`): a positive step needs `start <= end`, a negative one
+    /// `start >= end`.
+    fn rangeIsEmptyVal(r: anytype) bool {
+        return if (r.step > 0) r.start > r.end else r.start < r.end;
+    }
+
     /// Equality with boxed `Number` semantics (each boxed type only matches
     /// its own type; collections compare elements boxed too).
     pub fn structuralEqBoxed(a: *const Value, b: *const Value) bool {
@@ -1871,9 +1878,9 @@ pub const Value = union(enum) {
             .Null => b.* == .Null,
             .Unit => b.* == .Unit,
             .CoroutineSuspended => b.* == .CoroutineSuspended,
-            .Range => |x| b.* == .Range and
-                x.start == b.Range.start and x.end == b.Range.end and
-                x.step == b.Range.step and x.kind == b.Range.kind,
+            .Range => |x| b.* == .Range and x.kind == b.Range.kind and
+                ((rangeIsEmptyVal(x) and rangeIsEmptyVal(b.Range)) or
+                    (x.start == b.Range.start and x.end == b.Range.end and x.step == b.Range.step)),
             .List => |x| b.* == .List and listEqBoxed(x.items, b.List.items),
             .Set => |x| b.* == .Set and setEqBoxed(x.items, b.Set.items),
             .Map => |x| b.* == .Map and mapEqBoxed(x.entries, b.Map.entries),
