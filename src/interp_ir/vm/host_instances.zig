@@ -2751,7 +2751,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
 
     // Names the object closes over that name a top-level *extension* fn
     // must NOT be value-captured; drop them so the body resolves them
-    // through the global/member path.
+    // through the global/member path. But a captured name that the object
+    // *overrides* (a member of its own class or a supertype, e.g. the
+    // crossinline `iterator` param behind `Iterable { … }`) shadows that
+    // member and must stay value-captured, or the override would recurse.
     var anon_cap_set = StringSet.init(allocator);
     for (captured_names) |n| {
         var names_extension = false;
@@ -2766,7 +2769,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             }
         }
         mg.deinit();
-        if (!names_extension) try anon_cap_set.put(n, {});
+        if (!names_extension or own_members.contains(n)) try anon_cap_set.put(n, {});
     }
     ir.lower.setLowerAnonCaptures(anon_cap_set);
     // `setLowerAnonCaptures` takes ownership; clear it after lowering.

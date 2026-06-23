@@ -2523,7 +2523,12 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // `Iterable.maxOf` / array `maxOf`) is the package-level function,
         // not a receiver member — it must fall through to the bare-name path.
         const recv_chain = try narrowingRecvChain(b);
-        if (b.resolve(nm) == null and !b.knowsOuter(nm)) {
+        // A captured crossinline param shadows a same-named member of the
+        // anonymous object being lowered (`object : Iterable<T> { override fun
+        // iterator() = iterator() }` — the bare `iterator()` is the captured
+        // lambda, not the override, which would recurse). Let it fall through
+        // to the anon-capture invocation below.
+        if (b.resolve(nm) == null and !b.knowsOuter(nm) and !isLowerAnonCapture(nm)) {
             // Confident the call binds to the spliced `this`: the name is a
             // member of its class, or an extension whose declared receiver is
             // compatible with the *known* receiver-type chain. Dispatch it
