@@ -15,6 +15,7 @@ const runtime = @import("runtime");
 const StdlibFn = runtime.StdlibFn;
 
 // Per-area intrinsic submodules.
+pub const atomics = @import("implementations/atomics.zig");
 pub const char = @import("implementations/char.zig");
 pub const collections = @import("implementations/collections.zig");
 pub const comparisons = @import("implementations/comparisons.zig");
@@ -47,6 +48,37 @@ pub const concurrent_lock_exit = concurrent.concurrent_lock_exit;
 const Entry = struct { fqn: []const u8, f: StdlibFn };
 
 const TABLE = [_]Entry{
+    // kotlin.concurrent.atomics — composite read-modify-write under the cell
+    // lock (load/store stay as the class's atomic single field access).
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicInt.exchange", .f = atomics.exchange },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicInt.compareAndSet", .f = atomics.compareAndSet },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicInt.compareAndExchange", .f = atomics.compareAndExchange },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicInt.fetchAndAdd", .f = atomics.fetchAndAdd },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicInt.addAndFetch", .f = atomics.addAndFetch },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicLong.exchange", .f = atomics.exchange },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicLong.compareAndSet", .f = atomics.compareAndSet },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicLong.compareAndExchange", .f = atomics.compareAndExchange },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicLong.fetchAndAdd", .f = atomics.fetchAndAdd },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicLong.addAndFetch", .f = atomics.addAndFetch },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicBoolean.exchange", .f = atomics.exchange },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicBoolean.compareAndSet", .f = atomics.compareAndSet },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicBoolean.compareAndExchange", .f = atomics.compareAndExchange },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicReference.exchange", .f = atomics.exchange },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicReference.compareAndSet", .f = atomics.compareAndSet },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicReference.compareAndExchange", .f = atomics.compareAndExchange },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicIntArray.exchangeAt", .f = atomics.exchangeAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicIntArray.compareAndSetAt", .f = atomics.compareAndSetAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicIntArray.compareAndExchangeAt", .f = atomics.compareAndExchangeAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicIntArray.fetchAndAddAt", .f = atomics.fetchAndAddAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicIntArray.addAndFetchAt", .f = atomics.addAndFetchAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicLongArray.exchangeAt", .f = atomics.exchangeAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicLongArray.compareAndSetAt", .f = atomics.compareAndSetAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicLongArray.compareAndExchangeAt", .f = atomics.compareAndExchangeAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicLongArray.fetchAndAddAt", .f = atomics.fetchAndAddAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicLongArray.addAndFetchAt", .f = atomics.addAndFetchAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicArray.exchangeAt", .f = atomics.exchangeAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicArray.compareAndSetAt", .f = atomics.compareAndSetAt },
+    .{ .fqn = "kotlin.concurrent.atomics.AtomicArray.compareAndExchangeAt", .f = atomics.compareAndExchangeAt },
     .{ .fqn = "kotlin.error", .f = control.contract_error },
     .{ .fqn = "kotlin.TODO", .f = control.contract_todo },
     .{ .fqn = "kotlin.collections.buildList", .f = control.builders_build_list },
