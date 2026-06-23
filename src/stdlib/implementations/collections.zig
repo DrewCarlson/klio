@@ -624,7 +624,40 @@ fn iterableItemsCtx(ctx: *CallCtx, v: Value, what: []const u8) Error!ItemsOutcom
             .err => |e| .{ .err = .{ .err = e } },
         };
     }
+    // A user/anonymous `Iterable` (e.g. the object `CharSequence.asIterable()`
+    // returns) has no built-in backing; drain it through its `iterator()`.
+    if (v == .Instance) {
+        if (try drainViaIterator(ctx, v)) |r| return r;
+    }
     return iterableItems(ctx.allocator, v, what);
+}
+
+/// Drain any value that exposes `iterator()` / `hasNext()` / `next()` into a
+/// flat element slice. Returns null when the value has no `iterator()` (so the
+/// caller can fall back to the built-in extractor or a type error).
+fn drainViaIterator(ctx: *CallCtx, v: Value) Error!?ItemsOutcome {
+    const a = ctx.allocator;
+    const iter_opt = try ctx.host.invokeMethod(&v, "iterator", &.{}, ctx.out);
+    const iter_res = iter_opt orelse return null;
+    const iter = switch (iter_res) {
+        .ok => |x| x,
+        .err => |e| return ItemsOutcome{ .err = .{ .err = e } },
+    };
+    var out: std.ArrayList(Value) = .empty;
+    while (true) {
+        const hn = (try ctx.host.invokeMethod(&iter, "hasNext", &.{}, ctx.out)) orelse return null;
+        const has = switch (hn) {
+            .ok => |x| x == .Bool and x.Bool,
+            .err => |e| return ItemsOutcome{ .err = .{ .err = e } },
+        };
+        if (!has) break;
+        const nx = (try ctx.host.invokeMethod(&iter, "next", &.{}, ctx.out)) orelse return null;
+        switch (nx) {
+            .ok => |item| try out.append(a, item),
+            .err => |e| return ItemsOutcome{ .err = .{ .err = e } },
+        }
+    }
+    return ItemsOutcome{ .items = try out.toOwnedSlice(a) };
 }
 
 // =====================================================================
@@ -4552,14 +4585,11 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
         .Set => |s| to_add = try snapshotItems(a, s.items),
         // `MutableCollection<in T>.addAll(elements: Array<out T>)`.
         .Array => |arr| to_add = try arr.snapshot(a),
-        // `addAll(elements: Sequence<T>)` (e.g. `list + aSequence`).
-        .Sequence => to_add = switch (try materialiseSequence(a, ctx.host, ctx.out, arg)) {
+        // `addAll(elements: Sequence<T>)` and `addAll(elements: Iterable<T>)`
+        // over a lazy sequence or a user/anonymous iterable.
+        else => to_add = switch (try iterableItemsCtx(ctx, arg, "addAll")) {
             .items => |x| x,
-            .err => |e| return .{ .err = e },
-        },
-        else => {
-            const ad = try display(a, arg);
-            return typeErr(try fmt(a, "addAll requires a collection, got {s}", .{ad}));
+            .err => |e| return e,
         },
     }
     // `to_add` is a shallow `snapshotItems` dupe; `appendSlice` copies its
