@@ -51,3 +51,20 @@ public actual fun CharArray.concatToString(): String {
 
 public actual val String.Companion.CASE_INSENSITIVE_ORDER: Comparator<String>
     get() = Comparator { a, b -> a.compareTo(b, ignoreCase = true) }
+
+/// Unicode general category, backed by the upstream generated
+/// `getCategoryValue()` table (see `_CharCategories.kt`). The category int
+/// indexes the enum entries (17 is reserved/unused), mirroring
+/// `CharCategory.valueOf(Int)`.
+public actual val Char.category: CharCategory
+    get() = when (val category = getCategoryValue()) {
+        in 0..16 -> CharCategory.values()[category]
+        in 18..30 -> CharCategory.values()[category - 1]
+        else -> throw IllegalArgumentException("Category #$category is not defined.")
+    }
+
+public actual fun Char.isDefined(): Boolean =
+    getCategoryValue() != CharCategory.UNASSIGNED.value
+
+public actual fun Char.isTitleCase(): Boolean =
+    getCategoryValue() == CharCategory.TITLECASE_LETTER.value
