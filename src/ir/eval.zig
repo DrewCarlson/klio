@@ -3564,7 +3564,7 @@ fn argNamesAllNull(names: []const ?ConstId) bool {
     return true;
 }
 
-fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u8) Allocator.Error![]Value {
+fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u32) Allocator.Error![]Value {
     const out = try allocator.alloc(Value, n);
     var i: u32 = 0;
     while (i < n) : (i += 1) {

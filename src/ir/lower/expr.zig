@@ -1818,7 +1818,7 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .receiver = recv,
                     .name = set_nm,
                     .args = key_start,
-                    .n_args = @as(u8, @intCast(n_keys)) + 1,
+                    .n_args = @as(u32, @intCast(n_keys)) + 1,
                     .arg_names = &.{},
                 } });
                 return old;
@@ -2319,7 +2319,7 @@ fn lowerCallWithWritebackPath(
         }
     }
     try run_regs.appendSlice(b.allocator, arg_regs);
-    const n_args: u8 = @intCast(run_regs.items.len);
+    const n_args: u32 = @intCast(run_regs.items.len);
     const args_start = try packContiguous(b, run_regs.items);
 
     var arg_names_list: std.ArrayList(?ConstId) = .empty;
@@ -4403,7 +4403,7 @@ fn lowerImplicitThisCall(
             .dst = dst,
             .func = fid,
             .args = args_start,
-            .n_args = @as(u8, @intCast(args.len)) + 1,
+            .n_args = @as(u32, @intCast(args.len)) + 1,
             .arg_names = arg_names,
             .type_args = &.{},
             .exact = false,
