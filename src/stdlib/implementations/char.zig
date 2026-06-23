@@ -82,6 +82,39 @@ fn imod(a: i64, b: i64) i64 {
 /// `kotlin.internal.getProgressionLastElement(start, end, step)`.
 ///
 /// Result narrows back to a Kotlin Int when the progression was Int-typed.
+/// A progression step value as an i64, regardless of its int kind.
+fn stepAsI64(v: Value) i64 {
+    return switch (v) {
+        .Int => |x| @as(i64, x),
+        .Long => |x| x,
+        .Short => |x| @as(i64, x),
+        .Byte => |x| @as(i64, x),
+        .UInt => |x| @as(i64, @as(i32, @bitCast(x))),
+        .ULong => |x| @bitCast(x),
+        else => 1,
+    };
+}
+fn diffModU32(a: u32, b: u32, c: u32) u32 {
+    const ac = a % c;
+    const bc = b % c;
+    return if (ac >= bc) ac - bc else ac -% bc +% c;
+}
+fn uintProgressionLast(start: u32, end: u32, step: i32) u32 {
+    if (step > 0) return if (start >= end) end else end - diffModU32(end, start, @intCast(step));
+    if (step < 0) return if (start <= end) end else end + diffModU32(start, end, @intCast(-step));
+    return end;
+}
+fn diffModU64(a: u64, b: u64, c: u64) u64 {
+    const ac = a % c;
+    const bc = b % c;
+    return if (ac >= bc) ac - bc else ac -% bc +% c;
+}
+fn ulongProgressionLast(start: u64, end: u64, step: i64) u64 {
+    if (step > 0) return if (start >= end) end else end - diffModU64(end, start, @intCast(step));
+    if (step < 0) return if (start <= end) end else end + diffModU64(start, end, @intCast(-step));
+    return end;
+}
+
 pub fn internal_get_progression_last_element(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const args = ctx.args;
     if (args.len != 3) {
@@ -91,6 +124,18 @@ pub fn internal_get_progression_last_element(ctx: *CallCtx) std.mem.Allocator.Er
     var end: i64 = undefined;
     var step: i64 = undefined;
     var is_long: bool = undefined;
+    // Unsigned progressions use unsigned modular arithmetic (UProgressionUtil).
+    if (args[0] == .UInt and args[1] == .UInt) {
+        const s: u32 = args[0].UInt;
+        const e: u32 = args[1].UInt;
+        const st: i32 = @truncate(stepAsI64(args[2]));
+        return ok(.{ .UInt = uintProgressionLast(s, e, st) });
+    }
+    if (args[0] == .ULong and args[1] == .ULong) {
+        const s: u64 = args[0].ULong;
+        const e: u64 = args[1].ULong;
+        return ok(.{ .ULong = ulongProgressionLast(s, e, stepAsI64(args[2])) });
+    }
     if (args[0] == .Long and args[1] == .Long and args[2] == .Long) {
         start = args[0].Long;
         end = args[1].Long;
