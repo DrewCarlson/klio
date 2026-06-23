@@ -27,16 +27,15 @@ const proc_env = @import("proc_env.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Default RSS cap. The in-process harnesses (differential / e2e / fuzz /
-/// stdlib-isolation) run the whole corpus through one long-lived process; most
-/// reset a per-program arena between programs, but the baked stdlib image and
-/// the per-program residue still plateau, and that plateau scales with the
-/// stdlib's footprint (now larger: full Unicode category tables, the atomics
-/// API, the kotlin.test pack). The bound stays well below system OOM and a
-/// single runaway program — which races unbounded rather than plateauing — is
-/// still aborted long before the machine is endangered. Override with
-/// `KLIO_RSS_CAP_KB` (or the legacy `KLIO_PARITY_RSS_CAP_KB`).
-const DEFAULT_RSS_CAP_KB: u64 = 8 * 1024 * 1024;
+/// Default RSS cap, matching the Rust harness's 6 GiB. The in-process harnesses
+/// (differential / e2e / fuzz) run the whole corpus through one long-lived
+/// process, but each program is run on a per-program arena that is reset (or
+/// destroyed) between programs, so the resident peak is a single program's
+/// worth rather than the accumulated corpus. A single runaway program — which
+/// races unbounded toward system OOM, not a bounded plateau — is still aborted
+/// long before the machine is endangered. Override with `KLIO_RSS_CAP_KB` (or
+/// the legacy `KLIO_PARITY_RSS_CAP_KB`) to raise or lower the bound.
+const DEFAULT_RSS_CAP_KB: u64 = 6 * 1024 * 1024;
 
 /// How often the watchdogs sample, in nanoseconds (100ms — same as Rust).
 const POLL_NS: u64 = 100 * std.time.ns_per_ms;
