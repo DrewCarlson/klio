@@ -815,6 +815,24 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             return ok(.{ .Range = .{ .start = 0, .end = len - 1, .step = 1, .kind = .Int } });
         }
     }
+    // `UByteArray.storage` etc. — the signed array over the same bytes. The
+    // `PrimBuf` carries its own kind, so reinterpret by copying the bytes into
+    // a fresh signed-kind buffer.
+    if (std.mem.eql(u8, name, "storage") and receiver.* == .Array) {
+        const a = receiver.Array;
+        if (a.prim) |k| {
+            if (k.signedCounterpart()) |signed| {
+                if (a.storage == .scalars) {
+                    const g = a.storage.scalars.borrow();
+                    defer g.deinit();
+                    var pb = runtime.PrimBuf{ .kind = signed };
+                    try pb.bytes.appendSlice(allocator, g.get().bytes.items);
+                    const view = try ObjRef(runtime.PrimBuf).initOwned(allocator, pb);
+                    return ok(.{ .Array = .{ .storage = .{ .scalars = view }, .prim = signed } });
+                }
+            }
+        }
+    }
     // `size` on arrays + collections.
     if (std.mem.eql(u8, name, "size")) {
         switch (receiver.*) {
