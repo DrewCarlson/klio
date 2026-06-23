@@ -3445,8 +3445,8 @@ pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
     const items = g.get().items;
     const len: i64 = @intCast(items.len);
     var out: std.ArrayList(Value) = .empty;
-    if (ctx.args.len > 1 and ctx.args[1] == .Range) {
-        const r = ctx.args[1].Range;
+    if (ctx.args.len > 1 and asRangeView(ctx.args[1]) != null) {
+        const r = asRangeView(ctx.args[1]).?;
         var rit = RangeIter.init(r.start, r.end, r.step);
         while (rit.next()) |i| {
             if (i < 0 or i >= len) {
