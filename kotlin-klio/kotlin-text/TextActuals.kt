@@ -52,10 +52,13 @@ public actual fun CharArray.concatToString(): String {
 public actual val String.Companion.CASE_INSENSITIVE_ORDER: Comparator<String>
     get() = Comparator { a, b -> a.compareTo(b, ignoreCase = true) }
 
-/// Unicode general category, backed by the upstream generated
-/// `getCategoryValue()` table (see `_CharCategories.kt`). The category int
-/// indexes the enum entries (17 is reserved/unused), mirroring
-/// `CharCategory.valueOf(Int)`.
+/// The Unicode general-category code. The body is a placeholder: the host
+/// binding `kotlin.Char.getCategoryValue` (a compiled-in table) shadows it, so
+/// the huge category data never enters the stdlib pack.
+internal fun Char.getCategoryValue(): Int = 0
+
+/// Unicode general category. The category int indexes the enum entries (17 is
+/// reserved/unused), mirroring `CharCategory.valueOf(Int)`.
 public actual val Char.category: CharCategory
     get() = when (val category = getCategoryValue()) {
         in 0..16 -> CharCategory.values()[category]

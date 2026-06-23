@@ -94,8 +94,6 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "src/kotlin/enums/EnumEntries.kt",
     "src/kotlin/Library.kt",
     "src/kotlin/uuid/Uuid.kt",
-    "native-wasm/src/generated/_DigitChars.kt",
-    "native-wasm/src/generated/_CharCategories.kt",
     "src/kotlin/Unit.kt",
     "src/kotlin/Throwable.kt",
     "src/kotlin/text/regex/MatchResult.kt",

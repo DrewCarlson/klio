@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const unicode_category = @import("unicode_category.zig");
 
 const Value = runtime.Value;
 const RuntimeError = runtime.RuntimeError;
@@ -60,6 +61,16 @@ pub fn char_code(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return switch (r) {
         .err => |e| .{ .err = e },
         .unit => |u| ok(Value.newInt(@as(i64, u))),
+    };
+}
+
+/// `Char.getCategoryValue()` — the Unicode general-category code, from the
+/// compiled-in table (see `unicode_category.zig`).
+pub fn char_get_category_value(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const r = recvChar(ctx.args, "Char.getCategoryValue");
+    return switch (r) {
+        .err => |e| .{ .err = e },
+        .unit => |u| ok(Value.newInt(@as(i64, unicode_category.categoryValue(@as(i32, u))))),
     };
 }
 
