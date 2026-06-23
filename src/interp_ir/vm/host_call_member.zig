@@ -1302,6 +1302,14 @@ pub fn hostHasProperty(self: *VmHost, receiver: *const Value, name: []const u8) 
     var cls_name: []const u8 = undefined;
     {
         const g = inst.borrow();
+        // A property already materialized on the instance (default-initialized
+        // at construction) counts — covers pack/IR-backed classes whose defs
+        // aren't in the tree-walker class registry walked below (e.g. a
+        // builder receiver like `HexFormat.Builder`'s `upperCase`).
+        if (g.get().get(name) != null) {
+            g.deinit();
+            return true;
+        }
         const cg = g.get().class.borrow();
         cls_name = cg.get().name;
         cg.deinit();
