@@ -3117,31 +3117,43 @@ pub fn coll_list_sum(ctx: *CallCtx) Error!EvalResult {
     };
     const g = it.borrow();
     defer g.deinit();
-    var acc_int: ?i64 = 0;
-    var acc_dbl: ?f64 = null;
-    for (g.get().items) |v| {
-        if (v.isIntegral()) {
-            const n = v.asI64().?;
-            if (acc_int) |*aa| {
-                aa.* +%= n;
-            } else if (acc_dbl) |*aa| {
-                aa.* += @as(f64, @floatFromInt(n));
-            }
-        } else if (v.isFloating()) {
-            const d = v.asF64().?;
-            if (acc_int) |aa| {
-                acc_dbl = @as(f64, @floatFromInt(aa)) + d;
-                acc_int = null;
-            } else if (acc_dbl) |*aa| {
-                aa.* += d;
-            }
-        } else {
-            const vd = try display(a, v);
-            return typeErr(try fmt(a, "List.sum requires numeric elements, got {s}", .{vd}));
+    return sumValues(a, g.get().items, "List.sum");
+}
+
+/// Sum a numeric element slice, returning the Kotlin result type for the
+/// element type: `Long` -> Long, `Double` -> Double, `Float` -> Float, and
+/// Int/Short/Byte -> Int (wrapping, like Kotlin).
+fn sumValues(a: Allocator, items: []const Value, what: []const u8) Error!EvalResult {
+    var acc_i: i64 = 0;
+    var acc_f: f64 = 0;
+    var any_long = false;
+    var any_float = false;
+    var any_double = false;
+    for (items) |v| {
+        switch (v) {
+            .Long => {
+                any_long = true;
+                acc_i +%= v.asI64().?;
+            },
+            .Int, .Short, .Byte, .UByte, .UShort, .UInt, .ULong => acc_i +%= v.asI64() orelse @intCast(v.asU64() orelse 0),
+            .Float => {
+                any_float = true;
+                acc_f += v.asF64().?;
+            },
+            .Double => {
+                any_double = true;
+                acc_f += v.asF64().?;
+            },
+            else => {
+                const vd = try display(a, v);
+                return typeErr(try fmt(a, "{s} requires numeric elements, got {s}", .{ what, vd }));
+            },
         }
     }
-    if (acc_dbl) |d| return ok(.{ .Double = d });
-    return ok(Value.newInt(acc_int orelse 0));
+    if (any_double) return ok(.{ .Double = acc_f + @as(f64, @floatFromInt(acc_i)) });
+    if (any_float) return ok(.{ .Float = @floatCast(acc_f + @as(f64, @floatFromInt(acc_i))) });
+    if (any_long) return ok(.{ .Long = acc_i });
+    return ok(Value.newInt(@as(i32, @truncate(acc_i))));
 }
 
 pub fn coll_list_average(ctx: *CallCtx) Error!EvalResult {
@@ -5476,31 +5488,7 @@ fn arraySumImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
         .err => |e| return e,
     };
     defer if (runtime.freeScratch()) a.free(items);
-    var int_acc: i64 = 0;
-    var dbl_acc: f64 = 0.0;
-    var as_double = false;
-    for (items) |v| {
-        switch (v) {
-            .Int, .Long, .Short, .Byte => int_acc += v.asI64() orelse 0,
-            .Double => |d| {
-                if (!as_double) {
-                    dbl_acc = @floatFromInt(int_acc);
-                    as_double = true;
-                }
-                dbl_acc += d;
-            },
-            .Float => |f| {
-                if (!as_double) {
-                    dbl_acc = @floatFromInt(int_acc);
-                    as_double = true;
-                }
-                dbl_acc += @as(f64, f);
-            },
-            else => return typeErr(try fmt(a, "{s}: non-numeric element", .{what})),
-        }
-    }
-    if (as_double) return ok(.{ .Double = dbl_acc });
-    return ok(Value.newInt(int_acc));
+    return sumValues(a, items, what);
 }
 
 pub fn array_sum_int(ctx: *CallCtx) Error!EvalResult {
