@@ -1498,7 +1498,12 @@ pub fn map_get_or_else(ctx: *CallCtx) Error!EvalResult {
     {
         const g = ctx.args[0].Map.entries.borrowMut();
         defer g.deinit();
-        if (try g.get().find(a, &key)) |i| return okElem(g.get().pairs.items[i].value);
+        // `getOrElse` is `get(key) ?: defaultValue()`: a present-but-null value
+        // falls through to the default just like an absent key.
+        if (try g.get().find(a, &key)) |i| {
+            const v = g.get().pairs.items[i].value;
+            if (v != .Null) return okElem(v);
+        }
     }
     const block = ctx.args[2];
     return try ctx.host.invokeCallable(&block, &.{}, ctx.out);
@@ -1513,7 +1518,13 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries_rc.borrowMut();
         defer g.deinit();
-        if (try g.get().find(a, &key)) |i| return okElem(g.get().pairs.items[i].value);
+        // `getOrPut` returns the stored value only when it is non-null; a
+        // present-but-null value is recomputed and stored (Kotlin's `value
+        // == null` branch).
+        if (try g.get().find(a, &key)) |i| {
+            const v = g.get().pairs.items[i].value;
+            if (v != .Null) return okElem(v);
+        }
     }
     const block = ctx.args[2];
     const new_v = switch (try invoke(ctx, &block, &.{})) {
@@ -1523,15 +1534,21 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries_rc.borrowMut();
         defer g.deinit();
-        // The map takes ownership of one ref to the stored key and value; the
-        // block's `new_v` is also returned, so retain both for the map and
-        // hand back the block's owned ref untouched.
-        if (runtime.reclaimEnabled()) {
-            key.retain();
-            new_v.retain();
+        // The map takes ownership of one ref to the stored value; the block's
+        // `new_v` is also returned, so retain it for the map and hand back the
+        // block's owned ref untouched.
+        if (runtime.reclaimEnabled()) new_v.retain();
+        // A present key (its value was null, which is why we got here) is
+        // updated in place; a genuinely absent key appends a new entry.
+        if (try g.get().find(a, &key)) |i| {
+            const old = g.get().pairs.items[i].value;
+            g.get().pairs.items[i].value = new_v;
+            if (runtime.reclaimEnabled()) old.release(a);
+        } else {
+            if (runtime.reclaimEnabled()) key.retain();
+            try g.get().pairs.append(a, .{ .key = key, .value = new_v });
+            try g.get().noteAppended(a, g.get().pairs.items.len - 1);
         }
-        try g.get().pairs.append(a, .{ .key = key, .value = new_v });
-        try g.get().noteAppended(a, g.get().pairs.items.len - 1);
     }
     return ok(new_v);
 }
