@@ -4675,6 +4675,38 @@ fn lowerFqnGlobalCall(
     defer b.allocator.free(fqn);
     const head = firstSegment(fqn);
     const head_is_real_pkg = isPkgRoot(head);
+    // A fully-qualified property access followed by a member call
+    // (`kotlin.math.PI.toFloat()`): the prefix names a top-level property, so
+    // the call is a member call on that property's value, not a global
+    // function whose FQN is the whole dotted path. Decline and let the
+    // member-call fallback lower the property load + `CallMember`.
+    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
+        const prefix = fqn[0..dot];
+        const prefix_name = rsplitLast(prefix, '.');
+        if (b.module.topLevelPropFqn(prefix_name)) |pfqn| {
+            if (std.mem.eql(u8, pfqn, prefix)) {
+                // Load the property value by its package-qualified FQN, then
+                // member-call the trailing segment on it.
+                const recv = b.allocReg();
+                const pn = try b.module.internConst(b.allocator, .{ .String = prefix });
+                try b.push(.{ .LoadGlobal = .{ .dst = recv, .name = pn } });
+                const last = fqn[dot + 1 ..];
+                const run = try lowerArgRun(b, args);
+                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                const dst = b.allocReg();
+                const mname = try b.module.internConst(b.allocator, .{ .String = last });
+                try b.push(.{ .CallMember = .{
+                    .dst = dst,
+                    .receiver = recv,
+                    .name = mname,
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                } });
+                return dst;
+            }
+        }
+    }
     if (isPackageHead(head) and
         headIsPackage(b, head) and
         b.resolve(head) == null and
