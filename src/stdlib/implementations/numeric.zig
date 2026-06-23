@@ -819,6 +819,35 @@ pub fn double_to_long(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .Long = f64ToI64Kotlin(d) });
 }
 
+/// `Double`/`Float.toU*()` — Kotlin defines these as `toLong().toU*()`: the
+/// floating value saturates to `Long`, then truncates to the unsigned width.
+fn doubleToUnsigned(ctx: *CallCtx, comptime which: []const u8) Allocator.Error!?u64 {
+    const d = switch (try recvDouble(ctx.allocator, ctx.args, which)) {
+        .ok => |v| v,
+        .err => |e| {
+            _ = e;
+            return null;
+        },
+    };
+    return @bitCast(f64ToI64Kotlin(d));
+}
+pub fn double_to_uint(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const u = (try doubleToUnsigned(ctx, "toUInt")) orelse return .{ .err = .{ .Type = "toUInt requires a floating receiver" } };
+    return ok(.{ .UInt = @truncate(u) });
+}
+pub fn double_to_ulong(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const u = (try doubleToUnsigned(ctx, "toULong")) orelse return .{ .err = .{ .Type = "toULong requires a floating receiver" } };
+    return ok(.{ .ULong = u });
+}
+pub fn double_to_ushort(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const u = (try doubleToUnsigned(ctx, "toUShort")) orelse return .{ .err = .{ .Type = "toUShort requires a floating receiver" } };
+    return ok(.{ .UShort = @truncate(u) });
+}
+pub fn double_to_ubyte(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const u = (try doubleToUnsigned(ctx, "toUByte")) orelse return .{ .err = .{ .Type = "toUByte requires a floating receiver" } };
+    return ok(.{ .UByte = @truncate(u) });
+}
+
 /// Kotlin's `Double.toInt` semantics: truncate toward zero, saturate at
 /// `Int.MIN_VALUE`/`Int.MAX_VALUE` for out-of-range, `NaN -> 0`.
 pub fn f64ToI32Kotlin(d: f64) i32 {
@@ -1064,6 +1093,10 @@ pub fn num_count_leading_zero_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
         .Int => |v| @clz(@as(u32, @bitCast(v))),
         .Short => |v| @clz(@as(u16, @bitCast(v))),
         .Byte => |v| @clz(@as(u8, @bitCast(v))),
+        .ULong => |v| @clz(v),
+        .UInt => |v| @clz(v),
+        .UShort => |v| @clz(v),
+        .UByte => |v| @clz(v),
         else => return .{ .err = try countTypeErr(ctx.allocator, "countLeadingZeroBits", ctx.args[0]) },
     };
     return ok(Value.newInt(@as(i64, n)));
@@ -1079,6 +1112,10 @@ pub fn num_count_trailing_zero_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
         .Int => |v| @ctz(@as(u32, @bitCast(v))),
         .Short => |v| @min(@as(i32, @ctz(@as(u16, @bitCast(v)))), 16),
         .Byte => |v| @min(@as(i32, @ctz(@as(u8, @bitCast(v)))), 8),
+        .ULong => |v| @ctz(v),
+        .UInt => |v| @ctz(v),
+        .UShort => |v| @min(@as(i32, @ctz(v)), 16),
+        .UByte => |v| @min(@as(i32, @ctz(v)), 8),
         else => return .{ .err = try countTypeErr(ctx.allocator, "countTrailingZeroBits", ctx.args[0]) },
     };
     return ok(Value.newInt(@as(i64, n)));
@@ -1094,6 +1131,10 @@ pub fn num_count_one_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
         .Int => |v| @popCount(@as(u32, @bitCast(v))),
         .Short => |v| @popCount(@as(u16, @bitCast(v))),
         .Byte => |v| @popCount(@as(u8, @bitCast(v))),
+        .ULong => |v| @popCount(v),
+        .UInt => |v| @popCount(v),
+        .UShort => |v| @popCount(v),
+        .UByte => |v| @popCount(v),
         else => return .{ .err = try countTypeErr(ctx.allocator, "countOneBits", ctx.args[0]) },
     };
     return ok(Value.newInt(@as(i64, n)));

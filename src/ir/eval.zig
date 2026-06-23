@@ -2303,6 +2303,16 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             }
             if (operatorMethod(bo.op)) |method| {
                 if (l == .Instance or r == .Instance) {
+                    // `a == b` dispatches `a.equals(b)`, but a builtin
+                    // collection carries only structural equality; when the
+                    // left operand is a builtin and the right is a user
+                    // Instance (a class implementing Set/List/Map with its own
+                    // `equals`), dispatch on the Instance instead. Structural
+                    // equality is symmetric, so the result is identical and a
+                    // builtin receiver need not implement `equals(Instance)`.
+                    const swap = bo.op == .Eq and l != .Instance and r == .Instance;
+                    const recv_ptr = if (swap) &r else &l;
+                    const arg_val = if (swap) l else r;
                     // Strict extension dispatch: an operator extension whose
                     // declared receiver doesn't accept `l` is not a candidate
                     // (kotlinc drops it), so `Unimplemented` surfaces and the
@@ -2310,7 +2320,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     // on a type declaring only `plusAssign` must not bind a
                     // receiver-incompatible `plus` like `String?.plus(Any?)`.
                     var result: Value = undefined;
-                    switch (try host.callMemberStrictExt(allocator, &l, method, &.{r}, &.{null}, null)) {
+                    switch (try host.callMemberStrictExt(allocator, recv_ptr, method, &.{arg_val}, &.{null}, null)) {
                         .ok => |v| result = v,
                         .err => |e| switch (e) {
                             // `a OP= b` lowers to `a = a.OP(b)`, but the
@@ -2323,6 +2333,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                                         .err => |e2| return raiseStep(frame, e2),
                                     }
                                     result = l;
+                                } else if (bo.op == .Eq) {
+                                    // No user `equals` surface: Kotlin's
+                                    // default is structural/identity equality.
+                                    result = .{ .Bool = Value.structuralEq(&l, &r) };
                                 } else {
                                     return raiseStep(frame, e);
                                 }

@@ -542,6 +542,9 @@ fn kotlinHashCode(v: *const Value) i32 {
             if (r.step == 1) break :blk @as(i32, 31) *% f +% l;
             break :blk (@as(i32, 31) *% (@as(i32, 31) *% f +% l)) +% s;
         },
+        // `Map.Entry.hashCode()` is `key.hashCode() xor value.hashCode()`, so a
+        // Set-of-entries (a map's `entries`) folds to the map's hashCode.
+        .MapEntry => |e| kotlinHashCode(e.key.asPtr()) ^ kotlinHashCode(e.value.asPtr()),
         else => valueStructuralHash(v),
     };
 }
@@ -974,6 +977,15 @@ fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *cons
     }
     if (!receiverImplementsHead(self, receiver, pn)) return false;
     if (ty_args.len == 0) return true;
+    // A user `Instance` carries no reified generic arguments, so the head
+    // match is the strongest provable check (kotlinc resolves the type
+    // arguments statically). Treat it as sufficient: an extension on a
+    // generic user class — `CompareContext<Collection<T>>.collectionBehavior`
+    // called on a `CompareContext<…>` lambda receiver — then proves strictly
+    // on the innermost receiver instead of deferring to the lenient pass,
+    // where a same-named member on an OUTER receiver would otherwise preempt
+    // it. `elementsProveArgs` only introspects the builtin container shapes.
+    if (receiver.* == .Instance) return true;
     return elementsProveArgs(self, allocator, receiver, fid, pn, ty_args, fuel);
 }
 
@@ -1577,6 +1589,13 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
             }
             return 20;
         }
+        // A callable can never bind a concrete non-function parameter type
+        // (`Iterable`/`Collection`/`Array`/`String`/`Int`…): disqualify the
+        // candidate so a sibling function-typed overload wins. Without this a
+        // lambda scores a weak-but-positive 8 against `removeAll(Iterable)`,
+        // and the receiver-specificity tier (ranked above arg fit) then elects
+        // that Iterable form over `removeAll(predicate)` → infinite recursion.
+        if (isDefinitelyNonFunctionTypeName(simpleName(nm))) return null;
         return 8;
     }
     // Subtype distance scoring for an instance argument.
@@ -1763,13 +1782,18 @@ fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver:
 }
 
 /// Parameter-type names that can never bind a function-typed argument.
-/// Conservative: only the builtin value types and `String`/`CharSequence`,
-/// so a typealiased function type or user interface is never adjudicated.
+/// Conservative: the builtin value types, `String`/`CharSequence`, and the
+/// concrete container types — none of which is ever a function type or a
+/// typealias to one. This lets a trailing-lambda call drop a same-named
+/// collection-typed member (`removeAll(elements: Collection)`) so the
+/// predicate extension (`removeAll(predicate: (T) -> Boolean)`) binds.
 fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     const names = [_][]const u8{
-        "String", "CharSequence", "Boolean", "Char",  "Byte",  "Short",
-        "Int",    "Long",         "Float",   "Double", "UByte", "UShort",
-        "UInt",   "ULong",        "Number",
+        "String",     "CharSequence",      "Boolean",  "Char",          "Byte",    "Short",
+        "Int",        "Long",              "Float",    "Double",         "UByte",   "UShort",
+        "UInt",       "ULong",             "Number",   "Collection",     "MutableCollection",
+        "Iterable",   "MutableIterable",   "List",     "MutableList",    "Set",     "MutableSet",
+        "Map",        "MutableMap",        "Array",    "Sequence",
     };
     for (names) |n| {
         if (std.mem.eql(u8, pn, n)) return true;
@@ -2659,6 +2683,26 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (std.mem.eql(u8, name, "toString") and args.len == 0) return .{ .ok = try strVal(allocator, "kotlin.Unit") };
     }
 
+    // `Boolean` operator members: `b.not()`, `b.and(x)`, `b.or(x)`,
+    // `b.xor(x)`, `b.compareTo(x)`. The `!`/`&&`/`||` syntax lowers to
+    // unary/binops, but the named members are also callable (e.g.
+    // `isEmpty().not()`), and are not otherwise resolved for a `Bool` value.
+    if (receiver.* == .Bool) {
+        const b = receiver.Bool;
+        if (std.mem.eql(u8, name, "not") and args.len == 0) return .{ .ok = boolVal(!b) };
+        if (args.len == 1 and args[0] == .Bool) {
+            const o = args[0].Bool;
+            if (std.mem.eql(u8, name, "and")) return .{ .ok = boolVal(b and o) };
+            if (std.mem.eql(u8, name, "or")) return .{ .ok = boolVal(b or o) };
+            if (std.mem.eql(u8, name, "xor")) return .{ .ok = boolVal(b != o) };
+            if (std.mem.eql(u8, name, "compareTo")) {
+                const bi: i64 = @intFromBool(b);
+                const oi: i64 = @intFromBool(o);
+                return .{ .ok = Value.newInt(if (bi < oi) @as(i64, -1) else if (bi > oi) @as(i64, 1) else 0) };
+            }
+        }
+    }
+
     // `hashCode()` on a builtin value type.
     if (args.len == 0 and std.mem.eql(u8, name, "hashCode") and
         receiver.* != .Instance and receiver.* != .Class and receiver.* != .PropertyRef)
@@ -3124,6 +3168,12 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
         },
         .Set => |s| {
+            // A mutable set shares its backing so `MutableIterator.remove()`
+            // mutates the source set (the `filterInPlace` removeAll/retainAll
+            // path iterates + removes); an immutable set snapshots.
+            if (s.mutable and s.backing == null) {
+                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
+            }
             const items = try cloneItemsList(allocator, s.items);
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
         },
@@ -3174,6 +3224,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
 fn isBuiltinScalar(v: *const Value) bool {
     return switch (v.*) {
         .String, .Int, .Long, .Short, .Byte, .Double, .Float, .Bool, .Char => true,
+        .UInt, .ULong, .UShort, .UByte => true,
         else => false,
     };
 }
@@ -4722,6 +4773,20 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     }
 
     var all = try prependReceiver(allocator, receiver, args);
+    // Kotlin trailing-lambda rule for an under-applied member call: the final
+    // supplied callable binds the LAST function-typed parameter, with the
+    // intervening defaulted parameters filled from their defaults rather than
+    // bound left-to-right. `padArgsWithDefaults` fills positionally (lambda →
+    // first gap param), so route this shape through the shared positional
+    // binder, which implements the rule uniformly (and varargs/defaults).
+    if (all.len < f.params.len and all.len != 0 and
+        isFunctionTypeRefResolved(self, &f.params[f.params.len - 1].ty) and
+        isCallable(&all[all.len - 1]) and (all.len - 1) < (f.params.len - 1))
+    {
+        const r = try callFuncRec(self, allocator, mod, fid, all);
+        if (runtime.freeScratch()) allocator.free(all);
+        return r;
+    }
     const defaults = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();

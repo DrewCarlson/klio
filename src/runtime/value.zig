@@ -1827,8 +1827,10 @@ pub const Value = union(enum) {
     /// its own type; collections compare elements boxed too).
     pub fn structuralEqBoxed(a: *const Value, b: *const Value) bool {
         switch (a.*) {
-            .Double => |x| if (b.* == .Double) return @as(u64, @bitCast(x)) == @as(u64, @bitCast(b.Double)),
-            .Float => |x| if (b.* == .Float) return @as(u32, @bitCast(x)) == @as(u32, @bitCast(b.Float)),
+            // `Double.equals` collapses every NaN to one canonical bit pattern
+            // (`toBits`), so any two NaNs compare equal while `0.0 != -0.0`.
+            .Double => |x| if (b.* == .Double) return (std.math.isNan(x) and std.math.isNan(b.Double)) or @as(u64, @bitCast(x)) == @as(u64, @bitCast(b.Double)),
+            .Float => |x| if (b.* == .Float) return (std.math.isNan(x) and std.math.isNan(b.Float)) or @as(u32, @bitCast(x)) == @as(u32, @bitCast(b.Float)),
             .Int => |x| if (b.* == .Int) return x == b.Int,
             .Long => |x| if (b.* == .Long) return x == b.Long,
             .Short => |x| if (b.* == .Short) return x == b.Short,
@@ -2421,6 +2423,17 @@ const pair_typed_creators = [_][]const u8{
 /// not a numeric primitive, or the element is non-numeric. Mirrors the
 /// type-directed conversion kotlinc applies to integer/float literals so a
 /// `List<Byte>` compares equal to one built from a `ByteArray`.
+fn elemAsU64(v: Value) ?u64 {
+    return switch (v) {
+        .UByte => |x| x,
+        .UShort => |x| x,
+        .UInt => |x| x,
+        .ULong => |x| x,
+        .Byte, .Short, .Int, .Long => if (v.asI64()) |n| (if (n >= 0) @as(u64, @intCast(n)) else null) else null,
+        else => null,
+    };
+}
+
 fn coerceNumericElem(val: Value, head: []const u8) ?Value {
     const eq = std.mem.eql;
     if (eq(u8, head, "Byte")) {
@@ -2433,6 +2446,14 @@ fn coerceNumericElem(val: Value, head: []const u8) ?Value {
         if (val != .Float and (val.isIntegral() or val.isFloating())) if (val.asF64()) |f| return .{ .Float = @floatCast(f) };
     } else if (eq(u8, head, "Double")) {
         if (val != .Double and (val.isIntegral() or val.isFloating())) if (val.asF64()) |f| return .{ .Double = f };
+    } else if (eq(u8, head, "UByte")) {
+        if (val != .UByte) if (elemAsU64(val)) |n| return .{ .UByte = @truncate(n) };
+    } else if (eq(u8, head, "UShort")) {
+        if (val != .UShort) if (elemAsU64(val)) |n| return .{ .UShort = @truncate(n) };
+    } else if (eq(u8, head, "UInt")) {
+        if (val != .UInt) if (elemAsU64(val)) |n| return .{ .UInt = @truncate(n) };
+    } else if (eq(u8, head, "ULong")) {
+        if (val != .ULong) if (elemAsU64(val)) |n| return .{ .ULong = n };
     }
     return null;
 }

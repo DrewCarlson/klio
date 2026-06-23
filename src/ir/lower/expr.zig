@@ -54,6 +54,7 @@ const internArgNames = helpers.internArgNames;
 const internTypeArgs = helpers.internTypeArgs;
 const exprSpan = helpers.exprSpan;
 const isAnyTypedPath = helpers.isAnyTypedPath;
+const isGenericTypedPath = helpers.isGenericTypedPath;
 const lambdaWritesOuterVar = helpers.lambdaWritesOuterVar;
 
 const isBoxedToAnyForm = ast_scan.isBoxedToAnyForm;
@@ -573,10 +574,13 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     const lhs = bin.lhs;
     const rhs = bin.rhs;
 
-    // `==` on a boxed `Any` operand uses bitwise equality for Double/Float.
+    // `==` on a boxed operand (an `Any`-typed or generic type-parameter value,
+    // e.g. `assertEquals(expected: T, actual: T)`) uses total-order equality —
+    // `NaN == NaN` is true and `0.0 != -0.0`, matching boxed `Double.equals`.
     if ((op == .Eq or op == .Neq) and
         (isBoxedToAnyForm(lhs) or isBoxedToAnyForm(rhs) or
-            isAnyTypedPath(b, lhs) or isAnyTypedPath(b, rhs)))
+            isAnyTypedPath(b, lhs) or isAnyTypedPath(b, rhs) or
+            isGenericTypedPath(b, lhs) or isGenericTypedPath(b, rhs)))
     {
         const l = try lowerExpr(b, lhs);
         const r = try lowerExpr(b, rhs);
@@ -3385,21 +3389,16 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     const last_arg_lambda = lastArgIsLambda(args);
 
     const name_is_alias = isAliasName(name0);
-    const intrinsic_owns_all = std.mem.eql(u8, name0, "compareValues") or
-        std.mem.eql(u8, name0, "compareValuesBy");
 
-    const contract_with_msg = (std.mem.eql(u8, name0, "require") or
-        std.mem.eql(u8, name0, "check") or std.mem.eql(u8, name0, "checkNotNull")) and
-        lastArgIsLambda(args);
     const prefer_member = b.resolve("this") != null and b.hasOwnMember(name0) and
-        b.resolve(name0) == null and !b.isLocalFn(name0) and !b.isLocalExtFn(name0) and
-        !contract_with_msg;
+        b.ownMemberApplicable(name0, args.len) and
+        b.resolve(name0) == null and !b.isLocalFn(name0) and !b.isLocalExtFn(name0);
 
-    const cast_pick: ?FuncId = if (intrinsic_owns_all) null else try overloadPickByCast(b, cands, args, want);
+    const cast_pick: ?FuncId = try overloadPickByCast(b, cands, args, want);
 
     var bare_func_id: ?FuncId = null;
     var rung: HeurRung = .none;
-    if (!(intrinsic_owns_all or (prefer_member and cast_pick == null))) {
+    if (!(prefer_member and cast_pick == null)) {
         bare_func_id = cast_pick;
         if (bare_func_id != null) rung = .cast;
         if (bare_func_id == null) {
@@ -4393,11 +4392,12 @@ fn lowerImplicitThisCall(
     const segments = callee.Path.segments;
     if (segments.len != 1) return null;
     const name0 = segments[0].name;
-    const contract_with_msg = (std.mem.eql(u8, name0, "require") or
-        std.mem.eql(u8, name0, "check") or std.mem.eql(u8, name0, "checkNotNull")) and
-        lastArgIsLambda(args);
-    if (contract_with_msg) return null;
     if (b.resolve(name0) != null or b.knowsOuter(name0) or !b.hasOwnMember(name0)) return null;
+    // A same-named member that cannot bind this call's arity (a 0-arg
+    // `requireNotNull()` for a 1-arg `requireNotNull(x)`) does not shadow the
+    // top-level function: defer to the global-resolution path instead of
+    // emitting a `this.<member>` call that can't dispatch.
+    if (!b.ownMemberApplicable(name0, args.len)) return null;
     const this_reg = b.resolve("this") orelse return null;
 
     // Private own-class methods bind statically.
