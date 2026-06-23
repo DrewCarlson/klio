@@ -155,10 +155,13 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "common/src/kotlin/JvmAnnotationsH.kt",
     "src/kotlin/annotations/NativeAnnotations.kt",
     "src/kotlin/annotations/NativeConcurrentAnnotations.kt",
-    // `AtomicArrays.common.kt` is omitted: experimental array atomics with no
-    // klio actual whose bare names collided with kotlinx.atomicfu types. The
-    // scalar atomics stay.
+    // kotlin.concurrent.atomics: the common `expect`s carry the size+init
+    // factories and the increment/update extension family; the wasm `actual`s
+    // carry the cell/array-backing class shapes. RMW methods are made atomic by
+    // host bindings (see implementations/atomics.zig).
+    "src/kotlin/concurrent/atomics/Atomics.common.kt",
     "wasm/src/kotlin/concurrent/atomics/Atomics.wasm.kt",
+    "src/kotlin/concurrent/atomics/AtomicArrays.common.kt",
     "wasm/src/kotlin/concurrent/atomics/AtomicArrays.wasm.kt",
     "src/kotlin/util/Lazy.kt",
     "common/src/kotlin/KotlinH.kt",

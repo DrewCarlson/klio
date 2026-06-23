@@ -157,6 +157,37 @@ fn secondaryCtors(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const roo
     return g.get().secondary_ctors.get(sideTableKey(fqn, name)) orelse &.{};
 }
 
+/// Simple runtime type-name head of a value (`IntArray`, `Int`).
+fn valueTypeHead(v: Value) []const u8 {
+    const fqn = v.typeFqn();
+    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| return fqn[i + 1 ..];
+    return fqn;
+}
+
+/// Pick the secondary ctor for `args` by arity, disambiguating same-arity
+/// overloads by argument type (`AtomicIntArray(size: Int)` vs
+/// `AtomicIntArray(array: IntArray)`). Falls back to the first arity match when
+/// no parameter type distinguishes them.
+fn chooseSecondaryCtor(entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
+    var first: ?root.build.SecondaryCtorEntry = null;
+    var best: ?root.build.SecondaryCtorEntry = null;
+    var best_score: i32 = 0;
+    for (entries) |e| {
+        if (e.param_count != args.len) continue;
+        if (first == null) first = e;
+        var score: i32 = 0;
+        var i: usize = 0;
+        while (i < args.len and i < e.param_type_heads.len) : (i += 1) {
+            if (std.mem.eql(u8, e.param_type_heads[i], valueTypeHead(args[i]))) score += 1;
+        }
+        if (score > best_score) {
+            best_score = score;
+            best = e;
+        }
+    }
+    return if (best != null) best else first;
+}
+
 fn parentCtorArgThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const FuncId {
     const g = self.prog.borrow();
     defer g.deinit();
@@ -603,13 +634,7 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
         return .{ .ok = {} };
     }
     const entries = secondaryCtors(self, class_fqn, class_name);
-    var chosen: ?root.build.SecondaryCtorEntry = null;
-    for (entries) |e| {
-        if (e.param_count == args.len) {
-            chosen = e;
-            break;
-        }
-    }
+    const chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(entries, args);
     const entry = chosen orelse {
         // No secondary ctor takes this shape: the class delegates through
         // its PRIMARY ctor (`open class A(msg: String) : B(msg)`). Bind
@@ -1437,13 +1462,7 @@ fn funcParamHasDefault(self: *VmHost, fid: FuncId, idx: usize) bool {
 fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), args: []const Value, outer_hint: ?*const Value) Allocator.Error!?EvalResult {
     const class_name = classDefName(class_def);
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
-    var chosen: ?root.build.SecondaryCtorEntry = null;
-    for (entries) |e| {
-        if (e.param_count == args.len) {
-            chosen = e;
-            break;
-        }
-    }
+    var chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(entries, args);
     if (chosen == null) {
         for (entries) |e| {
             if (e.param_count > args.len) {

@@ -98,6 +98,16 @@ pub const TypedDefault = enum(u8) {
 /// category. Nullable, function, and non-primitive heads are references
 /// (default null); a qualified head only counts as a builtin primitive
 /// when the qualifier is exactly `kotlin`.
+/// Simple type-name head for ctor-overload disambiguation: drop any package
+/// qualifier, generic arguments, and trailing nullability.
+fn simpleTypeHead(name: []const u8) []const u8 {
+    var s = name;
+    if (std.mem.lastIndexOfScalar(u8, s, '.')) |i| s = s[i + 1 ..];
+    if (std.mem.indexOfScalar(u8, s, '<')) |i| s = s[0..i];
+    if (s.len > 0 and s[s.len - 1] == '?') s = s[0 .. s.len - 1];
+    return s;
+}
+
 pub fn typedDefaultFor(ty: ?*const ast.TypeRef) TypedDefault {
     const t = ty orelse return .none;
     if (t.nullable or t.function != null) return .null_ref;
@@ -181,6 +191,9 @@ pub const SecondaryCtorEntry = struct {
     param_count: usize,
     /// Declared parameter names, in order.
     param_names: [][]const u8,
+    /// Simple type-name head of each parameter (`IntArray`, `Int`), used to
+    /// disambiguate same-arity constructor overloads by argument type.
+    param_type_heads: [][]const u8,
     is_super: bool,
     /// `true` for an explicit `: this(...)` delegation.
     is_this: bool,
@@ -2020,6 +2033,8 @@ fn buildModuleWithOverrides(
         for (c.secondary_ctors, 0..) |*sc, sc_idx| {
             var param_names = try a.alloc([]const u8, sc.params.len);
             for (sc.params, 0..) |*p, i| param_names[i] = p.name.name;
+            var param_type_heads = try a.alloc([]const u8, sc.params.len);
+            for (sc.params, 0..) |*p, i| param_type_heads[i] = simpleTypeHead(p.ty.name.name);
 
             var delegation_args: []const ast.Expr = &.{};
             var is_super = false;
@@ -2061,6 +2076,7 @@ fn buildModuleWithOverrides(
             entries[sc_idx] = .{
                 .param_count = sc.params.len,
                 .param_names = param_names,
+                .param_type_heads = param_type_heads,
                 .is_super = is_super,
                 .is_this = is_this,
                 .delegation_arg_thunks = arg_fids,
