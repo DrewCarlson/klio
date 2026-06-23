@@ -16,8 +16,8 @@ const std = @import("std");
 const runtime = @import("runtime");
 
 /// Minimum number of stdlib commonTest cases that must pass. A ratchet: bump it
-/// up as fixes land, never down. (Total discovered today is ~1240; ~1143 pass.)
-const BASELINE: usize = 1135;
+/// up as fixes land, never down. (Total discovered today is ~1240; ~1154 pass.)
+const BASELINE: usize = 1148;
 
 const TEST_ROOT = "kotlin/libraries/stdlib/test";
 const ACTUALS = [_][]const u8{
