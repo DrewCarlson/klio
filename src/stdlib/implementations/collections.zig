@@ -3401,6 +3401,10 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("minus requires an argument");
     const arg = ctx.args[1];
     var removals: std.ArrayList(Value) = .empty;
+    // `minus(elements: Collection/Array/Sequence)` removes every element that
+    // is a member of `elements`; `minus(element)` removes only the first
+    // occurrence of that single element.
+    var is_collection = true;
     switch (arg) {
         .List => |l| try appendVL(&removals, a, l.items),
         .Set => |s| try appendVL(&removals, a, s.items),
@@ -3409,16 +3413,21 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
                 .items => |x| x,
                 .err => |e| return e,
             };
-    defer if (runtime.freeScratch()) a.free(xs);
+            defer if (runtime.freeScratch()) a.free(xs);
             try removals.appendSlice(a, xs);
         },
-        else => try removals.append(a, arg),
+        else => {
+            is_collection = false;
+            try removals.append(a, arg);
+        },
     }
     var out: std.ArrayList(Value) = .empty;
     const src = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
-        if (indexOfBoxed(removals.items, &v)) |pos| {
+        if (is_collection) {
+            if (!containsBoxed(removals.items, &v)) try out.append(a, v);
+        } else if (indexOfBoxed(removals.items, &v)) |pos| {
             _ = removals.orderedRemove(pos);
         } else {
             try out.append(a, v);
@@ -3810,6 +3819,10 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
             .List => |l| break :blk try snapshotItems(a, l.items),
             .Set => |s| break :blk try snapshotItems(a, s.items),
             .Array => |arr| if (allow_array) break :blk try arr.snapshot(a) else return typeErr(try fmt(a, "{s} requires a collection", .{what})),
+            .Sequence => break :blk switch (try iterableItemsCtx(ctx, arg, what)) {
+                .items => |x| x,
+                .err => |e| return e,
+            },
             else => return typeErr(try fmt(a, "{s} requires a collection", .{what})),
         }
     };
