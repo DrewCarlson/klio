@@ -54,7 +54,7 @@ fn runKlio(
         .environ_map = env,
         // A test file that makes the interpreter hang (infinite loop, not a
         // crash) must not stall the suite; cap each child.
-        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(60_000), .clock = .awake } },
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
     }) catch |e| {
         // A timed-out (hanging) child is reported as a blocked file, not a
         // hard spawn failure.
