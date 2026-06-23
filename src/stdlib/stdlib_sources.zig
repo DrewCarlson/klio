@@ -158,7 +158,8 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     // `AtomicArrays.common.kt` is omitted: experimental array atomics with no
     // klio actual whose bare names collided with kotlinx.atomicfu types. The
     // scalar atomics stay.
-    "src/kotlin/concurrent/atomics/Atomics.common.kt",
+    "wasm/src/kotlin/concurrent/atomics/Atomics.wasm.kt",
+    "wasm/src/kotlin/concurrent/atomics/AtomicArrays.wasm.kt",
     "src/kotlin/util/Lazy.kt",
     "common/src/kotlin/KotlinH.kt",
     "common/src/kotlin/ioH.kt",
