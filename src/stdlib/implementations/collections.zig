@@ -661,6 +661,112 @@ fn drainViaIterator(ctx: *CallCtx, v: Value) Error!?ItemsOutcome {
 }
 
 // =====================================================================
+// random / randomOrNull / shuffled
+// =====================================================================
+
+var random_state: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0x2545F4914F6CDD1D);
+
+const IndexOutcome = union(enum) { idx: usize, err: RuntimeError };
+
+/// A uniform index in `[0, n)`. When a `Random` argument was supplied (the
+/// `random(Random)` / `shuffled(Random)` overloads, where it sits at
+/// `args[1]`), draw from it through the host so a seeded source stays
+/// deterministic; otherwise use the process RNG.
+fn pickIndex(ctx: *CallCtx, n: usize) Error!IndexOutcome {
+    if (n <= 1) return .{ .idx = 0 };
+    if (ctx.args.len > 1 and ctx.args[1] == .Instance) {
+        const arg = ctx.args[1];
+        if (try ctx.host.invokeMethod(&arg, "nextInt", &.{Value.newInt(@intCast(n))}, ctx.out)) |res| {
+            switch (res) {
+                .ok => |v| if (v.asI64()) |iv| {
+                    const m = @mod(iv, @as(i64, @intCast(n)));
+                    return .{ .idx = @intCast(m) };
+                },
+                .err => |e| return .{ .err = e },
+            }
+        }
+    }
+    return .{ .idx = random_state.random().uintLessThan(usize, n) };
+}
+
+pub fn coll_random(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("random requires a receiver");
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "random")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    if (items.len == 0) return try thrown(a, "kotlin.NoSuchElementException", "Collection is empty.");
+    const idx = switch (try pickIndex(ctx, items.len)) {
+        .idx => |i| i,
+        .err => |e| return .{ .err = e },
+    };
+    const v = items[idx];
+    if (runtime.reclaimEnabled()) v.retain();
+    return ok(v);
+}
+
+pub fn coll_random_or_null(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("randomOrNull requires a receiver");
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "randomOrNull")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    if (items.len == 0) return ok(.Null);
+    const idx = switch (try pickIndex(ctx, items.len)) {
+        .idx => |i| i,
+        .err => |e| return .{ .err = e },
+    };
+    const v = items[idx];
+    if (runtime.reclaimEnabled()) v.retain();
+    return ok(v);
+}
+
+/// Fisher-Yates shuffle of `slice` in place, drawing indices via `pickIndex`.
+fn shuffleInPlace(ctx: *CallCtx, slice: []Value) Error!?RuntimeError {
+    var i: usize = slice.len;
+    while (i > 1) {
+        i -= 1;
+        const j = switch (try pickIndex(ctx, i + 1)) {
+            .idx => |x| x,
+            .err => |e| return e,
+        };
+        const tmp = slice[i];
+        slice[i] = slice[j];
+        slice[j] = tmp;
+    }
+    return null;
+}
+
+pub fn coll_shuffled(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("shuffled requires a receiver");
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "shuffled")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    if (try shuffleInPlace(ctx, items)) |e| return .{ .err = e };
+    return ok(try makeList(a, items, false));
+}
+
+/// `MutableList.shuffle()` — shuffle in place.
+pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.shuffle")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const g = it.borrowMut();
+    defer g.deinit();
+    if (try shuffleInPlace(ctx, g.get().items)) |e| return .{ .err = e };
+    return ok(.Unit);
+}
+
+// =====================================================================
 // Iterable transforms (filterNotNull, sumOf, max/min of, distinctBy,
 // groupBy, groupingBy + terminals, associate*, sorted*, onEach, mapNotNull)
 // =====================================================================
