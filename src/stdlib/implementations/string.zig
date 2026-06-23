@@ -832,6 +832,12 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
     const start_i64 = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse 0) else 0;
     const start_u16: usize = if (start_i64 < 0) 0 else @intCast(start_i64);
     const ignore_case = ctx.args.len > 3 and ctx.args[3] == .Bool and ctx.args[3].Bool;
+    // The empty string matches at the start index, clamped to the length (the
+    // JVM behavior `"abc".indexOf("", n)` returns `n.coerceAtMost(length)`).
+    if (needle.len == 0) {
+        const total = utf16Len(s);
+        return .{ .ok = Value.newInt(@intCast(@min(start_u16, total))) };
+    }
     const start_byte = utf16IndexToByte(s, start_u16);
     if (start_byte > s.len) return .{ .ok = Value.newInt(-1) };
     const hay = s[start_byte..];
