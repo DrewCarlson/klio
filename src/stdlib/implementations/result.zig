@@ -373,7 +373,24 @@ pub fn result_get_or_default(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 pub fn result_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = recvResult(ctx.args) orelse
         return .{ .err = .{ .Type = "Result.toString requires a Result receiver" } };
-    const inner = try recv.payload.display(ctx.allocator);
+    // `Success($value)` / `Failure($exception)` interpolate the payload, so a
+    // value (commonly the thrown exception) with an overridden `toString()`
+    // must use it rather than the structural identity rendering.
+    const inner: []const u8 = blk: {
+        if (recv.payload.* == .Instance) {
+            if (try ctx.host.invokeMethod(recv.payload, "toString", &.{}, ctx.out)) |res| {
+                switch (res) {
+                    .ok => |v| if (v == .String) {
+                        const g = v.String.borrow();
+                        defer g.deinit();
+                        break :blk try ctx.allocator.dupe(u8, g.get().bytes);
+                    },
+                    .err => |e| return .{ .err = e },
+                }
+            }
+        }
+        break :blk try recv.payload.display(ctx.allocator);
+    };
     defer ctx.allocator.free(inner);
     const s = if (recv.ok)
         try std.fmt.allocPrint(ctx.allocator, "Success({s})", .{inner})
