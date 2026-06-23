@@ -610,6 +610,25 @@ pub fn long_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     return ok(.{ .Int = if (a < b) -1 else @intFromBool(a > b) });
 }
+fn unsignedVal(v: Value) ?u64 {
+    return switch (v) {
+        .UByte => |x| @as(u64, x),
+        .UShort => |x| @as(u64, x),
+        .UInt => |x| @as(u64, x),
+        .ULong => |x| x,
+        else => null,
+    };
+}
+
+/// `compareTo` for the unsigned types — an unsigned comparison (the Kotlin
+/// default would recurse without a native binding).
+pub fn unsigned_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Type = "compareTo requires an argument" } };
+    const a = unsignedVal(ctx.args[0]) orelse return .{ .err = .{ .Type = "unsigned compareTo: bad receiver" } };
+    const b = unsignedVal(ctx.args[1]) orelse return .{ .err = .{ .Type = "unsigned compareTo: bad argument" } };
+    return ok(.{ .Int = if (a < b) @as(i32, -1) else @intFromBool(a > b) });
+}
+
 pub fn int_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = switch (try recvInt(ctx.allocator, ctx.args, "Int.compareTo")) {
         .ok => |v| v,
