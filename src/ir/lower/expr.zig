@@ -54,6 +54,7 @@ const internArgNames = helpers.internArgNames;
 const internTypeArgs = helpers.internTypeArgs;
 const exprSpan = helpers.exprSpan;
 const isAnyTypedPath = helpers.isAnyTypedPath;
+const isGenericTypedPath = helpers.isGenericTypedPath;
 const lambdaWritesOuterVar = helpers.lambdaWritesOuterVar;
 
 const isBoxedToAnyForm = ast_scan.isBoxedToAnyForm;
@@ -573,10 +574,13 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     const lhs = bin.lhs;
     const rhs = bin.rhs;
 
-    // `==` on a boxed `Any` operand uses bitwise equality for Double/Float.
+    // `==` on a boxed operand (an `Any`-typed or generic type-parameter value,
+    // e.g. `assertEquals(expected: T, actual: T)`) uses total-order equality —
+    // `NaN == NaN` is true and `0.0 != -0.0`, matching boxed `Double.equals`.
     if ((op == .Eq or op == .Neq) and
         (isBoxedToAnyForm(lhs) or isBoxedToAnyForm(rhs) or
-            isAnyTypedPath(b, lhs) or isAnyTypedPath(b, rhs)))
+            isAnyTypedPath(b, lhs) or isAnyTypedPath(b, rhs) or
+            isGenericTypedPath(b, lhs) or isGenericTypedPath(b, rhs)))
     {
         const l = try lowerExpr(b, lhs);
         const r = try lowerExpr(b, rhs);

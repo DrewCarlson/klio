@@ -33,6 +33,16 @@ pub fn isAnyTypedPath(b: *const FuncBuilder, e: *const Expr) bool {
     };
 }
 
+/// True when `e` is a bare name bound to a non-nullable generic type-parameter
+/// parameter (`a: T`). Such a value is boxed, so `==` on it is total-order
+/// (`NaN == NaN`), matching boxed `Double.equals`.
+pub fn isGenericTypedPath(b: *const FuncBuilder, e: *const Expr) bool {
+    return switch (e.*) {
+        .Path => |p| p.segments.len == 1 and b.isGenericTypedParam(p.segments[0].name),
+        else => false,
+    };
+}
+
 /// True when `arg` is a lambda whose body assigns to a name that the IR's
 /// current scope shadows or knows as an outer capture.
 pub fn lambdaWritesOuterVar(b: *FuncBuilder, arg: *const Expr) Allocator.Error!bool {

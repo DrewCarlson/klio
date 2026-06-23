@@ -1827,8 +1827,10 @@ pub const Value = union(enum) {
     /// its own type; collections compare elements boxed too).
     pub fn structuralEqBoxed(a: *const Value, b: *const Value) bool {
         switch (a.*) {
-            .Double => |x| if (b.* == .Double) return @as(u64, @bitCast(x)) == @as(u64, @bitCast(b.Double)),
-            .Float => |x| if (b.* == .Float) return @as(u32, @bitCast(x)) == @as(u32, @bitCast(b.Float)),
+            // `Double.equals` collapses every NaN to one canonical bit pattern
+            // (`toBits`), so any two NaNs compare equal while `0.0 != -0.0`.
+            .Double => |x| if (b.* == .Double) return (std.math.isNan(x) and std.math.isNan(b.Double)) or @as(u64, @bitCast(x)) == @as(u64, @bitCast(b.Double)),
+            .Float => |x| if (b.* == .Float) return (std.math.isNan(x) and std.math.isNan(b.Float)) or @as(u32, @bitCast(x)) == @as(u32, @bitCast(b.Float)),
             .Int => |x| if (b.* == .Int) return x == b.Int,
             .Long => |x| if (b.* == .Long) return x == b.Long,
             .Short => |x| if (b.* == .Short) return x == b.Short,
