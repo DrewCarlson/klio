@@ -3003,19 +3003,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                             resolved = v;
                             break;
                         },
-                        // A candidate whose accessor RAN and produced control
-                        // flow (a delegate `getValue` that threw, a suspension,
-                        // a non-local return) is the real target — propagate it
-                        // rather than mistaking it for a "no such member" miss
-                        // and falling through to the global tier.
-                        .err => |e| switch (e) {
-                            .Throw, .NonLocalReturn, .LabeledReturn, .CalleeFailed, .Suspended, .StackOverflow => return raiseStep(frame, e),
-                            // Each candidate miss allocates a `Vm::get_field`
-                            // message the resolver discards while walking to the
-                            // next candidate / global tier; free it (a per-lookup
-                            // leak the coroutine shim does heavily).
-                            else => freeMissErr(allocator, e),
-                        },
+                        // Each candidate miss allocates a `Vm::get_field` message
+                        // the resolver discards while walking to the next
+                        // candidate / global tier; free it (a per-lookup leak in
+                        // bare-identifier resolution, which the coroutine shim
+                        // does heavily).
+                        .err => |e| freeMissErr(allocator, e),
                     }
                 }
             }
