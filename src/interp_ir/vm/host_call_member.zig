@@ -2445,6 +2445,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             }
             return .{ .ok = boolVal(false) };
         }
+        // `Char.equals(other, ignoreCase = true)`.
+        if (receiver.* == .Char and args.len > 1 and args[1] == .Bool and args[1].Bool) {
+            if (args.len > 0 and args[0] == .Char) {
+                const eq = stdlib.implementations.char.charEqIgnoreCase(receiver.Char, args[0].Char);
+                return .{ .ok = boolVal(eq) };
+            }
+            return .{ .ok = boolVal(false) };
+        }
         if (args.len > 0) {
             return .{ .ok = boolVal(Value.structuralEq(receiver, &args[0])) };
         }

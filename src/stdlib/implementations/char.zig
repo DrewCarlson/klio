@@ -480,6 +480,19 @@ pub fn singleCaseChar(c: u21, map: []const CaseEntry) u21 {
     return c;
 }
 
+/// `Char.equals(other, ignoreCase = true)`: equal if the upper-cased units
+/// match, or failing that the lower-cased upper-cased units match (Kotlin's
+/// rule, which also pairs characters that share a lowercase form).
+pub fn charEqIgnoreCase(a_unit: u16, b_unit: u16) bool {
+    if (a_unit == b_unit) return true;
+    const a = charUnitToScalar(a_unit) orelse return false;
+    const b = charUnitToScalar(b_unit) orelse return false;
+    const a_up = singleCaseChar(a, &uppercase_map);
+    const b_up = singleCaseChar(b, &uppercase_map);
+    if (a_up == b_up) return true;
+    return singleCaseChar(a_up, &lowercase_map) == singleCaseChar(b_up, &lowercase_map);
+}
+
 fn singleCasedChar(ctx: *CallCtx, comptime what: []const u8, map: []const CaseEntry) EvalResult {
     const r = recvChar(ctx.args, what);
     return switch (r) {
