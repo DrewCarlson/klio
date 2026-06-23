@@ -4417,8 +4417,11 @@ fn lowerImplicitThisCall(
     // non-callable *property* (`val allStatusCodes = allStatusCodes()`),
     // which kotlinc skips for a call — emit the OrGlobal form so member
     // dispatch still wins when callable but a miss falls through to the
-    // function instead of erroring.
-    if (b.module.funcsBySimpleName(name0).len != 0) {
+    // function instead of erroring. The same applies when the name is a
+    // known top-level stdlib function (a host intrinsic, absent from
+    // `funcsBySimpleName`): a `@Test fun listOfNotNull()` method calling the
+    // top-level `listOfNotNull(...)` must fall through on the arity miss.
+    if (b.module.funcsBySimpleName(name0).len != 0 or isAliasName(name0)) {
         const this_idx = try b.recordCapture("this");
         orEmitAudit(b, "implicit_this_call_global_fallback", "CallMemberOrGlobal", name0);
         try b.push(.{ .CallMemberOrGlobal = .{
