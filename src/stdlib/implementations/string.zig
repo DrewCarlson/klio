@@ -885,8 +885,36 @@ pub fn string_last_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(needle);
-    const found = std.mem.lastIndexOf(u8, s, needle);
-    return .{ .ok = Value.newInt(byteToCharIndex(s, found)) };
+    const total = utf16Len(s);
+    // Optional `startIndex: Int` then `ignoreCase: Boolean`. The search runs
+    // backward from `startIndex` (a code-unit index, default the last index),
+    // returning the start of the last occurrence whose start is <= startIndex.
+    var from_char: i64 = @intCast(total);
+    var ignore_case = false;
+    var k: usize = 2;
+    while (k < ctx.args.len) : (k += 1) {
+        if (ctx.args[k] == .Bool) {
+            ignore_case = ctx.args[k].Bool;
+        } else if (ctx.args[k].asI64()) |iv| {
+            from_char = iv;
+        }
+    }
+    if (from_char < 0) return .{ .ok = Value.newInt(-1) };
+    const limit_char: usize = @min(@as(usize, @intCast(from_char)), total);
+    if (needle.len == 0) return .{ .ok = Value.newInt(@intCast(limit_char)) };
+    const hay = if (ignore_case) try mapCase(ctx.allocator, s, false) else s;
+    defer if (ignore_case and runtime.freeScratch()) ctx.allocator.free(hay);
+    const ndl = if (ignore_case) try mapCase(ctx.allocator, needle, false) else needle;
+    defer if (ignore_case and runtime.freeScratch()) ctx.allocator.free(ndl);
+    var result: i64 = -1;
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, search_from, ndl)) |pos| {
+        const start_char = utf16Len(s[0..pos]);
+        if (start_char > limit_char) break;
+        result = @intCast(start_char);
+        search_from = pos + 1;
+    }
+    return .{ .ok = Value.newInt(result) };
 }
 
 /// Kotlin indexOf/lastIndexOf return an Int code-unit index (or -1).

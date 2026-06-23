@@ -1231,6 +1231,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.text.StringBuilder.setCharAt", .f = stringbuilder.string_builder_set_char_at },
     .{ .fqn = "kotlin.text.StringBuilder.indices", .f = stringbuilder.string_builder_indices },
     .{ .fqn = "kotlin.text.StringBuilder.trimToSize", .f = stringbuilder.string_builder_trim_to_size },
+    .{ .fqn = "kotlin.text.StringBuilder.indexOf", .f = string.string_index_of },
+    .{ .fqn = "kotlin.text.StringBuilder.lastIndexOf", .f = string.string_last_index_of },
     .{ .fqn = "kotlin.text.StringBuilder.replace", .f = stringbuilder.string_builder_replace },
     .{ .fqn = "kotlin.text.StringBuilder.lastIndex", .f = stringbuilder.string_builder_last_index },
     .{ .fqn = "kotlin.text.String.format", .f = string.string_format_static },
