@@ -19,3 +19,7 @@ public actual inline fun <T : AutoCloseable?, R> T.use(block: (T) -> R): R {
         this?.close()
     }
 }
+
+public actual inline fun AutoCloseable(crossinline closeAction: () -> Unit): AutoCloseable = object : AutoCloseable {
+    override fun close() = closeAction()
+}
