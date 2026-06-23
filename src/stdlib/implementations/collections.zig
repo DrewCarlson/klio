@@ -4049,6 +4049,16 @@ pub fn coll_map_plus(ctx: *CallCtx) Error!EvalResult {
                 if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtr().*, .value = p.Pair.second.asPtr().* });
             }
         },
+        .Array, .Sequence, .Range => {
+            const items = switch (try iterableItemsCtx(ctx, arg, "Map.plus")) {
+                .items => |x| x,
+                .err => |e| return e,
+            };
+            defer if (runtime.freeScratch()) a.free(items);
+            for (items) |p| {
+                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtr().*, .value = p.Pair.second.asPtr().* });
+            }
+        },
         else => return typeErr("Map.plus expects a Pair, Map, or Iterable<Pair>"),
     }
     return ok(try makeMap(a, out.items, false));
@@ -4066,6 +4076,14 @@ pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
     switch (arg) {
         .List => |l| try appendVL(&keys, a, l.items),
         .Set => |s| try appendVL(&keys, a, s.items),
+        .Array, .Sequence, .Range => {
+            const items = switch (try iterableItemsCtx(ctx, arg, "Map.minus")) {
+                .items => |x| x,
+                .err => |e| return e,
+            };
+            defer if (runtime.freeScratch()) a.free(items);
+            try keys.appendSlice(a, items);
+        },
         else => try keys.append(a, arg),
     }
     var out: std.ArrayList(MapPair) = .empty;
