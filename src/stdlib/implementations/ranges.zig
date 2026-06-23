@@ -257,11 +257,12 @@ pub fn range_to_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 // The element count is a Kotlin Int; range sizes never exceed i64::MAX.
 pub fn range_count(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "count") orelse return typeErr("count requires a Range receiver");
-    var n: i64 = 0;
-    var it = rangeIterInt(view.start, view.end, view.step);
-    while (it.next()) |_| {
-        n += 1;
-    }
+    // O(1) element count: never iterate (a near-MAX range has billions of
+    // elements). `(last - first) / step + 1`, clamped to 0 when empty.
+    const n: i64 = if (view.step > 0)
+        (if (view.start > view.end) 0 else @divFloor(view.end - view.start, view.step) + 1)
+    else
+        (if (view.start < view.end) 0 else @divFloor(view.start - view.end, -view.step) + 1);
     return ok(Value.newInt(n));
 }
 
