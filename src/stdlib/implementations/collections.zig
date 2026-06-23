@@ -614,6 +614,19 @@ fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcome {
     }
 }
 
+/// As `iterableItems`, but also materialises a (possibly lazy) `Sequence`
+/// argument, which needs the host to run its pipeline. Use this wherever a
+/// bulk op accepts a `Sequence` operand (`list + aSequence`, `list - aSequence`).
+fn iterableItemsCtx(ctx: *CallCtx, v: Value, what: []const u8) Error!ItemsOutcome {
+    if (v == .Sequence) {
+        return switch (try materialiseSequence(ctx.allocator, ctx.host, ctx.out, v)) {
+            .items => |x| .{ .items = x },
+            .err => |e| .{ .err = .{ .err = e } },
+        };
+    }
+    return iterableItems(ctx.allocator, v, what);
+}
+
 // =====================================================================
 // Iterable transforms (filterNotNull, sumOf, max/min of, distinctBy,
 // groupBy, groupingBy + terminals, associate*, sorted*, onEach, mapNotNull)
@@ -3334,7 +3347,7 @@ pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
         .List => |l| try appendVL(&out, a, l.items),
         .Set => |s| try appendVL(&out, a, s.items),
         .Range, .Sequence, .Array => {
-            const xs = switch (try iterableItems(a, arg, "plus")) {
+            const xs = switch (try iterableItemsCtx(ctx, arg, "plus")) {
                 .items => |x| x,
                 .err => |e| return e,
             };
@@ -3359,7 +3372,7 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
         .List => |l| try appendVL(&removals, a, l.items),
         .Set => |s| try appendVL(&removals, a, s.items),
         .Range, .Sequence, .Array => {
-            const xs = switch (try iterableItems(a, arg, "minus")) {
+            const xs = switch (try iterableItemsCtx(ctx, arg, "minus")) {
                 .items => |x| x,
                 .err => |e| return e,
             };
@@ -3539,6 +3552,16 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
                 if (!containsBoxed(out.items, &v)) try out.append(a, v);
             }
         },
+        .Array, .Range, .Sequence => {
+            const xs = switch (try iterableItemsCtx(ctx, arg, what)) {
+                .items => |x| x,
+                .err => |e| return e,
+            };
+            defer if (runtime.freeScratch()) a.free(xs);
+            for (xs) |v| {
+                if (!containsBoxed(out.items, &v)) try out.append(a, v);
+            }
+        },
         else => {
             if (!containsBoxed(out.items, &arg)) try out.append(a, arg);
         },
@@ -3569,6 +3592,14 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     switch (arg) {
         .List => |l| try appendVL(&removals, a, l.items),
         .Set => |s| try appendVL(&removals, a, s.items),
+        .Array, .Range, .Sequence => {
+            const xs = switch (try iterableItemsCtx(ctx, arg, "minus")) {
+                .items => |x| x,
+                .err => |e| return e,
+            };
+            defer if (runtime.freeScratch()) a.free(xs);
+            try removals.appendSlice(a, xs);
+        },
         else => try removals.append(a, arg),
     }
     var out: std.ArrayList(Value) = .empty;
@@ -4521,6 +4552,11 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
         .Set => |s| to_add = try snapshotItems(a, s.items),
         // `MutableCollection<in T>.addAll(elements: Array<out T>)`.
         .Array => |arr| to_add = try arr.snapshot(a),
+        // `addAll(elements: Sequence<T>)` (e.g. `list + aSequence`).
+        .Sequence => to_add = switch (try materialiseSequence(a, ctx.host, ctx.out, arg)) {
+            .items => |x| x,
+            .err => |e| return .{ .err = e },
+        },
         else => {
             const ad = try display(a, arg);
             return typeErr(try fmt(a, "addAll requires a collection, got {s}", .{ad}));
@@ -4672,8 +4708,14 @@ pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    const to_add = (try collectColl(a, if (ctx.args.len > 1) ctx.args[1] else null)) orelse
-        return typeErr("addAll requires a collection");
+    const arg = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
+    const to_add = if (arg == .Sequence)
+        switch (try materialiseSequence(a, ctx.host, ctx.out, arg)) {
+            .items => |x| x,
+            .err => |e| return .{ .err = e },
+        }
+    else
+        (try collectColl(a, arg)) orelse return typeErr("addAll requires a collection");
     const g = it.borrowMut();
     defer g.deinit();
     var changed = false;
