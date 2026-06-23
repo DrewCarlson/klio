@@ -49,6 +49,7 @@ const boxedCellReg = helpers.boxedCellReg;
 const calleeLabel = helpers.calleeLabel;
 const lowerArgRun = helpers.lowerArgRun;
 const lowerArgRunWithArity = helpers.lowerArgRunWithArity;
+const lowerArgRunFull = helpers.lowerArgRunFull;
 const internArgNames = helpers.internArgNames;
 const internTypeArgs = helpers.internTypeArgs;
 const exprSpan = helpers.exprSpan;
@@ -2806,6 +2807,9 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const callee_r = try lowerExpr(b, callee);
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    // Carry explicit call-site type arguments so an intrinsic container
+    // creator (`listOf<Byte>(…)`) stamps and coerces its element type.
+    const type_args = try internTypeArgs(b.allocator, b.module, call.type_args);
     const dst = b.allocReg();
     try b.push(.{ .CallValue = .{
         .dst = dst,
@@ -2813,6 +2817,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
+        .type_args = type_args,
     } });
     return dst;
 }
@@ -3205,7 +3210,8 @@ fn lowerValueInvocation(
                 return dst;
             }
         }
-        const run = try lowerArgRun(b, args);
+        const lfp: ?[]const ?[]const u8 = if (allNull(ast_arg_names)) b.localFnParamTys(name0) else null;
+        const run = try lowerArgRunFull(b, args, null, lfp);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const dst = b.allocReg();
         try b.push(.{ .CallValue = .{
@@ -4169,7 +4175,19 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         }
         break :blk null;
     };
-    const run = try lowerArgRunWithArity(b, args, arg_arity);
+    const param_ty_names: ?[]const ?[]const u8 = blk: {
+        const f = b.module.funcById(func_id) orelse break :blk null;
+        if (!allNull(ast_arg_names)) break :blk null;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        const names = try b.allocator.alloc(?[]const u8, args.len);
+        for (names, 0..) |*t, j| {
+            const pidx = recv_off + j;
+            t.* = if (pidx < f.params.len and !f.params[pidx].is_vararg) f.params[pidx].ty.name else null;
+        }
+        break :blk names;
+    };
+    defer if (param_ty_names) |pt| b.allocator.free(pt);
+    const run = try lowerArgRunFull(b, args, arg_arity, param_ty_names);
     // A trailing lambda always binds the target's last (function-typed)
     // parameter. When a vararg parameter precedes it, positional binding
     // would otherwise pack the lambda into the vararg and leave the last
@@ -4417,8 +4435,11 @@ fn lowerImplicitThisCall(
     // non-callable *property* (`val allStatusCodes = allStatusCodes()`),
     // which kotlinc skips for a call — emit the OrGlobal form so member
     // dispatch still wins when callable but a miss falls through to the
-    // function instead of erroring.
-    if (b.module.funcsBySimpleName(name0).len != 0) {
+    // function instead of erroring. The same applies when the name is a
+    // known top-level stdlib function (a host intrinsic, absent from
+    // `funcsBySimpleName`): a `@Test fun listOfNotNull()` method calling the
+    // top-level `listOfNotNull(...)` must fall through on the arity miss.
+    if (b.module.funcsBySimpleName(name0).len != 0 or isAliasName(name0)) {
         const this_idx = try b.recordCapture("this");
         orEmitAudit(b, "implicit_this_call_global_fallback", "CallMemberOrGlobal", name0);
         try b.push(.{ .CallMemberOrGlobal = .{

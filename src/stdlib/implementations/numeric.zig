@@ -32,6 +32,52 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
+/// `inc()` / `dec()` keep the receiver's numeric type; `delta` is +1 or -1.
+fn numIncDec(ctx: *CallCtx, comptime delta: i64) Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "inc/dec: missing receiver" } };
+    return switch (ctx.args[0]) {
+        .Int => |x| ok(.{ .Int = x +% @as(i32, @intCast(delta)) }),
+        .Long => |x| ok(.{ .Long = x +% delta }),
+        .Short => |x| ok(.{ .Short = x +% @as(i16, @intCast(delta)) }),
+        .Byte => |x| ok(.{ .Byte = x +% @as(i8, @intCast(delta)) }),
+        .UInt => |x| ok(.{ .UInt = if (delta > 0) x +% 1 else x -% 1 }),
+        .ULong => |x| ok(.{ .ULong = if (delta > 0) x +% 1 else x -% 1 }),
+        .UShort => |x| ok(.{ .UShort = if (delta > 0) x +% 1 else x -% 1 }),
+        .UByte => |x| ok(.{ .UByte = if (delta > 0) x +% 1 else x -% 1 }),
+        .Float => |x| ok(.{ .Float = x + @as(f32, @floatFromInt(delta)) }),
+        .Double => |x| ok(.{ .Double = x + @as(f64, @floatFromInt(delta)) }),
+        .Char => |x| ok(.{ .Char = if (delta > 0) x +% 1 else x -% 1 }),
+        else => .{ .err = .{ .Type = "inc/dec requires a numeric receiver" } },
+    };
+}
+
+pub fn num_inc(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return numIncDec(ctx, 1);
+}
+
+pub fn num_dec(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return numIncDec(ctx, -1);
+}
+
+pub fn num_unary_plus(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "unaryPlus: missing receiver" } };
+    return ok(ctx.args[0]);
+}
+
+pub fn num_unary_minus(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "unaryMinus: missing receiver" } };
+    return switch (ctx.args[0]) {
+        .Int => |x| ok(.{ .Int = -%x }),
+        .Long => |x| ok(.{ .Long = -%x }),
+        // `Byte`/`Short.unaryMinus()` widen to `Int` (Kotlin).
+        .Short => |x| ok(.{ .Int = -@as(i32, x) }),
+        .Byte => |x| ok(.{ .Int = -@as(i32, x) }),
+        .Float => |x| ok(.{ .Float = -x }),
+        .Double => |x| ok(.{ .Double = -x }),
+        else => .{ .err = .{ .Type = "unaryMinus requires a signed numeric receiver" } },
+    };
+}
+
 fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Allocator.Error!RuntimeError {
     return .{ .Type = try std.fmt.allocPrint(allocator, fmt, args) };
 }
@@ -949,12 +995,32 @@ pub fn int_coerce_in(ctx: *CallCtx) Allocator.Error!EvalResult {
     const rest = ctx.args[@min(1, ctx.args.len)..];
     if (rest.len == 1 and rest[0] == .Range) {
         const r = rest[0].Range;
-        return ok(Value.newInt(@min(@max(v, r.start), r.end)));
+        if (r.start > r.end) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "Cannot coerce value to an empty range: {d}..{d}.", .{ r.start, r.end });
+            const e = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+            if (runtime.freeScratch()) ctx.allocator.free(msg);
+            return .{ .err = .{ .Thrown = e } };
+        }
+        return ok(Value.newInt(@truncate(@min(@max(v, r.start), r.end))));
     }
-    if (rest.len == 2 and rest[0].isIntegral() and rest[1].isIntegral()) {
-        const lo = rest[0].asI64().?;
-        const hi = rest[1].asI64().?;
-        return ok(Value.newInt(@min(@max(v, lo), hi)));
+    if (rest.len == 2) {
+        // `coerceIn(min: Int?, max: Int?)`: a null bound is unconstrained.
+        const lo: ?i64 = if (rest[0] == .Null) null else (rest[0].asI64() orelse return .{ .err = .{ .Type = "coerceIn min must be an Int" } });
+        const hi: ?i64 = if (rest[1] == .Null) null else (rest[1].asI64() orelse return .{ .err = .{ .Type = "coerceIn max must be an Int" } });
+        if (lo != null and hi != null and lo.? > hi.?) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "Cannot coerce value to an empty range: maximum {d} is less than minimum {d}.", .{ hi.?, lo.? });
+            const e = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+            if (runtime.freeScratch()) ctx.allocator.free(msg);
+            return .{ .err = .{ .Thrown = e } };
+        }
+        var result = v;
+        if (lo) |l| {
+            if (result < l) result = l;
+        }
+        if (hi) |h| {
+            if (result > h) result = h;
+        }
+        return ok(Value.newInt(@truncate(result)));
     }
     return .{ .err = .{ .Type = "coerceIn requires (min, max) or a range" } };
 }
@@ -1051,6 +1117,11 @@ pub fn num_floor_div(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (divisor == 0) {
         return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero") } };
     }
+    // `MIN / -1` overflows the truncated quotient; Kotlin wraps it to MIN
+    // (and the remainder is 0, so floorDiv == MIN too).
+    if (dividend == std.math.minInt(i64) and divisor == -1) {
+        return ok(if (lhs == .Long or rhs == .Long) Value{ .Long = dividend } else Value.newInt(@truncate(dividend)));
+    }
     var quotient = @divTrunc(dividend, divisor);
     const rem = @rem(dividend, divisor);
     if (rem != 0 and ((rem < 0) != (divisor < 0))) {
@@ -1074,6 +1145,10 @@ pub fn num_mod(ctx: *CallCtx) Allocator.Error!EvalResult {
     const divisor = rhs.asI64() orelse return .{ .err = .{ .Type = "mod requires integers" } };
     if (divisor == 0) {
         return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero") } };
+    }
+    // `MIN % -1` is 0 mathematically but the raw `@rem` overflows; short-circuit.
+    if (dividend == std.math.minInt(i64) and divisor == -1) {
+        return ok(if (lhs == .Long or rhs == .Long) Value{ .Long = 0 } else Value.newInt(0));
     }
     var rem = @rem(dividend, divisor);
     if (rem != 0 and ((rem < 0) != (divisor < 0))) {
@@ -1174,6 +1249,12 @@ pub fn num_coerce_in(ctx: *CallCtx) Allocator.Error!EvalResult {
     const rest = ctx.args[1..];
     if (rest.len == 1 and rest[0] == .Range) {
         const r = rest[0].Range;
+        if (r.start > r.end) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "Cannot coerce value to an empty range: {d}..{d}.", .{ r.start, r.end });
+            const e = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+            if (runtime.freeScratch()) ctx.allocator.free(msg);
+            return .{ .err = .{ .Thrown = e } };
+        }
         const lo = switch (try numExtreme(ctx.allocator, &.{ recv, .{ .Long = r.start } }, false, "coerceIn")) {
             .ok => |v| v,
             .err => |e| return .{ .err = e },
@@ -1181,11 +1262,25 @@ pub fn num_coerce_in(ctx: *CallCtx) Allocator.Error!EvalResult {
         return wrapRes(try numExtreme(ctx.allocator, &.{ lo, .{ .Long = r.end } }, true, "coerceIn"));
     }
     if (rest.len == 2) {
-        const lo = switch (try numExtreme(ctx.allocator, &.{ recv, rest[0] }, false, "coerceIn")) {
-            .ok => |v| v,
-            .err => |e| return .{ .err = e },
-        };
-        return wrapRes(try numExtreme(ctx.allocator, &.{ lo, rest[1] }, true, "coerceIn"));
+        // A null bound is unconstrained (`coerceIn(min: T?, max: T?)`); both
+        // present with min > max is an empty range.
+        if (rest[0] != .Null and rest[1] != .Null) {
+            if (rest[0].asF64()) |lo| if (rest[1].asF64()) |hi| if (lo > hi) {
+                const e = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", "Cannot coerce value to an empty range: maximum is less than minimum.");
+                return .{ .err = .{ .Thrown = e } };
+            };
+        }
+        var cur = recv;
+        if (rest[0] != .Null) {
+            cur = switch (try numExtreme(ctx.allocator, &.{ cur, rest[0] }, false, "coerceIn")) {
+                .ok => |v| v,
+                .err => |e| return .{ .err = e },
+            };
+        }
+        if (rest[1] != .Null) {
+            return wrapRes(try numExtreme(ctx.allocator, &.{ cur, rest[1] }, true, "coerceIn"));
+        }
+        return ok(cur);
     }
     return .{ .err = .{ .Type = "coerceIn requires (min, max) or a range" } };
 }

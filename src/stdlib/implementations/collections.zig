@@ -624,7 +624,146 @@ fn iterableItemsCtx(ctx: *CallCtx, v: Value, what: []const u8) Error!ItemsOutcom
             .err => |e| .{ .err = .{ .err = e } },
         };
     }
+    // A user/anonymous `Iterable` (e.g. the object `CharSequence.asIterable()`
+    // returns) has no built-in backing; drain it through its `iterator()`.
+    if (v == .Instance) {
+        if (try drainViaIterator(ctx, v)) |r| return r;
+    }
     return iterableItems(ctx.allocator, v, what);
+}
+
+/// Drain any value that exposes `iterator()` / `hasNext()` / `next()` into a
+/// flat element slice. Returns null when the value has no `iterator()` (so the
+/// caller can fall back to the built-in extractor or a type error).
+fn drainViaIterator(ctx: *CallCtx, v: Value) Error!?ItemsOutcome {
+    const a = ctx.allocator;
+    const iter_opt = try ctx.host.invokeMethod(&v, "iterator", &.{}, ctx.out);
+    const iter_res = iter_opt orelse return null;
+    const iter = switch (iter_res) {
+        .ok => |x| x,
+        .err => |e| return ItemsOutcome{ .err = .{ .err = e } },
+    };
+    var out: std.ArrayList(Value) = .empty;
+    while (true) {
+        const hn = (try ctx.host.invokeMethod(&iter, "hasNext", &.{}, ctx.out)) orelse return null;
+        const has = switch (hn) {
+            .ok => |x| x == .Bool and x.Bool,
+            .err => |e| return ItemsOutcome{ .err = .{ .err = e } },
+        };
+        if (!has) break;
+        const nx = (try ctx.host.invokeMethod(&iter, "next", &.{}, ctx.out)) orelse return null;
+        switch (nx) {
+            .ok => |item| try out.append(a, item),
+            .err => |e| return ItemsOutcome{ .err = .{ .err = e } },
+        }
+    }
+    return ItemsOutcome{ .items = try out.toOwnedSlice(a) };
+}
+
+// =====================================================================
+// random / randomOrNull / shuffled
+// =====================================================================
+
+var random_state: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0x2545F4914F6CDD1D);
+
+const IndexOutcome = union(enum) { idx: usize, err: RuntimeError };
+
+/// A uniform index in `[0, n)`. When a `Random` argument was supplied (the
+/// `random(Random)` / `shuffled(Random)` overloads, where it sits at
+/// `args[1]`), draw from it through the host so a seeded source stays
+/// deterministic; otherwise use the process RNG.
+fn pickIndex(ctx: *CallCtx, n: usize) Error!IndexOutcome {
+    if (n <= 1) return .{ .idx = 0 };
+    if (ctx.args.len > 1 and ctx.args[1] == .Instance) {
+        const arg = ctx.args[1];
+        if (try ctx.host.invokeMethod(&arg, "nextInt", &.{Value.newInt(@intCast(n))}, ctx.out)) |res| {
+            switch (res) {
+                .ok => |v| if (v.asI64()) |iv| {
+                    const m = @mod(iv, @as(i64, @intCast(n)));
+                    return .{ .idx = @intCast(m) };
+                },
+                .err => |e| return .{ .err = e },
+            }
+        }
+    }
+    return .{ .idx = random_state.random().uintLessThan(usize, n) };
+}
+
+pub fn coll_random(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("random requires a receiver");
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "random")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    if (items.len == 0) return try thrown(a, "kotlin.NoSuchElementException", "Collection is empty.");
+    const idx = switch (try pickIndex(ctx, items.len)) {
+        .idx => |i| i,
+        .err => |e| return .{ .err = e },
+    };
+    const v = items[idx];
+    if (runtime.reclaimEnabled()) v.retain();
+    return ok(v);
+}
+
+pub fn coll_random_or_null(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("randomOrNull requires a receiver");
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "randomOrNull")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    if (items.len == 0) return ok(.Null);
+    const idx = switch (try pickIndex(ctx, items.len)) {
+        .idx => |i| i,
+        .err => |e| return .{ .err = e },
+    };
+    const v = items[idx];
+    if (runtime.reclaimEnabled()) v.retain();
+    return ok(v);
+}
+
+/// Fisher-Yates shuffle of `slice` in place, drawing indices via `pickIndex`.
+fn shuffleInPlace(ctx: *CallCtx, slice: []Value) Error!?RuntimeError {
+    var i: usize = slice.len;
+    while (i > 1) {
+        i -= 1;
+        const j = switch (try pickIndex(ctx, i + 1)) {
+            .idx => |x| x,
+            .err => |e| return e,
+        };
+        const tmp = slice[i];
+        slice[i] = slice[j];
+        slice[j] = tmp;
+    }
+    return null;
+}
+
+pub fn coll_shuffled(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("shuffled requires a receiver");
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "shuffled")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    if (try shuffleInPlace(ctx, items)) |e| return .{ .err = e };
+    return ok(try makeList(a, items, false));
+}
+
+/// `MutableList.shuffle()` — shuffle in place.
+pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.shuffle")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const g = it.borrowMut();
+    defer g.deinit();
+    if (try shuffleInPlace(ctx, g.get().items)) |e| return .{ .err = e };
+    return ok(.Unit);
 }
 
 // =====================================================================
@@ -1359,7 +1498,12 @@ pub fn map_get_or_else(ctx: *CallCtx) Error!EvalResult {
     {
         const g = ctx.args[0].Map.entries.borrowMut();
         defer g.deinit();
-        if (try g.get().find(a, &key)) |i| return okElem(g.get().pairs.items[i].value);
+        // `getOrElse` is `get(key) ?: defaultValue()`: a present-but-null value
+        // falls through to the default just like an absent key.
+        if (try g.get().find(a, &key)) |i| {
+            const v = g.get().pairs.items[i].value;
+            if (v != .Null) return okElem(v);
+        }
     }
     const block = ctx.args[2];
     return try ctx.host.invokeCallable(&block, &.{}, ctx.out);
@@ -1374,7 +1518,13 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries_rc.borrowMut();
         defer g.deinit();
-        if (try g.get().find(a, &key)) |i| return okElem(g.get().pairs.items[i].value);
+        // `getOrPut` returns the stored value only when it is non-null; a
+        // present-but-null value is recomputed and stored (Kotlin's `value
+        // == null` branch).
+        if (try g.get().find(a, &key)) |i| {
+            const v = g.get().pairs.items[i].value;
+            if (v != .Null) return okElem(v);
+        }
     }
     const block = ctx.args[2];
     const new_v = switch (try invoke(ctx, &block, &.{})) {
@@ -1384,15 +1534,21 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries_rc.borrowMut();
         defer g.deinit();
-        // The map takes ownership of one ref to the stored key and value; the
-        // block's `new_v` is also returned, so retain both for the map and
-        // hand back the block's owned ref untouched.
-        if (runtime.reclaimEnabled()) {
-            key.retain();
-            new_v.retain();
+        // The map takes ownership of one ref to the stored value; the block's
+        // `new_v` is also returned, so retain it for the map and hand back the
+        // block's owned ref untouched.
+        if (runtime.reclaimEnabled()) new_v.retain();
+        // A present key (its value was null, which is why we got here) is
+        // updated in place; a genuinely absent key appends a new entry.
+        if (try g.get().find(a, &key)) |i| {
+            const old = g.get().pairs.items[i].value;
+            g.get().pairs.items[i].value = new_v;
+            if (runtime.reclaimEnabled()) old.release(a);
+        } else {
+            if (runtime.reclaimEnabled()) key.retain();
+            try g.get().pairs.append(a, .{ .key = key, .value = new_v });
+            try g.get().noteAppended(a, g.get().pairs.items.len - 1);
         }
-        try g.get().pairs.append(a, .{ .key = key, .value = new_v });
-        try g.get().noteAppended(a, g.get().pairs.items.len - 1);
     }
     return ok(new_v);
 }
@@ -3084,31 +3240,43 @@ pub fn coll_list_sum(ctx: *CallCtx) Error!EvalResult {
     };
     const g = it.borrow();
     defer g.deinit();
-    var acc_int: ?i64 = 0;
-    var acc_dbl: ?f64 = null;
-    for (g.get().items) |v| {
-        if (v.isIntegral()) {
-            const n = v.asI64().?;
-            if (acc_int) |*aa| {
-                aa.* +%= n;
-            } else if (acc_dbl) |*aa| {
-                aa.* += @as(f64, @floatFromInt(n));
-            }
-        } else if (v.isFloating()) {
-            const d = v.asF64().?;
-            if (acc_int) |aa| {
-                acc_dbl = @as(f64, @floatFromInt(aa)) + d;
-                acc_int = null;
-            } else if (acc_dbl) |*aa| {
-                aa.* += d;
-            }
-        } else {
-            const vd = try display(a, v);
-            return typeErr(try fmt(a, "List.sum requires numeric elements, got {s}", .{vd}));
+    return sumValues(a, g.get().items, "List.sum");
+}
+
+/// Sum a numeric element slice, returning the Kotlin result type for the
+/// element type: `Long` -> Long, `Double` -> Double, `Float` -> Float, and
+/// Int/Short/Byte -> Int (wrapping, like Kotlin).
+fn sumValues(a: Allocator, items: []const Value, what: []const u8) Error!EvalResult {
+    var acc_i: i64 = 0;
+    var acc_f: f64 = 0;
+    var any_long = false;
+    var any_float = false;
+    var any_double = false;
+    for (items) |v| {
+        switch (v) {
+            .Long => {
+                any_long = true;
+                acc_i +%= v.asI64().?;
+            },
+            .Int, .Short, .Byte, .UByte, .UShort, .UInt, .ULong => acc_i +%= v.asI64() orelse @intCast(v.asU64() orelse 0),
+            .Float => {
+                any_float = true;
+                acc_f += v.asF64().?;
+            },
+            .Double => {
+                any_double = true;
+                acc_f += v.asF64().?;
+            },
+            else => {
+                const vd = try display(a, v);
+                return typeErr(try fmt(a, "{s} requires numeric elements, got {s}", .{ what, vd }));
+            },
         }
     }
-    if (acc_dbl) |d| return ok(.{ .Double = d });
-    return ok(Value.newInt(acc_int orelse 0));
+    if (any_double) return ok(.{ .Double = acc_f + @as(f64, @floatFromInt(acc_i)) });
+    if (any_float) return ok(.{ .Float = @floatCast(acc_f + @as(f64, @floatFromInt(acc_i))) });
+    if (any_long) return ok(.{ .Long = acc_i });
+    return ok(Value.newInt(@as(i32, @truncate(acc_i))));
 }
 
 pub fn coll_list_average(ctx: *CallCtx) Error!EvalResult {
@@ -3124,13 +3292,9 @@ pub fn coll_list_average(ctx: *CallCtx) Error!EvalResult {
     var sum: f64 = 0.0;
     var n: i64 = 0;
     for (items) |v| {
-        sum += switch (v) {
-            .Int => |x| @floatFromInt(x),
-            .Double => |x| x,
-            else => {
-                const vd = try display(a, v);
-                return typeErr(try fmt(a, "List.average requires numeric elements, got {s}", .{vd}));
-            },
+        sum += v.asF64() orelse {
+            const vd = try display(a, v);
+            return typeErr(try fmt(a, "List.average requires numeric elements, got {s}", .{vd}));
         };
         n += 1;
     }
@@ -3270,6 +3434,40 @@ pub fn coll_list_drop_last(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeList(a, items[0..end], false));
 }
 
+/// True when a `plusAssign`/`minusAssign` argument is a multi-element
+/// collection (so it flattens via addAll/removeAll) rather than a single
+/// element to add/remove.
+fn isMultiElementArg(v: Value) bool {
+    return switch (v) {
+        .List, .Set, .Range, .Sequence, .Array => true,
+        else => false,
+    };
+}
+
+/// `MutableCollection += elements` — addAll for a collection argument, add
+/// for a single element; mutates the receiver in place.
+pub fn coll_mut_collection_plus_assign(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return arityErr("plusAssign requires an argument");
+    const multi = isMultiElementArg(ctx.args[1]);
+    return switch (ctx.args[0]) {
+        .List => if (multi) coll_mut_list_add_all(ctx) else coll_mut_list_add(ctx),
+        .Set => if (multi) coll_mut_set_add_all(ctx) else coll_mut_set_add(ctx),
+        else => typeErr("plusAssign requires a mutable collection receiver"),
+    };
+}
+
+/// `MutableCollection -= elements` — removeAll for a collection argument,
+/// remove for a single element; mutates the receiver in place.
+pub fn coll_mut_collection_minus_assign(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return arityErr("minusAssign requires an argument");
+    const multi = isMultiElementArg(ctx.args[1]);
+    return switch (ctx.args[0]) {
+        .List => if (multi) coll_mut_list_remove_all(ctx) else coll_mut_list_remove(ctx),
+        .Set => if (multi) coll_mut_set_remove_all(ctx) else coll_mut_set_remove(ctx),
+        else => typeErr("minusAssign requires a mutable collection receiver"),
+    };
+}
+
 pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "List.slice")) {
@@ -3281,8 +3479,8 @@ pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
     const items = g.get().items;
     const len: i64 = @intCast(items.len);
     var out: std.ArrayList(Value) = .empty;
-    if (ctx.args.len > 1 and ctx.args[1] == .Range) {
-        const r = ctx.args[1].Range;
+    if (ctx.args.len > 1 and asRangeView(ctx.args[1]) != null) {
+        const r = asRangeView(ctx.args[1]).?;
         var rit = RangeIter.init(r.start, r.end, r.step);
         while (rit.next()) |i| {
             if (i < 0 or i >= len) {
@@ -3368,6 +3566,10 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return arityErr("minus requires an argument");
     const arg = ctx.args[1];
     var removals: std.ArrayList(Value) = .empty;
+    // `minus(elements: Collection/Array/Sequence)` removes every element that
+    // is a member of `elements`; `minus(element)` removes only the first
+    // occurrence of that single element.
+    var is_collection = true;
     switch (arg) {
         .List => |l| try appendVL(&removals, a, l.items),
         .Set => |s| try appendVL(&removals, a, s.items),
@@ -3376,16 +3578,21 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
                 .items => |x| x,
                 .err => |e| return e,
             };
-    defer if (runtime.freeScratch()) a.free(xs);
+            defer if (runtime.freeScratch()) a.free(xs);
             try removals.appendSlice(a, xs);
         },
-        else => try removals.append(a, arg),
+        else => {
+            is_collection = false;
+            try removals.append(a, arg);
+        },
     }
     var out: std.ArrayList(Value) = .empty;
     const src = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
-        if (indexOfBoxed(removals.items, &v)) |pos| {
+        if (is_collection) {
+            if (!containsBoxed(removals.items, &v)) try out.append(a, v);
+        } else if (indexOfBoxed(removals.items, &v)) |pos| {
             _ = removals.orderedRemove(pos);
         } else {
             try out.append(a, v);
@@ -3777,6 +3984,10 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
             .List => |l| break :blk try snapshotItems(a, l.items),
             .Set => |s| break :blk try snapshotItems(a, s.items),
             .Array => |arr| if (allow_array) break :blk try arr.snapshot(a) else return typeErr(try fmt(a, "{s} requires a collection", .{what})),
+            .Sequence => break :blk switch (try iterableItemsCtx(ctx, arg, what)) {
+                .items => |x| x,
+                .err => |e| return e,
+            },
             else => return typeErr(try fmt(a, "{s} requires a collection", .{what})),
         }
     };
@@ -3868,6 +4079,16 @@ pub fn coll_map_plus(ctx: *CallCtx) Error!EvalResult {
                 if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtr().*, .value = p.Pair.second.asPtr().* });
             }
         },
+        .Array, .Sequence, .Range => {
+            const items = switch (try iterableItemsCtx(ctx, arg, "Map.plus")) {
+                .items => |x| x,
+                .err => |e| return e,
+            };
+            defer if (runtime.freeScratch()) a.free(items);
+            for (items) |p| {
+                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtr().*, .value = p.Pair.second.asPtr().* });
+            }
+        },
         else => return typeErr("Map.plus expects a Pair, Map, or Iterable<Pair>"),
     }
     return ok(try makeMap(a, out.items, false));
@@ -3885,6 +4106,14 @@ pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
     switch (arg) {
         .List => |l| try appendVL(&keys, a, l.items),
         .Set => |s| try appendVL(&keys, a, s.items),
+        .Array, .Sequence, .Range => {
+            const items = switch (try iterableItemsCtx(ctx, arg, "Map.minus")) {
+                .items => |x| x,
+                .err => |e| return e,
+            };
+            defer if (runtime.freeScratch()) a.free(items);
+            try keys.appendSlice(a, items);
+        },
         else => try keys.append(a, arg),
     }
     var out: std.ArrayList(MapPair) = .empty;
@@ -4552,14 +4781,11 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
         .Set => |s| to_add = try snapshotItems(a, s.items),
         // `MutableCollection<in T>.addAll(elements: Array<out T>)`.
         .Array => |arr| to_add = try arr.snapshot(a),
-        // `addAll(elements: Sequence<T>)` (e.g. `list + aSequence`).
-        .Sequence => to_add = switch (try materialiseSequence(a, ctx.host, ctx.out, arg)) {
+        // `addAll(elements: Sequence<T>)` and `addAll(elements: Iterable<T>)`
+        // over a lazy sequence or a user/anonymous iterable.
+        else => to_add = switch (try iterableItemsCtx(ctx, arg, "addAll")) {
             .items => |x| x,
-            .err => |e| return .{ .err = e },
-        },
-        else => {
-            const ad = try display(a, arg);
-            return typeErr(try fmt(a, "addAll requires a collection, got {s}", .{ad}));
+            .err => |e| return e,
         },
     }
     // `to_add` is a shallow `snapshotItems` dupe; `appendSlice` copies its
@@ -4757,7 +4983,14 @@ pub fn coll_map_get_value(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     if (ctx.args.len < 2) return arityErr("getValue requires a key");
-    const key = ctx.args[1];
+    // Property-delegation form `getValue(thisRef, property)` keys by the
+    // property name (`Map<String,V>.getValue` -> getOrImplicitDefault(name));
+    // the plain `getValue(key)` form keys by the argument itself.
+    const key: Value = if (ctx.args.len >= 3 and ctx.args[2] == .PropertyRef) blk: {
+        const g = ctx.args[2].PropertyRef.name.borrow();
+        defer g.deinit();
+        break :blk .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, g.get().bytes)) };
+    } else ctx.args[1];
     {
         const g = entries.borrowMut();
         defer g.deinit();
@@ -4848,6 +5081,11 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     var to_add: []MapPair = undefined;
     switch (arg) {
+        .Pair => |p| {
+            const one = try a.alloc(MapPair, 1);
+            one[0] = .{ .key = p.first.asPtr().*, .value = p.second.asPtr().* };
+            to_add = one;
+        },
         .Map => |m| to_add = try snapshotEntries(a, m.entries),
         .Array => |arr| to_add = (switch (try pairsFromValues(a, try arr.snapshot(a), "putAll")) {
             .entries => |x| x,
@@ -5433,31 +5671,7 @@ fn arraySumImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
         .err => |e| return e,
     };
     defer if (runtime.freeScratch()) a.free(items);
-    var int_acc: i64 = 0;
-    var dbl_acc: f64 = 0.0;
-    var as_double = false;
-    for (items) |v| {
-        switch (v) {
-            .Int, .Long, .Short, .Byte => int_acc += v.asI64() orelse 0,
-            .Double => |d| {
-                if (!as_double) {
-                    dbl_acc = @floatFromInt(int_acc);
-                    as_double = true;
-                }
-                dbl_acc += d;
-            },
-            .Float => |f| {
-                if (!as_double) {
-                    dbl_acc = @floatFromInt(int_acc);
-                    as_double = true;
-                }
-                dbl_acc += @as(f64, f);
-            },
-            else => return typeErr(try fmt(a, "{s}: non-numeric element", .{what})),
-        }
-    }
-    if (as_double) return ok(.{ .Double = dbl_acc });
-    return ok(Value.newInt(int_acc));
+    return sumValues(a, items, what);
 }
 
 pub fn array_sum_int(ctx: *CallCtx) Error!EvalResult {

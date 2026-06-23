@@ -185,10 +185,12 @@ pub fn math_sqrt(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len != 1) {
         return .{ .err = .{ .Arity = "sqrt expects 1 argument" } };
     }
+    const is_float = ctx.args[0] == .Float;
     const d = switch (try as_double(&ctx.args[0], "sqrt", ctx)) {
         .ok => |v| v,
         .err => |e| return e,
     };
+    if (is_float) return ok(.{ .Float = @floatCast(@sqrt(d)) });
     return ok(.{ .Double = @sqrt(d) });
 }
 
@@ -333,11 +335,17 @@ fn unaryDouble(ctx: *CallCtx, what: []const u8, comptime f: fn (f64) f64) std.me
         .ok => |p| p,
         .err => |e| return e,
     };
+    const is_float = v.* == .Float;
     const d = switch (try as_double(v, what, ctx)) {
         .ok => |x| x,
         .err => |e| return e,
     };
-    return ok(.{ .Double = f(d) });
+    const r = f(d);
+    // The `Float` overload of each function returns a `Float`; computing in
+    // f64 and narrowing matches the special values (NaN/±∞/±0) exactly and
+    // is within tolerance for the finite cases the tests assert.
+    if (is_float) return ok(.{ .Float = @floatCast(r) });
+    return ok(.{ .Double = r });
 }
 
 fn fSinh(x: f64) f64 {

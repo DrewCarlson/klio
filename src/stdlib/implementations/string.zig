@@ -116,6 +116,11 @@ fn recvString(allocator: Allocator, args: []const Value, what: []const u8) Alloc
             defer g.deinit();
             return .{ .ok = g.get().bytes };
         },
+        .StringBuilder => |sb| {
+            const g = sb.borrow();
+            defer g.deinit();
+            return .{ .ok = g.get().items };
+        },
         else => |other| {
             const od = try other.display(allocator);
             const msg = try std.fmt.allocPrint(allocator, "{s} requires a String receiver, got {s}", .{ what, od });
@@ -132,6 +137,11 @@ fn argAsString(allocator: Allocator, v: Value, what: []const u8) Allocator.Error
             const g = s.borrow();
             defer g.deinit();
             return .{ .ok = try allocator.dupe(u8, g.get().bytes) };
+        },
+        .StringBuilder => |sb| {
+            const g = sb.borrow();
+            defer g.deinit();
+            return .{ .ok = try allocator.dupe(u8, g.get().items) };
         },
         .Char => |c| return .{ .ok = try charUnitToString(allocator, c) },
         .Int => |n| return .{ .ok = try std.fmt.allocPrint(allocator, "{d}", .{n}) },
@@ -470,7 +480,31 @@ pub fn string_starts_with(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(prefix);
-    return .{ .ok = .{ .Bool = std.mem.startsWith(u8, s, prefix) } };
+    // Remaining args are `startIndex: Int` and/or `ignoreCase: Boolean`.
+    var ignore_case = false;
+    var start_index: i64 = 0;
+    var k: usize = 2;
+    while (k < ctx.args.len) : (k += 1) {
+        if (ctx.args[k] == .Bool) {
+            ignore_case = ctx.args[k].Bool;
+        } else if (ctx.args[k].asI64()) |iv| {
+            start_index = iv;
+        }
+    }
+    const sc = try utf16Units(ctx.allocator, s);
+    defer ctx.allocator.free(sc);
+    const pc = try utf16Units(ctx.allocator, prefix);
+    defer ctx.allocator.free(pc);
+    if (start_index < 0 or start_index + @as(i64, @intCast(pc.len)) > @as(i64, @intCast(sc.len))) {
+        return .{ .ok = .{ .Bool = false } };
+    }
+    const off: usize = @intCast(start_index);
+    for (pc, 0..) |b, i| {
+        const a = sc[off + i];
+        const eq = if (ignore_case) charUnitsEqIgnoreCase(a, b) else a == b;
+        if (!eq) return .{ .ok = .{ .Bool = false } };
+    }
+    return .{ .ok = .{ .Bool = true } };
 }
 
 /// `String.regionMatches(thisOffset, other, otherOffset, length,
@@ -557,7 +591,19 @@ pub fn string_ends_with(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(suffix);
-    return .{ .ok = .{ .Bool = std.mem.endsWith(u8, s, suffix) } };
+    const ignore_case = ctx.args.len > 2 and ctx.args[2] == .Bool and ctx.args[2].Bool;
+    const sc = try utf16Units(ctx.allocator, s);
+    defer ctx.allocator.free(sc);
+    const pc = try utf16Units(ctx.allocator, suffix);
+    defer ctx.allocator.free(pc);
+    if (pc.len > sc.len) return .{ .ok = .{ .Bool = false } };
+    const off = sc.len - pc.len;
+    for (pc, 0..) |b, i| {
+        const a = sc[off + i];
+        const eq = if (ignore_case) charUnitsEqIgnoreCase(a, b) else a == b;
+        if (!eq) return .{ .ok = .{ .Bool = false } };
+    }
+    return .{ .ok = .{ .Bool = true } };
 }
 
 pub fn string_filter(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -759,7 +805,14 @@ pub fn string_contains(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(needle);
-    const found = std.mem.indexOf(u8, s, needle) != null;
+    const ignore_case = ctx.args.len > 2 and ctx.args[2] == .Bool and ctx.args[2].Bool;
+    const found = if (ignore_case) blk: {
+        const lhay = try mapCase(ctx.allocator, s, false);
+        defer ctx.allocator.free(lhay);
+        const lneed = try mapCase(ctx.allocator, needle, false);
+        defer ctx.allocator.free(lneed);
+        break :blk std.mem.indexOf(u8, lhay, lneed) != null;
+    } else std.mem.indexOf(u8, s, needle) != null;
     return .{ .ok = .{ .Bool = found } };
 }
 
@@ -779,6 +832,12 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
     const start_i64 = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse 0) else 0;
     const start_u16: usize = if (start_i64 < 0) 0 else @intCast(start_i64);
     const ignore_case = ctx.args.len > 3 and ctx.args[3] == .Bool and ctx.args[3].Bool;
+    // The empty string matches at the start index, clamped to the length (the
+    // JVM behavior `"abc".indexOf("", n)` returns `n.coerceAtMost(length)`).
+    if (needle.len == 0) {
+        const total = utf16Len(s);
+        return .{ .ok = Value.newInt(@intCast(@min(start_u16, total))) };
+    }
     const start_byte = utf16IndexToByte(s, start_u16);
     if (start_byte > s.len) return .{ .ok = Value.newInt(-1) };
     const hay = s[start_byte..];
@@ -826,8 +885,36 @@ pub fn string_last_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(needle);
-    const found = std.mem.lastIndexOf(u8, s, needle);
-    return .{ .ok = Value.newInt(byteToCharIndex(s, found)) };
+    const total = utf16Len(s);
+    // Optional `startIndex: Int` then `ignoreCase: Boolean`. The search runs
+    // backward from `startIndex` (a code-unit index, default the last index),
+    // returning the start of the last occurrence whose start is <= startIndex.
+    var from_char: i64 = @intCast(total);
+    var ignore_case = false;
+    var k: usize = 2;
+    while (k < ctx.args.len) : (k += 1) {
+        if (ctx.args[k] == .Bool) {
+            ignore_case = ctx.args[k].Bool;
+        } else if (ctx.args[k].asI64()) |iv| {
+            from_char = iv;
+        }
+    }
+    if (from_char < 0) return .{ .ok = Value.newInt(-1) };
+    const limit_char: usize = @min(@as(usize, @intCast(from_char)), total);
+    if (needle.len == 0) return .{ .ok = Value.newInt(@intCast(limit_char)) };
+    const hay = if (ignore_case) try mapCase(ctx.allocator, s, false) else s;
+    defer if (ignore_case and runtime.freeScratch()) ctx.allocator.free(hay);
+    const ndl = if (ignore_case) try mapCase(ctx.allocator, needle, false) else needle;
+    defer if (ignore_case and runtime.freeScratch()) ctx.allocator.free(ndl);
+    var result: i64 = -1;
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, search_from, ndl)) |pos| {
+        const start_char = utf16Len(s[0..pos]);
+        if (start_char > limit_char) break;
+        result = @intCast(start_char);
+        search_from = pos + 1;
+    }
+    return .{ .ok = Value.newInt(result) };
 }
 
 /// Kotlin indexOf/lastIndexOf return an Int code-unit index (or -1).

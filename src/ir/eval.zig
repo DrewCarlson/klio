@@ -3783,6 +3783,9 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
             .Long => |l| return ok(.{ .Long = -%l }),
             .Double => |d| return ok(.{ .Double = -d }),
             .Float => |f| return ok(.{ .Float = -f }),
+            // `Byte`/`Short.unaryMinus()` widen to `Int` (Kotlin).
+            .Byte => |b| return ok(.{ .Int = -@as(i32, b) }),
+            .Short => |s| return ok(.{ .Int = -@as(i32, s) }),
             else => {},
         },
         .Plus => return ok(v.*),
@@ -3792,6 +3795,13 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
             .Float => |f| return ok(.{ .Float = f + 1.0 }),
             .Double => |d| return ok(.{ .Double = d + 1.0 }),
             .Char => |c| return ok(.{ .Char = c +% 1 }),
+            // `inc()`/`dec()` keep the receiver's type.
+            .Byte => |b| return ok(.{ .Byte = b +% 1 }),
+            .Short => |s| return ok(.{ .Short = s +% 1 }),
+            .UByte => |b| return ok(.{ .UByte = b +% 1 }),
+            .UShort => |s| return ok(.{ .UShort = s +% 1 }),
+            .UInt => |x| return ok(.{ .UInt = x +% 1 }),
+            .ULong => |x| return ok(.{ .ULong = x +% 1 }),
             else => {},
         },
         .Dec => switch (v.*) {
@@ -3800,6 +3810,12 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
             .Float => |f| return ok(.{ .Float = f - 1.0 }),
             .Double => |d| return ok(.{ .Double = d - 1.0 }),
             .Char => |c| return ok(.{ .Char = c -% 1 }),
+            .Byte => |b| return ok(.{ .Byte = b -% 1 }),
+            .Short => |s| return ok(.{ .Short = s -% 1 }),
+            .UByte => |b| return ok(.{ .UByte = b -% 1 }),
+            .UShort => |s| return ok(.{ .UShort = s -% 1 }),
+            .UInt => |x| return ok(.{ .UInt = x -% 1 }),
+            .ULong => |x| return ok(.{ .ULong = x -% 1 }),
             else => {},
         },
     }
@@ -4168,6 +4184,40 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
 
 /// Comparison dispatch for `<`, `<=`, `>`, `>=`. Returns `null` for an
 /// unhandled operand pairing.
+fn asUnsigned(v: *const Value) ?u64 {
+    return switch (v.*) {
+        .UByte => |x| x,
+        .UShort => |x| x,
+        .UInt => |x| x,
+        .ULong => |x| x,
+        else => null,
+    };
+}
+
+fn asSignedI64(v: *const Value) ?i64 {
+    return switch (v.*) {
+        .Byte => |x| x,
+        .Short => |x| x,
+        .Int => |x| x,
+        .Long => |x| x,
+        else => null,
+    };
+}
+
+/// Order an unsigned `u` against a signed `s`: any negative `s` is below `u`.
+fn cmpU64I64(u: u64, s: i64) std.math.Order {
+    if (s < 0) return .gt;
+    return std.math.order(u, @as(u64, @intCast(s)));
+}
+
+fn invertOrder(o: std.math.Order) std.math.Order {
+    return switch (o) {
+        .lt => .gt,
+        .gt => .lt,
+        .eq => .eq,
+    };
+}
+
 fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?bool {
     const Pair = struct {
         fn cmpOrder(o: BinOp, order: std.math.Order) bool {
@@ -4205,6 +4255,17 @@ fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?b
     // Mixed Int/Long.
     if (l.* == .Int and r.* == .Long) return Pair.cmpOrder(op, std.math.order(@as(i64, l.Int), r.Long));
     if (l.* == .Long and r.* == .Int) return Pair.cmpOrder(op, std.math.order(l.Long, @as(i64, r.Int)));
+    // Mixed-width unsigned (`ULong` vs `UInt`, etc.) compare by magnitude.
+    if (asUnsigned(l)) |lu| {
+        if (asUnsigned(r)) |ru| return Pair.cmpOrder(op, std.math.order(lu, ru));
+        // Mixed unsigned / signed: a negative signed value is below every
+        // unsigned value; otherwise compare magnitudes. (kotlinc coerces the
+        // literal, but a bare pairing still has a well-defined numeric order.)
+        if (asSignedI64(r)) |ri| return Pair.cmpOrder(op, cmpU64I64(lu, ri));
+    }
+    if (asUnsigned(r)) |ru| {
+        if (asSignedI64(l)) |li| return Pair.cmpOrder(op, invertOrder(cmpU64I64(ru, li)));
+    }
     // Mixed with Double (IEEE relational semantics: the Double side may be NaN).
     if (l.* == .Int and r.* == .Double) return Pair.cmpFloat(op, @as(f64, @floatFromInt(l.Int)), r.Double);
     if (l.* == .Double and r.* == .Int) return Pair.cmpFloat(op, l.Double, @as(f64, @floatFromInt(r.Int)));

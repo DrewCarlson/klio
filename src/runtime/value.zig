@@ -1816,6 +1816,13 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Whether a range/progression value covers no elements (Kotlin
+    /// `isEmpty()`): a positive step needs `start <= end`, a negative one
+    /// `start >= end`.
+    fn rangeIsEmptyVal(r: anytype) bool {
+        return if (r.step > 0) r.start > r.end else r.start < r.end;
+    }
+
     /// Equality with boxed `Number` semantics (each boxed type only matches
     /// its own type; collections compare elements boxed too).
     pub fn structuralEqBoxed(a: *const Value, b: *const Value) bool {
@@ -1871,9 +1878,9 @@ pub const Value = union(enum) {
             .Null => b.* == .Null,
             .Unit => b.* == .Unit,
             .CoroutineSuspended => b.* == .CoroutineSuspended,
-            .Range => |x| b.* == .Range and
-                x.start == b.Range.start and x.end == b.Range.end and
-                x.step == b.Range.step and x.kind == b.Range.kind,
+            .Range => |x| b.* == .Range and x.kind == b.Range.kind and
+                ((rangeIsEmptyVal(x) and rangeIsEmptyVal(b.Range)) or
+                    (x.start == b.Range.start and x.end == b.Range.end and x.step == b.Range.step)),
             .List => |x| b.* == .List and listEqBoxed(x.items, b.List.items),
             .Set => |x| b.* == .Set and setEqBoxed(x.items, b.Set.items),
             .Map => |x| b.* == .Map and mapEqBoxed(x.entries, b.Map.entries),
@@ -2408,6 +2415,36 @@ const pair_typed_creators = [_][]const u8{
 /// `kotlin*` creators qualify — a user function named `listOf` does not),
 /// and the `type_args` strings must outlive the value (they are the
 /// module's interned consts).
+/// Coerce a numeric literal element to the container's explicit element type
+/// (`listOf<Byte>(1, 2)` stores `Byte`s, not the `Int` literals). Returns null
+/// when no coercion applies — the element is already that type, the type is
+/// not a numeric primitive, or the element is non-numeric. Mirrors the
+/// type-directed conversion kotlinc applies to integer/float literals so a
+/// `List<Byte>` compares equal to one built from a `ByteArray`.
+fn coerceNumericElem(val: Value, head: []const u8) ?Value {
+    const eq = std.mem.eql;
+    if (eq(u8, head, "Byte")) {
+        if (val != .Byte and val.isIntegral()) if (val.asI64()) |n| return .{ .Byte = @truncate(n) };
+    } else if (eq(u8, head, "Short")) {
+        if (val != .Short and val.isIntegral()) if (val.asI64()) |n| return .{ .Short = @truncate(n) };
+    } else if (eq(u8, head, "Long")) {
+        if (val != .Long and val.isIntegral()) if (val.asI64()) |n| return .{ .Long = n };
+    } else if (eq(u8, head, "Float")) {
+        if (val != .Float and (val.isIntegral() or val.isFloating())) if (val.asF64()) |f| return .{ .Float = @floatCast(f) };
+    } else if (eq(u8, head, "Double")) {
+        if (val != .Double and (val.isIntegral() or val.isFloating())) if (val.asF64()) |f| return .{ .Double = f };
+    }
+    return null;
+}
+
+fn coerceListElems(items: ValueList, head: []const u8) void {
+    const g = items.borrowMut();
+    defer g.deinit();
+    for (g.get().items) |*slot| {
+        if (coerceNumericElem(slot.*, head)) |c| slot.* = c;
+    }
+}
+
 pub fn attachDeclaredElemTypes(fqn: []const u8, type_args: []const []const u8, v: *Value) void {
     if (type_args.len == 0) return;
     if (!std.mem.startsWith(u8, fqn, "kotlin")) return;
@@ -2419,9 +2456,11 @@ pub fn attachDeclaredElemTypes(fqn: []const u8, type_args: []const []const u8, v
         switch (v.*) {
             .List => |*l| {
                 if (l.declared_elem == null) l.declared_elem = elem_arg;
+                coerceListElems(l.items, elem_arg);
             },
             .Set => |*s| {
                 if (s.declared_elem == null) s.declared_elem = elem_arg;
+                coerceListElems(s.items, elem_arg);
             },
             else => {},
         }
