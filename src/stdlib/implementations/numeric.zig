@@ -949,12 +949,32 @@ pub fn int_coerce_in(ctx: *CallCtx) Allocator.Error!EvalResult {
     const rest = ctx.args[@min(1, ctx.args.len)..];
     if (rest.len == 1 and rest[0] == .Range) {
         const r = rest[0].Range;
-        return ok(Value.newInt(@min(@max(v, r.start), r.end)));
+        if (r.start > r.end) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "Cannot coerce value to an empty range: {d}..{d}.", .{ r.start, r.end });
+            const e = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+            if (runtime.freeScratch()) ctx.allocator.free(msg);
+            return .{ .err = .{ .Thrown = e } };
+        }
+        return ok(Value.newInt(@truncate(@min(@max(v, r.start), r.end))));
     }
-    if (rest.len == 2 and rest[0].isIntegral() and rest[1].isIntegral()) {
-        const lo = rest[0].asI64().?;
-        const hi = rest[1].asI64().?;
-        return ok(Value.newInt(@min(@max(v, lo), hi)));
+    if (rest.len == 2) {
+        // `coerceIn(min: Int?, max: Int?)`: a null bound is unconstrained.
+        const lo: ?i64 = if (rest[0] == .Null) null else (rest[0].asI64() orelse return .{ .err = .{ .Type = "coerceIn min must be an Int" } });
+        const hi: ?i64 = if (rest[1] == .Null) null else (rest[1].asI64() orelse return .{ .err = .{ .Type = "coerceIn max must be an Int" } });
+        if (lo != null and hi != null and lo.? > hi.?) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "Cannot coerce value to an empty range: maximum {d} is less than minimum {d}.", .{ hi.?, lo.? });
+            const e = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+            if (runtime.freeScratch()) ctx.allocator.free(msg);
+            return .{ .err = .{ .Thrown = e } };
+        }
+        var result = v;
+        if (lo) |l| {
+            if (result < l) result = l;
+        }
+        if (hi) |h| {
+            if (result > h) result = h;
+        }
+        return ok(Value.newInt(@truncate(result)));
     }
     return .{ .err = .{ .Type = "coerceIn requires (min, max) or a range" } };
 }
@@ -1183,6 +1203,12 @@ pub fn num_coerce_in(ctx: *CallCtx) Allocator.Error!EvalResult {
     const rest = ctx.args[1..];
     if (rest.len == 1 and rest[0] == .Range) {
         const r = rest[0].Range;
+        if (r.start > r.end) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "Cannot coerce value to an empty range: {d}..{d}.", .{ r.start, r.end });
+            const e = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+            if (runtime.freeScratch()) ctx.allocator.free(msg);
+            return .{ .err = .{ .Thrown = e } };
+        }
         const lo = switch (try numExtreme(ctx.allocator, &.{ recv, .{ .Long = r.start } }, false, "coerceIn")) {
             .ok => |v| v,
             .err => |e| return .{ .err = e },
@@ -1190,11 +1216,25 @@ pub fn num_coerce_in(ctx: *CallCtx) Allocator.Error!EvalResult {
         return wrapRes(try numExtreme(ctx.allocator, &.{ lo, .{ .Long = r.end } }, true, "coerceIn"));
     }
     if (rest.len == 2) {
-        const lo = switch (try numExtreme(ctx.allocator, &.{ recv, rest[0] }, false, "coerceIn")) {
-            .ok => |v| v,
-            .err => |e| return .{ .err = e },
-        };
-        return wrapRes(try numExtreme(ctx.allocator, &.{ lo, rest[1] }, true, "coerceIn"));
+        // A null bound is unconstrained (`coerceIn(min: T?, max: T?)`); both
+        // present with min > max is an empty range.
+        if (rest[0] != .Null and rest[1] != .Null) {
+            if (rest[0].asF64()) |lo| if (rest[1].asF64()) |hi| if (lo > hi) {
+                const e = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", "Cannot coerce value to an empty range: maximum is less than minimum.");
+                return .{ .err = .{ .Thrown = e } };
+            };
+        }
+        var cur = recv;
+        if (rest[0] != .Null) {
+            cur = switch (try numExtreme(ctx.allocator, &.{ cur, rest[0] }, false, "coerceIn")) {
+                .ok => |v| v,
+                .err => |e| return .{ .err = e },
+            };
+        }
+        if (rest[1] != .Null) {
+            return wrapRes(try numExtreme(ctx.allocator, &.{ cur, rest[1] }, true, "coerceIn"));
+        }
+        return ok(cur);
     }
     return .{ .err = .{ .Type = "coerceIn requires (min, max) or a range" } };
 }
