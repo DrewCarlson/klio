@@ -91,15 +91,17 @@ pub fn normalizeProgressionEnd(start: i64, end: i64, step: i64) i64 {
         return end;
     }
     if (step > 0) {
+        // Kotlin getProgressionLastElement: `start >= end` yields `end` (an
+        // empty/one-element progression keeps the closed-range bound as `last`).
         if (start > end) {
-            return start - 1;
+            return end;
         }
         const diff = end - start;
         const rem = @rem(diff, step);
         return end - rem;
     } else {
         if (start < end) {
-            return start + 1;
+            return end;
         }
         const diff = start - end;
         const mag = -step;
@@ -197,7 +199,9 @@ fn rangeViewArg(ctx: *const CallCtx, op: []const u8) ?RangeView {
 }
 
 fn rangeViewEmpty(view: RangeView) bool {
-    return if (view.step > 0) view.start > view.end else view.start < view.end;
+    // Empty when `start` is already past `end` in the step direction (unsigned
+    // for ULong, so `MaxUL..MinUL` is empty rather than a wrapped range).
+    return !view.kind.inBounds(view.start, view.end, view.step);
 }
 
 fn throwNoSuchElement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -210,6 +214,9 @@ fn throwNoSuchElement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 /// `IntProgression.first()` / `last()` (the iterable extensions, not the
 /// `start`/`endInclusive` bound properties) throw on an empty progression.
+/// The `Iterable.first()`/`last()` *functions* (a call): throw on an empty
+/// range. The `Progression.first`/`.last` property *reads* (non-throwing) are
+/// served ahead of this in the field-access path.
 pub fn range_first(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "first") orelse return typeErr("first requires a Range receiver");
     if (rangeViewEmpty(view)) return throwNoSuchElement(ctx);
@@ -236,7 +243,13 @@ pub fn range_end_inclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn range_step_field(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "step") orelse return typeErr("step requires a Range receiver");
-    return ok(rangeEndpoint(view.kind, intAbs(view.step)));
+    // A progression's `step` is always `Int` (Int/Char/UInt progressions) or
+    // `Long` (Long/ULong progressions) — never the element type — and keeps its
+    // sign (negative for a `downTo`).
+    return ok(switch (view.kind) {
+        .Long, .ULong => Value{ .Long = view.step },
+        .Int, .Char, .UInt => Value.newInt(view.step),
+    });
 }
 
 fn rangeKindMax(kind: RangeKind) i64 {
@@ -317,7 +330,7 @@ pub fn range_to_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     {
         const g = items.borrowMut();
         defer g.deinit();
-        var it = rangeIterInt(view.start, view.end, view.step);
+        var it = rangeIterInt(view.start, view.end, view.step, view.kind);
         while (it.next()) |v| {
             try g.get().append(ctx.allocator, rangeEndpoint(view.kind, v));
         }
@@ -340,7 +353,7 @@ pub fn range_count(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 pub fn range_sum(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "sum") orelse return typeErr("sum requires a Range receiver");
     var s: i64 = 0;
-    var it = rangeIterInt(view.start, view.end, view.step);
+    var it = rangeIterInt(view.start, view.end, view.step, view.kind);
     while (it.next()) |v| {
         s +%= v;
     }
@@ -372,29 +385,31 @@ const RangeIntIter = struct {
     cur: i64,
     end: i64,
     step: i64,
+    kind: RangeKind,
     done: bool,
 
     fn next(self: *RangeIntIter) ?i64 {
         if (self.done or self.step == 0) return null;
-        if (self.step > 0) {
-            if (self.cur > self.end) {
-                self.done = true;
-                return null;
-            }
-        } else {
-            if (self.cur < self.end) {
-                self.done = true;
-                return null;
-            }
+        // `inBounds` compares unsigned for ULong (`MaxUL..MinUL` is empty).
+        if (!self.kind.inBounds(self.cur, self.end, self.step)) {
+            self.done = true;
+            return null;
         }
         const v = self.cur;
-        self.cur = saturatingAdd(self.cur, self.step);
+        // `end` is the exact final element; stop once yielded so the cursor
+        // never advances past it (Long.MAX overflow, or a ULong wrap past MaxUL).
+        if (self.cur == self.end) {
+            self.done = true;
+            return v;
+        }
+        const adv = saturatingAdd(self.cur, self.step);
+        if (adv == self.cur) self.done = true else self.cur = adv;
         return v;
     }
 };
 
-fn rangeIterInt(start: i64, end: i64, step: i64) RangeIntIter {
-    return .{ .cur = start, .end = end, .step = step, .done = false };
+fn rangeIterInt(start: i64, end: i64, step: i64, kind: RangeKind) RangeIntIter {
+    return .{ .cur = start, .end = end, .step = step, .kind = kind, .done = false };
 }
 
 fn saturatingAdd(a: i64, b: i64) i64 {
@@ -645,10 +660,10 @@ test "range view rejects a non-range receiver" {
 }
 
 test "range iter is empty when bounds cross" {
-    var it = rangeIterInt(5, 1, 1);
+    var it = rangeIterInt(5, 1, 1, .Int);
     try testing.expect(it.next() == null);
-    var it2 = rangeIterInt(1, 5, -1);
+    var it2 = rangeIterInt(1, 5, -1, .Int);
     try testing.expect(it2.next() == null);
-    var it3 = rangeIterInt(1, 10, 0);
+    var it3 = rangeIterInt(1, 10, 0, .Int);
     try testing.expect(it3.next() == null);
 }

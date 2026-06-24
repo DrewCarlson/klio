@@ -854,9 +854,17 @@ pub fn double_to_long(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .Long = f64ToI64Kotlin(d) });
 }
 
-/// `Double`/`Float.toU*()` — Kotlin defines these as `toLong().toU*()`: the
-/// floating value saturates to `Long`, then truncates to the unsigned width.
-fn doubleToUnsigned(ctx: *CallCtx, comptime which: []const u8) Allocator.Error!?u64 {
+/// `Double`/`Float.toU*()` saturate to the *unsigned* destination range, per
+/// Kotlin: `NaN -> 0`, `<= 0 -> 0`, `>= max -> max`, else truncate toward zero.
+/// (Routing through `toLong()` would wrap negatives and overshoot values above
+/// the narrow unsigned max.)
+fn floatingToUnsignedSat(d: f64, max_val: u64) u64 {
+    if (std.math.isNan(d) or d <= 0.0) return 0;
+    const maxf: f64 = @floatFromInt(max_val);
+    if (d >= maxf) return max_val;
+    return @intFromFloat(@trunc(d));
+}
+fn doubleToUnsigned(ctx: *CallCtx, comptime which: []const u8, max_val: u64) Allocator.Error!?u64 {
     const d = switch (try recvDouble(ctx.allocator, ctx.args, which)) {
         .ok => |v| v,
         .err => |e| {
@@ -864,22 +872,22 @@ fn doubleToUnsigned(ctx: *CallCtx, comptime which: []const u8) Allocator.Error!?
             return null;
         },
     };
-    return @bitCast(f64ToI64Kotlin(d));
+    return floatingToUnsignedSat(d, max_val);
 }
 pub fn double_to_uint(ctx: *CallCtx) Allocator.Error!EvalResult {
-    const u = (try doubleToUnsigned(ctx, "toUInt")) orelse return .{ .err = .{ .Type = "toUInt requires a floating receiver" } };
+    const u = (try doubleToUnsigned(ctx, "toUInt", std.math.maxInt(u32))) orelse return .{ .err = .{ .Type = "toUInt requires a floating receiver" } };
     return ok(.{ .UInt = @truncate(u) });
 }
 pub fn double_to_ulong(ctx: *CallCtx) Allocator.Error!EvalResult {
-    const u = (try doubleToUnsigned(ctx, "toULong")) orelse return .{ .err = .{ .Type = "toULong requires a floating receiver" } };
+    const u = (try doubleToUnsigned(ctx, "toULong", std.math.maxInt(u64))) orelse return .{ .err = .{ .Type = "toULong requires a floating receiver" } };
     return ok(.{ .ULong = u });
 }
 pub fn double_to_ushort(ctx: *CallCtx) Allocator.Error!EvalResult {
-    const u = (try doubleToUnsigned(ctx, "toUShort")) orelse return .{ .err = .{ .Type = "toUShort requires a floating receiver" } };
+    const u = (try doubleToUnsigned(ctx, "toUShort", std.math.maxInt(u16))) orelse return .{ .err = .{ .Type = "toUShort requires a floating receiver" } };
     return ok(.{ .UShort = @truncate(u) });
 }
 pub fn double_to_ubyte(ctx: *CallCtx) Allocator.Error!EvalResult {
-    const u = (try doubleToUnsigned(ctx, "toUByte")) orelse return .{ .err = .{ .Type = "toUByte requires a floating receiver" } };
+    const u = (try doubleToUnsigned(ctx, "toUByte", std.math.maxInt(u8))) orelse return .{ .err = .{ .Type = "toUByte requires a floating receiver" } };
     return ok(.{ .UByte = @truncate(u) });
 }
 

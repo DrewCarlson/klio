@@ -149,6 +149,11 @@ pub const MapStore = struct {
     indexed_len: usize = 0,
     built: bool = false,
     indexable: bool = true,
+    /// Structural-modification counter for fail-fast iteration over a mutable
+    /// map's `keys`/`values`/`entries` views. Shared (ObjRef handle) with every
+    /// such view; the map's structural mutations bump it on a size change and a
+    /// view iterator captures it. Null for a read-only map.
+    mod_count: ?ObjRef(u64) = null,
 
     /// Below this entry count, a linear scan beats a hash table (and avoids the
     /// table's allocation), so the index is not built.
@@ -158,6 +163,7 @@ pub const MapStore = struct {
         self.pairs.deinit(a);
         self.head.deinit(a);
         self.chain.deinit(a);
+        if (self.mod_count) |mc| mc.deinit();
     }
 
     /// GC teardown (no allocator-bound buffers escape the cell): free the same
@@ -169,6 +175,7 @@ pub const MapStore = struct {
     /// Out-edges: only the entry list owns `Value`s; the index is index-only.
     pub fn gcTrace(self: *const MapStore, m: *objcell.gc.Marker) void {
         for (self.pairs.items) |*kv| kv.gcTrace(m);
+        if (self.mod_count) |mc| m.shade(&mc.cell.hdr);
     }
 
     /// Hash for a key, consistent with `Value.structuralEqBoxed` (equal keys
@@ -372,6 +379,20 @@ pub const RangeKind = enum {
     ULong,
 
     pub const default: RangeKind = .Int;
+
+    /// Whether `cur` has not yet passed `end` in the step's direction — the
+    /// "keep iterating" test. `ULong` values span the full u64 range stored as
+    /// i64, so they compare unsigned; every other kind fits a signed i64 (UInt
+    /// is 0..2^32-1). Used by every progression cursor and the emptiness check
+    /// so `MaxUL..MinUL` reads as empty rather than a wrapped, huge range.
+    pub fn inBounds(self: RangeKind, cur: i64, end: i64, step: i64) bool {
+        if (self == .ULong) {
+            const uc: u64 = @bitCast(cur);
+            const ue: u64 = @bitCast(end);
+            return if (step > 0) uc <= ue else uc >= ue;
+        }
+        return if (step > 0) cur <= end else cur >= end;
+    }
 };
 
 /// Numeric promotion rank — wider types win in mixed arithmetic.
@@ -488,8 +509,16 @@ pub const PrimBuf = struct {
 
     /// Box element `i` into the `Value` the boxed array would have held.
     pub fn get(self: *const PrimBuf, i: usize) Value {
-        const p: [*]const u8 = self.bytes.items.ptr + i * self.kind.elemSize();
-        return switch (self.kind) {
+        return self.getAs(i, self.kind);
+    }
+
+    /// As `get`, but boxes according to `view_kind` rather than the storage
+    /// kind. The two differ only for an unsigned-array view over signed
+    /// backing (`IntArray.asUIntArray()`), where the byte layout is identical
+    /// and only the boxed tag changes (`Int` -> `UInt`).
+    pub fn getAs(self: *const PrimBuf, i: usize, view_kind: PrimitiveArrayKind) Value {
+        const p: [*]const u8 = self.bytes.items.ptr + i * view_kind.elemSize();
+        return switch (view_kind) {
             .Int => .{ .Int = readAs(i32, p) },
             .Long => .{ .Long = readAs(i64, p) },
             .Double => .{ .Double = readAs(f64, p) },
@@ -509,8 +538,13 @@ pub const PrimBuf = struct {
     /// read through the widening accessors so a coerced argument still stores
     /// correctly; the destination kind defines the stored width.
     pub fn set(self: *PrimBuf, i: usize, v: Value) void {
-        const p: [*]u8 = self.bytes.items.ptr + i * self.kind.elemSize();
-        switch (self.kind) {
+        self.setAs(i, v, self.kind);
+    }
+
+    /// As `set`, but unboxes according to `view_kind` (see `getAs`).
+    pub fn setAs(self: *PrimBuf, i: usize, v: Value, view_kind: PrimitiveArrayKind) void {
+        const p: [*]u8 = self.bytes.items.ptr + i * view_kind.elemSize();
+        switch (view_kind) {
             .Int => writeAs(i32, p, @truncate(v.asI64() orelse 0)),
             .Long => writeAs(i64, p, v.asI64() orelse 0),
             .Double => writeAs(f64, p, v.asF64() orelse 0),
@@ -595,7 +629,7 @@ pub const ArrayData = struct {
             .scalars => |pb| {
                 const g = pb.borrow();
                 defer g.deinit();
-                return g.get().get(i);
+                return g.get().getAs(i, self.prim orelse g.get().kind);
             },
         }
     }
@@ -618,7 +652,7 @@ pub const ArrayData = struct {
             .scalars => |pb| {
                 const g = pb.borrowMut();
                 defer g.deinit();
-                g.get().set(i, v);
+                g.get().setAs(i, v, self.prim orelse g.get().kind);
             },
         }
     }
@@ -637,10 +671,11 @@ pub const ArrayData = struct {
             .scalars => |pb| {
                 const g = pb.borrow();
                 defer g.deinit();
+                const view_kind = self.prim orelse g.get().kind;
                 const n = g.get().len();
                 const out = try allocator.alloc(Value, n);
                 var i: usize = 0;
-                while (i < n) : (i += 1) out[i] = g.get().get(i);
+                while (i < n) : (i += 1) out[i] = g.get().getAs(i, view_kind);
                 return out;
             },
         }
@@ -1069,6 +1104,11 @@ pub const Value = union(enum) {
         /// throwable construction site (`host.allocInstanceId()`); 0 for
         /// exceptions built outside that path, which then compare structurally.
         identity: u64 = 0,
+        /// Suppressed throwables (`addSuppressed`/`suppressedExceptions`). A
+        /// shared list allocated at the constructor site so every value-copy
+        /// of the exception observes the same suppressed set; null for
+        /// exceptions built outside that path.
+        suppressed: ?ValueList = null,
     },
     /// `kotlin.collections.List` / `MutableList`.
     List: struct {
@@ -1086,6 +1126,13 @@ pub const Value = union(enum) {
         /// outlive every value. Dispatch reads it to type an empty list;
         /// `null` everywhere the creation site carried no annotation.
         declared_elem: ?[]const u8 = null,
+        /// Structural-modification counter for fail-fast iteration. Allocated
+        /// when a mutable list is created; shared (by ObjRef handle) across
+        /// every value-copy of the list and the iterators it spawns. A
+        /// structural mutation (add/remove/clear/…) bumps it; an iterator
+        /// captures it and throws `ConcurrentModificationException` when it
+        /// changes underneath. Null for read-only lists / views.
+        mod_count: ?ObjRef(u64) = null,
     },
     /// `kotlin.Array<T>` and primitive-array siblings.
     Array: ArrayData,
@@ -1098,6 +1145,8 @@ pub const Value = union(enum) {
         /// Declared element-type head from an explicit call-site type
         /// argument on the creating stdlib function; see `List`.
         declared_elem: ?[]const u8 = null,
+        /// Structural-modification counter for fail-fast iteration; see `List`.
+        mod_count: ?ObjRef(u64) = null,
     },
     /// `kotlin.collections.Map` / `MutableMap`.
     Map: struct {
@@ -1145,6 +1194,13 @@ pub const Value = union(enum) {
         items: ValueList,
         pos: ObjRef(usize),
         prim: ?PrimitiveArrayKind,
+        /// The source collection's `mod_count` (shared handle) and the value
+        /// this iterator captured at creation. `next`/`hasNext` throw
+        /// `ConcurrentModificationException` when they differ; the iterator's
+        /// own `add`/`remove` resync `exp_mod`. Both null when the source had
+        /// no `mod_count`.
+        mod_count: ?ObjRef(u64) = null,
+        exp_mod: ?ObjRef(u64) = null,
     },
     /// Lazy O(1)-memory iterator over a `Range`/progression.
     RangeIter: struct {
@@ -1152,6 +1208,12 @@ pub const Value = union(enum) {
         end: i64,
         step: i64,
         kind: RangeKind,
+        /// Set once the last element has been yielded. Needed because the
+        /// cursor saturates at the integer boundary (`MaxL +| 1 == MaxL`), so a
+        /// `cur <= end` test alone would loop forever on a range ending at
+        /// `Long.MAX_VALUE`/`MIN_VALUE`. Shared (ObjRef) so it survives the
+        /// iterator value being copied between cursor reads.
+        done: ObjRef(bool),
     },
     /// A built-in property delegate.
     Delegate: ObjRef(DelegateKind),
@@ -1225,10 +1287,12 @@ pub const Value = union(enum) {
             .List => |x| {
                 visitor.visit(x.items);
                 if (x.backing) |b| visitor.visit(MapBackingRef{ .cell = b });
+                if (x.mod_count) |mc| visitor.visit(mc);
             },
             .Set => |x| {
                 visitor.visit(x.items);
                 if (x.backing) |b| visitor.visit(MapBackingRef{ .cell = b });
+                if (x.mod_count) |mc| visitor.visit(mc);
             },
             .Array => |x| switch (x.storage) {
                 .boxed => |vl| visitor.visit(vl),
@@ -1238,8 +1302,13 @@ pub const Value = union(enum) {
             .Iterator => |x| {
                 visitor.visit(x.items);
                 visitor.visit(x.pos);
+                if (x.mod_count) |mc| visitor.visit(mc);
+                if (x.exp_mod) |em| visitor.visit(em);
             },
-            .RangeIter => |x| visitor.visit(x.cur),
+            .RangeIter => |x| {
+                visitor.visit(x.cur);
+                visitor.visit(x.done);
+            },
             .PropertyRef => |p| visitor.visit(p.name),
             .MatchGroup => |g| visitor.visit(g.value),
             .Exception => |e| {
@@ -1247,6 +1316,7 @@ pub const Value = union(enum) {
                 if (e.message) |m| visitor.visit(m);
                 if (e.cause) |c| visitor.visit(c);
                 if (e.stack) |s| visitor.visit(s);
+                if (e.suppressed) |sl| visitor.visit(sl);
             },
             .Pair => |p| {
                 visitor.visit(p.first);
@@ -1356,10 +1426,12 @@ pub const Value = union(enum) {
                 // Drop the view's owned `MapBacking` cell (the borrowed entries
                 // it points at are owned by the source map, not released here).
                 if (x.backing) |b| (MapBackingRef{ .cell = b }).deinit();
+                if (x.mod_count) |mc| mc.deinit();
             },
             .Set => |x| {
                 releaseValueList(x.items, allocator);
                 if (x.backing) |b| (MapBackingRef{ .cell = b }).deinit();
+                if (x.mod_count) |mc| mc.deinit();
             },
             .Array => |x| switch (x.storage) {
                 .boxed => |vl| releaseValueList(vl, allocator),
@@ -1380,14 +1452,20 @@ pub const Value = union(enum) {
             .Iterator => |x| {
                 releaseValueList(x.items, allocator);
                 x.pos.deinit();
+                if (x.mod_count) |mc| mc.deinit();
+                if (x.exp_mod) |em| em.deinit();
             },
-            .RangeIter => |x| x.cur.deinit(),
+            .RangeIter => |x| {
+                x.cur.deinit();
+                x.done.deinit();
+            },
             .PropertyRef => |p| p.name.deinit(),
             .MatchGroup => |g| g.value.deinit(),
             .Exception => |e| {
                 e.fqn.deinit();
                 if (e.message) |m| m.deinit();
                 if (e.cause) |c| c.deinit();
+                if (e.suppressed) |sl| sl.deinit();
             },
             .Pair => |p| {
                 p.first.deinit();
@@ -1880,6 +1958,9 @@ pub const Value = union(enum) {
                     structuralEqBoxed(x.third.asPtr(), b.Triple.third.asPtr()),
             .MapEntry => |x| if (b.* == .MapEntry)
                 return structuralEqBoxed(x.key.asPtr(), b.MapEntry.key.asPtr()) and structuralEqBoxed(x.value.asPtr(), b.MapEntry.value.asPtr()),
+            // `Throwable.equals` is reference identity (Kotlin does not override
+            // it), so `==`/`assertEquals` on exceptions is `===`.
+            .Exception => if (b.* == .Exception) return referenceEq(a, b),
             else => {},
         }
         // Any other mix of two numerics is a cross-type boxed comparison.

@@ -123,26 +123,44 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
         if (first.* != .Double and second.* != .Double) return ok(.{ .Float = @floatCast(r) });
         return ok(.{ .Double = r });
     }
-    // Unsigned pairs compare by unsigned magnitude and keep their kind,
-    // widening to the larger when the kinds differ.
-    if (unsigned_as_u64(first) != null or unsigned_as_u64(second) != null) {
-        const x = unsigned_as_u64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
-        const y = unsigned_as_u64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
+    // A pair that is *both* unsigned compares by unsigned magnitude and keeps
+    // its unsigned kind, widening to the larger when the kinds differ.
+    if (unsigned_as_u64(first) != null and unsigned_as_u64(second) != null) {
+        const x = unsigned_as_u64(first).?;
+        const y = unsigned_as_u64(second).?;
         const r: u64 = if (want_min) @min(x, y) else @max(x, y);
         if (first.* == .ULong or second.* == .ULong) return ok(.{ .ULong = r });
         if (first.* == .UInt or second.* == .UInt) return ok(.{ .UInt = @intCast(r) });
         if (first.* == .UShort or second.* == .UShort) return ok(.{ .UShort = @intCast(r) });
         return ok(.{ .UByte = @intCast(r) });
     }
-    const x = numeric_as_i64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
-    const y = numeric_as_i64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
+    // Otherwise compare by signed value, accepting an unsigned operand by its
+    // magnitude: a mixed signed/unsigned pair arises when an untyped integer
+    // literal lands on the unsigned overload of `minOf`/`maxOf`. Kotlin's
+    // result there is the signed integral type, so widen to i64 and return
+    // Int (or Long when either side is 64-bit).
+    const x = integral_as_i64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
+    const y = integral_as_i64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
     const r: i64 = if (want_min) @min(x, y) else @max(x, y);
-    // Widen to Long if either operand was Long; otherwise Int.
-    if (first.* == .Long or second.* == .Long) {
+    if (first.* == .Long or second.* == .Long or first.* == .ULong or second.* == .ULong) {
         return ok(.{ .Long = r });
     }
-    // Kotlin Int min/max keeps an Int result.
     return ok(.{ .Int = @truncate(r) });
+}
+
+/// Any integral operand widened to `i64`, signed or unsigned, by magnitude.
+fn integral_as_i64(v: *const Value) ?i64 {
+    return switch (v.*) {
+        .Int => |x| @intCast(x),
+        .Long => |x| x,
+        .Short => |x| @intCast(x),
+        .Byte => |x| @intCast(x),
+        .UByte => |x| @intCast(x),
+        .UShort => |x| @intCast(x),
+        .UInt => |x| @intCast(x),
+        .ULong => |x| @bitCast(x),
+        else => null,
+    };
 }
 
 /// Unsigned operand widened to `u64` (UByte/UShort/UInt/ULong only).
@@ -367,6 +385,34 @@ fn unaryDouble(ctx: *CallCtx, what: []const u8, comptime f: fn (f64) f64) std.me
     return ok(.{ .Double = r });
 }
 
+/// As `unaryDouble`, for a two-argument function: the `Float,Float` overload
+/// returns a `Float`, so narrow when both operands are `Float`.
+fn binaryDouble(ctx: *CallCtx, what: []const u8, comptime f: fn (f64, f64) f64) std.mem.Allocator.Error!EvalResult {
+    const pair = switch (try arg2(ctx, what)) {
+        .ok => |p| p,
+        .err => |e| return e,
+    };
+    const both_float = pair.a.* == .Float and pair.b.* == .Float;
+    const a = switch (try as_double(pair.a, what, ctx)) {
+        .ok => |x| x,
+        .err => |e| return e,
+    };
+    const b = switch (try as_double(pair.b, what, ctx)) {
+        .ok => |x| x,
+        .err => |e| return e,
+    };
+    const r = f(a, b);
+    if (both_float) return ok(.{ .Float = @floatCast(r) });
+    return ok(.{ .Double = r });
+}
+
+fn fAtan2(y: f64, x: f64) f64 {
+    return std.math.atan2(y, x);
+}
+fn fHypot(a: f64, b: f64) f64 {
+    return std.math.hypot(a, b);
+}
+
 fn fSinh(x: f64) f64 {
     return std.math.sinh(x);
 }
@@ -476,6 +522,7 @@ pub fn math_log(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |p| p,
         .err => |e| return e,
     };
+    const both_float = pair.a.* == .Float and pair.b.* == .Float;
     const x = switch (try as_double(pair.a, "log", ctx)) {
         .ok => |v| v,
         .err => |e| return e,
@@ -486,8 +533,9 @@ pub fn math_log(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     // Kotlin's `Double.log(base)` is `ln(x) / ln(base)`, and is NaN when the
     // base is not a usable logarithm base (`base <= 0` or `base == 1`).
-    if (base <= 0.0 or base == 1.0) return ok(.{ .Double = std.math.nan(f64) });
-    return ok(.{ .Double = std.math.log(f64, base, x) });
+    const r = if (base <= 0.0 or base == 1.0) std.math.nan(f64) else std.math.log(f64, base, x);
+    if (both_float) return ok(.{ .Float = @floatCast(r) });
+    return ok(.{ .Double = r });
 }
 pub fn math_log10(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return unaryDouble(ctx, "log10", fLog10);
@@ -528,19 +576,7 @@ pub fn math_truncate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return unaryDouble(ctx, "truncate", fTrunc);
 }
 pub fn math_hypot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const pair = switch (try arg2(ctx, "hypot")) {
-        .ok => |p| p,
-        .err => |e| return e,
-    };
-    const a = switch (try as_double(pair.a, "hypot", ctx)) {
-        .ok => |v| v,
-        .err => |e| return e,
-    };
-    const b = switch (try as_double(pair.b, "hypot", ctx)) {
-        .ok => |v| v,
-        .err => |e| return e,
-    };
-    return ok(.{ .Double = std.math.hypot(a, b) });
+    return binaryDouble(ctx, "hypot", fHypot);
 }
 
 /// Kotlin's sign preserves a signed/NaN zero: sign(0.0)=0.0, sign(-0.0)=-0.0,
@@ -835,19 +871,7 @@ pub fn math_atan(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return unaryDouble(ctx, "atan", fAtan);
 }
 pub fn math_atan2(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const pair = switch (try arg2(ctx, "atan2")) {
-        .ok => |p| p,
-        .err => |e| return e,
-    };
-    const y = switch (try as_double(pair.a, "atan2", ctx)) {
-        .ok => |v| v,
-        .err => |e| return e,
-    };
-    const x = switch (try as_double(pair.b, "atan2", ctx)) {
-        .ok => |v| v,
-        .err => |e| return e,
-    };
-    return ok(.{ .Double = std.math.atan2(y, x) });
+    return binaryDouble(ctx, "atan2", fAtan2);
 }
 
 // ------------------------------------------------------------

@@ -522,6 +522,35 @@ pub fn inlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Function {
     return first;
 }
 
+/// Among the inline overloads of `name` that fit the call shape, return the
+/// one declaring a `reified` type parameter (if any). A call with an explicit
+/// `<T>` argument binds that argument to a reified parameter, so a reified
+/// overload outranks a non-reified `KClass<T>`-parameter namesake of the same
+/// shape — without this, `assertFailsWith<E>(msg) { … }` resolves to the
+/// `assertFailsWith(KClass<E>, …)` overload and the type argument lowers as a
+/// constructor value rather than binding `T::class`.
+pub fn reifiedInlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Function {
+    if (isShadowed(name)) return null;
+    const cands = candidatesFor(name) orelse return null;
+    if (cands.len < 2) return null;
+    const shape = call orelse return null;
+    if (!shape.last_is_lambda) return null;
+    const lead = shape.want -| 1;
+    // The first reified overload of this shape. Sibling reified overloads that
+    // differ only in the block's return type (`() -> Any?` vs `() -> Unit`)
+    // splice the same body, so the first fitting one is sufficient to bind the
+    // type argument as `T::class`.
+    for (cands) |f| {
+        if (fitsTrailingLambda(f, lead) and fnHasReified(f)) return f;
+    }
+    return null;
+}
+
+fn fnHasReified(f: *const ast.Function) bool {
+    for (f.type_params) |tp| if (tp.is_reified) return true;
+    return false;
+}
+
 pub fn inlineExpandEnter() bool {
     if (inline_expand_depth >= INLINE_EXPAND_MAX) return false;
     inline_expand_depth += 1;

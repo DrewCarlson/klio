@@ -23,24 +23,46 @@ fn arityErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Arity = msg } };
 }
 
+/// `buildList`/`buildSet`/`buildMap` with an explicit capacity throw
+/// `IllegalArgumentException` for a negative capacity, before running the
+/// builder block. Returns the thrown result, or null when the capacity is
+/// absent/valid.
+fn negativeCapacity(ctx: *CallCtx) std.mem.Allocator.Error!?EvalResult {
+    if (ctx.args.len < 2) return null;
+    const cap = ctx.args[0].asI64() orelse return null;
+    if (cap >= 0) return null;
+    const msg = try std.fmt.allocPrint(ctx.allocator, "capacity must be non-negative, but was {d}.", .{cap});
+    return EvalResult{ .err = .{ .Thrown = .{ .Exception = .{
+        .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
+        .message = try runtime.strInitOwned(ctx.allocator, msg),
+        .cause = null,
+    } } } };
+}
+
 pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args.len > 2) {
         return arityErr("buildList expects (block) or (capacity, block)");
     }
+    if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
     const buildable = Value{ .List = .{
         .items = try ValueList.init(ctx.allocator, .empty),
         .mutable = true,
         .enum_entries = false,
         .backing = null,
+        // The builder is a live `MutableList` the block iterates + mutates;
+        // give it a structural counter so a concurrent iterator fails-fast.
+        .mod_count = try ObjRef(u64).init(ctx.allocator, 0),
     } };
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
         if (r == .err) {
             buildable.List.items.deinit();
+            if (buildable.List.mod_count) |mc| mc.deinit();
             return r;
         }
     }
+    if (buildable.List.mod_count) |mc| mc.deinit();
     return ok(.{ .List = .{
         .items = buildable.List.items,
         .mutable = false,
@@ -53,40 +75,29 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args.len > 2) {
         return arityErr("buildSet expects (block) or (capacity, block)");
     }
+    if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
-    const buildable = Value{ .List = .{
+    // A genuine mutable SET builder (not a list): `add`/`addAll` dedupe under
+    // the block, so a builder iterator observes `add(existing)` as a no-op
+    // (Kotlin's `buildSet` exposes a `MutableSet`). A shared counter lets a
+    // concurrent iterator fail-fast.
+    const buildable = Value{ .Set = .{
         .items = try ValueList.init(ctx.allocator, .empty),
         .mutable = true,
-        .enum_entries = false,
         .backing = null,
+        .mod_count = try ObjRef(u64).init(ctx.allocator, 0),
     } };
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
         if (r == .err) {
-            buildable.List.items.deinit();
+            buildable.Set.items.deinit();
+            if (buildable.Set.mod_count) |mc| mc.deinit();
             return r;
         }
     }
-    var deduped = try ValueList.init(ctx.allocator, .empty);
-    {
-        const src = buildable.List.items.borrow();
-        defer src.deinit();
-        const dst = deduped.borrowMut();
-        defer dst.deinit();
-        for (src.get().items) |*v| {
-            var seen = false;
-            for (dst.get().items) |*x| {
-                if (Value.structuralEqBoxed(x, v)) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) try dst.get().append(ctx.allocator, v.*);
-        }
-    }
-    buildable.List.items.deinit();
+    if (buildable.Set.mod_count) |mc| mc.deinit();
     return ok(.{ .Set = .{
-        .items = deduped,
+        .items = buildable.Set.items,
         .mutable = false,
         .backing = null,
     } });
@@ -96,9 +107,12 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args.len > 2) {
         return arityErr("buildMap expects (block) or (capacity, block)");
     }
+    if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
+    // The builder is a live `MutableMap` the block can iterate (via keys/values/
+    // entries) and mutate; give it a structural counter for fail-fast iteration.
     const buildable = Value{ .Map = .{
-        .entries = try MapEntries.init(ctx.allocator, .{}),
+        .entries = try MapEntries.init(ctx.allocator, .{ .mod_count = try ObjRef(u64).init(ctx.allocator, 0) }),
         .mutable = true,
     } };
     {

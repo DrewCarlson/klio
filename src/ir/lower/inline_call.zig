@@ -834,15 +834,21 @@ pub fn tryInlineCallWithTypeArgs(
                 cls_reg_opt = reg;
             } else {
                 const cls_reg = b.allocReg();
-                const arg_name = try b.module.internConst(b.allocator, .{ .String = a.name.name });
+                // A private / file-local nested class is lifted under a mangled
+                // name; resolve the type-arg name through the scope rename (the
+                // same path `Nested(args)` construction takes) so a reified
+                // `<PrivateNested>` binds its class instead of an unresolved
+                // global of the source name.
+                const resolved_name = expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name;
+                const arg_name = try b.module.internConst(b.allocator, .{ .String = resolved_name });
                 // Carry the resolved class identity so a builtin/stdlib type
                 // whose bare name otherwise resolves to a constructor
                 // intrinsic (an exception class) binds the `.Class` value
                 // instead, matching how a concrete `Type::class` receiver
                 // lowers. Without it `T::class` for such a type yields the
                 // intrinsic and member dispatch (`isInstance`) misses.
-                const idx_pick = b.module.classIdIndexed(a.name.name, b.self_package, a.name.span.file);
-                const flat_pick = b.module.classId(a.name.name);
+                const idx_pick = b.module.classIdIndexed(resolved_name, b.self_package, a.name.span.file);
+                const flat_pick = b.module.classId(resolved_name);
                 const cls_pick: ?ir.ClassId = idx_pick orelse flat_pick;
                 try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name, .class = cls_pick } });
                 cls_reg_opt = cls_reg;

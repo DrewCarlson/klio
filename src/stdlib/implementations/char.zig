@@ -391,6 +391,10 @@ fn toDigit(c: u21, radix: u32) ?u32 {
         '0'...'9' => c - '0',
         'a'...'z' => c - 'a' + 10,
         'A'...'Z' => c - 'A' + 10,
+        // Fullwidth forms (U+FF10.. digits, U+FF21.. upper, U+FF41.. lower).
+        0xFF10...0xFF19 => c - 0xFF10,
+        0xFF21...0xFF3A => c - 0xFF21 + 10,
+        0xFF41...0xFF5A => c - 0xFF41 + 10,
         else => return null,
     };
     return if (digit < radix) digit else null;
@@ -464,6 +468,31 @@ pub fn char_is_surrogate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
 }
 
+/// `Char(code: Int)` / `Char(code: UShort)` constructors. The `Int` overload
+/// requires `code in 0..0xFFFF` and throws `IllegalArgumentException`
+/// otherwise; the unsigned overload is always in range (a `u16`-wide value).
+pub fn char_ctor(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 1) return typeErr("Char requires a code argument");
+    switch (ctx.args[0]) {
+        .UShort, .UByte, .UInt, .ULong => {
+            const code = ctx.args[0].asU64() orelse 0;
+            return ok(.{ .Char = @truncate(code) });
+        },
+        else => {
+            const code = ctx.args[0].asI64() orelse return typeErr("Char requires an Int or UShort code");
+            if (code < 0 or code > 0xFFFF) {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "Invalid Char code: {d}", .{code});
+                return .{ .err = .{ .Thrown = .{ .Exception = .{
+                    .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
+                    .message = try runtime.strInitOwned(ctx.allocator, msg),
+                    .cause = null,
+                } } } };
+            }
+            return ok(.{ .Char = @intCast(code) });
+        },
+    }
+}
+
 // ============================================================
 // Additional Char
 // ============================================================
@@ -509,25 +538,94 @@ pub fn char_uppercase_char(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 pub fn char_lowercase_char(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    return singleCasedChar(ctx, "Char.lowercaseChar", &lowercase_map);
+    // `lowercaseChar()` is the SIMPLE one-to-one mapping; where the full
+    // mapping is multi-scalar Kotlin still yields a single char (İ U+0130 ->
+    // 'i', not 'i' + combining dot). The full map would return the original.
+    const unit = switch (recvChar(ctx.args, "Char.lowercaseChar")) {
+        .err => |e| return .{ .err = e },
+        .unit => |u| u,
+    };
+    if (charUnitToScalar(unit)) |c| {
+        if (c == 0x0130) return ok(.{ .Char = 0x69 });
+        return ok(.{ .Char = @truncate(singleCaseChar(c, &lowercase_map)) });
+    }
+    return ok(.{ .Char = unit });
 }
 
 // ============================================================
 // Char title-case
 // ============================================================
 
+/// The dedicated titlecase (Lt) form of the `DŽ/LJ/NJ/DZ` digraph letters,
+/// whose titlecase differs from their uppercase (e.g. `Ǆ` U+01C4 titlecases
+/// to `ǅ` U+01C5, not to itself). Null for every other char (titlecase ==
+/// uppercase there).
+fn titlecaseSingle(c: u21) ?u21 {
+    return switch (c) {
+        0x01C4, 0x01C5, 0x01C6 => 0x01C5,
+        0x01C7, 0x01C8, 0x01C9 => 0x01C8,
+        0x01CA, 0x01CB, 0x01CC => 0x01CB,
+        0x01F1, 0x01F2, 0x01F3 => 0x01F2,
+        else => null,
+    };
+}
+
 pub fn char_titlecase(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // Most chars: titlecase == uppercase. The diacritic ligatures and a
-    // handful of compatibility lowercase chars map to a multi-char title
-    // form; this approximates via uppercase().
-    return casedStringValue(ctx, "Char.titlecase", &uppercase_map);
+    const unit = switch (recvChar(ctx.args, "Char.titlecase")) {
+        .err => |e| return .{ .err = e },
+        .unit => |u| u,
+    };
+    if (charUnitToScalar(unit)) |c| {
+        // A Lt digraph letter titlecases to its single title form.
+        if (titlecaseSingle(c)) |t| {
+            const s = try charUnitToString(ctx.allocator, @truncate(t));
+            return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
+        }
+        // Every other char: the uppercase expansion with only the first unit
+        // kept upper (e.g. 'ß' -> "Ss", not "SS").
+        const up = try caseString(ctx.allocator, c, &uppercase_map);
+        defer ctx.allocator.free(up);
+        const titled = try titlecaseFirst(ctx.allocator, up);
+        return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, titled) });
+    }
+    const s = try charUnitToString(ctx.allocator, unit);
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
+}
+
+/// Lowercase every codepoint of `s` except the first (so an all-uppercase
+/// multi-char case expansion like "SS" becomes the title form "Ss").
+fn titlecaseFirst(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var view = std.unicode.Utf8View.initUnchecked(s);
+    var it = view.iterator();
+    var first = true;
+    var buf: [4]u8 = undefined;
+    while (it.nextCodepoint()) |cp| {
+        const mapped: u21 = if (first) cp else singleCaseChar(cp, &lowercase_map);
+        first = false;
+        const n = std.unicode.utf8Encode(mapped, &buf) catch {
+            const m = std.unicode.utf8Encode(cp, &buf) catch 0;
+            try out.appendSlice(allocator, buf[0..m]);
+            continue;
+        };
+        try out.appendSlice(allocator, buf[0..n]);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn char_titlecase_char(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // Title-case 1:1 mapping -- for chars without a specific title form this
-    // is the uppercase mapping, and (like uppercaseChar) the original char
-    // when the uppercase mapping isn't a single character ('ß' -> 'ß').
-    return singleCasedChar(ctx, "Char.titlecaseChar", &uppercase_map);
+    // The dedicated Lt title form when one exists; otherwise the uppercase
+    // 1:1 mapping (and the original char when uppercase isn't single, 'ß').
+    const unit = switch (recvChar(ctx.args, "Char.titlecaseChar")) {
+        .err => |e| return .{ .err = e },
+        .unit => |u| u,
+    };
+    if (charUnitToScalar(unit)) |c| {
+        if (titlecaseSingle(c)) |t| return ok(.{ .Char = @truncate(t) });
+        return ok(.{ .Char = @truncate(singleCaseChar(c, &uppercase_map)) });
+    }
+    return ok(.{ .Char = unit });
 }
 
 /// Render a UTF-8 string the way Rust's `{:?}` (`str`'s `Debug`) does:

@@ -740,6 +740,15 @@ fn writeBackLvalue(b: *FuncBuilder, target: *const Expr, val: Reg) Allocator.Err
 /// A bare `name` an enclosing class declares as a value member (an enclosing
 /// companion's `Default`) shadows an unrelated global classifier of the same
 /// simple name. True when `name` is an enclosing member and is NOT a nested
+/// Whether `name` is a known class that has a registered companion object.
+/// Such a name in value position is its companion singleton (Kotlin: `C`
+/// yields `C.Companion`), which must win over a folded classifier name that
+/// would otherwise route the read to a non-existent `this.<name>` field.
+fn classWithCompanion(b: *const FuncBuilder, name: []const u8) bool {
+    return b.module.classId(name) != null and
+        b.module.registry.companion_singletons.contains(name);
+}
+
 /// type reachable along the enclosing-owner chain (a nested type keeps the
 /// classifier path so it names a class value).
 fn enclosingMemberShadowsClass(b: *const FuncBuilder, name: []const u8) bool {
@@ -951,8 +960,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
         // Member read on `this` via GetField when the owning class declares
-        // this name.
-        if (b.hasOwnMember(name0)) {
+        // this name. A companioned class name is excepted: it is its companion
+        // singleton, resolved by the classifier sentinel below, not a field.
+        if (b.hasOwnMember(name0) and !classWithCompanion(b, name0)) {
             if (b.resolve("this")) |this_reg| {
                 const dst = b.allocReg();
                 const nm = try sgetterName(b, name0);
@@ -979,7 +989,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // expression position), so the read decides at runtime with the
         // index-resolved class riding as the exact global arm; the
         // companion sentinel passes a member value through unchanged.
-        if (b.module.classId(name0) != null and !enclosingMemberShadowsClass(b, name0)) {
+        if (b.module.classId(name0) != null and
+            (!enclosingMemberShadowsClass(b, name0) or classWithCompanion(b, name0)))
+        {
             const n = try b.module.internConst(b.allocator, .{ .String = name0 });
             const cls = b.allocReg();
             if (inReceiverContext(b)) {
@@ -1837,6 +1849,74 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
     return out;
 }
 
+/// `argFnArities` for a constructor call: the per-argument expected lambda
+/// arity from the class's primary-constructor parameters. A `T.() -> R`
+/// receiver-lambda parameter reports arity 0 so the lambda drops its `it` and
+/// resolves bare members through the receiver bound at invocation (the same as
+/// a function-call argument).
+fn ctorArgFnArities(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!?[]i16 {
+    if (args.len == 0) return null;
+    for (args) |*a| if (a.* == .Spread) return null;
+    if (class_id.int() >= b.module.classes.items.len) return null;
+    const params = b.module.classes.items[class_id.int()].primary_params;
+    const out = try b.allocator.alloc(i16, args.len);
+    for (out) |*o| o.* = -1;
+    const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
+    if (trailing_lambda) {
+        // An unnamed trailing lambda binds the LAST function-typed parameter
+        // (intervening defaulted/named params are skipped) — find it and take
+        // its arity, so `Op(desc, named = x) { member() }` still detects the
+        // receiver lambda.
+        var pi = params.len;
+        while (pi > 0) : (pi -= 1) {
+            if (fnTypeArityAlias(b, params[pi - 1].ty)) |ar| {
+                out[args.len - 1] = ar;
+                break;
+            }
+        }
+    }
+    // Leading positional args map 1:1 only when there are no named args.
+    if (allNull(arg_names) and args.len <= params.len) {
+        var i: usize = 0;
+        const lead: usize = if (trailing_lambda) args.len - 1 else args.len;
+        while (i < lead) : (i += 1) out[i] = fnTypeArityAlias(b, params[i].ty) orelse -1;
+    }
+    return out;
+}
+
+/// When an unnamed trailing lambda binds a constructor's function-typed
+/// parameter that sits *after* one or more defaulted parameters (`Op("d") {…}`
+/// for `Op(d: String, flag: Boolean = true, f: C.() -> Unit)`), positional
+/// binding would put the lambda in the defaulted slot. Returns an arg-name
+/// vector that names the trailing lambda with the function parameter so the
+/// named-arg constructor path realigns it (the gap params take their defaults).
+/// Null when no realignment is needed.
+fn ctorRealignedArgNames(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!?[]?[]const u8 {
+    if (args.len == 0 or !allNull(arg_names)) return null;
+    if (!(args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun)) return null;
+    if (class_id.int() >= b.module.classes.items.len) return null;
+    const params = b.module.classes.items[class_id.int()].primary_params;
+    if (args.len > params.len) return null;
+    var fn_idx: ?usize = null;
+    var pi = params.len;
+    while (pi > 0) : (pi -= 1) {
+        if (fnTypeArityAlias(b, params[pi - 1].ty) != null) {
+            fn_idx = pi - 1;
+            break;
+        }
+    }
+    const fi = fn_idx orelse return null;
+    const lead = args.len - 1; // positional args preceding the trailing lambda
+    if (fi <= lead) return null; // the lambda already aligns with (or past) the fn param
+    // Every skipped parameter must be defaultable.
+    var k = lead;
+    while (k < fi) : (k += 1) if (!params[k].has_default and params[k].default == null) return null;
+    const out = try b.allocator.alloc(?[]const u8, args.len);
+    for (out) |*o| o.* = null;
+    out[args.len - 1] = params[fi].name;
+    return out;
+}
+
 fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const pf = expr.Postfix;
     const inner = pf.expr;
@@ -2548,6 +2628,21 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             .last_is_lambda = lastArgIsLambdaOrAnon(args),
             .trailing_lambda_arity = trailingLambdaArity(args),
         };
+        // An explicit `<T>` argument binds a reified parameter, so a reified
+        // inline overload of this shape outranks a non-reified `KClass<T>`
+        // namesake (which would lower `<T>` as a constructor value instead of
+        // binding `T::class`). Splice the reified overload directly.
+        if (ast_type_args.len != 0) {
+            if (inline_state.reifiedInlineFnAstFor(nm, inline_call_shape)) |rf| {
+                if (bareInlineNeedsSplice(b, nm, rf, args)) {
+                    const expected = b.peekExpected();
+                    const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+                    if (try tryInlineCallWithTypeArgs(b, nm, rf, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
+                        return r;
+                    }
+                }
+            }
+        }
         if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
             // A reified inline overload whose type parameter lives only in
             // the trailing lambda's parameter list (`T.(R) -> Unit`) cannot
@@ -2798,8 +2893,12 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // cross-package simple-name collision constructs the right class.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         if (b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file)) |class_id| {
-            const run = try lowerArgRun(b, args);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
+            defer if (ctor_arity) |ca| b.allocator.free(ca);
+            const run = try lowerArgRunFull(b, args, ctor_arity, null);
+            const realigned = try ctorRealignedArgNames(b, class_id, args, ast_arg_names);
+            defer if (realigned) |r| b.allocator.free(r);
+            const arg_names = try internArgNames(b.allocator, b.module, realigned orelse ast_arg_names);
             const dst = b.allocReg();
             if (shadowed_by_class) {
                 // A bare `Inner()` uses the enclosing `this` as the new

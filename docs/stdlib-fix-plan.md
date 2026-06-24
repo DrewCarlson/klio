@@ -269,3 +269,35 @@ bindThrowableArgs / the builtin-throwable ctor — find where `Exception(msg,cau
 value); add a `.Exception` case to referenceEq comparing non-zero identities. Cause flow already
 stores the passed value (boxRef), so identity preserves across copies. ctor-ref invoke prereq is
 DONE (commit above). ~40 default-0 construction sites are safe (referenceEq requires id != 0).
+
+---
+
+# PROGRESS LOG + REMAINING DEEP CLUSTERS (baseline 1630)
+
+## Landed this pass (baseline 1567 -> 1630)
+- isRuntimeType builtin-Throwable hierarchy (assertFailsWith<RuntimeException> matches subtypes); Value.Exception reference identity (===/assertSame).
+- Catchable range guards: from>to -> IllegalArgumentException, OOB -> IndexOutOfBoundsException (subList/copyOfRange/fill/sort/sortWith/substring).
+- Sequence flatMap flattens Range/Array/Map/Iterable transform results (the real handler is collections.zig applySeqOp, NOT sequence.zig applyBufferedOp — there are TWO materialise paths; stdlib.materialise_sequence = collections.materialise_sequence).
+- callable-ref overloadScoreArg: .Function/.Class arity.
+- Unsigned array views (UIntArray(intArray) shares backing via PrimBuf.getAs/setAs + ArrayData boxes per its own prim), compareValues unsigned magnitude order, Double/Float.toU* per-type saturation.
+- Companioned class name in value position -> companion singleton (lowerPath classWithCompanion guard).
+- Char(Int)/Char(UShort) ctors, lowercaseChar U+0130->i, titlecase Lt forms + ss->Ss, fullwidth toDigit.
+- Grouping.sourceIterator/keyOf + Array/Sequence/CharSequence.groupingBy.
+- Function-typed property vs same-name vararg method: property wins only when the sole arg is an Array.
+- Bare call to an inherited companion function resolves on the class-hierarchy companion (orderedEquals/checkElementIndex).
+- math atan2/hypot/log(x,base) narrow to Float for Float,Float args (binaryDouble helper).
+
+## Remaining clusters are DEEP — verified diagnoses (repro-confirmed)
+- **iterable +/- static dispatch (IterableTests ~24, SetTest/LinkedSetTest)**: a Set-runtime receiver statically typed Iterable (or `it: T` where T:Iterable<String> — a lambda param) must dispatch Iterable.plus (List result), not Set.plus (Set). Needs GENERIC-BOUND-aware static type at the +/- site. `localDeclType` only covers locals with annotations; the failing receivers are lambda params typed by a generic bound and class properties. Infra present: CallMember.static_recv (ir.zig:287) honored at eval.zig:2738; List.plus already bound to coll_list_plus. Blocker: no static-type/generic-bound inference at lowerBinary. HARD.
+- **HexFormat nested-nested-class (BytesHexFormatTest 25, NumberHexFormatTest 15)**: `BytesHexFormat.Builder()` at HexFormat.kt:664 — BytesHexFormat is a companioned NESTED class used as a qualifier; resolves to its Companion (value), then `.Builder` member-misses ("Builder on ...Companion"). Pre-existing (was "Type" before the companion-value fix; count unchanged). Needs Companion-instance/qualifier -> enclosing nested-class resolution. The deep-workflow agent's classReceiverField (.Class) fix is MISLOCATED (receiver is the Companion .Instance). HARD.
+- **AtomicArray nested reified (AtomicArrayCommonTest ~6: "unresolved global Data")**: `AtomicArray<reified T>(size,init) = AtomicArray(Array(size){...})` (AtomicArrays.common.kt:666). The inner `Array<reified T>(size,init)` splice resolves the element type `Data` (a user nested class) via LoadGlobal against the STDLIB file context, missing it. Single-level reified nested-class resolution WORKS (repro passes); the NESTED splice loses the user call-site context. inline_call.zig:824-863 reified binding; classIdIndexed uses a.name.span.file (stdlib file). HARD (reified inference through nested splices).
+- **regex flags/options (RegexTest 29)**: RegexOption is a real enum; `options` must return setOf(RegexOption enum instances); the Matcher has no handle to RegexData flags (needs threading). Deep-workflow spec is pseudocode for the matcher part. DEFER until matcher flag-threading is designed.
+- **ReversedViews (10)**: orderedEquals dispatch now fixed; remaining are "BinOp.Less on 0 and null" (a null reaching a `<` — reversed-view index/size bug), set()-before-next(), stack overflow. Distinct bugs.
+- **DeepRecursiveTest (7)**: Suspended-trampoline (startCoroutineUninterceptedOrReturn must catch the body park and return COROUTINE_SUSPENDED). Deep.
+- **MathTest remaining (6)**: cbrt of negatives -> should be real not NaN; nextUp/nextDown overflow at large magnitude (Expected 1.99E292 got Infinity); Float NaN tags. Subtle IEEE.
+- **MapTest (17), CollectionTest (20)**: grab-bags of distinct small ops (plusAssignArray, minMaxWith, filterIsInstanceTo unresolved-reified, STRING_CASE_INSENSITIVE_ORDER, etc.), not single root causes.
+- **ContainerBuilderTest (~2 tractable)**: buildList(-1)/buildSet(-1)/buildMap(-1) capacity validation -> IllegalArgumentException (use makeException, NOT a hand-rolled Exception literal). assertSame(emptyList(), buildList{}) needs an empty-singleton — larger.
+
+## METHOD NOTES
+- Two sequence materialise impls exist (collections.zig is the live one for toList/terminals; sequence.zig's is used by sequence.zig's own terminal intrinsics). Fix both or consolidate.
+- The companion-value fix (lowerPath classWithCompanion) over-applies to qualifier position (X.Nested) but that case was already broken; net no regression. A proper fix would keep X a class qualifier when followed by a nested-class segment.

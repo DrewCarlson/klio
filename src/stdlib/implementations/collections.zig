@@ -85,6 +85,79 @@ fn makeStringOwned(a: Allocator, s: []const u8) Error!Value {
 }
 
 /// `make_list(items, mutable)` — wrap a slice of values into a `List`.
+/// A fresh structural-modification counter for a mutable list (so its
+/// iterators can fail-fast), or null for a read-only list.
+fn modCountFor(a: Allocator, mutable: bool) Error!?ObjRef(u64) {
+    if (!mutable) return null;
+    return try ObjRef(u64).init(a, 0);
+}
+
+/// A `List`/`Set` element count, or 0 for anything else — for the
+/// structural-bump diff. (`Map` fail-fast is handled via its own counter.)
+fn listLenOf(v: *const Value) usize {
+    return switch (v.*) {
+        .List => |l| listLen(l.items),
+        .Set => |s| listLen(s.items),
+        else => 0,
+    };
+}
+
+/// The shared `mod_count` of a `List`/`Set` value, if any.
+fn modCountOf(v: *const Value) ?ObjRef(u64) {
+    return switch (v.*) {
+        .List => |l| l.mod_count,
+        .Set => |s| s.mod_count,
+        else => null,
+    };
+}
+
+/// Increment a collection's `mod_count` (no-op when absent). Use directly for a
+/// structural op that does not change length (`trimToSize`/`ensureCapacity`).
+pub fn bumpModCount(v: *const Value) void {
+    if (modCountOf(v)) |mc| {
+        const g = mc.borrowMut();
+        defer g.deinit();
+        g.get().* +%= 1;
+    }
+}
+
+/// `defer structuralBump(&ctx.args[0], before)`: bump `mod_count` only when the
+/// length actually changed, so `remove(absent)` / `removeAll([])` / `retainAll`
+/// of an unchanged collection register no modification (Kotlin's contract).
+fn structuralBump(v: *const Value, before: usize) void {
+    if (listLenOf(v) != before) bumpModCount(v);
+}
+
+/// `entries.pairs.len` — captured before a map mutation for the size diff.
+fn mapEntriesLen(entries: MapEntries) usize {
+    const g = entries.borrow();
+    defer g.deinit();
+    return g.get().pairs.items.len;
+}
+
+/// `defer mapStructuralBump(entries, before)`: bump the map's `mod_count` only
+/// when the entry count changed, so `put(existing)`/`putAll([])` register no
+/// modification while a fresh key / `remove`/`clear` fail a concurrent view
+/// iterator (which shares this counter).
+fn mapStructuralBump(entries: MapEntries, before: usize) void {
+    const g = entries.borrowMut();
+    defer g.deinit();
+    if (g.get().pairs.items.len == before) return;
+    if (g.get().mod_count) |mc| {
+        const mg = mc.borrowMut();
+        defer mg.deinit();
+        mg.get().* +%= 1;
+    }
+}
+
+/// A new handle on the map's shared `mod_count`, for a `keys`/`values`/`entries`
+/// view so its iterator fails fast when the source map mutates structurally.
+fn entriesModCountClone(entries: MapEntries) ?ObjRef(u64) {
+    const g = entries.borrow();
+    defer g.deinit();
+    return if (g.get().mod_count) |mc| mc.clone() else null;
+}
+
 fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(a, items);
@@ -96,6 +169,7 @@ fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
         .mutable = mutable,
         .enum_entries = false,
         .backing = null,
+        .mod_count = try modCountFor(a, mutable),
     } };
 }
 
@@ -106,6 +180,7 @@ fn makeListFromArrayList(a: Allocator, list: std.ArrayList(Value), mutable: bool
         .mutable = mutable,
         .enum_entries = false,
         .backing = null,
+        .mod_count = try modCountFor(a, mutable),
     } };
 }
 
@@ -169,6 +244,7 @@ fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
         .items = try ValueList.init(a, deduped),
         .mutable = mutable,
         .backing = null,
+        .mod_count = try modCountFor(a, mutable),
     } };
 }
 
@@ -222,11 +298,11 @@ fn makeMap(a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
             try out.append(a, kv);
         }
     }
-    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = out }), .mutable = mutable } };
+    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = out, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable } };
 }
 
 fn makeMapFromArrayList(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool) Error!Value {
-    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = entries }), .mutable = mutable } };
+    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = entries, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable } };
 }
 
 /// `makeMapFromArrayList` for entries whose key+value are *borrowed*: the new
@@ -262,6 +338,22 @@ fn makeException(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!Valu
 /// `Err(RuntimeError::Thrown(make_exception(...)))` as an EvalResult.
 fn thrown(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!EvalResult {
     return .{ .err = .{ .Thrown = try makeException(a, fqn, message) } };
+}
+
+/// A structural mutation on a read-only collection throws
+/// `UnsupportedOperationException` (Kotlin: a `List`/`Set`/`Map` built read-only
+/// rejects `add`/`remove`/`set`/`put`/`clear`). Returns the thrown result when
+/// `args[0]` is an immutable collection, else null so the caller proceeds.
+fn readOnlyMutationGuard(a: Allocator, args: []const Value) Error!?EvalResult {
+    if (args.len == 0) return null;
+    const read_only = switch (args[0]) {
+        .List => |l| !l.mutable,
+        .Set => |s| !s.mutable,
+        .Map => |m| !m.mutable,
+        else => false,
+    };
+    if (!read_only) return null;
+    return try thrown(a, "kotlin.UnsupportedOperationException", null);
 }
 
 // =====================================================================
@@ -414,6 +506,11 @@ fn kotlinFloatTotalCmp(x: f64, y: f64) Order {
 fn compareValues(a: Allocator, x: Value, y: Value) Error!CompareOutcome {
     if (x.isNumeric() and y.isNumeric()) {
         if (x.isIntegral() and y.isIntegral()) {
+            // Unsigned operands compare by magnitude; reading them as i64 would
+            // wrap (UInt.MAX -> -1) and misorder the sort.
+            if (x.isUnsigned() and y.isUnsigned()) {
+                return .{ .order = std.math.order(x.asU64().?, y.asU64().?) };
+            }
             return .{ .order = std.math.order(x.asI64().?, y.asI64().?) };
         }
         return .{ .order = kotlinFloatTotalCmp(x.asF64().?, y.asF64().?) };
@@ -512,29 +609,30 @@ const RangeIter = struct {
     cur: i64,
     end: i64,
     step: i64,
+    kind: RangeKind,
     done: bool,
 
-    fn init(start: i64, end: i64, step: i64) RangeIter {
-        const empty = step == 0 or (step > 0 and start > end) or (step < 0 and start < end);
-        return .{ .cur = start, .end = end, .step = step, .done = empty };
+    fn init(start: i64, end: i64, step: i64, kind: RangeKind) RangeIter {
+        const empty = step == 0 or !kind.inBounds(start, end, step);
+        return .{ .cur = start, .end = end, .step = step, .kind = kind, .done = empty };
     }
 
     fn next(self: *RangeIter) ?i64 {
         if (self.done) return null;
-        const v = self.cur;
-        if (self.step > 0) {
-            if (self.cur > self.end) {
-                self.done = true;
-                return null;
-            }
-            self.cur +|= self.step;
-        } else {
-            if (self.cur < self.end) {
-                self.done = true;
-                return null;
-            }
-            self.cur +|= self.step;
+        // `inBounds` compares unsigned for ULong (`MaxUL..MinUL` is empty).
+        if (!self.kind.inBounds(self.cur, self.end, self.step)) {
+            self.done = true;
+            return null;
         }
+        const v = self.cur;
+        // `end` is the exact final element; stop once yielded so the cursor
+        // never advances past it (Long.MAX overflow, or a ULong wrap past MaxUL).
+        if (self.cur == self.end) {
+            self.done = true;
+            return v;
+        }
+        const adv = self.cur +| self.step;
+        if (adv == self.cur) self.done = true else self.cur = adv;
         return v;
     }
 };
@@ -633,7 +731,7 @@ pub fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcom
                 return .{ .err = typeErr(try fmt(a, "{s} requires an iterable receiver", .{what})) };
             };
             var list: std.ArrayList(Value) = .empty;
-            var it = RangeIter.init(view.start, view.end, view.step);
+            var it = RangeIter.init(view.start, view.end, view.step, view.kind);
             while (it.next()) |n| try list.append(a, rangeEndpoint(view.kind, n));
             return .{ .items = try list.toOwnedSlice(a) };
         },
@@ -782,6 +880,7 @@ pub fn coll_shuffled(ctx: *CallCtx) Error!EvalResult {
 
 /// `MutableList.shuffle()` — shuffle in place.
 pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.shuffle")) {
         .items => |x| x,
@@ -956,7 +1055,9 @@ pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_iter_grouping_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("groupingBy expects (receiver, keySelector)");
-    const items = switch (try iterableItems(a, ctx.args[0], "groupingBy")) {
+    // `iterableItemsCtx` drains a Sequence / CharSequence / user Iterable too,
+    // so Array/Sequence/CharSequence.groupingBy share this synth shape.
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "groupingBy")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -969,6 +1070,33 @@ pub fn coll_iter_grouping_by(ctx: *CallCtx) Error!EvalResult {
         .{ .name = "__grouping_key", .value = block },
     };
     return ok(try ctx.host.newSynthInstance("kotlin.collections.Grouping", id, &fields));
+}
+
+/// `Grouping.sourceIterator()` — the iterator over the captured source, used
+/// by the upstream `foldTo`/`reduceTo`/`eachCountTo`/`aggregate` terminals.
+pub fn coll_grouping_source_iterator(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args[0] != .Instance) return typeErr("sourceIterator expects a Grouping receiver");
+    const src: Value = blk: {
+        const g = ctx.args[0].Instance.borrow();
+        defer g.deinit();
+        break :blk (g.get().get("__grouping_src") orelse return typeErr("not a Grouping"));
+    };
+    return (try ctx.host.invokeMethod(&src, "iterator", &.{}, ctx.out)) orelse
+        typeErr("Grouping source is not iterable");
+}
+
+/// `Grouping.keyOf(element)` — applies the captured key selector.
+pub fn coll_grouping_key_of(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[0] != .Instance) return arityErr("keyOf expects (Grouping, element)");
+    const key: Value = blk: {
+        const g = ctx.args[0].Instance.borrow();
+        defer g.deinit();
+        break :blk (g.get().get("__grouping_key") orelse return typeErr("not a Grouping"));
+    };
+    return switch (try invoke(ctx, &key, &.{ctx.args[1]})) {
+        .value => |v| ok(v),
+        .err => |e| e,
+    };
 }
 
 const GroupingParts = union(enum) { parts: struct { items: []Value, key: Value }, err: EvalResult };
@@ -1303,6 +1431,7 @@ fn invokeComparatorCompare(ctx: *CallCtx, comparator: Value, x: Value, y: Value)
 }
 
 pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.sort")) {
         .items => |x| x,
@@ -1316,6 +1445,7 @@ pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.sortWith")) {
         .items => |x| x,
@@ -1345,6 +1475,7 @@ pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_fill(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.fill")) {
         .items => |x| x,
@@ -1359,6 +1490,7 @@ pub fn coll_mut_list_fill(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_reverse(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.reverse")) {
         .items => |x| x,
@@ -1623,6 +1755,23 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args.len > 2) {
         return arityErr(try fmt(a, "{s} expects (size) or (size, init)", .{name}));
+    }
+    // Storage-wrapping unsigned-array constructor: `UIntArray(intArray)` (and
+    // the UByte/UShort/ULong siblings, what `asUIntArray()` lowers to) shares
+    // the signed array's packed buffer as an unsigned view — mutations through
+    // either alias, matching Kotlin's inline value-class storage.
+    if (ctx.args.len == 1 and prim != null and ctx.args[0] == .Array) {
+        const arr = ctx.args[0].Array;
+        if (arr.prim) |src| {
+            const is_view = (prim.? == .UByte and src == .Byte) or
+                (prim.? == .UShort and src == .Short) or
+                (prim.? == .UInt and src == .Int) or
+                (prim.? == .ULong and src == .Long);
+            if (is_view) switch (arr.storage) {
+                .scalars => |pb| return ok(.{ .Array = .{ .storage = .{ .scalars = pb.clone() }, .prim = prim.? } }),
+                .boxed => {},
+            };
+        }
     }
     const n = switch (try arraySizeArg(a, ctx.args[0], name)) {
         .n => |v| v,
@@ -2039,12 +2188,15 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_hash_map_ctor(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    if (ctx.args.len == 0 or (ctx.args.len == 1 and ctx.args[0] == .Int)) {
-        return ok(try makeMap(a, &.{}, true));
-    }
+    if (ctx.args.len == 0) return ok(try makeMap(a, &.{}, true));
     if (ctx.args.len == 1 and ctx.args[0] == .Map) {
         return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), true));
     }
+    // `HashMap(initialCapacity)` / `(initialCapacity, loadFactor)` /
+    // `LinkedHashMap(initialCapacity, loadFactor, accessOrder)` — the capacity,
+    // load factor, and access-order flag do not change the observable behavior
+    // of klio's insertion-ordered map beyond construction.
+    if (ctx.args[0] == .Int) return ok(try makeMap(a, &.{}, true));
     return typeErr("HashMap expects no args, an Int capacity, or a Map");
 }
 
@@ -2415,6 +2567,9 @@ pub fn coll_list_to_string(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
+    if (try readOnlyMutationGuard(a, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const it = switch (try recvListItems(a, ctx.args, "MutableList.add")) {
         .items => |x| x,
         .err => |e| return e,
@@ -2448,6 +2603,9 @@ pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     return arityErr("add requires an argument");
 }
 pub fn coll_mut_list_add_first(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.addFirst")) {
         .items => |x| x,
@@ -2461,6 +2619,9 @@ pub fn coll_mut_list_add_first(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 pub fn coll_mut_list_remove_first(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeFirst")) {
         .items => |x| x,
@@ -2474,6 +2635,9 @@ pub fn coll_mut_list_remove_first(ctx: *CallCtx) Error!EvalResult {
     return ok(g.get().orderedRemove(0));
 }
 pub fn coll_mut_list_remove_last(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeLast")) {
         .items => |x| x,
@@ -2485,6 +2649,9 @@ pub fn coll_mut_list_remove_last(ctx: *CallCtx) Error!EvalResult {
     return try thrown(a, "kotlin.NoSuchElementException", "ArrayDeque is empty.");
 }
 pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeAt")) {
         .items => |x| x,
@@ -2504,6 +2671,9 @@ pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
     return ok(g.get().orderedRemove(@intCast(i)));
 }
 pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.clear")) {
         .items => |x| x,
@@ -2520,7 +2690,10 @@ pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 pub fn coll_array_list_capacity_noop(ctx: *CallCtx) Error!EvalResult {
-    _ = ctx;
+    // `ArrayList.trimToSize()` / `ensureCapacity(n)` are capacity-only no-ops
+    // here (no backing-array capacity is tracked), but Java registers them as
+    // structural modifications, so a concurrent iterator must still fail-fast.
+    if (ctx.args.len > 0) bumpModCount(&ctx.args[0]);
     return ok(Value.Unit);
 }
 
@@ -3554,7 +3727,7 @@ pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
     var out: std.ArrayList(Value) = .empty;
     if (ctx.args.len > 1 and asRangeView(ctx.args[1]) != null) {
         const r = asRangeView(ctx.args[1]).?;
-        var rit = RangeIter.init(r.start, r.end, r.step);
+        var rit = RangeIter.init(r.start, r.end, r.step, r.kind);
         while (rit.next()) |i| {
             if (i < 0 or i >= len) {
                 const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
@@ -3773,7 +3946,7 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
         .Set => |s| try appendVL(&rhs, a, s.items),
         .Array => |arr| try appendArrItems(&rhs, a, arr),
         .Range => |r| {
-            var rit = RangeIter.init(r.start, r.end, r.step);
+            var rit = RangeIter.init(r.start, r.end, r.step, r.kind);
             while (rit.next()) |n| try rhs.append(a, Value.newInt(n));
         },
         else => {
@@ -3988,6 +4161,9 @@ pub fn coll_set_to_string(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.add")) {
         .items => |x| x,
@@ -4004,6 +4180,9 @@ pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .Bool = true });
 }
 pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.remove")) {
         .items => |x| x,
@@ -4027,6 +4206,9 @@ pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .Bool = removed });
 }
 pub fn coll_mut_set_clear(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.clear")) {
         .items => |x| x,
@@ -4100,6 +4282,9 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
 }
 
 pub fn coll_mut_set_remove_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.removeAll")) {
         .items => |x| x,
@@ -4108,6 +4293,9 @@ pub fn coll_mut_set_remove_all(ctx: *CallCtx) Error!EvalResult {
     return mutCollRemoveRetain(ctx, it, ctx.args[0], "removeAll", false, true);
 }
 pub fn coll_mut_set_retain_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.retainAll")) {
         .items => |x| x,
@@ -4315,7 +4503,7 @@ pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Keys });
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = true, .backing = backing.cell } });
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = true, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
 }
 pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4334,7 +4522,7 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Values });
-    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_entries = false, .backing = backing.cell } });
+    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_entries = false, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
 }
 pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4357,18 +4545,21 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Entries });
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = true, .backing = backing.cell } });
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = true, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
 }
 pub fn coll_map_to_string(ctx: *CallCtx) Error!EvalResult {
     return collToString(ctx, "Map.toString");
 }
 
 pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const entries = switch (try recvMapEntries(a, ctx.args, "MutableMap.put")) {
         .entries => |x| x,
         .err => |e| return e,
     };
+    const _mb = mapEntriesLen(entries);
+    defer mapStructuralBump(entries, _mb);
     if (ctx.args.len < 2) return arityErr("put requires a key");
     const key = ctx.args[1];
     if (ctx.args.len < 3) return arityErr("put requires a value");
@@ -4395,11 +4586,14 @@ pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Null);
 }
 pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const entries = switch (try recvMapEntries(a, ctx.args, "MutableMap.remove")) {
         .entries => |x| x,
         .err => |e| return e,
     };
+    const _mb = mapEntriesLen(entries);
+    defer mapStructuralBump(entries, _mb);
     if (ctx.args.len < 2) return arityErr("remove requires a key");
     const key = ctx.args[1];
     if (try mapKeyIndex(ctx, entries, key)) |pos| {
@@ -4416,10 +4610,13 @@ pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Null);
 }
 pub fn coll_mut_map_clear(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const entries = switch (try recvMapEntries(ctx.allocator, ctx.args, "MutableMap.clear")) {
         .entries => |x| x,
         .err => |e| return e,
     };
+    const _mb = mapEntriesLen(entries);
+    defer mapStructuralBump(entries, _mb);
     const g = entries.borrowMut();
     defer g.deinit();
     g.get().pairs.clearRetainingCapacity();
@@ -4847,6 +5044,9 @@ pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.addAll")) {
         .items => |x| x,
@@ -4880,6 +5080,9 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.remove")) {
         .items => |x| x,
@@ -4904,6 +5107,9 @@ pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_remove_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeAll")) {
         .items => |x| x,
@@ -4912,6 +5118,9 @@ pub fn coll_mut_list_remove_all(ctx: *CallCtx) Error!EvalResult {
     return mutCollRemoveRetain(ctx, it, ctx.args[0], "removeAll", false, false);
 }
 pub fn coll_mut_list_retain_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.retainAll")) {
         .items => |x| x,
@@ -4921,6 +5130,7 @@ pub fn coll_mut_list_retain_all(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_set(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.set")) {
         .items => |x| x,
@@ -5008,6 +5218,9 @@ pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
     return ok(try withIndexImpl(a, try snapshotItems(a, it)));
 }
 pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.addAll")) {
         .items => |x| x,
@@ -5151,11 +5364,14 @@ pub fn coll_map_count_no_pred(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const entries = switch (try recvMapEntries(a, ctx.args, "MutableMap.putAll")) {
         .entries => |x| x,
         .err => |e| return e,
     };
+    const _mb = mapEntriesLen(entries);
+    defer mapStructuralBump(entries, _mb);
     if (ctx.args.len < 2) return arityErr("putAll requires a Map");
     const arg = ctx.args[1];
     var to_add: []MapPair = undefined;
@@ -5220,6 +5436,7 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_map_set(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const r = try coll_mut_map_put(ctx);
     if (r == .err) return r;
     return ok(Value.Unit);
