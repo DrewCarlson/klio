@@ -961,7 +961,9 @@ pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_iter_grouping_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("groupingBy expects (receiver, keySelector)");
-    const items = switch (try iterableItems(a, ctx.args[0], "groupingBy")) {
+    // `iterableItemsCtx` drains a Sequence / CharSequence / user Iterable too,
+    // so Array/Sequence/CharSequence.groupingBy share this synth shape.
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "groupingBy")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -974,6 +976,33 @@ pub fn coll_iter_grouping_by(ctx: *CallCtx) Error!EvalResult {
         .{ .name = "__grouping_key", .value = block },
     };
     return ok(try ctx.host.newSynthInstance("kotlin.collections.Grouping", id, &fields));
+}
+
+/// `Grouping.sourceIterator()` — the iterator over the captured source, used
+/// by the upstream `foldTo`/`reduceTo`/`eachCountTo`/`aggregate` terminals.
+pub fn coll_grouping_source_iterator(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args[0] != .Instance) return typeErr("sourceIterator expects a Grouping receiver");
+    const src: Value = blk: {
+        const g = ctx.args[0].Instance.borrow();
+        defer g.deinit();
+        break :blk (g.get().get("__grouping_src") orelse return typeErr("not a Grouping"));
+    };
+    return (try ctx.host.invokeMethod(&src, "iterator", &.{}, ctx.out)) orelse
+        typeErr("Grouping source is not iterable");
+}
+
+/// `Grouping.keyOf(element)` — applies the captured key selector.
+pub fn coll_grouping_key_of(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[0] != .Instance) return arityErr("keyOf expects (Grouping, element)");
+    const key: Value = blk: {
+        const g = ctx.args[0].Instance.borrow();
+        defer g.deinit();
+        break :blk (g.get().get("__grouping_key") orelse return typeErr("not a Grouping"));
+    };
+    return switch (try invoke(ctx, &key, &.{ctx.args[1]})) {
+        .value => |v| ok(v),
+        .err => |e| e,
+    };
 }
 
 const GroupingParts = union(enum) { parts: struct { items: []Value, key: Value }, err: EvalResult };
