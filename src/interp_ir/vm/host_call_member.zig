@@ -1279,7 +1279,10 @@ pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bo
                 }
             }
             for (d.primary_params) |p| {
-                if (std.mem.eql(u8, p.name, name)) {
+                // Only `val`/`var` ctor params (`property != null`) become
+                // accessible members; a plain ctor parameter is local to the
+                // initializer and is not a member of instances.
+                if (p.property != null and std.mem.eql(u8, p.name, name)) {
                     dg.deinit();
                     cg.deinit();
                     return true;
@@ -1342,7 +1345,9 @@ pub fn hostHasProperty(self: *VmHost, receiver: *const Value, name: []const u8) 
             const dg = def.borrow();
             const d = dg.get();
             for (d.primary_params) |p| {
-                if (std.mem.eql(u8, p.name, name)) {
+                // Only `val`/`var` ctor params are properties; a plain ctor
+                // parameter (`property == null`) is not.
+                if (p.property != null and std.mem.eql(u8, p.name, name)) {
                     dg.deinit();
                     cg.deinit();
                     return true;
@@ -2458,6 +2463,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Null-receiver `equals`.
     if (receiver.* == .Null and std.mem.eql(u8, name, "equals") and args.len == 1) {
         return .{ .ok = boolVal(args[0] == .Null) };
+    }
+    // Null-receiver `toString()` (`null.toString()` is the string "null"); the
+    // bodyless `Any?.toString()` actual would otherwise evaluate to Unit.
+    if (receiver.* == .Null and std.mem.eql(u8, name, "toString") and args.len == 0) {
+        return .{ .ok = .{ .String = try runtime.strInit(allocator, "null") } };
+    }
+    if (receiver.* == .Null and std.mem.eql(u8, name, "hashCode") and args.len == 0) {
+        return .{ .ok = .{ .Int = 0 } };
     }
 
     // `equals` on a builtin scalar/String.

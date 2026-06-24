@@ -815,6 +815,18 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             return ok(.{ .Range = .{ .start = 0, .end = len - 1, .step = 1, .kind = .Int } });
         }
     }
+    // The underlying-storage accessor of an unsigned inline type:
+    // `UByte(val data: Byte)` etc. `x.data` reinterprets the unsigned scalar
+    // as its signed counterpart (used by `UByte.toHexString` == `data.toHexString`).
+    if (std.mem.eql(u8, name, "data")) {
+        switch (receiver.*) {
+            .UByte => |x| return ok(.{ .Byte = @bitCast(x) }),
+            .UShort => |x| return ok(.{ .Short = @bitCast(x) }),
+            .UInt => |x| return ok(.{ .Int = @bitCast(x) }),
+            .ULong => |x| return ok(.{ .Long = @bitCast(x) }),
+            else => {},
+        }
+    }
     // `UByteArray.storage` etc. — the signed array over the same bytes. The
     // `PrimBuf` carries its own kind, so reinterpret by copying the bytes into
     // a fresh signed-kind buffer.
@@ -888,7 +900,9 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         for (delegates.items) |d| {
             switch (try getFieldInner(self, allocator, &d, name, suppress_cc_redirect, member_probe)) {
                 .ok => |v| if (v != .Unit) return ok(v),
-                .err => |e| freeFieldMiss(allocator, e),
+                // Only the dispatch-miss sentinel means "no such member";
+                // a real throw from the delegate's accessor must propagate.
+                .err => |e| if (e == .Unimplemented) freeFieldMiss(allocator, e) else return .{ .err = e },
             }
         }
     }
@@ -934,7 +948,18 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     }
                 }
             }
-            cur = firstSupertype(self, cname);
+            // Walk the supertype chain first, then the lexically-enclosing
+            // class chain: a member declared by an enclosing class's companion
+            // (`HexFormat.Default` referenced bare from the nested
+            // `HexFormat.Builder`) is in scope unqualified and must be found
+            // before a same-named top-level/global class swaps in below.
+            if (firstSupertype(self, cname)) |sup| {
+                cur = sup;
+            } else {
+                const g = self.module.borrow();
+                defer g.deinit();
+                cur = g.get().registry.enclosing_class.get(cname);
+            }
         }
     }
     // A top-level *function* must not outrank a property of an enclosing
@@ -1621,6 +1646,15 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         cg.deinit();
         g.deinit();
     }
+    // A member declared by a companion on this receiver's class / supertype /
+    // enclosing-class chain is in scope unqualified and must be resolved by the
+    // companion walk in `getFieldInner` (which runs after this returns null),
+    // not shadowed here by an unrelated global object / class of the same simple
+    // name (`Default` from a nested `Builder` is `HexFormat.Companion.Default`,
+    // not `kotlin.random.Random.Default`).
+    if (!member_probe and try enclosingCompanionDeclares(self, allocator, class_name, name)) {
+        return null;
+    }
     // Nested-class fallback. An `object` declaration referenced by bare
     // name in value position is its singleton instance, never the bare
     // class value (kotlinc: `val c = EmptyCoroutineContext` binds the
@@ -1653,6 +1687,40 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         if (gg.get().lookup(name)) |v| return ok(v);
     }
     return null;
+}
+
+/// Whether a companion object on `class_name`'s class / supertype /
+/// lexically-enclosing-class chain declares a member named `name`. Keeps
+/// `instanceField`'s eager class / global fallback from shadowing an enclosing
+/// companion member with an unrelated same-named global classifier.
+fn enclosingCompanionDeclares(self: *VmHost, allocator: Allocator, class_name: []const u8, name: []const u8) Allocator.Error!bool {
+    var cur: ?[]const u8 = class_name;
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(allocator);
+    while (cur) |cn| {
+        cur = null;
+        if (containsStr(seen.items, cn)) break;
+        try seen.append(allocator, cn);
+        const comp_name: ?[]const u8 = blk: {
+            const g = self.module.borrow();
+            defer g.deinit();
+            break :blk g.get().registry.companion_singletons.get(cn);
+        };
+        if (comp_name) |comp| {
+            switch (try host_globals.objectSingletonForMember(self, comp, name)) {
+                .ok => |maybe| if (maybe != null) return true,
+                .err => return false,
+            }
+        }
+        if (firstSupertype(self, cn)) |sup| {
+            cur = sup;
+        } else {
+            const g = self.module.borrow();
+            defer g.deinit();
+            cur = g.get().registry.enclosing_class.get(cn);
+        }
+    }
+    return false;
 }
 
 /// Resolve an instance custom-getter `FuncId`, applying the

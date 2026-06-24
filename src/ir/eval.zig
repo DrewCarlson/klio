@@ -2664,9 +2664,22 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     try effective_names.append(allocator, name);
                 }
             }
-            switch (try host.callValueNamed(allocator, &callee_v, arg_values.items, effective_names.items)) {
-                .ok => |rv| try frame.write(cs.dst, rv),
-                .err => |e| return raiseStep(frame, e),
+            if (cs.member) |mid| {
+                const mname = constStr(frame.module, mid) orelse
+                    return raiseStep(frame, .{ .Type = "CallSpread: member not a string const" });
+                // The receiver is borrowed for the call's whole duration;
+                // pin it across dispatch (the body may drop other refs).
+                callee_v.retain();
+                defer callee_v.release(allocator);
+                switch (try host.callMemberNamed(allocator, &callee_v, mname, arg_values.items, effective_names.items)) {
+                    .ok => |rv| try frame.write(cs.dst, rv),
+                    .err => |e| return raiseStep(frame, e),
+                }
+            } else {
+                switch (try host.callValueNamed(allocator, &callee_v, arg_values.items, effective_names.items)) {
+                    .ok => |rv| try frame.write(cs.dst, rv),
+                    .err => |e| return raiseStep(frame, e),
+                }
             }
         },
         .CallSuper => |csup| {
@@ -2982,6 +2995,9 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // rejects resolving it against a *caller's* receiver (dynamic
             // scope), so a miss is a hard unresolved reference.
             var v: Value = undefined;
+            if (std.mem.eql(u8, name_str, "asserter")) {
+                std.debug.print("KLIODBG asserter LoadGlobal in fn={s} found={} getters.count={d} module={*}\n", .{ frame.func.fqn, found != null, frame.module.registry.top_level_prop_getters.count(), frame.module });
+            }
             if (found) |fv| {
                 v = fv;
             } else if (comptime @hasDecl(H, "callFunc")) {
@@ -2996,6 +3012,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                         .err => |e| return raiseStep(frame, e),
                     }
                 }
+                std.debug.print("KLIODBG LoadGlobal miss name={s} getters.count={d} module={*}\n", .{ name_str, frame.module.registry.top_level_prop_getters.count(), frame.module });
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                 return raiseStep(frame, .{ .Unbound = msg });
             } else {
@@ -3035,12 +3052,23 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                             resolved = v;
                             break;
                         },
-                        // Each candidate miss allocates a `Vm::get_field` message
-                        // the resolver discards while walking to the next
-                        // candidate / global tier; free it (a per-lookup leak in
-                        // bare-identifier resolution, which the coroutine shim
-                        // does heavily).
-                        .err => |e| freeMissErr(allocator, e),
+                        // Only the dispatch-miss sentinel (`Unimplemented`)
+                        // means "this candidate has no such member" — discard
+                        // its `Vm::get_field` message and walk to the next
+                        // candidate / global tier. Any other error is a member
+                        // that resolved and whose accessor actually ran: a
+                        // throw from a delegated property's `getValue`
+                        // (`NoSuchElementException` on a missing map key), a
+                        // `CalleeFailed`, a `StackOverflow`. Those propagate —
+                        // swallowing them would mask the throw and fall through
+                        // to a spurious `unresolved global`.
+                        .err => |e| {
+                            if (e == .Unimplemented) {
+                                freeMissErr(allocator, e);
+                            } else {
+                                return raiseStep(frame, e);
+                            }
+                        },
                     }
                 }
             }
@@ -3190,6 +3218,11 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // when that is empty — the enclosing function's `this` *parameter*.
     const direct_this: ?Value = if (cmg.recv) |r| frame.read(r) else null;
     const this_val = if (direct_this) |dt| dt else implicitThisValue(frame, cmg.this_idx, true);
+    if (std.mem.eql(u8, name_str, "isFinite")) {
+        std.debug.print("KLIOPROBE3 CMG isFinite fn={s} this_idx={d} recv_set={} this_ty={s} hasMember={}\n", .{
+            frame.func.fqn, cmg.this_idx, cmg.recv != null, this_val.typeFqn(), host.hostHasMember(&this_val, "isFinite"),
+        });
+    }
     // A bare callee whose name starts uppercase is a constructor / type,
     // never an instance member.
     const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]);
@@ -4181,11 +4214,34 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
             if (l.* == .Double and r.* == .Double) return ok(.{ .Double = @rem(l.Double, r.Double) });
             if (l.* == .Double and r.* == .Int) return ok(.{ .Double = @rem(l.Double, @as(f64, @floatFromInt(r.Int))) });
             if (l.* == .Int and r.* == .Double) return ok(.{ .Double = @rem(@as(f64, @floatFromInt(l.Int)), r.Double) });
+            if (l.* == .Float and r.* == .Float) return ok(.{ .Float = @rem(l.Float, r.Float) });
+            if (l.* == .Float and r.* == .Double) return ok(.{ .Double = @rem(@as(f64, l.Float), r.Double) });
+            if (l.* == .Double and r.* == .Float) return ok(.{ .Double = @rem(l.Double, @as(f64, r.Float)) });
+            if (l.* == .Int and r.* == .Float) return ok(.{ .Float = @rem(@as(f32, @floatFromInt(l.Int)), r.Float) });
+            if (l.* == .Float and r.* == .Int) return ok(.{ .Float = @rem(l.Float, @as(f32, @floatFromInt(r.Int))) });
+            if (l.* == .Long and r.* == .Float) return ok(.{ .Float = @rem(@as(f32, @floatFromInt(l.Long)), r.Float) });
+            if (l.* == .Float and r.* == .Long) return ok(.{ .Float = @rem(l.Float, @as(f32, @floatFromInt(r.Long))) });
         },
-        .Eq => return ok(.{ .Bool = Value.structuralEq(l, r) }),
-        .NotEq => return ok(.{ .Bool = !Value.structuralEq(l, r) }),
-        .BoxedEq => return ok(.{ .Bool = Value.structuralEqBoxed(l, r) }),
-        .BoxedNotEq => return ok(.{ .Bool = !Value.structuralEqBoxed(l, r) }),
+        .Eq, .NotEq, .BoxedEq, .BoxedNotEq => {
+            // Mixed-width unsigned equality compares by magnitude
+            // (`0u == 0uL`); same-tag and signed paths keep structural equality.
+            // Mirrors the relational `compareValues` unsigned reconciliation.
+            if (std.meta.activeTag(l.*) != std.meta.activeTag(r.*)) {
+                if (asUnsigned(l)) |lu| {
+                    if (asUnsigned(r)) |ru| {
+                        const eq = lu == ru;
+                        const neg = op == .NotEq or op == .BoxedNotEq;
+                        return ok(.{ .Bool = if (neg) !eq else eq });
+                    }
+                }
+            }
+            const eq = if (op == .BoxedEq or op == .BoxedNotEq)
+                Value.structuralEqBoxed(l, r)
+            else
+                Value.structuralEq(l, r);
+            const neg = op == .NotEq or op == .BoxedNotEq;
+            return ok(.{ .Bool = if (neg) !eq else eq });
+        },
         .Less, .LessEq, .Greater, .GreaterEq => {
             if (try compareValues(op, l, r)) |b| return ok(.{ .Bool = b });
         },
