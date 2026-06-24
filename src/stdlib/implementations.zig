@@ -231,6 +231,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.String.trimEnd", .f = string.string_trim_end },
     .{ .fqn = "kotlin.String.trimStart", .f = string.string_trim_start },
     .{ .fqn = "kotlin.String.uppercase", .f = string.string_uppercase },
+    .{ .fqn = "kotlin.Char", .f = char.char_ctor },
     .{ .fqn = "kotlin.Char.code", .f = char.char_code },
     .{ .fqn = "kotlin.Char.toInt", .f = char.char_code },
     .{ .fqn = "kotlin.internal.getProgressionLastElement", .f = char.internal_get_progression_last_element },
