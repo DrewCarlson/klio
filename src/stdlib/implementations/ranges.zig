@@ -108,12 +108,17 @@ pub fn normalizeProgressionEnd(start: i64, end: i64, step: i64) i64 {
     }
 }
 
+fn argToI64(v: Value) ?i64 {
+    if (v == .Char) return @as(i64, v.Char);
+    return v.asI64();
+}
+
 fn pairIntArgs(ctx: *const CallCtx, what: []const u8) ?[2]i64 {
     _ = what;
-    if (ctx.args.len == 2 and ctx.args[0].isIntegral() and ctx.args[1].isIntegral()) {
-        return .{ ctx.args[0].asI64().?, ctx.args[1].asI64().? };
-    }
-    return null;
+    if (ctx.args.len != 2) return null;
+    const a = argToI64(ctx.args[0]) orelse return null;
+    const b = argToI64(ctx.args[1]) orelse return null;
+    return .{ a, b };
 }
 
 // Int narrows the endpoint; Char reinterprets it as a UTF-16 code unit.
