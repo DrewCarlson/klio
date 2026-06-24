@@ -2967,6 +2967,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Discard sites free it via `freeDispatchMiss` (it is recognizable and
     // allocated here), so it does not leak per call.
     if (receiver.* == .Instance) {
+        // A bare call to an inherited companion function (`orderedEquals`,
+        // `checkElementIndex`) is folded into the class's member scope but is
+        // not an instance member; resolve it on the class-hierarchy companion.
+        if (try companionWithMember(self, allocator, receiver, name)) |comp| {
+            if (!Value.referenceEq(&comp, receiver)) {
+                return callMemberRec(self, allocator, &comp, name, args);
+            }
+        }
         const g = receiver.Instance.borrow();
         defer g.deinit();
         const cg = g.get().class.borrow();
