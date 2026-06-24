@@ -2423,6 +2423,17 @@ const pair_typed_creators = [_][]const u8{
 /// not a numeric primitive, or the element is non-numeric. Mirrors the
 /// type-directed conversion kotlinc applies to integer/float literals so a
 /// `List<Byte>` compares equal to one built from a `ByteArray`.
+fn elemAsU64(v: Value) ?u64 {
+    return switch (v) {
+        .UByte => |x| x,
+        .UShort => |x| x,
+        .UInt => |x| x,
+        .ULong => |x| x,
+        .Byte, .Short, .Int, .Long => if (v.asI64()) |n| (if (n >= 0) @as(u64, @intCast(n)) else null) else null,
+        else => null,
+    };
+}
+
 fn coerceNumericElem(val: Value, head: []const u8) ?Value {
     const eq = std.mem.eql;
     if (eq(u8, head, "Byte")) {
@@ -2435,6 +2446,14 @@ fn coerceNumericElem(val: Value, head: []const u8) ?Value {
         if (val != .Float and (val.isIntegral() or val.isFloating())) if (val.asF64()) |f| return .{ .Float = @floatCast(f) };
     } else if (eq(u8, head, "Double")) {
         if (val != .Double and (val.isIntegral() or val.isFloating())) if (val.asF64()) |f| return .{ .Double = f };
+    } else if (eq(u8, head, "UByte")) {
+        if (val != .UByte) if (elemAsU64(val)) |n| return .{ .UByte = @truncate(n) };
+    } else if (eq(u8, head, "UShort")) {
+        if (val != .UShort) if (elemAsU64(val)) |n| return .{ .UShort = @truncate(n) };
+    } else if (eq(u8, head, "UInt")) {
+        if (val != .UInt) if (elemAsU64(val)) |n| return .{ .UInt = @truncate(n) };
+    } else if (eq(u8, head, "ULong")) {
+        if (val != .ULong) if (elemAsU64(val)) |n| return .{ .ULong = n };
     }
     return null;
 }
