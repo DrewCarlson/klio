@@ -147,12 +147,22 @@ pub fn addAndFetch(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 const ArrayStep = struct { next: Value, out: Value };
 
+fn throwAtomicIoob(ctx: *CallCtx, idx: i64, len: usize) std.mem.Allocator.Error!EvalResult {
+    const msg = try std.fmt.allocPrint(ctx.allocator, "index: {d}, size: {d}", .{ idx, len });
+    const r: EvalResult = .{ .err = .{ .Thrown = .{ .Exception = .{
+        .fqn = try runtime.strInit(ctx.allocator, "kotlin.IndexOutOfBoundsException"),
+        .message = try runtime.strInitOwned(ctx.allocator, msg),
+        .cause = null,
+    } } } };
+    return r;
+}
+
 fn withArrayElemMut(
     ctx: *CallCtx,
     comptime Ctx: type,
     fctx: Ctx,
     f: *const fn (Ctx, Value) ArrayStep,
-) EvalResult {
+) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or ctx.args[0] != .Instance) {
         return typeErr("atomic array op requires a receiver + index");
     }
@@ -164,7 +174,8 @@ fn withArrayElemMut(
     const arr_v = g.get().get("array") orelse return typeErr("atomic array missing `array`");
     if (arr_v != .Array) return typeErr("atomic array backing is not an array");
     const arr = arr_v.Array;
-    if (idx < 0 or idx >= arr.len()) return typeErr("atomic array index out of bounds");
+    // A catchable IndexOutOfBoundsException (not an interpreter `.Type` error).
+    if (idx < 0 or idx >= arr.len()) return throwAtomicIoob(ctx, idx, arr.len());
     const cur = arr.get(@intCast(idx));
     const step = f(fctx, cur);
     if (runtime.reclaimEnabled()) step.out.retain();

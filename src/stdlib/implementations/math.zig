@@ -118,6 +118,9 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
             @min(x, y)
         else
             @max(x, y);
+        // Kotlin's `min/max(Float, Float)` (and Float+integral) returns Float;
+        // only a Double operand widens the result to Double.
+        if (first.* != .Double and second.* != .Double) return ok(.{ .Float = @floatCast(r) });
         return ok(.{ .Double = r });
     }
     // Unsigned pairs compare by unsigned magnitude and keep their kind,

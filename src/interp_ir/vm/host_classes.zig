@@ -422,6 +422,7 @@ fn builtinExceptionParentMatch(tail: []const u8, target: []const u8) bool {
         "NoSuchElementException",         "NumberFormatException",
         "UnsupportedOperationException",  "UninitializedPropertyAccessException",
         "ConcurrentModificationException", "NoWhenBranchMatchedException",
+        "NegativeArraySizeException",
     };
     if (std.mem.eql(u8, target, "RuntimeException") and containsStr(&runtime_exc, tail)) return true;
     if (std.mem.eql(u8, target, "IndexOutOfBoundsException") and
@@ -729,7 +730,7 @@ fn isBuiltinTypeName(name: []const u8) bool {
         "NullPointerException",       "ArithmeticException",  "ClassCastException",
         "NoSuchElementException",     "NumberFormatException", "UnsupportedOperationException",
         "UninitializedPropertyAccessException", "ConcurrentModificationException",
-        "NoWhenBranchMatchedException", "AssertionError",
+        "NoWhenBranchMatchedException", "AssertionError", "NegativeArraySizeException",
     };
     if (containsStr(&builtins, name)) return true;
     return std.mem.startsWith(u8, name, "Function");
