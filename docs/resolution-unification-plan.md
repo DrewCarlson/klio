@@ -68,4 +68,28 @@ the interpreter.
 
 ## Progress
 
-- [ ] Step 1 — DeclSig + sig_index
+- Step 1 (DeclSig) — largely PRE-EXISTING: `decl_user_arity` + `decl_user_sig` are
+  already recorded for every top-level func (incl. inline) at phase-1 header
+  registration (interp_ir/build.zig:1493-1513). The gap was that CLASS MEMBERS were
+  not in any arity-queryable index, so member-vs-global couldn't be arity-aware.
+- [x] Step 4 (commit fea12203) — removed the `intrinsic_owns_all` /
+  `intrinsicOwnsBareName` hatch; `compareValues`/`compareValuesBy` resolve as
+  ordinary symbols, native form attached via `resolvedNativeForm`. Verified 1452.
+- [x] Arity-aware member-vs-global (commit de327622) — `collectMemberArities` records
+  per-member arity masks threaded to the FuncBuilder (`own_member_arity` +
+  `ownMemberApplicable`); gates both `prefer_member` and `lowerImplicitThisCall`. A
+  0-arg member no longer shadows a 1-arg top-level fn. Fixes PreconditionsTest
+  (requireNotNull/checkNotNull) — the recurring "test-vs-run divergence" bug — with
+  NO name list. Verified 1455 (+3), no regression. This is plan Step 6's core (RC-3).
+
+### Next (each full-sweep-verified before commit)
+- Remove `contract_with_msg` (require/check/checkNotNull name-list, RC-5) — likely
+  subsumed by arity-aware resolution now; test require/check-with-message cases.
+- Remove `isAliasName` (RC-5) — once the implicit-`this` global fallback no longer
+  needs the name list (inline stdlib funcs should be reachable via the index/runtime
+  global lookup; verify the `funcsBySimpleName` membership of inline funcs first).
+- RC-4: replace the global `class_member_names` gate with an enclosing-receiver-type
+  member query (the broader run-vs-test divergence; the requireNotNull instance is
+  fixed, but the structural gate remains). Add the run-vs-test parity harness.
+- `applicability.zig`: lift `memberApplicableForWalk` so compile- and run-time share
+  one applicability check (the arity-mask is a first step toward this).
