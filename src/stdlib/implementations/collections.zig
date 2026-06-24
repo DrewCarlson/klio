@@ -3341,41 +3341,55 @@ pub fn coll_list_average(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_list_max_or_null(ctx: *CallCtx) Error!EvalResult {
-    const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, "List.maxOrNull")) {
-        .items => |x| x,
-        .err => |e| return e,
-    };
-    const items = try snapshotItems(a, it);
-    defer if (runtime.freeScratch()) a.free(items);
-    if (items.len == 0) return ok(Value.Null);
-    var best = items[0];
-    for (items[1..]) |v| {
-        const o = switch (try compareHostAware(ctx, v, best)) {
-            .order => |o| o,
-            .err => |e| return e,
-        };
-        if (o == .gt) best = v;
-    }
-    return ok(best);
+    return collListMinMaxCore(ctx, true, true, "List.maxOrNull");
 }
 
 pub fn coll_list_min_or_null(ctx: *CallCtx) Error!EvalResult {
+    return collListMinMaxCore(ctx, false, true, "List.minOrNull");
+}
+
+pub fn coll_list_max(ctx: *CallCtx) Error!EvalResult {
+    return collListMinMaxCore(ctx, true, false, "List.max");
+}
+
+pub fn coll_list_min(ctx: *CallCtx) Error!EvalResult {
+    return collListMinMaxCore(ctx, false, false, "List.min");
+}
+
+fn collListMinMaxCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, "List.minOrNull")) {
+    const it = switch (try recvListItems(a, ctx.args, what)) {
         .items => |x| x,
         .err => |e| return e,
     };
     const items = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(items);
-    if (items.len == 0) return ok(Value.Null);
+    if (items.len == 0) {
+        if (or_null) return ok(Value.Null);
+        const msg = try fmt(a, "{s}: empty", .{what});
+        const e = try thrown(a, "kotlin.NoSuchElementException", msg);
+        if (runtime.freeScratch()) a.free(msg);
+        return e;
+    }
+    // Floating-point elements follow `Math.min`/`Math.max` (NaN propagates,
+    // `-0.0 < 0.0`); the natural order cannot express either.
+    if (items[0] == .Double or items[0] == .Float) {
+        const is_float = items[0] == .Float;
+        var acc: f64 = floatVal(items[0]) orelse return floatFallback(a, items, want_max);
+        for (items[1..]) |v| {
+            const x = floatVal(v) orelse return floatFallback(a, items, want_max);
+            acc = if (want_max) kotlinFloatMax(acc, x) else kotlinFloatMin(acc, x);
+        }
+        return ok(if (is_float) .{ .Float = @floatCast(acc) } else .{ .Double = acc });
+    }
     var best = items[0];
     for (items[1..]) |v| {
         const o = switch (try compareHostAware(ctx, v, best)) {
             .order => |o| o,
             .err => |e| return e,
         };
-        if (o == .lt) best = v;
+        const take = if (want_max) o == .gt else o == .lt;
+        if (take) best = v;
     }
     return ok(best);
 }
@@ -5772,6 +5786,18 @@ pub fn array_average_impl(ctx: *CallCtx) Error!EvalResult {
 }
 
 fn arrayMaxMinImpl(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult {
+    return arrayMaxMinCore(ctx, want_max, false, what);
+}
+
+pub fn array_min_or_null(ctx: *CallCtx) Error!EvalResult {
+    return arrayMaxMinCore(ctx, false, true, "Array.minOrNull");
+}
+
+pub fn array_max_or_null(ctx: *CallCtx) Error!EvalResult {
+    return arrayMaxMinCore(ctx, true, true, "Array.maxOrNull");
+}
+
+fn arrayMaxMinCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
     const items = switch (try iterableItems(a, ctx.args[0], what)) {
@@ -5780,11 +5806,51 @@ fn arrayMaxMinImpl(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalRe
     };
     defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) {
+        if (or_null) return ok(Value.Null);
         const msg = try fmt(a, "{s}: empty", .{what});
         const e = try thrown(a, "kotlin.NoSuchElementException", msg);
         if (runtime.freeScratch()) a.free(msg);
         return e;
     }
+    // Floating-point arrays follow `Math.min`/`Math.max` semantics: NaN
+    // propagates (any NaN element makes the result NaN) and signed zero is
+    // ordered `-0.0 < 0.0`. The natural `compareValues` order expresses
+    // neither, so fold the raw f64s directly.
+    if (items[0] == .Double or items[0] == .Float) {
+        const is_float = items[0] == .Float;
+        var acc: f64 = floatVal(items[0]) orelse return floatFallback(a, items, want_max);
+        for (items[1..]) |v| {
+            const x = floatVal(v) orelse return floatFallback(a, items, want_max);
+            acc = if (want_max) kotlinFloatMax(acc, x) else kotlinFloatMin(acc, x);
+        }
+        return ok(if (is_float) .{ .Float = @floatCast(acc) } else .{ .Double = acc });
+    }
+    return floatFallback(a, items, want_max);
+}
+
+fn floatVal(v: Value) ?f64 {
+    return switch (v) {
+        .Double => |d| d,
+        .Float => |f| @floatCast(f),
+        else => null,
+    };
+}
+
+fn kotlinFloatMin(x: f64, y: f64) f64 {
+    if (std.math.isNan(x) or std.math.isNan(y)) return std.math.nan(f64);
+    if (x == 0.0 and y == 0.0) return if (std.math.signbit(x) or std.math.signbit(y)) -0.0 else 0.0;
+    return @min(x, y);
+}
+
+fn kotlinFloatMax(x: f64, y: f64) f64 {
+    if (std.math.isNan(x) or std.math.isNan(y)) return std.math.nan(f64);
+    if (x == 0.0 and y == 0.0) return if (std.math.signbit(x) and std.math.signbit(y)) -0.0 else 0.0;
+    return @max(x, y);
+}
+
+/// Natural-order min/max fold (non-float arrays, or a float array that turned
+/// out to hold a non-float `Comparable` element).
+fn floatFallback(a: Allocator, items: []const Value, want_max: bool) Error!EvalResult {
     var best = items[0];
     for (items[1..]) |v| {
         const o = switch (try compareValues(a, v, best)) {

@@ -749,6 +749,11 @@ pub const Class = struct {
     /// Construction-site lowering consults this so a lambda building a
     /// bare `Inner()` captures the enclosing `this` it depends on.
     is_inner: bool = false,
+    /// `abstract class` / `interface` / `sealed class` — cannot be
+    /// constructed directly. A bare `Name(args)` call against such a class
+    /// is therefore never construction; it must resolve to a same-named
+    /// factory function, so bare-call lowering must not treat it as a ctor.
+    is_abstract: bool = false,
 };
 
 /// `class_index` / `func_index` entry: simple name → id.

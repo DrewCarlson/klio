@@ -22,6 +22,18 @@ fn typeErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
 
+/// The progression's element kind, derived from the operand types so a Long
+/// `downTo`/`until` yields a `.Long` range (structurally equal to the matching
+/// `..` range) rather than a default `.Int` one.
+fn rangeKindForArgs(a: Value, b: Value) RangeKind {
+    if (a == .Long or b == .Long) return .Long;
+    if (a == .ULong or b == .ULong) return .ULong;
+    if (a == .Char or b == .Char) return .Char;
+    if (a == .UInt or a == .UByte or a == .UShort or
+        b == .UInt or b == .UByte or b == .UShort) return .UInt;
+    return .Int;
+}
+
 // ============================================================
 // Range progressions
 // ============================================================
@@ -32,7 +44,7 @@ pub fn ranges_down_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .start = pair[0],
         .end = pair[1],
         .step = -1,
-        .kind = .Int,
+        .kind = rangeKindForArgs(ctx.args[0], ctx.args[1]),
     } });
 }
 
@@ -42,7 +54,7 @@ pub fn ranges_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .start = pair[0],
         .end = saturatingSub(pair[1], 1),
         .step = 1,
-        .kind = .Int,
+        .kind = rangeKindForArgs(ctx.args[0], ctx.args[1]),
     } });
 }
 
@@ -96,12 +108,17 @@ pub fn normalizeProgressionEnd(start: i64, end: i64, step: i64) i64 {
     }
 }
 
+fn argToI64(v: Value) ?i64 {
+    if (v == .Char) return @as(i64, v.Char);
+    return v.asI64();
+}
+
 fn pairIntArgs(ctx: *const CallCtx, what: []const u8) ?[2]i64 {
     _ = what;
-    if (ctx.args.len == 2 and ctx.args[0].isIntegral() and ctx.args[1].isIntegral()) {
-        return .{ ctx.args[0].asI64().?, ctx.args[1].asI64().? };
-    }
-    return null;
+    if (ctx.args.len != 2) return null;
+    const a = argToI64(ctx.args[0]) orelse return null;
+    const b = argToI64(ctx.args[1]) orelse return null;
+    return .{ a, b };
 }
 
 // Int narrows the endpoint; Char reinterprets it as a UTF-16 code unit.
@@ -179,13 +196,41 @@ fn rangeViewArg(ctx: *const CallCtx, op: []const u8) ?RangeView {
     return asRangeView(&ctx.args[0]);
 }
 
+fn rangeViewEmpty(view: RangeView) bool {
+    return if (view.step > 0) view.start > view.end else view.start < view.end;
+}
+
+fn throwNoSuchElement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return .{ .err = .{ .Thrown = .{ .Exception = .{
+        .fqn = try runtime.strInit(ctx.allocator, "kotlin.NoSuchElementException"),
+        .message = null,
+        .cause = null,
+    } } } };
+}
+
+/// `IntProgression.first()` / `last()` (the iterable extensions, not the
+/// `start`/`endInclusive` bound properties) throw on an empty progression.
 pub fn range_first(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "first") orelse return typeErr("first requires a Range receiver");
+    if (rangeViewEmpty(view)) return throwNoSuchElement(ctx);
     return ok(rangeEndpoint(view.kind, view.start));
 }
 
 pub fn range_last(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "last") orelse return typeErr("last requires a Range receiver");
+    if (rangeViewEmpty(view)) return throwNoSuchElement(ctx);
+    return ok(rangeEndpoint(view.kind, view.end));
+}
+
+/// `ClosedRange.start` / `endInclusive` return the stored bound even for an
+/// empty range (unlike `first()`/`last()`).
+pub fn range_start(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const view = rangeViewArg(ctx, "start") orelse return typeErr("start requires a Range receiver");
+    return ok(rangeEndpoint(view.kind, view.start));
+}
+
+pub fn range_end_inclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const view = rangeViewArg(ctx, "endInclusive") orelse return typeErr("endInclusive requires a Range receiver");
     return ok(rangeEndpoint(view.kind, view.end));
 }
 
@@ -194,10 +239,29 @@ pub fn range_step_field(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(rangeEndpoint(view.kind, intAbs(view.step)));
 }
 
+fn rangeKindMax(kind: RangeKind) i64 {
+    return switch (kind) {
+        .Int => std.math.maxInt(i32),
+        .Long => std.math.maxInt(i64),
+        .Char => std.math.maxInt(u16),
+        .UInt => std.math.maxInt(u32),
+        .ULong => @bitCast(@as(u64, std.math.maxInt(u64))),
+    };
+}
+
 /// `OpenEndRange.endExclusive` — one past the last element. A `..<` range is
 /// stored as the closed `start..(end-1)`, so the exclusive bound is `end + 1`.
+/// When `endInclusive` is the element type's MAX value the exclusive bound is
+/// unrepresentable, so the access throws (matching the stdlib).
 pub fn range_end_exclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "endExclusive") orelse return typeErr("endExclusive requires a Range receiver");
+    if (view.end == rangeKindMax(view.kind)) {
+        return .{ .err = .{ .Thrown = .{ .Exception = .{
+            .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalStateException"),
+            .message = try runtime.strInitOwned(ctx.allocator, try ctx.allocator.dupe(u8, "Cannot return the exclusive upper bound of a range that includes MAX_VALUE.")),
+            .cause = null,
+        } } } };
+    }
     return ok(rangeEndpoint(view.kind, view.end + 1));
 }
 
