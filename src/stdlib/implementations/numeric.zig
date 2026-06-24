@@ -283,6 +283,41 @@ fn recvUnsigned(allocator: Allocator, args: []const Value, what: []const u8) All
     return .{ .err = try typeErr(allocator, "{s} requires an integer receiver", .{what}) };
 }
 
+fn unsignedKindResult(recv: Value, r: u64) Value {
+    return switch (recv) {
+        .ULong => .{ .ULong = r },
+        .UInt => .{ .UInt = @truncate(r) },
+        .UShort => .{ .UShort = @truncate(r) },
+        .UByte => .{ .UByte = @truncate(r) },
+        else => .{ .UInt = @truncate(r) },
+    };
+}
+
+/// `UInt/ULong/UByte/UShort.div`/`floorDiv` — unsigned division keeping the
+/// receiver's kind. For unsigned values floorDiv == div (no sign).
+pub fn unsigned_div(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = try arityErr(ctx.allocator, "div expects a divisor", .{}) };
+    const x = ctx.args[0].asU64() orelse return .{ .err = try typeErr(ctx.allocator, "div: non-unsigned receiver", .{}) };
+    const y = ctx.args[1].asU64() orelse return .{ .err = try typeErr(ctx.allocator, "div: non-unsigned divisor", .{}) };
+    if (y == 0) {
+        const e = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero");
+        return .{ .err = .{ .Thrown = e } };
+    }
+    return ok(unsignedKindResult(ctx.args[0], x / y));
+}
+
+/// `UInt/ULong/UByte/UShort.rem`/`mod` — unsigned remainder (mod == rem).
+pub fn unsigned_rem(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = try arityErr(ctx.allocator, "rem expects a divisor", .{}) };
+    const x = ctx.args[0].asU64() orelse return .{ .err = try typeErr(ctx.allocator, "rem: non-unsigned receiver", .{}) };
+    const y = ctx.args[1].asU64() orelse return .{ .err = try typeErr(ctx.allocator, "rem: non-unsigned divisor", .{}) };
+    if (y == 0) {
+        const e = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero");
+        return .{ .err = .{ .Thrown = e } };
+    }
+    return ok(unsignedKindResult(ctx.args[0], x % y));
+}
+
 pub fn to_ubyte(ctx: *CallCtx) Allocator.Error!EvalResult {
     const v = switch (try recvUnsigned(ctx.allocator, ctx.args, "toUByte")) {
         .ok => |x| x,
