@@ -109,3 +109,23 @@ RC-4 work: one index built identically (including pack symbols) before any body 
 lowered, so `funcsBySimpleName` is complete and `shadowedByClass` sees the factory in
 every entry point. Needs a careful look at how `klio test` vs `klio run` assemble the
 module/index relative to the pack.
+
+### MEASURED (instrumented `lowerPathCall` cands for `Random`)
+For `klio test randT.kt`, two lowering contexts print:
+- user file (file=0): `cands=0 fni_count=5 funcs=854 func_index=5`
+- baked `kotlin.random` (file=211): `cands=2 fni_count=730 funcs=6489 func_index=4373`
+
+So when USER code is lowered, the module has 854 funcs but only **5** `func_index`
+entries — the baked-stdlib base contributes its functions to the `funcs` TABLE but
+NOT to the `func_index` / `func_name_index` symbol index. `funcsBySimpleName` reads
+`func_name_index` (rebuilt FROM `func_index` at image load, ir.zig:1239), so non-inline
+top-level stdlib functions are NOT lowering-resolvable from user code. Runtime global
+lookup masks this for plain bare calls (they fall to CallMemberOrGlobal and resolve at
+run time), so the test impact is limited to LOWERING-TIME decisions that consult the
+index — class-vs-factory shadowing (`shadowedByClass`), overload picking. The
+abstract-class fix (commit 3054a090) already covers the class-named instance.
+The structural fix: make the base/image carry its top-level `func_index` (it has 4373
+at creation, ~5 after the base→extend handoff) so `funcsBySimpleName` is complete when
+user bodies lower. Inline funcs resolve via a separate path (inline_state), which is why
+requireNotNull/listOf work from user code despite the empty index. LOWER PRIORITY than
+believed — most calls already work via the runtime; pursue after contained wins.
