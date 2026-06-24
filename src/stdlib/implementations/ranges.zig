@@ -196,13 +196,41 @@ fn rangeViewArg(ctx: *const CallCtx, op: []const u8) ?RangeView {
     return asRangeView(&ctx.args[0]);
 }
 
+fn rangeViewEmpty(view: RangeView) bool {
+    return if (view.step > 0) view.start > view.end else view.start < view.end;
+}
+
+fn throwNoSuchElement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return .{ .err = .{ .Thrown = .{ .Exception = .{
+        .fqn = try runtime.strInit(ctx.allocator, "kotlin.NoSuchElementException"),
+        .message = null,
+        .cause = null,
+    } } } };
+}
+
+/// `IntProgression.first()` / `last()` (the iterable extensions, not the
+/// `start`/`endInclusive` bound properties) throw on an empty progression.
 pub fn range_first(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "first") orelse return typeErr("first requires a Range receiver");
+    if (rangeViewEmpty(view)) return throwNoSuchElement(ctx);
     return ok(rangeEndpoint(view.kind, view.start));
 }
 
 pub fn range_last(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "last") orelse return typeErr("last requires a Range receiver");
+    if (rangeViewEmpty(view)) return throwNoSuchElement(ctx);
+    return ok(rangeEndpoint(view.kind, view.end));
+}
+
+/// `ClosedRange.start` / `endInclusive` return the stored bound even for an
+/// empty range (unlike `first()`/`last()`).
+pub fn range_start(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const view = rangeViewArg(ctx, "start") orelse return typeErr("start requires a Range receiver");
+    return ok(rangeEndpoint(view.kind, view.start));
+}
+
+pub fn range_end_inclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const view = rangeViewArg(ctx, "endInclusive") orelse return typeErr("endInclusive requires a Range receiver");
     return ok(rangeEndpoint(view.kind, view.end));
 }
 
