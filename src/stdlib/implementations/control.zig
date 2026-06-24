@@ -23,10 +23,27 @@ fn arityErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Arity = msg } };
 }
 
+/// `buildList`/`buildSet`/`buildMap` with an explicit capacity throw
+/// `IllegalArgumentException` for a negative capacity, before running the
+/// builder block. Returns the thrown result, or null when the capacity is
+/// absent/valid.
+fn negativeCapacity(ctx: *CallCtx) std.mem.Allocator.Error!?EvalResult {
+    if (ctx.args.len < 2) return null;
+    const cap = ctx.args[0].asI64() orelse return null;
+    if (cap >= 0) return null;
+    const msg = try std.fmt.allocPrint(ctx.allocator, "capacity must be non-negative, but was {d}.", .{cap});
+    return EvalResult{ .err = .{ .Thrown = .{ .Exception = .{
+        .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
+        .message = try runtime.strInitOwned(ctx.allocator, msg),
+        .cause = null,
+    } } } };
+}
+
 pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args.len > 2) {
         return arityErr("buildList expects (block) or (capacity, block)");
     }
+    if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
     const buildable = Value{ .List = .{
         .items = try ValueList.init(ctx.allocator, .empty),
@@ -53,6 +70,7 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args.len > 2) {
         return arityErr("buildSet expects (block) or (capacity, block)");
     }
+    if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
     const buildable = Value{ .List = .{
         .items = try ValueList.init(ctx.allocator, .empty),
@@ -96,6 +114,7 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args.len > 2) {
         return arityErr("buildMap expects (block) or (capacity, block)");
     }
+    if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
     const buildable = Value{ .Map = .{
         .entries = try MapEntries.init(ctx.allocator, .{}),

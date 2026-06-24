@@ -264,6 +264,22 @@ fn thrown(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!EvalResult 
     return .{ .err = .{ .Thrown = try makeException(a, fqn, message) } };
 }
 
+/// A structural mutation on a read-only collection throws
+/// `UnsupportedOperationException` (Kotlin: a `List`/`Set`/`Map` built read-only
+/// rejects `add`/`remove`/`set`/`put`/`clear`). Returns the thrown result when
+/// `args[0]` is an immutable collection, else null so the caller proceeds.
+fn readOnlyMutationGuard(a: Allocator, args: []const Value) Error!?EvalResult {
+    if (args.len == 0) return null;
+    const read_only = switch (args[0]) {
+        .List => |l| !l.mutable,
+        .Set => |s| !s.mutable,
+        .Map => |m| !m.mutable,
+        else => false,
+    };
+    if (!read_only) return null;
+    return try thrown(a, "kotlin.UnsupportedOperationException", null);
+}
+
 // =====================================================================
 // Borrow helpers over ObjRef containers
 // =====================================================================
@@ -787,6 +803,7 @@ pub fn coll_shuffled(ctx: *CallCtx) Error!EvalResult {
 
 /// `MutableList.shuffle()` — shuffle in place.
 pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.shuffle")) {
         .items => |x| x,
@@ -1337,6 +1354,7 @@ fn invokeComparatorCompare(ctx: *CallCtx, comparator: Value, x: Value, y: Value)
 }
 
 pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.sort")) {
         .items => |x| x,
@@ -1350,6 +1368,7 @@ pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.sortWith")) {
         .items => |x| x,
@@ -1379,6 +1398,7 @@ pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_fill(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.fill")) {
         .items => |x| x,
@@ -1393,6 +1413,7 @@ pub fn coll_mut_list_fill(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_reverse(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.reverse")) {
         .items => |x| x,
@@ -2466,6 +2487,7 @@ pub fn coll_list_to_string(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
+    if (try readOnlyMutationGuard(a, ctx.args)) |e| return e;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.add")) {
         .items => |x| x,
         .err => |e| return e,
@@ -2499,6 +2521,7 @@ pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     return arityErr("add requires an argument");
 }
 pub fn coll_mut_list_add_first(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.addFirst")) {
         .items => |x| x,
@@ -2512,6 +2535,7 @@ pub fn coll_mut_list_add_first(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 pub fn coll_mut_list_remove_first(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeFirst")) {
         .items => |x| x,
@@ -2525,6 +2549,7 @@ pub fn coll_mut_list_remove_first(ctx: *CallCtx) Error!EvalResult {
     return ok(g.get().orderedRemove(0));
 }
 pub fn coll_mut_list_remove_last(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeLast")) {
         .items => |x| x,
@@ -2536,6 +2561,7 @@ pub fn coll_mut_list_remove_last(ctx: *CallCtx) Error!EvalResult {
     return try thrown(a, "kotlin.NoSuchElementException", "ArrayDeque is empty.");
 }
 pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeAt")) {
         .items => |x| x,
@@ -2555,6 +2581,7 @@ pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
     return ok(g.get().orderedRemove(@intCast(i)));
 }
 pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.clear")) {
         .items => |x| x,
@@ -4039,6 +4066,7 @@ pub fn coll_set_to_string(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.add")) {
         .items => |x| x,
@@ -4055,6 +4083,7 @@ pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .Bool = true });
 }
 pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.remove")) {
         .items => |x| x,
@@ -4078,6 +4107,7 @@ pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .Bool = removed });
 }
 pub fn coll_mut_set_clear(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.clear")) {
         .items => |x| x,
@@ -4151,6 +4181,7 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
 }
 
 pub fn coll_mut_set_remove_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.removeAll")) {
         .items => |x| x,
@@ -4159,6 +4190,7 @@ pub fn coll_mut_set_remove_all(ctx: *CallCtx) Error!EvalResult {
     return mutCollRemoveRetain(ctx, it, ctx.args[0], "removeAll", false, true);
 }
 pub fn coll_mut_set_retain_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.retainAll")) {
         .items => |x| x,
@@ -4415,6 +4447,7 @@ pub fn coll_map_to_string(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const entries = switch (try recvMapEntries(a, ctx.args, "MutableMap.put")) {
         .entries => |x| x,
@@ -4446,6 +4479,7 @@ pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Null);
 }
 pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const entries = switch (try recvMapEntries(a, ctx.args, "MutableMap.remove")) {
         .entries => |x| x,
@@ -4467,6 +4501,7 @@ pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Null);
 }
 pub fn coll_mut_map_clear(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const entries = switch (try recvMapEntries(ctx.allocator, ctx.args, "MutableMap.clear")) {
         .entries => |x| x,
         .err => |e| return e,
@@ -4898,6 +4933,7 @@ pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.addAll")) {
         .items => |x| x,
@@ -4931,6 +4967,7 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.remove")) {
         .items => |x| x,
@@ -4955,6 +4992,7 @@ pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_remove_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeAll")) {
         .items => |x| x,
@@ -4963,6 +5001,7 @@ pub fn coll_mut_list_remove_all(ctx: *CallCtx) Error!EvalResult {
     return mutCollRemoveRetain(ctx, it, ctx.args[0], "removeAll", false, false);
 }
 pub fn coll_mut_list_retain_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.retainAll")) {
         .items => |x| x,
@@ -4972,6 +5011,7 @@ pub fn coll_mut_list_retain_all(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_list_set(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.set")) {
         .items => |x| x,
@@ -5059,6 +5099,7 @@ pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
     return ok(try withIndexImpl(a, try snapshotItems(a, it)));
 }
 pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.addAll")) {
         .items => |x| x,
@@ -5202,6 +5243,7 @@ pub fn coll_map_count_no_pred(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
     const entries = switch (try recvMapEntries(a, ctx.args, "MutableMap.putAll")) {
         .entries => |x| x,
@@ -5271,6 +5313,7 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_mut_map_set(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const r = try coll_mut_map_put(ctx);
     if (r == .err) return r;
     return ok(Value.Unit);
