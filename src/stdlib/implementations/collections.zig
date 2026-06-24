@@ -3341,41 +3341,55 @@ pub fn coll_list_average(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_list_max_or_null(ctx: *CallCtx) Error!EvalResult {
-    const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, "List.maxOrNull")) {
-        .items => |x| x,
-        .err => |e| return e,
-    };
-    const items = try snapshotItems(a, it);
-    defer if (runtime.freeScratch()) a.free(items);
-    if (items.len == 0) return ok(Value.Null);
-    var best = items[0];
-    for (items[1..]) |v| {
-        const o = switch (try compareHostAware(ctx, v, best)) {
-            .order => |o| o,
-            .err => |e| return e,
-        };
-        if (o == .gt) best = v;
-    }
-    return ok(best);
+    return collListMinMaxCore(ctx, true, true, "List.maxOrNull");
 }
 
 pub fn coll_list_min_or_null(ctx: *CallCtx) Error!EvalResult {
+    return collListMinMaxCore(ctx, false, true, "List.minOrNull");
+}
+
+pub fn coll_list_max(ctx: *CallCtx) Error!EvalResult {
+    return collListMinMaxCore(ctx, true, false, "List.max");
+}
+
+pub fn coll_list_min(ctx: *CallCtx) Error!EvalResult {
+    return collListMinMaxCore(ctx, false, false, "List.min");
+}
+
+fn collListMinMaxCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, "List.minOrNull")) {
+    const it = switch (try recvListItems(a, ctx.args, what)) {
         .items => |x| x,
         .err => |e| return e,
     };
     const items = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(items);
-    if (items.len == 0) return ok(Value.Null);
+    if (items.len == 0) {
+        if (or_null) return ok(Value.Null);
+        const msg = try fmt(a, "{s}: empty", .{what});
+        const e = try thrown(a, "kotlin.NoSuchElementException", msg);
+        if (runtime.freeScratch()) a.free(msg);
+        return e;
+    }
+    // Floating-point elements follow `Math.min`/`Math.max` (NaN propagates,
+    // `-0.0 < 0.0`); the natural order cannot express either.
+    if (items[0] == .Double or items[0] == .Float) {
+        const is_float = items[0] == .Float;
+        var acc: f64 = floatVal(items[0]) orelse return floatFallback(a, items, want_max);
+        for (items[1..]) |v| {
+            const x = floatVal(v) orelse return floatFallback(a, items, want_max);
+            acc = if (want_max) kotlinFloatMax(acc, x) else kotlinFloatMin(acc, x);
+        }
+        return ok(if (is_float) .{ .Float = @floatCast(acc) } else .{ .Double = acc });
+    }
     var best = items[0];
     for (items[1..]) |v| {
         const o = switch (try compareHostAware(ctx, v, best)) {
             .order => |o| o,
             .err => |e| return e,
         };
-        if (o == .lt) best = v;
+        const take = if (want_max) o == .gt else o == .lt;
+        if (take) best = v;
     }
     return ok(best);
 }
