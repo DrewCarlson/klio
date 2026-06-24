@@ -2975,6 +2975,31 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 return callMemberRec(self, allocator, &comp, name, args);
             }
         }
+        // A nested-class constructor resolved onto a `*.Companion` instance:
+        // an inline factory's `Outer.Nested(args)` where `Outer` resolved to
+        // its companion. Construct the enclosing class's nested class.
+        if (name.len > 0 and std.ascii.isUpper(name[0])) {
+            const enc_fqn: ?[]const u8 = blk: {
+                const ig = receiver.Instance.borrow();
+                defer ig.deinit();
+                const icg = ig.get().class.borrow();
+                defer icg.deinit();
+                const fqn = icg.get().fqn;
+                if (std.mem.endsWith(u8, fqn, ".Companion"))
+                    break :blk fqn[0 .. fqn.len - ".Companion".len];
+                break :blk null;
+            };
+            if (enc_fqn) |enc| {
+                const nested_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ enc, name });
+                defer if (runtime.freeScratch()) allocator.free(nested_fqn);
+                const cid = blk: {
+                    const mg = self.module.borrow();
+                    defer mg.deinit();
+                    break :blk mg.get().classIdByFqn(nested_fqn);
+                };
+                if (cid) |c| return newInstanceById(self, allocator, c, args, null);
+            }
+        }
         const g = receiver.Instance.borrow();
         defer g.deinit();
         const cg = g.get().class.borrow();
