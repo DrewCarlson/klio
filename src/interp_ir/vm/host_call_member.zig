@@ -509,6 +509,9 @@ fn kotlinHashCode(v: *const Value) i32 {
             for (g.get().items) |e| h = h *% 31 +% kotlinHashCode(&e);
             break :blk h;
         },
+        // Kotlin data-class hashCode: first*31 + second (+ *31 + third).
+        .Pair => |p| kotlinHashCode(p.first.asPtr()) *% 31 +% kotlinHashCode(p.second.asPtr()),
+        .Triple => |t| (kotlinHashCode(t.first.asPtr()) *% 31 +% kotlinHashCode(t.second.asPtr())) *% 31 +% kotlinHashCode(t.third.asPtr()),
         .Set => |s| blk: {
             const g = s.items.borrow();
             defer g.deinit();
@@ -2328,13 +2331,22 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // `listIterator(index)` / `listIterator()` on a List.
     if (std.mem.eql(u8, name, "listIterator") and args.len <= 1 and receiver.* == .List) {
-        const start: usize = if (args.len > 0) blk: {
-            break :blk switch (args[0]) {
-                .Int => |n| @intCast(@max(n, 0)),
-                .Long => |n| @intCast(@max(n, 0)),
-                else => 0,
-            };
-        } else 0;
+        const size: i64 = blk_sz: {
+            const g = receiver.List.items.borrow();
+            defer g.deinit();
+            break :blk_sz @intCast(g.get().items.len);
+        };
+        const idx: i64 = if (args.len > 0) (args[0].asI64() orelse 0) else 0;
+        // `List.listIterator(index)` throws when `index !in 0..size`.
+        if (idx < 0 or idx > size) {
+            const msg = try std.fmt.allocPrint(allocator, "index: {d}, size: {d}", .{ idx, size });
+            return .{ .err = .{ .Throw = .{ .Exception = .{
+                .fqn = try runtime.strInit(allocator, "kotlin.IndexOutOfBoundsException"),
+                .message = try runtime.strInitOwned(allocator, msg),
+                .cause = null,
+            } } } };
+        }
+        const start: usize = @intCast(idx);
         const items = try cloneItemsList(allocator, receiver.List.items);
         return .{ .ok = .{ .Iterator = .{
             .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
@@ -4054,11 +4066,15 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
         .Pair => |p| {
             if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "first")) return extractOwned(p.first);
             if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "second")) return extractOwned(p.second);
+            if (std.mem.eql(u8, name, "equals") and args.len == 1) return .{ .ok = boolVal(Value.structuralEq(receiver, &args[0])) };
+            if (std.mem.eql(u8, name, "hashCode") and args.len == 0) return .{ .ok = .{ .Int = kotlinHashCode(receiver) } };
         },
         .Triple => |t| {
             if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "first")) return extractOwned(t.first);
             if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "second")) return extractOwned(t.second);
             if (std.mem.eql(u8, name, "component3") or std.mem.eql(u8, name, "third")) return extractOwned(t.third);
+            if (std.mem.eql(u8, name, "equals") and args.len == 1) return .{ .ok = boolVal(Value.structuralEq(receiver, &args[0])) };
+            if (std.mem.eql(u8, name, "hashCode") and args.len == 0) return .{ .ok = .{ .Int = kotlinHashCode(receiver) } };
         },
         .MapEntry => |me| {
             if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "key")) return extractOwned(me.key);
