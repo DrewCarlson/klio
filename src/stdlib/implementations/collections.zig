@@ -309,6 +309,33 @@ fn containsBoxed(items: []const Value, needle: *const Value) bool {
     return false;
 }
 
+/// Reinterpret a numeric `needle` into the element kind of a primitive
+/// array, mirroring the call-site coercion Kotlin applies to a `contains`
+/// argument typed as the array's element type (`uintArrayOf(...).contains(5u)`
+/// passes a `UInt`, not the bare literal's default kind). Non-numeric needles
+/// (objects, null) pass through so an `Any?` probe still compares as-is.
+fn coerceNeedleToArrayKind(needle: Value, kind: ?PrimitiveArrayKind) Value {
+    const k = kind orelse return needle;
+    const bits: u64 = switch (needle) {
+        .Int => |x| @bitCast(@as(i64, x)),
+        .Long => |x| @bitCast(x),
+        .Short => |x| @bitCast(@as(i64, x)),
+        .Byte => |x| @bitCast(@as(i64, x)),
+        .UInt => |x| x,
+        .ULong => |x| x,
+        .UShort => |x| x,
+        .UByte => |x| x,
+        else => return needle,
+    };
+    return switch (k) {
+        .UInt => .{ .UInt = @truncate(bits) },
+        .ULong => .{ .ULong = bits },
+        .UShort => .{ .UShort = @truncate(bits) },
+        .UByte => .{ .UByte = @truncate(bits) },
+        else => needle,
+    };
+}
+
 fn indexOfBoxed(items: []const Value, needle: *const Value) ?usize {
     for (items, 0..) |*v, i| {
         if (eqBoxed(v, needle)) return i;
@@ -5439,6 +5466,39 @@ pub fn array_content_deep_hash_code(ctx: *CallCtx) Error!EvalResult {
     const recv = ctx.args[0];
     if (recv == .Null) return ok(.{ .Int = 0 });
     return ok(.{ .Int = deepHashElement(recv) });
+}
+
+pub fn array_contains(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len < 2) return arityErr("contains expects (element)");
+    const items = switch (try iterableItems(a, ctx.args[0], "contains")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    const needle = coerceNeedleToArrayKind(ctx.args[1], arrayPrimOf(ctx.args[0]));
+    return ok(.{ .Bool = containsBoxed(items, &needle) });
+}
+
+pub fn array_contains_all(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len < 2) return arityErr("containsAll expects (elements)");
+    const items = switch (try iterableItems(a, ctx.args[0], "containsAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    const needles = switch (try iterableItems(a, ctx.args[1], "containsAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(needles);
+    const kind = arrayPrimOf(ctx.args[0]);
+    for (needles) |*n| {
+        const needle = coerceNeedleToArrayKind(n.*, kind);
+        if (!containsBoxed(items, &needle)) return ok(.{ .Bool = false });
+    }
+    return ok(.{ .Bool = true });
 }
 
 pub fn array_element_at(ctx: *CallCtx) Error!EvalResult {

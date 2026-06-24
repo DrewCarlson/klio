@@ -974,6 +974,15 @@ fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *cons
     }
     if (!receiverImplementsHead(self, receiver, pn)) return false;
     if (ty_args.len == 0) return true;
+    // A user `Instance` carries no reified generic arguments, so the head
+    // match is the strongest provable check (kotlinc resolves the type
+    // arguments statically). Treat it as sufficient: an extension on a
+    // generic user class — `CompareContext<Collection<T>>.collectionBehavior`
+    // called on a `CompareContext<…>` lambda receiver — then proves strictly
+    // on the innermost receiver instead of deferring to the lenient pass,
+    // where a same-named member on an OUTER receiver would otherwise preempt
+    // it. `elementsProveArgs` only introspects the builtin container shapes.
+    if (receiver.* == .Instance) return true;
     return elementsProveArgs(self, allocator, receiver, fid, pn, ty_args, fuel);
 }
 
@@ -4723,6 +4732,20 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     }
 
     var all = try prependReceiver(allocator, receiver, args);
+    // Kotlin trailing-lambda rule for an under-applied member call: the final
+    // supplied callable binds the LAST function-typed parameter, with the
+    // intervening defaulted parameters filled from their defaults rather than
+    // bound left-to-right. `padArgsWithDefaults` fills positionally (lambda →
+    // first gap param), so route this shape through the shared positional
+    // binder, which implements the rule uniformly (and varargs/defaults).
+    if (all.len < f.params.len and all.len != 0 and
+        isFunctionTypeRefResolved(self, &f.params[f.params.len - 1].ty) and
+        isCallable(&all[all.len - 1]) and (all.len - 1) < (f.params.len - 1))
+    {
+        const r = try callFuncRec(self, allocator, mod, fid, all);
+        if (runtime.freeScratch()) allocator.free(all);
+        return r;
+    }
     const defaults = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
