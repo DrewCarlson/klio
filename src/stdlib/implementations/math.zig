@@ -632,6 +632,10 @@ pub fn num_take_highest_one_bit(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
             const r: i64 = if (u == 0) 0 else @bitCast(@as(u64, 1) << @intCast(std.math.log2_int(u64, u)));
             return ok(.{ .Long = r });
         },
+        .UByte => |u| return ok(.{ .UByte = if (u == 0) 0 else @as(u8, 1) << @intCast(std.math.log2_int(u8, u)) }),
+        .UShort => |u| return ok(.{ .UShort = if (u == 0) 0 else @as(u16, 1) << @intCast(std.math.log2_int(u16, u)) }),
+        .UInt => |u| return ok(.{ .UInt = if (u == 0) 0 else @as(u32, 1) << @intCast(std.math.log2_int(u32, u)) }),
+        .ULong => |u| return ok(.{ .ULong = if (u == 0) 0 else @as(u64, 1) << @intCast(std.math.log2_int(u64, u)) }),
         else => {
             const rendered = v.display(ctx.allocator) catch return .{ .err = .{ .Type = "out of memory" } };
             defer ctx.allocator.free(rendered);
@@ -654,6 +658,10 @@ pub fn num_take_lowest_one_bit(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
             const neg = 0 -% n;
             return ok(.{ .Long = n & neg });
         },
+        .UByte => |u| return ok(.{ .UByte = u & (0 -% u) }),
+        .UShort => |u| return ok(.{ .UShort = u & (0 -% u) }),
+        .UInt => |u| return ok(.{ .UInt = u & (0 -% u) }),
+        .ULong => |u| return ok(.{ .ULong = u & (0 -% u) }),
         else => {
             const rendered = v.display(ctx.allocator) catch return .{ .err = .{ .Type = "out of memory" } };
             defer ctx.allocator.free(rendered);
@@ -679,6 +687,10 @@ pub fn num_rotate_left(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             const u: u64 = @bitCast(x);
             return ok(.{ .Long = @bitCast(std.math.rotl(u64, u, sh)) });
         },
+        .UByte => |u| return ok(.{ .UByte = std.math.rotl(u8, u, @as(u8, @intCast(@mod(n, 8)))) }),
+        .UShort => |u| return ok(.{ .UShort = std.math.rotl(u16, u, @as(u16, @intCast(@mod(n, 16)))) }),
+        .UInt => |u| return ok(.{ .UInt = std.math.rotl(u32, u, @as(u32, @intCast(@mod(n, 32)))) }),
+        .ULong => |u| return ok(.{ .ULong = std.math.rotl(u64, u, @as(u64, @intCast(@mod(n, 64)))) }),
         else => {
             const rendered = pair.a.display(ctx.allocator) catch return .{ .err = .{ .Type = "out of memory" } };
             defer ctx.allocator.free(rendered);
@@ -704,6 +716,10 @@ pub fn num_rotate_right(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             const u: u64 = @bitCast(x);
             return ok(.{ .Long = @bitCast(std.math.rotr(u64, u, sh)) });
         },
+        .UByte => |u| return ok(.{ .UByte = std.math.rotr(u8, u, @as(u8, @intCast(@mod(n, 8)))) }),
+        .UShort => |u| return ok(.{ .UShort = std.math.rotr(u16, u, @as(u16, @intCast(@mod(n, 16)))) }),
+        .UInt => |u| return ok(.{ .UInt = std.math.rotr(u32, u, @as(u32, @intCast(@mod(n, 32)))) }),
+        .ULong => |u| return ok(.{ .ULong = std.math.rotr(u64, u, @as(u64, @intCast(@mod(n, 64)))) }),
         else => {
             const rendered = pair.a.display(ctx.allocator) catch return .{ .err = .{ .Type = "out of memory" } };
             defer ctx.allocator.free(rendered);

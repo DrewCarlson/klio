@@ -1064,6 +1064,10 @@ pub fn num_count_leading_zero_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
         .Int => |v| @clz(@as(u32, @bitCast(v))),
         .Short => |v| @clz(@as(u16, @bitCast(v))),
         .Byte => |v| @clz(@as(u8, @bitCast(v))),
+        .ULong => |v| @clz(v),
+        .UInt => |v| @clz(v),
+        .UShort => |v| @clz(v),
+        .UByte => |v| @clz(v),
         else => return .{ .err = try countTypeErr(ctx.allocator, "countLeadingZeroBits", ctx.args[0]) },
     };
     return ok(Value.newInt(@as(i64, n)));
@@ -1079,6 +1083,10 @@ pub fn num_count_trailing_zero_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
         .Int => |v| @ctz(@as(u32, @bitCast(v))),
         .Short => |v| @min(@as(i32, @ctz(@as(u16, @bitCast(v)))), 16),
         .Byte => |v| @min(@as(i32, @ctz(@as(u8, @bitCast(v)))), 8),
+        .ULong => |v| @ctz(v),
+        .UInt => |v| @ctz(v),
+        .UShort => |v| @min(@as(i32, @ctz(v)), 16),
+        .UByte => |v| @min(@as(i32, @ctz(v)), 8),
         else => return .{ .err = try countTypeErr(ctx.allocator, "countTrailingZeroBits", ctx.args[0]) },
     };
     return ok(Value.newInt(@as(i64, n)));
@@ -1094,6 +1102,10 @@ pub fn num_count_one_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
         .Int => |v| @popCount(@as(u32, @bitCast(v))),
         .Short => |v| @popCount(@as(u16, @bitCast(v))),
         .Byte => |v| @popCount(@as(u8, @bitCast(v))),
+        .ULong => |v| @popCount(v),
+        .UInt => |v| @popCount(v),
+        .UShort => |v| @popCount(v),
+        .UByte => |v| @popCount(v),
         else => return .{ .err = try countTypeErr(ctx.allocator, "countOneBits", ctx.args[0]) },
     };
     return ok(Value.newInt(@as(i64, n)));
