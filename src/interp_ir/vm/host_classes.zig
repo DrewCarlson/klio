@@ -274,17 +274,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         .Exception => |e| {
             const g = e.fqn.borrow();
             defer g.deinit();
-            const fqn = g.get().bytes;
-            const tail = lastSegment(fqn);
-            if (std.mem.eql(u8, tail, ty.name)) return true;
-            if (matchesAny(ty.name, &.{ "Throwable", "Any" })) return true;
-            // `Error`-side throwables are not `Exception`s: kotlinc
-            // matches `catch (e: Error)` and not `catch (e: Exception)`
-            // for AssertionError / FileFailedToInitializeException and
-            // kin.
-            if (std.mem.eql(u8, ty.name, "Exception")) return !isErrorSideThrowable(tail);
-            if (std.mem.eql(u8, ty.name, "Error")) return isErrorSideThrowable(tail);
-            return builtinExceptionParentMatch(tail, ty.name);
+            return runtime.Value.builtinThrowableIsA(g.get().bytes, ty.name);
         },
         else => {},
     }
@@ -399,40 +389,11 @@ fn interfaceChainMatches(self: *VmHost, cdef: *const ClassDef, name: []const u8)
     return false;
 }
 
-/// Throwables on the `kotlin.Error` side of the hierarchy (everything
-/// else thrown as a `Value.Exception` descends from `kotlin.Exception`).
-fn isErrorSideThrowable(tail: []const u8) bool {
-    const error_side = [_][]const u8{
-        "Error",                           "AssertionError",
-        "NotImplementedError",             "OutOfMemoryError",
-        "StackOverflowError",              "FileFailedToInitializeException",
-    };
-    return containsStr(&error_side, tail);
-}
-
 /// Best-effort builtin-Throwable parent walk used for `Value.Exception`
 /// `is`/`as` matches when the target is one of the exception class's
 /// known parents. The common case here is the immediate parent.
 fn builtinExceptionParentMatch(tail: []const u8, target: []const u8) bool {
-    const runtime_exc = [_][]const u8{
-        "IllegalArgumentException",       "IllegalStateException",
-        "IndexOutOfBoundsException",      "ArrayIndexOutOfBoundsException",
-        "StringIndexOutOfBoundsException", "NullPointerException",
-        "ArithmeticException",            "ClassCastException",
-        "NoSuchElementException",         "NumberFormatException",
-        "UnsupportedOperationException",  "UninitializedPropertyAccessException",
-        "ConcurrentModificationException", "NoWhenBranchMatchedException",
-        "NegativeArraySizeException",
-    };
-    if (std.mem.eql(u8, target, "RuntimeException") and containsStr(&runtime_exc, tail)) return true;
-    if (std.mem.eql(u8, target, "IndexOutOfBoundsException") and
-        (std.mem.eql(u8, tail, "ArrayIndexOutOfBoundsException") or
-            std.mem.eql(u8, tail, "StringIndexOutOfBoundsException"))) return true;
-    if (std.mem.eql(u8, target, "Error") and std.mem.eql(u8, tail, "AssertionError")) return true;
-    if (std.mem.eql(u8, target, "Exception") and std.mem.eql(u8, tail, "RuntimeException")) return true;
-    if (std.mem.eql(u8, target, "Throwable") and
-        (std.mem.eql(u8, tail, "Error") or std.mem.eql(u8, tail, "Exception"))) return true;
-    return false;
+    return runtime.Value.builtinThrowableIsA(tail, target);
 }
 
 /// `(class, member)` key for `anon_methods`, unit-separated. Must match

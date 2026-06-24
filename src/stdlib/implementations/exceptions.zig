@@ -80,6 +80,7 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
         .fqn = try runtime.strInit(ctx.allocator, fqn),
         .message = message,
         .cause = cause,
+        .identity = ctx.host.allocInstanceId(),
     } });
 }
 
