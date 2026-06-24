@@ -228,7 +228,26 @@ pub fn lowerAccessorExpr(
     expr: *const Expr,
     name: []const u8,
 ) Allocator.Error!FuncId {
-    return lowerAccessorExprWithExpected(module, owner_class, own_members, params, expr, name, null);
+    return lowerAccessorExprFull(module, owner_class, own_members, null, params, expr, name, null);
+}
+
+/// Like [`lowerAccessorExpr`] but seeds the lexically-enclosing class's
+/// member set, so a body-property initializer / accessor in a *nested*
+/// class resolves a bare name the enclosing class (or its companion)
+/// declares — e.g. `HexFormat.Builder.upperCase = Default.upperCase`, where
+/// `Default` is the enclosing companion's member — against the enclosing
+/// scope instead of an unrelated global class of the same simple name.
+pub fn lowerAccessorExprEnclosing(
+    module: *Module,
+    owner_class: []const u8,
+    own_members: *const StringSet,
+    enclosing_members: ?*const StringSet,
+    params: []const []const u8,
+    expr: *const Expr,
+    name: []const u8,
+    expected: ?TypeRef,
+) Allocator.Error!FuncId {
+    return lowerAccessorExprFull(module, owner_class, own_members, enclosing_members, params, expr, name, expected);
 }
 
 /// Like [`lowerAccessorExpr`] but seeds the tail-position expected
@@ -240,6 +259,19 @@ pub fn lowerAccessorExprWithExpected(
     module: *Module,
     owner_class: []const u8,
     own_members: *const StringSet,
+    params: []const []const u8,
+    expr: *const Expr,
+    name: []const u8,
+    expected: ?TypeRef,
+) Allocator.Error!FuncId {
+    return lowerAccessorExprFull(module, owner_class, own_members, null, params, expr, name, expected);
+}
+
+fn lowerAccessorExprFull(
+    module: *Module,
+    owner_class: []const u8,
+    own_members: *const StringSet,
+    enclosing_members: ?*const StringSet,
     params: []const []const u8,
     expr: *const Expr,
     name: []const u8,
@@ -257,6 +289,7 @@ pub fn lowerAccessorExprWithExpected(
     // operator, not ktor's inline `HttpClient.get`).
     b.setRecvTy(owner_class);
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
+    if (enclosing_members) |em| b.setEnclosingMembers(try cloneOwnMembers(allocator, em));
     try bindParams(&b, params);
     const prev = b.pushExpected(expected);
     const v = try lowerExpr(&b, expr);

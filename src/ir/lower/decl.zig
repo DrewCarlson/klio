@@ -417,7 +417,10 @@ pub fn lowerClassWithExtras(
     for (c.primary_params) |*p| {
         try primary_params.append(a, .{
             .name = p.name.name,
-            .ty = build.typeUnit(),
+            // Preserve the lowered parameter type (notably a `Function{N}`
+            // head for a `T.() -> R` param) so an argument lambda can read
+            // its expected arity and drop a synthetic `it`.
+            .ty = try loweredTypeRef(a, &p.ty, false),
             .default = null,
             .is_property = p.property != null,
             .is_vararg = p.is_vararg,

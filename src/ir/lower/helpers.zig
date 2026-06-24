@@ -162,7 +162,7 @@ pub fn lowerArgRun(b: *FuncBuilder, args: []const Expr) Allocator.Error!struct {
 /// argument whose declared parameter type is a numeric primitive that differs
 /// from the literal's natural type (kotlinc literal typing). Only literals are
 /// touched, and the negated literal is folded to a constant (no runtime `Neg`).
-fn coerceNumericLiteralArg(b: *FuncBuilder, e: *const Expr, type_name: []const u8) Allocator.Error!?Reg {
+pub fn coerceNumericLiteralArg(b: *FuncBuilder, e: *const Expr, type_name: []const u8) Allocator.Error!?Reg {
     var int_val: ?i64 = null;
     var flt_val: ?f64 = null;
     switch (e.*) {

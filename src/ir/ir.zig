@@ -220,6 +220,12 @@ pub const Inst = union(enum) {
         callee: Reg,
         parts: []SpreadPart,
         arg_names: []?ConstId = &.{},
+        /// When set, this is a member-dispatched spread call: the
+        /// flattened args are passed to method `member` on the value in
+        /// `callee` (the receiver), rather than invoking `callee` as a
+        /// callable. Lets `recv.method(*array)` / a bare own-member
+        /// `m(*array)` dispatch through member resolution.
+        member: ?ConstId = null,
     },
     /// `super.method(args)` — dispatch the named method on the
     /// receiver's value, but resolved against the parent of

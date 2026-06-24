@@ -247,3 +247,15 @@ Ranked by impact x tractability. Implement + full-sweep-verify one at a time.
 
 **Fix:** Tractable: fix coll_mut_list_add_all to handle addAll(index, elements) when args.len==3 and args[1]==.Int, inserting at the index (covered by mutable-bulk-ops cluster). The dominant blocker requires either making ArrayDeque a real source-backed instance (remove from isIntrinsicClass and the ctor binding, run the source class's ring-buffer/internalStructure) or adding native intrinsics for internalStructure/testToArray/testRemoveRange plus a mutable list-iterator value shape — both substantial.
 
+
+## NOTE: triage agents applied partial fixes to the working tree
+The triage workflow (wf_0d596714) used default-tool agents, several of which
+EDITED src/ (not just diagnosed): build.zig (object FQN recursion, const Long
+widening, nested-enclosing body-prop), lift.zig (nested-in-object lift +
+collectEnclosingMemberNames), host_call_func.zig (bound-ref overload scoring),
+ir.zig (SpreadCall.member), decl.zig (primary-param lowered type),
+inline_call.zig (inline literal coercion + T::class binding), thunks.zig
+(lowerAccessorExprEnclosing), helpers/lower/mod (exports). These were in the
+binary for waves A/B/C and are sweep-validated. A stray KLIOBIND debug print was
+removed. FUTURE: run diagnosis agents with a read-only agent type (Explore) to
+avoid uncontrolled working-tree edits.

@@ -62,6 +62,7 @@ pub const widenNumericLiteral = mod.widenNumericLiteral;
 pub const lowerAccessorBlock = mod.lowerAccessorBlock;
 pub const lowerAccessorExpr = mod.lowerAccessorExpr;
 pub const lowerAccessorExprWithExpected = mod.lowerAccessorExprWithExpected;
+pub const lowerAccessorExprEnclosing = mod.lowerAccessorExprEnclosing;
 pub const lowerBinaryExprAsThunk = mod.lowerBinaryExprAsThunk;
 pub const lowerBlockAsThunk = mod.lowerBlockAsThunk;
 pub const lowerBlockAsUnaryThunk = mod.lowerBlockAsUnaryThunk;

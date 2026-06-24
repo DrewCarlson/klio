@@ -640,8 +640,16 @@ fn collectClassFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: 
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, c.name.name });
         for (c.members) |*m| try collectClassFqns(allocator, m, inner_pkg, out);
     }
-    if (d.* == .Object and pkg.len != 0) {
-        try out.put(d.Object.span, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, d.Object.name.name }));
+    if (d.* == .Object) {
+        const o = &d.Object;
+        if (pkg.len != 0) {
+            try out.put(o.span, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, o.name.name }));
+        }
+        const inner_pkg = if (pkg.len == 0)
+            o.name.name
+        else
+            try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, o.name.name });
+        for (o.members) |*m| try collectClassFqns(allocator, m, inner_pkg, out);
     }
 }
 
@@ -785,7 +793,14 @@ fn collectHierarchyMemberNames(start: []const u8, by_name: *const FileClasses, o
 fn literalToConst(e: *const ast.Expr) ?Const {
     return switch (e.*) {
         .IntLit => |lit| switch (lit.kind) {
-            .Int, .UInt => Const{ .Int = @truncate(lit.value) },
+            // A suffix-less integer literal whose magnitude exceeds the `Int`
+            // range is a `Long` in Kotlin; mirror the IntLit-lowering widening
+            // in `ir/lower/expr.zig` so `const val` folding does not truncate.
+            .Int => if (lit.value >= std.math.minInt(i32) and lit.value <= std.math.maxInt(i32))
+                Const{ .Int = @truncate(lit.value) }
+            else
+                Const{ .Long = lit.value },
+            .UInt => Const{ .Int = @truncate(lit.value) },
             .Long, .ULong => Const{ .Long = lit.value },
         },
         .FloatLit => |lit| switch (lit.kind) {
@@ -1654,12 +1669,17 @@ fn buildModuleWithOverrides(
 
         const body_prop_cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
         const body_prop_dual = !std.mem.eql(u8, body_prop_cfqn, c.name.name);
+        // For a nested class the lexically-enclosing class's (and its
+        // companion's) members are visible bare inside its body-property
+        // initializers; thread them so a bare `Default` referencing the
+        // enclosing companion does not bind a foreign global class.
+        const body_enclosing: ?*const StringSet = nested_outer_members.getPtr(c.name.name);
         for (c.members) |*m| {
             if (m.* != .Property) continue;
             const p = m.Property;
             if (p.init) |*init| {
                 const nm = try std.fmt.allocPrint(a, "__init_prop_{s}_{s}", .{ c.name.name, p.name.name });
-                const fid = try ir.lower.lowerAccessorExprWithExpected(module, c.name.name, &own_members, prop_init_params.items, init, nm, p.ty);
+                const fid = try ir.lower.lowerAccessorExprEnclosing(module, c.name.name, &own_members, body_enclosing, prop_init_params.items, init, nm, p.ty);
                 try body_prop_inits.put(.{ .a = c.name.name, .b = p.name.name }, fid);
                 if (body_prop_dual) try body_prop_inits.put(.{ .a = body_prop_cfqn, .b = p.name.name }, fid);
             } else if (p.delegate) |delegate| {
