@@ -5785,6 +5785,45 @@ fn arrayMaxMinImpl(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalRe
         if (runtime.freeScratch()) a.free(msg);
         return e;
     }
+    // Floating-point arrays follow `Math.min`/`Math.max` semantics: NaN
+    // propagates (any NaN element makes the result NaN) and signed zero is
+    // ordered `-0.0 < 0.0`. The natural `compareValues` order expresses
+    // neither, so fold the raw f64s directly.
+    if (items[0] == .Double or items[0] == .Float) {
+        const is_float = items[0] == .Float;
+        var acc: f64 = floatVal(items[0]) orelse return floatFallback(a, items, want_max);
+        for (items[1..]) |v| {
+            const x = floatVal(v) orelse return floatFallback(a, items, want_max);
+            acc = if (want_max) kotlinFloatMax(acc, x) else kotlinFloatMin(acc, x);
+        }
+        return ok(if (is_float) .{ .Float = @floatCast(acc) } else .{ .Double = acc });
+    }
+    return floatFallback(a, items, want_max);
+}
+
+fn floatVal(v: Value) ?f64 {
+    return switch (v) {
+        .Double => |d| d,
+        .Float => |f| @floatCast(f),
+        else => null,
+    };
+}
+
+fn kotlinFloatMin(x: f64, y: f64) f64 {
+    if (std.math.isNan(x) or std.math.isNan(y)) return std.math.nan(f64);
+    if (x == 0.0 and y == 0.0) return if (std.math.signbit(x) or std.math.signbit(y)) -0.0 else 0.0;
+    return @min(x, y);
+}
+
+fn kotlinFloatMax(x: f64, y: f64) f64 {
+    if (std.math.isNan(x) or std.math.isNan(y)) return std.math.nan(f64);
+    if (x == 0.0 and y == 0.0) return if (std.math.signbit(x) and std.math.signbit(y)) -0.0 else 0.0;
+    return @max(x, y);
+}
+
+/// Natural-order min/max fold (non-float arrays, or a float array that turned
+/// out to hold a non-float `Comparable` element).
+fn floatFallback(a: Allocator, items: []const Value, want_max: bool) Error!EvalResult {
     var best = items[0];
     for (items[1..]) |v| {
         const o = switch (try compareValues(a, v, best)) {
