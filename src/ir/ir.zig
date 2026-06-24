@@ -1440,15 +1440,6 @@ pub const Module = struct {
         return f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
     }
 
-    /// Names whose bare call the lowerer always routes to an intrinsic
-    /// rather than a same-named lowered body. The index must defer on
-    /// these so it agrees with that routing (it would otherwise bind the
-    /// shipped body the lowerer deliberately skips). Mirrors the
-    /// `intrinsic_owns_all` gate in bare-call lowering.
-    fn intrinsicOwnsBareName(name: []const u8) bool {
-        return std.mem.eql(u8, name, "compareValues") or
-            std.mem.eql(u8, name, "compareValuesBy");
-    }
 
     /// Why the symbol index declined to resolve a bare call. Every
     /// deferral carries one of these so an audit sweep can prove that
@@ -1678,7 +1669,6 @@ pub const Module = struct {
         want_arity: usize,
         last_arg_lambda: bool,
     ) BareCallResolution {
-        if (intrinsicOwnsBareName(name)) return BareCallResolution.deferred(.intrinsic_owned);
         const cands = self.funcsBySimpleName(name);
         if (cands.len == 0) return BareCallResolution.deferred(.no_candidates);
 
@@ -1860,7 +1850,6 @@ pub const Module = struct {
         caller_pkg: []const u8,
         caller_file: FileId,
     ) ?FuncId {
-        if (intrinsicOwnsBareName(name)) return null;
         const cands = self.funcsBySimpleName(name);
         if (cands.len == 0) return null;
         var best_tier: u8 = 255;
@@ -1902,7 +1891,6 @@ pub const Module = struct {
         caller_pkg: []const u8,
         caller_file: FileId,
     ) ?u8 {
-        if (intrinsicOwnsBareName(name)) return null;
         const cands = self.funcsBySimpleName(name);
         if (cands.len == 0) return null;
         var best_tier: u8 = 255;
@@ -2970,17 +2958,18 @@ test "symbol index defers an unknown name as no_candidates" {
     try testing.expectEqual(Module.ResolveDeferReason.no_candidates, deferReasonOf(got).?);
 }
 
-test "symbol index defers an intrinsic-owned name" {
+test "symbol index resolves an intrinsic-backed name like any other symbol" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Even with a matching lowered body present, the lowerer routes
-    // `compareValues` to the intrinsic; the index must agree.
-    _ = try pushTestFunc(&m, a, "compareValues", "kotlin.comparisons.compareValues", "kotlin.comparisons", 2);
+    // `compareValues` is an ordinary symbol: it resolves through the index like
+    // any other function. Its native intrinsic attaches at run time via
+    // `resolvedNativeForm`, not through a name-based index escape hatch.
+    const fid = try pushTestFunc(&m, a, "compareValues", "kotlin.comparisons.compareValues", "kotlin.comparisons", 2);
     try m.rebuildFuncNameIndex(a);
 
     const got = m.resolveBareCallIndexed("compareValues", "app", FileId.from(0), 2, false);
-    try testing.expectEqual(Module.ResolveDeferReason.intrinsic_owned, deferReasonOf(got).?);
+    try testing.expectEqual(fid, got.pick().?);
 }
 
 test "symbol index defers an arity mismatch in the winning tier" {

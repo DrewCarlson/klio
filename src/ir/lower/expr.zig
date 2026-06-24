@@ -3389,8 +3389,6 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     const last_arg_lambda = lastArgIsLambda(args);
 
     const name_is_alias = isAliasName(name0);
-    const intrinsic_owns_all = std.mem.eql(u8, name0, "compareValues") or
-        std.mem.eql(u8, name0, "compareValuesBy");
 
     const contract_with_msg = (std.mem.eql(u8, name0, "require") or
         std.mem.eql(u8, name0, "check") or std.mem.eql(u8, name0, "checkNotNull")) and
@@ -3399,11 +3397,11 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
         b.resolve(name0) == null and !b.isLocalFn(name0) and !b.isLocalExtFn(name0) and
         !contract_with_msg;
 
-    const cast_pick: ?FuncId = if (intrinsic_owns_all) null else try overloadPickByCast(b, cands, args, want);
+    const cast_pick: ?FuncId = try overloadPickByCast(b, cands, args, want);
 
     var bare_func_id: ?FuncId = null;
     var rung: HeurRung = .none;
-    if (!(intrinsic_owns_all or (prefer_member and cast_pick == null))) {
+    if (!(prefer_member and cast_pick == null)) {
         bare_func_id = cast_pick;
         if (bare_func_id != null) rung = .cast;
         if (bare_func_id == null) {
