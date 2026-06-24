@@ -25,6 +25,7 @@ pub const exceptions = @import("implementations/exceptions.zig");
 pub const io = @import("implementations/io.zig");
 pub const math = @import("implementations/math.zig");
 pub const numeric = @import("implementations/numeric.zig");
+pub const random = @import("implementations/random.zig");
 pub const ranges = @import("implementations/ranges.zig");
 pub const regexp = @import("implementations/regexp.zig");
 pub const result = @import("implementations/result.zig");
@@ -1012,6 +1013,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Long.countTrailingZeroBits", .f = numeric.num_count_trailing_zero_bits },
     .{ .fqn = "kotlin.Int.countOneBits", .f = numeric.num_count_one_bits },
     .{ .fqn = "kotlin.Long.countOneBits", .f = numeric.num_count_one_bits },
+    .{ .fqn = "kotlin.random.XorWowRandom.nextInt", .f = random.random_next_int },
+    .{ .fqn = "kotlin.random.XorWowRandom.nextBits", .f = random.random_next_bits },
     .{ .fqn = "kotlin.Int.inc", .f = numeric.num_inc },
     .{ .fqn = "kotlin.Long.inc", .f = numeric.num_inc },
     .{ .fqn = "kotlin.Short.inc", .f = numeric.num_inc },
