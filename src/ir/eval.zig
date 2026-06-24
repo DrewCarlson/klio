@@ -2356,12 +2356,14 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     return .cont;
                 }
             }
-            // Floating-point `..` / `..<` builds a `ClosedFloatingPointRange`
-            // (resp. `OpenEndRange`) through the stdlib `Double.rangeTo` /
-            // `Float.rangeTo` operator; the i64-backed `Range` value cannot
-            // represent a floating-point range, so route to the member.
+            // A `..` / `..<` over operands the i64-backed `Range` value cannot
+            // represent — floating point (`ClosedFloatingPointRange`), strings,
+            // or any other `Comparable` (`ClosedRange` via `Comparable.rangeTo`)
+            // — routes to the stdlib `rangeTo`/`rangeUntil` operator. Integer,
+            // Char and unsigned operands are handled by `applyBinop` below.
             if ((bo.op == .RangeTo or bo.op == .RangeUntil) and
-                (l == .Double or l == .Float or r == .Double or r == .Float))
+                (l == .Double or l == .Float or r == .Double or r == .Float or
+                    l == .String or r == .String or l == .Instance or r == .Instance))
             {
                 const method = if (bo.op == .RangeUntil) "rangeUntil" else "rangeTo";
                 switch (try host.callMember(allocator, &l, method, &.{r})) {
