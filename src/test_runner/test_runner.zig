@@ -139,14 +139,22 @@ fn qualify(gpa: Allocator, pkg: []const u8, name: []const u8) []const u8 {
 /// resolve `kotlin.test` annotations on its members).
 const ClassEntry = struct { cls: *const ast.Class, imports: []const ast.ImportDecl };
 
-fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.KotlinFile) Allocator.Error!Plan {
+/// True when `only_fids` is unrestricted (empty) or contains `fid`.
+fn fileSelected(only_fids: []const u32, fid: u32) bool {
+    if (only_fids.len == 0) return true;
+    for (only_fids) |x| if (x == fid) return true;
+    return false;
+}
+
+fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.KotlinFile, only_fids: []const u32) Allocator.Error!Plan {
     var top: std.ArrayList(TopTest) = .empty;
     var classes: std.ArrayList(ClassTests) = .empty;
 
     // Index every class by simple name so a concrete class can pull in the
     // `@Test` methods it inherits from abstract base classes (the stdlib tests
     // put the test bodies in abstract `…Tests` bases and run them through
-    // concrete subclasses).
+    // concrete subclasses). The index spans every file so cross-file helper /
+    // base classes resolve even when test discovery is narrowed to one file.
     var index = std.StringHashMap(ClassEntry).init(gpa);
     defer index.deinit();
     for (user_asts) |*file| {
@@ -156,6 +164,10 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
     }
 
     for (user_asts) |*file| {
+        // `--only-file`: compile every file (above) but discover tests only in
+        // the selected file(s), so a file's tests run with cross-file helpers
+        // available yet are not double-counted across sibling files.
+        if (!fileSelected(only_fids, file.span.file.int())) continue;
         const pkg = filePackage(gpa, file);
         defer gpa.free(pkg);
         for (file.decls) |*d| {
@@ -395,11 +407,12 @@ pub fn runTests(
     vm: *Vm,
     user_asts: []const ast.KotlinFile,
     out: Output,
+    only_fids: []const u32,
 ) Allocator.Error!Report {
     var plan: Plan = blk: {
         const mg = vm.module.borrow();
         defer mg.deinit();
-        break :blk try discover(gpa, mg.get(), user_asts);
+        break :blk try discover(gpa, mg.get(), user_asts, only_fids);
     };
     defer freePlan(gpa, &plan);
 

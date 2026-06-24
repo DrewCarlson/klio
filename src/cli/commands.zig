@@ -285,6 +285,7 @@ const TestRunCtx = struct {
     out: runtime.Output,
     time_mode: interp_ir.TimeMode,
     reclaim: bool,
+    only_fids: []const u32,
 };
 
 /// Big-stack worker entry: re-establish the thread-local coroutine time mode
@@ -292,7 +293,7 @@ const TestRunCtx = struct {
 fn testRunEntry(ctx: TestRunCtx) test_runner.Report {
     interp_ir.setCoroutineTimeMode(ctx.time_mode);
     runtime.setReclaim(ctx.reclaim);
-    return test_runner.runTests(ctx.gpa, ctx.vm, ctx.user_asts, ctx.out) catch
+    return test_runner.runTests(ctx.gpa, ctx.vm, ctx.user_asts, ctx.out, ctx.only_fids) catch
         test_runner.Report{ .results = &.{}, .passed = 0, .failed = 1, .skipped = 0 };
 }
 
@@ -303,6 +304,7 @@ pub fn runTestFiles(
     gpa: std.mem.Allocator,
     paths: []const []const u8,
     features: *const RequestedFeatures,
+    only_files: []const []const u8,
 ) u8 {
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
@@ -325,10 +327,21 @@ pub fn runTestFiles(
     var map = SourceMap.init(gpa);
     defer map.deinit();
 
+    // `--only-file`: FileIds whose `@Test` methods should actually run (the
+    // rest are compiled as context only). Empty = run every file's tests.
+    var only_fids: std.ArrayList(u32) = .empty;
+    defer only_fids.deinit(gpa);
+
     var user_asts: std.ArrayList(KotlinFile) = .empty;
     defer user_asts.deinit(gpa);
     for (files.items) |path| {
         const id = load(gpa, &map, path) orelse return 1;
+        for (only_files) |of| {
+            if (std.mem.eql(u8, path, of) or std.mem.endsWith(u8, path, of)) {
+                only_fids.append(gpa, id.int()) catch return 1;
+                break;
+            }
+        }
         const src = map.get(id).source;
         var lx = Lexer.init(gpa, id, src) catch return 1;
         var lexed = lx.tokenize() catch return 1;
@@ -385,6 +398,7 @@ pub fn runTestFiles(
         .out = stdout.output(),
         .time_mode = interp_ir.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
+        .only_fids = only_fids.items,
     });
     defer report.deinit(gpa);
 

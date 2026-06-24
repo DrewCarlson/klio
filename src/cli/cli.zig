@@ -190,6 +190,8 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     defer paths.deinit(gpa);
     var feature_specs: std.ArrayList([]const u8) = .empty;
     defer feature_specs.deinit(gpa);
+    var only_files: std.ArrayList([]const u8) = .empty;
+    defer only_files.deinit(gpa);
     var virtual_time = false;
 
     var i: usize = 0;
@@ -197,6 +199,15 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         const a = args[i];
         if (std.mem.eql(u8, a, "--virtual-time")) {
             virtual_time = true;
+        } else if (std.mem.eql(u8, a, "--only-file")) {
+            i += 1;
+            if (i >= args.len) {
+                printErr(gpa, "error: --only-file requires a path\n", .{});
+                return 2;
+            }
+            only_files.append(gpa, args[i]) catch return 2;
+        } else if (optionValue(a, "--only-file=")) |v| {
+            only_files.append(gpa, v) catch return 2;
         } else if (std.mem.eql(u8, a, "--feature")) {
             i += 1;
             if (i >= args.len) {
@@ -230,7 +241,7 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         printErr(gpa, "usage: klio test <file.kt | dir> [...]\n", .{});
         return 2;
     }
-    return commands.runTestFiles(gpa, paths.items, &requested);
+    return commands.runTestFiles(gpa, paths.items, &requested, only_files.items);
 }
 
 fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
