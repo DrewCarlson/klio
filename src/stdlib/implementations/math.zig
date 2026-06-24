@@ -222,6 +222,11 @@ pub fn double_pow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return e,
     };
+    // Java/Kotlin Math.pow: `pow(±1, ±Inf)` is NaN (unlike C/Zig pow which
+    // returns 1). Every other base with a NaN exponent is NaN too.
+    if (@abs(base) == 1.0 and (std.math.isInf(exp) or std.math.isNan(exp))) {
+        return ok(.{ .Double = std.math.nan(f64) });
+    }
     return ok(.{ .Double = std.math.pow(f64, base, exp) });
 }
 
@@ -479,7 +484,9 @@ pub fn math_log(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return e,
     };
-    // Kotlin's `Double.log(base)` is `ln(x) / ln(base)`.
+    // Kotlin's `Double.log(base)` is `ln(x) / ln(base)`, and is NaN when the
+    // base is not a usable logarithm base (`base <= 0` or `base == 1`).
+    if (base <= 0.0 or base == 1.0) return ok(.{ .Double = std.math.nan(f64) });
     return ok(.{ .Double = std.math.log(f64, base, x) });
 }
 pub fn math_log10(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {

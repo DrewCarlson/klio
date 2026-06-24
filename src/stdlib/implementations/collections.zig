@@ -596,12 +596,12 @@ fn instNum(inst: *const InstanceData, names: []const []const u8) ?i64 {
 // =====================================================================
 
 /// Either a collected slice of items or a short-circuit error EvalResult.
-const ItemsOutcome = union(enum) { items: []Value, err: EvalResult };
+pub const ItemsOutcome = union(enum) { items: []Value, err: EvalResult };
 
 /// Collect a List/Set/Array/Map/Range receiver into a freshly allocated
 /// slice. Map yields `MapEntry` values. Returns an error EvalResult when
 /// the receiver is not iterable.
-fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcome {
+pub fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcome {
     switch (v) {
         .List, .Set, .Array => {
             const items = switch (v) {
@@ -644,7 +644,7 @@ fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcome {
 /// As `iterableItems`, but also materialises a (possibly lazy) `Sequence`
 /// argument, which needs the host to run its pipeline. Use this wherever a
 /// bulk op accepts a `Sequence` operand (`list + aSequence`, `list - aSequence`).
-fn iterableItemsCtx(ctx: *CallCtx, v: Value, what: []const u8) Error!ItemsOutcome {
+pub fn iterableItemsCtx(ctx: *CallCtx, v: Value, what: []const u8) Error!ItemsOutcome {
     if (v == .Sequence) {
         return switch (try materialiseSequence(ctx.allocator, ctx.host, ctx.out, v)) {
             .items => |x| .{ .items = x },
@@ -3082,7 +3082,20 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
                         };
                         try nx.appendSlice(a, sub);
                     },
-                    else => try nx.append(a, mapped),
+                    // Every other iterable transform result (Array, Range, Map,
+                    // a user `Instance` Iterable) is flattened through the
+                    // shared extractor; a non-iterable result degrades to a
+                    // single element as before.
+                    else => {
+                        var ctx = runtime.CallCtx{ .args = &.{}, .out = out, .host = host, .allocator = a };
+                        switch (try iterableItemsCtx(&ctx, mapped, "flatMap")) {
+                            .items => |flat| {
+                                try nx.appendSlice(a, flat);
+                                if (runtime.freeScratch()) a.free(flat);
+                            },
+                            .err => try nx.append(a, mapped),
+                        }
+                    },
                 }
             }
             return .{ .items = try nx.toOwnedSlice(a) };
@@ -3582,9 +3595,15 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     defer g.deinit();
     const items = g.get().items;
     const len: i64 = @intCast(items.len);
-    if (from < 0 or to > len or from > to) {
+    if (from < 0 or to > len) {
         const msg = try fmt(a, "fromIndex: {d}, toIndex: {d}, size: {d}", .{ from, to, len });
         const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        if (runtime.freeScratch()) a.free(msg);
+        return e;
+    }
+    if (from > to) {
+        const msg = try fmt(a, "fromIndex: {d} > toIndex: {d}", .{ from, to });
+        const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
         if (runtime.freeScratch()) a.free(msg);
         return e;
     }
@@ -5250,6 +5269,12 @@ fn indexOob(a: Allocator, msg: []const u8) Error!EvalResult {
     return e;
 }
 
+fn illegalArg(a: Allocator, msg: []const u8) Error!EvalResult {
+    const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
+    if (runtime.freeScratch()) a.free(msg);
+    return e;
+}
+
 pub fn array_slice_impl(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr("sliceArray requires a receiver");
@@ -5662,8 +5687,11 @@ pub fn array_copy_of_range(ctx: *CallCtx) Error!EvalResult {
         .idx => |v| v,
         .err => |e| return e,
     };
-    if (from < 0 or to > len or from > to) {
+    if (from < 0 or to > len) {
         return indexOob(a, try fmt(a, "copyOfRange: [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
+    }
+    if (from > to) {
+        return illegalArg(a, try fmt(a, "copyOfRange: fromIndex {d} > toIndex {d}", .{ from, to }));
     }
     const snap = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(snap);
@@ -5685,8 +5713,11 @@ pub fn array_fill(ctx: *CallCtx) Error!EvalResult {
         .idx => |v| v,
         .err => |e| return e,
     };
-    if (from < 0 or to > len or from > to) {
+    if (from < 0 or to > len) {
         return indexOob(a, try fmt(a, "fill: [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
+    }
+    if (from > to) {
+        return illegalArg(a, try fmt(a, "fill: fromIndex {d} > toIndex {d}", .{ from, to }));
     }
     var i: usize = @intCast(from);
     while (i < @as(usize, @intCast(to))) : (i += 1) arr.set(a, i, element);
@@ -5706,8 +5737,11 @@ pub fn array_sort(ctx: *CallCtx) Error!EvalResult {
         .idx => |v| v,
         .err => |e| return e,
     };
-    if (from < 0 or to > len or from > to) {
+    if (from < 0 or to > len) {
         return indexOob(a, try fmt(a, "sort: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
+    }
+    if (from > to) {
+        return illegalArg(a, try fmt(a, "sort: fromIndex {d} > toIndex {d}", .{ from, to }));
     }
     const buf = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(buf);
@@ -5732,8 +5766,11 @@ pub fn array_sort_with(ctx: *CallCtx) Error!EvalResult {
         .idx => |v| v,
         .err => |e| return e,
     };
-    if (from < 0 or to > len or from > to) {
+    if (from < 0 or to > len) {
         return indexOob(a, try fmt(a, "sortWith: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
+    }
+    if (from > to) {
+        return illegalArg(a, try fmt(a, "sortWith: fromIndex {d} > toIndex {d}", .{ from, to }));
     }
     const buf = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(buf);
@@ -5875,6 +5912,51 @@ pub fn array_max(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn array_min(ctx: *CallCtx) Error!EvalResult {
     return arrayMaxMinImpl(ctx, false, "Array.min");
+}
+
+/// `minWith`/`maxWith`(`OrNull`) over any iterable: fold by the Comparator
+/// argument (args[1]) rather than natural order.
+fn minMaxWithImpl(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len < 2) return arityErr(try fmt(a, "{s} expects (comparator)", .{what}));
+    // `iterableItemsCtx` drains a `.Sequence` receiver via the host (the plain
+    // `iterableItems` only snapshots eager collections).
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    if (items.len == 0) {
+        if (or_null) return ok(Value.Null);
+        const msg = try fmt(a, "{s}: empty", .{what});
+        const e = try thrown(a, "kotlin.NoSuchElementException", msg);
+        if (runtime.freeScratch()) a.free(msg);
+        return e;
+    }
+    const comparator = ctx.args[1];
+    var best = items[0];
+    for (items[1..]) |v| {
+        const n = switch (try invokeComparatorCompare(ctx, comparator, v, best)) {
+            .n => |x| x,
+            .err => |e| return e,
+        };
+        const take = if (want_max) n > 0 else n < 0;
+        if (take) best = v;
+    }
+    return ok(best);
+}
+
+pub fn coll_min_with(ctx: *CallCtx) Error!EvalResult {
+    return minMaxWithImpl(ctx, false, false, "minWith");
+}
+pub fn coll_max_with(ctx: *CallCtx) Error!EvalResult {
+    return minMaxWithImpl(ctx, true, false, "maxWith");
+}
+pub fn coll_min_with_or_null(ctx: *CallCtx) Error!EvalResult {
+    return minMaxWithImpl(ctx, false, true, "minWithOrNull");
+}
+pub fn coll_max_with_or_null(ctx: *CallCtx) Error!EvalResult {
+    return minMaxWithImpl(ctx, true, true, "maxWithOrNull");
 }
 
 // =====================================================================

@@ -132,7 +132,9 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // same-named top-level class owns the bare `class_id`. Falling
         // through to `lowerExpr` applies the rewrite in the `Path` arm.
         const aliased = scopeTypeRename(b, n, segments[0].span.file.int()) != null;
-        if (!aliased and b.resolve(n) == null and !b.knowsOuter(n) and b.module.classId(n) != null) {
+        if (!aliased and b.resolve(n) == null and !b.knowsOuter(n) and
+            b.module.classId(n) != null and !enclosingMemberShadowsClass(b, n))
+        {
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = n });
             // The index-resolved class rides as the exact identity so a
@@ -735,6 +737,25 @@ fn writeBackLvalue(b: *FuncBuilder, target: *const Expr, val: Reg) Allocator.Err
     try stmt_mod.storeCombinedToTarget(b, target, val);
 }
 
+/// A bare `name` an enclosing class declares as a value member (an enclosing
+/// companion's `Default`) shadows an unrelated global classifier of the same
+/// simple name. True when `name` is an enclosing member and is NOT a nested
+/// type reachable along the enclosing-owner chain (a nested type keeps the
+/// classifier path so it names a class value).
+fn enclosingMemberShadowsClass(b: *const FuncBuilder, name: []const u8) bool {
+    if (!b.hasEnclosingMember(name)) return false;
+    var owner = b.ownerClass();
+    var hops: usize = 0;
+    while (owner) |o| : (hops += 1) {
+        if (hops > 32) break;
+        if (b.module.registry.nested_object_aliases.get(o)) |m| {
+            if (m.contains(name)) return false;
+        }
+        owner = b.module.registry.enclosing_class.get(o);
+    }
+    return true;
+}
+
 /// The mangled lift name a type reference `name` resolves to in the
 /// current scope: a (mangled) nested class/object aliased anywhere along
 /// the enclosing-class chain — Kotlin makes a private nested class
@@ -958,7 +979,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // expression position), so the read decides at runtime with the
         // index-resolved class riding as the exact global arm; the
         // companion sentinel passes a member value through unchanged.
-        if (b.module.classId(name0) != null) {
+        if (b.module.classId(name0) != null and !enclosingMemberShadowsClass(b, name0)) {
             const n = try b.module.internConst(b.allocator, .{ .String = name0 });
             const cls = b.allocReg();
             if (inReceiverContext(b)) {
@@ -1360,13 +1381,17 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (try collectDottedFqn(b.allocator, expr)) |fqn| {
         defer b.allocator.free(fqn);
         const head = firstSegment(fqn);
+        // A real package root (`kotlin.math.PI`) flattens to an FQN LoadGlobal
+        // even inside a class method; only an ambiguous head defers to a member
+        // when `this` is in scope. Mirrors the call path (lowerFqnGlobalCall).
+        const head_is_real_pkg = isPkgRoot(head);
         if (isPackageHead(head) and
             headIsPackage(b, head) and
             b.resolve(head) == null and
             !b.knowsOuter(head) and
             !b.hasEnclosingMember(head) and
             b.module.classId(head) == null and
-            b.resolve("this") == null)
+            (head_is_real_pkg or b.resolve("this") == null))
         {
             const dst = b.allocReg();
             const n = try b.module.internConst(b.allocator, .{ .String = fqn });
@@ -4443,6 +4468,15 @@ fn lowerImplicitThisCall(
     if (!b.ownMemberApplicable(name0, args.len)) return null;
     const this_reg = b.resolve("this") orelse return null;
 
+    if (std.mem.eql(u8, name0, "isFinite")) {
+        const pf = b.privateMethodFid("isFinite");
+        std.debug.print("KLIOPROBE2 isFinite ITC privFid={?d} fbs={d} alias={}\n", .{
+            if (pf) |p| p.int() else null,
+            b.module.funcsBySimpleName("isFinite").len,
+            isAliasName("isFinite"),
+        });
+    }
+
     // Private own-class methods bind statically.
     if (b.privateMethodFid(name0)) |fid| {
         // Reserve the receiver slot first, then lower the arguments into a
@@ -4488,6 +4522,7 @@ fn lowerImplicitThisCall(
         try b.push(.{ .CallMemberOrGlobal = .{
             .dst = dst,
             .this_idx = this_idx,
+            .recv = this_reg,
             .name = nm,
             .args = run[0],
             .n_args = run[1],
