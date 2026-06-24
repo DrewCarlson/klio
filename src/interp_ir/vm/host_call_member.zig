@@ -2218,6 +2218,14 @@ fn varargShadowedFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *con
     };
     if (!is_vararg) return null;
 
+    // The property's single parameter is the *packed* array form (e.g.
+    // `(Array<out String>) -> T`); invoke it only when the sole argument is
+    // actually an array (`createFrom(items)`). A non-array single argument
+    // (`createFrom("foo")`) is the vararg-element form and must bind the
+    // vararg method, which packs it — invoking the property would pass the
+    // element where its body expects an array (then `*it` spreads a scalar).
+    if (args.len == 1 and args[0] != .Array) return null;
+
     return try callValueRec(self, allocator, &field_val, args);
 }
 
