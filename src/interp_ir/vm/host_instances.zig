@@ -2459,24 +2459,34 @@ fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u
         break :blk mg.get().registry.delegated_body_props.contains(.{ .a = cls_name, .b = prop_name });
     };
     if (!is_delegated) return v;
-    const dcls_name = blk: {
+    // The delegate provides a `provideDelegate` operator when its OWN runtime
+    // class chain declares one — including a SAM-converted `fun interface`
+    // (e.g. `PropertyDelegateProvider { … }`), whose abstract method carries a
+    // `sam_lambda` rather than a module-level `FuncId`. Checking the instance's
+    // runtime class (not the static IR class) catches both forms; a plain
+    // `ReadOnlyProperty`/`ReadWriteProperty` delegate has only `getValue`/
+    // `setValue`, so it is left untouched.
+    const has_provide = blk: {
         const g = v.Instance.borrow();
         defer g.deinit();
-        const cg = g.get().class.borrow();
-        defer cg.deinit();
-        break :blk cg.get().name;
-    };
-    const has_provide = blk: {
+        const cls_ref = g.get().class;
+        // A concrete `provideDelegate` somewhere on the runtime class chain.
+        if (ClassDef.findMethod(cls_ref, allocator, "provideDelegate")) |hit| {
+            hit.class.deinit();
+            break :blk true;
+        }
+        // A SAM-converted `fun interface` carries no materialized method; its
+        // abstract surface is recorded in `hierarchy_methods` (the same table
+        // `samInstanceDispatch` consults to route a call to the lambda).
+        const dcls = blk2: {
+            const cg = cls_ref.borrow();
+            defer cg.deinit();
+            break :blk2 cg.get().name;
+        };
         const mg = self.module.borrow();
         defer mg.deinit();
-        const m = mg.get();
-        for (m.classes.items) |*c| {
-            if (!std.mem.eql(u8, c.name, dcls_name)) continue;
-            for (c.methods) |fid| {
-                if (m.funcById(fid)) |pf| {
-                    if (std.mem.eql(u8, pf.name, "provideDelegate")) break :blk true;
-                }
-            }
+        if (mg.get().registry.hierarchy_methods.get(dcls)) |methods| {
+            break :blk methods.contains("provideDelegate");
         }
         break :blk false;
     };
