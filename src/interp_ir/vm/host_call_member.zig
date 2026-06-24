@@ -1586,6 +1586,13 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
             }
             return 20;
         }
+        // A callable can never bind a concrete non-function parameter type
+        // (`Iterable`/`Collection`/`Array`/`String`/`Int`…): disqualify the
+        // candidate so a sibling function-typed overload wins. Without this a
+        // lambda scores a weak-but-positive 8 against `removeAll(Iterable)`,
+        // and the receiver-specificity tier (ranked above arg fit) then elects
+        // that Iterable form over `removeAll(predicate)` → infinite recursion.
+        if (isDefinitelyNonFunctionTypeName(simpleName(nm))) return null;
         return 8;
     }
     // Subtype distance scoring for an instance argument.
@@ -1772,13 +1779,18 @@ fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver:
 }
 
 /// Parameter-type names that can never bind a function-typed argument.
-/// Conservative: only the builtin value types and `String`/`CharSequence`,
-/// so a typealiased function type or user interface is never adjudicated.
+/// Conservative: the builtin value types, `String`/`CharSequence`, and the
+/// concrete container types — none of which is ever a function type or a
+/// typealias to one. This lets a trailing-lambda call drop a same-named
+/// collection-typed member (`removeAll(elements: Collection)`) so the
+/// predicate extension (`removeAll(predicate: (T) -> Boolean)`) binds.
 fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     const names = [_][]const u8{
-        "String", "CharSequence", "Boolean", "Char",  "Byte",  "Short",
-        "Int",    "Long",         "Float",   "Double", "UByte", "UShort",
-        "UInt",   "ULong",        "Number",
+        "String",     "CharSequence",      "Boolean",  "Char",          "Byte",    "Short",
+        "Int",        "Long",              "Float",    "Double",         "UByte",   "UShort",
+        "UInt",       "ULong",             "Number",   "Collection",     "MutableCollection",
+        "Iterable",   "MutableIterable",   "List",     "MutableList",    "Set",     "MutableSet",
+        "Map",        "MutableMap",        "Array",    "Sequence",
     };
     for (names) |n| {
         if (std.mem.eql(u8, pn, n)) return true;
@@ -3133,6 +3145,12 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
         },
         .Set => |s| {
+            // A mutable set shares its backing so `MutableIterator.remove()`
+            // mutates the source set (the `filterInPlace` removeAll/retainAll
+            // path iterates + removes); an immutable set snapshots.
+            if (s.mutable and s.backing == null) {
+                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
+            }
             const items = try cloneItemsList(allocator, s.items);
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
         },
