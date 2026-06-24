@@ -2995,9 +2995,6 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // rejects resolving it against a *caller's* receiver (dynamic
             // scope), so a miss is a hard unresolved reference.
             var v: Value = undefined;
-            if (std.mem.eql(u8, name_str, "asserter")) {
-                std.debug.print("KLIODBG asserter LoadGlobal in fn={s} found={} getters.count={d} module={*}\n", .{ frame.func.fqn, found != null, frame.module.registry.top_level_prop_getters.count(), frame.module });
-            }
             if (found) |fv| {
                 v = fv;
             } else if (comptime @hasDecl(H, "callFunc")) {
@@ -3012,7 +3009,6 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                         .err => |e| return raiseStep(frame, e),
                     }
                 }
-                std.debug.print("KLIODBG LoadGlobal miss name={s} getters.count={d} module={*}\n", .{ name_str, frame.module.registry.top_level_prop_getters.count(), frame.module });
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                 return raiseStep(frame, .{ .Unbound = msg });
             } else {
