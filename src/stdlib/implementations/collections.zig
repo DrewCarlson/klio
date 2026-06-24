@@ -5772,6 +5772,18 @@ pub fn array_average_impl(ctx: *CallCtx) Error!EvalResult {
 }
 
 fn arrayMaxMinImpl(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult {
+    return arrayMaxMinCore(ctx, want_max, false, what);
+}
+
+pub fn array_min_or_null(ctx: *CallCtx) Error!EvalResult {
+    return arrayMaxMinCore(ctx, false, true, "Array.minOrNull");
+}
+
+pub fn array_max_or_null(ctx: *CallCtx) Error!EvalResult {
+    return arrayMaxMinCore(ctx, true, true, "Array.maxOrNull");
+}
+
+fn arrayMaxMinCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
     const items = switch (try iterableItems(a, ctx.args[0], what)) {
@@ -5780,6 +5792,7 @@ fn arrayMaxMinImpl(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalRe
     };
     defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) {
+        if (or_null) return ok(Value.Null);
         const msg = try fmt(a, "{s}: empty", .{what});
         const e = try thrown(a, "kotlin.NoSuchElementException", msg);
         if (runtime.freeScratch()) a.free(msg);

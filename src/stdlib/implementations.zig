@@ -705,6 +705,14 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.LongArray.min", .f = collections.array_min },
     .{ .fqn = "kotlin.DoubleArray.max", .f = collections.array_max },
     .{ .fqn = "kotlin.DoubleArray.min", .f = collections.array_min },
+    // Boxed `Array<T>.min()/max()` return the smallest/largest ELEMENT by
+    // natural order (no numeric promotion: `arrayOf(1, 2, Long.MAX_VALUE).min()`
+    // is the `Int` 1, not a widened `Long`). Without these the call falls to the
+    // sequence-terminal path, which folds through the promoting `numExtreme`.
+    .{ .fqn = "kotlin.Array.max", .f = collections.array_max },
+    .{ .fqn = "kotlin.Array.min", .f = collections.array_min },
+    .{ .fqn = "kotlin.Array.maxOrNull", .f = collections.array_max_or_null },
+    .{ .fqn = "kotlin.Array.minOrNull", .f = collections.array_min_or_null },
     .{ .fqn = "kotlin.Array.joinToString", .f = collections.coll_array_join_to_string },
     .{ .fqn = "kotlin.IntArray.joinToString", .f = collections.coll_array_join_to_string },
     .{ .fqn = "kotlin.LongArray.joinToString", .f = collections.coll_array_join_to_string },
