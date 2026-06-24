@@ -32,6 +32,52 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
+/// `inc()` / `dec()` keep the receiver's numeric type; `delta` is +1 or -1.
+fn numIncDec(ctx: *CallCtx, comptime delta: i64) Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "inc/dec: missing receiver" } };
+    return switch (ctx.args[0]) {
+        .Int => |x| ok(.{ .Int = x +% @as(i32, @intCast(delta)) }),
+        .Long => |x| ok(.{ .Long = x +% delta }),
+        .Short => |x| ok(.{ .Short = x +% @as(i16, @intCast(delta)) }),
+        .Byte => |x| ok(.{ .Byte = x +% @as(i8, @intCast(delta)) }),
+        .UInt => |x| ok(.{ .UInt = if (delta > 0) x +% 1 else x -% 1 }),
+        .ULong => |x| ok(.{ .ULong = if (delta > 0) x +% 1 else x -% 1 }),
+        .UShort => |x| ok(.{ .UShort = if (delta > 0) x +% 1 else x -% 1 }),
+        .UByte => |x| ok(.{ .UByte = if (delta > 0) x +% 1 else x -% 1 }),
+        .Float => |x| ok(.{ .Float = x + @as(f32, @floatFromInt(delta)) }),
+        .Double => |x| ok(.{ .Double = x + @as(f64, @floatFromInt(delta)) }),
+        .Char => |x| ok(.{ .Char = if (delta > 0) x +% 1 else x -% 1 }),
+        else => .{ .err = .{ .Type = "inc/dec requires a numeric receiver" } },
+    };
+}
+
+pub fn num_inc(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return numIncDec(ctx, 1);
+}
+
+pub fn num_dec(ctx: *CallCtx) Allocator.Error!EvalResult {
+    return numIncDec(ctx, -1);
+}
+
+pub fn num_unary_plus(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "unaryPlus: missing receiver" } };
+    return ok(ctx.args[0]);
+}
+
+pub fn num_unary_minus(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "unaryMinus: missing receiver" } };
+    return switch (ctx.args[0]) {
+        .Int => |x| ok(.{ .Int = -%x }),
+        .Long => |x| ok(.{ .Long = -%x }),
+        // `Byte`/`Short.unaryMinus()` widen to `Int` (Kotlin).
+        .Short => |x| ok(.{ .Int = -@as(i32, x) }),
+        .Byte => |x| ok(.{ .Int = -@as(i32, x) }),
+        .Float => |x| ok(.{ .Float = -x }),
+        .Double => |x| ok(.{ .Double = -x }),
+        else => .{ .err = .{ .Type = "unaryMinus requires a signed numeric receiver" } },
+    };
+}
+
 fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Allocator.Error!RuntimeError {
     return .{ .Type = try std.fmt.allocPrint(allocator, fmt, args) };
 }
