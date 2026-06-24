@@ -22,6 +22,18 @@ fn typeErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
 
+/// The progression's element kind, derived from the operand types so a Long
+/// `downTo`/`until` yields a `.Long` range (structurally equal to the matching
+/// `..` range) rather than a default `.Int` one.
+fn rangeKindForArgs(a: Value, b: Value) RangeKind {
+    if (a == .Long or b == .Long) return .Long;
+    if (a == .ULong or b == .ULong) return .ULong;
+    if (a == .Char or b == .Char) return .Char;
+    if (a == .UInt or a == .UByte or a == .UShort or
+        b == .UInt or b == .UByte or b == .UShort) return .UInt;
+    return .Int;
+}
+
 // ============================================================
 // Range progressions
 // ============================================================
@@ -32,7 +44,7 @@ pub fn ranges_down_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .start = pair[0],
         .end = pair[1],
         .step = -1,
-        .kind = .Int,
+        .kind = rangeKindForArgs(ctx.args[0], ctx.args[1]),
     } });
 }
 
@@ -42,7 +54,7 @@ pub fn ranges_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .start = pair[0],
         .end = saturatingSub(pair[1], 1),
         .step = 1,
-        .kind = .Int,
+        .kind = rangeKindForArgs(ctx.args[0], ctx.args[1]),
     } });
 }
 
