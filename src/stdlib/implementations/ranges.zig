@@ -239,10 +239,29 @@ pub fn range_step_field(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(rangeEndpoint(view.kind, intAbs(view.step)));
 }
 
+fn rangeKindMax(kind: RangeKind) i64 {
+    return switch (kind) {
+        .Int => std.math.maxInt(i32),
+        .Long => std.math.maxInt(i64),
+        .Char => std.math.maxInt(u16),
+        .UInt => std.math.maxInt(u32),
+        .ULong => @bitCast(@as(u64, std.math.maxInt(u64))),
+    };
+}
+
 /// `OpenEndRange.endExclusive` — one past the last element. A `..<` range is
 /// stored as the closed `start..(end-1)`, so the exclusive bound is `end + 1`.
+/// When `endInclusive` is the element type's MAX value the exclusive bound is
+/// unrepresentable, so the access throws (matching the stdlib).
 pub fn range_end_exclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "endExclusive") orelse return typeErr("endExclusive requires a Range receiver");
+    if (view.end == rangeKindMax(view.kind)) {
+        return .{ .err = .{ .Thrown = .{ .Exception = .{
+            .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalStateException"),
+            .message = try runtime.strInitOwned(ctx.allocator, try ctx.allocator.dupe(u8, "Cannot return the exclusive upper bound of a range that includes MAX_VALUE.")),
+            .cause = null,
+        } } } };
+    }
     return ok(rangeEndpoint(view.kind, view.end + 1));
 }
 
