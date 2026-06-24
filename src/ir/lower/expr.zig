@@ -740,6 +740,15 @@ fn writeBackLvalue(b: *FuncBuilder, target: *const Expr, val: Reg) Allocator.Err
 /// A bare `name` an enclosing class declares as a value member (an enclosing
 /// companion's `Default`) shadows an unrelated global classifier of the same
 /// simple name. True when `name` is an enclosing member and is NOT a nested
+/// Whether `name` is a known class that has a registered companion object.
+/// Such a name in value position is its companion singleton (Kotlin: `C`
+/// yields `C.Companion`), which must win over a folded classifier name that
+/// would otherwise route the read to a non-existent `this.<name>` field.
+fn classWithCompanion(b: *const FuncBuilder, name: []const u8) bool {
+    return b.module.classId(name) != null and
+        b.module.registry.companion_singletons.contains(name);
+}
+
 /// type reachable along the enclosing-owner chain (a nested type keeps the
 /// classifier path so it names a class value).
 fn enclosingMemberShadowsClass(b: *const FuncBuilder, name: []const u8) bool {
@@ -951,8 +960,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
         // Member read on `this` via GetField when the owning class declares
-        // this name.
-        if (b.hasOwnMember(name0)) {
+        // this name. A companioned class name is excepted: it is its companion
+        // singleton, resolved by the classifier sentinel below, not a field.
+        if (b.hasOwnMember(name0) and !classWithCompanion(b, name0)) {
             if (b.resolve("this")) |this_reg| {
                 const dst = b.allocReg();
                 const nm = try sgetterName(b, name0);
@@ -979,7 +989,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // expression position), so the read decides at runtime with the
         // index-resolved class riding as the exact global arm; the
         // companion sentinel passes a member value through unchanged.
-        if (b.module.classId(name0) != null and !enclosingMemberShadowsClass(b, name0)) {
+        if (b.module.classId(name0) != null and
+            (!enclosingMemberShadowsClass(b, name0) or classWithCompanion(b, name0)))
+        {
             const n = try b.module.internConst(b.allocator, .{ .String = name0 });
             const cls = b.allocReg();
             if (inReceiverContext(b)) {
