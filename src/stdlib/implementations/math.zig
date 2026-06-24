@@ -89,8 +89,19 @@ fn numeric_as_i64(v: *const Value) ?i64 {
 /// to the larger of the two so e.g. `minOf(Long, Int)` is a Long);
 /// any floating operand promotes the result to Double.
 pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []const u8) std.mem.Allocator.Error!EvalResult {
-    if (args.len != 2) {
-        return arityErr(ctx, "{s} expects 2 arguments", .{what});
+    if (args.len == 0) return arityErr(ctx, "{s} expects at least 2 arguments", .{what});
+    if (args.len == 1) return ok(args[0]);
+    // `minOf(a, b, c, …)` / `minOf(a, vararg others)` fold pairwise.
+    if (args.len > 2) {
+        var acc = args[0];
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            switch (try num_extreme(ctx, &.{ acc, args[i] }, want_min, what)) {
+                .ok => |v| acc = v,
+                .err => |e| return .{ .err = e },
+            }
+        }
+        return ok(acc);
     }
     const first = &args[0];
     const second = &args[1];
