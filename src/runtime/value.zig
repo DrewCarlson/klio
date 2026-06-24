@@ -1083,6 +1083,11 @@ pub const Value = union(enum) {
         /// throwable construction site (`host.allocInstanceId()`); 0 for
         /// exceptions built outside that path, which then compare structurally.
         identity: u64 = 0,
+        /// Suppressed throwables (`addSuppressed`/`suppressedExceptions`). A
+        /// shared list allocated at the constructor site so every value-copy
+        /// of the exception observes the same suppressed set; null for
+        /// exceptions built outside that path.
+        suppressed: ?ValueList = null,
     },
     /// `kotlin.collections.List` / `MutableList`.
     List: struct {
@@ -1261,6 +1266,7 @@ pub const Value = union(enum) {
                 if (e.message) |m| visitor.visit(m);
                 if (e.cause) |c| visitor.visit(c);
                 if (e.stack) |s| visitor.visit(s);
+                if (e.suppressed) |sl| visitor.visit(sl);
             },
             .Pair => |p| {
                 visitor.visit(p.first);
@@ -1402,6 +1408,7 @@ pub const Value = union(enum) {
                 e.fqn.deinit();
                 if (e.message) |m| m.deinit();
                 if (e.cause) |c| c.deinit();
+                if (e.suppressed) |sl| sl.deinit();
             },
             .Pair => |p| {
                 p.first.deinit();
@@ -1894,6 +1901,9 @@ pub const Value = union(enum) {
                     structuralEqBoxed(x.third.asPtr(), b.Triple.third.asPtr()),
             .MapEntry => |x| if (b.* == .MapEntry)
                 return structuralEqBoxed(x.key.asPtr(), b.MapEntry.key.asPtr()) and structuralEqBoxed(x.value.asPtr(), b.MapEntry.value.asPtr()),
+            // `Throwable.equals` is reference identity (Kotlin does not override
+            // it), so `==`/`assertEquals` on exceptions is `===`.
+            .Exception => if (b.* == .Exception) return referenceEq(a, b),
             else => {},
         }
         // Any other mix of two numerics is a cross-type boxed comparison.

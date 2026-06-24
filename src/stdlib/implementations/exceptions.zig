@@ -81,6 +81,9 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
         .message = message,
         .cause = cause,
         .identity = ctx.host.allocInstanceId(),
+        // A shared list so `addSuppressed` on any value-copy is observed by
+        // `suppressedExceptions` on every other copy of this throwable.
+        .suppressed = try ValueList.init(ctx.allocator, .empty),
     } });
 }
 
@@ -172,17 +175,29 @@ pub fn throwable_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
 
-/// `Throwable.addSuppressed(other)` — klio does not surface
-/// suppressed-exception chains in diagnostics, so this records
-/// nothing. Accepts any throwable-shaped receiver.
+/// `Throwable.addSuppressed(other)` — append to the receiver's shared
+/// suppressed list (built at construction). A throwable created outside the
+/// constructor path has no list, so the call is a no-op there.
 pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    _ = ctx;
+    if (ctx.args.len >= 2 and ctx.args[0] == .Exception) {
+        if (ctx.args[0].Exception.suppressed) |sl| {
+            const g = sl.borrowMut();
+            defer g.deinit();
+            if (runtime.reclaimEnabled()) ctx.args[1].retain();
+            try g.get().append(ctx.allocator, ctx.args[1]);
+        }
+    }
     return ok(.Unit);
 }
 
-/// `Throwable.suppressedExceptions` / `getSuppressed()` — always empty (see
-/// `throwable_add_suppressed`).
+/// `Throwable.suppressedExceptions` / `getSuppressed()` — a read-only view of
+/// the receiver's shared suppressed list (empty when none recorded).
 pub fn throwable_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len >= 1 and ctx.args[0] == .Exception) {
+        if (ctx.args[0].Exception.suppressed) |sl| {
+            return ok(makeList(sl.clone(), false));
+        }
+    }
     const items = try ValueList.init(ctx.allocator, .empty);
     return ok(makeList(items, false));
 }
