@@ -93,3 +93,19 @@ the interpreter.
   fixed, but the structural gate remains). Add the run-vs-test parity harness.
 - `applicability.zig`: lift `memberApplicableForWalk` so compile- and run-time share
   one applicability check (the arity-mask is a first step toward this).
+
+### New finding (RC-4 / provenance, concrete instance): `Random(seed)`
+`Random(42)` works under `klio run` but fails under `klio test` with
+"Cannot create an instance of an abstract class: Random". Tracing the bare-call
+lowering of `Random` shows two lowerings with DIFFERENT `funcsBySimpleName("Random")`
+candidate counts (`cands=0` vs `cands=2`) — i.e. at the moment the failing one is
+lowered, the pack's `Random(seed: Int/Long)` factory functions are NOT yet in
+`func_name_index`, so `shadowedByClass` returns true (no applicable factory) and the
+call lowers to `NewInstance(abstract Random)`. Root: the symbol/func index is not
+uniformly populated with pack factory functions before user/test bodies are lowered
+(pack-vs-source provenance + phase ordering). This is the same class as the `Random`
+abstract-instantiation failures in MutableMapRemoveHashAtTest. Fix belongs with the
+RC-4 work: one index built identically (including pack symbols) before any body is
+lowered, so `funcsBySimpleName` is complete and `shadowedByClass` sees the factory in
+every entry point. Needs a careful look at how `klio test` vs `klio run` assemble the
+module/index relative to the pack.
