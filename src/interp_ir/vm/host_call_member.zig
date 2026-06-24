@@ -542,6 +542,9 @@ fn kotlinHashCode(v: *const Value) i32 {
             if (r.step == 1) break :blk @as(i32, 31) *% f +% l;
             break :blk (@as(i32, 31) *% (@as(i32, 31) *% f +% l)) +% s;
         },
+        // `Map.Entry.hashCode()` is `key.hashCode() xor value.hashCode()`, so a
+        // Set-of-entries (a map's `entries`) folds to the map's hashCode.
+        .MapEntry => |e| kotlinHashCode(e.key.asPtr()) ^ kotlinHashCode(e.value.asPtr()),
         else => valueStructuralHash(v),
     };
 }
@@ -2678,6 +2681,26 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
         if (std.mem.eql(u8, name, "hashCode") and args.len == 0) return .{ .ok = Value.newInt(0) };
         if (std.mem.eql(u8, name, "toString") and args.len == 0) return .{ .ok = try strVal(allocator, "kotlin.Unit") };
+    }
+
+    // `Boolean` operator members: `b.not()`, `b.and(x)`, `b.or(x)`,
+    // `b.xor(x)`, `b.compareTo(x)`. The `!`/`&&`/`||` syntax lowers to
+    // unary/binops, but the named members are also callable (e.g.
+    // `isEmpty().not()`), and are not otherwise resolved for a `Bool` value.
+    if (receiver.* == .Bool) {
+        const b = receiver.Bool;
+        if (std.mem.eql(u8, name, "not") and args.len == 0) return .{ .ok = boolVal(!b) };
+        if (args.len == 1 and args[0] == .Bool) {
+            const o = args[0].Bool;
+            if (std.mem.eql(u8, name, "and")) return .{ .ok = boolVal(b and o) };
+            if (std.mem.eql(u8, name, "or")) return .{ .ok = boolVal(b or o) };
+            if (std.mem.eql(u8, name, "xor")) return .{ .ok = boolVal(b != o) };
+            if (std.mem.eql(u8, name, "compareTo")) {
+                const bi: i64 = @intFromBool(b);
+                const oi: i64 = @intFromBool(o);
+                return .{ .ok = Value.newInt(if (bi < oi) @as(i64, -1) else if (bi > oi) @as(i64, 1) else 0) };
+            }
+        }
     }
 
     // `hashCode()` on a builtin value type.
