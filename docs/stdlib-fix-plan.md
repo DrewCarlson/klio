@@ -259,3 +259,13 @@ inline_call.zig (inline literal coercion + T::class binding), thunks.zig
 binary for waves A/B/C and are sweep-validated. A stray KLIOBIND debug print was
 removed. FUTURE: run diagnosis agents with a read-only agent type (Explore) to
 avoid uncontrolled working-tree edits.
+
+## NEXT KEYSTONE: exception reference identity (~17 fails: ExceptionTest 14, CancellationException, suppressed)
+KLIO `.Exception` is an inline value (value.zig:1060 {fqn,message,cause,stack}) with NO
+identity, so `assertSame(cause, e.cause)` and `e.cause === c` are false (referenceEq falls to
+structuralEq, value.zig:1907/1922). Plan: add `identity: u64 = 0` to ExceptionData; assign a
+fresh id (host nextInstanceId) at the USER exception ctor site (host_instances.zig
+bindThrowableArgs / the builtin-throwable ctor — find where `Exception(msg,cause)` builds the
+value); add a `.Exception` case to referenceEq comparing non-zero identities. Cause flow already
+stores the passed value (boxRef), so identity preserves across copies. ctor-ref invoke prereq is
+DONE (commit above). ~40 default-0 construction sites are safe (referenceEq requires id != 0).
