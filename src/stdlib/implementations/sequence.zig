@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const collections = @import("collections.zig");
 
 const Value = runtime.Value;
 const RuntimeError = runtime.RuntimeError;
@@ -759,6 +760,33 @@ fn materialiseSequenceBounded(
 }
 
 /// Apply one buffered op in place. Returns a `RuntimeError` on failure.
+/// Outcome of expanding a `flatMap` transform result.
+const FlatMapOutcome = union(enum) { expanded: void, single: void, err: RuntimeError };
+
+/// Flatten a `flatMap` transform result that is neither a List/Set/Sequence
+/// (handled inline by the caller). Built-in iterable shapes (Array, Range,
+/// Map) expand directly through the shared `iterableItems` extractor; any
+/// other value (a user `Instance` that is `Iterable`) drains through the host
+/// `iterator()`/`hasNext()`/`next()` protocol. Returns `.single` when the
+/// value is not iterable, so the caller appends it as one element.
+fn flatMapExpand(
+    allocator: std.mem.Allocator,
+    host: IntrinsicHost,
+    out: Output,
+    mapped: Value,
+    nx: *std.ArrayList(Value),
+) std.mem.Allocator.Error!FlatMapOutcome {
+    var ctx = runtime.CallCtx{ .args = &.{}, .out = out, .host = host, .allocator = allocator };
+    switch (try collections.iterableItemsCtx(&ctx, mapped, "flatMap")) {
+        .items => |items| {
+            try nx.appendSlice(allocator, items);
+            if (runtime.freeScratch()) allocator.free(items);
+            return .expanded;
+        },
+        .err => return .single,
+    }
+}
+
 fn applyBufferedOp(
     allocator: std.mem.Allocator,
     host: IntrinsicHost,
@@ -918,7 +946,14 @@ fn applyBufferedOp(
                             },
                         }
                     },
-                    else => try nx.append(allocator, mapped),
+                    else => switch (try flatMapExpand(allocator, host, out, mapped, &nx)) {
+                        .expanded => {},
+                        .single => try nx.append(allocator, mapped),
+                        .err => |e| {
+                            nx.deinit(allocator);
+                            return e;
+                        },
+                    },
                 }
             }
             items.deinit(allocator);

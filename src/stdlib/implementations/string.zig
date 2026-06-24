@@ -492,9 +492,13 @@ pub fn string_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     } else {
         return errArity("substring requires 1 or 2 Int args");
     }
-    if (start < 0 or end > len or start > end) {
+    if (start < 0 or end > len) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "substring({d},{d}) on length {d}", .{ start, end, len });
         return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+    }
+    if (start > end) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d} > endIndex: {d}", .{ start, end });
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
     return .{ .ok = try newString(ctx.allocator, try utf16Slice(ctx.allocator, s, @intCast(start), @intCast(end))) };
 }
