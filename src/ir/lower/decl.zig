@@ -254,6 +254,51 @@ fn collectMembers(
     }
 }
 
+/// The bit `i` of a member's arity mask is set when some overload binds
+/// exactly `i` user arguments; bit 63 marks a vararg overload (accepts any
+/// count). Mirrors `collectMembers`' walk so member-vs-global resolution can
+/// be arity-aware.
+fn funcArityMask(f: *const ast.Function) u64 {
+    var required: usize = 0;
+    var any_vararg = false;
+    for (f.params) |*p| {
+        if (p.is_vararg) any_vararg = true;
+        if (p.default == null and !p.is_vararg) required += 1;
+    }
+    if (any_vararg) return @as(u64, 1) << 63;
+    var mask: u64 = 0;
+    // Every count from `required` up to the full parameter count binds (the
+    // trailing defaulted params may be omitted).
+    var n = required;
+    while (n <= f.params.len and n < 63) : (n += 1) mask |= @as(u64, 1) << @intCast(n);
+    return mask;
+}
+
+fn mergeMemberArity(out: *std.StringHashMap(u64), name: []const u8, mask: u64) Allocator.Error!void {
+    const gop = try out.getOrPut(name);
+    if (gop.found_existing) gop.value_ptr.* |= mask else gop.value_ptr.* = mask;
+}
+
+fn collectMemberArities(
+    c: *const ast.Class,
+    file_classes: *const FileClasses,
+    out: *std.StringHashMap(u64),
+    seen: *StringSet,
+) Allocator.Error!void {
+    {
+        const gop = try seen.getOrPut(c.name.name);
+        if (gop.found_existing) return;
+    }
+    for (c.members) |*m| {
+        if (m.* == .Function) try mergeMemberArity(out, m.Function.name.name, funcArityMask(&m.Function));
+    }
+    for (c.supertypes) |*sup| {
+        if (file_classes.get(sup.name.name)) |parent| {
+            try collectMemberArities(parent.get(), file_classes, out, seen);
+        }
+    }
+}
+
 /// Add enum-entry, nested-class, and companion-member names that are
 /// visible under their bare names inside the class's method bodies.
 fn addVisibleMemberNames(
@@ -416,6 +461,14 @@ pub fn lowerClassWithExtras(
     defer seen_for_collect.deinit();
     try collectMembers(c, file_classes, &own_member_names, &seen_for_collect);
     try addVisibleMemberNames(c, &own_member_names);
+    // Per-member arity masks, so a method body's bare call prefers a member
+    // only when one is arity-applicable (a 0-arg member must not shadow a
+    // same-named 1-arg top-level function).
+    var own_member_arity = std.StringHashMap(u64).init(a);
+    defer own_member_arity.deinit();
+    var seen_for_arity = StringSet.init(a);
+    defer seen_for_arity.deinit();
+    try collectMemberArities(c, file_classes, &own_member_arity, &seen_for_arity);
 
     var methods: std.ArrayList(FuncId) = .empty;
     errdefer methods.deinit(a);
@@ -455,6 +508,7 @@ pub fn lowerClassWithExtras(
                 &own_member_names,
                 extra_members,
                 &private_method_fids,
+                &own_member_arity,
             );
             try methods.append(a, placed.id);
             if (f.visibility == .Private) {
@@ -746,7 +800,7 @@ pub fn lowerMethod(
     defer empty.deinit();
     var no_enclosing = StringSet.init(module.registry.allocator);
     defer no_enclosing.deinit();
-    return lowerMethodWithPrivate(module, f, owner_class, own_members, &no_enclosing, &empty);
+    return lowerMethodWithPrivate(module, f, owner_class, own_members, &no_enclosing, &empty, null);
 }
 
 pub fn lowerMethodWithPrivate(
@@ -756,6 +810,7 @@ pub fn lowerMethodWithPrivate(
     own_members: *const StringSet,
     enclosing_members: *const StringSet,
     private_method_fids: *const StringFuncIdMap,
+    own_member_arity: ?*const std.StringHashMap(u64),
 ) Allocator.Error!Func {
     const a = module.registry.allocator;
     // A member extension function (`class C { fun R.f(p) { … } }`) binds
@@ -773,7 +828,7 @@ pub fn lowerMethodWithPrivate(
     // extensions use (the receiver is prepended as the implicit `this`).
     if (f.receiver_type != null) {
         const implicit = [_][]const u8{"this"};
-        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, null, null, enclosing_members, null);
+        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, null, null, enclosing_members, null, null);
         const id = module.nextFuncId();
         var placed = func;
         placed.id = id;
@@ -801,6 +856,7 @@ pub fn lowerMethodWithPrivate(
         own_members,
         enclosing_members,
         private_method_fids,
+        own_member_arity,
     );
     const id = module.nextFuncId();
     var placed = func;
@@ -826,6 +882,7 @@ pub fn lowerFunctionBodyWithImplicitOwner(
         own_members,
         null,
         null,
+        null,
     );
 }
 
@@ -845,6 +902,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerPriv(
         own_members,
         null,
         private_method_fids,
+        null,
     );
 }
 
@@ -862,6 +920,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     own_members: ?*const StringSet,
     enclosing_members: ?*const StringSet,
     private_method_fids: ?*const StringFuncIdMap,
+    own_member_arity: ?*const std.StringHashMap(u64),
 ) Allocator.Error!Func {
     const a = module.registry.allocator;
     var b = try FuncBuilder.init(a, module);
@@ -932,6 +991,12 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     }
     if (private_method_fids) |map| {
         b.setPrivateMethodFids(try cloneStringFuncIdMap(a, map));
+    }
+    if (own_member_arity) |map| {
+        var copy = std.StringHashMap(u64).init(a);
+        var it = map.iterator();
+        while (it.next()) |e| try copy.put(e.key_ptr.*, e.value_ptr.*);
+        b.setOwnMemberArity(copy);
     }
     if (f.is_tailrec) {
         b.setTailrecSelf(f.name.name);

@@ -233,6 +233,14 @@ pub const FuncBuilder = struct {
     /// body lowering to know whether an unqualified `foo(...)`
     /// is `this.foo(...)` (a class member) or a global lookup.
     own_members: StringSet,
+    /// Per own-member NAME: a bitmask of the argument counts its overload
+    /// set can accept (bit `i` set ⇒ some overload binds `i` user args; bit
+    /// 63 ⇒ a vararg overload accepts any count at/above its fixed prefix).
+    /// Lets `prefer_member` be arity-aware: a 0-arg member must not suppress
+    /// a same-named 1-arg top-level function. A name absent from the map (or
+    /// a non-function member like a property) stays conservatively
+    /// "applicable", preserving prior behavior.
+    own_member_arity: std.StringHashMap(u64),
     /// Member names of the lexically enclosing class, carried into a
     /// lambda body. Unlike `own_members` this never reroutes a bare
     /// reference through `this.<member>`; it only lets an enclosing
@@ -377,6 +385,7 @@ pub const FuncBuilder = struct {
             .boxed_vars = StringSet.init(allocator),
             .any_typed_locals = StringSet.init(allocator),
             .own_members = StringSet.init(allocator),
+            .own_member_arity = std.StringHashMap(u64).init(allocator),
             .enclosing_members = StringSet.init(allocator),
             .private_method_fids = StringFuncIdMap.init(allocator),
             .param_names = StringSet.init(allocator),
@@ -422,6 +431,7 @@ pub const FuncBuilder = struct {
         self.boxed_vars.deinit();
         self.any_typed_locals.deinit();
         self.own_members.deinit();
+        self.own_member_arity.deinit();
         self.enclosing_members.deinit();
         self.private_method_fids.deinit();
         self.param_names.deinit();
@@ -776,6 +786,23 @@ pub const FuncBuilder = struct {
     }
     pub fn hasOwnMember(self: *const FuncBuilder, name: []const u8) bool {
         return self.own_members.contains(name);
+    }
+    /// Replace the own-member arity-mask map. Takes ownership of `map`.
+    pub fn setOwnMemberArity(self: *FuncBuilder, map: std.StringHashMap(u64)) void {
+        self.own_member_arity.deinit();
+        self.own_member_arity = map;
+    }
+    /// Whether an own member named `name` could bind a call supplying `want`
+    /// arguments. Conservative: a name with no recorded arity mask (a
+    /// property, or a member not captured) is treated as applicable so
+    /// resolution behaves as before; only a recorded mask that excludes
+    /// `want` reports inapplicable, letting a same-named top-level function
+    /// resolve instead (kotlinc resolves by applicability, not by name).
+    pub fn ownMemberApplicable(self: *const FuncBuilder, name: []const u8, want: usize) bool {
+        const mask = self.own_member_arity.get(name) orelse return true;
+        if (mask & (@as(u64, 1) << 63) != 0) return true; // a vararg overload
+        if (want >= 63) return false;
+        return mask & (@as(u64, 1) << @intCast(want)) != 0;
     }
     /// Swap-in a new `owner_class` + `own_members` pair and return the
     /// previous values, so an inline splice can run the spliced body in

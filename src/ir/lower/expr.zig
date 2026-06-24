@@ -3394,6 +3394,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
         std.mem.eql(u8, name0, "check") or std.mem.eql(u8, name0, "checkNotNull")) and
         lastArgIsLambda(args);
     const prefer_member = b.resolve("this") != null and b.hasOwnMember(name0) and
+        b.ownMemberApplicable(name0, args.len) and
         b.resolve(name0) == null and !b.isLocalFn(name0) and !b.isLocalExtFn(name0) and
         !contract_with_msg;
 
@@ -4400,6 +4401,11 @@ fn lowerImplicitThisCall(
         lastArgIsLambda(args);
     if (contract_with_msg) return null;
     if (b.resolve(name0) != null or b.knowsOuter(name0) or !b.hasOwnMember(name0)) return null;
+    // A same-named member that cannot bind this call's arity (a 0-arg
+    // `requireNotNull()` for a 1-arg `requireNotNull(x)`) does not shadow the
+    // top-level function: defer to the global-resolution path instead of
+    // emitting a `this.<member>` call that can't dispatch.
+    if (!b.ownMemberApplicable(name0, args.len)) return null;
     const this_reg = b.resolve("this") orelse return null;
 
     // Private own-class methods bind statically.
