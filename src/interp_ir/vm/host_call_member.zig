@@ -2505,6 +2505,16 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (try boundRefDispatch(self, allocator, receiver, name, args)) |r| return r;
     }
 
+    // A constructor reference (`::Throwable`, `::Foo`) invoked through its
+    // `invoke`/`call` member constructs. The SAM block below deliberately
+    // skips `invoke`, so route class / constructor-intrinsic receivers here.
+    if ((receiver.* == .Class or receiver.* == .Intrinsic) and
+        (std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")))
+    {
+        const r = try callValueRec(self, allocator, receiver, args);
+        if (r == .ok) return r;
+    }
+
     // SAM conversion on a callable receiver.
     if (isCallableOrIntrinsic(receiver)) {
         const has_ext = extWithThisLongerThanArgs(self, name, args.len);
