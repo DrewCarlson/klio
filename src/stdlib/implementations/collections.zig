@@ -414,6 +414,11 @@ fn kotlinFloatTotalCmp(x: f64, y: f64) Order {
 fn compareValues(a: Allocator, x: Value, y: Value) Error!CompareOutcome {
     if (x.isNumeric() and y.isNumeric()) {
         if (x.isIntegral() and y.isIntegral()) {
+            // Unsigned operands compare by magnitude; reading them as i64 would
+            // wrap (UInt.MAX -> -1) and misorder the sort.
+            if (x.isUnsigned() and y.isUnsigned()) {
+                return .{ .order = std.math.order(x.asU64().?, y.asU64().?) };
+            }
             return .{ .order = std.math.order(x.asI64().?, y.asI64().?) };
         }
         return .{ .order = kotlinFloatTotalCmp(x.asF64().?, y.asF64().?) };
@@ -1623,6 +1628,23 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args.len > 2) {
         return arityErr(try fmt(a, "{s} expects (size) or (size, init)", .{name}));
+    }
+    // Storage-wrapping unsigned-array constructor: `UIntArray(intArray)` (and
+    // the UByte/UShort/ULong siblings, what `asUIntArray()` lowers to) shares
+    // the signed array's packed buffer as an unsigned view — mutations through
+    // either alias, matching Kotlin's inline value-class storage.
+    if (ctx.args.len == 1 and prim != null and ctx.args[0] == .Array) {
+        const arr = ctx.args[0].Array;
+        if (arr.prim) |src| {
+            const is_view = (prim.? == .UByte and src == .Byte) or
+                (prim.? == .UShort and src == .Short) or
+                (prim.? == .UInt and src == .Int) or
+                (prim.? == .ULong and src == .Long);
+            if (is_view) switch (arr.storage) {
+                .scalars => |pb| return ok(.{ .Array = .{ .storage = .{ .scalars = pb.clone() }, .prim = prim.? } }),
+                .boxed => {},
+            };
+        }
     }
     const n = switch (try arraySizeArg(a, ctx.args[0], name)) {
         .n => |v| v,

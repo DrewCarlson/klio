@@ -488,8 +488,16 @@ pub const PrimBuf = struct {
 
     /// Box element `i` into the `Value` the boxed array would have held.
     pub fn get(self: *const PrimBuf, i: usize) Value {
-        const p: [*]const u8 = self.bytes.items.ptr + i * self.kind.elemSize();
-        return switch (self.kind) {
+        return self.getAs(i, self.kind);
+    }
+
+    /// As `get`, but boxes according to `view_kind` rather than the storage
+    /// kind. The two differ only for an unsigned-array view over signed
+    /// backing (`IntArray.asUIntArray()`), where the byte layout is identical
+    /// and only the boxed tag changes (`Int` -> `UInt`).
+    pub fn getAs(self: *const PrimBuf, i: usize, view_kind: PrimitiveArrayKind) Value {
+        const p: [*]const u8 = self.bytes.items.ptr + i * view_kind.elemSize();
+        return switch (view_kind) {
             .Int => .{ .Int = readAs(i32, p) },
             .Long => .{ .Long = readAs(i64, p) },
             .Double => .{ .Double = readAs(f64, p) },
@@ -509,8 +517,13 @@ pub const PrimBuf = struct {
     /// read through the widening accessors so a coerced argument still stores
     /// correctly; the destination kind defines the stored width.
     pub fn set(self: *PrimBuf, i: usize, v: Value) void {
-        const p: [*]u8 = self.bytes.items.ptr + i * self.kind.elemSize();
-        switch (self.kind) {
+        self.setAs(i, v, self.kind);
+    }
+
+    /// As `set`, but unboxes according to `view_kind` (see `getAs`).
+    pub fn setAs(self: *PrimBuf, i: usize, v: Value, view_kind: PrimitiveArrayKind) void {
+        const p: [*]u8 = self.bytes.items.ptr + i * view_kind.elemSize();
+        switch (view_kind) {
             .Int => writeAs(i32, p, @truncate(v.asI64() orelse 0)),
             .Long => writeAs(i64, p, v.asI64() orelse 0),
             .Double => writeAs(f64, p, v.asF64() orelse 0),
@@ -595,7 +608,7 @@ pub const ArrayData = struct {
             .scalars => |pb| {
                 const g = pb.borrow();
                 defer g.deinit();
-                return g.get().get(i);
+                return g.get().getAs(i, self.prim orelse g.get().kind);
             },
         }
     }
@@ -618,7 +631,7 @@ pub const ArrayData = struct {
             .scalars => |pb| {
                 const g = pb.borrowMut();
                 defer g.deinit();
-                g.get().set(i, v);
+                g.get().setAs(i, v, self.prim orelse g.get().kind);
             },
         }
     }
@@ -637,10 +650,11 @@ pub const ArrayData = struct {
             .scalars => |pb| {
                 const g = pb.borrow();
                 defer g.deinit();
+                const view_kind = self.prim orelse g.get().kind;
                 const n = g.get().len();
                 const out = try allocator.alloc(Value, n);
                 var i: usize = 0;
-                while (i < n) : (i += 1) out[i] = g.get().get(i);
+                while (i < n) : (i += 1) out[i] = g.get().getAs(i, view_kind);
                 return out;
             },
         }
