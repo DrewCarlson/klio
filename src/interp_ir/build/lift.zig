@@ -265,6 +265,12 @@ pub fn liftClassRecursive(
             if (is_private) {
                 synth.name = .{ .name = lifted_name, .span = co.name.span };
             }
+            // A type nested inside this object (e.g. an inline `value class`
+            // declared in `object Monotonic`) is itself a classifier that
+            // must lift to a top-level class and register its simple name.
+            const next_chain = try appendChain(a, enclosing_chain, c);
+            defer a.free(next_chain);
+            try liftClassRecursive(ctx, &synth, next_chain);
             try ctx.out_decls.append(a, .{ .Class = synth });
         } else if (m.* == .Class) {
             const nested = &m.Class;
@@ -304,14 +310,12 @@ pub fn liftClassRecursive(
                 try ctx.companion_singletons.put(c.name.name, comp_name);
             } else {
                 var extras = StringSet.init(a);
-                for (c.primary_params) |*p| try extras.put(try a.dupe(u8, p.name.name), {});
-                for (c.members) |*m2| {
-                    switch (m2.*) {
-                        .Property => |p| try extras.put(try a.dupe(u8, p.name.name), {}),
-                        .Function => |*f| try extras.put(try a.dupe(u8, f.name.name), {}),
-                        else => {},
-                    }
-                }
+                // The enclosing class's own members AND its companion's members
+                // are visible under bare names inside this nested class — a
+                // companion `Default` referenced from a nested `Builder` must
+                // bind the enclosing companion, not an unrelated global class of
+                // the same simple name.
+                try collectEnclosingMemberNames(c, &extras);
                 var ci = enclosing_chain.len;
                 while (ci > 0) {
                     ci -= 1;

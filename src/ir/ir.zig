@@ -220,6 +220,12 @@ pub const Inst = union(enum) {
         callee: Reg,
         parts: []SpreadPart,
         arg_names: []?ConstId = &.{},
+        /// When set, this is a member-dispatched spread call: the
+        /// flattened args are passed to method `member` on the value in
+        /// `callee` (the receiver), rather than invoking `callee` as a
+        /// callable. Lets `recv.method(*array)` / a bare own-member
+        /// `m(*array)` dispatch through member resolution.
+        member: ?ConstId = null,
     },
     /// `super.method(args)` — dispatch the named method on the
     /// receiver's value, but resolved against the parent of
@@ -1969,9 +1975,13 @@ pub const Module = struct {
         var class = class_in;
         if (self.classIndexEntryByName(class.name)) |id| {
             const existing = &self.classes.items[id.int()];
+            // `primary_params` is intentionally NOT part of the stub test: a
+            // build pre-pass fills every reserved class's primary parameters
+            // (so a forward-referenced constructor sees them) before the class
+            // is fully lowered, and that filled stub must still overwrite in
+            // place here.
             const is_stub = std.mem.eql(u8, existing.fqn, existing.name) and
                 existing.methods.len == 0 and
-                existing.primary_params.len == 0 and
                 existing.supertypes.len == 0 and
                 existing.init_block == null;
             // A reserved-stub fill, or the same class re-lowered
@@ -1995,7 +2005,7 @@ pub const Module = struct {
         return id;
     }
 
-    fn classIndexEntryByName(self: *const Module, name: []const u8) ?ClassId {
+    pub fn classIndexEntryByName(self: *const Module, name: []const u8) ?ClassId {
         for (self.class_index.items) |entry| {
             if (std.mem.eql(u8, entry.name, name)) return entry.id;
         }

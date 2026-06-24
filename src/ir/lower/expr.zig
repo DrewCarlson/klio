@@ -4468,15 +4468,6 @@ fn lowerImplicitThisCall(
     if (!b.ownMemberApplicable(name0, args.len)) return null;
     const this_reg = b.resolve("this") orelse return null;
 
-    if (std.mem.eql(u8, name0, "isFinite")) {
-        const pf = b.privateMethodFid("isFinite");
-        std.debug.print("KLIOPROBE2 isFinite ITC privFid={?d} fbs={d} alias={}\n", .{
-            if (pf) |p| p.int() else null,
-            b.module.funcsBySimpleName("isFinite").len,
-            isAliasName("isFinite"),
-        });
-    }
-
     // Private own-class methods bind statically.
     if (b.privateMethodFid(name0)) |fid| {
         // Reserve the receiver slot first, then lower the arguments into a

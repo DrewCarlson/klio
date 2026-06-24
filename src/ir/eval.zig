@@ -2995,9 +2995,6 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // rejects resolving it against a *caller's* receiver (dynamic
             // scope), so a miss is a hard unresolved reference.
             var v: Value = undefined;
-            if (std.mem.eql(u8, name_str, "asserter")) {
-                std.debug.print("KLIODBG asserter LoadGlobal in fn={s} found={} getters.count={d} module={*}\n", .{ frame.func.fqn, found != null, frame.module.registry.top_level_prop_getters.count(), frame.module });
-            }
             if (found) |fv| {
                 v = fv;
             } else if (comptime @hasDecl(H, "callFunc")) {
@@ -3012,7 +3009,6 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                         .err => |e| return raiseStep(frame, e),
                     }
                 }
-                std.debug.print("KLIODBG LoadGlobal miss name={s} getters.count={d} module={*}\n", .{ name_str, frame.module.registry.top_level_prop_getters.count(), frame.module });
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                 return raiseStep(frame, .{ .Unbound = msg });
             } else {
@@ -3218,11 +3214,6 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // when that is empty — the enclosing function's `this` *parameter*.
     const direct_this: ?Value = if (cmg.recv) |r| frame.read(r) else null;
     const this_val = if (direct_this) |dt| dt else implicitThisValue(frame, cmg.this_idx, true);
-    if (std.mem.eql(u8, name_str, "isFinite")) {
-        std.debug.print("KLIOPROBE3 CMG isFinite fn={s} this_idx={d} recv_set={} this_ty={s} hasMember={}\n", .{
-            frame.func.fqn, cmg.this_idx, cmg.recv != null, this_val.typeFqn(), host.hostHasMember(&this_val, "isFinite"),
-        });
-    }
     // A bare callee whose name starts uppercase is a constructor / type,
     // never an instance member.
     const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]);

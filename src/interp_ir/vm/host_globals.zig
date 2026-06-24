@@ -615,17 +615,28 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                 // first-access construction stays with the name-keyed
                 // throwing path, which drives the init gate exactly once
                 // and surfaces an init failure with its cause.
-                const obj_name: ?[]const u8 = blk: {
+                const cls_name, const is_object = blk: {
                     const dg = def.borrow();
                     defer dg.deinit();
-                    if (dg.get().is_object) break :blk dg.get().name;
+                    break :blk .{ dg.get().name, dg.get().is_object };
+                };
+                // In value position a class with a companion is its companion
+                // singleton (Kotlin: `C` ⇒ `C.Companion`); a plain `object` is
+                // its own singleton. Both only when the singleton is already
+                // published — first access stays on the name-keyed throwing
+                // path that drives the init gate once.
+                const singleton_name: ?[]const u8 = blk: {
+                    const mg = self.module.borrow();
+                    defer mg.deinit();
+                    if (mg.get().registry.companion_singletons.get(cls_name)) |cn| break :blk cn;
+                    if (is_object) break :blk cls_name;
                     break :blk null;
                 };
-                if (obj_name) |n| {
+                if (singleton_name) |sn| {
                     const published: ?Value = blk: {
                         const gg = self.globals.borrow();
                         defer gg.deinit();
-                        break :blk gg.get().lookup(n);
+                        break :blk gg.get().lookup(sn);
                     };
                     def.deinit();
                     if (published) |v| {

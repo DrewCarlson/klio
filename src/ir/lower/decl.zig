@@ -404,6 +404,30 @@ fn recordAbstractMemberDefaults(
 /// so bare references inside the inner's body lower as `this.X`
 /// (resolved against the captured outer at runtime) instead of
 /// `LoadGlobal(X)`.
+/// Lower a class's primary-constructor parameters (names + lowered types).
+/// Exposed so a build pre-pass can fill every class's `primary_params` before
+/// any method body is lowered — a constructor call to a forward-declared class
+/// (`class A { fun f() = B("x") {} }; class B(...)`) must see B's parameter
+/// types for the argument-lambda arity / trailing-lambda realignment.
+pub fn classPrimaryParams(a: Allocator, c: *const ast.Class) Allocator.Error![]Param {
+    var primary_params: std.ArrayList(Param) = .empty;
+    errdefer primary_params.deinit(a);
+    for (c.primary_params) |*p| {
+        try primary_params.append(a, .{
+            .name = p.name.name,
+            // Preserve the lowered parameter type (notably a `Function{N}`
+            // head for a `T.() -> R` param) so an argument lambda can read
+            // its expected arity and drop a synthetic `it`.
+            .ty = try loweredTypeRef(a, &p.ty, false),
+            .default = null,
+            .is_property = p.property != null,
+            .is_vararg = p.is_vararg,
+            .has_default = p.default != null,
+        });
+    }
+    return primary_params.toOwnedSlice(a);
+}
+
 pub fn lowerClassWithExtras(
     module: *Module,
     c: *const ast.Class,
@@ -412,18 +436,6 @@ pub fn lowerClassWithExtras(
 ) Allocator.Error!ClassId {
     const a = module.registry.allocator;
 
-    var primary_params: std.ArrayList(Param) = .empty;
-    errdefer primary_params.deinit(a);
-    for (c.primary_params) |*p| {
-        try primary_params.append(a, .{
-            .name = p.name.name,
-            .ty = build.typeUnit(),
-            .default = null,
-            .is_property = p.property != null,
-            .is_vararg = p.is_vararg,
-            .has_default = p.default != null,
-        });
-    }
     // Register the class shell first so the class name resolves inside
     // its own method bodies (`class Foo { fun copy() = Foo(...) }`).
     const class_fqn = lower_class_fqn orelse c.name.name;
@@ -432,7 +444,7 @@ pub fn lowerClassWithExtras(
         .name = c.name.name,
         .fqn = class_fqn,
         .package = lower_class_pkg orelse ir.packageOfFqn(class_fqn, c.name.name),
-        .primary_params = try primary_params.toOwnedSlice(a),
+        .primary_params = try classPrimaryParams(a, c),
         .methods = &.{},
         .init_block = null,
         .companion = null,

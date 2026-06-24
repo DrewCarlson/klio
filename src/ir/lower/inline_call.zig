@@ -9,6 +9,7 @@ const build = @import("../build.zig");
 const expr_lower = @import("expr.zig");
 const inline_state = @import("inline_state.zig");
 const ast_scan = @import("ast_scan.zig");
+const helpers = @import("helpers.zig");
 
 const Allocator = std.mem.Allocator;
 const FuncBuilder = build.FuncBuilder;
@@ -682,7 +683,18 @@ pub fn tryInlineCallWithTypeArgs(
     defer b.allocator.free(arg_regs);
     for (f.params, 0..) |*p, i| {
         const a = ordered[i].?; // filled above
-        const r = try lowerExpr(b, a);
+        // A numeric literal argument re-types to its declared primitive
+        // parameter (kotlinc literal typing): `f(1)` for `f(x: Long)`
+        // binds a `Long`, not an `Int`. The regular call path coerces in
+        // `lowerArgRunFull`; the inline splice binds the lowered arg
+        // directly, so apply the same coercion here. Without it the bound
+        // value stays `Int` and any later `==`/`equals` against a `Long`
+        // is a cross-type comparison that is always false.
+        const coerced: ?Reg = if (p.ty.function == null and !p.ty.nullable)
+            try helpers.coerceNumericLiteralArg(b, a, p.ty.name.name)
+        else
+            null;
+        const r = coerced orelse try lowerExpr(b, a);
         arg_regs[i] = r;
         // A lambda argument is spliced inline (its body is expanded at the
         // call site), so it is never a closure value to box — skip boxing
@@ -829,7 +841,9 @@ pub fn tryInlineCallWithTypeArgs(
                 // instead, matching how a concrete `Type::class` receiver
                 // lowers. Without it `T::class` for such a type yields the
                 // intrinsic and member dispatch (`isInstance`) misses.
-                const cls_pick: ?ir.ClassId = b.module.classIdIndexed(a.name.name, b.self_package, a.name.span.file) orelse b.module.classId(a.name.name);
+                const idx_pick = b.module.classIdIndexed(a.name.name, b.self_package, a.name.span.file);
+                const flat_pick = b.module.classId(a.name.name);
+                const cls_pick: ?ir.ClassId = idx_pick orelse flat_pick;
                 try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name, .class = cls_pick } });
                 cls_reg_opt = cls_reg;
             }

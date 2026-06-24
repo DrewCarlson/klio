@@ -84,6 +84,7 @@ pub const widenNumericLiteral = literals.widenNumericLiteral;
 pub const lowerAccessorBlock = thunks.lowerAccessorBlock;
 pub const lowerAccessorExpr = thunks.lowerAccessorExpr;
 pub const lowerAccessorExprWithExpected = thunks.lowerAccessorExprWithExpected;
+pub const lowerAccessorExprEnclosing = thunks.lowerAccessorExprEnclosing;
 pub const lowerBinaryExprAsThunk = thunks.lowerBinaryExprAsThunk;
 pub const lowerBlockAsThunk = thunks.lowerBlockAsThunk;
 pub const lowerBlockAsUnaryThunk = thunks.lowerBlockAsUnaryThunk;

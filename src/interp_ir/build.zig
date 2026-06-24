@@ -640,8 +640,16 @@ fn collectClassFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: 
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, c.name.name });
         for (c.members) |*m| try collectClassFqns(allocator, m, inner_pkg, out);
     }
-    if (d.* == .Object and pkg.len != 0) {
-        try out.put(d.Object.span, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, d.Object.name.name }));
+    if (d.* == .Object) {
+        const o = &d.Object;
+        if (pkg.len != 0) {
+            try out.put(o.span, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, o.name.name }));
+        }
+        const inner_pkg = if (pkg.len == 0)
+            o.name.name
+        else
+            try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, o.name.name });
+        for (o.members) |*m| try collectClassFqns(allocator, m, inner_pkg, out);
     }
 }
 
@@ -785,7 +793,14 @@ fn collectHierarchyMemberNames(start: []const u8, by_name: *const FileClasses, o
 fn literalToConst(e: *const ast.Expr) ?Const {
     return switch (e.*) {
         .IntLit => |lit| switch (lit.kind) {
-            .Int, .UInt => Const{ .Int = @truncate(lit.value) },
+            // A suffix-less integer literal whose magnitude exceeds the `Int`
+            // range is a `Long` in Kotlin; mirror the IntLit-lowering widening
+            // in `ir/lower/expr.zig` so `const val` folding does not truncate.
+            .Int => if (lit.value >= std.math.minInt(i32) and lit.value <= std.math.maxInt(i32))
+                Const{ .Int = @truncate(lit.value) }
+            else
+                Const{ .Long = lit.value },
+            .UInt => Const{ .Int = @truncate(lit.value) },
             .Long, .ULong => Const{ .Long = lit.value },
         },
         .FloatLit => |lit| switch (lit.kind) {
@@ -1208,6 +1223,13 @@ fn buildModuleWithOverrides(
             try collectClassMemberNamesInto(&module.registry.class_member_names, &.{}, d.Object.members);
         }
     }
+    // Builtin value-class members no user class declares: the unsigned types'
+    // backing `val data` (UByte/UShort/UInt/ULong). A bare `data` inside an
+    // unsigned extension (`UByte.toHexString = data.toHexString(...)`) is
+    // `this.data`, so it must shadow a same-named cross-package top-level the
+    // way a declared member would — otherwise the stdlib file fails to resolve
+    // whenever a test package happens to declare a top-level `data`.
+    try module.registry.class_member_names.put("data", {});
     // Per-class transitive supertype-name chain, nearest first, so body
     // lowering can rank extension receivers against the enclosing class
     // before the IR-side supertype slots are filled.
@@ -1427,6 +1449,21 @@ fn buildModuleWithOverrides(
         }
     }
     ir.lower.setTypeAliasTags(&module.registry.type_aliases);
+    // Fill every reserved class's primary-constructor parameters BEFORE any
+    // class method body is lowered. Class method bodies lower inside the loop
+    // below in declaration order, so a constructor call to a class declared
+    // later (`class A { fun f() = B("x") {} }; class B(d, flag, block)`) must
+    // already see B's parameter types for the argument-lambda arity and the
+    // trailing-lambda realignment (otherwise the lambda binds the wrong slot).
+    for (decls) |*d| {
+        if (d.* != .Class) continue;
+        const c = &d.Class;
+        if (module.classIndexEntryByName(c.name.name)) |cid| {
+            if (cid.int() < module.classes.items.len and module.classes.items[cid.int()].primary_params.len == 0) {
+                module.classes.items[cid.int()].primary_params = try ir.lower.decl.classPrimaryParams(a, c);
+            }
+        }
+    }
     // Lower each class.
     var empty_set = StringSet.init(a);
     defer empty_set.deinit();
@@ -1654,12 +1691,17 @@ fn buildModuleWithOverrides(
 
         const body_prop_cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
         const body_prop_dual = !std.mem.eql(u8, body_prop_cfqn, c.name.name);
+        // For a nested class the lexically-enclosing class's (and its
+        // companion's) members are visible bare inside its body-property
+        // initializers; thread them so a bare `Default` referencing the
+        // enclosing companion does not bind a foreign global class.
+        const body_enclosing: ?*const StringSet = nested_outer_members.getPtr(c.name.name);
         for (c.members) |*m| {
             if (m.* != .Property) continue;
             const p = m.Property;
             if (p.init) |*init| {
                 const nm = try std.fmt.allocPrint(a, "__init_prop_{s}_{s}", .{ c.name.name, p.name.name });
-                const fid = try ir.lower.lowerAccessorExprWithExpected(module, c.name.name, &own_members, prop_init_params.items, init, nm, p.ty);
+                const fid = try ir.lower.lowerAccessorExprEnclosing(module, c.name.name, &own_members, body_enclosing, prop_init_params.items, init, nm, p.ty);
                 try body_prop_inits.put(.{ .a = c.name.name, .b = p.name.name }, fid);
                 if (body_prop_dual) try body_prop_inits.put(.{ .a = body_prop_cfqn, .b = p.name.name }, fid);
             } else if (p.delegate) |delegate| {
