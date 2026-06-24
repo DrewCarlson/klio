@@ -3235,7 +3235,13 @@ fn lowerValueInvocation(
 fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) Allocator.Error!bool {
     if (callee.* != .Path or callee.Path.segments.len != 1) return false;
     const name = callee.Path.segments[0].name;
-    if (b.module.classId(name) == null) return false;
+    const cid = b.module.classId(name) orelse return false;
+    // An abstract/interface/sealed class cannot be constructed, so a bare
+    // `Name(args)` is never a constructor call — it is a same-named factory
+    // function (`fun Random(seed): Random`). Resolve it as a function (the
+    // runtime global lookup finds the factory) rather than emitting a
+    // `NewInstance` that aborts on the abstract class at run time.
+    if (cid.int() < b.module.classes.items.len and b.module.classes.items[cid.int()].is_abstract) return false;
     const nargs = args.len;
     if (lastArgIsLambda(args)) {
         // A trailing lambda routes to a same-named factory with a
