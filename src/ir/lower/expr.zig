@@ -1007,6 +1007,19 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 const qualified = Expr{ .Path = .{ .segments = &rsegs, .span = sp } };
                 return lowerExpr(b, &qualified);
             }
+            // A member brought in bare by `import EnumOrObject.*`
+            // (`import DurationUnit.*` → `MINUTES` == `DurationUnit.MINUTES`).
+            if (!b.hasOwnMember(name0)) {
+                if (wildcardClassMemberRewrite(b, segments[0].span.file)) |cls| {
+                    const sp = segments[0].span;
+                    var rsegs = [_]ast.Ident{
+                        .{ .name = cls, .span = sp },
+                        .{ .name = name0, .span = sp },
+                    };
+                    const qualified = Expr{ .Path = .{ .segments = &rsegs, .span = sp } };
+                    return lowerExpr(b, &qualified);
+                }
+            }
         }
         // A bare reference to a known top-level property is a global read
         // — unless a runtime implicit receiver could shadow it: kotlinc
@@ -1188,6 +1201,30 @@ fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?I
         return .{ .cls = segs[ci], .member = segs[segs.len - 1] };
     }
     return null;
+}
+
+/// A bare name brought into scope by `import EnumOrObject.*` resolves to that
+/// class's member (`import DurationUnit.*` makes `MINUTES` mean
+/// `DurationUnit.MINUTES`). Returns the simple class name to qualify with, or
+/// null when no wildcard import targets a declared class with this surface.
+/// The runtime `GetField` resolves the enum entry / companion member exactly as
+/// it does for the written-out `Class.name`.
+fn wildcardClassMemberRewrite(b: *FuncBuilder, file: ir.FileId) ?[]const u8 {
+    const list = b.module.registry.import_wildcards.get(file) orelse return null;
+    for (list.items) |path| {
+        // The wildcard target names a class (enum / object) rather than a
+        // package: its members are visible under their bare names. Match the
+        // full FQN first, then the simple tail.
+        if (b.module.classIdByFqn(path) != null) return lastPathSegment(path);
+        const tail = lastPathSegment(path);
+        if (b.module.classId(tail) != null) return tail;
+    }
+    return null;
+}
+
+fn lastPathSegment(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| return path[dot + 1 ..];
+    return path;
 }
 
 fn isBuiltinTypeName(name: []const u8) bool {
