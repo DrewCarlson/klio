@@ -1675,6 +1675,18 @@ pub fn array_ctor_boolean(ctx: *CallCtx) Error!EvalResult {
 pub fn array_ctor_char(ctx: *CallCtx) Error!EvalResult {
     return arrayCtorImpl(ctx, "CharArray", .Char, .{ .Char = 0 });
 }
+pub fn array_ctor_uint(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "UIntArray", .UInt, .{ .UInt = 0 });
+}
+pub fn array_ctor_ulong(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "ULongArray", .ULong, .{ .ULong = 0 });
+}
+pub fn array_ctor_ushort(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "UShortArray", .UShort, .{ .UShort = 0 });
+}
+pub fn array_ctor_ubyte(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "UByteArray", .UByte, .{ .UByte = 0 });
+}
 
 // =====================================================================
 // Collection builders
