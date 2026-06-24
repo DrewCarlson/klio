@@ -254,10 +254,73 @@ pub fn string_to_byte_array(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
-    var items = try ctx.allocator.alloc(Value, s.len);
+    // `encodeToByteArray(startIndex, endIndex, throwOnInvalidSequence)` indices
+    // are Kotlin char (UTF-16 unit) offsets, not byte offsets; an astral char
+    // is a 4-byte UTF-8 sequence counted as two units. `String.toByteArray`
+    // (a separate stdlib entry that shares this body) is always called with a
+    // charset receiver-arg and no range, so the range path is encode-only.
+    const char_len = charLen(s);
+    // A range is requested when a positional/named startIndex or endIndex slot
+    // carries an integer (a defaulted slot reorders to `Null` and keeps the
+    // default). `String.toByteArray` shares this body but always passes only a
+    // charset receiver-arg, so it never enters the range/bounds path.
+    const has_start = ctx.args.len > 1 and isIntLike(ctx.args[1]);
+    const has_end = ctx.args.len > 2 and isIntLike(ctx.args[2]);
+    const start = if (has_start) (ctx.args[1].asI64() orelse 0) else 0;
+    const end = if (has_end) (ctx.args[2].asI64() orelse char_len) else char_len;
+    if (has_start or has_end) {
+        // AbstractList.checkBoundsIndexes: OOB throws IndexOutOfBoundsException;
+        // start > end throws IllegalArgumentException.
+        if (start < 0 or end > char_len) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, char_len });
+            return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+        }
+        if (start > end) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d} > endIndex: {d}", .{ start, end });
+            return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        }
+    }
+    const byte_start = charToByteOffset(s, @intCast(start));
+    const byte_end = charToByteOffset(s, @intCast(end));
+    const slice = s[byte_start..byte_end];
+    var items = try ctx.allocator.alloc(Value, slice.len);
     defer ctx.allocator.free(items);
-    for (s, 0..) |b, i| items[i] = .{ .Byte = @bitCast(b) };
+    for (slice, 0..) |b, i| items[i] = .{ .Byte = @bitCast(b) };
     return .{ .ok = try runtime.ArrayData.initPacked(ctx.allocator, .Byte, items) };
+}
+
+/// Number of Kotlin char (UTF-16) units the UTF-8 string `s` decodes to: a
+/// 4-byte sequence (astral plane) is two units, everything else is one.
+fn charLen(s: []const u8) i64 {
+    var n: i64 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const adv = if (i + len > s.len) 1 else len;
+        n += if (adv == 4) 2 else 1;
+        i += adv;
+    }
+    return n;
+}
+
+/// Byte offset of Kotlin char unit `target` within UTF-8 string `s`.
+fn charToByteOffset(s: []const u8, target: usize) usize {
+    var units: usize = 0;
+    var i: usize = 0;
+    while (i < s.len and units < target) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const adv = if (i + len > s.len) 1 else len;
+        units += if (adv == 4) 2 else 1;
+        i += adv;
+    }
+    return i;
+}
+
+fn isIntLike(v: Value) bool {
+    return switch (v) {
+        .Int, .Long, .Short, .Byte => true,
+        else => false,
+    };
 }
 
 /// `ByteArray.decodeToString(startIndex = 0, endIndex = size,
@@ -282,14 +345,43 @@ pub fn byte_array_decode_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         };
     }
     const len: i64 = @intCast(bytes.len);
-    const start = if (ctx.args.len > 1) (ctx.args[1].asI64() orelse 0) else 0;
-    const end = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse len) else len;
-    if (start < 0 or end > len or start > end) {
-        const msg = try std.fmt.allocPrint(ctx.allocator, "decodeToString: [{d}, {d}) out of bounds for length {d}", .{ start, end, len });
+    const has_start = ctx.args.len > 1 and isIntLike(ctx.args[1]);
+    const has_end = ctx.args.len > 2 and isIntLike(ctx.args[2]);
+    const start = if (has_start) (ctx.args[1].asI64() orelse 0) else 0;
+    const end = if (has_end) (ctx.args[2].asI64() orelse len) else len;
+    // AbstractList.checkBoundsIndexes: out-of-bounds throws
+    // IndexOutOfBoundsException; start > end throws IllegalArgumentException.
+    if (start < 0 or end > len) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, len });
         return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
     }
-    const out = try utf8Lossy(ctx.allocator, bytes[@intCast(start)..@intCast(end)]);
+    if (start > end) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d} > endIndex: {d}", .{ start, end });
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+    }
+    const slice = bytes[@intCast(start)..@intCast(end)];
+    // `throwOnInvalidSequence` is the third user parameter (`args[3]` after
+    // the receiver and the reordered start/end slots).
+    const throw_invalid = ctx.args.len > 3 and ctx.args[3] == .Bool and ctx.args[3].Bool;
+    if (throw_invalid and !utf8WellFormed(slice)) {
+        return try thrown(ctx.allocator, "kotlin.text.CharacterCodingException", "Input length = 1");
+    }
+    const out = try utf8Lossy(ctx.allocator, slice);
     return .{ .ok = try newString(ctx.allocator, out) };
+}
+
+/// Strict UTF-8 well-formedness check matching Kotlin's decoder: rejects
+/// overlong forms, surrogate code points (U+D800..U+DFFF), code points above
+/// U+10FFFF, and truncated sequences.
+fn utf8WellFormed(bytes: []const u8) bool {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch return false;
+        if (i + len > bytes.len) return false;
+        _ = std.unicode.utf8Decode(bytes[i .. i + len]) catch return false;
+        i += len;
+    }
+    return true;
 }
 
 pub fn string_uppercase(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -1079,6 +1171,29 @@ pub fn string_reversed(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = try newString(ctx.allocator, try out.toOwnedSlice(ctx.allocator)) };
 }
 
+/// Kotlin `String.compareTo(other, ignoreCase = true)`: per scalar, when the
+/// two differ, compare uppercased forms then lowercased-uppercased forms; the
+/// shorter string sorts first on a common prefix.
+fn compareIgnoreCaseUtf8(a: []const u8, b: []const u8) std.math.Order {
+    var ia = (std.unicode.Utf8View.init(a) catch return text.compareUtf16(a, b)).iterator();
+    var ib = (std.unicode.Utf8View.init(b) catch return text.compareUtf16(a, b)).iterator();
+    while (true) {
+        const ca = ia.nextCodepoint();
+        const cb = ib.nextCodepoint();
+        if (ca == null and cb == null) return .eq;
+        if (ca == null) return .lt;
+        if (cb == null) return .gt;
+        if (ca.? == cb.?) continue;
+        const ua = scalarToUpper(ca.?);
+        const ub = scalarToUpper(cb.?);
+        if (ua != ub) {
+            const la = scalarToLower(ua);
+            const lb = scalarToLower(ub);
+            if (la != lb) return std.math.order(la, lb);
+        }
+    }
+}
+
 pub fn string_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     const r = try recvString(ctx.allocator, ctx.args, "String.compareTo");
     const s = switch (r) {
@@ -1090,7 +1205,11 @@ pub fn string_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const g = ctx.args[1].String.borrow();
     defer g.deinit();
-    const order = text.compareUtf16(s, g.get().bytes);
+    const ignore_case = ctx.args.len > 2 and ctx.args[2] == .Bool and ctx.args[2].Bool;
+    const order = if (ignore_case)
+        compareIgnoreCaseUtf8(s, g.get().bytes)
+    else
+        text.compareUtf16(s, g.get().bytes);
     const v: i32 = switch (order) {
         .lt => -1,
         .eq => 0,

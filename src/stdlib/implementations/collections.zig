@@ -1608,7 +1608,14 @@ const SizeOutcome = union(enum) { n: i64, err: EvalResult };
 
 fn arraySizeArg(a: Allocator, v: Value, what: []const u8) Error!SizeOutcome {
     const n = v.asI64() orelse return .{ .err = typeErr(try fmt(a, "{s} expects an Int size", .{what})) };
-    if (n < 0) return .{ .err = typeErr(try fmt(a, "{s}: negative array size {d}", .{ what, n })) };
+    // A negative size is a catchable `NegativeArraySizeException`, not an
+    // interpreter `.Type` error (which unwinds past `assertFailsWith`).
+    if (n < 0) {
+        const msg = try fmt(a, "{d}", .{n});
+        const e = try thrown(a, "kotlin.NegativeArraySizeException", msg);
+        if (runtime.freeScratch()) a.free(msg);
+        return .{ .err = e };
+    }
     return .{ .n = n };
 }
 

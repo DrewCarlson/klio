@@ -1065,6 +1065,10 @@ pub const Value = union(enum) {
         /// (`fillInStackTrace`). Null until thrown. Borrows program-lifetime
         /// frame labels; the frame slice is owned by the `StackRef` cell.
         stack: ?StackRef = null,
+        /// Reference identity for `===` / `assertSame`. Assigned fresh at the
+        /// throwable construction site (`host.allocInstanceId()`); 0 for
+        /// exceptions built outside that path, which then compare structurally.
+        identity: u64 = 0,
     },
     /// `kotlin.collections.List` / `MutableList`.
     List: struct {
@@ -1690,6 +1694,36 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Whether a builtin `Throwable` whose fully-qualified name is `fqn` is an
+    /// instance of the type named `name` (simple or fully-qualified) per the
+    /// `kotlin.*` exception hierarchy. The single source of truth shared by
+    /// `isRuntimeType` (the `is`/`as` and `KClass.isInstance` paths) and the
+    /// VM's `instanceOf`.
+    pub fn builtinThrowableIsA(fqn: []const u8, name: []const u8) bool {
+        const tail = lastSegment(fqn);
+        if (std.mem.eql(u8, tail, name)) return true;
+        if (matchesAny(name, &.{ "Throwable", "Any" })) return true;
+        if (std.mem.eql(u8, fqn, name)) return true;
+        // `Error`-side throwables (AssertionError, OutOfMemoryError, ...) are
+        // not `Exception`s; `Exception`-side are not `Error`s.
+        if (std.mem.eql(u8, name, "Exception")) return !throwableIsErrorSide(tail);
+        if (std.mem.eql(u8, name, "Error")) return throwableIsErrorSide(tail);
+        const runtime_exc = [_][]const u8{
+            "IllegalArgumentException",        "IllegalStateException",
+            "IndexOutOfBoundsException",       "ArrayIndexOutOfBoundsException",
+            "StringIndexOutOfBoundsException", "NullPointerException",
+            "ArithmeticException",             "ClassCastException",
+            "NoSuchElementException",          "NumberFormatException",
+            "UnsupportedOperationException",   "UninitializedPropertyAccessException",
+            "ConcurrentModificationException", "NoWhenBranchMatchedException",
+            "NegativeArraySizeException",
+        };
+        if (std.mem.eql(u8, name, "RuntimeException") and matchesAny(tail, &runtime_exc)) return true;
+        if (std.mem.eql(u8, name, "IndexOutOfBoundsException") and
+            matchesAny(tail, &.{ "ArrayIndexOutOfBoundsException", "StringIndexOutOfBoundsException" })) return true;
+        return false;
+    }
+
     /// Runtime `is` check against a simple type name.
     pub fn isRuntimeType(self: Value, name: []const u8) bool {
         return switch (self) {
@@ -1764,11 +1798,7 @@ pub const Value = union(enum) {
             .Exception => |e| blk: {
                 const g = e.fqn.borrow();
                 defer g.deinit();
-                const fqn = g.get().bytes;
-                const tail = lastSegment(fqn);
-                break :blk std.mem.eql(u8, tail, name) or
-                    matchesAny(name, &.{ "Throwable", "Exception", "Any" }) or
-                    std.mem.eql(u8, fqn, name);
+                break :blk builtinThrowableIsA(g.get().bytes, name);
             },
             .Class, .BoundInnerClass => matchesAny(name, &.{ "KClass", "kotlin.reflect.KClass", "Any" }),
             .Instance => |i| blk: {
@@ -1907,6 +1937,16 @@ pub const Value = union(enum) {
     pub fn referenceEq(a: *const Value, b: *const Value) bool {
         switch (a.*) {
             .Instance => |x| return b.* == .Instance and ObjRef(InstanceData).ptrEq(x, b.Instance),
+            .Exception => |x| {
+                if (b.* != .Exception) return false;
+                // A throwable built through a constructor carries a fresh
+                // identity, so `===` is true only between the same object.
+                // Exceptions built outside that path (identity 0) fall back to
+                // structural equality so test-only throwables still compare.
+                if (x.identity != 0 and x.identity == b.Exception.identity) return true;
+                if (x.identity != 0 or b.Exception.identity != 0) return false;
+                return structuralEq(a, b);
+            },
             .Cell => |x| if (b.* == .Cell) return ObjRef(Value).ptrEq(x, b.Cell),
             .List => |x| if (b.* == .List) return ValueList.ptrEq(x.items, b.List.items),
             .Set => |x| if (b.* == .Set) return ValueList.ptrEq(x.items, b.Set.items),
@@ -2212,6 +2252,14 @@ fn matchesAny(name: []const u8, candidates: []const []const u8) bool {
         if (std.mem.eql(u8, name, c)) return true;
     }
     return false;
+}
+
+fn throwableIsErrorSide(tail: []const u8) bool {
+    return matchesAny(tail, &.{
+        "Error",            "AssertionError",
+        "NotImplementedError", "OutOfMemoryError",
+        "StackOverflowError",  "FileFailedToInitializeException",
+    });
 }
 
 fn simpleNameMatchesIterator(name: []const u8, simple: []const u8) bool {
