@@ -5877,6 +5877,51 @@ pub fn array_min(ctx: *CallCtx) Error!EvalResult {
     return arrayMaxMinImpl(ctx, false, "Array.min");
 }
 
+/// `minWith`/`maxWith`(`OrNull`) over any iterable: fold by the Comparator
+/// argument (args[1]) rather than natural order.
+fn minMaxWithImpl(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len < 2) return arityErr(try fmt(a, "{s} expects (comparator)", .{what}));
+    // `iterableItemsCtx` drains a `.Sequence` receiver via the host (the plain
+    // `iterableItems` only snapshots eager collections).
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    if (items.len == 0) {
+        if (or_null) return ok(Value.Null);
+        const msg = try fmt(a, "{s}: empty", .{what});
+        const e = try thrown(a, "kotlin.NoSuchElementException", msg);
+        if (runtime.freeScratch()) a.free(msg);
+        return e;
+    }
+    const comparator = ctx.args[1];
+    var best = items[0];
+    for (items[1..]) |v| {
+        const n = switch (try invokeComparatorCompare(ctx, comparator, v, best)) {
+            .n => |x| x,
+            .err => |e| return e,
+        };
+        const take = if (want_max) n > 0 else n < 0;
+        if (take) best = v;
+    }
+    return ok(best);
+}
+
+pub fn coll_min_with(ctx: *CallCtx) Error!EvalResult {
+    return minMaxWithImpl(ctx, false, false, "minWith");
+}
+pub fn coll_max_with(ctx: *CallCtx) Error!EvalResult {
+    return minMaxWithImpl(ctx, true, false, "maxWith");
+}
+pub fn coll_min_with_or_null(ctx: *CallCtx) Error!EvalResult {
+    return minMaxWithImpl(ctx, false, true, "minWithOrNull");
+}
+pub fn coll_max_with_or_null(ctx: *CallCtx) Error!EvalResult {
+    return minMaxWithImpl(ctx, true, true, "maxWithOrNull");
+}
+
 // =====================================================================
 // Public re-exports for the interpreter's higher-order ops
 // =====================================================================
