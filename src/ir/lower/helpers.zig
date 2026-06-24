@@ -166,13 +166,14 @@ fn coerceNumericLiteralArg(b: *FuncBuilder, e: *const Expr, type_name: []const u
     var int_val: ?i64 = null;
     var flt_val: ?f64 = null;
     switch (e.*) {
-        .IntLit => |l| {
-            if (l.kind == .Int) int_val = l.value;
-        },
+        // An integer literal of any integer kind (`5`, `5u`, `5L`) can re-type
+        // to a different numeric primitive parameter; the parsed value carries
+        // the magnitude regardless of suffix.
+        .IntLit => |l| int_val = l.value,
         .FloatLit => |l| flt_val = l.value,
         .Unary => |u| if (u.op == .Neg) switch (u.expr.*) {
             .IntLit => |l| {
-                if (l.kind == .Int) int_val = -l.value;
+                if (l.kind == .Int or l.kind == .Long) int_val = -l.value;
             },
             .FloatLit => |l| flt_val = -l.value,
             else => {},
@@ -186,6 +187,11 @@ fn coerceNumericLiteralArg(b: *FuncBuilder, e: *const Expr, type_name: []const u
         if (eq(u8, type_name, "Long")) return try b.emitConst(.{ .Long = iv });
         if (eq(u8, type_name, "Float")) return try b.emitConst(.{ .Float = @floatFromInt(iv) });
         if (eq(u8, type_name, "Double")) return try b.emitConst(.{ .Double = @floatFromInt(iv) });
+        const uv: u64 = @bitCast(iv);
+        if (eq(u8, type_name, "UByte")) return try b.emitConst(.{ .UByte = @truncate(uv) });
+        if (eq(u8, type_name, "UShort")) return try b.emitConst(.{ .UShort = @truncate(uv) });
+        if (eq(u8, type_name, "UInt")) return try b.emitConst(.{ .UInt = @truncate(uv) });
+        if (eq(u8, type_name, "ULong")) return try b.emitConst(.{ .ULong = uv });
     } else if (flt_val) |fv| {
         if (eq(u8, type_name, "Float")) return try b.emitConst(.{ .Float = @floatCast(fv) });
         if (eq(u8, type_name, "Double")) return try b.emitConst(.{ .Double = fv });
