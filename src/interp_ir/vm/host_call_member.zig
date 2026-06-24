@@ -3174,6 +3174,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
 fn isBuiltinScalar(v: *const Value) bool {
     return switch (v.*) {
         .String, .Int, .Long, .Short, .Byte, .Double, .Float, .Bool, .Char => true,
+        .UInt, .ULong, .UShort, .UByte => true,
         else => false,
     };
 }
