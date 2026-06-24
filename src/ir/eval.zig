@@ -3218,11 +3218,6 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // when that is empty — the enclosing function's `this` *parameter*.
     const direct_this: ?Value = if (cmg.recv) |r| frame.read(r) else null;
     const this_val = if (direct_this) |dt| dt else implicitThisValue(frame, cmg.this_idx, true);
-    if (std.mem.eql(u8, name_str, "isFinite")) {
-        std.debug.print("KLIOPROBE3 CMG isFinite fn={s} this_idx={d} recv_set={} this_ty={s} hasMember={}\n", .{
-            frame.func.fqn, cmg.this_idx, cmg.recv != null, this_val.typeFqn(), host.hostHasMember(&this_val, "isFinite"),
-        });
-    }
     // A bare callee whose name starts uppercase is a constructor / type,
     // never an instance member.
     const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]);

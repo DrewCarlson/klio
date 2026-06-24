@@ -402,9 +402,13 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     if ((std.mem.eql(u8, nm, "Double") or std.mem.eql(u8, nm, "Float")) and std.mem.eql(u8, v_ty, "Int")) return 30;
     if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
 
-    // A callable argument against a function-typed parameter.
+    // A callable argument against a function-typed parameter. A `::name`
+    // member reference loads as a `.Function`; a constructor reference loads
+    // as a `.Class`. Both must score by arity against a `FunctionN` param.
     const arg_arity: ?usize = switch (arg.*) {
         .IrClosure => |c| if (self.closures.get(c.id)) |info| info.n_params else null,
+        .Function => |f| f.decl.params.len,
+        .Class => 0,
         else => null,
     };
     // A bound callable reference (`recv::method`, `Enum::values`) is a
