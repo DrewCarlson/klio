@@ -1302,6 +1302,37 @@ pub fn num_coerce_in(ctx: *CallCtx) Allocator.Error!EvalResult {
         };
         return wrapRes(try numExtreme(ctx.allocator, &.{ lo, .{ .Long = r.end } }, true, "coerceIn"));
     }
+    // A floating-point range (`ClosedFloatingPointRange`, a runtime instance)
+    // clamps via IEEE `<=` so NaN and signed zero behave as Kotlin specifies:
+    // the value is returned unchanged when neither comparison holds (NaN), and
+    // an empty range (`!(start <= end)`) throws.
+    // `ClosedFloatingPointRange` (ClosedDoubleRange / ClosedFloatRange) backs
+    // its bounds with `_start` / `_endInclusive` fields. Clamp via IEEE `<=` so
+    // NaN and signed zero behave as Kotlin specifies: the value is returned
+    // unchanged when neither comparison holds (NaN), and an empty range
+    // (`!(start <= end)`) throws.
+    if (rest.len == 1 and rest[0] == .Instance) {
+        var start_v: Value = undefined;
+        var end_v: Value = undefined;
+        {
+            const g = rest[0].Instance.borrow();
+            defer g.deinit();
+            start_v = g.get().get("_start") orelse return .{ .err = .{ .Type = "coerceIn requires (min, max) or a range" } };
+            end_v = g.get().get("_endInclusive") orelse return .{ .err = .{ .Type = "coerceIn requires (min, max) or a range" } };
+        }
+        const sf = start_v.asF64() orelse return .{ .err = .{ .Type = "coerceIn: non-numeric range bound" } };
+        const ef = end_v.asF64() orelse return .{ .err = .{ .Type = "coerceIn: non-numeric range bound" } };
+        const vf = recv.asF64() orelse return .{ .err = .{ .Type = "coerceIn: non-numeric receiver" } };
+        if (!(sf <= ef)) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "Cannot coerce value to an empty range: {d}..{d}.", .{ sf, ef });
+            const e = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+            if (runtime.freeScratch()) ctx.allocator.free(msg);
+            return .{ .err = .{ .Thrown = e } };
+        }
+        if (vf <= sf and !(sf <= vf)) return ok(start_v);
+        if (ef <= vf and !(vf <= ef)) return ok(end_v);
+        return ok(recv);
+    }
     if (rest.len == 2) {
         // A null bound is unconstrained (`coerceIn(min: T?, max: T?)`); both
         // present with min > max is an empty range.

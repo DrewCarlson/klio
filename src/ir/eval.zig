@@ -2356,6 +2356,22 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     return .cont;
                 }
             }
+            // Floating-point `..` / `..<` builds a `ClosedFloatingPointRange`
+            // (resp. `OpenEndRange`) through the stdlib `Double.rangeTo` /
+            // `Float.rangeTo` operator; the i64-backed `Range` value cannot
+            // represent a floating-point range, so route to the member.
+            if ((bo.op == .RangeTo or bo.op == .RangeUntil) and
+                (l == .Double or l == .Float or r == .Double or r == .Float))
+            {
+                const method = if (bo.op == .RangeUntil) "rangeUntil" else "rangeTo";
+                switch (try host.callMember(allocator, &l, method, &.{r})) {
+                    .ok => |rv| {
+                        try frame.write(bo.dst, rv);
+                        return .cont;
+                    },
+                    .err => |e| return raiseStep(frame, e),
+                }
+            }
             switch (try applyBinop(allocator, bo.op, &l, &r)) {
                 .ok => |out| try frame.write(bo.dst, out),
                 .err => |e| return raiseStep(frame, e),
