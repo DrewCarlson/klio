@@ -91,15 +91,17 @@ pub fn normalizeProgressionEnd(start: i64, end: i64, step: i64) i64 {
         return end;
     }
     if (step > 0) {
+        // Kotlin getProgressionLastElement: `start >= end` yields `end` (an
+        // empty/one-element progression keeps the closed-range bound as `last`).
         if (start > end) {
-            return start - 1;
+            return end;
         }
         const diff = end - start;
         const rem = @rem(diff, step);
         return end - rem;
     } else {
         if (start < end) {
-            return start + 1;
+            return end;
         }
         const diff = start - end;
         const mag = -step;
@@ -210,6 +212,9 @@ fn throwNoSuchElement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 /// `IntProgression.first()` / `last()` (the iterable extensions, not the
 /// `start`/`endInclusive` bound properties) throw on an empty progression.
+/// The `Iterable.first()`/`last()` *functions* (a call): throw on an empty
+/// range. The `Progression.first`/`.last` property *reads* (non-throwing) are
+/// served ahead of this in the field-access path.
 pub fn range_first(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "first") orelse return typeErr("first requires a Range receiver");
     if (rangeViewEmpty(view)) return throwNoSuchElement(ctx);
@@ -236,7 +241,13 @@ pub fn range_end_inclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn range_step_field(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "step") orelse return typeErr("step requires a Range receiver");
-    return ok(rangeEndpoint(view.kind, intAbs(view.step)));
+    // A progression's `step` is always `Int` (Int/Char/UInt progressions) or
+    // `Long` (Long/ULong progressions) — never the element type — and keeps its
+    // sign (negative for a `downTo`).
+    return ok(switch (view.kind) {
+        .Long, .ULong => Value{ .Long = view.step },
+        .Int, .Char, .UInt => Value.newInt(view.step),
+    });
 }
 
 fn rangeKindMax(kind: RangeKind) i64 {
