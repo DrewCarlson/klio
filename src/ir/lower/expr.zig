@@ -1884,6 +1884,39 @@ fn ctorArgFnArities(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, a
     return out;
 }
 
+/// When an unnamed trailing lambda binds a constructor's function-typed
+/// parameter that sits *after* one or more defaulted parameters (`Op("d") {…}`
+/// for `Op(d: String, flag: Boolean = true, f: C.() -> Unit)`), positional
+/// binding would put the lambda in the defaulted slot. Returns an arg-name
+/// vector that names the trailing lambda with the function parameter so the
+/// named-arg constructor path realigns it (the gap params take their defaults).
+/// Null when no realignment is needed.
+fn ctorRealignedArgNames(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!?[]?[]const u8 {
+    if (args.len == 0 or !allNull(arg_names)) return null;
+    if (!(args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun)) return null;
+    if (class_id.int() >= b.module.classes.items.len) return null;
+    const params = b.module.classes.items[class_id.int()].primary_params;
+    if (args.len > params.len) return null;
+    var fn_idx: ?usize = null;
+    var pi = params.len;
+    while (pi > 0) : (pi -= 1) {
+        if (fnTypeArityAlias(b, params[pi - 1].ty) != null) {
+            fn_idx = pi - 1;
+            break;
+        }
+    }
+    const fi = fn_idx orelse return null;
+    const lead = args.len - 1; // positional args preceding the trailing lambda
+    if (fi <= lead) return null; // the lambda already aligns with (or past) the fn param
+    // Every skipped parameter must be defaultable.
+    var k = lead;
+    while (k < fi) : (k += 1) if (!params[k].has_default and params[k].default == null) return null;
+    const out = try b.allocator.alloc(?[]const u8, args.len);
+    for (out) |*o| o.* = null;
+    out[args.len - 1] = params[fi].name;
+    return out;
+}
+
 fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const pf = expr.Postfix;
     const inner = pf.expr;
@@ -2848,7 +2881,9 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
             defer if (ctor_arity) |ca| b.allocator.free(ca);
             const run = try lowerArgRunFull(b, args, ctor_arity, null);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const realigned = try ctorRealignedArgNames(b, class_id, args, ast_arg_names);
+            defer if (realigned) |r| b.allocator.free(r);
+            const arg_names = try internArgNames(b.allocator, b.module, realigned orelse ast_arg_names);
             const dst = b.allocReg();
             if (shadowed_by_class) {
                 // A bare `Inner()` uses the enclosing `this` as the new
