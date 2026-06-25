@@ -3120,6 +3120,20 @@ fn inlineTargetForBareCall(
         },
         .deferred => narrowed,
     };
+    // An inline overload whose last parameter is a function type does not
+    // apply when its matching argument is an object instance — e.g. a
+    // `FlowCollector` passed to `Flow.collect`, where the real target is the
+    // member `collect(collector)`, not the inline `collect(action: (T) -> Unit)`
+    // extension. Splicing it would bind the object to the function parameter and
+    // invoke it as `obj.invoke(...)`. Decline the splice so the member wins.
+    if (pick) |pf| {
+        const inline_takes_fn = pf.params.len != 0 and pf.params[pf.params.len - 1].ty.function != null;
+        if (inline_takes_fn and lastArgIsObjectNotFunction(b, args) and
+            b.resolve(nm) == null and b.hasOwnMember(nm))
+        {
+            return null;
+        }
+    }
     inlineResolveAudit(b, nm, seg.span.file, narrowed, pick, args, shape.last_is_lambda, ires);
     return pick;
 }
@@ -3135,6 +3149,23 @@ fn inlineTargetForBareCall(
 /// receiver, or inside a class method the enclosing class itself — and
 /// matching is subtype-aware: an extension declared on a base class
 /// accepts a subclass receiver.
+/// Whether the last argument is definitely an object instance, not a
+/// function value: an `object : Foo {}` expression, or a local bound to
+/// one. Such an argument cannot satisfy a function-typed parameter, so an
+/// inline overload that wants a lambda there is the wrong target.
+fn lastArgIsObjectNotFunction(b: *FuncBuilder, args: []const Expr) bool {
+    if (args.len == 0) return false;
+    switch (args[args.len - 1]) {
+        .ObjectExpr => return true,
+        .Path => |p| {
+            if (p.segments.len != 1) return false;
+            if (b.localInitExpr(p.segments[0].name)) |e| return e.* == .ObjectExpr;
+            return false;
+        },
+        else => return false,
+    }
+}
+
 fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function, args: []const Expr) bool {
     const has_reified = anyReified(f.type_params);
     const want = args.len;
