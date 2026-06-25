@@ -2515,6 +2515,23 @@ fn lowerCallWithWritebackPath(
                 .type_args = type_args,
                 .exact = false,
             } });
+        } else if (b.resolve(segments[0].name) == null and
+            b.hasOwnMember(segments[0].name) and b.resolve("this") != null)
+        {
+            // A member of the enclosing class — e.g. an inherited inline fn
+            // (`forEachSlotLocked`) whose trailing lambda mutates a captured
+            // local, routing the call through this writeback path — dispatches
+            // on `this`. The index never resolves members (`bound_id` is null),
+            // so without this it falls to an unresolved global LoadGlobal.
+            const this_reg = b.resolve("this").?;
+            try b.push(.{ .CallMember = .{
+                .dst = dst,
+                .receiver = this_reg,
+                .name = try b.module.internConst(b.allocator, .{ .String = segments[0].name }),
+                .args = args_start,
+                .n_args = n_args,
+                .arg_names = arg_names,
+            } });
         } else {
             const callee_r = blk: {
                 if (b.resolve(segments[0].name) != null) {
