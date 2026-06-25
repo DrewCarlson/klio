@@ -571,6 +571,7 @@ const RegistryImage = struct {
     func_type_params: []KV(FuncId, []const []const u8),
     func_type_param_bounds: []KV(FuncId, []const ir.ModuleRegistry.TypeParamBound),
     top_level_delegated_props: []const []const u8,
+    top_level_prop_getters: []KV([]const u8, FuncId),
     hierarchy_methods: []KV([]const u8, []const []const u8),
     class_member_names: []const []const u8,
     class_super_names: []KV([]const u8, []const []const u8),
@@ -1197,6 +1198,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
         },
         .func_type_param_bounds = try autoMapToSlice(FuncId, []const ir.ModuleRegistry.TypeParamBound, a, &r.func_type_param_bounds),
         .top_level_delegated_props = try setToSlice(a, &r.top_level_delegated_props),
+        .top_level_prop_getters = try strMapToSlice(FuncId, a, &r.top_level_prop_getters),
         .hierarchy_methods = blk: {
             var list = try a.alloc(KV([]const u8, []const []const u8), r.hierarchy_methods.count());
             var it = r.hierarchy_methods.iterator();
@@ -1875,6 +1877,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     }
     for (ri.func_type_param_bounds) |kv| try r.func_type_param_bounds.put(kv.k, kv.v);
     for (ri.top_level_delegated_props) |k| try r.top_level_delegated_props.put(k, {});
+    for (ri.top_level_prop_getters) |kv| try r.top_level_prop_getters.put(kv.k, kv.v);
     for (ri.hierarchy_methods) |kv| {
         try r.hierarchy_methods.put(kv.k, try sliceToSet(a, kv.v));
     }
