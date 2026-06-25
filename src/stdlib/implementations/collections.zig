@@ -85,6 +85,37 @@ fn makeStringOwned(a: Allocator, s: []const u8) Error!Value {
 }
 
 /// `make_list(items, mutable)` — wrap a slice of values into a `List`.
+/// A fresh structural-modification counter for a mutable list (so its
+/// iterators can fail-fast), or null for a read-only list.
+fn modCountFor(a: Allocator, mutable: bool) Error!?ObjRef(u64) {
+    if (!mutable) return null;
+    return try ObjRef(u64).init(a, 0);
+}
+
+/// `list.items.len`, or 0 for a non-list — for the structural-bump diff.
+fn listLenOf(v: *const Value) usize {
+    return if (v.* == .List) listLen(v.List.items) else 0;
+}
+
+/// Increment a list's `mod_count` (no-op when absent). Use directly for a
+/// structural op that does not change length (`trimToSize`/`ensureCapacity`).
+pub fn bumpModCount(v: *const Value) void {
+    if (v.* != .List) return;
+    if (v.List.mod_count) |mc| {
+        const g = mc.borrowMut();
+        defer g.deinit();
+        g.get().* +%= 1;
+    }
+}
+
+/// `defer structuralBump(&ctx.args[0], before)`: bump `mod_count` only when the
+/// length actually changed, so `remove(absent)` / `removeAll([])` / `retainAll`
+/// of an unchanged list register no modification (matching Kotlin's contract).
+fn structuralBump(v: *const Value, before: usize) void {
+    if (v.* != .List) return;
+    if (listLenOf(v) != before) bumpModCount(v);
+}
+
 fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(a, items);
@@ -96,6 +127,7 @@ fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
         .mutable = mutable,
         .enum_entries = false,
         .backing = null,
+        .mod_count = try modCountFor(a, mutable),
     } };
 }
 
@@ -106,6 +138,7 @@ fn makeListFromArrayList(a: Allocator, list: std.ArrayList(Value), mutable: bool
         .mutable = mutable,
         .enum_entries = false,
         .backing = null,
+        .mod_count = try modCountFor(a, mutable),
     } };
 }
 
@@ -2488,6 +2521,8 @@ pub fn coll_list_to_string(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (try readOnlyMutationGuard(a, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const it = switch (try recvListItems(a, ctx.args, "MutableList.add")) {
         .items => |x| x,
         .err => |e| return e,
@@ -2522,6 +2557,8 @@ pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_add_first(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.addFirst")) {
         .items => |x| x,
@@ -2536,6 +2573,8 @@ pub fn coll_mut_list_add_first(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_remove_first(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeFirst")) {
         .items => |x| x,
@@ -2550,6 +2589,8 @@ pub fn coll_mut_list_remove_first(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_remove_last(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeLast")) {
         .items => |x| x,
@@ -2562,6 +2603,8 @@ pub fn coll_mut_list_remove_last(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeAt")) {
         .items => |x| x,
@@ -2582,6 +2625,8 @@ pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.clear")) {
         .items => |x| x,
@@ -2598,7 +2643,10 @@ pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 pub fn coll_array_list_capacity_noop(ctx: *CallCtx) Error!EvalResult {
-    _ = ctx;
+    // `ArrayList.trimToSize()` / `ensureCapacity(n)` are capacity-only no-ops
+    // here (no backing-array capacity is tracked), but Java registers them as
+    // structural modifications, so a concurrent iterator must still fail-fast.
+    if (ctx.args.len > 0) bumpModCount(&ctx.args[0]);
     return ok(Value.Unit);
 }
 
@@ -4934,6 +4982,8 @@ pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.addAll")) {
         .items => |x| x,
@@ -4968,6 +5018,8 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.remove")) {
         .items => |x| x,
@@ -4993,6 +5045,8 @@ pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_remove_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.removeAll")) {
         .items => |x| x,
@@ -5002,6 +5056,8 @@ pub fn coll_mut_list_remove_all(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_retain_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.retainAll")) {
         .items => |x| x,

@@ -1105,6 +1105,13 @@ pub const Value = union(enum) {
         /// outlive every value. Dispatch reads it to type an empty list;
         /// `null` everywhere the creation site carried no annotation.
         declared_elem: ?[]const u8 = null,
+        /// Structural-modification counter for fail-fast iteration. Allocated
+        /// when a mutable list is created; shared (by ObjRef handle) across
+        /// every value-copy of the list and the iterators it spawns. A
+        /// structural mutation (add/remove/clear/…) bumps it; an iterator
+        /// captures it and throws `ConcurrentModificationException` when it
+        /// changes underneath. Null for read-only lists / views.
+        mod_count: ?ObjRef(u64) = null,
     },
     /// `kotlin.Array<T>` and primitive-array siblings.
     Array: ArrayData,
@@ -1164,6 +1171,13 @@ pub const Value = union(enum) {
         items: ValueList,
         pos: ObjRef(usize),
         prim: ?PrimitiveArrayKind,
+        /// The source collection's `mod_count` (shared handle) and the value
+        /// this iterator captured at creation. `next`/`hasNext` throw
+        /// `ConcurrentModificationException` when they differ; the iterator's
+        /// own `add`/`remove` resync `exp_mod`. Both null when the source had
+        /// no `mod_count`.
+        mod_count: ?ObjRef(u64) = null,
+        exp_mod: ?ObjRef(u64) = null,
     },
     /// Lazy O(1)-memory iterator over a `Range`/progression.
     RangeIter: struct {
@@ -1244,6 +1258,7 @@ pub const Value = union(enum) {
             .List => |x| {
                 visitor.visit(x.items);
                 if (x.backing) |b| visitor.visit(MapBackingRef{ .cell = b });
+                if (x.mod_count) |mc| visitor.visit(mc);
             },
             .Set => |x| {
                 visitor.visit(x.items);
@@ -1257,6 +1272,8 @@ pub const Value = union(enum) {
             .Iterator => |x| {
                 visitor.visit(x.items);
                 visitor.visit(x.pos);
+                if (x.mod_count) |mc| visitor.visit(mc);
+                if (x.exp_mod) |em| visitor.visit(em);
             },
             .RangeIter => |x| visitor.visit(x.cur),
             .PropertyRef => |p| visitor.visit(p.name),
@@ -1376,6 +1393,7 @@ pub const Value = union(enum) {
                 // Drop the view's owned `MapBacking` cell (the borrowed entries
                 // it points at are owned by the source map, not released here).
                 if (x.backing) |b| (MapBackingRef{ .cell = b }).deinit();
+                if (x.mod_count) |mc| mc.deinit();
             },
             .Set => |x| {
                 releaseValueList(x.items, allocator);
@@ -1400,6 +1418,8 @@ pub const Value = union(enum) {
             .Iterator => |x| {
                 releaseValueList(x.items, allocator);
                 x.pos.deinit();
+                if (x.mod_count) |mc| mc.deinit();
+                if (x.exp_mod) |em| em.deinit();
             },
             .RangeIter => |x| x.cur.deinit(),
             .PropertyRef => |p| p.name.deinit(),

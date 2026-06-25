@@ -50,14 +50,19 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .mutable = true,
         .enum_entries = false,
         .backing = null,
+        // The builder is a live `MutableList` the block iterates + mutates;
+        // give it a structural counter so a concurrent iterator fails-fast.
+        .mod_count = try ObjRef(u64).init(ctx.allocator, 0),
     } };
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
         if (r == .err) {
             buildable.List.items.deinit();
+            if (buildable.List.mod_count) |mc| mc.deinit();
             return r;
         }
     }
+    if (buildable.List.mod_count) |mc| mc.deinit();
     return ok(.{ .List = .{
         .items = buildable.List.items,
         .mutable = false,
