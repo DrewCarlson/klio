@@ -34,6 +34,32 @@
   outputs, byte-identical across image/direct load modes; `docs/packs/shipped/
   compose-runtime.md`; `examples/README.md` entries.
 
+### Extended runtime (post-core) — done
+
+- **Observable collections** — `SnapshotStateList`/`Map`/`Set` (+ `mutableStateListOf`/
+  `MapOf`/`SetOf`/`toMutableStateList`): reads via `notifyRead`, mutations via
+  `notifyWrite`, so changing one recomposes readers. (Implemented over a plain
+  backing collection, not `AbstractMutableList` — see the follow-up below.)
+- **`derivedStateOf` + `rememberUpdatedState`** — derived caches a value computed
+  from tracked state deps, recomputed + propagated on a dependency change.
+- **Primitive state** — `mutableIntStateOf`/`Long`/`Float`/`Double` (+ interfaces).
+- **Coroutine effects** — `rememberCoroutineScope`, `LaunchedEffect`, `produceState`.
+  klio runs launched coroutines eagerly to completion, so these are exact for
+  **finite** effects; long-running/hot effects await the async recomposer.
+- **`key{}`** — reorder-stable list-item identity via a movable group keyed by the
+  joined keys (verified: remembered state follows the id across a reorder).
+- **`@Stable`/`@Immutable`/`@StableMarker`** markers; **`RememberObserver`**
+  (onRemembered on first remember, onForgotten on composition dispose).
+
+### Genuinely blocked by klio's eager-coroutine model (need a real event loop)
+
+`snapshotFlow` / `Flow|State.collectAsState` on a never-completing source, the async
+`Recomposer.runRecomposeAndApplyChanges` frame-clock loop, and long-running
+`LaunchedEffect`s would collect/loop forever under eager execution. Driving them
+needs a cooperative frame dispatcher; deferred. The synchronous `recompose()` model
+is complete and covers compose semantics (selective recomposition, skipping,
+arg-change, locals, effects, derived, collections, key).
+
 **FOLLOW-UP — AbstractMutableList bug (revisit when fixed):** klio's stdlib
 `AbstractMutableList` currently throws `BinOp.Less on 0 and null` (a `modCount`
 read returns null) when subclassed, so `SnapshotStateList`/`Set`/`Map` are
