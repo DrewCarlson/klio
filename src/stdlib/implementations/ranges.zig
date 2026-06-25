@@ -454,14 +454,15 @@ test "normalize progression end clamps to last reachable element" {
     try testing.expectEqual(@as(i64, 10), normalizeProgressionEnd(1, 10, 3, .Int));
     // exact multiple stays put.
     try testing.expectEqual(@as(i64, 9), normalizeProgressionEnd(1, 9, 2, .Int));
-    // empty forward range collapses to start-1.
-    try testing.expectEqual(@as(i64, 4), normalizeProgressionEnd(5, 1, 2, .Int));
+    // empty forward range keeps the closed-range bound (Kotlin
+    // getProgressionLastElement: start >= end yields end).
+    try testing.expectEqual(@as(i64, 1), normalizeProgressionEnd(5, 1, 2, .Int));
     // step == 0 returns end unchanged.
     try testing.expectEqual(@as(i64, 10), normalizeProgressionEnd(1, 10, 0, .Int));
     // 10 downTo 1 step 2 -> 10,8,6,4,2 -> 2.
     try testing.expectEqual(@as(i64, 2), normalizeProgressionEnd(10, 1, -2, .Int));
-    // empty backward range collapses to start+1.
-    try testing.expectEqual(@as(i64, 2), normalizeProgressionEnd(1, 5, -2, .Int));
+    // empty backward range keeps the closed-range bound (start <= end yields end).
+    try testing.expectEqual(@as(i64, 5), normalizeProgressionEnd(1, 5, -2, .Int));
 }
 
 test "downTo builds a descending range" {
@@ -548,12 +549,13 @@ test "first and last read range endpoints" {
     try testing.expectEqual(@as(i32, 7), l.ok.Int);
 }
 
-test "step field returns the absolute step" {
+test "step field returns the signed step" {
+    // `10 downTo 1 step 2` -> IntProgression.step is -2 (Kotlin keeps the sign).
     const range = Value{ .Range = .{ .start = 10, .end = 1, .step = -2, .kind = .Int } };
     const args = [_]Value{range};
     var ctx = noopCtx(&args);
     const s = try range_step_field(&ctx);
-    try testing.expectEqual(@as(i32, 2), s.ok.Int);
+    try testing.expectEqual(@as(i32, -2), s.ok.Int);
 }
 
 test "char range endpoints reinterpret as code units" {
