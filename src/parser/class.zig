@@ -163,7 +163,9 @@ fn skipNlIfHeaderContinues(p: *Parser) void {
                 std.mem.eql(u8, t, "public") or
                 std.mem.eql(u8, t, "private") or
                 std.mem.eql(u8, t, "protected") or
-                std.mem.eql(u8, t, "internal");
+                std.mem.eql(u8, t, "internal") or
+                std.mem.eql(u8, t, "actual") or
+                std.mem.eql(u8, t, "expect");
         },
         else => false,
     };

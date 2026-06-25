@@ -192,7 +192,7 @@ pub const setLowerSelfPackage = build.setLowerSelfPackage;
 /// `name` is one of them must dispatch as CallMemberOrValue with a
 /// `LoadGlobal(name)` fallback (the receiver's member wins if present,
 /// else the captured callable is invoked with the receiver bound).
-var lower_anon_captures: ?StringSet = null;
+threadlocal var lower_anon_captures: ?StringSet = null;
 
 /// Install / clear the set of capture names used while lowering an
 /// anonymous-object's method bodies. `null` clears it. Takes ownership of

@@ -3663,6 +3663,36 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     const index_pick = index_res.pick();
     resolveAudit(b, name0, segments[0].span.file, want, last_arg_lambda, bare_func_id, rung, index_res, shadowed_by_class, prefer_member);
 
+    // A known stdlib host-intrinsic global (alias) (`min`, `max`, …) whose simple
+    // name also has a user overload that does NOT apply to this call (e.g.
+    // `min(Int, Int)` against the unsigned `min(UInt, UInt)` in UMath): the
+    // overload resolution above found no applicable user candidate
+    // (`bare_func_id == null`), but the name still resolves to the intrinsic
+    // global. Bind it directly. Without this, an enclosing receiver context
+    // would fall through to a `this.<name>` redispatch that invokes the
+    // receiver itself, since no class declares the name as a member.
+    if (bare_func_id == null and !shadowed_by_class and inReceiverContext(b) and
+        isAliasName(name0) and !b.module.registry.class_member_names.contains(name0) and
+        b.resolve(name0) == null and !b.knowsOuter(name0))
+    {
+        orEmitAudit(b, "alias_global_no_overload", "LoadGlobal", name0);
+        const callee_r = b.allocReg();
+        const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+        try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
+        const run = try lowerArgRun(b, args);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+        const dst = b.allocReg();
+        try b.push(.{ .CallValue = .{
+            .dst = dst,
+            .callee = callee_r,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+            .type_args = type_args,
+        } });
+        return dst;
+    }
     if (bare_func_id) |func_id| {
         if (!shadowed_by_class) {
             // The call binds a bare top-level function. If the index saw
