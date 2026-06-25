@@ -95,6 +95,8 @@ internal class KlioComposition(private val parent: Recomposer) : Composition {
                 __compose_popComposer()
             }
         }
+        // SideEffects run after the composition they were queued in completes.
+        composer.runSideEffects()
     }
 
     internal fun recompose() {
@@ -106,6 +108,7 @@ internal class KlioComposition(private val parent: Recomposer) : Composition {
     override fun dispose() {
         if (disposed) return
         disposed = true
+        composer.disposeAll()
         content = null
         writeObserverHandle?.invoke()
         writeObserverHandle = null
