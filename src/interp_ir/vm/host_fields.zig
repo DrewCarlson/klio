@@ -367,20 +367,29 @@ fn freeFieldMiss(allocator: Allocator, e: EvalError) void {
 }
 
 fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool) Allocator.Error!EvalResult {
-    // `Progression.first`/`.last` are constructor-set properties: a *read* (no
-    // parens) returns the stored bound even when the range is empty. The
-    // `Iterable.first()`/`last()` *functions* (a call, dispatched through the
-    // member-call path) still throw NoSuchElementException on an empty range.
-    if (receiver.* == .Range and (std.mem.eql(u8, name, "first") or std.mem.eql(u8, name, "last"))) {
-        const r = receiver.Range;
-        const v: i64 = if (std.mem.eql(u8, name, "first")) r.start else r.end;
-        return ok(switch (r.kind) {
-            .Int => .{ .Int = @truncate(v) },
-            .Long => .{ .Long = v },
-            .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
-            .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(v))) },
-            .ULong => .{ .ULong = @bitCast(v) },
-        });
+    // Progression `first`/`last`/`step` property *reads* (no parens): `first`/
+    // `last` return the stored bound even when empty (the `Iterable.first()`/
+    // `last()` *functions*, dispatched as calls, still throw on empty); `step`
+    // is always Int (Int/Char/UInt) or Long (Long/ULong) with its sign. Applies
+    // to a host `Value.Range` and to a source range `Instance` (e.g.
+    // `ULongRange.EMPTY`, whose `step` field would otherwise read back as Int).
+    if (std.mem.eql(u8, name, "first") or std.mem.eql(u8, name, "last") or std.mem.eql(u8, name, "step")) {
+        if (stdlib.implementations.ranges.asRangeView(receiver)) |view| {
+            if (std.mem.eql(u8, name, "step")) {
+                return ok(switch (view.kind) {
+                    .Long, .ULong => Value{ .Long = view.step },
+                    .Int, .Char, .UInt => Value{ .Int = @truncate(view.step) },
+                });
+            }
+            const v: i64 = if (std.mem.eql(u8, name, "first")) view.start else view.end;
+            return ok(switch (view.kind) {
+                .Int => .{ .Int = @truncate(v) },
+                .Long => .{ .Long = v },
+                .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
+                .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(v))) },
+                .ULong => .{ .ULong = @bitCast(v) },
+            });
+        }
     }
     // Reflective reads on a *bound* member reference (`this::name`):
     // `.name`/`.simpleName` yield the referenced member's name, and
