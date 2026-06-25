@@ -36,6 +36,15 @@ public interface Composer {
      */
     public fun shouldRunGroup(): Boolean
 
+    /** Push a CompositionLocal provider layer for the enclosed content. */
+    public fun startProviders(values: Array<out ProvidedValue<*>>)
+
+    /** Pop the most recent provider layer. */
+    public fun endProviders()
+
+    /** The nearest provided value for [local], or its default. */
+    public fun consume(local: CompositionLocal<*>): Any?
+
     public companion object {
         /** Sentinel for an unwritten slot — distinct from any user value (incl. null). */
         public val Empty: Any = EmptySlot
@@ -76,6 +85,9 @@ internal class KlioComposer : Composer {
     private val invalidated = HashSet<GroupNode>()                  // groups awaiting recompose
     private var runSet: HashSet<GroupNode>? = null                  // null => run everything (initial pass)
 
+    // CompositionLocal provider layers, outermost first.
+    private val localsStack = ArrayList<HashMap<CompositionLocal<*>, Any?>>()
+
     init {
         stack.add(root)
     }
@@ -106,6 +118,7 @@ internal class KlioComposer : Composer {
         stack.clear()
         stack.add(root)
         root.enterPass()
+        localsStack.clear()
     }
 
     fun endCompose() {
@@ -172,6 +185,26 @@ internal class KlioComposer : Composer {
 
     override fun endGroup() {
         if (stack.size > 1) stack.removeAt(stack.size - 1)
+    }
+
+    override fun startProviders(values: Array<out ProvidedValue<*>>) {
+        val layer = HashMap<CompositionLocal<*>, Any?>()
+        for (pv in values) layer[pv.compositionLocal] = pv.value
+        localsStack.add(layer)
+    }
+
+    override fun endProviders() {
+        if (localsStack.isNotEmpty()) localsStack.removeAt(localsStack.size - 1)
+    }
+
+    override fun consume(local: CompositionLocal<*>): Any? {
+        var i = localsStack.size - 1
+        while (i >= 0) {
+            val layer = localsStack[i]
+            if (layer.containsKey(local)) return layer[local]
+            i = i - 1
+        }
+        return local.defaultFactory()
     }
 
     override fun rememberedValue(): Any? {
