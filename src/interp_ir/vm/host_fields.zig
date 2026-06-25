@@ -889,7 +889,12 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // Stdlib property read on a built-in type — `"abc".length`, etc.
     const type_fqn = receiver.typeFqn();
     const probe_is_toplevel_fn = stdlib.isToplevelFunction(name);
-    if (!probe_is_toplevel_fn) {
+    // The binary `kotlin.math.min`/`max` functions are not property
+    // accessors: dispatched with the receiver as their lone argument they
+    // return it unchanged, which would mask the read as the receiver itself
+    // (a bare `min(x, y)` callee in a receiver context is the package
+    // function, not a member of the implicit receiver).
+    if (!probe_is_toplevel_fn and !stdlib.isBinaryMathFunction(name)) {
         const probes = [_][]const u8{
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }),
             try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}),
@@ -2043,6 +2048,52 @@ fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Instance
 // set_field
 // -------------------------------------------------------------------------
 
+/// Whether the receiver instance declares (or already stores) a member
+/// property of this name, anywhere in its class hierarchy. A member
+/// property shadows a same-named extension property
+/// (`EXTENSION_SHADOWED_BY_MEMBER`), so the extension getter/setter must not
+/// fire when the member exists — otherwise `this.value` inside a class that
+/// has both a member `value` and an extension `value` re-enters the
+/// extension accessor and recurses (e.g. coroutines' `WorkaroundAtomicReference`).
+fn instanceDeclaresProperty(self: *VmHost, receiver: *const Value, name: []const u8) bool {
+    if (receiver.* != .Instance) return false;
+    const inst = receiver.Instance;
+    {
+        const g = inst.borrow();
+        defer g.deinit();
+        if (g.get().get(name) != null) return true;
+    }
+    var cur: ?[]const u8 = className(inst);
+    var depth: usize = 0;
+    while (cur) |cn| : (depth += 1) {
+        if (depth > 64) break;
+        var found = false;
+        {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            if (cg.get().get(cn)) |d| {
+                const dg = d.borrow();
+                defer dg.deinit();
+                for (dg.get().primary_params) |p| {
+                    if (p.property != null and std.mem.eql(u8, p.name, name)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) for (dg.get().body_properties) |p| {
+                    if (std.mem.eql(u8, p.name, name)) {
+                        found = true;
+                        break;
+                    }
+                };
+            }
+        }
+        if (found) return true;
+        cur = firstSupertype(self, cn);
+    }
+    return false;
+}
+
 pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {
     // Companion forwarding for writes: `Foo.count = 1` routes to the
     // companion singleton instance's field.
@@ -2069,8 +2120,11 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     }
     const bypass_setter = std.mem.startsWith(u8, name, "__klio_field__");
     const real_name = if (bypass_setter) name["__klio_field__".len..] else name;
-    // Extension-property setter — `var T.x set(value) {…}`.
-    if (!bypass_setter) {
+    // Extension-property setter — `var T.x set(value) {…}`. A member property
+    // of the same name shadows the extension, so skip it when the receiver
+    // declares its own `real_name` (else `this.x = …` recurses through the
+    // extension setter).
+    if (!bypass_setter and !instanceDeclaresProperty(self, receiver, real_name)) {
         // A `var X.Companion.x` setter registers under `X`'s simple name;
         // its `this` is `X`'s companion instance, not the class value.
         const recv_simple: []const u8 = switch (receiver.*) {

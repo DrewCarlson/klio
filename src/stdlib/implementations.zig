@@ -40,6 +40,8 @@ pub const compare_values = collections.compare_values;
 pub const materialise_sequence = collections.materialise_sequence;
 pub const primitive_companion_const = collections.primitive_companion_const;
 pub const concurrent_synchronized = concurrent.concurrent_synchronized;
+pub const concurrent_monitor_enter = concurrent.concurrent_monitor_enter;
+pub const concurrent_monitor_exit = concurrent.concurrent_monitor_exit;
 pub const concurrent_lock_enter = concurrent.concurrent_lock_enter;
 pub const concurrent_lock_try_enter = concurrent.concurrent_lock_try_enter;
 pub const concurrent_lock_exit = concurrent.concurrent_lock_exit;
@@ -86,7 +88,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.collections.buildSet", .f = control.builders_build_set },
     .{ .fqn = "kotlin.collections.buildMap", .f = control.builders_build_map },
     .{ .fqn = "kotlin.text.buildString", .f = control.builders_build_string },
-    .{ .fqn = "kotlin.synchronized", .f = concurrent.concurrent_synchronized },
+    .{ .fqn = "kotlin.__klioMonitorEnter", .f = concurrent.concurrent_monitor_enter },
+    .{ .fqn = "kotlin.__klioMonitorExit", .f = concurrent.concurrent_monitor_exit },
     .{ .fqn = "kotlin.concurrent.thread", .f = concurrent.concurrent_thread },
     .{ .fqn = "kotlin.concurrent.Thread.sleep", .f = concurrent.concurrent_thread_sleep },
     .{ .fqn = "kotlin.concurrent.Thread.currentThread", .f = concurrent.concurrent_thread_current },
@@ -1506,7 +1509,8 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.collections.List.sortedWith", .names = &.{"comparator"} },
     .{ .fqn = "kotlin.collections.MutableList.sortedWith", .names = &.{"comparator"} },
     .{ .fqn = "kotlin.Result.getOrDefault", .names = &.{"defaultValue"} },
-    .{ .fqn = "kotlin.synchronized", .names = &.{"lock", "block"} },
+    .{ .fqn = "kotlin.__klioMonitorEnter", .names = &.{"lock"} },
+    .{ .fqn = "kotlin.__klioMonitorExit", .names = &.{"lock"} },
     .{ .fqn = "kotlin.concurrent.thread", .names = &.{"start", "isDaemon", "contextClassLoader", "name", "priority", "block"} },
     .{ .fqn = "kotlin.concurrent.Thread.sleep", .names = &.{"millis"} },
     // `copyInto(destination, destinationOffset, startIndex, endIndex)` —

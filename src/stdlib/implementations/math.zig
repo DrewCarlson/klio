@@ -114,6 +114,14 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
         // Rust's f64::min/max which return the non-NaN operand.
         const r: f64 = if (std.math.isNan(x) or std.math.isNan(y))
             std.math.nan(f64)
+        else if (x == 0.0 and y == 0.0)
+            // Signed-zero tie (`@min`/`@max` treat -0.0 == 0.0): match
+            // Math.min/max — min yields -0.0 if either is -0.0, max yields
+            // +0.0 unless both are -0.0.
+            (if (want_min)
+                (if (std.math.signbit(x) or std.math.signbit(y)) -@as(f64, 0.0) else 0.0)
+            else
+                (if (std.math.signbit(x) and std.math.signbit(y)) -@as(f64, 0.0) else 0.0))
         else if (want_min)
             @min(x, y)
         else
@@ -183,6 +191,30 @@ pub fn math_max(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 pub fn cmp_extreme(ctx: *CallCtx, want_min: bool, what: []const u8) std.mem.Allocator.Error!EvalResult {
+    // `maxOf(a, b, comparator)` / `maxOf(a, b, c, comparator)` /
+    // `maxOf(a, vararg other, comparator)`: a trailing `Comparator` picks the
+    // extreme of the preceding values by `comparator.compare`, not numerically.
+    // On a tie the first operand wins (Kotlin's `compare(a,b) >= 0 ? a : b`).
+    if (ctx.args.len >= 3 and ctx.args[ctx.args.len - 1] == .Comparator) {
+        const cmp = ctx.args[ctx.args.len - 1];
+        const vals = ctx.args[0 .. ctx.args.len - 1];
+        var acc = vals[0];
+        var i: usize = 1;
+        while (i < vals.len) : (i += 1) {
+            const pair = [_]Value{ acc, vals[i] };
+            const r = if (try ctx.host.invokeMethod(&cmp, "compare", &pair, ctx.out)) |m|
+                m
+            else
+                try ctx.host.invokeCallable(&cmp, &pair, ctx.out);
+            const ord: i64 = switch (r) {
+                .ok => |v| v.asI64() orelse return typeErr(ctx, "{s}: comparator must return Int", .{what}),
+                .err => |e| return .{ .err = e },
+            };
+            const take_new = if (want_min) ord > 0 else ord < 0;
+            if (take_new) acc = vals[i];
+        }
+        return ok(acc);
+    }
     // Instance-aware path: a user receiver implementing Comparable
     // (`operator fun compareTo`) reaches min/max via call_member,
     // falling back to the primitive num_extreme for plain numbers.

@@ -1116,11 +1116,15 @@ pub const Value = union(enum) {
     Exception: struct {
         fqn: StringRef,
         message: ?StringRef,
-        cause: ?ValueBox,
+        /// Stored as a bare nullable cell pointer (`?*ValueBox.Cell`, 8 bytes —
+        /// `?ObjRef` is not null-optimized) and reconstructed as `ValueBox` at
+        /// each use, keeping `Value` pinned at 64. Mirrors `List.backing`.
+        cause: ?*ValueBox.Cell,
         /// The call stack captured when this throwable was first thrown
         /// (`fillInStackTrace`). Null until thrown. Borrows program-lifetime
         /// frame labels; the frame slice is owned by the `StackRef` cell.
-        stack: ?StackRef = null,
+        /// Stored as `?*StackRef.Cell`; reconstructed as `StackRef` at use.
+        stack: ?*StackRef.Cell = null,
         /// Reference identity for `===` / `assertSame`. Assigned fresh at the
         /// throwable construction site (`host.allocInstanceId()`); 0 for
         /// exceptions built outside that path, which then compare structurally.
@@ -1128,8 +1132,9 @@ pub const Value = union(enum) {
         /// Suppressed throwables (`addSuppressed`/`suppressedExceptions`). A
         /// shared list allocated at the constructor site so every value-copy
         /// of the exception observes the same suppressed set; null for
-        /// exceptions built outside that path.
-        suppressed: ?ValueList = null,
+        /// exceptions built outside that path. Stored as `?*ValueList.Cell`;
+        /// reconstructed as `ValueList` at use.
+        suppressed: ?*ValueList.Cell = null,
     },
     /// `kotlin.collections.List` / `MutableList`.
     List: struct {
@@ -1335,9 +1340,9 @@ pub const Value = union(enum) {
             .Exception => |e| {
                 visitor.visit(e.fqn);
                 if (e.message) |m| visitor.visit(m);
-                if (e.cause) |c| visitor.visit(c);
-                if (e.stack) |s| visitor.visit(s);
-                if (e.suppressed) |sl| visitor.visit(sl);
+                if (e.cause) |c| visitor.visit(ValueBox{ .cell = c });
+                if (e.stack) |s| visitor.visit(StackRef{ .cell = s });
+                if (e.suppressed) |sl| visitor.visit(ValueList{ .cell = sl });
             },
             .Pair => |p| {
                 visitor.visit(p.first);
@@ -1485,8 +1490,8 @@ pub const Value = union(enum) {
             .Exception => |e| {
                 e.fqn.deinit();
                 if (e.message) |m| m.deinit();
-                if (e.cause) |c| c.deinit();
-                if (e.suppressed) |sl| sl.deinit();
+                if (e.cause) |c| (ValueBox{ .cell = c }).deinit();
+                if (e.suppressed) |sl| (ValueList{ .cell = sl }).deinit();
             },
             .Pair => |p| {
                 p.first.deinit();

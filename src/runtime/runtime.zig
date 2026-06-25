@@ -106,6 +106,7 @@ pub const strInit = value_mod.strInit;
 pub const strInitOwned = value_mod.strInitOwned;
 pub const strMeta = value_mod.strMeta;
 pub const ValueList = value_mod.ValueList;
+pub const ValueBox = value_mod.ValueBox;
 pub const ValueSlice = value_mod.ValueSlice;
 
 // class
@@ -167,6 +168,8 @@ pub const registerRunBoundaryHook = threads_mod.registerRunBoundaryHook;
 pub const runBoundarySweep = threads_mod.runBoundarySweep;
 pub const setThreadAbandonable = threads_mod.setThreadAbandonable;
 pub const isThreadAbandonable = threads_mod.isThreadAbandonable;
+pub const setWallBlockHook = threads_mod.setWallBlockHook;
+pub const notifyWallBlock = threads_mod.notifyWallBlock;
 pub const requestAbandon = threads_mod.requestAbandon;
 pub const clearAbandon = threads_mod.clearAbandon;
 pub const shouldAbandon = threads_mod.shouldAbandon;

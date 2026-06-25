@@ -94,6 +94,24 @@ pub fn isThreadAbandonable() bool {
     return thread_abandonable;
 }
 
+/// Optional hook the coroutine layer installs to be told the calling thread
+/// is about to block in a real wall sleep (`Thread.sleep`). A dispatched pool
+/// task doing wall work is not advancing the cooperative virtual clock, so the
+/// hook settles its virtual-clock "unsettled" count, letting a top-level
+/// driver advance virtual time without waiting out the wall sleep. `null`
+/// until installed; a no-op for every non-coroutine build.
+var wall_block_hook: ?*const fn () void = null;
+
+pub fn setWallBlockHook(hook: *const fn () void) void {
+    wall_block_hook = hook;
+}
+
+/// Notify the installed hook (if any) that this thread is entering a wall
+/// sleep. Cheap when no hook is installed.
+pub fn notifyWallBlock() void {
+    if (wall_block_hook) |h| h();
+}
+
 /// Ask every abandonable thread to abort its current task.
 pub fn requestAbandon() void {
     abandon_requested.store(true, .release);

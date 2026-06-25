@@ -79,11 +79,11 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
     return ok(.{ .Exception = .{
         .fqn = try runtime.strInit(ctx.allocator, fqn),
         .message = message,
-        .cause = cause,
+        .cause = if (cause) |c| c.cell else null,
         .identity = ctx.host.allocInstanceId(),
         // A shared list so `addSuppressed` on any value-copy is observed by
         // `suppressedExceptions` on every other copy of this throwable.
-        .suppressed = try ValueList.init(ctx.allocator, .empty),
+        .suppressed = (try ValueList.init(ctx.allocator, .empty)).cell,
     } });
 }
 
@@ -180,7 +180,8 @@ pub fn throwable_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// constructor path has no list, so the call is a no-op there.
 pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len >= 2 and ctx.args[0] == .Exception) {
-        if (ctx.args[0].Exception.suppressed) |sl| {
+        if (ctx.args[0].Exception.suppressed) |sl_cell| {
+            const sl = ValueList{ .cell = sl_cell };
             const g = sl.borrowMut();
             defer g.deinit();
             if (runtime.reclaimEnabled()) ctx.args[1].retain();
@@ -194,8 +195,8 @@ pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
 /// the receiver's shared suppressed list (empty when none recorded).
 pub fn throwable_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len >= 1 and ctx.args[0] == .Exception) {
-        if (ctx.args[0].Exception.suppressed) |sl| {
-            return ok(makeList(sl.clone(), false));
+        if (ctx.args[0].Exception.suppressed) |sl_cell| {
+            return ok(makeList((ValueList{ .cell = sl_cell }).clone(), false));
         }
     }
     const items = try ValueList.init(ctx.allocator, .empty);
@@ -208,7 +209,7 @@ pub fn throwable_cause(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     const cause = ctx.args[0].Exception.cause;
     if (cause) |c| {
-        const out = c.asPtr().*;
+        const out = (ValueBox{ .cell = c }).asPtr().*;
         out.retain();
         return ok(out);
     }
@@ -230,11 +231,16 @@ fn makeList(items: ValueList, mutable: bool) Value {
 
 const testing = std.testing;
 
+// A shared stateless host so the exception constructor's
+// `ctx.host.allocInstanceId()` resolves (NoopHost has no `alloc_instance_id`
+// vtable entry, so it returns 0) instead of dereferencing an undefined host.
+var test_noop_host: runtime.NoopHost = .{};
+
 fn noopCtx(args: []const Value) CallCtx {
     return .{
         .args = args,
         .out = undefined,
-        .host = undefined,
+        .host = test_noop_host.host(),
         .allocator = testing.allocator,
     };
 }
@@ -242,7 +248,8 @@ fn noopCtx(args: []const Value) CallCtx {
 fn freeException(exc: anytype) void {
     exc.fqn.deinit();
     if (exc.message) |m| m.deinit();
-    if (exc.cause) |c| c.deinit();
+    if (exc.cause) |c| (ValueBox{ .cell = c }).deinit();
+    if (exc.suppressed) |s| (ValueList{ .cell = s }).deinit();
 }
 
 test "build exception with no arguments" {
@@ -313,8 +320,9 @@ test "single throwable argument is treated as the cause" {
     defer freeException(exc);
     try testing.expect(exc.message == null);
     try testing.expect(exc.cause != null);
-    try testing.expect(exc.cause.?.asPtr().* == .Exception);
-    const ig = exc.cause.?.asPtr().Exception.fqn.borrow();
+    const cause_box = ValueBox{ .cell = exc.cause.? };
+    try testing.expect(cause_box.asPtr().* == .Exception);
+    const ig = cause_box.asPtr().Exception.fqn.borrow();
     defer ig.deinit();
     try testing.expectEqualStrings("kotlin.IllegalStateException", ig.get().bytes);
 }
@@ -475,11 +483,11 @@ test "cause accessor returns the cause value" {
     const outer = Value{ .Exception = .{
         .fqn = try runtime.strInit(testing.allocator, "kotlin.RuntimeException"),
         .message = null,
-        .cause = cause_box,
+        .cause = cause_box.cell,
     } };
     defer {
         outer.Exception.fqn.deinit();
-        outer.Exception.cause.?.deinit();
+        (ValueBox{ .cell = outer.Exception.cause.? }).deinit();
     }
     const args = [_]Value{outer};
     var ctx = noopCtx(&args);

@@ -327,6 +327,12 @@ pub const Pool = struct {
 fn runVmTask(task: *Task) ?RuntimeError {
     root.setCoroutineTimeMode(task.time_mode);
     runtime.setReclaim(task.reclaim);
+    // This task was counted "unsettled" on the virtual clock at dispatch (so a
+    // top-level driver could not advance time across the dispatch→start gap).
+    // Arm the per-thread flag so its pump's first published barrier floor
+    // settles it; settle on return if the body never published.
+    coroutines.poolTaskRunBegin();
+    defer coroutines.poolTaskRunEnd();
     // The block left the queue, so its closure is reachable only through this
     // stack local now; pin it on the keepalive stack so a collection during the
     // task keeps the closure's capture store + chain alive.
@@ -360,6 +366,9 @@ fn runVmTask(task: *Task) ?RuntimeError {
 /// Drop a task that never ran (pool stopping). The seed's handles are
 /// released through the same child-Vm teardown a completed task uses.
 fn dropVmTask(task: *Task) void {
+    // The task was counted "unsettled" at dispatch and will never run; release
+    // that count so a virtual-clock gate is not held by a dropped task.
+    coroutines.poolTaskSettleDropped();
     if (runtime.reclaimEnabled()) task.block.release(task.seed.allocator);
     var vm = task.seed.materialize() catch return;
     vm.deinit();

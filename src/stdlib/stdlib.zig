@@ -104,6 +104,7 @@ pub const IMPLICIT_ALIASES = [_]Alias{
     .{ .name = "emptySequence", .fqn = "kotlin.sequences.emptySequence" },
     .{ .name = "generateSequence", .fqn = "kotlin.sequences.generateSequence" },
     .{ .name = "sequence", .fqn = "kotlin.sequences.sequence" },
+    .{ .name = "iterator", .fqn = "kotlin.sequences.iterator" },
     .{ .name = "downTo", .fqn = "kotlin.ranges.downTo" },
     .{ .name = "step", .fqn = "kotlin.ranges.step" },
     .{ .name = "until", .fqn = "kotlin.ranges.until" },
@@ -158,6 +159,18 @@ pub fn isToplevelFunction(name: []const u8) bool {
         }
     }
     return false;
+}
+
+/// True when `name` is a top-level `kotlin.math` function whose two parameters
+/// are both plain values (`min(a, b)` / `max(a, b)`), as opposed to a
+/// single-receiver accessor. A property read probes `kotlin.math.{name}` and
+/// dispatches the match with the receiver as the sole argument; for these the
+/// runtime implementation returns its lone argument unchanged, which would
+/// silently report the receiver itself as the property value. A property read
+/// must never match them — a bare `min(x, y)` callee in a receiver context
+/// resolves to the package function, not a member of the implicit receiver.
+pub fn isBinaryMathFunction(name: []const u8) bool {
+    return std.mem.eql(u8, name, "min") or std.mem.eql(u8, name, "max");
 }
 
 /// Top-level non-extension control / precondition functions in `kotlin`.
@@ -630,15 +643,18 @@ test "the inline shadow set's name domain comes from the shared constructor" {
     // The lowerer derives `shadowed_inline_names` from
     // `noteBareNameMapping` over `IMPLICITLY_IMPORTED_PACKAGES`; pin two
     // production-load-bearing members of that domain and one
-    // non-implicit exclusion.
+    // non-implicit exclusion. `synchronized` is deliberately NOT a member:
+    // it is an inline actual that splices (so its block can suspend), not a
+    // host binding, so its name must remain expandable.
     var map = std.StringHashMap([]const u8).init(testing.allocator);
     defer map.deinit();
     var it = implementations.allFqns();
     while (it.next()) |fqn| {
         try noteBareNameMapping(&map, &IMPLICITLY_IMPORTED_PACKAGES, fqn);
     }
-    try testing.expect(map.contains("synchronized"));
+    try testing.expect(map.contains("listOf"));
     try testing.expect(map.contains("arrayOf"));
+    try testing.expect(!map.contains("synchronized"));
     // kotlin.concurrent is not implicitly imported.
     try testing.expect(!map.contains("thread"));
 }
@@ -692,4 +708,14 @@ test "is array builder and toplevel function" {
     try testing.expect(isToplevelFunction("checkNotNull"));
     try testing.expect(isToplevelFunction("TODO"));
     try testing.expect(isToplevelFunction("assert"));
+}
+
+test "binary math functions are not property accessors" {
+    try testing.expect(isBinaryMathFunction("min"));
+    try testing.expect(isBinaryMathFunction("max"));
+    // Single-receiver math accessors stay property-eligible.
+    try testing.expect(!isBinaryMathFunction("absoluteValue"));
+    try testing.expect(!isBinaryMathFunction("sign"));
+    try testing.expect(!isBinaryMathFunction("minOf"));
+    try testing.expect(!isBinaryMathFunction("length"));
 }

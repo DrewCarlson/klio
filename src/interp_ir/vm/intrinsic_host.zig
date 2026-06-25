@@ -828,6 +828,11 @@ pub fn spawnOsThread(self: *VmIntrinsicHost, block: *const Value, out: Output) A
 /// its own reader/writer lock (the spawned-thread boundary contract).
 pub fn coroutineDispatchPooled(self: *VmIntrinsicHost, block: *const Value, io_kind: bool, out: Output) Allocator.Error!?RuntimeError {
     _ = out;
+    // Count this dispatch as "unsettled" on the virtual clock from the moment
+    // it is posted, so a top-level driver cannot advance virtual time across
+    // the window between dispatch and the task establishing its barrier floor.
+    // Released by the task's pump (first floor) or its drop at shutdown.
+    coroutines.poolTaskDispatched();
     // The runnable crosses to a pool thread that outlives this call; retain so
     // its captures survive until the task runs (or is dropped). The pool's
     // task runner / drop path releases it. No-op under the arena fast path.
@@ -839,6 +844,7 @@ pub fn coroutineDispatchPooled(self: *VmIntrinsicHost, block: *const Value, io_k
         .reclaim = runtime.reclaimEnabled(),
         .kind = if (io_kind) .io else .default,
     }) catch |e| {
+        coroutines.poolTaskSettleDropped();
         block.release(self.allocator);
         return e;
     };

@@ -3977,7 +3977,10 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
 
 fn isZipTransform(v: Value) bool {
     return switch (v) {
-        .IrClosure, .BoundMethod, .Instance => true,
+        // Any callable third argument is the transform: a lambda, a bound or
+        // user method, a function/intrinsic reference, a constructor reference
+        // (`::SomeClass` evaluates to a `.Class`), or a functional Instance.
+        .IrClosure, .BoundMethod, .BoundUserMethod, .Instance, .Class, .Function, .Intrinsic => true,
         else => false,
     };
 }
@@ -4939,9 +4942,16 @@ pub fn coll_list_flatten(ctx: *CallCtx) Error!EvalResult {
         switch (v) {
             .List => |l| try appendVL(&out, a, l.items),
             .Set => |s| try appendVL(&out, a, s.items),
+            // Any other inner iterable (a range, array, sequence, map, or user
+            // Iterable) is drained through the shared helper, which retains each
+            // element it yields.
             else => {
-                const vd = try display(a, v);
-                return typeErr(try fmt(a, "flatten requires nested collections, got {s}", .{vd}));
+                const inner = switch (try iterableItemsCtx(ctx, v, "flatten")) {
+                    .items => |x| x,
+                    .err => |e| return e,
+                };
+                defer if (runtime.freeScratch()) a.free(inner);
+                try out.appendSlice(a, inner);
             },
         }
     }
