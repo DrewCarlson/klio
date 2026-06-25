@@ -185,3 +185,15 @@ test "hostBindings registers the composer-stack intrinsics" {
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_popComposer") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_currentComposer") != null);
 }
+
+test "argsHash is stable, order-sensitive, and value-sensitive" {
+    const a = [_]Value{ Value.newInt(1), Value.newInt(2) };
+    const same = [_]Value{ Value.newInt(1), Value.newInt(2) };
+    const reordered = [_]Value{ Value.newInt(2), Value.newInt(1) };
+    const changed = [_]Value{ Value.newInt(1), Value.newInt(3) };
+    try testing.expectEqual(argsHash(&a), argsHash(&same));
+    try testing.expect(argsHash(&a) != argsHash(&reordered));
+    try testing.expect(argsHash(&a) != argsHash(&changed));
+    // No-arg call: a fixed seed, equal to itself.
+    try testing.expectEqual(argsHash(&.{}), argsHash(&.{}));
+}

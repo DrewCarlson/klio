@@ -1,0 +1,10 @@
+Screen {
+Item first -> id 1
+Item second -> id 2
+}
+allocations after first compose = 2
+Screen {
+Item first -> id 1
+Item second -> id 2
+}
+allocations after second compose = 2
