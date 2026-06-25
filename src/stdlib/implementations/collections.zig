@@ -609,24 +609,29 @@ const RangeIter = struct {
     cur: i64,
     end: i64,
     step: i64,
+    kind: RangeKind,
     done: bool,
 
-    fn init(start: i64, end: i64, step: i64) RangeIter {
-        const empty = step == 0 or (step > 0 and start > end) or (step < 0 and start < end);
-        return .{ .cur = start, .end = end, .step = step, .done = empty };
+    fn init(start: i64, end: i64, step: i64, kind: RangeKind) RangeIter {
+        const empty = step == 0 or !kind.inBounds(start, end, step);
+        return .{ .cur = start, .end = end, .step = step, .kind = kind, .done = empty };
     }
 
     fn next(self: *RangeIter) ?i64 {
         if (self.done) return null;
-        const v = self.cur;
-        if ((self.step > 0 and self.cur > self.end) or (self.step < 0 and self.cur < self.end)) {
+        // `inBounds` compares unsigned for ULong (`MaxUL..MinUL` is empty).
+        if (!self.kind.inBounds(self.cur, self.end, self.step)) {
             self.done = true;
             return null;
         }
+        const v = self.cur;
+        // `end` is the exact final element; stop once yielded so the cursor
+        // never advances past it (Long.MAX overflow, or a ULong wrap past MaxUL).
+        if (self.cur == self.end) {
+            self.done = true;
+            return v;
+        }
         const adv = self.cur +| self.step;
-        // Saturation at the integer boundary (`MaxL +| 1 == MaxL`): the cursor
-        // cannot advance, so `v` was the final element. Mark done rather than
-        // yielding it forever (a range ending at Long.MAX_VALUE/MIN_VALUE).
         if (adv == self.cur) self.done = true else self.cur = adv;
         return v;
     }
@@ -726,7 +731,7 @@ pub fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcom
                 return .{ .err = typeErr(try fmt(a, "{s} requires an iterable receiver", .{what})) };
             };
             var list: std.ArrayList(Value) = .empty;
-            var it = RangeIter.init(view.start, view.end, view.step);
+            var it = RangeIter.init(view.start, view.end, view.step, view.kind);
             while (it.next()) |n| try list.append(a, rangeEndpoint(view.kind, n));
             return .{ .items = try list.toOwnedSlice(a) };
         },
@@ -3719,7 +3724,7 @@ pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
     var out: std.ArrayList(Value) = .empty;
     if (ctx.args.len > 1 and asRangeView(ctx.args[1]) != null) {
         const r = asRangeView(ctx.args[1]).?;
-        var rit = RangeIter.init(r.start, r.end, r.step);
+        var rit = RangeIter.init(r.start, r.end, r.step, r.kind);
         while (rit.next()) |i| {
             if (i < 0 or i >= len) {
                 const msg = try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len });
@@ -3938,7 +3943,7 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
         .Set => |s| try appendVL(&rhs, a, s.items),
         .Array => |arr| try appendArrItems(&rhs, a, arr),
         .Range => |r| {
-            var rit = RangeIter.init(r.start, r.end, r.step);
+            var rit = RangeIter.init(r.start, r.end, r.step, r.kind);
             while (rit.next()) |n| try rhs.append(a, Value.newInt(n));
         },
         else => {

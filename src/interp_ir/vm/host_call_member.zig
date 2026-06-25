@@ -622,24 +622,17 @@ fn valueStructuralHash(v: *const Value) i32 {
 /// Materialise an integer/char progression's elements.
 fn materialiseRangeItems(allocator: Allocator, start: i64, end: i64, step: i64, kind: RangeKind) Allocator.Error!std.ArrayList(Value) {
     var out: std.ArrayList(Value) = .empty;
+    if (step == 0) return out;
     var cur = start;
-    if (step > 0) {
-        while (cur <= end) {
-            try out.append(allocator, rangeElem(cur, kind));
-            const adv = cur +| step;
-            // Saturation at the integer boundary (`MaxL +| 1 == MaxL`): the
-            // cursor cannot advance, so this was the final element. Break
-            // rather than appending it forever (range ending at Long.MAX/MIN).
-            if (adv <= cur) break;
-            cur = adv;
-        }
-    } else if (step < 0) {
-        while (cur >= end) {
-            try out.append(allocator, rangeElem(cur, kind));
-            const adv = cur +| step;
-            if (adv >= cur) break;
-            cur = adv;
-        }
+    // `inBounds` compares unsigned for ULong (so `MaxUL..MinUL` is empty). `end`
+    // is the exact final element (normalized), so stop once it is yielded —
+    // advancing past it would overflow/wrap (Long.MAX, or a ULong past MaxUL).
+    while (kind.inBounds(cur, end, step)) {
+        try out.append(allocator, rangeElem(cur, kind));
+        if (cur == end) break;
+        const adv = cur +| step;
+        if (adv == cur) break;
+        cur = adv;
     }
     return out;
 }
@@ -4391,13 +4384,11 @@ fn rangeIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         break :blk dg.get().*;
     };
     const more = blk: {
-        if (done) break :blk false;
+        if (done or ri.step == 0) break :blk false;
         const cg = ri.cur.borrow();
         const c = cg.get().*;
         cg.deinit();
-        if (ri.step > 0) break :blk c <= ri.end;
-        if (ri.step < 0) break :blk c >= ri.end;
-        break :blk false;
+        break :blk ri.kind.inBounds(c, ri.end, ri.step);
     };
     if (std.mem.eql(u8, name, "hasNext") and args.len == 0) {
         return .{ .ok = boolVal(more) };
@@ -4407,10 +4398,11 @@ fn rangeIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         const cg = ri.cur.borrowMut();
         const c = cg.get().*;
         const adv = c +| ri.step;
-        // The cursor saturates at the integer boundary; if it could not
-        // advance (`adv == c`), `c` was the final element — mark done so the
-        // next `hasNext` is false instead of looping on the saturated value.
-        if (adv == c) {
+        // `end` is the exact final element; once it is yielded, stop. Also stop
+        // if the cursor saturates (`adv == c`). Both avoid advancing past the
+        // end — a Long.MAX overflow or a ULong wrap past MaxUL that `more`
+        // (unsigned for ULong) would otherwise read as still in-bounds.
+        if (c == ri.end or adv == c) {
             cg.deinit();
             const dg = ri.done.borrowMut();
             dg.get().* = true;

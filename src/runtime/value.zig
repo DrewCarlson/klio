@@ -379,6 +379,20 @@ pub const RangeKind = enum {
     ULong,
 
     pub const default: RangeKind = .Int;
+
+    /// Whether `cur` has not yet passed `end` in the step's direction — the
+    /// "keep iterating" test. `ULong` values span the full u64 range stored as
+    /// i64, so they compare unsigned; every other kind fits a signed i64 (UInt
+    /// is 0..2^32-1). Used by every progression cursor and the emptiness check
+    /// so `MaxUL..MinUL` reads as empty rather than a wrapped, huge range.
+    pub fn inBounds(self: RangeKind, cur: i64, end: i64, step: i64) bool {
+        if (self == .ULong) {
+            const uc: u64 = @bitCast(cur);
+            const ue: u64 = @bitCast(end);
+            return if (step > 0) uc <= ue else uc >= ue;
+        }
+        return if (step > 0) cur <= end else cur >= end;
+    }
 };
 
 /// Numeric promotion rank — wider types win in mixed arithmetic.
