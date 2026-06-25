@@ -1849,6 +1849,41 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
     return out;
 }
 
+/// `argFnArities` for a constructor call: the per-argument expected lambda
+/// arity from the class's primary-constructor parameters. A `T.() -> R`
+/// receiver-lambda parameter reports arity 0 so the lambda drops its `it` and
+/// resolves bare members through the receiver bound at invocation (the same as
+/// a function-call argument).
+fn ctorArgFnArities(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!?[]i16 {
+    if (args.len == 0) return null;
+    for (args) |*a| if (a.* == .Spread) return null;
+    if (class_id.int() >= b.module.classes.items.len) return null;
+    const params = b.module.classes.items[class_id.int()].primary_params;
+    const out = try b.allocator.alloc(i16, args.len);
+    for (out) |*o| o.* = -1;
+    const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
+    if (trailing_lambda) {
+        // An unnamed trailing lambda binds the LAST function-typed parameter
+        // (intervening defaulted/named params are skipped) — find it and take
+        // its arity, so `Op(desc, named = x) { member() }` still detects the
+        // receiver lambda.
+        var pi = params.len;
+        while (pi > 0) : (pi -= 1) {
+            if (fnTypeArityAlias(b, params[pi - 1].ty)) |ar| {
+                out[args.len - 1] = ar;
+                break;
+            }
+        }
+    }
+    // Leading positional args map 1:1 only when there are no named args.
+    if (allNull(arg_names) and args.len <= params.len) {
+        var i: usize = 0;
+        const lead: usize = if (trailing_lambda) args.len - 1 else args.len;
+        while (i < lead) : (i += 1) out[i] = fnTypeArityAlias(b, params[i].ty) orelse -1;
+    }
+    return out;
+}
+
 fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const pf = expr.Postfix;
     const inner = pf.expr;
@@ -2810,7 +2845,9 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // cross-package simple-name collision constructs the right class.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         if (b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file)) |class_id| {
-            const run = try lowerArgRun(b, args);
+            const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
+            defer if (ctor_arity) |ca| b.allocator.free(ca);
+            const run = try lowerArgRunFull(b, args, ctor_arity, null);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const dst = b.allocReg();
             if (shadowed_by_class) {
