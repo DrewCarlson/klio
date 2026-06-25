@@ -109,8 +109,10 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
+    // The builder is a live `MutableMap` the block can iterate (via keys/values/
+    // entries) and mutate; give it a structural counter for fail-fast iteration.
     const buildable = Value{ .Map = .{
-        .entries = try MapEntries.init(ctx.allocator, .{}),
+        .entries = try MapEntries.init(ctx.allocator, .{ .mod_count = try ObjRef(u64).init(ctx.allocator, 0) }),
         .mutable = true,
     } };
     {

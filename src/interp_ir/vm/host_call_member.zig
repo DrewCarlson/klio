@@ -3245,8 +3245,12 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                 const cap = try captureModCount(allocator, l.mod_count);
                 return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
             }
+            // A snapshot iterator (immutable list, or a live map `values` view):
+            // still capture `mod_count` so a concurrent structural change to the
+            // source (the map) fails the iterator fast.
             const items = try cloneItemsList(allocator, l.items);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
+            const cap = try captureModCount(allocator, l.mod_count);
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
         },
         .Set => |s| {
             // A mutable set shares its backing so `MutableIterator.remove()`
@@ -3256,12 +3260,14 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                 const cap = try captureModCount(allocator, s.mod_count);
                 return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
             }
+            // Snapshot iterator (immutable set, or a live map `keys`/`entries`
+            // view): capture `mod_count` so a concurrent map mutation fails fast.
             const items = try cloneItemsList(allocator, s.items);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
+            const cap = try captureModCount(allocator, s.mod_count);
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
         },
         .Map => |m| {
             const g = m.entries.borrow();
-            defer g.deinit();
             var items: std.ArrayList(Value) = .empty;
             for (g.get().pairs.items) |kv| {
                 kv.key.retain();
@@ -3270,7 +3276,10 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                 const v = try Value.boxRef(allocator, kv.value);
                 try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = null } });
             }
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
+            const src_mc = g.get().mod_count;
+            g.deinit();
+            const cap = try captureModCount(allocator, src_mc);
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
         },
         .Range => |r| {
             return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind } } };

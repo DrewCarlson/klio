@@ -128,6 +128,36 @@ fn structuralBump(v: *const Value, before: usize) void {
     if (listLenOf(v) != before) bumpModCount(v);
 }
 
+/// `entries.pairs.len` — captured before a map mutation for the size diff.
+fn mapEntriesLen(entries: MapEntries) usize {
+    const g = entries.borrow();
+    defer g.deinit();
+    return g.get().pairs.items.len;
+}
+
+/// `defer mapStructuralBump(entries, before)`: bump the map's `mod_count` only
+/// when the entry count changed, so `put(existing)`/`putAll([])` register no
+/// modification while a fresh key / `remove`/`clear` fail a concurrent view
+/// iterator (which shares this counter).
+fn mapStructuralBump(entries: MapEntries, before: usize) void {
+    const g = entries.borrowMut();
+    defer g.deinit();
+    if (g.get().pairs.items.len == before) return;
+    if (g.get().mod_count) |mc| {
+        const mg = mc.borrowMut();
+        defer mg.deinit();
+        mg.get().* +%= 1;
+    }
+}
+
+/// A new handle on the map's shared `mod_count`, for a `keys`/`values`/`entries`
+/// view so its iterator fails fast when the source map mutates structurally.
+fn entriesModCountClone(entries: MapEntries) ?ObjRef(u64) {
+    const g = entries.borrow();
+    defer g.deinit();
+    return if (g.get().mod_count) |mc| mc.clone() else null;
+}
+
 fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(a, items);
@@ -268,11 +298,11 @@ fn makeMap(a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
             try out.append(a, kv);
         }
     }
-    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = out }), .mutable = mutable } };
+    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = out, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable } };
 }
 
 fn makeMapFromArrayList(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool) Error!Value {
-    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = entries }), .mutable = mutable } };
+    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = entries, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable } };
 }
 
 /// `makeMapFromArrayList` for entries whose key+value are *borrowed*: the new
@@ -4469,7 +4499,7 @@ pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Keys });
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = true, .backing = backing.cell } });
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = true, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
 }
 pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4488,7 +4518,7 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Values });
-    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_entries = false, .backing = backing.cell } });
+    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_entries = false, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
 }
 pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -4511,7 +4541,7 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try MapBackingRef.init(a, .{ .entries = entries, .kind = .Entries });
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = true, .backing = backing.cell } });
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = true, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
 }
 pub fn coll_map_to_string(ctx: *CallCtx) Error!EvalResult {
     return collToString(ctx, "Map.toString");
@@ -4524,6 +4554,8 @@ pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
         .entries => |x| x,
         .err => |e| return e,
     };
+    const _mb = mapEntriesLen(entries);
+    defer mapStructuralBump(entries, _mb);
     if (ctx.args.len < 2) return arityErr("put requires a key");
     const key = ctx.args[1];
     if (ctx.args.len < 3) return arityErr("put requires a value");
@@ -4556,6 +4588,8 @@ pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
         .entries => |x| x,
         .err => |e| return e,
     };
+    const _mb = mapEntriesLen(entries);
+    defer mapStructuralBump(entries, _mb);
     if (ctx.args.len < 2) return arityErr("remove requires a key");
     const key = ctx.args[1];
     if (try mapKeyIndex(ctx, entries, key)) |pos| {
@@ -4577,6 +4611,8 @@ pub fn coll_mut_map_clear(ctx: *CallCtx) Error!EvalResult {
         .entries => |x| x,
         .err => |e| return e,
     };
+    const _mb = mapEntriesLen(entries);
+    defer mapStructuralBump(entries, _mb);
     const g = entries.borrowMut();
     defer g.deinit();
     g.get().pairs.clearRetainingCapacity();
@@ -5330,6 +5366,8 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
         .entries => |x| x,
         .err => |e| return e,
     };
+    const _mb = mapEntriesLen(entries);
+    defer mapStructuralBump(entries, _mb);
     if (ctx.args.len < 2) return arityErr("putAll requires a Map");
     const arg = ctx.args[1];
     var to_add: []MapPair = undefined;

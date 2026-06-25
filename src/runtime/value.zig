@@ -149,6 +149,11 @@ pub const MapStore = struct {
     indexed_len: usize = 0,
     built: bool = false,
     indexable: bool = true,
+    /// Structural-modification counter for fail-fast iteration over a mutable
+    /// map's `keys`/`values`/`entries` views. Shared (ObjRef handle) with every
+    /// such view; the map's structural mutations bump it on a size change and a
+    /// view iterator captures it. Null for a read-only map.
+    mod_count: ?ObjRef(u64) = null,
 
     /// Below this entry count, a linear scan beats a hash table (and avoids the
     /// table's allocation), so the index is not built.
@@ -158,6 +163,7 @@ pub const MapStore = struct {
         self.pairs.deinit(a);
         self.head.deinit(a);
         self.chain.deinit(a);
+        if (self.mod_count) |mc| mc.deinit();
     }
 
     /// GC teardown (no allocator-bound buffers escape the cell): free the same
@@ -169,6 +175,7 @@ pub const MapStore = struct {
     /// Out-edges: only the entry list owns `Value`s; the index is index-only.
     pub fn gcTrace(self: *const MapStore, m: *objcell.gc.Marker) void {
         for (self.pairs.items) |*kv| kv.gcTrace(m);
+        if (self.mod_count) |mc| m.shade(&mc.cell.hdr);
     }
 
     /// Hash for a key, consistent with `Value.structuralEqBoxed` (equal keys
