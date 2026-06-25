@@ -1,5 +1,51 @@
 # COMPOSE-RUNTIME — getting androidx.compose.runtime functional in klio
 
+## Implementation status
+
+- **P0 (pack scaffold)** — done. `klio.toml` curates the annotation surface;
+  `src/compose_runtime` ships the pure host intrinsics; `klioMain/HostIntrinsics.kt`
+  declares them. A `@Composable` function loads from the pack and runs.
+- **P1 (`mutableStateOf`)** — done. klioMain `SnapshotState.kt` + `StateObservation`
+  hub; get/set, `by` delegation, destructuring, structural policy all verified.
+- **P2 (compose once)** — done. `src/interp_ir/vm/compose.zig` holds the implicit
+  composer stack + `__compose_{push,pop,current}Composer` intrinsics + `callSiteKey`;
+  `host_call_func.zig` brackets every `@Composable` body with `startGroup`/`endGroup`
+  on the current composer (excluded from the fast path). klioMain `KlioComposer`
+  (slot tree, per-occurrence group disambiguation), `KlioComposition`, `Recomposer`.
+  A nested `@Composable` tree composes in source order.
+- **P3 (`remember`)** — done. `remember`/`remember(keys…)`/`key` consume slots from
+  the current group; memoizes across compose passes (verified: a `remember{}` block
+  runs once across two compositions of the same content lambda).
+
+### Findings / divergences from the original plan
+
+- **Compiled packs dropped top-level computed property getters.** A top-level
+  `val x get() = …` resolves via `ModuleRegistry.top_level_prop_getters`
+  (eval.zig:3011), but that map was not serialized into the baked stdlib image, so
+  `currentComposer` (a top-level computed `val`) failed under `klio run` (worked with
+  `KLIO_STDLIB_IMAGE=0`). Fixed by round-tripping `top_level_prop_getters` through the
+  per-module `RegistryImage` (image.zig). klioMain's internal composer reads still go
+  through a top-level **function** (`requireComposer()`) belt-and-suspenders.
+- **SnapshotState is REPLACED wholesale for the core** (not PARTIAL): a simple
+  observer-backed `State`/`MutableState` avoids pulling the full `StateRecord`/MVCC
+  contract into the critical path. Full snapshot fidelity is deferred to the
+  observable-collections / `derivedStateOf` phase.
+
+### P4 design (recomposition on state write) — selective, no thunk capture
+
+State reads during compose subscribe the **current group node** (the running
+composable's group) via `StateObservation.observe`. A state write looks up subscribed
+groups, marks them invalid, and walks parent pointers to mark the path to root. On
+`recompose()`, the content re-runs from the root but each `@Composable` call is
+**skipped** (body not executed, slots/children preserved) unless its group is fresh or
+on an invalidated path — so a sibling that did not read the state never re-runs. The
+interpreter hook gains a `shouldRun` check between `startGroup` and the body. The
+re-run reaches an invalidated descendant because its ancestors are on the invalid path
+(not skipped); no per-scope re-invocation thunk is needed.
+
+---
+
+
 Target: Compose Multiplatform **1.11.1** `androidx.compose.runtime` commonMain
 (188 `.kt` files under
 `kotlin-klio/klio-compose-runtime/upstream/compose/runtime/runtime/src/commonMain/kotlin/androidx/compose/runtime`).
