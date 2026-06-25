@@ -160,6 +160,18 @@ pub fn isToplevelFunction(name: []const u8) bool {
     return false;
 }
 
+/// True when `name` is a top-level `kotlin.math` function whose two parameters
+/// are both plain values (`min(a, b)` / `max(a, b)`), as opposed to a
+/// single-receiver accessor. A property read probes `kotlin.math.{name}` and
+/// dispatches the match with the receiver as the sole argument; for these the
+/// runtime implementation returns its lone argument unchanged, which would
+/// silently report the receiver itself as the property value. A property read
+/// must never match them — a bare `min(x, y)` callee in a receiver context
+/// resolves to the package function, not a member of the implicit receiver.
+pub fn isBinaryMathFunction(name: []const u8) bool {
+    return std.mem.eql(u8, name, "min") or std.mem.eql(u8, name, "max");
+}
+
 /// Top-level non-extension control / precondition functions in `kotlin`.
 /// Each takes a value (not a receiver) as its first parameter, so member
 /// dispatch must resolve a bare call to the global intrinsic instead of
@@ -692,4 +704,14 @@ test "is array builder and toplevel function" {
     try testing.expect(isToplevelFunction("checkNotNull"));
     try testing.expect(isToplevelFunction("TODO"));
     try testing.expect(isToplevelFunction("assert"));
+}
+
+test "binary math functions are not property accessors" {
+    try testing.expect(isBinaryMathFunction("min"));
+    try testing.expect(isBinaryMathFunction("max"));
+    // Single-receiver math accessors stay property-eligible.
+    try testing.expect(!isBinaryMathFunction("absoluteValue"));
+    try testing.expect(!isBinaryMathFunction("sign"));
+    try testing.expect(!isBinaryMathFunction("minOf"));
+    try testing.expect(!isBinaryMathFunction("length"));
 }

@@ -889,7 +889,12 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // Stdlib property read on a built-in type — `"abc".length`, etc.
     const type_fqn = receiver.typeFqn();
     const probe_is_toplevel_fn = stdlib.isToplevelFunction(name);
-    if (!probe_is_toplevel_fn) {
+    // The binary `kotlin.math.min`/`max` functions are not property
+    // accessors: dispatched with the receiver as their lone argument they
+    // return it unchanged, which would mask the read as the receiver itself
+    // (a bare `min(x, y)` callee in a receiver context is the package
+    // function, not a member of the implicit receiver).
+    if (!probe_is_toplevel_fn and !stdlib.isBinaryMathFunction(name)) {
         const probes = [_][]const u8{
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }),
             try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}),

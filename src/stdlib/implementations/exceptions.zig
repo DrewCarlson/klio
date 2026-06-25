@@ -231,11 +231,16 @@ fn makeList(items: ValueList, mutable: bool) Value {
 
 const testing = std.testing;
 
+// A shared stateless host so the exception constructor's
+// `ctx.host.allocInstanceId()` resolves (NoopHost has no `alloc_instance_id`
+// vtable entry, so it returns 0) instead of dereferencing an undefined host.
+var test_noop_host: runtime.NoopHost = .{};
+
 fn noopCtx(args: []const Value) CallCtx {
     return .{
         .args = args,
         .out = undefined,
-        .host = undefined,
+        .host = test_noop_host.host(),
         .allocator = testing.allocator,
     };
 }
@@ -244,6 +249,7 @@ fn freeException(exc: anytype) void {
     exc.fqn.deinit();
     if (exc.message) |m| m.deinit();
     if (exc.cause) |c| (ValueBox{ .cell = c }).deinit();
+    if (exc.suppressed) |s| (ValueList{ .cell = s }).deinit();
 }
 
 test "build exception with no arguments" {
