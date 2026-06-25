@@ -210,6 +210,14 @@ threadlocal var active_chain_base: usize = 0;
 // -------------------------------------------------------------------------
 threadlocal var frame_chain: ?*Frame = null;
 
+/// The source span of the statement the innermost active frame is currently
+/// executing — i.e. the call site of a call being dispatched from that frame.
+/// The compose `@Composable` hook reads this to derive a stable positional
+/// group key per call site (set per-statement by the `.Trace` instruction).
+pub fn currentCallSiteSpan() ?ir.Span {
+    return if (frame_chain) |fr| fr.cur_span else null;
+}
+
 /// Per-thread free-list of register buffers, reused across calls so a freeing
 /// backend pays no per-call alloc/free for the `regs` array. Only used under the
 /// reference-counting (freeing) backends: under the tracing GC the buffer memory

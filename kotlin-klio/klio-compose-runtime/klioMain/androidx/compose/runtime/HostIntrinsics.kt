@@ -19,3 +19,15 @@ internal fun __compose_monotonicNanos(): Long =
 
 internal fun __compose_logError(message: String, error: Throwable?): Unit =
     error("intrinsic androidx.compose.runtime.__compose_logError not installed")
+
+// Implicit-composer stack (implemented in src/interp_ir/vm/compose.zig). The
+// `Composition` pushes its composer around the content lambda; the call
+// dispatcher and `currentComposer` read the stack head.
+internal fun __compose_pushComposer(composer: Any?): Unit =
+    error("intrinsic androidx.compose.runtime.__compose_pushComposer not installed")
+
+internal fun __compose_popComposer(): Unit =
+    error("intrinsic androidx.compose.runtime.__compose_popComposer not installed")
+
+internal fun __compose_currentComposer(): Any? =
+    error("intrinsic androidx.compose.runtime.__compose_currentComposer not installed")

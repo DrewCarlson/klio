@@ -69,6 +69,7 @@ pub const host_instances = @import("host_instances.zig");
 pub const host_impl = @import("host_impl.zig");
 pub const intrinsic_host = @import("intrinsic_host.zig");
 pub const coroutines = @import("coroutines.zig");
+pub const compose = @import("compose.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const trace = @import("trace.zig");
 
@@ -152,6 +153,7 @@ pub fn resetReceiverThreadLocals() void {
     host_fields.resetReceiverTls();
     host_impl.resetReceiverTls();
     coroutines.resetReceiverTls();
+    compose.resetAtRunBoundary();
     // Drop the AST-address-keyed anon-`object` site caches: their keys and
     // thunk sub-modules belong to the finished run and must not be reused by
     // the next one in the same process (tests, repeated CLI runs).

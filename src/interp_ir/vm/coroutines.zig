@@ -1221,6 +1221,7 @@ pub fn gcThreadExit() void {
     ir.eval.gcUninstallFrameRoot();
     runtime.gcUninstallKeepaliveRoot();
     gcUninstallCoroRoot();
+    @import("compose.zig").gcUninstallComposeRoot();
 }
 
 /// Push a fresh interceptor for a newly-entered driven root.

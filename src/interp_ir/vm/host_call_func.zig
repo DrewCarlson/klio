@@ -18,6 +18,7 @@ const trace = @import("trace.zig");
 const host_call_member = @import("host_call_member.zig");
 const host_globals = @import("host_globals.zig");
 const overload_match = @import("overload_match.zig");
+const compose = @import("compose.zig");
 
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -679,6 +680,9 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     const f = funcAt(module, func) orelse return 1;
     if (!f.hasBody()) return 1;
     if (f.is_suspend or f.is_inline) return 1;
+    // A `@Composable` call must route through `callFunc` so its body is
+    // bracketed with the composer group push/pop; never take the fast path.
+    if (compose.isComposable(f)) return 1;
     if (f.params.len > 253) return 1;
     if (paramIsThis(f.params) or f.has_receiver_param) return 1;
     if (lastIsVararg(f.params)) return 1;
@@ -844,7 +848,37 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // free. Take ownership of the final list and disarm the defer.
     args = .empty;
     vmhost.emitPath(allocator, "call_func", f.fqn, func, null, args_in);
-    return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
+    return composableEval(self, allocator, module, f, packed_args);
+}
+
+/// Run `f`'s body, bracketing a `@Composable` call with the current composer's
+/// `startGroup(key)` / `endGroup()` so positional `remember` slots stay stable
+/// across recompositions (klio's replacement for the compiler plugin's group
+/// emission). Plain calls, or a `@Composable` invoked with no active composer
+/// (e.g. directly from `main`), run the body unwrapped.
+fn composableEval(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    f: *const Func,
+    packed_args: std.ArrayList(Value),
+) Allocator.Error!EvalResult {
+    if (!compose.isComposable(f))
+        return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
+    const composer = compose.currentComposer() orelse
+        return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
+
+    const key_val = Value.newLong(@bitCast(compose.callSiteKey()));
+    switch (try host_call_member.callMember(self, allocator, &composer, "startGroup", &.{key_val})) {
+        .err => |e| return .{ .err = e },
+        .ok => {},
+    }
+    const res = try ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
+    switch (try host_call_member.callMember(self, allocator, &composer, "endGroup", &.{})) {
+        .err => |e| return .{ .err = e },
+        .ok => {},
+    }
+    return res;
 }
 
 /// Single named-argument call dispatch flow.
