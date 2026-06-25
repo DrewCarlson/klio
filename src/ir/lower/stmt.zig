@@ -165,6 +165,7 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         try b.setLocalDeclType(p.name.name, ty.name.name);
     } else if (p.init) |*e| {
         if (e.* == .Call) try b.setLocalInitExpr(p.name.name, e);
+        if (e.* == .ObjectExpr) try b.markObjectInitLocal(p.name.name);
     }
     if (b.isBoxed(p.name.name)) {
         // Captured `var` — box into a shared cell so writes

@@ -2515,6 +2515,23 @@ fn lowerCallWithWritebackPath(
                 .type_args = type_args,
                 .exact = false,
             } });
+        } else if (b.resolve(segments[0].name) == null and
+            b.hasOwnMember(segments[0].name) and b.resolve("this") != null)
+        {
+            // A member of the enclosing class — e.g. an inherited inline fn
+            // (`forEachSlotLocked`) whose trailing lambda mutates a captured
+            // local, routing the call through this writeback path — dispatches
+            // on `this`. The index never resolves members (`bound_id` is null),
+            // so without this it falls to an unresolved global LoadGlobal.
+            const this_reg = b.resolve("this").?;
+            try b.push(.{ .CallMember = .{
+                .dst = dst,
+                .receiver = this_reg,
+                .name = try b.module.internConst(b.allocator, .{ .String = segments[0].name }),
+                .args = args_start,
+                .n_args = n_args,
+                .arg_names = arg_names,
+            } });
         } else {
             const callee_r = blk: {
                 if (b.resolve(segments[0].name) != null) {
@@ -3103,6 +3120,20 @@ fn inlineTargetForBareCall(
         },
         .deferred => narrowed,
     };
+    // An inline overload whose last parameter is a function type does not
+    // apply when its matching argument is an object instance — e.g. a
+    // `FlowCollector` passed to `Flow.collect`, where the real target is the
+    // member `collect(collector)`, not the inline `collect(action: (T) -> Unit)`
+    // extension. Splicing it would bind the object to the function parameter and
+    // invoke it as `obj.invoke(...)`. Decline the splice so the member wins.
+    if (pick) |pf| {
+        const inline_takes_fn = pf.params.len != 0 and pf.params[pf.params.len - 1].ty.function != null;
+        if (inline_takes_fn and lastArgIsObjectNotFunction(b, args) and
+            b.resolve(nm) == null and b.hasOwnMember(nm))
+        {
+            return null;
+        }
+    }
     inlineResolveAudit(b, nm, seg.span.file, narrowed, pick, args, shape.last_is_lambda, ires);
     return pick;
 }
@@ -3118,6 +3149,22 @@ fn inlineTargetForBareCall(
 /// receiver, or inside a class method the enclosing class itself — and
 /// matching is subtype-aware: an extension declared on a base class
 /// accepts a subclass receiver.
+/// Whether the last argument is definitely an object instance, not a
+/// function value: an `object : Foo {}` expression, or a local bound to
+/// one. Such an argument cannot satisfy a function-typed parameter, so an
+/// inline overload that wants a lambda there is the wrong target.
+fn lastArgIsObjectNotFunction(b: *FuncBuilder, args: []const Expr) bool {
+    if (args.len == 0) return false;
+    switch (args[args.len - 1]) {
+        .ObjectExpr => return true,
+        .Path => |p| {
+            if (p.segments.len != 1) return false;
+            return b.isObjectInitLocal(p.segments[0].name);
+        },
+        else => return false,
+    }
+}
+
 fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function, args: []const Expr) bool {
     const has_reified = anyReified(f.type_params);
     const want = args.len;
@@ -3663,6 +3710,36 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     const index_pick = index_res.pick();
     resolveAudit(b, name0, segments[0].span.file, want, last_arg_lambda, bare_func_id, rung, index_res, shadowed_by_class, prefer_member);
 
+    // A known stdlib host-intrinsic global (alias) (`min`, `max`, …) whose simple
+    // name also has a user overload that does NOT apply to this call (e.g.
+    // `min(Int, Int)` against the unsigned `min(UInt, UInt)` in UMath): the
+    // overload resolution above found no applicable user candidate
+    // (`bare_func_id == null`), but the name still resolves to the intrinsic
+    // global. Bind it directly. Without this, an enclosing receiver context
+    // would fall through to a `this.<name>` redispatch that invokes the
+    // receiver itself, since no class declares the name as a member.
+    if (bare_func_id == null and !shadowed_by_class and inReceiverContext(b) and
+        isAliasName(name0) and !b.module.registry.class_member_names.contains(name0) and
+        b.resolve(name0) == null and !b.knowsOuter(name0))
+    {
+        orEmitAudit(b, "alias_global_no_overload", "LoadGlobal", name0);
+        const callee_r = b.allocReg();
+        const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+        try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
+        const run = try lowerArgRun(b, args);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+        const dst = b.allocReg();
+        try b.push(.{ .CallValue = .{
+            .dst = dst,
+            .callee = callee_r,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+            .type_args = type_args,
+        } });
+        return dst;
+    }
     if (bare_func_id) |func_id| {
         if (!shadowed_by_class) {
             // The call binds a bare top-level function. If the index saw

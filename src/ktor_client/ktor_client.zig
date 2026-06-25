@@ -812,7 +812,14 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
         if (runtime.shouldAbandon()) break;
         if (serve_max != 0 and served >= serve_max) break;
         var pfd = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        // The accept wait holds no unrooted live Value, so bracket it as a GC
+        // blocking-safe region: a collection triggered by a concurrent
+        // dispatcher worker (e.g. the application's `launch { … }` running on
+        // `Dispatchers.Default`) can complete its stop-the-world rendezvous
+        // while this thread parks here instead of stalling on it.
+        runtime.gc.enterBlockingSafe();
         const ready = c.poll(&pfd, 1, 200);
+        runtime.gc.exitBlockingSafe();
         if (ready <= 0) continue; // timeout (re-check abandon) or transient error
         const conn = c.accept(listen_fd, null, null);
         if (conn < 0) continue;
