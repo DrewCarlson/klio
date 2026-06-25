@@ -570,12 +570,27 @@ fn lowerAssign(
                 .Rem => .Mod,
                 .Assign => unreachable,
             };
+            // Mark the combine step so a mutable-collection left operand can
+            // mutate in place via `<op>Assign`. Only do so when the rebind is
+            // NOT viable: a reassignable local (`var`/boxed) target follows
+            // Kotlin's `a = a.plus(b)` form, which for a read-only-typed local
+            // holding a mutable value (`var x: List = mutableListOf()`) must
+            // produce a fresh list and leave the original untouched. A val /
+            // member / global target cannot be rebound, so the in-place
+            // operator is what Kotlin uses there.
+            const target_reassignable_local = switch (target.*) {
+                .Path => |p| p.segments.len == 1 and
+                    b.resolve(p.segments[0].name) != null and
+                    (b.isMutable(p.segments[0].name) or b.isBoxed(p.segments[0].name)),
+                else => false,
+            };
             const dst = b.allocReg();
             try b.push(.{ .BinOp = .{
                 .dst = dst,
                 .op = bin,
                 .lhs = cur,
                 .rhs = v,
+                .compound = !target_reassignable_local,
             } });
             break :blk dst;
         },

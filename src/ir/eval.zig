@@ -2251,6 +2251,31 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 .Map, .List, .Set, .Sequence, .Range => true,
                 else => false,
             }) {
+                // A compound assign (`xs += y`) onto a mutable collection
+                // dispatches the in-place `plusAssign` / `minusAssign`
+                // (Kotlin prefers `MutableCollection.plusAssign`), so the
+                // collection stays mutable. A read-only collection (or a
+                // plain `xs + y`) takes the `plus` / `minus` path below,
+                // producing a fresh read-only result.
+                if (bo.compound) {
+                    const mutable = switch (l) {
+                        .List => |c| c.mutable,
+                        .Set => |c| c.mutable,
+                        .Map => |c| c.mutable,
+                        else => false,
+                    };
+                    if (mutable) {
+                        const assign = if (bo.op == .Add) "plusAssign" else "minusAssign";
+                        switch (try host.callMember(allocator, &l, assign, &.{r})) {
+                            .ok => {
+                                l.retain();
+                                try frame.write(bo.dst, l);
+                                return .cont;
+                            },
+                            .err => |e| return raiseStep(frame, e),
+                        }
+                    }
+                }
                 const method = if (bo.op == .Add) "plus" else "minus";
                 switch (try host.callMember(allocator, &l, method, &.{r})) {
                     .ok => |rv| {

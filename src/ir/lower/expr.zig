@@ -4288,6 +4288,28 @@ fn isAliasName(name: []const u8) bool {
     return false;
 }
 
+/// True when `f` shares its simple name and arity with another overload whose
+/// parameter at `pidx` has a different declared type. A bare call is lowered to
+/// one (arbitrarily-picked) overload before the runtime types its arguments, so
+/// when the overloads disagree on a parameter's type that pick is not an
+/// authoritative coercion target — re-typing a numeric literal to it (e.g.
+/// turning the `Int` literal `50` into `UInt` because the lowering happened to
+/// pick `minOf(UInt, UInt)`) is wrong. Leaving the literal at its natural type
+/// lets the runtime overload resolver select the right form.
+fn overloadParamTypeConflicts(module: *const Module, f: *const Func, pidx: usize) bool {
+    if (pidx >= f.params.len) return false;
+    const want_ty = f.params[pidx].ty.name;
+    const cands = module.funcsBySimpleName(f.name);
+    if (cands.len < 2) return false;
+    for (cands) |cid| {
+        const g = module.funcById(cid) orelse continue;
+        if (g.params.len != f.params.len) continue;
+        if (pidx >= g.params.len) continue;
+        if (!std.mem.eql(u8, g.params[pidx].ty.name, want_ty)) return true;
+    }
+    return false;
+}
+
 /// Emit a resolved bare-name `Call` (or the receiver-prepended forms).
 fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
@@ -4371,7 +4393,13 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         const names = try b.allocator.alloc(?[]const u8, args.len);
         for (names, 0..) |*t, j| {
             const pidx = recv_off + j;
-            t.* = if (pidx < f.params.len and !f.params[pidx].is_vararg) f.params[pidx].ty.name else null;
+            if (pidx < f.params.len and !f.params[pidx].is_vararg and
+                !overloadParamTypeConflicts(b.module, f, pidx))
+            {
+                t.* = f.params[pidx].ty.name;
+            } else {
+                t.* = null;
+            }
         }
         break :blk names;
     };

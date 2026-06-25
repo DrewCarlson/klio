@@ -322,6 +322,13 @@ pub const Inst = union(enum) {
         op: BinOp,
         lhs: Reg,
         rhs: Reg,
+        /// Set when this BinOp is the combine step of a compound assignment
+        /// (`a += b` lowered to `a = a.<op>(b)`). For a mutable collection
+        /// left operand the evaluator then dispatches the in-place
+        /// `<op>Assign` (Kotlin prefers `MutableCollection.plusAssign`),
+        /// keeping the receiver mutable instead of producing a read-only
+        /// `plus` result that a later mutation would reject.
+        compound: bool = false,
     },
     /// Unary primitive operation.
     UnOp: struct { dst: Reg, op: UnOp, operand: Reg },
@@ -760,6 +767,13 @@ pub const Class = struct {
     /// is therefore never construction; it must resolve to a same-named
     /// factory function, so bare-call lowering must not treat it as a ctor.
     is_abstract: bool = false,
+    /// True only for an as-yet-unfilled `reserveClass` placeholder. A real
+    /// class is registered with `methods`/`supertypes`/`init_block` not yet
+    /// backpatched, so it is structurally indistinguishable from a stub;
+    /// this flag lets `addClass` tell a reserved slot (which the real
+    /// declaration overwrites in place) from a genuine same-simple-name
+    /// twin in another package (which must keep its own id).
+    is_stub: bool = false,
 };
 
 /// `class_index` / `func_index` entry: simple name → id.
@@ -1975,15 +1989,14 @@ pub const Module = struct {
         var class = class_in;
         if (self.classIndexEntryByName(class.name)) |id| {
             const existing = &self.classes.items[id.int()];
-            // `primary_params` is intentionally NOT part of the stub test: a
-            // build pre-pass fills every reserved class's primary parameters
-            // (so a forward-referenced constructor sees them) before the class
-            // is fully lowered, and that filled stub must still overwrite in
-            // place here.
-            const is_stub = std.mem.eql(u8, existing.fqn, existing.name) and
-                existing.methods.len == 0 and
-                existing.supertypes.len == 0 and
-                existing.init_block == null;
+            // A reserved `reserveClass` placeholder carries `is_stub`. The
+            // structural shape (fqn==name, empty methods/supertypes/init) is
+            // NOT a reliable stub test: a real class is added before its
+            // methods/supertypes/init are backpatched, so a genuine
+            // root-package class (whose fqn equals its simple name) is
+            // structurally identical to a stub. Trusting the explicit flag
+            // keeps a same-simple-name twin in another package distinct.
+            const is_stub = existing.is_stub;
             // A reserved-stub fill, or the same class re-lowered
             // (identical FQN), overwrites in place so forward
             // references keep their id. A different fully-qualified
@@ -2070,6 +2083,7 @@ pub const Module = struct {
             .companion = null,
             .supertypes = &.{},
             .is_inner = is_inner,
+            .is_stub = true,
         });
         return id;
     }
