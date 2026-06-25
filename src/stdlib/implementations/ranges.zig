@@ -303,7 +303,11 @@ pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     const lo = if (view.step > 0) view.start else view.end;
     const hi = if (view.step > 0) view.end else view.start;
-    const in_bounds = n >= lo and n <= hi;
+    // ULong bounds span the full u64 range stored as i64, so test unsigned.
+    const in_bounds = if (view.kind == .ULong) blk2: {
+        const un: u64 = @bitCast(n);
+        break :blk2 un >= @as(u64, @bitCast(lo)) and un <= @as(u64, @bitCast(hi));
+    } else (n >= lo and n <= hi);
     if (!in_bounds) {
         return ok(.{ .Bool = false });
     }
@@ -313,8 +317,9 @@ pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn range_is_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "isEmpty") orelse return typeErr("isEmpty requires a Range receiver");
-    const empty = if (view.step > 0) view.start > view.end else view.start < view.end;
-    return ok(.{ .Bool = empty });
+    // `rangeViewEmpty` compares unsigned for ULong, so `ULongRange.EMPTY`
+    // (`MaxUL..MinUL`) reads as empty.
+    return ok(.{ .Bool = rangeViewEmpty(view) });
 }
 
 pub fn range_reversed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {

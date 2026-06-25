@@ -1949,7 +1949,7 @@ pub const Value = union(enum) {
     /// `isEmpty()`): a positive step needs `start <= end`, a negative one
     /// `start >= end`.
     fn rangeIsEmptyVal(r: anytype) bool {
-        return if (r.step > 0) r.start > r.end else r.start < r.end;
+        return !r.kind.inBounds(r.start, r.end, r.step);
     }
 
     /// Equality with boxed `Number` semantics (each boxed type only matches
