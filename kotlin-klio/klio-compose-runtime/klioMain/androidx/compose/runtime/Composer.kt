@@ -84,6 +84,9 @@ internal class KlioComposer : Composer {
     private val root = GroupNode(0L, null)
     private val stack = ArrayList<GroupNode>()
 
+    /** The recomposer driving this composition; effects launch onto its scope. */
+    @JvmField var recomposer: Recomposer? = null
+
     // Recomposition state.
     private val stateToGroups = HashMap<Any, HashSet<GroupNode>>()  // state -> subscribed groups
     private val invalidated = HashSet<GroupNode>()                  // groups awaiting recompose

@@ -15,19 +15,27 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.CancellationException
 import kotlin.coroutines.CoroutineContext
 
+// The scope effects launch onto: the recomposer's effect scope. Its context
+// carries the driver's interceptor (when the recomposer was built with a driver
+// context, e.g. Recomposer(coroutineContext) under runBlocking), so launches
+// dispatch + suspend correctly; with a plain Recomposer() it falls back to the
+// eager synchronous behavior.
+private fun effectScopeOf(c: KlioComposer): CoroutineScope =
+    c.recomposer?.effectScope ?: CoroutineScope(Job())
+
 /** A CoroutineScope bound to the composition; cancelled when it is disposed. */
 public fun rememberCoroutineScope(): CoroutineScope {
     val c = requireComposer() as KlioComposer
     val existing = c.rememberedValue()
     if (existing is CoroutineScope) return existing
-    val scope = CoroutineScope(Job())
+    val scope = CoroutineScope(effectScopeOf(c).coroutineContext + Job())
     c.updateRememberedValue(scope)
     c.registerCleanup { scope.cancel() }
     return scope
 }
 
 private class LaunchedHolder {
-    var scope: CoroutineScope? = null
+    var job: Job? = null
 }
 
 private fun launchEffect(c: KlioComposer, changed: Boolean, block: suspend CoroutineScope.() -> Unit) {
@@ -36,15 +44,13 @@ private fun launchEffect(c: KlioComposer, changed: Boolean, block: suspend Corou
     val holder: LaunchedHolder
     if (slot is LaunchedHolder) {
         holder = slot
-        holder.scope?.cancel()
+        holder.job?.cancel()
     } else {
         holder = LaunchedHolder()
         c.updateRememberedValue(holder)
-        c.registerCleanup { holder.scope?.cancel() }
+        c.registerCleanup { holder.job?.cancel() }
     }
-    val scope = CoroutineScope(Job())
-    holder.scope = scope
-    scope.launch { block() }
+    holder.job = effectScopeOf(c).launch { block() }
 }
 
 /** Launch [block] on first composition and whenever [key1] changes. */
