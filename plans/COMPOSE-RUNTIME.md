@@ -34,6 +34,16 @@
   outputs, byte-identical across image/direct load modes; `docs/packs/shipped/
   compose-runtime.md`; `examples/README.md` entries.
 
+**FOLLOW-UP — AbstractMutableList bug (revisit when fixed):** klio's stdlib
+`AbstractMutableList` currently throws `BinOp.Less on 0 and null` (a `modCount`
+read returns null) when subclassed, so `SnapshotStateList`/`Set`/`Map` are
+implemented by fully overriding the `Mutable*` interface over a plain backing
+collection rather than extending `AbstractMutableList`. This works and tracks
+reads/writes correctly, but is more verbose. Once the stdlib `AbstractMutableList`
+`modCount` bug is fixed (the user is fixing it separately), revisit and simplify
+`SnapshotStateCollections.kt` to extend `AbstractMutableList`/`AbstractMutableSet`/
+`AbstractMutableMap`, keeping the `notifyRead`/`notifyWrite` instrumentation.
+
 Remaining (later phases): P7 async (LaunchedEffect / rememberCoroutineScope /
 produceState / snapshotFlow / derivedStateOf, frame-clock recomposer — blocked on the
 coroutine Flow/StateFlow interpreter bugs in §9), observable SnapshotStateList/Map/Set,
