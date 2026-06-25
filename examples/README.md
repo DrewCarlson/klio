@@ -45,6 +45,7 @@ Run any program with:
 | `object_lazy_init.kt`      | Lazy first-access `object`/companion initialization: unused objects never initialize, init/property interleaving, companion init at first instantiation, anon-object init blocks, init-failure wrapping (`FileFailedToInitializeException`) without retry. |
 | `value_class.kt`           | Inline `value class`.                                           |
 | `annotation_class.kt`      | `annotation class` declarations.                               |
+| `annotated_function_types.kt` | Type-use-site annotations on function types (`@Composable () -> Unit`): params, return types, nullable, receiver, generic args, typealias, property getter, and annotated lambda expressions. |
 | `plain_class_tostring.kt`  | Default and overridden `toString`.                             |
 | `ir_instance_identity.kt`  | Reference identity of instances.                               |
 | `smart_cast_field.kt`, `as_cast.kt` | Smart casts and `as` / `as?`.                         |

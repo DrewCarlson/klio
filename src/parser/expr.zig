@@ -512,9 +512,12 @@ pub fn parseMultiplicative(p: *Parser) ?Expr {
 /// exact shape for the safe form.
 pub fn parseAs(p: *Parser) ?Expr {
     var lhs = parsePrefix(p) orelse return null;
-    while (std.meta.activeTag(support.peekKind(p).*) == .Keyword and
-        support.peekKind(p).Keyword == .As)
-    {
+    while (true) {
+        // `as` / `as?` is an infix operator that can never begin a
+        // statement, so a leading `as` on a continuation line always
+        // applies to the preceding expression. Look past newlines for it.
+        if (!peekIsAsAcrossNewlines(p)) break;
+        support.skipNl(p);
         _ = support.bump(p); // `as`
         const safe = support.peekKind(p).isQuestion();
         if (safe) {
@@ -893,6 +896,19 @@ pub fn tryConsumeNamedArgName(p: *Parser) ?[]const u8 {
     _ = support.bump(p); // `=`
     support.skipNl(p);
     return name;
+}
+
+/// Peek forward past any number of `Newline` tokens. Returns `true` when
+/// the next non-newline token is the `as` keyword (the start of an
+/// `as`/`as?` cast).
+fn peekIsAsAcrossNewlines(p: *const Parser) bool {
+    var i = p.pos;
+    while (kindAt(p, i)) |k| {
+        if (std.meta.activeTag(k) != .Newline) break;
+        i += 1;
+    }
+    const next = kindAt(p, i) orelse return false;
+    return std.meta.activeTag(next) == .Keyword and next.Keyword == .As;
 }
 
 /// Peek forward past any number of `Newline` tokens. Returns `true` when

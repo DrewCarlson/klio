@@ -510,7 +510,18 @@ pub fn parseProperty(p: *Parser) ?Property {
     return parsePropertyWithFlags(p, ModifierFlags{});
 }
 
+/// Parse a local `val`/`var`. Local properties cannot declare `get`/`set`
+/// accessors, so a following `get(...)`/`set(...)` is a separate statement
+/// (e.g. a call to a function named `set`) and must not be consumed.
+pub fn parseLocalProperty(p: *Parser) ?Property {
+    return parsePropertyInner(p, ModifierFlags{}, false);
+}
+
 pub fn parsePropertyWithFlags(p: *Parser, flags: ModifierFlags) ?Property {
+    return parsePropertyInner(p, flags, true);
+}
+
+fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?Property {
     // `suspend` is not a meaningful property modifier, but the stdlib
     // `coroutineContext` intrinsic carries it (under a `@Suppress`). klio runs
     // suspend bodies inline, so the modifier is simply inert on a property
@@ -573,7 +584,10 @@ pub fn parsePropertyWithFlags(p: *Parser, flags: ModifierFlags) ?Property {
             delegate = exprmod.parseExpr(p);
         }
     }
-    const accessors = parsePropertyAccessors(p) orelse return null;
+    const accessors = if (allow_accessors)
+        (parsePropertyAccessors(p) orelse return null)
+    else
+        PropertyAccessors{ .getter = null, .setter = null, .setter_visibility = null };
     const end = p.tokens[p.pos -| 1].span;
     const delegate_boxed: ?*Expr = if (delegate) |dv| blk: {
         const e = p.allocator.create(Expr) catch @panic("OOM");
@@ -674,6 +688,7 @@ const AccessorScan = struct {
     index: usize,
     visibility: ?Visibility,
     inlined: bool,
+    had_annotation: bool,
 };
 
 /// Lookahead from `from`, skipping newlines and any leading `inline` /
@@ -688,6 +703,7 @@ fn scanAccessorModifiers(p: *const Parser, from: usize) AccessorScan {
     }
     var acc_visibility: ?Visibility = null;
     var acc_inline = false;
+    var had_annotation = false;
     // Accept `inline` and / or a visibility modifier in either order ahead of
     // the `get` / `set` keyword. Kotlin allows `inline get()` and
     // `private inline set(v)`; both combinations parse here.
@@ -696,6 +712,7 @@ fn scanAccessorModifiers(p: *const Parser, from: usize) AccessorScan {
         // Skip an annotation on the accessor (`@InternalAPI set(value)`,
         // `@Suppress("X") get()`); klio ignores accessor annotations.
         if (tok.kind.isAt()) {
+            had_annotation = true;
             i += 1; // `@`
             // Optional use-site target `@set:Foo` / `@get:Foo`.
             const a = kindAt(p, i);
@@ -770,7 +787,7 @@ fn scanAccessorModifiers(p: *const Parser, from: usize) AccessorScan {
         }
         break;
     }
-    return .{ .index = i, .visibility = acc_visibility, .inlined = acc_inline };
+    return .{ .index = i, .visibility = acc_visibility, .inlined = acc_inline, .had_annotation = had_annotation };
 }
 
 /// Getter, setter, and bare-`set` visibility produced by
@@ -805,17 +822,22 @@ fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
         // accessor in place but restricts visibility. We synthesize a bodyless
         // accessor whose presence carries only the visibility.
         const is_bodyless = !(next != null and is(&next.?, .LParen));
-        if (is_bodyless and acc_visibility == null and !acc_inline) {
-            // No modifier and no `(` — not an accessor, bail.
+        if (is_bodyless and acc_visibility == null and !acc_inline and !scan.had_annotation) {
+            // No modifier, no annotation, and no `(` — not an accessor
+            // (e.g. a following statement that calls a `get`/`set`
+            // function). Bail.
             break;
         }
-        // Commit — consume the newlines, optional vis, and accessor.
+        // Commit — consume the newlines, optional vis/annotation, and accessor.
         p.pos = i;
         const start_span = bump(p).span; // get / set
         if (is_bodyless) {
-            // `private set` (no `(...)`): record visibility on the Property
-            // itself; do NOT synthesize a custom accessor — the default one
-            // stays in effect.
+            // Bodyless accessor (no `(...)`):
+            //   - `private set` restricts the setter's visibility while the
+            //     default accessor stays in effect;
+            //   - an abstract `@TestOnly get` / `get` (interface member or
+            //     `abstract`/`expect` property) declares the accessor without
+            //     a body. Either way there is nothing to synthesize here.
             if (is_set) {
                 if (acc_visibility) |v| setter_visibility = v;
             }

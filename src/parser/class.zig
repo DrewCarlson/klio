@@ -642,6 +642,11 @@ pub fn parseSecondaryCtor(
                 if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
                     break;
                 }
+                // A named delegation argument (`this(groups = …, slots = …)`):
+                // consume the `name =` prefix. The delegation AST carries
+                // only positional expressions, so the argument binds by
+                // its position in the call.
+                _ = expr.tryConsumeNamedArgName(p);
                 const a = expr.parseExpr(p) orelse break;
                 args.append(p.allocator, a) catch @panic("OOM");
                 support.skipNl(p);

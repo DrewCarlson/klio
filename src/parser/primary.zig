@@ -17,6 +17,7 @@ const control = @import("control.zig");
 const members = @import("members.zig");
 const class = @import("class.zig");
 const types = @import("types.zig");
+const file = @import("file.zig");
 
 const Parser = root.Parser;
 const Expr = ast.Expr;
@@ -95,6 +96,22 @@ pub fn parsePrimary(p: *Parser) ?Expr {
             } };
         },
         .StringQuote => return parseStringTemplate(p),
+        .AtNoWs, .AtPostWs, .AtPreWs, .AtBothWs => {
+            // Annotated expression: `@Composable { ... }`,
+            // `@Suppress("UNCHECKED_CAST") (x as T)`,
+            // `@OptIn(Api::class) Flags.enabled`. The annotation prefixes
+            // an expression; it is a runtime no-op here, so consume and
+            // discard the annotation set(s), then parse the expression
+            // that follows.
+            _ = file.parseAnnotations(p);
+            support.skipNl(p);
+            // A `{` after the annotations is a function literal; other
+            // forms parse as ordinary primary expressions.
+            if (std.meta.activeTag(support.peekKind(p).*) == .LBrace) {
+                return control.parseLambdaLiteral(p);
+            }
+            return parsePrimary(p);
+        },
         .Ident => {
             if (control.tryParseLabelBinding(p)) |label_expr| {
                 return label_expr;

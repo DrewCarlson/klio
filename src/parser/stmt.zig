@@ -81,7 +81,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                 if (next != null and std.meta.activeTag(next.?) == .LParen) {
                     return parseDestructuringDecl(p);
                 }
-                const prop = members.parseProperty(p) orelse return null;
+                const prop = members.parseLocalProperty(p) orelse return null;
                 const pp = p.allocator.create(ast.Property) catch @panic("OOM");
                 pp.* = prop;
                 return Stmt{ .Decl = Decl{ .Property = pp } };
