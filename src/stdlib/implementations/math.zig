@@ -123,26 +123,44 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
         if (first.* != .Double and second.* != .Double) return ok(.{ .Float = @floatCast(r) });
         return ok(.{ .Double = r });
     }
-    // Unsigned pairs compare by unsigned magnitude and keep their kind,
-    // widening to the larger when the kinds differ.
-    if (unsigned_as_u64(first) != null or unsigned_as_u64(second) != null) {
-        const x = unsigned_as_u64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
-        const y = unsigned_as_u64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
+    // A pair that is *both* unsigned compares by unsigned magnitude and keeps
+    // its unsigned kind, widening to the larger when the kinds differ.
+    if (unsigned_as_u64(first) != null and unsigned_as_u64(second) != null) {
+        const x = unsigned_as_u64(first).?;
+        const y = unsigned_as_u64(second).?;
         const r: u64 = if (want_min) @min(x, y) else @max(x, y);
         if (first.* == .ULong or second.* == .ULong) return ok(.{ .ULong = r });
         if (first.* == .UInt or second.* == .UInt) return ok(.{ .UInt = @intCast(r) });
         if (first.* == .UShort or second.* == .UShort) return ok(.{ .UShort = @intCast(r) });
         return ok(.{ .UByte = @intCast(r) });
     }
-    const x = numeric_as_i64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
-    const y = numeric_as_i64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
+    // Otherwise compare by signed value, accepting an unsigned operand by its
+    // magnitude: a mixed signed/unsigned pair arises when an untyped integer
+    // literal lands on the unsigned overload of `minOf`/`maxOf`. Kotlin's
+    // result there is the signed integral type, so widen to i64 and return
+    // Int (or Long when either side is 64-bit).
+    const x = integral_as_i64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
+    const y = integral_as_i64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
     const r: i64 = if (want_min) @min(x, y) else @max(x, y);
-    // Widen to Long if either operand was Long; otherwise Int.
-    if (first.* == .Long or second.* == .Long) {
+    if (first.* == .Long or second.* == .Long or first.* == .ULong or second.* == .ULong) {
         return ok(.{ .Long = r });
     }
-    // Kotlin Int min/max keeps an Int result.
     return ok(.{ .Int = @truncate(r) });
+}
+
+/// Any integral operand widened to `i64`, signed or unsigned, by magnitude.
+fn integral_as_i64(v: *const Value) ?i64 {
+    return switch (v.*) {
+        .Int => |x| @intCast(x),
+        .Long => |x| x,
+        .Short => |x| @intCast(x),
+        .Byte => |x| @intCast(x),
+        .UByte => |x| @intCast(x),
+        .UShort => |x| @intCast(x),
+        .UInt => |x| @intCast(x),
+        .ULong => |x| @bitCast(x),
+        else => null,
+    };
 }
 
 /// Unsigned operand widened to `u64` (UByte/UShort/UInt/ULong only).
