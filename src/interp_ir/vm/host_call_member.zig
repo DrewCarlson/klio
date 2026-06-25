@@ -3253,7 +3253,8 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // mutates the source set (the `filterInPlace` removeAll/retainAll
             // path iterates + removes); an immutable set snapshots.
             if (s.mutable and s.backing == null) {
-                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
+                const cap = try captureModCount(allocator, s.mod_count);
+                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
             }
             const items = try cloneItemsList(allocator, s.items);
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };

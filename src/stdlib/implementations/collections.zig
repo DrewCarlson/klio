@@ -92,16 +92,29 @@ fn modCountFor(a: Allocator, mutable: bool) Error!?ObjRef(u64) {
     return try ObjRef(u64).init(a, 0);
 }
 
-/// `list.items.len`, or 0 for a non-list — for the structural-bump diff.
+/// A `List`/`Set` element count, or 0 for anything else — for the
+/// structural-bump diff. (`Map` fail-fast is handled via its own counter.)
 fn listLenOf(v: *const Value) usize {
-    return if (v.* == .List) listLen(v.List.items) else 0;
+    return switch (v.*) {
+        .List => |l| listLen(l.items),
+        .Set => |s| listLen(s.items),
+        else => 0,
+    };
 }
 
-/// Increment a list's `mod_count` (no-op when absent). Use directly for a
+/// The shared `mod_count` of a `List`/`Set` value, if any.
+fn modCountOf(v: *const Value) ?ObjRef(u64) {
+    return switch (v.*) {
+        .List => |l| l.mod_count,
+        .Set => |s| s.mod_count,
+        else => null,
+    };
+}
+
+/// Increment a collection's `mod_count` (no-op when absent). Use directly for a
 /// structural op that does not change length (`trimToSize`/`ensureCapacity`).
 pub fn bumpModCount(v: *const Value) void {
-    if (v.* != .List) return;
-    if (v.List.mod_count) |mc| {
+    if (modCountOf(v)) |mc| {
         const g = mc.borrowMut();
         defer g.deinit();
         g.get().* +%= 1;
@@ -110,9 +123,8 @@ pub fn bumpModCount(v: *const Value) void {
 
 /// `defer structuralBump(&ctx.args[0], before)`: bump `mod_count` only when the
 /// length actually changed, so `remove(absent)` / `removeAll([])` / `retainAll`
-/// of an unchanged list register no modification (matching Kotlin's contract).
+/// of an unchanged collection register no modification (Kotlin's contract).
 fn structuralBump(v: *const Value, before: usize) void {
-    if (v.* != .List) return;
     if (listLenOf(v) != before) bumpModCount(v);
 }
 
@@ -202,6 +214,7 @@ fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
         .items = try ValueList.init(a, deduped),
         .mutable = mutable,
         .backing = null,
+        .mod_count = try modCountFor(a, mutable),
     } };
 }
 
@@ -4115,6 +4128,8 @@ pub fn coll_set_to_string(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.add")) {
         .items => |x| x,
@@ -4132,6 +4147,8 @@ pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.remove")) {
         .items => |x| x,
@@ -4156,6 +4173,8 @@ pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_set_clear(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.clear")) {
         .items => |x| x,
@@ -4230,6 +4249,8 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
 
 pub fn coll_mut_set_remove_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.removeAll")) {
         .items => |x| x,
@@ -4239,6 +4260,8 @@ pub fn coll_mut_set_remove_all(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_set_retain_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.retainAll")) {
         .items => |x| x,
@@ -5156,6 +5179,8 @@ pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    const _szb = listLenOf(&ctx.args[0]);
+    defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
     const it = switch (try recvSetItems(a, ctx.args, "MutableSet.addAll")) {
         .items => |x| x,

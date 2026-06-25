@@ -1124,6 +1124,8 @@ pub const Value = union(enum) {
         /// Declared element-type head from an explicit call-site type
         /// argument on the creating stdlib function; see `List`.
         declared_elem: ?[]const u8 = null,
+        /// Structural-modification counter for fail-fast iteration; see `List`.
+        mod_count: ?ObjRef(u64) = null,
     },
     /// `kotlin.collections.Map` / `MutableMap`.
     Map: struct {
@@ -1263,6 +1265,7 @@ pub const Value = union(enum) {
             .Set => |x| {
                 visitor.visit(x.items);
                 if (x.backing) |b| visitor.visit(MapBackingRef{ .cell = b });
+                if (x.mod_count) |mc| visitor.visit(mc);
             },
             .Array => |x| switch (x.storage) {
                 .boxed => |vl| visitor.visit(vl),
@@ -1398,6 +1401,7 @@ pub const Value = union(enum) {
             .Set => |x| {
                 releaseValueList(x.items, allocator);
                 if (x.backing) |b| (MapBackingRef{ .cell = b }).deinit();
+                if (x.mod_count) |mc| mc.deinit();
             },
             .Array => |x| switch (x.storage) {
                 .boxed => |vl| releaseValueList(vl, allocator),
