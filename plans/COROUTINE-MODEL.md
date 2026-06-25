@@ -585,3 +585,35 @@ B1 (monitor-across-suspend) as the one Zig prerequisite for `StateFlow`. Then sh
 PART B as the general correctness fix, B-(a) first (root cause), B-(b)/B-(b') as
 the defensive completions. Every step keeps the verified driven behavior
 (p1a/p4/p6) green.
+
+## Root cause found: field receiver-lambda park (the real "B1")
+
+The blocker for snapshotFlow + StateFlow.collectAsState is NOT monitor-across-
+suspend. It is narrower and exact: a call `recv.lambda()` where `lambda` is a
+**receiver-typed suspend lambda read from a field/property** (not a local), whose
+body **parks**, breaks on resume — the activation re-invokes the lambda from the
+top (producer re-runs) or the root driver re-invokes a non-closure (`Vm: Type`).
+
+Confirmed minimal repro (no flows involved):
+- V3 `recv.block()` where `block` is a **param**            → resumes OK
+- V5 `val b = block; recv.b()` (copy field to a local)      → resumes OK
+- V4 `recv.block()` where `block` is a **field**            → BREAKS
+
+`SafeFlow` is V4 verbatim: `private val block: suspend FlowCollector<T>.() -> Unit`
++ `collectSafely(collector) { collector.block() }`. So every `flow{}` that parks
+inside its producer hits this.
+
+Mechanism: `recv.fieldLambda()` lowers to a name-resolving `CallMember` on `recv`;
+`recv` has no such member, so eval falls back to the enclosing-`this` closure. That
+works the first time, but the suspend-activation capture records "re-invoke this
+member call" rather than "resume the closure's continuation" — so resume re-runs
+(or re-resolves the name on `recv`, which is not a closure → Type).
+
+Fix direction: when a `CallMember` resolves to an enclosing-`this` closure, invoke
+it as a value call (`CallValueWithThis` shape) so the park captures the closure
+continuation — exactly what the local-copy V5 already does. Either lower
+`recv.enclosingFieldReceiverLambda()` to `CallValueWithThis(GetField(this,name),
+this=recv)`, or fix the CallMember eval's enclosing-`this` fallback to do so.
+
+snapshotFlow + both collectAsState overloads are written and correct (held out of
+the pack) and will work once this lands.
