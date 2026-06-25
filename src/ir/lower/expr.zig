@@ -2628,6 +2628,21 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             .last_is_lambda = lastArgIsLambdaOrAnon(args),
             .trailing_lambda_arity = trailingLambdaArity(args),
         };
+        // An explicit `<T>` argument binds a reified parameter, so a reified
+        // inline overload of this shape outranks a non-reified `KClass<T>`
+        // namesake (which would lower `<T>` as a constructor value instead of
+        // binding `T::class`). Splice the reified overload directly.
+        if (ast_type_args.len != 0) {
+            if (inline_state.reifiedInlineFnAstFor(nm, inline_call_shape)) |rf| {
+                if (bareInlineNeedsSplice(b, nm, rf, args)) {
+                    const expected = b.peekExpected();
+                    const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+                    if (try tryInlineCallWithTypeArgs(b, nm, rf, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
+                        return r;
+                    }
+                }
+            }
+        }
         if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
             // A reified inline overload whose type parameter lives only in
             // the trailing lambda's parameter list (`T.(R) -> Unit`) cannot
