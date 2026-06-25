@@ -983,6 +983,29 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
         }
+        // A bare reference to the enclosing type's own companion object
+        // (`Key` inside `interface I { companion object Key; … = Key }`)
+        // resolves to that companion singleton via the qualified `I.Key`
+        // form. Needed because a companion that has a supertype (e.g.
+        // `companion object Key : CoroutineContext.Key<I>`) is also
+        // registered as a classId under its simple name, which would
+        // otherwise route the bare name to the class reference below
+        // instead of the singleton.
+        if (b.ownerClass()) |owner| {
+            const comp_mangled: ?[]const u8 = b.module.registry.companion_singletons.get(owner);
+            if (comp_mangled) |cm| {
+                const simple = if (std.mem.lastIndexOfScalar(u8, cm, '$')) |i| cm[i + 1 ..] else cm;
+                if (std.mem.eql(u8, simple, name0)) {
+                    const sp = segments[0].span;
+                    var rsegs = [_]ast.Ident{
+                        .{ .name = owner, .span = sp },
+                        .{ .name = name0, .span = sp },
+                    };
+                    const qualified = Expr{ .Path = .{ .segments = &rsegs, .span = sp } };
+                    return lowerExpr(b, &qualified);
+                }
+            }
+        }
         // A bare name that is a known class is a class reference. In a
         // receiver context a runtime receiver member shadows the
         // classifier (kotlinc: a property named like a class wins in

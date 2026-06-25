@@ -959,6 +959,17 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 break :blk g.get().registry.companion_singletons.get(cname);
             };
             if (comp_name) |cn| {
+                // The bare name IS this class's (or an inherited interface's)
+                // companion object's own simple name (`Key` referencing
+                // `companion object Key`, registered mangled as
+                // `Owner$Companion$Key`): resolve to the companion singleton
+                // itself, not a member of it. This covers a super-interface's
+                // companion, which a bare reference from a default member /
+                // implementor would otherwise miss (the member lookup below
+                // only finds members declared *inside* the companion).
+                if (std.mem.eql(u8, companionSimpleName(cn), name)) {
+                    if (try companionInstanceForClass(self, cname)) |comp| return ok(comp);
+                }
                 const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
                     .ok => |maybe| maybe,
                     .err => |e| return errRes(e),
@@ -2389,6 +2400,12 @@ fn firstSupertypeOf(inst: ObjRef(InstanceData)) ?[]const u8 {
 
 /// The first declared supertype simple name of class `cn`, via the
 /// runtime class table.
+/// The simple name of a companion singleton from its mangled registry key
+/// (`Owner$Companion$Key` → `Key`).
+fn companionSimpleName(mangled: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, mangled, '$')) |i| mangled[i + 1 ..] else mangled;
+}
+
 fn firstSupertype(self: *VmHost, cn: []const u8) ?[]const u8 {
     const cg = self.classes.borrow();
     defer cg.deinit();
