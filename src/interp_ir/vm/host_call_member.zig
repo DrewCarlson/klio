@@ -2355,9 +2355,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             } } } };
         }
         const start: usize = @intCast(idx);
-        const items = try cloneItemsList(allocator, receiver.List.items);
+        // Share the backing list (not a snapshot) so a `MutableListIterator`'s
+        // `set`/`add`/`remove` mutate the underlying list, matching Kotlin.
         return .{ .ok = .{ .Iterator = .{
-            .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
+            .items = receiver.List.items.clone(),
             .pos = try ObjRef(usize).init(allocator, start),
             .prim = null,
         } } };
@@ -4245,6 +4246,24 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             if (runtime.reclaimEnabled()) nv.retain();
             g.get().items[p - 1] = nv;
         }
+        return .{ .ok = .Unit };
+    }
+    // `MutableListIterator.add(x)` — insert before the element a subsequent
+    // `next()` would return (at the cursor) and advance the cursor past it,
+    // so the inserted element is skipped by the following `next()`.
+    if (std.mem.eql(u8, name, "add") and args.len == 1) {
+        const pg = it.pos.borrow();
+        const p = pg.get().*;
+        pg.deinit();
+        const g = it.items.borrowMut();
+        defer g.deinit();
+        var nv = args[0];
+        if (runtime.reclaimEnabled()) nv.retain();
+        const idx = if (p <= g.get().items.len) p else g.get().items.len;
+        try g.get().insert(allocator, idx, nv);
+        const pmg = it.pos.borrowMut();
+        pmg.get().* = p + 1;
+        pmg.deinit();
         return .{ .ok = .Unit };
     }
     // `MutableIterator.remove()` — drop the element last returned by `next()`
