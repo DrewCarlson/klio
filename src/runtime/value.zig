@@ -393,6 +393,27 @@ pub const RangeKind = enum {
         }
         return if (step > 0) cur <= end else cur >= end;
     }
+
+    /// `a until to` / `a ..< to` is empty exactly when `to` is the kind's
+    /// MIN_VALUE (Char/UInt/ULong: 0).
+    pub fn untilEmpty(self: RangeKind, to: i64) bool {
+        return switch (self) {
+            .Int => to <= std.math.minInt(i32),
+            .Long => to == std.math.minInt(i64),
+            .Char, .UInt, .ULong => to == 0,
+        };
+    }
+
+    /// Stored `(start, end)` bounds of the kind's EMPTY range: signed kinds use
+    /// `1..0`, unsigned kinds `MAX..0` (matching `IntRange.EMPTY` /
+    /// `UIntRange.EMPTY`).
+    pub fn emptyBounds(self: RangeKind) [2]i64 {
+        return switch (self) {
+            .Int, .Long, .Char => .{ 1, 0 },
+            .UInt => .{ std.math.maxInt(u32), 0 },
+            .ULong => .{ -1, 0 },
+        };
+    }
 };
 
 /// Numeric promotion rank — wider types win in mixed arithmetic.
@@ -1928,7 +1949,7 @@ pub const Value = union(enum) {
     /// `isEmpty()`): a positive step needs `start <= end`, a negative one
     /// `start >= end`.
     fn rangeIsEmptyVal(r: anytype) bool {
-        return if (r.step > 0) r.start > r.end else r.start < r.end;
+        return !r.kind.inBounds(r.start, r.end, r.step);
     }
 
     /// Equality with boxed `Number` semantics (each boxed type only matches

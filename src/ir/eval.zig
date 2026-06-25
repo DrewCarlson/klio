@@ -2251,6 +2251,31 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 .Map, .List, .Set, .Sequence, .Range => true,
                 else => false,
             }) {
+                // A compound assign (`xs += y`) onto a mutable collection
+                // dispatches the in-place `plusAssign` / `minusAssign`
+                // (Kotlin prefers `MutableCollection.plusAssign`), so the
+                // collection stays mutable. A read-only collection (or a
+                // plain `xs + y`) takes the `plus` / `minus` path below,
+                // producing a fresh read-only result.
+                if (bo.compound) {
+                    const mutable = switch (l) {
+                        .List => |c| c.mutable,
+                        .Set => |c| c.mutable,
+                        .Map => |c| c.mutable,
+                        else => false,
+                    };
+                    if (mutable) {
+                        const assign = if (bo.op == .Add) "plusAssign" else "minusAssign";
+                        switch (try host.callMember(allocator, &l, assign, &.{r})) {
+                            .ok => {
+                                l.retain();
+                                try frame.write(bo.dst, l);
+                                return .cont;
+                            },
+                            .err => |e| return raiseStep(frame, e),
+                        }
+                    }
+                }
                 const method = if (bo.op == .Add) "plus" else "minus";
                 switch (try host.callMember(allocator, &l, method, &.{r})) {
                     .ok => |rv| {
@@ -4363,33 +4388,52 @@ fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?b
 /// Build a `Range` value for `..` / `..<`. Returns `null` for unhandled
 /// operand pairings.
 fn rangeValue(op: BinOp, l: *const Value, r: *const Value) ?Value {
-    const minus_one: i64 = if (op == .RangeUntil) 1 else 0;
+    // Resolve the operand pairing to (start, end-bound, kind). UByte/UShort
+    // promote to a UInt range, mirroring Kotlin's `UByte.rangeTo` etc.
+    var start: i64 = undefined;
+    var bound: i64 = undefined;
+    var kind: RangeKind = undefined;
     if (l.* == .Int and r.* == .Int) {
-        return .{ .Range = .{ .start = @as(i64, l.Int), .end = @as(i64, r.Int) - minus_one, .step = 1, .kind = .Int } };
+        start = l.Int;
+        bound = r.Int;
+        kind = .Int;
+    } else if (l.* == .Char and r.* == .Char) {
+        start = l.Char;
+        bound = r.Char;
+        kind = .Char;
+    } else if (l.* == .Long and r.* == .Long) {
+        start = l.Long;
+        bound = r.Long;
+        kind = .Long;
+    } else if (l.* == .Int and r.* == .Long) {
+        start = l.Int;
+        bound = r.Long;
+        kind = .Long;
+    } else if (l.* == .Long and r.* == .Int) {
+        start = l.Long;
+        bound = r.Int;
+        kind = .Long;
+    } else if (l.* == .ULong and r.* == .ULong) {
+        start = @bitCast(l.ULong);
+        bound = @bitCast(r.ULong);
+        kind = .ULong;
+    } else if (smallUnsigned(l)) |lu| {
+        const ru = smallUnsigned(r) orelse return null;
+        start = lu;
+        bound = ru;
+        kind = .UInt;
+    } else return null;
+
+    if (op == .RangeUntil) {
+        // `a ..< MIN_VALUE` is empty -> the kind's EMPTY range; otherwise the
+        // inclusive end is one before the exclusive bound.
+        if (kind.untilEmpty(bound)) {
+            const e = kind.emptyBounds();
+            return .{ .Range = .{ .start = e[0], .end = e[1], .step = 1, .kind = kind } };
+        }
+        bound -= 1;
     }
-    if (l.* == .Char and r.* == .Char) {
-        return .{ .Range = .{ .start = @as(i64, l.Char), .end = @as(i64, r.Char) - minus_one, .step = 1, .kind = .Char } };
-    }
-    if (l.* == .Long and r.* == .Long) {
-        return .{ .Range = .{ .start = l.Long, .end = r.Long - minus_one, .step = 1, .kind = .Long } };
-    }
-    if (l.* == .Int and r.* == .Long) {
-        return .{ .Range = .{ .start = @as(i64, l.Int), .end = r.Long - minus_one, .step = 1, .kind = .Long } };
-    }
-    if (l.* == .Long and r.* == .Int) {
-        return .{ .Range = .{ .start = l.Long, .end = @as(i64, r.Int) - minus_one, .step = 1, .kind = .Long } };
-    }
-    // UInt and the smaller unsigned types (UByte/UShort promote to a UInt
-    // range, mirroring Kotlin's `UByte.rangeTo` etc.).
-    const lu = smallUnsigned(l);
-    const ru = smallUnsigned(r);
-    if (lu != null and ru != null) {
-        return .{ .Range = .{ .start = lu.?, .end = ru.? - minus_one, .step = 1, .kind = .UInt } };
-    }
-    if (l.* == .ULong and r.* == .ULong) {
-        return .{ .Range = .{ .start = @bitCast(l.ULong), .end = @as(i64, @bitCast(r.ULong)) - minus_one, .step = 1, .kind = .ULong } };
-    }
-    return null;
+    return .{ .Range = .{ .start = start, .end = bound, .step = 1, .kind = kind } };
 }
 
 /// A UByte/UShort/UInt value as an i64 (for forming a UInt range), else null.

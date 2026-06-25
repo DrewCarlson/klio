@@ -239,6 +239,22 @@ const RecordingHost = struct {
                 defer g.deinit();
                 for (self.append_values) |v| try g.get().append(self.allocator, v);
             },
+            // `buildSet` builds a genuine mutable Set, so the mock's `add`
+            // dedups structurally-equal elements just like the real set.
+            .Set => |s| {
+                const g = s.items.borrowMut();
+                defer g.deinit();
+                for (self.append_values) |v| {
+                    var dup = false;
+                    for (g.get().items) |*existing| {
+                        if (Value.structuralEqBoxed(existing, &v)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) try g.get().append(self.allocator, v);
+                }
+            },
             .Map => |m| {
                 const g = m.entries.borrowMut();
                 defer g.deinit();

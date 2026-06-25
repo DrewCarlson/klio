@@ -50,11 +50,18 @@ pub fn ranges_down_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn ranges_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const pair = pairIntArgs(ctx, "until") orelse return typeErr("until requires two Int operands");
+    const kind = rangeKindForArgs(ctx.args[0], ctx.args[1]);
+    // `a until MIN_VALUE` is empty: Kotlin returns the type's EMPTY range rather
+    // than wrapping `to - 1` below MIN.
+    if (kind.untilEmpty(pair[1])) {
+        const e = kind.emptyBounds();
+        return ok(.{ .Range = .{ .start = e[0], .end = e[1], .step = 1, .kind = kind } });
+    }
     return ok(.{ .Range = .{
         .start = pair[0],
         .end = saturatingSub(pair[1], 1),
         .step = 1,
-        .kind = rangeKindForArgs(ctx.args[0], ctx.args[1]),
+        .kind = kind,
     } });
 }
 
@@ -71,7 +78,7 @@ pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             } } } };
         }
         const signed = if (r.step < 0) -n else n;
-        const normalized_end = normalizeProgressionEnd(r.start, r.end, signed);
+        const normalized_end = normalizeProgressionEnd(r.start, r.end, signed, r.kind);
         return ok(.{ .Range = .{
             .start = r.start,
             .end = normalized_end,
@@ -86,27 +93,16 @@ pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// last element that's actually reachable from `start` with the given
 /// `step`. For `1..10 step 2` this normalizes 10 -> 9 because 9 is the last
 /// reachable value.
-pub fn normalizeProgressionEnd(start: i64, end: i64, step: i64) i64 {
-    if (step == 0) {
-        return end;
-    }
+pub fn normalizeProgressionEnd(start: i64, end: i64, step: i64, kind: RangeKind) i64 {
+    if (step == 0) return end;
+    // Kotlin getProgressionLastElement: when `start` is already past `end` (an
+    // empty/one-element progression, unsigned for ULong), the closed-range bound
+    // stays as `last`.
+    if (!kind.inBounds(start, end, step)) return end;
     if (step > 0) {
-        // Kotlin getProgressionLastElement: `start >= end` yields `end` (an
-        // empty/one-element progression keeps the closed-range bound as `last`).
-        if (start > end) {
-            return end;
-        }
-        const diff = end - start;
-        const rem = @rem(diff, step);
-        return end - rem;
+        return end - @rem(end - start, step);
     } else {
-        if (start < end) {
-            return end;
-        }
-        const diff = start - end;
-        const mag = -step;
-        const rem = @rem(diff, mag);
-        return end + rem;
+        return end + @rem(start - end, -step);
     }
 }
 
@@ -163,7 +159,14 @@ pub fn asRangeView(v: *const Value) ?RangeView {
             if (!std.mem.startsWith(u8, fqn, "kotlin.ranges.")) {
                 return null;
             }
-            const kind: RangeKind = if (std.mem.indexOf(u8, fqn, "Long") != null)
+            // Test ULong/UInt before Long/Int: "ULongRange" contains "Long",
+            // "UIntRange" contains "Int", and a wrong kind makes the unsigned
+            // range iterate signed (`ULongRange.EMPTY` would not read as empty).
+            const kind: RangeKind = if (std.mem.indexOf(u8, fqn, "ULong") != null)
+                .ULong
+            else if (std.mem.indexOf(u8, fqn, "UInt") != null)
+                .UInt
+            else if (std.mem.indexOf(u8, fqn, "Long") != null)
                 .Long
             else if (std.mem.indexOf(u8, fqn, "Char") != null)
                 .Char
@@ -300,7 +303,11 @@ pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     const lo = if (view.step > 0) view.start else view.end;
     const hi = if (view.step > 0) view.end else view.start;
-    const in_bounds = n >= lo and n <= hi;
+    // ULong bounds span the full u64 range stored as i64, so test unsigned.
+    const in_bounds = if (view.kind == .ULong) blk2: {
+        const un: u64 = @bitCast(n);
+        break :blk2 un >= @as(u64, @bitCast(lo)) and un <= @as(u64, @bitCast(hi));
+    } else (n >= lo and n <= hi);
     if (!in_bounds) {
         return ok(.{ .Bool = false });
     }
@@ -310,8 +317,9 @@ pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn range_is_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "isEmpty") orelse return typeErr("isEmpty requires a Range receiver");
-    const empty = if (view.step > 0) view.start > view.end else view.start < view.end;
-    return ok(.{ .Bool = empty });
+    // `rangeViewEmpty` compares unsigned for ULong, so `ULongRange.EMPTY`
+    // (`MaxUL..MinUL`) reads as empty.
+    return ok(.{ .Bool = rangeViewEmpty(view) });
 }
 
 pub fn range_reversed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -441,19 +449,20 @@ fn noopCtx(args: []const Value) CallCtx {
 
 test "normalize progression end clamps to last reachable element" {
     // 1..10 step 2 -> last reachable is 9.
-    try testing.expectEqual(@as(i64, 9), normalizeProgressionEnd(1, 10, 2));
+    try testing.expectEqual(@as(i64, 9), normalizeProgressionEnd(1, 10, 2, .Int));
     // 1..10 step 3 -> 1,4,7,10 -> 10.
-    try testing.expectEqual(@as(i64, 10), normalizeProgressionEnd(1, 10, 3));
+    try testing.expectEqual(@as(i64, 10), normalizeProgressionEnd(1, 10, 3, .Int));
     // exact multiple stays put.
-    try testing.expectEqual(@as(i64, 9), normalizeProgressionEnd(1, 9, 2));
-    // empty forward range collapses to start-1.
-    try testing.expectEqual(@as(i64, 4), normalizeProgressionEnd(5, 1, 2));
+    try testing.expectEqual(@as(i64, 9), normalizeProgressionEnd(1, 9, 2, .Int));
+    // empty forward range keeps the closed-range bound (Kotlin
+    // getProgressionLastElement: start >= end yields end).
+    try testing.expectEqual(@as(i64, 1), normalizeProgressionEnd(5, 1, 2, .Int));
     // step == 0 returns end unchanged.
-    try testing.expectEqual(@as(i64, 10), normalizeProgressionEnd(1, 10, 0));
+    try testing.expectEqual(@as(i64, 10), normalizeProgressionEnd(1, 10, 0, .Int));
     // 10 downTo 1 step 2 -> 10,8,6,4,2 -> 2.
-    try testing.expectEqual(@as(i64, 2), normalizeProgressionEnd(10, 1, -2));
-    // empty backward range collapses to start+1.
-    try testing.expectEqual(@as(i64, 2), normalizeProgressionEnd(1, 5, -2));
+    try testing.expectEqual(@as(i64, 2), normalizeProgressionEnd(10, 1, -2, .Int));
+    // empty backward range keeps the closed-range bound (start <= end yields end).
+    try testing.expectEqual(@as(i64, 5), normalizeProgressionEnd(1, 5, -2, .Int));
 }
 
 test "downTo builds a descending range" {
@@ -540,12 +549,13 @@ test "first and last read range endpoints" {
     try testing.expectEqual(@as(i32, 7), l.ok.Int);
 }
 
-test "step field returns the absolute step" {
+test "step field returns the signed step" {
+    // `10 downTo 1 step 2` -> IntProgression.step is -2 (Kotlin keeps the sign).
     const range = Value{ .Range = .{ .start = 10, .end = 1, .step = -2, .kind = .Int } };
     const args = [_]Value{range};
     var ctx = noopCtx(&args);
     const s = try range_step_field(&ctx);
-    try testing.expectEqual(@as(i32, 2), s.ok.Int);
+    try testing.expectEqual(@as(i32, -2), s.ok.Int);
 }
 
 test "char range endpoints reinterpret as code units" {

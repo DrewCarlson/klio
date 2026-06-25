@@ -854,13 +854,13 @@ test "lowercaseChar maps a regular letter" {
     try testing.expectEqual(@as(u16, 'a'), r.ok.Char);
 }
 
-test "lowercaseChar keeps multi-scalar mappings unchanged" {
-    // U+0130 (dotted capital I) lowercases to two scalars, so the single-char
-    // form returns the original char.
+test "lowercaseChar uses the single-char simple mapping (U+0130 -> i)" {
+    // İ (U+0130) has a multi-scalar FULL lowercase, but `lowercaseChar()` yields
+    // the single-char simple mapping 'i' (matching `Character.toLowerCase`).
     const args = [_]Value{.{ .Char = 0x0130 }};
     var ctx = noopCtx(&args);
     const r = try char_lowercase_char(&ctx);
-    try testing.expectEqual(@as(u16, 0x0130), r.ok.Char);
+    try testing.expectEqual(@as(u16, 0x69), r.ok.Char);
 }
 
 test "digitToInt parses within radix" {

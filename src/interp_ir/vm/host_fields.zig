@@ -367,20 +367,29 @@ fn freeFieldMiss(allocator: Allocator, e: EvalError) void {
 }
 
 fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool) Allocator.Error!EvalResult {
-    // `Progression.first`/`.last` are constructor-set properties: a *read* (no
-    // parens) returns the stored bound even when the range is empty. The
-    // `Iterable.first()`/`last()` *functions* (a call, dispatched through the
-    // member-call path) still throw NoSuchElementException on an empty range.
-    if (receiver.* == .Range and (std.mem.eql(u8, name, "first") or std.mem.eql(u8, name, "last"))) {
-        const r = receiver.Range;
-        const v: i64 = if (std.mem.eql(u8, name, "first")) r.start else r.end;
-        return ok(switch (r.kind) {
-            .Int => .{ .Int = @truncate(v) },
-            .Long => .{ .Long = v },
-            .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
-            .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(v))) },
-            .ULong => .{ .ULong = @bitCast(v) },
-        });
+    // Progression `first`/`last`/`step` property *reads* (no parens): `first`/
+    // `last` return the stored bound even when empty (the `Iterable.first()`/
+    // `last()` *functions*, dispatched as calls, still throw on empty); `step`
+    // is always Int (Int/Char/UInt) or Long (Long/ULong) with its sign. Applies
+    // to a host `Value.Range` and to a source range `Instance` (e.g.
+    // `ULongRange.EMPTY`, whose `step` field would otherwise read back as Int).
+    if (std.mem.eql(u8, name, "first") or std.mem.eql(u8, name, "last") or std.mem.eql(u8, name, "step")) {
+        if (stdlib.implementations.ranges.asRangeView(receiver)) |view| {
+            if (std.mem.eql(u8, name, "step")) {
+                return ok(switch (view.kind) {
+                    .Long, .ULong => Value{ .Long = view.step },
+                    .Int, .Char, .UInt => Value{ .Int = @truncate(view.step) },
+                });
+            }
+            const v: i64 = if (std.mem.eql(u8, name, "first")) view.start else view.end;
+            return ok(switch (view.kind) {
+                .Int => .{ .Int = @truncate(v) },
+                .Long => .{ .Long = v },
+                .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
+                .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(v))) },
+                .ULong => .{ .ULong = @bitCast(v) },
+            });
+        }
     }
     // Reflective reads on a *bound* member reference (`this::name`):
     // `.name`/`.simpleName` yield the referenced member's name, and
@@ -950,6 +959,17 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 break :blk g.get().registry.companion_singletons.get(cname);
             };
             if (comp_name) |cn| {
+                // The bare name IS this class's (or an inherited interface's)
+                // companion object's own simple name (`Key` referencing
+                // `companion object Key`, registered mangled as
+                // `Owner$Companion$Key`): resolve to the companion singleton
+                // itself, not a member of it. This covers a super-interface's
+                // companion, which a bare reference from a default member /
+                // implementor would otherwise miss (the member lookup below
+                // only finds members declared *inside* the companion).
+                if (std.mem.eql(u8, companionSimpleName(cn), name)) {
+                    if (try companionInstanceForClass(self, cname)) |comp| return ok(comp);
+                }
                 const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
                     .ok => |maybe| maybe,
                     .err => |e| return errRes(e),
@@ -1969,14 +1989,21 @@ fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Instance
     while (cur_outer) |o| {
         switch (o) {
             .Instance => |outer_inst| {
+                // Resolve through getFieldInner first so an overriding custom
+                // getter on the outer instance's runtime (sub)class is invoked
+                // virtually, rather than short-circuiting on an inherited raw
+                // backing slot (e.g. an `abstract`/`open val` overridden by a
+                // getter-only `override`). getFieldInner itself falls back to
+                // the raw slot when no getter resolves, so legitimately stored
+                // fields still read correctly.
+                const oid = outer_inst.identity();
+                if (try withFieldResolvePair(self, allocator, oid, name, &o, false, false)) |r| {
+                    if (r == .ok and r.ok != .Unit) return r;
+                }
                 {
                     const g = outer_inst.borrow();
                     defer g.deinit();
                     if (g.get().get(name)) |v| return ok(v);
-                }
-                const oid = outer_inst.identity();
-                if (try withFieldResolvePair(self, allocator, oid, name, &o, false, false)) |r| {
-                    if (r == .ok and r.ok != .Unit) return r;
                 }
                 cur_outer = blk: {
                     const g = outer_inst.borrow();
@@ -2373,6 +2400,12 @@ fn firstSupertypeOf(inst: ObjRef(InstanceData)) ?[]const u8 {
 
 /// The first declared supertype simple name of class `cn`, via the
 /// runtime class table.
+/// The simple name of a companion singleton from its mangled registry key
+/// (`Owner$Companion$Key` → `Key`).
+fn companionSimpleName(mangled: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, mangled, '$')) |i| mangled[i + 1 ..] else mangled;
+}
+
 fn firstSupertype(self: *VmHost, cn: []const u8) ?[]const u8 {
     const cg = self.classes.borrow();
     defer cg.deinit();
