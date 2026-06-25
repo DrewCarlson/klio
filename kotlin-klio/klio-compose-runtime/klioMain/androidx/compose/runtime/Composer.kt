@@ -98,6 +98,7 @@ internal class KlioComposer : Composer {
     private val sideEffects = ArrayList<() -> Unit>()
     private val disposers = ArrayList<DisposableEffectResult>()
     private val cleanups = ArrayList<() -> Unit>()
+    private val rememberObservers = ArrayList<RememberObserver>()
 
     init {
         stack.add(root)
@@ -248,7 +249,12 @@ internal class KlioComposer : Composer {
         cleanups.add(cleanup)
     }
 
-    /** Dispose every live DisposableEffect + cleanup, in reverse registration order. */
+    /** Track a remembered RememberObserver (its onRemembered already ran). */
+    fun registerRememberObserver(observer: RememberObserver) {
+        rememberObservers.add(observer)
+    }
+
+    /** Dispose every live DisposableEffect + cleanup + RememberObserver, in reverse order. */
     fun disposeAll() {
         val live = ArrayList(disposers)
         disposers.clear()
@@ -263,6 +269,13 @@ internal class KlioComposer : Composer {
         while (j >= 0) {
             cl[j]()
             j = j - 1
+        }
+        val ro = ArrayList(rememberObservers)
+        rememberObservers.clear()
+        var k = ro.size - 1
+        while (k >= 0) {
+            ro[k].onForgotten()
+            k = k - 1
         }
     }
 

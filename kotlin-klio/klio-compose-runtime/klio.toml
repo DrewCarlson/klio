@@ -41,6 +41,9 @@ include = [
     "androidx/compose/runtime/ComposeVersion.kt",
     "androidx/compose/runtime/internal/FunctionKeyMeta.kt",
     "androidx/compose/runtime/internal/StabilityInferred.kt",
+    # Pure public interface: a remembered value implementing it gets
+    # onRemembered/onForgotten lifecycle callbacks (wired by the klioMain engine).
+    "androidx/compose/runtime/RememberObserver.kt",
 ]
 
 # klio-supplied layer: the composer / composition / recomposer / snapshot-state
