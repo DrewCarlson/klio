@@ -30,6 +30,11 @@ const run_mod = @import("vm/run.zig");
 pub const VmHost = vmhost.VmHost;
 pub const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
+/// `@Composable` implicit-composer support: the composer-stack host intrinsics
+/// (`__compose_pushComposer` / `__compose_popComposer` /
+/// `__compose_currentComposer`) the loader merges into the host bindings.
+pub const compose = @import("vm/compose.zig");
+
 /// Assert-empty + clear the process-wide receiver/coroutine thread-locals at a
 /// run boundary. Called by `Vm.deinit` and by the public runners so leaked
 /// cross-run state is a loud Debug failure.

@@ -988,6 +988,15 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             }
         }
     }
+    // A param declared `Any` / `Any?` holds a boxed value, so `==` on it uses
+    // total-order equality (`NaN == NaN`, `0.0 != -0.0`) like `Double.equals`.
+    // `kotlin.test`'s `assertEquals(expected: Any?, actual: Any?)` relies on
+    // this for boxed `Double`/`Float` comparisons.
+    for (f.params) |*p| {
+        if (p.ty.function == null and std.mem.eql(u8, p.ty.name.name, "Any")) {
+            try b.markAnyTyped(p.name.name);
+        }
+    }
     if (owner_class) |owner| {
         b.setOwnerClass(owner);
     }

@@ -37,6 +37,7 @@ const kotlinx_datetime = @import("kotlinx_datetime");
 const kotlinx_coroutines = @import("kotlinx_coroutines");
 const kotlinx_serialization = @import("kotlinx_serialization");
 const compose_runtime = @import("compose_runtime");
+const interp_ir = @import("interp_ir");
 const ktor_client = @import("ktor_client");
 
 const io = @import("io.zig");
@@ -191,6 +192,23 @@ fn collectUserImportPrefixes(
                 allocator.free(joined);
             } else {
                 gop.value_ptr.* = {};
+            }
+        }
+        // A file in package P implicitly sees all of P (same-package
+        // top-level declarations resolve by simple name). Fold the declared
+        // package into the gate set so a pack whose `library_id` is that
+        // package (or a parent/child of it) is loaded even when the file
+        // imports nothing from it — e.g. a `package androidx.collection` test
+        // referencing `MutableIntIntMap` with no import.
+        if (f.package) |pkg| {
+            if (pkg.path.len != 0) {
+                const joined = try joinIdentPath(allocator, pkg.path);
+                const gop = try out.getOrPut(joined);
+                if (gop.found_existing) {
+                    allocator.free(joined);
+                } else {
+                    gop.value_ptr.* = {};
+                }
             }
         }
     }
@@ -1140,6 +1158,9 @@ pub fn mergedHostBindings(gpa: Allocator) HostBindings {
     mergeInto(&out, kotlinx_coroutines.hostBindings(gpa) catch null);
     mergeInto(&out, kotlinx_serialization.hostBindings(gpa) catch null);
     mergeInto(&out, compose_runtime.hostBindings(gpa) catch null);
+    // The composer-stack intrinsics live in interp_ir (they touch the VM's
+    // implicit-composer threadlocal), registered alongside the pure ones.
+    mergeInto(&out, interp_ir.compose.hostBindings(gpa) catch null);
     // ktor-client is opt-in (pack must be installed to take effect) but
     // its host functions are always available in the registry so the
     // pack's bindings resolve when installed.
