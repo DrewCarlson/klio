@@ -7,8 +7,13 @@ public actual fun CoroutineScope.newCoroutineContext(
     context: CoroutineContext
 ): CoroutineContext {
     val combined = coroutineContext + context
+    // Match Kotlin/JVM: a coroutine launched with no explicit dispatcher (e.g.
+    // GlobalScope.launch / CoroutineScope(Job()).launch outside a driver) runs
+    // on Dispatchers.Default — dispatched to the worker pool with real
+    // suspension — not eagerly inline. Inside runBlocking the context already
+    // carries an interceptor, so this branch is not taken there.
     return if (combined[ContinuationInterceptor] == null)
-        combined + KlioDispatcher
+        combined + Dispatchers.Default
     else combined
 }
 
