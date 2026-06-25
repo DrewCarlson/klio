@@ -79,6 +79,16 @@ public fun <T> remember(key1: Any?, key2: Any?, key3: Any?, calculation: () -> T
 }
 
 /**
+ * Remember a [MutableState] holding [newValue], updating it every composition.
+ * Lets a long-lived lambda or effect read the latest value without restarting.
+ */
+public fun <T> rememberUpdatedState(newValue: T): State<T> {
+    val state = remember { mutableStateOf(newValue) }
+    state.value = newValue
+    return state
+}
+
+/**
  * Group [block] under a distinct positional identity per [keys]. Used to give a
  * stable identity to each item of a list so its `remember`/state survives
  * reordering. The interpreter already opens a group for this call; the explicit
