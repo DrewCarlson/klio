@@ -19,6 +19,7 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
+const host_call_member = @import("host_call_member.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -106,6 +107,31 @@ pub fn callSiteKey() u64 {
     h.update(std.mem.asBytes(&sp.start));
     h.update(std.mem.asBytes(&sp.end));
     return h.final();
+}
+
+/// Hash one argument for the `@Composable` arg-changed check. Primitives and
+/// content types hash by value/content; reference types (instances, closures,
+/// `MutableState`, …) hash by identity — their value changing is observed via
+/// the snapshot read subscription, not the arg-changed path, matching Compose's
+/// stability model (a stable parameter is "unchanged" while its object is the
+/// same instance).
+fn argValueHash(v: *const Value) u64 {
+    return switch (v.*) {
+        .Null, .Unit => 0,
+        .Bool, .Char, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .String, .Pair, .Triple, .List, .Map, .Set, .Array, .Range, .MapEntry => @as(u64, @bitCast(@as(i64, host_call_member.kotlinHashCode(v)))),
+        else => if (v.lockIdentity()) |id| @as(u64, id) else @as(u64, @bitCast(@as(i64, host_call_member.kotlinHashCode(v)))),
+    };
+}
+
+/// FNV-1a combine of the call's argument hashes — the @Composable "changed"
+/// signal. A group whose args hash differs from last pass re-composes even if it
+/// was not directly invalidated (klio's stand-in for the plugin's `$changed`).
+pub fn argsHash(args: []const Value) i64 {
+    var h: u64 = 1469598103934665603;
+    for (args) |*a| {
+        h = (h ^ argValueHash(a)) *% 1099511628211;
+    }
+    return @bitCast(h);
 }
 
 // ----- host intrinsics (klioMain composer stack management) -----
