@@ -1,0 +1,16 @@
+with key:
+  id=1 created=1
+  id=2 created=2
+  id=3 created=3
+  -- reorder to [3, 1, 2] --
+  id=3 created=3
+  id=1 created=1
+  id=2 created=2
+without key:
+  id=1 created=1
+  id=2 created=2
+  id=3 created=3
+  -- reorder to [3, 1, 2] --
+  id=3 created=1
+  id=1 created=2
+  id=2 created=3
