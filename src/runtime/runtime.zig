@@ -106,6 +106,7 @@ pub const strInit = value_mod.strInit;
 pub const strInitOwned = value_mod.strInitOwned;
 pub const strMeta = value_mod.strMeta;
 pub const ValueList = value_mod.ValueList;
+pub const ValueBox = value_mod.ValueBox;
 pub const ValueSlice = value_mod.ValueSlice;
 
 // class

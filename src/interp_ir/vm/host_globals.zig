@@ -84,7 +84,7 @@ const FILE_INIT_FAILED_MSG = "There was an error during file or class initializa
 fn fileInitFailedThrow(allocator: Allocator, cause: ?Value) Allocator.Error!EvalError {
     const fqn = try runtime.strInit(allocator, FILE_INIT_FAILED_FQN);
     const msg = try runtime.strInit(allocator, FILE_INIT_FAILED_MSG);
-    const cause_box = if (cause) |c| try Value.boxRef(allocator, c) else null;
+    const cause_box = if (cause) |c| (try Value.boxRef(allocator, c)).cell else null;
     return .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = cause_box } } };
 }
 

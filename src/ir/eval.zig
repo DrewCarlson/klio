@@ -417,7 +417,7 @@ pub fn formatStackTrace(allocator: Allocator, trace: *const runtime.StackTraceDa
 /// Returns null for a receiver that carries no captured trace.
 pub fn stackTraceArray(allocator: Allocator, v: *const Value) Allocator.Error!?Value {
     const stk: ?runtime.StackRef = switch (v.*) {
-        .Exception => |e| e.stack,
+        .Exception => |e| if (e.stack) |c| runtime.StackRef{ .cell = c } else null,
         .Instance => |inst| blk: {
             const g = inst.borrow();
             defer g.deinit();
@@ -462,9 +462,9 @@ pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayLis
                 try out.appendSlice(allocator, ": ");
                 try out.appendSlice(allocator, mg.get().bytes);
             }
-            stk = e.stack;
+            stk = if (e.stack) |c| runtime.StackRef{ .cell = c } else null;
             if (e.cause) |c| {
-                const cg = c.borrow();
+                const cg = (runtime.ValueBox{ .cell = c }).borrow();
                 defer cg.deinit();
                 cause = cg.get().*;
             }
@@ -513,7 +513,7 @@ pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
     switch (v.*) {
         .Exception => |*e| {
             if (e.stack != null) return;
-            e.stack = try captureStack(allocator);
+            if (try captureStack(allocator)) |s| e.stack = s.cell;
         },
         .Instance => |inst| {
             const g = inst.borrowMut();
