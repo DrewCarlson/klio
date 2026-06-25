@@ -461,7 +461,7 @@ fn allUppercase(s: []const u8) bool {
 const builtinKindMismatch = overload_match.builtinKindMismatch;
 
 /// Kotlin-faithful `hashCode()` for builtin value types.
-fn kotlinHashCode(v: *const Value) i32 {
+pub fn kotlinHashCode(v: *const Value) i32 {
     return switch (v.*) {
         .Null => 0,
         .Bool => |b| if (b) @as(i32, 1231) else @as(i32, 1237),

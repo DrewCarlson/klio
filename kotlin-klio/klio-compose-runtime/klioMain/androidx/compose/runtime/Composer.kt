@@ -31,10 +31,11 @@ public interface Composer {
 
     /**
      * Whether the group just entered by [startGroup] should execute its body
-     * this pass. False means skip: the group was composed before and is not on
-     * an invalidated path, so its slots and child groups are reused unchanged.
+     * this pass, given the hash of the call's arguments. False means skip: the
+     * group was composed before, its args are unchanged, and it is not on an
+     * invalidated path, so its slots and child groups are reused unchanged.
      */
-    public fun shouldRunGroup(): Boolean
+    public fun shouldRunGroup(argsHash: Long): Boolean
 
     /** Push a CompositionLocal provider layer for the enclosed content. */
     public fun startProviders(values: Array<out ProvidedValue<*>>)
@@ -68,6 +69,9 @@ internal class GroupNode(@JvmField val key: Long, @JvmField val parent: GroupNod
 
     /** True once this group has executed at least once. */
     @JvmField var composed: Boolean = false
+
+    /** Hash of the arguments this group last (re)composed with. */
+    @JvmField var lastArgsHash: Long = 0L
 
     /** Reset the per-composition-pass cursors before (re)entering this group. */
     fun enterPass() {
@@ -175,15 +179,18 @@ internal class KlioComposer : Composer {
         stack.add(node)
     }
 
-    override fun shouldRunGroup(): Boolean {
+    override fun shouldRunGroup(argsHash: Long): Boolean {
         val g = current()
         val rs = runSet
-        val should = !g.composed || rs == null || rs.contains(g)
+        // Run when fresh, when the whole tree runs (initial pass), when on the
+        // invalidated path, or when the arguments changed since last pass.
+        val should = !g.composed || rs == null || rs.contains(g) || g.lastArgsHash != argsHash
         if (should) {
             // The group is (re)running: drop its stale subscriptions; they
             // re-accumulate as the body re-reads state this pass.
             clearReads(g)
             g.composed = true
+            g.lastArgsHash = argsHash
         }
         return should
     }

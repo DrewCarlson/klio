@@ -886,7 +886,8 @@ fn composableEval(
         },
         .ok => {},
     }
-    const run = switch (try host_call_member.callMember(self, allocator, &composer, "shouldRunGroup", &.{})) {
+    const args_hash = Value.newLong(compose.argsHash(packed_args.items));
+    const run = switch (try host_call_member.callMember(self, allocator, &composer, "shouldRunGroup", &.{args_hash})) {
         .err => |e| {
             _ = host_call_member.callMember(self, allocator, &composer, "endGroup", &.{}) catch {};
             discardArgs(allocator, packed_args);
