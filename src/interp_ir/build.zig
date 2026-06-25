@@ -1223,6 +1223,13 @@ fn buildModuleWithOverrides(
             try collectClassMemberNamesInto(&module.registry.class_member_names, &.{}, d.Object.members);
         }
     }
+    // Builtin value-class members no user class declares: the unsigned types'
+    // backing `val data` (UByte/UShort/UInt/ULong). A bare `data` inside an
+    // unsigned extension (`UByte.toHexString = data.toHexString(...)`) is
+    // `this.data`, so it must shadow a same-named cross-package top-level the
+    // way a declared member would — otherwise the stdlib file fails to resolve
+    // whenever a test package happens to declare a top-level `data`.
+    try module.registry.class_member_names.put("data", {});
     // Per-class transitive supertype-name chain, nearest first, so body
     // lowering can rank extension receivers against the enclosing class
     // before the IR-side supertype slots are filled.
