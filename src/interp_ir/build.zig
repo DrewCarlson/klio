@@ -1442,6 +1442,21 @@ fn buildModuleWithOverrides(
         }
     }
     ir.lower.setTypeAliasTags(&module.registry.type_aliases);
+    // Fill every reserved class's primary-constructor parameters BEFORE any
+    // class method body is lowered. Class method bodies lower inside the loop
+    // below in declaration order, so a constructor call to a class declared
+    // later (`class A { fun f() = B("x") {} }; class B(d, flag, block)`) must
+    // already see B's parameter types for the argument-lambda arity and the
+    // trailing-lambda realignment (otherwise the lambda binds the wrong slot).
+    for (decls) |*d| {
+        if (d.* != .Class) continue;
+        const c = &d.Class;
+        if (module.classIndexEntryByName(c.name.name)) |cid| {
+            if (cid.int() < module.classes.items.len and module.classes.items[cid.int()].primary_params.len == 0) {
+                module.classes.items[cid.int()].primary_params = try ir.lower.decl.classPrimaryParams(a, c);
+            }
+        }
+    }
     // Lower each class.
     var empty_set = StringSet.init(a);
     defer empty_set.deinit();
