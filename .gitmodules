@@ -27,3 +27,15 @@
 	update = none
 	shallow = true
 	branch = v2.3.21
+# Upstream Compose Multiplatform core: the compose runtime pack consumes
+# androidx.compose.runtime commonMain sources verbatim. The full
+# compose-multiplatform-core repo is a large androidx-derived monorepo, so a
+# blanket `submodule update` must not pull it -- `update = none` skips it, and
+# the checkout is a treeless, sparse (compose/runtime/runtime/src/commonMain),
+# shallow clone of the pinned tag. See scripts/init-compose-submodule.sh.
+[submodule "kotlin-klio/klio-compose-runtime/upstream"]
+	path = kotlin-klio/klio-compose-runtime/upstream
+	url = https://github.com/JetBrains/compose-multiplatform-core
+	update = none
+	shallow = true
+	branch = v1.11.1
