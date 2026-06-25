@@ -58,3 +58,7 @@ id = "stdlib"
 # produceState) build on the kotlinx.coroutines pack.
 [[deps]]
 id = "kotlinx.coroutines"
+# The compose runtime's common code (frame clock, AwaiterQueue, snapshot
+# system, collections) is built on androidx.collection.
+[[deps]]
+id = "androidx.collection"

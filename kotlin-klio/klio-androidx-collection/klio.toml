@@ -1,0 +1,28 @@
+[library]
+# androidx.collection — the high-performance collection library the compose
+# runtime's common code depends on (ScatterMap/Set, ObjectList, the primitive
+# collections, SparseArray, LruCache, …). Consumed verbatim from the
+# compose-multiplatform-core fork; klio supplies no actuals — the non-JVM
+# (`nonJvmMain`) + JetBrains (`jbMain`) source sets provide pure-Kotlin actuals
+# for every `expect` (Float.fromBits, LinkedHashMap-backed LruHashMap,
+# kotlinx.atomicfu.locks-backed Lock, …).
+id = "androidx.collection"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+# The complete library: commonMain declarations + the non-JVM / JetBrains
+# actuals. No `include` list — every `.kt` under each root is consumed.
+[[source]]
+root = "upstream/collection/collection/src/commonMain/kotlin"
+[[source]]
+root = "upstream/collection/collection/src/nonJvmMain/kotlin"
+[[source]]
+root = "upstream/collection/collection/src/jbMain/kotlin"
+
+[[deps]]
+id = "stdlib"
+# The `Lock` actual (jbMain) uses kotlinx.atomicfu.locks.
+[[deps]]
+id = "kotlinx.atomicfu"

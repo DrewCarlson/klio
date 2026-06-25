@@ -202,6 +202,7 @@ const kotlinx_pack_dirs = [_][]const u8{
     "kotlin-klio/klio-kotlinx-coroutines",
     "kotlin-klio/klio-kotlinx-atomicfu",
     "kotlin-klio/klio-kotlinx-io",
+    "kotlin-klio/klio-androidx-collection",
     "kotlin-klio/klio-compose-runtime",
 };
 
