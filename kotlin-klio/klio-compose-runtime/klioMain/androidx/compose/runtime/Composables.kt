@@ -89,14 +89,20 @@ public fun <T> rememberUpdatedState(newValue: T): State<T> {
 }
 
 /**
- * Group [block] under a distinct positional identity per [keys]. Used to give a
- * stable identity to each item of a list so its `remember`/state survives
- * reordering. The interpreter already opens a group for this call; the explicit
- * keys disambiguate sibling invocations sharing one call site.
+ * Give [block] a group identity derived from [keys] rather than its call site, so
+ * its `remember`/state follows the key across reorders. Used per list item:
+ * `for (item in items) key(item.id) { Row(item) }`. Implemented as a movable
+ * group keyed by the joined keys (not the call-site span), so two iterations at
+ * the same source position get distinct, reorder-stable groups.
  */
-@Composable
 public fun <T> key(vararg keys: Any?, block: @Composable () -> T): T {
     val c = requireComposer()
-    for (k in keys) c.changed(k)
-    return block()
+    var h = -0x61c8864680b583ebL // golden-ratio seed, away from span-hash space
+    for (k in keys) h = h * 31L + (if (k == null) 0L else k.hashCode().toLong())
+    c.startGroup(h)
+    try {
+        return block()
+    } finally {
+        c.endGroup()
+    }
 }
