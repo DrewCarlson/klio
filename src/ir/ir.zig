@@ -24,6 +24,7 @@ pub const build = @import("build.zig");
 pub const eval = @import("eval.zig");
 pub const lower = @import("lower.zig");
 pub const jit_loop = @import("jit_loop.zig");
+pub const disasm = @import("disasm.zig");
 
 /// Type reference inside the IR. Today this is a textual FQN/name
 /// — the evaluator resolves against the class table at runtime.

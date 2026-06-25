@@ -16,6 +16,16 @@ internal fun requireComposer(): Composer =
     currentComposerOrNull()
         ?: error("currentComposer read with no active composition (call inside setContent)")
 
+// A freshly remembered value implementing RememberObserver gets onRemembered now
+// and onForgotten when the composition is disposed.
+private fun <T> rememberObserved(c: Composer, computed: T): T {
+    if (computed is RememberObserver) {
+        computed.onRemembered()
+        (c as KlioComposer).registerRememberObserver(computed)
+    }
+    return computed
+}
+
 /** The composer for the composition currently running, from the implicit stack. */
 public val currentComposer: Composer
     get() = requireComposer()
@@ -27,7 +37,7 @@ public fun <T> remember(calculation: () -> T): T {
     if (value === Composer.Empty) {
         val computed = calculation()
         c.updateRememberedValue(computed)
-        return computed
+        return rememberObserved(c, computed)
     }
     @Suppress("UNCHECKED_CAST")
     return value as T
@@ -41,7 +51,7 @@ public fun <T> remember(key1: Any?, calculation: () -> T): T {
     if (invalid || value === Composer.Empty) {
         val computed = calculation()
         c.updateRememberedValue(computed)
-        return computed
+        return rememberObserved(c, computed)
     }
     @Suppress("UNCHECKED_CAST")
     return value as T
@@ -56,7 +66,7 @@ public fun <T> remember(key1: Any?, key2: Any?, calculation: () -> T): T {
     if (invalid || value === Composer.Empty) {
         val computed = calculation()
         c.updateRememberedValue(computed)
-        return computed
+        return rememberObserved(c, computed)
     }
     @Suppress("UNCHECKED_CAST")
     return value as T
@@ -72,7 +82,7 @@ public fun <T> remember(key1: Any?, key2: Any?, key3: Any?, calculation: () -> T
     if (invalid || value === Composer.Empty) {
         val computed = calculation()
         c.updateRememberedValue(computed)
-        return computed
+        return rememberObserved(c, computed)
     }
     @Suppress("UNCHECKED_CAST")
     return value as T

@@ -37,6 +37,14 @@ public interface Composer {
      */
     public fun shouldRunGroup(argsHash: Long): Boolean
 
+    /** Cache the current group's @Composable return value, for reuse when the
+     * group is skipped on a later pass. */
+    public fun setGroupReturn(value: Any?)
+
+    /** The current group's cached @Composable return value, or [Unit] if the
+     * group has never recorded one. */
+    public fun groupReturn(): Any?
+
     /** Push a CompositionLocal provider layer for the enclosed content. */
     public fun startProviders(values: Array<out ProvidedValue<*>>)
 
@@ -73,6 +81,10 @@ internal class GroupNode(@JvmField val key: Long, @JvmField val parent: GroupNod
     /** Hash of the arguments this group last (re)composed with. */
     @JvmField var lastArgsHash: Long = 0L
 
+    /** The @Composable's return value from its last execution, reused verbatim
+     * when this group is skipped. [Composer.Empty] until first recorded. */
+    @JvmField var returnValue: Any? = Composer.Empty
+
     /** Reset the per-composition-pass cursors before (re)entering this group. */
     fun enterPass() {
         slotCursor = 0
@@ -83,6 +95,9 @@ internal class GroupNode(@JvmField val key: Long, @JvmField val parent: GroupNod
 internal class KlioComposer : Composer {
     private val root = GroupNode(0L, null)
     private val stack = ArrayList<GroupNode>()
+
+    /** The recomposer driving this composition; effects launch onto its scope. */
+    @JvmField var recomposer: Recomposer? = null
 
     // Recomposition state.
     private val stateToGroups = HashMap<Any, HashSet<GroupNode>>()  // state -> subscribed groups
@@ -98,6 +113,7 @@ internal class KlioComposer : Composer {
     private val sideEffects = ArrayList<() -> Unit>()
     private val disposers = ArrayList<DisposableEffectResult>()
     private val cleanups = ArrayList<() -> Unit>()
+    private val rememberObservers = ArrayList<RememberObserver>()
 
     init {
         stack.add(root)
@@ -197,6 +213,15 @@ internal class KlioComposer : Composer {
         return should
     }
 
+    override fun setGroupReturn(value: Any?) {
+        current().returnValue = value
+    }
+
+    override fun groupReturn(): Any? {
+        val v = current().returnValue
+        return if (v === Composer.Empty) Unit else v
+    }
+
     override fun endGroup() {
         if (stack.size > 1) stack.removeAt(stack.size - 1)
     }
@@ -248,7 +273,12 @@ internal class KlioComposer : Composer {
         cleanups.add(cleanup)
     }
 
-    /** Dispose every live DisposableEffect + cleanup, in reverse registration order. */
+    /** Track a remembered RememberObserver (its onRemembered already ran). */
+    fun registerRememberObserver(observer: RememberObserver) {
+        rememberObservers.add(observer)
+    }
+
+    /** Dispose every live DisposableEffect + cleanup + RememberObserver, in reverse order. */
     fun disposeAll() {
         val live = ArrayList(disposers)
         disposers.clear()
@@ -263,6 +293,13 @@ internal class KlioComposer : Composer {
         while (j >= 0) {
             cl[j]()
             j = j - 1
+        }
+        val ro = ArrayList(rememberObservers)
+        rememberObservers.clear()
+        var k = ro.size - 1
+        while (k >= 0) {
+            ro[k].onForgotten()
+            k = k - 1
         }
     }
 

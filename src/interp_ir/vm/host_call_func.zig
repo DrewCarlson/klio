@@ -898,8 +898,29 @@ fn composableEval(
     var res: EvalResult = .{ .ok = .{ .Unit = {} } };
     if (run) {
         res = try ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
+        // Cache the return value on the group so a later pass that skips this
+        // group (args unchanged, not invalidated) can hand back the same value
+        // — a value-returning @Composable (`collectAsState`, a passthrough)
+        // must not collapse to Unit when skipped.
+        if (res == .ok) {
+            switch (try host_call_member.callMember(self, allocator, &composer, "setGroupReturn", &.{res.ok})) {
+                .err => |e| {
+                    _ = host_call_member.callMember(self, allocator, &composer, "endGroup", &.{}) catch {};
+                    return .{ .err = e };
+                },
+                .ok => {},
+            }
+        }
     } else {
         discardArgs(allocator, packed_args);
+        // Reuse the cached return value from when this group last composed.
+        switch (try host_call_member.callMember(self, allocator, &composer, "groupReturn", &.{})) {
+            .err => |e| {
+                _ = host_call_member.callMember(self, allocator, &composer, "endGroup", &.{}) catch {};
+                return .{ .err = e };
+            },
+            .ok => |v| res = .{ .ok = v },
+        }
     }
     switch (try host_call_member.callMember(self, allocator, &composer, "endGroup", &.{})) {
         .err => |e| return .{ .err = e },

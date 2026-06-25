@@ -41,6 +41,20 @@ include = [
     "androidx/compose/runtime/ComposeVersion.kt",
     "androidx/compose/runtime/internal/FunctionKeyMeta.kt",
     "androidx/compose/runtime/internal/StabilityInferred.kt",
+    # Pure public interface: a remembered value implementing it gets
+    # onRemembered/onForgotten lifecycle callbacks (wired by the klioMain engine).
+    "androidx/compose/runtime/RememberObserver.kt",
+    # Frame clock: the MonotonicFrameClock contract + BroadcastFrameClock driver
+    # + its AwaiterQueue store, consumed straight from upstream. The platform
+    # `synchronized` + atomic `expect`s these pull in are satisfied by the
+    # klioMain actuals below (platform/Synchronization.kt, internal/Atomic.kt).
+    "androidx/compose/runtime/MonotonicFrameClock.kt",
+    "androidx/compose/runtime/BroadcastFrameClock.kt",
+    "androidx/compose/runtime/CancellationHandle.kt",
+    "androidx/compose/runtime/internal/AwaiterQueue.kt",
+    "androidx/compose/runtime/internal/Atomic.kt",
+    "androidx/compose/runtime/internal/JvmDefaultWithCompatibility.kt",
+    "androidx/compose/runtime/platform/Synchronization.kt",
 ]
 
 # klio-supplied layer: the composer / composition / recomposer / snapshot-state
@@ -55,3 +69,7 @@ id = "stdlib"
 # produceState) build on the kotlinx.coroutines pack.
 [[deps]]
 id = "kotlinx.coroutines"
+# The compose runtime's common code (frame clock, AwaiterQueue, snapshot
+# system, collections) is built on androidx.collection.
+[[deps]]
+id = "androidx.collection"

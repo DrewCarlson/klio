@@ -30,6 +30,7 @@ const KotlinFile = ast.KotlinFile;
 const resolver = @import("resolver");
 const typeck = @import("typeck");
 
+const ir = @import("ir");
 const interp_ir = @import("interp_ir");
 const Vm = interp_ir.Vm;
 
@@ -276,6 +277,58 @@ pub fn runFileIrVm(
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
 
     return runBuilt(gpa, all_asts.items, loaded.bindings, &map, "error: no main function found");
+}
+
+/// `klio dump-ir <file> [--func NAME] [--all]` — lower the file (linked against
+/// the stdlib + any gated packs, exactly as `run`/`test` do) and print its IR
+/// without executing it. The Direct/Dynamic call tally is the oracle for the
+/// static-binding work.
+pub fn runDumpIr(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    opts: ir.disasm.Options,
+    features: *const RequestedFeatures,
+) u8 {
+    var map = SourceMap.init(gpa);
+    defer map.deinit();
+    const id = load(gpa, &map, path) orelse return 1;
+    const src = map.get(id).source;
+    var lx = Lexer.init(gpa, id, src) catch return 1;
+    var lexed = lx.tokenize() catch return 1;
+    defer lexed.deinit(gpa);
+    renderToStderr(gpa, &lexed.diagnostics, &map);
+    if (lexed.diagnostics.hasErrors()) return 1;
+    const p = Parser.new(gpa, id, src, lexed.tokens);
+    const file_ast = p.parseFile();
+    renderToStderr(gpa, &p.diagnostics, &map);
+    if (p.diagnostics.hasErrors()) return 1;
+
+    var user_asts: std.ArrayList(KotlinFile) = .empty;
+    defer user_asts.deinit(gpa);
+    user_asts.append(gpa, file_ast) catch return 1;
+
+    const loaded = loadInstalledPacks(gpa, user_asts.items, &map, features);
+    var all_asts: std.ArrayList(KotlinFile) = .empty;
+    defer all_asts.deinit(gpa);
+    all_asts.appendSlice(gpa, loaded.asts) catch return 1;
+    all_asts.appendSlice(gpa, user_asts.items) catch return 1;
+
+    var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
+        io.printStderr(gpa, "error: lowering failed\n", .{});
+        return 1;
+    };
+    defer built.deinit();
+
+    const mg = built.module.borrow();
+    defer mg.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    ir.disasm.dumpModule(&aw.writer, mg.get(), opts) catch return 1;
+    const text = aw.toOwnedSlice() catch return 1;
+    defer gpa.free(text);
+    io.printStdout(gpa, "{s}", .{text});
+    return 0;
 }
 
 const TestRunCtx = struct {

@@ -39,3 +39,12 @@
 	update = none
 	shallow = true
 	branch = v1.11.1
+# Upstream androidx.collection (from the same compose-multiplatform-core fork):
+# the compose runtime's common code depends on it. Treeless/sparse/shallow,
+# update=none; see scripts/init-androidx-collection-submodule.sh.
+[submodule "kotlin-klio/klio-androidx-collection/upstream"]
+	path = kotlin-klio/klio-androidx-collection/upstream
+	url = https://github.com/JetBrains/compose-multiplatform-core
+	update = none
+	shallow = true
+	branch = v1.11.1
