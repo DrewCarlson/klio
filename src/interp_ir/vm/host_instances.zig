@@ -2423,7 +2423,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                             const g = cls.borrow();
                             defer g.deinit();
                             const bp = g.get().body_properties[prop_idx];
-                            break :blk bp.getter != null or bp.delegate != null;
+                            break :blk bp.getter != null or bp.delegate != null or bp.is_abstract;
                         };
                         if (!skip) {
                             const exists = blk: {
@@ -3063,6 +3063,9 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         const cg = class_def.borrow();
         defer cg.deinit();
         for (cg.get().body_properties) |p| {
+            // An abstract or getter/delegate-backed property has no backing
+            // field; seeding a Null slot would shadow the overriding getter.
+            if (p.is_abstract or p.getter != null or p.delegate != null) continue;
             var v: Value = .Null;
             if (p.init) |init_field| {
                 const init_expr = init_field.get();

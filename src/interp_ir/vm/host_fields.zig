@@ -1978,14 +1978,21 @@ fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Instance
     while (cur_outer) |o| {
         switch (o) {
             .Instance => |outer_inst| {
+                // Resolve through getFieldInner first so an overriding custom
+                // getter on the outer instance's runtime (sub)class is invoked
+                // virtually, rather than short-circuiting on an inherited raw
+                // backing slot (e.g. an `abstract`/`open val` overridden by a
+                // getter-only `override`). getFieldInner itself falls back to
+                // the raw slot when no getter resolves, so legitimately stored
+                // fields still read correctly.
+                const oid = outer_inst.identity();
+                if (try withFieldResolvePair(self, allocator, oid, name, &o, false, false)) |r| {
+                    if (r == .ok and r.ok != .Unit) return r;
+                }
                 {
                     const g = outer_inst.borrow();
                     defer g.deinit();
                     if (g.get().get(name)) |v| return ok(v);
-                }
-                const oid = outer_inst.identity();
-                if (try withFieldResolvePair(self, allocator, oid, name, &o, false, false)) |r| {
-                    if (r == .ok and r.ok != .Unit) return r;
                 }
                 cur_outer = blk: {
                     const g = outer_inst.borrow();

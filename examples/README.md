@@ -36,6 +36,7 @@ Run any program with:
 | `inheritance_delegation.kt`, `delegated_inheritance.kt` | Interface and inherited-delegate resolution (`by`). |
 | `interfaces.kt`            | Abstract members, default methods, multiple interfaces, marker interfaces. |
 | `abstract_inner.kt`        | `abstract` classes, secondary constructors, inner classes.     |
+| `inner_outer_property.kt`  | An inner class reads the outer instance's overridden property (virtual getter dispatch), incl. an `AbstractMutableList` subclass. |
 | `anon_local.kt`, `anon_object_tostring.kt` | Anonymous objects and local classes.           |
 | `anon_object_init.kt`      | Anonymous-object initialization: property initializers over the enclosing scope (top-level properties, object singletons, inline-HOF calls, captured locals), supertype ctor-arg expressions, init-block interleaving. |
 | `enums.kt`, `enum_companion.kt`, `enum_entries_interface.kt` | Enum entries, ctor args, per-entry overrides, `entries`/`values()`, enum companions. |

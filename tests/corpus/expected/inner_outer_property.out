@@ -1,0 +1,6 @@
+viaAbstract=42
+viaOpen=100
+list=[99, 1, 2, 3] size=4
+sum=105 contains=true indexOf=3
+equals=true
+afterRemove=[1, 2, 3]
