@@ -1,41 +1,23 @@
 // Observable collections — mutating one triggers recomposition of any composable
 // that read it. Each collection is a state object: reads route through
 // StateObservation.notifyRead (subscribing the running composable's group),
-// mutations through notifyWrite (invalidating those groups). Backed by a plain
-// collection, implementing the full Mutable* interface directly (klio's stdlib
-// AbstractMutableList is avoided).
+// mutations through notifyWrite (invalidating those groups). The list rides
+// AbstractMutableList, whose derived operations (iterator, contains, addAll,
+// clear, …) route through the five read/write-hooked primitives below; the map
+// and set delegate to a plain backing collection per operation.
 
 package androidx.compose.runtime
 
-public class SnapshotStateList<T> : MutableList<T> {
+public class SnapshotStateList<T> : AbstractMutableList<T>() {
     private val backing = ArrayList<T>()
     private fun read() = StateObservation.notifyRead(this)
     private fun write() = StateObservation.notifyWrite(this)
 
     override val size: Int get() { read(); return backing.size }
-    override fun isEmpty(): Boolean { read(); return backing.isEmpty() }
-    override fun contains(element: T): Boolean { read(); return backing.contains(element) }
-    override fun containsAll(elements: Collection<T>): Boolean { read(); return backing.containsAll(elements) }
     override fun get(index: Int): T { read(); return backing[index] }
-    override fun indexOf(element: T): Int { read(); return backing.indexOf(element) }
-    override fun lastIndexOf(element: T): Int { read(); return backing.lastIndexOf(element) }
-    override fun iterator(): MutableIterator<T> { read(); return backing.iterator() }
-    override fun listIterator(): MutableListIterator<T> { read(); return backing.listIterator() }
-    override fun listIterator(index: Int): MutableListIterator<T> { read(); return backing.listIterator(index) }
-    override fun subList(fromIndex: Int, toIndex: Int): MutableList<T> { read(); return backing.subList(fromIndex, toIndex) }
-
-    override fun add(element: T): Boolean { val r = backing.add(element); write(); return r }
-    override fun add(index: Int, element: T) { backing.add(index, element); write() }
-    override fun addAll(elements: Collection<T>): Boolean { val r = backing.addAll(elements); if (r) write(); return r }
-    override fun addAll(index: Int, elements: Collection<T>): Boolean { val r = backing.addAll(index, elements); if (r) write(); return r }
-    override fun clear() { if (backing.isNotEmpty()) { backing.clear(); write() } }
-    override fun remove(element: T): Boolean { val r = backing.remove(element); if (r) write(); return r }
-    override fun removeAll(elements: Collection<T>): Boolean { val r = backing.removeAll(elements); if (r) write(); return r }
-    override fun removeAt(index: Int): T { val r = backing.removeAt(index); write(); return r }
-    override fun retainAll(elements: Collection<T>): Boolean { val r = backing.retainAll(elements); if (r) write(); return r }
     override fun set(index: Int, element: T): T { val r = backing.set(index, element); write(); return r }
-
-    override fun toString(): String { read(); return backing.toString() }
+    override fun add(index: Int, element: T) { backing.add(index, element); write() }
+    override fun removeAt(index: Int): T { val r = backing.removeAt(index); write(); return r }
 }
 
 public class SnapshotStateMap<K, V> : MutableMap<K, V> {
