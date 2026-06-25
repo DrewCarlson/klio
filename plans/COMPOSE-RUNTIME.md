@@ -16,6 +16,29 @@
 - **P3 (`remember`)** — done. `remember`/`remember(keys…)`/`key` consume slots from
   the current group; memoizes across compose passes (verified: a `remember{}` block
   runs once across two compositions of the same content lambda).
+- **P4 (recomposition on state write)** — done. State reads subscribe the running
+  composable's group; a write invalidates them; `recompose()` re-runs from the root
+  but skips any composed group not on an invalidated path. Verified: a sibling that
+  did not read the changed state does not re-run.
+- **arg-changed recomposition** — done (the `$changed` stand-in). A group also
+  re-composes when its arguments hash differs from last pass (value/content for
+  primitives + strings, identity for reference types). Verified: a child given a
+  changed string re-renders while an unchanged-arg sibling is skipped.
+- **P5 (CompositionLocal)** — done. `compositionLocalOf` / `staticCompositionLocalOf`
+  / `CompositionLocalProvider` / `current`; provider layers on the composer.
+  Verified: default, provide, nested override, scope restoration.
+- **P6 (effects)** — done (synchronous subset). `SideEffect` (runs after each
+  composition that ran it) + `DisposableEffect` (setup on first/key-change, onDispose
+  on dispose) as non-restartable plain functions in the caller's group.
+- **examples + docs** — `examples/compose_*.kt` (6) with baked `tests/corpus/expected`
+  outputs, byte-identical across image/direct load modes; `docs/packs/shipped/
+  compose-runtime.md`; `examples/README.md` entries.
+
+Remaining (later phases): P7 async (LaunchedEffect / rememberCoroutineScope /
+produceState / snapshotFlow / derivedStateOf, frame-clock recomposer — blocked on the
+coroutine Flow/StateFlow interpreter bugs in §9), observable SnapshotStateList/Map/Set,
+`key{}` movable groups for lists, full MVCC snapshot transactions, the auxiliary
+Compose modules (ui / foundation / material), and a Skia rendering backend.
 
 ### Findings / divergences from the original plan
 
