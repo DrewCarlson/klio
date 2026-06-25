@@ -153,6 +153,18 @@ pub fn concurrent_synchronized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
     return result;
 }
 
+pub fn concurrent_monitor_enter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const key = if (ctx.args.len > 0) (ctx.args[0].lockIdentity() orelse 0) else 0;
+    try monitorEnter(key);
+    return .{ .ok = .Unit };
+}
+
+pub fn concurrent_monitor_exit(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const key = if (ctx.args.len > 0) (ctx.args[0].lockIdentity() orelse 0) else 0;
+    _ = try monitorExit(key);
+    return .{ .ok = .Unit };
+}
+
 /// Monitor key for a lock-object receiver: its object identity, or the
 /// shared sentinel `0` for identity-less values (mirrors
 /// `concurrent_synchronized`).
