@@ -2876,13 +2876,15 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (pushed_outer) {
             if (prior_this) |p| pushAccessEnclosing(self, &p);
         }
-        var sink = self.out_sink;
-        var intrinsic = makeIntrinsicHost(self);
-        defer deinitIntrinsicHost(&intrinsic);
-        var ihost = intrinsic.intrinsicHost();
-        const r = try ihost.invokeCallableWithThis(&v, args, receiver, sink.output());
+        // Dispatch on the main evaluator path (`callValueWithThis`), not the
+        // intrinsic-host invoke: that path snapshots frames so a suspension
+        // inside the receiver-lambda body parks + resumes correctly. The
+        // intrinsic-host invoke strands the activation, so a `suspend
+        // FlowCollector.() -> Unit` field invoked as `collector.block()` (every
+        // `flow {}` producer) re-runs from the top or resumes a non-closure.
+        const r = try self.callValueWithThis(allocator, &v, receiver, args, &.{});
         if (pushed_outer) popAccessEnclosing(self);
-        return mapRuntimeResult(allocator, r);
+        return r;
     }
 
 
