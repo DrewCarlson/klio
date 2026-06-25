@@ -92,10 +92,12 @@ internal class KlioComposer : Composer {
     // CompositionLocal provider layers, outermost first.
     private val localsStack = ArrayList<HashMap<CompositionLocal<*>, Any?>>()
 
-    // Effects: side effects queued during a pass (run after it), and the live
-    // DisposableEffect results (disposed on key change / composition dispose).
+    // Effects: side effects queued during a pass (run after it), the live
+    // DisposableEffect results (disposed on key change / composition dispose),
+    // and generic cleanups (e.g. cancelling a remembered CoroutineScope).
     private val sideEffects = ArrayList<() -> Unit>()
     private val disposers = ArrayList<DisposableEffectResult>()
+    private val cleanups = ArrayList<() -> Unit>()
 
     init {
         stack.add(root)
@@ -241,7 +243,12 @@ internal class KlioComposer : Composer {
         disposers.remove(result)
     }
 
-    /** Dispose every live DisposableEffect, in reverse registration order. */
+    /** Register a cleanup to run when the composition is disposed. */
+    fun registerCleanup(cleanup: () -> Unit) {
+        cleanups.add(cleanup)
+    }
+
+    /** Dispose every live DisposableEffect + cleanup, in reverse registration order. */
     fun disposeAll() {
         val live = ArrayList(disposers)
         disposers.clear()
@@ -249,6 +256,13 @@ internal class KlioComposer : Composer {
         while (i >= 0) {
             live[i].onDispose()
             i = i - 1
+        }
+        val cl = ArrayList(cleanups)
+        cleanups.clear()
+        var j = cl.size - 1
+        while (j >= 0) {
+            cl[j]()
+            j = j - 1
         }
     }
 

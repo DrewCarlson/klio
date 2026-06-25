@@ -51,3 +51,7 @@ root = "klioMain"
 
 [[deps]]
 id = "stdlib"
+# The coroutine-backed effects (rememberCoroutineScope / LaunchedEffect /
+# produceState) build on the kotlinx.coroutines pack.
+[[deps]]
+id = "kotlinx.coroutines"
