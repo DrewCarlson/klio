@@ -626,14 +626,19 @@ fn materialiseRangeItems(allocator: Allocator, start: i64, end: i64, step: i64, 
     if (step > 0) {
         while (cur <= end) {
             try out.append(allocator, rangeElem(cur, kind));
-            cur +|= step;
-            if (cur > end) break;
+            const adv = cur +| step;
+            // Saturation at the integer boundary (`MaxL +| 1 == MaxL`): the
+            // cursor cannot advance, so this was the final element. Break
+            // rather than appending it forever (range ending at Long.MAX/MIN).
+            if (adv <= cur) break;
+            cur = adv;
         }
     } else if (step < 0) {
         while (cur >= end) {
             try out.append(allocator, rangeElem(cur, kind));
-            cur +|= step;
-            if (cur < end) break;
+            const adv = cur +| step;
+            if (adv >= cur) break;
+            cur = adv;
         }
     }
     return out;
@@ -3282,7 +3287,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
         },
         .Range => |r| {
-            return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind } } };
+            return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind, .done = try ObjRef(bool).init(allocator, false) } } };
         },
         .Array => |arr| {
             const items = try cloneArrayItems(allocator, arr);
@@ -4380,7 +4385,13 @@ fn isIteratorNext(name: []const u8) bool {
 fn rangeIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     _ = self;
     const ri = receiver.RangeIter;
+    const done = blk: {
+        const dg = ri.done.borrow();
+        defer dg.deinit();
+        break :blk dg.get().*;
+    };
     const more = blk: {
+        if (done) break :blk false;
         const cg = ri.cur.borrow();
         const c = cg.get().*;
         cg.deinit();
@@ -4395,8 +4406,19 @@ fn rangeIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         if (!more) return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator exhausted") };
         const cg = ri.cur.borrowMut();
         const c = cg.get().*;
-        cg.get().* = c +| ri.step;
-        cg.deinit();
+        const adv = c +| ri.step;
+        // The cursor saturates at the integer boundary; if it could not
+        // advance (`adv == c`), `c` was the final element — mark done so the
+        // next `hasNext` is false instead of looping on the saturated value.
+        if (adv == c) {
+            cg.deinit();
+            const dg = ri.done.borrowMut();
+            dg.get().* = true;
+            dg.deinit();
+        } else {
+            cg.get().* = adv;
+            cg.deinit();
+        }
         return .{ .ok = rangeElem(c, ri.kind) };
     }
     return null;

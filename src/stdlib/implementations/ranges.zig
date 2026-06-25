@@ -376,19 +376,16 @@ const RangeIntIter = struct {
 
     fn next(self: *RangeIntIter) ?i64 {
         if (self.done or self.step == 0) return null;
-        if (self.step > 0) {
-            if (self.cur > self.end) {
-                self.done = true;
-                return null;
-            }
-        } else {
-            if (self.cur < self.end) {
-                self.done = true;
-                return null;
-            }
+        if ((self.step > 0 and self.cur > self.end) or (self.step < 0 and self.cur < self.end)) {
+            self.done = true;
+            return null;
         }
         const v = self.cur;
-        self.cur = saturatingAdd(self.cur, self.step);
+        const adv = saturatingAdd(self.cur, self.step);
+        // Saturation at the integer boundary (`MaxL +| 1 == MaxL`): the cursor
+        // cannot advance, so `v` was the final element. Mark done rather than
+        // yielding it forever (a range ending at Long.MAX_VALUE/MIN_VALUE).
+        if (adv == self.cur) self.done = true else self.cur = adv;
         return v;
     }
 };

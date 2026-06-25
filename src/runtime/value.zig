@@ -1194,6 +1194,12 @@ pub const Value = union(enum) {
         end: i64,
         step: i64,
         kind: RangeKind,
+        /// Set once the last element has been yielded. Needed because the
+        /// cursor saturates at the integer boundary (`MaxL +| 1 == MaxL`), so a
+        /// `cur <= end` test alone would loop forever on a range ending at
+        /// `Long.MAX_VALUE`/`MIN_VALUE`. Shared (ObjRef) so it survives the
+        /// iterator value being copied between cursor reads.
+        done: ObjRef(bool),
     },
     /// A built-in property delegate.
     Delegate: ObjRef(DelegateKind),
@@ -1285,7 +1291,10 @@ pub const Value = union(enum) {
                 if (x.mod_count) |mc| visitor.visit(mc);
                 if (x.exp_mod) |em| visitor.visit(em);
             },
-            .RangeIter => |x| visitor.visit(x.cur),
+            .RangeIter => |x| {
+                visitor.visit(x.cur);
+                visitor.visit(x.done);
+            },
             .PropertyRef => |p| visitor.visit(p.name),
             .MatchGroup => |g| visitor.visit(g.value),
             .Exception => |e| {
@@ -1432,7 +1441,10 @@ pub const Value = union(enum) {
                 if (x.mod_count) |mc| mc.deinit();
                 if (x.exp_mod) |em| em.deinit();
             },
-            .RangeIter => |x| x.cur.deinit(),
+            .RangeIter => |x| {
+                x.cur.deinit();
+                x.done.deinit();
+            },
             .PropertyRef => |p| p.name.deinit(),
             .MatchGroup => |g| g.value.deinit(),
             .Exception => |e| {
