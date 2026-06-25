@@ -851,10 +851,20 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     return composableEval(self, allocator, module, f, packed_args);
 }
 
+/// Free the packed argument list backing without running the body. Mirrors how
+/// `evalWith` consumes the list (its elements are borrowed from the caller's
+/// `args_in`, so only the list itself is freed).
+fn discardArgs(allocator: Allocator, packed_args: std.ArrayList(Value)) void {
+    var list = packed_args;
+    list.deinit(allocator);
+}
+
 /// Run `f`'s body, bracketing a `@Composable` call with the current composer's
-/// `startGroup(key)` / `endGroup()` so positional `remember` slots stay stable
-/// across recompositions (klio's replacement for the compiler plugin's group
-/// emission). Plain calls, or a `@Composable` invoked with no active composer
+/// group: `startGroup(key)` opens the positional group; `shouldRunGroup()`
+/// decides whether to (re)compose it — a group that was composed before and is
+/// not on an invalidated path is skipped (its slots/children reused, body not
+/// run), which is how a sibling that did not read the changed state avoids
+/// re-running. Plain calls, or a `@Composable` invoked with no active composer
 /// (e.g. directly from `main`), run the body unwrapped.
 fn composableEval(
     self: *VmHost,
@@ -870,10 +880,26 @@ fn composableEval(
 
     const key_val = Value.newLong(@bitCast(compose.callSiteKey()));
     switch (try host_call_member.callMember(self, allocator, &composer, "startGroup", &.{key_val})) {
-        .err => |e| return .{ .err = e },
+        .err => |e| {
+            discardArgs(allocator, packed_args);
+            return .{ .err = e };
+        },
         .ok => {},
     }
-    const res = try ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
+    const run = switch (try host_call_member.callMember(self, allocator, &composer, "shouldRunGroup", &.{})) {
+        .err => |e| {
+            _ = host_call_member.callMember(self, allocator, &composer, "endGroup", &.{}) catch {};
+            discardArgs(allocator, packed_args);
+            return .{ .err = e };
+        },
+        .ok => |v| v == .Bool and v.Bool,
+    };
+    var res: EvalResult = .{ .ok = .{ .Unit = {} } };
+    if (run) {
+        res = try ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
+    } else {
+        discardArgs(allocator, packed_args);
+    }
     switch (try host_call_member.callMember(self, allocator, &composer, "endGroup", &.{})) {
         .err => |e| return .{ .err = e },
         .ok => {},

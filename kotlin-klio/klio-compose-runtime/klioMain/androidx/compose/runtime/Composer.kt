@@ -29,6 +29,13 @@ public interface Composer {
     /** Consume a slot comparing [value] to its previous content; true if it differs. */
     public fun changed(value: Any?): Boolean
 
+    /**
+     * Whether the group just entered by [startGroup] should execute its body
+     * this pass. False means skip: the group was composed before and is not on
+     * an invalidated path, so its slots and child groups are reused unchanged.
+     */
+    public fun shouldRunGroup(): Boolean
+
     public companion object {
         /** Sentinel for an unwritten slot — distinct from any user value (incl. null). */
         public val Empty: Any = EmptySlot
@@ -39,12 +46,19 @@ private object EmptySlot {
     override fun toString(): String = "Composer.Empty"
 }
 
-/** One positional group: an ordered slot list plus keyed child groups. */
-internal class GroupNode(@JvmField val key: Long) {
+/** One positional group: an ordered slot list, keyed child groups, and the
+ * recompose-scope bookkeeping (parent link, read set, composed flag). */
+internal class GroupNode(@JvmField val key: Long, @JvmField val parent: GroupNode?) {
     @JvmField val slots: ArrayList<Any?> = ArrayList()
     @JvmField val children: HashMap<Long, GroupNode> = HashMap()
     @JvmField var slotCursor: Int = 0
     @JvmField val childOccurrences: HashMap<Long, Int> = HashMap()
+
+    /** State objects read while this group last executed (its subscriptions). */
+    @JvmField val reads: HashSet<Any> = HashSet()
+
+    /** True once this group has executed at least once. */
+    @JvmField var composed: Boolean = false
 
     /** Reset the per-composition-pass cursors before (re)entering this group. */
     fun enterPass() {
@@ -54,8 +68,13 @@ internal class GroupNode(@JvmField val key: Long) {
 }
 
 internal class KlioComposer : Composer {
-    private val root = GroupNode(0L)
+    private val root = GroupNode(0L, null)
     private val stack = ArrayList<GroupNode>()
+
+    // Recomposition state.
+    private val stateToGroups = HashMap<Any, HashSet<GroupNode>>()  // state -> subscribed groups
+    private val invalidated = HashSet<GroupNode>()                  // groups awaiting recompose
+    private var runSet: HashSet<GroupNode>? = null                  // null => run everything (initial pass)
 
     init {
         stack.add(root)
@@ -63,7 +82,26 @@ internal class KlioComposer : Composer {
 
     private fun current(): GroupNode = stack[stack.size - 1]
 
-    /** Begin a fresh composition pass at the root group. */
+    /** Begin the initial composition pass (every group executes). */
+    fun beginInitialPass() {
+        runSet = null
+    }
+
+    /**
+     * Begin a recomposition pass: only invalidated groups and their ancestors
+     * (the path that reaches them) execute; every other composed group skips.
+     */
+    fun beginRecomposePass() {
+        val rs = HashSet<GroupNode>()
+        for (g in invalidated) {
+            var n: GroupNode? = g
+            while (n != null && rs.add(n)) n = n.parent
+        }
+        invalidated.clear()
+        runSet = rs
+    }
+
+    /** Reset the stack + root cursor for a pass (init/recompose already chosen). */
     fun beginCompose() {
         stack.clear()
         stack.add(root)
@@ -72,7 +110,37 @@ internal class KlioComposer : Composer {
 
     fun endCompose() {
         // Group balance is the interpreter's responsibility (startGroup/endGroup
-        // are emitted around every @Composable body); nothing to settle here yet.
+        // are emitted around every @Composable body); nothing to settle here.
+    }
+
+    /** True if a state write has invalidated at least one composed group. */
+    val hasInvalidations: Boolean
+        get() = invalidated.isNotEmpty()
+
+    /** Record that the current group read [state] (called by the read observer). */
+    fun subscribeRead(state: Any) {
+        val g = current()
+        if (g.reads.add(state)) {
+            var set = stateToGroups[state]
+            if (set == null) {
+                set = HashSet()
+                stateToGroups[state] = set
+            }
+            set.add(g)
+        }
+    }
+
+    /** Mark groups subscribed to [state] for recomposition; true if any matched. */
+    fun invalidate(state: Any): Boolean {
+        val groups = stateToGroups[state] ?: return false
+        if (groups.isEmpty()) return false
+        for (g in groups) invalidated.add(g)
+        return true
+    }
+
+    private fun clearReads(g: GroupNode) {
+        for (s in g.reads) stateToGroups[s]?.remove(g)
+        g.reads.clear()
     }
 
     override fun startGroup(key: Long) {
@@ -82,11 +150,24 @@ internal class KlioComposer : Composer {
         val cid = key * 1000003L + occ.toLong()
         var node = parent.children[cid]
         if (node == null) {
-            node = GroupNode(key)
+            node = GroupNode(key, parent)
             parent.children[cid] = node
         }
         node.enterPass()
         stack.add(node)
+    }
+
+    override fun shouldRunGroup(): Boolean {
+        val g = current()
+        val rs = runSet
+        val should = !g.composed || rs == null || rs.contains(g)
+        if (should) {
+            // The group is (re)running: drop its stale subscriptions; they
+            // re-accumulate as the body re-reads state this pass.
+            clearReads(g)
+            g.composed = true
+        }
+        return should
     }
 
     override fun endGroup() {

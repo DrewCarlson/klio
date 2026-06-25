@@ -53,7 +53,7 @@ internal class KlioComposition(private val parent: Recomposer) : Composition {
     val composer: KlioComposer = KlioComposer()
     private var content: (@Composable () -> Unit)? = null
     private var disposed: Boolean = false
-    internal var pendingInvalidation: Boolean = false
+    private var writeObserverHandle: (() -> Unit)? = null
 
     init {
         parent.registerComposition(this)
@@ -63,29 +63,43 @@ internal class KlioComposition(private val parent: Recomposer) : Composition {
         get() = disposed
 
     override val hasInvalidations: Boolean
-        get() = pendingInvalidation
+        get() = composer.hasInvalidations
+
+    private fun ensureWriteObserver() {
+        if (writeObserverHandle == null) {
+            writeObserverHandle = StateObservation.registerWriteObserver { state ->
+                composer.invalidate(state)
+            }
+        }
+    }
 
     override fun setContent(content: @Composable () -> Unit) {
         check(!disposed) { "setContent on a disposed Composition" }
+        ensureWriteObserver()
         this.content = content
+        composer.beginInitialPass()
         composeContent()
     }
 
     private fun composeContent() {
         val body = content ?: return
-        pendingInvalidation = false
-        __compose_pushComposer(composer)
-        try {
-            composer.beginCompose()
-            body()
-            composer.endCompose()
-        } finally {
-            __compose_popComposer()
+        // Reads during composition subscribe the running composable's group;
+        // a later write to one of those state objects invalidates that group.
+        StateObservation.observe({ state -> composer.subscribeRead(state) }) {
+            __compose_pushComposer(composer)
+            try {
+                composer.beginCompose()
+                body()
+                composer.endCompose()
+            } finally {
+                __compose_popComposer()
+            }
         }
     }
 
     internal fun recompose() {
         if (disposed) return
+        composer.beginRecomposePass()
         composeContent()
     }
 
@@ -93,6 +107,8 @@ internal class KlioComposition(private val parent: Recomposer) : Composition {
         if (disposed) return
         disposed = true
         content = null
+        writeObserverHandle?.invoke()
+        writeObserverHandle = null
         parent.unregisterComposition(this)
     }
 }
