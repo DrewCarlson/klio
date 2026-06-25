@@ -372,9 +372,58 @@ const VirtualClock = struct {
     var mutex: SpinMutex = .{};
     var slots: std.ArrayList(Slot) = .empty;
     var next_id: u64 = 1;
+    /// The shared logical clock. Every virtual pump measures `delay`
+    /// deadlines from this single monotonic value, and a pump that resumes
+    /// on a fresh interceptor (a cross-pump hop) seeds its `virtual_now`
+    /// from it, so accumulated virtual time is never lost across the hop.
+    /// Only ever advances; reset at the run boundary by `drainAll`.
+    var now: i64 = 0;
+    /// Count of dispatched pool tasks that have started running but whose
+    /// pump has not yet published any barrier floor (it is still executing
+    /// toward its first suspension). Such a task holds no floor, so the
+    /// per-pump floor comparison cannot order it; a top-level driver must not
+    /// advance virtual time while any is in flight, lest it fire a timer
+    /// ahead of a sibling that will park on a sooner one (or fail and cancel
+    /// the driver's job). A task that has published a floor — even a future
+    /// one it is now barrier-parked on — no longer counts here; the floor
+    /// mechanism orders it, so the gate cannot deadlock against it.
+    var pool_unsettled: usize = 0;
 
     fn allocator() Allocator {
         return std.heap.page_allocator;
+    }
+
+    fn enterUnsettled() void {
+        mutex.lock();
+        defer mutex.unlock();
+        pool_unsettled += 1;
+    }
+
+    fn settle() void {
+        mutex.lock();
+        defer mutex.unlock();
+        if (pool_unsettled != 0) pool_unsettled -= 1;
+    }
+
+    fn hasUnsettled() bool {
+        mutex.lock();
+        defer mutex.unlock();
+        return pool_unsettled != 0;
+    }
+
+    /// Current shared virtual time. A new or resuming pump starts here.
+    fn currentNow() i64 {
+        mutex.lock();
+        defer mutex.unlock();
+        return now;
+    }
+
+    /// Advance the shared clock to `t` (a future timer a pump is firing).
+    /// Monotonic: a stale lower value never moves it back.
+    fn advanceNow(t: i64) void {
+        mutex.lock();
+        defer mutex.unlock();
+        if (t > now) now = t;
     }
 
     /// Lazily join the barrier with an initial finite floor. Returns the
@@ -445,8 +494,64 @@ const VirtualClock = struct {
         mutex.lock();
         defer mutex.unlock();
         slots.clearAndFree(allocator());
+        now = 0;
+        pool_unsettled = 0;
     }
 };
+
+/// Whether the pool task running on this thread still counts as "unsettled"
+/// (its pump has not yet published any barrier floor). Armed by `poolTaskRun`
+/// when a task that was counted at dispatch begins; the first `publishFloor`
+/// on this thread, or `poolTaskRun`'s `defer` if the task never published,
+/// clears it (settling the global count exactly once per dispatched task).
+threadlocal var pool_task_unsettled: bool = false;
+
+/// Settle the pool task running on the calling thread, if it is still
+/// unsettled. Installed as the runtime wall-block hook so a dispatched task
+/// entering a real `Thread.sleep` (wall work, not a virtual suspension)
+/// releases its virtual-clock claim instead of holding a top-level driver
+/// across the whole sleep.
+fn wallBlockSettle() void {
+    if (pool_task_unsettled) {
+        pool_task_unsettled = false;
+        VirtualClock.settle();
+    }
+}
+
+var wall_hook_installed = std.atomic.Value(bool).init(false);
+
+/// Count a coroutine dispatched onto the pool as "unsettled" from the moment
+/// it is posted: a top-level driver must not advance virtual time across the
+/// window between dispatch and the task establishing its barrier floor. Paired
+/// with `poolTaskSettleDropped` (task never ran) or the task's first
+/// `publishFloor` / `poolTaskRun` end (task ran). No-op under wall time.
+pub fn poolTaskDispatched() void {
+    if (root.coroutineTimeMode() != .Virtual) return;
+    if (!wall_hook_installed.swap(true, .monotonic)) {
+        runtime.setWallBlockHook(wallBlockSettle);
+    }
+    VirtualClock.enterUnsettled();
+}
+
+/// Settle a dispatched task that was dropped before running (pool stopping).
+pub fn poolTaskSettleDropped() void {
+    if (root.coroutineTimeMode() != .Virtual) return;
+    VirtualClock.settle();
+}
+
+/// Run-time bracket for a pool task body: arm the per-thread unsettled flag so
+/// the first `publishFloor` settles this task's dispatch count, and settle on
+/// return if the body never published (a synchronous body or immediate throw).
+pub fn poolTaskRunBegin() void {
+    pool_task_unsettled = root.coroutineTimeMode() == .Virtual;
+}
+
+pub fn poolTaskRunEnd() void {
+    if (pool_task_unsettled) {
+        pool_task_unsettled = false;
+        VirtualClock.settle();
+    }
+}
 
 /// Clear the process-global virtual-clock barrier at a run boundary.
 pub fn drainVirtualClock() void {
@@ -575,14 +680,18 @@ pub const CooperativeInterceptor = struct {
     token_resume_value: std.AutoHashMap(u64, Value),
     allocator: Allocator,
 
-    /// Fresh interceptor honoring this thread's time mode.
+    /// Fresh interceptor honoring this thread's time mode. Under `Virtual`
+    /// it seeds `virtual_now` from the shared logical clock so a coroutine
+    /// resuming on a fresh pump (a cross-pump hop) keeps the virtual time
+    /// already elapsed — its next `delay` is measured from there, not 0.
     pub fn new(allocator: Allocator) Allocator.Error!CooperativeInterceptor {
+        const mode = root.coroutineTimeMode();
         return .{
             .wakeup = try DriverWakeup.new(allocator),
-            .mode = root.coroutineTimeMode(),
+            .mode = mode,
             .started = null,
             .next_token = 0,
-            .virtual_now = 0,
+            .virtual_now = if (mode == .Virtual) VirtualClock.currentNow() else 0,
             // Join the barrier lazily (on the first finite-floor publish),
             // so timer-free pumps never touch the global lock.
             .clock_id = VirtualClock.UNREGISTERED,
@@ -801,6 +910,14 @@ pub const CooperativeInterceptor = struct {
     /// timer it stays unregistered (implicitly `INDEFINITE`), so a heavy
     /// fan-out of timer-free tasks never touches the global lock.
     fn publishFloor(self: *CooperativeInterceptor, floor: i64) void {
+        // Reaching a publish point means this pump's body has parked and the
+        // pump is now declaring its barrier position: a dispatched pool task
+        // is no longer "unsettled" — its floor (this value) now orders it, so
+        // a waiting top-level driver may proceed past the startup gate.
+        if (pool_task_unsettled) {
+            pool_task_unsettled = false;
+            VirtualClock.settle();
+        }
         if (self.published_floor == floor) return;
         self.published_floor = floor;
         if (self.clock_id == VirtualClock.UNREGISTERED) {
@@ -809,6 +926,21 @@ pub const CooperativeInterceptor = struct {
             return;
         }
         VirtualClock.publish(self.clock_id, floor);
+    }
+
+    /// Claim the current shared instant: while this pump has work to run at
+    /// `now` (queued launches, ready coroutines) it holds the barrier floor
+    /// at the shared clock so no other pump advances virtual time past the
+    /// current instant before this pump has reached and parked on its own
+    /// timer. Without it, a pump still starting a child that is about to
+    /// `delay(d)` would let a sibling pump jump to a *later* timer first,
+    /// reordering wakeups (a `delay`-then-`cancel` race that must fire by
+    /// ascending deadline across all pumps). No-op outside `Virtual`.
+    fn claimNow(self: *CooperativeInterceptor) void {
+        if (self.mode != .Virtual) return;
+        const shared = VirtualClock.currentNow();
+        if (shared > self.virtual_now) self.virtual_now = shared;
+        self.publishFloor(self.virtual_now);
     }
 
     /// Seam: nothing ready — advance the clock to the soonest timer and
@@ -834,6 +966,12 @@ pub const CooperativeInterceptor = struct {
         };
         switch (self.mode) {
             .Virtual => {
+                // Catch up to the shared clock first: another pump may have
+                // advanced global time past this pump's local view while it
+                // was busy. A timer at or before the shared `now` is then
+                // ready-now work, fired without a clock jump.
+                const shared = VirtualClock.currentNow();
+                if (shared > self.virtual_now) self.virtual_now = shared;
                 // A timer already due at the current instant (`yield`, an
                 // immediate dispatch handshake) is ready-now work, not a
                 // clock advance: fire it without consulting the barrier so
@@ -847,7 +985,22 @@ pub const CooperativeInterceptor = struct {
                 if (t > self.virtual_now) {
                     self.publishFloor(t);
                     if (!VirtualClock.mayFire(self.clock_id, t)) return .blocked;
+                    // A top-level driver must also wait while a dispatched
+                    // pool task it (transitively) launched is still running
+                    // toward its first suspension and has not yet published a
+                    // barrier floor: that coroutine may park on a sooner timer
+                    // — or fail and cancel this driver's job — before this
+                    // future timer fires. The floor `t` published above stands
+                    // (not lowered to the current instant), so a sibling whose
+                    // own sooner timer is below `t` may still advance to it.
+                    // Once every such task has published a floor (settled), the
+                    // floor mechanism orders them, so the gate cannot deadlock
+                    // against a task barrier-parked on a *later* timer.
+                    if (!vmhost.scheduler.onPoolWorker() and VirtualClock.hasUnsettled()) {
+                        return .blocked;
+                    }
                     self.virtual_now = t;
+                    VirtualClock.advanceNow(t);
                 } else {
                     self.publishFloor(self.virtual_now);
                 }
@@ -1195,6 +1348,17 @@ pub fn driveRunBlocking(self: *VmIntrinsicHost, block: *const Value, scope: *con
 pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output, persist: bool) Allocator.Error!RuntimeEvalResult {
     const a = self.allocator;
     try coroPush(a);
+    // A top-level (non-pool-worker) driver holds the shared virtual clock at
+    // the current instant while it runs its body's synchronous prefix: a
+    // coroutine the body dispatches onto a pool worker must not advance
+    // virtual time past `now` before the body has reached the `delay`/`launch`
+    // that establish the sibling timers. Without this a `Dispatchers.Default`
+    // child could run through its whole `delay` chain on another thread while
+    // `runBlocking` is still executing synchronously, reordering cross-pump
+    // wakeups. A pool-worker driver does NOT claim — its body may do real
+    // blocking work (`Thread.sleep`) that must not hold the virtual clock,
+    // and a sibling's floor already orders any virtual `delay` it parks on.
+    if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
     // An undispatched block's scope push (`coroutinePushScope`) pops when
     // its activation completes; an activation abandoned with this pump
     // never completes, so the pump truncates the stack back to its entry
@@ -1239,6 +1403,7 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
 pub fn driveSuspendMain(self: *VmIntrinsicHost, main_id: ir.FuncId, out: Output) Allocator.Error!RuntimeEvalResult {
     const a = self.allocator;
     try coroPush(a);
+    if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
     const scope_depth = active_scope_stack.items.len;
     defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
     const unit: Value = .Unit;
@@ -1276,6 +1441,7 @@ pub fn driveSuspendMain(self: *VmIntrinsicHost, main_id: ir.FuncId, out: Output)
 pub fn driveResumed(self: *VmIntrinsicHost, state_in: SuspendState, value: Value, scope_delta: []const Value, out: Output) Allocator.Error!void {
     const a = self.allocator;
     try coroPush(a);
+    if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
     const scope_depth = active_scope_stack.items.len;
     defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
     var root_value: ?Value = null;
@@ -1341,6 +1507,18 @@ fn pumpLoop(
         //     cancelled child's stale timer) and dies with the pump,
         //     exactly as upstream `runBlocking` returns without it.
         if (!persist and root_token.* == null) break;
+
+        // 0c. While this pump still has work to run at the current virtual
+        //     instant — a queued launch to start, or a coroutine already
+        //     ready — hold the shared-clock barrier at `now` so no sibling
+        //     pump advances virtual time past this instant before this pump
+        //     reaches and parks on its own timer. A child still on its way
+        //     to `delay(d)` must register its `now + d` deadline before any
+        //     pump jumps to a later one, so cross-pump wakeups fire in
+        //     ascending-deadline order.
+        if ((coroTop().?).launched.items.len != 0 or (coroTop().?).ready.items.len != 0) {
+            (coroTop().?).claimNow();
+        }
 
         // 1. Start any queued child launches. A started launch may
         //    enqueue more (a `delay` schedules its timer through a
