@@ -3159,8 +3159,7 @@ fn lastArgIsObjectNotFunction(b: *FuncBuilder, args: []const Expr) bool {
         .ObjectExpr => return true,
         .Path => |p| {
             if (p.segments.len != 1) return false;
-            if (b.localInitExpr(p.segments[0].name)) |e| return e.* == .ObjectExpr;
-            return false;
+            return b.isObjectInitLocal(p.segments[0].name);
         },
         else => return false,
     }

@@ -213,6 +213,11 @@ pub const FuncBuilder = struct {
     /// annotation — used by the `==` lowering to detect a boxed
     /// operand the same way the tree walker does.
     any_typed_locals: StringSet,
+    /// Locals whose initializer is an `object : T {}` expression. Kept apart
+    /// from `local_init_exprs` (which feeds receiver-type inference) so that
+    /// recording an object initializer for overload-applicability checks does
+    /// not perturb inline receiver narrowing.
+    object_init_locals: StringSet,
     /// When the function is a class method, the simple name of
     /// the owning class. Used by `super.method()` lowering to
     /// emit `Inst.CallSuper` with the right starting class.
@@ -384,6 +389,7 @@ pub const FuncBuilder = struct {
             .mutable_homes = StringRegMap.init(allocator),
             .boxed_vars = StringSet.init(allocator),
             .any_typed_locals = StringSet.init(allocator),
+            .object_init_locals = StringSet.init(allocator),
             .own_members = StringSet.init(allocator),
             .own_member_arity = std.StringHashMap(u64).init(allocator),
             .enclosing_members = StringSet.init(allocator),
@@ -430,6 +436,7 @@ pub const FuncBuilder = struct {
         self.mutable_homes.deinit();
         self.boxed_vars.deinit();
         self.any_typed_locals.deinit();
+        self.object_init_locals.deinit();
         self.own_members.deinit();
         self.own_member_arity.deinit();
         self.enclosing_members.deinit();
@@ -579,6 +586,12 @@ pub const FuncBuilder = struct {
     }
     pub fn isAnyTyped(self: *const FuncBuilder, name: []const u8) bool {
         return self.any_typed_locals.contains(name);
+    }
+    pub fn markObjectInitLocal(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.object_init_locals.put(name, {});
+    }
+    pub fn isObjectInitLocal(self: *const FuncBuilder, name: []const u8) bool {
+        return self.object_init_locals.contains(name);
     }
 
     pub fn markMutable(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
