@@ -1,0 +1,13 @@
+frame {
+  label: Counter
+  label: count = 0
+}
+frame {
+  label: count = 1
+}
+frame {
+  label: count = 2
+}
+frame {
+  label: count = 3
+}

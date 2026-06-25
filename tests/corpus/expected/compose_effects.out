@@ -1,0 +1,3 @@
+Widget value=0
+Widget value=1
+log: setup effect(0) effect(1) teardown
