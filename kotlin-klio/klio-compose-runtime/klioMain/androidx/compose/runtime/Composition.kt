@@ -41,16 +41,23 @@ public class Recomposer(
 
     private val effectJob: Job = Job()
 
+    /** The upstream frame clock effects await via withFrameNanos; the loop fans a
+     * frame to its awaiters each pass. A new awaiter wakes the loop. */
+    internal val frameClock: BroadcastFrameClock = BroadcastFrameClock { notifyWorkAvailable() }
+
+    private var frameNanos: Long = 0L
+
     /** The scope effects (LaunchedEffect / rememberCoroutineScope / produceState)
      * launch onto. With a driver context (Recomposer(coroutineContext) under
      * runBlocking) it carries the driver's interceptor so launches dispatch +
      * suspend correctly. Without one (a plain Recomposer() used synchronously)
      * it pins Dispatchers.Unconfined so a finite effect still runs eagerly
-     * instead of being abandoned on the worker pool when control returns. */
+     * instead of being abandoned on the worker pool when control returns. The
+     * frame clock rides the context so withFrameNanos resolves it. */
     internal val effectScope: CoroutineScope =
         CoroutineScope(
-            if (effectContext[ContinuationInterceptor] != null) effectContext + effectJob
-            else effectContext + Dispatchers.Unconfined + effectJob,
+            if (effectContext[ContinuationInterceptor] != null) effectContext + frameClock + effectJob
+            else effectContext + frameClock + Dispatchers.Unconfined + effectJob,
         )
 
     // Conflated wake channel: a write-observer invalidation sends a unit; the
@@ -72,9 +79,11 @@ public class Recomposer(
         if (!closed) workChannel.trySend(Unit)
     }
 
-    /** True if any registered composition has pending invalidations. */
+    /** True if any registered composition has pending invalidations, or a
+     * frame-clock awaiter (a withFrameNanos effect) is waiting for a frame. */
     public val hasPendingWork: Boolean
         get() {
+            if (frameClock.hasAwaiters) return true
             for (c in compositions) if (c.hasInvalidations) return true
             return false
         }
@@ -101,6 +110,10 @@ public class Recomposer(
                     break // channel closed → stop the loop
                 }
             }
+            // Fan a frame to withFrameNanos awaiters (animations, produceState
+            // pacing), then recompose any invalidated content.
+            frameClock.sendFrame(frameNanos)
+            frameNanos += 16_666_666L // ~60fps, monotonic + deterministic
             recompose()
         }
     }

@@ -158,3 +158,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `compose_counter.kt`       | A counter "app": state + `remember` + a `@Composable` tree re-rendered each frame after a state write drives recomposition (unchanged labels are skipped). |
 | `compose_todo.kt`          | Observable `SnapshotStateList` + `mutableIntStateOf` + `derivedStateOf` (a computed "remaining" count): mutating the model recomposes the view and the derived value updates. |
 | `compose_key.kt`           | `key{}` gives each list item identity tied to its key, so its remembered state follows the item across a reorder (contrasted with the unkeyed, position-based run). |
+| `compose_frame_clock.kt`   | The upstream frame clock (`MonotonicFrameClock` / `BroadcastFrameClock`): a `Recomposer` driven inside `runBlocking` fans a frame to `withFrameNanos` awaiters each pass, so a `LaunchedEffect` advances animation state frame-by-frame and each advance recomposes. |
