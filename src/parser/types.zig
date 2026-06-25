@@ -306,8 +306,9 @@ pub fn parseType(p: *Parser) ?TypeRef {
     }
     // Type-use-site annotations: `@Foo @Bar Baz` / `@UnsafeVariance T`.
     // Accept zero or more annotation sets and stash them on the
-    // resulting TypeRef.
-    const type_annotations = file.parseAnnotations(p);
+    // resulting TypeRef. A `(` after the annotation name belongs to a
+    // function type (`@Composable () -> Unit`), not annotation args.
+    const type_annotations = file.parseTypeAnnotations(p);
     support.skipNl(p);
     const start_span = support.currentSpan(p);
     var ty: TypeRef = if (isKind(peekKind(p), .LParen))

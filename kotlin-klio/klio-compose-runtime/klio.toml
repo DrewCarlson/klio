@@ -1,0 +1,53 @@
+[library]
+# androidx.compose.runtime — the Compose Multiplatform runtime. A pack is
+# selected when a user import prefix-matches its id, so importing any
+# `androidx.compose.runtime.*` symbol pulls this pack in.
+id = "androidx.compose.runtime"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+# Upstream androidx.compose.runtime commonMain, consumed straight from the
+# in-pack git submodule (compose-multiplatform-core v1.11.1). `include` curates
+# exactly the files klio can lex + parse and that do not depend on the compiler
+# plugin: the public annotations / contracts. The compiler-coupled engine
+# (Composer / SlotTable / Recomposer), the MVCC snapshot core, and the
+# platform/atomic `expect`s are supplied instead by the klioMain layer below
+# (klio has no compiler plugin; the interpreter threads an implicit composer +
+# positional group keys, and `currentComposer` resolves to it).
+[[source]]
+root = "upstream/compose/runtime/runtime/src/commonMain/kotlin"
+include = [
+    # Marker + opt-in annotations (pure declarations).
+    "androidx/compose/runtime/Composable.kt",
+    "androidx/compose/runtime/ComposableTarget.kt",
+    "androidx/compose/runtime/ComposableTargetMarker.kt",
+    "androidx/compose/runtime/ComposableInferredTarget.kt",
+    "androidx/compose/runtime/ComposableOpenTarget.kt",
+    "androidx/compose/runtime/ComposeCompilerApi.kt",
+    "androidx/compose/runtime/DisallowComposableCalls.kt",
+    "androidx/compose/runtime/DontMemoize.kt",
+    "androidx/compose/runtime/ExplicitGroupsComposable.kt",
+    "androidx/compose/runtime/NonRestartableComposable.kt",
+    "androidx/compose/runtime/NonSkippableComposable.kt",
+    "androidx/compose/runtime/ReadOnlyComposable.kt",
+    "androidx/compose/runtime/NoLiveLiterals.kt",
+    "androidx/compose/runtime/InternalComposeApi.kt",
+    "androidx/compose/runtime/ExperimentalComposeApi.kt",
+    "androidx/compose/runtime/ExperimentalComposeRuntimeApi.kt",
+    "androidx/compose/runtime/InternalComposeTracingApi.kt",
+    "androidx/compose/runtime/ComposeRuntimeFlags.kt",
+    "androidx/compose/runtime/ComposeVersion.kt",
+    "androidx/compose/runtime/internal/FunctionKeyMeta.kt",
+    "androidx/compose/runtime/internal/StabilityInferred.kt",
+]
+
+# klio-supplied layer: the composer / composition / recomposer / snapshot-state
+# engine reimplemented in plain Kotlin, plus actuals for the platform/atomic
+# `expect`s and the host-intrinsic entrypoints (backed by src/compose_runtime).
+[[source]]
+root = "klioMain"
+
+[[deps]]
+id = "stdlib"

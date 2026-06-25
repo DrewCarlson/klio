@@ -476,6 +476,10 @@ pub fn skipModifiersWithFlags(p: *Parser) ModifierFlags {
 ///   - `@field:Foo` (use-site target)
 ///   - `@field:[A B C]` (array form with use-site target)
 pub fn parseAnnotationSet(p: *Parser) ?[]Annotation {
+    return parseAnnotationSetCtx(p, false);
+}
+
+fn parseAnnotationSetCtx(p: *Parser, in_type_position: bool) ?[]Annotation {
     const at_span = if (support.peekKind(p).*.isAt())
         support.bump(p).span
     else
@@ -490,7 +494,7 @@ pub fn parseAnnotationSet(p: *Parser) ?[]Annotation {
                 .RBracket, .Eof => break,
                 else => {},
             }
-            if (parseUnescapedAnnotation(p, use_site, at_span)) |a| {
+            if (parseUnescapedAnnotationCtx(p, use_site, at_span, in_type_position)) |a| {
                 anns.append(p.allocator, a) catch @panic("OOM");
             } else {
                 break;
@@ -500,7 +504,7 @@ pub fn parseAnnotationSet(p: *Parser) ?[]Annotation {
         _ = support.expect(p, .RBracket, "`]`");
         return anns.toOwnedSlice(p.allocator) catch @panic("OOM");
     }
-    if (parseUnescapedAnnotation(p, use_site, at_span)) |a| {
+    if (parseUnescapedAnnotationCtx(p, use_site, at_span, in_type_position)) |a| {
         const out = p.allocator.alloc(Annotation, 1) catch @panic("OOM");
         out[0] = a;
         return out;
@@ -550,6 +554,15 @@ pub fn parseUnescapedAnnotation(
     use_site: ?AnnotationUseSite,
     at_span: Span,
 ) ?Annotation {
+    return parseUnescapedAnnotationCtx(p, use_site, at_span, false);
+}
+
+pub fn parseUnescapedAnnotationCtx(
+    p: *Parser,
+    use_site: ?AnnotationUseSite,
+    at_span: Span,
+    in_type_position: bool,
+) ?Annotation {
     const first = support.parseIdent(p, "annotation name") orelse return null;
     var path: std.ArrayList(Ident) = .empty;
     path.append(p.allocator, first) catch @panic("OOM");
@@ -569,7 +582,9 @@ pub fn parseUnescapedAnnotation(
     }
     var args: std.ArrayList(Expr) = .empty;
     var arg_names: std.ArrayList(?[]const u8) = .empty;
-    if (std.meta.activeTag(support.peekKind(p).*) == .LParen) {
+    const consume_args = std.meta.activeTag(support.peekKind(p).*) == .LParen and
+        !(in_type_position and parenStartsFunctionType(p));
+    if (consume_args) {
         _ = support.bump(p);
         while (true) {
             support.skipNl(p);
@@ -630,14 +645,53 @@ pub fn skipFileAnnotations(p: *Parser) void {
 /// `skipModifiersWithFlags` (params, type parameters, type-refs,
 /// enum entries, when-bindings).
 pub fn parseAnnotations(p: *Parser) []Annotation {
+    return parseAnnotationsCtx(p, false);
+}
+
+/// Like `parseAnnotations` but for type-use position, where a `(` after
+/// the annotation name may begin a function-type parameter list
+/// (`@Composable () -> Unit`) rather than annotation arguments.
+pub fn parseTypeAnnotations(p: *Parser) []Annotation {
+    return parseAnnotationsCtx(p, true);
+}
+
+fn parseAnnotationsCtx(p: *Parser, in_type_position: bool) []Annotation {
     var out: std.ArrayList(Annotation) = .empty;
     while (true) {
         support.skipNl(p);
         if (!support.peekKind(p).*.isAt()) {
             break;
         }
-        const set = parseAnnotationSet(p) orelse break;
+        const set = parseAnnotationSetCtx(p, in_type_position) orelse break;
         out.appendSlice(p.allocator, set) catch @panic("OOM");
     }
     return out.toOwnedSlice(p.allocator) catch @panic("OOM");
+}
+
+/// In type-use position, a `(` immediately following the annotation name
+/// belongs to a function type (`@Composable () -> Unit`,
+/// `@Composable (P) -> Unit`) and must not be eaten as annotation
+/// arguments. We treat the `(...)` as a function-type parameter list when
+/// the matching `)` is followed by `->`. Empty `()` followed by `->` and
+/// non-empty lists are both covered.
+fn parenStartsFunctionType(p: *Parser) bool {
+    if (std.meta.activeTag(support.peekKind(p).*) != .LParen) return false;
+    var depth: usize = 0;
+    var i = p.pos;
+    while (i < p.tokens.len) : (i += 1) {
+        switch (std.meta.activeTag(p.tokens[i].kind)) {
+            .LParen => depth += 1,
+            .RParen => {
+                depth -= 1;
+                if (depth == 0) {
+                    var j = i + 1;
+                    while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Newline) j += 1;
+                    return j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Arrow;
+                }
+            },
+            .Eof => return false,
+            else => {},
+        }
+    }
+    return false;
 }

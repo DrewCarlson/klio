@@ -1,0 +1,9 @@
+render #1 (0 items, 0 remaining):
+render #2 (1 items, 1 remaining):
+  - buy milk
+render #3 (2 items, 2 remaining):
+  - buy milk
+  - walk dog
+render #4 (2 items, 1 remaining):
+  - buy milk
+  - walk dog

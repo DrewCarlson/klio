@@ -40,10 +40,14 @@ Available:
 | Group            | Members                                                                              |
 |------------------|--------------------------------------------------------------------------------------|
 | State            | `mutableStateOf`, `State`, `MutableState`, `getValue`/`setValue`, the equality policies (`structuralEqualityPolicy` / `referentialEqualityPolicy` / `neverEqualPolicy`) |
+| Primitive state  | `mutableIntStateOf` / `mutableLongStateOf` / `mutableFloatStateOf` / `mutableDoubleStateOf` (+ the `*State` / `Mutable*State` interfaces) |
+| Observable collections | `mutableStateListOf`, `mutableStateMapOf`, `mutableStateSetOf` (`SnapshotStateList` / `Map` / `Set`), `toMutableStateList` |
+| Derived          | `derivedStateOf`, `rememberUpdatedState`                                              |
 | Composition      | `Composition`, `Recomposer`, `Composer`, `setContent`, `recompose`, `dispose`        |
 | Memoization      | `remember`, `remember(key…)`, `key`                                                   |
 | CompositionLocal | `compositionLocalOf`, `staticCompositionLocalOf`, `CompositionLocalProvider`, `CompositionLocal.current` |
 | Effects          | `SideEffect`, `DisposableEffect` (`onDispose`)                                        |
+| Coroutine effects| `rememberCoroutineScope`, `LaunchedEffect`, `produceState`                            |
 
 ## How it works (no compiler plugin)
 
@@ -73,12 +77,24 @@ without a compiler plugin.
 
 ## Status
 
-The synchronous core is functional. Not yet implemented: the coroutine-driven
-effects (`LaunchedEffect`, `rememberCoroutineScope`, `produceState`,
-`snapshotFlow`), `derivedStateOf`, observable `SnapshotStateList`/`Map`/`Set`,
-movable content, the async frame-clock recomposition loop, and the full MVCC
-snapshot transaction API. Auxiliary Compose modules (ui / foundation / material)
-and a rendering backend build on this runtime later.
+The runtime is functional for synchronous composition and finite effects:
+state (incl. primitive + observable collections), composition + selective
+recomposition (with arg-change skipping), `remember`, `key`-stable list identity,
+CompositionLocal, `SideEffect`/`DisposableEffect`, `derivedStateOf`, and the
+coroutine effects (`LaunchedEffect` / `rememberCoroutineScope` / `produceState`)
+for effects that complete.
+
+The async story is now functional too (klio has a cooperative coroutine pump):
+the async `Recomposer.runRecomposeAndApplyChanges` loop + the upstream frame clock,
+`snapshotFlow`, `Flow.collectAsState`, and `StateFlow.collectAsState` on hot sources
+all work (`examples/compose_frame_clock.kt`, `compose_snapshot_flow.kt`,
+`compose_stateflow.kt`). Long-running `LaunchedEffect`s drive under the Recomposer.
+
+What remains is downstream of the runtime: the **node-emission (Applier) layer** that
+node-based UI is built on (the current composer renders via side effects, not a node
+tree), then the Mosaic (terminal) and Compose-UI/Skia rendering packs, plus the full
+MVCC snapshot transaction API and movable content. See
+`plans/UI-RENDERING-PACKS.md` for that plan.
 
 See `examples/compose_*.kt` for runnable demonstrations of each feature, and
-`plans/COMPOSE-RUNTIME.md` for the design and roadmap.
+`plans/UI-RENDERING-PACKS.md` for the rendering roadmap.

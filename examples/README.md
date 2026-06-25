@@ -45,6 +45,7 @@ Run any program with:
 | `object_lazy_init.kt`      | Lazy first-access `object`/companion initialization: unused objects never initialize, init/property interleaving, companion init at first instantiation, anon-object init blocks, init-failure wrapping (`FileFailedToInitializeException`) without retry. |
 | `value_class.kt`           | Inline `value class`.                                           |
 | `annotation_class.kt`      | `annotation class` declarations.                               |
+| `annotated_function_types.kt` | Type-use-site annotations on function types (`@Composable () -> Unit`): params, return types, nullable, receiver, generic args, typealias, property getter, and annotated lambda expressions. |
 | `plain_class_tostring.kt`  | Default and overridden `toString`.                             |
 | `ir_instance_identity.kt`  | Reference identity of instances.                               |
 | `smart_cast_field.kt`, `as_cast.kt` | Smart casts and `as` / `as?`.                         |
@@ -149,3 +150,11 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `user_extension_shadows_stdlib.kt`| A same-file top-level extension (`infix fun Int.to`) shadows the implicitly imported stdlib extension of the same name on the same receiver; a receiver type the user extension does not cover keeps the stdlib `to` (Pair). |
 | `stack_trace.kt`           | A thrown exception captures the call stack at the throw site; `stackTraceToString` renders each frame with its function and source position (file:line) for user, stdlib, and pack frames. |
 | `interface_companion.kt`   | A bare reference to an interface's own companion object resolves to that companion — from a default member, from an implementor's method, and through a companion that carries a supertype (the `CoroutineContext.Element` / `companion object Key : Key<…>` pattern). |
+| `compose_state.kt`         | `androidx.compose.runtime` observable state: `mutableStateOf` reads/writes, `by` delegation, destructuring, and the structural-equality mutation policy. |
+| `compose_remember.kt`      | A `@Composable` tree composes in source order; `remember` memoizes a value across recompositions of the same content. |
+| `compose_recomposition.kt` | A state write recomposes only the composable that read the state (and its ancestors); a sibling that did not read it is skipped. |
+| `compose_locals.kt`        | `CompositionLocal`: a value provided to a subtree via `CompositionLocalProvider`, with nested overrides and a default. |
+| `compose_effects.kt`       | `SideEffect` runs after each composition that ran it; `DisposableEffect` runs setup once and `onDispose` when the composition is disposed. |
+| `compose_counter.kt`       | A counter "app": state + `remember` + a `@Composable` tree re-rendered each frame after a state write drives recomposition (unchanged labels are skipped). |
+| `compose_todo.kt`          | Observable `SnapshotStateList` + `mutableIntStateOf` + `derivedStateOf` (a computed "remaining" count): mutating the model recomposes the view and the derived value updates. |
+| `compose_key.kt`           | `key{}` gives each list item identity tied to its key, so its remembered state follows the item across a reorder (contrasted with the unkeyed, position-based run). |
