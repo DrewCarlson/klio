@@ -13,8 +13,10 @@
 package androidx.compose.runtime
 
 import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 
@@ -40,10 +42,16 @@ public class Recomposer(
     private val effectJob: Job = Job()
 
     /** The scope effects (LaunchedEffect / rememberCoroutineScope / produceState)
-     * launch onto: the driver's context (so launches dispatch + suspend correctly)
-     * under a cancellable job. */
+     * launch onto. With a driver context (Recomposer(coroutineContext) under
+     * runBlocking) it carries the driver's interceptor so launches dispatch +
+     * suspend correctly. Without one (a plain Recomposer() used synchronously)
+     * it pins Dispatchers.Unconfined so a finite effect still runs eagerly
+     * instead of being abandoned on the worker pool when control returns. */
     internal val effectScope: CoroutineScope =
-        CoroutineScope(effectContext + effectJob)
+        CoroutineScope(
+            if (effectContext[ContinuationInterceptor] != null) effectContext + effectJob
+            else effectContext + Dispatchers.Unconfined + effectJob,
+        )
 
     // Conflated wake channel: a write-observer invalidation sends a unit; the
     // async loop receives it and recomposes.
