@@ -189,6 +189,15 @@ pub const ProgramImage = struct {
     /// so memoize the bool — a bare top-level call inside a hot method (e.g.
     /// `hash(key)` in `MutableIntIntMap.set`) otherwise re-walks every time.
     host_has_member_cache: std.AutoHashMap(MemberHasKey, bool),
+    /// Records a `CallMemberOrGlobal` site that resolved to a global (no member
+    /// or receiver-extension on its single implicit-receiver candidate). A bare
+    /// call to a top-level function inside a hot method (`hash(key)` /
+    /// `group(...)` in `MutableIntIntMap.set`) otherwise runs the full strict +
+    /// lenient member-dispatch passes — which always miss — before falling to
+    /// the global. Keyed by the enclosing function (its candidate structure is
+    /// fixed) plus the runtime receiver class, name pointer, and arity, so a hit
+    /// is safe to skip straight to global. Only single-candidate calls are stored.
+    cmg_global_cache: std.AutoHashMap(CmgGlobalKey, void),
     /// Overload-resolution cache for global function calls. `pickOverload` scans
     /// and type-scores every same-name candidate per call — the dominant cost for
     /// generic stdlib calls (`maxOf`/`minOf`/math) in a hot loop. Its result is a
@@ -202,6 +211,7 @@ pub const ProgramImage = struct {
     pub const MemberResolveEntry = struct { func: ?StdlibFn, fqn: []const u8 };
     pub const InstanceMethodKey = struct { class_p: usize, name_p: usize, n_args: u32, sig: u64 };
     pub const MemberHasKey = struct { class_p: usize, name_p: usize };
+    pub const CmgGlobalKey = struct { func_p: usize, class_p: usize, name_p: usize, sig: u64 };
     pub const OverloadKey = struct { module_p: usize, func_p: u32, sig: u64 };
 
     /// Packages a bare global name may bind into implicitly, in
@@ -263,6 +273,7 @@ pub const ProgramImage = struct {
             .instance_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
             .instance_intrinsic_cache = std.AutoHashMap(InstanceMethodKey, MemberResolveEntry).init(allocator),
             .host_has_member_cache = std.AutoHashMap(MemberHasKey, bool).init(allocator),
+            .cmg_global_cache = std.AutoHashMap(CmgGlobalKey, void).init(allocator),
             .overload_cache = std.AutoHashMap(OverloadKey, u32).init(allocator),
             .allocator = allocator,
         };
@@ -301,6 +312,7 @@ pub const ProgramImage = struct {
         }
         self.instance_intrinsic_cache.deinit();
         self.host_has_member_cache.deinit();
+        self.cmg_global_cache.deinit();
         self.overload_cache.deinit();
     }
 

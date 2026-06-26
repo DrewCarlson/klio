@@ -1272,6 +1272,40 @@ pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bo
     return result;
 }
 
+fn cmgGlobalKey(receiver: *const Value, func_p: usize, name: []const u8, args: []const Value) ?root_mod.ProgramImage.CmgGlobalKey {
+    if (receiver.* != .Instance) return null;
+    // The arg-type signature keys the entry: a global miss on `f(String)` must
+    // not skip the member dispatch of a sibling `f(Int)`. A non-primitive arg
+    // yields no signature, so such a call is never cached.
+    const sig = methodArgSig(args) orelse return null;
+    const g = receiver.Instance.borrow();
+    defer g.deinit();
+    return .{
+        .func_p = func_p,
+        .class_p = g.get().class.identity(),
+        .name_p = @intFromPtr(name.ptr),
+        .sig = sig,
+    };
+}
+
+/// True when this `(enclosing func, receiver class, name, arg-sig)` was recorded
+/// as resolving to a global — the member-dispatch passes can be skipped.
+pub fn cmgGlobalSkip(self: *VmHost, func_p: usize, receiver: *const Value, name: []const u8, args: []const Value) bool {
+    const key = cmgGlobalKey(receiver, func_p, name, args) orelse return false;
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return pg.get().cmg_global_cache.contains(key);
+}
+
+/// Record that this call resolved to a global with a single implicit-receiver
+/// candidate, so a repeat skips the member passes.
+pub fn cmgGlobalRecord(self: *VmHost, func_p: usize, receiver: *const Value, name: []const u8, args: []const Value) void {
+    const key = cmgGlobalKey(receiver, func_p, name, args) orelse return;
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    pg.get().cmg_global_cache.put(key, {}) catch {};
+}
+
 fn hostHasMemberUncached(self: *VmHost, receiver: *const Value, name: []const u8) bool {
     const inst = switch (receiver.*) {
         .Instance => |inst| inst,
