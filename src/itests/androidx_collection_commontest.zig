@@ -49,7 +49,7 @@ fn runKlio(
     allocator: std.mem.Allocator,
     env: *std.process.Environ.Map,
     argv: []const []const u8,
-    timeout_ms: u64,
+    timeout_ms: i64,
 ) !struct { term: std.process.Child.Term, stdout: []u8, stderr: []u8 } {
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
