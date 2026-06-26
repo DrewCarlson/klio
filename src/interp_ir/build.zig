@@ -2740,7 +2740,15 @@ fn retainDecl(
         .Class => |*c| return !(c.is_expect and actual_class_names_set.contains(c.name.name)),
         .Object => |*o| return !(o.is_expect and actual_object_names_set.contains(o.name.name)),
         .Property => |p| {
-            if (std.mem.eql(u8, p.name.name, "coroutineContext") or std.mem.eql(u8, p.name.name, "isInitialized")) return false;
+            // `coroutineContext` / `isInitialized` are host-provided intrinsics,
+            // but only the stdlib's declarations: a user property of the same
+            // name in their own package must still register (and shadow the
+            // intrinsic), per the no-name-clash rule.
+            if ((std.mem.eql(u8, p.name.name, "coroutineContext") or std.mem.eql(u8, p.name.name, "isInitialized")) and
+                (p.is_expect or std.mem.startsWith(u8, package_prefix, "kotlin")))
+            {
+                return false;
+            }
             return !(p.is_expect and actual_prop_names.contains(p.name.name));
         },
         else => return true,
