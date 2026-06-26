@@ -950,7 +950,12 @@ fn scoreNamedCandidate(
     recv_external: bool,
 ) ?i32 {
     const cf = funcAt(module, cand) orelse return null;
-    if (!cf.hasBody()) return null; // never pick a bodyless `expect`
+    // A bodyless declaration is only a valid named-call target when it
+    // backs a native intrinsic (a `expect`/`actual` whose actual klio
+    // supplies as a host function, e.g. `String.replaceFirst(oldChar,
+    // newChar, ignoreCase)`); otherwise it is an unimplemented `expect`
+    // and must never be picked.
+    if (!cf.hasBody() and resolvedNativeForm(self, cand) == null and lookupIntrinsic(self, cf.fqn) == null) return null;
     const params = cf.params;
     if (params.len > 64) return null;
     var filled = [_]bool{false} ** 64;

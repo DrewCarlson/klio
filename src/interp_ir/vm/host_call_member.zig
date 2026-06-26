@@ -1249,6 +1249,64 @@ fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []cons
 // -------------------------------------------------------------------------
 
 pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bool {
+    if (receiver.* != .Instance) return false;
+    const key: root_mod.ProgramImage.MemberHasKey = .{
+        .class_p = blk: {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            break :blk g.get().class.identity();
+        },
+        .name_p = @intFromPtr(name.ptr),
+    };
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (pg.get().host_has_member_cache.get(key)) |v| return v;
+    }
+    const result = hostHasMemberUncached(self, receiver, name);
+    {
+        const pg = self.prog.borrowMut();
+        defer pg.deinit();
+        pg.get().host_has_member_cache.put(key, result) catch {};
+    }
+    return result;
+}
+
+fn cmgGlobalKey(receiver: *const Value, func_p: usize, name: []const u8, args: []const Value) ?root_mod.ProgramImage.CmgGlobalKey {
+    if (receiver.* != .Instance) return null;
+    // The arg-type signature keys the entry: a global miss on `f(String)` must
+    // not skip the member dispatch of a sibling `f(Int)`. A non-primitive arg
+    // yields no signature, so such a call is never cached.
+    const sig = methodArgSig(args) orelse return null;
+    const g = receiver.Instance.borrow();
+    defer g.deinit();
+    return .{
+        .func_p = func_p,
+        .class_p = g.get().class.identity(),
+        .name_p = @intFromPtr(name.ptr),
+        .sig = sig,
+    };
+}
+
+/// True when this `(enclosing func, receiver class, name, arg-sig)` was recorded
+/// as resolving to a global — the member-dispatch passes can be skipped.
+pub fn cmgGlobalSkip(self: *VmHost, func_p: usize, receiver: *const Value, name: []const u8, args: []const Value) bool {
+    const key = cmgGlobalKey(receiver, func_p, name, args) orelse return false;
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return pg.get().cmg_global_cache.contains(key);
+}
+
+/// Record that this call resolved to a global with a single implicit-receiver
+/// candidate, so a repeat skips the member passes.
+pub fn cmgGlobalRecord(self: *VmHost, func_p: usize, receiver: *const Value, name: []const u8, args: []const Value) void {
+    const key = cmgGlobalKey(receiver, func_p, name, args) orelse return;
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    pg.get().cmg_global_cache.put(key, {}) catch {};
+}
+
+fn hostHasMemberUncached(self: *VmHost, receiver: *const Value, name: []const u8) bool {
     const inst = switch (receiver.*) {
         .Instance => |inst| inst,
         else => return false,
@@ -3105,6 +3163,21 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         g.deinit();
     }
 
+    // Inline cache: a prior resolution of this (class, name, arg-sig) returns
+    // straight to its intrinsic (or to a cached "no intrinsic" miss) without
+    // rebuilding the probe FQNs or walking the supertype chain. Only a
+    // primitive-arg call is keyed (`instanceMethodKey`); anything else falls
+    // through to the full probe below.
+    const ib_key = instanceMethodKey(receiver, name, args);
+    if (ib_key) |k| {
+        if (instanceIntrinsicCacheGet(self, k)) |entry| {
+            const func = entry.func orelse return null;
+            const all_args = try prependReceiver(allocator, receiver, args);
+            defer if (runtime.freeScratch()) allocator.free(all_args);
+            return try dispatchIntrinsic(self, allocator, entry.fqn, func, all_args);
+        }
+    }
+
     var probes: std.ArrayList([]const u8) = .empty;
     // Probe FQNs are per-call scratch (all `allocPrint`ed below); free them and
     // the list. No-op under the arena; reclaims under a freeing allocator.
@@ -3148,6 +3221,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
             break :blk bg.get().resolve(p);
         };
         if (installed) |func| {
+            if (ib_key) |k| instanceIntrinsicCachePut(self, k, func, p);
             const all_args = try prependReceiver(allocator, receiver, args);
             defer if (runtime.freeScratch()) allocator.free(all_args);
             return try dispatchIntrinsic(self, allocator, p, func, all_args);
@@ -3210,12 +3284,16 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         };
         if (mapped) |p| {
             if (lookupIntrinsic(self, p)) |func| {
+                if (ib_key) |k| instanceIntrinsicCachePut(self, k, func, p);
                 const all_args = try prependReceiver(allocator, receiver, args);
                 defer if (runtime.freeScratch()) allocator.free(all_args);
                 return try dispatchIntrinsic(self, allocator, p, func, all_args);
             }
         }
     }
+    // No intrinsic for this (class, name, arg-sig) through any probe stage:
+    // cache the miss so the next call returns immediately.
+    if (ib_key) |k| instanceIntrinsicCachePut(self, k, null, "");
     return null;
 }
 
@@ -3978,10 +4056,23 @@ fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         var start: usize = 0;
         var end: usize = chars.len;
         if (args.len == 2) {
-            const s: usize = @intCast(@max(args[0].asI64() orelse 0, 0));
-            const e: usize = @intCast(@max(args[1].asI64() orelse @as(i64, @intCast(chars.len)), 0));
-            start = @min(s, chars.len);
-            end = @min(e, chars.len);
+            const si = args[0].asI64() orelse 0;
+            const ei = args[1].asI64() orelse @as(i64, @intCast(chars.len));
+            const size: i64 = @intCast(chars.len);
+            // `CharArray.concatToString(startIndex, endIndex)` validates via
+            // `checkBoundsIndexes`: out-of-range bounds throw
+            // IndexOutOfBoundsException, an inverted range throws
+            // IllegalArgumentException.
+            if (si < 0 or ei > size) {
+                const msg = try std.fmt.allocPrint(allocator, "startIndex: {d}, endIndex: {d}, size: {d}", .{ si, ei, size });
+                return .{ .err = try throwExc(allocator, "kotlin.IndexOutOfBoundsException", msg) };
+            }
+            if (si > ei) {
+                const msg = try std.fmt.allocPrint(allocator, "startIndex: {d} > endIndex: {d}", .{ si, ei });
+                return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
+            }
+            start = @intCast(si);
+            end = @intCast(ei);
         }
         var units: std.ArrayList(u16) = .empty;
         defer units.deinit(allocator);
@@ -5082,6 +5173,27 @@ fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceM
     pg.get().instance_method_cache.put(key, raw) catch {};
 }
 
+fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?root_mod.ProgramImage.MemberResolveEntry {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return pg.get().instance_intrinsic_cache.get(key);
+}
+
+/// Memoize the `instanceBindingProbe` outcome for `key`. `func == null` caches
+/// "no intrinsic" so the next call returns immediately without rebuilding the
+/// probe FQNs or walking the supertype chain. The `fqn` (the winning probe, or
+/// "" for a miss) is duped into the image-owned allocator on first store.
+fn instanceIntrinsicCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, func: ?StdlibFn, fqn: []const u8) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    const cache = &pg.get().instance_intrinsic_cache;
+    if (cache.contains(key)) return;
+    const owned: []const u8 = if (fqn.len == 0) "" else (pg.get().allocator.dupe(u8, fqn) catch return);
+    cache.put(key, .{ .func = func, .fqn = owned }) catch {
+        if (owned.len != 0) pg.get().allocator.free(owned);
+    };
+}
+
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     // Inline cache: memoize the (class, method-name, arg-type-signature) →
     // FuncId resolution. The signature captures the argument primitive types the
@@ -5891,6 +6003,19 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
                 // A concrete (non-top, non-generic) param type that the arg
                 // satisfies is more specific than a top/`Any`/`T` param.
                 if (!isTopOrGenericType(f.params[i + 1].ty.name)) param_spec += 1;
+            }
+        }
+        // Every parameter past the supplied arguments must be defaulted or
+        // vararg, or the candidate cannot bind this call — a 5-param private
+        // `findAnyOf(strings, startIndex, ignoreCase, last)` is not applicable
+        // to `findAnyOf(strings)`, so the 3-param public sibling wins.
+        if (want < f.params.len) {
+            var k = want;
+            while (k < f.params.len) : (k += 1) {
+                if (!f.params[k].has_default and !f.params[k].is_vararg) {
+                    applicable = 0;
+                    break;
+                }
             }
         }
         if (f.params.len == want) score += 5;

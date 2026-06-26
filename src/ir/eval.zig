@@ -3326,9 +3326,18 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     const shadow_capture = host.isShadowingCapture(name_str) and
         ((this_val == .Null or this_val == .Unit) or !host.hostHasMember(&this_val, name_str));
 
-    if (!is_ctor_name and !shadow_capture) {
+    // A prior call from this site with this receiver class resolved to a
+    // global (single candidate, no member/extension): skip the member passes.
+    const func_p = @intFromPtr(frame.func);
+    const cmg_skip = comptime @hasDecl(H, "cmgGlobalSkip");
+    const skip_member = cmg_skip and !is_ctor_name and !shadow_capture and
+        host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values);
+    var single_cand = false;
+
+    if (!is_ctor_name and !shadow_capture and !skip_member) {
         const cands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
         defer allocator.free(cands);
+        single_cand = cands.len == 1;
         // Inside an extension body, the implicit `this` has the
         // extension's DECLARED receiver type, and Kotlin resolves a bare
         // extension call against that static type — not the runtime
@@ -3400,6 +3409,10 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     if (resolved) |v| {
         result = v;
     } else {
+        // The member passes all missed on a single implicit-receiver
+        // candidate: record so a repeat call skips straight here.
+        if (cmg_skip and single_cand and !is_ctor_name and !shadow_capture)
+            host.cmgGlobalRecord(func_p, &this_val, name_str, arg_values);
         // Overloaded top-level function: select by runtime arg types
         // before falling back to the single global value baked in at
         // lower time.

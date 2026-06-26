@@ -301,15 +301,19 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
             if (ctx.args.len >= 3) {
                 const off = ctx.args[1].asI64() orelse 0;
                 const cnt = ctx.args[2].asI64() orelse 0;
-                start = @intCast(@max(off, 0));
-                count = @intCast(@max(cnt, 0));
+                const size: i64 = @intCast(elems.len);
+                // `String(chars, offset, count)` throws when offset or count
+                // is negative or the slice runs past the array end (JVM's
+                // StringIndexOutOfBoundsException, an IndexOutOfBoundsException).
+                if (off < 0 or cnt < 0 or off > size - cnt) {
+                    const msg = try std.fmt.allocPrint(a, "offset {d}, count {d}, size {d}", .{ off, cnt, size });
+                    defer if (runtime.freeScratch()) a.free(msg);
+                    return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+                }
+                start = @intCast(off);
+                count = @intCast(cnt);
             }
             const end = @min(start +| count, elems.len);
-            if (start > elems.len or end > elems.len) {
-                const msg = try std.fmt.allocPrint(a, "offset {d}, count {d}, size {d}", .{ start, count, elems.len });
-                defer if (runtime.freeScratch()) a.free(msg);
-                return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
-            }
 
             // `String(ByteArray[, offset, length][, charset])` decodes
             // bytes as UTF-8; `String(CharArray[, offset, count])` builds
