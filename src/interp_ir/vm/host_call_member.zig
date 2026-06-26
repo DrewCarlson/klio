@@ -4999,6 +4999,52 @@ pub fn resolveMemberFuncId(self: *VmHost, allocator: Allocator, receiver: *const
 /// `FuncId`. `unambiguous` is set when the resolving class had exactly one
 /// method of that name (so the choice does not depend on argument types and the
 /// resolution may be cached for the inline dispatch cache).
+/// A function/lambda argument bound to a member parameter typed as a bare
+/// type-parameter (`value: T`) matches only because the receiver's type
+/// argument is erased. When a same-name extension applicable to this receiver
+/// takes that argument as a concrete function type, it is the more specific —
+/// and in Kotlin the only applicable — overload (the member's `T` is the
+/// receiver's non-function type argument, e.g. `CancellableContinuation<Unit>`,
+/// which a function does not satisfy). Defer the member to it. Example:
+/// `cont.tryResume(onCancellation)` must bind the `Boolean`-returning extension
+/// `CancellableContinuation<Unit>.tryResume(onCancellation)`, not the member
+/// `tryResume(value: T): Any?`.
+fn callableArgPrefersFunctionExtension(self: *VmHost, mod: *const Module, name: []const u8, member: *const Func, receiver: *const Value, args: []const Value) bool {
+    const mskip: usize = if (member.params.len > 0 and std.mem.eql(u8, member.params[0].name, "this")) 1 else 0;
+    var fn_arg_pos: ?usize = null;
+    for (args, 0..) |*a, i| {
+        // A function value, or a null where a (nullable) function is expected,
+        // is the kind of argument the extension takes concretely.
+        const fn_shaped = isCallable(a) or a.* == .Null;
+        if (!fn_shaped) continue;
+        const pi = mskip + i;
+        if (pi >= member.params.len) continue;
+        const mp = member.params[pi].ty;
+        if (std.mem.startsWith(u8, mp.name, "Function")) return false; // member already takes a function here
+        // The member binds this argument only through a bare type-parameter
+        // slot (`value: T`) — it is the receiver's erased, non-function type
+        // argument, which a function/null does not satisfy.
+        if (mp.name.len <= 2 and allUppercase(mp.name)) fn_arg_pos = i;
+    }
+    const want_pos = fn_arg_pos orelse return false;
+
+    const recv_chain = receiverClassChain(self, self.allocator, receiver.Instance) catch return false;
+    defer @constCast(&recv_chain).deinit();
+
+    for (mod.funcsBySimpleName(name)) |fid| {
+        const ef = funcAt(mod, fid) orelse continue;
+        if (ef.kind != .top_level_extension and ef.kind != .member_extension) continue;
+        if (ef.params.len == 0) continue;
+        const rt = ef.params[0].ty.name; // extension receiver type
+        const recv_ok = recv_chain.contains(rt) or std.mem.eql(u8, rt, "Any") or (rt.len <= 2 and allUppercase(rt));
+        if (!recv_ok) continue;
+        const epi = 1 + want_pos; // skip the extension's `this`
+        if (epi >= ef.params.len) continue;
+        if (std.mem.startsWith(u8, ef.params[epi].ty.name, "Function")) return true;
+    }
+    return false;
+}
+
 fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?ResolvedMethod {
     const inst = receiver.Instance;
     var class_name: []const u8 = undefined;
@@ -5059,7 +5105,8 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                     }
                 }
                 if (pickMethodOverload(self, candidates.items, args)) |f| {
-                    return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
+                    if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args))
+                        return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
                 }
             }
         }

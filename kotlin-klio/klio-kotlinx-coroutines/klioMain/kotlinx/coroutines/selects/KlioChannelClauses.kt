@@ -62,16 +62,13 @@ private fun klioRegReceive(clauseObject: Any, select: SelectInstance<*>, ignored
 
 @Suppress("UNCHECKED_CAST")
 private fun klioProcessReceive(clauseObject: Any, ignored: Any?, result: Any?): Any? {
-    // Registration-phase result (a holder with the value) or a `trySelect`
-    // result (KLIO_CLOSED, or a holder from the offering send).
+    // A registration-phase poll passes the value in a holder; an offering send
+    // that woke this parked select passes the value itself as the trySelect
+    // result (a rendezvous hands the value straight through, so it is not in
+    // the channel to re-poll).
     if (result is KlioClauseHolder) return result.value
     if (result === KLIO_CLOSED) throw closedReceiveException(clauseObject)
-    // Woken by an offering send: re-poll once to take the offered value.
-    val holder = KlioClauseHolder()
-    return when (__kxco_chanSelectPollReceive(clauseObject, holder)) {
-        0 -> holder.value
-        else -> throw closedReceiveException(clauseObject)
-    }
+    return result
 }
 
 // ---- onReceiveCatching ----------------------------------------------
@@ -87,11 +84,7 @@ public val <E> ReceiveChannel<E>.onReceiveCatching: SelectClause1<ChannelResult<
 private fun klioProcessReceiveCatching(clauseObject: Any, ignored: Any?, result: Any?): Any? {
     if (result is KlioClauseHolder) return ChannelResult.success(result.value as Any?)
     if (result === KLIO_CLOSED) return ChannelResult.closed<Any?>(null)
-    val holder = KlioClauseHolder()
-    return when (__kxco_chanSelectPollReceive(clauseObject, holder)) {
-        0 -> ChannelResult.success(holder.value as Any?)
-        else -> ChannelResult.closed<Any?>(null)
-    }
+    return ChannelResult.success(result)
 }
 
 // ---- onSend ----------------------------------------------------------
