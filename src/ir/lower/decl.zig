@@ -978,13 +978,20 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // Comparison operators on such an operand follow Kotlin's
     // `compareTo`-based total order, not the IEEE primitive — the
     // comparison-lowering arm consults this.
-    if (f.type_params.len != 0) {
+    {
         var tp_names = StringSet.init(a);
         defer tp_names.deinit();
         for (f.type_params) |*tp| try tp_names.put(tp.name.name, {});
         for (f.params) |*p| {
             if (p.ty.function == null and !p.ty.nullable and tp_names.contains(p.ty.name.name)) {
                 try b.markGenericTypedParam(p.name.name);
+            }
+            // A concrete non-function param type (not a function type, not a
+            // bare generic type-parameter): such a param does not shadow a
+            // same-named top-level function for a call (`flow: Flow<T>` vs the
+            // `flow {}` builder).
+            if (p.ty.function == null and !tp_names.contains(p.ty.name.name)) {
+                try b.markNonFnParam(p.name.name);
             }
         }
     }

@@ -969,6 +969,23 @@ test "labeled_lambda_via_run" {
     try testing.expect(stmts[0].Expr.Labeled.expr.* == .Call);
 }
 
+test "generic_call_with_labeled_trailing_lambda" {
+    // `f<Unit> sc@{ … }` is a generic call whose trailing lambda carries a
+    // label, not the comparison `f < Unit > sc`. Without the labeled-lambda
+    // case in `trySkipGenericCallArgs` the `<`/`>` parse as operators and
+    // `suspendCancellableCoroutine<Unit> sc@{ … }` mis-lowers.
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(), "fun main() { val r = f<Unit> sc@{ it } }\n");
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const stmts = bodyStmts(out.file.decls[0].Function);
+    // `val r = <Call>` — the initializer is a Call, not a comparison Binary.
+    const init = stmts[0].Decl.Property.init.?;
+    try testing.expect(init == .Call);
+    try testing.expect(init.Call.type_args.len == 1);
+}
+
 test "const_val_flag_captured" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

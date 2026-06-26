@@ -346,3 +346,160 @@ test "coroutine_scope_extension_reads_receiver_context" {
     ;
     try assertKlio("scope_extension_context", src, "held\nambient-none\n");
 }
+
+// `select { }` over channel clauses: a buffered `onReceive` is ready and wins
+// over an empty channel's clause in biased registration order. The selected
+// clause's block runs with the received value.
+test "select_onreceive_ready_clause_wins" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val a = Channel<Int>(1)
+        \\    val b = Channel<Int>(1)
+        \\    a.send(7)
+        \\    val r = select<String> {
+        \\        a.onReceive { "a=$it" }
+        \\        b.onReceive { "b=$it" }
+        \\    }
+        \\    println(r)
+        \\}
+        \\
+    ;
+    try assertKlio("select_onreceive_ready", src, "a=7\n");
+}
+
+// `onTimeout(0)` is selected immediately when no other clause is ready.
+test "select_ontimeout_zero_is_immediate" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val empty = Channel<Int>(1)
+        \\    val r = select<String> {
+        \\        empty.onReceive { "received $it" }
+        \\        onTimeout(0) { "timeout" }
+        \\    }
+        \\    println(r)
+        \\}
+        \\
+    ;
+    try assertKlio("select_ontimeout_zero", src, "timeout\n");
+}
+
+// A binary `Semaphore` serializes two `launch` coroutines through
+// `withPermit` under contention: the second acquirer suspends until the first
+// releases, so both critical sections run exactly once and the permit is
+// returned at the end.
+test "semaphore_withpermit_serializes_under_contention" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.sync.*
+        \\fun main() = runBlocking {
+        \\    val sem = Semaphore(1)
+        \\    val order = mutableListOf<Int>()
+        \\    val jobs = (1..2).map { i ->
+        \\        launch { sem.withPermit { order.add(i) } }
+        \\    }
+        \\    jobs.forEach { it.join() }
+        \\    println("permits=${sem.availablePermits} ran=${order.size}")
+        \\}
+        \\
+    ;
+    try assertKlio("semaphore_contention", src, "permits=1 ran=2\n");
+}
+
+// A fan-in `select` over a rendezvous channel: the sender parks between its
+// two sends, and each `onReceive` select takes a value handed off by the
+// parked sender (the first directly, the second from the sender now waiting
+// in the channel). Both values arrive in order.
+test "select_onreceive_parks_then_woken_by_rendezvous_sender" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val c = Channel<Int>()
+        \\    launch { c.send(1); c.send(2) }
+        \\    val sums = mutableListOf<Int>()
+        \\    repeat(2) { sums.add(select<Int> { c.onReceive { it } }) }
+        \\    println(sums)
+        \\}
+        \\
+    ;
+    try assertKlio("select_onreceive_parks", src, "[1, 2]\n");
+}
+
+// An `onSend` select that parks before any receiver exists is woken when a
+// later `receive` arrives: the parked select hands its value straight to the
+// new receiver. The receiver then takes a second plain send.
+test "select_onsend_parks_then_woken_by_receiver" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val c = Channel<Int>()
+        \\    val got = mutableListOf<Int>()
+        \\    val r = launch { repeat(2) { got.add(c.receive()) } }
+        \\    select<Unit> { c.onSend(7) {} }
+        \\    c.send(9)
+        \\    r.join()
+        \\    println(got)
+        \\}
+        \\
+    ;
+    try assertKlio("select_onsend_parks", src, "[7, 9]\n");
+}
+
+// A parked `onReceiveCatching` select is woken by a `close` with the closed
+// result (not a spurious `null` value); a parked plain `onReceive` throws.
+test "select_onreceive_observes_close_while_parked" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val c = Channel<Int>()
+        \\    launch { c.send(1); c.send(2); c.close() }
+        \\    val xs = mutableListOf<String>()
+        \\    repeat(3) {
+        \\        xs.add(select { c.onReceiveCatching { r -> if (r.isClosed) "closed" else "v=${r.getOrNull()}" } })
+        \\    }
+        \\    println(xs)
+        \\}
+        \\
+    ;
+    try assertKlio("select_onreceive_close", src, "[v=1, v=2, closed]\n");
+}
+
+// An `onSend` select feeds a `for (x in channel)` iterator consumer: the
+// iterator's parked `hasNext` is woken by a registered `onSend` select for
+// each element, not just the first.
+test "select_onsend_feeds_channel_iterator" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val c = Channel<Int>()
+        \\    val consumer = launch { for (x in c) println("got $x") }
+        \\    select<Unit> { c.onSend(1) {} }
+        \\    select<Unit> { c.onSend(2) {} }
+        \\    c.close()
+        \\    consumer.join()
+        \\    println("done")
+        \\}
+        \\
+    ;
+    try assertKlio("select_onsend_iterator", src, "got 1\ngot 2\ndone\n");
+}

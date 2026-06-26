@@ -50,6 +50,8 @@ private class KlioBlockingCoroutine<T>(
     private var failed = false
     private var completionSlot: Long = 0L
 
+    internal override fun nameString(): String = "BlockingCoroutine"
+
     override fun onCompleted(value: T) {
         result = value
     }

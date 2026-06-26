@@ -3034,6 +3034,33 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
+    // `recv.prop { lambda }` where `prop` is an extension property (not a
+    // member method) whose value is a callable instance: Kotlin parses this
+    // as `(recv.prop)(lambda)`. When no `prop` method resolves, get the
+    // extension-property value and invoke it with the trailing lambda. This
+    // is how `channel.onReceive { … }` works — `onReceive` is a
+    // `SelectClause1` property whose `invoke` operator (supplied by the
+    // enclosing `SelectBuilder`) registers the clause. Resolved via
+    // `getMemberField` (receiver-owned only, no global/top-level fallback)
+    // and gated on (a) an `Instance` property value and (b) a trailing
+    // callable argument — the clause-invoke shape — so an ordinary member
+    // call whose method resolution legitimately missed (and is handled by a
+    // downstream fallback) is never pre-empted. Leading positional args before
+    // the trailing lambda are passed through, so a `SelectClause2`
+    // (`channel.onSend(value) { … }`) invokes with `(value, block)`.
+    if (receiver.* == .Instance and args.len >= 1 and isCallable(&args[args.len - 1])) {
+        const got = self.getMemberField(allocator, receiver, name) catch EvalResult{ .err = .{ .Type = "" } };
+        if (got == .ok) {
+            const pv = got.ok;
+            if (pv == .Instance) {
+                const r = try callValueRec(self, allocator, &pv, args);
+                pv.release(allocator);
+                return r;
+            }
+            pv.release(allocator);
+        }
+    }
+
     // Dispatch-miss: the message carries `Vm::call_member `name` on `fqn``,
     // which downstream fallbacks pattern-match (e.g. the object-singleton walk)
     // to tell a top-level miss for *this* name from a deeper genuine error.
@@ -4974,6 +5001,52 @@ pub fn resolveMemberFuncId(self: *VmHost, allocator: Allocator, receiver: *const
 /// `FuncId`. `unambiguous` is set when the resolving class had exactly one
 /// method of that name (so the choice does not depend on argument types and the
 /// resolution may be cached for the inline dispatch cache).
+/// A function/lambda argument bound to a member parameter typed as a bare
+/// type-parameter (`value: T`) matches only because the receiver's type
+/// argument is erased. When a same-name extension applicable to this receiver
+/// takes that argument as a concrete function type, it is the more specific —
+/// and in Kotlin the only applicable — overload (the member's `T` is the
+/// receiver's non-function type argument, e.g. `CancellableContinuation<Unit>`,
+/// which a function does not satisfy). Defer the member to it. Example:
+/// `cont.tryResume(onCancellation)` must bind the `Boolean`-returning extension
+/// `CancellableContinuation<Unit>.tryResume(onCancellation)`, not the member
+/// `tryResume(value: T): Any?`.
+fn callableArgPrefersFunctionExtension(self: *VmHost, mod: *const Module, name: []const u8, member: *const Func, receiver: *const Value, args: []const Value) bool {
+    const mskip: usize = if (member.params.len > 0 and std.mem.eql(u8, member.params[0].name, "this")) 1 else 0;
+    var fn_arg_pos: ?usize = null;
+    for (args, 0..) |*a, i| {
+        // A function value, or a null where a (nullable) function is expected,
+        // is the kind of argument the extension takes concretely.
+        const fn_shaped = isCallable(a) or a.* == .Null;
+        if (!fn_shaped) continue;
+        const pi = mskip + i;
+        if (pi >= member.params.len) continue;
+        const mp = member.params[pi].ty;
+        if (std.mem.startsWith(u8, mp.name, "Function")) return false; // member already takes a function here
+        // The member binds this argument only through a bare type-parameter
+        // slot (`value: T`) — it is the receiver's erased, non-function type
+        // argument, which a function/null does not satisfy.
+        if (mp.name.len <= 2 and allUppercase(mp.name)) fn_arg_pos = i;
+    }
+    const want_pos = fn_arg_pos orelse return false;
+
+    const recv_chain = receiverClassChain(self, self.allocator, receiver.Instance) catch return false;
+    defer @constCast(&recv_chain).deinit();
+
+    for (mod.funcsBySimpleName(name)) |fid| {
+        const ef = funcAt(mod, fid) orelse continue;
+        if (ef.kind != .top_level_extension and ef.kind != .member_extension) continue;
+        if (ef.params.len == 0) continue;
+        const rt = ef.params[0].ty.name; // extension receiver type
+        const recv_ok = recv_chain.contains(rt) or std.mem.eql(u8, rt, "Any") or (rt.len <= 2 and allUppercase(rt));
+        if (!recv_ok) continue;
+        const epi = 1 + want_pos; // skip the extension's `this`
+        if (epi >= ef.params.len) continue;
+        if (std.mem.startsWith(u8, ef.params[epi].ty.name, "Function")) return true;
+    }
+    return false;
+}
+
 fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?ResolvedMethod {
     const inst = receiver.Instance;
     var class_name: []const u8 = undefined;
@@ -5019,16 +5092,23 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
             }
             first = false;
             if (ir_class) |irc| {
-                // Gather candidates named `name`.
+                // Gather candidates named `name`. A `@LowPriorityInOverloadResolution`
+                // / `@Deprecated(level = ERROR)` member is a guard stub that only
+                // applies when no ordinary candidate (member or top-level extension)
+                // does; skip it here so resolution falls through to the extension
+                // path. kotlinx.coroutines' `SelectBuilder.onTimeout` shadows its own
+                // `onTimeout` extension this way, and binding the stub would
+                // self-recurse (its body just calls the extension).
                 var candidates: std.ArrayList(Func) = .empty;
                 defer candidates.deinit(allocator);
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
-                        if (std.mem.eql(u8, f.name, name)) try candidates.append(allocator, f);
+                        if (std.mem.eql(u8, f.name, name) and !f.low_priority) try candidates.append(allocator, f);
                     }
                 }
                 if (pickMethodOverload(self, candidates.items, args)) |f| {
-                    return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
+                    if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args))
+                        return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
                 }
             }
         }
@@ -5726,6 +5806,31 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
             if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
             try candidates.append(allocator, .{ .fid = fid, .func = f });
+        }
+    }
+
+    // A low-priority candidate (`@Deprecated(level = ERROR/HIDDEN)`,
+    // `@LowPriorityInOverloadResolution`) is only a candidate when no ordinary
+    // overload applies — kotlinc hides it from resolution. Drop them up front
+    // when any ordinary candidate exists, for BOTH the strict and lenient
+    // passes below. Without this, the lenient pass can bind a HIDDEN
+    // binary-compat stub that delegates to a sibling overload but self-recurses
+    // (`buffer(capacity) = buffer(capacity)`, conflate → stack overflow).
+    {
+        var any_ordinary = false;
+        for (candidates.items) |c| {
+            if (!c.func.low_priority) {
+                any_ordinary = true;
+                break;
+            }
+        }
+        if (any_ordinary) {
+            var filtered: std.ArrayList(Candidate) = .empty;
+            for (candidates.items) |c| {
+                if (!c.func.low_priority) filtered.append(allocator, c) catch {};
+            }
+            candidates.deinit(allocator);
+            candidates = filtered;
         }
     }
 
@@ -6504,26 +6609,18 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
             if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
-            // Every supplied argument name must name one of the candidate's
-            // params (kotlinc: a candidate without the named param is not
-            // applicable) — `invokeOnCompletion(onCancelling = true) { }`
-            // must not bind an extension that has no `onCancelling`.
-            var names_fit = true;
-            for (arg_names) |maybe_n| {
-                const n = maybe_n orelse continue;
-                var found = false;
-                for (f.params) |*p| {
-                    if (std.mem.eql(u8, p.name, n)) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    names_fit = false;
-                    break;
-                }
-            }
-            if (!names_fit) continue;
+            // Full applicability under the actual binding (kotlinc semantics):
+            // each supplied name must hit a declared param, positional args
+            // fill leading params (with the trailing-lambda rule), every
+            // argument's type must be compatible with the param it binds, and
+            // every unbound param must be defaulted/vararg. This subsumes the
+            // bare "every name is a param" filter and, crucially, rejects an
+            // overload whose positional slot takes an argument of the wrong
+            // type — e.g. `produce(ctx, cap, onBufferOverflow, start = …,
+            // block = …)` must not bind the 5-param `produce(ctx, cap, start,
+            // onCompletion, block)` (the `BufferOverflow` would land in
+            // `start: CoroutineStart`).
+            if (!memberApplicableForWalkNamed(self, &f, args, arg_names)) continue;
             candidates.append(allocator, .{ .fid = fid, .func = f }) catch {};
         }
     }
@@ -6594,6 +6691,14 @@ fn memberApplicableForWalkNamed(self: *VmHost, f: *const Func, args: []const Val
         if (supplied_name) |nm| {
             for (effective, 0..) |*p, k| {
                 if (std.mem.eql(u8, p.name, nm)) {
+                    // A named argument that targets a parameter already filled
+                    // (by a leading positional argument) makes this overload
+                    // inapplicable — kotlinc rejects the double binding. This
+                    // is what distinguishes `produce(ctx, cap, onBufferOverflow,
+                    // start = …)` from the 5-param `produce(ctx, cap, start,
+                    // onCompletion, …)`, whose 3rd positional already fills
+                    // `start` that `start = …` then re-targets.
+                    if (bound[k]) return false;
                     param = p;
                     bound[k] = true;
                     break;
