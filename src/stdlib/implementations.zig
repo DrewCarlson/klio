@@ -1470,6 +1470,21 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.collections.MutableList.joinToString", .names = &.{"separator", "prefix", "postfix", "limit", "truncated", "transform"} },
     .{ .fqn = "kotlin.collections.MutableList.slice", .names = &.{"indices"} },
     .{ .fqn = "kotlin.collections.MutableList.subList", .names = &.{"fromIndex", "toIndex"} },
+    // The ranged primitive/object array `sort(fromIndex, toIndex)` — named
+    // args (`content.sort(fromIndex = 0, toIndex = _size)`, as androidx's
+    // primitive `*List.sort()` calls it) must reorder to positional.
+    .{ .fqn = "kotlin.Array.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.IntArray.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.LongArray.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.DoubleArray.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.FloatArray.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.ShortArray.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.ByteArray.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.CharArray.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.UIntArray.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.ULongArray.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.UShortArray.sort", .names = &.{ "fromIndex", "toIndex" } },
+    .{ .fqn = "kotlin.UByteArray.sort", .names = &.{ "fromIndex", "toIndex" } },
     .{ .fqn = "kotlin.collections.MutableList.take", .names = &.{"n"} },
     .{ .fqn = "kotlin.collections.MutableList.takeLast", .names = &.{"n"} },
     .{ .fqn = "kotlin.collections.MutableList.windowed", .names = &.{"size", "step", "partialWindows", "transform"} },
