@@ -3042,11 +3042,13 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // `SelectClause1` property whose `invoke` operator (supplied by the
     // enclosing `SelectBuilder`) registers the clause. Resolved via
     // `getMemberField` (receiver-owned only, no global/top-level fallback)
-    // and gated on (a) an `Instance` property value and (b) a single
-    // trailing callable argument — the clause-invoke shape — so an ordinary
-    // member call whose method resolution legitimately missed (and is
-    // handled by a downstream fallback) is never pre-empted.
-    if (receiver.* == .Instance and args.len == 1 and isCallable(&args[0])) {
+    // and gated on (a) an `Instance` property value and (b) a trailing
+    // callable argument — the clause-invoke shape — so an ordinary member
+    // call whose method resolution legitimately missed (and is handled by a
+    // downstream fallback) is never pre-empted. Leading positional args before
+    // the trailing lambda are passed through, so a `SelectClause2`
+    // (`channel.onSend(value) { … }`) invokes with `(value, block)`.
+    if (receiver.* == .Instance and args.len >= 1 and isCallable(&args[args.len - 1])) {
         const got = self.getMemberField(allocator, receiver, name) catch EvalResult{ .err = .{ .Type = "" } };
         if (got == .ok) {
             const pv = got.ok;
