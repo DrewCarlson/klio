@@ -1072,7 +1072,12 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // star-imported class. `hasOwnMember` alone misses the lambda case
             // (a lambda body has no own class), so a bare `state` inside a
             // method's lambda was wrongly rewritten to `Enum.state`.
-            if (!b.hasEnclosingMember(name0)) {
+            // A same-scope top-level declaration also outranks a star-import:
+            // a bare `STATE_COMPLETED` that names a top-level `val`/`fun` is
+            // that declaration, not `Enum.STATE_COMPLETED` for some unrelated
+            // `import Enum.*` whose enum does not even declare it (which would
+            // wrongly qualify it onto the enum and read a bogus field).
+            if (!b.hasEnclosingMember(name0) and !isTopLevelProp(name0) and b.module.funcId(name0) == null) {
                 if (wildcardClassMemberRewrite(b, segments[0].span.file)) |cls| {
                     const sp = segments[0].span;
                     var rsegs = [_]ast.Ident{
