@@ -2343,7 +2343,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     // `equals`), dispatch on the Instance instead. Structural
                     // equality is symmetric, so the result is identical and a
                     // builtin receiver need not implement `equals(Instance)`.
-                    const swap = bo.op == .Eq and l != .Instance and r == .Instance;
+                    const swap = (bo.op == .Eq or bo.op == .BoxedEq) and l != .Instance and r == .Instance;
                     const recv_ptr = if (swap) &r else &l;
                     const arg_val = if (swap) l else r;
                     // Strict extension dispatch: an operator extension whose
@@ -2366,10 +2366,13 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                                         .err => |e2| return raiseStep(frame, e2),
                                     }
                                     result = l;
-                                } else if (bo.op == .Eq) {
+                                } else if (bo.op == .Eq or bo.op == .BoxedEq) {
                                     // No user `equals` surface: Kotlin's
                                     // default is structural/identity equality.
-                                    result = .{ .Bool = Value.structuralEq(&l, &r) };
+                                    result = .{ .Bool = if (bo.op == .BoxedEq)
+                                        Value.structuralEqBoxed(&l, &r)
+                                    else
+                                        Value.structuralEq(&l, &r) };
                                 } else {
                                     return raiseStep(frame, e);
                                 }
@@ -3974,7 +3977,7 @@ fn operatorMethod(op: BinOp) ?[]const u8 {
         .Mul => "times",
         .Div => "div",
         .Mod => "rem",
-        .Eq => "equals",
+        .Eq, .BoxedEq => "equals",
         .Less, .LessEq, .Greater, .GreaterEq => "compareTo",
         .RangeTo => "rangeTo",
         .RangeUntil => "rangeUntil",
