@@ -51,30 +51,45 @@
 - **`@Stable`/`@Immutable`/`@StableMarker`** markers; **`RememberObserver`**
   (onRemembered on first remember, onForgotten on composition dispose).
 
-### Genuinely blocked by klio's eager-coroutine model (need a real event loop)
+### Async story — DONE (2026-06-26; was "blocked by the eager model")
 
-`snapshotFlow` / `Flow|State.collectAsState` on a never-completing source, the async
-`Recomposer.runRecomposeAndApplyChanges` frame-clock loop, and long-running
-`LaunchedEffect`s would collect/loop forever under eager execution. Driving them
-needs a cooperative frame dispatcher; deferred. The synchronous `recompose()` model
-is complete and covers compose semantics (selective recomposition, skipping,
-arg-change, locals, effects, derived, collections, key).
+The "blocked by the eager model" framing is **superseded** — klio has a working
+cooperative pump (see COROUTINE-MODEL.md "STATUS 2026-06-26"). All of the previously
+deferred async pieces now work, green in the corpus:
 
-**FOLLOW-UP — AbstractMutableList bug (revisit when fixed):** klio's stdlib
-`AbstractMutableList` currently throws `BinOp.Less on 0 and null` (a `modCount`
-read returns null) when subclassed, so `SnapshotStateList`/`Set`/`Map` are
-implemented by fully overriding the `Mutable*` interface over a plain backing
-collection rather than extending `AbstractMutableList`. This works and tracks
-reads/writes correctly, but is more verbose. Once the stdlib `AbstractMutableList`
-`modCount` bug is fixed (the user is fixing it separately), revisit and simplify
-`SnapshotStateCollections.kt` to extend `AbstractMutableList`/`AbstractMutableSet`/
-`AbstractMutableMap`, keeping the `notifyRead`/`notifyWrite` instrumentation.
+- **Async `Recomposer.runRecomposeAndApplyChanges`** + the upstream frame clock
+  (`MonotonicFrameClock` / `BroadcastFrameClock`) — `examples/compose_frame_clock.kt`.
+- **`snapshotFlow` + `Flow.collectAsState`** — `examples/compose_snapshot_flow.kt`.
+- **`StateFlow.collectAsState`** (hot source, collector under the Recomposer) —
+  `examples/compose_stateflow.kt`. The last blocker was a *compose* bug, not a
+  coroutine one: a skipped `@Composable` returned `Unit` instead of its cached value
+  (`composableEval`), so a `State`-returning composable crashed on the recompose its own
+  collector triggered. Fixed by caching each group's return value on its `GroupNode`
+  (`Composer.setGroupReturn`/`groupReturn`).
+- **`SnapshotStateList`/`Set`/`Map`** now ride `AbstractMutableList`/`Set`/`Map` (the
+  `modCount` bug was fixed); the `notifyRead`/`notifyWrite` instrumentation is preserved.
 
-Remaining (later phases): P7 async (LaunchedEffect / rememberCoroutineScope /
-produceState / snapshotFlow / derivedStateOf, frame-clock recomposer — blocked on the
-coroutine Flow/StateFlow interpreter bugs in §9), observable SnapshotStateList/Map/Set,
-`key{}` movable groups for lists, full MVCC snapshot transactions, the auxiliary
-Compose modules (ui / foundation / material), and a Skia rendering backend.
+The supporting interpreter fixes (synchronized inline actual, writeback→member,
+object-arg overload, member-shadows-extension, object-init-locals, skipped-composable
+return) are all on `main`/compose. Long-running `LaunchedEffect`s and hot collectors now
+drive correctly under the Recomposer.
+
+### REMAINING WORK — node-emission (Applier) layer for the Mosaic / Skia UI packs
+
+The runtime is functional for *logic* composition (state, recomposition, remember, key,
+effects, locals, collectAsState, **and `@Composable` content lambdas** — verified
+`Frame { Item("a"); Item("b") }`). What it does NOT yet have is the **node-emission
+(Applier) path** that every node-based UI library is built on. The current `KlioComposer`
+is slot-based and "renders" by running side effects (the examples *print*); there is no
+`createNode`/`startNode`/`endNode`/`Applier`, and `Composition` takes no applier.
+`Applier.kt` is vendored upstream but unused.
+
+This is the single foundational gap before Mosaic or Compose-UI. **The full design and
+build plan for it (the Applier interface, `ComposeNode`/`ReusableComposeNode` emit, the
+composer node-management, `Composition(applier, parent)` holding a root node,
+subcomposition, then the Mosaic pack and the Skia UI stack) lives in
+[`plans/UI-RENDERING-PACKS.md`](UI-RENDERING-PACKS.md).** Other later phases (full MVCC
+snapshot transactions, movable content) remain there too.
 
 ### Findings / divergences from the original plan
 

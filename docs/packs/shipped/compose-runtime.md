@@ -84,13 +84,17 @@ CompositionLocal, `SideEffect`/`DisposableEffect`, `derivedStateOf`, and the
 coroutine effects (`LaunchedEffect` / `rememberCoroutineScope` / `produceState`)
 for effects that complete.
 
-klio runs launched coroutines eagerly (there is no async event loop driving
-suspension), so the parts that need a real frame-clock / hot-stream loop are
-deferred: `snapshotFlow` / `collectAsState` on a never-completing source, the
-async `Recomposer.runRecomposeAndApplyChanges` loop, and long-running
-`LaunchedEffect`s. The full MVCC snapshot transaction API and movable content are
-also later phases. Auxiliary Compose modules (ui / foundation / material) and a
-rendering backend build on this runtime.
+The async story is now functional too (klio has a cooperative coroutine pump):
+the async `Recomposer.runRecomposeAndApplyChanges` loop + the upstream frame clock,
+`snapshotFlow`, `Flow.collectAsState`, and `StateFlow.collectAsState` on hot sources
+all work (`examples/compose_frame_clock.kt`, `compose_snapshot_flow.kt`,
+`compose_stateflow.kt`). Long-running `LaunchedEffect`s drive under the Recomposer.
+
+What remains is downstream of the runtime: the **node-emission (Applier) layer** that
+node-based UI is built on (the current composer renders via side effects, not a node
+tree), then the Mosaic (terminal) and Compose-UI/Skia rendering packs, plus the full
+MVCC snapshot transaction API and movable content. See
+`plans/UI-RENDERING-PACKS.md` for that plan.
 
 See `examples/compose_*.kt` for runnable demonstrations of each feature, and
-`plans/COMPOSE-RUNTIME.md` for the design and roadmap.
+`plans/COMPOSE-RUNTIME.md` + `plans/UI-RENDERING-PACKS.md` for the design and roadmap.

@@ -3,6 +3,118 @@
 Author role: concurrency runtime architect. This plan is grounded in the live code
 (file:line below), not the probe summaries alone.
 
+---
+
+## STATUS 2026-06-26 — async-compose story DONE; coroutine-semantics audit found the remaining work
+
+The original framing ("eager model, no async event loop") is **superseded**. klio
+*has* a working cooperative pump + ready-queue (`coroutines.zig`), launch ordering is
+correct (`runBlocking { launch{A}; print B }` → `B A`), and the whole async-compose
+story this plan was written for now works end-to-end:
+
+- `kotlin.synchronized` as an inline actual (block can suspend) — `main`.
+- `StateFlow`/`SharedFlow` collect machinery: writeback-call→member (`forEachSlotLocked`),
+  object-arg-vs-fn-param inline overload (`collectWhile`/first/single), member-shadows-
+  extension property (the `WorkaroundAtomicReference` recursion) — all on `main`.
+- Frame clock + async `Recomposer.runRecomposeAndApplyChanges` + `snapshotFlow` +
+  `Flow.collectAsState` **and** `StateFlow.collectAsState` — all green
+  (`examples/compose_frame_clock.kt`, `compose_snapshot_flow.kt`, `compose_stateflow.kt`).
+- The last collectAsState blocker was a compose bug (skipped `@Composable` returned
+  Unit), not a coroutine one — see COMPOSE-RUNTIME.md.
+
+### Audit 2026-06-26 — 33 confirmed divergences from kotlinx.coroutines (the remaining work)
+
+A category audit (10 categories, each probe verified against vendored upstream
+semantics) found **33 confirmed divergences**, clustering into ~10 root causes. These
+are the remaining tasks to make klio coroutines match Kotlin. Ordered by severity:
+
+1. **Structured-concurrency parent-job leak (10 findings) — highest impact.** A
+   `coroutineScope`/`supervisorScope`/scoped-coroutine child failure that is **caught
+   externally** still leaks to the parent `runBlocking` job → stdout is correct but the
+   process ALSO prints `runtime error: uncaught …` to stderr and exits 1 (double
+   delivery). Root cause: `klioMain/kotlinx/coroutines/KlioRuntime.kt` (`joinBlocking`
+   ~lines 45/57/62-71, the `if (failed) throw failure`) records and rethrows a failure
+   that upstream `JobSupport.cancelParent` short-circuits for scoped coroutines
+   (`JobSupport.kt:336-338` `if (isScopedCoroutine) return true`; `internal/Scopes.kt`
+   sets `isScopedCoroutine=true`). Fix: the parent `runBlocking` job must NOT be marked
+   failed when a scoped-coroutine child's exception was delivered via the rethrow path
+   (and supervisor children never propagate at all). Also surfaces as `join()` leaking
+   the internal `KlioBlockingCoroutine` class name.
+
+2. **CoroutineExceptionHandler not wired (2 findings + 1 segfault).** A `CEH` in the
+   context of `GlobalScope.launch` / a `supervisorScope` child is IGNORED — the
+   exception goes to the default "Exception in thread …" handler instead of the
+   installed handler (`klioMain/kotlinx/coroutines/internal/Misc.kt:23`,
+   `src/kotlinx_coroutines/kotlinx_coroutines.zig:613`). And a **SEGFAULT** when a CEH is
+   installed on `CoroutineScope(SupervisorJob() + handler)` and a child throws
+   (`src/interp_ir/vm/host_call_member.zig:3104`). Fix: route an uncaught coroutine
+   exception through the context's `CoroutineExceptionHandler` before the default.
+
+3. **Channel API + semantics (6 findings).** `trySend` returns `Boolean` not
+   `ChannelResult` (`.isSuccess` fails on a Bool), `tryReceive` returns the bare value
+   not `ChannelResult`, `isClosedForSend`/`isClosedForReceive` are dispatched as methods
+   not properties, `produce` returns a `ReceiveChannel` whose `receive()` is broken,
+   rendezvous `send` doesn't suspend (it behaves buffered), and a conflated channel keeps
+   all values instead of the latest. Root: the channel actuals
+   (`src/kotlinx_coroutines/kotlinx_coroutines.zig` + the `KlioChannel` klioMain) have
+   wrong return types and buffering semantics. Fix: return `ChannelResult` from
+   `trySend`/`tryReceive`, make the closed-flags properties, implement rendezvous +
+   conflated buffering, fix `produce`.
+
+4. **`select` + `Semaphore` (6 findings).** Every `select` clause crashes/errs —
+   `onReceive`/`onSend`/`onReceiveCatching` (members unresolved on `KlioChannel`),
+   `onAwait` (unresolved on `Job.Key`), and `onTimeout` **SEGFAULTs** (unbounded
+   recursion through the select machinery). `Semaphore.withPermit` under contention
+   crashes (`BinOp.Less on {ir-closure} and kotlin.Unit`). Fix: implement the `select`
+   builder + the channel/deferred `SelectClause`s; fix the `Semaphore` permit accounting.
+
+5. **Channel-backed flow operators (4 findings).** `buffer`/`conflate`/`flowOn`
+   (ChannelFlow → `iterator` on a channel), `combine`/`zip`/`flatMapMerge` (`invoke` on a
+   `SafeCollector`), `drop`/`dropWhile`/`takeWhile` (`collect` on `unsafeFlow`), and
+   `onCompletion` + `catch` (`invoke` on `$anon`). Mostly **downstream of #3 (channels)**
+   and the SafeCollector emit path (#6); re-verify after those land.
+
+6. **Hot-flow suspending collector (3 findings).** A `SharedFlow`/`StateFlow` collector
+   that suspends and then takes a *second* emit fails with `Vm::call_member emit on
+   kotlin.Function` (`src/interp_ir/vm/host_call_member.zig:3013` — the SafeCollector
+   emit dispatch on resume binds the collector as a bare function). And
+   `subscriptionCount` hits `unresolved global lastReplayedLocked` — the *same*
+   pack-member-inline-unresolved class as `forEachSlotLocked` (now fixed) but for another
+   `AbstractSharedFlow` member (`src/ir/eval.zig:3045`). Fix: the resume-side
+   SafeCollector emit must dispatch the collector's `emit`, and `lastReplayedLocked`
+   needs the inherited-member-inline resolution.
+
+7. **`Dispatchers.Unconfined` eager-start ordering (3 findings).** `Unconfined` should
+   start eagerly on the current thread until the first suspension; klio's interleaving
+   differs (`A C B D` vs Kotlin's order). The narrowest genuine remnant of the "eager"
+   divergence (default `launch` ordering is already correct).
+
+8. **`yield()` doesn't yield to the pump (1, found pre-audit).** In a `launch`-collector
+   loop resumed across `yield()`s from another coroutine, the yielder runs again before
+   the ready coroutine, double-resuming the same continuation → `Already resumed`
+   (`/tmp` repro `loopsusp.kt`). Not on the collectAsState path (that uses delay/slot
+   resume), but a real dispatch-ordering bug.
+
+9. **User top-level `coroutineContext` symbol corrupts the runtime (1).** A user-declared
+   top-level `coroutineContext` (or similar coroutine-intrinsic name) shadows/poisons the
+   runtime → `ClassCastException: cast to Map failed`. A name-domain/resolution bug, same
+   family as the `System.err` → `Clock.System` clash noted while probing.
+
+10. **`channel_worker_writer` missed-wakeup deadlock (pre-existing, from memory).** A
+    `ByteChannel` + `Dispatchers.Default` worker hangs on a missed wakeup. Re-verify after
+    the channel + dispatcher fixes; may be subsumed.
+
+Unsure/uncconfirmed: 2 probes the audit could not pin to a definite Kotlin-correct
+output — re-derive before acting.
+
+**Suggested fix order:** #1 (structured-concurrency leak — the KlioRuntime parent-failure
+path) and #2 (CEH + segfault) first (highest user impact, shared root in KlioRuntime);
+then #3 (channels) which unblocks #4 (select), #5 (channel flow ops), and parts of #6;
+then #6/#7/#8 (flow + dispatch ordering); #9 is an isolated resolution fix. Each fix
+ships with a deterministic probe promoted into the parity/e2e corpus.
+
+---
+
 ## 0. What the machinery actually is (verified)
 
 Two layers, exactly as mapped:
