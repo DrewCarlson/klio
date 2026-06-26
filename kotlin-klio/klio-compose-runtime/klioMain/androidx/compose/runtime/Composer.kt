@@ -37,6 +37,14 @@ public interface Composer {
      */
     public fun shouldRunGroup(argsHash: Long): Boolean
 
+    /** Cache the current group's @Composable return value, for reuse when the
+     * group is skipped on a later pass. */
+    public fun setGroupReturn(value: Any?)
+
+    /** The current group's cached @Composable return value, or [Unit] if the
+     * group has never recorded one. */
+    public fun groupReturn(): Any?
+
     /** Push a CompositionLocal provider layer for the enclosed content. */
     public fun startProviders(values: Array<out ProvidedValue<*>>)
 
@@ -72,6 +80,10 @@ internal class GroupNode(@JvmField val key: Long, @JvmField val parent: GroupNod
 
     /** Hash of the arguments this group last (re)composed with. */
     @JvmField var lastArgsHash: Long = 0L
+
+    /** The @Composable's return value from its last execution, reused verbatim
+     * when this group is skipped. [Composer.Empty] until first recorded. */
+    @JvmField var returnValue: Any? = Composer.Empty
 
     /** Reset the per-composition-pass cursors before (re)entering this group. */
     fun enterPass() {
@@ -199,6 +211,15 @@ internal class KlioComposer : Composer {
             g.lastArgsHash = argsHash
         }
         return should
+    }
+
+    override fun setGroupReturn(value: Any?) {
+        current().returnValue = value
+    }
+
+    override fun groupReturn(): Any? {
+        val v = current().returnValue
+        return if (v === Composer.Empty) Unit else v
     }
 
     override fun endGroup() {
