@@ -2920,6 +2920,19 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                     slots[ai] = null;
                     if ((try simpleLiteral(allocator, ae)) != null) continue;
                     if (bareCaptureResolvable(ae, capture_pairs)) continue;
+                    // A bare class/interface name resolves to its companion at
+                    // build time (`evalSuperArg`); the synthetic thunk module
+                    // has no class registry to resolve the companion, so skip
+                    // thunking it.
+                    if (ae.* == .Path and ae.Path.segments.len == 1) {
+                        const cn = ae.Path.segments[0].name;
+                        const has_comp = blk2: {
+                            const mg = self.module.borrow();
+                            defer mg.deinit();
+                            break :blk2 mg.get().registry.companion_singletons.get(cn) != null;
+                        };
+                        if (has_comp and findCapture(capture_pairs, cn) == null) continue;
+                    }
                     const thunk_name: ast.Ident = .{
                         .name = try std.fmt.allocPrint(allocator, "$superarg${d}${d}", .{ si, ai }),
                         .span = obj.span,
@@ -3353,11 +3366,27 @@ fn runAnonThunk(
 /// bare captured name, then a field reached through the captured outer
 /// `this`.
 fn evalSuperArg(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, capture_pairs: []const NameValue) Allocator.Error!Value {
-    _ = self;
     if (try simpleLiteral(allocator, expr)) |v| return v;
     if (expr.* == .Path and expr.Path.segments.len == 1) {
         const nm = expr.Path.segments[0].name;
         if (findCapture(capture_pairs, nm)) |v| return v;
+        // A bare class/interface name in value position resolves to its
+        // companion object — e.g. the CEH factory's
+        // `AbstractCoroutineContextElement(CoroutineExceptionHandler)` passes
+        // the interface's companion `Key`. (The super-arg thunk is skipped for
+        // such names so this path runs, since the thunk's synthetic module has
+        // no class registry to resolve the companion.)
+        const comp_name: ?[]const u8 = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().registry.companion_singletons.get(nm);
+        };
+        if (comp_name) |cn| {
+            switch (try host_globals.ensureObjectSingleton(self, cn)) {
+                .ok => |maybe| if (maybe) |v| return v,
+                .err => {},
+            }
+        }
         if (findCapture(capture_pairs, "this")) |tv| {
             if (tv == .Instance) {
                 const ig = tv.Instance.borrow();
