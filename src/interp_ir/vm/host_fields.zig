@@ -482,18 +482,44 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if (std.mem.eql(u8, name, "$coroutineContext$explicit")) {
         return getFieldInner(self, allocator, receiver, "coroutineContext", true, member_probe);
     }
-    // Scope-qualified property read (`$sgetter$<owner>\u{1f}<name>`):
-    // invoke the lexically enclosing owner's own custom getter.
+    // Scope-qualified property read (`$sgetter$<owner>\u{1f}<name>`): a bare
+    // property read inside a method. Kotlin dispatches this virtually — an
+    // `open val` overridden in a subclass calls the subclass's getter even
+    // when read from a base-class method (e.g. `JobSupport.cancelParent`
+    // reading `isScopedCoroutine`, overridden by `ScopeCoroutine`). Resolve
+    // the getter from the receiver's runtime class (most-derived first); the
+    // lexically enclosing `owner`'s getter is only the fallback.
     if (std.mem.startsWith(u8, name, "$sgetter$")) {
         const rest = name["$sgetter$".len..];
         if (std.mem.indexOfScalar(u8, rest, '\u{1f}')) |sep| {
             const owner = rest[0..sep];
             const prop = rest[sep + 1 ..];
-            const pg = self.prog.borrow();
-            const fid_opt = lookupPairFunc(pg.get().instance_prop_getters, owner, prop);
-            pg.deinit();
+            const mptr: *const Module = self.module.asPtr();
+            if (receiver.* == .Instance) {
+                var cur: ?[]const u8 = className(receiver.Instance);
+                var seen: std.ArrayList([]const u8) = .empty;
+                defer seen.deinit(allocator);
+                while (cur) |cn| {
+                    cur = null;
+                    if (containsStr(seen.items, cn)) break;
+                    try seen.append(allocator, cn);
+                    const vfid = blk: {
+                        const pg = self.prog.borrow();
+                        defer pg.deinit();
+                        break :blk lookupPairFunc(pg.get().instance_prop_getters, cn, prop);
+                    };
+                    if (vfid) |fid| {
+                        if (fid.int() < mptr.funcCount()) return evalGetter(self, allocator, fid, receiver.*);
+                    }
+                    cur = firstSupertype(self, cn);
+                }
+            }
+            const fid_opt = blk: {
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                break :blk lookupPairFunc(pg.get().instance_prop_getters, owner, prop);
+            };
             if (fid_opt) |fid| {
-                const mptr: *const Module = self.module.asPtr();
                 if (fid.int() < mptr.funcCount()) {
                     return evalGetter(self, allocator, fid, receiver.*);
                 }
