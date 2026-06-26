@@ -752,16 +752,40 @@ bugs. Three were general interpreter bugs, now fixed:
    bogus enum field -> an internal `Symbol` where the state machine expected its
    sentinel. Fixed: skip the wildcard rewrite for a known top-level property/fn.
 
-Remaining (deep select-engine work, not the bare-name bug):
+Two more were the wake-up itself, now fixed:
 
-4. **Offer value-handoff.** A rendezvous send hands its value to the parked select
-   through `trySelect`'s result, but `klioProcessReceive` re-polls the (empty)
-   channel instead of returning that result. Returning the `trySelect` result is
-   the fix, but it is gated behind (5).
-5. **`trySelect` state-machine spins / never returns.** With (1)-(3) fixed, the
-   channel `onReceive` parks and the sender's `trySelect` is invoked, but
-   `trySelectInternal`'s `state.loop` does not reach a returning branch (the
-   `curState is CancellableContinuation` / CAS path), so `trySelect` hangs. The
-   deferred `onAwait` parking path has its own analogous `Symbol`/state issue.
-   These plus the suspend/resume dispatch for a parked-then-woken select are the
-   remaining layers.
+4. **Offer value-handoff (FIXED).** A rendezvous send hands its value to the
+   parked select through `trySelect`'s result; `klioProcessReceive`/`Catching`
+   now return that result rather than re-polling the channel a rendezvous never
+   buffered.
+5. **`cont.tryResume(onCancellation)` bound the wrong overload (FIXED).** It must
+   bind the `Boolean`-returning extension `CancellableContinuation<Unit>.tryResume`,
+   not the member `tryResume(value: T): Any?`; the erased type argument `Unit`
+   does not accept the function argument so only the extension applies. The
+   dispatcher now prefers a function-typed extension over a member whose matching
+   parameter is a bare type-parameter when the argument is a function (or a null
+   where a nullable function is expected). Without it `trySelect` returned a resume
+   token where a `Bool` was expected.
+
+Plus `channel.onSend(value) { }` now dispatches (the clause-invoke fallback passes
+the leading value before the trailing lambda).
+
+**Working and reliable:** a single parking `select` over channel `onReceive`, a
+deferred `onAwait` (ready and parking), `onTimeout`, `onSend`, `Semaphore` under
+contention, multi-clause select where one clause parks, and a select loop over a
+buffered channel.
+
+Remaining (one deep pump issue):
+
+6. **A rendezvous sender that parks *after* its offer drops the select's wake.**
+   When the offering send hands its value to the select and then itself suspends
+   on a later send (`launch { c.send(1); c.send(2) }` with the select taking 1 and
+   the sender parking on 2), the select never resumes. Pump trace: the select's
+   `CancellableContinuation` resume targets a continuation-scheme slot (`slot=1`)
+   that no parked activation owns, while the select's activation actually parked on
+   a kxco slot (`1<<48` and up, from `allocKxcoSlot`). The resume is stashed and
+   never claimed, so the pump stalls (`parked=2 ready=0`). `park.kt` (sender
+   completes after the offer) only survives because the activation's real slot is
+   resumed by a second path. The fix is in the continuation↔activation slot binding
+   for `suspendCancellableCoroutine` so a `tryResume` wakes the activation that
+   parked, regardless of whether the resumer subsequently suspends.
