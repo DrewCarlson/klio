@@ -172,6 +172,23 @@ pub const ProgramImage = struct {
     /// the method body. Keyed by identity: the class cell pointer and interned
     /// method-name pointer are stable for the program's lifetime.
     instance_method_cache: std.AutoHashMap(InstanceMethodKey, u32),
+    /// Inline cache for the pack-binding / stdlib-intrinsic resolution on an
+    /// `Instance` receiver (the `instanceBindingProbe` path). Without it every
+    /// intrinsic instance-method call rebuilds candidate FQN strings, walks the
+    /// supertype chain (heap-allocating a seen-set + queue), and re-resolves
+    /// against the binding table — the dominant cost for an interpreted
+    /// primitive-collection (`MutableIntIntMap.set` in a 1M loop). The resolved
+    /// `(func, fqn)` for `(class identity, method-name pointer, arg-sig)` is
+    /// invariant for a named class (the binding table is static); a `null` func
+    /// is a cached "no intrinsic" so the next call skips the probe and falls
+    /// straight through. The duped `fqn` is owned by this image.
+    instance_intrinsic_cache: std.AutoHashMap(InstanceMethodKey, MemberResolveEntry),
+    /// `hostHasMember(class, name)` decides member-vs-global for a bare call;
+    /// it walks the class hierarchy (heap-allocating a seen-set + queue) every
+    /// call. The answer is a pure function of `(class identity, name pointer)`,
+    /// so memoize the bool — a bare top-level call inside a hot method (e.g.
+    /// `hash(key)` in `MutableIntIntMap.set`) otherwise re-walks every time.
+    host_has_member_cache: std.AutoHashMap(MemberHasKey, bool),
     /// Overload-resolution cache for global function calls. `pickOverload` scans
     /// and type-scores every same-name candidate per call — the dominant cost for
     /// generic stdlib calls (`maxOf`/`minOf`/math) in a hot loop. Its result is a
@@ -184,6 +201,7 @@ pub const ProgramImage = struct {
     pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool };
     pub const MemberResolveEntry = struct { func: ?StdlibFn, fqn: []const u8 };
     pub const InstanceMethodKey = struct { class_p: usize, name_p: usize, n_args: u32, sig: u64 };
+    pub const MemberHasKey = struct { class_p: usize, name_p: usize };
     pub const OverloadKey = struct { module_p: usize, func_p: u32, sig: u64 };
 
     /// Packages a bare global name may bind into implicitly, in
@@ -243,6 +261,8 @@ pub const ProgramImage = struct {
             .resolved_linked = false,
             .member_resolve_cache = std.AutoHashMap(MemberResolveKey, MemberResolveEntry).init(allocator),
             .instance_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
+            .instance_intrinsic_cache = std.AutoHashMap(InstanceMethodKey, MemberResolveEntry).init(allocator),
+            .host_has_member_cache = std.AutoHashMap(MemberHasKey, bool).init(allocator),
             .overload_cache = std.AutoHashMap(OverloadKey, u32).init(allocator),
             .allocator = allocator,
         };
@@ -275,6 +295,12 @@ pub const ProgramImage = struct {
         }
         self.member_resolve_cache.deinit();
         self.instance_method_cache.deinit();
+        {
+            var it = self.instance_intrinsic_cache.valueIterator();
+            while (it.next()) |e| if (e.fqn.len != 0) self.allocator.free(e.fqn);
+        }
+        self.instance_intrinsic_cache.deinit();
+        self.host_has_member_cache.deinit();
         self.overload_cache.deinit();
     }
 

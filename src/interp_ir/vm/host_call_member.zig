@@ -1249,6 +1249,30 @@ fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []cons
 // -------------------------------------------------------------------------
 
 pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bool {
+    if (receiver.* != .Instance) return false;
+    const key: root_mod.ProgramImage.MemberHasKey = .{
+        .class_p = blk: {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            break :blk g.get().class.identity();
+        },
+        .name_p = @intFromPtr(name.ptr),
+    };
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (pg.get().host_has_member_cache.get(key)) |v| return v;
+    }
+    const result = hostHasMemberUncached(self, receiver, name);
+    {
+        const pg = self.prog.borrowMut();
+        defer pg.deinit();
+        pg.get().host_has_member_cache.put(key, result) catch {};
+    }
+    return result;
+}
+
+fn hostHasMemberUncached(self: *VmHost, receiver: *const Value, name: []const u8) bool {
     const inst = switch (receiver.*) {
         .Instance => |inst| inst,
         else => return false,
@@ -3105,6 +3129,21 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         g.deinit();
     }
 
+    // Inline cache: a prior resolution of this (class, name, arg-sig) returns
+    // straight to its intrinsic (or to a cached "no intrinsic" miss) without
+    // rebuilding the probe FQNs or walking the supertype chain. Only a
+    // primitive-arg call is keyed (`instanceMethodKey`); anything else falls
+    // through to the full probe below.
+    const ib_key = instanceMethodKey(receiver, name, args);
+    if (ib_key) |k| {
+        if (instanceIntrinsicCacheGet(self, k)) |entry| {
+            const func = entry.func orelse return null;
+            const all_args = try prependReceiver(allocator, receiver, args);
+            defer if (runtime.freeScratch()) allocator.free(all_args);
+            return try dispatchIntrinsic(self, allocator, entry.fqn, func, all_args);
+        }
+    }
+
     var probes: std.ArrayList([]const u8) = .empty;
     // Probe FQNs are per-call scratch (all `allocPrint`ed below); free them and
     // the list. No-op under the arena; reclaims under a freeing allocator.
@@ -3148,6 +3187,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
             break :blk bg.get().resolve(p);
         };
         if (installed) |func| {
+            if (ib_key) |k| instanceIntrinsicCachePut(self, k, func, p);
             const all_args = try prependReceiver(allocator, receiver, args);
             defer if (runtime.freeScratch()) allocator.free(all_args);
             return try dispatchIntrinsic(self, allocator, p, func, all_args);
@@ -3210,12 +3250,16 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
         };
         if (mapped) |p| {
             if (lookupIntrinsic(self, p)) |func| {
+                if (ib_key) |k| instanceIntrinsicCachePut(self, k, func, p);
                 const all_args = try prependReceiver(allocator, receiver, args);
                 defer if (runtime.freeScratch()) allocator.free(all_args);
                 return try dispatchIntrinsic(self, allocator, p, func, all_args);
             }
         }
     }
+    // No intrinsic for this (class, name, arg-sig) through any probe stage:
+    // cache the miss so the next call returns immediately.
+    if (ib_key) |k| instanceIntrinsicCachePut(self, k, null, "");
     return null;
 }
 
@@ -5093,6 +5137,27 @@ fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceM
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().instance_method_cache.put(key, raw) catch {};
+}
+
+fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?root_mod.ProgramImage.MemberResolveEntry {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return pg.get().instance_intrinsic_cache.get(key);
+}
+
+/// Memoize the `instanceBindingProbe` outcome for `key`. `func == null` caches
+/// "no intrinsic" so the next call returns immediately without rebuilding the
+/// probe FQNs or walking the supertype chain. The `fqn` (the winning probe, or
+/// "" for a miss) is duped into the image-owned allocator on first store.
+fn instanceIntrinsicCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, func: ?StdlibFn, fqn: []const u8) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    const cache = &pg.get().instance_intrinsic_cache;
+    if (cache.contains(key)) return;
+    const owned: []const u8 = if (fqn.len == 0) "" else (pg.get().allocator.dupe(u8, fqn) catch return);
+    cache.put(key, .{ .func = func, .fqn = owned }) catch {
+        if (owned.len != 0) pg.get().allocator.free(owned);
+    };
 }
 
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
