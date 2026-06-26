@@ -9,6 +9,7 @@ const std = @import("std");
 const runtime = @import("runtime");
 const text = @import("../text.zig");
 const regexp = @import("regexp.zig");
+const char = @import("char.zig");
 
 const Value = runtime.Value;
 const RuntimeError = runtime.RuntimeError;
@@ -483,7 +484,13 @@ pub fn string_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     var start: i64 = undefined;
     var end: i64 = undefined;
     const rest = ctx.args[1..];
-    if (rest.len == 1 and rest[0].isIntegral()) {
+    if (rest.len == 1 and rest[0] == .Range) {
+        // `substring(range)` keeps `range.start .. range.endInclusive`,
+        // i.e. an exclusive end of `endInclusive + 1`.
+        const rg = rest[0].Range;
+        start = rg.start;
+        end = rg.end + 1;
+    } else if (rest.len == 1 and rest[0].isIntegral()) {
         start = rest[0].asI64().?;
         end = len;
     } else if (rest.len == 2 and rest[0].isIntegral() and rest[1].isIntegral()) {
@@ -492,13 +499,12 @@ pub fn string_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     } else {
         return errArity("substring requires 1 or 2 Int args");
     }
-    if (start < 0 or end > len) {
-        const msg = try std.fmt.allocPrint(ctx.allocator, "substring({d},{d}) on length {d}", .{ start, end, len });
+    // `String.substring(begin[, end])` throws StringIndexOutOfBoundsException
+    // (an IndexOutOfBoundsException) for every out-of-bounds case, including
+    // `begin > end`.
+    if (start < 0 or end > len or start > end) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "begin {d}, end {d}, length {d}", .{ start, end, len });
         return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
-    }
-    if (start > end) {
-        const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d} > endIndex: {d}", .{ start, end });
-        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
     return .{ .ok = try newString(ctx.allocator, try utf16Slice(ctx.allocator, s, @intCast(start), @intCast(end))) };
 }
@@ -1043,7 +1049,12 @@ pub fn string_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(new);
-    return .{ .ok = try newString(ctx.allocator, try replaceAll(ctx.allocator, s, old, new, null)) };
+    const ignore_case = ctx.args.len > 3 and ctx.args[3] == .Bool and ctx.args[3].Bool;
+    const out = if (ignore_case)
+        try replaceAllIgnoreCase(ctx.allocator, s, old, new, null)
+    else
+        try replaceAll(ctx.allocator, s, old, new, null);
+    return .{ .ok = try newString(ctx.allocator, out) };
 }
 
 /// trim / trimStart / trimEnd, honoring the optional argument: a vararg
@@ -1411,8 +1422,20 @@ fn stringSplitItems(ctx: *CallCtx, who: []const u8) Allocator.Error!union(enum) 
             },
         }
     }
+    if (limit < 0) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "Limit must be non-negative, but was {d}", .{limit});
+        return switch (try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg)) {
+            .err => |e| .{ .err = e },
+            .ok => unreachable,
+        };
+    }
+    // `split(vararg)` with no delimiters supplied returns the whole string
+    // as a single element. A supplied empty-string delimiter still splits
+    // at every position (matched length 0), so it is not "no delimiter".
     if (delims.items.len == 0) {
-        return .{ .err = .{ .Type = "String.split requires at least one delimiter" } };
+        var single: std.ArrayList(Value) = .empty;
+        try single.append(ctx.allocator, try newString(ctx.allocator, try ctx.allocator.dupe(u8, s)));
+        return .{ .ok = try single.toOwnedSlice(ctx.allocator) };
     }
     const out = try splitOnAny(ctx.allocator, s, delims.items, ignore_case, limit);
     return .{ .ok = out };
@@ -1431,47 +1454,59 @@ fn delimToString(allocator: Allocator, v: Value) Allocator.Error!?[]const u8 {
     }
 }
 
-/// Split `s` on any of `delims` (left-to-right, non-overlapping), honoring
-/// a positive `limit` (max substrings) and ASCII `ignore_case`. An empty
-/// delimiter is skipped.
+/// Advance one UTF-8 code point forward from byte offset `i` in `s`.
+fn nextCharBoundary(s: []const u8, i: usize) usize {
+    if (i >= s.len) return s.len;
+    var j = i + 1;
+    while (j < s.len and !isCharBoundary(s, j)) j += 1;
+    return j;
+}
+
+/// Split `s` on any of `delims`, mirroring `DelimitedRangesSequence`: at
+/// each search position find the first (declaration-order) delimiter that
+/// matches and emit the segment before it. A positive `limit` bounds the
+/// number of substrings; an empty-string delimiter matches with length 0
+/// (advancing the search by one code point) so `"abc".split("")` yields
+/// the inter-character segments. ASCII `ignore_case`.
 fn splitOnAny(allocator: Allocator, s: []const u8, delims: []const []const u8, ignore_case: bool, limit: i64) Allocator.Error![]Value {
-    var nonempty: std.ArrayList([]const u8) = .empty;
-    defer nonempty.deinit(allocator);
-    for (delims) |d| {
-        if (d.len != 0) try nonempty.append(allocator, d);
-    }
     var out: std.ArrayList(Value) = .empty;
     errdefer out.deinit(allocator);
-    if (nonempty.items.len == 0) {
-        try out.append(allocator, try newString(allocator, try allocator.dupe(u8, s)));
-        return out.toOwnedSlice(allocator);
-    }
     var seg_start: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
+    var search: usize = 0;
+    while (true) {
         if (limit > 0 and @as(i64, @intCast(out.items.len)) == limit - 1) break;
-        if (!isCharBoundary(s, i)) {
-            i += 1;
-            continue;
-        }
-        var matched: ?usize = null;
-        for (nonempty.items) |d| {
-            const end = i + d.len;
-            if (end <= s.len and isCharBoundary(s, end)) {
-                const cand = s[i..end];
-                const eq = if (ignore_case) std.ascii.eqlIgnoreCase(cand, d) else std.mem.eql(u8, cand, d);
-                if (eq) {
-                    matched = d.len;
-                    break;
+        if (search > s.len) break;
+        // Find the first delimiter match at or after `search`.
+        var match_at: ?usize = null;
+        var match_len: usize = 0;
+        var pos: usize = search;
+        scan: while (pos <= s.len) {
+            for (delims) |d| {
+                const end = pos + d.len;
+                if (end <= s.len and (d.len == 0 or (isCharBoundary(s, pos) and isCharBoundary(s, end)))) {
+                    const cand = s[pos..end];
+                    const eq = if (ignore_case) std.ascii.eqlIgnoreCase(cand, d) else std.mem.eql(u8, cand, d);
+                    if (eq) {
+                        match_at = pos;
+                        match_len = d.len;
+                        break :scan;
+                    }
                 }
             }
+            if (pos >= s.len) break;
+            pos = nextCharBoundary(s, pos);
         }
-        if (matched) |dlen| {
-            try out.append(allocator, try newString(allocator, try allocator.dupe(u8, s[seg_start..i])));
-            i += dlen;
-            seg_start = i;
+        const idx = match_at orelse break;
+        try out.append(allocator, try newString(allocator, try allocator.dupe(u8, s[seg_start..idx])));
+        seg_start = idx + match_len;
+        // A zero-length match (empty delimiter) advances the search one
+        // code point so the next iteration makes progress; at end of input
+        // that pushes `search` past `s.len`, ending the loop after the
+        // final trailing segment is emitted.
+        if (match_len == 0) {
+            search = if (seg_start >= s.len) s.len + 1 else nextCharBoundary(s, seg_start);
         } else {
-            i += 1;
+            search = seg_start;
         }
     }
     try out.append(allocator, try newString(allocator, try allocator.dupe(u8, s[seg_start..])));
@@ -1805,7 +1840,12 @@ pub fn string_replace_first(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(new);
-    return .{ .ok = try newString(ctx.allocator, try replaceAll(ctx.allocator, s, old, new, 1)) };
+    const ignore_case = ctx.args.len > 3 and ctx.args[3] == .Bool and ctx.args[3].Bool;
+    const out = if (ignore_case)
+        try replaceAllIgnoreCase(ctx.allocator, s, old, new, 1)
+    else
+        try replaceAll(ctx.allocator, s, old, new, 1);
+    return .{ .ok = try newString(ctx.allocator, out) };
 }
 
 pub fn string_trim_indent(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -1882,26 +1922,63 @@ pub fn string_trim_margin(ctx: *CallCtx) Allocator.Error!EvalResult {
             },
         }
     }
+    // Split into lines (LF / CR / CRLF), mirroring `lines()`.
+    var raw_lines: std.ArrayList([]const u8) = .empty;
+    defer raw_lines.deinit(ctx.allocator);
+    {
+        var i: usize = 0;
+        var line_start: usize = 0;
+        while (i < s.len) {
+            if (s[i] == '\n' or s[i] == '\r') {
+                try raw_lines.append(ctx.allocator, s[line_start..i]);
+                if (s[i] == '\r' and i + 1 < s.len and s[i + 1] == '\n') i += 1;
+                i += 1;
+                line_start = i;
+            } else i += 1;
+        }
+        try raw_lines.append(ctx.allocator, s[line_start..]);
+    }
     var out_lines: std.ArrayList([]const u8) = .empty;
     defer {
         for (out_lines.items) |l| ctx.allocator.free(l);
         out_lines.deinit(ctx.allocator);
     }
-    var it = std.mem.splitScalar(u8, s, '\n');
-    while (it.next()) |l| {
-        const trimmed_start = std.mem.trimStart(u8, l, " \t");
-        if (std.mem.startsWith(u8, trimmed_start, prefix_buf)) {
-            try out_lines.append(ctx.allocator, try ctx.allocator.dupe(u8, trimmed_start[prefix_buf.len..]));
-        } else {
-            try out_lines.append(ctx.allocator, try ctx.allocator.dupe(u8, l));
+    const last_index = raw_lines.items.len - 1;
+    for (raw_lines.items, 0..) |l, idx| {
+        // A blank first or last line is dropped entirely (`reindent`).
+        if ((idx == 0 or idx == last_index) and lineIsBlank(l)) continue;
+        // Cut at the margin prefix following the leading whitespace; a line
+        // with no such prefix (including an all-whitespace line) is kept
+        // unchanged (`indentCutFunction(...) ?: value`).
+        const fnw = firstNonWhitespaceByte(l);
+        if (fnw) |w| {
+            if (std.mem.startsWith(u8, l[w..], prefix_buf)) {
+                try out_lines.append(ctx.allocator, try ctx.allocator.dupe(u8, l[w + prefix_buf.len ..]));
+                continue;
+            }
         }
+        try out_lines.append(ctx.allocator, try ctx.allocator.dupe(u8, l));
     }
-    // Trim a single leading/trailing empty line (matching Kotlin behavior).
-    var start: usize = 0;
-    var stop: usize = out_lines.items.len;
-    if (stop > start and out_lines.items[start].len == 0) start += 1;
-    if (stop > start and out_lines.items[stop - 1].len == 0) stop -= 1;
-    return .{ .ok = try newString(ctx.allocator, try joinLines(ctx.allocator, out_lines.items[start..stop])) };
+    return .{ .ok = try newString(ctx.allocator, try joinLines(ctx.allocator, out_lines.items)) };
+}
+
+/// Byte offset of the first non-whitespace code point in `l`, or null when
+/// every code point is whitespace (`indexOfFirst { !it.isWhitespace() }`).
+fn firstNonWhitespaceByte(l: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < l.len) {
+        const len = std.unicode.utf8ByteSequenceLength(l[i]) catch 1;
+        const end = @min(i + len, l.len);
+        const cp = std.unicode.utf8Decode(l[i..end]) catch l[i];
+        if (!isWhitespace(@intCast(cp))) return i;
+        i = end;
+    }
+    return null;
+}
+
+/// Whether every code point in `l` is whitespace (`CharSequence.isBlank`).
+fn lineIsBlank(l: []const u8) bool {
+    return firstNonWhitespaceByte(l) == null;
 }
 
 pub fn string_lines(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -2747,6 +2824,57 @@ fn lineAllWhitespace(l: []const u8) bool {
         i = end;
     }
     return true;
+}
+
+/// Case-insensitive equality of two UTF-16 unit sub-slices of equal length.
+fn unitsEqIgnoreCase(a: []const u16, b: []const u16) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!char.charEqIgnoreCase(x, y)) return false;
+    }
+    return true;
+}
+
+/// `replace`/`replaceFirst` with ASCII/Unicode case folding. Matches the
+/// JVM behavior of comparing each candidate window to `old` with
+/// `Char.equals(ignoreCase = true)`. Works in UTF-16 units so a delimiter
+/// matches at code-unit boundaries. `max` bounds the number of replacements.
+fn replaceAllIgnoreCase(allocator: Allocator, s: []const u8, old: []const u8, new: []const u8, max: ?usize) Allocator.Error![]u8 {
+    const su = try utf16Units(allocator, s);
+    defer allocator.free(su);
+    const ou = try utf16Units(allocator, old);
+    defer allocator.free(ou);
+    const nu = try utf16Units(allocator, new);
+    defer allocator.free(nu);
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(allocator);
+    var count: usize = 0;
+    if (ou.len == 0) {
+        try out.appendSlice(allocator, nu);
+        count += 1;
+        for (su) |u| {
+            try out.append(allocator, u);
+            if (max == null or count < max.?) {
+                try out.appendSlice(allocator, nu);
+                count += 1;
+            }
+        }
+        return charUnitsToString(allocator, out.items);
+    }
+    var i: usize = 0;
+    while (i < su.len) {
+        if ((max == null or count < max.?) and i + ou.len <= su.len and
+            unitsEqIgnoreCase(su[i .. i + ou.len], ou))
+        {
+            try out.appendSlice(allocator, nu);
+            i += ou.len;
+            count += 1;
+        } else {
+            try out.append(allocator, su[i]);
+            i += 1;
+        }
+    }
+    return charUnitsToString(allocator, out.items);
 }
 
 /// Replace occurrences of `old` with `new`, up to `max` (null = all). An

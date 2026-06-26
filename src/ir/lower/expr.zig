@@ -2595,7 +2595,22 @@ fn lowerCallSpread(
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
 ) Allocator.Error!Reg {
-    const callee_reg = try lowerExpr(b, callee);
+    // `recv.method(*array)` dispatches the spread-flattened args through
+    // member resolution on the receiver, not by invoking `recv.method` as a
+    // first-class value (which a member like `split` is not). Lower the
+    // receiver and carry the method name so the evaluator routes through
+    // `callMemberNamed`.
+    var member_id: ?ConstId = null;
+    const callee_reg = blk: {
+        if (callee.* == .Member) {
+            const m = callee.Member;
+            if (b.resolve(m.name.name) == null and !b.knowsOuter(m.name.name) and !b.isLocalFn(m.name.name)) {
+                member_id = try b.module.internConst(b.allocator, .{ .String = m.name.name });
+                break :blk try lowerReceiver(b, m.receiver);
+            }
+        }
+        break :blk try lowerExpr(b, callee);
+    };
     const parts = try b.allocator.alloc(SpreadPart, args.len);
     for (args, parts) |*a, *p| {
         if (a.* == .Spread) {
@@ -2613,6 +2628,7 @@ fn lowerCallSpread(
         .callee = callee_reg,
         .parts = parts,
         .arg_names = arg_names,
+        .member = member_id,
     } });
     return dst;
 }
@@ -4677,6 +4693,35 @@ fn allNull(names: []const ?[]const u8) bool {
     return true;
 }
 
+/// Whether the statically-bound private method `fid` can accept a call
+/// supplying `n_args` positional arguments. The fid map keeps one entry
+/// per name, so an overloaded private method may bind a sibling of the
+/// wrong arity; declining here routes the call through dynamic member
+/// dispatch, which picks the right overload. A named-argument call binds
+/// by parameter name, which only the dynamic path models, so accept it
+/// only when the positional arity already fits the bound fid.
+fn privateFidAcceptsArity(b: *FuncBuilder, fid: FuncId, n_args: usize, arg_names: []const ?[]const u8) bool {
+    const f = b.module.funcById(fid) orelse return true;
+    const params = f.params;
+    const skip: usize = if (params.len > 0 and std.mem.eql(u8, params[0].name, "this")) 1 else 0;
+    const user = params[skip..];
+    // A vararg tail absorbs any number of trailing positional args.
+    if (user.len > 0 and user[user.len - 1].is_vararg) return n_args + 1 >= user.len;
+    if (n_args > user.len) return false;
+    if (n_args == user.len) return true;
+    // Fewer args than params: every unsupplied trailing parameter must be
+    // defaulted. Named args may fill a gap, so only decline when a clearly
+    // unfilled positional tail has no default.
+    _ = arg_names;
+    const defaults = b.module.registry.local_fn_defaults.get(fid);
+    var i = skip + n_args;
+    while (i < params.len) : (i += 1) {
+        const has = defaults != null and i < defaults.?.items.len and defaults.?.items[i] != null;
+        if (!has) return false;
+    }
+    return true;
+}
+
 /// Inside a method body: unqualified `name(...)` is a method call on `this`.
 fn lowerImplicitThisCall(
     b: *FuncBuilder,
@@ -4695,10 +4740,14 @@ fn lowerImplicitThisCall(
     if (!b.ownMemberApplicable(name0, args.len)) return null;
     const this_reg = b.resolve("this") orelse return null;
 
-    // Private own-class methods bind statically — but only to an overload
-    // whose arity accepts this call; an arity mismatch defers to dynamic
-    // dispatch so an overloaded private method picks the right sibling.
-    if (b.privateMethodFidForArity(name0, args.len)) |fid| {
+    // Private own-class methods bind statically. The fid map records one
+    // entry per name, so an overloaded private method (two `helper`s of
+    // different arity) keeps only one of them. Take the static bind only
+    // when that fid can actually accept this call's arity; otherwise fall
+    // through to the dynamic member dispatch below, whose
+    // `pickMethodOverload` selects the right private sibling from the
+    // class method table.
+    if (b.privateMethodFid(name0)) |fid| if (privateFidAcceptsArity(b, fid, args.len, ast_arg_names)) {
         // Reserve the receiver slot first, then lower the arguments into a
         // contiguous run immediately after it. `lowerArgRun` reserves every
         // argument slot before lowering any argument, so an argument's own
@@ -4723,7 +4772,7 @@ fn lowerImplicitThisCall(
             .exact = false,
         } });
         return dst;
-    }
+    };
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
@@ -5212,6 +5261,11 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
             const dst = b.allocReg();
+            // The cast picked this overload by its declared receiver type;
+            // mark the call exact so the runtime overload re-resolution
+            // (which keys on the receiver's runtime type) cannot flip a
+            // `(this as CharSequence).f()` back onto the `String.f` namesake
+            // and recurse.
             try b.push(.{ .Call = .{
                 .dst = dst,
                 .func = func_id,
@@ -5219,7 +5273,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
                 .n_args = @intCast(arg_regs.len),
                 .arg_names = arg_names,
                 .type_args = type_args,
-                .exact = false,
+                .exact = true,
             } });
             return dst;
         }

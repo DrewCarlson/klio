@@ -174,6 +174,13 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.String.endsWith", .f = string.string_ends_with },
     .{ .fqn = "kotlin.String.get", .f = string.string_get },
     .{ .fqn = "kotlin.String.indexOf", .f = string.string_index_of },
+    // `nativeIndexOf` / `nativeLastIndexOf` are the platform helpers the
+    // common `CharSequence.indexOf(char/string)` calls when `this is String`.
+    // klio backs them with the same UTF-16 index intrinsics.
+    .{ .fqn = "kotlin.text.nativeIndexOf", .f = string.string_index_of },
+    .{ .fqn = "kotlin.text.nativeLastIndexOf", .f = string.string_last_index_of },
+    .{ .fqn = "kotlin.String.nativeIndexOf", .f = string.string_index_of },
+    .{ .fqn = "kotlin.String.nativeLastIndexOf", .f = string.string_last_index_of },
     .{ .fqn = "kotlin.String.toString", .f = string.string_to_string },
     .{ .fqn = "kotlin.String.toByteArray", .f = string.string_to_byte_array },
     .{ .fqn = "kotlin.String.encodeToByteArray", .f = string.string_to_byte_array },
@@ -233,6 +240,16 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.String.windowed", .f = string.string_windowed },
     .{ .fqn = "kotlin.String.trimEnd", .f = string.string_trim_end },
     .{ .fqn = "kotlin.String.trimStart", .f = string.string_trim_start },
+    // `CharSequence.trim*` runs over any CharSequence receiver (e.g. a
+    // StringBuilder); `recvString` reads its backing units, so the String
+    // trim intrinsics serve both. A StringBuilder receiver probes the
+    // `kotlin.text.<name>` FQN, so the helpers are registered there too.
+    .{ .fqn = "kotlin.CharSequence.trim", .f = string.string_trim },
+    .{ .fqn = "kotlin.CharSequence.trimEnd", .f = string.string_trim_end },
+    .{ .fqn = "kotlin.CharSequence.trimStart", .f = string.string_trim_start },
+    .{ .fqn = "kotlin.text.trim", .f = string.string_trim },
+    .{ .fqn = "kotlin.text.trimEnd", .f = string.string_trim_end },
+    .{ .fqn = "kotlin.text.trimStart", .f = string.string_trim_start },
     .{ .fqn = "kotlin.String.uppercase", .f = string.string_uppercase },
     .{ .fqn = "kotlin.Char", .f = char.char_ctor },
     .{ .fqn = "kotlin.Char.code", .f = char.char_code },
@@ -1462,6 +1479,7 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.String.compareTo", .names = &.{ "other", "ignoreCase" } },
     .{ .fqn = "kotlin.String.repeat", .names = &.{"n"} },
     .{ .fqn = "kotlin.String.replace", .names = &.{"oldValue", "newValue", "ignoreCase"} },
+    .{ .fqn = "kotlin.String.replaceFirst", .names = &.{ "oldValue", "newValue", "ignoreCase" } },
     .{ .fqn = "kotlin.String.split", .names = &.{"delimiters", "ignoreCase", "limit"} },
     .{ .fqn = "kotlin.String.substring", .names = &.{"startIndex", "endIndex"} },
     .{ .fqn = "kotlin.String.encodeToByteArray", .names = &.{"startIndex", "endIndex", "throwOnInvalidSequence"} },

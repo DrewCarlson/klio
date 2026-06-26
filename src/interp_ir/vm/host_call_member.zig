@@ -3978,10 +3978,23 @@ fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         var start: usize = 0;
         var end: usize = chars.len;
         if (args.len == 2) {
-            const s: usize = @intCast(@max(args[0].asI64() orelse 0, 0));
-            const e: usize = @intCast(@max(args[1].asI64() orelse @as(i64, @intCast(chars.len)), 0));
-            start = @min(s, chars.len);
-            end = @min(e, chars.len);
+            const si = args[0].asI64() orelse 0;
+            const ei = args[1].asI64() orelse @as(i64, @intCast(chars.len));
+            const size: i64 = @intCast(chars.len);
+            // `CharArray.concatToString(startIndex, endIndex)` validates via
+            // `checkBoundsIndexes`: out-of-range bounds throw
+            // IndexOutOfBoundsException, an inverted range throws
+            // IllegalArgumentException.
+            if (si < 0 or ei > size) {
+                const msg = try std.fmt.allocPrint(allocator, "startIndex: {d}, endIndex: {d}, size: {d}", .{ si, ei, size });
+                return .{ .err = try throwExc(allocator, "kotlin.IndexOutOfBoundsException", msg) };
+            }
+            if (si > ei) {
+                const msg = try std.fmt.allocPrint(allocator, "startIndex: {d} > endIndex: {d}", .{ si, ei });
+                return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
+            }
+            start = @intCast(si);
+            end = @intCast(ei);
         }
         var units: std.ArrayList(u16) = .empty;
         defer units.deinit(allocator);
@@ -5891,6 +5904,19 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
                 // A concrete (non-top, non-generic) param type that the arg
                 // satisfies is more specific than a top/`Any`/`T` param.
                 if (!isTopOrGenericType(f.params[i + 1].ty.name)) param_spec += 1;
+            }
+        }
+        // Every parameter past the supplied arguments must be defaulted or
+        // vararg, or the candidate cannot bind this call — a 5-param private
+        // `findAnyOf(strings, startIndex, ignoreCase, last)` is not applicable
+        // to `findAnyOf(strings)`, so the 3-param public sibling wins.
+        if (want < f.params.len) {
+            var k = want;
+            while (k < f.params.len) : (k += 1) {
+                if (!f.params[k].has_default and !f.params[k].is_vararg) {
+                    applicable = 0;
+                    break;
+                }
             }
         }
         if (f.params.len == want) score += 5;
