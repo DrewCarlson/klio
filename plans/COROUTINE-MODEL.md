@@ -775,17 +775,22 @@ deferred `onAwait` (ready and parking), `onTimeout`, `onSend`, `Semaphore` under
 contention, multi-clause select where one clause parks, and a select loop over a
 buffered channel.
 
-Remaining (one deep pump issue):
+Remaining (the B1 continuation-identity bug):
 
 6. **A rendezvous sender that parks *after* its offer drops the select's wake.**
    When the offering send hands its value to the select and then itself suspends
    on a later send (`launch { c.send(1); c.send(2) }` with the select taking 1 and
-   the sender parking on 2), the select never resumes. Pump trace: the select's
-   `CancellableContinuation` resume targets a continuation-scheme slot (`slot=1`)
-   that no parked activation owns, while the select's activation actually parked on
-   a kxco slot (`1<<48` and up, from `allocKxcoSlot`). The resume is stashed and
-   never claimed, so the pump stalls (`parked=2 ready=0`). `park.kt` (sender
-   completes after the offer) only survives because the activation's real slot is
-   resumed by a second path. The fix is in the continuation↔activation slot binding
-   for `suspendCancellableCoroutine` so a `tryResume` wakes the activation that
-   parked, regardless of whether the resumer subsequently suspends.
+   the sender parking on 2), the select never resumes. The wake goes through the
+   dispatcher: `cont.tryResume` -> `completeResume` -> `KlioDispatcher.dispatch` ->
+   `__kxco_spawn { block.run() }`. The spawn DOES fire (pump trace:
+   `enqueueLaunch ... launched.len now=1`, drained each round), but running the
+   block does not resume the select activation that parked on its kxco slot
+   (`1<<48`) - it re-runs the block instead, so the activation stays parked and the
+   pump stalls (`parked=2 ready=0`). `park.kt` works only because there the sender
+   *completes* after the offer and the activation's real slot is resumed by a
+   direct path rather than the dispatcher.
+   This is the documented **B1 continuation-identity bug** (above): a dispatcher
+   resume must resume the *captured activation* (by its slot/token), never
+   re-invoke the closure from scratch. Fixing B1 unblocks both the rendezvous
+   parking select here and `StateFlow.collectAsState` / suspending flow collectors.
+   Everything else in the parking-select stack (1-5) is fixed and in `main`.
