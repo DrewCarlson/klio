@@ -1522,11 +1522,15 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
     if (label) |lbl| {
-        if (b.currentInlineFn() != null) {
-            b.terminate(.{ .LabeledReturn = .{ .label = lbl.name, .value = r } });
-        } else {
-            b.terminate(.{ .Return = r });
-        }
+        // A labeled return unwinds at runtime to the frame whose function /
+        // lambda carries this label (`frameMatchesLabel`). That is correct
+        // whether the target is the current lambda (a local `return@self`,
+        // absorbed at this frame) or an enclosing one reached through a
+        // non-inlined call — e.g. `run sc@{ once { return@sc } }`, where the
+        // lambda passed to the inline `once` is itself lowered outside any
+        // inline context. Emitting a plain `Return` there returned from the
+        // lambda locally and silently dropped the non-local return.
+        b.terminate(.{ .LabeledReturn = .{ .label = lbl.name, .value = r } });
     } else if (b.isLambdaBody() and !b.isNamedLocalFn()) {
         b.terminate(.{ .NonLocalReturn = r });
     } else {
