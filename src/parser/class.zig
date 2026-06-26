@@ -192,24 +192,26 @@ fn skipPrimaryCtorAnnotations(p: *Parser) void {
         }
         support.skipNl(p);
     }
-    // Skip an optional visibility ident, then require `constructor`.
+    // Skip an optional run of constructor modifiers (visibility plus the
+    // `actual`/`expect` soft keywords, in any order — e.g. `@JvmOverloads
+    // public actual constructor`), then require `constructor`.
     var probe = p.pos;
-    const probe_is_vis = probe < p.tokens.len and
-        std.meta.activeTag(p.tokens[probe].kind) == .Ident and blk: {
-            const t = support.text(p, p.tokens[probe].span);
-            break :blk std.mem.eql(u8, t, "public") or
-                std.mem.eql(u8, t, "private") or
-                std.mem.eql(u8, t, "protected") or
-                std.mem.eql(u8, t, "internal");
-        };
-    if (probe_is_vis) {
-        probe += 1;
+    while (probe < p.tokens.len) {
         while (probe < p.tokens.len and
-            std.meta.activeTag(p.tokens[probe].kind) == .Newline)
-        {
-            probe += 1;
-        }
+            std.meta.activeTag(p.tokens[probe].kind) == .Newline) probe += 1;
+        if (probe >= p.tokens.len or std.meta.activeTag(p.tokens[probe].kind) != .Ident) break;
+        const t = support.text(p, p.tokens[probe].span);
+        const is_ctor_mod = std.mem.eql(u8, t, "public") or
+            std.mem.eql(u8, t, "private") or
+            std.mem.eql(u8, t, "protected") or
+            std.mem.eql(u8, t, "internal") or
+            std.mem.eql(u8, t, "actual") or
+            std.mem.eql(u8, t, "expect");
+        if (!is_ctor_mod) break;
+        probe += 1;
     }
+    while (probe < p.tokens.len and
+        std.meta.activeTag(p.tokens[probe].kind) == .Newline) probe += 1;
     const is_primary_ctor = probe < p.tokens.len and
         std.meta.activeTag(p.tokens[probe].kind) == .Ident and
         std.mem.eql(u8, support.text(p, p.tokens[probe].span), "constructor");
