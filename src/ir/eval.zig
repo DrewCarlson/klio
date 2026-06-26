@@ -2163,6 +2163,18 @@ fn constStr(module: *const Module, id: ConstId) ?[]const u8 {
     };
 }
 
+/// A callable reference (`Long::toByte`, `recv::method`) is represented as a
+/// synth `Instance` whose class name is `$bound_ref$<name>`. Such a value is
+/// invocable even though it carries no `invoke` member declaration.
+fn isBoundRefInstance(v: *const Value) bool {
+    if (v.* != .Instance) return false;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    return std.mem.startsWith(u8, cg.get().name, "$bound_ref$");
+}
+
 fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
     switch (inst.*) {
         .SuspendResumePoint => {
@@ -2847,7 +2859,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // shadow the real member.
             const fb_invocable = switch (fb) {
                 .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod, .PropertyRef => true,
-                .Instance => host.hostHasMember(&fb, "invoke") or host.callableReceiverShape(&fb) != null,
+                // A bound/unbound callable reference (`Long::toByte`,
+                // `recv::method`) is a `$bound_ref$<name>` synth instance: it
+                // is invocable, so `recv.refParam()` invokes the reference
+                // with `recv` as its receiver rather than dispatching a member
+                // named `refParam` on `recv`.
+                .Instance => isBoundRefInstance(&fb) or host.hostHasMember(&fb, "invoke") or host.callableReceiverShape(&fb) != null,
                 else => false,
             };
             if (fb_invocable and !host.hostHasMember(&recv, name_str)) {

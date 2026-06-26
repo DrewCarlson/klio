@@ -2304,24 +2304,40 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         }
     }
 
-    // Evaluate class-delegation expressions.
+    // Evaluate class-delegation expressions. A `by <expr>` interface
+    // delegation declared on any class in the chain forwards the
+    // delegated interface's members, so each level's delegate thunks run
+    // against that level's resolved super-args — not only the leaf's, so a
+    // subclass of a delegating base inherits its delegate fields. Leaf
+    // first: a more-derived class's delegation for an interface overrides
+    // a base's, so the first delegate field for a given interface wins and
+    // a later (base-level) one is skipped. The leaf is keyed on its
+    // runtime `class_name` (the side table's key), not the IR name the
+    // chain records, which can differ when the def was resolved through a
+    // sibling/fqn lookup.
     {
-        const delegates = classDelegateThunks(self, class_fqn, class_name);
-        for (delegates) |sf| {
-            const fr = try funcAt(self, sf.func, "class delegate");
-            switch (fr) {
-                .err => {},
-                .ok => |func| {
-                    switch (try evalThunk(self, func, args)) {
-                        .ok => |v| {
-                            const key = try std.fmt.allocPrint(allocator, "__delegate__{s}", .{sf.name});
-                            const g = inst.borrowMut();
-                            try g.get().fields.append(allocator, .{ .name = key, .value = v });
-                            g.deinit();
-                        },
-                        .err => |e| return .{ .err = e },
-                    }
-                },
+        for (chain.items, 0..) |c, idx| {
+            const lookup_name = if (idx == 0) class_name else c.name;
+            const delegates = classDelegateThunks(self, c.fqn, lookup_name);
+            for (delegates) |sf| {
+                const fr = try funcAt(self, sf.func, "class delegate");
+                switch (fr) {
+                    .err => {},
+                    .ok => |func| {
+                        switch (try evalThunk(self, func, c.args)) {
+                            .ok => |v| {
+                                const key = try std.fmt.allocPrint(allocator, "__delegate__{s}", .{sf.name});
+                                const g = inst.borrowMut();
+                                const already = g.get().get(key) != null;
+                                if (!already) {
+                                    try g.get().fields.append(allocator, .{ .name = key, .value = v });
+                                }
+                                g.deinit();
+                            },
+                            .err => |e| return .{ .err = e },
+                        }
+                    },
+                }
             }
         }
     }
@@ -3299,6 +3315,34 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         switch (try runAnonThunk(self, allocator, it.module, it.func, &inst_value, capture_pairs)) {
             .ok => {},
             .err => |e| return .{ .err = e },
+        }
+    }
+
+    // Interface delegation (`object : Iface by expr {}`): store the delegate
+    // value as a `__delegate__<Iface>` field so the member/field forwarders
+    // reach it (a named class does this through its ctor; the runtime synthesis
+    // here would otherwise drop it). A delegate that is a captured name resolves
+    // through `capture_pairs`.
+    {
+        const delegates = obj.supertype_delegates;
+        for (supertypes, 0..) |*sup, i| {
+            if (i >= delegates.len) break;
+            const de = delegates[i] orelse continue;
+            const dv: ?Value = switch (de) {
+                .Path => |p| if (p.segments.len == 1) findCapture(capture_pairs, p.segments[0].name) else null,
+                else => null,
+            };
+            const v = dv orelse continue;
+            const key = try std.fmt.allocPrint(allocator, "__delegate__{s}", .{sup.name.name});
+            v.retain();
+            const ig = inst.borrowMut();
+            const already = ig.get().get(key) != null;
+            if (!already) {
+                try ig.get().fields.append(allocator, .{ .name = key, .value = v });
+            } else {
+                v.release(allocator);
+            }
+            ig.deinit();
         }
     }
 

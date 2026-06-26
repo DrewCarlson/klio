@@ -1926,10 +1926,57 @@ pub fn string_to_char_array(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
+    var units: std.ArrayList(u16) = .empty;
+    defer units.deinit(ctx.allocator);
+    var it = Utf16View{ .bytes = s };
+    while (it.next()) |u| try units.append(ctx.allocator, u);
+    const length: i64 = @intCast(units.items.len);
+
+    // `toCharArray(destination, destinationOffset, startIndex, endIndex)`:
+    // copy the `[startIndex, endIndex)` subrange into the existing
+    // `destination` CharArray at `destinationOffset` and return it.
+    if (ctx.args.len > 1 and ctx.args[1] == .Array) {
+        const dest = ctx.args[1].Array;
+        const dest_offset = if (ctx.args.len > 2 and isIntLike(ctx.args[2])) (ctx.args[2].asI64() orelse 0) else 0;
+        const start = if (ctx.args.len > 3 and isIntLike(ctx.args[3])) (ctx.args[3].asI64() orelse 0) else 0;
+        const end = if (ctx.args.len > 4 and isIntLike(ctx.args[4])) (ctx.args[4].asI64() orelse length) else length;
+        if (start < 0 or end > length) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, length });
+            return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+        }
+        if (start > end) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d} > endIndex: {d}", .{ start, end });
+            return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+        }
+        const dest_len: i64 = @intCast(dest.len());
+        const count = end - start;
+        if (dest_offset < 0 or dest_offset + count > dest_len) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "destinationOffset: {d}, count: {d}, destination.length: {d}", .{ dest_offset, count, dest_len });
+            return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+        }
+        var i: i64 = 0;
+        while (i < count) : (i += 1) {
+            dest.set(ctx.allocator, @intCast(dest_offset + i), .{ .Char = units.items[@intCast(start + i)] });
+        }
+        return .{ .ok = ctx.args[1] };
+    }
+
+    // `toCharArray()` / `toCharArray(startIndex, endIndex)`: a fresh
+    // CharArray holding the `[startIndex, endIndex)` subrange.
+    const start = if (ctx.args.len > 1 and isIntLike(ctx.args[1])) (ctx.args[1].asI64() orelse 0) else 0;
+    const end = if (ctx.args.len > 2 and isIntLike(ctx.args[2])) (ctx.args[2].asI64() orelse length) else length;
+    if (start < 0 or end > length) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, length });
+        return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+    }
+    if (start > end) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d} > endIndex: {d}", .{ start, end });
+        return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
+    }
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(ctx.allocator);
-    var it = Utf16View{ .bytes = s };
-    while (it.next()) |u| try items.append(ctx.allocator, .{ .Char = u });
+    var k: i64 = start;
+    while (k < end) : (k += 1) try items.append(ctx.allocator, .{ .Char = units.items[@intCast(k)] });
     return .{ .ok = try runtime.ArrayData.initPacked(ctx.allocator, .Char, items.items) };
 }
 

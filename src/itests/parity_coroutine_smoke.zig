@@ -91,3 +91,6 @@ test "cs7_scope_builders" {
 test "cs8_dotted_in_builder" {
     try runSmoke("cs8_dotted_in_builder");
 }
+test "cs9_channels" {
+    try runSmoke("cs9_channels");
+}

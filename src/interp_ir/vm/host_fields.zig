@@ -482,18 +482,44 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if (std.mem.eql(u8, name, "$coroutineContext$explicit")) {
         return getFieldInner(self, allocator, receiver, "coroutineContext", true, member_probe);
     }
-    // Scope-qualified property read (`$sgetter$<owner>\u{1f}<name>`):
-    // invoke the lexically enclosing owner's own custom getter.
+    // Scope-qualified property read (`$sgetter$<owner>\u{1f}<name>`): a bare
+    // property read inside a method. Kotlin dispatches this virtually — an
+    // `open val` overridden in a subclass calls the subclass's getter even
+    // when read from a base-class method (e.g. `JobSupport.cancelParent`
+    // reading `isScopedCoroutine`, overridden by `ScopeCoroutine`). Resolve
+    // the getter from the receiver's runtime class (most-derived first); the
+    // lexically enclosing `owner`'s getter is only the fallback.
     if (std.mem.startsWith(u8, name, "$sgetter$")) {
         const rest = name["$sgetter$".len..];
         if (std.mem.indexOfScalar(u8, rest, '\u{1f}')) |sep| {
             const owner = rest[0..sep];
             const prop = rest[sep + 1 ..];
-            const pg = self.prog.borrow();
-            const fid_opt = lookupPairFunc(pg.get().instance_prop_getters, owner, prop);
-            pg.deinit();
+            const mptr: *const Module = self.module.asPtr();
+            if (receiver.* == .Instance) {
+                var cur: ?[]const u8 = className(receiver.Instance);
+                var seen: std.ArrayList([]const u8) = .empty;
+                defer seen.deinit(allocator);
+                while (cur) |cn| {
+                    cur = null;
+                    if (containsStr(seen.items, cn)) break;
+                    try seen.append(allocator, cn);
+                    const vfid = blk: {
+                        const pg = self.prog.borrow();
+                        defer pg.deinit();
+                        break :blk lookupPairFunc(pg.get().instance_prop_getters, cn, prop);
+                    };
+                    if (vfid) |fid| {
+                        if (fid.int() < mptr.funcCount()) return evalGetter(self, allocator, fid, receiver.*);
+                    }
+                    cur = firstSupertype(self, cn);
+                }
+            }
+            const fid_opt = blk: {
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                break :blk lookupPairFunc(pg.get().instance_prop_getters, owner, prop);
+            };
             if (fid_opt) |fid| {
-                const mptr: *const Module = self.module.asPtr();
                 if (fid.int() < mptr.funcCount()) {
                     return evalGetter(self, allocator, fid, receiver.*);
                 }
@@ -952,6 +978,14 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if (!member_probe and receiver.* == .Instance) {
         const is_companion_recv = std.mem.indexOf(u8, className(receiver.Instance), "$Companion$") != null;
         var cur: ?[]const u8 = if (is_companion_recv) null else className(receiver.Instance);
+        // The lexically-enclosing class for the *first* hop is taken from the
+        // receiver's FQN, whose nesting is unambiguous. The `enclosing_class`
+        // map keys by simple name, so when two nested classes share a simple
+        // name (`Outer1.Builder` and `Outer2.Builder` both lift to `Builder`)
+        // it resolves only one of them; the FQN-derived parent keeps each
+        // receiver bound to its own enclosing scope.
+        const recv_encl_from_fqn: ?[]const u8 = enclosingSimpleFromFqn(self, receiver.Instance);
+        var first_hop = true;
         var seen: std.ArrayList([]const u8) = .empty;
         defer seen.deinit(allocator);
         while (cur) |cname| {
@@ -995,11 +1029,14 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             // before a same-named top-level/global class swaps in below.
             if (firstSupertype(self, cname)) |sup| {
                 cur = sup;
+            } else if (first_hop and recv_encl_from_fqn != null) {
+                cur = recv_encl_from_fqn;
             } else {
                 const g = self.module.borrow();
                 defer g.deinit();
                 cur = g.get().registry.enclosing_class.get(cname);
             }
+            first_hop = false;
         }
     }
     // A top-level *function* must not outrank a property of an enclosing
@@ -1135,6 +1172,26 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 break :blk g.get().registry.enclosing_class.get(cls_name);
             };
             cls_name = enc orelse break;
+        }
+    }
+    // Native property getter on a host-synthesised instance, as a last
+    // resort. `typeFqn()` is `<instance>` for any `Instance`, so the
+    // stdlib property probe above never keys on the instance's class. A
+    // host-synthesised class (e.g. the native `KlioChannel`) exposes
+    // properties like `isClosedForSend` through a zero-arg installed
+    // binding `<classFqn>.<name>`; read it as a getter once fields,
+    // delegation, companion, and enclosing lookups have all declined.
+    // Restricted to host synth classes so a user/stdlib property that
+    // genuinely does not resolve still reports the miss.
+    if (receiver.* == .Instance and !probe_is_toplevel_fn and instanceIsHostSynth(receiver.Instance)) {
+        const cls_fqn = classFqnOf(receiver.Instance);
+        if (cls_fqn.len != 0) {
+            const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name });
+            defer allocator.free(probe);
+            if (lookupIntrinsic(self, probe)) |func| {
+                const args = [_]Value{receiver.*};
+                return dispatchIntrinsic(self, allocator, probe, func, &args);
+            }
         }
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
@@ -1291,6 +1348,36 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
         defer cg.deinit();
         if (cg.get().get(name)) |def| return ok(.{ .Class = def });
     }
+    return null;
+}
+
+/// The simple name of the lexically-enclosing class of a nested-class
+/// instance, derived from its FQN (`a.b.Outer.Inner` -> the class whose
+/// FQN is `a.b.Outer`, returning `Outer`). Null when the receiver's FQN
+/// has no parent class (a top-level class, whose parent segment is a
+/// package). The FQN nesting is unambiguous where the simple-name
+/// `enclosing_class` map collides for nested classes that share a simple
+/// name across different enclosing classes.
+fn enclosingSimpleFromFqn(self: *VmHost, inst: ObjRef(InstanceData)) ?[]const u8 {
+    const fqn: []const u8 = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
+    const last_dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return null;
+    const parent_fqn = fqn[0..last_dot];
+    const parent_simple = if (std.mem.lastIndexOfScalar(u8, parent_fqn, '.')) |d| parent_fqn[d + 1 ..] else parent_fqn;
+    // Confirm the parent FQN names an actual class (not a package): the
+    // class table is keyed by simple name, so verify the matching entry's
+    // FQN equals the parent FQN before treating it as the enclosing class.
+    const cg = self.classes.borrow();
+    defer cg.deinit();
+    const def = cg.get().get(parent_simple) orelse return null;
+    const dg = def.borrow();
+    defer dg.deinit();
+    if (std.mem.eql(u8, dg.get().fqn, parent_fqn)) return parent_simple;
     return null;
 }
 
@@ -1790,13 +1877,32 @@ fn resolveInstanceGetter(
         found = lookupPairFunc(pg.get().instance_prop_getters, recv_fqn, name);
     }
     if (found != null) return found;
-    var cur: ?[]const u8 = if (own_is_qualified) firstSupertypeOf(inst) else class_name;
-    var seen: std.ArrayList([]const u8) = .empty;
-    defer seen.deinit(allocator);
-    while (cur) |cn| {
-        cur = null;
-        if (containsStr(seen.items, cn)) break;
-        try seen.append(allocator, cn);
+    // Walk the FULL supertype closure breadth-first (nearest-first), not just
+    // the first supertype: `class D : I, B()` lists the interface `I` before
+    // the base class `B`, so following only `supertype_names[0]` would stop at
+    // `I` and never reach `B`'s inherited getter. Methods already BFS the
+    // hierarchy (`resolveInstanceMethod`); property getters must too.
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(allocator);
+    var seen: std.StringHashMap(void) = .init(allocator);
+    defer seen.deinit();
+    if (own_is_qualified) {
+        const cg = self.classes.borrow();
+        if (cg.get().get(firstSupertypeOf(inst) orelse class_name)) |d| {
+            const dg = d.borrow();
+            for (dg.get().supertype_names) |sn| queue.append(allocator, sn) catch {};
+            dg.deinit();
+        }
+        cg.deinit();
+        try queue.append(allocator, firstSupertypeOf(inst) orelse class_name);
+    } else {
+        try queue.append(allocator, class_name);
+    }
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cn = queue.items[head];
+        if (seen.contains(cn)) continue;
+        try seen.put(cn, {});
         const cdef: ?ObjRef(ClassDef) = blk: {
             const cg = self.classes.borrow();
             defer cg.deinit();
@@ -1822,7 +1928,7 @@ fn resolveInstanceGetter(
         if (cdef) |d| {
             const dg = d.borrow();
             defer dg.deinit();
-            cur = if (dg.get().supertype_names.len > 0) dg.get().supertype_names[0] else null;
+            for (dg.get().supertype_names) |sn| queue.append(allocator, sn) catch {};
         }
     }
     return found;
@@ -1832,11 +1938,20 @@ fn resolveInstanceGetter(
 /// property *without* a custom getter / delegate (overriding any
 /// inherited `open val … get()`).
 fn declaresStored(cdef: *const ClassDef, name: []const u8) bool {
+    // An interface stores no state — its `val`/`var` members are abstract
+    // declarations, never backing fields (a getter-less interface property is
+    // still implicitly abstract even when the parser leaves `is_abstract`
+    // unset). So an interface in the hierarchy never overrides a base getter.
+    if (cdef.is_interface) return false;
     for (cdef.primary_params) |p| {
         if (std.mem.eql(u8, p.name, name) and p.property != null) return true;
     }
     for (cdef.body_properties) |p| {
-        if (std.mem.eql(u8, p.name, name) and p.getter == null and p.delegate == null) return true;
+        // An `abstract val`/`var` (notably an interface's `val isActive`)
+        // stores nothing — it is a declaration to be overridden, not a
+        // backing field. Only a concrete property with no getter/delegate is
+        // a real stored field that overrides an inherited getter.
+        if (std.mem.eql(u8, p.name, name) and p.getter == null and p.delegate == null and !p.is_abstract) return true;
     }
     return false;
 }
@@ -2440,6 +2555,35 @@ fn className(inst: ObjRef(InstanceData)) []const u8 {
     const cg = g.get().class.borrow();
     defer cg.deinit();
     return cg.get().name;
+}
+
+/// The instance's class FQN (falling back to its simple name when no FQN
+/// is recorded). Used to key a native property-getter binding.
+fn classFqnOf(inst: ObjRef(InstanceData)) []const u8 {
+    const g = inst.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    const fqn = cg.get().fqn;
+    return if (fqn.len != 0) fqn else cg.get().name;
+}
+
+/// Whether the instance's class is a host-synthesised class — anonymous
+/// (built through `newSynthInstance`) with a package-qualified FQN that
+/// differs from its simple name. The native `KlioChannel` qualifies; a
+/// source `object : I {}` literal does not (its FQN is its bare `$anon$N`
+/// name), so only host synth classes reach the native property-getter
+/// probe.
+fn instanceIsHostSynth(inst: ObjRef(InstanceData)) bool {
+    const g = inst.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    if (!cg.get().is_anonymous) return false;
+    const fqn = cg.get().fqn;
+    return fqn.len != 0 and
+        std.mem.indexOfScalar(u8, fqn, '.') != null and
+        !std.mem.eql(u8, fqn, cg.get().name);
 }
 
 /// The first declared supertype simple name of an instance's class.
