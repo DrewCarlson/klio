@@ -2188,12 +2188,15 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_hash_map_ctor(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    if (ctx.args.len == 0 or (ctx.args.len == 1 and ctx.args[0] == .Int)) {
-        return ok(try makeMap(a, &.{}, true));
-    }
+    if (ctx.args.len == 0) return ok(try makeMap(a, &.{}, true));
     if (ctx.args.len == 1 and ctx.args[0] == .Map) {
         return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), true));
     }
+    // `HashMap(initialCapacity)` / `(initialCapacity, loadFactor)` /
+    // `LinkedHashMap(initialCapacity, loadFactor, accessOrder)` — the capacity,
+    // load factor, and access-order flag do not change the observable behavior
+    // of klio's insertion-ordered map beyond construction.
+    if (ctx.args[0] == .Int) return ok(try makeMap(a, &.{}, true));
     return typeErr("HashMap expects no args, an Int capacity, or a Map");
 }
 
