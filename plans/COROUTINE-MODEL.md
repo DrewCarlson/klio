@@ -729,3 +729,39 @@ this=recv)`, or fix the CallMember eval's enclosing-`this` fallback to do so.
 
 snapshotFlow + both collectAsState overloads are written and correct (held out of
 the pack) and will work once this lands.
+
+## Parking `select` — layered blockers (ready-clause select + Semaphore work)
+
+A `select` whose clauses are all ready (a buffered `onReceive`, `onTimeout`, an
+`onAwait` on a completed `Deferred`) and `Semaphore` under contention work. A
+`select` that must *park* on a not-yet-ready clause and be woken by a concurrent
+`trySelect` was a never-exercised path; reaching it uncovered a stack of distinct
+bugs. Three were general interpreter bugs, now fixed:
+
+1. **Star-import shadows an enclosing receiver member.** `import Enum.*` rewrote a
+   bare name to `Enum.name` whenever it was not an *own* member; a lambda has no
+   own class, so `state` inside `SelectImplementation.waitUntilSelected`'s lambda
+   became `TrySelectDetailedResult.state` (the AtomicRef read the wrong receiver).
+   Fixed: gate on `hasEnclosingMember`.
+2. **A labeled return from a non-inlined lambda was dropped.** `return@sc` from the
+   lambda passed to the (called-not-spliced) inline `atomicfu.loop` lowered to a
+   plain `Return`, so `state.loop { … return@sc }` looped forever. Fixed: always
+   emit `LabeledReturn` for a labeled return.
+3. **A star-import outranked a same-scope top-level decl.** Bare `STATE_COMPLETED`
+   (a top-level `val`) became `TrySelectDetailedResult.STATE_COMPLETED`, reading a
+   bogus enum field -> an internal `Symbol` where the state machine expected its
+   sentinel. Fixed: skip the wildcard rewrite for a known top-level property/fn.
+
+Remaining (deep select-engine work, not the bare-name bug):
+
+4. **Offer value-handoff.** A rendezvous send hands its value to the parked select
+   through `trySelect`'s result, but `klioProcessReceive` re-polls the (empty)
+   channel instead of returning that result. Returning the `trySelect` result is
+   the fix, but it is gated behind (5).
+5. **`trySelect` state-machine spins / never returns.** With (1)-(3) fixed, the
+   channel `onReceive` parks and the sender's `trySelect` is invoked, but
+   `trySelectInternal`'s `state.loop` does not reach a returning branch (the
+   `curState is CancellableContinuation` / CAS path), so `trySelect` hangs. The
+   deferred `onAwait` parking path has its own analogous `Symbol`/state issue.
+   These plus the suspend/resume dispatch for a parked-then-woken select are the
+   remaining layers.
