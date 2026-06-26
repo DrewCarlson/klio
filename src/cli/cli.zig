@@ -9,6 +9,7 @@
 
 const std = @import("std");
 
+const ir = @import("ir");
 const interp_ir = @import("interp_ir");
 const runtime = @import("runtime");
 
@@ -37,6 +38,8 @@ const USAGE =
     \\Commands:
     \\  lex <file>                 Lex a source file and print tokens.
     \\  parse <file>               Parse a source file and print the AST.
+    \\  dump-ir <file> [--func N]  Lower a file and print its IR (no execution),
+    \\                             tallying DIRECT vs DYNAMIC call sites.
     \\  run <file...> [options]    Run one or more `.kt` source files.
     \\  test <file|dir...>         Run `kotlin.test` `@Test` functions.
     \\  check <file...> [options]  Type-check `.kt` files and emit diagnostics.
@@ -97,6 +100,8 @@ pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
         return runLexCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "parse")) {
         return runParseCmd(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "dump-ir")) {
+        return runDumpIrCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "run")) {
         return runRunCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "test")) {
@@ -129,6 +134,39 @@ fn runParseCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         return 2;
     }
     return commands.runParse(gpa, args[0]);
+}
+
+fn runDumpIrCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
+    var file: ?[]const u8 = null;
+    var opts: ir.disasm.Options = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--all")) {
+            opts.all = true;
+        } else if (std.mem.eql(u8, a, "--func")) {
+            i += 1;
+            if (i >= args.len) {
+                printErr(gpa, "usage: klio dump-ir <file.kt> [--func NAME] [--all]\n", .{});
+                return 2;
+            }
+            opts.func_filter = args[i];
+        } else if (optionValue(a, "--func=")) |v| {
+            opts.func_filter = v;
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            printErr(gpa, "error: unknown option `{s}`\n", .{a});
+            return 2;
+        } else {
+            file = a;
+        }
+    }
+    if (file == null) {
+        printErr(gpa, "usage: klio dump-ir <file.kt> [--func NAME] [--all]\n", .{});
+        return 2;
+    }
+    var requested = parseRequestedFeatures(gpa, &.{});
+    defer deinitRequestedFeatures(&requested);
+    return commands.runDumpIr(gpa, file.?, opts, &requested);
 }
 
 fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {

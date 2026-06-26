@@ -37,7 +37,7 @@ const mod_list = [_]Mod{
     .{ .name = "typeck", .deps = &.{ "span", "ast", "diagnostics", "resolver", "types", "cfa" }, .tested = true },
     .{ .name = "diagnostics_gen", .deps = &.{}, .tested = true },
     .{ .name = "test_runner", .deps = &.{ "ast", "ir", "runtime", "interp_ir", "span" }, .tested = true },
-    .{ .name = "cli", .deps = &.{ "span", "diagnostics", "lexer", "parser", "resolver", "typeck", "interp_ir", "ast", "pack", "stdlib", "stdlib_pack", "kotlinx_atomicfu", "kotlinx_coroutines", "kotlinx_datetime", "kotlinx_io", "kotlinx_serialization", "compose_runtime", "ktor_client", "runtime", "types", "test_runner" }, .tested = true },
+    .{ .name = "cli", .deps = &.{ "span", "diagnostics", "lexer", "parser", "resolver", "typeck", "ir", "interp_ir", "ast", "pack", "stdlib", "stdlib_pack", "kotlinx_atomicfu", "kotlinx_coroutines", "kotlinx_datetime", "kotlinx_io", "kotlinx_serialization", "compose_runtime", "ktor_client", "runtime", "types", "test_runner" }, .tested = true },
     .{ .name = "parity", .deps = &.{ "ast", "interp_ir", "kotlinx_atomicfu", "kotlinx_coroutines", "kotlinx_datetime", "kotlinx_io", "kotlinx_serialization", "compose_runtime", "lexer", "pack", "parser", "resolver", "runtime", "span", "stdlib", "stdlib_pack", "typeck" }, .tested = true },
     .{ .name = "bench", .deps = &.{ "ast", "interp_ir", "lexer", "parity", "parser", "resolver", "runtime", "span", "typeck" }, .tested = true },
     // End-to-end corpus test: runs every examples/*.kt in-process via the
@@ -175,6 +175,13 @@ const itests_files = [_]Itest{
         "kotlin/libraries/kotlin.test",
         "kotlin/libraries/stdlib/test",
         "tests/stdlib_commontest_actuals",
+    } },
+    // androidx.collection's own commonTest sources run through a child
+    // `klio test` against the installed androidx.collection pack.
+    .{ .name = "androidx_collection_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-androidx-collection",
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlin-test",
     } },
 };
 
