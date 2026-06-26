@@ -353,6 +353,18 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
     return coroutines.coroutineDrainToIdle(self, out);
 }
 
+/// Whether `v` is a companion-object singleton instance, recognized by the
+/// `$Companion$` marker in its lift name or a `.Companion` FQN tail.
+fn isCompanionInstanceValue(v: Value) bool {
+    if (v != .Instance) return false;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    return std.mem.indexOf(u8, cg.get().name, "$Companion$") != null or
+        std.mem.endsWith(u8, cg.get().fqn, ".Companion");
+}
+
 /// Single callable-dispatch flow over the value variants.
 pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []const Value, out: Output) Allocator.Error!RuntimeEvalResult {
     // Bound method/property reference (`recv::method`, `Cls::method`):
@@ -379,7 +391,14 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         if (recv != null and name != null) {
             const r = recv.?;
             const nm = name.?;
-            const unbound = r == .Class and args.len != 0;
+            // An unbound class-method reference's captured receiver is the type
+            // itself — a `.Class`, or its companion-object instance when one is
+            // in scope. Both route the first argument as the dispatch receiver
+            // when the named member is an instance method, not a companion one.
+            var host0 = vmHost(self, out);
+            const type_like = (r == .Class) or
+                (isCompanionInstanceValue(r) and !host0.hostHasMember(&r, nm));
+            const unbound = type_like and args.len != 0;
             var target: Value = undefined;
             var member_args: []const Value = undefined;
             if (unbound) {
@@ -591,6 +610,18 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
             return result;
         }
         return invokeCallable(self, callable, args, out);
+    }
+
+    // A callable reference (`recv::method`, `Long::toByte`) invoked with
+    // receiver syntax (`recv.refValue()`): the receiver is the reference's
+    // leading argument. `invokeCallable` then routes an unbound class-method
+    // reference's first argument as its dispatch receiver.
+    if (callable.* == .Instance) {
+        var with_recv: std.ArrayList(Value) = .empty;
+        defer with_recv.deinit(self.allocator);
+        try with_recv.append(self.allocator, this_value.*);
+        try with_recv.appendSlice(self.allocator, args);
+        return invokeCallable(self, callable, with_recv.items, out);
     }
 
     const msg = try std.fmt.allocPrint(self.allocator, "Vm::invoke_callable_with_this on `{s}`", .{callable.typeFqn()});

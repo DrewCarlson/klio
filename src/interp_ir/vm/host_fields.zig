@@ -952,6 +952,14 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if (!member_probe and receiver.* == .Instance) {
         const is_companion_recv = std.mem.indexOf(u8, className(receiver.Instance), "$Companion$") != null;
         var cur: ?[]const u8 = if (is_companion_recv) null else className(receiver.Instance);
+        // The lexically-enclosing class for the *first* hop is taken from the
+        // receiver's FQN, whose nesting is unambiguous. The `enclosing_class`
+        // map keys by simple name, so when two nested classes share a simple
+        // name (`Outer1.Builder` and `Outer2.Builder` both lift to `Builder`)
+        // it resolves only one of them; the FQN-derived parent keeps each
+        // receiver bound to its own enclosing scope.
+        const recv_encl_from_fqn: ?[]const u8 = enclosingSimpleFromFqn(self, receiver.Instance);
+        var first_hop = true;
         var seen: std.ArrayList([]const u8) = .empty;
         defer seen.deinit(allocator);
         while (cur) |cname| {
@@ -995,11 +1003,14 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             // before a same-named top-level/global class swaps in below.
             if (firstSupertype(self, cname)) |sup| {
                 cur = sup;
+            } else if (first_hop and recv_encl_from_fqn != null) {
+                cur = recv_encl_from_fqn;
             } else {
                 const g = self.module.borrow();
                 defer g.deinit();
                 cur = g.get().registry.enclosing_class.get(cname);
             }
+            first_hop = false;
         }
     }
     // A top-level *function* must not outrank a property of an enclosing
@@ -1291,6 +1302,36 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
         defer cg.deinit();
         if (cg.get().get(name)) |def| return ok(.{ .Class = def });
     }
+    return null;
+}
+
+/// The simple name of the lexically-enclosing class of a nested-class
+/// instance, derived from its FQN (`a.b.Outer.Inner` -> the class whose
+/// FQN is `a.b.Outer`, returning `Outer`). Null when the receiver's FQN
+/// has no parent class (a top-level class, whose parent segment is a
+/// package). The FQN nesting is unambiguous where the simple-name
+/// `enclosing_class` map collides for nested classes that share a simple
+/// name across different enclosing classes.
+fn enclosingSimpleFromFqn(self: *VmHost, inst: ObjRef(InstanceData)) ?[]const u8 {
+    const fqn: []const u8 = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
+    const last_dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return null;
+    const parent_fqn = fqn[0..last_dot];
+    const parent_simple = if (std.mem.lastIndexOfScalar(u8, parent_fqn, '.')) |d| parent_fqn[d + 1 ..] else parent_fqn;
+    // Confirm the parent FQN names an actual class (not a package): the
+    // class table is keyed by simple name, so verify the matching entry's
+    // FQN equals the parent FQN before treating it as the enclosing class.
+    const cg = self.classes.borrow();
+    defer cg.deinit();
+    const def = cg.get().get(parent_simple) orelse return null;
+    const dg = def.borrow();
+    defer dg.deinit();
+    if (std.mem.eql(u8, dg.get().fqn, parent_fqn)) return parent_simple;
     return null;
 }
 

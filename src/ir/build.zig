@@ -797,6 +797,27 @@ pub const FuncBuilder = struct {
     pub fn privateMethodFid(self: *const FuncBuilder, name: []const u8) ?FuncId {
         return self.private_method_fids.get(name);
     }
+    /// The statically-bound private own-class method for `name`, but only
+    /// when its parameter list can accept a positional call of `n_args`
+    /// user arguments. The map holds one FuncId per name, so when a private
+    /// method is overloaded the stored entry may be a different-arity
+    /// sibling; binding it regardless would route the call to the wrong
+    /// overload. A mismatch returns null so the caller defers to the
+    /// arity-aware dynamic dispatch.
+    pub fn privateMethodFidForArity(self: *const FuncBuilder, name: []const u8, n_args: usize) ?FuncId {
+        const fid = self.private_method_fids.get(name) orelse return null;
+        const f = self.module.funcById(fid) orelse return fid;
+        const has_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        const user = if (has_this) f.params.len - 1 else f.params.len;
+        var min_required: usize = 0;
+        var has_vararg = false;
+        for (f.params[(if (has_this) @as(usize, 1) else 0)..]) |p| {
+            if (p.is_vararg) has_vararg = true;
+            if (!p.has_default and !p.is_vararg) min_required += 1;
+        }
+        if (has_vararg) return if (n_args >= min_required) fid else null;
+        return if (n_args >= min_required and n_args <= user) fid else null;
+    }
     pub fn hasOwnMember(self: *const FuncBuilder, name: []const u8) bool {
         return self.own_members.contains(name);
     }

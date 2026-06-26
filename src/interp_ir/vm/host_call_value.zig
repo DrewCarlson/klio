@@ -43,6 +43,18 @@ fn unsupported(name: []const u8) EvalResult {
     return .{ .err = .{ .Unsupported = name } };
 }
 
+/// Whether `v` is a companion-object singleton instance. Its lift name
+/// carries the `$Companion$` marker and its FQN ends in `.Companion`.
+fn isCompanionInstance(v: Value) bool {
+    if (v != .Instance) return false;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    return std.mem.indexOf(u8, cg.get().name, "$Companion$") != null or
+        std.mem.endsWith(u8, cg.get().fqn, ".Companion");
+}
+
 /// Single callable-value dispatch over the value variants.
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     if (callee.* == .Intrinsic) {
@@ -69,7 +81,17 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 defer g.deinit();
                 break :blk g.get().bytes;
             };
-            if (rv == .Class and args.len != 0) {
+            // An unbound class-method reference (`Long::toByte`, `String::plus`)
+            // consumes its first argument as the receiver. The reference's
+            // captured receiver is the type itself: a `.Class` value, or — when
+            // a companion object is in scope for the type — that companion's
+            // instance. Both are type-like; route the first argument as the
+            // receiver when the named member is an instance method rather than a
+            // companion member.
+            const type_like = (rv == .Class) or
+                (rv == .Instance and isCompanionInstance(rv) and
+                    !host_call_member.hostHasMember(self, &rv, name));
+            if (type_like and args.len != 0) {
                 const first = args[0];
                 const rest = args[1..];
                 if (rest.len == 0 and root.memberIsProperty(allocator, &self.classes, &first, name)) {

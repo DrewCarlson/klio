@@ -6146,6 +6146,25 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         if (try copyNamed(self, allocator, receiver, args, arg_names)) |r| return r;
     }
 
+    // `CharArray.concatToString(startIndex = …)` / `(endIndex = …)`: the
+    // subrange overload is handled inline by the array-member dispatch, not
+    // the intrinsic table, so its `(startIndex = 0, endIndex = size)` defaults
+    // are filled here before the positional handler runs.
+    if (any_named and receiver.* == .Array and std.mem.eql(u8, name, "concatToString")) {
+        const size: i64 = @intCast(receiver.Array.len());
+        var start: i64 = 0;
+        var end: i64 = size;
+        for (args, 0..) |a, i| {
+            const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+            if (nm) |an| {
+                if (std.mem.eql(u8, an, "startIndex")) start = a.asI64() orelse 0;
+                if (std.mem.eql(u8, an, "endIndex")) end = a.asI64() orelse size;
+            }
+        }
+        const filled = [_]Value{ .{ .Int = @intCast(start) }, .{ .Int = @intCast(end) } };
+        return try callMemberInnerStatic(self, allocator, receiver, name, &filled, strict_ext, static_recv);
+    }
+
     // Stdlib intrinsic dispatch with named args.
     if (any_named) {
         if (try stdlibNamedDispatch(self, allocator, receiver, name, args, arg_names)) |r| return r;

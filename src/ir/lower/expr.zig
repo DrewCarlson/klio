@@ -4695,8 +4695,10 @@ fn lowerImplicitThisCall(
     if (!b.ownMemberApplicable(name0, args.len)) return null;
     const this_reg = b.resolve("this") orelse return null;
 
-    // Private own-class methods bind statically.
-    if (b.privateMethodFid(name0)) |fid| {
+    // Private own-class methods bind statically — but only to an overload
+    // whose arity accepts this call; an arity mismatch defers to dynamic
+    // dispatch so an overloaded private method picks the right sibling.
+    if (b.privateMethodFidForArity(name0, args.len)) |fid| {
         // Reserve the receiver slot first, then lower the arguments into a
         // contiguous run immediately after it. `lowerArgRun` reserves every
         // argument slot before lowering any argument, so an argument's own
