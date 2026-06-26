@@ -2319,7 +2319,7 @@ fn writeInstance(writer: *std.Io.Writer, inst_ref: ObjRef(InstanceData)) std.Io.
         return;
     }
     if (cls.is_data or cls.is_value) {
-        try writer.print("{s}(", .{cls.name});
+        try writer.print("{s}(", .{classDisplayName(cls.name)});
         var first = true;
         for (cls.primary_params) |p| {
             if (!first) try writer.writeAll(", ");
@@ -2384,6 +2384,17 @@ fn lastSegment(fqn: []const u8) []const u8 {
 fn lastDotSegment(name: []const u8) ?[]const u8 {
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
     return null;
+}
+
+/// The Kotlin source simple name to print for a class. A nested class lifts
+/// to a flat top-level mangle (`Outer$Data`); Kotlin's `toString` shows just
+/// `Data`. `$` cannot occur in a source class name, so the tail after the
+/// last `$` (then the last `.`) is the source simple name.
+fn classDisplayName(name: []const u8) []const u8 {
+    var n = name;
+    if (std.mem.lastIndexOfScalar(u8, n, '$')) |i| n = n[i + 1 ..];
+    if (std.mem.lastIndexOfScalar(u8, n, '.')) |i| n = n[i + 1 ..];
+    return n;
 }
 
 fn isFunctionType(self: Value, name: []const u8) bool {

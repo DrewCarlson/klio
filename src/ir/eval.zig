@@ -880,6 +880,7 @@ const Frame = struct {
     ) Allocator.Error!Frame {
         const params = params_in;
         coerceIntArgsToLong(func, params.items);
+        coerceGenericIntPeersToLong(module, func, params.items);
         const regs = try acquireRegs(allocator, func.n_locals);
         return .{
             .module = module,
@@ -1016,6 +1017,52 @@ fn coerceIntArgsToLong(func: *const Func, params: []Value) void {
     while (i < params.len and i < func.params.len) : (i += 1) {
         if (!func.params[i].is_vararg) {
             coerceIntToLongTy(func.params[i].ty, &params[i]);
+        }
+    }
+}
+
+/// Whether `name` is one of the function's declared type-parameter names
+/// (`T` of a `fun <T> f(...)`). A param typed by a bare type variable holds
+/// whatever the call-site type argument resolved to.
+fn isFuncTypeParam(module: *const Module, func: *const Func, name: []const u8) bool {
+    if (module.registry.func_type_params.get(func.id)) |tps| {
+        for (tps.items) |t| if (std.mem.eql(u8, t, name)) return true;
+    }
+    return false;
+}
+
+/// Kotlin types an integer literal by the type it flows into, so a bare `0`
+/// passed to a type-variable param (`T`) whose call-site argument is `Long`
+/// becomes a `Long` (e.g. `assertEquals(0, longValue)` infers `T = Long`).
+/// At runtime a literal `Int` flowing into a shared `T` slot keeps its `Int`
+/// tag; when a peer param bound to the same `T` is a `Long`, widen it so the
+/// generic body's boxed `T == T` comparison sees two `Long`s. Only the
+/// literal-coercion shape this captures can produce an `Int`/`Long` mix in a
+/// shared type variable in valid Kotlin, so the widen is always safe.
+fn coerceGenericIntPeersToLong(module: *const Module, func: *const Func, params: []Value) void {
+    const n = @min(params.len, func.params.len);
+    if (n < 2) return;
+    var has_tparam = false;
+    for (func.params[0..n]) |*p| {
+        if (!p.ty.nullable and isFuncTypeParam(module, func, p.ty.name)) {
+            has_tparam = true;
+            break;
+        }
+    }
+    if (!has_tparam) return;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const iv = params[i];
+        if (iv != .Int) continue;
+        const ti = func.params[i].ty;
+        if (ti.nullable or !isFuncTypeParam(module, func, ti.name)) continue;
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            if (j == i or params[j] != .Long) continue;
+            if (std.mem.eql(u8, func.params[j].ty.name, ti.name)) {
+                params[i] = .{ .Long = @as(i64, iv.Int) };
+                break;
+            }
         }
     }
 }

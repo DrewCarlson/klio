@@ -100,6 +100,17 @@ fn simpleName(name: []const u8) []const u8 {
     return name;
 }
 
+/// The Kotlin simple name shown by `toString`/`KClass.simpleName` for a
+/// class whose internal `name` may be a lifted-nested mangle. A nested
+/// class lifts to a flat top-level name like `Outer$Data`; Kotlin reports
+/// just `Data`. `$` cannot appear in a source class name, so the segment
+/// after the last `$` (then the last `.`) is the source simple name.
+fn classDisplayName(name: []const u8) []const u8 {
+    var n = name;
+    if (std.mem.lastIndexOfScalar(u8, n, '$')) |i| n = n[i + 1 ..];
+    return simpleName(n);
+}
+
 // -------------------------------------------------------------------------
 // Dispatch invariants (KLIO_TRACE_INVARIANTS, default OFF). These detect — but
 // never repair — structural dispatch hazards at the candidate-selection choke
@@ -4503,7 +4514,7 @@ fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
     const has_user_override = classHasUserMethod(self, allocator, class_name, name);
 
     if (is_data and is_object and !has_user_override and std.mem.eql(u8, name, "toString")) {
-        return .{ .ok = try strVal(allocator, class_name) };
+        return .{ .ok = try strVal(allocator, classDisplayName(class_name)) };
     }
     if ((is_data or is_value) and !has_user_override and args.len == 0) {
         if (is_data and std.mem.startsWith(u8, name, "component")) {
@@ -4629,7 +4640,7 @@ fn renderStructural(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceDa
     }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, cg.get().name);
+    try buf.appendSlice(allocator, classDisplayName(cg.get().name));
     try buf.append(allocator, '(');
     for (cg.get().primary_params, 0..) |p, idx| {
         if (idx > 0) try buf.appendSlice(allocator, ", ");
@@ -5144,7 +5155,7 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
 fn renderStructuralLocked(allocator: Allocator, inst: *const InstanceData, cls: *const ClassDef) Allocator.Error!Value {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, cls.name);
+    try buf.appendSlice(allocator, classDisplayName(cls.name));
     try buf.append(allocator, '(');
     for (cls.primary_params, 0..) |p, idx| {
         if (idx > 0) try buf.appendSlice(allocator, ", ");

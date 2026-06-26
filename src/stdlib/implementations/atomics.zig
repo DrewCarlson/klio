@@ -37,11 +37,25 @@ fn asI64(v: Value) ?i64 {
     };
 }
 
-/// Compare for atomic compare-and-set: by value for the primitives a cell
-/// holds, and (since the expected operand is the loaded reference itself)
-/// structurally for boxed references.
-fn atomicEq(a: Value, b: Value) bool {
-    return Value.structuralEq(&a, &b);
+/// Widen an `Int` operand to `Long` when the cell it targets holds a `Long`.
+/// `AtomicLong`'s `expectedValue`/`newValue` are `Long`, but a bare integer
+/// literal (`compareAndSet(0, 1)`) reaches this native binding still tagged
+/// `Int`; matching the cell's type keeps comparison and write-back on `Long`.
+fn matchCell(cell: Value, operand: Value) Value {
+    if (cell == .Long and operand == .Int) return .{ .Long = @as(i64, operand.Int) };
+    return operand;
+}
+
+/// Compare an atomic's current value against the caller's expected value.
+/// `AtomicReference` (and the reference `AtomicArray`) compare by reference
+/// identity; primitive cells (`AtomicInt`/`AtomicLong`/`AtomicBoolean`)
+/// compare by value, reconciling an `Int` literal against a `Long` cell.
+fn atomicEq(cur: Value, expected: Value) bool {
+    if (cur.isNumeric() or cur == .Bool or cur == .Char) {
+        const e = matchCell(cur, expected);
+        return Value.structuralEq(&cur, &e);
+    }
+    return Value.referenceEq(&cur, &expected);
 }
 
 // -------------------------------------------------------------------------
@@ -78,7 +92,7 @@ pub fn exchange(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2) return typeErr("exchange requires a value");
     const step = struct {
         fn run(n: Value, cur: Value) ScalarStep {
-            return .{ .next = n, .out = cur };
+            return .{ .next = matchCell(cur, n), .out = cur };
         }
     }.run;
     return withValueMut(ctx, Value, ctx.args[1], step);
@@ -90,7 +104,7 @@ pub fn compareAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const cap = Cap{ .expected = ctx.args[1], .update = ctx.args[2] };
     const step = struct {
         fn run(c: Cap, cur: Value) ScalarStep {
-            if (atomicEq(cur, c.expected)) return .{ .next = c.update, .out = .{ .Bool = true } };
+            if (atomicEq(cur, c.expected)) return .{ .next = matchCell(cur, c.update), .out = .{ .Bool = true } };
             return .{ .next = cur, .out = .{ .Bool = false } };
         }
     }.run;
@@ -103,7 +117,7 @@ pub fn compareAndExchange(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const cap = Cap{ .expected = ctx.args[1], .update = ctx.args[2] };
     const step = struct {
         fn run(c: Cap, cur: Value) ScalarStep {
-            if (atomicEq(cur, c.expected)) return .{ .next = c.update, .out = cur };
+            if (atomicEq(cur, c.expected)) return .{ .next = matchCell(cur, c.update), .out = cur };
             return .{ .next = cur, .out = cur };
         }
     }.run;
@@ -187,7 +201,7 @@ pub fn exchangeAt(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 3) return typeErr("exchangeAt requires a value");
     const step = struct {
         fn run(n: Value, cur: Value) ArrayStep {
-            return .{ .next = n, .out = cur };
+            return .{ .next = matchCell(cur, n), .out = cur };
         }
     }.run;
     return withArrayElemMut(ctx, Value, ctx.args[2], step);
@@ -199,7 +213,7 @@ pub fn compareAndSetAt(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const cap = Cap{ .expected = ctx.args[2], .update = ctx.args[3] };
     const step = struct {
         fn run(c: Cap, cur: Value) ArrayStep {
-            if (atomicEq(cur, c.expected)) return .{ .next = c.update, .out = .{ .Bool = true } };
+            if (atomicEq(cur, c.expected)) return .{ .next = matchCell(cur, c.update), .out = .{ .Bool = true } };
             return .{ .next = cur, .out = .{ .Bool = false } };
         }
     }.run;
@@ -212,7 +226,7 @@ pub fn compareAndExchangeAt(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const cap = Cap{ .expected = ctx.args[2], .update = ctx.args[3] };
     const step = struct {
         fn run(c: Cap, cur: Value) ArrayStep {
-            if (atomicEq(cur, c.expected)) return .{ .next = c.update, .out = cur };
+            if (atomicEq(cur, c.expected)) return .{ .next = matchCell(cur, c.update), .out = cur };
             return .{ .next = cur, .out = cur };
         }
     }.run;
