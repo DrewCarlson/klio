@@ -33,10 +33,19 @@ const HostBindings = stdlib.HostBindings;
 const ChannelState = struct {
     buffer: Deque(Value),
     capacity: usize,
+    /// Buffer-overflow policy. `suspend` parks a sender when the buffer is
+    /// full; `drop_oldest`/`drop_latest` never park, dropping an element
+    /// instead. A conflated channel is capacity-1 `drop_oldest`.
+    overflow: Overflow,
+    /// A rendezvous channel (`Channel<T>()` / capacity 0) has no buffer at
+    /// all: `send` always parks until a receiver takes the element.
+    rendezvous: bool,
     closed: bool,
-    /// Slot ids of `receive()` callers currently parked because the
-    /// buffer was empty. The next `send` resumes the head waiter.
-    receive_waiters: Deque(i64),
+    /// `receive()` / `receiveCatching()` callers currently parked because
+    /// the buffer was empty. The next `send` resumes the head waiter. A
+    /// `catching` waiter is resumed with a `ChannelResult.success(value)`
+    /// (its caller is `receiveCatching`); a plain waiter with the value.
+    receive_waiters: Deque(RecvWaiter),
     /// Iterator-style waiters: a parked `for (v in ch)` `hasNext()`
     /// caller plus a handle to its iterator instance, so the next
     /// send can stash the value in `__pending__` on the iterator
@@ -49,13 +58,17 @@ const ChannelState = struct {
 
     const IterWaiter = struct { slot: i64, iter: ObjRef(InstanceData) };
     const SendWaiter = struct { slot: i64, value: Value };
+    const RecvWaiter = struct { slot: i64, catching: bool };
+    const Overflow = enum { suspend_, drop_oldest, drop_latest };
 
-    fn init(capacity: usize) ChannelState {
+    fn init(capacity: usize, overflow: Overflow, rendezvous: bool) ChannelState {
         return .{
             .buffer = Deque(Value).empty,
             .capacity = capacity,
+            .overflow = overflow,
+            .rendezvous = rendezvous,
             .closed = false,
-            .receive_waiters = Deque(i64).empty,
+            .receive_waiters = Deque(RecvWaiter).empty,
             .receive_iter_waiters = Deque(IterWaiter).empty,
             .send_waiters = Deque(SendWaiter).empty,
         };
@@ -187,30 +200,105 @@ fn sweepRegistryAtRunBoundary() void {
 /// a synthesised `Value.Instance` whose `identity` keys a `ChannelState`
 /// in this thread's registry; every channel member binding finds the
 /// state by that key.
+/// Channel capacity sentinels mirroring `Channel.Factory`.
+const CAP_UNLIMITED: i64 = std.math.maxInt(i32); // Int.MAX_VALUE
+const CAP_RENDEZVOUS: i64 = 0;
+const CAP_CONFLATED: i64 = -1;
+const CAP_BUFFERED: i64 = -2;
+const DEFAULT_BUFFER_CAPACITY: usize = 64;
+
 fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // First arg is the capacity (Int / Long). Defaults / overloads ship
-    // `0` (RENDEZVOUS) and `-1` (UNLIMITED) as sentinel ints.
-    const cap_arg: Value = if (ctx.args.len > 0) ctx.args[0] else Value.newInt(0);
+    // arg0 is the capacity (Int / Long); arg1, when present, is the
+    // `BufferOverflow` policy enum entry. `Channel(...)` is shadowed by
+    // this native factory, so these arrive exactly as the user spelled
+    // them (the upstream `when(capacity)` lowering does not run).
+    const cap_arg: Value = if (ctx.args.len > 0) ctx.args[0] else Value.newInt(CAP_RENDEZVOUS);
     const capacity: i64 = switch (cap_arg) {
         .Int => |n| @as(i64, n),
         .Long => |n| n,
-        else => 0,
+        else => CAP_RENDEZVOUS,
     };
-    const effective_cap: usize = if (capacity < 0)
-        std.math.maxInt(usize) // UNLIMITED / BUFFERED
-    else if (capacity == 0)
-        1 // rendezvous degenerate: one-slot buffer in our model
-    else
-        @intCast(capacity);
+    const overflow_arg: Value = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
+    const overflow = overflowOf(&overflow_arg);
+
+    var rendezvous = false;
+    var effective_cap: usize = undefined;
+    var eff_overflow = overflow;
+    if (capacity == CAP_CONFLATED) {
+        // A conflated channel keeps only the latest value: capacity-1
+        // drop-oldest, regardless of the requested overflow policy.
+        effective_cap = 1;
+        eff_overflow = .drop_oldest;
+    } else if (capacity == CAP_UNLIMITED) {
+        effective_cap = std.math.maxInt(usize);
+    } else if (capacity == CAP_BUFFERED) {
+        effective_cap = DEFAULT_BUFFER_CAPACITY;
+    } else if (capacity == CAP_RENDEZVOUS) {
+        if (overflow == .suspend_) {
+            // A true rendezvous: no buffer, `send` parks until received.
+            rendezvous = true;
+            effective_cap = 0;
+        } else {
+            // RENDEZVOUS with a non-default overflow degrades to a
+            // capacity-1 buffered channel (upstream `ConflatedBufferedChannel`).
+            effective_cap = 1;
+        }
+    } else {
+        effective_cap = @intCast(capacity);
+    }
+
     const id = ctx.host.allocInstanceId();
     ensureCoroRegRoot();
     {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
-        try coro_reg.channels.put(regAllocator(), id, ChannelState.init(effective_cap));
+        try coro_reg.channels.put(regAllocator(), id, ChannelState.init(effective_cap, eff_overflow, rendezvous));
     }
     const inst = try ctx.host.newSynthInstance("kotlinx.coroutines.channels.KlioChannel", id, &.{});
     return .{ .ok = inst };
+}
+
+/// Read a `BufferOverflow` enum entry's policy from its `ordinal` field
+/// (SUSPEND=0, DROP_OLDEST=1, DROP_LATEST=2). Defaults to `suspend`.
+fn overflowOf(v: *const Value) ChannelState.Overflow {
+    if (v.* == .Instance) {
+        if (v.Instance.asPtr().get("ordinal")) |ord| {
+            const n: i64 = switch (ord) {
+                .Int => |i| @as(i64, i),
+                .Long => |l| l,
+                else => 0,
+            };
+            return switch (n) {
+                1 => .drop_oldest,
+                2 => .drop_latest,
+                else => .suspend_,
+            };
+        }
+    }
+    return .suspend_;
+}
+
+/// Build a `ChannelResult<T>` by calling the Kotlin companion factory
+/// (`ChannelResult.success/failure/closed`) so the value-class semantics
+/// (`isSuccess`/`getOrNull`/`isClosed`) are the upstream ones. Falls back
+/// to the raw value when the companion cannot be resolved.
+fn channelResult(ctx: *CallCtx, comptime kind: enum { success, failure, closed }, payload: Value) std.mem.Allocator.Error!Value {
+    const cls = ctx.host.lookupGlobal("ChannelResult") orelse return payload;
+    const name = switch (kind) {
+        .success => "success",
+        .failure => "failure",
+        .closed => "closed",
+    };
+    const args: []const Value = switch (kind) {
+        .success => &.{payload},
+        .failure => &.{},
+        .closed => &.{Value.Null},
+    };
+    const r = (try ctx.host.invokeMethod(&cls, name, args, ctx.out)) orelse return payload;
+    return switch (r) {
+        .ok => |val| val,
+        .err => payload,
+    };
 }
 
 fn channelId(arg0: *const Value) ?u64 {
@@ -221,7 +309,7 @@ fn channelId(arg0: *const Value) ?u64 {
 }
 
 const ChannelSendOutcome = union(enum) {
-    HandToReceiver: struct { slot: i64, value: Value },
+    HandToReceiver: struct { slot: i64, value: Value, catching: bool },
     HandToIter: i64,
     Buffered,
     ParkOnSlot: i64,
@@ -232,11 +320,13 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = ctx.args[0];
     const value: Value = if (ctx.args.len > 1) ctx.args[1] else .Unit;
     const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.send: bad receiver" } };
-    // Direct rendezvous: if a receiver is parked, hand the value
-    // straight to it without buffering. Else if buffer has room, push
-    // and return. Else park this sender and suspend. The whole
-    // check-and-transition is one atomic section under the registry
-    // lock; the host resume runs after release.
+    // If a receiver is parked, hand the value straight to it without
+    // buffering. Otherwise the channel's capacity / overflow policy
+    // decides: a rendezvous channel always parks the sender; a buffered
+    // channel pushes while it has room; a full buffer either parks
+    // (SUSPEND) or drops an element (DROP_OLDEST / DROP_LATEST). The whole
+    // check-and-transition is one atomic section under the registry lock;
+    // the host resume runs after release.
     var outcome: ChannelSendOutcome = undefined;
     {
         coro_reg_mutex.lock();
@@ -249,21 +339,34 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         if (state.receive_iter_waiters.popFront()) |w| {
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
             outcome = .{ .HandToIter = w.slot };
-        } else if (state.receive_waiters.popFront()) |slot| {
-            outcome = .{ .HandToReceiver = .{ .slot = slot, .value = value } };
-        } else if (state.buffer.len() < state.capacity) {
-            try state.buffer.pushBack(regAllocator(), value);
-            outcome = .Buffered;
-        } else {
+        } else if (state.receive_waiters.popFront()) |w| {
+            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+        } else if (state.rendezvous) {
             const slot = allocKxcoSlot();
             try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value });
             outcome = .{ .ParkOnSlot = slot };
+        } else if (state.buffer.len() < state.capacity) {
+            try state.buffer.pushBack(regAllocator(), value);
+            outcome = .Buffered;
+        } else switch (state.overflow) {
+            .suspend_ => {
+                const slot = allocKxcoSlot();
+                try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value });
+                outcome = .{ .ParkOnSlot = slot };
+            },
+            .drop_oldest => {
+                _ = state.buffer.popFront();
+                try state.buffer.pushBack(regAllocator(), value);
+                outcome = .Buffered;
+            },
+            .drop_latest => outcome = .Buffered,
         }
     }
 
     switch (outcome) {
         .HandToReceiver => |h| {
-            ctx.host.coroutineResumeSlotValue(h.slot, h.value);
+            const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
+            ctx.host.coroutineResumeSlotValue(h.slot, resume_val);
             return .{ .ok = .Unit };
         },
         .HandToIter => |slot| {
@@ -279,7 +382,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 const ChannelTrySendOutcome = union(enum) {
-    HandToReceiver: struct { slot: i64, value: Value },
+    HandToReceiver: struct { slot: i64, value: Value, catching: bool },
     Success,
     Full,
     Closed,
@@ -298,33 +401,60 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.trySend: missing state" } };
         if (state.closed) {
             outcome = .Closed;
-        } else if (state.receive_waiters.popFront()) |slot| {
-            outcome = .{ .HandToReceiver = .{ .slot = slot, .value = value } };
+        } else if (state.receive_iter_waiters.popFront()) |w| {
+            try w.iter.asPtr().define(regAllocator(), "__pending__", value);
+            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = .{ .Bool = true }, .catching = false } };
+        } else if (state.receive_waiters.popFront()) |w| {
+            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+        } else if (state.rendezvous) {
+            // No buffer and no parked receiver: a rendezvous `trySend`
+            // cannot complete synchronously.
+            outcome = .Full;
         } else if (state.buffer.len() < state.capacity) {
             try state.buffer.pushBack(regAllocator(), value);
             outcome = .Success;
-        } else {
-            outcome = .Full;
+        } else switch (state.overflow) {
+            .suspend_ => outcome = .Full,
+            .drop_oldest => {
+                _ = state.buffer.popFront();
+                try state.buffer.pushBack(regAllocator(), value);
+                outcome = .Success;
+            },
+            .drop_latest => outcome = .Success,
         }
     }
 
     const result: Value = switch (outcome) {
         .HandToReceiver => |h| blk: {
-            ctx.host.coroutineResumeSlotValue(h.slot, h.value);
-            break :blk .{ .Bool = true };
+            const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
+            ctx.host.coroutineResumeSlotValue(h.slot, resume_val);
+            break :blk try channelResult(ctx, .success, .Unit);
         },
-        .Success => .{ .Bool = true },
-        .Full, .Closed => .{ .Bool = false },
+        .Success => try channelResult(ctx, .success, .Unit),
+        .Full => try channelResult(ctx, .failure, .Unit),
+        .Closed => try channelResult(ctx, .closed, .Unit),
     };
     return .{ .ok = result };
 }
 
 const ChannelReceiveOutcome = union(enum) {
     Got: struct { value: Value, resumed: ?i64 },
+    Closed,
     ParkOnSlot: i64,
 };
 
 fn channelReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return channelReceiveImpl(ctx, false);
+}
+
+/// `receiveCatching()` — like `receive`, but a closed channel yields a
+/// `ChannelResult.closed(...)` instead of throwing, and a delivered value
+/// is wrapped in `ChannelResult.success(...)`.
+fn channelReceiveCatching(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return channelReceiveImpl(ctx, true);
+}
+
+fn channelReceiveImpl(ctx: *CallCtx, catching: bool) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.receive expects a receiver" } };
     const recv = ctx.args[0];
     const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.receive: bad receiver" } };
@@ -340,11 +470,15 @@ fn channelReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                 try state.buffer.pushBack(regAllocator(), sw.value);
             }
             outcome = .{ .Got = .{ .value = v, .resumed = if (resumed_sender) |sw| sw.slot else null } };
+        } else if (state.send_waiters.popFront()) |sw| {
+            // A rendezvous channel never buffers: a parked sender's value
+            // is handed directly to this receiver and the sender resumes.
+            outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot } };
         } else if (state.closed) {
-            return .{ .err = .{ .Thrown = try closedReceiveExc(ctx.allocator) } };
+            outcome = .Closed;
         } else {
             const slot = allocKxcoSlot();
-            try state.receive_waiters.pushBack(regAllocator(), slot);
+            try state.receive_waiters.pushBack(regAllocator(), .{ .slot = slot, .catching = catching });
             outcome = .{ .ParkOnSlot = slot };
         }
     }
@@ -352,7 +486,12 @@ fn channelReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     switch (outcome) {
         .Got => |g| {
             if (g.resumed) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
+            if (catching) return .{ .ok = try channelResult(ctx, .success, g.value) };
             return .{ .ok = g.value };
+        },
+        .Closed => {
+            if (catching) return .{ .ok = try channelResult(ctx, .closed, .Unit) };
+            return .{ .err = .{ .Thrown = try closedReceiveExc(ctx.allocator) } };
         },
         .ParkOnSlot => |slot| {
             ctx.host.coroutineArmSlot(slot);
@@ -361,12 +500,18 @@ fn channelReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
 }
 
+const ChannelTryReceiveOutcome = union(enum) {
+    Got: Value,
+    Empty,
+    Closed,
+};
+
 fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.tryReceive expects a receiver" } };
     const recv = ctx.args[0];
     const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.tryReceive: bad receiver" } };
 
-    var value: ?Value = null;
+    var outcome: ChannelTryReceiveOutcome = .Closed;
     var resumed_slot: ?i64 = null;
     {
         coro_reg_mutex.lock();
@@ -378,13 +523,26 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                     try state.buffer.pushBack(regAllocator(), sw.value);
                     resumed_slot = sw.slot;
                 }
-                value = v;
+                outcome = .{ .Got = v };
+            } else if (state.send_waiters.popFront()) |sw| {
+                // A rendezvous channel buffers nothing; a parked sender's
+                // value is the element a `tryReceive` retrieves.
+                resumed_slot = sw.slot;
+                outcome = .{ .Got = sw.value };
+            } else if (state.closed) {
+                outcome = .Closed;
+            } else {
+                outcome = .Empty;
             }
-            // else: closed or empty — value stays null.
         }
     }
     if (resumed_slot) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
-    return .{ .ok = value orelse .Null };
+    const result: Value = switch (outcome) {
+        .Got => |v| try channelResult(ctx, .success, v),
+        .Empty => try channelResult(ctx, .failure, .Unit),
+        .Closed => try channelResult(ctx, .closed, .Unit),
+    };
+    return .{ .ok = result };
 }
 
 fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -392,7 +550,7 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = ctx.args[0];
     const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.close: bad receiver" } };
 
-    var recvs: []i64 = &.{};
+    var recvs: []ChannelState.RecvWaiter = &.{};
     var iters: []ChannelState.IterWaiter = &.{};
     var sends: []ChannelState.SendWaiter = &.{};
     {
@@ -411,10 +569,17 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
     const exc = try closedReceiveExc(ctx.allocator);
     defer exc.release(ctx.allocator);
-    for (recvs) |slot| {
-        exc.retain();
-        const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, exc) } };
-        ctx.host.coroutineResumeSlotValue(slot, failure);
+    for (recvs) |w| {
+        // A parked `receiveCatching()` resumes with a closed result; a
+        // parked `receive()` resumes with a `Result` failure that rethrows
+        // the close cause at the suspension point.
+        if (w.catching) {
+            ctx.host.coroutineResumeSlotValue(w.slot, try channelResult(ctx, .closed, .Unit));
+        } else {
+            exc.retain();
+            const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, exc) } };
+            ctx.host.coroutineResumeSlotValue(w.slot, failure);
+        }
     }
     // Iterator-style waiters resume with `Bool(false)` so the
     // for-loop hasNext() returns false and the loop exits.
@@ -510,6 +675,9 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                     resumed = sw.slot;
                 }
                 outcome = .{ .Got = .{ .value = v, .resumed = resumed } };
+            } else if (state.send_waiters.popFront()) |sw| {
+                // Rendezvous: hand the parked sender's value to the iterator.
+                outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot } };
             } else if (state.closed) {
                 outcome = .Closed;
             } else {
@@ -881,6 +1049,7 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.send", .f = channelSend },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.trySend", .f = channelTrySend },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.receive", .f = channelReceive },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.receiveCatching", .f = channelReceiveCatching },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.tryReceive", .f = channelTryReceive },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.close", .f = channelClose },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.isClosedForSend", .f = channelIsClosedForSend },
@@ -1086,6 +1255,128 @@ test "channel iter next without pending throws NoSuchElementException" {
     const r = try channelIterNext(&ctx);
     try testing.expect(r == .err and r.err == .Thrown);
     try testing.expectEqualStrings("kotlin.NoSuchElementException", r.err.Thrown.Exception.fqn.asPtr().bytes);
+}
+
+/// Build a `KlioChannel` Instance keyed on `id` and register a channel
+/// state for it in the registry. The caller resets the registry.
+fn makeChannel(a: std.mem.Allocator, id: u64, state: ChannelState) !Value {
+    {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        try coro_reg.channels.put(regAllocator(), id, state);
+    }
+    const cls = try makeClassDef(a, "kotlinx.coroutines.channels.KlioChannel");
+    const fields: std.ArrayList(InstanceData.Field) = .empty;
+    const inst = try ObjRef(InstanceData).init(a, .{
+        .class = cls,
+        .fields = fields,
+        .outer = null,
+        .identity = id,
+        .native_state = null,
+    });
+    return .{ .Instance = inst };
+}
+
+test "overflowOf reads the BufferOverflow ordinal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    inline for (.{
+        .{ @as(i64, 0), ChannelState.Overflow.suspend_ },
+        .{ @as(i64, 1), ChannelState.Overflow.drop_oldest },
+        .{ @as(i64, 2), ChannelState.Overflow.drop_latest },
+    }) |pair| {
+        const cls = try makeClassDef(a, "kotlinx.coroutines.channels.BufferOverflow");
+        var fields: std.ArrayList(InstanceData.Field) = .empty;
+        try fields.append(a, .{ .name = "ordinal", .value = Value.newInt(pair[0]) });
+        const inst = try ObjRef(InstanceData).init(a, .{
+            .class = cls,
+            .fields = fields,
+            .outer = null,
+            .identity = 1,
+            .native_state = null,
+        });
+        const v = Value{ .Instance = inst };
+        try testing.expectEqual(pair[1], overflowOf(&v));
+    }
+    // A non-instance argument defaults to suspend.
+    const nil: Value = .Null;
+    try testing.expectEqual(ChannelState.Overflow.suspend_, overflowOf(&nil));
+}
+
+test "conflated channel keeps only the latest value" {
+    defer resetRegistry();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+
+    // Capacity-1 drop-oldest mirrors `Channel(CONFLATED)`.
+    const recv = try makeChannel(a, 4242, ChannelState.init(1, .drop_oldest, false));
+    inline for (.{ @as(i32, 10), @as(i32, 20), @as(i32, 30) }) |n| {
+        const args = [_]Value{ recv, Value.newInt(n) };
+        var ctx = makeCtx(&host, &cap, &args);
+        const r = try channelTrySend(&ctx);
+        try testing.expect(r == .ok);
+    }
+    // tryReceive returns 30 (NoopHost makes `channelResult` return the raw
+    // payload, so the success value surfaces directly).
+    {
+        const args = [_]Value{recv};
+        var ctx = makeCtx(&host, &cap, &args);
+        const r = try channelTryReceive(&ctx);
+        try testing.expectEqual(@as(i32, 30), r.ok.Int);
+    }
+    // Buffer now empty: tryReceive yields the failure payload (Unit here).
+    {
+        const args = [_]Value{recv};
+        var ctx = makeCtx(&host, &cap, &args);
+        const r = try channelTryReceive(&ctx);
+        try testing.expect(r.ok == .Unit);
+    }
+}
+
+test "buffered channel trySend fails when full; rendezvous trySend fails without a receiver" {
+    defer resetRegistry();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+
+    // Capacity-1 SUSPEND buffer: first trySend buffers, second is full.
+    const buf = try makeChannel(a, 5151, ChannelState.init(1, .suspend_, false));
+    {
+        const args = [_]Value{ buf, Value.newInt(1) };
+        var ctx = makeCtx(&host, &cap, &args);
+        try testing.expect((try channelTrySend(&ctx)).ok == .Unit); // success payload
+    }
+    {
+        const args = [_]Value{ buf, Value.newInt(2) };
+        var ctx = makeCtx(&host, &cap, &args);
+        // Full SUSPEND: failure payload (Unit under NoopHost).
+        try testing.expect((try channelTrySend(&ctx)).ok == .Unit);
+        // The buffer still holds exactly the first element.
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        try testing.expectEqual(@as(usize, 1), coro_reg.channels.getPtr(5151).?.buffer.len());
+    }
+
+    // Rendezvous: no buffer, no parked receiver -> trySend cannot complete.
+    const rv = try makeChannel(a, 6262, ChannelState.init(0, .suspend_, true));
+    {
+        const args = [_]Value{ rv, Value.newInt(9) };
+        var ctx = makeCtx(&host, &cap, &args);
+        try testing.expect((try channelTrySend(&ctx)).ok == .Unit); // failure payload
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        try testing.expectEqual(@as(usize, 0), coro_reg.channels.getPtr(6262).?.buffer.len());
+    }
 }
 
 test "bad receiver arities and types" {

@@ -2304,24 +2304,40 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         }
     }
 
-    // Evaluate class-delegation expressions.
+    // Evaluate class-delegation expressions. A `by <expr>` interface
+    // delegation declared on any class in the chain forwards the
+    // delegated interface's members, so each level's delegate thunks run
+    // against that level's resolved super-args — not only the leaf's, so a
+    // subclass of a delegating base inherits its delegate fields. Leaf
+    // first: a more-derived class's delegation for an interface overrides
+    // a base's, so the first delegate field for a given interface wins and
+    // a later (base-level) one is skipped. The leaf is keyed on its
+    // runtime `class_name` (the side table's key), not the IR name the
+    // chain records, which can differ when the def was resolved through a
+    // sibling/fqn lookup.
     {
-        const delegates = classDelegateThunks(self, class_fqn, class_name);
-        for (delegates) |sf| {
-            const fr = try funcAt(self, sf.func, "class delegate");
-            switch (fr) {
-                .err => {},
-                .ok => |func| {
-                    switch (try evalThunk(self, func, args)) {
-                        .ok => |v| {
-                            const key = try std.fmt.allocPrint(allocator, "__delegate__{s}", .{sf.name});
-                            const g = inst.borrowMut();
-                            try g.get().fields.append(allocator, .{ .name = key, .value = v });
-                            g.deinit();
-                        },
-                        .err => |e| return .{ .err = e },
-                    }
-                },
+        for (chain.items, 0..) |c, idx| {
+            const lookup_name = if (idx == 0) class_name else c.name;
+            const delegates = classDelegateThunks(self, c.fqn, lookup_name);
+            for (delegates) |sf| {
+                const fr = try funcAt(self, sf.func, "class delegate");
+                switch (fr) {
+                    .err => {},
+                    .ok => |func| {
+                        switch (try evalThunk(self, func, c.args)) {
+                            .ok => |v| {
+                                const key = try std.fmt.allocPrint(allocator, "__delegate__{s}", .{sf.name});
+                                const g = inst.borrowMut();
+                                const already = g.get().get(key) != null;
+                                if (!already) {
+                                    try g.get().fields.append(allocator, .{ .name = key, .value = v });
+                                }
+                                g.deinit();
+                            },
+                            .err => |e| return .{ .err = e },
+                        }
+                    },
+                }
             }
         }
     }

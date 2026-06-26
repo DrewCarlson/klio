@@ -1174,6 +1174,26 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             cls_name = enc orelse break;
         }
     }
+    // Native property getter on a host-synthesised instance, as a last
+    // resort. `typeFqn()` is `<instance>` for any `Instance`, so the
+    // stdlib property probe above never keys on the instance's class. A
+    // host-synthesised class (e.g. the native `KlioChannel`) exposes
+    // properties like `isClosedForSend` through a zero-arg installed
+    // binding `<classFqn>.<name>`; read it as a getter once fields,
+    // delegation, companion, and enclosing lookups have all declined.
+    // Restricted to host synth classes so a user/stdlib property that
+    // genuinely does not resolve still reports the miss.
+    if (receiver.* == .Instance and !probe_is_toplevel_fn and instanceIsHostSynth(receiver.Instance)) {
+        const cls_fqn = classFqnOf(receiver.Instance);
+        if (cls_fqn.len != 0) {
+            const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name });
+            defer allocator.free(probe);
+            if (lookupIntrinsic(self, probe)) |func| {
+                const args = [_]Value{receiver.*};
+                return dispatchIntrinsic(self, allocator, probe, func, &args);
+            }
+        }
+    }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
     const msg = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ name, tf });
     allocator.free(tf);
@@ -2507,6 +2527,35 @@ fn className(inst: ObjRef(InstanceData)) []const u8 {
     const cg = g.get().class.borrow();
     defer cg.deinit();
     return cg.get().name;
+}
+
+/// The instance's class FQN (falling back to its simple name when no FQN
+/// is recorded). Used to key a native property-getter binding.
+fn classFqnOf(inst: ObjRef(InstanceData)) []const u8 {
+    const g = inst.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    const fqn = cg.get().fqn;
+    return if (fqn.len != 0) fqn else cg.get().name;
+}
+
+/// Whether the instance's class is a host-synthesised class — anonymous
+/// (built through `newSynthInstance`) with a package-qualified FQN that
+/// differs from its simple name. The native `KlioChannel` qualifies; a
+/// source `object : I {}` literal does not (its FQN is its bare `$anon$N`
+/// name), so only host synth classes reach the native property-getter
+/// probe.
+fn instanceIsHostSynth(inst: ObjRef(InstanceData)) bool {
+    const g = inst.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    if (!cg.get().is_anonymous) return false;
+    const fqn = cg.get().fqn;
+    return fqn.len != 0 and
+        std.mem.indexOfScalar(u8, fqn, '.') != null and
+        !std.mem.eql(u8, fqn, cg.get().name);
 }
 
 /// The first declared supertype simple name of an instance's class.
