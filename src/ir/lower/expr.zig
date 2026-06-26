@@ -1065,7 +1065,14 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             // A member brought in bare by `import EnumOrObject.*`
             // (`import DurationUnit.*` → `MINUTES` == `DurationUnit.MINUTES`).
-            if (!b.hasOwnMember(name0)) {
+            // An implicit-receiver member shadows a star-import: a bare name
+            // that is a member of `this` — or of any lexically enclosing
+            // receiver, which is the case inside a lambda whose enclosing class
+            // declares the name — resolves against that receiver, not the
+            // star-imported class. `hasOwnMember` alone misses the lambda case
+            // (a lambda body has no own class), so a bare `state` inside a
+            // method's lambda was wrongly rewritten to `Enum.state`.
+            if (!b.hasEnclosingMember(name0)) {
                 if (wildcardClassMemberRewrite(b, segments[0].span.file)) |cls| {
                     const sp = segments[0].span;
                     var rsegs = [_]ast.Ident{
