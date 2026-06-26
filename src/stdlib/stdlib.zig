@@ -642,15 +642,18 @@ test "the inline shadow set's name domain comes from the shared constructor" {
     // The lowerer derives `shadowed_inline_names` from
     // `noteBareNameMapping` over `IMPLICITLY_IMPORTED_PACKAGES`; pin two
     // production-load-bearing members of that domain and one
-    // non-implicit exclusion.
+    // non-implicit exclusion. `synchronized` is deliberately NOT a member:
+    // it is an inline actual that splices (so its block can suspend), not a
+    // host binding, so its name must remain expandable.
     var map = std.StringHashMap([]const u8).init(testing.allocator);
     defer map.deinit();
     var it = implementations.allFqns();
     while (it.next()) |fqn| {
         try noteBareNameMapping(&map, &IMPLICITLY_IMPORTED_PACKAGES, fqn);
     }
-    try testing.expect(map.contains("synchronized"));
+    try testing.expect(map.contains("listOf"));
     try testing.expect(map.contains("arrayOf"));
+    try testing.expect(!map.contains("synchronized"));
     // kotlin.concurrent is not implicitly imported.
     try testing.expect(!map.contains("thread"));
 }
