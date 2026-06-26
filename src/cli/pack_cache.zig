@@ -194,6 +194,23 @@ fn collectUserImportPrefixes(
                 gop.value_ptr.* = {};
             }
         }
+        // A file in package P implicitly sees all of P (same-package
+        // top-level declarations resolve by simple name). Fold the declared
+        // package into the gate set so a pack whose `library_id` is that
+        // package (or a parent/child of it) is loaded even when the file
+        // imports nothing from it — e.g. a `package androidx.collection` test
+        // referencing `MutableIntIntMap` with no import.
+        if (f.package) |pkg| {
+            if (pkg.path.len != 0) {
+                const joined = try joinIdentPath(allocator, pkg.path);
+                const gop = try out.getOrPut(joined);
+                if (gop.found_existing) {
+                    allocator.free(joined);
+                } else {
+                    gop.value_ptr.* = {};
+                }
+            }
+        }
     }
     try mergeQualifiedRefPrefixes(allocator, &out, user_asts);
     return out;
