@@ -672,6 +672,18 @@ pub fn trySkipGenericCallArgs(p: *const Parser) bool {
                                 const after: ?TokenKind = if (i + 2 < p.tokens.len) p.tokens[i + 2].kind else null;
                                 break :blk after != null and std.meta.activeTag(after.?) == .ColonColon;
                             },
+                            // `f<T> label@{ … }` — a generic call whose
+                            // trailing lambda carries a label (`>` then an
+                            // identifier, an `@`, and the lambda `{`).
+                            // Without this the `<`/`>` are read as comparison
+                            // operators (`suspendCancellableCoroutine<Unit>
+                            // sc@{ … }`).
+                            .Ident => blk: {
+                                const t1: ?TokenKind = if (i + 2 < p.tokens.len) p.tokens[i + 2].kind else null;
+                                const t2: ?TokenKind = if (i + 3 < p.tokens.len) p.tokens[i + 3].kind else null;
+                                break :blk t1 != null and t1.?.isAt() and
+                                    t2 != null and std.meta.activeTag(t2.?) == .LBrace;
+                            },
                             else => false,
                         };
                     }

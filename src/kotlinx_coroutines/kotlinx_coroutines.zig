@@ -55,6 +55,16 @@ const ChannelState = struct {
     /// full. The next `receive()` resumes the head and admits its
     /// pending value into the buffer.
     send_waiters: Deque(SendWaiter),
+    /// `select { … }` operations registered to *receive* from this channel
+    /// (an `onReceive` / `onReceiveCatching` clause). When a value becomes
+    /// available the channel offers it to each registered select via
+    /// `SelectInstance.trySelect`; the first that accepts takes the value.
+    /// A select removes itself once it commits to any clause.
+    select_recv_waiters: Deque(ObjRef(InstanceData)),
+    /// `select { … }` operations registered to *send* to this channel (an
+    /// `onSend` clause). When a buffer slot frees, the channel offers the
+    /// send to each registered select via `trySelect`.
+    select_send_waiters: Deque(ObjRef(InstanceData)),
 
     const IterWaiter = struct { slot: i64, iter: ObjRef(InstanceData) };
     const SendWaiter = struct { slot: i64, value: Value };
@@ -71,6 +81,8 @@ const ChannelState = struct {
             .receive_waiters = Deque(RecvWaiter).empty,
             .receive_iter_waiters = Deque(IterWaiter).empty,
             .send_waiters = Deque(SendWaiter).empty,
+            .select_recv_waiters = Deque(ObjRef(InstanceData)).empty,
+            .select_send_waiters = Deque(ObjRef(InstanceData)).empty,
         };
     }
 
@@ -79,6 +91,19 @@ const ChannelState = struct {
         self.receive_waiters.deinit(allocator);
         self.receive_iter_waiters.deinit(allocator);
         self.send_waiters.deinit(allocator);
+        self.select_recv_waiters.deinit(allocator);
+        self.select_send_waiters.deinit(allocator);
+    }
+
+    fn removeSelectInst(deque: *Deque(ObjRef(InstanceData)), sel: ObjRef(InstanceData)) void {
+        var i: usize = 0;
+        while (i < deque.items.items.len) {
+            if (ObjRef(InstanceData).ptrEq(deque.items.items[i], sel)) {
+                _ = deque.items.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
     }
 };
 
@@ -173,6 +198,8 @@ fn gcMarkCoroReg(m: *runtime.gc.Marker) void {
         for (st.buffer.items.items) |v| v.gcMark(m);
         for (st.send_waiters.items.items) |w| w.value.gcMark(m);
         for (st.receive_iter_waiters.items.items) |w| m.shade(&w.iter.cell.hdr);
+        for (st.select_recv_waiters.items.items) |sel| m.shade(&sel.cell.hdr);
+        for (st.select_send_waiters.items.items) |sel| m.shade(&sel.cell.hdr);
     }
 }
 
@@ -308,6 +335,67 @@ fn channelId(arg0: *const Value) ?u64 {
     };
 }
 
+/// `select`'s `SelectInstance.trySelect(clauseObject, internalResult)`,
+/// called on a Kotlin select instance to make a rendezvous with a now-ready
+/// channel clause. Returns `true` when this select committed to the clause
+/// (so the offered value/slot is consumed by it). Invoked outside the
+/// registry lock: `trySelect` resumes the select's parked continuation
+/// inline through the cooperative driver, which must not run under the lock.
+fn selectTrySelect(ctx: *CallCtx, sel: ObjRef(InstanceData), clause_obj: Value, internal: Value) bool {
+    var recv = Value{ .Instance = sel };
+    const args = [_]Value{ clause_obj, internal };
+    const r = ctx.host.invokeMethod(&recv, "trySelect", &args, ctx.out) catch return false;
+    const res = r orelse return false;
+    return switch (res) {
+        .ok => |v| (v == .Bool and v.Bool),
+        .err => false,
+    };
+}
+
+/// Offer `value` (a value the channel can deliver now) to the registered
+/// `onReceive` selects in FIFO order. The first select whose `trySelect`
+/// accepts takes the value; rejected (already-completed) selects are
+/// dropped. Returns `true` when a select took the value. The channel
+/// instance (`chan`) is the clause object the select registered with.
+/// Pops one waiter at a time under the lock, offers it lock-free, and
+/// stops at the first acceptor — matching a single rendezvous.
+fn offerValueToSelectReceivers(ctx: *CallCtx, id: u64, chan: Value, value: Value) bool {
+    while (true) {
+        var sel: ?ObjRef(InstanceData) = null;
+        {
+            coro_reg_mutex.lock();
+            defer coro_reg_mutex.unlock();
+            if (coro_reg.channels.getPtr(id)) |state| {
+                sel = state.select_recv_waiters.popFront();
+            }
+        }
+        const s = sel orelse return false;
+        if (selectTrySelect(ctx, s, chan, value)) return true;
+        // Rejected: that select committed elsewhere or was cancelled; it is
+        // already removed from this list (popped above). Try the next.
+    }
+}
+
+/// Notify the registered `onSend` selects that the channel can now accept a
+/// send (a buffer slot freed or a receiver parked). Each accepting select
+/// performs its own send through its clause block, so the internal result
+/// passed is `Unit`. Stops at the first acceptor. Returns `true` when a
+/// select took the send opportunity.
+fn offerSendToSelectSenders(ctx: *CallCtx, id: u64, chan: Value) bool {
+    while (true) {
+        var sel: ?ObjRef(InstanceData) = null;
+        {
+            coro_reg_mutex.lock();
+            defer coro_reg_mutex.unlock();
+            if (coro_reg.channels.getPtr(id)) |state| {
+                sel = state.select_send_waiters.popFront();
+            }
+        }
+        const s = sel orelse return false;
+        if (selectTrySelect(ctx, s, chan, .Unit)) return true;
+    }
+}
+
 const ChannelSendOutcome = union(enum) {
     HandToReceiver: struct { slot: i64, value: Value, catching: bool },
     HandToIter: i64,
@@ -328,6 +416,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // check-and-transition is one atomic section under the registry lock;
     // the host resume runs after release.
     var outcome: ChannelSendOutcome = undefined;
+    var offer_to_selects = false;
     {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
@@ -341,6 +430,12 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             outcome = .{ .HandToIter = w.slot };
         } else if (state.receive_waiters.popFront()) |w| {
             outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+        } else if (state.select_recv_waiters.len() > 0) {
+            // A registered `onReceive` select may take this value directly.
+            // Offering calls `trySelect` (Kotlin), so it must run outside the
+            // lock; defer to after release.
+            offer_to_selects = true;
+            outcome = .Buffered; // tentative; reconsidered below
         } else if (state.rendezvous) {
             const slot = allocKxcoSlot();
             try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value });
@@ -361,6 +456,43 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             },
             .drop_latest => outcome = .Buffered,
         }
+    }
+
+    if (offer_to_selects) {
+        if (offerValueToSelectReceivers(ctx, id, recv, value)) {
+            return .{ .ok = .Unit };
+        }
+        // No select took it — fall back to the buffer-or-park decision.
+        var fallback: ChannelSendOutcome = undefined;
+        {
+            coro_reg_mutex.lock();
+            defer coro_reg_mutex.unlock();
+            const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.send: missing state" } };
+            if (state.closed) return .{ .err = .{ .Thrown = try closedSendExc(ctx.allocator) } };
+            if (state.receive_waiters.popFront()) |w| {
+                fallback = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+            } else if (state.rendezvous) {
+                const slot = allocKxcoSlot();
+                try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value });
+                fallback = .{ .ParkOnSlot = slot };
+            } else if (state.buffer.len() < state.capacity) {
+                try state.buffer.pushBack(regAllocator(), value);
+                fallback = .Buffered;
+            } else switch (state.overflow) {
+                .suspend_ => {
+                    const slot = allocKxcoSlot();
+                    try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value });
+                    fallback = .{ .ParkOnSlot = slot };
+                },
+                .drop_oldest => {
+                    _ = state.buffer.popFront();
+                    try state.buffer.pushBack(regAllocator(), value);
+                    fallback = .Buffered;
+                },
+                .drop_latest => fallback = .Buffered,
+            }
+        }
+        outcome = fallback;
     }
 
     switch (outcome) {
@@ -395,6 +527,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.trySend: bad receiver" } };
 
     var outcome: ChannelTrySendOutcome = undefined;
+    var offer_to_selects = false;
     {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
@@ -406,6 +539,9 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = .{ .Bool = true }, .catching = false } };
         } else if (state.receive_waiters.popFront()) |w| {
             outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+        } else if (state.select_recv_waiters.len() > 0) {
+            offer_to_selects = true;
+            outcome = .Success; // tentative; reconsidered below
         } else if (state.rendezvous) {
             // No buffer and no parked receiver: a rendezvous `trySend`
             // cannot complete synchronously.
@@ -421,6 +557,48 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                 outcome = .Success;
             },
             .drop_latest => outcome = .Success,
+        }
+    }
+
+    if (offer_to_selects) {
+        if (offerValueToSelectReceivers(ctx, id, recv, value)) {
+            return .{ .ok = try channelResult(ctx, .success, .Unit) };
+        }
+        // No select took it — re-decide buffer vs full under the lock,
+        // resuming any receiver after release.
+        var fb: ChannelTrySendOutcome = undefined;
+        {
+            coro_reg_mutex.lock();
+            defer coro_reg_mutex.unlock();
+            const state = coro_reg.channels.getPtr(id) orelse return .{ .ok = try channelResult(ctx, .failure, .Unit) };
+            if (state.closed) {
+                fb = .Closed;
+            } else if (state.receive_waiters.popFront()) |w| {
+                fb = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+            } else if (state.rendezvous) {
+                fb = .Full;
+            } else if (state.buffer.len() < state.capacity) {
+                try state.buffer.pushBack(regAllocator(), value);
+                fb = .Success;
+            } else switch (state.overflow) {
+                .suspend_ => fb = .Full,
+                .drop_oldest => {
+                    _ = state.buffer.popFront();
+                    try state.buffer.pushBack(regAllocator(), value);
+                    fb = .Success;
+                },
+                .drop_latest => fb = .Success,
+            }
+        }
+        switch (fb) {
+            .HandToReceiver => |h| {
+                const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
+                ctx.host.coroutineResumeSlotValue(h.slot, resume_val);
+                return .{ .ok = try channelResult(ctx, .success, .Unit) };
+            },
+            .Success => return .{ .ok = try channelResult(ctx, .success, .Unit) },
+            .Full => return .{ .ok = try channelResult(ctx, .failure, .Unit) },
+            .Closed => return .{ .ok = try channelResult(ctx, .closed, .Unit) },
         }
     }
 
@@ -486,6 +664,8 @@ fn channelReceiveImpl(ctx: *CallCtx, catching: bool) std.mem.Allocator.Error!Eva
     switch (outcome) {
         .Got => |g| {
             if (g.resumed) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
+            // Freeing a buffer slot lets a registered `onSend` select proceed.
+            _ = offerSendToSelectSenders(ctx, id, recv);
             if (catching) return .{ .ok = try channelResult(ctx, .success, g.value) };
             return .{ .ok = g.value };
         },
@@ -537,6 +717,9 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     if (resumed_slot) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
+    // A retrieved element frees a buffer slot, letting a registered `onSend`
+    // select proceed.
+    if (outcome == .Got) _ = offerSendToSelectSenders(ctx, id, recv);
     const result: Value = switch (outcome) {
         .Got => |v| try channelResult(ctx, .success, v),
         .Empty => try channelResult(ctx, .failure, .Unit),
@@ -593,7 +776,224 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, send_exc) } };
         ctx.host.coroutineResumeSlotValue(sw.slot, failure);
     }
+    // A close makes every registered receive/send clause resolvable
+    // (a closed result for `onReceiveCatching`, a failure otherwise). Offer
+    // the closed state to each registered select; its clause re-polls the
+    // channel and observes the close.
+    var sel_recvs: []ObjRef(InstanceData) = &.{};
+    var sel_sends: []ObjRef(InstanceData) = &.{};
+    {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        if (coro_reg.channels.getPtr(id)) |state| {
+            sel_recvs = state.select_recv_waiters.drain(regAllocator()) catch &.{};
+            sel_sends = state.select_send_waiters.drain(regAllocator()) catch &.{};
+        }
+    }
+    defer regAllocator().free(sel_recvs);
+    defer regAllocator().free(sel_sends);
+    for (sel_recvs) |sel| _ = selectTrySelect(ctx, sel, recv, CLOSED_MARKER);
+    for (sel_sends) |sel| _ = selectTrySelect(ctx, sel, recv, CLOSED_MARKER);
     return .{ .ok = .{ .Bool = true } };
+}
+
+/// Internal-result sentinel handed to `trySelect` when a channel clause
+/// resolves because the channel closed. The clause's `processResFunc`
+/// re-polls the native channel; this marker just drives the rendezvous.
+const CLOSED_MARKER: Value = .Null;
+
+// -------------------------------------------------------------------------
+// select { } native channel clauses
+//
+// The upstream `SelectImplementation` drives `select`: each channel clause
+// registers via these intrinsics. `onReceive` / `onSend` poll the native
+// channel during registration (taking a value / placing a send immediately
+// when ready, completing the select in its registration phase). When not
+// ready, the select instance is stored as a receive/send waiter on the
+// native channel; a later send/receive/close offers the rendezvous to it by
+// calling `SelectInstance.trySelect` (`offerValueToSelectReceivers` /
+// `offerSendToSelectSenders`). On completion or cancellation the select
+// removes itself via the corresponding remove intrinsic.
+// -------------------------------------------------------------------------
+
+/// `__kxco_chanSelectAddReceiver(channel, select)` — store `select` as an
+/// `onReceive` waiter on `channel`. A later send/close offers it a value via
+/// `trySelect`.
+fn channelSelectAddReceiver(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Arity = "selectAddReceiver expects (channel, select)" } };
+    const id = channelId(&ctx.args[0]) orelse return .{ .err = .{ .Type = "selectAddReceiver: bad channel" } };
+    const sel: ObjRef(InstanceData) = switch (ctx.args[1]) {
+        .Instance => |i| i,
+        else => return .{ .err = .{ .Type = "selectAddReceiver: bad select" } },
+    };
+    coro_reg_mutex.lock();
+    defer coro_reg_mutex.unlock();
+    if (coro_reg.channels.getPtr(id)) |state| try state.select_recv_waiters.pushBack(regAllocator(), sel);
+    return .{ .ok = .Unit };
+}
+
+/// `__kxco_chanSelectRemoveReceiver(channel, select)` — drop `select` from
+/// the `onReceive` waiters (commit/cancel cleanup).
+fn channelSelectRemoveReceiver(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Arity = "selectRemoveReceiver expects (channel, select)" } };
+    const id = channelId(&ctx.args[0]) orelse return .{ .err = .{ .Type = "selectRemoveReceiver: bad channel" } };
+    const sel: ObjRef(InstanceData) = switch (ctx.args[1]) {
+        .Instance => |i| i,
+        else => return .{ .err = .{ .Type = "selectRemoveReceiver: bad select" } },
+    };
+    coro_reg_mutex.lock();
+    defer coro_reg_mutex.unlock();
+    if (coro_reg.channels.getPtr(id)) |state| ChannelState.removeSelectInst(&state.select_recv_waiters, sel);
+    return .{ .ok = .Unit };
+}
+
+/// `__kxco_chanSelectAddSender(channel, select)` — store `select` as an
+/// `onSend` waiter on `channel`.
+fn channelSelectAddSender(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Arity = "selectAddSender expects (channel, select)" } };
+    const id = channelId(&ctx.args[0]) orelse return .{ .err = .{ .Type = "selectAddSender: bad channel" } };
+    const sel: ObjRef(InstanceData) = switch (ctx.args[1]) {
+        .Instance => |i| i,
+        else => return .{ .err = .{ .Type = "selectAddSender: bad select" } },
+    };
+    coro_reg_mutex.lock();
+    defer coro_reg_mutex.unlock();
+    if (coro_reg.channels.getPtr(id)) |state| try state.select_send_waiters.pushBack(regAllocator(), sel);
+    return .{ .ok = .Unit };
+}
+
+/// `__kxco_chanSelectRemoveSender(channel, select)` — drop `select` from the
+/// `onSend` waiters.
+fn channelSelectRemoveSender(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Arity = "selectRemoveSender expects (channel, select)" } };
+    const id = channelId(&ctx.args[0]) orelse return .{ .err = .{ .Type = "selectRemoveSender: bad channel" } };
+    const sel: ObjRef(InstanceData) = switch (ctx.args[1]) {
+        .Instance => |i| i,
+        else => return .{ .err = .{ .Type = "selectRemoveSender: bad select" } },
+    };
+    coro_reg_mutex.lock();
+    defer coro_reg_mutex.unlock();
+    if (coro_reg.channels.getPtr(id)) |state| ChannelState.removeSelectInst(&state.select_send_waiters, sel);
+    return .{ .ok = .Unit };
+}
+
+/// `__kxco_chanSelectPollReceive(channel, holder): Int` — atomically take a
+/// value if one is available. Returns `0` and writes the received value into
+/// `holder.value` when a value is taken (admitting a parked sender),
+/// `1` when the channel is closed-and-drained (the receive clause fails or
+/// yields a closed result), or `2` when no value is ready right now. A taken
+/// value frees a buffer slot, so any parked sender is admitted and a
+/// registered `onSend` select is offered the freed slot.
+fn channelSelectPollReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Arity = "selectPollReceive expects (channel, holder)" } };
+    const id = channelId(&ctx.args[0]) orelse return .{ .err = .{ .Type = "selectPollReceive: bad channel" } };
+    const holder: ObjRef(InstanceData) = switch (ctx.args[1]) {
+        .Instance => |i| i,
+        else => return .{ .err = .{ .Type = "selectPollReceive: bad holder" } },
+    };
+
+    const Outcome = union(enum) {
+        Got: struct { value: Value, resumed: ?i64 },
+        Closed,
+        NotReady,
+    };
+    var outcome: Outcome = undefined;
+    {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        const state = coro_reg.channels.getPtr(id) orelse return .{ .ok = Value.newInt(2) };
+        if (state.buffer.popFront()) |v| {
+            const resumed_sender = state.send_waiters.popFront();
+            var resumed: ?i64 = null;
+            if (resumed_sender) |sw| {
+                try state.buffer.pushBack(regAllocator(), sw.value);
+                resumed = sw.slot;
+            }
+            outcome = .{ .Got = .{ .value = v, .resumed = resumed } };
+        } else if (state.closed) {
+            outcome = .Closed;
+        } else {
+            outcome = .NotReady;
+        }
+    }
+    switch (outcome) {
+        .Got => |g| {
+            try holder.asPtr().define(regAllocator(), "value", g.value);
+            if (g.resumed) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
+            _ = offerSendToSelectSenders(ctx, id, ctx.args[0]);
+            return .{ .ok = Value.newInt(0) };
+        },
+        .Closed => return .{ .ok = Value.newInt(1) },
+        .NotReady => return .{ .ok = Value.newInt(2) },
+    }
+}
+
+/// `__kxco_chanSelectPollSend(channel, value): Int` — atomically place
+/// `value` if the channel can accept it now. Returns `0` when the value was
+/// handed to a parked receiver / a registered `onReceive` select / buffered,
+/// `1` when the channel is closed (the send clause fails), or `2` when the
+/// channel is full.
+fn channelSelectPollSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Arity = "selectPollSend expects (channel, value)" } };
+    const id = channelId(&ctx.args[0]) orelse return .{ .err = .{ .Type = "selectPollSend: bad channel" } };
+    const value = ctx.args[1];
+
+    const Outcome = union(enum) {
+        HandToIter: i64,
+        HandToReceiver: struct { slot: i64, value: Value, catching: bool },
+        OfferSelects,
+        Buffered,
+        Closed,
+        Full,
+    };
+    var outcome: Outcome = undefined;
+    {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        const state = coro_reg.channels.getPtr(id) orelse return .{ .ok = Value.newInt(2) };
+        if (state.closed) {
+            outcome = .Closed;
+        } else if (state.receive_iter_waiters.popFront()) |w| {
+            try w.iter.asPtr().define(regAllocator(), "__pending__", value);
+            outcome = .{ .HandToIter = w.slot };
+        } else if (state.receive_waiters.popFront()) |w| {
+            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+        } else if (state.select_recv_waiters.len() > 0) {
+            outcome = .OfferSelects;
+        } else if (state.buffer.len() < state.capacity) {
+            try state.buffer.pushBack(regAllocator(), value);
+            outcome = .Buffered;
+        } else {
+            outcome = .Full;
+        }
+    }
+    switch (outcome) {
+        .HandToIter => |slot| {
+            ctx.host.coroutineResumeSlotValue(slot, .{ .Bool = true });
+            return .{ .ok = Value.newInt(0) };
+        },
+        .HandToReceiver => |h| {
+            const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
+            ctx.host.coroutineResumeSlotValue(h.slot, resume_val);
+            return .{ .ok = Value.newInt(0) };
+        },
+        .OfferSelects => {
+            if (offerValueToSelectReceivers(ctx, id, ctx.args[0], value)) return .{ .ok = Value.newInt(0) };
+            // No select took it — buffer or report full.
+            coro_reg_mutex.lock();
+            defer coro_reg_mutex.unlock();
+            const state = coro_reg.channels.getPtr(id) orelse return .{ .ok = Value.newInt(2) };
+            if (state.closed) return .{ .ok = Value.newInt(1) };
+            if (state.buffer.len() < state.capacity) {
+                try state.buffer.pushBack(regAllocator(), value);
+                return .{ .ok = Value.newInt(0) };
+            }
+            return .{ .ok = Value.newInt(2) };
+        },
+        .Buffered => return .{ .ok = Value.newInt(0) },
+        .Closed => return .{ .ok = Value.newInt(1) },
+        .Full => return .{ .ok = Value.newInt(2) },
+    }
 }
 
 fn channelIsClosedForSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -1041,6 +1441,12 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_newSlot", .f = newSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_parkSlot", .f = parkSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_resumeSlot", .f = resumeSlot },
+    .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectAddReceiver", .f = channelSelectAddReceiver },
+    .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectRemoveReceiver", .f = channelSelectRemoveReceiver },
+    .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectAddSender", .f = channelSelectAddSender },
+    .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectRemoveSender", .f = channelSelectRemoveSender },
+    .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectPollReceive", .f = channelSelectPollReceive },
+    .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectPollSend", .f = channelSelectPollSend },
     .{ .fqn = "kotlinx.coroutines.__kxco_rbPump", .f = rbPump },
     .{ .fqn = "kotlinx.coroutines.internal.__kxco_reportUncaught", .f = reportUncaught },
     .{ .fqn = "kotlinx.coroutines.yield", .f = yieldNow },

@@ -3034,6 +3034,31 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
+    // `recv.prop { lambda }` where `prop` is an extension property (not a
+    // member method) whose value is a callable instance: Kotlin parses this
+    // as `(recv.prop)(lambda)`. When no `prop` method resolves, get the
+    // extension-property value and invoke it with the trailing lambda. This
+    // is how `channel.onReceive { … }` works — `onReceive` is a
+    // `SelectClause1` property whose `invoke` operator (supplied by the
+    // enclosing `SelectBuilder`) registers the clause. Resolved via
+    // `getMemberField` (receiver-owned only, no global/top-level fallback)
+    // and gated on (a) an `Instance` property value and (b) a single
+    // trailing callable argument — the clause-invoke shape — so an ordinary
+    // member call whose method resolution legitimately missed (and is
+    // handled by a downstream fallback) is never pre-empted.
+    if (receiver.* == .Instance and args.len == 1 and isCallable(&args[0])) {
+        const got = self.getMemberField(allocator, receiver, name) catch EvalResult{ .err = .{ .Type = "" } };
+        if (got == .ok) {
+            const pv = got.ok;
+            if (pv == .Instance) {
+                const r = try callValueRec(self, allocator, &pv, args);
+                pv.release(allocator);
+                return r;
+            }
+            pv.release(allocator);
+        }
+    }
+
     // Dispatch-miss: the message carries `Vm::call_member `name` on `fqn``,
     // which downstream fallbacks pattern-match (e.g. the object-singleton walk)
     // to tell a top-level miss for *this* name from a deeper genuine error.
@@ -5019,12 +5044,18 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
             }
             first = false;
             if (ir_class) |irc| {
-                // Gather candidates named `name`.
+                // Gather candidates named `name`. A `@LowPriorityInOverloadResolution`
+                // / `@Deprecated(level = ERROR)` member is a guard stub that only
+                // applies when no ordinary candidate (member or top-level extension)
+                // does; skip it here so resolution falls through to the extension
+                // path. kotlinx.coroutines' `SelectBuilder.onTimeout` shadows its own
+                // `onTimeout` extension this way, and binding the stub would
+                // self-recurse (its body just calls the extension).
                 var candidates: std.ArrayList(Func) = .empty;
                 defer candidates.deinit(allocator);
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
-                        if (std.mem.eql(u8, f.name, name)) try candidates.append(allocator, f);
+                        if (std.mem.eql(u8, f.name, name) and !f.low_priority) try candidates.append(allocator, f);
                     }
                 }
                 if (pickMethodOverload(self, candidates.items, args)) |f| {

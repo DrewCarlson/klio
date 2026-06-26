@@ -346,3 +346,70 @@ test "coroutine_scope_extension_reads_receiver_context" {
     ;
     try assertKlio("scope_extension_context", src, "held\nambient-none\n");
 }
+
+// `select { }` over channel clauses: a buffered `onReceive` is ready and wins
+// over an empty channel's clause in biased registration order. The selected
+// clause's block runs with the received value.
+test "select_onreceive_ready_clause_wins" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val a = Channel<Int>(1)
+        \\    val b = Channel<Int>(1)
+        \\    a.send(7)
+        \\    val r = select<String> {
+        \\        a.onReceive { "a=$it" }
+        \\        b.onReceive { "b=$it" }
+        \\    }
+        \\    println(r)
+        \\}
+        \\
+    ;
+    try assertKlio("select_onreceive_ready", src, "a=7\n");
+}
+
+// `onTimeout(0)` is selected immediately when no other clause is ready.
+test "select_ontimeout_zero_is_immediate" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val empty = Channel<Int>(1)
+        \\    val r = select<String> {
+        \\        empty.onReceive { "received $it" }
+        \\        onTimeout(0) { "timeout" }
+        \\    }
+        \\    println(r)
+        \\}
+        \\
+    ;
+    try assertKlio("select_ontimeout_zero", src, "timeout\n");
+}
+
+// A binary `Semaphore` serializes two `launch` coroutines through
+// `withPermit` under contention: the second acquirer suspends until the first
+// releases, so both critical sections run exactly once and the permit is
+// returned at the end.
+test "semaphore_withpermit_serializes_under_contention" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.sync.*
+        \\fun main() = runBlocking {
+        \\    val sem = Semaphore(1)
+        \\    val order = mutableListOf<Int>()
+        \\    val jobs = (1..2).map { i ->
+        \\        launch { sem.withPermit { order.add(i) } }
+        \\    }
+        \\    jobs.forEach { it.join() }
+        \\    println("permits=${sem.availablePermits} ran=${order.size}")
+        \\}
+        \\
+    ;
+    try assertKlio("semaphore_contention", src, "permits=1 ran=2\n");
+}

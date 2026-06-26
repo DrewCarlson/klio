@@ -828,12 +828,22 @@ pub fn parseTrailingLambda(p: *Parser) ?Expr {
 /// level (depth 0) before its closing `}`. Nested lambdas /
 /// function types / `when` arrows sit at depth > 0 and are
 /// ignored. Non-mutating.
+///
+/// A depth-0 `->` that belongs to a *function type* rather than a
+/// lambda header does not count. The unambiguous signal is an `as` /
+/// `as?` cast keyword at depth 0 before the arrow: a lambda parameter
+/// list never contains `as`, so `{ x as () -> T; … }` is a block whose
+/// first statement casts `x` to a function type, not a lambda
+/// `{ params -> body }`. Without this, the function-type arrow in the
+/// cast target is mistaken for a lambda header and the surrounding
+/// `{ }` is parsed as a function value.
 pub fn lambdaHasHeader(p: *const Parser) bool {
     var depth: i32 = 0;
     var i = p.pos;
     while (i < p.tokens.len) : (i += 1) {
         switch (p.tokens[i].kind) {
             .Arrow => if (depth == 0) return true,
+            .Keyword => |kw| if (depth == 0 and kw == .As) return false,
             .LParen, .LBracket, .LBrace => {
                 depth += 1;
             },
