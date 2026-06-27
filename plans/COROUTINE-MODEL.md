@@ -98,7 +98,14 @@ are the implementation notes behind these verdicts.
     made inside a `FlowCollector<R>` extension body, splices with the receiver bound to the
     enclosing implicit `this` (the SafeCollector) instead of the actual receiver value —
     `f.collect{}` with `f: Flow` *param* works (ci_min4), `val f = flows[i]; f.collect{}` fails
-    (ci_min5). An inline-splice receiver-binding bug for an untyped-local receiver. Still open.
+    (ci_min5). Narrowed further: it is **receiver-type inference**, not the splice per se —
+    `f.collect{}`/`f.collect(collector)` dispatch on the actual receiver only when klio can
+    statically infer the receiver is a `Flow`. `val f = other` (other a `Flow` param) works
+    (lv1); `flows[i]` does not, because `inferReceiverType` (`inline_call.zig:38`) has no
+    `.Index` case and `localDeclType` carries only a type *head* ("Array"), losing the
+    `Array<out Flow<T>>` element. Fix needs element-type inference for an index receiver (and
+    combine has further layers — the batched `resultChannel.receiveCatching()` loop — beyond it).
+    Still open.
   - `conflate`/`flatMapMerge` → SIGSEGV (stack overflow in the channel-flow + merge path).
   - `takeWhile`/`transformWhile` → `invoke on $anon$0`: inside `unsafeFlow { collectWhile { … } }`
     a bare `emit`/`predicate` in the (non-inline) takeWhile lambda, once spliced into
