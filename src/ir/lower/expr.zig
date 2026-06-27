@@ -3472,6 +3472,14 @@ fn lowerValueInvocation(
     }
 
     if (b.resolve(name0)) |reg| {
+        // A non-function-typed param does not shadow a same-named top-level
+        // function for a *call*: `flow { … }` inside
+        // `fun Flow<T>.combine(flow: Flow<T2>, …)` resolves to the `flow {}`
+        // builder, not the `flow: Flow<T2>` parameter (a `Flow` is not
+        // invokable). Defer to the bare-function path so the builder binds.
+        if (b.isNonFnParam(name0) and b.module.funcId(name0) != null) {
+            return null;
+        }
         var callee_reg = reg;
         if (b.isBoxed(name0)) {
             const c = b.allocReg();

@@ -299,6 +299,13 @@ pub const FuncBuilder = struct {
     /// `a.compareTo(b) <op> 0` — the total order, unlike the IEEE
     /// primitive operators.
     generic_typed_params: StringSet,
+    /// Params whose declared type is a concrete NON-function type (not a
+    /// function type, not a bare generic type-parameter). Such a param does
+    /// NOT shadow a same-named top-level function for a *call*: kotlinc
+    /// resolves `flow { … }` to the `flow {}` builder, not a `flow: Flow<T>`
+    /// parameter, because a `Flow` is not invokable. A bare call to one of
+    /// these names defers to the function-resolution path.
+    non_fn_params: StringSet,
     /// Reified type-parameter names bound by an in-progress inline
     /// splice, each mapped to the register holding the resolved class
     /// value. A nested splice whose call-site type argument names an
@@ -402,6 +409,7 @@ pub const FuncBuilder = struct {
             .local_ext_fns = StringSet.init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
             .generic_typed_params = StringSet.init(allocator),
+            .non_fn_params = StringSet.init(allocator),
             .reified_type_binds = StringRegMap.init(allocator),
             .is_lambda_body = false,
             .is_anon_fn_body = false,
@@ -453,6 +461,7 @@ pub const FuncBuilder = struct {
         self.local_ext_fns.deinit();
         self.receiver_lambda_params.deinit();
         self.generic_typed_params.deinit();
+        self.non_fn_params.deinit();
         self.reified_type_binds.deinit();
         self.finally_stack.deinit(a);
         self.inline_return.deinit(a);
@@ -957,6 +966,12 @@ pub const FuncBuilder = struct {
     }
     pub fn isGenericTypedParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.generic_typed_params.contains(name);
+    }
+    pub fn markNonFnParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.non_fn_params.put(name, {});
+    }
+    pub fn isNonFnParam(self: *const FuncBuilder, name: []const u8) bool {
+        return self.non_fn_params.contains(name);
     }
     pub fn clearGenericTypedParam(self: *FuncBuilder, name: []const u8) void {
         _ = self.generic_typed_params.remove(name);
