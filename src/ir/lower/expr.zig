@@ -2500,8 +2500,50 @@ fn lowerCallWithWritebackPath(
             }
         }
         if (needs_this) {
-            const this_reg = try resolveThisForBareCall(b);
-            if (this_reg) |tr| try run_regs.append(b.allocator, tr);
+            // The bound target is an extension taking an implicit receiver.
+            // The nearest `this` is NOT necessarily that receiver — a bare
+            // `collect { … }` inside a `FlowCollector.()` flow-builder lambda
+            // (whose collect-lambda mutates an outer var, which is what routes
+            // the call through this writeback path) must reach the enclosing
+            // `Flow` receiver, not dispatch on the collector. Resolve it with
+            // the same receiver-walking dispatch the general path uses
+            // (`CallMemberOrGlobal`, which tries each implicit receiver
+            // innermost-first before any global), not a static `this`-pinned
+            // `Call`. Mirrors the `ext_bare_call_lambda` arm in
+            // `lowerCallGeneral`.
+            const args_start = try packContiguous(b, arg_regs);
+            const an = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const nmc = try b.module.internConst(b.allocator, .{ .String = segments[0].name });
+            if (b.capturesThisSlot()) {
+                const this_idx = try b.recordCapture("this");
+                const dst = b.allocReg();
+                orEmitAudit(b, "writeback_ext_bare_call", "CallMemberOrGlobal", segments[0].name);
+                try b.push(.{ .CallMemberOrGlobal = .{
+                    .dst = dst,
+                    .this_idx = this_idx,
+                    .name = nmc,
+                    .args = args_start,
+                    .n_args = @intCast(arg_regs.len),
+                    .arg_names = an,
+                    .func = bound_id,
+                } });
+                return dst;
+            }
+            if (try resolveThisForBareCallNoBind(b)) |tr| {
+                const dst = b.allocReg();
+                orEmitAudit(b, "writeback_ext_bare_call", "CallMemberOrGlobal", segments[0].name);
+                try b.push(.{ .CallMemberOrGlobal = .{
+                    .dst = dst,
+                    .this_idx = 0,
+                    .name = nmc,
+                    .args = args_start,
+                    .n_args = @intCast(arg_regs.len),
+                    .arg_names = an,
+                    .func = bound_id,
+                    .recv = tr,
+                } });
+                return dst;
+            }
         }
     }
     try run_regs.appendSlice(b.allocator, arg_regs);
@@ -4945,12 +4987,33 @@ fn lowerUnresolvedBareCall(
         } });
         return dst0;
     }
+    // When `this` is bound locally (the frame's own receiver param — a
+    // top-level/member extension's receiver, not an outer closure capture),
+    // pass it as the explicit innermost receiver. A `recordCapture("this")`
+    // here is wrong: a non-closure extension function has no capture frame,
+    // so the capture slot is empty and the bare member misses its own
+    // receiver. This is the `is JobSupport -> invokeOnCompletionInternal(…)`
+    // shape — a bare member call on the extension's smart-cast receiver.
+    const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+    const dst = b.allocReg();
+    orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);
+    if (b.resolve("this")) |this_reg| {
+        const run = try lowerArgRun(b, args);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        try b.push(.{ .CallMemberOrGlobal = .{
+            .dst = dst,
+            .this_idx = 0,
+            .name = nm,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+            .recv = this_reg,
+        } });
+        return dst;
+    }
     const this_idx = try b.recordCapture("this");
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-    const dst = b.allocReg();
-    const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-    orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);
     try b.push(.{ .CallMemberOrGlobal = .{
         .dst = dst,
         .this_idx = this_idx,

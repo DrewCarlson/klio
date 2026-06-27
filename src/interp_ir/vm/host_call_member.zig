@@ -6584,26 +6584,18 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
             if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
-            // Every supplied argument name must name one of the candidate's
-            // params (kotlinc: a candidate without the named param is not
-            // applicable) — `invokeOnCompletion(onCancelling = true) { }`
-            // must not bind an extension that has no `onCancelling`.
-            var names_fit = true;
-            for (arg_names) |maybe_n| {
-                const n = maybe_n orelse continue;
-                var found = false;
-                for (f.params) |*p| {
-                    if (std.mem.eql(u8, p.name, n)) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    names_fit = false;
-                    break;
-                }
-            }
-            if (!names_fit) continue;
+            // Full applicability under the actual binding (kotlinc semantics):
+            // each supplied name must hit a declared param, positional args
+            // fill leading params (with the trailing-lambda rule), every
+            // argument's type must be compatible with the param it binds, and
+            // every unbound param must be defaulted/vararg. This subsumes the
+            // bare "every name is a param" filter and, crucially, rejects an
+            // overload whose positional slot takes an argument of the wrong
+            // type — e.g. `produce(ctx, cap, onBufferOverflow, start = …,
+            // block = …)` must not bind the 5-param `produce(ctx, cap, start,
+            // onCompletion, block)` (the `BufferOverflow` would land in
+            // `start: CoroutineStart`).
+            if (!memberApplicableForWalkNamed(self, &f, args, arg_names)) continue;
             candidates.append(allocator, .{ .fid = fid, .func = f }) catch {};
         }
     }
@@ -6674,6 +6666,14 @@ fn memberApplicableForWalkNamed(self: *VmHost, f: *const Func, args: []const Val
         if (supplied_name) |nm| {
             for (effective, 0..) |*p, k| {
                 if (std.mem.eql(u8, p.name, nm)) {
+                    // A named argument that targets a parameter already filled
+                    // (by a leading positional argument) makes this overload
+                    // inapplicable — kotlinc rejects the double binding. This
+                    // is what distinguishes `produce(ctx, cap, onBufferOverflow,
+                    // start = …)` from the 5-param `produce(ctx, cap, start,
+                    // onCompletion, …)`, whose 3rd positional already fills
+                    // `start` that `start = …` then re-targets.
+                    if (bound[k]) return false;
                     param = p;
                     bound[k] = true;
                     break;
