@@ -138,11 +138,18 @@ are the implementation notes behind these verdicts.
     So the suspend-state capture/restore mis-indexes value captures when type-parameter casts
     add reified captures — `transform` reads the slot holding `this@combineX`. Fix lives in the
     suspend activation capture machinery (`src/ir/eval.zig`), NOT in member dispatch. DEEP.
-- **Hot-flow suspending collector (#6, 0/3).** A `SharedFlow`/`StateFlow` collector that
-  suspends and then takes a *second* emit fails `Vm::call_member emit on kotlin.Function`
-  (resume-side SafeCollector emit binds the collector as a bare function,
-  `src/interp_ir/vm/host_call_member.zig`); `subscriptionCount` hits `unresolved global
-  lastReplayedLocked` (inherited-member-inline resolution, `src/ir/eval.zig`).
+- **Hot-flow suspending collector (#6, 2/3 — collector FIXED).** A `SharedFlow`/`StateFlow`
+  collector that suspends and takes a *second* (and further) emit now works
+  (`MutableSharedFlow().collect{}` over two `emit`s → both delivered; `MutableStateFlow`
+  collect over `value=1; value=2` → 0,1,2). The field-receiver-lambda park (the "real B1") is
+  resolved. **Remaining:** `subscriptionCount.value` → `unresolved global lastReplayedLocked`.
+  This is NOT the runtime getter walk (that is fixed — see the inherited-getter BFS commit;
+  a plain iface-first inherited property read works). It is the LOWERING: inside
+  `SubscriptionCountStateFlow.value`'s `synchronized(this) { lastReplayedLocked }`, the
+  `synchronized` inline-splice loses the receiver context, so `inReceiverContext` is false at
+  the bare read and it lowers to `LoadGlobal` instead of the receiver-walking
+  `LoadFromThisOrGlobal` (expr.zig:1149). An inline-splice receiver-context loss; subscriptionCount
+  is niche. Still open.
 - **`Dispatchers.Unconfined` eager-start ordering (#7, 0/3).** `Unconfined` must start the
   child undispatched on the current thread until the first suspension, and `yield()` under
   it must drain an unconfined event loop. Requires a distinct Unconfined dispatcher (not

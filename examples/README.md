@@ -165,3 +165,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `select_on_timeout_loses.kt` | A parked `select` whose `onTimeout` clause *loses* to a channel `onReceive` that arrives first — the registered (but unfired) timeout `Runnable` is invoked as a value on resume and dispatches `run()`. |
 | `flow_operators.kt`        | Flow operators `drop`/`dropWhile`/`buffer`/`flowOn`/`onCompletion` — the bare-extension receiver walk, the channel-backed `buffer`/`flowOn` (correct `produce` overload), and `onCompletion`. |
 | `channel_invoke_on_close.kt` | `SendChannel.invokeOnClose { cause -> … }` runs the handler once when the channel closes, before the buffered elements are drained. |
+| `sharedflow_collect.kt`    | A `MutableSharedFlow` collector that suspends and takes several successive `emit`s (the hot-flow suspending collector / field-receiver-lambda park). |
