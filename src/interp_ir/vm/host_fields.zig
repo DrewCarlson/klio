@@ -1877,13 +1877,32 @@ fn resolveInstanceGetter(
         found = lookupPairFunc(pg.get().instance_prop_getters, recv_fqn, name);
     }
     if (found != null) return found;
-    var cur: ?[]const u8 = if (own_is_qualified) firstSupertypeOf(inst) else class_name;
-    var seen: std.ArrayList([]const u8) = .empty;
-    defer seen.deinit(allocator);
-    while (cur) |cn| {
-        cur = null;
-        if (containsStr(seen.items, cn)) break;
-        try seen.append(allocator, cn);
+    // Walk the FULL supertype closure breadth-first (nearest-first), not just
+    // the first supertype: `class D : I, B()` lists the interface `I` before
+    // the base class `B`, so following only `supertype_names[0]` would stop at
+    // `I` and never reach `B`'s inherited getter. Methods already BFS the
+    // hierarchy (`resolveInstanceMethod`); property getters must too.
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(allocator);
+    var seen: std.StringHashMap(void) = .init(allocator);
+    defer seen.deinit();
+    if (own_is_qualified) {
+        const cg = self.classes.borrow();
+        if (cg.get().get(firstSupertypeOf(inst) orelse class_name)) |d| {
+            const dg = d.borrow();
+            for (dg.get().supertype_names) |sn| queue.append(allocator, sn) catch {};
+            dg.deinit();
+        }
+        cg.deinit();
+        try queue.append(allocator, firstSupertypeOf(inst) orelse class_name);
+    } else {
+        try queue.append(allocator, class_name);
+    }
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cn = queue.items[head];
+        if (seen.contains(cn)) continue;
+        try seen.put(cn, {});
         const cdef: ?ObjRef(ClassDef) = blk: {
             const cg = self.classes.borrow();
             defer cg.deinit();
@@ -1909,7 +1928,7 @@ fn resolveInstanceGetter(
         if (cdef) |d| {
             const dg = d.borrow();
             defer dg.deinit();
-            cur = if (dg.get().supertype_names.len > 0) dg.get().supertype_names[0] else null;
+            for (dg.get().supertype_names) |sn| queue.append(allocator, sn) catch {};
         }
     }
     return found;
@@ -1919,11 +1938,20 @@ fn resolveInstanceGetter(
 /// property *without* a custom getter / delegate (overriding any
 /// inherited `open val … get()`).
 fn declaresStored(cdef: *const ClassDef, name: []const u8) bool {
+    // An interface stores no state — its `val`/`var` members are abstract
+    // declarations, never backing fields (a getter-less interface property is
+    // still implicitly abstract even when the parser leaves `is_abstract`
+    // unset). So an interface in the hierarchy never overrides a base getter.
+    if (cdef.is_interface) return false;
     for (cdef.primary_params) |p| {
         if (std.mem.eql(u8, p.name, name) and p.property != null) return true;
     }
     for (cdef.body_properties) |p| {
-        if (std.mem.eql(u8, p.name, name) and p.getter == null and p.delegate == null) return true;
+        // An `abstract val`/`var` (notably an interface's `val isActive`)
+        // stores nothing — it is a declaration to be overridden, not a
+        // backing field. Only a concrete property with no getter/delegate is
+        // a real stored field that overrides an inherited getter.
+        if (std.mem.eql(u8, p.name, name) and p.getter == null and p.delegate == null and !p.is_abstract) return true;
     }
     return false;
 }
