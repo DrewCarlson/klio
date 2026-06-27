@@ -5,113 +5,113 @@ Author role: concurrency runtime architect. This plan is grounded in the live co
 
 ---
 
-## STATUS 2026-06-26 — async-compose story DONE; coroutine-semantics audit found the remaining work
+## STATUS 2026-06-27 — verified current state and remaining work
 
-The original framing ("eager model, no async event loop") is **superseded**. klio
-*has* a working cooperative pump + ready-queue (`coroutines.zig`), launch ordering is
-correct (`runBlocking { launch{A}; print B }` → `B A`), and the whole async-compose
-story this plan was written for now works end-to-end:
+The original framing ("eager model, no async event loop") is **superseded**: klio has a
+working cooperative pump + ready-queue (`coroutines.zig`), correct launch ordering
+(`runBlocking { launch{A}; print B }` → `B A`), and the async-compose story below works
+end-to-end. The state here comes from a fresh 12-category audit (every verdict
+adversarially re-probed against the live build, 2026-06-27); it supersedes the earlier
+"33 divergences" list. The detailed PART A / PART B / root-cause sections further down
+are the implementation notes behind these verdicts.
 
-- `kotlin.synchronized` as an inline actual (block can suspend) — `main`.
-- `StateFlow`/`SharedFlow` collect machinery: writeback-call→member (`forEachSlotLocked`),
-  object-arg-vs-fn-param inline overload (`collectWhile`/first/single), member-shadows-
-  extension property (the `WorkaroundAtomicReference` recursion) — all on `main`.
-- Frame clock + async `Recomposer.runRecomposeAndApplyChanges` + `snapshotFlow` +
-  `Flow.collectAsState` **and** `StateFlow.collectAsState` — all green
+### Done
+
+- **Async-compose story (PART A).** `kotlin.synchronized` inline actual (block can
+  suspend); the `StateFlow`/`SharedFlow` collect machinery; frame clock + async
+  `Recomposer.runRecomposeAndApplyChanges` + `snapshotFlow` + `Flow.collectAsState`
+  **and** `StateFlow.collectAsState` — all green and matching `kotlinc`
   (`examples/compose_frame_clock.kt`, `compose_snapshot_flow.kt`, `compose_stateflow.kt`).
-- The last collectAsState blocker was a compose bug (skipped `@Composable` returned
-  Unit), not a coroutine one — see COMPOSE-RUNTIME.md.
+- **Channel API + semantics (#3, 6/6).** `trySend`/`tryReceive` return `ChannelResult`;
+  `isClosedForSend`/`isClosedForReceive` are properties; `produce` works; a rendezvous
+  `send` suspends until a receiver; a conflated channel keeps only the latest.
 
-### Audit 2026-06-26 — 33 confirmed divergences from kotlinx.coroutines (the remaining work)
+### Partial — one concrete remnant each
 
-A category audit (10 categories, each probe verified against vendored upstream
-semantics) found **33 confirmed divergences**, clustering into ~10 root causes. These
-are the remaining tasks to make klio coroutines match Kotlin. Ordered by severity:
+- **`select` + `Semaphore` (#4, 5/6).** Working: `onReceive`/`onReceiveCatching` (incl.
+  observing a close while parked), `onSend` (receiver-first or sender-first, and feeding a
+  `for (x in channel)` iterator consumer), `onAwait` (ready + deferred), and
+  `Semaphore.withPermit` under contention. **Remaining:** when a `select` registers an
+  `onTimeout` timer and then parks, and a channel/`onAwait` clause subsequently *wins*,
+  the resume crashes `Vm::call_member invoke on kotlinx.coroutines.Runnable`. It is not
+  the channel layer — the crash is inside the `CancellableContinuationImpl.tryResume`
+  decision-state loop, where the parked select's installed cancel handler meets the resume
+  while the timer continuation is still scheduled (shares a root with #7 / the missing
+  unconfined event loop). `onTimeout` that *wins* works; only `onTimeout`-loses-after-
+  parking crashes.
+- **Structured-concurrency parent-job leak (#1, 9/10).** Fixed: a caught-externally
+  `coroutineScope`/`supervisorScope` child failure no longer double-delivers to stderr/
+  exit 1; non-`runBlocking` job `toString`s report the correct upstream names
+  (StandaloneCoroutine/DeferredCoroutine/ScopeCoroutine/SupervisorCoroutine). **Remaining:**
+  the `runBlocking` job's `toString` still leaks the internal class name
+  (`KlioBlockingCoroutine{Active}@…` vs upstream `BlockingCoroutine{…}`). Fix: rename (or
+  override `nameString()` for) `private class KlioBlockingCoroutine` at
+  `klioMain/kotlinx/coroutines/KlioRuntime.kt:45`.
+- **CoroutineExceptionHandler (#2, 2/3).** Fixed: a CEH in `GlobalScope.launch` / a
+  `supervisorScope` child receives the uncaught exception with the right type; a regular
+  non-root `launch` correctly ignores its CEH; `async` does not fire a CEH. **Remaining:**
+  `CoroutineScope(SupervisorJob() + handler)` SEGFAULTs (stack overflow) when the scope has
+  more than one throwing child, or a throwing child plus a normally-completing sibling.
+  Unbounded mutual recursion `callMemberNamedInner → callMemberInnerStatic → irMethodWalk
+  → invokeMethodFuncId → … → callMemberNamedInner` in
+  `src/interp_ir/vm/host_call_member.zig` (2783/5302/6315/6412), SIGSEGV in
+  `instanceBindingProbe` (~:3215).
+- **launch/async OUTSIDE a driver (PART B, 1/2).** Fixed: an outside-`runBlocking`
+  `launch`/`async` no longer runs eagerly — it routes through `Dispatchers.Default`
+  (`ContextActuals.kt` `newCoroutineContext`); an uncaught exception reports to the worker
+  reporter and the process still exits 0. **Remaining:** suspends on the `Default`/`IO`
+  worker pool do not honor cancellation — `KlioDefaultDispatcher`/
+  `KlioIoDispatcher.scheduleResumeAfterDelay` (KlioRuntime.kt ~122/157) must register an
+  `invokeOnCancellation` that aborts the pending `__kxco_delayMillis` and resumes early
+  with the cancellation cause.
 
-1. **Structured-concurrency parent-job leak (10 findings) — highest impact.** A
-   `coroutineScope`/`supervisorScope`/scoped-coroutine child failure that is **caught
-   externally** still leaks to the parent `runBlocking` job → stdout is correct but the
-   process ALSO prints `runtime error: uncaught …` to stderr and exits 1 (double
-   delivery). Root cause: `klioMain/kotlinx/coroutines/KlioRuntime.kt` (`joinBlocking`
-   ~lines 45/57/62-71, the `if (failed) throw failure`) records and rethrows a failure
-   that upstream `JobSupport.cancelParent` short-circuits for scoped coroutines
-   (`JobSupport.kt:336-338` `if (isScopedCoroutine) return true`; `internal/Scopes.kt`
-   sets `isScopedCoroutine=true`). Fix: the parent `runBlocking` job must NOT be marked
-   failed when a scoped-coroutine child's exception was delivered via the rethrow path
-   (and supervisor children never propagate at all). Also surfaces as `join()` leaking
-   the internal `KlioBlockingCoroutine` class name.
+### Open — not started
 
-2. **CoroutineExceptionHandler not wired (2 findings + 1 segfault).** A `CEH` in the
-   context of `GlobalScope.launch` / a `supervisorScope` child is IGNORED — the
-   exception goes to the default "Exception in thread …" handler instead of the
-   installed handler (`klioMain/kotlinx/coroutines/internal/Misc.kt:23`,
-   `src/kotlinx_coroutines/kotlinx_coroutines.zig:613`). And a **SEGFAULT** when a CEH is
-   installed on `CoroutineScope(SupervisorJob() + handler)` and a child throws
-   (`src/interp_ir/vm/host_call_member.zig:3104`). Fix: route an uncaught coroutine
-   exception through the context's `CoroutineExceptionHandler` before the default.
+- **Channel-backed flow operators (#5, 0/4).** `buffer`/`conflate`/`flowOn` error
+  `unresolved global invokeOnCompletionInternal` (and `conflate` stack-overflows); `zip`
+  → `invokeOnClose on Channel.Factory`; `combine` → `invoke on SafeFlow`; `flatMapMerge`
+  → SafeCollector emit binds the collector as a bare function (the #6 root);
+  `drop`/`dropWhile`/`takeWhile` → `collect` on `unsafeFlow`; `onCompletion`+`catch` →
+  `invoke on $anon`. Mostly downstream of #6.
+- **Hot-flow suspending collector (#6, 0/3).** A `SharedFlow`/`StateFlow` collector that
+  suspends and then takes a *second* emit fails `Vm::call_member emit on kotlin.Function`
+  (resume-side SafeCollector emit binds the collector as a bare function,
+  `src/interp_ir/vm/host_call_member.zig`); `subscriptionCount` hits `unresolved global
+  lastReplayedLocked` (inherited-member-inline resolution, `src/ir/eval.zig`).
+- **`Dispatchers.Unconfined` eager-start ordering (#7, 0/3).** `Unconfined` must start the
+  child undispatched on the current thread until the first suspension, and `yield()` under
+  it must drain an unconfined event loop. Requires a distinct Unconfined dispatcher (not
+  aliased to `KlioDispatcher` at `KlioRuntime.kt:191`) + an eager-start branch in
+  `coroutineLaunch`. Shares a root with the #4 `onTimeout` crash (the missing event loop).
+- **`yield()` resume ordering (#8, 0/1).** An externally-resumed `CancellableContinuation`
+  must be ordered ahead of a subsequently-yielding coroutine in the ready queue; today a
+  `cont.resume()` + `yield()` re-schedules the yielder first, hanging the resumed coroutine
+  (`coroutineResumeExternal`/`resumeSlotValue` vs the yield ready-queue append in
+  `src/interp_ir/vm/coroutines.zig`).
+- **User top-level `coroutineContext` symbol (#9, 0/1).** A user-declared top-level
+  `coroutineContext` shadows the suspend-implicit intrinsic read at
+  `kotlin-klio/kotlin-coroutines/Intrinsics.kt:29` (and :121 / Actuals.kt) →
+  `ClassCastException: cast to Map failed`. A name-domain/resolution bug.
+- **`Dispatchers.Default` worker missed-wakeup deadlock (#10, 0/1).** Two-plus `Default`
+  workers producing into a channel + a worker consumer + a worker join-closer deadlock on
+  a dropped cross-thread wakeup (NOT subsumed by the channel fixes). Cross-thread resume
+  path `coroutineResumeExternal` / the DriverWakeup mailbox / SlotOwners in
+  `src/interp_ir/vm/coroutines.zig`.
 
-3. **Channel API + semantics (6 findings).** `trySend` returns `Boolean` not
-   `ChannelResult` (`.isSuccess` fails on a Bool), `tryReceive` returns the bare value
-   not `ChannelResult`, `isClosedForSend`/`isClosedForReceive` are dispatched as methods
-   not properties, `produce` returns a `ReceiveChannel` whose `receive()` is broken,
-   rendezvous `send` doesn't suspend (it behaves buffered), and a conflated channel keeps
-   all values instead of the latest. Root: the channel actuals
-   (`src/kotlinx_coroutines/kotlinx_coroutines.zig` + the `KlioChannel` klioMain) have
-   wrong return types and buffering semantics. Fix: return `ChannelResult` from
-   `trySend`/`tryReceive`, make the closed-flags properties, implement rendezvous +
-   conflated buffering, fix `produce`.
+### Adjacent defect
 
-4. **`select` + `Semaphore` (6 findings).** Every `select` clause crashes/errs —
-   `onReceive`/`onSend`/`onReceiveCatching` (members unresolved on `KlioChannel`),
-   `onAwait` (unresolved on `Job.Key`), and `onTimeout` **SEGFAULTs** (unbounded
-   recursion through the select machinery). `Semaphore.withPermit` under contention
-   crashes (`BinOp.Less on {ir-closure} and kotlin.Unit`). Fix: implement the `select`
-   builder + the channel/deferred `SelectClause`s; fix the `Semaphore` permit accounting.
+- **Cancel of a coroutine parked on a channel `send`/`receive` hangs.** klio's channel
+  park is a host intrinsic (`coroutineArmSlot`), so it bypasses `CancellableContinuation`
+  and `Job.cancel` cannot reach it — `cancelAndJoin` of a parked send *or* receive never
+  resumes with `CancellationException`. Related to the PART B worker-cancel remnant: a
+  channel park must register cancellation interest so a cancel resumes its slot with the
+  exception.
 
-5. **Channel-backed flow operators (4 findings).** `buffer`/`conflate`/`flowOn`
-   (ChannelFlow → `iterator` on a channel), `combine`/`zip`/`flatMapMerge` (`invoke` on a
-   `SafeCollector`), `drop`/`dropWhile`/`takeWhile` (`collect` on `unsafeFlow`), and
-   `onCompletion` + `catch` (`invoke` on `$anon`). Mostly **downstream of #3 (channels)**
-   and the SafeCollector emit path (#6); re-verify after those land.
-
-6. **Hot-flow suspending collector (3 findings).** A `SharedFlow`/`StateFlow` collector
-   that suspends and then takes a *second* emit fails with `Vm::call_member emit on
-   kotlin.Function` (`src/interp_ir/vm/host_call_member.zig:3013` — the SafeCollector
-   emit dispatch on resume binds the collector as a bare function). And
-   `subscriptionCount` hits `unresolved global lastReplayedLocked` — the *same*
-   pack-member-inline-unresolved class as `forEachSlotLocked` (now fixed) but for another
-   `AbstractSharedFlow` member (`src/ir/eval.zig:3045`). Fix: the resume-side
-   SafeCollector emit must dispatch the collector's `emit`, and `lastReplayedLocked`
-   needs the inherited-member-inline resolution.
-
-7. **`Dispatchers.Unconfined` eager-start ordering (3 findings).** `Unconfined` should
-   start eagerly on the current thread until the first suspension; klio's interleaving
-   differs (`A C B D` vs Kotlin's order). The narrowest genuine remnant of the "eager"
-   divergence (default `launch` ordering is already correct).
-
-8. **`yield()` doesn't yield to the pump (1, found pre-audit).** In a `launch`-collector
-   loop resumed across `yield()`s from another coroutine, the yielder runs again before
-   the ready coroutine, double-resuming the same continuation → `Already resumed`
-   (`/tmp` repro `loopsusp.kt`). Not on the collectAsState path (that uses delay/slot
-   resume), but a real dispatch-ordering bug.
-
-9. **User top-level `coroutineContext` symbol corrupts the runtime (1).** A user-declared
-   top-level `coroutineContext` (or similar coroutine-intrinsic name) shadows/poisons the
-   runtime → `ClassCastException: cast to Map failed`. A name-domain/resolution bug, same
-   family as the `System.err` → `Clock.System` clash noted while probing.
-
-10. **`channel_worker_writer` missed-wakeup deadlock (pre-existing, from memory).** A
-    `ByteChannel` + `Dispatchers.Default` worker hangs on a missed wakeup. Re-verify after
-    the channel + dispatcher fixes; may be subsumed.
-
-Unsure/uncconfirmed: 2 probes the audit could not pin to a definite Kotlin-correct
-output — re-derive before acting.
-
-**Suggested fix order:** #1 (structured-concurrency leak — the KlioRuntime parent-failure
-path) and #2 (CEH + segfault) first (highest user impact, shared root in KlioRuntime);
-then #3 (channels) which unblocks #4 (select), #5 (channel flow ops), and parts of #6;
-then #6/#7/#8 (flow + dispatch ordering); #9 is an isolated resolution fix. Each fix
-ships with a deterministic probe promoted into the parity/e2e corpus.
+**Suggested fix order:** the #4 `onTimeout` remnant + the cancel-on-channel-park defect
+(closes out the select work); then #1 + #2 (shared `KlioRuntime` root, one segfault);
+then the flow/dispatch cluster #5–#8 (largest, with #7 Unconfined the shared root the #4
+`onTimeout` crash also touches); #9/#10 are isolated. Each fix ships a deterministic probe
+promoted into the parity/e2e corpus.
 
 ---
 
@@ -786,14 +786,29 @@ Two more were the channel `poll` paths missing a parked counterparty, now fixed:
    placement. A parking `receive` now offers to `onSend` selects, and the wake
    signals placement so the value reaches the receiver.
 
-**Working and reliable:** a single parking `select` over channel `onReceive`, a
-deferred `onAwait` (ready and parking), `onTimeout`, `onSend` (receiver-first or
-sender-first), `Semaphore` under contention, multi-clause select where one clause
-parks, a select loop over a buffered *or* rendezvous channel, and a balanced
-fan-in/out where either party arrives first. An unbalanced program (more sends
-than receives, or vice-versa) still deadlocks — correctly, as it must.
+An `onSend` select feeding a `for (x in channel)` iterator consumer was a third
+manifestation, also fixed: the iterator's parked `hasNext` (in `receive_iter_waiters`)
+now carries the channel handle and offers itself to registered `onSend` selects, so an
+iterator consumer is woken for every element, not just the first.
 
-The earlier suspicion that the rendezvous-park case was the B1 continuation-identity
-bug was wrong: the activation resume path was fine; the two channel `poll` paths
-above simply never admitted a parked counterparty. B1 remains relevant only to
+**Working and reliable:** a single parking `select` over channel `onReceive`/
+`onReceiveCatching` (incl. observing a close while parked), a deferred `onAwait` (ready
+and parking), `onSend` (receiver-first or sender-first, and feeding a channel-iterator
+consumer), `Semaphore` under contention, a multi-clause select where one clause parks, a
+select loop over a buffered *or* rendezvous channel, and a balanced fan-in/out where
+either party arrives first. An unbalanced program (more sends than receives, or
+vice-versa) still deadlocks — correctly, as it must.
+
+The earlier suspicion that the rendezvous-park case was the B1 continuation-identity bug
+was wrong: the activation resume path was fine; the channel `poll` paths above simply
+never admitted a parked counterparty. B1 remains relevant only to
 `StateFlow.collectAsState` / suspending flow collectors, not to `select`.
+
+**Remaining `select` work (see STATUS at the top):** an `onTimeout` timer that is
+registered, parks, and then *loses* to a channel/`onAwait` clause crashes
+`Vm::call_member invoke on kotlinx.coroutines.Runnable` inside the
+`CancellableContinuationImpl.tryResume` decision-state loop — the parked select's
+installed cancel handler colliding with the resume while the timer continuation is still
+scheduled (a shared root with the missing unconfined event loop, #7). `onTimeout` that
+wins is fine. Separately, cancelling a coroutine parked on a channel `send`/`receive`
+hangs, because the channel park is a host intrinsic that bypasses `CancellableContinuation`.
