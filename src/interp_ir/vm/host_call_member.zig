@@ -5809,6 +5809,31 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
     }
 
+    // A low-priority candidate (`@Deprecated(level = ERROR/HIDDEN)`,
+    // `@LowPriorityInOverloadResolution`) is only a candidate when no ordinary
+    // overload applies — kotlinc hides it from resolution. Drop them up front
+    // when any ordinary candidate exists, for BOTH the strict and lenient
+    // passes below. Without this, the lenient pass can bind a HIDDEN
+    // binary-compat stub that delegates to a sibling overload but self-recurses
+    // (`buffer(capacity) = buffer(capacity)`, conflate → stack overflow).
+    {
+        var any_ordinary = false;
+        for (candidates.items) |c| {
+            if (!c.func.low_priority) {
+                any_ordinary = true;
+                break;
+            }
+        }
+        if (any_ordinary) {
+            var filtered: std.ArrayList(Candidate) = .empty;
+            for (candidates.items) |c| {
+                if (!c.func.low_priority) filtered.append(allocator, c) catch {};
+            }
+            candidates.deinit(allocator);
+            candidates = filtered;
+        }
+    }
+
     // Receiver-type filter. The strict probe (the bare-name resolver's
     // innermost-first walk) demands a *proven* receiver match — the
     // declared receiver type (or a generic / `Any` / function-shape
