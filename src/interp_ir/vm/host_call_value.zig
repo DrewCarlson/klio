@@ -120,7 +120,23 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             }
             return r;
         }
-        return host_call_member.callMember(self, allocator, callee, "invoke", args);
+        const inv = try host_call_member.callMember(self, allocator, callee, "invoke", args);
+        // A `fun interface` instance with a single abstract method that is NOT
+        // `invoke` — notably `kotlinx.coroutines.Runnable { fun run() }` — is
+        // invoked as a function value by the dispatcher resume path
+        // (`block()`); route it to `run()`. Only on the `invoke` dispatch miss,
+        // so an `operator fun invoke` or a SAM whose method IS `invoke` is
+        // unaffected.
+        if (inv == .err and inv.err == .Unimplemented and callee.* == .Instance and
+            host_call_member.hostHasMember(self, callee, "run"))
+        {
+            if (runtime.freeScratch()) {
+                const m = inv.err.Unimplemented;
+                if (std.mem.indexOf(u8, m, "Vm::call_member") != null) allocator.free(m);
+            }
+            return host_call_member.callMember(self, allocator, callee, "run", args);
+        }
+        return inv;
     }
     // Constructor-like call on a user class value
     // (`val ctor = ::Foo; ctor(1, 2)`). Falls through to a
