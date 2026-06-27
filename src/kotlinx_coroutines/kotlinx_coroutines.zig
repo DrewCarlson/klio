@@ -65,6 +65,11 @@ const ChannelState = struct {
     /// `onSend` clause). When a buffer slot frees, the channel offers the
     /// send to each registered select via `trySelect`.
     select_send_waiters: Deque(ObjRef(InstanceData)),
+    /// `SendChannel.invokeOnClose` handlers — each a `(cause: Throwable?) ->
+    /// Unit`. Invoked once, in registration order, when the channel closes
+    /// (with the close cause, or null for a normal close). Registering on an
+    /// already-closed channel invokes immediately.
+    close_handlers: Deque(Value),
 
     const IterWaiter = struct { slot: i64, iter: ObjRef(InstanceData) };
     const SendWaiter = struct { slot: i64, value: Value };
@@ -83,6 +88,7 @@ const ChannelState = struct {
             .send_waiters = Deque(SendWaiter).empty,
             .select_recv_waiters = Deque(ObjRef(InstanceData)).empty,
             .select_send_waiters = Deque(ObjRef(InstanceData)).empty,
+            .close_handlers = Deque(Value).empty,
         };
     }
 
@@ -93,6 +99,7 @@ const ChannelState = struct {
         self.send_waiters.deinit(allocator);
         self.select_recv_waiters.deinit(allocator);
         self.select_send_waiters.deinit(allocator);
+        self.close_handlers.deinit(allocator);
     }
 
     fn removeSelectInst(deque: *Deque(ObjRef(InstanceData)), sel: ObjRef(InstanceData)) void {
@@ -200,6 +207,7 @@ fn gcMarkCoroReg(m: *runtime.gc.Marker) void {
         for (st.receive_iter_waiters.items.items) |w| m.shade(&w.iter.cell.hdr);
         for (st.select_recv_waiters.items.items) |sel| m.shade(&sel.cell.hdr);
         for (st.select_send_waiters.items.items) |sel| m.shade(&sel.cell.hdr);
+        for (st.close_handlers.items.items) |h| h.gcMark(m);
     }
 }
 
@@ -792,19 +800,55 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // channel and observes the close.
     var sel_recvs: []ObjRef(InstanceData) = &.{};
     var sel_sends: []ObjRef(InstanceData) = &.{};
+    var handlers: []Value = &.{};
     {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
         if (coro_reg.channels.getPtr(id)) |state| {
             sel_recvs = state.select_recv_waiters.drain(regAllocator()) catch &.{};
             sel_sends = state.select_send_waiters.drain(regAllocator()) catch &.{};
+            handlers = state.close_handlers.drain(regAllocator()) catch &.{};
         }
     }
     defer regAllocator().free(sel_recvs);
     defer regAllocator().free(sel_sends);
+    defer regAllocator().free(handlers);
     for (sel_recvs) |sel| _ = selectTrySelect(ctx, sel, recv, CLOSED_MARKER);
     for (sel_sends) |sel| _ = selectTrySelect(ctx, sel, recv, CLOSED_MARKER);
+    // `invokeOnClose` handlers run once, with the close cause (null for a
+    // normal close). `close()`'s no-arg form (`KlioChannel.cancel`/`close`)
+    // closes without a cause.
+    for (handlers) |h| {
+        _ = ctx.host.invokeCallable(&h, &.{.Null}, ctx.out) catch {};
+        if (runtime.reclaimEnabled()) h.release(ctx.allocator);
+    }
     return .{ .ok = .{ .Bool = true } };
+}
+
+/// `SendChannel.invokeOnClose(handler)` — register a `(cause: Throwable?) ->
+/// Unit` invoked once when the channel closes. On an already-closed channel
+/// the handler runs immediately (with a null cause for a normal close).
+fn channelInvokeOnClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .err = .{ .Arity = "Channel.invokeOnClose expects (receiver, handler)" } };
+    const recv = ctx.args[0];
+    const handler = ctx.args[1];
+    const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.invokeOnClose: bad receiver" } };
+    var run_now = false;
+    {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.invokeOnClose: missing state" } };
+        if (state.closed) {
+            run_now = true;
+        } else {
+            if (runtime.reclaimEnabled()) handler.retain();
+            try state.close_handlers.pushBack(regAllocator(), handler);
+        }
+    }
+    if (run_now) {
+        _ = ctx.host.invokeCallable(&handler, &.{.Null}, ctx.out) catch {};
+    }
+    return .{ .ok = .Unit };
 }
 
 /// Internal-result sentinel handed to `trySelect` when a channel clause
@@ -1486,6 +1530,7 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.isClosedForSend", .f = channelIsClosedForSend },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.isClosedForReceive", .f = channelIsClosedForReceive },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.isEmpty", .f = channelIsEmpty },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.invokeOnClose", .f = channelInvokeOnClose },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.iterator", .f = channelIterator },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannelIterator.hasNext", .f = channelIterHasNext },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannelIterator.next", .f = channelIterNext },

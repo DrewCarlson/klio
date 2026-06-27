@@ -88,8 +88,10 @@ are the implementation notes behind these verdicts.
   overload, dropping `onBufferOverflow` into `start` and `block` into `onCompletion`, so
   `coroutine.invokeOnCompletion(handler = onBufferOverflow)` ran with a `BufferOverflow` where
   a `JobNode` was expected. REMAINING:
-  - `zip` → `invokeOnClose` is unimplemented on klio channels (a real missing intrinsic — even
-    a plain `Channel<Int>().invokeOnClose{}` errors `Vm::call_member invokeOnClose on KlioChannel`).
+  - `zip` → `invokeOnClose` is now implemented (a real channel intrinsic + close-handler list;
+    `examples/channel_invoke_on_close.kt`). zip now progresses past it to a deeper layer:
+    `Vm::get_field coroutineContext on StackFrameContinuation` (the `withContextUndispatched` +
+    `threadContextElements` + suspend-implicit `coroutineContext` machinery). Still open.
   - `combine` → builder layer FIXED (the `fun Flow<T1>.combine(flow: Flow<T2>, …) = flow { … }`
     parameter named `flow` shadowed the `flow {}` builder; see the non-fn-param shadow commit).
     It now reaches a deeper `collect on SafeCollector` layer in `combineInternal`'s
