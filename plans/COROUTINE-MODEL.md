@@ -93,8 +93,12 @@ are the implementation notes behind these verdicts.
   - `combine` → builder layer FIXED (the `fun Flow<T1>.combine(flow: Flow<T2>, …) = flow { … }`
     parameter named `flow` shadowed the `flow {}` builder; see the non-fn-param shadow commit).
     It now reaches a deeper `collect on SafeCollector` layer in `combineInternal`'s
-    `launch { flows[i].collect { … } }` + batched `resultChannel.receiveCatching()` machinery —
-    still open.
+    `flows[i].collect { … }`. Isolated: a call to an **inline** Flow extension (`collect`,
+    `first`) whose receiver is a **local / array-index value** (type not statically a Flow),
+    made inside a `FlowCollector<R>` extension body, splices with the receiver bound to the
+    enclosing implicit `this` (the SafeCollector) instead of the actual receiver value —
+    `f.collect{}` with `f: Flow` *param* works (ci_min4), `val f = flows[i]; f.collect{}` fails
+    (ci_min5). An inline-splice receiver-binding bug for an untyped-local receiver. Still open.
   - `conflate`/`flatMapMerge` → SIGSEGV (stack overflow in the channel-flow + merge path).
   - `takeWhile`/`transformWhile` → `invoke on $anon$0`: inside `unsafeFlow { collectWhile { … } }`
     a bare `emit`/`predicate` in the (non-inline) takeWhile lambda, once spliced into
