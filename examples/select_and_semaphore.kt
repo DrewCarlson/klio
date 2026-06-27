@@ -27,6 +27,26 @@ fun main() = runBlocking {
     }
     println(timed)
 
+    // A fan-in select over a rendezvous channel: the producer parks between its
+    // two sends, and each onReceive select takes a value handed off by the
+    // parked producer. Both values arrive in order.
+    val rv = Channel<Int>()
+    launch { rv.send(1); rv.send(2) }
+    val drained = mutableListOf<Int>()
+    repeat(2) { drained.add(select<Int> { rv.onReceive { it } }) }
+    println(drained)
+
+    // An onSend select that parks before any receiver exists is woken when a
+    // later receive arrives: the parked select hands its value straight to the
+    // new receiver, which then takes a second plain send.
+    val out = Channel<Int>()
+    val got = mutableListOf<Int>()
+    val consumer = launch { repeat(2) { got.add(out.receive()) } }
+    select<Unit> { out.onSend(10) {} }
+    out.send(20)
+    consumer.join()
+    println(got)
+
     // A binary semaphore serializes two launches: the second acquirer
     // suspends until the first releases, so the critical sections do not
     // interleave and both run exactly once.

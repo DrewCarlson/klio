@@ -770,27 +770,30 @@ Two more were the wake-up itself, now fixed:
 Plus `channel.onSend(value) { }` now dispatches (the clause-invoke fallback passes
 the leading value before the trailing lambda).
 
+Two more were the channel `poll` paths missing a parked counterparty, now fixed:
+
+6. **`onReceive` select missed a parked sender on a rendezvous channel (FIXED).**
+   `channelSelectPollReceive` only drained the buffer; on an empty-buffer
+   (rendezvous) channel with a parked sender it returned not-ready, so the select
+   parked even though a sender was waiting. It now takes a parked sender's value
+   directly, mirroring a plain `receive`. This is what made a fan-in select loop
+   over a rendezvous channel (`launch { c.send(1); c.send(2) }` + two
+   `select { c.onReceive }`) hang: the second select never saw the second send.
+7. **`onSend` select woken by a receive never placed its value (FIXED).** A plain
+   `receive` that parked did not offer itself to a registered `onSend` select, and
+   `offerSendToSelectSenders` signalled the woken select with `Unit` — which
+   `klioProcessSend` reads as "already sent during registration" and skips
+   placement. A parking `receive` now offers to `onSend` selects, and the wake
+   signals placement so the value reaches the receiver.
+
 **Working and reliable:** a single parking `select` over channel `onReceive`, a
-deferred `onAwait` (ready and parking), `onTimeout`, `onSend`, `Semaphore` under
-contention, multi-clause select where one clause parks, and a select loop over a
-buffered channel.
+deferred `onAwait` (ready and parking), `onTimeout`, `onSend` (receiver-first or
+sender-first), `Semaphore` under contention, multi-clause select where one clause
+parks, a select loop over a buffered *or* rendezvous channel, and a balanced
+fan-in/out where either party arrives first. An unbalanced program (more sends
+than receives, or vice-versa) still deadlocks — correctly, as it must.
 
-Remaining (the B1 continuation-identity bug):
-
-6. **A rendezvous sender that parks *after* its offer drops the select's wake.**
-   When the offering send hands its value to the select and then itself suspends
-   on a later send (`launch { c.send(1); c.send(2) }` with the select taking 1 and
-   the sender parking on 2), the select never resumes. The wake goes through the
-   dispatcher: `cont.tryResume` -> `completeResume` -> `KlioDispatcher.dispatch` ->
-   `__kxco_spawn { block.run() }`. The spawn DOES fire (pump trace:
-   `enqueueLaunch ... launched.len now=1`, drained each round), but running the
-   block does not resume the select activation that parked on its kxco slot
-   (`1<<48`) - it re-runs the block instead, so the activation stays parked and the
-   pump stalls (`parked=2 ready=0`). `park.kt` works only because there the sender
-   *completes* after the offer and the activation's real slot is resumed by a
-   direct path rather than the dispatcher.
-   This is the documented **B1 continuation-identity bug** (above): a dispatcher
-   resume must resume the *captured activation* (by its slot/token), never
-   re-invoke the closure from scratch. Fixing B1 unblocks both the rendezvous
-   parking select here and `StateFlow.collectAsState` / suspending flow collectors.
-   Everything else in the parking-select stack (1-5) is fixed and in `main`.
+The earlier suspicion that the rendezvous-park case was the B1 continuation-identity
+bug was wrong: the activation resume path was fine; the two channel `poll` paths
+above simply never admitted a parked counterparty. B1 remains relevant only to
+`StateFlow.collectAsState` / suspending flow collectors, not to `select`.
