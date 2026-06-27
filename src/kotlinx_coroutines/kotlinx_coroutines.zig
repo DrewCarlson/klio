@@ -1040,6 +1040,9 @@ fn channelIterator(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // The channel id is an opaque u64 stored bit-for-bit in a Long slot.
     const fields = [_]InstanceData.Field{
         .{ .name = "__channel_id__", .value = .{ .Long = @bitCast(ch_id) } },
+        // Keep the channel handle so a parked `hasNext` can offer itself to a
+        // registered `onSend` select (the offer needs the clause object).
+        .{ .name = "__channel__", .value = recv },
         .{ .name = "__pending__", .value = .Null },
     };
     const inst = try ctx.host.newSynthInstance("kotlinx.coroutines.channels.KlioChannelIterator", id, &fields);
@@ -1114,6 +1117,12 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .Closed, .NoState => return .{ .ok = .{ .Bool = false } },
         .ParkOnSlot => |slot| {
             ctx.host.coroutineArmSlot(slot);
+            // This iterator is now parked in `receive_iter_waiters`; a
+            // registered `onSend` select can hand its value straight to it,
+            // exactly as a plain parking `receive` offers to `onSend` selects.
+            if (iter_inst.asPtr().get("__channel__")) |chan| {
+                _ = offerSendToSelectSenders(ctx, ch_id, chan);
+            }
             return .{ .err = .{ .Suspend = -1 } };
         },
     }

@@ -480,3 +480,26 @@ test "select_onreceive_observes_close_while_parked" {
     ;
     try assertKlio("select_onreceive_close", src, "[v=1, v=2, closed]\n");
 }
+
+// An `onSend` select feeds a `for (x in channel)` iterator consumer: the
+// iterator's parked `hasNext` is woken by a registered `onSend` select for
+// each element, not just the first.
+test "select_onsend_feeds_channel_iterator" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val c = Channel<Int>()
+        \\    val consumer = launch { for (x in c) println("got $x") }
+        \\    select<Unit> { c.onSend(1) {} }
+        \\    select<Unit> { c.onSend(2) {} }
+        \\    c.close()
+        \\    consumer.join()
+        \\    println("done")
+        \\}
+        \\
+    ;
+    try assertKlio("select_onsend_iterator", src, "got 1\ngot 2\ndone\n");
+}
