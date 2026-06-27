@@ -66,6 +66,7 @@ const isPackageHead = literals.isPackageHead;
 const isPkgRoot = literals.isPkgRoot;
 
 const isTopLevelProp = inline_state.isTopLevelProp;
+const isDroppedStdlibFactory = inline_state.isDroppedStdlibFactory;
 const inlineFnAst = inline_state.inlineFnAst;
 const inlineFnAstForRecv = inline_state.inlineFnAstForRecv;
 const CallShape = inline_state.CallShape;
@@ -1138,7 +1139,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // plain extension receiver does not lexically see — the
             // runtime walk below resolves member-vs-global with the right
             // receiver scope.
-            const is_known_global = b.module.funcId(name0) != null or isTopLevelProp(name0);
+            const is_known_global = b.module.funcId(name0) != null or isTopLevelProp(name0) or isDroppedStdlibFactory(name0);
             if (!is_known_global) {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -3545,10 +3546,62 @@ fn lowerValueInvocation(
 
 /// Whether a single-segment class-name call resolves to the constructor
 /// rather than a same-named factory function.
+const LitKind = enum { numeric, string, boolean, char };
+
+/// Definite builtin value kind of a literal argument expression, or null when
+/// the argument's type is not a known literal (so it can never *disprove* a
+/// candidate parameter type).
+fn argLitKind(e: *const Expr) ?LitKind {
+    return switch (e.*) {
+        .IntLit, .FloatLit => .numeric,
+        .BoolLit => .boolean,
+        .CharLit => .char,
+        .StringTemplate => .string,
+        else => null,
+    };
+}
+
+/// Builtin value kind a declared parameter type accepts, or null when unknown
+/// (a user class, a type parameter, `Any`, …) — those never disprove.
+fn paramLitKind(type_name: []const u8) ?LitKind {
+    const n = std.mem.trimEnd(u8, type_name, "?");
+    const eq = std.mem.eql;
+    if (eq(u8, n, "Int") or eq(u8, n, "Long") or eq(u8, n, "Short") or eq(u8, n, "Byte") or
+        eq(u8, n, "UInt") or eq(u8, n, "ULong") or eq(u8, n, "UShort") or eq(u8, n, "UByte") or
+        eq(u8, n, "Double") or eq(u8, n, "Float") or eq(u8, n, "Number")) return .numeric;
+    if (eq(u8, n, "String") or eq(u8, n, "CharSequence")) return .string;
+    if (eq(u8, n, "Boolean")) return .boolean;
+    if (eq(u8, n, "Char")) return .char;
+    return null;
+}
+
+/// True when a same-name factory's declared parameter types DEFINITELY cannot
+/// accept the literal argument kinds (e.g. an `Int` literal against a `String`
+/// parameter) — so the bare `Name(args)` constructs the class rather than
+/// calling the factory. Conservative: an unknown argument or parameter kind
+/// never disproves, so only a literal-vs-builtin mismatch flips the decision.
+fn factorySigRejectsArgs(sig: []const ir.TypeRef, args: []const Expr) bool {
+    for (args, 0..) |*a, i| {
+        if (i >= sig.len) break;
+        const ak = argLitKind(a) orelse continue;
+        const pk = paramLitKind(sig[i].name) orelse continue;
+        if (ak != pk) return true;
+    }
+    return false;
+}
+
 fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) Allocator.Error!bool {
     if (callee.* != .Path or callee.Path.segments.len != 1) return false;
     const name = callee.Path.segments[0].name;
-    const cid = b.module.classId(name) orelse return false;
+    // Resolve the class the SAME way the construct path below does — through
+    // the scope-aware index (file imports, then self package, then global) —
+    // not the simple-name-global `classId`, which picks an arbitrary winner on
+    // a cross-package simple-name collision. Otherwise a bare `Name(args)` here
+    // can be judged against the wrong same-named class (e.g. an abstract
+    // `kotlinx.coroutines.internal.Segment` shadowing the concrete
+    // `kotlinx.io.Segment` at its own construction site), inverting the
+    // ctor-vs-factory decision.
+    const cid = b.module.classIdIndexed(name, b.self_package, callee.Path.segments[0].span.file) orelse return false;
     // An abstract/interface/sealed class cannot be constructed, so a bare
     // `Name(args)` is never a constructor call — it is a same-named factory
     // function (`fun Random(seed): Random`). Resolve it as a function (the
@@ -3587,6 +3640,14 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
         if (b.module.decl_user_arity.get(entry.id.int())) |arity| {
             const n: u32 = @intCast(nargs);
             if (n >= arity.required and (arity.has_vararg or n <= arity.total)) {
+                // A same-arity factory whose declared parameter types
+                // definitely cannot accept the literal argument types is not
+                // applicable — the call constructs the class instead. This is
+                // what tells `Box(5)` (ctor `Box(Int)`) from the same-arity
+                // factory `fun Box(s: String)`.
+                if (b.module.decl_user_sig.get(entry.id.int())) |sig| {
+                    if (factorySigRejectsArgs(sig, args)) continue;
+                }
                 any_factory_applicable = true;
                 break;
             }
@@ -4661,7 +4722,6 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
         }
         break :blk null;
     };
-    const run = try lowerArgRunWithArity(b, all, arg_arity);
 
     // Target params for trailing-lambda arg-name synthesis.
     var target_params: [][]const u8 = &.{};
@@ -4739,6 +4799,11 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
         } });
         return dst;
     }
+    // The member-precedence branch above lowers its own argument run and
+    // returns; only the static-call path reaches here, so the `this`-prepended
+    // run is lowered now — lowering it earlier would emit (and execute) every
+    // argument's side effects a second time on the member path.
+    const run = try lowerArgRunWithArity(b, all, arg_arity);
     const dst = b.allocReg();
     try b.push(.{ .Call = .{
         .dst = dst,

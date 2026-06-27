@@ -4240,9 +4240,60 @@ fn collectColl(a: Allocator, v: ?Value) Error!?[]Value {
     return null;
 }
 
+/// A removeAll/retainAll argument that is a lambda/function reference (not a
+/// collection or a callable user Collection instance) is the predicate form
+/// `removeAll { (T) -> Boolean }`.
+fn isPredicateArg(v: Value) bool {
+    return switch (v) {
+        .IrClosure, .BoundMethod, .BoundUserMethod, .Function, .Intrinsic => true,
+        else => false,
+    };
+}
+
+/// `MutableCollection.removeAll/retainAll { predicate }`: keep an element when
+/// `retain == predicate(element)`.
+fn mutCollRemoveRetainPred(ctx: *CallCtx, items: ValueList, recv: Value, retain: bool) Error!EvalResult {
+    const a = ctx.allocator;
+    const pred = ctx.args[1];
+    const snap = try snapshotItems(a, items);
+    defer if (runtime.freeScratch()) a.free(snap);
+    const keep = try a.alloc(bool, snap.len);
+    defer if (runtime.freeScratch()) a.free(keep);
+    for (snap, 0..) |v, i| {
+        const rv = switch (try invoke(ctx, &pred, &.{v})) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+        const truth = rv == .Bool and rv.Bool;
+        keep[i] = if (retain) truth else !truth;
+    }
+    var changed = false;
+    {
+        const g = items.borrowMut();
+        defer g.deinit();
+        const list = g.get();
+        const before = list.items.len;
+        var w: usize = 0;
+        for (list.items, 0..) |v, i| {
+            const k = if (i < keep.len) keep[i] else true;
+            if (k) {
+                list.items[w] = v;
+                w += 1;
+            } else if (runtime.reclaimEnabled()) {
+                v.release(a);
+            }
+        }
+        list.shrinkRetainingCapacity(w);
+        changed = list.items.len != before;
+    }
+    if (changed) syncMapView(a, recv);
+    return ok(.{ .Bool = changed });
+}
+
 fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []const u8, retain: bool, allow_array: bool) Error!EvalResult {
     const a = ctx.allocator;
     const arg = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
+    if (isPredicateArg(arg)) return mutCollRemoveRetainPred(ctx, items, recv, retain);
     const other = blk: {
         switch (arg) {
             .List => |l| break :blk try snapshotItems(a, l.items),
@@ -5025,11 +5076,17 @@ pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeSetVL(a, it, true));
 }
 
-fn withIndexImpl(a: Allocator, items: []const Value) Error!Value {
+fn withIndexImpl(ctx: *CallCtx, items: []const Value) Error!Value {
+    const a = ctx.allocator;
     var indexed: std.ArrayList(Value) = .empty;
     for (items, 0..) |v, i| {
         v.retain();
-        try indexed.append(a, try makePair(a, Value.newInt(@intCast(i)), v));
+        const id = ctx.host.allocInstanceId();
+        const fields = [_]InstanceData.Field{
+            .{ .name = "index", .value = Value.newInt(@intCast(i)) },
+            .{ .name = "value", .value = v },
+        };
+        try indexed.append(a, try ctx.host.newSynthInstance("kotlin.collections.IndexedValue", id, &fields));
     }
     return makeListFromArrayList(a, indexed, false);
 }
@@ -5040,7 +5097,7 @@ pub fn coll_list_with_index(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try withIndexImpl(a, try snapshotItems(a, it)));
+    return ok(try withIndexImpl(ctx, try snapshotItems(a, it)));
 }
 pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -5050,7 +5107,7 @@ pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     defer if (runtime.freeScratch()) a.free(items);
-    return ok(try withIndexImpl(a, items));
+    return ok(try withIndexImpl(ctx, items));
 }
 
 pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
@@ -5225,7 +5282,7 @@ pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try withIndexImpl(a, try snapshotItems(a, it)));
+    return ok(try withIndexImpl(ctx, try snapshotItems(a, it)));
 }
 pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;

@@ -93,6 +93,18 @@ pub const IMPLICIT_ALIASES = [_]Alias{
     .{ .name = "mutableMapOf", .fqn = "kotlin.collections.mutableMapOf" },
     .{ .name = "mutableSetOf", .fqn = "kotlin.collections.mutableSetOf" },
     .{ .name = "setOf", .fqn = "kotlin.collections.setOf" },
+    // Collection factories whose Kotlin source the build drops for an intrinsic
+    // (so they have no lowered FuncId): bind them as value-position globals too,
+    // so `factory(*array)` spread calls and value-position references resolve.
+    .{ .name = "arrayListOf", .fqn = "kotlin.collections.arrayListOf" },
+    .{ .name = "hashMapOf", .fqn = "kotlin.collections.hashMapOf" },
+    .{ .name = "linkedMapOf", .fqn = "kotlin.collections.linkedMapOf" },
+    .{ .name = "hashSetOf", .fqn = "kotlin.collections.hashSetOf" },
+    .{ .name = "linkedSetOf", .fqn = "kotlin.collections.linkedSetOf" },
+    .{ .name = "sortedSetOf", .fqn = "kotlin.collections.sortedSetOf" },
+    .{ .name = "sortedMapOf", .fqn = "kotlin.collections.sortedMapOf" },
+    .{ .name = "listOfNotNull", .fqn = "kotlin.collections.listOfNotNull" },
+    .{ .name = "setOfNotNull", .fqn = "kotlin.collections.setOfNotNull" },
     .{ .name = "to", .fqn = "kotlin.to" },
     .{ .name = "ArrayList", .fqn = "kotlin.collections.ArrayList" },
     .{ .name = "ArrayDeque", .fqn = "kotlin.collections.ArrayDeque" },

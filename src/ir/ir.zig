@@ -1988,25 +1988,30 @@ pub const Module = struct {
     /// so forward references that resolved to that id stay valid.
     pub fn addClass(self: *Module, allocator: Allocator, class_in: Class) Allocator.Error!ClassId {
         var class = class_in;
-        if (self.classIndexEntryByName(class.name)) |id| {
-            const existing = &self.classes.items[id.int()];
-            // A reserved `reserveClass` placeholder carries `is_stub`. The
-            // structural shape (fqn==name, empty methods/supertypes/init) is
-            // NOT a reliable stub test: a real class is added before its
-            // methods/supertypes/init are backpatched, so a genuine
-            // root-package class (whose fqn equals its simple name) is
-            // structurally identical to a stub. Trusting the explicit flag
-            // keeps a same-simple-name twin in another package distinct.
-            const is_stub = existing.is_stub;
-            // A reserved-stub fill, or the same class re-lowered
-            // (identical FQN), overwrites in place so forward
-            // references keep their id. A different fully-qualified
-            // name sharing the simple name is a genuinely distinct
-            // class from another package: give it its own ClassId —
-            // including a root-package class arriving after a packaged
-            // twin filled the slot (its FQN is its simple name, which
-            // must not alias it onto the other package's class).
-            if (is_stub or std.mem.eql(u8, existing.fqn, class.fqn)) {
+        // Match the reserved stub / a prior lowering by FULLY-QUALIFIED name,
+        // not simple name: two classes that share a simple name in different
+        // packages each keep their own slot (a `reserveClassFqn` pre-pass gives
+        // both a distinct stub up front so neither shadows the other at its own
+        // construction sites). A legacy stub reserved without an FQN
+        // (`reserveClass`, e.g. a nested class) carries `fqn == simple name`
+        // and is claimed only when no exact-FQN slot exists.
+        // Fast path: no class with this simple name yet → definitely new, so
+        // skip the same-name scan (the common, no-collision case stays cheap).
+        if (self.classIndexEntryByName(class.name) != null) {
+            var legacy_stub: ?ClassId = null;
+            for (self.class_index.items) |entry| {
+                if (!std.mem.eql(u8, entry.name, class.name)) continue;
+                const existing = &self.classes.items[entry.id.int()];
+                if (std.mem.eql(u8, existing.fqn, class.fqn)) {
+                    class.id = entry.id;
+                    self.classes.items[entry.id.int()] = class;
+                    return entry.id;
+                }
+                if (legacy_stub == null and existing.is_stub and std.mem.eql(u8, existing.fqn, class.name)) {
+                    legacy_stub = entry.id;
+                }
+            }
+            if (legacy_stub) |id| {
                 class.id = id;
                 self.classes.items[id.int()] = class;
                 return id;
@@ -2078,6 +2083,39 @@ pub const Module = struct {
             .id = id,
             .name = name,
             .fqn = name,
+            .primary_params = &.{},
+            .methods = &.{},
+            .init_block = null,
+            .companion = null,
+            .supertypes = &.{},
+            .is_inner = is_inner,
+            .is_stub = true,
+        });
+        return id;
+    }
+
+    /// Reserve a class placeholder keyed by its FULLY-QUALIFIED name + package.
+    /// Unlike `reserveClass` (simple-name dedup), two classes that share a
+    /// simple name across packages each get their own stub, so a same-named
+    /// class from another pack cannot shadow this one at its construction sites
+    /// during the window before its body lowers. Dedups only an exact-FQN
+    /// re-reservation of the SAME class.
+    pub fn reserveClassFqn(self: *Module, allocator: Allocator, name: []const u8, fqn: []const u8, pkg: []const u8, is_inner: bool) Allocator.Error!ClassId {
+        // Fast path: a simple-name collision is rare, so only scan when one
+        // exists; otherwise this is definitely a new class.
+        if (self.classIndexEntryByName(name) != null) {
+            for (self.class_index.items) |entry| {
+                if (!std.mem.eql(u8, entry.name, name)) continue;
+                if (std.mem.eql(u8, self.classes.items[entry.id.int()].fqn, fqn)) return entry.id;
+            }
+        }
+        const id = ClassId.from(@intCast(self.classes.items.len));
+        try self.class_index.append(allocator, .{ .name = name, .id = id });
+        try self.classes.append(allocator, .{
+            .id = id,
+            .name = name,
+            .fqn = fqn,
+            .package = pkg,
             .primary_params = &.{},
             .methods = &.{},
             .init_block = null,

@@ -74,6 +74,20 @@ fn lastIsVararg(params: []const ir.Param) bool {
     return params.len > 0 and params[params.len - 1].is_vararg;
 }
 
+/// A `vararg` parameter that is NOT the last parameter (Kotlin allows a vararg
+/// before trailing defaulted / named-only parameters). An all-positional call
+/// to such a function cannot be bound by the simple trailing-collapse path
+/// (`packVarargArgs`): the vararg must consume the positional args at its own
+/// position while the trailing parameters take their defaults. Such calls are
+/// routed through the reorder-aware binder in `callFuncNamed`.
+fn hasNonFinalVararg(params: []const ir.Param) bool {
+    if (params.len == 0) return false;
+    for (params[0 .. params.len - 1]) |p| {
+        if (p.is_vararg) return true;
+    }
+    return false;
+}
+
 /// `func.params.last()` default thunk lookup for `func`.
 fn funcDefaults(self: *VmHost, func: FuncId) ?[]?FuncId {
     const g = self.prog.borrow();
@@ -1077,8 +1091,8 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
     // overload by parameter name and supplied any implicit extension
     // receiver, so bind against `func_in` as given.
     const func = func_in;
-    if (any_named) {
-        if (funcAt(module, func)) |f| {
+    if (funcAt(module, func)) |f| {
+        if (any_named or hasNonFinalVararg(f.params)) {
             const params = f.params;
             // Reorder named args against the declared parameter list.
             var slots = try allocator.alloc(?Value, params.len);

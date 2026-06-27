@@ -278,6 +278,7 @@ fn inferReifiedTypeArgs(
     f: *const Function,
     explicit: []const TypeRef,
     expected: ?*const TypeRef,
+    ordered: []const ?*const Expr,
 ) Allocator.Error![]?TypeRef {
     var out = try allocator.alloc(?TypeRef, f.type_params.len);
     for (f.type_params, 0..) |_, i| {
@@ -291,8 +292,6 @@ fn inferReifiedTypeArgs(
         }
     }
     if (!needs_infer) return out;
-    const exp = expected orelse return out;
-    const ret = if (f.return_type) |*r| r else return out;
 
     var tp_names = std.StringHashMap(void).init(allocator);
     defer tp_names.deinit();
@@ -301,7 +300,27 @@ fn inferReifiedTypeArgs(
     }
     var subst = std.StringHashMap(TypeRef).init(allocator);
     defer subst.deinit();
-    try unifyTypeParam(ret, exp, &tp_names, &subst);
+
+    // Unify each declared value-parameter type against its actual argument.
+    // A reified `T` that appears only in a parameter position — including
+    // inside a function-typed parameter `block: (T) -> R`, solved from the
+    // lambda literal's parameter annotations (`{ s: String -> … }`) — is
+    // inferred here, before the return-type fallback below.
+    for (f.params, 0..) |*p, i| {
+        if (i >= ordered.len) break;
+        const arg = ordered[i] orelse continue;
+        try unifyParamAgainstArg(&p.ty, arg, &tp_names, &subst);
+    }
+
+    // Fallback: unify the declared return type against the call's expected
+    // (tail-position) type, so `val u: User = resp.body()` binds `T = User`
+    // with no explicit `<User>`.
+    if (expected) |exp| {
+        if (f.return_type) |*ret| {
+            try unifyTypeParam(ret, exp, &tp_names, &subst);
+        }
+    }
+
     for (f.type_params, 0..) |tp, i| {
         if (out[i] == null) {
             if (subst.get(tp.name.name)) |t| {
@@ -310,6 +329,31 @@ fn inferReifiedTypeArgs(
         }
     }
     return out;
+}
+
+/// Unify one declared value-parameter type against its actual argument
+/// expression, recording any reified type-parameter solutions in `subst`.
+/// A function-typed parameter `(P…) -> R` unifies each declared parameter
+/// type against the lambda literal's corresponding annotation, so a reified
+/// `T` carried only by a lambda parameter is solved from `{ s: String -> … }`.
+fn unifyParamAgainstArg(
+    param_ty: *const TypeRef,
+    arg: *const Expr,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+) Allocator.Error!void {
+    if (param_ty.function) |ft| {
+        if (arg.* == .Lambda) {
+            const lam = &arg.Lambda;
+            const n = @min(ft.params.len, lam.param_tys.len);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (lam.param_tys[i]) |*pt| {
+                    try unifyTypeParam(&ft.params[i], pt, tp_names, subst);
+                }
+            }
+        }
+    }
 }
 
 /// Unify a declared type (which may mention type parameters) against a
@@ -626,7 +670,7 @@ pub fn tryInlineCallWithTypeArgs(
     // reified parameters (the `Json.encodeToString(value)` shape) splices
     // fine without a binding.
     {
-        const probe = try inferReifiedTypeArgs(b.allocator, f, type_args, expected);
+        const probe = try inferReifiedTypeArgs(b.allocator, f, type_args, expected, ordered);
         defer b.allocator.free(probe);
         var unbound_reified = false;
         for (f.type_params, 0..) |tp, i| {
@@ -816,7 +860,7 @@ pub fn tryInlineCallWithTypeArgs(
     // unspecified is inferred by unifying the function's declared return
     // type against the call's expected (tail-position) type, so
     // `val u: User = resp.body()` binds `T = User` with no `<User>`.
-    const effective_type_args = try inferReifiedTypeArgs(b.allocator, f, type_args, expected);
+    const effective_type_args = try inferReifiedTypeArgs(b.allocator, f, type_args, expected, ordered);
     defer b.allocator.free(effective_type_args);
     const ReifiedRestore = struct { name: []const u8, prev: ?Reg };
     var reified_restores: std.ArrayList(ReifiedRestore) = .empty;
