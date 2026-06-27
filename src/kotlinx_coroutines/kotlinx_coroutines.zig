@@ -392,7 +392,11 @@ fn offerSendToSelectSenders(ctx: *CallCtx, id: u64, chan: Value) bool {
             }
         }
         const s = sel orelse return false;
-        if (selectTrySelect(ctx, s, chan, .Unit)) return true;
+        // A non-`Unit` internal result signals `klioProcessSend` to place the
+        // value now (it skips placement on `Unit`, which marks a value already
+        // sent during registration). Without this a woken `onSend` select
+        // completes without ever handing its value to the waiting receiver.
+        if (selectTrySelect(ctx, s, chan, .{ .Bool = true })) return true;
     }
 }
 
@@ -675,6 +679,12 @@ fn channelReceiveImpl(ctx: *CallCtx, catching: bool) std.mem.Allocator.Error!Eva
         },
         .ParkOnSlot => |slot| {
             ctx.host.coroutineArmSlot(slot);
+            // This receiver is now parked in `receive_waiters`; a registered
+            // `onSend` select can hand its value straight to it (the mirror of
+            // a send offering a parked `onReceive` select). Without this an
+            // `onSend` select that parked before any receiver arrived would
+            // never be woken by a later plain `receive`.
+            _ = offerSendToSelectSenders(ctx, id, recv);
             return .{ .err = .{ .Suspend = -1 } };
         },
     }
@@ -910,6 +920,12 @@ fn channelSelectPollReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                 resumed = sw.slot;
             }
             outcome = .{ .Got = .{ .value = v, .resumed = resumed } };
+        } else if (state.send_waiters.popFront()) |sw| {
+            // Empty buffer (or rendezvous) but a sender is parked: take its
+            // value directly and admit the sender, exactly as a plain
+            // `receive` rendezvous does. Without this an `onReceive` select
+            // would miss a parked sender and park forever.
+            outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot } };
         } else if (state.closed) {
             outcome = .Closed;
         } else {
