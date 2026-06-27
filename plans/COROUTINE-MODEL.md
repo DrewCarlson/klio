@@ -106,7 +106,12 @@ are the implementation notes behind these verdicts.
     `Array<out Flow<T>>` element. Fix needs element-type inference for an index receiver (and
     combine has further layers — the batched `resultChannel.receiveCatching()` loop — beyond it).
     Still open.
-  - `conflate`/`flatMapMerge` → SIGSEGV (stack overflow in the channel-flow + merge path).
+  - `conflate` → FIXED. `conflate() = buffer(CONFLATED)`, and the `@Deprecated(level=HIDDEN)`
+    binary-compat `Flow.buffer(capacity) = buffer(capacity)` (Context.kt:143) self-recursed
+    because the runtime extension resolver's lenient pass kept low-priority candidates. Now
+    low-priority overloads are dropped up front when an ordinary candidate exists
+    (`extensionFnFallback`). `flatMapMerge` still SIGSEGVs — it needs `ChannelFlowMerge`
+    (the channel-merge + concurrent inner-collect machinery, in the combine cluster).
   - `takeWhile`/`transformWhile` → `invoke on $anon$0`: inside `unsafeFlow { collectWhile { … } }`
     a bare `emit`/`predicate` in the (non-inline) takeWhile lambda, once spliced into
     `collectWhile`'s inline `object : FlowCollector` body, re-binds to that inner object instead
