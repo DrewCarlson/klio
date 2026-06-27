@@ -1,131 +1,237 @@
-# Name-Resolution & Execution Unification
+# Dispatch & Name-Resolution Unification
 
 Goal: one source of truth for "what does this name resolve to" and one execution
-path, regardless of run-vs-test, pack-vs-source, or inline-vs-regular. Stdlib code
-is functional from the stdlib pack and resolves exactly like user code; native
-intrinsics exist only as the backing implementation of a stdlib declaration that
-requires native support, reached through the normal resolved symbol — never as a
-parallel resolution path or a name-list shortcut. No escape hatches for stdlib in
-the interpreter.
+path, regardless of run-vs-test, pack-vs-source-vs-stdlib, or inline-vs-regular.
+Stdlib code is functional from the stdlib pack and resolves exactly like user code;
+native intrinsics exist only as the backing implementation of a stdlib declaration
+reached through the normal resolved symbol, never as a parallel resolution path or a
+name-list shortcut. No escape hatches for stdlib in the interpreter.
+
+This plan supersedes the earlier RC-1..RC-5 sketch. Every root cause below was
+confirmed against the current code with a live reproduction (the repro names are the
+verification ratchet in the phase plan).
 
 ## Root causes
 
-- **RC-1** Two arity oracles disagree: `Module.resolveBareCallIndexed` (ir.zig)
-  uses `decl_user_arity`; the heuristic ladder in `lowerPathCall` (expr.zig) re-ranks
-  the same candidates but gates on `f.hasBody()` and the hardcoded `isAliasName` list.
-  When they disagree, `bare_func_id` is null → inline/stdlib escapes.
-- **RC-2** Inline funcs are body-stripped and live in `inline_state`, a different
-  table than the index the bare-call emitter trusts → inline never resolves as a
-  bare global.
-- **RC-3** `prefer_member` is arity-unaware: any same-named enclosing member
-  suppresses global resolution even when arity can't match.
-- **RC-4** Member-vs-global gated on `class_member_names` (a global set over ALL
-  pack+user classes) + `inReceiverContext` differing top-level vs `@Test` method →
-  same source lowers to different IR under `run` vs `test`.
-- **RC-5** Name-lists papering the seams: `isAliasName`, `intrinsic_owns_all` /
-  `intrinsicOwnsBareName`, `contract_with_msg`, `CONTROL_INTRINSICS`.
+- **RC-A — no canonical index.** There is no single signature index over all
+  provenances populated before any body lowers. `func_name_index` is built in the
+  wrong order and consulted while incomplete. Within a single build, class bodies
+  lower (`interp_ir/build.zig:1470`) before the phase-1 header loop (`:1489-1561`),
+  so `funcsBySimpleName`/`funcId`/`decl_user_arity` are empty for user top-level
+  funcs when any class method (including a `@Test` method) lowers. The `klio run`
+  extend path pre-seeds the index via `cloneForExtend` (which *does* carry
+  `func_index`, `ir.zig:1142-1150`), masking the bug for stdlib names; `klio test`
+  goes straight to `buildModuleFiles` with no pre-seed, exposing it for everything.
+  Members and inline members get no arity-queryable index entry at all. The index is
+  consulted as a refiner, not a primary, so even when complete it cannot bind a
+  target the heuristic ladder declined. *This is the true root of run-vs-test
+  divergence — not the base->extend handoff the old plan blamed.*
+  Evidence: `factRun`; measured 5 `func_index` entries during user-body lowering.
+
+- **RC-B — no shared, type-aware applicability.** Applicability/overload matching is
+  reimplemented at least three times (lowering ladder, runtime global scorer, runtime
+  member scorer) with no shared core, and the lowering ladder is **arity-only and
+  type-blind**. `shadowedByClass` + `findCand`/`arityMatch` (`expr.zig:4324-4364`)
+  bind `Box(5)` to `fun Box(String)`; only `overload_match.zig:124`
+  `builtinKindMismatch` rejects it at runtime, and only when the call deferred (empty
+  index). The runtime re-rank (`pickOverloadCached`, `host_call_func.zig:1266`) is a
+  safety net, not a fix: bypassed by exact casts (`eval.zig:2586`), `TailCallFunc`
+  (no re-pick), and any lowering-only decision (class-vs-factory). `src/ir/applicability.zig`
+  does not exist. Evidence: `factRun` (crashes under run, passes under test).
+
+- **RC-C — member-vs-global by a program-wide name set.** The decision uses
+  `class_member_names` (a union over ALL pack+user classes) plus `inReceiverContext`,
+  not the enclosing receiver TYPE's actual members. Six gate sites
+  (`expr.zig:1099,3804,3961,4521,4931,4979`). `inReceiverContext` is true for any
+  method body, false for top-level `main`, so identical bodies lower to different IR
+  under run vs test. `emitBareFuncCall` deliberately discards a statically-resolved
+  FuncId and defers to runtime, so run==test output only because the runtime probe
+  re-derives the answer. The `de327622` arity-aware `prefer_member` fix closed the
+  0-arg-member-shadows-1-arg-global case but not the structural over-broadness.
+  Evidence: `crossmember.kt`.
+
+- **RC-D — name-keyed field storage.** `InstanceData.fields` is a flat
+  `ArrayList(Field{name,value})` keyed by name only (`class.zig:318-353`);
+  `define` overwrites. A subclass field with a parent's name destroys/aliases the
+  parent's backing cell (`materializeInstance` writes bottom-up,
+  `host_instances.zig:2378-2422`). Kotlin needs two distinct backing fields keyed by
+  (declaring class, name) for a shadow, but one shared cell for an override. The
+  current model cannot represent the distinction. This is a value-layer root cause
+  below the dispatch layer; it reproduces byte-identically run-vs-test. Evidence:
+  `c_shadow` prints 2/2/2/2, expected 1/2/1/1.
+
+- **RC-E — non-final vararg on the positional path.** The positional dispatch path
+  packs varargs only when the vararg is the LAST parameter (`packVarargArgs`,
+  `host_call_func.zig:93`; member twin `host_call_member.zig:374`). A non-final
+  vararg followed by a defaulted param crashes on a purely-positional call (pads the
+  trailing default first, then the packer no-ops, leaving an unpacked Int in the
+  vararg slot). The named binder `callFuncNamed` handles mid-list varargs correctly;
+  the two binders disagree on a Kotlin-legal shape. Evidence: `e_vararg`
+  (`report("T4",6,7,8)` crashes; adding any named arg fixes it).
+
+- **RC-F — reified inference is return-type-only.** `inferReifiedTypeArgs`
+  (`inline_call.zig:276-313`) unifies only `f.return_type` against the expected type,
+  never value-parameter types, so a reified `T` inferable only from a lambda
+  parameter annotation stays unbound and `x is T` degenerates to always-true.
+  Evidence: `j2` (`classify(7){ s: String -> s }` prints `is`, expected `no`).
+
+- **RC-G — typeck resolution discarded.** Typeck resolves overloads internally
+  (`checkOverloadedCall` picks a `*const FnSig`) but never records the target;
+  `TypeCheck` exposes no `Span->FuncId` map (`check.zig:72-88`), and `klio run`/`test`
+  never invoke typecheck. Three overload oracles (typeck Type-based, lowering
+  arity+tier, runtime value-class) share no resolved-symbol channel; a call can be
+  type-checked against one overload and executed against another with no diagnostic.
+
+- **RC-H — hatch name-lists.** A web of hardcoded name-lists papers over the seams
+  left by RC-A and RC-B: `isAliasName` (41 names, 4 gate sites), two near-duplicate
+  inconsistent builtin-supertype tables (`builtinSupersFor` vs `builtinHeadAccepts`),
+  three inconsistent Throwable lists, the `concreteSibling` same-simple-name abstract
+  redirect, `tailrec_fn_names`, `shadowed_inline_names`, `isPrimitiveConv`,
+  `CONTROL_INTRINSICS`. These are CLAUDE.md-forbidden symptom-hiding. They exist only
+  because the index is incomplete and applicability is not shared/type-aware; deleting
+  them is the proof those fixes are complete.
 
 ## Target architecture
 
-- (A) One canonical index: `DeclSig` per FuncId for every top-level func (user, pack,
-  baked, inline). Supersedes `decl_user_arity` + ad-hoc body-param inspection.
-- (B) One resolver `Module.resolveCall(name, arg_shapes, scope) -> Resolution`,
-  folding the heuristic ladder + indexed resolver, ranking all candidates with one
-  shared `applicable(DeclSig, arg_shapes)` (the runtime `memberApplicableForWalk`
-  logic, lifted to a shared module so compile- and run-time agree).
-- (C) One global lookup; emit resolved `Call`/`CallMember`. `CallMemberOrGlobal`
-  survives only for genuinely runtime-polymorphic receivers, carrying the candidate
-  set (not a name probe).
-- (D) Member-vs-global by applicability against the enclosing-`this` TYPE's members
-  (not a global name set). Kills RC-4 + run-vs-test divergence structurally.
-- (E) Intrinsics attach via `resolvedNativeForm(FuncId)` only. Delete
-  `intrinsicOwnsBareName`/`intrinsic_owns_all`.
-- (F) Inline selected after `resolveCall` yields a FuncId for which `isInline` is
-  true; `inline_state` becomes a body-source keyed by FuncId.
+1. **One canonical signature index (RC-A).** A per-FuncId `DeclSig` in `ir.zig`
+   (subsuming `decl_user_arity`/`decl_user_sig`/`decl_user_params`): `{ fqn, package,
+   simple_name, kind: {top_level,member,ctor,factory,extension}, enclosing_class,
+   receiver_ty, params: []ParamSig{name, ty, has_default, is_vararg, is_function_typed},
+   type_params: []{name, is_reified}, is_inline, is_suspend, low_priority }`.
+   `ParamSig.ty` rendered by the same `loweredTypeRef` phase-1 already uses. A new
+   **phase 0** in `buildModuleWithOverrides` registers a `DeclSig` for every
+   declaration — top-level funcs, constructors (keyed by class simple name), member
+   methods (signatures only), inline funcs (top-level and member) — BEFORE the
+   class-lowering loop and phase-1. Three phases: (0) sig registration over all decls,
+   (1) class body lowering, (2) top-level body lowering. Member+ctor sigs baked into
+   the image. `runTestFiles` routed through the same extend/image assembly as `run`.
+   After this, `funcsBySimpleName` returns the full source+pack+stdlib+inline+member+ctor
+   candidate set in every entry point, order-independent.
 
-## Steps (each independently testable; hatches removed only after subsumed)
+2. **One type-aware applicability function (RC-B, RC-E).** New `src/ir/applicability.zig`:
+   `pub fn applicable(sig, args: []const ArgShape, scope) ?Score`. `ArgShape = { ty:
+   ?TypeRef, is_lambda, lambda_arity, lambda_param_types, is_named: ?[]const u8,
+   is_spread }`, populated from lowering (lowered expr type / literal kind), runtime
+   (value class name), or typeck (checked Type lowered to TypeRef). `applicable` folds
+   in one place: named-arg-to-distinct-param, default padding, vararg packing at ANY
+   position, trailing-lambda-out-of-sequence binding to the last function-typed param,
+   and per-arg type scoring (lifting `overloadScoreArg` + `builtinKindMismatch`).
+   The two builtin-supertype tables merge into one canonical relation derived from the
+   class hierarchy where possible. Three callers, one function: lowering's
+   `resolveCall`, runtime `pickOverload`/`pickMethodOverload`, typeck `checkOverloadedCall`.
 
-1. **DeclSig + sig_index**, additive, populate for every func incl inline. (no behavior change)
-2. Lift `memberApplicableForWalk` arity core into `src/ir/applicability.zig`; runtime calls it.
-3. Add `Module.resolveCall`; run in SHADOW/audit mode behind `KLIO_RESOLVE_AUDIT`, log disagreements.
-4. Move intrinsics fully onto `resolvedNativeForm`; delete `intrinsicOwnsBareName`/`intrinsic_owns_all`.
-5. Switch top-level (non-member-shadowed) bare-call emission to `resolveCall`.
-6. Make member-vs-global applicability-aware; remove `prefer_member` + `contract_with_msg`.
-7. Replace `class_member_names` global gate with enclosing-receiver-type member query; remove the field.
-8. Route inline selection through the resolver.
-9. Delete residual hatches (`isAliasName`, `decl_user_arity`, control-intrinsic name lists).
-10. Collapse `execCallMemberOrGlobal` to the ambiguous-only case.
+3. **`Module.resolveCall` — one resolver, index primary (RC-A, RC-B).** Replaces the
+   two-oracle asymmetry. Tiers candidates by Kotlin scope (`bareCallTier`), ranks the
+   best non-empty tier by `applicable`, returns `Resolution{ target: FuncId,
+   confidence: {exact, runtime_polymorphic}, candidate_set }`. A unique best -> resolved
+   `Call`. A genuine tie or runtime-only receiver -> `CallMemberOrGlobal` carrying the
+   candidate set (not a name probe). The heuristic ladder, `preferredBareTarget`,
+   `resolveBareCallIndexed`-as-refiner, and the inline-vs-noninline split all collapse
+   into this. Constructors are ordinary candidates, so class-vs-factory is a normal
+   overload set, not a `shadowedByClass` branch.
+
+4. **Member-vs-global by enclosing-receiver type (RC-C).** Delete `class_member_names`
+   (registry field + 6 gate sites) and the `inReceiverContext` switch as the
+   discriminator. A bare call inside a method queries the enclosing receiver type's
+   member set via the sig index (`kind==member && enclosing_class==this_class`, walking
+   the receiver's supertype closure by ClassId). Member-shadowable iff THIS receiver
+   type (or a supertype) has an applicable member of that name+shape. Pure function of
+   (call-site receiver type, sig index); independent of main-vs-`@Test`.
+   `emitBareFuncCall`'s downgrade is deleted. `CallMemberOrGlobal` survives only for
+   genuinely runtime-polymorphic receivers.
+
+5. **Distinct-keyed inherited fields + super/method-walk fixes (RC-D).** Change
+   `InstanceData.Field` key from name to `(declaring_class: ClassId, name)`. `get/set/
+   define` take an optional declaring-class qualifier. An override writes under the
+   most-derived class only (one cell — preserves override semantics); a shadow writes a
+   separate cell keyed by its own declaring class (override-vs-shadow detected at
+   construction via the `override` modifier). A bare `x` in a method of class C resolves
+   to the C-or-nearest-supertype-that-declares-stored-`x` cell; `super.x` reads the
+   parent's cell; external `(b as Base).x` reads via the static type. Also fix
+   `firstSupertypeName` to skip interfaces (`host_call_member.zig:6901`, the
+   `super.method` bug) and FQN-qualify the method walk after the first hop.
+
+6. **Position-agnostic vararg packing (RC-E).** Unify the positional and named binders
+   onto `applicability.zig`'s position-agnostic bind step; `internArgNames` stops
+   collapsing all-positional to empty for a non-final-vararg sig. Deletes the
+   positional/named divergence.
+
+7. **Reified inference from parameter positions (RC-F).** Extend `inferReifiedTypeArgs`
+   to unify each declared value-parameter type (recursing into function-typed params'
+   parameter lists) against actual argument / lambda-parameter-annotation types before
+   the return-type fallback. Reuse `unifyTypeParam`.
+
+8. **Typeck records + reuses resolution (RC-G).** Add `TypeCheck.resolved_calls:
+   Span->FuncId`. `checkOverloadedCall` calls the shared `resolveCall`/`applicable`
+   over the assembled sig index. Minimum: audit-assert typeck pick == lowering pick.
+   Full: lowering consumes `resolved_calls`. The dead TYPECK pack section is wired or
+   deleted.
+
+9. **Delete the hatches (RC-H) — the completeness proof.** After 1-5 land: delete
+   `isAliasName`, the merged-away duplicate builtin table, `class_member_names`,
+   `prefer_member`, `contract_with_msg`/`CONTROL_INTRINSICS`, `tailrec_fn_names` as an
+   overload gate (TailCallFunc re-picks via `applicable`), the `concreteSibling` redirect
+   (abstract instantiation becomes a diagnostic), `isPrimitiveConv`, and the Throwable
+   lists (route via `resolvedNativeForm`/FQN). Each deletion gated on
+   `KLIO_RESOLVE_AUDIT` zero-disagreement + the full sweep.
+
+## Phases (each independently shippable; hatches removed only after subsumed)
+
+- **P0 — Unblock the run-vs-test parity harness.** Root-cause why `assertEquals`/etc do
+  not resolve under `klio test` (likely RC-A surfacing for pack top-level funcs). Make
+  `tests/fixtures/test_runner/sample_test.kt` pass. Files: `cli/commands.zig`,
+  `cli/stdlib_image.zig`, `stdlib_pack/*`, `interp_ir/build.zig`.
+- **P1 — DeclSig + sig phase 0 (RC-A).** Additive; `resolveCall` not yet switched.
+  Verify: `KLIO_RESOLVE_AUDIT` shows tier_count>0 for user top-level funcs called from
+  methods under `klio test`; image round-trip; full sweep unchanged.
+- **P2 — `applicability.zig` (RC-B, RC-E).** Lift the type-aware scorer + position-agnostic
+  bind; merge the two builtin tables. Runtime callers switch first. Verify: `e_vararg`
+  passes under run AND test; named-arg corpus unchanged.
+- **P3 — `Module.resolveCall`, switch bare-call emission (RC-A, RC-B).** Shadow behind
+  `KLIO_RESOLVE_AUDIT` to zero disagreement, then switch. Verify: `factRun` prints 5/5
+  under run AND test.
+- **P4 — Member-vs-global by receiver-type membership (RC-C); delete `class_member_names`.**
+  Verify: run-vs-test parity harness byte-identical; `crossmember.kt` no longer downgrades.
+- **P5 — Distinct-keyed inherited fields (RC-D) + super/method-walk fixes.** Verify:
+  `c_shadow` 1/2/1/1; override still woof/4; `super.method` interface-skip correct.
+- **P6 — Reified inference from parameter positions (RC-F).** Verify: `j2`/`j4` correct;
+  controls stay correct.
+- **P7 — Typeck records + reuses resolution (RC-G).** Verify: typeck-vs-lowering zero
+  disagreement on the corpus; `klio check` diagnostics unchanged.
+- **P8 — Delete the hatch name-lists (RC-H).** Each deletion audit-gated + full sweep;
+  user class named `Error`/`Random` constructs correctly; abstract instantiation
+  diagnoses.
 
 ## Verification
 
-- Ratchet gate: `stdlib commonTest` ≥ 1452 (stdlib_commontest.zig). Risky steps
-  (3,5,6,7,8,10) run the FULL sweep. Raise baseline after real fixes.
-- requireNotNull/checkNotNull repro: 1-arg and 2-arg(trailing-lambda) overloads, at
-  top level AND inside a method whose class has a same-named member.
-- run-vs-test parity: a fixed `.kt` body wrapped in `fun main()` and `@Test fun t()`
-  must produce byte-identical output (guard for RC-4, required from Step 7).
-- `KLIO_RESOLVE_AUDIT` zero-disagreement invariant before each hatch removal.
+- **Ratchet:** stdlib commonTest baseline (`stdlib_commontest.zig`, currently >=1455).
+  Risky phases run the FULL sweep; raise the baseline only after a real fix; a phase that
+  drops the count is rejected, not accommodated.
+- **`KLIO_RESOLVE_AUDIT` zero-disagreement** before switching any resolution path and
+  before each hatch deletion. Extend it to flag type-blind agreement (index and heuristic
+  agreeing on a wrong pick — the `factRun` blind spot) via an applicability-confidence field.
+- **Run-vs-test parity harness** (built in P0, required from P4): each fixture body emitted
+  twice — `fun main(){...}` and `class T{ @Test fun t(){...} }` — asserting byte-identical
+  stdout. Throw-on-mismatch `@Test` bodies as a fallback if assert resolution is partial.
+- **Repro ratchet:** the four headline crashes locked as corpus tests that currently FAIL
+  and must pass post-fix, each under BOTH run and test, each failing if its fix is reverted:
+  `factRun` -> 5/5; `e_vararg` -> `T4 [6,7,8] end`; `c_shadow` -> 1/2/1/1; `j2` -> is/no.
+- **Structural invariants** after the design lands: (a) every bare-call resolution is a pure
+  function of (call site, sig index); (b) `funcsBySimpleName` at file=0 == at any later file;
+  (c) zero name-list lookups remain in the dispatch path; (d) runtime pick == lowering pick
+  for every non-runtime-polymorphic call.
+- **Negative tests:** abstract instantiation emits a diagnostic (not a `concreteSibling`
+  redirect); a user class named `Error`/`Exception`/`Random` constructs via its own
+  declaration; named args on a function-typed value diagnose rather than silently drop.
 
-## Progress
+## Prior progress (carried from the RC-1..RC-5 sketch)
 
-- Step 1 (DeclSig) — largely PRE-EXISTING: `decl_user_arity` + `decl_user_sig` are
-  already recorded for every top-level func (incl. inline) at phase-1 header
-  registration (interp_ir/build.zig:1493-1513). The gap was that CLASS MEMBERS were
-  not in any arity-queryable index, so member-vs-global couldn't be arity-aware.
-- [x] Step 4 (commit fea12203) — removed the `intrinsic_owns_all` /
-  `intrinsicOwnsBareName` hatch; `compareValues`/`compareValuesBy` resolve as
-  ordinary symbols, native form attached via `resolvedNativeForm`. Verified 1452.
-- [x] Arity-aware member-vs-global (commit de327622) — `collectMemberArities` records
-  per-member arity masks threaded to the FuncBuilder (`own_member_arity` +
-  `ownMemberApplicable`); gates both `prefer_member` and `lowerImplicitThisCall`. A
-  0-arg member no longer shadows a 1-arg top-level fn. Fixes PreconditionsTest
-  (requireNotNull/checkNotNull) — the recurring "test-vs-run divergence" bug — with
-  NO name list. Verified 1455 (+3), no regression. This is plan Step 6's core (RC-3).
-
-### Next (each full-sweep-verified before commit)
-- Remove `contract_with_msg` (require/check/checkNotNull name-list, RC-5) — likely
-  subsumed by arity-aware resolution now; test require/check-with-message cases.
-- Remove `isAliasName` (RC-5) — once the implicit-`this` global fallback no longer
-  needs the name list (inline stdlib funcs should be reachable via the index/runtime
-  global lookup; verify the `funcsBySimpleName` membership of inline funcs first).
-- RC-4: replace the global `class_member_names` gate with an enclosing-receiver-type
-  member query (the broader run-vs-test divergence; the requireNotNull instance is
-  fixed, but the structural gate remains). Add the run-vs-test parity harness.
-- `applicability.zig`: lift `memberApplicableForWalk` so compile- and run-time share
-  one applicability check (the arity-mask is a first step toward this).
-
-### New finding (RC-4 / provenance, concrete instance): `Random(seed)`
-`Random(42)` works under `klio run` but fails under `klio test` with
-"Cannot create an instance of an abstract class: Random". Tracing the bare-call
-lowering of `Random` shows two lowerings with DIFFERENT `funcsBySimpleName("Random")`
-candidate counts (`cands=0` vs `cands=2`) — i.e. at the moment the failing one is
-lowered, the pack's `Random(seed: Int/Long)` factory functions are NOT yet in
-`func_name_index`, so `shadowedByClass` returns true (no applicable factory) and the
-call lowers to `NewInstance(abstract Random)`. Root: the symbol/func index is not
-uniformly populated with pack factory functions before user/test bodies are lowered
-(pack-vs-source provenance + phase ordering). This is the same class as the `Random`
-abstract-instantiation failures in MutableMapRemoveHashAtTest. Fix belongs with the
-RC-4 work: one index built identically (including pack symbols) before any body is
-lowered, so `funcsBySimpleName` is complete and `shadowedByClass` sees the factory in
-every entry point. Needs a careful look at how `klio test` vs `klio run` assemble the
-module/index relative to the pack.
-
-### MEASURED (instrumented `lowerPathCall` cands for `Random`)
-For `klio test randT.kt`, two lowering contexts print:
-- user file (file=0): `cands=0 fni_count=5 funcs=854 func_index=5`
-- baked `kotlin.random` (file=211): `cands=2 fni_count=730 funcs=6489 func_index=4373`
-
-So when USER code is lowered, the module has 854 funcs but only **5** `func_index`
-entries — the baked-stdlib base contributes its functions to the `funcs` TABLE but
-NOT to the `func_index` / `func_name_index` symbol index. `funcsBySimpleName` reads
-`func_name_index` (rebuilt FROM `func_index` at image load, ir.zig:1239), so non-inline
-top-level stdlib functions are NOT lowering-resolvable from user code. Runtime global
-lookup masks this for plain bare calls (they fall to CallMemberOrGlobal and resolve at
-run time), so the test impact is limited to LOWERING-TIME decisions that consult the
-index — class-vs-factory shadowing (`shadowedByClass`), overload picking. The
-abstract-class fix (commit 3054a090) already covers the class-named instance.
-The structural fix: make the base/image carry its top-level `func_index` (it has 4373
-at creation, ~5 after the base→extend handoff) so `funcsBySimpleName` is complete when
-user bodies lower. Inline funcs resolve via a separate path (inline_state), which is why
-requireNotNull/listOf work from user code despite the empty index. LOWER PRIORITY than
-believed — most calls already work via the runtime; pursue after contained wins.
+- Step 4 (commit `fea12203`) — removed the `intrinsic_owns_all`/`intrinsicOwnsBareName`
+  hatch; `compareValues`/`compareValuesBy` resolve as ordinary symbols.
+- Arity-aware member-vs-global (commit `de327622`) — `collectMemberArities` +
+  `own_member_arity` mask; a 0-arg member no longer shadows a 1-arg top-level fn. Fixes
+  `requireNotNull`/`checkNotNull`. This is RC-C's arity core; the structural name-set gate
+  remains (addressed by P4).
+- The old plan's RC-4 attribution (base->extend `func_index` drop) was wrong:
+  `cloneForExtend` already carries `func_index`. The real root is intra-build phase
+  ordering (RC-A) plus `klio test` not routing through the extend assembly.
