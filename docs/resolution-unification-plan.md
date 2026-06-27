@@ -224,6 +224,41 @@ verification ratchet in the phase plan).
   redirect); a user class named `Error`/`Exception`/`Random` constructs via its own
   declaration; named args on a function-typed value diagnose rather than silently drop.
 
+## P4 investigation (member-vs-global by receiver type) — deferred, design captured
+
+A full attempt landed and was reverted. Findings that constrain the real fix:
+
+- **P4 fixes no user-visible bug.** The `class_member_names` gate is over-broad but the
+  runtime `CallMemberOrGlobal` probe already resolves to the correct target — output is
+  identical across `klio run` and `klio test` (the full sweep exercises both;
+  `stdlib_commontest`=1756, e2e green). The divergence is IR-level only.
+- **The lowerer is largely untyped**, so a scope-function receiver's type
+  (`with(x){ memberOfX() }`) is unknown at the call site — which is *why* the runtime
+  probe exists. A naive `class_member_names` → `hasOwnMember` swap regresses scope-receiver
+  member calls (verified: `with(Box()){ greet() }` bound the top-level `greet`).
+- **A workable signal exists**: a `receiverRebindActive()` on the FuncBuilder —
+  `capturesThisSlot() or isParamThunk()` (a lambda/anon/thunk body's `this` is a
+  scope/receiver of unknown type) OR the in-scope `this` resolves at a scope depth other
+  than the function's own-`this` scope (captured via `own_this_scope` set right after a
+  method/extension binds params). With it, the member-shadowable gate narrows safely in
+  plain method bodies (fixes the spurious `@Test` downgrade) while keeping the
+  over-approximation where a non-enclosing receiver is in scope.
+- **The divergence's other half is RC-A index ordering (P1).** Even with the gate fixed,
+  a top-level function called from a `@Test` method still `defer`s under test because the
+  index isn't complete when class bodies lower. The P1 reorder (top-level headers before
+  class bodies) fixes that — but it cascades: making the index complete during class-body
+  lowering flips OTHER member-preference decisions. Fixed so far: the member-shadowable
+  gate (expr.zig ~4581) and `prefer_member` (extended to enclosing/outer-class members).
+  STILL regressing: a bare outer-member call inside a stdlib INNER class
+  (`AbstractMutableList.IteratorImpl` reaching the list's `get`) resolves to a global once
+  the index is complete — a deeper inner-class outer-member path needs the same
+  receiver-type-aware treatment. P1 + P4 must land together with EVERY member-preference
+  site made receiver-type-aware; this is the substantial work remaining.
+
+Resume by reinstating `receiverRebindActive`/`own_this_scope`, the gate + `prefer_member`
+changes, and the P1 reorder, then driving the inner-class outer-member site (and any the
+full sweep surfaces) to green before committing — audit-gated, sweep-verified.
+
 ## Landed RC-F fix (reified inference from parameter positions)
 
 `inferReifiedTypeArgs` inferred a reified type parameter only by unifying the
