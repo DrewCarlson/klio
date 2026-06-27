@@ -35,17 +35,17 @@ are the implementation notes behind these verdicts.
 
 ### Partial — one concrete remnant each
 
-- **`select` + `Semaphore` (#4, 5/6).** Working: `onReceive`/`onReceiveCatching` (incl.
-  observing a close while parked), `onSend` (receiver-first or sender-first, and feeding a
-  `for (x in channel)` iterator consumer), `onAwait` (ready + deferred), and
-  `Semaphore.withPermit` under contention. **Remaining:** when a `select` registers an
-  `onTimeout` timer and then parks, and a channel/`onAwait` clause subsequently *wins*,
-  the resume crashes `Vm::call_member invoke on kotlinx.coroutines.Runnable`. It is not
-  the channel layer — the crash is inside the `CancellableContinuationImpl.tryResume`
-  decision-state loop, where the parked select's installed cancel handler meets the resume
-  while the timer continuation is still scheduled (shares a root with #7 / the missing
-  unconfined event loop). `onTimeout` that *wins* works; only `onTimeout`-loses-after-
-  parking crashes.
+- **`select` + `Semaphore` (#4, 6/6 — DONE).** Working: `onReceive`/`onReceiveCatching`
+  (incl. observing a close while parked), `onSend` (receiver-first or sender-first, and
+  feeding a `for (x in channel)` iterator consumer), `onAwait` (ready + deferred),
+  `Semaphore.withPermit` under contention, and now an `onTimeout` that *loses* to a
+  channel/`onAwait` clause after parking. The crash was NOT in the
+  `CancellableContinuationImpl` decision loop: the dispatcher resume path invokes the
+  resume `Runnable` as a function value (`block()`), and klio errored
+  `invoke on kotlinx.coroutines.Runnable` because a `Runnable` fun-interface's abstract
+  method is `run`, not `invoke`. Fix: a value-call on an `Instance` that has a `run` member
+  but no `invoke` dispatches `run()` (`src/interp_ir/vm/host_call_value.zig`).
+  Example/probe: `examples/select_on_timeout_loses.kt`.
 - **Structured-concurrency parent-job leak (#1, 9/10).** Fixed: a caught-externally
   `coroutineScope`/`supervisorScope` child failure no longer double-delivers to stderr/
   exit 1; non-`runBlocking` job `toString`s report the correct upstream names
