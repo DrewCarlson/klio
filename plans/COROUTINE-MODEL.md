@@ -97,13 +97,19 @@ are the implementation notes behind these verdicts.
     `collectWhile`'s inline `object : FlowCollector` body, re-binds to that inner object instead
     of the captured outer `this@unsafeFlow` collector — an inline-splice bare-name re-resolution
     bug distinct from the writeback fix.
-  - **Shared root for `combine`/`takeWhile`/`flatMapMerge` and #6:** an `invoke on <object>`
-    (SafeFlow / $anon / kotlin.Function) is always a captured *function-typed* value (a flow
-    collector, a predicate, a SafeCollector emit) that, inside an inline splice or a resumed
-    activation, mis-resolves to a nearby implicit-receiver object and is invoked as if it were
-    that object — the "collector bound as a bare function" root the §"field receiver-lambda
-    park" notes below describe. Fixing that resolution should unblock the cluster; it is the
-    next high-leverage flow fix after the overload work landed.
+  - **Shared root for `combine` (and the family): a suspend lambda's captured function-typed
+    param mis-resolves to a co-captured `this@<ext>` value.** Minimal repro
+    `plans/repros/combine_captured_param_typeparam_cast.kt` (cap14): a `flow { helper(arrayOf(
+    this@combineX, flow), …) { emit(transform(it[0] as T1, it[1] as T2)) } }` where the trailing
+    suspend lambda is invoked inside `helper` (a foreign suspend frame). The bare `transform`
+    (combineX's captured param) is invoked on `this@combineX` (a SafeFlow) → `invoke on SafeFlow`.
+    Bisected triggers (ALL required): (1) the lambda runs in a *foreign suspend frame*
+    (non-suspend plain-class equivalent cap17 works); (2) it captures `this@<ext>` as a value
+    (passing flows as plain params, cap_E, works); (3) it casts to **two distinct** enclosing
+    type parameters `as T1`/`as T2` (a single cast cap16 works; concrete `as Int` cap11 works).
+    So the suspend-state capture/restore mis-indexes value captures when type-parameter casts
+    add reified captures — `transform` reads the slot holding `this@combineX`. Fix lives in the
+    suspend activation capture machinery (`src/ir/eval.zig`), NOT in member dispatch. DEEP.
 - **Hot-flow suspending collector (#6, 0/3).** A `SharedFlow`/`StateFlow` collector that
   suspends and then takes a *second* emit fails `Vm::call_member emit on kotlin.Function`
   (resume-side SafeCollector emit binds the collector as a bare function,
