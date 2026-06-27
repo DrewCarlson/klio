@@ -25,6 +25,13 @@ are the implementation notes behind these verdicts.
 - **Channel API + semantics (#3, 6/6).** `trySend`/`tryReceive` return `ChannelResult`;
   `isClosedForSend`/`isClosedForReceive` are properties; `produce` works; a rendezvous
   `send` suspends until a receiver; a conflated channel keeps only the latest.
+- **#1 runBlocking job name** — `toString` reports `BlockingCoroutine{…}` (nameString override).
+- **Flow operators, dispatch cluster** — `map`/`filter`/`onEach`/`transform`/`take`/`reduce`/
+  `toList`/`flatMapConcat` already worked; now also `drop`/`dropWhile`/`onCompletion`+`catch`
+  (writeback bare-extension receiver walk) and `produceIn`/`buffer`/`flowOn` (named-arg
+  overload applicability — the wrong `produce` overload was bound). See the #5 note below for
+  the exact root causes and the operators still open (`zip`/`combine`/`conflate`/`flatMapMerge`/
+  `takeWhile`).
 
 ### Partial — one concrete remnant each
 
@@ -51,11 +58,14 @@ are the implementation notes behind these verdicts.
   `supervisorScope` child receives the uncaught exception with the right type; a regular
   non-root `launch` correctly ignores its CEH; `async` does not fire a CEH. **Remaining:**
   `CoroutineScope(SupervisorJob() + handler)` SEGFAULTs (stack overflow) when the scope has
-  more than one throwing child, or a throwing child plus a normally-completing sibling.
-  Unbounded mutual recursion `callMemberNamedInner → callMemberInnerStatic → irMethodWalk
-  → invokeMethodFuncId → … → callMemberNamedInner` in
-  `src/interp_ir/vm/host_call_member.zig` (2783/5302/6315/6412), SIGSEGV in
-  `instanceBindingProbe` (~:3215).
+  more than one *throwing* child (two non-throwing children that `join` are fine — `i2d`).
+  Root: the failure path runs the upstream `LockFreeLinkedListNode` CAS loop for the job's
+  completion-handler list (`loop`/`compareAndSet`/`lazySet`/`finishAdd`/`removeOrNext`/
+  `removed` all appear in the spin), and klio's atomicfu CAS shims can't satisfy the
+  multi-node remove-under-cancellation, so the helping logic recurses without progress until
+  the (small, worker-thread) stack overflows in `instanceBindingProbe`'s `allocPrint`
+  (~host_call_member.zig:3215). The real fix is either real atomicfu CAS semantics or a
+  native bypass of the job node-list (mirroring the native channel bypass). DEEP — deferred.
 - **launch/async OUTSIDE a driver (PART B, 1/2).** Fixed: an outside-`runBlocking`
   `launch`/`async` no longer runs eagerly — it routes through `Dispatchers.Default`
   (`ContextActuals.kt` `newCoroutineContext`); an uncaught exception reports to the worker
@@ -67,12 +77,33 @@ are the implementation notes behind these verdicts.
 
 ### Open — not started
 
-- **Channel-backed flow operators (#5, 0/4).** `buffer`/`conflate`/`flowOn` error
-  `unresolved global invokeOnCompletionInternal` (and `conflate` stack-overflows); `zip`
-  → `invokeOnClose on Channel.Factory`; `combine` → `invoke on SafeFlow`; `flatMapMerge`
-  → SafeCollector emit binds the collector as a bare function (the #6 root);
-  `drop`/`dropWhile`/`takeWhile` → `collect` on `unsafeFlow`; `onCompletion`+`catch` →
-  `invoke on $anon`. Mostly downstream of #6.
+- **Channel-backed flow operators (#5, partial).** FIXED: `drop`/`dropWhile`/`onCompletion`
+  (a bare extension call whose trailing lambda mutated an outer var pinned the nearest `this`
+  instead of walking implicit receivers — `lowerCallWithWritebackPath`/`lowerUnresolvedBareCall`
+  in `src/ir/lower/expr.zig`) and `produceIn`/`buffer`/`flowOn` (overload resolution bound the
+  wrong `produce` overload: a named arg that re-targets a positionally-filled parameter must
+  make the overload inapplicable — `memberApplicableForWalkNamed`/`resolveExtOverloadLocal` in
+  `src/interp_ir/vm/host_call_member.zig`). The decisive divergence was
+  `scope.produce(ctx, cap, onBufferOverflow, start=…, block=…)` binding the 5-arg deprecated
+  overload, dropping `onBufferOverflow` into `start` and `block` into `onCompletion`, so
+  `coroutine.invokeOnCompletion(handler = onBufferOverflow)` ran with a `BufferOverflow` where
+  a `JobNode` was expected. REMAINING:
+  - `zip` → `invokeOnClose` is unimplemented on klio channels (a real missing intrinsic — even
+    a plain `Channel<Int>().invokeOnClose{}` errors `Vm::call_member invokeOnClose on KlioChannel`).
+  - `combine` → `invoke on SafeFlow` (combineInternal machinery).
+  - `conflate`/`flatMapMerge` → SIGSEGV (stack overflow in the channel-flow + merge path).
+  - `takeWhile`/`transformWhile` → `invoke on $anon$0`: inside `unsafeFlow { collectWhile { … } }`
+    a bare `emit`/`predicate` in the (non-inline) takeWhile lambda, once spliced into
+    `collectWhile`'s inline `object : FlowCollector` body, re-binds to that inner object instead
+    of the captured outer `this@unsafeFlow` collector — an inline-splice bare-name re-resolution
+    bug distinct from the writeback fix.
+  - **Shared root for `combine`/`takeWhile`/`flatMapMerge` and #6:** an `invoke on <object>`
+    (SafeFlow / $anon / kotlin.Function) is always a captured *function-typed* value (a flow
+    collector, a predicate, a SafeCollector emit) that, inside an inline splice or a resumed
+    activation, mis-resolves to a nearby implicit-receiver object and is invoked as if it were
+    that object — the "collector bound as a bare function" root the §"field receiver-lambda
+    park" notes below describe. Fixing that resolution should unblock the cluster; it is the
+    next high-leverage flow fix after the overload work landed.
 - **Hot-flow suspending collector (#6, 0/3).** A `SharedFlow`/`StateFlow` collector that
   suspends and then takes a *second* emit fails `Vm::call_member emit on kotlin.Function`
   (resume-side SafeCollector emit binds the collector as a bare function,
