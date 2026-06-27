@@ -224,6 +224,25 @@ verification ratchet in the phase plan).
   redirect); a user class named `Error`/`Exception`/`Random` constructs via its own
   declaration; named args on a function-typed value diagnose rather than silently drop.
 
+## Landed RC-E fix (non-final vararg)
+
+A `vararg` parameter before a trailing defaulted parameter, called positionally,
+crashed: the binders only collapsed a vararg in the LAST parameter, so the middle
+positional args were never packed (`report("T4", 6, 7, 8)` left an `Int` in the
+`items: Array` slot). Fixed by making the binders vararg-position-aware:
+- `callFuncNamed` enters its reorder-aware binder when the callee has a non-final
+  vararg (not only when an argument is named); `hasNonFinalVararg` gates it.
+- `pickMethodOverload`'s single-candidate applicability binds the prefix
+  positionally, the vararg consumes the remaining positional args, and the
+  post-vararg params take defaults — instead of type-checking a vararg-bound arg
+  against a post-vararg parameter.
+- `invokeMethodFuncId` routes a non-final-vararg member call through the
+  reorder-aware func binder rather than the trailing-collapse fast path.
+Locked by `examples/vararg_nonfinal.kt`. The broader RC-B consolidation (one
+shared `applicability.zig` over the lowering/runtime/member scorers + merging the
+two builtin-supertype tables) folds into P3, co-designed with `resolveCall`'s
+needs rather than shipped as an unused abstraction.
+
 ## Landed RC-A fixes
 
 - **Cross-package class-name collision** — `reserveClass` deduped class stubs by SIMPLE

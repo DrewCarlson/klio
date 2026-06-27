@@ -1992,6 +1992,45 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         const f = candidates[0];
         const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         const effective = f.params[skip..];
+        // Non-final vararg (a vararg before trailing defaulted / named-only
+        // params): the prefix binds positionally, the vararg consumes the
+        // remaining positional args, and the post-vararg params take their
+        // defaults. The naive args[i]-vs-effective[i] pairing below would
+        // wrongly type-check a vararg-bound arg against a post-vararg param
+        // (e.g. `report("A", 1, 2)` checking `2` against `footer: String`).
+        var nf_vararg: ?usize = null;
+        for (effective, 0..) |*p, k| {
+            if (p.is_vararg) {
+                if (k + 1 < effective.len) nf_vararg = k;
+                break;
+            }
+        }
+        if (nf_vararg) |vp| {
+            const defaults = funcDefaults(self, &f);
+            // Prefix params not supplied positionally must be defaulted.
+            if (args.len < vp) {
+                var k: usize = args.len;
+                while (k < vp) : (k += 1) {
+                    if (!paramHasDefault(defaults, skip + k)) return null;
+                }
+            }
+            // Post-vararg params can't be reached positionally → must default.
+            var k: usize = vp + 1;
+            while (k < effective.len) : (k += 1) {
+                if (!paramHasDefault(defaults, skip + k)) return null;
+            }
+            // Prefix args against prefix params; the rest against the vararg
+            // element type.
+            var i: usize = 0;
+            while (i < args.len and i < vp) : (i += 1) {
+                if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i])) return null;
+            }
+            var j: usize = vp;
+            while (j < args.len) : (j += 1) {
+                if (argDefinitelyNotParamType(self, &effective[vp].ty, &args[j])) return null;
+            }
+            return f;
+        }
         // Over-supply with no vararg tail can't bind: decline so an
         // applicable top-level/extension overload wins — e.g. the stdlib
         // `buildString { … }` inside an extension on a class that declares
@@ -5131,6 +5170,21 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     defer mg.deinit();
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
+
+    // Non-final vararg (a vararg before trailing defaulted / named-only params):
+    // the prepend + trailing-collapse path cannot bind it — the vararg must
+    // consume the mid-list positional args at its own position while the
+    // trailing parameters take their defaults. Route through the reorder-aware
+    // func binder (receiver prepended, all-positional), which handles it.
+    if (f.params.len > 1) {
+        for (f.params[0 .. f.params.len - 1]) |*p| {
+            if (p.is_vararg) {
+                const all = try prependReceiver(allocator, receiver, args);
+                defer if (runtime.freeScratch()) allocator.free(all);
+                return try callFuncNamedRec(self, allocator, mod, fid, all, &.{});
+            }
+        }
+    }
 
     // Fast path: no vararg tail and the call is fully applied (no default
     // padding), so the frame argument list is exactly `[receiver] ++ args`.
