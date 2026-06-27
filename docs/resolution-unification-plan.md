@@ -224,6 +224,22 @@ verification ratchet in the phase plan).
   redirect); a user class named `Error`/`Exception`/`Random` constructs via its own
   declaration; named args on a function-typed value diagnose rather than silently drop.
 
+## Landed RC-B slice (type-aware class-vs-factory)
+
+A same-name factory function and a constructor of the SAME arity were
+disambiguated arity-only, so `Box(5)` (ctor `Box(Int)`) bound the factory
+`fun Box(s: String)` type-blind and crashed on `s.length`. `shadowedByClass`
+now consults the candidate factory's declared parameter types
+(`decl_user_sig`) against the literal argument kinds: a factory whose parameter
+type definitely cannot accept a literal argument (an `Int` literal against a
+`String` parameter) is not applicable, so the call constructs the class.
+Conservative — only a literal-vs-builtin kind mismatch flips the decision; an
+unknown argument or parameter type never disproves. Locked by
+`examples/class_factory_overload.kt`. The full RC-B/RC-A consolidation
+(`Module.resolveCall` with constructors as first-class index candidates and one
+shared type-aware applicability over lowering+runtime+member) remains the bulk
+of P3.
+
 ## Landed RC-E fix (non-final vararg)
 
 A `vararg` parameter before a trailing defaulted parameter, called positionally,

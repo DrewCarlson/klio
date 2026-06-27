@@ -3545,6 +3545,50 @@ fn lowerValueInvocation(
 
 /// Whether a single-segment class-name call resolves to the constructor
 /// rather than a same-named factory function.
+const LitKind = enum { numeric, string, boolean, char };
+
+/// Definite builtin value kind of a literal argument expression, or null when
+/// the argument's type is not a known literal (so it can never *disprove* a
+/// candidate parameter type).
+fn argLitKind(e: *const Expr) ?LitKind {
+    return switch (e.*) {
+        .IntLit, .FloatLit => .numeric,
+        .BoolLit => .boolean,
+        .CharLit => .char,
+        .StringTemplate => .string,
+        else => null,
+    };
+}
+
+/// Builtin value kind a declared parameter type accepts, or null when unknown
+/// (a user class, a type parameter, `Any`, …) — those never disprove.
+fn paramLitKind(type_name: []const u8) ?LitKind {
+    const n = std.mem.trimEnd(u8, type_name, "?");
+    const eq = std.mem.eql;
+    if (eq(u8, n, "Int") or eq(u8, n, "Long") or eq(u8, n, "Short") or eq(u8, n, "Byte") or
+        eq(u8, n, "UInt") or eq(u8, n, "ULong") or eq(u8, n, "UShort") or eq(u8, n, "UByte") or
+        eq(u8, n, "Double") or eq(u8, n, "Float") or eq(u8, n, "Number")) return .numeric;
+    if (eq(u8, n, "String") or eq(u8, n, "CharSequence")) return .string;
+    if (eq(u8, n, "Boolean")) return .boolean;
+    if (eq(u8, n, "Char")) return .char;
+    return null;
+}
+
+/// True when a same-name factory's declared parameter types DEFINITELY cannot
+/// accept the literal argument kinds (e.g. an `Int` literal against a `String`
+/// parameter) — so the bare `Name(args)` constructs the class rather than
+/// calling the factory. Conservative: an unknown argument or parameter kind
+/// never disproves, so only a literal-vs-builtin mismatch flips the decision.
+fn factorySigRejectsArgs(sig: []const ir.TypeRef, args: []const Expr) bool {
+    for (args, 0..) |*a, i| {
+        if (i >= sig.len) break;
+        const ak = argLitKind(a) orelse continue;
+        const pk = paramLitKind(sig[i].name) orelse continue;
+        if (ak != pk) return true;
+    }
+    return false;
+}
+
 fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) Allocator.Error!bool {
     if (callee.* != .Path or callee.Path.segments.len != 1) return false;
     const name = callee.Path.segments[0].name;
@@ -3595,6 +3639,14 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
         if (b.module.decl_user_arity.get(entry.id.int())) |arity| {
             const n: u32 = @intCast(nargs);
             if (n >= arity.required and (arity.has_vararg or n <= arity.total)) {
+                // A same-arity factory whose declared parameter types
+                // definitely cannot accept the literal argument types is not
+                // applicable — the call constructs the class instead. This is
+                // what tells `Box(5)` (ctor `Box(Int)`) from the same-arity
+                // factory `fun Box(s: String)`.
+                if (b.module.decl_user_sig.get(entry.id.int())) |sig| {
+                    if (factorySigRejectsArgs(sig, args)) continue;
+                }
                 any_factory_applicable = true;
                 break;
             }
