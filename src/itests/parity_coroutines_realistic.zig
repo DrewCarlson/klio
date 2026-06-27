@@ -413,3 +413,48 @@ test "semaphore_withpermit_serializes_under_contention" {
     ;
     try assertKlio("semaphore_contention", src, "permits=1 ran=2\n");
 }
+
+// A fan-in `select` over a rendezvous channel: the sender parks between its
+// two sends, and each `onReceive` select takes a value handed off by the
+// parked sender (the first directly, the second from the sender now waiting
+// in the channel). Both values arrive in order.
+test "select_onreceive_parks_then_woken_by_rendezvous_sender" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val c = Channel<Int>()
+        \\    launch { c.send(1); c.send(2) }
+        \\    val sums = mutableListOf<Int>()
+        \\    repeat(2) { sums.add(select<Int> { c.onReceive { it } }) }
+        \\    println(sums)
+        \\}
+        \\
+    ;
+    try assertKlio("select_onreceive_parks", src, "[1, 2]\n");
+}
+
+// An `onSend` select that parks before any receiver exists is woken when a
+// later `receive` arrives: the parked select hands its value straight to the
+// new receiver. The receiver then takes a second plain send.
+test "select_onsend_parks_then_woken_by_receiver" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val c = Channel<Int>()
+        \\    val got = mutableListOf<Int>()
+        \\    val r = launch { repeat(2) { got.add(c.receive()) } }
+        \\    select<Unit> { c.onSend(7) {} }
+        \\    c.send(9)
+        \\    r.join()
+        \\    println(got)
+        \\}
+        \\
+    ;
+    try assertKlio("select_onsend_parks", src, "[7, 9]\n");
+}
