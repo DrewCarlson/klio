@@ -90,7 +90,11 @@ are the implementation notes behind these verdicts.
   a `JobNode` was expected. REMAINING:
   - `zip` → `invokeOnClose` is unimplemented on klio channels (a real missing intrinsic — even
     a plain `Channel<Int>().invokeOnClose{}` errors `Vm::call_member invokeOnClose on KlioChannel`).
-  - `combine` → `invoke on SafeFlow` (combineInternal machinery).
+  - `combine` → builder layer FIXED (the `fun Flow<T1>.combine(flow: Flow<T2>, …) = flow { … }`
+    parameter named `flow` shadowed the `flow {}` builder; see the non-fn-param shadow commit).
+    It now reaches a deeper `collect on SafeCollector` layer in `combineInternal`'s
+    `launch { flows[i].collect { … } }` + batched `resultChannel.receiveCatching()` machinery —
+    still open.
   - `conflate`/`flatMapMerge` → SIGSEGV (stack overflow in the channel-flow + merge path).
   - `takeWhile`/`transformWhile` → `invoke on $anon$0`: inside `unsafeFlow { collectWhile { … } }`
     a bare `emit`/`predicate` in the (non-inline) takeWhile lambda, once spliced into
