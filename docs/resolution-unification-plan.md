@@ -224,6 +224,17 @@ verification ratchet in the phase plan).
   redirect); a user class named `Error`/`Exception`/`Random` constructs via its own
   declaration; named args on a function-typed value diagnose rather than silently drop.
 
+## Landed RC-F fix (reified inference from parameter positions)
+
+`inferReifiedTypeArgs` inferred a reified type parameter only by unifying the
+function's RETURN type against the call's expected type, so a reified `T` that
+appears only in a value parameter (e.g. `block: (T) -> String`) stayed unbound
+and `x is T` degenerated to always-true. It now first unifies each declared
+value-parameter type against the actual argument — a function-typed parameter
+against the lambda literal's parameter annotations (`{ s: String -> … }`) —
+before the return-type fallback. Explicit `<T>` arguments still win (filled
+before inference). Locked by `examples/reified_param_inference.kt`.
+
 ## Landed RC-B slice (type-aware class-vs-factory)
 
 A same-name factory function and a constructor of the SAME arity were
