@@ -224,6 +224,31 @@ verification ratchet in the phase plan).
   redirect); a user class named `Error`/`Exception`/`Random` constructs via its own
   declaration; named args on a function-typed value diagnose rather than silently drop.
 
+## Landed RC-A fixes
+
+- **Cross-package class-name collision** — `reserveClass` deduped class stubs by SIMPLE
+  name, so two classes sharing a simple name across packages (`kotlinx.io.Segment` public
+  + concrete vs `kotlinx.coroutines.internal.Segment` internal + abstract) collapsed onto
+  one slot; whichever pack reserved first won, and the loser's own `Name(args)`
+  construction sites misresolved to the winner (here: to the abstract twin's companion
+  `invoke`). Fixed with `reserveClassFqn` (FQN-keyed reservation) + FQN-aware stub reuse
+  in `addClass`, plus `shadowedByClass` now resolving through the scope-tiered
+  `classIdIndexed` rather than the simple-name-global `classId`. This surfaced as a
+  `kotlinx.io` ByteChannel failure/deadlock under co-loaded `kotlinx.coroutines` and is
+  locked by `tests/fixtures/dispatch/class_name_collision.kt`.
+
+## Sequencing note: P1 must land WITH P4
+
+The intra-build reorder (register top-level headers before class bodies lower) is NOT
+safely additive: completing the index during class-body lowering changes member-vs-global
+decisions, because the lowering still decides member-vs-global by the heuristic
+(`class_member_names` global set + `prefer_member`), not by the receiver type. The reorder
+alone regressed a stdlib inner-class call (`AbstractMutableList.IteratorImpl` resolving a
+bare `get` to the wrong target). So P1 (the reorder) is folded into P4: the index is made
+complete during class lowering only once member-vs-global is decided by the enclosing
+receiver type (RC-C). Until then the build keeps the original order (class bodies before
+top-level headers).
+
 ## Prior progress (carried from the RC-1..RC-5 sketch)
 
 - Step 4 (commit `fea12203`) — removed the `intrinsic_owns_all`/`intrinsicOwnsBareName`

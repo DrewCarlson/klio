@@ -3548,7 +3548,15 @@ fn lowerValueInvocation(
 fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) Allocator.Error!bool {
     if (callee.* != .Path or callee.Path.segments.len != 1) return false;
     const name = callee.Path.segments[0].name;
-    const cid = b.module.classId(name) orelse return false;
+    // Resolve the class the SAME way the construct path below does — through
+    // the scope-aware index (file imports, then self package, then global) —
+    // not the simple-name-global `classId`, which picks an arbitrary winner on
+    // a cross-package simple-name collision. Otherwise a bare `Name(args)` here
+    // can be judged against the wrong same-named class (e.g. an abstract
+    // `kotlinx.coroutines.internal.Segment` shadowing the concrete
+    // `kotlinx.io.Segment` at its own construction site), inverting the
+    // ctor-vs-factory decision.
+    const cid = b.module.classIdIndexed(name, b.self_package, callee.Path.segments[0].span.file) orelse return false;
     // An abstract/interface/sealed class cannot be constructed, so a bare
     // `Name(args)` is never a constructor call — it is a same-named factory
     // function (`fun Random(seed): Random`). Resolve it as a function (the

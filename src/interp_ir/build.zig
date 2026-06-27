@@ -1430,9 +1430,18 @@ fn buildModuleWithOverrides(
         }
     }
 
-    // Pre-register every class name so `classId` resolves order-independently.
+    // Pre-register every class by its FULLY-QUALIFIED name so resolution is
+    // order-independent AND a same-simple-name class in another package (an
+    // `internal` `kotlinx.coroutines...Segment` vs a public `kotlinx.io.Segment`)
+    // does not collapse onto a single slot — each keeps its own stub before any
+    // body lowers, so a bare `Name(args)` at its own construction site resolves
+    // to the package-local class through the scope-tiered index.
     for (decls) |*d| {
-        if (d.* == .Class) _ = try module.reserveClass(a, d.Class.name.name, d.Class.is_inner);
+        if (d.* != .Class) continue;
+        const c = &d.Class;
+        const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+        _ = try module.reserveClassFqn(a, c.name.name, cfqn, cls_pkg, c.is_inner);
     }
     // Register typealias → head tags BEFORE phase-2 body lowering so the
     // lambda-arity detection (`argFnArities`) resolves an aliased

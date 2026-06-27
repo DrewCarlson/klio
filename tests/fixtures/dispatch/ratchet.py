@@ -24,6 +24,7 @@ CASES = [
     ("reified_param_infer.kt",    "is\nno\n",                                "P6"),
     ("reified_inline_overload.kt","plain:5\nis:HI\nno\n",                    "P6"),
     ("member_vs_global.kt",       "7\n",                                     None),
+    ("class_name_collision.kt",   "size=20000\n",                            None),
 ]
 
 
