@@ -69,11 +69,17 @@ are the implementation notes behind these verdicts.
 - **launch/async OUTSIDE a driver (PART B, 1/2).** Fixed: an outside-`runBlocking`
   `launch`/`async` no longer runs eagerly — it routes through `Dispatchers.Default`
   (`ContextActuals.kt` `newCoroutineContext`); an uncaught exception reports to the worker
-  reporter and the process still exits 0. **Remaining:** suspends on the `Default`/`IO`
-  worker pool do not honor cancellation — `KlioDefaultDispatcher`/
-  `KlioIoDispatcher.scheduleResumeAfterDelay` (KlioRuntime.kt ~122/157) must register an
-  `invokeOnCancellation` that aborts the pending `__kxco_delayMillis` and resumes early
-  with the cancellation cause.
+  reporter and the process still exits 0. **Remaining (root nailed):** delays are REAL
+  wall-clock by default (`delay(3000)` ≈ 3.5s). On a `Dispatchers.Default`/`IO` *worker*
+  there is no cooperative pump, so `scheduleResumeAfterDelay`'s `__kxco_spawn { … }` runs
+  EAGERLY INLINE on the worker thread — `__kxco_delayMillis` becomes a blocking real sleep
+  that nothing can preempt. So `launch(Dispatchers.Default){ delay(10_000) }` +
+  `cancelAndJoin()` waits the FULL 10s (pb1: 10546ms) instead of returning at once, while the
+  same on the runBlocking pump aborts instantly (pb7: 586ms — `__kxco_spawn` enqueues and the
+  delay parks cooperatively + cancellably). Fix is PART-B(b'): give every dispatched worker
+  task a cooperative driver (`driveRoot(persist=true)` around `runVmTask`) so its
+  `__kxco_spawn` delays park instead of blocking and the `CancellableContinuation`'s
+  cancellation can resume them early. DEEP (worker-pump infrastructure).
 
 ### Open — not started
 
