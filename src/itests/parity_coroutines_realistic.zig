@@ -458,3 +458,25 @@ test "select_onsend_parks_then_woken_by_receiver" {
     ;
     try assertKlio("select_onsend_parks", src, "[7, 9]\n");
 }
+
+// A parked `onReceiveCatching` select is woken by a `close` with the closed
+// result (not a spurious `null` value); a parked plain `onReceive` throws.
+test "select_onreceive_observes_close_while_parked" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\import kotlinx.coroutines.channels.*
+        \\import kotlinx.coroutines.selects.*
+        \\fun main() = runBlocking {
+        \\    val c = Channel<Int>()
+        \\    launch { c.send(1); c.send(2); c.close() }
+        \\    val xs = mutableListOf<String>()
+        \\    repeat(3) {
+        \\        xs.add(select { c.onReceiveCatching { r -> if (r.isClosed) "closed" else "v=${r.getOrNull()}" } })
+        \\    }
+        \\    println(xs)
+        \\}
+        \\
+    ;
+    try assertKlio("select_onreceive_close", src, "[v=1, v=2, closed]\n");
+}

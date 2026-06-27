@@ -68,6 +68,11 @@ private fun klioProcessReceive(clauseObject: Any, ignored: Any?, result: Any?): 
     // the channel to re-poll).
     if (result is KlioClauseHolder) return result.value
     if (result === KLIO_CLOSED) throw closedReceiveException(clauseObject)
+    // The native close path wakes a parked select with a null marker; a real
+    // received value is never null on a still-open channel, so a null result
+    // on a closed-for-receive channel is the close, not a value.
+    if (result == null && (clauseObject as ReceiveChannel<*>).isClosedForReceive)
+        throw closedReceiveException(clauseObject)
     return result
 }
 
@@ -84,6 +89,8 @@ public val <E> ReceiveChannel<E>.onReceiveCatching: SelectClause1<ChannelResult<
 private fun klioProcessReceiveCatching(clauseObject: Any, ignored: Any?, result: Any?): Any? {
     if (result is KlioClauseHolder) return ChannelResult.success(result.value as Any?)
     if (result === KLIO_CLOSED) return ChannelResult.closed<Any?>(null)
+    if (result == null && (clauseObject as ReceiveChannel<*>).isClosedForReceive)
+        return ChannelResult.closed<Any?>(null)
     return ChannelResult.success(result)
 }
 
