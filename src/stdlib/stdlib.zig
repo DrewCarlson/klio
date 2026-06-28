@@ -104,6 +104,7 @@ pub const IMPLICIT_ALIASES = [_]Alias{
     .{ .name = "emptySequence", .fqn = "kotlin.sequences.emptySequence" },
     .{ .name = "generateSequence", .fqn = "kotlin.sequences.generateSequence" },
     .{ .name = "sequence", .fqn = "kotlin.sequences.sequence" },
+    .{ .name = "iterator", .fqn = "kotlin.sequences.iterator" },
     .{ .name = "downTo", .fqn = "kotlin.ranges.downTo" },
     .{ .name = "step", .fqn = "kotlin.ranges.step" },
     .{ .name = "until", .fqn = "kotlin.ranges.until" },

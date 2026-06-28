@@ -114,6 +114,14 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
         // Rust's f64::min/max which return the non-NaN operand.
         const r: f64 = if (std.math.isNan(x) or std.math.isNan(y))
             std.math.nan(f64)
+        else if (x == 0.0 and y == 0.0)
+            // Signed-zero tie (`@min`/`@max` treat -0.0 == 0.0): match
+            // Math.min/max — min yields -0.0 if either is -0.0, max yields
+            // +0.0 unless both are -0.0.
+            (if (want_min)
+                (if (std.math.signbit(x) or std.math.signbit(y)) -@as(f64, 0.0) else 0.0)
+            else
+                (if (std.math.signbit(x) and std.math.signbit(y)) -@as(f64, 0.0) else 0.0))
         else if (want_min)
             @min(x, y)
         else
