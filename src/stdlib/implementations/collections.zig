@@ -4240,9 +4240,60 @@ fn collectColl(a: Allocator, v: ?Value) Error!?[]Value {
     return null;
 }
 
+/// A removeAll/retainAll argument that is a lambda/function reference (not a
+/// collection or a callable user Collection instance) is the predicate form
+/// `removeAll { (T) -> Boolean }`.
+fn isPredicateArg(v: Value) bool {
+    return switch (v) {
+        .IrClosure, .BoundMethod, .BoundUserMethod, .Function, .Intrinsic => true,
+        else => false,
+    };
+}
+
+/// `MutableCollection.removeAll/retainAll { predicate }`: keep an element when
+/// `retain == predicate(element)`.
+fn mutCollRemoveRetainPred(ctx: *CallCtx, items: ValueList, recv: Value, retain: bool) Error!EvalResult {
+    const a = ctx.allocator;
+    const pred = ctx.args[1];
+    const snap = try snapshotItems(a, items);
+    defer if (runtime.freeScratch()) a.free(snap);
+    const keep = try a.alloc(bool, snap.len);
+    defer if (runtime.freeScratch()) a.free(keep);
+    for (snap, 0..) |v, i| {
+        const rv = switch (try invoke(ctx, &pred, &.{v})) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+        const truth = rv == .Bool and rv.Bool;
+        keep[i] = if (retain) truth else !truth;
+    }
+    var changed = false;
+    {
+        const g = items.borrowMut();
+        defer g.deinit();
+        const list = g.get();
+        const before = list.items.len;
+        var w: usize = 0;
+        for (list.items, 0..) |v, i| {
+            const k = if (i < keep.len) keep[i] else true;
+            if (k) {
+                list.items[w] = v;
+                w += 1;
+            } else if (runtime.reclaimEnabled()) {
+                v.release(a);
+            }
+        }
+        list.shrinkRetainingCapacity(w);
+        changed = list.items.len != before;
+    }
+    if (changed) syncMapView(a, recv);
+    return ok(.{ .Bool = changed });
+}
+
 fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []const u8, retain: bool, allow_array: bool) Error!EvalResult {
     const a = ctx.allocator;
     const arg = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
+    if (isPredicateArg(arg)) return mutCollRemoveRetainPred(ctx, items, recv, retain);
     const other = blk: {
         switch (arg) {
             .List => |l| break :blk try snapshotItems(a, l.items),
