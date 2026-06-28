@@ -106,6 +106,7 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         .CellSet => |c| try w.print("CellSet r{d} <- r{d}", .{ reg(c.cell), reg(c.value) }),
         .GetField => |c| try w.print("r{d} <- GetField r{d}.'{s}'        [DYN field]", .{ reg(c.dst), reg(c.receiver), constStr(m, c.field) }),
         .SetField => |c| try w.print("SetField r{d}.'{s}' <- r{d}        [DYN field]", .{ reg(c.receiver), constStr(m, c.field), reg(c.value) }),
+        .CompoundField => |c| try w.print("CompoundField r{d}.'{s}' {s}= r{d}        [DYN field]", .{ reg(c.receiver), constStr(m, c.field), @tagName(c.op), reg(c.value) }),
         .Index => |c| try w.print("r{d} <- Index r{d}[r{d}]", .{ reg(c.dst), reg(c.receiver), reg(c.index) }),
         .IndexSet => |c| try w.print("IndexSet r{d}[r{d}] <- r{d}", .{ reg(c.receiver), reg(c.index), reg(c.value) }),
         .Call => |c| {

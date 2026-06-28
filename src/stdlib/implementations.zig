@@ -1389,6 +1389,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.text.Regex.replace", .f = regexp.regex_replace },
     .{ .fqn = "kotlin.text.Regex.replaceFirst", .f = regexp.regex_replace_first },
     .{ .fqn = "kotlin.text.Regex.split", .f = regexp.regex_split },
+    .{ .fqn = "kotlin.text.Regex.splitToSequence", .f = regexp.regex_split_to_sequence },
     .{ .fqn = "kotlin.text.Regex.escape", .f = regexp.regex_static_escape },
     .{ .fqn = "kotlin.text.Regex.fromLiteral", .f = regexp.regex_from_literal },
     .{ .fqn = "kotlin.text.Regex.escapeReplacement", .f = regexp.regex_static_escape_replacement },

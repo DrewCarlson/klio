@@ -203,3 +203,28 @@ test "object_self_reference_during_init" {
     ;
     try assertKlio("object_self_ref_init", src, "[a, b]\n2\n");
 }
+
+test "top_level_property_reference_get_set" {
+    const src =
+        \\
+        \\import kotlin.reflect.KProperty0
+        \\import kotlin.reflect.KMutableProperty0
+        \\val pi: Double get() = 3.14
+        \\val label = "kt"
+        \\var counter = 7
+        \\fun main() {
+        \\    val piRef: KProperty0<Double> = ::pi
+        \\    println(piRef.get())
+        \\    val labelRef: KProperty0<String> = ::label
+        \\    println(labelRef.get())
+        \\    println(labelRef.invoke())
+        \\    val counterRef: KMutableProperty0<Int> = ::counter
+        \\    println(counterRef.get())
+        \\    counterRef.set(9)
+        \\    println(counterRef.get())
+        \\    println(counter)
+        \\}
+        \\
+    ;
+    try assertKlio("top_level_property_reference", src, "3.14\nkt\nkt\n7\n9\n9\n");
+}

@@ -345,6 +345,11 @@ pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value)
     coroutines.coroutineResumeSlotValue(self, slot, value);
 }
 
+pub fn activeCoroScope(self: *VmIntrinsicHost) ?Value {
+    _ = self;
+    return coroutines.activeCoroScope();
+}
+
 pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) void {
     coroutines.coroutineResumeExternal(self, slot, value, out) catch {};
 }
@@ -642,6 +647,20 @@ pub fn invokeMethod(self: *VmIntrinsicHost, receiver: *const Value, name: []cons
     };
 }
 
+pub fn getProperty(self: *VmIntrinsicHost, receiver: *const Value, name: []const u8, out: Output) Allocator.Error!?RuntimeEvalResult {
+    // Route through the field path so custom getters / stored fields /
+    // ctor-property params resolve (call_member only dispatches functions).
+    var host = vmHost(self, out);
+    const r = try host.getField(self.allocator, receiver, name);
+    return switch (r) {
+        .ok => |v| RuntimeEvalResult{ .ok = v },
+        .err => |e| switch (e) {
+            .Throw => |v| RuntimeEvalResult{ .err = .{ .Thrown = v } },
+            else => null,
+        },
+    };
+}
+
 pub fn lookupGlobal(self: *VmIntrinsicHost, name: []const u8) ?Value {
     {
         const g = self.globals.borrow();
@@ -661,6 +680,16 @@ pub fn lookupGlobal(self: *VmIntrinsicHost, name: []const u8) ?Value {
         return .{ .Class = def.clone() };
     }
     return null;
+}
+
+/// Resolve a top-level Kotlin function value by name for a native intrinsic
+/// that needs to invoke a pack helper. Distinct from `lookupGlobal` (which
+/// only covers globals/objects/classes) so the heavier module-function
+/// resolution runs only when explicitly needed.
+pub fn lookupGlobalFunc(self: *VmIntrinsicHost, name: []const u8) ?Value {
+    const state = vmhost.SharedHandles.fromIntrinsic(self);
+    var host = VmHost.borrowed(state, state.globals, self.out_sink.output());
+    return vmhost.host_globals.lookupGlobal(&host, name);
 }
 
 pub fn allocInstanceId(self: *VmIntrinsicHost) u64 {

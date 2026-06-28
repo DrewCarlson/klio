@@ -20,4 +20,17 @@ fun main() {
     ledger += 200
     ledger -= 100
     println(ledger)
+
+    val cart = Cart()
+    cart.items += "apple"
+    cart.items += "pear"
+    cart.total += 5
+    cart.total += 3
+    println(cart.items)
+    println(cart.total)
+}
+
+class Cart {
+    val items = mutableListOf<String>()
+    var total = 0
 }

@@ -49,6 +49,11 @@ pub const IntrinsicHost = struct {
         /// Invoke a named method on a receiver. `null` slot => default
         /// (returns `null`, i.e. fall back to structural rendering).
         invoke_method: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
+        /// Read a property/field off a receiver: resolves custom getters,
+        /// stored fields, and ctor-property params (unlike `invoke_method`,
+        /// which only dispatches functions). `null` slot => default (returns
+        /// `null`, i.e. unavailable).
+        get_property: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8, out: Output) std.mem.Allocator.Error!?EvalResult = null,
         /// Resolve a top-level identifier. `null` => default (`null`).
         lookup_global: ?*const fn (ctx: *anyopaque, name: []const u8) ?Value = null,
         /// Allocate a fresh instance identity. `null` => default (`0`).
@@ -69,6 +74,13 @@ pub const IntrinsicHost = struct {
         coroutine_push_scope: ?*const fn (ctx: *anyopaque, scope: *const Value) void = null,
         coroutine_pop_scope: ?*const fn (ctx: *anyopaque) void = null,
         coroutine_resume_slot_value: ?*const fn (ctx: *anyopaque, slot: i64, value: Value) void = null,
+        /// The active coroutine scope (the running coroutine / `Job`), or
+        /// `null` outside any cooperative driver. `null` slot => no scope.
+        active_coro_scope: ?*const fn (ctx: *anyopaque) ?Value = null,
+        /// Resolve a top-level Kotlin function by name (the heavier
+        /// module-function lookup, distinct from `lookup_global`). `null`
+        /// slot => default (`null`).
+        lookup_global_func: ?*const fn (ctx: *anyopaque, name: []const u8) ?Value = null,
         coroutine_drain_to_idle: ?*const fn (ctx: *anyopaque, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_resume_external: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) void = null,
         /// Post a dispatcher runnable onto the shared worker pool
@@ -90,6 +102,11 @@ pub const IntrinsicHost = struct {
 
     pub fn invokeMethod(self: IntrinsicHost, receiver: *const Value, name: []const u8, args: []const Value, out: Output) !?EvalResult {
         if (self.vtable.invoke_method) |f| return f(self.ctx, receiver, name, args, out);
+        return null;
+    }
+
+    pub fn getProperty(self: IntrinsicHost, receiver: *const Value, name: []const u8, out: Output) !?EvalResult {
+        if (self.vtable.get_property) |f| return f(self.ctx, receiver, name, out);
         return null;
     }
 
@@ -145,6 +162,16 @@ pub const IntrinsicHost = struct {
 
     pub fn coroutineResumeSlotValue(self: IntrinsicHost, slot: i64, value: Value) void {
         if (self.vtable.coroutine_resume_slot_value) |f| f(self.ctx, slot, value);
+    }
+
+    pub fn activeCoroScope(self: IntrinsicHost) ?Value {
+        if (self.vtable.active_coro_scope) |f| return f(self.ctx);
+        return null;
+    }
+
+    pub fn lookupGlobalFunc(self: IntrinsicHost, name: []const u8) ?Value {
+        if (self.vtable.lookup_global_func) |f| return f(self.ctx, name);
+        return null;
     }
 
     pub fn coroutineDrainToIdle(self: IntrinsicHost, out: Output) !?RuntimeError {

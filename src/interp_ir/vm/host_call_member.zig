@@ -729,7 +729,9 @@ fn mapContainsKeyEq(self: *VmHost, allocator: Allocator, entries: runtime.MapEnt
 
 /// Build a builtin `Value::Map` from a user `Map` implementation.
 fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) Allocator.Error!EvalResult {
-    const entries_r = try callMemberRec(self, allocator, recv, "entries", &.{});
+    // `entries` is a property (custom getter), so read it through the field
+    // path; a plain method dispatch would not resolve a property getter.
+    const entries_r = try getFieldRec(self, allocator, recv, "entries");
     const entries_val = switch (entries_r) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
@@ -2463,13 +2465,15 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const start: usize = @intCast(idx);
         const cap = try captureModCount(allocator, receiver.List.mod_count);
         // Share the backing list (not a snapshot) so a `MutableListIterator`'s
-        // `set`/`add`/`remove` mutate the underlying list, matching Kotlin.
+        // `set`/`add`/`remove` mutate the underlying list, matching Kotlin. The
+        // iterator is mutable only when the source list is.
         return .{ .ok = .{ .Iterator = .{
             .items = receiver.List.items.clone(),
             .pos = try ObjRef(usize).init(allocator, start),
             .prim = null,
             .mod_count = cap.mod_count,
             .exp_mod = cap.exp_mod,
+            .mutable = receiver.List.mutable and receiver.List.backing == null,
         } } };
     }
 
@@ -3395,10 +3399,12 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
         .List => |l| {
             // A mutable list shares its backing so `MutableIterator.remove()`
             // mutates the source (and the iterating loop observes it); an
-            // immutable list snapshots, as before.
-            if (l.mutable and l.backing == null) {
+            // immutable list snapshots, as before. A live map `values` view is
+            // also mutable (no read-only error; CME still fires on concurrent
+            // map modification); only a genuinely read-only list snapshots.
+            if (l.mutable) {
                 const cap = try captureModCount(allocator, l.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
             }
             // A snapshot iterator (immutable list, or a live map `values` view):
             // still capture `mod_count` so a concurrent structural change to the
@@ -3410,10 +3416,13 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
         .Set => |s| {
             // A mutable set shares its backing so `MutableIterator.remove()`
             // mutates the source set (the `filterInPlace` removeAll/retainAll
-            // path iterates + removes); an immutable set snapshots.
-            if (s.mutable and s.backing == null) {
+            // path iterates + removes); an immutable set snapshots. A live map
+            // `keys`/`entries` view is also mutable (its iterator supports
+            // remove and reports CME on concurrent map modification); only a
+            // genuinely read-only set yields a read-only iterator.
+            if (s.mutable) {
                 const cap = try captureModCount(allocator, s.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
             }
             // Snapshot iterator (immutable set, or a live map `keys`/`entries`
             // view): capture `mod_count` so a concurrent map mutation fails fast.
@@ -3434,7 +3443,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             const src_mc = g.get().mod_count;
             g.deinit();
             const cap = try captureModCount(allocator, src_mc);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = m.mutable } } };
         },
         .Range => |r| {
             return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind, .done = try ObjRef(bool).init(allocator, false) } } };
@@ -3893,6 +3902,22 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
             return try callValueRec(self, allocator, &callable.?, args);
         }
     }
+    // Unbound `KProperty0` / `KMutableProperty0`: `get()` (and the
+    // `() -> V` `invoke()`/`call()` forms) read the referenced top-level
+    // property, and `set(v)` writes it. The reference carries only the
+    // property name, so resolve the value the same way a bare read does —
+    // a stored `val`/`var` from globals (driving a deferred initializer on
+    // demand), otherwise a custom `get()` accessor's 0-arg getter func.
+    if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and args.len == 0) {
+        if (try topLevelPropertyGet(self, allocator, pname)) |r| return r;
+    }
+    if (std.mem.eql(u8, name, "set") and args.len == 1) {
+        const r = try self.storeGlobal(allocator, pname, args[0]);
+        return switch (r) {
+            .ok => .{ .ok = Value.Unit },
+            .err => |e| .{ .err = e },
+        };
+    }
     if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and args.len == 1) {
         return try getFieldRec(self, allocator, &args[0], pname);
     }
@@ -3905,6 +3930,29 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
     if (std.mem.eql(u8, name, "toString") and args.len == 0) {
         const s = try std.fmt.allocPrint(allocator, "property {s}", .{pname});
         return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
+    }
+    return null;
+}
+
+/// Read the top-level property `pname` for an unbound property reference's
+/// `get()`. Mirrors the `LoadGlobal` resolution: a stored `val`/`var` comes
+/// from globals (driving a deferred initializer and resolving delegates),
+/// and a property declared with only a custom `get()` re-runs its 0-arg
+/// getter func on each read. Returns `null` when `pname` names no top-level
+/// property, leaving the remaining dispatch branches to handle it.
+fn topLevelPropertyGet(self: *VmHost, allocator: Allocator, pname: []const u8) Allocator.Error!?EvalResult {
+    switch (try self.lookupGlobalThrowing(allocator, pname)) {
+        .ok => |maybe| if (maybe) |v| {
+            v.retain();
+            return .{ .ok = v };
+        },
+        .err => |e| return .{ .err = e },
+    }
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    if (mod.registry.top_level_prop_getters.get(pname)) |fid| {
+        return try self.callFunc(allocator, mod, fid, &.{});
     }
     return null;
 }
@@ -4303,6 +4351,11 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
         .MapEntry => |me| {
             if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "key")) return extractOwned(me.key);
             if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "value")) return extractOwned(me.value);
+            // `Map.Entry` equality contract: compare by key and value, so a
+            // builtin entry equals a user `Map.Entry` instance with the same
+            // key/value (`structuralEqBoxed` applies the contract).
+            if (std.mem.eql(u8, name, "equals") and args.len == 1) return .{ .ok = boolVal(Value.structuralEqBoxed(receiver, &args[0])) };
+            if (std.mem.eql(u8, name, "hashCode") and args.len == 0) return .{ .ok = .{ .Int = kotlinHashCode(receiver) } };
             if (std.mem.eql(u8, name, "setValue")) {
                 const new_v = if (args.len > 0) args[0] else Value.Unit;
                 const prev = me.value.asPtr().*;
@@ -4477,7 +4530,12 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     }
     // `MutableListIterator.set(x)` — overwrite the element last returned.
     if (std.mem.eql(u8, name, "set") and args.len == 1) {
+        // Check concurrent modification before the read-only guard: a
+        // mutable collection's view iterator modified during iteration must
+        // report CME, while a genuinely immutable iterator (whose mod count
+        // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
+        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
         const pg = it.pos.borrow();
         const p = pg.get().*;
         pg.deinit();
@@ -4498,7 +4556,12 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // `next()` would return (at the cursor) and advance the cursor past it,
     // so the inserted element is skipped by the following `next()`.
     if (std.mem.eql(u8, name, "add") and args.len == 1) {
+        // Check concurrent modification before the read-only guard: a
+        // mutable collection's view iterator modified during iteration must
+        // report CME, while a genuinely immutable iterator (whose mod count
+        // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
+        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
         const pg = it.pos.borrow();
         const p = pg.get().*;
         pg.deinit();
@@ -4518,7 +4581,12 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // (at `pos - 1`) from the backing list and rewind the cursor so the
     // following `next()` resumes correctly. A no-op before the first `next()`.
     if (std.mem.eql(u8, name, "remove") and args.len == 0) {
+        // Check concurrent modification before the read-only guard: a
+        // mutable collection's view iterator modified during iteration must
+        // report CME, while a genuinely immutable iterator (whose mod count
+        // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
+        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
         const pg = it.pos.borrow();
         const p = pg.get().*;
         pg.deinit();
@@ -5390,6 +5458,13 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         return .{ .ok = Value.newInt(@bitCast(g.get().identity)) };
     }
     if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
+        // A user `Map.Entry` implementation with no `equals` override follows
+        // the `Map.Entry` contract: equal iff keys and values are equal,
+        // regardless of the other operand's concrete type (a builtin
+        // `MapEntry` or another `Map.Entry` instance).
+        if (Value.mapEntryContractEq(receiver, &args[0])) |eq| {
+            return .{ .ok = boolVal(eq) };
+        }
         if (args[0] == .Instance) {
             return .{ .ok = boolVal(ObjRef(InstanceData).ptrEq(inst, args[0].Instance)) };
         }
