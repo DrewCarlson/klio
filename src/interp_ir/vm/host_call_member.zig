@@ -729,7 +729,9 @@ fn mapContainsKeyEq(self: *VmHost, allocator: Allocator, entries: runtime.MapEnt
 
 /// Build a builtin `Value::Map` from a user `Map` implementation.
 fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) Allocator.Error!EvalResult {
-    const entries_r = try callMemberRec(self, allocator, recv, "entries", &.{});
+    // `entries` is a property (custom getter), so read it through the field
+    // path; a plain method dispatch would not resolve a property getter.
+    const entries_r = try getFieldRec(self, allocator, recv, "entries");
     const entries_val = switch (entries_r) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
@@ -2463,13 +2465,15 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const start: usize = @intCast(idx);
         const cap = try captureModCount(allocator, receiver.List.mod_count);
         // Share the backing list (not a snapshot) so a `MutableListIterator`'s
-        // `set`/`add`/`remove` mutate the underlying list, matching Kotlin.
+        // `set`/`add`/`remove` mutate the underlying list, matching Kotlin. The
+        // iterator is mutable only when the source list is.
         return .{ .ok = .{ .Iterator = .{
             .items = receiver.List.items.clone(),
             .pos = try ObjRef(usize).init(allocator, start),
             .prim = null,
             .mod_count = cap.mod_count,
             .exp_mod = cap.exp_mod,
+            .mutable = receiver.List.mutable and receiver.List.backing == null,
         } } };
     }
 
@@ -3398,7 +3402,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // immutable list snapshots, as before.
             if (l.mutable and l.backing == null) {
                 const cap = try captureModCount(allocator, l.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
             }
             // A snapshot iterator (immutable list, or a live map `values` view):
             // still capture `mod_count` so a concurrent structural change to the
@@ -3413,7 +3417,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // path iterates + removes); an immutable set snapshots.
             if (s.mutable and s.backing == null) {
                 const cap = try captureModCount(allocator, s.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
             }
             // Snapshot iterator (immutable set, or a live map `keys`/`entries`
             // view): capture `mod_count` so a concurrent map mutation fails fast.
@@ -4516,6 +4520,7 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     }
     // `MutableListIterator.set(x)` — overwrite the element last returned.
     if (std.mem.eql(u8, name, "set") and args.len == 1) {
+        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
         if (try iteratorCheckMod(allocator, it)) |e| return e;
         const pg = it.pos.borrow();
         const p = pg.get().*;
@@ -4537,6 +4542,7 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // `next()` would return (at the cursor) and advance the cursor past it,
     // so the inserted element is skipped by the following `next()`.
     if (std.mem.eql(u8, name, "add") and args.len == 1) {
+        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
         if (try iteratorCheckMod(allocator, it)) |e| return e;
         const pg = it.pos.borrow();
         const p = pg.get().*;
@@ -4557,6 +4563,7 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // (at `pos - 1`) from the backing list and rewind the cursor so the
     // following `next()` resumes correctly. A no-op before the first `next()`.
     if (std.mem.eql(u8, name, "remove") and args.len == 0) {
+        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
         if (try iteratorCheckMod(allocator, it)) |e| return e;
         const pg = it.pos.borrow();
         const p = pg.get().*;

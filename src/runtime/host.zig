@@ -49,6 +49,11 @@ pub const IntrinsicHost = struct {
         /// Invoke a named method on a receiver. `null` slot => default
         /// (returns `null`, i.e. fall back to structural rendering).
         invoke_method: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
+        /// Read a property/field off a receiver: resolves custom getters,
+        /// stored fields, and ctor-property params (unlike `invoke_method`,
+        /// which only dispatches functions). `null` slot => default (returns
+        /// `null`, i.e. unavailable).
+        get_property: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8, out: Output) std.mem.Allocator.Error!?EvalResult = null,
         /// Resolve a top-level identifier. `null` => default (`null`).
         lookup_global: ?*const fn (ctx: *anyopaque, name: []const u8) ?Value = null,
         /// Allocate a fresh instance identity. `null` => default (`0`).
@@ -90,6 +95,11 @@ pub const IntrinsicHost = struct {
 
     pub fn invokeMethod(self: IntrinsicHost, receiver: *const Value, name: []const u8, args: []const Value, out: Output) !?EvalResult {
         if (self.vtable.invoke_method) |f| return f(self.ctx, receiver, name, args, out);
+        return null;
+    }
+
+    pub fn getProperty(self: IntrinsicHost, receiver: *const Value, name: []const u8, out: Output) !?EvalResult {
+        if (self.vtable.get_property) |f| return f(self.ctx, receiver, name, out);
         return null;
     }
 

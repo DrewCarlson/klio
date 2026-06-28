@@ -3604,6 +3604,61 @@ fn pairsFromValues(a: Allocator, items: []const Value, who: []const u8) Error!un
     return .{ .entries = entries };
 }
 
+/// Read a user `Map` implementation (a `.Instance` whose class implements
+/// `kotlin.collections.Map`) into a slice of `MapPair`. Drains the instance's
+/// `entries` view, then extracts `key`/`value` from each entry through host
+/// member dispatch (entries may be `Map.Entry` instances, builtin `MapEntry`
+/// values, or `Pair`s). Returns an error EvalResult on a non-map instance.
+fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enum) { entries: []MapPair, err: EvalResult } {
+    const a = ctx.allocator;
+    const entries_r = (try ctx.host.getProperty(&inst, "entries", ctx.out)) orelse
+        return .{ .err = typeErr(try fmt(a, "{s} requires a Map or a collection of Pairs", .{who})) };
+    const entries_val = switch (entries_r) {
+        .ok => |v| v,
+        .err => |e| return .{ .err = .{ .err = e } },
+    };
+    const items = switch (try materialiseIterableInstance(ctx, entries_val)) {
+        .items => |x| x,
+        .err => |e| return .{ .err = e },
+    };
+    var out: std.ArrayList(MapPair) = .empty;
+    for (items) |entry| {
+        var key: Value = undefined;
+        var val: Value = undefined;
+        switch (entry) {
+            .MapEntry => |me| {
+                key = me.key.asPtr().*;
+                val = me.value.asPtr().*;
+            },
+            .Pair => |p| {
+                key = p.first.asPtr().*;
+                val = p.second.asPtr().*;
+            },
+            // A user `Map.Entry` instance: read its `key`/`value` properties.
+            else => {
+                const kr = (try ctx.host.getProperty(&entry, "key", ctx.out)) orelse
+                    return .{ .err = typeErr(try fmt(a, "{s} entry is missing key", .{who})) };
+                key = switch (kr) {
+                    .ok => |v| v,
+                    .err => |e| return .{ .err = .{ .err = e } },
+                };
+                const vr = (try ctx.host.getProperty(&entry, "value", ctx.out)) orelse
+                    return .{ .err = typeErr(try fmt(a, "{s} entry is missing value", .{who})) };
+                val = switch (vr) {
+                    .ok => |v| v,
+                    .err => |e| return .{ .err = .{ .err = e } },
+                };
+            },
+        }
+        if (findKeyIndexBoxed(out.items, &key)) |i| {
+            out.items[i].value = val;
+        } else {
+            try out.append(a, .{ .key = key, .value = val });
+        }
+    }
+    return .{ .entries = try out.toOwnedSlice(a) };
+}
+
 pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const items = if (ctx.args.len > 0 and ctx.args[0] == .Array)
@@ -5470,6 +5525,12 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
                 .entries => |x| x,
                 .err => |e| return e,
             }).items;
+        },
+        // A user class implementing `kotlin.collections.Map`: drain its entries
+        // through host member dispatch.
+        .Instance => to_add = switch (try userMapPairs(ctx, arg, "putAll")) {
+            .entries => |x| x,
+            .err => |e| return e,
         },
         else => return typeErr("putAll requires a Map or a collection of Pairs"),
     }

@@ -1227,6 +1227,12 @@ pub const Value = union(enum) {
         /// no `mod_count`.
         mod_count: ?ObjRef(u64) = null,
         exp_mod: ?ObjRef(u64) = null,
+        /// True only when the iterator shares a *mutable* collection's backing,
+        /// so `MutableIterator.remove`/`MutableListIterator.set`/`.add` mutate
+        /// the source. A snapshot iterator over a read-only collection (or an
+        /// array/string) is false: those mutating ops throw
+        /// `UnsupportedOperationException`, matching Kotlin.
+        mutable: bool = false,
     },
     /// Lazy O(1)-memory iterator over a `Range`/progression.
     RangeIter: struct {
