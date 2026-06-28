@@ -111,6 +111,7 @@ Run any program with:
 | `reflection_lite.kt`       | `::class`, `::member`, basic `KClass` introspection.           |
 | `member_references.kt`     | Bound and unbound property / getter / function references, invoked directly and passed as transforms (`map(Class::prop)`, `map(::topLevelFun)`). |
 | `top_level_property_reference.kt` | Unbound top-level property references as `KProperty0`/`KMutableProperty0`: `get()`/`invoke()` read a stored or custom-getter `val`, and `set()` writes a `var` through to the real property. |
+| `sequence_iterator_builder.kt` | The `iterator { yield(...) }` builder resolves to the coroutine builder rather than the no-arg `Iterator.iterator()` extension. |
 | `reified_filter.kt`        | `reified` type parameters: `filterIsInstance<T>()` over lists, and a user-defined `inline fun <reified T>` extension that composes with it. |
 | `text_transforms.kt`       | `chunked(size) { transform }`, `Regex.replace`/`replaceFirst` with a `(MatchResult)->CharSequence` lambda and `$group` replacement templates. |
 | `map_views.kt`             | Live `MutableMap` `keys`/`values`/`entries` views: `remove`/`removeAll`/`retainAll`/`clear` and `MutableEntry.setValue` write through to the map. |
