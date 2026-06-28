@@ -74,6 +74,13 @@ pub const IntrinsicHost = struct {
         coroutine_push_scope: ?*const fn (ctx: *anyopaque, scope: *const Value) void = null,
         coroutine_pop_scope: ?*const fn (ctx: *anyopaque) void = null,
         coroutine_resume_slot_value: ?*const fn (ctx: *anyopaque, slot: i64, value: Value) void = null,
+        /// The active coroutine scope (the running coroutine / `Job`), or
+        /// `null` outside any cooperative driver. `null` slot => no scope.
+        active_coro_scope: ?*const fn (ctx: *anyopaque) ?Value = null,
+        /// Resolve a top-level Kotlin function by name (the heavier
+        /// module-function lookup, distinct from `lookup_global`). `null`
+        /// slot => default (`null`).
+        lookup_global_func: ?*const fn (ctx: *anyopaque, name: []const u8) ?Value = null,
         coroutine_drain_to_idle: ?*const fn (ctx: *anyopaque, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_resume_external: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) void = null,
         /// Post a dispatcher runnable onto the shared worker pool
@@ -155,6 +162,16 @@ pub const IntrinsicHost = struct {
 
     pub fn coroutineResumeSlotValue(self: IntrinsicHost, slot: i64, value: Value) void {
         if (self.vtable.coroutine_resume_slot_value) |f| f(self.ctx, slot, value);
+    }
+
+    pub fn activeCoroScope(self: IntrinsicHost) ?Value {
+        if (self.vtable.active_coro_scope) |f| return f(self.ctx);
+        return null;
+    }
+
+    pub fn lookupGlobalFunc(self: IntrinsicHost, name: []const u8) ?Value {
+        if (self.vtable.lookup_global_func) |f| return f(self.ctx, name);
+        return null;
     }
 
     pub fn coroutineDrainToIdle(self: IntrinsicHost, out: Output) !?RuntimeError {

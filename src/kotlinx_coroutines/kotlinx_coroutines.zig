@@ -176,6 +176,19 @@ const CoroutineRegistry = struct {
     /// their state from any entry-point without threading a host handle
     /// through the call stack.
     channels: std.AutoHashMapUnmanaged(u64, ChannelState) = .empty,
+    /// Cancellation watchers for parked channel waiters, keyed by the
+    /// waiter's park slot. Each value is the `CancellableContinuation` of a
+    /// child coroutine launched by `__kxco_chanArmCancel` that awaits
+    /// cancellation; a normal value delivery resumes it (so the parking
+    /// coroutine's Job completes) and a cancellation fires its
+    /// `invokeOnCancellation` to wake the parked waiter with the cause.
+    chan_watchers: std.AutoHashMapUnmanaged(i64, Value) = .empty,
+    /// Slots whose waiter was delivered/woken before the watcher child got
+    /// a chance to bind its continuation (a value handed off in the same
+    /// pump turn the waiter parked). The watcher, when it finally binds,
+    /// completes immediately instead of parking — so it never outlives the
+    /// suspension it guards.
+    chan_delivered: std.AutoHashMapUnmanaged(i64, void) = .empty,
 };
 
 var coro_reg_mutex: runtime.SpinMutex = .{};
@@ -209,6 +222,8 @@ fn gcMarkCoroReg(m: *runtime.gc.Marker) void {
         for (st.select_send_waiters.items.items) |sel| m.shade(&sel.cell.hdr);
         for (st.close_handlers.items.items) |h| h.gcMark(m);
     }
+    var wit = coro_reg.chan_watchers.valueIterator();
+    while (wit.next()) |w| w.gcMark(m);
 }
 
 /// Empty the registry at the run boundary. The registry spine is
@@ -226,6 +241,10 @@ fn sweepRegistryAtRunBoundary() void {
     var it = coro_reg.channels.valueIterator();
     while (it.next()) |state| state.deinit(regAllocator());
     coro_reg.channels.deinit(regAllocator());
+    var wit = coro_reg.chan_watchers.valueIterator();
+    while (wit.next()) |w| w.release(regAllocator());
+    coro_reg.chan_watchers.deinit(regAllocator());
+    coro_reg.chan_delivered.deinit(regAllocator());
     coro_reg = .{};
 }
 
@@ -358,6 +377,183 @@ fn selectTrySelect(ctx: *CallCtx, sel: ObjRef(InstanceData), clause_obj: Value, 
         .ok => |v| (v == .Bool and v.Bool),
         .err => false,
     };
+}
+
+/// Register cancellation interest for a coroutine about to park on a
+/// channel `send`/`receive`/iterator slot. A native channel park bypasses
+/// `suspendCancellableCoroutine`, so without this a `Job.cancel` (or
+/// `withTimeout` expiry) could never reach the parked waiter and
+/// `cancelAndJoin`/`join` would hang. The Kotlin helper `__kxco_chanArmCancel`
+/// launches, on the parking coroutine's own scope, a child that parks in a
+/// `suspendCancellableCoroutine`; when the Job is cancelled the child is
+/// cancelled with it (structured concurrency), firing the continuation's
+/// `invokeOnCancellation`, which calls `__kxco_chanCancelWaiter(channel, slot,
+/// cause)` to remove the waiter and resume its slot with `Result.failure` — a
+/// throw at the suspension point, so the user's `finally` runs and the join
+/// completes. A normal value delivery resumes the watcher (see
+/// `resumeWaiterNormal`) so the child does not outlive the suspension. This
+/// reuses the proven `suspendCancellableCoroutine` cancellation path.
+fn armChannelCancel(ctx: *CallCtx, chan: Value, slot: i64) void {
+    const scope = ctx.host.activeCoroScope() orelse return;
+    if (scope != .Instance) return;
+    const helper = ctx.host.lookupGlobalFunc("__kxco_chanArmCancel") orelse return;
+    const args = [_]Value{ scope, chan, .{ .Long = slot } };
+    _ = ctx.host.invokeCallable(&helper, &args, ctx.out) catch return;
+}
+
+/// `__kxco_chanBindWatcher(slot, cont)` — store the cancellation-watcher
+/// continuation for the waiter parked on `slot`, so a normal value delivery
+/// can resume (complete) the watcher child. If the waiter was ALREADY
+/// delivered before the watcher bound (a same-turn handoff), complete the
+/// watcher immediately so it never parks.
+fn channelBindWatcher(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .ok = .Unit };
+    const slot: i64 = switch (ctx.args[0]) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .ok = .Unit },
+    };
+    const cont = ctx.args[1];
+    const already_delivered = blk: {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        if (coro_reg.chan_delivered.fetchRemove(slot) != null) break :blk true;
+        cont.retain();
+        if (coro_reg.chan_watchers.fetchPut(regAllocator(), slot, cont) catch null) |old| {
+            old.value.release(regAllocator());
+        }
+        break :blk false;
+    };
+    if (already_delivered) {
+        // The waiter already received its value; complete the watcher now.
+        var recv = cont;
+        const ok_unit = try makeSuccessResult(ctx.allocator, .Unit);
+        _ = ctx.host.invokeMethod(&recv, "resumeWith", &.{ok_unit}, ctx.out) catch {};
+    }
+    return .{ .ok = .Unit };
+}
+
+/// Complete and drop the cancellation-watcher child bound to `slot` (a
+/// normal value delivery / close woke the real waiter, so the watcher must
+/// finish too). Resumes the watcher's `suspendCancellableCoroutine` with
+/// `Unit`. If the watcher has not bound yet (it is still queued to start),
+/// record the slot as delivered so it completes immediately on bind. Runs
+/// outside `coro_reg_mutex` (the resume drives Kotlin).
+fn dropWatcher(ctx: *CallCtx, slot: i64) void {
+    const cont: ?Value = blk: {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        if (coro_reg.chan_watchers.fetchRemove(slot)) |kv| break :blk kv.value;
+        // No watcher bound yet: mark delivered so a later bind self-completes.
+        coro_reg.chan_delivered.put(regAllocator(), slot, {}) catch {};
+        break :blk null;
+    };
+    if (cont) |c| {
+        defer c.release(regAllocator());
+        var recv = c;
+        const ok_unit = makeSuccessResult(ctx.allocator, .Unit) catch return;
+        _ = ctx.host.invokeMethod(&recv, "resumeWith", &.{ok_unit}, ctx.out) catch {};
+    }
+}
+
+/// Resume a parked channel waiter with a normally-delivered value, then
+/// complete its cancellation watcher so the watcher child does not keep the
+/// parking coroutine's Job alive.
+fn resumeWaiterNormal(ctx: *CallCtx, slot: i64, value: Value) void {
+    ctx.host.coroutineResumeSlotValue(slot, value);
+    dropWatcher(ctx, slot);
+}
+
+fn makeSuccessResult(allocator: std.mem.Allocator, payload: Value) std.mem.Allocator.Error!Value {
+    return .{ .Result = .{ .ok = true, .payload = try Value.boxRef(allocator, payload) } };
+}
+
+/// `__kxco_chanCancelWaiter(channel, slot, cause)` — invoked from the
+/// Kotlin cancellation handler installed by `armChannelCancel`. Removes the
+/// waiter parked on `slot` from the channel's send/receive/iterator queues
+/// and, if it was still parked, resumes its slot with `Result.failure(cause)`
+/// so the parked `send`/`receive` throws the cancellation at its suspension
+/// point. Idempotent: a slot already handed a value (delivered before the
+/// cancel landed) is no longer in any queue, so the resume is skipped — no
+/// double-resume.
+fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .ok = .Unit };
+    const recv = ctx.args[0];
+    const slot: i64 = switch (ctx.args[1]) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .ok = .Unit },
+    };
+    const cause: Value = if (ctx.args.len > 2) ctx.args[2] else Value.Null;
+    const id = channelId(&recv) orelse return .{ .ok = .Unit };
+
+    // The watcher firing means the parking coroutine is being cancelled; drop
+    // its watcher entry (it is completing) so it is not resumed again, and
+    // any stale "delivered" marker for this slot.
+    {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        if (coro_reg.chan_watchers.fetchRemove(slot)) |kv| kv.value.release(regAllocator());
+        _ = coro_reg.chan_delivered.remove(slot);
+    }
+
+    var found = false;
+    {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        if (coro_reg.channels.getPtr(id)) |state| {
+            found = removeWaiterBySlot(state, slot);
+        }
+    }
+    if (!found) return .{ .ok = .Unit };
+
+    // A throw at the suspension point: `Result.failure(cause)` routed by
+    // the resume engine as `pending_throw_from_inner` (see ir/eval.zig).
+    const cancellation: Value = if (cause == .Null) try cancellationExc(ctx.allocator) else cause;
+    const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, cancellation) } };
+    ctx.host.coroutineResumeExternal(slot, failure, ctx.out);
+    return .{ .ok = .Unit };
+}
+
+/// Drop the channel waiter (send/receive/iterator) whose park slot equals
+/// `slot`. Returns whether one was removed.
+fn removeWaiterBySlot(state: *ChannelState, slot: i64) bool {
+    {
+        var i: usize = 0;
+        while (i < state.receive_waiters.items.items.len) : (i += 1) {
+            if (state.receive_waiters.items.items[i].slot == slot) {
+                _ = state.receive_waiters.items.orderedRemove(i);
+                return true;
+            }
+        }
+    }
+    {
+        var i: usize = 0;
+        while (i < state.send_waiters.items.items.len) : (i += 1) {
+            if (state.send_waiters.items.items[i].slot == slot) {
+                _ = state.send_waiters.items.orderedRemove(i);
+                return true;
+            }
+        }
+    }
+    {
+        var i: usize = 0;
+        while (i < state.receive_iter_waiters.items.items.len) : (i += 1) {
+            if (state.receive_iter_waiters.items.items[i].slot == slot) {
+                _ = state.receive_iter_waiters.items.orderedRemove(i);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn cancellationExc(allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
+    return .{ .Exception = .{
+        .fqn = try runtime.strInit(allocator, "kotlinx.coroutines.JobCancellationException"),
+        .message = try runtime.strInit(allocator, "Job was cancelled"),
+        .cause = null,
+    } };
 }
 
 /// Offer `value` (a value the channel can deliver now) to the registered
@@ -510,16 +706,17 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     switch (outcome) {
         .HandToReceiver => |h| {
             const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
-            ctx.host.coroutineResumeSlotValue(h.slot, resume_val);
+            resumeWaiterNormal(ctx, h.slot, resume_val);
             return .{ .ok = .Unit };
         },
         .HandToIter => |slot| {
-            ctx.host.coroutineResumeSlotValue(slot, .{ .Bool = true });
+            resumeWaiterNormal(ctx, slot, .{ .Bool = true });
             return .{ .ok = .Unit };
         },
         .Buffered => return .{ .ok = .Unit },
         .ParkOnSlot => |slot| {
             ctx.host.coroutineArmSlot(slot);
+            armChannelCancel(ctx, recv, slot);
             return .{ .err = .{ .Suspend = -1 } };
         },
     }
@@ -605,7 +802,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         switch (fb) {
             .HandToReceiver => |h| {
                 const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
-                ctx.host.coroutineResumeSlotValue(h.slot, resume_val);
+                resumeWaiterNormal(ctx, h.slot, resume_val);
                 return .{ .ok = try channelResult(ctx, .success, .Unit) };
             },
             .Success => return .{ .ok = try channelResult(ctx, .success, .Unit) },
@@ -617,7 +814,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const result: Value = switch (outcome) {
         .HandToReceiver => |h| blk: {
             const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
-            ctx.host.coroutineResumeSlotValue(h.slot, resume_val);
+            resumeWaiterNormal(ctx, h.slot, resume_val);
             break :blk try channelResult(ctx, .success, .Unit);
         },
         .Success => try channelResult(ctx, .success, .Unit),
@@ -675,7 +872,7 @@ fn channelReceiveImpl(ctx: *CallCtx, catching: bool) std.mem.Allocator.Error!Eva
 
     switch (outcome) {
         .Got => |g| {
-            if (g.resumed) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
+            if (g.resumed) |slot| resumeWaiterNormal(ctx, slot, .Unit);
             // Freeing a buffer slot lets a registered `onSend` select proceed.
             _ = offerSendToSelectSenders(ctx, id, recv);
             if (catching) return .{ .ok = try channelResult(ctx, .success, g.value) };
@@ -687,6 +884,7 @@ fn channelReceiveImpl(ctx: *CallCtx, catching: bool) std.mem.Allocator.Error!Eva
         },
         .ParkOnSlot => |slot| {
             ctx.host.coroutineArmSlot(slot);
+            armChannelCancel(ctx, recv, slot);
             // This receiver is now parked in `receive_waiters`; a registered
             // `onSend` select can hand its value straight to it (the mirror of
             // a send offering a parked `onReceive` select). Without this an
@@ -734,7 +932,7 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             }
         }
     }
-    if (resumed_slot) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
+    if (resumed_slot) |slot| resumeWaiterNormal(ctx, slot, .Unit);
     // A retrieved element frees a buffer slot, letting a registered `onSend`
     // select proceed.
     if (outcome == .Got) _ = offerSendToSelectSenders(ctx, id, recv);
@@ -775,24 +973,24 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         // parked `receive()` resumes with a `Result` failure that rethrows
         // the close cause at the suspension point.
         if (w.catching) {
-            ctx.host.coroutineResumeSlotValue(w.slot, try channelResult(ctx, .closed, .Unit));
+            resumeWaiterNormal(ctx, w.slot, try channelResult(ctx, .closed, .Unit));
         } else {
             exc.retain();
             const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, exc) } };
-            ctx.host.coroutineResumeSlotValue(w.slot, failure);
+            resumeWaiterNormal(ctx, w.slot, failure);
         }
     }
     // Iterator-style waiters resume with `Bool(false)` so the
     // for-loop hasNext() returns false and the loop exits.
     for (iters) |w| {
-        ctx.host.coroutineResumeSlotValue(w.slot, .{ .Bool = false });
+        resumeWaiterNormal(ctx, w.slot, .{ .Bool = false });
     }
     const send_exc = try closedSendExc(ctx.allocator);
     defer send_exc.release(ctx.allocator);
     for (sends) |sw| {
         send_exc.retain();
         const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, send_exc) } };
-        ctx.host.coroutineResumeSlotValue(sw.slot, failure);
+        resumeWaiterNormal(ctx, sw.slot, failure);
     }
     // A close makes every registered receive/send clause resolvable
     // (a closed result for `onReceiveCatching`, a failure otherwise). Offer
@@ -979,7 +1177,7 @@ fn channelSelectPollReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     switch (outcome) {
         .Got => |g| {
             try holder.asPtr().define(regAllocator(), "value", g.value);
-            if (g.resumed) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
+            if (g.resumed) |slot| resumeWaiterNormal(ctx, slot, .Unit);
             _ = offerSendToSelectSenders(ctx, id, ctx.args[0]);
             return .{ .ok = Value.newInt(0) };
         },
@@ -1029,12 +1227,12 @@ fn channelSelectPollSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     switch (outcome) {
         .HandToIter => |slot| {
-            ctx.host.coroutineResumeSlotValue(slot, .{ .Bool = true });
+            resumeWaiterNormal(ctx, slot, .{ .Bool = true });
             return .{ .ok = Value.newInt(0) };
         },
         .HandToReceiver => |h| {
             const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
-            ctx.host.coroutineResumeSlotValue(h.slot, resume_val);
+            resumeWaiterNormal(ctx, h.slot, resume_val);
             return .{ .ok = Value.newInt(0) };
         },
         .OfferSelects => {
@@ -1154,17 +1352,18 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     switch (outcome) {
         .Got => |g| {
-            if (g.resumed) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
+            if (g.resumed) |slot| resumeWaiterNormal(ctx, slot, .Unit);
             try iter_inst.asPtr().define(regAllocator(), "__pending__", g.value);
             return .{ .ok = .{ .Bool = true } };
         },
         .Closed, .NoState => return .{ .ok = .{ .Bool = false } },
         .ParkOnSlot => |slot| {
             ctx.host.coroutineArmSlot(slot);
-            // This iterator is now parked in `receive_iter_waiters`; a
-            // registered `onSend` select can hand its value straight to it,
-            // exactly as a plain parking `receive` offers to `onSend` selects.
             if (iter_inst.asPtr().get("__channel__")) |chan| {
+                armChannelCancel(ctx, chan, slot);
+                // This iterator is now parked in `receive_iter_waiters`; a
+                // registered `onSend` select can hand its value straight to it,
+                // exactly as a plain parking `receive` offers to `onSend` selects.
                 _ = offerSendToSelectSenders(ctx, ch_id, chan);
             }
             return .{ .err = .{ .Suspend = -1 } };
@@ -1510,6 +1709,8 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_newSlot", .f = newSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_parkSlot", .f = parkSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_resumeSlot", .f = resumeSlot },
+    .{ .fqn = "kotlinx.coroutines.__kxco_chanCancelWaiter", .f = channelCancelWaiter },
+    .{ .fqn = "kotlinx.coroutines.__kxco_chanBindWatcher", .f = channelBindWatcher },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectAddReceiver", .f = channelSelectAddReceiver },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectRemoveReceiver", .f = channelSelectRemoveReceiver },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectAddSender", .f = channelSelectAddSender },

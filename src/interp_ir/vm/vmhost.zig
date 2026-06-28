@@ -412,6 +412,12 @@ fn ivCoroutinePopScope(ctx: *anyopaque) void {
 fn ivCoroutineResumeSlotValue(ctx: *anyopaque, slot: i64, value: Value) void {
     intrinsic_host.coroutineResumeSlotValue(ip(ctx), slot, value);
 }
+fn ivActiveCoroScope(ctx: *anyopaque) ?Value {
+    return intrinsic_host.activeCoroScope(ip(ctx));
+}
+fn ivLookupGlobalFunc(ctx: *anyopaque, name: []const u8) ?Value {
+    return intrinsic_host.lookupGlobalFunc(ip(ctx), name);
+}
 fn ivCoroutineResumeExternal(ctx: *anyopaque, slot: i64, value: Value, out: Output) void {
     intrinsic_host.coroutineResumeExternal(ip(ctx), slot, value, out);
 }
@@ -447,6 +453,8 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .coroutine_push_scope = ivCoroutinePushScope,
     .coroutine_pop_scope = ivCoroutinePopScope,
     .coroutine_resume_slot_value = ivCoroutineResumeSlotValue,
+    .active_coro_scope = ivActiveCoroScope,
+    .lookup_global_func = ivLookupGlobalFunc,
     .coroutine_resume_external = ivCoroutineResumeExternal,
     .coroutine_dispatch_pooled = ivCoroutineDispatchPooled,
     .coroutine_drain_to_idle = ivCoroutineDrainToIdle,

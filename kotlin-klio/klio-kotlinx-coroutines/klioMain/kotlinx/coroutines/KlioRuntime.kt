@@ -22,6 +22,44 @@ internal fun __kxco_parkSlot(slot: Long) {}
 internal fun __kxco_resumeSlot(slot: Long) {}
 internal fun __kxco_rbPump(scope: Any?, block: () -> Unit) { block() }
 
+// Host intrinsic: remove a channel waiter parked on `slot` and resume its
+// suspension with `Result.failure(cause)` (a throw at the park point). The
+// native channel `send`/`receive` park calls `__kxco_chanArmCancel` below to
+// arm this against the active coroutine's Job.
+internal fun __kxco_chanCancelWaiter(channel: Any?, slot: Long, cause: Throwable?) {}
+
+// Host intrinsic: bind the cancellation-watcher continuation to a parked
+// channel `slot` so a normal value delivery on that slot can resume the
+// watcher (otherwise its child coroutine would keep the parking coroutine's
+// Job alive on the `suspendCancellableCoroutine` park and `join` /
+// `runBlocking` would never complete).
+internal fun __kxco_chanBindWatcher(slot: Long, cont: CancellableContinuation<Unit>) {}
+
+// Make a native channel `send`/`receive`/iterator park cancellation-aware.
+// A native park bypasses `suspendCancellableCoroutine`, so the host calls
+// this as the coroutine parks. The parking coroutine's own `Job` is the
+// `scope`; launch a child that parks in a `suspendCancellableCoroutine`.
+// When the parent Job is cancelled (`Job.cancel`, `cancelAndJoin`, or
+// `withTimeout` expiry) the child is cancelled with it through structured
+// concurrency, firing the continuation's `invokeOnCancellation`, which calls
+// `__kxco_chanCancelWaiter(channel, slot, cause)` to remove the waiter and
+// resume its slot with `Result.failure(cause)` — a throw at the suspension
+// point, so the user's `finally` runs and the join completes. This reuses
+// the proven `suspendCancellableCoroutine` cancellation path (a plain
+// `Job.invokeOnCompletion(onCancelling = true)` handler does not currently
+// fire in klio, but a `CancellableContinuation.invokeOnCancellation` does).
+// A normal value delivery resumes the watcher (via `__kxco_chanBindWatcher`)
+// so the child completes and does not outlive the suspension.
+internal fun __kxco_chanArmCancel(scope: Any?, channel: Any?, slot: Long) {
+    val cs = scope as? CoroutineScope ?: return
+    cs.launch {
+        suspendCancellableCoroutine<Unit> { cont ->
+            cont.invokeOnCancellation { cause -> __kxco_chanCancelWaiter(channel, slot, cause) }
+            __kxco_chanBindWatcher(slot, cont)
+        }
+    }
+}
+
 // `runBlocking` — the blocking bridge between regular and suspending
 // code. Mirrors the upstream JVM shape: a `BlockingCoroutine` job over
 // the caller's context, the body started as its child, and the calling
@@ -30,10 +68,22 @@ internal fun __kxco_rbPump(scope: Any?, block: () -> Unit) { block() }
 // child cancels it per structured concurrency, and the final state —
 // value or exception — surfaces here through the upstream completion
 // machinery (`onCompleted` / `onCancelled`).
+// Keep the native-invoked channel-cancellation helper reachable through
+// the pack's lazy symbol loader: a native channel `send`/`receive` park
+// calls `__kxco_chanArmCancel` by name, but no Kotlin caller references it,
+// so without this anchor the loader would prune it. The reference below is
+// never reached at runtime; it exists only so the symbol (and
+// `__kxco_chanCancelWaiter`, which it calls) is lowered into the module.
+@Suppress("UNUSED", "UNUSED_PARAMETER", "ConstantConditionIf")
+internal fun __kxco_keepChanCancelReachable(x: Boolean) {
+    if (x) __kxco_chanArmCancel(null, null, 0L)
+}
+
 public fun <T> runBlocking(
     context: CoroutineContext = EmptyCoroutineContext,
     block: suspend CoroutineScope.() -> T
 ): T {
+    __kxco_keepChanCancelReachable(false)
     val newContext = if (context[ContinuationInterceptor] == null)
         GlobalScope.newCoroutineContext(context + KlioDispatcher)
     else
@@ -49,8 +99,6 @@ private class KlioBlockingCoroutine<T>(
     private var failure: Throwable? = null
     private var failed = false
     private var completionSlot: Long = 0L
-
-    internal override fun nameString(): String = "BlockingCoroutine"
 
     override fun onCompleted(value: T) {
         result = value
