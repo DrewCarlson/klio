@@ -261,6 +261,15 @@ test "bare_call_prop_vs_toplevel_fn" {
     );
 }
 
+test "iterator_builder_vs_extension" {
+    try check("iterator_builder_vs_extension",
+        \\1
+        \\2
+        \\9
+        \\
+    );
+}
+
 test "local_ext_fn_capture_receiver" {
     try check("local_ext_fn_capture_receiver",
         \\snd:7|false|tail

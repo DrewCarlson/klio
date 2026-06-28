@@ -1150,7 +1150,17 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // runtime walk below resolves member-vs-global with the right
             // receiver scope.
             const is_known_global = b.module.funcId(name0) != null or isTopLevelProp(name0) or isDroppedStdlibFactory(name0);
-            if (!is_known_global) {
+            // Inside a lambda body the lexical `this` is the lambda's own
+            // receiver, which for a scope function (`buildString { … }`,
+            // `with(x) { … }`) is the scope receiver — not the enclosing class
+            // instance. A bare read of an enclosing-class member must not bind
+            // directly to that scope receiver: defer to the implicit-receiver
+            // walk below, which carries the owner-qualified getter and tries
+            // the scope receiver before the captured enclosing `this`. A member
+            // the scope receiver itself owns still resolves there (it is the
+            // innermost candidate), so a non-scope lambda is unaffected.
+            const lambda_encl_member = b.isLambdaBody() and b.hasEnclosingMember(name0);
+            if (!is_known_global and !lambda_encl_member) {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
                 try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm } });
@@ -4493,6 +4503,24 @@ fn fallbackByDeclArity(b: *FuncBuilder, cands: []const FuncId, name0: []const u8
             rung.* = .decl_arity_ext;
             return fid;
         }
+    }
+    // No same-name candidate's declared arity matches a call that supplies
+    // arguments, and the only candidates are extensions whose declared
+    // value arity is zero (e.g. `Iterator<T>.iterator()`): such an
+    // extension cannot bind a call that passes a trailing lambda. Binding
+    // it anyway prepends the lambda's receiver and fails at runtime. Decline
+    // so the bare call falls through to a global of this name — the inline
+    // builder intrinsic (`kotlin.sequences.iterator`) that actually accepts
+    // the lambda — exactly as the lambda-free `sequence { }` global resolves.
+    if (want > 0) {
+        var all_ext_zero_arity = cands.len != 0;
+        for (cands) |fid| {
+            if (isNonExt(b, fid) or declArity(b, fid) != 0) {
+                all_ext_zero_arity = false;
+                break;
+            }
+        }
+        if (all_ext_zero_arity) return null;
     }
     if (fallback != null) rung.* = .decl_arity_order;
     return fallback;

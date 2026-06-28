@@ -514,14 +514,28 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     cur = firstSupertype(self, cn);
                 }
             }
-            const fid_opt = blk: {
-                const pg = self.prog.borrow();
-                defer pg.deinit();
-                break :blk lookupPairFunc(pg.get().instance_prop_getters, owner, prop);
-            };
-            if (fid_opt) |fid| {
-                if (fid.int() < mptr.funcCount()) {
-                    return evalGetter(self, allocator, fid, receiver.*);
+            // Run the lexical `owner`'s getter against the receiver only when
+            // the receiver is actually an instance of `owner` (or a subclass).
+            // During a member probe of the implicit-receiver chain, a candidate
+            // that is not an `owner` instance — e.g. the StringBuilder receiver
+            // inside a `buildString { ... }` lambda when reading an enclosing
+            // class's property — must not run the owner's getter against the
+            // wrong receiver. It still falls through to the member-only
+            // bare-name lookup below, which resolves a property the candidate
+            // genuinely owns (a scope receiver's own member) and otherwise
+            // reports a probe miss so the resolver continues to the enclosing
+            // `owner` receiver further out.
+            const owner_applies = !member_probe or receiver.isRuntimeType(owner);
+            if (owner_applies) {
+                const fid_opt = blk: {
+                    const pg = self.prog.borrow();
+                    defer pg.deinit();
+                    break :blk lookupPairFunc(pg.get().instance_prop_getters, owner, prop);
+                };
+                if (fid_opt) |fid| {
+                    if (fid.int() < mptr.funcCount()) {
+                        return evalGetter(self, allocator, fid, receiver.*);
+                    }
                 }
             }
             return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
@@ -932,7 +946,20 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         for (probes) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
                 const args = [_]Value{receiver.*};
-                return dispatchIntrinsic(self, allocator, probe, func, &args);
+                const r = try dispatchIntrinsic(self, allocator, probe, func, &args);
+                // A strict member probe must not surface a `Type` error from an
+                // intrinsic that does not apply to this receiver — e.g. the
+                // `kotlin.math.absoluteValue` intrinsic dispatched on a
+                // StringBuilder (a `$sgetter$<owner>` read probed against a
+                // scope-function receiver). That is a probe miss, not a member
+                // whose accessor threw; report it as `.Unimplemented` so the
+                // resolver walks on to the enclosing receiver. Outside a probe
+                // the read was already bound to this receiver, so the error
+                // (a genuine wrong-type access) propagates as before.
+                if (member_probe and r == .err and r.err == .Type) {
+                    return errRes(.{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ name, type_fqn }) });
+                }
+                return r;
             }
         }
     }
