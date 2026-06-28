@@ -315,6 +315,11 @@ fn gcMarkAllVms(m: *runtime.gc.Marker) void {
 /// Register a live Vm as a GC root (its globals/class graph). Idempotent root
 /// registration; the Vm pointer is stable for the run.
 pub fn gcRegisterVm(vm: *const Vm) void {
+    // The lazy-`sequence{}` builder continuation mark/free hooks are needed
+    // regardless of the memory mode: `BuilderState.deinit` calls `freeSuspendHook`
+    // under refcount teardown too. Install them unconditionally (idempotent).
+    runtime.gc.markSuspendHook = ir.eval.gcMarkSuspendStateOpaque;
+    runtime.gc.freeSuspendHook = ir.eval.freeSuspendStateOpaque;
     if (!runtime.gc.gc_enabled) return;
     if (!gc_vm_root_registered.swap(true, .monotonic)) runtime.gc.registerRoot(gcMarkAllVms);
     gc_vms.append(std.heap.page_allocator, vm) catch @panic("KGC: vm root registration failed");

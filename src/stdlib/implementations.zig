@@ -38,6 +38,7 @@ pub const time = @import("implementations/time.zig");
 /// the stdlib root. Mirrors the Rust `pub use` lines.
 pub const compare_values = collections.compare_values;
 pub const materialise_sequence = collections.materialise_sequence;
+pub const materialise_sequence_bounded = collections.materialise_sequence_bounded;
 pub const primitive_companion_const = collections.primitive_companion_const;
 pub const concurrent_synchronized = concurrent.concurrent_synchronized;
 pub const concurrent_monitor_enter = concurrent.concurrent_monitor_enter;
@@ -1417,6 +1418,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.text.StringBuilder.append", .f = stringbuilder.string_builder_append },
     .{ .fqn = "kotlin.text.StringBuilder.appendLine", .f = stringbuilder.string_builder_append_line },
     .{ .fqn = "kotlin.text.StringBuilder.length", .f = stringbuilder.string_builder_length },
+    .{ .fqn = "kotlin.text.StringBuilder.capacity", .f = stringbuilder.string_builder_capacity },
+    .{ .fqn = "kotlin.text.StringBuilder.ensureCapacity", .f = stringbuilder.string_builder_ensure_capacity },
     .{ .fqn = "kotlin.text.StringBuilder.toString", .f = stringbuilder.string_builder_to_string },
     .{ .fqn = "kotlin.text.StringBuilder.get", .f = stringbuilder.string_builder_get },
     .{ .fqn = "kotlin.text.StringBuilder.isEmpty", .f = stringbuilder.string_builder_is_empty },

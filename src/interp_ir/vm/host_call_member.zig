@@ -2478,7 +2478,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
 
     // Self-iterator convention.
-    if (std.mem.eql(u8, name, "iterator") and args.len == 0 and (receiver.* == .Iterator or receiver.* == .RangeIter)) {
+    if (std.mem.eql(u8, name, "iterator") and args.len == 0 and (receiver.* == .Iterator or receiver.* == .RangeIter or receiver.* == .SeqIter)) {
         return .{ .ok = receiver.* };
     }
 
@@ -2809,6 +2809,9 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
     if (receiver.* == .RangeIter) {
         if (try rangeIterMember(self, allocator, receiver, name, args)) |r| return r;
+    }
+    if (receiver.* == .SeqIter) {
+        if (try seqIterMember(self, allocator, receiver, name, args)) |r| return r;
     }
 
     // Data-class / value-class auto members.
@@ -3523,6 +3526,13 @@ fn lookupGlobalValue(self: *VmHost, name: []const u8) ?Value {
 
 fn sequenceMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const seq = receiver.Sequence;
+    // `Sequence.iterator()` is lazy: a `SeqIter` pulls one element at a time so
+    // an infinite source never materialises (`sequence{}` / `generateSequence`).
+    if (std.mem.eql(u8, name, "iterator") and args.len == 0) {
+        var sv = receiver.*;
+        if (runtime.reclaimEnabled()) sv.retain();
+        return .{ .ok = try stdlib.makeSeqIter(allocator, sv) };
+    }
     const terminal = isSequenceTerminal(name);
     if (terminal) {
         const m = try materialiseSequence(self, allocator, receiver);
@@ -4650,6 +4660,329 @@ fn rangeIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value, 
             cg.deinit();
         }
         return .{ .ok = rangeElem(c, ri.kind) };
+    }
+    return null;
+}
+
+// -------------------------------------------------------------------------
+// Lazy `SeqIter` — one-element-at-a-time iteration over a `Sequence` (the
+// `Sequence.iterator()` / `iterator { }` result). Pulls a single source
+// element per step and runs it through the op pipeline, so an infinite source
+// is never materialised.
+// -------------------------------------------------------------------------
+
+const SeqIterState = runtime.SeqIterState;
+
+/// Lazily allocate the per-op streaming counters on first use.
+fn seqIterEnsureState(allocator: Allocator, st: *SeqIterState, n_ops: usize) Allocator.Error!void {
+    if (st.taken.len == n_ops or n_ops == 0) return;
+    st.taken = try allocator.alloc(usize, n_ops);
+    st.dropped = try allocator.alloc(usize, n_ops);
+    st.take_while_live = try allocator.alloc(bool, n_ops);
+    st.drop_while_live = try allocator.alloc(bool, n_ops);
+    st.indices = try allocator.alloc(usize, n_ops);
+    @memset(st.taken, 0);
+    @memset(st.dropped, 0);
+    @memset(st.take_while_live, true);
+    @memset(st.drop_while_live, true);
+    @memset(st.indices, 0);
+}
+
+/// Pull one raw element from the sequence source (no ops). Returns the element,
+/// `null` at exhaustion, or an error.
+fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out: runtime.Output) Allocator.Error!union(enum) { value: Value, done, err: EvalError } {
+    const sg = st.seq.Sequence.borrow();
+    const src = sg.get().source;
+    sg.deinit();
+    switch (src) {
+        .Items => |v| {
+            const g = v.borrow();
+            defer g.deinit();
+            const items = g.get().*;
+            const i = st.src_pos;
+            if (i >= items.len) return .done;
+            st.src_pos = i + 1;
+            var e = items[i];
+            if (runtime.reclaimEnabled()) e.retain();
+            return .{ .value = e };
+        },
+        .Builder => |bstate| {
+            var intrinsic = makeIntrinsicHost(self);
+            defer deinitIntrinsicHost(&intrinsic);
+            const ihost = intrinsic.intrinsicHost();
+            const step = try ihost.builderStep(bstate, out);
+            return switch (step) {
+                .value => |val| .{ .value = val },
+                .done => .done,
+                .err => |re| .{ .err = try mapRuntimeError(allocator, re) },
+            };
+        },
+        .Generate => |gen| {
+            if (st.done) return .done;
+            if (!st.gen_started) {
+                st.gen_started = true;
+                if (gen.seed) |s| {
+                    var sv = s.asPtr().*;
+                    if (runtime.reclaimEnabled()) sv.retain();
+                    st.gen_cur = sv;
+                    return .{ .value = sv };
+                }
+                // Nullary form: first element comes from next().
+            }
+            var intrinsic = makeIntrinsicHost(self);
+            defer deinitIntrinsicHost(&intrinsic);
+            const ihost = intrinsic.intrinsicHost();
+            const arg: []const Value = if (st.gen_cur) |c| &.{c} else &.{};
+            const r = try ihost.invokeCallable(&gen.next.asPtr().*, arg, out);
+            switch (r) {
+                .ok => |nv| {
+                    if (nv == .Null) {
+                        st.done = true;
+                        return .done;
+                    }
+                    var v = nv;
+                    if (runtime.reclaimEnabled()) v.retain();
+                    st.gen_cur = v;
+                    return .{ .value = v };
+                },
+                .err => |re| return .{ .err = try mapRuntimeError(allocator, re) },
+            }
+        },
+    }
+}
+
+/// Pull one OUTPUT element: pull source elements and run each through the ops
+/// until one passes (or the source is exhausted / a Take cap is hit).
+fn seqIterPull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out: runtime.Output) Allocator.Error!union(enum) { value: Value, done, err: EvalError } {
+    const n_ops = blk: {
+        const sg = st.seq.Sequence.borrow();
+        defer sg.deinit();
+        break :blk sg.get().ops.len;
+    };
+    try seqIterEnsureState(allocator, st, n_ops);
+
+    var intrinsic = makeIntrinsicHost(self);
+    defer deinitIntrinsicHost(&intrinsic);
+    const ihost = intrinsic.intrinsicHost();
+
+    outer: while (true) {
+        // Stop pulling the source once any Take cap is reached.
+        {
+            const sg = st.seq.Sequence.borrow();
+            const ops = sg.get().ops;
+            var capped = false;
+            for (ops, 0..) |op, i| {
+                if (op == .Take and st.taken[i] >= @as(usize, @intCast(@max(op.Take, 0)))) capped = true;
+            }
+            sg.deinit();
+            if (capped) return .done;
+        }
+
+        var current = switch (try seqIterSourcePull(self, allocator, st, out)) {
+            .value => |v| v,
+            .done => return .done,
+            .err => |e| return .{ .err = e },
+        };
+
+        const sg = st.seq.Sequence.borrow();
+        const ops = sg.get().ops;
+        for (ops, 0..) |op, idx| {
+            switch (op) {
+                .Map => |f| {
+                    const r = try ihost.invokeCallable(&f, &.{current}, out);
+                    switch (r) {
+                        .ok => |rv| current = rv,
+                        .err => |e| {
+                            sg.deinit();
+                            return .{ .err = try mapRuntimeError(allocator, e) };
+                        },
+                    }
+                },
+                .OnEach => |f| {
+                    const r = try ihost.invokeCallable(&f, &.{current}, out);
+                    if (r == .err) {
+                        sg.deinit();
+                        return .{ .err = try mapRuntimeError(allocator, r.err) };
+                    }
+                },
+                .MapIndexed => |f| {
+                    const i = st.indices[idx];
+                    st.indices[idx] += 1;
+                    const r = try ihost.invokeCallable(&f, &.{ Value.newInt(@intCast(i)), current }, out);
+                    switch (r) {
+                        .ok => |rv| current = rv,
+                        .err => |e| {
+                            sg.deinit();
+                            return .{ .err = try mapRuntimeError(allocator, e) };
+                        },
+                    }
+                },
+                .FilterIndexed => |f| {
+                    const i = st.indices[idx];
+                    st.indices[idx] += 1;
+                    const r = try ihost.invokeCallable(&f, &.{ Value.newInt(@intCast(i)), current }, out);
+                    switch (r) {
+                        .ok => |rv| if (!(rv == .Bool and rv.Bool)) {
+                            sg.deinit();
+                            continue :outer;
+                        },
+                        .err => |e| {
+                            sg.deinit();
+                            return .{ .err = try mapRuntimeError(allocator, e) };
+                        },
+                    }
+                },
+                .Filter => |f| {
+                    const r = try ihost.invokeCallable(&f, &.{current}, out);
+                    switch (r) {
+                        .ok => |rv| if (!(rv == .Bool and rv.Bool)) {
+                            sg.deinit();
+                            continue :outer;
+                        },
+                        .err => |e| {
+                            sg.deinit();
+                            return .{ .err = try mapRuntimeError(allocator, e) };
+                        },
+                    }
+                },
+                .FilterNot => |f| {
+                    const r = try ihost.invokeCallable(&f, &.{current}, out);
+                    switch (r) {
+                        .ok => |rv| if (rv == .Bool and rv.Bool) {
+                            sg.deinit();
+                            continue :outer;
+                        },
+                        .err => |e| {
+                            sg.deinit();
+                            return .{ .err = try mapRuntimeError(allocator, e) };
+                        },
+                    }
+                },
+                .Take => |n| {
+                    if (st.taken[idx] >= @as(usize, @intCast(@max(n, 0)))) {
+                        sg.deinit();
+                        return .done;
+                    }
+                    st.taken[idx] += 1;
+                },
+                .Drop => |n| {
+                    if (st.dropped[idx] < @as(usize, @intCast(@max(n, 0)))) {
+                        st.dropped[idx] += 1;
+                        sg.deinit();
+                        continue :outer;
+                    }
+                },
+                .TakeWhile => |f| {
+                    if (!st.take_while_live[idx]) {
+                        sg.deinit();
+                        return .done;
+                    }
+                    const r = try ihost.invokeCallable(&f, &.{current}, out);
+                    switch (r) {
+                        .ok => |rv| if (!(rv == .Bool and rv.Bool)) {
+                            st.take_while_live[idx] = false;
+                            sg.deinit();
+                            return .done;
+                        },
+                        .err => |e| {
+                            sg.deinit();
+                            return .{ .err = try mapRuntimeError(allocator, e) };
+                        },
+                    }
+                },
+                .DropWhile => |f| {
+                    if (st.drop_while_live[idx]) {
+                        const r = try ihost.invokeCallable(&f, &.{current}, out);
+                        switch (r) {
+                            .ok => |rv| {
+                                if (rv == .Bool and rv.Bool) {
+                                    sg.deinit();
+                                    continue :outer;
+                                }
+                                st.drop_while_live[idx] = false;
+                            },
+                            .err => |e| {
+                                sg.deinit();
+                                return .{ .err = try mapRuntimeError(allocator, e) };
+                            },
+                        }
+                    }
+                },
+                // Buffering ops (sort/flatMap/distinct/...) cannot stream one at
+                // a time; iterating such a sequence materialises it eagerly.
+                else => {
+                    sg.deinit();
+                    const mr = try materialiseSequence(self, allocator, &st.seq);
+                    switch (mr) {
+                        .ok => |list| {
+                            // Replace the source with the buffered items and clear
+                            // ops so subsequent pulls stream from the buffer.
+                            var owned = list;
+                            const slice = try owned.toOwnedSlice(allocator);
+                            const items_ref = try runtime.ValueSlice.init(allocator, slice);
+                            const data = try ObjRef(runtime.SequenceData).init(allocator, .{
+                                .source = .{ .Items = items_ref },
+                                .ops = &.{},
+                            });
+                            if (runtime.reclaimEnabled()) st.seq.release(allocator);
+                            st.seq = .{ .Sequence = data };
+                            st.src_pos = 0;
+                            st.taken = &.{};
+                            st.dropped = &.{};
+                            st.take_while_live = &.{};
+                            st.drop_while_live = &.{};
+                            st.indices = &.{};
+                            return seqIterPull(self, allocator, st, out);
+                        },
+                        .err => |e| return .{ .err = e },
+                    }
+                },
+            }
+        }
+        sg.deinit();
+        return .{ .value = current };
+    }
+}
+
+/// Ensure `st.buffered` holds the next element (or marks done). Returns whether
+/// an element is available, or an error.
+fn seqIterEnsure(self: *VmHost, allocator: Allocator, st: *SeqIterState, out: runtime.Output) Allocator.Error!union(enum) { has: bool, err: EvalError } {
+    if (st.buffered != null) return .{ .has = true };
+    if (st.done) return .{ .has = false };
+    switch (try seqIterPull(self, allocator, st, out)) {
+        .value => |v| {
+            st.buffered = v;
+            return .{ .has = true };
+        },
+        .done => {
+            st.done = true;
+            return .{ .has = false };
+        },
+        .err => |e| return .{ .err = e },
+    }
+}
+
+fn seqIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    const ref = receiver.SeqIter;
+    if (std.mem.eql(u8, name, "hasNext") and args.len == 0) {
+        const g = ref.borrowMut();
+        defer g.deinit();
+        return switch (try seqIterEnsure(self, allocator, g.get(), self.out)) {
+            .has => |b| .{ .ok = boolVal(b) },
+            .err => |e| .{ .err = e },
+        };
+    }
+    if (isIteratorNext(name) and args.len == 0) {
+        const g = ref.borrowMut();
+        defer g.deinit();
+        const st = g.get();
+        switch (try seqIterEnsure(self, allocator, st, self.out)) {
+            .has => |b| if (!b) return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator exhausted") },
+            .err => |e| return .{ .err = e },
+        }
+        const v = st.buffered.?;
+        st.buffered = null;
+        return .{ .ok = v };
     }
     return null;
 }

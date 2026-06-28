@@ -13,7 +13,17 @@ const output_mod = @import("output.zig");
 const Value = value_mod.Value;
 const RuntimeError = value_mod.RuntimeError;
 const EvalResult = value_mod.EvalResult;
+const BuilderStateRef = value_mod.BuilderStateRef;
 const Output = output_mod.Output;
+
+/// Outcome of driving a lazy `sequence{}`/`iterator{}` builder one step.
+pub const BuilderStepResult = union(enum) {
+    /// The block yielded a value (it suspended at a `yield`).
+    value: Value,
+    /// The block ran to completion — no more elements.
+    done,
+    err: RuntimeError,
+};
 
 /// Function pointer signature for a Rust-native stdlib intrinsic.
 ///
@@ -90,6 +100,11 @@ pub const IntrinsicHost = struct {
         spawn_os_thread: ?*const fn (ctx: *anyopaque, block: *const Value, out: Output) std.mem.Allocator.Error!HostResultU64 = null,
         join_os_thread: ?*const fn (ctx: *anyopaque, id: u64) std.mem.Allocator.Error!?RuntimeError = null,
         os_thread_alive: ?*const fn (ctx: *anyopaque, id: u64) bool = null,
+        /// Drive a lazy `sequence{}`/`iterator{}` builder one element: start or
+        /// resume the coroutine block, return the next yielded value (or
+        /// `.done` at completion). `null` => default (`.done`, i.e. an empty
+        /// sequence — only the VM host implements real lazy driving).
+        builder_step: ?*const fn (ctx: *anyopaque, state: BuilderStateRef, out: Output) std.mem.Allocator.Error!BuilderStepResult = null,
     };
 
     pub fn invokeCallable(self: IntrinsicHost, callable: *const Value, args: []const Value, out: Output) !EvalResult {
@@ -213,6 +228,11 @@ pub const IntrinsicHost = struct {
     pub fn osThreadAlive(self: IntrinsicHost, id: u64) bool {
         if (self.vtable.os_thread_alive) |f| return f(self.ctx, id);
         return false;
+    }
+
+    pub fn builderStep(self: IntrinsicHost, state: BuilderStateRef, out: Output) !BuilderStepResult {
+        if (self.vtable.builder_step) |f| return f(self.ctx, state, out);
+        return .done;
     }
 };
 

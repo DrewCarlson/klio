@@ -46,6 +46,8 @@ pub const build_stdlib_pack = pack_builder.buildStdlibPack;
 // Internal helpers the interpreter's higher-order ops use for comparisons.
 pub const compare_values = implementations.compare_values;
 pub const materialise_sequence = implementations.materialise_sequence;
+pub const materialise_sequence_bounded = implementations.materialise_sequence_bounded;
+pub const makeSeqIter = implementations.sequence.makeSeqIter;
 pub const primitive_companion_const = implementations.primitive_companion_const;
 pub const compareUtf16 = text.compareUtf16;
 

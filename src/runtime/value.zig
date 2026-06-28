@@ -848,6 +848,125 @@ pub const SuspendFrame = struct {
     pub const Local = struct { name: []const u8, value: Value };
 };
 
+/// The lazy coroutine state of a `sequence { yield(...) }` / `iterator { ... }`
+/// builder. The builder block runs as a restricted-suspension coroutine: each
+/// `yield(x)` suspends it, capturing the block's continuation as an
+/// `ir.eval.SuspendState` box held here through `cont` (an `*anyopaque` because
+/// `runtime` cannot import `ir`). The host drives one step per consumer pull
+/// (`builderStep`): the first pull starts the block, a later pull resumes the
+/// continuation. `scope` is the `SequenceScope` Instance the block runs against;
+/// the host reads the yielded value off its fields after each suspension.
+pub const BuilderState = struct {
+    /// The `suspend SequenceScope<T>.() -> Unit` block (an `IrClosure` Value).
+    block: ValueBox,
+    /// The `SequenceScope` Instance the block runs against; carries the pending
+    /// yielded value / yieldAll iterator between steps.
+    scope: ValueBox,
+    /// Host-owned `*ir.eval.SuspendState` — the parked continuation between
+    /// pulls. `null` before the first pull, after completion, and while a pull
+    /// is in flight.
+    cont: ?*anyopaque = null,
+    /// The block has been started (the first pull ran `evalClosureRaw`).
+    started: bool = false,
+    /// The block ran to completion (no more elements).
+    done: bool = false,
+
+    /// GC out-edges: the builder block, the scope Instance, and every Value
+    /// the parked continuation's frames keep live (through the suspend-mark
+    /// hook). All are reachable only through a held `Sequence`/`Iterator`.
+    pub fn gcTrace(self: *const BuilderState, m: *objcell.gc.Marker) void {
+        m.shade(&self.block.cell.hdr);
+        m.shade(&self.scope.cell.hdr);
+        if (self.cont) |c| {
+            if (objcell.gc.markSuspendHook) |h| h(c, m);
+        }
+    }
+
+    /// Finalize an abandoned builder: a `Sequence` swept without being driven
+    /// to completion still owns its parked continuation box (frames with
+    /// retained values + raw slice buffers). Release and free it through the
+    /// host hook so the run allocator reclaims it.
+    pub fn gcFinalize(self: *BuilderState, a: std.mem.Allocator) void {
+        self.freeCont(a);
+    }
+
+    /// Refcount teardown: same as `gcFinalize` (the continuation box must be
+    /// freed when the last handle to an undriven builder drops).
+    pub fn deinit(self: *BuilderState, a: std.mem.Allocator) void {
+        self.freeCont(a);
+    }
+
+    fn freeCont(self: *BuilderState, a: std.mem.Allocator) void {
+        if (self.cont) |c| {
+            self.cont = null;
+            if (objcell.gc.freeSuspendHook) |h| h(c, a);
+        }
+    }
+};
+
+pub const BuilderStateRef = ObjRef(BuilderState);
+
+/// Lazy iterator over a `Sequence` (the `Sequence.iterator()` / `iterator{}`
+/// result). Pulls one output element at a time from the underlying source +
+/// op pipeline, so an infinite source never materialises. Holds the `Sequence`
+/// value, a one-element lookahead, the done flag, and the per-op streaming
+/// counters (mirrors the materialiser's `PumpState`).
+pub const SeqIterState = struct {
+    /// The `Value.Sequence` being iterated.
+    seq: Value,
+    /// One-element lookahead produced by `hasNext()` and consumed by `next()`.
+    buffered: ?Value = null,
+    /// The pipeline is exhausted.
+    done: bool = false,
+    /// For an `Items` source: the cursor into the eager element slice.
+    src_pos: usize = 0,
+    /// For a `Generate` source: the next seed to emit (the seed initially,
+    /// then each step's result), or null before the first pull / once done.
+    gen_cur: ?Value = null,
+    gen_started: bool = false,
+    /// Per-op streaming counters, indexed by op position. Allocated lazily to
+    /// `ops.len`. `Take`/`Drop` counts and `takeWhile`/`dropWhile`/index state.
+    taken: []usize = &.{},
+    dropped: []usize = &.{},
+    take_while_live: []bool = &.{},
+    drop_while_live: []bool = &.{},
+    indices: []usize = &.{},
+
+    pub fn gcTrace(self: *const SeqIterState, m: *objcell.gc.Marker) void {
+        self.seq.gcMark(m);
+        if (self.buffered) |b| b.gcMark(m);
+        if (self.gen_cur) |g| g.gcMark(m);
+    }
+
+    pub fn gcFinalize(self: *SeqIterState, a: std.mem.Allocator) void {
+        self.freeBufs(a);
+    }
+
+    pub fn deinit(self: *SeqIterState, a: std.mem.Allocator) void {
+        if (objcell.reclaimEnabled()) {
+            self.seq.release(a);
+            if (self.buffered) |b| b.release(a);
+            if (self.gen_cur) |g| g.release(a);
+        }
+        self.freeBufs(a);
+    }
+
+    fn freeBufs(self: *SeqIterState, a: std.mem.Allocator) void {
+        if (self.taken.len != 0) a.free(self.taken);
+        if (self.dropped.len != 0) a.free(self.dropped);
+        if (self.take_while_live.len != 0) a.free(self.take_while_live);
+        if (self.drop_while_live.len != 0) a.free(self.drop_while_live);
+        if (self.indices.len != 0) a.free(self.indices);
+        self.taken = &.{};
+        self.dropped = &.{};
+        self.take_while_live = &.{};
+        self.drop_while_live = &.{};
+        self.indices = &.{};
+    }
+};
+
+pub const SeqIterStateRef = ObjRef(SeqIterState);
+
 pub const SequenceData = struct {
     source: SequenceSource,
     ops: []SeqOp,
@@ -864,6 +983,7 @@ pub const SequenceData = struct {
                 if (g.seed) |s| m.shade(&s.cell.hdr);
                 m.shade(&g.next.cell.hdr);
             },
+            .Builder => |b| m.shade(&b.cell.hdr),
         }
         for (self.ops) |op| switch (op) {
             .Map,
@@ -890,6 +1010,9 @@ pub const SequenceSource = union(enum) {
     /// `generateSequence(seed) { it -> next }`. `seed` is null for the
     /// nullary form.
     Generate: struct { seed: ?ValueBox, next: ValueBox },
+    /// `sequence { yield(...) }` / `iterator { ... }` — a lazy coroutine
+    /// builder driven one element at a time.
+    Builder: BuilderStateRef,
 };
 
 pub const SeqOp = union(enum) {
@@ -1247,6 +1370,9 @@ pub const Value = union(enum) {
         /// iterator value being copied between cursor reads.
         done: ObjRef(bool),
     },
+    /// Lazy iterator over a `Sequence` (the `Sequence.iterator()` / lazy
+    /// `iterator { }` result), pulling one element at a time.
+    SeqIter: SeqIterStateRef,
     /// A built-in property delegate.
     Delegate: ObjRef(DelegateKind),
     /// `::foo` — a lightweight property/function reference.
@@ -1341,6 +1467,7 @@ pub const Value = union(enum) {
                 visitor.visit(x.cur);
                 visitor.visit(x.done);
             },
+            .SeqIter => |s| visitor.visit(s),
             .PropertyRef => |p| visitor.visit(p.name),
             .MatchGroup => |g| visitor.visit(g.value),
             .Exception => |e| {
@@ -1491,6 +1618,7 @@ pub const Value = union(enum) {
                 x.cur.deinit();
                 x.done.deinit();
             },
+            .SeqIter => |s| s.deinit(),
             .PropertyRef => |p| p.name.deinit(),
             .MatchGroup => |g| g.value.deinit(),
             .Exception => |e| {
@@ -1754,6 +1882,7 @@ pub const Value = union(enum) {
             .Result => "kotlin.Result",
             .Comparator => "kotlin.Comparator",
             .Sequence => "kotlin.sequences.Sequence",
+            .SeqIter => "kotlin.collections.Iterator",
             .Iterator => |it| if (it.prim) |p| switch (p) {
                 .Int => "kotlin.collections.IntIterator",
                 .Long => "kotlin.collections.LongIterator",
@@ -1886,6 +2015,7 @@ pub const Value = union(enum) {
             .MapEntry => matchesAny(name, &.{ "Entry", "MapEntry", "Map.Entry", "Any" }),
             .Result => matchesAny(name, &.{ "Result", "Any" }),
             .Sequence => matchesAny(name, &.{ "Sequence", "Any" }),
+            .SeqIter => matchesAny(name, &.{ "Iterator", "Any" }),
             .Iterator => |it| blk: {
                 if (matchesAny(name, &.{ "Iterator", "Any" })) break :blk true;
                 if (it.prim) |p| {
@@ -2265,6 +2395,7 @@ pub const Value = union(enum) {
             },
             .Comparator => try writer.writeAll("Comparator"),
             .Sequence => try writer.writeAll("kotlin.sequences.Sequence"),
+            .SeqIter => try writer.writeAll("kotlin.collections.Iterator"),
             .Iterator => |it| if (it.prim) |p|
                 try writer.print("{s}Iterator", .{p.simpleName()})
             else

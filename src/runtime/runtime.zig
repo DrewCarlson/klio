@@ -96,6 +96,10 @@ pub const HostSlotResult = value_mod.HostSlotResult;
 pub const SequenceData = value_mod.SequenceData;
 pub const SequenceSource = value_mod.SequenceSource;
 pub const SeqOp = value_mod.SeqOp;
+pub const BuilderState = value_mod.BuilderState;
+pub const BuilderStateRef = value_mod.BuilderStateRef;
+pub const SeqIterState = value_mod.SeqIterState;
+pub const SeqIterStateRef = value_mod.SeqIterStateRef;
 pub const RegexData = value_mod.RegexData;
 pub const MatchData = value_mod.MatchData;
 pub const MatchGroupData = value_mod.MatchGroupData;
@@ -128,6 +132,7 @@ pub const CallCtx = host_mod.CallCtx;
 pub const IntrinsicHost = host_mod.IntrinsicHost;
 pub const NoopHost = host_mod.NoopHost;
 pub const HostResultU64 = host_mod.HostResultU64;
+pub const BuilderStepResult = host_mod.BuilderStepResult;
 
 // output
 pub const Output = output_mod.Output;
