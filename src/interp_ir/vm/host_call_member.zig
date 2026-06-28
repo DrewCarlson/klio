@@ -3399,8 +3399,10 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
         .List => |l| {
             // A mutable list shares its backing so `MutableIterator.remove()`
             // mutates the source (and the iterating loop observes it); an
-            // immutable list snapshots, as before.
-            if (l.mutable and l.backing == null) {
+            // immutable list snapshots, as before. A live map `values` view is
+            // also mutable (no read-only error; CME still fires on concurrent
+            // map modification); only a genuinely read-only list snapshots.
+            if (l.mutable) {
                 const cap = try captureModCount(allocator, l.mod_count);
                 return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
             }
@@ -3414,8 +3416,11 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
         .Set => |s| {
             // A mutable set shares its backing so `MutableIterator.remove()`
             // mutates the source set (the `filterInPlace` removeAll/retainAll
-            // path iterates + removes); an immutable set snapshots.
-            if (s.mutable and s.backing == null) {
+            // path iterates + removes); an immutable set snapshots. A live map
+            // `keys`/`entries` view is also mutable (its iterator supports
+            // remove and reports CME on concurrent map modification); only a
+            // genuinely read-only set yields a read-only iterator.
+            if (s.mutable) {
                 const cap = try captureModCount(allocator, s.mod_count);
                 return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
             }
@@ -3438,7 +3443,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             const src_mc = g.get().mod_count;
             g.deinit();
             const cap = try captureModCount(allocator, src_mc);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = m.mutable } } };
         },
         .Range => |r| {
             return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind, .done = try ObjRef(bool).init(allocator, false) } } };
@@ -4525,8 +4530,12 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     }
     // `MutableListIterator.set(x)` — overwrite the element last returned.
     if (std.mem.eql(u8, name, "set") and args.len == 1) {
-        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
+        // Check concurrent modification before the read-only guard: a
+        // mutable collection's view iterator modified during iteration must
+        // report CME, while a genuinely immutable iterator (whose mod count
+        // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
+        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
         const pg = it.pos.borrow();
         const p = pg.get().*;
         pg.deinit();
@@ -4547,8 +4556,12 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // `next()` would return (at the cursor) and advance the cursor past it,
     // so the inserted element is skipped by the following `next()`.
     if (std.mem.eql(u8, name, "add") and args.len == 1) {
-        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
+        // Check concurrent modification before the read-only guard: a
+        // mutable collection's view iterator modified during iteration must
+        // report CME, while a genuinely immutable iterator (whose mod count
+        // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
+        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
         const pg = it.pos.borrow();
         const p = pg.get().*;
         pg.deinit();
@@ -4568,8 +4581,12 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // (at `pos - 1`) from the backing list and rewind the cursor so the
     // following `next()` resumes correctly. A no-op before the first `next()`.
     if (std.mem.eql(u8, name, "remove") and args.len == 0) {
-        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
+        // Check concurrent modification before the read-only guard: a
+        // mutable collection's view iterator modified during iteration must
+        // report CME, while a genuinely immutable iterator (whose mod count
+        // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
+        if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
         const pg = it.pos.borrow();
         const p = pg.get().*;
         pg.deinit();
