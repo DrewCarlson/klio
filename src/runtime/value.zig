@@ -1963,9 +1963,70 @@ pub const Value = union(enum) {
         return !r.kind.inBounds(r.start, r.end, r.step);
     }
 
+    /// Whether a user `Instance` implements `kotlin.collections.Map.Entry`,
+    /// so it participates in the `Map.Entry` equality contract (compare by
+    /// key and value regardless of concrete type).
+    fn instanceImplementsMapEntry(inst: ObjRef(InstanceData)) bool {
+        const g = inst.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        var buf: [16 * 1024]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const a = fba.allocator();
+        const candidates = [_][]const u8{ "Entry", "MutableEntry", "Map.Entry", "MutableMap.MutableEntry", "kotlin.collections.Map.Entry" };
+        for (candidates) |name| {
+            fba.reset();
+            if (cg.get().isSubtypeOf(a, name)) return true;
+        }
+        return false;
+    }
+
+    /// The `key`/`value` pair of any value that satisfies the `Map.Entry`
+    /// contract: a builtin `MapEntry` box, or a user `Instance` implementing
+    /// `Map.Entry` (its `key`/`value` are read as stored fields). Returns
+    /// `null` for anything else. The returned values are copies of the
+    /// component slots; the underlying handles stay owned by the source value,
+    /// which the caller keeps alive across the comparison.
+    fn mapEntryParts(v: *const Value) ?struct { key: Value, value: Value } {
+        switch (v.*) {
+            .MapEntry => |e| return .{ .key = e.key.asPtr().*, .value = e.value.asPtr().* },
+            .Instance => |inst| {
+                if (!instanceImplementsMapEntry(inst)) return null;
+                const g = inst.borrow();
+                defer g.deinit();
+                // `key`/`value` come from the primary-ctor `override val`s, so
+                // they are stored fields read directly.
+                const k = g.get().get("key") orelse return null;
+                const val = g.get().get("value") orelse return null;
+                return .{ .key = k, .value = val };
+            },
+            else => return null,
+        }
+    }
+
+    /// `Map.Entry` equality contract: two entries are equal iff their keys and
+    /// values are equal, regardless of concrete type (builtin `MapEntry` vs a
+    /// user `Instance` implementing `Map.Entry`, in either direction). Returns
+    /// `null` when the contract does not apply (so the normal equality paths
+    /// handle the operands), `true`/`false` once it does.
+    pub fn mapEntryContractEq(a: *const Value, b: *const Value) ?bool {
+        const ap = mapEntryParts(a) orelse return null;
+        const bp = mapEntryParts(b) orelse return null;
+        return structuralEqBoxed(&ap.key, &bp.key) and structuralEqBoxed(&ap.value, &bp.value);
+    }
+
     /// Equality with boxed `Number` semantics (each boxed type only matches
     /// its own type; collections compare elements boxed too).
     pub fn structuralEqBoxed(a: *const Value, b: *const Value) bool {
+        // A builtin `MapEntry` and a user `Map.Entry` instance compare by key
+        // and value (the `Map.Entry` contract), so `map.entries.contains(e)`
+        // and `entry == e` work across concrete types. Only fires when at
+        // least one side is a builtin `MapEntry`; two plain instances keep
+        // their own `equals`/structural semantics.
+        if (a.* == .MapEntry or b.* == .MapEntry) {
+            if (mapEntryContractEq(a, b)) |eq| return eq;
+        }
         switch (a.*) {
             // `Double.equals` collapses every NaN to one canonical bit pattern
             // (`toBits`), so any two NaNs compare equal while `0.0 != -0.0`.

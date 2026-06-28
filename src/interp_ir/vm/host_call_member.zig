@@ -4346,6 +4346,11 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
         .MapEntry => |me| {
             if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "key")) return extractOwned(me.key);
             if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "value")) return extractOwned(me.value);
+            // `Map.Entry` equality contract: compare by key and value, so a
+            // builtin entry equals a user `Map.Entry` instance with the same
+            // key/value (`structuralEqBoxed` applies the contract).
+            if (std.mem.eql(u8, name, "equals") and args.len == 1) return .{ .ok = boolVal(Value.structuralEqBoxed(receiver, &args[0])) };
+            if (std.mem.eql(u8, name, "hashCode") and args.len == 0) return .{ .ok = .{ .Int = kotlinHashCode(receiver) } };
             if (std.mem.eql(u8, name, "setValue")) {
                 const new_v = if (args.len > 0) args[0] else Value.Unit;
                 const prev = me.value.asPtr().*;
@@ -5436,6 +5441,13 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         return .{ .ok = Value.newInt(@bitCast(g.get().identity)) };
     }
     if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
+        // A user `Map.Entry` implementation with no `equals` override follows
+        // the `Map.Entry` contract: equal iff keys and values are equal,
+        // regardless of the other operand's concrete type (a builtin
+        // `MapEntry` or another `Map.Entry` instance).
+        if (Value.mapEntryContractEq(receiver, &args[0])) |eq| {
+            return .{ .ok = boolVal(eq) };
+        }
         if (args[0] == .Instance) {
             return .{ .ok = boolVal(ObjRef(InstanceData).ptrEq(inst, args[0].Instance)) };
         }
