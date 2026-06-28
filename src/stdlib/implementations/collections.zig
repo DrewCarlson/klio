@@ -5025,11 +5025,17 @@ pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeSetVL(a, it, true));
 }
 
-fn withIndexImpl(a: Allocator, items: []const Value) Error!Value {
+fn withIndexImpl(ctx: *CallCtx, items: []const Value) Error!Value {
+    const a = ctx.allocator;
     var indexed: std.ArrayList(Value) = .empty;
     for (items, 0..) |v, i| {
         v.retain();
-        try indexed.append(a, try makePair(a, Value.newInt(@intCast(i)), v));
+        const id = ctx.host.allocInstanceId();
+        const fields = [_]InstanceData.Field{
+            .{ .name = "index", .value = Value.newInt(@intCast(i)) },
+            .{ .name = "value", .value = v },
+        };
+        try indexed.append(a, try ctx.host.newSynthInstance("kotlin.collections.IndexedValue", id, &fields));
     }
     return makeListFromArrayList(a, indexed, false);
 }
@@ -5040,7 +5046,7 @@ pub fn coll_list_with_index(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try withIndexImpl(a, try snapshotItems(a, it)));
+    return ok(try withIndexImpl(ctx, try snapshotItems(a, it)));
 }
 pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -5050,7 +5056,7 @@ pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     defer if (runtime.freeScratch()) a.free(items);
-    return ok(try withIndexImpl(a, items));
+    return ok(try withIndexImpl(ctx, items));
 }
 
 pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
@@ -5225,7 +5231,7 @@ pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try withIndexImpl(a, try snapshotItems(a, it)));
+    return ok(try withIndexImpl(ctx, try snapshotItems(a, it)));
 }
 pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;

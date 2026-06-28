@@ -66,6 +66,7 @@ const isPackageHead = literals.isPackageHead;
 const isPkgRoot = literals.isPkgRoot;
 
 const isTopLevelProp = inline_state.isTopLevelProp;
+const isDroppedStdlibFactory = inline_state.isDroppedStdlibFactory;
 const inlineFnAst = inline_state.inlineFnAst;
 const inlineFnAstForRecv = inline_state.inlineFnAstForRecv;
 const CallShape = inline_state.CallShape;
@@ -1138,7 +1139,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // plain extension receiver does not lexically see — the
             // runtime walk below resolves member-vs-global with the right
             // receiver scope.
-            const is_known_global = b.module.funcId(name0) != null or isTopLevelProp(name0);
+            const is_known_global = b.module.funcId(name0) != null or isTopLevelProp(name0) or isDroppedStdlibFactory(name0);
             if (!is_known_global) {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -4721,7 +4722,6 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
         }
         break :blk null;
     };
-    const run = try lowerArgRunWithArity(b, all, arg_arity);
 
     // Target params for trailing-lambda arg-name synthesis.
     var target_params: [][]const u8 = &.{};
@@ -4799,6 +4799,11 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
         } });
         return dst;
     }
+    // The member-precedence branch above lowers its own argument run and
+    // returns; only the static-call path reaches here, so the `this`-prepended
+    // run is lowered now — lowering it earlier would emit (and execute) every
+    // argument's side effects a second time on the member path.
+    const run = try lowerArgRunWithArity(b, all, arg_arity);
     const dst = b.allocReg();
     try b.push(.{ .Call = .{
         .dst = dst,

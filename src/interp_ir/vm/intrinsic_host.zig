@@ -674,6 +674,33 @@ pub fn newSynthInstance(self: *VmIntrinsicHost, class_fqn: []const u8, identity:
         if (std.mem.lastIndexOfScalar(u8, class_fqn, '.')) |i| break :blk class_fqn[i + 1 ..];
         break :blk class_fqn;
     };
+    // A concrete data class (e.g. `IndexedValue`) has a real registered
+    // ClassDef carrying its primary params and the synthesized data-class
+    // members (componentN, equals, toString). Reuse it so the synth instance
+    // behaves like one the constructor would build, instead of the bare
+    // field-bag stub below (which klio's klio-internal synth types — Grouping,
+    // SequenceScope, KlioChannel — are not data classes, so they keep).
+    {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(simple)) |real_def| {
+            const rg = real_def.borrow();
+            const is_data = rg.get().is_data;
+            rg.deinit();
+            if (is_data) {
+                var field_list: std.ArrayList(InstanceData.Field) = .empty;
+                try field_list.appendSlice(self.allocator, fields);
+                const inst = try ObjRef(InstanceData).init(self.allocator, .{
+                    .class = real_def.clone(),
+                    .fields = field_list,
+                    .outer = null,
+                    .identity = identity,
+                    .native_state = null,
+                });
+                return .{ .Instance = inst };
+            }
+        }
+    }
     // The native channel synth carries the `Channel` interface hierarchy so
     // extension resolution finds the `ReceiveChannel`/`SendChannel`
     // extension properties that supply the `select` clauses (`onReceive`,
