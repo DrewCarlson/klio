@@ -157,6 +157,21 @@ pub const Inst = union(enum) {
         field: ConstId,
         value: Reg,
     },
+    /// Compound-assign to a property: `recv.field <op>= value`. The
+    /// evaluator reads the current field value and, when that value
+    /// carries the in-place operator (`plusAssign` family — built-in
+    /// mutable collections, a user `operator fun plusAssign`), dispatches
+    /// it on the field value and performs NO write-back: Kotlin mutates the
+    /// receiver in place and never reassigns the (often read-only)
+    /// property. Otherwise it falls back to read-modify-write
+    /// (`recv.field = recv.field.<op>(value)`), which is what `Int` and
+    /// other scalar properties need.
+    CompoundField: struct {
+        receiver: Reg,
+        field: ConstId,
+        op: BinOp,
+        value: Reg,
+    },
     /// Index a `List`, `Map`, or `Array`. Range checks happen in
     /// the evaluator.
     Index: struct { dst: Reg, receiver: Reg, index: Reg },

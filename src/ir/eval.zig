@@ -2529,6 +2529,74 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 .err => |e| return raiseStep(frame, e),
             }
         },
+        .CompoundField => |cf| {
+            const recv = frame.read(cf.receiver);
+            const v = frame.read(cf.value);
+            const name = constStr(frame.module, cf.field) orelse
+                return raiseStep(frame, .{ .Type = "CompoundField: name not a string const" });
+            const cur = switch (try host.getField(allocator, &recv, name)) {
+                .ok => |fv| fv,
+                .err => |e| return raiseStep(frame, e),
+            };
+            // A collection-typed property compound-assigns in place: Kotlin
+            // dispatches `<op>Assign` on the field value and never reassigns
+            // the property. A mutable collection mutates; a read-only view
+            // (`map.entries`, `keys`, `values`) raises UnsupportedOperationException
+            // from its `add`. Either way there is NO write-back to the
+            // (read-only) property.
+            const is_collection = switch (cur) {
+                .List, .Set, .Map => true,
+                else => false,
+            };
+            const assign = compoundAssignMethod(cf.op);
+            if (is_collection and assign != null) {
+                switch (try host.callMember(allocator, &cur, assign.?, &.{v})) {
+                    .ok => {},
+                    .err => |e| return raiseStep(frame, e),
+                }
+                return .cont;
+            }
+            // A user instance may declare the in-place operator
+            // (`operator fun plusAssign`); prefer it, mutating in place with no
+            // write-back. Fall through to read-modify-write only when the type
+            // has no `<op>Assign`.
+            if (cur == .Instance and assign != null) {
+                switch (try host.callMember(allocator, &cur, assign.?, &.{v})) {
+                    .ok => return .cont,
+                    .err => |e| switch (e) {
+                        .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
+                        else => return raiseStep(frame, e),
+                    },
+                }
+            }
+            // Read-modify-write: compute `cur.<op>(value)` and reassign the
+            // property. Scalars and strings combine via `applyBinop`; a user
+            // type with only the binary operator (`operator fun plus`) routes
+            // through `callMember`.
+            const combined: Value = blk: {
+                if (cur == .Instance) {
+                    if (operatorMethod(cf.op)) |method| {
+                        switch (try host.callMember(allocator, &cur, method, &.{v})) {
+                            .ok => |rv| break :blk rv,
+                            .err => |e| return raiseStep(frame, e),
+                        }
+                    }
+                }
+                switch (try applyBinop(allocator, cf.op, &cur, &v)) {
+                    .ok => |rv| break :blk rv,
+                    .err => |e| return raiseStep(frame, e),
+                }
+            };
+            // `combined` is an owned value (applyBinop / a user operator both
+            // hand back a fresh reference); `setField` retains its own copy, so
+            // drop ours now to balance.
+            const r = try host.setField(allocator, &recv, name, combined);
+            combined.release(allocator);
+            switch (r) {
+                .ok => {},
+                .err => |e| return raiseStep(frame, e),
+            }
+        },
         .Call => |call| {
             // Monomorphic fast path: a plain top-level user function (single
             // overload, has body, non-extension, no varargs / defaults / type

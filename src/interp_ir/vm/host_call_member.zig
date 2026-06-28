@@ -3893,6 +3893,22 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
             return try callValueRec(self, allocator, &callable.?, args);
         }
     }
+    // Unbound `KProperty0` / `KMutableProperty0`: `get()` (and the
+    // `() -> V` `invoke()`/`call()` forms) read the referenced top-level
+    // property, and `set(v)` writes it. The reference carries only the
+    // property name, so resolve the value the same way a bare read does —
+    // a stored `val`/`var` from globals (driving a deferred initializer on
+    // demand), otherwise a custom `get()` accessor's 0-arg getter func.
+    if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and args.len == 0) {
+        if (try topLevelPropertyGet(self, allocator, pname)) |r| return r;
+    }
+    if (std.mem.eql(u8, name, "set") and args.len == 1) {
+        const r = try self.storeGlobal(allocator, pname, args[0]);
+        return switch (r) {
+            .ok => .{ .ok = Value.Unit },
+            .err => |e| .{ .err = e },
+        };
+    }
     if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and args.len == 1) {
         return try getFieldRec(self, allocator, &args[0], pname);
     }
@@ -3905,6 +3921,29 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
     if (std.mem.eql(u8, name, "toString") and args.len == 0) {
         const s = try std.fmt.allocPrint(allocator, "property {s}", .{pname});
         return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
+    }
+    return null;
+}
+
+/// Read the top-level property `pname` for an unbound property reference's
+/// `get()`. Mirrors the `LoadGlobal` resolution: a stored `val`/`var` comes
+/// from globals (driving a deferred initializer and resolving delegates),
+/// and a property declared with only a custom `get()` re-runs its 0-arg
+/// getter func on each read. Returns `null` when `pname` names no top-level
+/// property, leaving the remaining dispatch branches to handle it.
+fn topLevelPropertyGet(self: *VmHost, allocator: Allocator, pname: []const u8) Allocator.Error!?EvalResult {
+    switch (try self.lookupGlobalThrowing(allocator, pname)) {
+        .ok => |maybe| if (maybe) |v| {
+            v.retain();
+            return .{ .ok = v };
+        },
+        .err => |e| return .{ .err = e },
+    }
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    if (mod.registry.top_level_prop_getters.get(pname)) |fid| {
+        return try self.callFunc(allocator, mod, fid, &.{});
     }
     return null;
 }

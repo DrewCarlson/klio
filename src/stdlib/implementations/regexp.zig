@@ -105,7 +105,17 @@ const Program = struct {
     group_count: usize,
     /// `names[i]` is the name of group `i`, or null for an unnamed group.
     names: []const ?[]const u8,
+    /// `RegexOption` flags this pattern was compiled with.
+    flags: Flags = .{},
     allocator: std.mem.Allocator,
+};
+
+/// The subset of `kotlin.text.RegexOption` that affects matching here.
+const Flags = struct {
+    /// `RegexOption.IGNORE_CASE` — literals and character classes fold case.
+    case_insensitive: bool = false,
+    /// `RegexOption.MULTILINE` — `^`/`$` also match at line terminators.
+    multiline: bool = false,
 };
 
 const Quant = struct {
@@ -540,10 +550,49 @@ fn compileProgram(allocator: std.mem.Allocator, pattern: []const u8) !?*Program 
 /// One capture slot: byte offsets into the input, or `null` if unset.
 const Capture = struct { start: ?usize = null, end: ?usize = null };
 
+/// ASCII case fold (lowercase). Kotlin/Native folds Unicode too, but the
+/// programs reached here are ASCII-cased; this keeps `IGNORE_CASE` correct
+/// for the common case without a full case table.
+fn foldCp(c: u21) u21 {
+    if (c >= 'A' and c <= 'Z') return c + 32;
+    return c;
+}
+
+fn upperCp(c: u21) u21 {
+    if (c >= 'a' and c <= 'z') return c - 32;
+    return c;
+}
+
+fn cpEq(a: u21, b: u21, fold: bool) bool {
+    if (a == b) return true;
+    return fold and foldCp(a) == foldCp(b);
+}
+
+/// `matchClass`, honoring case-insensitivity. Membership in the positive
+/// item set is tested against the input codepoint and (under `fold`) its
+/// lower/upper case forms; negation is applied once over that membership so
+/// `[^a-z]` correctly rejects `A` under IGNORE_CASE.
+fn matchClassFold(items: []const ClassItem, negated: bool, c: u21, fold: bool) bool {
+    var member = matchClass(items, false, c);
+    if (fold and !member) {
+        const lo = foldCp(c);
+        const up = upperCp(c);
+        if (lo != c and matchClass(items, false, lo)) member = true;
+        if (!member and up != c and matchClass(items, false, up)) member = true;
+    }
+    return member != negated;
+}
+
+/// True when codepoint `c` is a line terminator for `^`/`$` in MULTILINE.
+fn isLineTerminator(c: u21) bool {
+    return c == '\n' or c == '\r';
+}
+
 /// Backtracking matcher over the UTF-8 input bytes.
 const Matcher = struct {
     input: []const u8,
     caps: []Capture,
+    flags: Flags = .{},
 
     /// Decode the codepoint at byte offset `at`. Returns the codepoint and
     /// its byte length, or null at end-of-input / on a bad byte.
@@ -585,7 +634,7 @@ const Matcher = struct {
             .empty => return k.run(self, at),
             .literal => |lit| {
                 const d = self.decode(at) orelse return null;
-                if (d.cp != lit) return null;
+                if (!cpEq(d.cp, lit, self.flags.case_insensitive)) return null;
                 return k.run(self, at + d.len);
             },
             .any => {
@@ -600,16 +649,26 @@ const Matcher = struct {
             },
             .class => |cl| {
                 const d = self.decode(at) orelse return null;
-                if (!matchClass(cl.items, cl.negated, d.cp)) return null;
+                if (!matchClassFold(cl.items, cl.negated, d.cp, self.flags.case_insensitive)) return null;
                 return k.run(self, at + d.len);
             },
             .anchor_start => {
-                if (at != 0) return null;
-                return k.run(self, at);
+                if (at == 0) return k.run(self, at);
+                if (self.flags.multiline) {
+                    if (self.prevCodepoint(at)) |p| {
+                        if (isLineTerminator(p)) return k.run(self, at);
+                    }
+                }
+                return null;
             },
             .anchor_end => {
-                if (at != self.input.len) return null;
-                return k.run(self, at);
+                if (at == self.input.len) return k.run(self, at);
+                if (self.flags.multiline) {
+                    if (self.decode(at)) |d| {
+                        if (isLineTerminator(d.cp)) return k.run(self, at);
+                    }
+                }
+                return null;
             },
             .word_boundary => |want| {
                 if (self.atWordBoundary(at) != want) return null;
@@ -770,7 +829,7 @@ fn runMatch(allocator: std.mem.Allocator, prog: *const Program, input: []const u
     var pos = from;
     while (true) {
         for (caps) |*c| c.* = .{};
-        var matcher = Matcher{ .input = input, .caps = caps };
+        var matcher = Matcher{ .input = input, .caps = caps, .flags = prog.flags };
         const top = TopCont{ .base = .{ .vtable = TopCont.vt } };
         if (matcher.match(prog.root, pos, &top.base)) |end| {
             caps[0] = .{ .start = pos, .end = end };
@@ -865,6 +924,11 @@ fn preprocessPattern(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
 /// Build a `Value::Regex` from a pattern, compiling the engine. Returns a
 /// `PatternSyntaxException` (as a thrown value) on a syntax error.
 fn compileRegex(allocator: std.mem.Allocator, pattern: []const u8) !EvalResult {
+    return compileRegexFlags(allocator, pattern, .{});
+}
+
+/// `compileRegex`, with the `RegexOption` flags to bake into the program.
+fn compileRegexFlags(allocator: std.mem.Allocator, pattern: []const u8, flags: Flags) !EvalResult {
     const prepared = try preprocessPattern(allocator, pattern);
     defer allocator.free(prepared);
     const prog = (try compileProgram(allocator, prepared)) orelse {
@@ -872,6 +936,7 @@ fn compileRegex(allocator: std.mem.Allocator, pattern: []const u8) !EvalResult {
         const ex = try makeException(allocator, "kotlin.text.PatternSyntaxException", msg);
         return .{ .err = .{ .Thrown = ex } };
     };
+    prog.flags = flags;
     const owned_pat = try allocator.dupe(u8, pattern);
     const data = RegexData{
         .pattern = try runtime.strInitOwned(allocator, owned_pat),
@@ -1115,10 +1180,66 @@ fn groupIndexByName(prog: *const Program, name: []const u8) ?usize {
 // Intrinsics — Regex
 // ============================================================
 
+/// Apply a single `RegexOption` enum entry (a `Value::Instance` whose class is
+/// `RegexOption`) onto `flags`. Unrecognized options are ignored.
+fn applyRegexOption(opt: Value, flags: *Flags) void {
+    switch (opt) {
+        .Instance => |inst| {
+            const data = inst.asPtr();
+            // Only honor entries declared by `RegexOption`.
+            const cls = data.class.asPtr();
+            const is_regex_option =
+                std.mem.eql(u8, cls.name, "RegexOption") or
+                std.mem.endsWith(u8, cls.fqn, ".RegexOption");
+            if (!is_regex_option) return;
+            const name_v = data.get("name") orelse return;
+            const name = stringBytes(name_v) orelse return;
+            if (std.mem.eql(u8, name, "IGNORE_CASE")) {
+                flags.case_insensitive = true;
+            } else if (std.mem.eql(u8, name, "MULTILINE")) {
+                flags.multiline = true;
+            }
+        },
+        else => {},
+    }
+}
+
+/// Parse the option argument of `Regex(pattern, options)` / `toRegex` — either
+/// a single `RegexOption` enum value or a `Set`/`List`/`Array` of them — into
+/// the compile/match `Flags`.
+fn optionsToFlags(opt_arg: ?Value) Flags {
+    var flags: Flags = .{};
+    const arg = opt_arg orelse return flags;
+    switch (arg) {
+        .Set => |s| {
+            const g = s.items.borrow();
+            defer g.deinit();
+            for (g.get().items) |it| applyRegexOption(it, &flags);
+        },
+        .List => |l| {
+            const g = l.items.borrow();
+            defer g.deinit();
+            for (g.get().items) |it| applyRegexOption(it, &flags);
+        },
+        .Array => |a| switch (a.storage) {
+            .boxed => |vl| {
+                const g = vl.borrow();
+                defer g.deinit();
+                for (g.get().items) |it| applyRegexOption(it, &flags);
+            },
+            .scalars => {},
+        },
+        .Instance => applyRegexOption(arg, &flags),
+        else => {},
+    }
+    return flags;
+}
+
 pub fn regex_ctor(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const pat = if (ctx.args.len > 0) stringBytes(ctx.args[0]) else null;
     if (pat == null) return typeErr("Regex requires a String pattern");
-    return compileRegex(ctx.allocator, pat.?);
+    const flags = optionsToFlags(if (ctx.args.len > 1) ctx.args[1] else null);
+    return compileRegexFlags(ctx.allocator, pat.?, flags);
 }
 
 pub fn regex_pattern(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -1428,6 +1549,31 @@ pub fn regex_split(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(try makeList(ctx.allocator, parts, false));
 }
 
+pub fn regex_split_to_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const r = switch (regexArg(ctx.args, "Regex.splitToSequence")) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
+        return typeErr("Regex.splitToSequence requires a String");
+    }
+    const sr = ctx.args[1].String;
+    const s = sr.asPtr().bytes;
+    var limit: i64 = 0;
+    if (ctx.args.len > 2) {
+        const v = ctx.args[2];
+        if (v.isIntegral()) {
+            limit = v.asI64().?;
+        } else {
+            return typeErr("Regex.splitToSequence limit must be Int");
+        }
+    }
+    const prog = progFromRegex(r) orelse return typeErr("Regex.splitToSequence requires a Regex receiver");
+    const parts = try splitItems(ctx.allocator, prog, s, limit);
+    defer ctx.allocator.free(parts);
+    return ok(try makeSequence(ctx.allocator, parts));
+}
+
 /// Split `s` on every match of `prog`, mirroring the `regex` crate's
 /// `split` / `splitn`. `limit <= 0` is unbounded; `limit > 0` caps the
 /// result at `limit` parts. Caller owns the returned slice.
@@ -1672,9 +1818,15 @@ pub fn match_group_range(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 const testing = std.testing;
 
 fn compileForTest(a: std.mem.Allocator, pattern: []const u8) !*Program {
+    return compileForTestFlags(a, pattern, .{});
+}
+
+fn compileForTestFlags(a: std.mem.Allocator, pattern: []const u8, flags: Flags) !*Program {
     const prepared = try preprocessPattern(a, pattern);
     defer a.free(prepared);
-    return (try compileProgram(a, prepared)).?;
+    const prog = (try compileProgram(a, prepared)).?;
+    prog.flags = flags;
+    return prog;
 }
 
 test "literal match and offsets" {
@@ -1882,4 +2034,44 @@ test "compile invalid pattern returns null" {
     const a = arena.allocator();
     const prepared = try preprocessPattern(a, "(unclosed");
     try testing.expect((try compileProgram(a, prepared)) == null);
+}
+
+test "IGNORE_CASE folds literals" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cs = try compileForTest(a, "hi");
+    try testing.expect((try runMatch(a, cs, "Hi", 0)) == null);
+    const ci = try compileForTestFlags(a, "hi", .{ .case_insensitive = true });
+    const caps = (try runMatch(a, ci, "Hi", 0)).?;
+    try testing.expectEqual(@as(?usize, 0), caps[0].start);
+    try testing.expectEqual(@as(?usize, 2), caps[0].end);
+}
+
+test "IGNORE_CASE folds character classes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ci = try compileForTestFlags(a, "[a-z]+", .{ .case_insensitive = true });
+    const caps = (try runMatch(a, ci, "ABC", 0)).?;
+    try testing.expectEqual(@as(?usize, 3), caps[0].end);
+    // Negation still rejects a case-variant.
+    const neg = try compileForTestFlags(a, "[^a-z]", .{ .case_insensitive = true });
+    try testing.expect((try runMatch(a, neg, "A", 0)) == null);
+}
+
+test "MULTILINE anchors match at line boundaries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const single = try compileForTest(a, "^b");
+    try testing.expect((try runMatch(a, single, "a\nb", 0)) == null);
+    const ml = try compileForTestFlags(a, "^b", .{ .multiline = true });
+    const caps = (try runMatch(a, ml, "a\nb", 0)).?;
+    try testing.expectEqual(@as(?usize, 2), caps[0].start);
+    try testing.expectEqual(@as(?usize, 3), caps[0].end);
+    // `$` at a line terminator under MULTILINE.
+    const eol = try compileForTestFlags(a, "b$", .{ .multiline = true });
+    const ecaps = (try runMatch(a, eol, "ab\ncb", 0)).?;
+    try testing.expectEqual(@as(?usize, 1), ecaps[0].start);
 }

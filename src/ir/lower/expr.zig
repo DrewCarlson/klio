@@ -487,6 +487,16 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
             } else if (b.module.funcId(pr.name.name) != null or b.module.classId(pr.name.name) != null) {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
+            } else if (isAliasName(pr.name.name) and
+                !b.module.registry.class_member_names.contains(pr.name.name))
+            {
+                // `::minOf` / `::maxOf` / `::listOf` … name a stdlib host
+                // intrinsic that no class declares as a member. A bare
+                // `LoadGlobal` resolves it to its `.Intrinsic` callable
+                // value; binding it to the enclosing `this` (the
+                // `!is_tracked` branch below) would instead emit a
+                // `this.<name>` member ref that misses at runtime.
+                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             } else if (!is_tracked) {
                 if (try resolveThisReg(b)) |this_reg| {
                     try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = this_reg, .name = nm } });

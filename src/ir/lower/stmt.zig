@@ -559,6 +559,38 @@ fn lowerAssign(
         } });
         return null;
     }
+    // Compound assign to a property (`recv.field += x`). Kotlin resolves
+    // this in place when the field's type carries the `<op>Assign` operator
+    // (built-in mutable collections, a user `operator fun plusAssign`),
+    // mutating the field value and NOT reassigning the property — so
+    // `map.entries += e` dispatches `entries.plusAssign(e)` on the read-only
+    // view (which throws) rather than trying to SET the read-only `entries`.
+    // The current value's type is only known at runtime, so emit a single
+    // `CompoundField` that reads the field, dispatches `<op>Assign` when the
+    // value supports it, and otherwise falls back to read-modify-write
+    // (needed for scalar properties like `obj.count += 1`).
+    if (op != .Assign) {
+        if (target.* == .Member and !target.Member.safe) {
+            const m = target.Member;
+            const recv = try lowerReceiver(b, m.receiver);
+            const bin: BinOp = switch (op) {
+                .Add => .Add,
+                .Sub => .Sub,
+                .Mul => .Mul,
+                .Div => .Div,
+                .Rem => .Mod,
+                .Assign => unreachable,
+            };
+            const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
+            try b.push(.{ .CompoundField = .{
+                .receiver = recv,
+                .field = field,
+                .op = bin,
+                .value = v,
+            } });
+            return null;
+        }
+    }
     const combined: Reg = switch (op) {
         .Assign => v,
         .Add, .Sub, .Mul, .Div, .Rem => blk: {
@@ -1084,6 +1116,38 @@ test "member assign emits set field" {
     defer freeFunc(func);
     const insts = func.blocks[0].insts;
     try testing.expect(insts[insts.len - 1] == .SetField);
+}
+
+test "compound assign to member emits compound field" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    const r = b.allocReg();
+    try b.bind("obj", r);
+    var recv_segs = [_]ast.Ident{.{ .name = "obj", .span = dummySpan() }};
+    var recv = pathExpr(&recv_segs);
+    const target = Expr{ .Member = .{
+        .receiver = &recv,
+        .name = .{ .name = "field", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    const assign = Stmt{ .Assign = .{
+        .target = target,
+        .op = .Add,
+        .value = intLit(2),
+        .span = dummySpan(),
+    } };
+    _ = try lowerStmt(&b, &assign);
+    b.terminate(.{ .Return = null });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    const insts = func.blocks[0].insts;
+    // A property compound-assign defers the plusAssign-vs-rewrite decision to
+    // runtime: a single `CompoundField`, never a read-modify-`SetField`.
+    try testing.expect(insts[insts.len - 1] == .CompoundField);
+    for (insts) |inst| try testing.expect(inst != .SetField);
 }
 
 test "index assign emits set call" {
