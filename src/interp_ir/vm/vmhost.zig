@@ -436,6 +436,9 @@ fn ivJoinOsThread(ctx: *anyopaque, id: u64) Allocator.Error!?RuntimeError {
 fn ivOsThreadAlive(ctx: *anyopaque, id: u64) bool {
     return intrinsic_host.osThreadAlive(ip(ctx), id);
 }
+fn ivBuilderStep(ctx: *anyopaque, state: runtime.BuilderStateRef, out: Output) Allocator.Error!runtime.BuilderStepResult {
+    return @import("coroutines.zig").builderStep(ip(ctx), state, out);
+}
 
 const intrinsic_vtable: IntrinsicHost.VTable = .{
     .invoke_callable = ivInvokeCallable,
@@ -461,6 +464,7 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .spawn_os_thread = ivSpawnOsThread,
     .join_os_thread = ivJoinOsThread,
     .os_thread_alive = ivOsThreadAlive,
+    .builder_step = ivBuilderStep,
 };
 
 const testing = std.testing;

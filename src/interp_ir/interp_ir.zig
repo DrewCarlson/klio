@@ -652,6 +652,11 @@ pub fn gcInstallClosureHook(closures: SharedClosures) void {
     active_closures = closures;
     runtime.gc.markClosureHook = markClosureThunk;
     runtime.gc.sweepClosureHook = sweepClosuresThunk;
+    // The lazy-`sequence{}` builder holds its parked continuation as an opaque
+    // `*ir.eval.SuspendState` in a `Sequence`'s `Builder` source; wire the
+    // mark/free hooks so the GC roots and reclaims those frames.
+    runtime.gc.markSuspendHook = ir.eval.gcMarkSuspendStateOpaque;
+    runtime.gc.freeSuspendHook = ir.eval.freeSuspendStateOpaque;
 }
 
 /// Lambda/closure side-table shared across every OS thread of one

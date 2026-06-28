@@ -788,6 +788,22 @@ pub fn gcMarkSuspendState(state: *const SuspendState, m: *runtime.gc.Marker) voi
     }
 }
 
+/// `runtime.gc.markSuspendHook` thunk: mark a builder continuation held as an
+/// opaque `*SuspendState` by a `Sequence`'s `Builder` source.
+pub fn gcMarkSuspendStateOpaque(cont: *anyopaque, m: *runtime.gc.Marker) void {
+    const st: *const SuspendState = @ptrCast(@alignCast(cont));
+    gcMarkSuspendState(st, m);
+}
+
+/// `runtime.gc.freeSuspendHook` thunk: release and free an abandoned builder
+/// continuation box. The frames were never resumed, so their retained snapshot
+/// values must be released and the slice buffers freed before the box itself.
+pub fn freeSuspendStateOpaque(cont: *anyopaque, allocator: Allocator) void {
+    const st: *SuspendState = @ptrCast(@alignCast(cont));
+    st.deinit(allocator);
+    allocator.destroy(st);
+}
+
 /// Release what `retainSnapshotValues` retained (the drop-without-resume
 /// path). Mirrors the retain set exactly.
 fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {

@@ -38,6 +38,7 @@ pub const time = @import("implementations/time.zig");
 /// the stdlib root. Mirrors the Rust `pub use` lines.
 pub const compare_values = collections.compare_values;
 pub const materialise_sequence = collections.materialise_sequence;
+pub const materialise_sequence_bounded = collections.materialise_sequence_bounded;
 pub const primitive_companion_const = collections.primitive_companion_const;
 pub const concurrent_synchronized = concurrent.concurrent_synchronized;
 pub const concurrent_monitor_enter = concurrent.concurrent_monitor_enter;

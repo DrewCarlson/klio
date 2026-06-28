@@ -130,120 +130,119 @@ fn rangeIterInt(allocator: std.mem.Allocator, start: i64, end: i64, step: i64) s
 // Sequence builder (`sequence { yield(...) }`)
 // ============================================================
 
-/// `sequence { yield(...) ; yieldAll(...) }` builder. klio runs the
-/// `suspend SequenceScope<T>.() -> Unit` block eagerly: a host
-/// `SequenceScope` instance carries a shared mutable buffer that the
-/// `yield`/`yieldAll` intrinsics append to; the collected items become a
-/// `Value::Sequence`. Faithful for finite builders (the common case); an
-/// unbounded `while (true) { yield(..) }` would grow the buffer and is
-/// bounded by the dev memory guard rather than truly lazy.
-fn seqScopeBuffer(scope: *const Value) ?ValueList {
-    if (scope.* == .Instance) {
-        const g = scope.Instance.borrow();
-        defer g.deinit();
-        if (g.get().get("__seq_buffer")) |v| {
-            if (v == .List) return v.List.items;
-        }
-    }
-    return null;
-}
+const BuilderState = runtime.BuilderState;
+const BuilderStateRef = runtime.BuilderStateRef;
+const SeqIterState = runtime.SeqIterState;
+const SeqIterStateRef = runtime.SeqIterStateRef;
 
-const BuilderResult = union(enum) {
-    items: ValueList,
-    err: RuntimeError,
-};
+// Scope-instance field names shared with the host builder driver
+// (`coroutines.builderStep`).
+const seq_has_value_field = "__seq_has_value";
+const seq_value_field = "__seq_value";
+const seq_yield_iter_field = "__seq_yield_iter";
 
-fn runSeqBuilder(ctx: *CallCtx, who: []const u8) std.mem.Allocator.Error!BuilderResult {
-    if (ctx.args.len < 1) {
-        _ = who;
-        return .{ .err = .{ .Arity = "sequence builder expects a block" } };
-    }
+/// Build the lazy `Builder`-source Sequence for `sequence { ... }` /
+/// `iterator { ... }`. The `suspend SequenceScope<T>.() -> Unit` block is NOT
+/// run here — the host drives it one `yield` at a time as the consumer pulls
+/// (`builderStep`). The scope is a synthetic `SequenceScope` instance carrying
+/// the pending yield value / yieldAll iterator between pulls.
+fn makeBuilderSequence(ctx: *CallCtx) std.mem.Allocator.Error!union(enum) { seq: Value, err: RuntimeError } {
+    if (ctx.args.len < 1) return .{ .err = .{ .Arity = "sequence builder expects a block" } };
     const block = ctx.args[0];
-    const buffer = try ValueList.init(ctx.allocator, .empty);
     const id = ctx.host.allocInstanceId();
     const fields = [_]InstanceData.Field{
-        .{ .name = "__seq_buffer", .value = .{ .List = .{
-            .items = buffer.clone(),
-            .mutable = true,
-            .enum_entries = false,
-            .backing = null,
-        } } },
+        .{ .name = seq_has_value_field, .value = .{ .Bool = false } },
+        .{ .name = seq_value_field, .value = .Unit },
+        .{ .name = seq_yield_iter_field, .value = .Null },
     };
     const scope = try ctx.host.newSynthInstance("kotlin.sequences.SequenceScope", id, &fields);
-    const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &scope, ctx.out);
-    switch (r) {
-        .ok => {},
-        .err => |e| return .{ .err = e },
-    }
-    return .{ .items = buffer };
+    if (runtime.reclaimEnabled()) block.retain();
+    const block_box = try Value.boxRef(ctx.allocator, block);
+    if (runtime.reclaimEnabled()) scope.retain();
+    const scope_box = try Value.boxRef(ctx.allocator, scope);
+    const state = try BuilderStateRef.init(ctx.allocator, .{
+        .block = block_box,
+        .scope = scope_box,
+    });
+    const data = try ObjRef(SequenceData).init(ctx.allocator, .{
+        .source = .{ .Builder = state },
+        .ops = &.{},
+    });
+    return .{ .seq = .{ .Sequence = data } };
 }
 
 pub fn seq_builder(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const r = try runSeqBuilder(ctx, "sequence");
-    const buffer = switch (r) {
-        .items => |b| b,
-        .err => |e| return err(e),
+    return switch (try makeBuilderSequence(ctx)) {
+        .seq => |s| ok(s),
+        .err => |e| err(e),
     };
-    const items = try cloneItems(ctx.allocator, buffer);
-    return ok(try makeSequence(ctx.allocator, items));
 }
 
 pub fn seq_iterator_builder(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const r = try runSeqBuilder(ctx, "iterator");
-    const buffer = switch (r) {
-        .items => |b| b,
+    const seq = switch (try makeBuilderSequence(ctx)) {
+        .seq => |s| s,
         .err => |e| return err(e),
     };
-    const items = try cloneItems(ctx.allocator, buffer);
-    var list: std.ArrayList(Value) = .empty;
-    try list.appendSlice(ctx.allocator, items);
-    const ref = try ValueList.init(ctx.allocator, list);
-    const pos = try ObjRef(usize).init(ctx.allocator, 0);
-    return ok(.{ .Iterator = .{ .items = ref, .pos = pos, .prim = null } });
+    return ok(try makeSeqIter(ctx.allocator, seq));
 }
 
+/// A lazy `SeqIter` over `seq` (the `Sequence.iterator()` / `iterator{}`
+/// result). Adopts one owned reference to `seq`.
+pub fn makeSeqIter(allocator: std.mem.Allocator, seq: Value) std.mem.Allocator.Error!Value {
+    const state = try SeqIterStateRef.init(allocator, .{ .seq = seq });
+    return .{ .SeqIter = state };
+}
+
+/// `SequenceScope.yield(value)` — stash the value on the scope and suspend the
+/// builder coroutine. The host's `builderStep` reads the value and resumes the
+/// block on the next pull.
 pub fn seq_scope_yield(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const buffer = seqScopeBuffer(&ctx.args[0]) orelse
-        return err(.{ .Type = "yield: not a SequenceScope" });
-    if (ctx.args.len > 1) {
-        const g = buffer.borrowMut();
-        defer g.deinit();
-        try g.get().append(ctx.allocator, ctx.args[1]);
-    }
-    return ok(.Unit);
+    if (ctx.args.len < 1 or ctx.args[0] != .Instance) return err(.{ .Type = "yield: not a SequenceScope" });
+    const g = ctx.args[0].Instance.borrowMut();
+    const inst = g.get();
+    const v = if (ctx.args.len > 1) ctx.args[1] else Value.Unit;
+    if (runtime.reclaimEnabled()) v.retain();
+    try inst.define(ctx.allocator, seq_value_field, v);
+    _ = inst.set(seq_has_value_field, .{ .Bool = true });
+    g.deinit();
+    return err(.{ .Suspend = -1 });
 }
 
+/// `SequenceScope.yieldAll(iterator/iterable/sequence)` — stash an Iterator on
+/// the scope and suspend; the host drains it lazily before resuming the block.
 pub fn seq_scope_yield_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const buffer = seqScopeBuffer(&ctx.args[0]) orelse
-        return err(.{ .Type = "yieldAll: not a SequenceScope" });
+    if (ctx.args.len < 1 or ctx.args[0] != .Instance) return err(.{ .Type = "yieldAll: not a SequenceScope" });
     if (ctx.args.len <= 1) return ok(.Unit);
     const arg = ctx.args[1];
-    var elems: []Value = undefined;
-    var owned_elems = false;
+    // Obtain a fresh Iterator over the argument so the host can pull lazily.
+    var iter: Value = undefined;
     switch (arg) {
-        .List => |l| elems = try cloneItems(ctx.allocator, l.items),
-        .Set => |s| elems = try cloneItems(ctx.allocator, s.items),
-        .Array => |a| elems = try a.snapshot(ctx.allocator),
-        .Iterator => |it| elems = try cloneItems(ctx.allocator, it.items),
-        .Sequence => {
-            const m = try materialiseSequence(ctx.allocator, ctx.host, ctx.out, &arg);
-            switch (m) {
-                .ok => |xs| {
-                    elems = xs;
-                    owned_elems = true;
-                },
+        .Iterator, .RangeIter, .SeqIter => iter = arg,
+        .List, .Set, .Array, .Sequence, .Map, .String, .Range => {
+            const r = (try ctx.host.invokeMethod(&arg, "iterator", &.{}, ctx.out)) orelse
+                return err(.{ .Type = "yieldAll: argument is not iterable" });
+            switch (r) {
+                .ok => |it| iter = it,
+                .err => |e| return err(e),
+            }
+        },
+        .Instance => {
+            const r = (try ctx.host.invokeMethod(&arg, "iterator", &.{}, ctx.out)) orelse
+                return err(.{ .Type = "yieldAll: argument is not iterable" });
+            switch (r) {
+                .ok => |it| iter = it,
                 .err => |e| return err(e),
             }
         },
         else => return err(.{ .Type = "yieldAll: expected an Iterable/Iterator/Sequence" }),
     }
     {
-        const g = buffer.borrowMut();
+        const g = ctx.args[0].Instance.borrowMut();
         defer g.deinit();
-        try g.get().appendSlice(ctx.allocator, elems);
+        if (runtime.reclaimEnabled()) iter.retain();
+        try g.get().define(ctx.allocator, seq_yield_iter_field, iter);
     }
-    if (owned_elems) ctx.allocator.free(elems);
-    return ok(.Unit);
+    return err(.{ .Suspend = -1 });
 }
 
 // ============================================================
@@ -376,7 +375,7 @@ fn recvSeqEager(args: []const Value, what: []const u8) EagerResult {
     if (data.ops.len != 0) return .none;
     return switch (data.source) {
         .Items => |items| .{ .some = items.clone() },
-        .Generate => .none,
+        .Generate, .Builder => .none,
     };
 }
 
@@ -644,6 +643,29 @@ fn materialiseSequenceBounded(
                     if (max) |m| if (output.items.len >= m) break;
                 }
             },
+            .Builder => |bstate| {
+                while (true) {
+                    if (takeCapReached(seq.ops, st.taken)) break;
+                    const step = try host.builderStep(bstate, out);
+                    const item = switch (step) {
+                        .value => |v| v,
+                        .done => break,
+                        .err => |e| {
+                            output.deinit(allocator);
+                            return .{ .err = e };
+                        },
+                    };
+                    const pr = try pump(allocator, host, out, item, seq.ops, &st, &output);
+                    switch (pr) {
+                        .cont => |c| if (!c) break,
+                        .err => |e| {
+                            output.deinit(allocator);
+                            return .{ .err = e };
+                        },
+                    }
+                    if (max) |m| if (output.items.len >= m) break;
+                }
+            },
             .Generate => |gen| {
                 var cur: ?Value = if (gen.seed) |s| blk: {
                     const sv = s.asPtr().*;
@@ -708,6 +730,19 @@ fn materialiseSequenceBounded(
             const g = v.borrow();
             defer g.deinit();
             try items.appendSlice(allocator, g.get().*);
+        },
+        .Builder => |bstate| {
+            while (true) {
+                const step = try host.builderStep(bstate, out);
+                switch (step) {
+                    .value => |v| try items.append(allocator, v),
+                    .done => break,
+                    .err => |e| {
+                        items.deinit(allocator);
+                        return .{ .err = e };
+                    },
+                }
+            }
         },
         .Generate => |gen| {
             const limit: usize = 1024;

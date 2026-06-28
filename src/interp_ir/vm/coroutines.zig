@@ -1322,6 +1322,221 @@ fn mapDriverErr(allocator: Allocator, e: EvalError) RuntimeError {
     };
 }
 
+// -------------------------------------------------------------------------
+// Lazy `sequence { yield(...) }` / `iterator { ... }` builder driver.
+//
+// The builder block is a restricted-suspension coroutine: each `yield(x)`
+// writes `x` onto the `SequenceScope` instance and suspends the block
+// (`RuntimeError.Suspend = -1`), which the eval engine captures as a
+// `SuspendState`. The consumer drives it one element at a time: the first
+// `builderStep` starts the block (`evalClosureRaw`), each later step resumes
+// the captured continuation (`resumeRaw`) until the next `yield`. No coroutine
+// driver / pump is pushed — the block parks only via `yield`/`yieldAll`, never
+// a `delay`, so its suspensions never escape this step loop.
+// -------------------------------------------------------------------------
+
+/// Scope field the `yield` intrinsic sets to `true` immediately before it
+/// suspends, so `builderStep` can tell a real yield apart from any other
+/// suspension a (mis-written) builder block might attempt.
+pub const seq_has_value_field = "__seq_has_value";
+/// Scope field holding the value passed to `yield(value)`.
+pub const seq_value_field = "__seq_value";
+/// Scope field holding the pending `yieldAll` iterator (an `Iterator` Value)
+/// the consumer drains lazily before the block resumes; `Null`/absent when no
+/// `yieldAll` is in flight.
+pub const seq_yield_iter_field = "__seq_yield_iter";
+
+const BuilderStepResult = runtime.BuilderStepResult;
+const InstanceData = runtime.InstanceData;
+
+const PendingKind = enum { value, yield_all, none };
+
+/// Inspect the scope after a suspension: did the block yield a single value,
+/// stash a `yieldAll` iterator, or suspend on something else? Read-and-clears
+/// the single-value flag.
+fn classifySuspension(scope: *const Value) struct { kind: PendingKind, value: Value } {
+    if (scope.* != .Instance) return .{ .kind = .none, .value = .Unit };
+    const g = scope.Instance.borrowMut();
+    defer g.deinit();
+    const inst = g.get();
+    if (inst.get(seq_has_value_field)) |has| {
+        if (has == .Bool and has.Bool) {
+            const v = inst.get(seq_value_field) orelse Value.Unit;
+            _ = inst.set(seq_has_value_field, .{ .Bool = false });
+            return .{ .kind = .value, .value = v };
+        }
+    }
+    if (inst.get(seq_yield_iter_field)) |it| {
+        if (it != .Null) return .{ .kind = .yield_all, .value = it };
+    }
+    return .{ .kind = .none, .value = .Unit };
+}
+
+/// The pending `yieldAll` iterator on the scope, or `null`.
+fn pendingYieldIter(scope: *const Value) ?Value {
+    if (scope.* != .Instance) return null;
+    const g = scope.Instance.borrow();
+    defer g.deinit();
+    const it = g.get().get(seq_yield_iter_field) orelse return null;
+    if (it == .Null) return null;
+    return it;
+}
+
+fn clearYieldIter(scope: *const Value) void {
+    if (scope.* != .Instance) return;
+    const g = scope.Instance.borrowMut();
+    defer g.deinit();
+    _ = g.get().set(seq_yield_iter_field, .Null);
+}
+
+/// Pull one element from the pending `yieldAll` iterator: `hasNext()` then
+/// `next()`. Returns the element, or `null` when the iterator is exhausted
+/// (the caller then clears it and resumes the block), or an error.
+fn drainOne(self: *VmIntrinsicHost, it: *const Value, out: Output) Allocator.Error!union(enum) { value: Value, done, err: RuntimeError } {
+    const hn = (try intrinsic_host.invokeMethod(self, it, "hasNext", &.{}, out)) orelse
+        return .{ .err = .{ .Type = "yieldAll: argument is not an Iterator" } };
+    switch (hn) {
+        .ok => |b| if (!(b == .Bool and b.Bool)) return .done,
+        .err => |e| return .{ .err = e },
+    }
+    const nx = (try intrinsic_host.invokeMethod(self, it, "next", &.{}, out)) orelse
+        return .{ .err = .{ .Type = "yieldAll: Iterator has no next()" } };
+    return switch (nx) {
+        .ok => |v| .{ .value = v },
+        .err => |e| .{ .err = e },
+    };
+}
+
+/// Drive a lazy `sequence{}`/`iterator{}` builder one element. Starts the block
+/// on the first call and resumes the captured continuation on each later call,
+/// returning the next yielded value or `.done` at completion.
+pub fn builderStep(self: *VmIntrinsicHost, state: runtime.BuilderStateRef, out: Output) Allocator.Error!BuilderStepResult {
+    const a = self.allocator;
+
+    var done: bool = undefined;
+    var scope: Value = undefined;
+    {
+        const g = state.borrow();
+        done = g.get().done;
+        scope = g.get().scope.asPtr().*;
+        g.deinit();
+    }
+    if (done) return .done;
+
+    // Phase A: keep draining a yieldAll iterator stashed on the scope before
+    // touching the coroutine, so its elements interleave lazily (an infinite
+    // yieldAll source never forces the block past its current suspension).
+    if (pendingYieldIter(&scope)) |it| {
+        switch (try drainOne(self, &it, out)) {
+            .value => |v| return .{ .value = v },
+            .done => clearYieldIter(&scope),
+            .err => |e| {
+                const g = state.borrowMut();
+                g.get().done = true;
+                g.deinit();
+                return .{ .err = e };
+            },
+        }
+    }
+
+    // Phase B: start or resume the coroutine, looping past empty yieldAll
+    // suspensions (a `yieldAll` of an empty/exhausted iterator yields nothing
+    // and the block must run on to its next real suspension).
+    while (true) {
+        var started: bool = undefined;
+        var cont: ?*SuspendState = undefined;
+        var block: Value = undefined;
+        {
+            const g = state.borrow();
+            started = g.get().started;
+            cont = if (g.get().cont) |c| @ptrCast(@alignCast(c)) else null;
+            block = g.get().block.asPtr().*;
+            g.deinit();
+        }
+
+        var r: ir.eval.EvalResult = undefined;
+        if (!started) {
+            {
+                const g = state.borrowMut();
+                g.get().started = true;
+                g.deinit();
+            }
+            r = try intrinsic_host.evalClosureRaw(self, &block, &.{}, &scope, out);
+        } else {
+            const old = cont orelse {
+                const g = state.borrowMut();
+                g.get().done = true;
+                g.deinit();
+                return .done;
+            };
+            {
+                const g = state.borrowMut();
+                g.get().cont = null;
+                g.deinit();
+            }
+            r = try intrinsic_host.resumeRaw(self, old, .Unit, out);
+            // `resumeContinuation` freed `old.frames`; free the box itself.
+            a.destroy(old);
+        }
+
+        switch (r) {
+            .ok => {
+                const g = state.borrowMut();
+                g.get().done = true;
+                g.deinit();
+                return .done;
+            },
+            .err => |e| switch (e) {
+                .Suspended => |new_state| {
+                    {
+                        const g = state.borrowMut();
+                        g.get().cont = @ptrCast(new_state);
+                        g.deinit();
+                    }
+                    const cls = classifySuspension(&scope);
+                    switch (cls.kind) {
+                        .value => return .{ .value = cls.value },
+                        .yield_all => {
+                            // Drain the first element now; if the iterator is
+                            // empty, clear it and resume the block again.
+                            const it = pendingYieldIter(&scope) orelse continue;
+                            switch (try drainOne(self, &it, out)) {
+                                .value => |v| return .{ .value = v },
+                                .done => {
+                                    clearYieldIter(&scope);
+                                    continue;
+                                },
+                                .err => |de| {
+                                    const g = state.borrowMut();
+                                    g.get().done = true;
+                                    g.deinit();
+                                    return .{ .err = de };
+                                },
+                            }
+                        },
+                        .none => {
+                            // Suspended via something other than yield/yieldAll.
+                            const g = state.borrowMut();
+                            g.get().done = true;
+                            g.get().cont = null;
+                            g.deinit();
+                            new_state.deinit(a);
+                            a.destroy(new_state);
+                            return .{ .err = .{ .Type = "sequence/iterator builder suspended on a call other than yield/yieldAll" } };
+                        },
+                    }
+                },
+                else => {
+                    const g = state.borrowMut();
+                    g.get().done = true;
+                    g.deinit();
+                    return .{ .err = mapDriverErr(a, e) };
+                },
+            },
+        }
+    }
+}
+
 /// Hand a freshly-suspended Layer-1 activation to the active interceptor
 /// (Layer 2). Returns the token so the driver can recognise the root's
 /// completion. The `*SuspendState` box is consumed: its value is copied

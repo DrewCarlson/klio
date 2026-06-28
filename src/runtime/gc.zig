@@ -218,6 +218,22 @@ pub var markClosureHook: ?*const fn (id: u64, m: *Marker) void = null;
 /// pause, after the sweep, so the side-table is stable.
 pub var sweepClosureHook: ?*const fn (epoch: usize) void = null;
 
+/// Marks the live Values reachable from a parked lazy-`sequence{}` builder
+/// continuation. The continuation is an `ir.eval.SuspendState` box held by a
+/// `Sequence`'s `Builder` source (an `*anyopaque` because `runtime` cannot
+/// import `ir`); `SequenceData.gcTrace` invokes this to shade each frame
+/// snapshot's regs/params/captures. Set by `interp_ir` to point at
+/// `ir.eval.gcMarkSuspendStateOpaque`; null (a no-op) otherwise.
+pub var markSuspendHook: ?*const fn (cont: *anyopaque, m: *Marker) void = null;
+
+/// Finalize an abandoned lazy-`sequence{}` builder continuation: a `Sequence`
+/// whose `Builder` source was swept without being driven to completion still
+/// owns its `SuspendState` box (frames with retained snapshot values + raw
+/// slice buffers). `BuilderState.gcFinalize`/`deinit` invokes this to release
+/// and free it through the cell's allocator. Set by `interp_ir`; null (a no-op)
+/// otherwise.
+pub var freeSuspendHook: ?*const fn (cont: *anyopaque, a: std.mem.Allocator) void = null;
+
 // ---------------------------------------------------------------------------
 // Per-thread roots. A subsystem's roots live in threadlocals (the eval frame
 // chain, the host-op keepalive stack, the coroutine interceptor/scope stacks),

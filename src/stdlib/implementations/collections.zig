@@ -3039,6 +3039,27 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 }
             }
         },
+        .Builder => |bstate| {
+            // Pull from the lazy builder one element at a time so an infinite
+            // generator never materialises past the consumer's demand.
+            while (true) {
+                if (takeCapReached(seq.ops, st.taken)) break;
+                const step = try host.builderStep(bstate, out);
+                const item = switch (step) {
+                    .value => |val| val,
+                    .done => break,
+                    .err => |e| return .{ .err = e },
+                };
+                const res = try pumpItem(a, host, out, item, seq.ops, &st, &output);
+                switch (res) {
+                    .cont => |c| if (!c) break,
+                    .err => |e| return .{ .err = e },
+                }
+                if (max) |m| {
+                    if (output.items.len >= m) break;
+                }
+            }
+        },
         .Generate => |gen| {
             var cur: ?Value = if (gen.seed) |s| blk: {
                 const sv = s.asPtr().*;
@@ -3088,6 +3109,16 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             const g = v.borrow();
             defer g.deinit();
             try items.appendSlice(a, g.get().*);
+        },
+        .Builder => |bstate| {
+            while (true) {
+                const step = try host.builderStep(bstate, out);
+                switch (step) {
+                    .value => |val| try items.append(a, val),
+                    .done => break,
+                    .err => |e| return .{ .err = e },
+                }
+            }
         },
         .Generate => |gen| {
             const limit: usize = 1024;
