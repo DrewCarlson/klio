@@ -209,12 +209,22 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             defer g.deinit();
             const cdef = g.get();
             var i: usize = 0;
-            while (i < cdef.primary_params.len and i < args.len) : (i += 1) {
-                if (cdef.primary_params[i].property != null) {
+            while (i < cdef.primary_params.len) : (i += 1) {
+                if (cdef.primary_params[i].property == null) continue;
+                if (i < args.len) {
                     // The instance owns one ref per primary-ctor field; `args[i]`
                     // is a borrow of the caller's register, so retain.
                     if (runtime.reclaimEnabled()) args[i].retain();
                     try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = args[i] });
+                } else {
+                    // An omitted trailing parameter takes its (literal) default;
+                    // without this the field is simply absent (a later access
+                    // fails "get_field" instead of reading the default value).
+                    const dv: Value = if (cdef.primary_params[i].default) |e|
+                        (simpleLiteral(allocator, e.get()) orelse Value.Null)
+                    else
+                        Value.Null;
+                    try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = dv });
                 }
             }
             // Body-property defaults for runtime-registered local
@@ -478,12 +488,96 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
         return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, @intCast(id), self);
     }
+    // `Comparator` is a `fun interface`: invoking it as a value
+    // (`comparator(a, b)`) calls `compare`.
+    if (callee.* == .Comparator and args.len == 2) {
+        return self.callMember(allocator, callee, "compare", args);
+    }
     const msg = try std.fmt.allocPrint(allocator, "Vm::call_value on `{s}`", .{callee.typeFqn()});
     return .{ .err = .{ .Unimplemented = msg } };
 }
 
 pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    _ = arg_names;
+    // A Class callee constructed with named arguments (e.g. a local class
+    // `Box(bb = true)` that skips a defaulted parameter) must reorder + default-
+    // fill; callValue constructs positionally and would shift values into the
+    // wrong fields.
+    if (callee.* == .Class) {
+        var any_named = false;
+        for (arg_names) |n| {
+            if (n != null) {
+                any_named = true;
+                break;
+            }
+        }
+        if (any_named) {
+            const cls = callee.Class;
+            const cls_name = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                break :blk g.get().name;
+            };
+            const cls_fqn = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                break :blk g.get().fqn;
+            };
+            const class_id: ?ir.ClassId = blk: {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                if (mg.get().classIdByFqn(cls_fqn)) |cid| break :blk cid;
+                for (mg.get().class_index.items) |entry| {
+                    if (std.mem.eql(u8, entry.name, cls_name)) break :blk entry.id;
+                }
+                break :blk null;
+            };
+            if (class_id) |cid| {
+                return host_instances.newInstanceNamed(self, allocator, cid, args, arg_names, null);
+            }
+            // Local class (not in the module index): reorder named args and fill
+            // literal defaults into a positional vector, then construct through
+            // callValue's positional direct-allocation path.
+            var positional: []Value = &.{};
+            {
+                const g = cls.borrow();
+                defer g.deinit();
+                const pp = g.get().primary_params;
+                const n = pp.len;
+                var reordered = try allocator.alloc(?Value, n);
+                defer allocator.free(reordered);
+                for (reordered) |*s| s.* = null;
+                var next_pos: usize = 0;
+                for (args, 0..) |v, i| {
+                    if (i < arg_names.len and arg_names[i] != null) {
+                        const nm = arg_names[i].?;
+                        for (pp, 0..) |p, idx| {
+                            if (std.mem.eql(u8, p.name, nm)) {
+                                reordered[idx] = v;
+                                break;
+                            }
+                        }
+                    } else {
+                        while (next_pos < n and reordered[next_pos] != null) next_pos += 1;
+                        if (next_pos < n) {
+                            reordered[next_pos] = v;
+                            next_pos += 1;
+                        }
+                    }
+                }
+                positional = try allocator.alloc(Value, n);
+                for (reordered, 0..) |slot, idx| {
+                    positional[idx] = if (slot) |v|
+                        v
+                    else if (pp[idx].default) |e|
+                        (simpleLiteral(allocator, e.get()) orelse Value.Null)
+                    else
+                        Value.Null;
+                }
+            }
+            defer allocator.free(positional);
+            return callValue(self, allocator, callee, positional);
+        }
+    }
     return callValue(self, allocator, callee, args);
 }
 

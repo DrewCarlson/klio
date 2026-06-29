@@ -193,11 +193,14 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                 "Map", "AbstractMap", "MutableMap", "HashMap", "LinkedHashMap",
             })) return true;
         },
-        .Range => {
+        .Range => |r| {
             if (matchesAny(ty.name, &.{
-                "IntRange",        "LongRange",       "CharRange",
-                "IntProgression",  "LongProgression", "CharProgression",
-                "ClosedRange",     "OpenEndRange",    "Iterable",
+                "IntProgression", "LongProgression", "CharProgression", "Iterable",
+            })) return true;
+            // A `..` range (step 1) is also an XRange / ClosedRange; a downTo or
+            // stepped progression (step != 1) is only a progression.
+            if (r.step == 1 and matchesAny(ty.name, &.{
+                "IntRange", "LongRange", "CharRange", "ClosedRange", "OpenEndRange",
             })) return true;
         },
         else => {},

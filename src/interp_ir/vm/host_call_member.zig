@@ -2229,6 +2229,12 @@ fn cloneArrayItems(allocator: Allocator, arr: runtime.ArrayData) Allocator.Error
 }
 
 /// Prepend `receiver` to `args`, returning a freshly-allocated slice.
+fn isArrayContentFn(name: []const u8) bool {
+    const fns = [_][]const u8{ "contentToString", "contentHashCode", "contentDeepToString", "contentDeepHashCode", "contentEquals", "contentDeepEquals" };
+    for (fns) |f| if (std.mem.eql(u8, name, f)) return true;
+    return false;
+}
+
 fn prependReceiver(allocator: Allocator, receiver: *const Value, args: []const Value) Allocator.Error![]Value {
     var all = try allocator.alloc(Value, args.len + 1);
     all[0] = receiver.*;
@@ -2605,6 +2611,19 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
     if (receiver.* == .Null and std.mem.eql(u8, name, "hashCode") and args.len == 0) {
         return .{ .ok = .{ .Int = 0 } };
+    }
+    // Null-receiver array `content*` extensions: `(null as IntArray?).contentToString()`
+    // and friends declare a nullable array receiver, so a null receiver is valid
+    // (`"null"`, `0`, or null-equality). The intrinsics are registered under
+    // `kotlin.Array.*` and already branch on a `.Null` receiver, but a null's type
+    // is `kotlin.Nothing`, so the type-probe never reaches them and the bodyless
+    // `expect` actual would otherwise evaluate to Unit.
+    if (receiver.* == .Null and isArrayContentFn(name)) {
+        var key_buf: [64]u8 = undefined;
+        const fqn = std.fmt.bufPrint(&key_buf, "kotlin.Array.{s}", .{name}) catch unreachable;
+        if (lookupIntrinsic(self, fqn)) |func| {
+            return dispatchWithReceiver(self, allocator, fqn, func, receiver, args);
+        }
     }
 
     // `equals` on a builtin scalar/String.
@@ -3398,6 +3417,9 @@ fn receiverClassChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Instance
 
 fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) Allocator.Error!?EvalResult {
     _ = self;
+    // An array `.asList()` view re-reads its scalar source so the iterator
+    // snapshot reflects later array writes.
+    receiver.refreshArrayView();
     switch (receiver.*) {
         .List => |l| {
             // A mutable list shares its backing so `MutableIterator.remove()`
@@ -4023,6 +4045,12 @@ fn ordToInt(o: Ordering) i64 {
 /// Builtin natural-order comparison. `null` when the pair is not
 /// builtin-comparable (mirrors `compare_values` rejecting Instances).
 fn compareValuesBuiltin(a: *const Value, b: *const Value) ?Ordering {
+    // Kotlin `compareValues`: null is ordered first (null < non-null, null ==
+    // null). A `compareBy { selectorReturningNull }` relies on this.
+    if (a.* == .Null or b.* == .Null) {
+        if (a.* == .Null and b.* == .Null) return .eq;
+        return if (a.* == .Null) .lt else .gt;
+    }
     if (a.* == .String and b.* == .String) {
         const ag = a.String.borrow();
         defer ag.deinit();
@@ -4059,7 +4087,9 @@ fn floatOf(v: *const Value) ?f64 {
 
 fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const cmp = receiver.Comparator;
-    if (std.mem.eql(u8, name, "compare") and args.len == 2) {
+    // `Comparator` is a `fun interface`, so `comparator(a, b)` and an explicit
+    // `comparator.invoke(a, b)` both call `compare`.
+    if ((std.mem.eql(u8, name, "compare") or std.mem.eql(u8, name, "invoke")) and args.len == 2) {
         const a = args[0];
         const b = args[1];
         var ord: Ordering = .eq;
@@ -4097,6 +4127,16 @@ fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Value,
                         .ok => |v| v,
                         .err => |e| return .{ .err = e },
                     };
+                    // `compareBy(comparator, selector)`: order the selected keys
+                    // by the step's comparator rather than their natural order.
+                    if (step.key_comparator) |kc| {
+                        const r = try callMemberRec(self, allocator, &kc, "compare", &.{ ka, kb });
+                        const nval: i64 = switch (r) {
+                            .ok => |v| v.asI64() orelse 0,
+                            .err => |e| return .{ .err = e },
+                        };
+                        break :blk if (nval < 0) .lt else if (nval > 0) .gt else .eq;
+                    }
                     break :blk compareValuesBuiltin(&ka, &kb) orelse return .{ .err = try typeErr(allocator, "incomparable values", .{}) };
                 };
                 const flipped = if (step.descending) flipOrd(o) else o;
@@ -4163,8 +4203,9 @@ fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         return .{ .ok = try listOf(allocator, items, true) };
     }
     if (std.mem.eql(u8, name, "asList") and args.len == 0) {
-        const items = try cloneArrayItems(allocator, arr);
-        return .{ .ok = try listOf(allocator, items, false) };
+        // Read-only, fixed-size live view over the array (element writes show
+        // through); not a copy.
+        return .{ .ok = try stdlib.implementations.collections.arrayAsListView(allocator, arr) };
     }
     if (std.mem.eql(u8, name, "toTypedArray") and args.len == 0) {
         const items = try cloneArrayItems(allocator, arr);
@@ -6518,14 +6559,22 @@ fn instanceOuterLink(v: *const Value) ?Value {
 /// Each candidate is ranked by a strict, total ordering so the winner is
 /// unique and deterministic (no declaration-order tie-break). Ranked, in
 /// descending priority:
-///   0. receiver specificity — the candidate whose receiver param most
+///   0. subtype specificity — how many other candidates' receiver types are
+///      supertypes of this one. Kotlin's most-specific rule is decided by the
+///      subtyping lattice, not by runtime hierarchy distance: with a receiver
+///      that satisfies several unrelated extension-receiver types (a coroutine
+///      is both a `Job` and a `CoroutineScope`), the candidate whose receiver
+///      is a subtype of another candidate's (`Job` <: `CoroutineContext`) is
+///      the more specific one even when an unrelated sibling sits nearer in
+///      the runtime class graph. When the lattice cannot decide (no candidate
+///      is a subtype of another) this ties at zero and the runtime-distance
+///      tier below breaks it;
+///   1. receiver specificity — the candidate whose receiver param most
 ///      specifically matches the receiver's runtime type (a `Flow` receiver
 ///      selects `Flow.forEach`, not the generic `Iterable.forEach`);
-///   1. applicability score — the numeric arg/param compatibility;
-///   2. owner rank — a member extension visible nearer on the enclosing-`this`
+///   2. applicability score — the numeric arg/param compatibility;
+///   3. owner rank — a member extension visible nearer on the enclosing-`this`
 ///      chain;
-///   3. subtype specificity — how many other candidates' receiver types are
-///      supertypes of this one;
 ///   4. parameter specificity — the most-specific declared parameter types
 ///      for the supplied value args;
 ///   5. a stable key (lowest `FuncId`) so the winner is always unique.
@@ -6622,7 +6671,7 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // package is always user code (every shipped/pack symbol is packaged),
         // so the common default-package case skips the registry scan.
         const is_user: i32 = @intFromBool(f.package.len == 0 or !stdlib.isKnownPackage(f.package));
-        const key: ExtKey = .{ applicable, is_user, recv_match, score, owner_rank, spec, param_spec, neg_fid };
+        const key: ExtKey = .{ applicable, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid };
         if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
             tied.append(self.allocator, f) catch {};
         }
@@ -7435,12 +7484,20 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
             var found_fid: ?FuncId = null;
             for (m.classes.items) |*cls_ir| {
                 if (!std.mem.eql(u8, cls_ir.name, cname)) continue;
+                // Collect every same-named method, then pick the overload that
+                // matches the call's arity/types. Resolving by name alone binds
+                // `super.listIterator(index)` to a no-arg `listIterator()` whose
+                // body re-dispatches `listIterator(0)` virtually — an infinite
+                // super/override cycle (AbstractMutableList$SubList).
+                var cands: std.ArrayList(Func) = .empty;
+                defer cands.deinit(allocator);
                 for (cls_ir.methods) |fid| {
                     const cf = m.funcById(fid) orelse continue;
-                    if (std.mem.eql(u8, cf.name, name)) {
-                        found_fid = fid;
-                        break;
-                    }
+                    if (std.mem.eql(u8, cf.name, name)) cands.append(allocator, cf.*) catch {};
+                }
+                if (cands.items.len != 0) {
+                    const chosen = pickMethodOverload(self, cands.items, args) orelse cands.items[0];
+                    found_fid = chosen.id;
                 }
                 break;
             }

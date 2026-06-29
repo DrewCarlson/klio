@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const string = @import("string.zig");
 
 const Value = runtime.Value;
 const RuntimeError = runtime.RuntimeError;
@@ -83,9 +84,16 @@ fn setBuf(buf: *Buffer, allocator: Allocator, bytes: []const u8) Allocator.Error
 fn encodeUtf16(allocator: Allocator, s: []const u8) Allocator.Error![]u16 {
     var out: std.ArrayList(u16) = .empty;
     errdefer out.deinit(allocator);
-    var view = std.unicode.Utf8View.initUnchecked(s);
-    var it = view.iterator();
-    while (it.nextCodepoint()) |cp| {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (runtime.isWtf8SurrogateAt(s, i)) {
+            try out.append(allocator, runtime.wtf8SurrogateUnit(s, i));
+            i += 3;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + len, s.len);
+        const cp = std.unicode.utf8Decode(s[i..end]) catch s[i];
         if (cp <= 0xFFFF) {
             try out.append(allocator, @intCast(cp));
         } else {
@@ -93,6 +101,7 @@ fn encodeUtf16(allocator: Allocator, s: []const u8) Allocator.Error![]u16 {
             try out.append(allocator, @intCast(0xD800 + (adjusted >> 10)));
             try out.append(allocator, @intCast(0xDC00 + (adjusted & 0x3FF)));
         }
+        i = end;
     }
     return out.toOwnedSlice(allocator);
 }
@@ -112,12 +121,41 @@ fn charUnitToString(allocator: Allocator, unit: u16) Allocator.Error![]u8 {
 
 /// Number of Kotlin `Char`s — UTF-8 string `chars().count()` counts each
 /// astral scalar as one `char`, matching Rust's `str::chars`.
+/// Number of Kotlin `Char`s = UTF-16 code units: an astral scalar is two units
+/// (a surrogate pair), a lone WTF-8 surrogate and any BMP scalar are one. For a
+/// surrogate-free string this equals the scalar count, so normal text is
+/// unaffected.
 fn charCount(s: []const u8) usize {
     var n: usize = 0;
-    var view = std.unicode.Utf8View.initUnchecked(s);
-    var it = view.iterator();
-    while (it.nextCodepoint()) |_| n += 1;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (runtime.isWtf8SurrogateAt(s, i)) {
+            n += 1;
+            i += 3;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + len, s.len);
+        const cp = std.unicode.utf8Decode(s[i..end]) catch s[i];
+        n += if (cp > 0xFFFF) 2 else 1;
+        i = end;
+    }
     return n;
+}
+
+/// Decode `s` to UTF-16 code units (WTF-8 lone surrogates kept as their unit).
+/// Caller owns the result.
+fn bufUnits(a: Allocator, s: []const u8) Allocator.Error![]u16 {
+    return encodeUtf16(a, s);
+}
+
+/// Re-encode UTF-16 `units` to a WTF-8 byte buffer (surrogate pairs coalesced
+/// into astral scalars, lone surrogates kept as WTF-8) and install it as the
+/// builder's contents.
+fn setBufUnits(buf: *Buffer, a: Allocator, units: []const u16) Allocator.Error!void {
+    const bytes = try runtime.charUnitsToString(a, units);
+    defer a.free(bytes);
+    try setBuf(buf, a, bytes);
 }
 
 /// Render `v` the way Kotlin's `toString` / templates do. Caller owns it.
@@ -145,6 +183,61 @@ fn appendValue(buf: *Buffer, allocator: Allocator, v: Value) Allocator.Error!voi
             try buf.appendSlice(allocator, piece);
         },
     }
+}
+
+/// Whether an instance's class directly declares `CharSequence` among its
+/// supertypes — the shapes whose `length` the append/insert overflow guard
+/// consults before materialising any content.
+fn instanceIsCharSequence(v: *const Value) bool {
+    if (v.* != .Instance) return false;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    for (cg.get().supertype_names) |s| {
+        if (std.mem.eql(u8, s, "CharSequence")) return true;
+    }
+    return false;
+}
+
+/// Guard an append/insert of `v` onto `sb`: when the argument's length is
+/// knowable up front (strings, builders, user CharSequences via their
+/// `length` property) and the combined UTF-16 length exceeds
+/// `Int.MAX_VALUE`, throw OutOfMemoryError BEFORE materialising anything —
+/// the JVM builder grows capacity first, so an overflowing CharSequence's
+/// chars are never read.
+fn appendOverflowGuard(ctx: *CallCtx, sb: StringBuilderRef, v: *const Value) Allocator.Error!?EvalResult {
+    const add: i64 = switch (v.*) {
+        .String => |s| blk: {
+            const g = s.borrow();
+            defer g.deinit();
+            break :blk @intCast(g.get().u16_len);
+        },
+        .StringBuilder => |other| blk: {
+            const g = other.borrow();
+            defer g.deinit();
+            break :blk @intCast(g.get().items.len);
+        },
+        .Instance => blk: {
+            if (!instanceIsCharSequence(v)) return null;
+            const r = ctx.host.getProperty(v, "length", ctx.out) catch return null;
+            const res = r orelse return null;
+            switch (res) {
+                .ok => |lv| break :blk lv.asI64() orelse return null,
+                .err => return null,
+            }
+        },
+        else => return null,
+    };
+    const cur: i64 = blk: {
+        const g = sb.borrow();
+        defer g.deinit();
+        break :blk @intCast(g.get().items.len);
+    };
+    if (cur + add > std.math.maxInt(i32)) {
+        return try thrown(ctx.allocator, "kotlin.OutOfMemoryError", "Requested character sequence exceeds the maximum length");
+    }
+    return null;
 }
 
 /// The text `append(value)` / `insert(_, value)` writes for `value`. Owned by
@@ -248,22 +341,6 @@ fn rangeOob(allocator: Allocator, msg: []const u8) Allocator.Error!RuntimeError 
     return .{ .Thrown = try makeException(allocator, "kotlin.IndexOutOfBoundsException", msg) };
 }
 
-/// Byte offset of the `idx`-th Kotlin `char` in `buf`, mirroring Rust's
-/// `sb_char_byte`. Returns `buf.len` for `idx == char_count`.
-fn sbCharByte(buf: []const u8, idx: i64) ?usize {
-    if (idx < 0) return null;
-    const target: usize = @intCast(idx);
-    if (target == charCount(buf)) return buf.len;
-    var view = std.unicode.Utf8View.initUnchecked(buf);
-    var it = view.iterator();
-    var count: usize = 0;
-    while (it.i < buf.len) {
-        if (count == target) return it.i;
-        _ = it.nextCodepoint();
-        count += 1;
-    }
-    return null;
-}
 
 // ============================================================
 // Constructors
@@ -468,12 +545,15 @@ pub fn string_builder_set_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const units = try encodeUtf16(a, buf.items);
     defer a.free(units);
     const len: i64 = @intCast(units.len);
-    if (start < 0 or start > len or start > end or end > len) {
+    // Throw only for start < 0, start > length, or start > endIndex; an
+    // endIndex past the length is clamped (Kotlin/JVM semantics).
+    if (start < 0 or start > len or start > end) {
         const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, length: {d}", .{ start, end, len });
         defer if (runtime.freeScratch()) a.free(msg);
         return errResult(try rangeOob(a, msg));
     }
-    const new_units = try spliceUnits(a, units, @intCast(start), @intCast(end), value.?);
+    const clamped_end = @min(end, len);
+    const new_units = try spliceUnits(a, units, @intCast(start), @intCast(clamped_end), value.?);
     defer a.free(new_units);
     const s = try fromUtf16Lossy(a, new_units);
     defer a.free(s);
@@ -575,6 +655,12 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 4 and isCharSeqOrArray(ctx.args[1]) and
         ctx.args[2].asI64() != null and ctx.args[3].asI64() != null)
     {
+        // `append(str: CharArray, offset, len)` is a deprecated stub that always
+        // throws (KT-15220); the real CharArray subrange is `appendRange`. Only
+        // the `CharSequence` subrange overload appends `value[start, end)`.
+        if (ctx.args[1] == .Array) {
+            return thrown(ctx.allocator, "kotlin.NotImplementedError", "An operation is not implemented.");
+        }
         return string_builder_append_range(ctx);
     }
     const a = ctx.allocator;
@@ -582,6 +668,7 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
     // Render each argument before borrowing the buffer: a user `toString()`
     // must not run while the receiver buffer is held mutably.
     for (ctx.args[1..]) |v| {
+        if (try appendOverflowGuard(ctx, sb, &v)) |oom| return oom;
         const piece = try renderPiece(ctx, v);
         defer a.free(piece);
         const g = sb.borrowMut();
@@ -698,7 +785,10 @@ pub fn string_builder_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.toString"));
     const g = sb.borrow();
     defer g.deinit();
-    const dup = try a.dupe(u8, g.get().items);
+    // Coalesce any WTF-8 surrogate pairs accumulated from individual `Char`
+    // appends into astral scalars, so the result is canonical UTF-8 (a builder
+    // fed a high+low pair equals the astral string literal).
+    const dup = try runtime.coalesceSurrogates(a, g.get().items);
     return ok(.{ .String = try runtime.strInitOwned(a, dup) });
 }
 
@@ -757,6 +847,7 @@ pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (idx == null) return errResult(.{ .Type = "insert index must be Int" });
     if (ctx.args.len < 3) return errResult(.{ .Arity = "insert requires a value" });
 
+    if (try appendOverflowGuard(ctx, sb, &ctx.args[2])) |oom| return oom;
     const piece_bytes = try renderPiece(ctx, ctx.args[2]);
     defer a.free(piece_bytes);
     var piece: Buffer = .empty;
@@ -766,14 +857,25 @@ pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrowMut();
     defer g.deinit();
     const buf = g.get();
-    const n: i64 = @intCast(charCount(buf.items));
+    // Splice in UTF-16-unit space so the insert index matches Kotlin even when
+    // the buffer (or piece) contains astral chars / lone surrogates.
+    const units = try bufUnits(a, buf.items);
+    defer a.free(units);
+    const n: i64 = @intCast(units.len);
     if (idx.? < 0 or idx.? > n) {
         const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
         defer if (runtime.freeScratch()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
-    const byte = sbCharByte(buf.items, idx.?).?;
-    try buf.insertSlice(a, byte, piece.items);
+    const piece_units = try bufUnits(a, piece.items);
+    defer a.free(piece_units);
+    const at: usize = @intCast(idx.?);
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(a);
+    try out.appendSlice(a, units[0..at]);
+    try out.appendSlice(a, piece_units);
+    try out.appendSlice(a, units[at..]);
+    try setBufUnits(buf, a, out.items);
     return okSb(sb);
 }
 
@@ -786,15 +888,20 @@ pub fn string_builder_delete_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrowMut();
     defer g.deinit();
     const buf = g.get();
-    const n: i64 = @intCast(charCount(buf.items));
+    const units = try bufUnits(a, buf.items);
+    defer a.free(units);
+    const n: i64 = @intCast(units.len);
     if (idx.? < 0 or idx.? >= n) {
         const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
         defer if (runtime.freeScratch()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
-    const byte = sbCharByte(buf.items, idx.?).?;
-    const ch_len = std.unicode.utf8ByteSequenceLength(buf.items[byte]) catch 1;
-    try replaceRange(buf, a, byte, byte + ch_len, "");
+    const at: usize = @intCast(idx.?);
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(a);
+    try out.appendSlice(a, units[0..at]);
+    try out.appendSlice(a, units[at + 1 ..]);
+    try setBufUnits(buf, a, out.items);
     return okSb(sb);
 }
 
@@ -809,29 +916,24 @@ pub fn string_builder_delete_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrowMut();
     defer g.deinit();
     const buf = g.get();
-    const n: i64 = @intCast(charCount(buf.items));
-    if (start.? < 0 or end.? > n or start.? > end.?) {
+    const units = try bufUnits(a, buf.items);
+    defer a.free(units);
+    const n: i64 = @intCast(units.len);
+    // Kotlin throws only for startIndex < 0, > length, or > endIndex; an
+    // endIndex past the length is clamped (deletes through the end).
+    if (start.? < 0 or start.? > n or start.? > end.?) {
         const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, length: {d}", .{ start.?, end.?, n });
         defer if (runtime.freeScratch()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
-    const sb_byte = sbCharByte(buf.items, start.?).?;
-    const eb_byte = sbCharByte(buf.items, end.?).?;
-    try replaceRange(buf, a, sb_byte, eb_byte, "");
+    const s: usize = @intCast(start.?);
+    const e: usize = @intCast(@min(end.?, n));
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(a);
+    try out.appendSlice(a, units[0..s]);
+    try out.appendSlice(a, units[e..]);
+    try setBufUnits(buf, a, out.items);
     return okSb(sb);
-}
-
-/// `String::replace_range(start_byte..end_byte, repl)` — splice `repl` over a
-/// byte range of the buffer.
-fn replaceRange(buf: *Buffer, allocator: Allocator, start_byte: usize, end_byte: usize, repl: []const u8) Allocator.Error!void {
-    const head = buf.items[0..start_byte];
-    const tail = buf.items[end_byte..];
-    var out = try allocator.alloc(u8, head.len + repl.len + tail.len);
-    @memcpy(out[0..head.len], head);
-    @memcpy(out[head.len .. head.len + repl.len], repl);
-    @memcpy(out[head.len + repl.len ..], tail);
-    defer allocator.free(out);
-    try setBuf(buf, allocator, out);
 }
 
 pub fn string_builder_set_length(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -848,16 +950,20 @@ pub fn string_builder_set_length(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrowMut();
     defer g.deinit();
     const buf = g.get();
-    const cur: i64 = @intCast(charCount(buf.items));
-    if (new_len.? <= cur) {
-        const byte = sbCharByte(buf.items, new_len.?).?;
-        buf.shrinkRetainingCapacity(byte);
+    const units = try bufUnits(a, buf.items);
+    defer a.free(units);
+    const cur: usize = units.len;
+    const target: usize = @intCast(new_len.?);
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(a);
+    if (target <= cur) {
+        try out.appendSlice(a, units[0..target]);
     } else {
-        var i: i64 = cur;
-        while (i < new_len.?) : (i += 1) {
-            try buf.append(a, 0);
-        }
+        try out.appendSlice(a, units);
+        // Kotlin pads the grown region with U+0000.
+        try out.appendNTimes(a, 0, target - cur);
     }
+    try setBufUnits(buf, a, out.items);
     return ok(.Unit);
 }
 
@@ -882,15 +988,27 @@ pub fn string_builder_reverse(ctx: *CallCtx) Allocator.Error!EvalResult {
 pub fn string_builder_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.substring"));
-    const start = if (ctx.args.len > 1) ctx.args[1].asI64() else null;
+    // `subSequence(range: IntRange)` — a single range argument whose `first`
+    // and `last + 1` are the substring bounds.
+    const is_range = ctx.args.len == 2 and ctx.args[1] == .Range;
+    const start = if (is_range)
+        @as(?i64, ctx.args[1].Range.start)
+    else if (ctx.args.len > 1)
+        ctx.args[1].asI64()
+    else
+        null;
     if (start == null) return errResult(.{ .Type = "substring start must be Int" });
 
     const g = sb.borrow();
     defer g.deinit();
     const buf = g.get().items;
-    const n: i64 = @intCast(charCount(buf));
+    const units = try bufUnits(a, buf);
+    defer a.free(units);
+    const n: i64 = @intCast(units.len);
     var end: i64 = n;
-    if (ctx.args.len > 2) {
+    if (is_range) {
+        end = ctx.args[1].Range.end + 1;
+    } else if (ctx.args.len > 2) {
         if (ctx.args[2].isIntegral()) {
             end = ctx.args[2].asI64().?;
         } else {
@@ -902,9 +1020,7 @@ pub fn string_builder_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
         defer if (runtime.freeScratch()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
-    const sb_byte = sbCharByte(buf, start.?).?;
-    const eb_byte = sbCharByte(buf, end).?;
-    const dup = try a.dupe(u8, buf[sb_byte..eb_byte]);
+    const dup = try runtime.charUnitsToString(a, units[@intCast(start.?)..@intCast(end)]);
     return ok(.{ .String = try runtime.strInitOwned(a, dup) });
 }
 
@@ -921,17 +1037,16 @@ pub fn string_builder_set_char_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrowMut();
     defer g.deinit();
     const buf = g.get();
-    const n: i64 = @intCast(charCount(buf.items));
+    const units = try bufUnits(a, buf.items);
+    defer a.free(units);
+    const n: i64 = @intCast(units.len);
     if (idx.? < 0 or idx.? >= n) {
         const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
         defer if (runtime.freeScratch()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
-    const byte = sbCharByte(buf.items, idx.?).?;
-    const old_len = std.unicode.utf8ByteSequenceLength(buf.items[byte]) catch 1;
-    const repl = try charUnitToString(a, ch);
-    defer a.free(repl);
-    try replaceRange(buf, a, byte, byte + old_len, repl);
+    units[@intCast(idx.?)] = ch;
+    try setBufUnits(buf, a, units);
     return ok(.Unit);
 }
 
@@ -940,6 +1055,24 @@ pub fn string_builder_set_char_at(ctx: *CallCtx) Allocator.Error!EvalResult {
 pub fn string_builder_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.replace"));
+    // The CharSequence `replace(oldValue, newValue[, ignoreCase])` and
+    // `replace(regex, replacement/transform)` extensions share this name with the
+    // Java `replace(start: Int, end: Int, str)` range mutator; a non-integer
+    // second argument is one of the extensions — snapshot the receiver as a
+    // String and route it to the String intrinsic.
+    if (ctx.args.len > 1 and !ctx.args[1].isIntegral()) {
+        const str_val: Value = blk: {
+            const sg = sb.borrow();
+            defer sg.deinit();
+            break :blk .{ .String = try runtime.strInit(a, sg.get().items) };
+        };
+        const new_args = try a.dupe(Value, ctx.args);
+        defer a.free(new_args);
+        new_args[0] = str_val;
+        var new_ctx = ctx.*;
+        new_ctx.args = new_args;
+        return string.string_replace(&new_ctx);
+    }
     const start = if (ctx.args.len > 1) ctx.args[1].asI64() else null;
     if (start == null) return errResult(.{ .Type = "replace start must be Int" });
     const end0 = if (ctx.args.len > 2) ctx.args[2].asI64() else null;
@@ -958,17 +1091,25 @@ pub fn string_builder_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrowMut();
     defer g.deinit();
     const buf = g.get();
-    const n: i64 = @intCast(charCount(buf.items));
+    const units = try bufUnits(a, buf.items);
+    defer a.free(units);
+    const n: i64 = @intCast(units.len);
     if (start.? < 0 or start.? > n or start.? > end0.?) {
         const msg = try std.fmt.allocPrint(a, "start {d}, end {d}, length {d}", .{ start.?, end0.?, n });
         defer if (runtime.freeScratch()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
     // Kotlin/JVM clamps the end to the current length.
-    const end = @min(end0.?, n);
-    const sb_byte = sbCharByte(buf.items, start.?).?;
-    const eb_byte = sbCharByte(buf.items, end).?;
-    try replaceRange(buf, a, sb_byte, eb_byte, repl);
+    const end: usize = @intCast(@min(end0.?, n));
+    const s: usize = @intCast(start.?);
+    const repl_units = try bufUnits(a, repl);
+    defer a.free(repl_units);
+    var out: std.ArrayList(u16) = .empty;
+    defer out.deinit(a);
+    try out.appendSlice(a, units[0..s]);
+    try out.appendSlice(a, repl_units);
+    try out.appendSlice(a, units[end..]);
+    try setBufUnits(buf, a, out.items);
     return okSb(sb);
 }
 

@@ -961,10 +961,63 @@ pub fn kotlinDoubleToString(allocator: std.mem.Allocator, d: f64) ![]u8 {
 /// replacement character, since a UTF-8 string cannot hold one. Caller
 /// owns the returned slice.
 pub fn charUnitToString(allocator: std.mem.Allocator, unit: u16) ![]u8 {
+    // A lone UTF-16 surrogate cannot be a valid UTF-8 scalar, so encode it as
+    // WTF-8 (the 3-byte `ED A0-BF 8x` form) so it round-trips through the byte
+    // buffer; an adjacent high+low pair is coalesced into the astral scalar by
+    // `coalesceSurrogates`. `Utf16View` decodes these back to the code unit.
+    if (unit >= 0xD800 and unit <= 0xDFFF) {
+        var sbuf: [3]u8 = undefined;
+        sbuf[0] = 0xE0 | @as(u8, @intCast(unit >> 12));
+        sbuf[1] = 0x80 | @as(u8, @intCast((unit >> 6) & 0x3F));
+        sbuf[2] = 0x80 | @as(u8, @intCast(unit & 0x3F));
+        return allocator.dupe(u8, sbuf[0..3]);
+    }
     var buf: [4]u8 = undefined;
-    const scalar: u21 = if (unit >= 0xD800 and unit <= 0xDFFF) 0xFFFD else unit;
-    const n = std.unicode.utf8Encode(scalar, &buf) catch unreachable;
+    const n = std.unicode.utf8Encode(unit, &buf) catch unreachable;
     return allocator.dupe(u8, buf[0..n]);
+}
+
+/// True for the first byte of a 3-byte WTF-8 surrogate sequence at `bytes[i]`
+/// (`ED` followed by `A0-BF`), i.e. an encoded lone UTF-16 surrogate.
+pub fn isWtf8SurrogateAt(bytes: []const u8, i: usize) bool {
+    return i + 3 <= bytes.len and bytes[i] == 0xED and bytes[i + 1] >= 0xA0 and bytes[i + 1] <= 0xBF;
+}
+
+/// Decode the WTF-8 surrogate 3-byte sequence at `bytes[i]` to its UTF-16 code
+/// unit (caller has checked `isWtf8SurrogateAt`).
+pub fn wtf8SurrogateUnit(bytes: []const u8, i: usize) u16 {
+    return (@as(u16, bytes[i] & 0x0F) << 12) | (@as(u16, bytes[i + 1] & 0x3F) << 6) | (bytes[i + 2] & 0x3F);
+}
+
+/// Coalesce adjacent WTF-8 high+low surrogate sequences (each `ED A0-BF 8x`)
+/// into the single 4-byte astral scalar they encode, leaving all other bytes
+/// untouched. Used when a String/StringBuilder is built from individual `Char`
+/// units so a high/low pair becomes valid UTF-8 (matching a string literal),
+/// while a genuinely lone surrogate keeps its 3-byte WTF-8 form. Returns a
+/// freshly-allocated slice owned by `allocator`.
+pub fn coalesceSurrogates(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, bytes, 0xED) == null) return allocator.dupe(u8, bytes);
+    var out = try std.ArrayList(u8).initCapacity(allocator, bytes.len);
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < bytes.len) {
+        if (i + 6 <= bytes.len and
+            bytes[i] == 0xED and bytes[i + 1] >= 0xA0 and bytes[i + 1] <= 0xAF and
+            bytes[i + 3] == 0xED and bytes[i + 4] >= 0xB0 and bytes[i + 4] <= 0xBF)
+        {
+            const hi = wtf8SurrogateUnit(bytes, i);
+            const lo = wtf8SurrogateUnit(bytes, i + 3);
+            const cp: u21 = 0x10000 + (@as(u21, hi - 0xD800) << 10) + (lo - 0xDC00);
+            var buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+            try out.appendSlice(allocator, buf[0..n]);
+            i += 6;
+        } else {
+            try out.append(allocator, bytes[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Snake_case aliases matching the names referenced across the codebase.
@@ -1078,9 +1131,26 @@ test "char unit to string" {
     defer a.free(bmp);
     try std.testing.expectEqualStrings("\u{00E9}", bmp);
 
+    // A lone surrogate is encoded as its 3-byte WTF-8 form (ED A0 80 for
+    // U+D800), not collapsed to U+FFFD, so it round-trips through the buffer.
     const lone_surrogate = try charUnitToString(a, 0xD800);
     defer a.free(lone_surrogate);
-    try std.testing.expectEqualStrings("\u{FFFD}", lone_surrogate);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xED, 0xA0, 0x80 }, lone_surrogate);
+    try std.testing.expect(isWtf8SurrogateAt(lone_surrogate, 0));
+    try std.testing.expectEqual(@as(u16, 0xD800), wtf8SurrogateUnit(lone_surrogate, 0));
+
+    // A high+low pair coalesces into the astral scalar (U+10000 = F0 90 80 80).
+    const pair = try charUnitToString(a, 0xD800);
+    defer a.free(pair);
+    const low = try charUnitToString(a, 0xDC00);
+    defer a.free(low);
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(a);
+    try joined.appendSlice(a, pair);
+    try joined.appendSlice(a, low);
+    const coalesced = try coalesceSurrogates(a, joined.items);
+    defer a.free(coalesced);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xF0, 0x90, 0x80, 0x80 }, coalesced);
 }
 
 test "kotlin aliases match" {
