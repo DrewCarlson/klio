@@ -426,7 +426,7 @@ pub fn string_builder_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                     defer if (runtime.freeScratch()) a.free(msg);
                     return thrown(a, "kotlin.NegativeArraySizeException", msg);
                 }
-                try buf.ensureTotalCapacity(a, @intCast(n));
+                try buf.ensureTotalCapacityPrecise(a, @intCast(n));
             },
             // `StringBuilder(content: CharSequence)` — seed from another
             // builder's current contents.
@@ -650,6 +650,15 @@ pub fn string_builder_length(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrow();
     defer g.deinit();
     return ok(Value.newInt(@intCast(charCount(g.get().items))));
+}
+
+/// `StringBuilder.capacity()` — the backing buffer's current capacity (always
+/// >= length). `StringBuilder(n)` reserves exactly `n`.
+pub fn string_builder_capacity(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.capacity"));
+    const g = sb.borrow();
+    defer g.deinit();
+    return ok(Value.newInt(@intCast(g.get().capacity)));
 }
 
 /// `StringBuilder.trimToSize()` — a capacity hint with no observable effect

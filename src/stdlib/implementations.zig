@@ -1418,6 +1418,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.text.StringBuilder.append", .f = stringbuilder.string_builder_append },
     .{ .fqn = "kotlin.text.StringBuilder.appendLine", .f = stringbuilder.string_builder_append_line },
     .{ .fqn = "kotlin.text.StringBuilder.length", .f = stringbuilder.string_builder_length },
+    .{ .fqn = "kotlin.text.StringBuilder.capacity", .f = stringbuilder.string_builder_capacity },
     .{ .fqn = "kotlin.text.StringBuilder.toString", .f = stringbuilder.string_builder_to_string },
     .{ .fqn = "kotlin.text.StringBuilder.get", .f = stringbuilder.string_builder_get },
     .{ .fqn = "kotlin.text.StringBuilder.isEmpty", .f = stringbuilder.string_builder_is_empty },
