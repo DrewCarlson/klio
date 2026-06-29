@@ -2250,7 +2250,34 @@ pub fn coll_hash_map_ctor(ctx: *CallCtx) Error!EvalResult {
     // `LinkedHashMap(initialCapacity, loadFactor, accessOrder)` — the capacity,
     // load factor, and access-order flag do not change the observable behavior
     // of klio's insertion-ordered map beyond construction.
-    if (ctx.args[0] == .Int) return ok(try makeMap(a, &.{}, true));
+    if (ctx.args[0] == .Int) {
+        // A negative initial capacity, or a non-positive load factor, is a
+        // catchable IllegalArgumentException (matching java.util.HashMap).
+        if (ctx.args[0].asI64()) |cap| {
+            if (cap < 0) {
+                const msg = try fmt(a, "Negative initial capacity: {d}", .{cap});
+                const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
+                if (runtime.freeScratch()) a.free(msg);
+                return r;
+            }
+        }
+        if (ctx.args.len >= 2) {
+            const lf: ?f64 = switch (ctx.args[1]) {
+                .Float => |x| x,
+                .Double => |x| x,
+                else => null,
+            };
+            if (lf) |v| {
+                if (!(v > 0)) {
+                    const msg = try fmt(a, "Illegal load factor: {d}", .{v});
+                    const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
+                    if (runtime.freeScratch()) a.free(msg);
+                    return r;
+                }
+            }
+        }
+        return ok(try makeMap(a, &.{}, true));
+    }
     return typeErr("HashMap expects no args, an Int capacity, or a Map");
 }
 
