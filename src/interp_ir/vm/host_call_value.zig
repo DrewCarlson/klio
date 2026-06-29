@@ -478,6 +478,11 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
         return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, @intCast(id), self);
     }
+    // `Comparator` is a `fun interface`: invoking it as a value
+    // (`comparator(a, b)`) calls `compare`.
+    if (callee.* == .Comparator and args.len == 2) {
+        return self.callMember(allocator, callee, "compare", args);
+    }
     const msg = try std.fmt.allocPrint(allocator, "Vm::call_value on `{s}`", .{callee.typeFqn()});
     return .{ .err = .{ .Unimplemented = msg } };
 }

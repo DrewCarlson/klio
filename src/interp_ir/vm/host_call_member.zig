@@ -4062,7 +4062,9 @@ fn floatOf(v: *const Value) ?f64 {
 
 fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const cmp = receiver.Comparator;
-    if (std.mem.eql(u8, name, "compare") and args.len == 2) {
+    // `Comparator` is a `fun interface`, so `comparator(a, b)` and an explicit
+    // `comparator.invoke(a, b)` both call `compare`.
+    if ((std.mem.eql(u8, name, "compare") or std.mem.eql(u8, name, "invoke")) and args.len == 2) {
         const a = args[0];
         const b = args[1];
         var ord: Ordering = .eq;
