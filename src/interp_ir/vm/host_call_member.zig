@@ -3398,6 +3398,9 @@ fn receiverClassChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Instance
 
 fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) Allocator.Error!?EvalResult {
     _ = self;
+    // An array `.asList()` view re-reads its scalar source so the iterator
+    // snapshot reflects later array writes.
+    receiver.refreshArrayView();
     switch (receiver.*) {
         .List => |l| {
             // A mutable list shares its backing so `MutableIterator.remove()`
@@ -4163,8 +4166,9 @@ fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         return .{ .ok = try listOf(allocator, items, true) };
     }
     if (std.mem.eql(u8, name, "asList") and args.len == 0) {
-        const items = try cloneArrayItems(allocator, arr);
-        return .{ .ok = try listOf(allocator, items, false) };
+        // Read-only, fixed-size live view over the array (element writes show
+        // through); not a copy.
+        return .{ .ok = try stdlib.implementations.collections.arrayAsListView(allocator, arr) };
     }
     if (std.mem.eql(u8, name, "toTypedArray") and args.len == 0) {
         const items = try cloneArrayItems(allocator, arr);

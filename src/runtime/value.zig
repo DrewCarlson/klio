@@ -347,28 +347,39 @@ pub const ValueBox = ObjRef(Value);
 /// Which face of a `MutableMap` a live view exposes.
 pub const MapViewKind = enum { Keys, Values, Entries };
 
-/// Back-reference carried by a live `MutableMap.keys`/`.values`/`.entries`
-/// collection so its mutators edit the originating map.
-pub const MapBacking = struct {
-    entries: MapEntries,
-    kind: MapViewKind,
+/// Back-reference carried by a live collection view so its reads and mutations
+/// resolve through the originating source.
+///   - `map`: a `MutableMap.keys`/`.values`/`.entries` view edits the map.
+///   - `sublist`: a `List.subList(from, to)` window into `parent`; reads and
+///     structural ops splice through the parent list's items.
+///   - `array`: a primitive-array `.asList()` over packed scalar storage; reads
+///     reflect later array element writes (a reference `Array<T>.asList()`
+///     instead shares the boxed buffer outright and carries no backing).
+pub const CollBacking = union(enum) {
+    map: struct { entries: MapEntries, kind: MapViewKind },
+    sublist: struct { parent: ValueList, from: usize, len: usize },
+    array: struct { buf: objcell.ObjRef(PrimBuf), view_kind: PrimitiveArrayKind },
 
-    /// GC out-edge: keep the source map's entries cell reachable while a live
-    /// view references it. The handle is a non-owning write-through reference
-    /// (no `deinit`), so refcount teardown of this cell never releases the
-    /// borrowed entries; only the GC keeps it marked.
-    pub fn gcTrace(self: *const MapBacking, m: *objcell.gc.Marker) void {
-        m.shade(&self.entries.cell.hdr);
+    /// GC out-edge: keep the source cell reachable while a live view references
+    /// it. The handle is a non-owning write-through reference (no `deinit`), so
+    /// refcount teardown of this cell never releases the borrowed source; only
+    /// the GC keeps it marked.
+    pub fn gcTrace(self: *const CollBacking, m: *objcell.gc.Marker) void {
+        switch (self.*) {
+            .map => |x| m.shade(&x.entries.cell.hdr),
+            .sublist => |x| m.shade(&x.parent.cell.hdr),
+            .array => |x| m.shade(&x.buf.cell.hdr),
+        }
     }
 };
 
-/// A heap-managed `MapBacking`: the view owns this cell (retained/released and
-/// GC-swept with the view) but not the entries it points at.
-pub const MapBackingRef = objcell.ObjRef(MapBacking);
-/// The control block behind a `MapBackingRef`. `List`/`Set` store `?*Cell`
+/// A heap-managed `CollBacking`: the view owns this cell (retained/released and
+/// GC-swept with the view) but not the source it points at.
+pub const CollBackingRef = objcell.ObjRef(CollBacking);
+/// The control block behind a `CollBackingRef`. `List`/`Set` store `?*Cell`
 /// (a single pointer, so `?` is null-optimized to 8 bytes — keeping `Value`
-/// pinned at 64) and reconstruct the `MapBackingRef` at each use.
-pub const MapBackingCell = MapBackingRef.Cell;
+/// pinned at 64) and reconstruct the `CollBackingRef` at each use.
+pub const CollBackingCell = CollBackingRef.Cell;
 
 /// Distinguishes integer ranges (`IntRange`) from long/char ranges.
 pub const RangeKind = enum {
@@ -1267,8 +1278,9 @@ pub const Value = union(enum) {
         /// a boolean ("is this the enum-entries list"), so a flag suffices — no
         /// StringRef allocation, and it keeps the `List` payload small.
         enum_entries: bool = false,
-        /// Set when this is a live `MutableMap.values` view.
-        backing: ?*MapBackingCell,
+        /// Set for a live view: a `MutableMap.values` view, a `subList` window,
+        /// or a primitive-array `.asList()` (see `CollBacking`).
+        backing: ?*CollBackingCell,
         /// Declared element-type head from an explicit call-site type
         /// argument on the creating stdlib function (`listOf<String>()`).
         /// Head name only; borrows the module's interned consts, which
@@ -1290,7 +1302,7 @@ pub const Value = union(enum) {
         items: ValueList,
         mutable: bool,
         /// Set when this is a live `MutableMap.keys`/`.entries` view.
-        backing: ?*MapBackingCell,
+        backing: ?*CollBackingCell,
         /// Declared element-type head from an explicit call-site type
         /// argument on the creating stdlib function; see `List`.
         declared_elem: ?[]const u8 = null,
@@ -1444,12 +1456,12 @@ pub const Value = union(enum) {
             .Comparator => |c| visitor.visit(c.steps),
             .List => |x| {
                 visitor.visit(x.items);
-                if (x.backing) |b| visitor.visit(MapBackingRef{ .cell = b });
+                if (x.backing) |b| visitor.visit(CollBackingRef{ .cell = b });
                 if (x.mod_count) |mc| visitor.visit(mc);
             },
             .Set => |x| {
                 visitor.visit(x.items);
-                if (x.backing) |b| visitor.visit(MapBackingRef{ .cell = b });
+                if (x.backing) |b| visitor.visit(CollBackingRef{ .cell = b });
                 if (x.mod_count) |mc| visitor.visit(mc);
             },
             .Array => |x| switch (x.storage) {
@@ -1541,7 +1553,7 @@ pub const Value = union(enum) {
         self.forEachChildCell(MarkVisitor{ .m = m });
         switch (self) {
             // `List`/`Set` view `backing` is shaded by `forEachChildCell` above
-            // (the `MapBacking` cell's own `gcTrace` reaches the source entries).
+            // (the `CollBacking` cell's own `gcTrace` reaches the source).
             .MapEntry => |e| if (e.backing) |b| m.shade(&b.cell.hdr),
             // Keep the side-table's canonical capture store + receiver chain for
             // this closure alive (the dup'd `captures` ValueSlice is already
@@ -1582,14 +1594,14 @@ pub const Value = union(enum) {
             .Comparator => |c| c.steps.deinit(),
             .List => |x| {
                 releaseValueList(x.items, allocator);
-                // Drop the view's owned `MapBacking` cell (the borrowed entries
-                // it points at are owned by the source map, not released here).
-                if (x.backing) |b| (MapBackingRef{ .cell = b }).deinit();
+                // Drop the view's owned `CollBacking` cell (the borrowed source
+                // it points at is owned elsewhere, not released here).
+                if (x.backing) |b| (CollBackingRef{ .cell = b }).deinit();
                 if (x.mod_count) |mc| mc.deinit();
             },
             .Set => |x| {
                 releaseValueList(x.items, allocator);
-                if (x.backing) |b| (MapBackingRef{ .cell = b }).deinit();
+                if (x.backing) |b| (CollBackingRef{ .cell = b }).deinit();
                 if (x.mod_count) |mc| mc.deinit();
             },
             .Array => |x| switch (x.storage) {
@@ -2170,7 +2182,11 @@ pub const Value = union(enum) {
             .ULong => |x| if (b.* == .ULong) return x == b.ULong,
             .UShort => |x| if (b.* == .UShort) return x == b.UShort,
             .UByte => |x| if (b.* == .UByte) return x == b.UByte,
-            .List => |x| if (b.* == .List) return listEqBoxed(x.items, b.List.items),
+            .List => |x| if (b.* == .List) {
+                a.refreshArrayView();
+                b.refreshArrayView();
+                return listEqBoxed(x.items, b.List.items);
+            },
             .Set => |x| if (b.* == .Set) return setEqBoxed(x.items, b.Set.items),
             .Map => |x| if (b.* == .Map) return mapEqBoxed(x.entries, b.Map.entries),
             .Pair => |x| if (b.* == .Pair)
@@ -2217,7 +2233,11 @@ pub const Value = union(enum) {
             .Range => |x| b.* == .Range and x.kind == b.Range.kind and
                 ((rangeIsEmptyVal(x) and rangeIsEmptyVal(b.Range)) or
                     (x.start == b.Range.start and x.end == b.Range.end and x.step == b.Range.step)),
-            .List => |x| b.* == .List and listEqBoxed(x.items, b.List.items),
+            .List => |x| b.* == .List and blk: {
+                a.refreshArrayView();
+                b.refreshArrayView();
+                break :blk listEqBoxed(x.items, b.List.items);
+            },
             .Set => |x| b.* == .Set and setEqBoxed(x.items, b.Set.items),
             .Map => |x| b.* == .Map and mapEqBoxed(x.entries, b.Map.entries),
             .Pair => |x| b.* == .Pair and
@@ -2341,7 +2361,10 @@ pub const Value = union(enum) {
                     try writer.writeAll(fg.get().bytes);
                 }
             },
-            .List => |coll| try writeElements(writer, coll.items, &self),
+            .List => |coll| {
+                self.refreshArrayView();
+                try writeElements(writer, coll.items, &self);
+            },
             .Set => |coll| try writeElements(writer, coll.items, &self),
             .Array => |a| {
                 const tag = if (a.prim) |k| k.typeFqn() else "kotlin.Array";
@@ -2457,6 +2480,30 @@ pub const Value = union(enum) {
     }
 
     /// Render to an owned string via `writeTo`.
+    /// Re-read a primitive-array `.asList()` view's element cache from the
+    /// backing array so a later array write shows through on the next read.
+    /// The view is fixed-size, so this only overwrites the existing (scalar,
+    /// non-refcounted) slots in place — no allocation, no retain/release. A
+    /// no-op for any value that is not an `array`-backed list. Reference
+    /// `Array<T>.asList()` views share the boxed buffer directly and carry no
+    /// backing, so they are inherently live and never reach here.
+    pub fn refreshArrayView(self: *const Value) void {
+        if (self.* != .List) return;
+        const b = self.List.backing orelse return;
+        if (b.data != .array) return;
+        const av = b.data.array;
+        const bg = av.buf.borrow();
+        defer bg.deinit();
+        const n = bg.get().len();
+        const ig = self.List.items.borrowMut();
+        defer ig.deinit();
+        const items = ig.get().items;
+        var i: usize = 0;
+        while (i < n and i < items.len) : (i += 1) {
+            items[i] = bg.get().getAs(i, av.view_kind);
+        }
+    }
+
     pub fn display(self: Value, allocator: std.mem.Allocator) ![]u8 {
         var alloc_writer = std.Io.Writer.Allocating.init(allocator);
         errdefer alloc_writer.deinit();

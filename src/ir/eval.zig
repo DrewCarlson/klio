@@ -3855,6 +3855,9 @@ inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
             },
         },
         .List => |l| {
+            // An array `.asList()` view re-reads its scalar source so a later
+            // array write shows through on this indexed load.
+            recv.refreshArrayView();
             const g = l.items.borrow();
             defer g.deinit();
             const items = g.get().items;
