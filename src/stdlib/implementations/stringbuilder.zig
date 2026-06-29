@@ -661,6 +661,23 @@ pub fn string_builder_capacity(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(@intCast(g.get().capacity)));
 }
 
+/// `StringBuilder.ensureCapacity(minimumCapacity)` — grow the backing buffer so
+/// its capacity is at least `minimumCapacity`; a non-positive argument is
+/// ignored (matching the JVM contract).
+pub fn string_builder_ensure_capacity(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.ensureCapacity"));
+    if (ctx.args.len >= 2) {
+        if (ctx.args[1].asI64()) |n| {
+            if (n > 0) {
+                const g = sb.borrowMut();
+                defer g.deinit();
+                try g.get().ensureTotalCapacity(ctx.allocator, @intCast(n));
+            }
+        }
+    }
+    return ok(.Unit);
+}
+
 /// `StringBuilder.trimToSize()` — a capacity hint with no observable effect
 /// on the contents (klio's buffer has no separate capacity to shrink).
 pub fn string_builder_trim_to_size(ctx: *CallCtx) Allocator.Error!EvalResult {
