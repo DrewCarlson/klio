@@ -6522,14 +6522,22 @@ fn instanceOuterLink(v: *const Value) ?Value {
 /// Each candidate is ranked by a strict, total ordering so the winner is
 /// unique and deterministic (no declaration-order tie-break). Ranked, in
 /// descending priority:
-///   0. receiver specificity — the candidate whose receiver param most
+///   0. subtype specificity — how many other candidates' receiver types are
+///      supertypes of this one. Kotlin's most-specific rule is decided by the
+///      subtyping lattice, not by runtime hierarchy distance: with a receiver
+///      that satisfies several unrelated extension-receiver types (a coroutine
+///      is both a `Job` and a `CoroutineScope`), the candidate whose receiver
+///      is a subtype of another candidate's (`Job` <: `CoroutineContext`) is
+///      the more specific one even when an unrelated sibling sits nearer in
+///      the runtime class graph. When the lattice cannot decide (no candidate
+///      is a subtype of another) this ties at zero and the runtime-distance
+///      tier below breaks it;
+///   1. receiver specificity — the candidate whose receiver param most
 ///      specifically matches the receiver's runtime type (a `Flow` receiver
 ///      selects `Flow.forEach`, not the generic `Iterable.forEach`);
-///   1. applicability score — the numeric arg/param compatibility;
-///   2. owner rank — a member extension visible nearer on the enclosing-`this`
+///   2. applicability score — the numeric arg/param compatibility;
+///   3. owner rank — a member extension visible nearer on the enclosing-`this`
 ///      chain;
-///   3. subtype specificity — how many other candidates' receiver types are
-///      supertypes of this one;
 ///   4. parameter specificity — the most-specific declared parameter types
 ///      for the supplied value args;
 ///   5. a stable key (lowest `FuncId`) so the winner is always unique.
@@ -6626,7 +6634,7 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // package is always user code (every shipped/pack symbol is packaged),
         // so the common default-package case skips the registry scan.
         const is_user: i32 = @intFromBool(f.package.len == 0 or !stdlib.isKnownPackage(f.package));
-        const key: ExtKey = .{ applicable, is_user, recv_match, score, owner_rank, spec, param_spec, neg_fid };
+        const key: ExtKey = .{ applicable, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid };
         if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
             tied.append(self.allocator, f) catch {};
         }
