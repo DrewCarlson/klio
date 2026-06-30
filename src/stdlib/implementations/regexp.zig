@@ -1988,15 +1988,24 @@ pub fn match_named_group_get(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         if (n >= 0 and n < md.groups.len) idx = @intCast(n);
     } else if (key == .String) {
         const name = key.String.asPtr().bytes;
+        var found = false;
         if (progFromRegex(md.regex)) |prog| {
             for (prog.names, 0..) |gn, i| {
                 if (gn) |nm| {
-                    if (std.mem.eql(u8, nm, name) and i < md.groups.len) {
-                        idx = i;
+                    if (std.mem.eql(u8, nm, name)) {
+                        if (i < md.groups.len) idx = i;
+                        found = true;
                         break;
                     }
                 }
             }
+        }
+        // A name that no group in the pattern declares is invalid (vs a declared
+        // group that simply did not participate, which yields null).
+        if (!found) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "No group with name <{s}>", .{name});
+            defer ctx.allocator.free(msg);
+            return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg) } };
         }
     } else return typeErr("MatchNamedGroupCollection.get key must be Int or String");
     if (idx) |i| return ok(matchGroupValue(md.groups[i]));
