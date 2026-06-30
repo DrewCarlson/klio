@@ -4186,6 +4186,22 @@ pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeListBorrowed(a, out, false));
 }
 
+/// `Collection.plusElement(element)` always appends `element` as a single
+/// element, even when it is itself a collection — unlike `plus`, which flattens
+/// an Iterable/Array/Sequence argument.
+pub fn coll_list_plus_element(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.plusElement")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    var out: std.ArrayList(Value) = .empty;
+    try appendVL(&out, a, it);
+    if (ctx.args.len < 2) return arityErr("plusElement requires an argument");
+    try out.append(a, ctx.args[1]);
+    return ok(try makeListBorrowed(a, out, false));
+}
+
 pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "List.minus")) {
