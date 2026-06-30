@@ -2882,38 +2882,6 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const ast_type_args = call.type_args;
     const is_infix = call.is_infix;
 
-    // A bare ctor callee that names a nested class must bind the one in THIS
-    // enclosing-class chain, not a same-simple-name nested class in a sibling
-    // outer class. Walk the owner's FQN prefixes and, if an enclosing scope
-    // declares `<prefix>.<name>`, rewrite the callee to that qualified path so
-    // `throw ResourceCloseException(msg)` resolves to this class's nested type.
-    if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1 and
-        b.resolve(callee.Path.segments[0].name) == null)
-    {
-        const cname = callee.Path.segments[0].name;
-        if (b.ownerClass()) |owner| resolve: {
-            const ocid = b.module.classId(owner) orelse break :resolve;
-            if (ocid.int() >= b.module.classes.items.len) break :resolve;
-            var prefix: []const u8 = b.module.classes.items[ocid.int()].fqn;
-            while (std.mem.lastIndexOfScalar(u8, prefix, '.')) |dot| {
-                prefix = prefix[0..dot];
-                const cand = try std.fmt.allocPrint(b.allocator, "{s}.{s}", .{ prefix, cname });
-                if (b.module.classIdByFqn(cand) != null) {
-                    var segs: std.ArrayList(ast.Ident) = .empty;
-                    var it = std.mem.splitScalar(u8, cand, '.');
-                    while (it.next()) |seg| try segs.append(b.allocator, .{ .name = seg, .span = callee.Path.segments[0].span });
-                    const new_callee = try b.allocator.create(Expr);
-                    new_callee.* = Expr{ .Path = .{ .segments = try segs.toOwnedSlice(b.allocator), .span = callee.Path.span } };
-                    var new_call = call;
-                    new_call.callee = new_callee;
-                    const rewritten = Expr{ .Call = new_call };
-                    return lowerCallGeneral(b, &rewritten);
-                }
-                b.allocator.free(cand);
-            }
-        }
-    }
-
     // Inline expansion (suspend-inline only).
     if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1) {
         const nm = callee.Path.segments[0].name;
