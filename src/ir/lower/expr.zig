@@ -1611,6 +1611,10 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const result = b.allocReg();
     const exit = try b.allocBlock();
     const finally_entry: ?BlockId = if (t.finally != null) try b.allocBlock() else null;
+    // The post-finally sentinel is allocated up front so catch handlers can be
+    // protected by the finally before their bodies are lowered (a throw in a
+    // catch must run the finally, then re-raise past this sentinel).
+    const finally_done: ?BlockId = if (finally_entry != null) try b.allocBlock() else null;
 
     // Pre-allocate each catch handler's entry block + exception register.
     const Handler = struct { c: ast.Catch, blk: BlockId, exc: Reg };
@@ -1631,6 +1635,7 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         ch.* = .{ .type_name = loweredTypeName(b, &h.c.ty), .handler = h.blk, .exception_reg = h.exc };
     }
     b.attachCatches(cur_id, catch_handlers, finally_entry);
+    if (finally_done) |done| b.setFinallyDoneFor(cur_id, done);
     if (t.finally) |blk| try b.pushFinally(blk);
     const body_val = try lowerBlock(b, &t.body);
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });
@@ -1640,9 +1645,11 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.terminate(.{ .Goto = exit });
     }
 
-    // Each handler body.
+    // Each handler body. A catch body is itself protected by the finally so a
+    // throw from within it still runs the finally before propagating.
     for (handlers) |h| {
         b.switchTo(h.blk);
+        if (finally_entry) |fin| b.protectCatchWithFinally(h.blk, fin, finally_done.?);
         try b.pushScope();
         try b.bind(h.c.binding.name, h.exc);
         const v = try lowerBlock(b, &h.c.body);
@@ -1658,12 +1665,11 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Finally body.
     if (finally_entry) |fin| {
         if (t.finally != null) b.popFinally();
-        const finally_done = try b.allocBlock();
+        const done = finally_done.?;
         b.switchTo(fin);
         if (t.finally) |blk| _ = try lowerBlock(b, &blk);
-        b.terminate(.{ .Goto = finally_done });
-        b.switchTo(finally_done);
-        b.setFinallyDoneFor(cur_id, finally_done);
+        b.terminate(.{ .Goto = done });
+        b.switchTo(done);
         b.terminate(.{ .Goto = exit });
     }
 

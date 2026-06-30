@@ -1093,6 +1093,17 @@ pub const FuncBuilder = struct {
         self.blocks.items[done.int()].finally_done_for = body_entry;
     }
 
+    /// Protect a catch-handler block with the try's `finally`: a throw from
+    /// within the catch then runs the finally (and re-raises past the done
+    /// sentinel) instead of skipping it. The handler keeps no catches of its
+    /// own, so it never re-catches into the same try. `done` is the shared
+    /// post-finally sentinel (so the re-raise fires after the finally runs);
+    /// `finally_done_for` is left pointing at the body, set separately.
+    pub fn protectCatchWithFinally(self: *FuncBuilder, catch_block: BlockId, finally_entry: BlockId, done: BlockId) void {
+        self.blocks.items[catch_block.int()].finally = finally_entry;
+        self.blocks.items[catch_block.int()].finally_done = done;
+    }
+
     /// Snapshot every register currently bound in any live scope, in
     /// ascending register order. The caller owns the returned slice.
     pub fn capturedRegs(self: *const FuncBuilder) Allocator.Error![]Reg {
