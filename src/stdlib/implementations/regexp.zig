@@ -1604,13 +1604,6 @@ fn splitItems(allocator: std.mem.Allocator, prog: *const Program, s: []const u8,
         defer allocator.free(caps);
         const m_start = caps[0].start.?;
         const m_end = caps[0].end.?;
-        // Rust's split skips an empty match at the very start.
-        if (m_end == 0 and m_start == 0) {
-            if (s.len == 0) break;
-            const len = std.unicode.utf8ByteSequenceLength(s[0]) catch 1;
-            pos = if (len <= s.len) len else 1;
-            continue;
-        }
         try items.append(allocator, try makeString(allocator, s[last..m_start]));
         last = m_end;
         if (m_end > m_start) {
