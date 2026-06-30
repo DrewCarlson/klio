@@ -742,14 +742,14 @@ pub const Lexer = struct {
                     const c: u32 = 0x10000 + ((@as(u32, unit) - 0xD800) << 10) + (@as(u32, lo) - 0xDC00);
                     try appendCodepoint(text, self.allocator, c);
                 } else {
-                    try appendCodepoint(text, self.allocator, 0xFFFD);
+                    try appendSurrogate(text, self.allocator, unit);
                     try self.pushStringUnit(text, lo);
                 }
             } else {
-                try appendCodepoint(text, self.allocator, 0xFFFD);
+                try appendSurrogate(text, self.allocator, unit);
             }
         } else if (unit >= 0xDC00 and unit <= 0xDFFF) {
-            try appendCodepoint(text, self.allocator, 0xFFFD);
+            try appendSurrogate(text, self.allocator, unit);
         } else {
             try appendCodepoint(text, self.allocator, unit);
         }
@@ -1060,6 +1060,16 @@ pub const Lexer = struct {
         }
     }
 };
+
+/// Append a lone UTF-16 surrogate as its 3-byte WTF-8 form so it survives in
+/// the string's byte buffer (a real UTF-8 string cannot hold one). `Utf16View`
+/// decodes it back to the surrogate code unit; a high+low pair is coalesced
+/// into the astral scalar by `coalesceSurrogates` when a string is built.
+fn appendSurrogate(text: *std.ArrayList(u8), allocator: std.mem.Allocator, unit: u16) !void {
+    try text.append(allocator, 0xE0 | @as(u8, @intCast(unit >> 12)));
+    try text.append(allocator, 0x80 | @as(u8, @intCast((unit >> 6) & 0x3F)));
+    try text.append(allocator, 0x80 | @as(u8, @intCast(unit & 0x3F)));
+}
 
 fn appendCodepoint(text: *std.ArrayList(u8), allocator: std.mem.Allocator, cp: u32) !void {
     var buf: [4]u8 = undefined;

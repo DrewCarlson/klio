@@ -143,6 +143,9 @@ pub const CaptureOutput = output_mod.CaptureOutput;
 pub const kotlinFloatToString = output_mod.kotlinFloatToString;
 pub const kotlinDoubleToString = output_mod.kotlinDoubleToString;
 pub const charUnitToString = output_mod.charUnitToString;
+pub const coalesceSurrogates = float_fmt_mod.coalesceSurrogates;
+pub const isWtf8SurrogateAt = float_fmt_mod.isWtf8SurrogateAt;
+pub const wtf8SurrogateUnit = float_fmt_mod.wtf8SurrogateUnit;
 pub const pushCharUnit = output_mod.pushCharUnit;
 pub const charUnitsToString = output_mod.charUnitsToString;
 

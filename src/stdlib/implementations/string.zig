@@ -23,6 +23,9 @@ const SequenceSource = runtime.SequenceSource;
 const PrimitiveArrayKind = runtime.PrimitiveArrayKind;
 const charUnitsToString = runtime.charUnitsToString;
 const charUnitToString = runtime.charUnitToString;
+const isWtf8SurrogateAt = runtime.isWtf8SurrogateAt;
+const wtf8SurrogateUnit = runtime.wtf8SurrogateUnit;
+const coalesceSurrogates = runtime.coalesceSurrogates;
 
 const Allocator = std.mem.Allocator;
 
@@ -2629,6 +2632,13 @@ const Utf16View = struct {
             return low;
         }
         if (self.pos >= self.bytes.len) return null;
+        // A WTF-8 lone surrogate (`ED A0-BF 8x`) decodes to its surrogate code
+        // unit directly — `utf8Decode` would reject it.
+        if (isWtf8SurrogateAt(self.bytes, self.pos)) {
+            const unit = wtf8SurrogateUnit(self.bytes, self.pos);
+            self.pos += 3;
+            return unit;
+        }
         const len = std.unicode.utf8ByteSequenceLength(self.bytes[self.pos]) catch {
             const unit: u16 = self.bytes[self.pos];
             self.pos += 1;

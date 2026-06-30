@@ -83,9 +83,16 @@ fn setBuf(buf: *Buffer, allocator: Allocator, bytes: []const u8) Allocator.Error
 fn encodeUtf16(allocator: Allocator, s: []const u8) Allocator.Error![]u16 {
     var out: std.ArrayList(u16) = .empty;
     errdefer out.deinit(allocator);
-    var view = std.unicode.Utf8View.initUnchecked(s);
-    var it = view.iterator();
-    while (it.nextCodepoint()) |cp| {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (runtime.isWtf8SurrogateAt(s, i)) {
+            try out.append(allocator, runtime.wtf8SurrogateUnit(s, i));
+            i += 3;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + len, s.len);
+        const cp = std.unicode.utf8Decode(s[i..end]) catch s[i];
         if (cp <= 0xFFFF) {
             try out.append(allocator, @intCast(cp));
         } else {
@@ -93,6 +100,7 @@ fn encodeUtf16(allocator: Allocator, s: []const u8) Allocator.Error![]u16 {
             try out.append(allocator, @intCast(0xD800 + (adjusted >> 10)));
             try out.append(allocator, @intCast(0xDC00 + (adjusted & 0x3FF)));
         }
+        i = end;
     }
     return out.toOwnedSlice(allocator);
 }
@@ -114,9 +122,18 @@ fn charUnitToString(allocator: Allocator, unit: u16) Allocator.Error![]u8 {
 /// astral scalar as one `char`, matching Rust's `str::chars`.
 fn charCount(s: []const u8) usize {
     var n: usize = 0;
-    var view = std.unicode.Utf8View.initUnchecked(s);
-    var it = view.iterator();
-    while (it.nextCodepoint()) |_| n += 1;
+    var i: usize = 0;
+    while (i < s.len) {
+        // A WTF-8 lone surrogate is one code unit; std iteration would reject it.
+        if (runtime.isWtf8SurrogateAt(s, i)) {
+            n += 1;
+            i += 3;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        i += @min(len, s.len - i);
+        n += 1;
+    }
     return n;
 }
 
@@ -254,12 +271,16 @@ fn sbCharByte(buf: []const u8, idx: i64) ?usize {
     if (idx < 0) return null;
     const target: usize = @intCast(idx);
     if (target == charCount(buf)) return buf.len;
-    var view = std.unicode.Utf8View.initUnchecked(buf);
-    var it = view.iterator();
+    var i: usize = 0;
     var count: usize = 0;
-    while (it.i < buf.len) {
-        if (count == target) return it.i;
-        _ = it.nextCodepoint();
+    while (i < buf.len) {
+        if (count == target) return i;
+        if (runtime.isWtf8SurrogateAt(buf, i)) {
+            i += 3;
+        } else {
+            const len = std.unicode.utf8ByteSequenceLength(buf[i]) catch 1;
+            i += @min(len, buf.len - i);
+        }
         count += 1;
     }
     return null;
@@ -698,7 +719,10 @@ pub fn string_builder_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.toString"));
     const g = sb.borrow();
     defer g.deinit();
-    const dup = try a.dupe(u8, g.get().items);
+    // Coalesce any WTF-8 surrogate pairs accumulated from individual `Char`
+    // appends into astral scalars, so the result is canonical UTF-8 (a builder
+    // fed a high+low pair equals the astral string literal).
+    const dup = try runtime.coalesceSurrogates(a, g.get().items);
     return ok(.{ .String = try runtime.strInitOwned(a, dup) });
 }
 
