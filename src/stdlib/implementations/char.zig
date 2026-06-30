@@ -509,6 +509,17 @@ pub fn singleCaseChar(c: u21, map: []const CaseEntry) u21 {
     return c;
 }
 
+/// The 1:1 lower-case of a Unicode scalar (full case table, not just ASCII).
+/// Used by the regex engine's case-insensitive matching to fold beyond ASCII.
+pub fn lowerScalar(c: u21) u21 {
+    return singleCaseChar(c, &lowercase_map);
+}
+
+/// The 1:1 upper-case of a Unicode scalar (full case table).
+pub fn upperScalar(c: u21) u21 {
+    return singleCaseChar(c, &uppercase_map);
+}
+
 /// `Char.equals(other, ignoreCase = true)`: equal if the upper-cased units
 /// match, or failing that the lower-cased upper-cased units match (Kotlin's
 /// rule, which also pairs characters that share a lowercase form).

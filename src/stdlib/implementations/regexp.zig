@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const char_impl = @import("char.zig");
 
 const Value = runtime.Value;
 const CallCtx = runtime.CallCtx;
@@ -554,13 +555,13 @@ const Capture = struct { start: ?usize = null, end: ?usize = null };
 /// programs reached here are ASCII-cased; this keeps `IGNORE_CASE` correct
 /// for the common case without a full case table.
 fn foldCp(c: u21) u21 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
+    if (c < 0x80) return if (c >= 'A' and c <= 'Z') c + 32 else c;
+    return char_impl.lowerScalar(c);
 }
 
 fn upperCp(c: u21) u21 {
-    if (c >= 'a' and c <= 'z') return c - 32;
-    return c;
+    if (c < 0x80) return if (c >= 'a' and c <= 'z') c - 32 else c;
+    return char_impl.upperScalar(c);
 }
 
 fn cpEq(a: u21, b: u21, fold: bool) bool {
