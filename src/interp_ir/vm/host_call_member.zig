@@ -3602,10 +3602,22 @@ fn sequenceMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         if (std.mem.eql(u8, name, "filter") and args.len == 1) break :blk .{ .Filter = args[0] };
         if (std.mem.eql(u8, name, "filterNot") and args.len == 1) break :blk .{ .FilterNot = args[0] };
         if (std.mem.eql(u8, name, "take") and args.len == 1) {
-            if (args[0].asI64()) |n| break :blk .{ .Take = n };
+            if (args[0].asI64()) |n| {
+                if (n < 0) {
+                    const msg = try std.fmt.allocPrint(allocator, "Requested element count {d} is less than zero.", .{n});
+                    return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
+                }
+                break :blk .{ .Take = n };
+            }
         }
         if (std.mem.eql(u8, name, "drop") and args.len == 1) {
-            if (args[0].asI64()) |n| break :blk .{ .Drop = n };
+            if (args[0].asI64()) |n| {
+                if (n < 0) {
+                    const msg = try std.fmt.allocPrint(allocator, "Requested element count {d} is less than zero.", .{n});
+                    return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
+                }
+                break :blk .{ .Drop = n };
+            }
         }
         if (std.mem.eql(u8, name, "takeWhile") and args.len == 1) break :blk .{ .TakeWhile = args[0] };
         if (std.mem.eql(u8, name, "dropWhile") and args.len == 1) break :blk .{ .DropWhile = args[0] };
