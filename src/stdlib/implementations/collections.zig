@@ -6331,7 +6331,12 @@ pub fn array_copy_of(ctx: *CallCtx) Error!EvalResult {
         .idx => |v| v,
         .err => |e| return e,
     };
-    if (new_size < 0) return typeErr(try fmt(a, "copyOf: negative new size {d}", .{new_size}));
+    if (new_size < 0) {
+        const msg = try fmt(a, "{d}", .{new_size});
+        const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
+        if (runtime.freeScratch()) a.free(msg);
+        return e;
+    }
     const n: usize = @intCast(new_size);
     const default = arrayPrimDefault(prim);
     const cur = try arr.snapshot(a);

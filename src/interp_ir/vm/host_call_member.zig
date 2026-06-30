@@ -4045,6 +4045,12 @@ fn ordToInt(o: Ordering) i64 {
 /// Builtin natural-order comparison. `null` when the pair is not
 /// builtin-comparable (mirrors `compare_values` rejecting Instances).
 fn compareValuesBuiltin(a: *const Value, b: *const Value) ?Ordering {
+    // Kotlin `compareValues`: null is ordered first (null < non-null, null ==
+    // null). A `compareBy { selectorReturningNull }` relies on this.
+    if (a.* == .Null or b.* == .Null) {
+        if (a.* == .Null and b.* == .Null) return .eq;
+        return if (a.* == .Null) .lt else .gt;
+    }
     if (a.* == .String and b.* == .String) {
         const ag = a.String.borrow();
         defer ag.deinit();
