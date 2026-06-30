@@ -6603,6 +6603,28 @@ pub fn array_sum_int(ctx: *CallCtx) Error!EvalResult {
     return arraySumImpl(ctx, "Array.sum");
 }
 
+/// `U{Byte,Short,Int}Array.sum(): UInt` and `ULongArray.sum(): ULong`. The
+/// generic sum widens unsigned elements but returns `Int`/`Long`; Kotlin's
+/// unsigned sum widens to `UInt` (or `ULong` for a ULongArray).
+pub fn array_sum_unsigned(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sum requires an array receiver");
+    const prim = ctx.args[0].Array.prim orelse return typeErr("sum requires a primitive unsigned array");
+    const items = switch (try iterableItems(a, ctx.args[0], "sum")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    if (prim == .ULong) {
+        var acc: u64 = 0;
+        for (items) |v| acc +%= v.asU64() orelse 0;
+        return ok(.{ .ULong = acc });
+    }
+    var acc: u32 = 0;
+    for (items) |v| acc +%= @as(u32, @truncate(v.asU64() orelse 0));
+    return ok(.{ .UInt = acc });
+}
+
 pub fn array_average_impl(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr("Array.average requires a receiver");
