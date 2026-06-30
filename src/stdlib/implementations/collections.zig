@@ -1035,31 +1035,41 @@ pub fn coll_iter_distinct_by(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    if (ctx.args.len != 2) return arityErr("groupBy expects (receiver, block)");
+    // `groupBy(keySelector)` or `groupBy(keySelector, valueTransform)`.
+    if (ctx.args.len != 2 and ctx.args.len != 3) return arityErr("groupBy expects (receiver, keySelector[, valueTransform])");
     const items = switch (try iterableItems(a, ctx.args[0], "groupBy")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
     defer if (runtime.freeScratch()) a.free(items);
-    const block = ctx.args[1];
+    const key_block = ctx.args[1];
+    const has_value_transform = ctx.args.len == 3;
     const Group = struct { key: Value, vs: std.ArrayList(Value) };
     var groups: std.ArrayList(Group) = .empty;
     for (items) |v| {
-        const key = switch (try invoke(ctx, &block, &.{v})) {
+        const key = switch (try invoke(ctx, &key_block, &.{v})) {
             .value => |val| val,
             .err => |e| return e,
         };
+        var value = v;
+        if (has_value_transform) {
+            const value_block = ctx.args[2];
+            value = switch (try invoke(ctx, &value_block, &.{v})) {
+                .value => |val| val,
+                .err => |e| return e,
+            };
+        }
         var found = false;
         for (groups.items) |*g| {
             if (eqBoxed(&g.key, &key)) {
-                try g.vs.append(a, v);
+                try g.vs.append(a, value);
                 found = true;
                 break;
             }
         }
         if (!found) {
             var vs: std.ArrayList(Value) = .empty;
-            try vs.append(a, v);
+            try vs.append(a, value);
             try groups.append(a, .{ .key = key, .vs = vs });
         }
     }
