@@ -1316,6 +1316,12 @@ pub fn regex_find(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const v = ctx.args[2];
         if (v.isIntegral()) {
             const n = v.asI64().?;
+            const length = byteToChar(s, s.len);
+            if (n < 0 or n > length) {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "Start index out of bounds: {d}, input length: {d}", .{ n, length });
+                defer ctx.allocator.free(msg);
+                return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg) } };
+            }
             start = if (n == 0) 0 else charIndexToByte(s, n);
         } else {
             return typeErr("Regex.find startIndex must be Int");
@@ -1342,9 +1348,20 @@ pub fn regex_find_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const s = sr.asPtr().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.findAll requires a Regex receiver");
 
+    // Optional `startIndex` (a char index into the input): scanning starts
+    // there. Out of `[0, length]` throws IndexOutOfBoundsException eagerly,
+    // matching `kotlin.text.Regex.findAll`.
+    const length = byteToChar(s, s.len);
+    const start_index: i64 = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse 0) else 0;
+    if (start_index < 0 or start_index > length) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "Start index out of bounds: {d}, input length: {d}", .{ start_index, length });
+        defer ctx.allocator.free(msg);
+        return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg) } };
+    }
+
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(ctx.allocator);
-    var pos: usize = 0;
+    var pos: usize = charIndexToByte(s, start_index);
     while (true) {
         const caps = (try runMatch(ctx.allocator, prog, s, pos)) orelse break;
         defer ctx.allocator.free(caps);
