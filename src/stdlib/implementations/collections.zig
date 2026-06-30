@@ -3838,16 +3838,50 @@ fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enum) {
 
 pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const items = if (ctx.args.len > 0 and ctx.args[0] == .Array)
-        try ctx.args[0].Array.snapshot(a)
-    else switch (try recvListItems(a, ctx.args, "toMap")) {
-        .items => |x| try snapshotItems(a, x),
-        .err => |e| return e,
+    const recv = if (ctx.args.len > 0) ctx.args[0] else Value.Null;
+    const items = switch (recv) {
+        .Array => |arr| try arr.snapshot(a),
+        // List/Set/Sequence and any user `.Instance` exposing `iterator()`.
+        else => switch (try iterableItemsCtx(ctx, recv, "toMap")) {
+            .items => |x| x,
+            .err => |e| return e,
+        },
     };
+    defer if (runtime.freeScratch()) a.free(items);
     const entries = switch (try pairsFromValues(a, items, "toMap")) {
         .entries => |x| x,
         .err => |e| return e,
     };
+    // `toMap(destination)`: write the pairs into the supplied mutable map and
+    // return it, rather than building a fresh read-only map.
+    if (ctx.args.len >= 2 and ctx.args[1] == .Map) {
+        const dest = ctx.args[1];
+        const g = dest.Map.entries.borrowMut();
+        defer g.deinit();
+        for (entries.items) |kv| {
+            var found = false;
+            for (g.get().pairs.items) |*slot| {
+                if (eqBoxed(&slot.key, &kv.key)) {
+                    if (runtime.reclaimEnabled()) {
+                        kv.value.retain();
+                        slot.value.release(a);
+                    }
+                    slot.value = kv.value;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (runtime.reclaimEnabled()) {
+                    kv.key.retain();
+                    kv.value.retain();
+                }
+                try g.get().pairs.append(a, kv);
+                try g.get().noteAppended(a, g.get().pairs.items.len - 1);
+            }
+        }
+        return ok(dest);
+    }
     return ok(try makeMap(a, entries.items, false));
 }
 
@@ -4151,7 +4185,16 @@ pub fn coll_list_windowed(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    if (ctx.args.len < 2 or ctx.args[1] != .Int) return typeErr("windowed requires an Int size");
+    // Peel a trailing callable as the `transform` (the `windowed(size, step,
+    // partialWindows, transform)` overload). The scalar size/step/partialWindows
+    // are then read positionally from the remaining args, so omitted middle
+    // defaults (`windowed(2) { ... }`) bind correctly.
+    var n = ctx.args.len;
+    const transform: ?Value = if (n > 2 and isCallable(ctx.args[n - 1])) blk: {
+        n -= 1;
+        break :blk ctx.args[n];
+    } else null;
+    if (n < 2 or ctx.args[1] != .Int) return typeErr("windowed requires an Int size");
     const size_i = ctx.args[1].Int;
     if (size_i <= 0) {
         const msg = try fmt(a, "size {d} must be greater than zero.", .{size_i});
@@ -4159,14 +4202,14 @@ pub fn coll_list_windowed(ctx: *CallCtx) Error!EvalResult {
         if (runtime.freeScratch()) a.free(msg);
         return e;
     }
-    const step_i: i64 = if (ctx.args.len <= 2) 1 else (if (ctx.args[2].isIntegral()) ctx.args[2].asI64().? else return typeErr("windowed step must be Int"));
+    const step_i: i64 = if (n <= 2) 1 else (if (ctx.args[2].isIntegral()) ctx.args[2].asI64().? else return typeErr("windowed step must be Int"));
     if (step_i <= 0) {
         const msg = try fmt(a, "step {d} must be greater than zero.", .{step_i});
         const e = try thrown(a, "kotlin.IllegalArgumentException", msg);
         if (runtime.freeScratch()) a.free(msg);
         return e;
     }
-    const partial_windows: bool = if (ctx.args.len <= 3) false else (if (ctx.args[3] == .Bool) ctx.args[3].Bool else return typeErr("windowed partialWindows must be Bool"));
+    const partial_windows: bool = if (n <= 3) false else (if (ctx.args[3] == .Bool) ctx.args[3].Bool else return typeErr("windowed partialWindows must be Bool"));
     const items = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(items);
     const size: usize = @intCast(size_i);
@@ -4175,10 +4218,22 @@ pub fn coll_list_windowed(ctx: *CallCtx) Error!EvalResult {
     var i: usize = 0;
     while (i < items.len) {
         const end = i + size;
-        if (end <= items.len) {
-            try out.append(a, try makeList(a, items[i..end], false));
-        } else if (partial_windows) {
-            try out.append(a, try makeList(a, items[i..], false));
+        const window: ?Value = if (end <= items.len)
+            try makeList(a, items[i..end], false)
+        else if (partial_windows)
+            try makeList(a, items[i..], false)
+        else
+            null;
+        if (window) |w| {
+            if (transform) |block| {
+                const r = switch (try invoke(ctx, &block, &.{w})) {
+                    .value => |v| v,
+                    .err => |e| return e,
+                };
+                try out.append(a, r);
+            } else {
+                try out.append(a, w);
+            }
         } else break;
         i += step;
     }
@@ -4549,16 +4604,18 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
     const a = ctx.allocator;
     const arg = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
     if (isPredicateArg(arg)) return mutCollRemoveRetainPred(ctx, items, recv, retain);
+    _ = allow_array; // `removeAll`/`retainAll` accept an Array overload too.
     const other = blk: {
         switch (arg) {
             .List => |l| break :blk try snapshotItems(a, l.items),
             .Set => |s| break :blk try snapshotItems(a, s.items),
-            .Array => |arr| if (allow_array) break :blk try arr.snapshot(a) else return typeErr(try fmt(a, "{s} requires a collection", .{what})),
-            .Sequence => break :blk switch (try iterableItemsCtx(ctx, arg, what)) {
+            .Array => |arr| break :blk try arr.snapshot(a),
+            // Any other Iterable (a `.Sequence`, or an `.Instance` exposing
+            // `iterator()`): drain it.
+            else => break :blk switch (try iterableItemsCtx(ctx, arg, what)) {
                 .items => |x| x,
                 .err => |e| return e,
             },
-            else => return typeErr(try fmt(a, "{s} requires a collection", .{what})),
         }
     };
     var changed = false;
@@ -5376,7 +5433,10 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     if (ctx.args.len < 2) return arityErr("addAll requires an argument");
-    const arg = ctx.args[1];
+    // Indexed overload `addAll(index: Int, elements)`: the collection is the
+    // third argument and is inserted at `index` rather than appended.
+    const indexed = ctx.args.len >= 3 and ctx.args[1] == .Int;
+    const arg = if (indexed) ctx.args[2] else ctx.args[1];
     var to_add: []Value = undefined;
     switch (arg) {
         .List => |l| to_add = try snapshotItems(a, l.items),
@@ -5398,7 +5458,12 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
     defer g.deinit();
     // The list owns one ref to each element it stores.
     if (runtime.reclaimEnabled()) for (to_add) |v| v.retain();
-    try g.get().appendSlice(a, to_add);
+    if (indexed) {
+        const idx: usize = @min(@as(usize, @intCast(@max(ctx.args[1].Int, 0))), g.get().items.len);
+        try g.get().insertSlice(a, idx, to_add);
+    } else {
+        try g.get().appendSlice(a, to_add);
+    }
     return ok(.{ .Bool = changed });
 }
 
@@ -5560,7 +5625,10 @@ pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
             .err => |e| return .{ .err = e },
         }
     else
-        (try collectColl(a, arg)) orelse return typeErr("addAll requires a collection");
+        (try collectColl(a, arg)) orelse switch (try iterableItemsCtx(ctx, arg, "MutableSet.addAll")) {
+            .items => |x| x,
+            .err => |e| return e,
+        };
     const g = it.borrowMut();
     defer g.deinit();
     var changed = false;
@@ -5833,15 +5901,36 @@ pub fn array_slice_impl(ctx: *CallCtx) Error!EvalResult {
     const arr = recv.Array;
     const prim = arr.prim;
     if (ctx.args.len < 2) return arityErr("sliceArray expects (receiver, range)");
-    if (ctx.args[1] != .Range) return typeErr("sliceArray expects an IntRange argument");
-    const start: usize = @intCast(@max(ctx.args[1].Range.start, 0));
-    const end_excl: usize = @intCast(@max(ctx.args[1].Range.end + 1, 0));
     const src = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(src);
-    const lo = @min(start, src.len);
-    const hi = @min(end_excl, src.len);
-    const slice: []const Value = if (lo <= hi) src[lo..hi] else &.{};
-    return ok(try makeArray(a, slice, prim));
+    if (ctx.args[1] == .Range) {
+        const start: usize = @intCast(@max(ctx.args[1].Range.start, 0));
+        const end_excl: usize = @intCast(@max(ctx.args[1].Range.end + 1, 0));
+        const lo = @min(start, src.len);
+        const hi = @min(end_excl, src.len);
+        const slice: []const Value = if (lo <= hi) src[lo..hi] else &.{};
+        return ok(try makeArray(a, slice, prim));
+    }
+    // `sliceArray(indices: Collection<Int>)`: gather `this[indices[k]]`.
+    const idxs = switch (try iterableItemsCtx(ctx, ctx.args[1], "sliceArray")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(idxs);
+    const sel = try a.alloc(Value, idxs.len);
+    defer if (runtime.freeScratch()) a.free(sel);
+    for (idxs, 0..) |iv, k| {
+        const i: i64 = switch (iv) {
+            .Int => |x| x,
+            .Long => |x| x,
+            else => return typeErr("sliceArray index must be Int"),
+        };
+        if (i < 0 or i >= src.len) return indexOob(a, "sliceArray: index out of bounds");
+        var e = src[@intCast(i)];
+        if (runtime.reclaimEnabled()) e.retain();
+        sel[k] = e;
+    }
+    return ok(try makeArray(a, sel, prim));
 }
 
 pub fn array_content_equals(ctx: *CallCtx) Error!EvalResult {
