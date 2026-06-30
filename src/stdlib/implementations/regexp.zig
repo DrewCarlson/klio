@@ -90,6 +90,19 @@ fn makeSequence(allocator: std.mem.Allocator, items: []const Value) !Value {
 fn stringBytes(v: Value) ?[]const u8 {
     return switch (v) {
         .String => |s| s.asPtr().bytes,
+        .StringBuilder => |sb| sb.asPtr().items,
+        else => null,
+    };
+}
+
+/// A `StringRef` over a regex input argument — a CharSequence, so both a
+/// `String` (shared) and a `StringBuilder` (its current bytes, copied) are
+/// accepted. `MatchResult` substrings reference this ref, so a StringBuilder
+/// input is snapshotted. Null when the value is not string-like.
+fn inputRef(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error!?StringRef {
+    return switch (v) {
+        .String => |s| s.clone(),
+        .StringBuilder => |sb| try runtime.strInitOwned(allocator, try allocator.dupe(u8, sb.asPtr().items)),
         else => null,
     };
 }
@@ -773,6 +786,18 @@ const TopCont = struct {
     }
 };
 
+/// Top-level continuation that only succeeds once the whole input is consumed.
+/// `matchEntire` runs with this so a lazy quantifier (`a+b+?`) backtracks and
+/// extends to reach the end rather than stopping at its minimal match.
+const EndCont = struct {
+    base: Cont,
+
+    fn vt(self: *const Cont, m: *Matcher, at: usize) ?usize {
+        _ = self;
+        return if (at == m.input.len) at else null;
+    }
+};
+
 const ConcatCont = struct {
     base: Cont,
     parts: []const *Node,
@@ -854,6 +879,24 @@ fn runMatch(allocator: std.mem.Allocator, prog: *const Program, input: []const u
         // Advance one codepoint and retry (leftmost scan).
         const len = std.unicode.utf8ByteSequenceLength(input[pos]) catch 1;
         pos += if (pos + len <= input.len) len else 1;
+    }
+    allocator.free(caps);
+    return null;
+}
+
+/// Full-input match anchored at offset 0 that must consume the entire input
+/// (`matchEntire`). Unlike `runMatch` it does not scan forward and it requires
+/// the match to reach `input.len`, so a lazy quantifier backtracks to span the
+/// whole input.
+fn runMatchFull(allocator: std.mem.Allocator, prog: *const Program, input: []const u8) !?[]Capture {
+    var caps = try allocator.alloc(Capture, prog.group_count);
+    errdefer allocator.free(caps);
+    for (caps) |*c| c.* = .{};
+    var matcher = Matcher{ .input = input, .caps = caps, .flags = prog.flags };
+    const top = EndCont{ .base = .{ .vtable = EndCont.vt } };
+    if (matcher.match(prog.root, 0, &top.base)) |end| {
+        caps[0] = .{ .start = 0, .end = end };
+        return caps;
     }
     allocator.free(caps);
     return null;
@@ -1335,7 +1378,7 @@ pub fn regex_find(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.find requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     var start: usize = 0;
     if (ctx.args.len > 2) {
@@ -1370,7 +1413,7 @@ pub fn regex_find_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.findAll requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.findAll requires a Regex receiver");
 
@@ -1415,15 +1458,13 @@ pub fn regex_match_entire(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.matchEntire requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.matchEntire requires a Regex receiver");
-    if (try runMatch(ctx.allocator, prog, s, 0)) |caps| {
+    if (try runMatchFull(ctx.allocator, prog, s)) |caps| {
         defer ctx.allocator.free(caps);
-        if (caps[0].start == 0 and caps[0].end == s.len) {
-            const md = try buildMatch(ctx.allocator, r, sr, caps);
-            return ok(try matchValue(ctx.allocator, md));
-        }
+        const md = try buildMatch(ctx.allocator, r, sr, caps);
+        return ok(try matchValue(ctx.allocator, md));
     }
     return ok(.Null);
 }
@@ -1436,7 +1477,7 @@ pub fn regex_match_at(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.matchAt requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     const idx = if (ctx.args.len > 2) ctx.args[2].asI64() else null;
     if (idx == null) return typeErr("Regex.matchAt requires Int index");
@@ -1633,7 +1674,7 @@ pub fn regex_replace(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.replace requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const repl = if (ctx.args.len > 2) ctx.args[2] else null;
     return performRegexReplace(ctx, r, sr, repl, .{ .first_only = false, .who = "Regex.replace" });
 }
@@ -1646,7 +1687,7 @@ pub fn regex_replace_first(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.replaceFirst requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const repl = if (ctx.args.len > 2) ctx.args[2] else null;
     return performRegexReplace(ctx, r, sr, repl, .{ .first_only = true, .who = "Regex.replaceFirst" });
 }
@@ -1659,7 +1700,7 @@ pub fn regex_split(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.split requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     var limit: i64 = 0;
     if (ctx.args.len > 2) {
@@ -1683,7 +1724,7 @@ pub fn regex_split_to_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.splitToSequence requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     var limit: i64 = 0;
     if (ctx.args.len > 2) {
