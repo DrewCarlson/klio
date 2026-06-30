@@ -487,15 +487,16 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
             } else if (b.module.funcId(pr.name.name) != null or b.module.classId(pr.name.name) != null) {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
-            } else if (isAliasName(pr.name.name) and
-                !b.module.registry.class_member_names.contains(pr.name.name))
-            {
+            } else if (isAliasName(pr.name.name) and !enclosingDeclaresMember(b, pr.name.name)) {
                 // `::minOf` / `::maxOf` / `::listOf` … name a stdlib host
-                // intrinsic that no class declares as a member. A bare
-                // `LoadGlobal` resolves it to its `.Intrinsic` callable
-                // value; binding it to the enclosing `this` (the
-                // `!is_tracked` branch below) would instead emit a
-                // `this.<name>` member ref that misses at runtime.
+                // intrinsic. A bare `LoadGlobal` resolves it to its
+                // `.Intrinsic` callable value; binding it to the enclosing
+                // `this` (the `!is_tracked` branch below) would emit a
+                // `this.<name>` member ref that misses at runtime. The member
+                // test is scoped to the ENCLOSING class's hierarchy — a
+                // program-wide member-name set is poisoned by an unrelated
+                // sibling class that happens to declare a `minOf`/`maxOf`
+                // `@Test`, which `::minOf` here can never refer to.
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             } else if (!is_tracked) {
                 if (try resolveThisReg(b)) |this_reg| {
@@ -4557,6 +4558,17 @@ fn fallbackByDeclArity(b: *FuncBuilder, cands: []const FuncId, name0: []const u8
     }
     if (fallback != null) rung.* = .decl_arity_order;
     return fallback;
+}
+
+/// Whether the enclosing class (or any of its supertypes) declares a member
+/// named `name`. Scoped to the current `owner_class` — a bare `::name` /
+/// `this.name` can only resolve to the enclosing class's members or a global,
+/// never an unrelated class's member, so a program-wide member-name set would
+/// over-suppress the global-alias path.
+fn enclosingDeclaresMember(b: *const FuncBuilder, name: []const u8) bool {
+    const oc = b.ownerClass() orelse return false;
+    const methods = b.module.registry.hierarchy_methods.get(oc) orelse return false;
+    return methods.contains(name);
 }
 
 fn isAliasName(name: []const u8) bool {
