@@ -176,13 +176,26 @@ pub fn pushCharUnit(allocator: std.mem.Allocator, out: *std.ArrayList(u8), prev:
             try appendScalar(allocator, out, c);
             return null;
         }
-        try appendScalar(allocator, out, 0xFFFD); // unpaired high surrogate
+        // Unpaired high surrogate: keep it as its WTF-8 form (a lone surrogate
+        // is a valid Kotlin Char that must round-trip), not U+FFFD.
+        try appendSurrogateUnit(allocator, out, hi);
     }
     if (unit >= 0xD800 and unit <= 0xDBFF) {
         return unit; // hold as pending high surrogate
     }
+    if (unit >= 0xDC00 and unit <= 0xDFFF) {
+        try appendSurrogateUnit(allocator, out, unit); // lone low surrogate -> WTF-8
+        return null;
+    }
     try appendScalar(allocator, out, @as(u32, unit));
     return null;
+}
+
+/// Append a lone UTF-16 surrogate as its 3-byte WTF-8 form.
+fn appendSurrogateUnit(allocator: std.mem.Allocator, out: *std.ArrayList(u8), unit: u16) !void {
+    try out.append(allocator, 0xE0 | @as(u8, @intCast(unit >> 12)));
+    try out.append(allocator, 0x80 | @as(u8, @intCast((unit >> 6) & 0x3F)));
+    try out.append(allocator, 0x80 | @as(u8, @intCast(unit & 0x3F)));
 }
 
 fn appendScalar(allocator: std.mem.Allocator, out: *std.ArrayList(u8), c: u32) !void {
@@ -206,8 +219,8 @@ pub fn charUnitsToString(allocator: std.mem.Allocator, units: []const u16) ![]u8
     for (units) |u| {
         pending = try pushCharUnit(allocator, &out, pending, u);
     }
-    if (pending != null) {
-        try appendScalar(allocator, &out, 0xFFFD);
+    if (pending) |hi| {
+        try appendSurrogateUnit(allocator, &out, hi);
     }
     return out.toOwnedSlice(allocator);
 }
