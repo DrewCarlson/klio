@@ -599,6 +599,12 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 4 and isCharSeqOrArray(ctx.args[1]) and
         ctx.args[2].asI64() != null and ctx.args[3].asI64() != null)
     {
+        // `append(str: CharArray, offset, len)` is a deprecated stub that always
+        // throws (KT-15220); the real CharArray subrange is `appendRange`. Only
+        // the `CharSequence` subrange overload appends `value[start, end)`.
+        if (ctx.args[1] == .Array) {
+            return thrown(ctx.allocator, "kotlin.NotImplementedError", "An operation is not implemented.");
+        }
         return string_builder_append_range(ctx);
     }
     const a = ctx.allocator;
