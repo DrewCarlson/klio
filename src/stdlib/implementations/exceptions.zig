@@ -35,6 +35,9 @@ pub fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]
         .fqn = try runtime.strInit(allocator, fqn),
         .message = if (message) |m| try runtime.strInit(allocator, m) else null,
         .cause = null,
+        // A shared suppressed list so `addSuppressed` (e.g. from `use`'s
+        // close-while-failing path) records onto this throwable.
+        .suppressed = (try ValueList.init(allocator, .empty)).cell,
     } };
 }
 

@@ -1695,7 +1695,10 @@ fn runFrameInner(
     var cur = cur_in;
     var resume_idx = resume_idx_in;
     var resume_throw = resume_throw_in;
-    var pending_rethrow: ?struct { key: BlockId, exc: Value } = null;
+    // `depth` is the try-stack height to restore before re-raising: the
+    // finally body may push (and not pop) its own try-frames, which must not
+    // intercept the re-raised exception.
+    var pending_rethrow: ?struct { key: BlockId, exc: Value, depth: usize } = null;
     var pending_return: ?struct { key: BlockId, val: Value } = null;
     const func: *const Func = frame.func;
     // Lazy IR: materialise a deferred function's blocks before the dispatch
@@ -1891,7 +1894,7 @@ fn runFrameInner(
                     break;
                 } else if (tf.finally_entry) |fin| {
                     const key = tf.finally_done orelse fin;
-                    pending_rethrow = .{ .key = key, .exc = exc };
+                    pending_rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                     cur = fin;
                     routed = true;
                     break;
@@ -1953,6 +1956,9 @@ fn runFrameInner(
             if (std.meta.eql(pr.key, cur) and term == .Goto) {
                 const exc = pr.exc;
                 pending_rethrow = null;
+                // Drop any try-frames the finally body pushed (and did not pop)
+                // so they cannot intercept the re-raised exception.
+                if (try_stack.items.len > pr.depth) try_stack.shrinkRetainingCapacity(pr.depth);
                 var routed = false;
                 while (try_stack.pop()) |tf| {
                     if (findCatch(H, host, &exc, tf.catches)) |h| {
@@ -1962,7 +1968,7 @@ fn runFrameInner(
                         break;
                     } else if (tf.finally_entry) |fin2| {
                         const key = tf.finally_done orelse fin2;
-                        pending_rethrow = .{ .key = key, .exc = exc };
+                        pending_rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin2;
                         routed = true;
                         break;
@@ -2052,7 +2058,7 @@ fn runFrameInner(
                         break;
                     } else if (tf.finally_entry) |fin| {
                         const key = tf.finally_done orelse fin;
-                        pending_rethrow = .{ .key = key, .exc = exc };
+                        pending_rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin;
                         routed = true;
                         break;
