@@ -188,6 +188,21 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         }
         try b.bind(p.name.name, home);
     } else {
+        // `val x = y` where `y` is a reassignable var reads `y`'s home register
+        // directly; a later write to `y` (`y = …`) Moves into that home and
+        // would alias into `x`. Snapshot the value into a fresh register so the
+        // val is an independent binding (Kotlin: a val captures the value, not
+        // the variable).
+        if (p.init) |*ie| {
+            if (ie.* == .Path and ie.Path.segments.len == 1 and
+                b.mutableHome(ie.Path.segments[0].name) != null)
+            {
+                const fresh = b.allocReg();
+                try b.push(.{ .Move = .{ .dst = fresh, .src = init } });
+                try b.bind(p.name.name, fresh);
+                return null;
+            }
+        }
         try b.bind(p.name.name, init);
     }
     return null;
