@@ -460,6 +460,15 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = pr.name.name });
             const is_tracked = b.resolve(pr.name.name) != null or isTopLevelProp(pr.name.name);
+            // A same-named enclosing member only shadows the global for `::name`
+            // when it could actually be the referenced callable: if the use
+            // site expects a specific arity (a function-typed parameter slot)
+            // and the member cannot accept it, the global wins — e.g.
+            // `propagateOf2(::minOf, …)` from a `@Test fun minOf()` references
+            // the stdlib `minOf`, not the zero-arg test method.
+            const ref_arity = b.pending_lambda_arity;
+            const member_shadows_ref = enclosingDeclaresMember(b, pr.name.name) and
+                (ref_arity < 0 or b.ownMemberApplicable(pr.name.name, @intCast(ref_arity)));
             const class_pick: ?ir.ClassId = b.module.classIdIndexed(pr.name.name, b.self_package, pr.name.span.file);
             const ref_pick: ?FuncId = if (class_pick != null)
                 null
@@ -487,7 +496,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
             } else if (b.module.funcId(pr.name.name) != null or b.module.classId(pr.name.name) != null) {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
-            } else if (isAliasName(pr.name.name) and !enclosingDeclaresMember(b, pr.name.name)) {
+            } else if (isAliasName(pr.name.name) and !member_shadows_ref) {
                 // `::minOf` / `::maxOf` / `::listOf` … name a stdlib host
                 // intrinsic. A bare `LoadGlobal` resolves it to its
                 // `.Intrinsic` callable value; binding it to the enclosing
@@ -5091,14 +5100,19 @@ fn lowerImplicitThisCall(
     // marks the lambda's matching params broad, so `it + x` over a runtime
     // `Set` yields a `List` (the declared, not runtime, receiver type).
     const itc_broad: ?[]u32 = blk: {
-        // Only a trailing lambda can be marked broad; member methods are not
-        // in any simple-name / fqn index at this lowering point, so scan the
-        // lowered funcs for the member-style overload (implicit leading `this`,
-        // matching user arity) and take the first whose function-typed
-        // parameter declares a broad collection.
+        // Only a trailing lambda can be marked broad. Member methods are not in
+        // any simple-name / fqn index at this lowering point, so scan the
+        // lowered funcs for member-style overloads (implicit leading `this`,
+        // matching user arity) of this name. The runtime dispatch target is not
+        // statically known, so mark broad ONLY when every same-named candidate
+        // agrees on the mask — otherwise (e.g. one class's `testPlus` takes an
+        // `Iterable` while another's takes a `Set`) the choice is ambiguous and
+        // guessing would mis-coerce an unrelated call. Soundness over coverage.
         if (args.len == 0) break :blk null;
         const last = args[args.len - 1];
         if (last != .Lambda and last != .AnonFun) break :blk null;
+        var chosen: ?[]u32 = null;
+        var ambiguous = false;
         var ii: usize = 0;
         const tot = b.module.funcCount();
         while (ii < tot) : (ii += 1) {
@@ -5107,12 +5121,20 @@ fn lowerImplicitThisCall(
             if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
             if (userParams(f) != args.len) continue;
             const m = (try argLambdaBroadMasks(b, f, args, ast_arg_names, 1)) orelse continue;
-            var any = false;
-            for (m) |bit| {
-                if (bit != 0) any = true;
+            if (chosen) |c| {
+                if (!std.mem.eql(u32, c, m)) ambiguous = true;
+                b.allocator.free(m);
+            } else {
+                chosen = m;
             }
-            if (any) break :blk m;
-            b.allocator.free(m);
+        }
+        if (chosen) |c| {
+            if (!ambiguous) {
+                for (c) |bit| {
+                    if (bit != 0) break :blk c;
+                }
+            }
+            b.allocator.free(c);
         }
         break :blk null;
     };
@@ -5133,7 +5155,11 @@ fn lowerImplicitThisCall(
         // the previous hand-rolled loop had, dropping local-variable args).
         const args_start = b.allocReg();
         b.pending_arg_broad_masks = itc_broad;
-        const run = try lowerArgRun(b, args);
+        const priv_arity: ?[]const i16 = if (b.module.funcById(fid)) |pf|
+            (try argFnArities(b, pf, args, ast_arg_names, if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0))
+        else
+            null;
+        const run = try lowerArgRunWithArity(b, args, priv_arity);
         try b.push(.{ .Move = .{ .dst = args_start, .src = this_reg } });
         var user_arg_names = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
         defer b.allocator.free(user_arg_names);
