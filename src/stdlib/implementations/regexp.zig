@@ -163,6 +163,8 @@ const Node = union(enum) {
     word_boundary: bool,
     /// A capture group: index into the capture array.
     group: struct { index: usize, child: *Node },
+    /// `\N` backreference: match the text the group at `index` captured.
+    backref: usize,
     /// A non-capturing group `(?:...)`.
     noncap: *Node,
     concat: []*Node,
@@ -466,6 +468,12 @@ const Parser = struct {
                 }
                 return self.node(.{ .literal = val });
             },
+            // `\1`..`\9`: a backreference to a capture group. A single digit
+            // index (Kotlin's `captureLargestValidIndex` behavior: a trailing
+            // `\12` backs off to group 1 then a literal `2`).
+            '1', '2', '3', '4', '5', '6', '7', '8', '9' => {
+                return self.node(.{ .backref = @intCast(e - '0') });
+            },
             else => return self.node(.{ .literal = escapeChar(e) }),
         }
     }
@@ -703,6 +711,23 @@ const Matcher = struct {
                 return k.run(self, at);
             },
             .noncap => |child| return self.match(child, at, k),
+            .backref => |idx| {
+                // Match the text the referenced group captured. An unset group
+                // (it did not participate) matches the empty string.
+                if (idx >= self.caps.len) return k.run(self, at);
+                const cs = self.caps[idx].start orelse return k.run(self, at);
+                const ce = self.caps[idx].end orelse return k.run(self, at);
+                var ci = cs;
+                var p = at;
+                while (ci < ce) {
+                    const cd = self.decode(ci) orelse break;
+                    const id = self.decode(p) orelse return null;
+                    if (!cpEq(cd.cp, id.cp, self.flags.case_insensitive)) return null;
+                    ci += cd.len;
+                    p += id.len;
+                }
+                return k.run(self, p);
+            },
             .group => |g| {
                 const saved = self.caps[g.index];
                 self.caps[g.index].start = at;
