@@ -2229,6 +2229,12 @@ fn cloneArrayItems(allocator: Allocator, arr: runtime.ArrayData) Allocator.Error
 }
 
 /// Prepend `receiver` to `args`, returning a freshly-allocated slice.
+fn isArrayContentFn(name: []const u8) bool {
+    const fns = [_][]const u8{ "contentToString", "contentHashCode", "contentDeepToString", "contentDeepHashCode", "contentEquals", "contentDeepEquals" };
+    for (fns) |f| if (std.mem.eql(u8, name, f)) return true;
+    return false;
+}
+
 fn prependReceiver(allocator: Allocator, receiver: *const Value, args: []const Value) Allocator.Error![]Value {
     var all = try allocator.alloc(Value, args.len + 1);
     all[0] = receiver.*;
@@ -2605,6 +2611,19 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
     if (receiver.* == .Null and std.mem.eql(u8, name, "hashCode") and args.len == 0) {
         return .{ .ok = .{ .Int = 0 } };
+    }
+    // Null-receiver array `content*` extensions: `(null as IntArray?).contentToString()`
+    // and friends declare a nullable array receiver, so a null receiver is valid
+    // (`"null"`, `0`, or null-equality). The intrinsics are registered under
+    // `kotlin.Array.*` and already branch on a `.Null` receiver, but a null's type
+    // is `kotlin.Nothing`, so the type-probe never reaches them and the bodyless
+    // `expect` actual would otherwise evaluate to Unit.
+    if (receiver.* == .Null and isArrayContentFn(name)) {
+        var key_buf: [64]u8 = undefined;
+        const fqn = std.fmt.bufPrint(&key_buf, "kotlin.Array.{s}", .{name}) catch unreachable;
+        if (lookupIntrinsic(self, fqn)) |func| {
+            return dispatchWithReceiver(self, allocator, fqn, func, receiver, args);
+        }
     }
 
     // `equals` on a builtin scalar/String.
