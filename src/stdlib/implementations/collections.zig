@@ -975,12 +975,25 @@ fn iterMaxMinOfOrNull(ctx: *CallCtx, want_max: bool, what: []const u8) Error!Eva
             .err => |e| return e,
         };
         if (best) |b| {
-            const o = switch (try compareValues(a, r, b)) {
-                .order => |o| o,
-                .err => |e| return e,
-            };
-            const take = if (want_max) o == .gt else o == .lt;
-            if (take) best = r;
+            // A Double/Float selector uses Math.min/Math.max semantics (NaN
+            // propagates, -0.0 < 0.0), NOT the generic Comparable total order.
+            if (r == .Double and b == .Double) {
+                const m = if (want_max) kotlinFloatMax(r.Double, b.Double) else kotlinFloatMin(r.Double, b.Double);
+                best = .{ .Double = m };
+            } else if (r == .Float and b == .Float) {
+                const m = if (want_max)
+                    kotlinFloatMax(@floatCast(r.Float), @floatCast(b.Float))
+                else
+                    kotlinFloatMin(@floatCast(r.Float), @floatCast(b.Float));
+                best = .{ .Float = @floatCast(m) };
+            } else {
+                const o = switch (try compareValues(a, r, b)) {
+                    .order => |o| o,
+                    .err => |e| return e,
+                };
+                const take = if (want_max) o == .gt else o == .lt;
+                if (take) best = r;
+            }
         } else {
             best = r;
         }
@@ -5799,11 +5812,30 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
                 .err => |e| return e,
             }).items;
         },
-        // A user class implementing `kotlin.collections.Map`: drain its entries
-        // through host member dispatch.
-        .Instance => to_add = switch (try userMapPairs(ctx, arg, "putAll")) {
-            .entries => |x| x,
-            .err => |e| return e,
+        // An Instance is either a user `Map` (drain its `entries`) or an
+        // `Iterable<Pair>` (e.g. an `asIterable()` view — drain it and read each
+        // Pair). `MutableMap.putAll(pairs: Iterable<Pair>)` reaches here with the
+        // latter, which has no `entries` property.
+        .Instance => {
+            const is_map = blk: {
+                const er = (try ctx.host.getProperty(&arg, "entries", ctx.out)) orelse break :blk false;
+                break :blk er == .ok;
+            };
+            if (is_map) {
+                to_add = switch (try userMapPairs(ctx, arg, "putAll")) {
+                    .entries => |x| x,
+                    .err => |e| return e,
+                };
+            } else {
+                const its = switch (try iterableItemsCtx(ctx, arg, "putAll")) {
+                    .items => |x| x,
+                    .err => |e| return e,
+                };
+                to_add = (switch (try pairsFromValues(ctx.allocator, its, "putAll")) {
+                    .entries => |x| x,
+                    .err => |e| return e,
+                }).items;
+            }
         },
         else => return typeErr("putAll requires a Map or a collection of Pairs"),
     }
