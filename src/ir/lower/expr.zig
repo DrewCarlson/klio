@@ -459,6 +459,16 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // forms) keep the name-keyed emission.
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = pr.name.name });
+            // `::localFn` names a local function, which is lowered to a closure
+            // value bound to a register. The reference loads that closure — it
+            // is the referenced callable, not an unbound property of whatever
+            // the use site later applies it to.
+            if (b.isLocalFn(pr.name.name)) {
+                if (b.resolve(pr.name.name)) |reg| {
+                    try b.push(.{ .Move = .{ .dst = dst, .src = reg } });
+                    return dst;
+                }
+            }
             const is_tracked = b.resolve(pr.name.name) != null or isTopLevelProp(pr.name.name);
             // A same-named enclosing member only shadows the global for `::name`
             // when it could actually be the referenced callable: if the use
