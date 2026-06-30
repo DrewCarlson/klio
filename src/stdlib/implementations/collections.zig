@@ -6457,6 +6457,27 @@ pub fn array_fill(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 
+/// `UIntArray.asIntArray()` (and the U{Byte,Short,Long} siblings): a signed
+/// VIEW sharing the unsigned array's packed buffer, so mutations through either
+/// alias — the mirror of `IntArray.asUIntArray()` (the unsigned ctor). klio
+/// otherwise falls to the stdlib body, which copies.
+pub fn array_as_signed_view(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("asArray requires an array receiver");
+    const arr = ctx.args[0].Array;
+    const src = arr.prim orelse return typeErr("asArray requires a primitive array");
+    const dst: PrimitiveArrayKind = switch (src) {
+        .UByte => .Byte,
+        .UShort => .Short,
+        .UInt => .Int,
+        .ULong => .Long,
+        else => return typeErr("asArray: receiver is not an unsigned array"),
+    };
+    switch (arr.storage) {
+        .scalars => |pb| return ok(.{ .Array = .{ .storage = .{ .scalars = pb.clone() }, .prim = dst } }),
+        .boxed => return typeErr("asArray: unsigned array is not packed"),
+    }
+}
+
 /// In-place `reverse()` / `reverse(fromIndex, toIndex)` for an array. The
 /// unsigned `reverse()` stdlib body delegates to `storage.reverse()`, which
 /// does not reach the array's elements here, so the unsigned arrays bind this.
