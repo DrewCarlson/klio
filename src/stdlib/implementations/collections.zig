@@ -2233,6 +2233,14 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
             const arg = ctx.args[0];
             switch (arg) {
                 .Int => {
+                    // A negative initial capacity is a catchable
+                    // IllegalArgumentException (matching java.util.ArrayList).
+                    if (arg.Int < 0) {
+                        const msg = try fmt(a, "Illegal Capacity: {d}", .{arg.Int});
+                        const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
+                        if (runtime.freeScratch()) a.free(msg);
+                        return r;
+                    }
                     var list: std.ArrayList(Value) = .empty;
                     if (arg.Int > 0) try list.ensureTotalCapacityPrecise(a, @intCast(arg.Int));
                     return ok(try makeListFromArrayList(a, list, true));
@@ -2301,7 +2309,17 @@ pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
         1 => {
             const arg = ctx.args[0];
             switch (arg) {
-                .Int => return ok(try makeSet(a, &.{}, true)),
+                .Int => {
+                    // HashSet delegates to a backing HashMap, so a negative
+                    // initial capacity is a catchable IllegalArgumentException.
+                    if (arg.Int < 0) {
+                        const msg = try fmt(a, "Illegal initial capacity: {d}", .{arg.Int});
+                        const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
+                        if (runtime.freeScratch()) a.free(msg);
+                        return r;
+                    }
+                    return ok(try makeSet(a, &.{}, true));
+                },
                 .List => |l| return ok(try makeSetVL(a, l.items, true)),
                 .Set => |s| return ok(try makeSetVL(a, s.items, true)),
                 .Instance => {
@@ -2314,7 +2332,34 @@ pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
                 else => return typeErr("HashSet expects no args, an Int capacity, or a Collection"),
             }
         },
-        else => return arityErr("HashSet expects 0 or 1 args"),
+        else => {
+            // `HashSet(initialCapacity, loadFactor)` validates both like the
+            // backing HashMap: a negative capacity or a non-positive / NaN load
+            // factor is a catchable IllegalArgumentException.
+            if (ctx.args.len == 2 and ctx.args[0] == .Int) {
+                if (ctx.args[0].Int < 0) {
+                    const msg = try fmt(a, "Illegal initial capacity: {d}", .{ctx.args[0].Int});
+                    const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
+                    if (runtime.freeScratch()) a.free(msg);
+                    return r;
+                }
+                const lf: ?f64 = switch (ctx.args[1]) {
+                    .Float => |x| x,
+                    .Double => |x| x,
+                    else => null,
+                };
+                if (lf) |v| {
+                    if (!(v > 0)) {
+                        const msg = try fmt(a, "Illegal load factor: {d}", .{v});
+                        const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
+                        if (runtime.freeScratch()) a.free(msg);
+                        return r;
+                    }
+                }
+                return ok(try makeSet(a, &.{}, true));
+            }
+            return arityErr("HashSet expects 0, 1, or 2 args");
+        },
     }
 }
 
