@@ -1669,6 +1669,11 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // re-arms it for the body's own nested calls).
     var expected_arity = b.pending_lambda_arity;
     b.pending_lambda_arity = -1;
+    // Broad-collection mask for this lambda's params (set by the call lowering
+    // from the callee parameter's function type). Consumed before the body
+    // recurses so a nested lambda does not inherit it.
+    const lambda_broad_mask = b.pending_lambda_broad_mask;
+    b.pending_lambda_broad_mask = 0;
     // A lambda assigned to a typed binding (`val h: Ctx.() -> Unit = { … }`)
     // never reaches the call-argument arity path; derive the arity from the
     // binding's functional type so a `T.() -> R` receiver lambda (zero value
@@ -1709,10 +1714,13 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 ft.?.params[i]
             else
                 null;
-            if (ty) |t| {
-                if (t.function == null and helpers.isBroadCollectionTypeName(t.name.name)) {
-                    try broad_names.append(b.allocator, p.name);
-                }
+            const by_ty = ty != null and ty.?.function == null and helpers.isBroadCollectionTypeName(ty.?.name.name);
+            // Also honor the callee-parameter mask: a call-argument lambda has
+            // no expected functional type on the stack, so its `it`'s declared
+            // `Iterable` type lives only in the callee's parameter signature.
+            const by_mask = i < 32 and (lambda_broad_mask >> @intCast(i)) & 1 != 0;
+            if (by_ty or by_mask) {
+                try broad_names.append(b.allocator, p.name);
             }
         }
     }
@@ -1959,6 +1967,64 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
     } else if (args.len == params.len) {
         for (params, out) |p, *o| o.* = fnTypeArityAlias(b, p.ty) orelse -1;
     } else {
+        return null;
+    }
+    return out;
+}
+
+/// A bitmask of which of a `FunctionN`-typed parameter's `arity` value
+/// parameters are declared as a broad collection (`Iterable`/`Collection`).
+/// Used so a lambda bound to that parameter marks those of its own params
+/// broad — then `it + x` over a runtime `Set` produces a `List`, matching the
+/// declared (not runtime) receiver type. Only direct `Function{N}` types are
+/// decoded (a typealias gives arity but not parameter types → mask 0).
+fn fnTypeBroadMask(ty: ir.TypeRef, arity: i16) u32 {
+    if (arity <= 0) return 0;
+    const n: usize = @intCast(arity);
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return 0;
+    // The lowered encoding is `[#suspend?] [receiver?] params… ret [#markers]`.
+    var hi: usize = ty.args.len;
+    while (hi > 0 and ty.args[hi - 1].name.len != 0 and ty.args[hi - 1].name[0] == '#') hi -= 1;
+    var lo: usize = 0;
+    if (lo < hi and std.mem.eql(u8, ty.args[lo].name, "#suspend")) lo += 1;
+    const remaining = hi - lo; // [receiver?] params(n) ret(1)
+    var pstart = lo;
+    if (remaining == n + 2) {
+        pstart = lo + 1; // an explicit receiver precedes the value params
+    } else if (remaining != n + 1) {
+        return 0; // cannot align
+    }
+    var mask: u32 = 0;
+    var i: usize = 0;
+    while (i < n and i < 32 and pstart + i < hi) : (i += 1) {
+        if (helpers.isBroadCollectionTypeName(ty.args[pstart + i].name)) {
+            mask |= (@as(u32, 1) << @intCast(i));
+        }
+    }
+    return mask;
+}
+
+/// Per-argument broad-collection lambda-parameter masks for a call dispatched
+/// to `func`, parallel to `args` and aligned exactly like `argFnArities`.
+fn argLambdaBroadMasks(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]u32 {
+    if (args.len == 0) return null;
+    for (arg_names) |an| if (an != null) return null;
+    for (args) |*a| if (a.* == .Spread) return null;
+    if (func.params.len < recv_offset) return null;
+    const params = func.params[recv_offset..];
+    const out = try b.allocator.alloc(u32, args.len);
+    for (out) |*o| o.* = 0;
+    const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
+    if (trailing_lambda and args.len <= params.len) {
+        var i: usize = 0;
+        while (i + 1 < args.len) : (i += 1) {
+            out[i] = fnTypeBroadMask(params[i].ty, fnTypeArityAlias(b, params[i].ty) orelse -1);
+        }
+        out[args.len - 1] = fnTypeBroadMask(params[params.len - 1].ty, fnTypeArityAlias(b, params[params.len - 1].ty) orelse -1);
+    } else if (args.len == params.len) {
+        for (params, out) |p, *o| o.* = fnTypeBroadMask(p.ty, fnTypeArityAlias(b, p.ty) orelse -1);
+    } else {
+        b.allocator.free(out);
         return null;
     }
     return out;
@@ -4717,6 +4783,13 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
             b.module.registry.class_member_names.contains(name0))
         {
             const this_idx = try b.recordCapture("this");
+            const broad_masks: ?[]u32 = blk: {
+                const f = b.module.funcById(func_id) orelse break :blk null;
+                const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+                break :blk try argLambdaBroadMasks(b, f, args, ast_arg_names, recv_off);
+            };
+            defer if (broad_masks) |m| b.allocator.free(m);
+            b.pending_arg_broad_masks = broad_masks;
             const run = try lowerArgRun(b, args);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -4759,6 +4832,13 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         break :blk names;
     };
     defer if (param_ty_names) |pt| b.allocator.free(pt);
+    const broad_masks: ?[]u32 = blk: {
+        const f = b.module.funcById(func_id) orelse break :blk null;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        break :blk try argLambdaBroadMasks(b, f, args, ast_arg_names, recv_off);
+    };
+    defer if (broad_masks) |m| b.allocator.free(m);
+    b.pending_arg_broad_masks = broad_masks;
     const run = try lowerArgRunFull(b, args, arg_arity, param_ty_names);
     // A trailing lambda always binds the target's last (function-typed)
     // parameter. When a vararg parameter precedes it, positional binding
@@ -5006,6 +5086,38 @@ fn lowerImplicitThisCall(
     if (!b.ownMemberApplicable(name0, args.len)) return null;
     const this_reg = b.resolve("this") orelse return null;
 
+    // Broad-collection mask: a trailing lambda bound to this member's
+    // function-typed parameter whose declared type is `Iterable`/`Collection`
+    // marks the lambda's matching params broad, so `it + x` over a runtime
+    // `Set` yields a `List` (the declared, not runtime, receiver type).
+    const itc_broad: ?[]u32 = blk: {
+        // Only a trailing lambda can be marked broad; member methods are not
+        // in any simple-name / fqn index at this lowering point, so scan the
+        // lowered funcs for the member-style overload (implicit leading `this`,
+        // matching user arity) and take the first whose function-typed
+        // parameter declares a broad collection.
+        if (args.len == 0) break :blk null;
+        const last = args[args.len - 1];
+        if (last != .Lambda and last != .AnonFun) break :blk null;
+        var ii: usize = 0;
+        const tot = b.module.funcCount();
+        while (ii < tot) : (ii += 1) {
+            const f = b.module.funcById(FuncId.from(@intCast(ii))) orelse continue;
+            if (!std.mem.eql(u8, f.name, name0)) continue;
+            if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            if (userParams(f) != args.len) continue;
+            const m = (try argLambdaBroadMasks(b, f, args, ast_arg_names, 1)) orelse continue;
+            var any = false;
+            for (m) |bit| {
+                if (bit != 0) any = true;
+            }
+            if (any) break :blk m;
+            b.allocator.free(m);
+        }
+        break :blk null;
+    };
+    defer if (itc_broad) |m| b.allocator.free(m);
+
     // Private own-class methods bind statically. The fid map records one
     // entry per name, so an overloaded private method (two `helper`s of
     // different arity) keeps only one of them. Take the static bind only
@@ -5020,6 +5132,7 @@ fn lowerImplicitThisCall(
         // scratch registers can never clobber an already-lowered slot (a bug
         // the previous hand-rolled loop had, dropping local-variable args).
         const args_start = b.allocReg();
+        b.pending_arg_broad_masks = itc_broad;
         const run = try lowerArgRun(b, args);
         try b.push(.{ .Move = .{ .dst = args_start, .src = this_reg } });
         var user_arg_names = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
@@ -5039,6 +5152,7 @@ fn lowerImplicitThisCall(
         } });
         return dst;
     };
+    b.pending_arg_broad_masks = itc_broad;
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();

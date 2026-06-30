@@ -262,6 +262,7 @@ pub fn lowerArgRunFull(
     for (slots, 0..) |slot, j| {
         b.pending_lambda_label = call_label;
         b.pending_lambda_arity = if (arg_arity) |aa| (if (j < aa.len) aa[j] else -1) else -1;
+        b.pending_lambda_broad_mask = if (b.pending_arg_broad_masks) |m| (if (j < m.len) m[j] else 0) else 0;
         const coerced: ?Reg = if (param_ty_names) |pts|
             (if (j < pts.len) (if (pts[j]) |tn| try coerceNumericLiteralArg(b, &args[j], tn) else null) else null)
         else
@@ -269,8 +270,10 @@ pub fn lowerArgRunFull(
         const r = coerced orelse try expr_mod.lowerExpr(b, &args[j]);
         b.pending_lambda_label = null;
         b.pending_lambda_arity = -1;
+        b.pending_lambda_broad_mask = 0;
         try b.push(.{ .Move = .{ .dst = slot, .src = r } });
     }
+    b.pending_arg_broad_masks = null;
     b.restoreExpected(prev_expected);
     return .{ first, @intCast(n) };
 }
@@ -306,11 +309,14 @@ pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]c
     for (slots, 0..) |slot, j| {
         b.pending_lambda_label = call_label;
         b.pending_lambda_arity = if (arg_arity) |aa| (if (j < aa.len) aa[j] else -1) else -1;
+        b.pending_lambda_broad_mask = if (b.pending_arg_broad_masks) |m| (if (j < m.len) m[j] else 0) else 0;
         const r = try expr_mod.lowerExpr(b, &args[j]);
         b.pending_lambda_label = null;
         b.pending_lambda_arity = -1;
+        b.pending_lambda_broad_mask = 0;
         try b.push(.{ .Move = .{ .dst = slot, .src = r } });
     }
+    b.pending_arg_broad_masks = null;
     b.restoreExpected(prev_expected);
     return .{ first, @intCast(n) };
 }

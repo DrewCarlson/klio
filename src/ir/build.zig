@@ -391,6 +391,15 @@ pub const FuncBuilder = struct {
     /// keeps the single-`it` binding.
     pending_lambda_arity: i16 = -1,
 
+    /// Per-argument bitmask: bit `i` set means the lambda value-parameter `i`
+    /// of the argument currently being lowered has a broad-collection declared
+    /// type (`Iterable`/`Collection`) coming from the *callee parameter's*
+    /// function type. `pending_lambda_broad_mask` is the mask for the lambda
+    /// being lowered right now; `pending_arg_broad_masks` is the per-argument
+    /// source the arg-run reads (parallel to the args), set by the call site.
+    pending_lambda_broad_mask: u32 = 0,
+    pending_arg_broad_masks: ?[]const u32 = null,
+
     pub fn init(allocator: Allocator, module: *Module) Allocator.Error!FuncBuilder {
         var self = FuncBuilder{
             .allocator = allocator,
