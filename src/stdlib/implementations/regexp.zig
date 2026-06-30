@@ -1804,7 +1804,10 @@ pub fn match_result_next(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                     const len = std.unicode.utf8ByteSequenceLength(input[start]) catch 1;
                     start = if (start + len <= input.len) start + len else input.len;
                 } else {
-                    start = input.len;
+                    // A zero-width match at the end of the input has no
+                    // successor — re-scanning from `input.len` would loop on
+                    // the same empty match.
+                    return ok(.Null);
                 }
             }
         }
