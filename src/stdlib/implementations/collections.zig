@@ -5989,12 +5989,16 @@ pub fn array_slice_impl(ctx: *CallCtx) Error!EvalResult {
     const src = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(src);
     if (ctx.args[1] == .Range) {
-        const start: usize = @intCast(@max(ctx.args[1].Range.start, 0));
-        const end_excl: usize = @intCast(@max(ctx.args[1].Range.end + 1, 0));
-        const lo = @min(start, src.len);
-        const hi = @min(end_excl, src.len);
-        const slice: []const Value = if (lo <= hi) src[lo..hi] else &.{};
-        return ok(try makeArray(a, slice, prim));
+        const rs = ctx.args[1].Range.start;
+        const re = ctx.args[1].Range.end;
+        const slen: i64 = @intCast(src.len);
+        // An empty range yields an empty array; otherwise the range must be in
+        // bounds (Kotlin's sliceArray throws for a negative/over-length range).
+        if (rs > re) return ok(try makeArray(a, &.{}, prim));
+        if (rs < 0 or re >= slen) {
+            return indexOob(a, try fmt(a, "sliceArray: range {d}..{d} out of bounds for length {d}", .{ rs, re, src.len }));
+        }
+        return ok(try makeArray(a, src[@intCast(rs)..@intCast(re + 1)], prim));
     }
     // `sliceArray(indices: Collection<Int>)`: gather `this[indices[k]]`.
     const idxs = switch (try iterableItemsCtx(ctx, ctx.args[1], "sliceArray")) {
