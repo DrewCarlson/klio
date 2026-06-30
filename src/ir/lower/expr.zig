@@ -3043,6 +3043,37 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // A `name<T>(…)` call whose name resolves to a value parameter/local that
+    // is not a local function names the SHADOWED global function/builder: a
+    // value takes no call-site type arguments. `iterator<List<T>> { … }` inside
+    // `windowedIterator(iterator: Iterator<T>, …)` binds the `iterator {}`
+    // builder, not the `iterator` parameter. Load the global so the runtime
+    // resolves the intrinsic builder rather than invoking the parameter.
+    if (callee.* == .Path and callee.Path.segments.len == 1 and ast_type_args.len != 0) {
+        const nm0 = callee.Path.segments[0].name;
+        if (b.resolve(nm0) != null and !b.isLocalFn(nm0) and
+            b.module.classIdIndexed(nm0, b.self_package, callee.Path.segments[0].span.file) == null)
+        {
+            const gv = b.allocReg();
+            const cn = try b.module.internConst(b.allocator, .{ .String = nm0 });
+            orEmitAudit(b, "typed_call_shadowed_global", "LoadGlobal", nm0);
+            try b.push(.{ .LoadGlobal = .{ .dst = gv, .name = cn } });
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+            const dst = b.allocReg();
+            try b.push(.{ .CallValue = .{
+                .dst = dst,
+                .callee = gv,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+                .type_args = type_args,
+            } });
+            return dst;
+        }
+    }
+
     // A single-name callee resolving to a local binding / parameter is a
     // value invocation.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
