@@ -1164,16 +1164,27 @@ fn expandKotlinReplacement(
                     }
                 }
             } else {
-                var num: std.ArrayList(u8) = .empty;
-                defer num.deinit(allocator);
-                while (i < chars.len and chars[i] >= '0' and chars[i] <= '9') {
-                    try num.append(allocator, @intCast(chars[i]));
-                    i += 1;
+                // Greedy `$N` with backoff to the largest existing group index
+                // (`$13` against 13 groups is group 1 then a literal `3`); the
+                // remaining digits fall through as literals. A bare `$` with no
+                // following digit emits a literal `$` (the replace entry point
+                // already rejected the genuinely-invalid forms).
+                var num: usize = 0;
+                var best: usize = 0;
+                var len: usize = 0;
+                while (i + len < chars.len and chars[i + len] >= '0' and chars[i + len] <= '9') {
+                    const nn = num * 10 + @as(usize, @intCast(chars[i + len] - '0'));
+                    len += 1;
+                    if (nn < prog.group_count) {
+                        num = nn;
+                        best = len;
+                    } else break;
                 }
-                if (std.fmt.parseInt(usize, num.items, 10)) |idx| {
-                    try out.appendSlice(allocator, groupText(groups, idx));
-                } else |_| {
+                if (best == 0) {
                     try out.append(allocator, '$');
+                } else {
+                    try out.appendSlice(allocator, groupText(groups, num));
+                    i += best;
                 }
             }
         } else {
@@ -1441,6 +1452,68 @@ const RegexReplace = struct {
 };
 
 /// Shared engine for `Regex.replace` / `Regex.replaceFirst`.
+/// Number of leading ASCII digits of `template[start..]` that form the largest
+/// group index `< group_count` (Kotlin's `$N` reference parses greedily but
+/// backs off so `$13` against 13 groups means group 1 then a literal `3`).
+/// Null when even the first digit indexes a non-existent group.
+fn bestGroupPrefix(template: []const u8, start: usize, group_count: usize) ?usize {
+    var num: usize = 0;
+    var best: usize = 0;
+    var len: usize = 0;
+    while (start + len < template.len and template[start + len] >= '0' and template[start + len] <= '9') {
+        const nn = num * 10 + @as(usize, template[start + len] - '0');
+        len += 1;
+        if (nn < group_count) {
+            num = nn;
+            best = len;
+        } else break;
+    }
+    return if (best == 0) null else best;
+}
+
+/// The exception FQN a Kotlin replacement string would raise, or null when it
+/// is valid. A `$` must introduce a group reference: `$N` (a digit index) or
+/// `${…}` (an index or a declared group name); `\` escapes the next character.
+/// A malformed `$` is IllegalArgumentException; a reference to a non-existent
+/// numeric group is IndexOutOfBoundsException.
+fn replacementError(template: []const u8, prog: *const Program) ?[]const u8 {
+    const IAE = "kotlin.IllegalArgumentException";
+    const IOOBE = "kotlin.IndexOutOfBoundsException";
+    var i: usize = 0;
+    while (i < template.len) {
+        const c = template[i];
+        if (c == '\\') {
+            i += 2;
+            continue;
+        }
+        if (c != '$') {
+            i += 1;
+            continue;
+        }
+        i += 1; // past '$'
+        if (i >= template.len) return IAE; // trailing '$'
+        if (template[i] == '{') {
+            i += 1;
+            const key_start = i;
+            while (i < template.len and template[i] != '}') i += 1;
+            if (i >= template.len) return IAE; // no closing '}'
+            const key = template[key_start..i];
+            i += 1; // past '}'
+            if (key.len == 0) return IAE;
+            if (std.fmt.parseInt(usize, key, 10)) |idx| {
+                if (idx >= prog.group_count) return IOOBE;
+            } else |_| {
+                if (groupIndexByName(prog, key) == null) return IAE;
+            }
+        } else if (template[i] >= '0' and template[i] <= '9') {
+            if (bestGroupPrefix(template, i, prog.group_count)) |n| {
+                i += n;
+            } else return IOOBE;
+        } else return IAE; // '$' followed by a non-reference character
+    }
+    return null;
+}
+
 fn performRegexReplace(
     ctx: *CallCtx,
     r: ObjRef(RegexData),
@@ -1458,6 +1531,11 @@ fn performRegexReplace(
 
     if (repl.? == .String) {
         const template = repl.?.String.asPtr().bytes;
+        if (replacementError(template, prog)) |fqn| {
+            const msg = try std.fmt.allocPrint(allocator, "Invalid replacement string: '{s}'", .{template});
+            defer allocator.free(msg);
+            return .{ .err = .{ .Thrown = try makeException(allocator, fqn, msg) } };
+        }
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
         var last: usize = 0;
