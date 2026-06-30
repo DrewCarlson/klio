@@ -287,10 +287,29 @@ pub fn string_to_byte_array(ctx: *CallCtx) Allocator.Error!EvalResult {
     const byte_start = charToByteOffset(s, @intCast(start));
     const byte_end = charToByteOffset(s, @intCast(end));
     const slice = s[byte_start..byte_end];
-    var items = try ctx.allocator.alloc(Value, slice.len);
-    defer ctx.allocator.free(items);
-    for (slice, 0..) |b, i| items[i] = .{ .Byte = @bitCast(b) };
-    return .{ .ok = try runtime.ArrayData.initPacked(ctx.allocator, .Byte, items) };
+    // A lone surrogate (stored as WTF-8) is not valid UTF-8: encodeToByteArray
+    // replaces it with U+FFFD by default, or throws CharacterCodingException
+    // when `throwOnInvalidSequence` is set. Any Bool argument is that flag.
+    var throw_on_invalid = false;
+    for (ctx.args[1..]) |arg| {
+        if (arg == .Bool) throw_on_invalid = arg.Bool;
+    }
+    var out: std.ArrayList(Value) = .empty;
+    defer out.deinit(ctx.allocator);
+    var i: usize = 0;
+    while (i < slice.len) {
+        if (isWtf8SurrogateAt(slice, i)) {
+            if (throw_on_invalid) {
+                return try thrown(ctx.allocator, "kotlin.text.CharacterCodingException", "Unmappable character");
+            }
+            for ([_]u8{ 0xEF, 0xBF, 0xBD }) |b| try out.append(ctx.allocator, .{ .Byte = @bitCast(b) });
+            i += 3;
+        } else {
+            try out.append(ctx.allocator, .{ .Byte = @bitCast(slice[i]) });
+            i += 1;
+        }
+    }
+    return .{ .ok = try runtime.ArrayData.initPacked(ctx.allocator, .Byte, out.items) };
 }
 
 /// Number of Kotlin char (UTF-16) units the UTF-8 string `s` decodes to: a
