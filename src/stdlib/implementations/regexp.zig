@@ -902,6 +902,13 @@ fn runMatchFull(allocator: std.mem.Allocator, prog: *const Program, input: []con
     return null;
 }
 
+/// Whether `r` matches anywhere in `s`. Backs `CharSequence.contains(Regex)`
+/// (`regex in string`), dispatched from `string_contains`.
+pub fn regexContainsIn(allocator: std.mem.Allocator, r: ObjRef(RegexData), s: []const u8) std.mem.Allocator.Error!bool {
+    const prog = progFromRegex(r) orelse return false;
+    return programIsMatch(allocator, prog, s);
+}
+
 /// `is_match` — does the pattern match anywhere?
 fn programIsMatch(allocator: std.mem.Allocator, prog: *const Program, input: []const u8) !bool {
     if (try runMatch(allocator, prog, input, 0)) |caps| {

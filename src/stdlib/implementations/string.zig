@@ -930,6 +930,10 @@ pub fn string_contains(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     if (ctx.args.len < 2) return errArity("contains requires an argument");
+    // `regex in string` → CharSequence.contains(Regex) → regex.containsMatchIn.
+    if (ctx.args[1] == .Regex) {
+        return .{ .ok = .{ .Bool = try regexp.regexContainsIn(ctx.allocator, ctx.args[1].Regex, s) } };
+    }
     const nr = try argAsString(ctx.allocator, ctx.args[1], "contains");
     const needle = switch (nr) {
         .ok => |v| v,
