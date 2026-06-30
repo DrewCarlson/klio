@@ -1490,6 +1490,52 @@ pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 
+/// Stable bottom-up merge sort driven by a Kotlin `Comparator` value: O(n log n)
+/// comparator callbacks. An insertion sort is O(n²) and times out on large lists.
+pub fn mergeSortComparator(ctx: *CallCtx, cmp: Value, items: []Value) Error!?EvalResult {
+    const a = ctx.allocator;
+    const n = items.len;
+    if (n < 2) return null;
+    const buf = try a.alloc(Value, n);
+    defer if (runtime.freeScratch()) a.free(buf);
+    var width: usize = 1;
+    while (width < n) : (width *= 2) {
+        var lo: usize = 0;
+        while (lo < n) : (lo += 2 * width) {
+            const mid = @min(lo + width, n);
+            const hi = @min(lo + 2 * width, n);
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (i < mid and j < hi) {
+                const c = switch (try invokeComparatorCompare(ctx, cmp, items[i], items[j])) {
+                    .n => |v| v,
+                    .err => |e| return e,
+                };
+                // Take the left run on a tie so the sort stays stable.
+                if (c <= 0) {
+                    buf[k] = items[i];
+                    i += 1;
+                } else {
+                    buf[k] = items[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            while (i < mid) : ({
+                i += 1;
+                k += 1;
+            }) buf[k] = items[i];
+            while (j < hi) : ({
+                j += 1;
+                k += 1;
+            }) buf[k] = items[j];
+        }
+        @memcpy(items[0..n], buf[0..n]);
+    }
+    return null;
+}
+
 pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
@@ -1502,21 +1548,7 @@ pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
     const cmp = ctx.args[1];
     const copy = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(copy);
-    // Insertion sort so the comparator callback can dispatch through host.
-    var i: usize = 1;
-    while (i < copy.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const n = switch (try invokeComparatorCompare(ctx, cmp, copy[j - 1], copy[j])) {
-                .n => |v| v,
-                .err => |e| return e,
-            };
-            if (n > 0) {
-                std.mem.swap(Value, &copy[j - 1], &copy[j]);
-                j -= 1;
-            } else break;
-        }
-    }
+    if (try mergeSortComparator(ctx, cmp, copy)) |e| return e;
     writeBackItems(it, a, copy) catch return error.OutOfMemory;
     return ok(Value.Unit);
 }
@@ -1554,68 +1586,27 @@ pub fn coll_mut_list_reverse(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_iter_sorted_with(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("sortedWith expects (receiver, comparator)");
-    var items = switch (try iterableItems(a, ctx.args[0], "sortedWith")) {
+    const items = switch (try iterableItems(a, ctx.args[0], "sortedWith")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
     const comparator = ctx.args[1];
-    if (comparator != .Comparator) {
-        // Treat as any object with `compare(a, b): Int`.
-        var i: usize = 1;
-        while (i < items.len) : (i += 1) {
-            var j = i;
-            while (j > 0) {
-                const o = switch (try invokeComparatorCompare(ctx, comparator, items[j - 1], items[j])) {
-                    .n => |v| v,
-                    .err => |e| return e,
-                };
-                if (o > 0) {
-                    std.mem.swap(Value, &items[j - 1], &items[j]);
-                    j -= 1;
-                } else break;
-            }
-        }
-        return ok(try makeList(a, items, false));
-    }
-    const descending = comparator.Comparator.descending;
-    const steps_g = comparator.Comparator.steps.borrow();
-    defer steps_g.deinit();
-    const steps = steps_g.get().*;
-    if (steps.len == 0) {
-        if (try sortValuesNaturalDesc(a, items, descending)) |e| return e;
-    } else {
-        var i: usize = 1;
-        while (i < items.len) : (i += 1) {
-            var j = i;
-            while (j > 0) {
-                var ord: Order = .eq;
-                for (steps) |step| {
-                    const ka = switch (try invoke(ctx, &step.selector, &.{items[j - 1]})) {
-                        .value => |v| v,
-                        .err => |e| return e,
-                    };
-                    const kb = switch (try invoke(ctx, &step.selector, &.{items[j]})) {
-                        .value => |v| v,
-                        .err => |e| return e,
-                    };
-                    const o = switch (try compareValues(a, ka, kb)) {
-                        .order => |o| o,
-                        .err => |e| return e,
-                    };
-                    const flipped = if (step.descending) reverseOrder(o) else o;
-                    if (flipped != .eq) {
-                        ord = flipped;
-                        break;
-                    }
-                }
-                if (descending) ord = reverseOrder(ord);
-                if (ord == .gt) {
-                    std.mem.swap(Value, &items[j - 1], &items[j]);
-                    j -= 1;
-                } else break;
-            }
+    // An empty-steps natural Comparator sorts builtin scalars directly.
+    if (comparator == .Comparator) {
+        const descending = comparator.Comparator.descending;
+        const empty = blk: {
+            const steps_g = comparator.Comparator.steps.borrow();
+            defer steps_g.deinit();
+            break :blk steps_g.get().len == 0;
+        };
+        if (empty) {
+            if (try sortValuesNaturalDesc(a, items, descending)) |e| return e;
+            return ok(try makeList(a, items, false));
         }
     }
+    // Everything else (a `compare(a,b)` object or a multi-step Comparator, whose
+    // `compare` the host evaluates) goes through the stable merge sort.
+    if (try mergeSortComparator(ctx, comparator, items)) |e| return e;
     return ok(try makeList(a, items, false));
 }
 
