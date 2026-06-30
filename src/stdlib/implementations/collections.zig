@@ -3198,7 +3198,10 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 }
             }
         },
-        .Builder => |bstate| {
+        .Builder => |bstate0| {
+            // Drive a FRESH cursor so this materialisation is independent of any
+            // other consumption of the same (re-iterable) Sequence.
+            const bstate = try freshBuilderState(host, a, bstate0);
             // Pull from the lazy builder one element at a time so an infinite
             // generator never materialises past the consumer's demand.
             while (true) {
@@ -3269,7 +3272,8 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             defer g.deinit();
             try items.appendSlice(a, g.get().*);
         },
-        .Builder => |bstate| {
+        .Builder => |bstate0| {
+            const bstate = try freshBuilderState(host, a, bstate0);
             while (true) {
                 const step = try host.builderStep(bstate, out);
                 switch (step) {
@@ -6643,6 +6647,55 @@ pub fn coll_max_with_or_null(ctx: *CallCtx) Error!EvalResult {
 /// ordering or a `RuntimeError` (as data) for incomparable values.
 pub fn compare_values(a: Allocator, x: Value, y: Value) Error!OrderResult {
     return compareValuesPublic(a, x, y);
+}
+
+// `SequenceScope` field names (kept in sync with coroutines.zig's canonical
+// copy, which lives in a higher module the stdlib cannot import).
+pub const seq_has_value_field = "__seq_has_value";
+pub const seq_value_field = "__seq_value";
+pub const seq_yield_iter_field = "__seq_yield_iter";
+
+/// A FRESH builder cursor cloned from `template`: a new `SequenceScope` and
+/// reset flags, sharing the template's block closure. Kotlin's `sequence { }`
+/// is re-iterable (a fresh coroutine per `iterator()`); klio embeds one cursor
+/// in the Sequence, so each new consumption drives a clone, leaving the
+/// embedded template pristine.
+pub fn freshBuilderState(host: IntrinsicHost, a: Allocator, template: runtime.BuilderStateRef) Allocator.Error!runtime.BuilderStateRef {
+    const block: Value = blk: {
+        const tg = template.borrow();
+        defer tg.deinit();
+        break :blk tg.get().block.asPtr().*;
+    };
+    const id = host.allocInstanceId();
+    const fields = [_]InstanceData.Field{
+        .{ .name = seq_has_value_field, .value = .{ .Bool = false } },
+        .{ .name = seq_value_field, .value = .Unit },
+        .{ .name = seq_yield_iter_field, .value = .Null },
+    };
+    const scope = try host.newSynthInstance("kotlin.sequences.SequenceScope", id, &fields);
+    var blk_val = block;
+    if (runtime.reclaimEnabled()) blk_val.retain();
+    const block_box = try Value.boxRef(a, blk_val);
+    if (runtime.reclaimEnabled()) scope.retain();
+    const scope_box = try Value.boxRef(a, scope);
+    return try runtime.BuilderStateRef.init(a, .{ .block = block_box, .scope = scope_box });
+}
+
+/// If `seq` is a `Builder`-source Sequence, a fresh Sequence with a cloned
+/// cursor (sharing the op pipeline) for independent iteration; else null.
+pub fn freshBuilderSeq(host: IntrinsicHost, a: Allocator, seq: Value) Allocator.Error!?Value {
+    if (seq != .Sequence) return null;
+    const sg = seq.Sequence.borrow();
+    if (sg.get().source != .Builder) {
+        sg.deinit();
+        return null;
+    }
+    const tmpl = sg.get().source.Builder;
+    const ops = sg.get().ops;
+    sg.deinit();
+    const state = try freshBuilderState(host, a, tmpl);
+    const data = try ObjRef(runtime.SequenceData).init(a, .{ .source = .{ .Builder = state }, .ops = ops });
+    return .{ .Sequence = data };
 }
 
 /// Drive a lazy `Value::Sequence` to completion. Returns the produced

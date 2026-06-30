@@ -3551,6 +3551,17 @@ fn sequenceMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // `Sequence.iterator()` is lazy: a `SeqIter` pulls one element at a time so
     // an infinite source never materialises (`sequence{}` / `generateSequence`).
     if (std.mem.eql(u8, name, "iterator") and args.len == 0) {
+        // A `sequence{}`/`iterator{}` builder Sequence is re-iterable: each
+        // `iterator()` drives a fresh coroutine cursor (clone), leaving the
+        // embedded template untouched so a second consumption is not empty.
+        {
+            var intrinsic = makeIntrinsicHost(self);
+            defer deinitIntrinsicHost(&intrinsic);
+            const ihost = intrinsic.intrinsicHost();
+            if (try stdlib.freshBuilderSeq(ihost, allocator, receiver.*)) |fresh| {
+                return .{ .ok = try stdlib.makeSeqIter(allocator, fresh) };
+            }
+        }
         var sv = receiver.*;
         if (runtime.reclaimEnabled()) sv.retain();
         return .{ .ok = try stdlib.makeSeqIter(allocator, sv) };
