@@ -999,30 +999,46 @@ fn matchArg(args: []const Value, comptime what: []const u8) union(enum) { ok: Ob
 // byte <-> char index conversion
 // ============================================================
 
+/// Length in bytes (and UTF-16 code units) of the encoded unit starting at
+/// `s[i]`. A lone WTF-8 surrogate is 3 bytes / 1 unit; an astral scalar is
+/// 4 bytes / 2 units; everything else is its UTF-8 length / 1 unit. Never
+/// panics on ill-formed bytes (advances one byte as one unit).
+fn unitAt(s: []const u8, i: usize) struct { bytes: usize, units: i64 } {
+    if (runtime.isWtf8SurrogateAt(s, i)) return .{ .bytes = 3, .units = 1 };
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return .{ .bytes = 1, .units = 1 };
+    if (i + len > s.len) return .{ .bytes = 1, .units = 1 };
+    const cp = std.unicode.utf8Decode(s[i .. i + len]) catch return .{ .bytes = 1, .units = 1 };
+    return .{ .bytes = len, .units = if (cp > 0xFFFF) 2 else 1 };
+}
+
 /// Count UTF-16 code units in the prefix `s[0..byte]` — the Kotlin char
-/// index for a byte offset.
+/// index for a byte offset. WTF-8-safe: a lone surrogate counts as one unit
+/// and ill-formed bytes never abort the decoder.
 fn byteToChar(s: []const u8, byte: usize) i64 {
     var count: i64 = 0;
-    var view = std.unicode.Utf8View.initUnchecked(s[0..byte]);
-    var it = view.iterator();
-    while (it.nextCodepoint()) |cp| {
-        count += if (cp > 0xFFFF) 2 else 1;
+    var i: usize = 0;
+    const end = @min(byte, s.len);
+    while (i < end) {
+        const u = unitAt(s, i);
+        if (i + u.bytes > end) break;
+        count += u.units;
+        i += u.bytes;
     }
     return count;
 }
 
-/// Byte offset of the char (codepoint) at Kotlin index `n`. Returns the
-/// string length when `n` is past the end.
+/// Byte offset of the codepoint at index `n` (each codepoint, including an
+/// astral scalar, advances the index by one — the engine's internal indexing).
+/// Returns the string length when `n` is past the end. WTF-8-safe: ill-formed
+/// bytes and lone surrogates never abort the decoder.
 fn charIndexToByte(s: []const u8, n: i64) usize {
     if (n <= 0) return 0;
-    var i: i64 = 0;
-    var byte: usize = 0;
-    var view = std.unicode.Utf8View.initUnchecked(s);
-    var it = view.iterator();
-    while (it.nextCodepoint()) |_| {
-        if (i == n) return byte;
-        byte = it.i;
-        i += 1;
+    var idx: i64 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (idx == n) return i;
+        i += unitAt(s, i).bytes;
+        idx += 1;
     }
     return s.len;
 }
