@@ -1764,6 +1764,13 @@ fn builtinSupers(nm: []const u8) []const []const u8 {
         return &.{"Iterable"};
     } else if (std.mem.eql(u8, s, "String")) {
         return &.{ "CharSequence", "Comparable" };
+    } else if (std.mem.eql(u8, s, "StringBuilder")) {
+        // A StringBuilder is a CharSequence (and Appendable). Without this an
+        // overload taking `CharSequence` scores inapplicable for a StringBuilder
+        // argument, so overload resolution falls to the lowest-FuncId tiebreak
+        // and elects a `Char`/first-declared sibling — `sb.startsWith(sb)` bound
+        // `startsWith(Char)` instead of `startsWith(CharSequence)`.
+        return &.{ "CharSequence", "Appendable" };
     }
     return &.{};
 }
