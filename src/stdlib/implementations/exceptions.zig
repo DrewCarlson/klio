@@ -143,6 +143,9 @@ pub fn excn_no_such_element(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 pub fn excn_unsupported(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return buildException(ctx, "kotlin.UnsupportedOperationException");
 }
+pub fn excn_uninitialized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return buildException(ctx, "kotlin.UninitializedPropertyAccessException");
+}
 pub fn excn_no_when(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return buildException(ctx, "kotlin.NoWhenBranchMatchedException");
 }

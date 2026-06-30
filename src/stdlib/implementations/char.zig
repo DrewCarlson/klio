@@ -576,6 +576,12 @@ pub fn char_titlecase(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .unit => |u| u,
     };
     if (charUnitToScalar(unit)) |c| {
+        // U+0149 (ŉ) has a multi-char title mapping "ʼN" (U+02BC U+004E) whose
+        // second unit is upper — not its uppercase-then-titlecase-first form
+        // ("ʼn"). Use the SpecialCasing title form directly.
+        if (c == 0x0149) {
+            return ok(.{ .String = try runtime.strInit(ctx.allocator, "\u{02BC}N") });
+        }
         // A Lt digraph letter titlecases to its single title form.
         if (titlecaseSingle(c)) |t| {
             const s = try charUnitToString(ctx.allocator, @truncate(t));

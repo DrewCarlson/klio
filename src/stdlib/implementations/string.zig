@@ -3056,22 +3056,71 @@ fn charSeqToString(allocator: Allocator, v: Value, what: []const u8) Allocator.E
 /// Parse a Double the way Kotlin's `String.toDouble` does (Java
 /// `Double.parseDouble`): trims surrounding whitespace, accepts Kotlin's
 /// `NaN`/`Infinity` spellings, otherwise standard float syntax.
+/// Kotlin only accepts the exact-case `NaN`/`Infinity` symbols (with an
+/// optional sign); a number otherwise begins with a digit, `.` or sign. A
+/// leading letter (after an optional sign) is a non-canonical spelling like
+/// "naN"/"inf"/"infinity" that `std.fmt.parseFloat` would wrongly accept, so
+/// reject it. (A digit-led overflow like "1e400" correctly yields Infinity.)
+/// Kotlin/Java accept a single trailing float type-suffix (`f`/`F`/`d`/`D`),
+/// which `std.fmt.parseFloat` does not. Strip it. For a hex literal the suffix
+/// letters are also hex digits, so only strip when a `p`/`P` binary exponent is
+/// present (a complete hex float); a bare `0x1f` keeps its `f` (and is rejected
+/// for lacking the exponent).
+fn stripFloatSuffix(s: []const u8) []const u8 {
+    if (s.len == 0) return s;
+    const last = s[s.len - 1];
+    if (last != 'f' and last != 'F' and last != 'd' and last != 'D') return s;
+    const body = s[0 .. s.len - 1];
+    const after_sign = if (body.len > 0 and (body[0] == '+' or body[0] == '-')) body[1..] else body;
+    const is_hex = after_sign.len >= 2 and after_sign[0] == '0' and (after_sign[1] == 'x' or after_sign[1] == 'X');
+    if (!is_hex) return body;
+    if (std.mem.indexOfScalar(u8, body, 'p') != null or std.mem.indexOfScalar(u8, body, 'P') != null) return body;
+    return s;
+}
+
+fn floatSymbolReject(s: []const u8) bool {
+    const body = if (s.len > 0 and (s[0] == '+' or s[0] == '-')) s[1..] else s;
+    if (body.len == 0) return false;
+    // A non-canonical nan/inf spelling (leading letter).
+    if (std.ascii.isAlphabetic(body[0])) return true;
+    // A hex float requires a `p`/`P` binary exponent (Java/Kotlin format
+    // `0x1.8p3`). `std.fmt.parseFloat` also accepts a bare hex *integer*
+    // (`0x11ff33`), which Kotlin rejects — so reject a `0x…` lacking `p`/`P`.
+    if (body.len >= 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X')) {
+        return std.mem.indexOfScalar(u8, body, 'p') == null and std.mem.indexOfScalar(u8, body, 'P') == null;
+    }
+    return false;
+}
+
+/// Java/Kotlin `parseDouble` trims any leading/trailing char `<= ' '`
+/// (the same set `String.trim()` strips — space, tab, newlines, and NUL and
+/// other ASCII controls). All such code units are single WTF-8 bytes.
+fn trimNumericWhitespace(raw: []const u8) []const u8 {
+    var lo: usize = 0;
+    var hi: usize = raw.len;
+    while (lo < hi and raw[lo] <= 0x20) lo += 1;
+    while (hi > lo and raw[hi - 1] <= 0x20) hi -= 1;
+    return raw[lo..hi];
+}
+
 fn parseDouble(raw: []const u8) ?f64 {
-    const s = std.mem.trim(u8, raw, " \t\n\r");
+    const s = trimNumericWhitespace(raw);
     if (s.len == 0) return null;
-    if (std.mem.eql(u8, s, "NaN")) return std.math.nan(f64);
+    if (std.mem.eql(u8, s, "NaN") or std.mem.eql(u8, s, "+NaN") or std.mem.eql(u8, s, "-NaN")) return std.math.nan(f64);
     if (std.mem.eql(u8, s, "Infinity") or std.mem.eql(u8, s, "+Infinity")) return std.math.inf(f64);
     if (std.mem.eql(u8, s, "-Infinity")) return -std.math.inf(f64);
-    return std.fmt.parseFloat(f64, s) catch null;
+    if (floatSymbolReject(s)) return null;
+    return std.fmt.parseFloat(f64, stripFloatSuffix(s)) catch null;
 }
 
 fn parseFloat(raw: []const u8) ?f32 {
-    const s = std.mem.trim(u8, raw, " \t\n\r");
+    const s = trimNumericWhitespace(raw);
     if (s.len == 0) return null;
-    if (std.mem.eql(u8, s, "NaN")) return std.math.nan(f32);
+    if (std.mem.eql(u8, s, "NaN") or std.mem.eql(u8, s, "+NaN") or std.mem.eql(u8, s, "-NaN")) return std.math.nan(f32);
     if (std.mem.eql(u8, s, "Infinity") or std.mem.eql(u8, s, "+Infinity")) return std.math.inf(f32);
     if (std.mem.eql(u8, s, "-Infinity")) return -std.math.inf(f32);
-    return std.fmt.parseFloat(f32, s) catch null;
+    if (floatSymbolReject(s)) return null;
+    return std.fmt.parseFloat(f32, stripFloatSuffix(s)) catch null;
 }
 
 // ============================================================

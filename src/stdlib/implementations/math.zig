@@ -296,6 +296,10 @@ pub fn float_pow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     const base: f32 = @floatCast(base_d);
     const exp: f32 = @floatCast(exp_d);
+    // Java/Kotlin Math.pow: `pow(±1, ±Inf)` is NaN (C/Zig pow returns 1).
+    if (@abs(base) == 1.0 and (std.math.isInf(exp) or std.math.isNan(exp))) {
+        return ok(.{ .Float = std.math.nan(f32) });
+    }
     return ok(.{ .Float = std.math.pow(f32, base, exp) });
 }
 
@@ -363,7 +367,10 @@ pub fn double_ulp(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         std.math.inf(f64)
     else blk: {
         const a = @abs(x);
-        break :blk f64_next_up(a) - a;
+        const up = f64_next_up(a);
+        // At MAX_VALUE the successor is +Inf; the ulp is then the gap to the
+        // predecessor (2^971), not Infinity.
+        break :blk if (std.math.isInf(up)) a - f64_next_down(a) else up - a;
     };
     return ok(.{ .Double = r });
 }

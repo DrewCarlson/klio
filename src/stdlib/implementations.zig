@@ -471,6 +471,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.RuntimeException", .f = exceptions.excn_runtime },
     .{ .fqn = "kotlin.Throwable", .f = exceptions.excn_throwable },
     .{ .fqn = "kotlin.UnsupportedOperationException", .f = exceptions.excn_unsupported },
+    .{ .fqn = "kotlin.UninitializedPropertyAccessException", .f = exceptions.excn_uninitialized },
     .{ .fqn = "kotlin.NoWhenBranchMatchedException", .f = exceptions.excn_no_when },
     .{ .fqn = "kotlin.NumberFormatException", .f = exceptions.excn_number_format },
     .{ .fqn = "kotlin.ConcurrentModificationException", .f = exceptions.excn_concurrent_mod },
