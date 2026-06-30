@@ -3318,6 +3318,34 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         }
     }
 
+    // Interface delegation (`object : Iface by expr {}`): store the delegate
+    // value as a `__delegate__<Iface>` field so the member/field forwarders
+    // reach it (a named class does this through its ctor; the runtime synthesis
+    // here would otherwise drop it). A delegate that is a captured name resolves
+    // through `capture_pairs`.
+    {
+        const delegates = obj.supertype_delegates;
+        for (supertypes, 0..) |*sup, i| {
+            if (i >= delegates.len) break;
+            const de = delegates[i] orelse continue;
+            const dv: ?Value = switch (de) {
+                .Path => |p| if (p.segments.len == 1) findCapture(capture_pairs, p.segments[0].name) else null,
+                else => null,
+            };
+            const v = dv orelse continue;
+            const key = try std.fmt.allocPrint(allocator, "__delegate__{s}", .{sup.name.name});
+            v.retain();
+            const ig = inst.borrowMut();
+            const already = ig.get().get(key) != null;
+            if (!already) {
+                try ig.get().fields.append(allocator, .{ .name = key, .value = v });
+            } else {
+                v.release(allocator);
+            }
+            ig.deinit();
+        }
+    }
+
     return .{ .ok = inst_value };
 }
 
