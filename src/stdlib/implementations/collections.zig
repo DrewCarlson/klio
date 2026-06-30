@@ -4125,12 +4125,16 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     if (runtime.reclaimEnabled()) for (window.items) |e| e.retain();
     const mutable = recv.List.mutable;
     const backing = try CollBackingRef.init(a, .{ .sublist = .{ .parent = root, .from = new_from, .len = win_len } });
+    // Share the root list's structural counter so a modification of the parent
+    // (not through this view) is observed as a ConcurrentModification by this
+    // subList's iterators — matching Kotlin's SubList, which tracks root.modCount.
+    const shared_mc = if (recv.List.mod_count) |mc| mc.clone() else try modCountFor(a, mutable);
     return ok(.{ .List = .{
         .items = try ValueList.init(a, window),
         .mutable = mutable,
         .enum_entries = false,
         .backing = backing.cell,
-        .mod_count = try modCountFor(a, mutable),
+        .mod_count = shared_mc,
     } });
 }
 
