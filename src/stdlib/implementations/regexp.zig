@@ -24,6 +24,7 @@ const ValueSlice = runtime.ValueSlice;
 const RegexData = runtime.RegexData;
 const MatchData = runtime.MatchData;
 const MatchGroupData = runtime.MatchGroupData;
+const InstanceData = runtime.InstanceData;
 const SequenceData = runtime.SequenceData;
 const charUnitToString = runtime.charUnitToString;
 
@@ -1953,26 +1954,79 @@ pub fn match_result_destructured(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
     return ok(try makeList(ctx.allocator, items.items, false));
 }
 
+/// `MatchResult.groups` returns a `MatchNamedGroupCollection`: indexable by
+/// group number AND by name, and castable to that interface. Modeled as a synth
+/// instance wrapping the match; `get`/`size` read its groups/names.
 pub fn match_result_groups(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const m = switch (matchArg(ctx.args, "MatchResult.groups")) {
         .ok => |v| v,
         .err => |e| return e,
     };
-    const groups = m.asPtr().groups;
+    const id = ctx.host.allocInstanceId();
+    const fields = [_]InstanceData.Field{
+        .{ .name = "__mgc", .value = .{ .Match = m.clone() } },
+    };
+    return ok(try ctx.host.newSynthInstance("kotlin.text.MatchNamedGroupCollection", id, &fields));
+}
+
+fn matchGroupValue(gd: ?MatchGroupData) Value {
+    if (gd) |d| return .{ .MatchGroup = .{ .value = d.value.clone(), .start = d.start, .end_inclusive = d.end_inclusive } };
+    return .Null;
+}
+
+pub fn match_named_group_get(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[0] != .Instance) return typeErr("MatchNamedGroupCollection.get requires a key");
+    const key = ctx.args[1];
+    const g = ctx.args[0].Instance.borrow();
+    defer g.deinit();
+    const mv = g.get().get("__mgc") orelse return typeErr("not a MatchNamedGroupCollection");
+    if (mv != .Match) return typeErr("not a MatchNamedGroupCollection");
+    const md = mv.Match.asPtr();
+    var idx: ?usize = null;
+    if (key.isIntegral()) {
+        const n = key.asI64() orelse return typeErr("bad group index");
+        if (n >= 0 and n < md.groups.len) idx = @intCast(n);
+    } else if (key == .String) {
+        const name = key.String.asPtr().bytes;
+        if (progFromRegex(md.regex)) |prog| {
+            for (prog.names, 0..) |gn, i| {
+                if (gn) |nm| {
+                    if (std.mem.eql(u8, nm, name) and i < md.groups.len) {
+                        idx = i;
+                        break;
+                    }
+                }
+            }
+        }
+    } else return typeErr("MatchNamedGroupCollection.get key must be Int or String");
+    if (idx) |i| return ok(matchGroupValue(md.groups[i]));
+    return ok(.Null);
+}
+
+pub fn match_named_group_size(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args[0] != .Instance) return ok(.{ .Int = 0 });
+    const g = ctx.args[0].Instance.borrow();
+    defer g.deinit();
+    const mv = g.get().get("__mgc") orelse return ok(.{ .Int = 0 });
+    if (mv != .Match) return ok(.{ .Int = 0 });
+    return ok(.{ .Int = @intCast(mv.Match.asPtr().groups.len) });
+}
+
+pub fn match_named_group_iterator(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args[0] != .Instance) return typeErr("not a MatchNamedGroupCollection");
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(ctx.allocator);
-    for (groups) |g| {
-        if (g) |gd| {
-            try items.append(ctx.allocator, .{ .MatchGroup = .{
-                .value = gd.value.clone(),
-                .start = gd.start,
-                .end_inclusive = gd.end_inclusive,
-            } });
-        } else {
-            try items.append(ctx.allocator, .Null);
+    {
+        const g = ctx.args[0].Instance.borrow();
+        defer g.deinit();
+        const mv = g.get().get("__mgc") orelse return typeErr("not a MatchNamedGroupCollection");
+        if (mv != .Match) return typeErr("not a MatchNamedGroupCollection");
+        for (mv.Match.asPtr().groups) |gd| {
+            try items.append(ctx.allocator, matchGroupValue(gd));
         }
     }
-    return ok(try makeList(ctx.allocator, items.items, false));
+    const list = try makeList(ctx.allocator, items.items, false);
+    return (try ctx.host.invokeMethod(&list, "iterator", &.{}, ctx.out)) orelse return typeErr("iterator");
 }
 
 pub fn match_result_next(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
