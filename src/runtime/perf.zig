@@ -123,6 +123,19 @@ pub fn resolveBinaryProfile(args: []const []const u8) Profile {
     if (getenvSlice("KLIO_OPT")) |v| {
         if (parseProfile(v)) |p| return p;
     }
+    // Default by subcommand. `test` runs many small programs whose hot loops
+    // are dispatch-heavy (assertions, collection ops) rather than pure numeric
+    // kernels, so the loop JIT's per-block tracking costs more than it saves;
+    // default it to the plain interpreter (`safe`). A single `run` keeps `fast`.
+    {
+        var j: usize = 1; // args[0] is the executable path
+        while (j < args.len) : (j += 1) {
+            const a = args[j];
+            if (a.len > 0 and a[0] == '-') continue;
+            if (std.mem.eql(u8, a, "test")) return .safe;
+            break; // the first non-flag token is the subcommand
+        }
+    }
     return .fast;
 }
 
