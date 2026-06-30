@@ -213,6 +213,14 @@ pub const FuncBuilder = struct {
     /// annotation — used by the `==` lowering to detect a boxed
     /// operand the same way the tree walker does.
     any_typed_locals: StringSet,
+    /// Names (params, lambda params, locals) whose declared static type is a
+    /// broad read-only collection — `Iterable`, `Collection`, or their
+    /// `Mutable*` forms — through which a runtime `Set` may flow. Kotlin's
+    /// `Iterable`/`Collection` `plus`/`minus` return a `List` regardless of the
+    /// runtime element container, so the operator lowering coerces such a
+    /// receiver to a list first (a `Set` receiver would otherwise dispatch the
+    /// `Set`-returning `plus`/`minus`).
+    broad_coll_locals: StringSet,
     /// Locals whose initializer is an `object : T {}` expression. Kept apart
     /// from `local_init_exprs` (which feeds receiver-type inference) so that
     /// recording an object initializer for overload-applicability checks does
@@ -396,6 +404,7 @@ pub const FuncBuilder = struct {
             .mutable_homes = StringRegMap.init(allocator),
             .boxed_vars = StringSet.init(allocator),
             .any_typed_locals = StringSet.init(allocator),
+            .broad_coll_locals = StringSet.init(allocator),
             .object_init_locals = StringSet.init(allocator),
             .own_members = StringSet.init(allocator),
             .own_member_arity = std.StringHashMap(u64).init(allocator),
@@ -444,6 +453,7 @@ pub const FuncBuilder = struct {
         self.mutable_homes.deinit();
         self.boxed_vars.deinit();
         self.any_typed_locals.deinit();
+        self.broad_coll_locals.deinit();
         self.object_init_locals.deinit();
         self.own_members.deinit();
         self.own_member_arity.deinit();
@@ -595,6 +605,12 @@ pub const FuncBuilder = struct {
     }
     pub fn isAnyTyped(self: *const FuncBuilder, name: []const u8) bool {
         return self.any_typed_locals.contains(name);
+    }
+    pub fn markBroadCollectionLocal(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.broad_coll_locals.put(name, {});
+    }
+    pub fn isBroadCollectionLocal(self: *const FuncBuilder, name: []const u8) bool {
+        return self.broad_coll_locals.contains(name);
     }
     pub fn markObjectInitLocal(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.object_init_locals.put(name, {});

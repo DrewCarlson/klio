@@ -727,7 +727,15 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         return dst;
     }
 
-    const l = try lowerExpr(b, lhs);
+    const l0 = try lowerExpr(b, lhs);
+    // `it + x` / `it - x` where `it` is statically a broad collection
+    // (`Iterable`/`Collection`) produces a `List` even when the runtime value
+    // is a `Set`; coerce the receiver to a list so the `List`-returning
+    // `plus`/`minus` is dispatched rather than the `Set`-returning one.
+    const l = if (op == .Add or op == .Sub)
+        try helpers.coerceBroadCollectionToList(b, lhs, l0)
+    else
+        l0;
     const r = try lowerExpr(b, rhs);
     const dst = b.allocReg();
     try b.push(.{ .BinOp = .{ .dst = dst, .op = astBinop(op), .lhs = l, .rhs = r } });
@@ -1662,6 +1670,30 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const suppress_it = lam.implicit_it and expected_arity == 0;
     const eff_params: []const ast.Ident = if (suppress_it) &.{} else lam.params;
     const eff_param_tys: []const ?ast.TypeRef = if (suppress_it) &.{} else lam.param_tys;
+    // Names of lambda params (including the implicit `it`) whose effective
+    // static type — the lambda's own annotation, else the expected functional
+    // type's parameter — is a broad collection (`Iterable`/`Collection`).
+    // Recorded on the body builder so `it + x` over a runtime `Set` produces a
+    // `List`. Derived here (not via the body's `param_tys`) so the implicit
+    // `it`'s runtime overload-dispatch placeholder type is left untouched.
+    var broad_names: std.ArrayList([]const u8) = .empty;
+    defer broad_names.deinit(b.allocator);
+    if (!suppress_it and eff_params.len != 0) {
+        const ft = if (b.peekExpected()) |exp| exp.function else null;
+        for (eff_params, 0..) |p, i| {
+            const ty: ?ast.TypeRef = if (i < eff_param_tys.len and eff_param_tys[i] != null)
+                eff_param_tys[i]
+            else if (ft != null and i < ft.?.params.len)
+                ft.?.params[i]
+            else
+                null;
+            if (ty) |t| {
+                if (t.function == null and helpers.isBroadCollectionTypeName(t.name.name)) {
+                    try broad_names.append(b.allocator, p.name);
+                }
+            }
+        }
+    }
     // `outer_names` / `inherited_rlp` ownership passes into the lambda lower.
     const outer_names = try b.visibleNames();
     const inherited_rlp = try b.receiverLambdaParamNames();
@@ -1685,6 +1717,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         enclosing_owner,
         suppress_it,
         if (suppress_it) lam.span else null,
+        broad_names.items,
     );
     const body_func = lowered.func;
     const captured_names = lowered.captures;

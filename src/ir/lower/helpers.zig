@@ -43,6 +43,49 @@ pub fn isGenericTypedPath(b: *const FuncBuilder, e: *const Expr) bool {
     };
 }
 
+/// A read-only/iterable collection type whose `plus`/`minus` operator returns a
+/// `List` regardless of the runtime element container. A `Set` value reached
+/// through such a static type must therefore produce a `List`, not a `Set`.
+pub fn isBroadCollectionTypeName(name: []const u8) bool {
+    const broad = [_][]const u8{ "Iterable", "MutableIterable", "Collection", "MutableCollection" };
+    for (broad) |b| {
+        if (std.mem.eql(u8, name, b)) return true;
+    }
+    return false;
+}
+
+/// True when `e` names a local/param statically typed as a broad collection
+/// (see `isBroadCollectionTypeName`).
+pub fn isBroadCollectionReceiver(b: *const FuncBuilder, e: *const Expr) bool {
+    return switch (e.*) {
+        .Path => |p| p.segments.len == 1 and b.isBroadCollectionLocal(p.segments[0].name),
+        else => false,
+    };
+}
+
+/// When `recv_expr` is statically a broad collection, emit `recv.toList()` and
+/// return the coerced register so a following `+`/`-` produces a `List`. Other
+/// receivers pass through unchanged.
+pub fn coerceBroadCollectionToList(
+    b: *FuncBuilder,
+    recv_expr: *const Expr,
+    recv: Reg,
+) Allocator.Error!Reg {
+    if (!isBroadCollectionReceiver(b, recv_expr)) return recv;
+    const dst = b.allocReg();
+    const args = b.allocReg();
+    const nm = try b.module.internConst(b.allocator, .{ .String = "toList" });
+    try b.push(.{ .CallMember = .{
+        .dst = dst,
+        .receiver = recv,
+        .name = nm,
+        .args = args,
+        .n_args = 0,
+        .arg_names = &.{},
+    } });
+    return dst;
+}
+
 /// True when `arg` is a lambda whose body assigns to a name that the IR's
 /// current scope shadows or knows as an outer capture.
 pub fn lambdaWritesOuterVar(b: *FuncBuilder, arg: *const Expr) Allocator.Error!bool {

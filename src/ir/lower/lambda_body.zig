@@ -189,6 +189,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
         enclosing_owner,
         false,
         null,
+        &.{},
     );
 }
 
@@ -211,6 +212,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     enclosing_owner: ?EnclosingOwner,
     suppress_it: bool,
     it_span: ?ast.Span,
+    broad_coll_params: []const []const u8,
 ) Allocator.Error!LoweredLambda {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
@@ -281,6 +283,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     }
     b.setBoxedVars(boxed);
     try decl.bindParams(&b, names.items);
+    // A lambda parameter (including the implicit `it`) statically typed as a
+    // broad collection (`Iterable`/`Collection`) yields a `List` from `+`/`-`
+    // even over a runtime `Set`; record it so the operator lowering coerces it.
+    for (broad_coll_params) |pname| {
+        try b.markBroadCollectionLocal(pname);
+    }
     const result = try expr.lowerBlock(&b, body);
     b.terminate(.{ .Return = result });
     const captured = try b.allocator.dupe([]const u8, b.capturesTaken());

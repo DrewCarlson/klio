@@ -163,6 +163,9 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
     // local receiver (`val resp = client.get(url); resp.body<T>()`).
     if (p.ty) |ty| {
         try b.setLocalDeclType(p.name.name, ty.name.name);
+        if (ty.function == null and helpers.isBroadCollectionTypeName(ty.name.name)) {
+            try b.markBroadCollectionLocal(p.name.name);
+        }
     } else if (p.init) |*e| {
         if (e.* == .Call) try b.setLocalInitExpr(p.name.name, e);
         if (e.* == .ObjectExpr) try b.markObjectInitLocal(p.name.name);
@@ -594,7 +597,15 @@ fn lowerAssign(
     const combined: Reg = switch (op) {
         .Assign => v,
         .Add, .Sub, .Mul, .Div, .Rem => blk: {
-            const cur = try lowerExpr(b, target);
+            const cur0 = try lowerExpr(b, target);
+            // `xs += y` / `xs -= y` on a statically broad collection
+            // (`Iterable`/`Collection`) rebinds to a `List`; coerce a `Set`
+            // runtime value to a list first so the `List`-returning operator
+            // is dispatched (mirrors the `lowerBinary` receiver coercion).
+            const cur = if (op == .Add or op == .Sub)
+                try helpers.coerceBroadCollectionToList(b, target, cur0)
+            else
+                cur0;
             const bin: BinOp = switch (op) {
                 .Add => .Add,
                 .Sub => .Sub,

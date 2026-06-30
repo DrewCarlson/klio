@@ -8,6 +8,7 @@ const ast = @import("ast");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
 const mod = @import("mod.zig");
+const helpers = @import("helpers.zig");
 const runtime = @import("runtime");
 const FF = runtime.forest.ForestField;
 
@@ -992,6 +993,12 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             // `flow {}` builder).
             if (p.ty.function == null and !tp_names.contains(p.ty.name.name)) {
                 try b.markNonFnParam(p.name.name);
+            }
+            // A param statically typed as a broad collection (`Iterable`/
+            // `Collection`): `p + x` / `p - x` returns a `List` even when the
+            // runtime value is a `Set`, so the operator lowering coerces it.
+            if (p.ty.function == null and helpers.isBroadCollectionTypeName(p.ty.name.name)) {
+                try b.markBroadCollectionLocal(p.name.name);
             }
         }
     }
