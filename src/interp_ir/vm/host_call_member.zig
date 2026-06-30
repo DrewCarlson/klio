@@ -7478,12 +7478,20 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
             var found_fid: ?FuncId = null;
             for (m.classes.items) |*cls_ir| {
                 if (!std.mem.eql(u8, cls_ir.name, cname)) continue;
+                // Collect every same-named method, then pick the overload that
+                // matches the call's arity/types. Resolving by name alone binds
+                // `super.listIterator(index)` to a no-arg `listIterator()` whose
+                // body re-dispatches `listIterator(0)` virtually — an infinite
+                // super/override cycle (AbstractMutableList$SubList).
+                var cands: std.ArrayList(Func) = .empty;
+                defer cands.deinit(allocator);
                 for (cls_ir.methods) |fid| {
                     const cf = m.funcById(fid) orelse continue;
-                    if (std.mem.eql(u8, cf.name, name)) {
-                        found_fid = fid;
-                        break;
-                    }
+                    if (std.mem.eql(u8, cf.name, name)) cands.append(allocator, cf.*) catch {};
+                }
+                if (cands.items.len != 0) {
+                    const chosen = pickMethodOverload(self, cands.items, args) orelse cands.items[0];
+                    found_fid = chosen.id;
                 }
                 break;
             }
