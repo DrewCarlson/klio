@@ -160,6 +160,22 @@ pub fn cmp_compare_by_descending(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
 /// selector, tagged with the shared per-step `descending` flag. The
 /// comparator-level `descending` stays `false`; reversal is per step.
 fn makeComparator(ctx: *CallCtx, descending: bool) std.mem.Allocator.Error!EvalResult {
+    // `compareBy(comparator, selector)` vs the vararg `compareBy(s1, s2)`:
+    // both take two args, distinguished by arg[0] — a comparator value
+    // (`.Comparator`, or a non-callable comparator like
+    // `String.CASE_INSENSITIVE_ORDER`) vs a selector (a callable). Only the
+    // comparator form gets a per-step key comparator; the selector form falls
+    // through to the multi-selector loop below.
+    if (ctx.args.len == 2 and isCallable(ctx.args[1]) and
+        (ctx.args[0] == .Comparator or !isCallable(ctx.args[0])))
+    {
+        const steps = try ctx.allocator.alloc(ComparatorStep, 1);
+        steps[0] = .{ .selector = ctx.args[1], .descending = descending, .key_comparator = ctx.args[0] };
+        return .{ .ok = .{ .Comparator = .{
+            .steps = try ObjRef([]ComparatorStep).init(ctx.allocator, steps),
+            .descending = false,
+        } } };
+    }
     const steps = try ctx.allocator.alloc(ComparatorStep, ctx.args.len);
     for (ctx.args, 0..) |arg, i| {
         steps[i] = .{ .selector = arg, .descending = descending };

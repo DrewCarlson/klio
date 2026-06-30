@@ -4102,6 +4102,16 @@ fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Value,
                         .ok => |v| v,
                         .err => |e| return .{ .err = e },
                     };
+                    // `compareBy(comparator, selector)`: order the selected keys
+                    // by the step's comparator rather than their natural order.
+                    if (step.key_comparator) |kc| {
+                        const r = try callMemberRec(self, allocator, &kc, "compare", &.{ ka, kb });
+                        const nval: i64 = switch (r) {
+                            .ok => |v| v.asI64() orelse 0,
+                            .err => |e| return .{ .err = e },
+                        };
+                        break :blk if (nval < 0) .lt else if (nval > 0) .gt else .eq;
+                    }
                     break :blk compareValuesBuiltin(&ka, &kb) orelse return .{ .err = try typeErr(allocator, "incomparable values", .{}) };
                 };
                 const flipped = if (step.descending) flipOrd(o) else o;

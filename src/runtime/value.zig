@@ -2517,8 +2517,13 @@ pub const Value = union(enum) {
 pub const ComparatorStep = struct {
     selector: Value,
     descending: bool,
+    /// `compareBy(comparator, selector)`: compare the selected keys with this
+    /// comparator instead of their natural order. Null for the plain
+    /// `compareBy(selector)` / `compareByDescending(selector)` forms.
+    key_comparator: ?Value = null,
     pub fn gcTrace(self: *const ComparatorStep, m: *objcell.gc.Marker) void {
         self.selector.gcMark(m);
+        if (self.key_comparator) |kc| kc.gcMark(m);
     }
 };
 
