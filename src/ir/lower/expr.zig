@@ -459,7 +459,26 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // forms) keep the name-keyed emission.
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = pr.name.name });
+            // `::localFn` names a local function, which is lowered to a closure
+            // value bound to a register. The reference loads that closure — it
+            // is the referenced callable, not an unbound property of whatever
+            // the use site later applies it to.
+            if (b.isLocalFn(pr.name.name)) {
+                if (b.resolve(pr.name.name)) |reg| {
+                    try b.push(.{ .Move = .{ .dst = dst, .src = reg } });
+                    return dst;
+                }
+            }
             const is_tracked = b.resolve(pr.name.name) != null or isTopLevelProp(pr.name.name);
+            // A same-named enclosing member only shadows the global for `::name`
+            // when it could actually be the referenced callable: if the use
+            // site expects a specific arity (a function-typed parameter slot)
+            // and the member cannot accept it, the global wins — e.g.
+            // `propagateOf2(::minOf, …)` from a `@Test fun minOf()` references
+            // the stdlib `minOf`, not the zero-arg test method.
+            const ref_arity = b.pending_lambda_arity;
+            const member_shadows_ref = enclosingDeclaresMember(b, pr.name.name) and
+                (ref_arity < 0 or b.ownMemberApplicable(pr.name.name, @intCast(ref_arity)));
             const class_pick: ?ir.ClassId = b.module.classIdIndexed(pr.name.name, b.self_package, pr.name.span.file);
             const ref_pick: ?FuncId = if (class_pick != null)
                 null
@@ -487,15 +506,16 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
             } else if (b.module.funcId(pr.name.name) != null or b.module.classId(pr.name.name) != null) {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
-            } else if (isAliasName(pr.name.name) and
-                !b.module.registry.class_member_names.contains(pr.name.name))
-            {
+            } else if (isAliasName(pr.name.name) and !member_shadows_ref) {
                 // `::minOf` / `::maxOf` / `::listOf` … name a stdlib host
-                // intrinsic that no class declares as a member. A bare
-                // `LoadGlobal` resolves it to its `.Intrinsic` callable
-                // value; binding it to the enclosing `this` (the
-                // `!is_tracked` branch below) would instead emit a
-                // `this.<name>` member ref that misses at runtime.
+                // intrinsic. A bare `LoadGlobal` resolves it to its
+                // `.Intrinsic` callable value; binding it to the enclosing
+                // `this` (the `!is_tracked` branch below) would emit a
+                // `this.<name>` member ref that misses at runtime. The member
+                // test is scoped to the ENCLOSING class's hierarchy — a
+                // program-wide member-name set is poisoned by an unrelated
+                // sibling class that happens to declare a `minOf`/`maxOf`
+                // `@Test`, which `::minOf` here can never refer to.
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             } else if (!is_tracked) {
                 if (try resolveThisReg(b)) |this_reg| {
@@ -549,6 +569,33 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .AnonFun => return lowerAnonFun(b, expr),
         .This => |t| {
+            if (t.qualifier) |q| {
+                // A labeled receiver `this@fn` for an enclosing (extension)
+                // function: resolve / capture the `this@<fn>` slot bound at
+                // that function's entry — possibly through nested lambdas — so
+                // it is the function's receiver, not the lambda's own `this`.
+                const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{q.name});
+                if (b.resolve(label)) |r| return r;
+                if (b.knowsOuter(label)) {
+                    const idx = try b.recordCapture(label);
+                    const dst2 = b.allocReg();
+                    try b.push(.{ .LoadCapture = .{ .dst = dst2, .idx = idx } });
+                    try b.bind(label, dst2);
+                    return dst2;
+                }
+                // Otherwise a class-name label (`this@Outer`): walk at runtime
+                // from the nearest `this` over the class/outer chain.
+                const this_reg = b.resolve("this") orelse blk: {
+                    const idx = try b.recordCapture("this");
+                    const dst = b.allocReg();
+                    try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+                    break :blk dst;
+                };
+                const nm = try b.module.internConst(b.allocator, .{ .String = q.name });
+                const dst = b.allocReg();
+                try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm } });
+                return dst;
+            }
             // `this` bare resolves to the implicit first param, or the
             // captured `this` slot inside a lambda body.
             const this_reg = b.resolve("this") orelse blk: {
@@ -557,12 +604,6 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
                 break :blk dst;
             };
-            if (t.qualifier) |q| {
-                const nm = try b.module.internConst(b.allocator, .{ .String = q.name });
-                const dst = b.allocReg();
-                try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm } });
-                return dst;
-            }
             return this_reg;
         },
         .Super => {
@@ -727,7 +768,15 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         return dst;
     }
 
-    const l = try lowerExpr(b, lhs);
+    const l0 = try lowerExpr(b, lhs);
+    // `it + x` / `it - x` where `it` is statically a broad collection
+    // (`Iterable`/`Collection`) produces a `List` even when the runtime value
+    // is a `Set`; coerce the receiver to a list so the `List`-returning
+    // `plus`/`minus` is dispatched rather than the `Set`-returning one.
+    const l = if (op == .Add or op == .Sub)
+        try helpers.coerceBroadCollectionToList(b, lhs, l0)
+    else
+        l0;
     const r = try lowerExpr(b, rhs);
     const dst = b.allocReg();
     try b.push(.{ .BinOp = .{ .dst = dst, .op = astBinop(op), .lhs = l, .rhs = r } });
@@ -1572,6 +1621,10 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const result = b.allocReg();
     const exit = try b.allocBlock();
     const finally_entry: ?BlockId = if (t.finally != null) try b.allocBlock() else null;
+    // The post-finally sentinel is allocated up front so catch handlers can be
+    // protected by the finally before their bodies are lowered (a throw in a
+    // catch must run the finally, then re-raise past this sentinel).
+    const finally_done: ?BlockId = if (finally_entry != null) try b.allocBlock() else null;
 
     // Pre-allocate each catch handler's entry block + exception register.
     const Handler = struct { c: ast.Catch, blk: BlockId, exc: Reg };
@@ -1592,6 +1645,7 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         ch.* = .{ .type_name = loweredTypeName(b, &h.c.ty), .handler = h.blk, .exception_reg = h.exc };
     }
     b.attachCatches(cur_id, catch_handlers, finally_entry);
+    if (finally_done) |done| b.setFinallyDoneFor(cur_id, done);
     if (t.finally) |blk| try b.pushFinally(blk);
     const body_val = try lowerBlock(b, &t.body);
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });
@@ -1601,9 +1655,11 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.terminate(.{ .Goto = exit });
     }
 
-    // Each handler body.
+    // Each handler body. A catch body is itself protected by the finally so a
+    // throw from within it still runs the finally before propagating.
     for (handlers) |h| {
         b.switchTo(h.blk);
+        if (finally_entry) |fin| b.protectCatchWithFinally(h.blk, fin, finally_done.?);
         try b.pushScope();
         try b.bind(h.c.binding.name, h.exc);
         const v = try lowerBlock(b, &h.c.body);
@@ -1619,12 +1675,11 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Finally body.
     if (finally_entry) |fin| {
         if (t.finally != null) b.popFinally();
-        const finally_done = try b.allocBlock();
+        const done = finally_done.?;
         b.switchTo(fin);
         if (t.finally) |blk| _ = try lowerBlock(b, &blk);
-        b.terminate(.{ .Goto = finally_done });
-        b.switchTo(finally_done);
-        b.setFinallyDoneFor(cur_id, finally_done);
+        b.terminate(.{ .Goto = done });
+        b.switchTo(done);
         b.terminate(.{ .Goto = exit });
     }
 
@@ -1639,6 +1694,11 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // re-arms it for the body's own nested calls).
     var expected_arity = b.pending_lambda_arity;
     b.pending_lambda_arity = -1;
+    // Broad-collection mask for this lambda's params (set by the call lowering
+    // from the callee parameter's function type). Consumed before the body
+    // recurses so a nested lambda does not inherit it.
+    const lambda_broad_mask = b.pending_lambda_broad_mask;
+    b.pending_lambda_broad_mask = 0;
     // A lambda assigned to a typed binding (`val h: Ctx.() -> Unit = { … }`)
     // never reaches the call-argument arity path; derive the arity from the
     // binding's functional type so a `T.() -> R` receiver lambda (zero value
@@ -1662,6 +1722,33 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const suppress_it = lam.implicit_it and expected_arity == 0;
     const eff_params: []const ast.Ident = if (suppress_it) &.{} else lam.params;
     const eff_param_tys: []const ?ast.TypeRef = if (suppress_it) &.{} else lam.param_tys;
+    // Names of lambda params (including the implicit `it`) whose effective
+    // static type — the lambda's own annotation, else the expected functional
+    // type's parameter — is a broad collection (`Iterable`/`Collection`).
+    // Recorded on the body builder so `it + x` over a runtime `Set` produces a
+    // `List`. Derived here (not via the body's `param_tys`) so the implicit
+    // `it`'s runtime overload-dispatch placeholder type is left untouched.
+    var broad_names: std.ArrayList([]const u8) = .empty;
+    defer broad_names.deinit(b.allocator);
+    if (!suppress_it and eff_params.len != 0) {
+        const ft = if (b.peekExpected()) |exp| exp.function else null;
+        for (eff_params, 0..) |p, i| {
+            const ty: ?ast.TypeRef = if (i < eff_param_tys.len and eff_param_tys[i] != null)
+                eff_param_tys[i]
+            else if (ft != null and i < ft.?.params.len)
+                ft.?.params[i]
+            else
+                null;
+            const by_ty = ty != null and ty.?.function == null and helpers.isBroadCollectionTypeName(ty.?.name.name);
+            // Also honor the callee-parameter mask: a call-argument lambda has
+            // no expected functional type on the stack, so its `it`'s declared
+            // `Iterable` type lives only in the callee's parameter signature.
+            const by_mask = i < 32 and (lambda_broad_mask >> @intCast(i)) & 1 != 0;
+            if (by_ty or by_mask) {
+                try broad_names.append(b.allocator, p.name);
+            }
+        }
+    }
     // `outer_names` / `inherited_rlp` ownership passes into the lambda lower.
     const outer_names = try b.visibleNames();
     const inherited_rlp = try b.receiverLambdaParamNames();
@@ -1685,6 +1772,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         enclosing_owner,
         suppress_it,
         if (suppress_it) lam.span else null,
+        broad_names.items,
     );
     const body_func = lowered.func;
     const captured_names = lowered.captures;
@@ -1904,6 +1992,64 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
     } else if (args.len == params.len) {
         for (params, out) |p, *o| o.* = fnTypeArityAlias(b, p.ty) orelse -1;
     } else {
+        return null;
+    }
+    return out;
+}
+
+/// A bitmask of which of a `FunctionN`-typed parameter's `arity` value
+/// parameters are declared as a broad collection (`Iterable`/`Collection`).
+/// Used so a lambda bound to that parameter marks those of its own params
+/// broad — then `it + x` over a runtime `Set` produces a `List`, matching the
+/// declared (not runtime) receiver type. Only direct `Function{N}` types are
+/// decoded (a typealias gives arity but not parameter types → mask 0).
+fn fnTypeBroadMask(ty: ir.TypeRef, arity: i16) u32 {
+    if (arity <= 0) return 0;
+    const n: usize = @intCast(arity);
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return 0;
+    // The lowered encoding is `[#suspend?] [receiver?] params… ret [#markers]`.
+    var hi: usize = ty.args.len;
+    while (hi > 0 and ty.args[hi - 1].name.len != 0 and ty.args[hi - 1].name[0] == '#') hi -= 1;
+    var lo: usize = 0;
+    if (lo < hi and std.mem.eql(u8, ty.args[lo].name, "#suspend")) lo += 1;
+    const remaining = hi - lo; // [receiver?] params(n) ret(1)
+    var pstart = lo;
+    if (remaining == n + 2) {
+        pstart = lo + 1; // an explicit receiver precedes the value params
+    } else if (remaining != n + 1) {
+        return 0; // cannot align
+    }
+    var mask: u32 = 0;
+    var i: usize = 0;
+    while (i < n and i < 32 and pstart + i < hi) : (i += 1) {
+        if (helpers.isBroadCollectionTypeName(ty.args[pstart + i].name)) {
+            mask |= (@as(u32, 1) << @intCast(i));
+        }
+    }
+    return mask;
+}
+
+/// Per-argument broad-collection lambda-parameter masks for a call dispatched
+/// to `func`, parallel to `args` and aligned exactly like `argFnArities`.
+fn argLambdaBroadMasks(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]u32 {
+    if (args.len == 0) return null;
+    for (arg_names) |an| if (an != null) return null;
+    for (args) |*a| if (a.* == .Spread) return null;
+    if (func.params.len < recv_offset) return null;
+    const params = func.params[recv_offset..];
+    const out = try b.allocator.alloc(u32, args.len);
+    for (out) |*o| o.* = 0;
+    const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
+    if (trailing_lambda and args.len <= params.len) {
+        var i: usize = 0;
+        while (i + 1 < args.len) : (i += 1) {
+            out[i] = fnTypeBroadMask(params[i].ty, fnTypeArityAlias(b, params[i].ty) orelse -1);
+        }
+        out[args.len - 1] = fnTypeBroadMask(params[params.len - 1].ty, fnTypeArityAlias(b, params[params.len - 1].ty) orelse -1);
+    } else if (args.len == params.len) {
+        for (params, out) |p, *o| o.* = fnTypeBroadMask(p.ty, fnTypeArityAlias(b, p.ty) orelse -1);
+    } else {
+        b.allocator.free(out);
         return null;
     }
     return out;
@@ -2752,6 +2898,42 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const ast_type_args = call.type_args;
     const is_infix = call.is_infix;
 
+    // A bare ctor callee naming a nested class must bind the one in THIS
+    // enclosing-class chain, not a same-simple-name nested class in a sibling
+    // outer class. Walk the owner's FQN, and for each prefix that is itself a
+    // CLASS (never a package — so a same-package top-level is left alone),
+    // check for a nested `<prefix>.<name>`. Only rewrite when it differs from
+    // the bare resolution (a genuine collision), to the qualified path.
+    if (!is_infix and ast_type_args.len == 0 and callee.* == .Path and
+        callee.Path.segments.len == 1 and b.resolve(callee.Path.segments[0].name) == null)
+    {
+        const cname = callee.Path.segments[0].name;
+        if (b.ownerClass()) |owner| resolve: {
+            const ocid = b.module.classId(owner) orelse break :resolve;
+            if (ocid.int() >= b.module.classes.items.len) break :resolve;
+            const bare = b.module.classIdIndexed(cname, b.self_package, callee.Path.segments[0].span.file);
+            var prefix: []const u8 = b.module.classes.items[ocid.int()].fqn;
+            while (std.mem.lastIndexOfScalar(u8, prefix, '.')) |dot| {
+                prefix = prefix[0..dot];
+                if (b.module.classIdByFqn(prefix) == null) continue; // package, not a class
+                const cand = try std.fmt.allocPrint(b.allocator, "{s}.{s}", .{ prefix, cname });
+                const cand_cid = b.module.classIdByFqn(cand);
+                if (cand_cid != null and (bare == null or cand_cid.?.int() != bare.?.int())) {
+                    var segs: std.ArrayList(ast.Ident) = .empty;
+                    var it = std.mem.splitScalar(u8, cand, '.');
+                    while (it.next()) |seg| try segs.append(b.allocator, .{ .name = seg, .span = callee.Path.segments[0].span });
+                    const new_callee = try b.allocator.create(Expr);
+                    new_callee.* = Expr{ .Path = .{ .segments = try segs.toOwnedSlice(b.allocator), .span = callee.Path.span } };
+                    var new_call = call;
+                    new_call.callee = new_callee;
+                    const rewritten = Expr{ .Call = new_call };
+                    return lowerCallGeneral(b, &rewritten);
+                }
+                b.allocator.free(cand);
+            }
+        }
+    }
+
     // Inline expansion (suspend-inline only).
     if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1) {
         const nm = callee.Path.segments[0].name;
@@ -3004,6 +3186,37 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 .args = run[0],
                 .n_args = run[1],
                 .arg_names = arg_names,
+            } });
+            return dst;
+        }
+    }
+
+    // A `name<T>(…)` call whose name resolves to a value parameter/local that
+    // is not a local function names the SHADOWED global function/builder: a
+    // value takes no call-site type arguments. `iterator<List<T>> { … }` inside
+    // `windowedIterator(iterator: Iterator<T>, …)` binds the `iterator {}`
+    // builder, not the `iterator` parameter. Load the global so the runtime
+    // resolves the intrinsic builder rather than invoking the parameter.
+    if (callee.* == .Path and callee.Path.segments.len == 1 and ast_type_args.len != 0) {
+        const nm0 = callee.Path.segments[0].name;
+        if (b.resolve(nm0) != null and !b.isLocalFn(nm0) and
+            b.module.classIdIndexed(nm0, b.self_package, callee.Path.segments[0].span.file) == null)
+        {
+            const gv = b.allocReg();
+            const cn = try b.module.internConst(b.allocator, .{ .String = nm0 });
+            orEmitAudit(b, "typed_call_shadowed_global", "LoadGlobal", nm0);
+            try b.push(.{ .LoadGlobal = .{ .dst = gv, .name = cn } });
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+            const dst = b.allocReg();
+            try b.push(.{ .CallValue = .{
+                .dst = dst,
+                .callee = gv,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+                .type_args = type_args,
             } });
             return dst;
         }
@@ -4526,6 +4739,17 @@ fn fallbackByDeclArity(b: *FuncBuilder, cands: []const FuncId, name0: []const u8
     return fallback;
 }
 
+/// Whether the enclosing class (or any of its supertypes) declares a member
+/// named `name`. Scoped to the current `owner_class` — a bare `::name` /
+/// `this.name` can only resolve to the enclosing class's members or a global,
+/// never an unrelated class's member, so a program-wide member-name set would
+/// over-suppress the global-alias path.
+fn enclosingDeclaresMember(b: *const FuncBuilder, name: []const u8) bool {
+    const oc = b.ownerClass() orelse return false;
+    const methods = b.module.registry.hierarchy_methods.get(oc) orelse return false;
+    return methods.contains(name);
+}
+
 fn isAliasName(name: []const u8) bool {
     const names = [_][]const u8{
         "maxOf",           "minOf",      "max",                 "min",
@@ -4620,6 +4844,13 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
             b.module.registry.class_member_names.contains(name0))
         {
             const this_idx = try b.recordCapture("this");
+            const broad_masks: ?[]u32 = blk: {
+                const f = b.module.funcById(func_id) orelse break :blk null;
+                const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+                break :blk try argLambdaBroadMasks(b, f, args, ast_arg_names, recv_off);
+            };
+            defer if (broad_masks) |m| b.allocator.free(m);
+            b.pending_arg_broad_masks = broad_masks;
             const run = try lowerArgRun(b, args);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -4662,6 +4893,13 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         break :blk names;
     };
     defer if (param_ty_names) |pt| b.allocator.free(pt);
+    const broad_masks: ?[]u32 = blk: {
+        const f = b.module.funcById(func_id) orelse break :blk null;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        break :blk try argLambdaBroadMasks(b, f, args, ast_arg_names, recv_off);
+    };
+    defer if (broad_masks) |m| b.allocator.free(m);
+    b.pending_arg_broad_masks = broad_masks;
     const run = try lowerArgRunFull(b, args, arg_arity, param_ty_names);
     // A trailing lambda always binds the target's last (function-typed)
     // parameter. When a vararg parameter precedes it, positional binding
@@ -4909,6 +5147,29 @@ fn lowerImplicitThisCall(
     if (!b.ownMemberApplicable(name0, args.len)) return null;
     const this_reg = b.resolve("this") orelse return null;
 
+    // Broad-collection mask: a trailing lambda bound to this member's
+    // function-typed parameter whose declared type is `Iterable`/`Collection`
+    // marks the lambda's matching params broad, so `it + x` over a runtime
+    // `Set` yields a `List` (the declared, not runtime, receiver type).
+    const itc_broad: ?[]u32 = blk: {
+        // Only a trailing lambda can be marked broad. Resolve the SIBLING member
+        // method statically and owner-scoped via the `member_method_fids` index
+        // (keyed by class + name + arity): the call target is `this.<name>`, and
+        // `this`'s static class is the enclosing owner, so this is the exact
+        // method — never a same-named member of an unrelated class.
+        if (args.len == 0) break :blk null;
+        const last = args[args.len - 1];
+        if (last != .Lambda and last != .AnonFun) break :blk null;
+        const owner = b.ownerClass() orelse break :blk null;
+        const key = try std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ owner, name0, args.len });
+        defer b.allocator.free(key);
+        const fid = b.module.registry.member_method_fids.get(key) orelse break :blk null;
+        const f = b.module.funcById(fid) orelse break :blk null;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        break :blk try argLambdaBroadMasks(b, f, args, ast_arg_names, recv_off);
+    };
+    defer if (itc_broad) |m| b.allocator.free(m);
+
     // Private own-class methods bind statically. The fid map records one
     // entry per name, so an overloaded private method (two `helper`s of
     // different arity) keeps only one of them. Take the static bind only
@@ -4923,7 +5184,12 @@ fn lowerImplicitThisCall(
         // scratch registers can never clobber an already-lowered slot (a bug
         // the previous hand-rolled loop had, dropping local-variable args).
         const args_start = b.allocReg();
-        const run = try lowerArgRun(b, args);
+        b.pending_arg_broad_masks = itc_broad;
+        const priv_arity: ?[]const i16 = if (b.module.funcById(fid)) |pf|
+            (try argFnArities(b, pf, args, ast_arg_names, if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0))
+        else
+            null;
+        const run = try lowerArgRunWithArity(b, args, priv_arity);
         try b.push(.{ .Move = .{ .dst = args_start, .src = this_reg } });
         var user_arg_names = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
         defer b.allocator.free(user_arg_names);
@@ -4942,6 +5208,7 @@ fn lowerImplicitThisCall(
         } });
         return dst;
     };
+    b.pending_arg_broad_masks = itc_broad;
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
@@ -5316,6 +5583,26 @@ fn lowerFqnGlobalCall(
     return null;
 }
 
+/// The simple head of a type name: drop a package qualifier and any generic
+/// arguments (`kotlin.collections.Iterable<Int>` -> `Iterable`).
+fn typeHead(s: []const u8) []const u8 {
+    var t = s;
+    if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
+    if (std.mem.lastIndexOfScalar(u8, t, '.')) |dot| t = t[dot + 1 ..];
+    return std.mem.trim(u8, t, " ");
+}
+
+/// The static-type head of a call argument when it is a plain local whose
+/// declared type is known — used to disambiguate cast-rebound overloads by
+/// parameter type (an `Iterable<Int>` arg must not bind an `IntRange` param).
+fn argStaticHead(b: *FuncBuilder, a: *const Expr) ?[]const u8 {
+    if (a.* != .Path) return null;
+    const p = a.Path;
+    if (p.segments.len != 1) return null;
+    if (b.localDeclType(p.segments[0].name)) |t| return typeHead(t);
+    return null;
+}
+
 /// The fallback member-call path: local-callable shadowing, super, cast-receiver
 /// static dispatch, and plain CallMember.
 fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
@@ -5414,6 +5701,12 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         const cast_ty = receiver.As.ty;
         const want_user = args.len;
         var chosen: ?FuncId = null;
+        // Among candidates matching the cast receiver type and arity, prefer the
+        // one whose parameter-type heads match the argument static-type heads.
+        // A bare first-match would bind e.g. an `Iterable<Int>` argument to an
+        // `IntRange` parameter (distinct, non-assignable types) when both slice
+        // overloads share the receiver type and arity.
+        var chosen_score: i32 = -1;
         for (b.module.funcsBySimpleName(name.name)) |fid| {
             const f = b.module.funcById(fid) orelse continue;
             if (!f.hasBody()) continue;
@@ -5436,9 +5729,16 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
                 if (want_user > user) break :blk f.params.len != 0 and f.params[f.params.len - 1].is_vararg;
                 break :blk false;
             };
-            if (arity_ok) {
+            if (!arity_ok) continue;
+            var score: i32 = 0;
+            for (args, 0..) |*a, i| {
+                if (i + 1 >= f.params.len) break;
+                const at = argStaticHead(b, a) orelse continue;
+                if (std.mem.eql(u8, at, typeHead(f.params[i + 1].ty.name))) score += 2;
+            }
+            if (score > chosen_score) {
                 chosen = fid;
-                break;
+                chosen_score = score;
             }
         }
         if (chosen) |func_id| {

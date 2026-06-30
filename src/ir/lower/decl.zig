@@ -8,6 +8,7 @@ const ast = @import("ast");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
 const mod = @import("mod.zig");
+const helpers = @import("helpers.zig");
 const runtime = @import("runtime");
 const FF = runtime.forest.ForestField;
 
@@ -524,6 +525,19 @@ pub fn lowerClassWithExtras(
                 &own_member_arity,
             );
             try methods.append(a, placed.id);
+            // Record this method by (class, name, declared arity) so a sibling
+            // method body lowered later can statically reach its signature
+            // (owner-scoped, so a same-named member of an unrelated class is
+            // never mistaken for it).
+            {
+                const ukey = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ c.name.name, f.name.name, f.params.len });
+                const gop = try module.registry.member_method_fids.getOrPut(ukey);
+                if (gop.found_existing) {
+                    a.free(ukey);
+                } else {
+                    gop.value_ptr.* = placed.id;
+                }
+            }
             if (f.visibility == .Private) {
                 try private_method_fids.put(f.name.name, placed.id);
             }
@@ -960,6 +974,22 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         }
     }
     try bindParams(&b, names.items);
+    // Record each declared parameter's static type head so a cast-rebound call
+    // can disambiguate overloads by an argument that names a parameter (an
+    // `Iterable<Int>` parameter must not bind an `IntRange`-typed overload slot).
+    for (f.params) |*p| {
+        try b.setLocalDeclType(p.name.name, p.ty.name.name);
+    }
+    // Labeled-receiver alias: `this@<fn>` names this function's receiver. A
+    // qualified `this@fn` in a nested lambda (e.g.
+    // `sequence { for (x in this@mine) ... }`) then captures this receiver
+    // rather than resolving the lambda's own `this` (the builder scope).
+    if (names.items.len != 0 and std.mem.eql(u8, names.items[0], "this")) {
+        if (b.resolve("this")) |this_reg| {
+            const label = try std.fmt.allocPrint(a, "this@{s}", .{f.name.name});
+            try b.bind(label, this_reg);
+        }
+    }
     // A param whose declared type is a receiver-typed function
     // (`block: T.() -> R`) carries that fact so a bare call `block(...)`
     // inside the body lowers to a member-call with the enclosing `this`
@@ -992,6 +1022,12 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             // `flow {}` builder).
             if (p.ty.function == null and !tp_names.contains(p.ty.name.name)) {
                 try b.markNonFnParam(p.name.name);
+            }
+            // A param statically typed as a broad collection (`Iterable`/
+            // `Collection`): `p + x` / `p - x` returns a `List` even when the
+            // runtime value is a `Set`, so the operator lowering coerces it.
+            if (p.ty.function == null and helpers.isBroadCollectionTypeName(p.ty.name.name)) {
+                try b.markBroadCollectionLocal(p.name.name);
             }
         }
     }

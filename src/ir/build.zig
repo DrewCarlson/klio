@@ -213,6 +213,14 @@ pub const FuncBuilder = struct {
     /// annotation — used by the `==` lowering to detect a boxed
     /// operand the same way the tree walker does.
     any_typed_locals: StringSet,
+    /// Names (params, lambda params, locals) whose declared static type is a
+    /// broad read-only collection — `Iterable`, `Collection`, or their
+    /// `Mutable*` forms — through which a runtime `Set` may flow. Kotlin's
+    /// `Iterable`/`Collection` `plus`/`minus` return a `List` regardless of the
+    /// runtime element container, so the operator lowering coerces such a
+    /// receiver to a list first (a `Set` receiver would otherwise dispatch the
+    /// `Set`-returning `plus`/`minus`).
+    broad_coll_locals: StringSet,
     /// Locals whose initializer is an `object : T {}` expression. Kept apart
     /// from `local_init_exprs` (which feeds receiver-type inference) so that
     /// recording an object initializer for overload-applicability checks does
@@ -383,6 +391,15 @@ pub const FuncBuilder = struct {
     /// keeps the single-`it` binding.
     pending_lambda_arity: i16 = -1,
 
+    /// Per-argument bitmask: bit `i` set means the lambda value-parameter `i`
+    /// of the argument currently being lowered has a broad-collection declared
+    /// type (`Iterable`/`Collection`) coming from the *callee parameter's*
+    /// function type. `pending_lambda_broad_mask` is the mask for the lambda
+    /// being lowered right now; `pending_arg_broad_masks` is the per-argument
+    /// source the arg-run reads (parallel to the args), set by the call site.
+    pending_lambda_broad_mask: u32 = 0,
+    pending_arg_broad_masks: ?[]const u32 = null,
+
     pub fn init(allocator: Allocator, module: *Module) Allocator.Error!FuncBuilder {
         var self = FuncBuilder{
             .allocator = allocator,
@@ -396,6 +413,7 @@ pub const FuncBuilder = struct {
             .mutable_homes = StringRegMap.init(allocator),
             .boxed_vars = StringSet.init(allocator),
             .any_typed_locals = StringSet.init(allocator),
+            .broad_coll_locals = StringSet.init(allocator),
             .object_init_locals = StringSet.init(allocator),
             .own_members = StringSet.init(allocator),
             .own_member_arity = std.StringHashMap(u64).init(allocator),
@@ -444,6 +462,7 @@ pub const FuncBuilder = struct {
         self.mutable_homes.deinit();
         self.boxed_vars.deinit();
         self.any_typed_locals.deinit();
+        self.broad_coll_locals.deinit();
         self.object_init_locals.deinit();
         self.own_members.deinit();
         self.own_member_arity.deinit();
@@ -595,6 +614,12 @@ pub const FuncBuilder = struct {
     }
     pub fn isAnyTyped(self: *const FuncBuilder, name: []const u8) bool {
         return self.any_typed_locals.contains(name);
+    }
+    pub fn markBroadCollectionLocal(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.broad_coll_locals.put(name, {});
+    }
+    pub fn isBroadCollectionLocal(self: *const FuncBuilder, name: []const u8) bool {
+        return self.broad_coll_locals.contains(name);
     }
     pub fn markObjectInitLocal(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.object_init_locals.put(name, {});
@@ -1066,6 +1091,17 @@ pub const FuncBuilder = struct {
     pub fn setFinallyDoneFor(self: *FuncBuilder, body_entry: BlockId, done: BlockId) void {
         self.blocks.items[body_entry.int()].finally_done = done;
         self.blocks.items[done.int()].finally_done_for = body_entry;
+    }
+
+    /// Protect a catch-handler block with the try's `finally`: a throw from
+    /// within the catch then runs the finally (and re-raises past the done
+    /// sentinel) instead of skipping it. The handler keeps no catches of its
+    /// own, so it never re-catches into the same try. `done` is the shared
+    /// post-finally sentinel (so the re-raise fires after the finally runs);
+    /// `finally_done_for` is left pointing at the body, set separately.
+    pub fn protectCatchWithFinally(self: *FuncBuilder, catch_block: BlockId, finally_entry: BlockId, done: BlockId) void {
+        self.blocks.items[catch_block.int()].finally = finally_entry;
+        self.blocks.items[catch_block.int()].finally_done = done;
     }
 
     /// Snapshot every register currently bound in any live scope, in

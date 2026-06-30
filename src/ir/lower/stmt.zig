@@ -163,6 +163,9 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
     // local receiver (`val resp = client.get(url); resp.body<T>()`).
     if (p.ty) |ty| {
         try b.setLocalDeclType(p.name.name, ty.name.name);
+        if (ty.function == null and helpers.isBroadCollectionTypeName(ty.name.name)) {
+            try b.markBroadCollectionLocal(p.name.name);
+        }
     } else if (p.init) |*e| {
         if (e.* == .Call) try b.setLocalInitExpr(p.name.name, e);
         if (e.* == .ObjectExpr) try b.markObjectInitLocal(p.name.name);
@@ -185,6 +188,21 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         }
         try b.bind(p.name.name, home);
     } else {
+        // `val x = y` where `y` is a reassignable var reads `y`'s home register
+        // directly; a later write to `y` (`y = …`) Moves into that home and
+        // would alias into `x`. Snapshot the value into a fresh register so the
+        // val is an independent binding (Kotlin: a val captures the value, not
+        // the variable).
+        if (p.init) |*ie| {
+            if (ie.* == .Path and ie.Path.segments.len == 1 and
+                b.mutableHome(ie.Path.segments[0].name) != null)
+            {
+                const fresh = b.allocReg();
+                try b.push(.{ .Move = .{ .dst = fresh, .src = init } });
+                try b.bind(p.name.name, fresh);
+                return null;
+            }
+        }
         try b.bind(p.name.name, init);
     }
     return null;
@@ -594,7 +612,15 @@ fn lowerAssign(
     const combined: Reg = switch (op) {
         .Assign => v,
         .Add, .Sub, .Mul, .Div, .Rem => blk: {
-            const cur = try lowerExpr(b, target);
+            const cur0 = try lowerExpr(b, target);
+            // `xs += y` / `xs -= y` on a statically broad collection
+            // (`Iterable`/`Collection`) rebinds to a `List`; coerce a `Set`
+            // runtime value to a list first so the `List`-returning operator
+            // is dispatched (mirrors the `lowerBinary` receiver coercion).
+            const cur = if (op == .Add or op == .Sub)
+                try helpers.coerceBroadCollectionToList(b, target, cur0)
+            else
+                cur0;
             const bin: BinOp = switch (op) {
                 .Add => .Add,
                 .Sub => .Sub,
