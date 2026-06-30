@@ -5100,43 +5100,21 @@ fn lowerImplicitThisCall(
     // marks the lambda's matching params broad, so `it + x` over a runtime
     // `Set` yields a `List` (the declared, not runtime, receiver type).
     const itc_broad: ?[]u32 = blk: {
-        // Only a trailing lambda can be marked broad. Member methods are not in
-        // any simple-name / fqn index at this lowering point, so scan the
-        // lowered funcs for member-style overloads (implicit leading `this`,
-        // matching user arity) of this name. The runtime dispatch target is not
-        // statically known, so mark broad ONLY when every same-named candidate
-        // agrees on the mask — otherwise (e.g. one class's `testPlus` takes an
-        // `Iterable` while another's takes a `Set`) the choice is ambiguous and
-        // guessing would mis-coerce an unrelated call. Soundness over coverage.
+        // Only a trailing lambda can be marked broad. Resolve the SIBLING member
+        // method statically and owner-scoped via the `member_method_fids` index
+        // (keyed by class + name + arity): the call target is `this.<name>`, and
+        // `this`'s static class is the enclosing owner, so this is the exact
+        // method — never a same-named member of an unrelated class.
         if (args.len == 0) break :blk null;
         const last = args[args.len - 1];
         if (last != .Lambda and last != .AnonFun) break :blk null;
-        var chosen: ?[]u32 = null;
-        var ambiguous = false;
-        var ii: usize = 0;
-        const tot = b.module.funcCount();
-        while (ii < tot) : (ii += 1) {
-            const f = b.module.funcById(FuncId.from(@intCast(ii))) orelse continue;
-            if (!std.mem.eql(u8, f.name, name0)) continue;
-            if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
-            if (userParams(f) != args.len) continue;
-            const m = (try argLambdaBroadMasks(b, f, args, ast_arg_names, 1)) orelse continue;
-            if (chosen) |c| {
-                if (!std.mem.eql(u32, c, m)) ambiguous = true;
-                b.allocator.free(m);
-            } else {
-                chosen = m;
-            }
-        }
-        if (chosen) |c| {
-            if (!ambiguous) {
-                for (c) |bit| {
-                    if (bit != 0) break :blk c;
-                }
-            }
-            b.allocator.free(c);
-        }
-        break :blk null;
+        const owner = b.ownerClass() orelse break :blk null;
+        const key = try std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ owner, name0, args.len });
+        defer b.allocator.free(key);
+        const fid = b.module.registry.member_method_fids.get(key) orelse break :blk null;
+        const f = b.module.funcById(fid) orelse break :blk null;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        break :blk try argLambdaBroadMasks(b, f, args, ast_arg_names, recv_off);
     };
     defer if (itc_broad) |m| b.allocator.free(m);
 

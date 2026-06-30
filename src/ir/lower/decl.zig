@@ -525,6 +525,19 @@ pub fn lowerClassWithExtras(
                 &own_member_arity,
             );
             try methods.append(a, placed.id);
+            // Record this method by (class, name, declared arity) so a sibling
+            // method body lowered later can statically reach its signature
+            // (owner-scoped, so a same-named member of an unrelated class is
+            // never mistaken for it).
+            {
+                const ukey = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ c.name.name, f.name.name, f.params.len });
+                const gop = try module.registry.member_method_fids.getOrPut(ukey);
+                if (gop.found_existing) {
+                    a.free(ukey);
+                } else {
+                    gop.value_ptr.* = placed.id;
+                }
+            }
             if (f.visibility == .Private) {
                 try private_method_fids.put(f.name.name, placed.id);
             }

@@ -2255,6 +2255,14 @@ pub const ModuleRegistry = struct {
     /// declares or inherits (transitively over supertypes). Lets the
     /// lowerer honor Kotlin's separate function/property namespaces.
     hierarchy_methods: std.StringHashMap(std.StringHashMap(void)),
+    /// `"<class>\x00<method>\x00<userArity>"` → the lowered method's FuncId,
+    /// populated incrementally as each class's method bodies are lowered. Lets
+    /// a method body statically reach a SIBLING member method's lowered
+    /// signature (e.g. the declared parameter types of `testPlus`) at lower
+    /// time, when `Class.methods` is not yet patched and members are absent
+    /// from the simple-name / fqn indexes. Owner-scoped, so a same-named member
+    /// in an unrelated class is never confused for it.
+    member_method_fids: std.StringHashMap(FuncId),
     /// Every member name (function, property, primary-ctor property,
     /// companion member) declared by ANY class in the program. A bare
     /// name in a receiver context can only be shadowed by a runtime
@@ -2349,6 +2357,7 @@ pub const ModuleRegistry = struct {
             .func_type_param_bounds = std.AutoHashMap(FuncId, []const TypeParamBound).init(allocator),
             .top_level_delegated_props = std.StringHashMap(void).init(allocator),
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
+            .member_method_fids = std.StringHashMap(FuncId).init(allocator),
             .class_member_names = std.StringHashMap(void).init(allocator),
             .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
             .delegated_body_props = StrPairSet.init(allocator),
@@ -2387,6 +2396,11 @@ pub const ModuleRegistry = struct {
             var it = self.hierarchy_methods.valueIterator();
             while (it.next()) |inner| inner.deinit();
             self.hierarchy_methods.deinit();
+        }
+        {
+            var it = self.member_method_fids.keyIterator();
+            while (it.next()) |k| self.allocator.free(k.*);
+            self.member_method_fids.deinit();
         }
         self.class_member_names.deinit();
         {
