@@ -4368,6 +4368,24 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                     },
                     .List => |lst| try collectPairs(allocator, &to_put, lst.items),
                     .Set => |st| try collectPairs(allocator, &to_put, st.items),
+                    .Array => |arr| if (arr.boxedList()) |bl| try collectPairs(allocator, &to_put, bl),
+                    .Sequence => {
+                        const ms = try materialiseSequence(self, allocator, &a2);
+                        var items = switch (ms) {
+                            .ok => |it| it,
+                            .err => |e| return .{ .err = e },
+                        };
+                        defer items.deinit(allocator);
+                        for (items.items) |v| {
+                            if (v == .Pair) {
+                                const k = v.Pair.first.asPtr().*;
+                                const val = v.Pair.second.asPtr().*;
+                                k.retain();
+                                val.retain();
+                                try to_put.append(allocator, .{ .key = k, .value = val });
+                            }
+                        }
+                    },
                     else => {},
                 }
                 const g = m.entries.borrowMut();
