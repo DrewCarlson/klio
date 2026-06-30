@@ -681,8 +681,19 @@ const Matcher = struct {
         if (at >= self.input.len) return null;
         const len = std.unicode.utf8ByteSequenceLength(self.input[at]) catch return null;
         if (at + len > self.input.len) return null;
-        const cp = std.unicode.utf8Decode(self.input[at .. at + len]) catch return null;
-        return .{ .cp = cp, .len = len };
+        if (std.unicode.utf8Decode(self.input[at .. at + len])) |cp| {
+            return .{ .cp = cp, .len = len };
+        } else |_| {
+            // WTF-8: a lone surrogate is a 3-byte `ED …` sequence that
+            // `utf8Decode` rejects; decode it to its code point so `.` and
+            // character classes match it as a single unit.
+            if (len == 3) {
+                const b = self.input[at .. at + 3];
+                const cp = (@as(u21, b[0] & 0x0F) << 12) | (@as(u21, b[1] & 0x3F) << 6) | @as(u21, b[2] & 0x3F);
+                if (cp >= 0xD800 and cp <= 0xDFFF) return .{ .cp = cp, .len = 3 };
+            }
+            return null;
+        }
     }
 
     /// Codepoint immediately before byte offset `at`, for word boundaries.
