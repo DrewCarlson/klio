@@ -151,10 +151,25 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
         // Bound each child with `timeout`: a test file that makes the
         // interpreter hang (infinite loop, not a crash) must not stall the
         // whole suite. A killed child yields no summary -> counted as blocked.
+        //
+        // A test file's top-level helpers (a shared `data class Sortable`, an
+        // `assertAlmostEquals`) frequently live in a *sibling* test file that
+        // also carries its own `@Test`s — the real Kotlin module compiles
+        // every file together. Compile every same-directory sibling target as
+        // context so those helpers resolve, and restrict the run to this
+        // target's own tests with `--only-file` so siblings' tests do not
+        // double-count.
+        const tdir = std.fs.path.dirname(target) orelse "";
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
+        try argv.append(a, try std.fmt.allocPrint(a, "--only-file={s}", .{target}));
         try argv.appendSlice(a, support.items);
+        for (targets.items) |sibling| {
+            if (std.mem.eql(u8, sibling, target)) continue;
+            const sdir = std.fs.path.dirname(sibling) orelse "";
+            if (std.mem.eql(u8, sdir, tdir)) try argv.append(a, sibling);
+        }
         try argv.append(a, target);
         const r = try runKlio(a, io, &env, argv.items);
         if (passedCount(r.stdout)) |p| {
