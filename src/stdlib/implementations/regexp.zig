@@ -479,6 +479,28 @@ const Parser = struct {
                 }
                 return self.node(.{ .literal = val });
             },
+            // `\k<name>`: a named backreference. A name declared so far (a
+            // backward or enclosing reference) becomes a backref to that group;
+            // an unknown/forward name falls back to a literal `k` (the
+            // `<name>` re-parses as literals), so the pattern simply fails to
+            // match — matching klio's not-yet-defined/non-existent handling.
+            'k' => {
+                if (self.peek() == '<') {
+                    const save = self.pos;
+                    _ = self.bump(); // '<'
+                    if (self.parseGroupName('>')) |gname| {
+                        for (self.names.items, 0..) |gn, i| {
+                            if (gn) |n| {
+                                if (std.mem.eql(u8, n, gname)) return self.node(.{ .backref = i });
+                            }
+                        }
+                        self.pos = save; // unknown name: re-parse `<name>` as literals
+                    } else |_| {
+                        self.pos = save;
+                    }
+                }
+                return self.node(.{ .literal = 'k' });
+            },
             // `\1`..`\9`: a backreference to a capture group. The first digit
             // always begins a reference (a forward reference to a not-yet-opened
             // group is legal and matches empty); further digits extend it only
