@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const char_impl = @import("char.zig");
 
 const Value = runtime.Value;
 const CallCtx = runtime.CallCtx;
@@ -23,6 +24,7 @@ const ValueSlice = runtime.ValueSlice;
 const RegexData = runtime.RegexData;
 const MatchData = runtime.MatchData;
 const MatchGroupData = runtime.MatchGroupData;
+const InstanceData = runtime.InstanceData;
 const SequenceData = runtime.SequenceData;
 const charUnitToString = runtime.charUnitToString;
 
@@ -89,6 +91,19 @@ fn makeSequence(allocator: std.mem.Allocator, items: []const Value) !Value {
 fn stringBytes(v: Value) ?[]const u8 {
     return switch (v) {
         .String => |s| s.asPtr().bytes,
+        .StringBuilder => |sb| sb.asPtr().items,
+        else => null,
+    };
+}
+
+/// A `StringRef` over a regex input argument — a CharSequence, so both a
+/// `String` (shared) and a `StringBuilder` (its current bytes, copied) are
+/// accepted. `MatchResult` substrings reference this ref, so a StringBuilder
+/// input is snapshotted. Null when the value is not string-like.
+fn inputRef(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error!?StringRef {
+    return switch (v) {
+        .String => |s| s.clone(),
+        .StringBuilder => |sb| try runtime.strInitOwned(allocator, try allocator.dupe(u8, sb.asPtr().items)),
         else => null,
     };
 }
@@ -149,6 +164,8 @@ const Node = union(enum) {
     word_boundary: bool,
     /// A capture group: index into the capture array.
     group: struct { index: usize, child: *Node },
+    /// `\N` backreference: match the text the group at `index` captured.
+    backref: usize,
     /// A non-capturing group `(?:...)`.
     noncap: *Node,
     concat: []*Node,
@@ -353,6 +370,14 @@ const Parser = struct {
 
         var index: usize = 0;
         if (capturing) {
+            // A duplicate capture-group name is invalid.
+            if (name) |nm| {
+                for (self.names.items) |existing| {
+                    if (existing) |en| {
+                        if (std.mem.eql(u8, en, nm)) return ParseError.InvalidPattern;
+                    }
+                }
+            }
             index = self.next_group;
             self.next_group += 1;
             try self.names.append(self.allocator, name);
@@ -379,6 +404,8 @@ const Parser = struct {
         }
         if (self.peek() != close) return ParseError.InvalidPattern;
         _ = self.bump();
+        // An empty group name (`(?<>…)`) is invalid.
+        if (buf.items.len == 0) return ParseError.InvalidPattern;
         return buf.toOwnedSlice(self.allocator);
     }
 
@@ -438,6 +465,60 @@ const Parser = struct {
             'B' => return self.node(.{ .word_boundary = false }),
             'A' => return self.node(.anchor_start),
             'z', 'Z' => return self.node(.anchor_end),
+            // `\0`, `\0n`, `\0nn`, `\0mnn`: an octal character escape (Java
+            // dialect). `\0` alone is NUL; up to three further octal digits
+            // give the code point (`\0141` is octal 141 = 'a').
+            '0' => {
+                var val: u21 = 0;
+                var count: usize = 0;
+                while (count < 3) : (count += 1) {
+                    const p = self.peek() orelse break;
+                    if (p < '0' or p > '7') break;
+                    val = val * 8 + @as(u21, @intCast(p - '0'));
+                    _ = self.bump();
+                }
+                return self.node(.{ .literal = val });
+            },
+            // `\k<name>`: a named backreference. A name declared so far (a
+            // backward or enclosing reference) becomes a backref to that group;
+            // an unknown/forward name falls back to a literal `k` (the
+            // `<name>` re-parses as literals), so the pattern simply fails to
+            // match — matching klio's not-yet-defined/non-existent handling.
+            'k' => {
+                if (self.peek() == '<') {
+                    const save = self.pos;
+                    _ = self.bump(); // '<'
+                    if (self.parseGroupName('>')) |gname| {
+                        for (self.names.items, 0..) |gn, i| {
+                            if (gn) |n| {
+                                if (std.mem.eql(u8, n, gname)) return self.node(.{ .backref = i });
+                            }
+                        }
+                        self.pos = save; // unknown name: re-parse `<name>` as literals
+                    } else |_| {
+                        self.pos = save;
+                    }
+                }
+                return self.node(.{ .literal = 'k' });
+            },
+            // `\1`..`\9`: a backreference to a capture group. The first digit
+            // always begins a reference (a forward reference to a not-yet-opened
+            // group is legal and matches empty); further digits extend it only
+            // while the index names a group opened so far — Kotlin's
+            // `captureLargestValidIndex` dialect, so `\12` with one group is
+            // group 1 then a literal `2`, while `\11` with 12 groups is group 11.
+            '1', '2', '3', '4', '5', '6', '7', '8', '9' => {
+                var num: usize = @intCast(e - '0');
+                while (self.peek()) |p| {
+                    if (p < '0' or p > '9') break;
+                    const nn = num * 10 + @as(usize, @intCast(p - '0'));
+                    if (nn < self.next_group) {
+                        num = nn;
+                        _ = self.bump();
+                    } else break;
+                }
+                return self.node(.{ .backref = num });
+            },
             else => return self.node(.{ .literal = escapeChar(e) }),
         }
     }
@@ -554,13 +635,13 @@ const Capture = struct { start: ?usize = null, end: ?usize = null };
 /// programs reached here are ASCII-cased; this keeps `IGNORE_CASE` correct
 /// for the common case without a full case table.
 fn foldCp(c: u21) u21 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
+    if (c < 0x80) return if (c >= 'A' and c <= 'Z') c + 32 else c;
+    return char_impl.lowerScalar(c);
 }
 
 fn upperCp(c: u21) u21 {
-    if (c >= 'a' and c <= 'z') return c - 32;
-    return c;
+    if (c < 0x80) return if (c >= 'a' and c <= 'z') c - 32 else c;
+    return char_impl.upperScalar(c);
 }
 
 fn cpEq(a: u21, b: u21, fold: bool) bool {
@@ -600,8 +681,19 @@ const Matcher = struct {
         if (at >= self.input.len) return null;
         const len = std.unicode.utf8ByteSequenceLength(self.input[at]) catch return null;
         if (at + len > self.input.len) return null;
-        const cp = std.unicode.utf8Decode(self.input[at .. at + len]) catch return null;
-        return .{ .cp = cp, .len = len };
+        if (std.unicode.utf8Decode(self.input[at .. at + len])) |cp| {
+            return .{ .cp = cp, .len = len };
+        } else |_| {
+            // WTF-8: a lone surrogate is a 3-byte `ED …` sequence that
+            // `utf8Decode` rejects; decode it to its code point so `.` and
+            // character classes match it as a single unit.
+            if (len == 3) {
+                const b = self.input[at .. at + 3];
+                const cp = (@as(u21, b[0] & 0x0F) << 12) | (@as(u21, b[1] & 0x3F) << 6) | @as(u21, b[2] & 0x3F);
+                if (cp >= 0xD800 and cp <= 0xDFFF) return .{ .cp = cp, .len = 3 };
+            }
+            return null;
+        }
     }
 
     /// Codepoint immediately before byte offset `at`, for word boundaries.
@@ -675,6 +767,23 @@ const Matcher = struct {
                 return k.run(self, at);
             },
             .noncap => |child| return self.match(child, at, k),
+            .backref => |idx| {
+                // Match the text the referenced group captured. An unset group
+                // (it did not participate) matches the empty string.
+                if (idx >= self.caps.len) return k.run(self, at);
+                const cs = self.caps[idx].start orelse return k.run(self, at);
+                const ce = self.caps[idx].end orelse return k.run(self, at);
+                var ci = cs;
+                var p = at;
+                while (ci < ce) {
+                    const cd = self.decode(ci) orelse break;
+                    const id = self.decode(p) orelse return null;
+                    if (!cpEq(cd.cp, id.cp, self.flags.case_insensitive)) return null;
+                    ci += cd.len;
+                    p += id.len;
+                }
+                return k.run(self, p);
+            },
             .group => |g| {
                 const saved = self.caps[g.index];
                 self.caps[g.index].start = at;
@@ -755,6 +864,18 @@ const TopCont = struct {
         _ = self;
         _ = m;
         return at;
+    }
+};
+
+/// Top-level continuation that only succeeds once the whole input is consumed.
+/// `matchEntire` runs with this so a lazy quantifier (`a+b+?`) backtracks and
+/// extends to reach the end rather than stopping at its minimal match.
+const EndCont = struct {
+    base: Cont,
+
+    fn vt(self: *const Cont, m: *Matcher, at: usize) ?usize {
+        _ = self;
+        return if (at == m.input.len) at else null;
     }
 };
 
@@ -842,6 +963,31 @@ fn runMatch(allocator: std.mem.Allocator, prog: *const Program, input: []const u
     }
     allocator.free(caps);
     return null;
+}
+
+/// Full-input match anchored at offset 0 that must consume the entire input
+/// (`matchEntire`). Unlike `runMatch` it does not scan forward and it requires
+/// the match to reach `input.len`, so a lazy quantifier backtracks to span the
+/// whole input.
+fn runMatchFull(allocator: std.mem.Allocator, prog: *const Program, input: []const u8) !?[]Capture {
+    var caps = try allocator.alloc(Capture, prog.group_count);
+    errdefer allocator.free(caps);
+    for (caps) |*c| c.* = .{};
+    var matcher = Matcher{ .input = input, .caps = caps, .flags = prog.flags };
+    const top = EndCont{ .base = .{ .vtable = EndCont.vt } };
+    if (matcher.match(prog.root, 0, &top.base)) |end| {
+        caps[0] = .{ .start = 0, .end = end };
+        return caps;
+    }
+    allocator.free(caps);
+    return null;
+}
+
+/// Whether `r` matches anywhere in `s`. Backs `CharSequence.contains(Regex)`
+/// (`regex in string`), dispatched from `string_contains`.
+pub fn regexContainsIn(allocator: std.mem.Allocator, r: ObjRef(RegexData), s: []const u8) std.mem.Allocator.Error!bool {
+    const prog = progFromRegex(r) orelse return false;
+    return programIsMatch(allocator, prog, s);
 }
 
 /// `is_match` — does the pattern match anywhere?
@@ -1163,16 +1309,27 @@ fn expandKotlinReplacement(
                     }
                 }
             } else {
-                var num: std.ArrayList(u8) = .empty;
-                defer num.deinit(allocator);
-                while (i < chars.len and chars[i] >= '0' and chars[i] <= '9') {
-                    try num.append(allocator, @intCast(chars[i]));
-                    i += 1;
+                // Greedy `$N` with backoff to the largest existing group index
+                // (`$13` against 13 groups is group 1 then a literal `3`); the
+                // remaining digits fall through as literals. A bare `$` with no
+                // following digit emits a literal `$` (the replace entry point
+                // already rejected the genuinely-invalid forms).
+                var num: usize = 0;
+                var best: usize = 0;
+                var len: usize = 0;
+                while (i + len < chars.len and chars[i + len] >= '0' and chars[i + len] <= '9') {
+                    const nn = num * 10 + @as(usize, @intCast(chars[i + len] - '0'));
+                    len += 1;
+                    if (nn < prog.group_count) {
+                        num = nn;
+                        best = len;
+                    } else break;
                 }
-                if (std.fmt.parseInt(usize, num.items, 10)) |idx| {
-                    try out.appendSlice(allocator, groupText(groups, idx));
-                } else |_| {
+                if (best == 0) {
                     try out.append(allocator, '$');
+                } else {
+                    try out.appendSlice(allocator, groupText(groups, num));
+                    i += best;
                 }
             }
         } else {
@@ -1309,13 +1466,19 @@ pub fn regex_find(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.find requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     var start: usize = 0;
     if (ctx.args.len > 2) {
         const v = ctx.args[2];
         if (v.isIntegral()) {
             const n = v.asI64().?;
+            const length = byteToChar(s, s.len);
+            if (n < 0 or n > length) {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "Start index out of bounds: {d}, input length: {d}", .{ n, length });
+                defer ctx.allocator.free(msg);
+                return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg) } };
+            }
             start = if (n == 0) 0 else charIndexToByte(s, n);
         } else {
             return typeErr("Regex.find startIndex must be Int");
@@ -1338,13 +1501,24 @@ pub fn regex_find_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.findAll requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.findAll requires a Regex receiver");
 
+    // Optional `startIndex` (a char index into the input): scanning starts
+    // there. Out of `[0, length]` throws IndexOutOfBoundsException eagerly,
+    // matching `kotlin.text.Regex.findAll`.
+    const length = byteToChar(s, s.len);
+    const start_index: i64 = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse 0) else 0;
+    if (start_index < 0 or start_index > length) {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "Start index out of bounds: {d}, input length: {d}", .{ start_index, length });
+        defer ctx.allocator.free(msg);
+        return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg) } };
+    }
+
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(ctx.allocator);
-    var pos: usize = 0;
+    var pos: usize = charIndexToByte(s, start_index);
     while (true) {
         const caps = (try runMatch(ctx.allocator, prog, s, pos)) orelse break;
         defer ctx.allocator.free(caps);
@@ -1372,15 +1546,13 @@ pub fn regex_match_entire(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.matchEntire requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     const prog = progFromRegex(r) orelse return typeErr("Regex.matchEntire requires a Regex receiver");
-    if (try runMatch(ctx.allocator, prog, s, 0)) |caps| {
+    if (try runMatchFull(ctx.allocator, prog, s)) |caps| {
         defer ctx.allocator.free(caps);
-        if (caps[0].start == 0 and caps[0].end == s.len) {
-            const md = try buildMatch(ctx.allocator, r, sr, caps);
-            return ok(try matchValue(ctx.allocator, md));
-        }
+        const md = try buildMatch(ctx.allocator, r, sr, caps);
+        return ok(try matchValue(ctx.allocator, md));
     }
     return ok(.Null);
 }
@@ -1393,7 +1565,7 @@ pub fn regex_match_at(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.matchAt requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     const idx = if (ctx.args.len > 2) ctx.args[2].asI64() else null;
     if (idx == null) return typeErr("Regex.matchAt requires Int index");
@@ -1423,6 +1595,68 @@ const RegexReplace = struct {
 };
 
 /// Shared engine for `Regex.replace` / `Regex.replaceFirst`.
+/// Number of leading ASCII digits of `template[start..]` that form the largest
+/// group index `< group_count` (Kotlin's `$N` reference parses greedily but
+/// backs off so `$13` against 13 groups means group 1 then a literal `3`).
+/// Null when even the first digit indexes a non-existent group.
+fn bestGroupPrefix(template: []const u8, start: usize, group_count: usize) ?usize {
+    var num: usize = 0;
+    var best: usize = 0;
+    var len: usize = 0;
+    while (start + len < template.len and template[start + len] >= '0' and template[start + len] <= '9') {
+        const nn = num * 10 + @as(usize, template[start + len] - '0');
+        len += 1;
+        if (nn < group_count) {
+            num = nn;
+            best = len;
+        } else break;
+    }
+    return if (best == 0) null else best;
+}
+
+/// The exception FQN a Kotlin replacement string would raise, or null when it
+/// is valid. A `$` must introduce a group reference: `$N` (a digit index) or
+/// `${…}` (an index or a declared group name); `\` escapes the next character.
+/// A malformed `$` is IllegalArgumentException; a reference to a non-existent
+/// numeric group is IndexOutOfBoundsException.
+fn replacementError(template: []const u8, prog: *const Program) ?[]const u8 {
+    const IAE = "kotlin.IllegalArgumentException";
+    const IOOBE = "kotlin.IndexOutOfBoundsException";
+    var i: usize = 0;
+    while (i < template.len) {
+        const c = template[i];
+        if (c == '\\') {
+            i += 2;
+            continue;
+        }
+        if (c != '$') {
+            i += 1;
+            continue;
+        }
+        i += 1; // past '$'
+        if (i >= template.len) return IAE; // trailing '$'
+        if (template[i] == '{') {
+            i += 1;
+            const key_start = i;
+            while (i < template.len and template[i] != '}') i += 1;
+            if (i >= template.len) return IAE; // no closing '}'
+            const key = template[key_start..i];
+            i += 1; // past '}'
+            if (key.len == 0) return IAE;
+            if (std.fmt.parseInt(usize, key, 10)) |idx| {
+                if (idx >= prog.group_count) return IOOBE;
+            } else |_| {
+                if (groupIndexByName(prog, key) == null) return IAE;
+            }
+        } else if (template[i] >= '0' and template[i] <= '9') {
+            if (bestGroupPrefix(template, i, prog.group_count)) |n| {
+                i += n;
+            } else return IOOBE;
+        } else return IAE; // '$' followed by a non-reference character
+    }
+    return null;
+}
+
 fn performRegexReplace(
     ctx: *CallCtx,
     r: ObjRef(RegexData),
@@ -1440,6 +1674,11 @@ fn performRegexReplace(
 
     if (repl.? == .String) {
         const template = repl.?.String.asPtr().bytes;
+        if (replacementError(template, prog)) |fqn| {
+            const msg = try std.fmt.allocPrint(allocator, "Invalid replacement string: '{s}'", .{template});
+            defer allocator.free(msg);
+            return .{ .err = .{ .Thrown = try makeException(allocator, fqn, msg) } };
+        }
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
         var last: usize = 0;
@@ -1523,7 +1762,7 @@ pub fn regex_replace(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.replace requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const repl = if (ctx.args.len > 2) ctx.args[2] else null;
     return performRegexReplace(ctx, r, sr, repl, .{ .first_only = false, .who = "Regex.replace" });
 }
@@ -1536,7 +1775,7 @@ pub fn regex_replace_first(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.replaceFirst requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const repl = if (ctx.args.len > 2) ctx.args[2] else null;
     return performRegexReplace(ctx, r, sr, repl, .{ .first_only = true, .who = "Regex.replaceFirst" });
 }
@@ -1549,7 +1788,7 @@ pub fn regex_split(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.split requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     var limit: i64 = 0;
     if (ctx.args.len > 2) {
@@ -1573,7 +1812,7 @@ pub fn regex_split_to_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
     if (ctx.args.len < 2 or stringBytes(ctx.args[1]) == null) {
         return typeErr("Regex.splitToSequence requires a String");
     }
-    const sr = ctx.args[1].String;
+    const sr = (try inputRef(ctx.allocator, ctx.args[1])) orelse return typeErr("regex input must be a CharSequence");
     const s = sr.asPtr().bytes;
     var limit: i64 = 0;
     if (ctx.args.len > 2) {
@@ -1604,13 +1843,6 @@ fn splitItems(allocator: std.mem.Allocator, prog: *const Program, s: []const u8,
         defer allocator.free(caps);
         const m_start = caps[0].start.?;
         const m_end = caps[0].end.?;
-        // Rust's split skips an empty match at the very start.
-        if (m_end == 0 and m_start == 0) {
-            if (s.len == 0) break;
-            const len = std.unicode.utf8ByteSequenceLength(s[0]) catch 1;
-            pos = if (len <= s.len) len else 1;
-            continue;
-        }
         try items.append(allocator, try makeString(allocator, s[last..m_start]));
         last = m_end;
         if (m_end > m_start) {
@@ -1731,26 +1963,112 @@ pub fn match_result_group_values(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
     return ok(try makeList(ctx.allocator, items.items, false));
 }
 
-pub fn match_result_groups(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const m = switch (matchArg(ctx.args, "MatchResult.groups")) {
+pub fn match_result_destructured(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const m = switch (matchArg(ctx.args, "MatchResult.destructured")) {
         .ok => |v| v,
         .err => |e| return e,
     };
     const groups = m.asPtr().groups;
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(ctx.allocator);
-    for (groups) |g| {
-        if (g) |gd| {
-            try items.append(ctx.allocator, .{ .MatchGroup = .{
-                .value = gd.value.clone(),
-                .start = gd.start,
-                .end_inclusive = gd.end_inclusive,
-            } });
-        } else {
-            try items.append(ctx.allocator, .Null);
+    // `MatchResult.Destructured` exposes the capture groups (index 1..) through
+    // `component1()..componentN()` and `toList()`. klio models it as the
+    // group-value list: a `List`'s own `componentN()` / `toList()` then satisfy
+    // the `Destructured` contract (group N at component N).
+    if (groups.len > 1) {
+        for (groups[1..]) |g| {
+            if (g) |gd| {
+                try items.append(ctx.allocator, .{ .String = gd.value.clone() });
+            } else {
+                try items.append(ctx.allocator, try makeString(ctx.allocator, ""));
+            }
         }
     }
     return ok(try makeList(ctx.allocator, items.items, false));
+}
+
+/// `MatchResult.groups` returns a `MatchNamedGroupCollection`: indexable by
+/// group number AND by name, and castable to that interface. Modeled as a synth
+/// instance wrapping the match; `get`/`size` read its groups/names.
+pub fn match_result_groups(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const m = switch (matchArg(ctx.args, "MatchResult.groups")) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
+    const id = ctx.host.allocInstanceId();
+    const fields = [_]InstanceData.Field{
+        .{ .name = "__mgc", .value = .{ .Match = m.clone() } },
+    };
+    return ok(try ctx.host.newSynthInstance("kotlin.text.MatchNamedGroupCollection", id, &fields));
+}
+
+fn matchGroupValue(gd: ?MatchGroupData) Value {
+    if (gd) |d| return .{ .MatchGroup = .{ .value = d.value.clone(), .start = d.start, .end_inclusive = d.end_inclusive } };
+    return .Null;
+}
+
+pub fn match_named_group_get(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[0] != .Instance) return typeErr("MatchNamedGroupCollection.get requires a key");
+    const key = ctx.args[1];
+    const g = ctx.args[0].Instance.borrow();
+    defer g.deinit();
+    const mv = g.get().get("__mgc") orelse return typeErr("not a MatchNamedGroupCollection");
+    if (mv != .Match) return typeErr("not a MatchNamedGroupCollection");
+    const md = mv.Match.asPtr();
+    var idx: ?usize = null;
+    if (key.isIntegral()) {
+        const n = key.asI64() orelse return typeErr("bad group index");
+        if (n >= 0 and n < md.groups.len) idx = @intCast(n);
+    } else if (key == .String) {
+        const name = key.String.asPtr().bytes;
+        var found = false;
+        if (progFromRegex(md.regex)) |prog| {
+            for (prog.names, 0..) |gn, i| {
+                if (gn) |nm| {
+                    if (std.mem.eql(u8, nm, name)) {
+                        if (i < md.groups.len) idx = i;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // A name that no group in the pattern declares is invalid (vs a declared
+        // group that simply did not participate, which yields null).
+        if (!found) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "No group with name <{s}>", .{name});
+            defer ctx.allocator.free(msg);
+            return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg) } };
+        }
+    } else return typeErr("MatchNamedGroupCollection.get key must be Int or String");
+    if (idx) |i| return ok(matchGroupValue(md.groups[i]));
+    return ok(.Null);
+}
+
+pub fn match_named_group_size(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args[0] != .Instance) return ok(.{ .Int = 0 });
+    const g = ctx.args[0].Instance.borrow();
+    defer g.deinit();
+    const mv = g.get().get("__mgc") orelse return ok(.{ .Int = 0 });
+    if (mv != .Match) return ok(.{ .Int = 0 });
+    return ok(.{ .Int = @intCast(mv.Match.asPtr().groups.len) });
+}
+
+pub fn match_named_group_iterator(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args[0] != .Instance) return typeErr("not a MatchNamedGroupCollection");
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(ctx.allocator);
+    {
+        const g = ctx.args[0].Instance.borrow();
+        defer g.deinit();
+        const mv = g.get().get("__mgc") orelse return typeErr("not a MatchNamedGroupCollection");
+        if (mv != .Match) return typeErr("not a MatchNamedGroupCollection");
+        for (mv.Match.asPtr().groups) |gd| {
+            try items.append(ctx.allocator, matchGroupValue(gd));
+        }
+    }
+    const list = try makeList(ctx.allocator, items.items, false);
+    return (try ctx.host.invokeMethod(&list, "iterator", &.{}, ctx.out)) orelse return typeErr("iterator");
 }
 
 pub fn match_result_next(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -1769,7 +2087,10 @@ pub fn match_result_next(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                     const len = std.unicode.utf8ByteSequenceLength(input[start]) catch 1;
                     start = if (start + len <= input.len) start + len else input.len;
                 } else {
-                    start = input.len;
+                    // A zero-width match at the end of the input has no
+                    // successor — re-scanning from `input.len` would loop on
+                    // the same empty match.
+                    return ok(.Null);
                 }
             }
         }

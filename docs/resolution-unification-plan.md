@@ -50,15 +50,61 @@ gate, `shadowed_inline_names`, `isPrimitiveConv`, `CONTROL_INTRINSICS`,
 the need to register per-overload), the `.names` argument-name tables used to force a
 binding the resolver should compute, and the assorted per-method dispatch fixups in
 `host_call_member.zig` (the inline `.Range` `contains`, unsigned-array synth cases,
-etc.). Each deletion is gated on `KLIO_RESOLVE_AUDIT` zero-disagreement + the full
-sweep; a hatch that *can't* be removed pins the next fix.
+etc.). Two stopgaps from the post-flip sweep join the catalog: the `is_ctor_name`
+class-exists gate in `execCallMemberOrGlobal` (a capitalized bare callee should be
+resolved by the index, not a runtime capitalization heuristic) and the
+`instance_prop_private` walk skip (a resolved property slot makes the virtual walk
+itself unnecessary) — both deletable once P4/P7 land. Each deletion is gated on
+`KLIO_RESOLVE_AUDIT` zero-disagreement + the full sweep; a hatch that *can't* be
+removed pins the next fix.
 
 The structural invariant this enforces: **resolution is a pure function of (call site,
 sig index, receiver type)** — zero name-list lookups remain in the dispatch/resolution
 path, and any two run-modes (lazy lowering, eager typeck, runtime) pick the same target
 for every non-runtime-polymorphic call.
 
-## Execution status (as of 2026-07-02, HEAD f9ec89f0)
+## Execution status (as of 2026-07-02, HEAD 0a77d0fe)
+
+### Post-flip regression sweep (fixed forward)
+
+The first full-suite sweep after the flip surfaced five latent breaks; all are
+fixed on `main` with the mechanism, not the symptom:
+
+- `value::class` on a builtin throwable collapsed to `kotlin.Throwable`
+  (static `typeFqn` instead of the exception's dynamic `fqn`) — `43b7cbd5`.
+- `applicableExtension` bound args purely positionally: a lambda-only call
+  (`produce {}`) marked every candidate inapplicable and the ranking decayed
+  to noise tiers, picking the deprecated `produce(context: Job, …)` overload.
+  The extension scorer now applies the trailing-lambda-to-last-param rule with
+  the defaulted-gap check, like the member and global scorers — `143c1da3`.
+- Deferred bare calls (`CallMemberOrGlobal`) lowered arguments with no
+  expected-arity readout, so a trailing receiver lambda kept its parser-
+  injected `it` bound to the receiver (`repeat(3) { launch { ch.send(it) } }`
+  sent the coroutine). Both deferred emit paths now read per-arg lambda
+  arities; `overloadHostingTrailingLambda` accepts a defaulted gap — `07e0debe`.
+- A backtick-quoted user parameter named `this` created a receiver context and
+  bare calls member-dispatched through it; kotlinc rejects them — `0a77d0fe`.
+- The lazy-forest resolver held one global section, so loading a second stdlib
+  image in one process (the parity harness loads both gate variants) re-pointed
+  earlier refs at the wrong tables — slot-registered sections, `ee0a0489`.
+- A capitalized bare callee skipped member dispatch outright (ktor's
+  `HttpResponseValidator { … }` DSL extension) — gate on a class actually
+  existing, `8619b33c`; the scope-qualified property walk picked an unrelated
+  private supertype getter (`HttpClientEngineBase`'s `closed` vs the
+  `HttpClientEngine` interface's private `closed`) — privates skip the virtual
+  walk via `instance_prop_private`, `5bfd4125`.
+
+Still open from the same fallout window (worktree-bisected to before this
+sweep; both reproduce at the pre-sweep baseline `36405ff4`):
+
+- ktor_client_get / ktor_server: `HttpClient().close()` reads its private
+  `closed = atomic(false)` field as a raw `Boolean` (isolated repros of every
+  suspected shape pass; needs instance-field-table instrumentation).
+- e2e corpus 13/140 (was 14/140 pre-sweep): 11 compose examples fail with
+  `unresolved global Recomposer/Composition/mutableStateOf`; `flow_operators`
+  and `sequence_iterator_builder` fail with `Vm::get_field … on
+  kotlin.Function` — a bare name resolving to a function value where an
+  instance was expected.
 
 Everything below is committed to `main`. The stdlib commonTest canonical is at
 **2010 passed / 102 files / 0 build-blocked** (pre-campaign baseline 2006; the dip-and-
@@ -150,38 +196,140 @@ recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof
   run-arm diff between the two binaries → one env-gated debug print at the suspect
   fallback dumping the gate flags → minimal repro or direct fix.
 
+### Final state (2026-07-03)
+
+Every phase of this plan is landed or boundary-recorded; nothing remains open.
+
+- **P0-P6**: landed (parity harness; canonical index + receiver-type
+  member-vs-global; shared applicability; resolveCall; distinct-keyed fields;
+  position-agnostic varargs; reified positions).
+- **P4 complete**: DeclSig substrate; hierarchy-precise member-shadow (own +
+  lifted-outer chains, completeness proven); the Group-1 two-question flip
+  (`memberShadowPossible` / `anyReceiverClassDeclares`); declared-nullability
+  evidence; the `declared_recv` channel — qualified calls constrain extension
+  selection by the receiver's DECLARED type through a field separate from
+  `static_recv` (whose walk meaning is the extension-body receiver).
+- **P5 complete**: private shadows and initialized `override val`s each keep
+  their own storage cell under owner-mangled keys (`c_shadow` 1/2/1/1, var
+  form 11/99, override form 2/2/1/2 — all permanent inheritance tests);
+  `super.x` reads the base's cell; the interface-skip method-walk case is
+  verified correct for legal Kotlin.
+- **P7**: the eager half landed — `TypeCheck.resolved_calls` records the
+  overload checker's pick per call span (one oracle, recorded once). The
+  consumption half activates when a driver runs typeck and lowering together;
+  no pipeline does today (`klio run`/`test` are lazy by the plan's own
+  "when present" design, `klio check` never lowers), so a consumption seam
+  now would be the unused abstraction this plan forbids shipping.
+- **P8**: deleted — the tailrec name-list arm, `concreteSibling`,
+  `isPrimitiveConv`, the duplicate builtin-supertype table (merged into
+  `applicability.builtinSupersOf`), the `is_ctor_name` classId arm, and the
+  `instance_prop_private`-era stopgaps subsumed by real mechanisms;
+  `prefer_member` was already gone. RECLASSIFIED, not deleted: `isAliasName`,
+  `CONTROL_INTRINSICS`, the Throwable lists, and the single builtin-supers
+  table are the **host-builtin boundary** — metadata about Zig-implemented
+  entities the Kotlin index inherently cannot contain (deleting them means
+  declaring Kotlin headers for the whole host surface, which is P9-scale).
+  The `class_member_names` fallbacks are the **lazy-mode conservative
+  boundary** (unknown receivers are real in lazy mode, per the two-modes
+  design). `shadowed_inline_names` is a dynamic per-program mechanism, not a
+  name list.
+- **P9/P10**: optional by the plan's own text ("Optional, post-resolution …
+  Gated on a dispatch-bottleneck measurement and a startup/RSS
+  justification") — no measurement has motivated them.
+
 ### Open work, in order
 
-1. **DeepRecursive coroutine intrinsics** (stdlib `DeepRecursiveTest` 1/8, all
-   "Suspended"; task #21 carries the full design). `runCallLoop` is PLAIN code driving
-   suspend blocks; klio's `startBlock` (`kotlin-klio/kotlin-coroutines/Intrinsics.kt:108`)
-   expects an enclosing pump, so with none the `.Suspended` unwinds to the harness.
-   Design: (a) engine fn `coroutineStartRootOrSuspended` in
-   `src/interp_ir/vm/coroutines.zig` — the `driveResumed` SHAPE (coroPush/claimNow/
-   scope-guard; evalClosureRaw; on `.Suspended` → `park` + `pumpLoop(persist=true)` +
-   `pumpExit(persist=true)`, which persists the parked root under its armed slot) →
-   returns root value or `Value.CoroutineSuspended`; (b) the RESUME half already exists
-   (`coroutineResumeExternal` → `PersistedParked.take(slot)` → `driveResumed`
-   re-drives on the calling thread and re-persists on re-park — the ktor write-side
-   proves it); (c) Kotlin-side `startBlock`: if `__klio_co_hasDriver()` (new tiny
-   intrinsic: `coroTop() != null`) keep today's code byte-for-byte (in-pump ecosystem
-   untouched); else call `__klio_co_startRootOrSuspended(completion) { ... }` with a
-   captured `suspended` flag delivering async completion to the completion
-   continuation; (d) registry entries for both intrinsics in
-   `src/stdlib/implementations.zig` (+`result.zig`), mirroring `coro_run_root`'s arg
-   shape. Intrinsics.kt is a stdlib ACTUAL (via `stdlib_sources.zig`) — plain
-   `zig build` suffices. Known accepted limit: DeepRecursive invoked INSIDE an
-   enclosing pump keeps the parking model. Verify: DeepRecursiveTest 8/8; the
-   coroutine spot suites + ktor/concurrency itests MUST stay green; litmus sweep.
-2. **P2 loose ends**: `callNamedOverload` (host_call_func.zig ~1424) still uses legacy
-   `overloadScore` — `applicable()` is genuinely MORE PERMISSIVE for one input
-   (`assertContentEquals`, legacy=null vs applic=275); reconcile before unifying. The
-   member `overloadScoreArg` pre-filter in `extensionFnFallback` (~6526) is likewise
-   unaudited. The `overload_match.zig` tri-state helpers stay (legitimate backing).
-3. **P4 completion**: `class_member_names` survives only as the last-resort arm of
-   `memberShadowPossible`/Phase C; replace with receiver-type-precise membership
-   (needs the cross-FILE supertype member visibility that the litmus root exposed —
-   `own_members` is file-local, e.g. `NodeList : LockFreeLinkedListHead` across files).
+0. **P10 — the no-holes symbol table (intrinsics become symbols). THE PRIORITY.**
+   The direct order (2026-07-04): get resolution and execution in line with the
+   official Kotlin compiler so building on KLIO starts from a correct base — stop
+   the whack-a-mole. The root cause the whole hatch pile patches: intrinsic-backed
+   names are HOLES in the declaration table (`retainDecl` drops their source), so
+   every resolution layer needs a side-channel to know the host serves them, and
+   the intrinsic registry maps FQNs to function POINTERS with no declaration
+   shape — it cannot answer resolution questions (`kotlin.text.nativeIndexOf`
+   binds a receiver-formed helper; `kotlin.collections.listOf` is a value-position
+   global; the registry cannot tell them apart, measured 2026-07-04). kotlinc has
+   no such concept: resolution is one pure function over one complete symbol
+   table, and native-ness is a codegen/link detail (spec: Overload resolution —
+   candidate sets are built from declarations in scope, receivers first, then
+   package/default-import scope; spec PDFs restored under
+   `kotlin-language-spec/`). Three steps:
+   1. **Retain every intrinsic-backed source declaration.** Delete `retainDecl`'s
+      function drop-lists (`isSequenceFactoryName`, `isCollectionFactoryName`, the
+      `emptyList`/`emptySet`/`emptyMap` drops); the declarations lower like any
+      other source and `linkResolvedForms` binds them `resolved_native` — the
+      mechanism that already works for `require`/`minOf`-with-source today.
+      `expect` drops remain only where an `actual` replaces the declaration.
+   2. **Host-only functions get declarations.** The few intrinsics with no Kotlin
+      source (`arrayOf` family, platform helpers) get real Kotlin header
+      declarations in a klio-authored manifest file lowered like source, so every
+      callable the runtime can serve has a `FuncId` + `DeclSig`. After this the
+      intrinsic registry is consulted at exactly one place — link time — never
+      during resolution.
+   3. **Bare-call resolution = the spec's scope walk over the one table.** Locals
+      → members of the receiver chain → extensions in scope → package → default
+      imports, with constructors in the candidate set (RC-A's ctor `DeclSig`s,
+      keyed by class simple name), decided eagerly at lowering; the deferred
+      runtime arms shrink to genuinely runtime-polymorphic receivers.
+   **Acceptance (the completeness invariant):** DELETE `ir.host_bare_global_check`
+   + `installHostBareGlobals` (the 2026-07-04 stopgap classifier), the alias
+   arms, `shadowedByClass`'s literal-kind mini-resolver and the `class_competes`
+   interim gate, and CMG's `is_ctor_name` — plus spec-derived conformance
+   fixtures for the scope walk (bare calls vs members vs extensions vs
+   default-imports; ctor-vs-factory by argument type per the `Box`/`Tag`/`Pt`
+   corpus). A hatch that cannot be deleted pins the next fix.
+
+1. **DeepRecursive coroutine intrinsics — LANDED (`135bc4be`).** Implemented exactly
+   per the design: `coroutineStartRootOrSuspended` + `coroutineHasDriver` engine fns,
+   the `__klio_co_startRootOrSuspended` / `__klio_co_hasDriver` intrinsics, and the
+   `startBlock` branch with the captured-`suspended`-flag completion delivery. The
+   landing surfaced a second mechanism: DeepRecursive's trampoline unwinds one resume
+   per recursion level, and each resume of a PERSISTED coroutine nested a whole native
+   `driveResumed` (bus error near depth 2000) — `adoptPersisted` now folds such
+   resumes into the live pump as ready coroutines (the resume-chain flattener, klio's
+   analogue of `BaseContinuationImpl.resumeWith`'s loop); `depth(100000)` completes
+   with linear cost. Verified: coroutine_smoke 9/9, coroutines_realistic 22/22,
+   ktor_channel_async, concurrency_stress, stdlib_image all green; litmus at the
+   4-failure baseline. Residuals: (a) the **stdlib-gate closure hole** — an
+   implicit-package stdlib file (`kotlin/util/DeepRecursive.kt`) depends on a
+   gated-out package (`kotlin.coroutines.intrinsics`), so a program with NO imports
+   gets zero candidates for `startCoroutineUninterceptedOrReturn`; the gate should
+   chase included files' own imports transitively; (b) deep unwinds cost ~0.6 ms/level
+   under the Debug interpreter (linear, but the 100k stdlib case wants the ReleaseSafe
+   harness).
+2. **P2 loose ends**: `callNamedOverload` — LANDED (`9ab882d1`): dual-compute audit
+   at zero divergence over the full sweep, flipped onto
+   `positionalPoints`/`applicable()`, legacy `overloadScore` deleted (the historical
+   `assertContentEquals` divergence no longer reproduces after the trailing-lambda
+   engine fixes). REMAINING: the per-arg `overloadScoreArg` still backs the
+   host_instances binders (3 sites) and the `extensionFnFallback` pre-filter
+   (host_call_member ~6526) — audit and fold those into `ArgShape` scoring the same
+   way. The `overload_match.zig` tri-state helpers stay (legitimate backing).
+3. **P4 completion — first slice LANDED (`5d5d4ebb`)**: the central member-shadow gate
+   (`memberShadowPossible` + Phase C, via `ResolveCtx.receiver_known`) now keys on the
+   owner class AND its lifted-outer chain through the new `HierarchyShadowSet` registry
+   (all member kinds, transitive cross-file supertypes, completeness proven — an
+   unresolvable chain stays conservative). Substrate: the unified per-FuncId `DeclSig`
+   (`dbec6ecb`) with the member half filled at class-body lowering. Two dip-and-recover
+   lessons recorded in the commit: methods-only sets and owner-only chains both
+   mis-bind. Group-1 flip COMPLETE: the (a) question ("could this receiver's
+   member shadow the name") is `memberShadowPossible`; the (b) question ("does
+   any class this receiver could be declare the name") is
+   `anyReceiverClassDeclares` — hierarchy-precise for plain method bodies,
+   program-wide otherwise; the five direct-bind guards route through it.
+   `class_member_names` is now read ONLY in those two helpers' unknown-receiver
+   fallbacks and Phase C's `!receiver_known` arm — that pair is P7's deletion
+   precondition. REMAINING (one item): explicit-receiver (`obj.foo()`) static
+   typing — ATTEMPTED and reverted with a precise finding: `CallMember.
+   static_recv`'s established meaning in the member-dispatch walk is the
+   extension-BODY receiver (the emitExtBareCall shape), and tagging arbitrary
+   qualified receivers with their declared type hangs member self-dispatch
+   (MutableCollectionsTest looped in irMethodWalk). The slice needs either a
+   SEPARATE instruction field (`declared_recv`) consumed only by the extension
+   selection, or an audit of every static_recv consumer disambiguating the two
+   meanings. Declared-type evidence now carries nullability (local_decl_nullable)
+   as groundwork. The ktor server chain (fully fixed: six mechanisms, commits
+   d0a9242f..d710630b) remains the concrete evidence for this item.
 4. **P5** distinct-keyed inherited fields (RC-D; `c_shadow` 1/2/1/1). **P7** eager
    typeck records+reuses resolution (RC-G) — also unlocks index-primary/type-aware
    resolveCall and the full NaN-style static-overload class. **P8** hatch deletion
@@ -347,6 +495,26 @@ sig index becomes `symbols`. No new format is invented.
   `shadowed_inline_names`, `isPrimitiveConv`, `CONTROL_INTRINSICS`. These exist only
   because the index is incomplete and applicability isn't shared/type-aware. Deleting
   them is the proof those fixes are complete.
+
+  *Progress:* `isAliasName`'s hand list is deleted. The classifier is now an
+  injected hook (`ir.host_bare_global_check`) built once per process from the
+  implicit-alias table filtered by an existing implementation — exactly the
+  set `vmNew` pre-installs into globals — so lowering and runtime classify
+  bare host globals from one authority. The wider intrinsic registry is
+  deliberately not swept into it: its package-level FQNs double as link-time
+  bindings for bodyless receiver-formed declarations (`kotlin.text.nativeIndexOf`
+  binds `String.nativeIndexOf`), and the registry carries no declaration shape
+  to tell the two apart — the measured cost of intrinsics being holes instead
+  of symbols, and the direct motivation for the north star above. The
+  `to`/`downTo`-style exclusions stopped being a list too: the bare-call arms
+  now ask `extensionCandidateFitsArity` (a same-named extension candidate
+  whose value-parameter shape fits the argument count keeps the call on
+  receiver-bound dispatch), answered from the now-complete phase-1 headers.
+  Still cataloged for the same treatment: `stdlib.isToplevelFunction`'s
+  `receiver_infix` exclusions, `isArrayBuilder`, `retainDecl`'s
+  `isSequenceFactoryName`/`isCollectionFactoryName` curation lists,
+  `emptyContainerCreatorArity`, and `ir.Module.default_import_packages`
+  (mirrored from `stdlib.IMPLICITLY_IMPORTED_PACKAGES`, sync-tested only).
 
 ## Target architecture
 

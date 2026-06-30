@@ -505,6 +505,13 @@ fn kotlinFloatTotalCmp(x: f64, y: f64) Order {
 
 /// Compare two values by Kotlin's natural ordering.
 fn compareValues(a: Allocator, x: Value, y: Value) Error!CompareOutcome {
+    // Nullable ordering (Kotlin `compareValues`): null sorts before any
+    // non-null value; two nulls are equal. A nullable selector
+    // (`sortedBy { if (...) null else it.length }`) relies on this.
+    if (x == .Null or y == .Null) {
+        if (x == .Null and y == .Null) return .{ .order = .eq };
+        return .{ .order = if (x == .Null) .lt else .gt };
+    }
     if (x.isNumeric() and y.isNumeric()) {
         if (x.isIntegral() and y.isIntegral()) {
             // Unsigned operands compare by magnitude; reading them as i64 would
@@ -1035,31 +1042,41 @@ pub fn coll_iter_distinct_by(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    if (ctx.args.len != 2) return arityErr("groupBy expects (receiver, block)");
+    // `groupBy(keySelector)` or `groupBy(keySelector, valueTransform)`.
+    if (ctx.args.len != 2 and ctx.args.len != 3) return arityErr("groupBy expects (receiver, keySelector[, valueTransform])");
     const items = switch (try iterableItems(a, ctx.args[0], "groupBy")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
     defer if (runtime.freeScratch()) a.free(items);
-    const block = ctx.args[1];
+    const key_block = ctx.args[1];
+    const has_value_transform = ctx.args.len == 3;
     const Group = struct { key: Value, vs: std.ArrayList(Value) };
     var groups: std.ArrayList(Group) = .empty;
     for (items) |v| {
-        const key = switch (try invoke(ctx, &block, &.{v})) {
+        const key = switch (try invoke(ctx, &key_block, &.{v})) {
             .value => |val| val,
             .err => |e| return e,
         };
+        var value = v;
+        if (has_value_transform) {
+            const value_block = ctx.args[2];
+            value = switch (try invoke(ctx, &value_block, &.{v})) {
+                .value => |val| val,
+                .err => |e| return e,
+            };
+        }
         var found = false;
         for (groups.items) |*g| {
             if (eqBoxed(&g.key, &key)) {
-                try g.vs.append(a, v);
+                try g.vs.append(a, value);
                 found = true;
                 break;
             }
         }
         if (!found) {
             var vs: std.ArrayList(Value) = .empty;
-            try vs.append(a, v);
+            try vs.append(a, value);
             try groups.append(a, .{ .key = key, .vs = vs });
         }
     }
@@ -1282,30 +1299,42 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    if (ctx.args.len != 2) return arityErr("associateBy expects (receiver, block)");
+    // `associateBy(keySelector)` or `associateBy(keySelector, valueTransform)`.
+    if (ctx.args.len != 2 and ctx.args.len != 3) return arityErr("associateBy expects (receiver, keySelector[, valueTransform])");
     const items = switch (try iterableItems(a, ctx.args[0], "associateBy")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
     defer if (runtime.freeScratch()) a.free(items);
-    const block = ctx.args[1];
+    const key_block = ctx.args[1];
+    const has_value_transform = ctx.args.len == 3;
     var entries: std.ArrayList(MapPair) = .empty;
     for (items) |v| {
-        const key = switch (try invoke(ctx, &block, &.{v})) {
+        const key = switch (try invoke(ctx, &key_block, &.{v})) {
             .value => |val| val,
             .err => |e| return e,
         };
-        // key is owned (invoke result); v is a borrowed receiver element, so
-        // the map owns its own ref to it. On overwrite, drop the displaced value.
+        // The value is `valueTransform(v)` (owned) or the element itself
+        // (borrowed — the map takes its own ref). key is owned either way.
+        var value = v;
+        var value_owned = false;
+        if (has_value_transform) {
+            const value_block = ctx.args[2];
+            value = switch (try invoke(ctx, &value_block, &.{v})) {
+                .value => |val| val,
+                .err => |e| return e,
+            };
+            value_owned = true;
+        }
         if (findKeyIndexBoxed(entries.items, &key)) |i| {
             if (runtime.reclaimEnabled()) {
                 entries.items[i].value.release(a);
-                v.retain();
+                if (!value_owned) value.retain();
             }
-            entries.items[i].value = v;
+            entries.items[i].value = value;
         } else {
-            if (runtime.reclaimEnabled()) v.retain();
-            try entries.append(a, .{ .key = key, .value = v });
+            if (runtime.reclaimEnabled() and !value_owned) value.retain();
+            try entries.append(a, .{ .key = key, .value = value });
         }
     }
     return ok(try makeMapFromArrayList(a, entries, false));
@@ -1461,9 +1490,57 @@ pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
     };
     const copy = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(copy);
-    if (try sortValuesNatural(a, copy)) |e| return e;
+    // Host-aware so a list of user `Comparable` instances sorts through their
+    // `compareTo` (sortValuesNatural only handles builtin scalars).
+    if (try sortListHostAware(ctx, copy)) |e| return e;
     writeBackItems(it, a, copy) catch return error.OutOfMemory;
     return ok(Value.Unit);
+}
+
+/// Stable bottom-up merge sort driven by a Kotlin `Comparator` value: O(n log n)
+/// comparator callbacks. An insertion sort is O(n²) and times out on large lists.
+pub fn mergeSortComparator(ctx: *CallCtx, cmp: Value, items: []Value) Error!?EvalResult {
+    const a = ctx.allocator;
+    const n = items.len;
+    if (n < 2) return null;
+    const buf = try a.alloc(Value, n);
+    defer if (runtime.freeScratch()) a.free(buf);
+    var width: usize = 1;
+    while (width < n) : (width *= 2) {
+        var lo: usize = 0;
+        while (lo < n) : (lo += 2 * width) {
+            const mid = @min(lo + width, n);
+            const hi = @min(lo + 2 * width, n);
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (i < mid and j < hi) {
+                const c = switch (try invokeComparatorCompare(ctx, cmp, items[i], items[j])) {
+                    .n => |v| v,
+                    .err => |e| return e,
+                };
+                // Take the left run on a tie so the sort stays stable.
+                if (c <= 0) {
+                    buf[k] = items[i];
+                    i += 1;
+                } else {
+                    buf[k] = items[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            while (i < mid) : ({
+                i += 1;
+                k += 1;
+            }) buf[k] = items[i];
+            while (j < hi) : ({
+                j += 1;
+                k += 1;
+            }) buf[k] = items[j];
+        }
+        @memcpy(items[0..n], buf[0..n]);
+    }
+    return null;
 }
 
 pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
@@ -1478,21 +1555,7 @@ pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
     const cmp = ctx.args[1];
     const copy = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(copy);
-    // Insertion sort so the comparator callback can dispatch through host.
-    var i: usize = 1;
-    while (i < copy.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const n = switch (try invokeComparatorCompare(ctx, cmp, copy[j - 1], copy[j])) {
-                .n => |v| v,
-                .err => |e| return e,
-            };
-            if (n > 0) {
-                std.mem.swap(Value, &copy[j - 1], &copy[j]);
-                j -= 1;
-            } else break;
-        }
-    }
+    if (try mergeSortComparator(ctx, cmp, copy)) |e| return e;
     writeBackItems(it, a, copy) catch return error.OutOfMemory;
     return ok(Value.Unit);
 }
@@ -1530,68 +1593,27 @@ pub fn coll_mut_list_reverse(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_iter_sorted_with(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("sortedWith expects (receiver, comparator)");
-    var items = switch (try iterableItems(a, ctx.args[0], "sortedWith")) {
+    const items = switch (try iterableItems(a, ctx.args[0], "sortedWith")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
     const comparator = ctx.args[1];
-    if (comparator != .Comparator) {
-        // Treat as any object with `compare(a, b): Int`.
-        var i: usize = 1;
-        while (i < items.len) : (i += 1) {
-            var j = i;
-            while (j > 0) {
-                const o = switch (try invokeComparatorCompare(ctx, comparator, items[j - 1], items[j])) {
-                    .n => |v| v,
-                    .err => |e| return e,
-                };
-                if (o > 0) {
-                    std.mem.swap(Value, &items[j - 1], &items[j]);
-                    j -= 1;
-                } else break;
-            }
-        }
-        return ok(try makeList(a, items, false));
-    }
-    const descending = comparator.Comparator.descending;
-    const steps_g = comparator.Comparator.steps.borrow();
-    defer steps_g.deinit();
-    const steps = steps_g.get().*;
-    if (steps.len == 0) {
-        if (try sortValuesNaturalDesc(a, items, descending)) |e| return e;
-    } else {
-        var i: usize = 1;
-        while (i < items.len) : (i += 1) {
-            var j = i;
-            while (j > 0) {
-                var ord: Order = .eq;
-                for (steps) |step| {
-                    const ka = switch (try invoke(ctx, &step.selector, &.{items[j - 1]})) {
-                        .value => |v| v,
-                        .err => |e| return e,
-                    };
-                    const kb = switch (try invoke(ctx, &step.selector, &.{items[j]})) {
-                        .value => |v| v,
-                        .err => |e| return e,
-                    };
-                    const o = switch (try compareValues(a, ka, kb)) {
-                        .order => |o| o,
-                        .err => |e| return e,
-                    };
-                    const flipped = if (step.descending) reverseOrder(o) else o;
-                    if (flipped != .eq) {
-                        ord = flipped;
-                        break;
-                    }
-                }
-                if (descending) ord = reverseOrder(ord);
-                if (ord == .gt) {
-                    std.mem.swap(Value, &items[j - 1], &items[j]);
-                    j -= 1;
-                } else break;
-            }
+    // An empty-steps natural Comparator sorts builtin scalars directly.
+    if (comparator == .Comparator) {
+        const descending = comparator.Comparator.descending;
+        const empty = blk: {
+            const steps_g = comparator.Comparator.steps.borrow();
+            defer steps_g.deinit();
+            break :blk steps_g.get().len == 0;
+        };
+        if (empty) {
+            if (try sortValuesNaturalDesc(a, items, descending)) |e| return e;
+            return ok(try makeList(a, items, false));
         }
     }
+    // Everything else (a `compare(a,b)` object or a multi-step Comparator, whose
+    // `compare` the host evaluates) goes through the stable merge sort.
+    if (try mergeSortComparator(ctx, comparator, items)) |e| return e;
     return ok(try makeList(a, items, false));
 }
 
@@ -2233,6 +2255,14 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
             const arg = ctx.args[0];
             switch (arg) {
                 .Int => {
+                    // A negative initial capacity is a catchable
+                    // IllegalArgumentException (matching java.util.ArrayList).
+                    if (arg.Int < 0) {
+                        const msg = try fmt(a, "Illegal Capacity: {d}", .{arg.Int});
+                        const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
+                        if (runtime.freeScratch()) a.free(msg);
+                        return r;
+                    }
                     var list: std.ArrayList(Value) = .empty;
                     if (arg.Int > 0) try list.ensureTotalCapacityPrecise(a, @intCast(arg.Int));
                     return ok(try makeListFromArrayList(a, list, true));
@@ -2301,7 +2331,17 @@ pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
         1 => {
             const arg = ctx.args[0];
             switch (arg) {
-                .Int => return ok(try makeSet(a, &.{}, true)),
+                .Int => {
+                    // HashSet delegates to a backing HashMap, so a negative
+                    // initial capacity is a catchable IllegalArgumentException.
+                    if (arg.Int < 0) {
+                        const msg = try fmt(a, "Illegal initial capacity: {d}", .{arg.Int});
+                        const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
+                        if (runtime.freeScratch()) a.free(msg);
+                        return r;
+                    }
+                    return ok(try makeSet(a, &.{}, true));
+                },
                 .List => |l| return ok(try makeSetVL(a, l.items, true)),
                 .Set => |s| return ok(try makeSetVL(a, s.items, true)),
                 .Instance => {
@@ -2314,7 +2354,34 @@ pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
                 else => return typeErr("HashSet expects no args, an Int capacity, or a Collection"),
             }
         },
-        else => return arityErr("HashSet expects 0 or 1 args"),
+        else => {
+            // `HashSet(initialCapacity, loadFactor)` validates both like the
+            // backing HashMap: a negative capacity or a non-positive / NaN load
+            // factor is a catchable IllegalArgumentException.
+            if (ctx.args.len == 2 and ctx.args[0] == .Int) {
+                if (ctx.args[0].Int < 0) {
+                    const msg = try fmt(a, "Illegal initial capacity: {d}", .{ctx.args[0].Int});
+                    const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
+                    if (runtime.freeScratch()) a.free(msg);
+                    return r;
+                }
+                const lf: ?f64 = switch (ctx.args[1]) {
+                    .Float => |x| x,
+                    .Double => |x| x,
+                    else => null,
+                };
+                if (lf) |v| {
+                    if (!(v > 0)) {
+                        const msg = try fmt(a, "Illegal load factor: {d}", .{v});
+                        const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
+                        if (runtime.freeScratch()) a.free(msg);
+                        return r;
+                    }
+                }
+                return ok(try makeSet(a, &.{}, true));
+            }
+            return arityErr("HashSet expects 0, 1, or 2 args");
+        },
     }
 }
 
@@ -3198,7 +3265,10 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 }
             }
         },
-        .Builder => |bstate| {
+        .Builder => |bstate0| {
+            // Drive a FRESH cursor so this materialisation is independent of any
+            // other consumption of the same (re-iterable) Sequence.
+            const bstate = try freshBuilderState(host, a, bstate0);
             // Pull from the lazy builder one element at a time so an infinite
             // generator never materialises past the consumer's demand.
             while (true) {
@@ -3269,7 +3339,8 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             defer g.deinit();
             try items.appendSlice(a, g.get().*);
         },
-        .Builder => |bstate| {
+        .Builder => |bstate0| {
+            const bstate = try freshBuilderState(host, a, bstate0);
             while (true) {
                 const step = try host.builderStep(bstate, out);
                 switch (step) {
@@ -3586,19 +3657,46 @@ fn sortListHostAware(ctx: *CallCtx, items: []Value) Error!?EvalResult {
         }
     }
     if (!needs_host) return sortValuesNatural(a, items);
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const o = switch (try compareHostAware(ctx, items[j - 1], items[j])) {
-                .order => |o| o,
-                .err => |e| return e,
-            };
-            if (o == .gt) {
-                std.mem.swap(Value, &items[j - 1], &items[j]);
-                j -= 1;
-            } else break;
+    // Stable bottom-up merge sort: O(n log n) host comparisons. An insertion
+    // sort here is O(n²) and times out on large host-comparable lists.
+    const n = items.len;
+    if (n < 2) return null;
+    const buf = try a.alloc(Value, n);
+    defer if (runtime.freeScratch()) a.free(buf);
+    var width: usize = 1;
+    while (width < n) : (width *= 2) {
+        var lo: usize = 0;
+        while (lo < n) : (lo += 2 * width) {
+            const mid = @min(lo + width, n);
+            const hi = @min(lo + 2 * width, n);
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (i < mid and j < hi) {
+                const o = switch (try compareHostAware(ctx, items[i], items[j])) {
+                    .order => |o| o,
+                    .err => |e| return e,
+                };
+                // Take the left run on a tie so the sort stays stable.
+                if (o != .gt) {
+                    buf[k] = items[i];
+                    i += 1;
+                } else {
+                    buf[k] = items[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            while (i < mid) : ({
+                i += 1;
+                k += 1;
+            }) buf[k] = items[i];
+            while (j < hi) : ({
+                j += 1;
+                k += 1;
+            }) buf[k] = items[j];
         }
+        @memcpy(items[0..n], buf[0..n]);
     }
     return null;
 }
@@ -4076,12 +4174,16 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     if (runtime.reclaimEnabled()) for (window.items) |e| e.retain();
     const mutable = recv.List.mutable;
     const backing = try CollBackingRef.init(a, .{ .sublist = .{ .parent = root, .from = new_from, .len = win_len } });
+    // Share the root list's structural counter so a modification of the parent
+    // (not through this view) is observed as a ConcurrentModification by this
+    // subList's iterators — matching Kotlin's SubList, which tracks root.modCount.
+    const shared_mc = if (recv.List.mod_count) |mc| mc.clone() else try modCountFor(a, mutable);
     return ok(.{ .List = .{
         .items = try ValueList.init(a, window),
         .mutable = mutable,
         .enum_entries = false,
         .backing = backing.cell,
-        .mod_count = try modCountFor(a, mutable),
+        .mod_count = shared_mc,
     } });
 }
 
@@ -4108,6 +4210,22 @@ pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
         },
         else => try out.append(a, arg),
     }
+    return ok(try makeListBorrowed(a, out, false));
+}
+
+/// `Collection.plusElement(element)` always appends `element` as a single
+/// element, even when it is itself a collection — unlike `plus`, which flattens
+/// an Iterable/Array/Sequence argument.
+pub fn coll_list_plus_element(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.plusElement")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    var out: std.ArrayList(Value) = .empty;
+    try appendVL(&out, a, it);
+    if (ctx.args.len < 2) return arityErr("plusElement requires an argument");
+    try out.append(a, ctx.args[1]);
     return ok(try makeListBorrowed(a, out, false));
 }
 
@@ -5936,12 +6054,16 @@ pub fn array_slice_impl(ctx: *CallCtx) Error!EvalResult {
     const src = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(src);
     if (ctx.args[1] == .Range) {
-        const start: usize = @intCast(@max(ctx.args[1].Range.start, 0));
-        const end_excl: usize = @intCast(@max(ctx.args[1].Range.end + 1, 0));
-        const lo = @min(start, src.len);
-        const hi = @min(end_excl, src.len);
-        const slice: []const Value = if (lo <= hi) src[lo..hi] else &.{};
-        return ok(try makeArray(a, slice, prim));
+        const rs = ctx.args[1].Range.start;
+        const re = ctx.args[1].Range.end;
+        const slen: i64 = @intCast(src.len);
+        // An empty range yields an empty array; otherwise the range must be in
+        // bounds (Kotlin's sliceArray throws for a negative/over-length range).
+        if (rs > re) return ok(try makeArray(a, &.{}, prim));
+        if (rs < 0 or re >= slen) {
+            return indexOob(a, try fmt(a, "sliceArray: range {d}..{d} out of bounds for length {d}", .{ rs, re, src.len }));
+        }
+        return ok(try makeArray(a, src[@intCast(rs)..@intCast(re + 1)], prim));
     }
     // `sliceArray(indices: Collection<Int>)`: gather `this[indices[k]]`.
     const idxs = switch (try iterableItemsCtx(ctx, ctx.args[1], "sliceArray")) {
@@ -6400,6 +6522,56 @@ pub fn array_fill(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 
+/// `UIntArray.asIntArray()` (and the U{Byte,Short,Long} siblings): a signed
+/// VIEW sharing the unsigned array's packed buffer, so mutations through either
+/// alias — the mirror of `IntArray.asUIntArray()` (the unsigned ctor). klio
+/// otherwise falls to the stdlib body, which copies.
+pub fn array_as_signed_view(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("asArray requires an array receiver");
+    const arr = ctx.args[0].Array;
+    const src = arr.prim orelse return typeErr("asArray requires a primitive array");
+    const dst: PrimitiveArrayKind = switch (src) {
+        .UByte => .Byte,
+        .UShort => .Short,
+        .UInt => .Int,
+        .ULong => .Long,
+        else => return typeErr("asArray: receiver is not an unsigned array"),
+    };
+    switch (arr.storage) {
+        .scalars => |pb| return ok(.{ .Array = .{ .storage = .{ .scalars = pb.clone() }, .prim = dst } }),
+        .boxed => return typeErr("asArray: unsigned array is not packed"),
+    }
+}
+
+/// In-place `reverse()` / `reverse(fromIndex, toIndex)` for an array. The
+/// unsigned `reverse()` stdlib body delegates to `storage.reverse()`, which
+/// does not reach the array's elements here, so the unsigned arrays bind this.
+pub fn array_reverse(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("reverse requires an array receiver");
+    const arr = ctx.args[0].Array;
+    const len: i64 = @intCast(arr.len());
+    const from = switch (try arrayOptIndex(a, ctx, 1, 0, "reverse")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    const to = switch (try arrayOptIndex(a, ctx, 2, len, "reverse")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    if (from < 0 or to > len) {
+        return indexOob(a, try fmt(a, "reverse: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
+    }
+    if (from > to) {
+        return illegalArg(a, try fmt(a, "reverse: fromIndex {d} > toIndex {d}", .{ from, to }));
+    }
+    const buf = try arr.snapshot(a);
+    defer if (runtime.freeScratch()) a.free(buf);
+    std.mem.reverse(Value, buf[@intCast(from)..@intCast(to)]);
+    try arr.writeBack(a, buf);
+    return ok(Value.Unit);
+}
+
 pub fn array_sort(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sort requires an array receiver");
@@ -6482,6 +6654,28 @@ fn arraySumImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
 
 pub fn array_sum_int(ctx: *CallCtx) Error!EvalResult {
     return arraySumImpl(ctx, "Array.sum");
+}
+
+/// `U{Byte,Short,Int}Array.sum(): UInt` and `ULongArray.sum(): ULong`. The
+/// generic sum widens unsigned elements but returns `Int`/`Long`; Kotlin's
+/// unsigned sum widens to `UInt` (or `ULong` for a ULongArray).
+pub fn array_sum_unsigned(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sum requires an array receiver");
+    const prim = ctx.args[0].Array.prim orelse return typeErr("sum requires a primitive unsigned array");
+    const items = switch (try iterableItems(a, ctx.args[0], "sum")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(items);
+    if (prim == .ULong) {
+        var acc: u64 = 0;
+        for (items) |v| acc +%= v.asU64() orelse 0;
+        return ok(.{ .ULong = acc });
+    }
+    var acc: u32 = 0;
+    for (items) |v| acc +%= @as(u32, @truncate(v.asU64() orelse 0));
+    return ok(.{ .UInt = acc });
 }
 
 pub fn array_average_impl(ctx: *CallCtx) Error!EvalResult {
@@ -6643,6 +6837,55 @@ pub fn coll_max_with_or_null(ctx: *CallCtx) Error!EvalResult {
 /// ordering or a `RuntimeError` (as data) for incomparable values.
 pub fn compare_values(a: Allocator, x: Value, y: Value) Error!OrderResult {
     return compareValuesPublic(a, x, y);
+}
+
+// `SequenceScope` field names (kept in sync with coroutines.zig's canonical
+// copy, which lives in a higher module the stdlib cannot import).
+pub const seq_has_value_field = "__seq_has_value";
+pub const seq_value_field = "__seq_value";
+pub const seq_yield_iter_field = "__seq_yield_iter";
+
+/// A FRESH builder cursor cloned from `template`: a new `SequenceScope` and
+/// reset flags, sharing the template's block closure. Kotlin's `sequence { }`
+/// is re-iterable (a fresh coroutine per `iterator()`); klio embeds one cursor
+/// in the Sequence, so each new consumption drives a clone, leaving the
+/// embedded template pristine.
+pub fn freshBuilderState(host: IntrinsicHost, a: Allocator, template: runtime.BuilderStateRef) Allocator.Error!runtime.BuilderStateRef {
+    const block: Value = blk: {
+        const tg = template.borrow();
+        defer tg.deinit();
+        break :blk tg.get().block.asPtr().*;
+    };
+    const id = host.allocInstanceId();
+    const fields = [_]InstanceData.Field{
+        .{ .name = seq_has_value_field, .value = .{ .Bool = false } },
+        .{ .name = seq_value_field, .value = .Unit },
+        .{ .name = seq_yield_iter_field, .value = .Null },
+    };
+    const scope = try host.newSynthInstance("kotlin.sequences.SequenceScope", id, &fields);
+    var blk_val = block;
+    if (runtime.reclaimEnabled()) blk_val.retain();
+    const block_box = try Value.boxRef(a, blk_val);
+    if (runtime.reclaimEnabled()) scope.retain();
+    const scope_box = try Value.boxRef(a, scope);
+    return try runtime.BuilderStateRef.init(a, .{ .block = block_box, .scope = scope_box });
+}
+
+/// If `seq` is a `Builder`-source Sequence, a fresh Sequence with a cloned
+/// cursor (sharing the op pipeline) for independent iteration; else null.
+pub fn freshBuilderSeq(host: IntrinsicHost, a: Allocator, seq: Value) Allocator.Error!?Value {
+    if (seq != .Sequence) return null;
+    const sg = seq.Sequence.borrow();
+    if (sg.get().source != .Builder) {
+        sg.deinit();
+        return null;
+    }
+    const tmpl = sg.get().source.Builder;
+    const ops = sg.get().ops;
+    sg.deinit();
+    const state = try freshBuilderState(host, a, tmpl);
+    const data = try ObjRef(runtime.SequenceData).init(a, .{ .source = .{ .Builder = state }, .ops = ops });
+    return .{ .Sequence = data };
 }
 
 /// Drive a lazy `Value::Sequence` to completion. Returns the produced

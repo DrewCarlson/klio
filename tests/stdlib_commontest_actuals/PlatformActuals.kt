@@ -19,10 +19,33 @@ public fun assertTypeEquals(expected: Any?, actual: Any?) {
 }
 
 // Regex / numeric platform-capability flags the common tests gate on. KLIO's
-// regex engine accepts escaping an arbitrary character but, like the JS
-// dialect, does not recognize octal literals; its `Float` arithmetic enforces
-// the 32-bit range.
+// regex engine accepts escaping an arbitrary character and octal character
+// literals (Java dialect); its `Float` arithmetic enforces the 32-bit range.
 public val isFloat32RangeEnforced: Boolean = true
-public val supportsOctalLiteralInRegex: Boolean get() = false
+public val supportsOctalLiteralInRegex: Boolean get() = true
 public val supportsEscapeAnyCharInRegex: Boolean get() = true
 public val regexSplitUnicodeCodePointHandling: Boolean get() = false
+
+// The commonTest backreference-handling enum + descriptor live in
+// `common/test/testUtils.kt`, which the klio harness does not load (it walks
+// `stdlib/test`, not `stdlib/common/test`); define them here so the regex tests
+// resolve them. How KLIO's regex engine resolves invalid/edge-case
+// backreferences (verified against its behavior): a backreference to a
+// not-yet-defined, enclosing, or non-existent NUMBERED group matches the empty
+// string (the expression is effectively ignored); a `\k<name>` to a
+// missing/forward NAMED group is a literal that fails to match; `\0` is an
+// octal NUL literal, so a "group zero" reference matches nothing. A trailing
+// extra digit of a numbered backreference is captured at the largest valid index.
+public enum class HandlingOption {
+    MATCH_NOTHING, THROW, IGNORE_BACK_REFERENCE_EXPRESSION
+}
+
+public object BackReferenceHandling {
+    val captureLargestValidIndex: Boolean get() = true
+    val notYetDefinedGroup: HandlingOption = HandlingOption.IGNORE_BACK_REFERENCE_EXPRESSION
+    val notYetDefinedNamedGroup: HandlingOption = HandlingOption.MATCH_NOTHING
+    val enclosingGroup: HandlingOption = HandlingOption.IGNORE_BACK_REFERENCE_EXPRESSION
+    val nonExistentGroup: HandlingOption = HandlingOption.IGNORE_BACK_REFERENCE_EXPRESSION
+    val nonExistentNamedGroup: HandlingOption = HandlingOption.MATCH_NOTHING
+    val groupZero: HandlingOption = HandlingOption.MATCH_NOTHING
+}

@@ -1,10 +1,9 @@
 // klio commonMain shipment of `AutoCloseable.use`.
 //
-// The upstream commonMain declaration is `public expect inline fun`
-// with a per-platform body — JVM has the suppressed-exception path,
-// Native has a simple try/finally. klio does not surface
-// suppressed-exception chains, so it ships the Native-shaped
-// try/finally body directly here.
+// The upstream commonMain declaration is `public expect inline fun` with a
+// per-platform body. This matches the full semantics: the block's exception
+// propagates, and an exception thrown by `close()` while unwinding is added to
+// the block exception's suppressed list rather than replacing it.
 
 package kotlin
 
@@ -13,10 +12,23 @@ import kotlin.contracts.contract
 
 public actual inline fun <T : AutoCloseable?, R> T.use(block: (T) -> R): R {
     contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }
+    var exception: Throwable? = null
     try {
         return block(this)
+    } catch (e: Throwable) {
+        exception = e
+        throw e
     } finally {
-        this?.close()
+        when {
+            this == null -> {}
+            exception == null -> close()
+            else ->
+                try {
+                    close()
+                } catch (closeException: Throwable) {
+                    exception.addSuppressed(closeException)
+                }
+        }
     }
 }
 

@@ -643,7 +643,10 @@ fn materialiseSequenceBounded(
                     if (max) |m| if (output.items.len >= m) break;
                 }
             },
-            .Builder => |bstate| {
+            .Builder => |bstate0| {
+                // Drive a FRESH cursor so this materialisation is independent of
+                // any other consumption of the same (re-iterable) Sequence.
+                const bstate = try collections.freshBuilderState(host, allocator, bstate0);
                 while (true) {
                     if (takeCapReached(seq.ops, st.taken)) break;
                     const step = try host.builderStep(bstate, out);
@@ -731,7 +734,8 @@ fn materialiseSequenceBounded(
             defer g.deinit();
             try items.appendSlice(allocator, g.get().*);
         },
-        .Builder => |bstate| {
+        .Builder => |bstate0| {
+            const bstate = try collections.freshBuilderState(host, allocator, bstate0);
             while (true) {
                 const step = try host.builderStep(bstate, out);
                 switch (step) {

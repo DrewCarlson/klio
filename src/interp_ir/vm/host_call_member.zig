@@ -1764,6 +1764,13 @@ fn builtinSupers(nm: []const u8) []const []const u8 {
         return &.{"Iterable"};
     } else if (std.mem.eql(u8, s, "String")) {
         return &.{ "CharSequence", "Comparable" };
+    } else if (std.mem.eql(u8, s, "StringBuilder")) {
+        // A StringBuilder is a CharSequence (and Appendable). Without this an
+        // overload taking `CharSequence` scores inapplicable for a StringBuilder
+        // argument, so overload resolution falls to the lowest-FuncId tiebreak
+        // and elects a `Char`/first-declared sibling — `sb.startsWith(sb)` bound
+        // `startsWith(Char)` instead of `startsWith(CharSequence)`.
+        return &.{ "CharSequence", "Appendable" };
     }
     return &.{};
 }
@@ -2727,17 +2734,21 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // `r.contains(x)` on a Range.
     if (std.mem.eql(u8, name, "contains") and args.len == 1 and receiver.* == .Range) {
         const r = receiver.Range;
+        // A descending progression (step < 0) has start > end; the membership
+        // bounds run low..high regardless of iteration direction.
+        const lo = if (r.step > 0) r.start else r.end;
+        const hi = if (r.step > 0) r.end else r.start;
         const inside = blk: {
             if (args[0] == .Char and r.kind == .Char) {
                 const cv: i64 = @intCast(args[0].Char);
-                break :blk cv >= r.start and cv <= r.end and @rem(cv - r.start, r.step) == 0;
+                break :blk cv >= lo and cv <= hi and @rem(cv - r.start, r.step) == 0;
             }
             if (args[0].asI64()) |v| {
                 // Widen the step-alignment difference: `v - r.start` overflows
                 // i64 for a range spanning most of the type (`MIN..MAX`), which
                 // Kotlin's `in` check tolerates.
                 const diff = @as(i128, v) - @as(i128, r.start);
-                break :blk v >= r.start and v <= r.end and @rem(diff, @as(i128, r.step)) == 0;
+                break :blk v >= lo and v <= hi and @rem(diff, @as(i128, r.step)) == 0;
             }
             break :blk false;
         };
@@ -3463,7 +3474,10 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                 kv.value.retain();
                 const k = try Value.boxRef(allocator, kv.key);
                 const v = try Value.boxRef(allocator, kv.value);
-                try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = null } });
+                // A mutable map's iterator yields live entries: `setValue`
+                // writes through, and `MutableIterator.remove` deletes from the
+                // backing via this reference (the `items` list is a snapshot).
+                try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = if (m.mutable) m.entries else null } });
             }
             const src_mc = g.get().mod_count;
             g.deinit();
@@ -3551,6 +3565,17 @@ fn sequenceMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // `Sequence.iterator()` is lazy: a `SeqIter` pulls one element at a time so
     // an infinite source never materialises (`sequence{}` / `generateSequence`).
     if (std.mem.eql(u8, name, "iterator") and args.len == 0) {
+        // A `sequence{}`/`iterator{}` builder Sequence is re-iterable: each
+        // `iterator()` drives a fresh coroutine cursor (clone), leaving the
+        // embedded template untouched so a second consumption is not empty.
+        {
+            var intrinsic = makeIntrinsicHost(self);
+            defer deinitIntrinsicHost(&intrinsic);
+            const ihost = intrinsic.intrinsicHost();
+            if (try stdlib.freshBuilderSeq(ihost, allocator, receiver.*)) |fresh| {
+                return .{ .ok = try stdlib.makeSeqIter(allocator, fresh) };
+            }
+        }
         var sv = receiver.*;
         if (runtime.reclaimEnabled()) sv.retain();
         return .{ .ok = try stdlib.makeSeqIter(allocator, sv) };
@@ -3584,10 +3609,22 @@ fn sequenceMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         if (std.mem.eql(u8, name, "filter") and args.len == 1) break :blk .{ .Filter = args[0] };
         if (std.mem.eql(u8, name, "filterNot") and args.len == 1) break :blk .{ .FilterNot = args[0] };
         if (std.mem.eql(u8, name, "take") and args.len == 1) {
-            if (args[0].asI64()) |n| break :blk .{ .Take = n };
+            if (args[0].asI64()) |n| {
+                if (n < 0) {
+                    const msg = try std.fmt.allocPrint(allocator, "Requested element count {d} is less than zero.", .{n});
+                    return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
+                }
+                break :blk .{ .Take = n };
+            }
         }
         if (std.mem.eql(u8, name, "drop") and args.len == 1) {
-            if (args[0].asI64()) |n| break :blk .{ .Drop = n };
+            if (args[0].asI64()) |n| {
+                if (n < 0) {
+                    const msg = try std.fmt.allocPrint(allocator, "Requested element count {d} is less than zero.", .{n});
+                    return .{ .err = try throwExc(allocator, "kotlin.IllegalArgumentException", msg) };
+                }
+                break :blk .{ .Drop = n };
+            }
         }
         if (std.mem.eql(u8, name, "takeWhile") and args.len == 1) break :blk .{ .TakeWhile = args[0] };
         if (std.mem.eql(u8, name, "dropWhile") and args.len == 1) break :blk .{ .DropWhile = args[0] };
@@ -4338,6 +4375,24 @@ fn collectionMutators(self: *VmHost, allocator: Allocator, receiver: *const Valu
                     },
                     .List => |lst| try collectPairs(allocator, &to_put, lst.items),
                     .Set => |st| try collectPairs(allocator, &to_put, st.items),
+                    .Array => |arr| if (arr.boxedList()) |bl| try collectPairs(allocator, &to_put, bl),
+                    .Sequence => {
+                        const ms = try materialiseSequence(self, allocator, &a2);
+                        var items = switch (ms) {
+                            .ok => |it| it,
+                            .err => |e| return .{ .err = e },
+                        };
+                        defer items.deinit(allocator);
+                        for (items.items) |v| {
+                            if (v == .Pair) {
+                                const k = v.Pair.first.asPtr().*;
+                                const val = v.Pair.second.asPtr().*;
+                                k.retain();
+                                val.retain();
+                                try to_put.append(allocator, .{ .key = k, .value = val });
+                            }
+                        }
+                    },
                     else => {},
                 }
                 const g = m.entries.borrowMut();
@@ -4645,6 +4700,26 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const g = it.items.borrowMut();
         defer g.deinit();
         if (p - 1 < g.get().items.len) {
+            const removed = g.get().items[p - 1];
+            // A map iterator's element is a live MapEntry over a snapshot list;
+            // also delete the entry from the backing map (by key).
+            if (removed == .MapEntry) {
+                if (removed.MapEntry.backing) |entries| {
+                    const eg = entries.borrowMut();
+                    defer eg.deinit();
+                    const key = removed.MapEntry.key.asPtr();
+                    for (eg.get().pairs.items, 0..) |*slot, i| {
+                        if (Value.structuralEq(&slot.key, key)) {
+                            if (runtime.reclaimEnabled()) {
+                                slot.key.release(allocator);
+                                slot.value.release(allocator);
+                            }
+                            _ = eg.get().pairs.orderedRemove(i);
+                            break;
+                        }
+                    }
+                }
+            }
             _ = g.get().orderedRemove(p - 1);
             const pmg = it.pos.borrowMut();
             pmg.get().* = p - 1;

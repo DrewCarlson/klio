@@ -36,6 +36,7 @@ fn negativeCapacity(ctx: *CallCtx) std.mem.Allocator.Error!?EvalResult {
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
         .message = try runtime.strInitOwned(ctx.allocator, msg),
         .cause = null,
+        .suppressed = (try runtime.ValueList.init(ctx.allocator, .empty)).cell,
     } } } };
 }
 
@@ -168,6 +169,7 @@ pub fn contract_error(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalStateException"),
         .message = try runtime.strInitOwned(ctx.allocator, msg),
         .cause = null,
+        .suppressed = (try runtime.ValueList.init(ctx.allocator, .empty)).cell,
     } } } };
 }
 
@@ -188,6 +190,7 @@ pub fn contract_todo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.NotImplementedError"),
         .message = try runtime.strInitOwned(ctx.allocator, msg),
         .cause = null,
+        .suppressed = (try runtime.ValueList.init(ctx.allocator, .empty)).cell,
     } } } };
 }
 

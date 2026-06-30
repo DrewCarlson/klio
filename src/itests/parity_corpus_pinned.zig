@@ -538,6 +538,10 @@ test "inner_member_calls_outer_member" {
 // keyword) is an ordinary parameter, not a dispatch receiver, so a bare
 // call in the function body is unresolved (kotlinc: `unresolved reference
 // 'show'`).
+test "capitalized_extension_fn" {
+    try check("capitalized_extension_fn", "validator installed expectSuccess=true\n");
+}
+
 test "backtick_this_param_not_receiver" {
     try checkErr("backtick_this_param_not_receiver", "show");
 }

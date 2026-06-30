@@ -35,6 +35,9 @@ pub fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]
         .fqn = try runtime.strInit(allocator, fqn),
         .message = if (message) |m| try runtime.strInit(allocator, m) else null,
         .cause = null,
+        // A shared suppressed list so `addSuppressed` (e.g. from `use`'s
+        // close-while-failing path) records onto this throwable.
+        .suppressed = (try ValueList.init(allocator, .empty)).cell,
     } };
 }
 
@@ -142,6 +145,36 @@ pub fn excn_no_such_element(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 pub fn excn_unsupported(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return buildException(ctx, "kotlin.UnsupportedOperationException");
+}
+pub fn excn_uninitialized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return buildException(ctx, "kotlin.UninitializedPropertyAccessException");
+}
+pub fn excn_cancellation(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const a = ctx.allocator;
+    const fqn = "kotlin.coroutines.cancellation.CancellationException";
+    // `CancellationException(cause)` — a single Throwable argument — defaults
+    // its message to cause.toString(); the generic builder leaves it null.
+    if (ctx.args.len == 1 and (ctx.args[0] == .Exception or ctx.args[0] == .Instance)) {
+        const cause = ctx.args[0];
+        var message: ?StringRef = null;
+        if (try ctx.host.invokeMethod(&cause, "toString", &.{}, ctx.out)) |m| {
+            if (m == .ok and m.ok == .String) {
+                const g = m.ok.String.borrow();
+                defer g.deinit();
+                message = try runtime.strInit(a, g.get().bytes);
+            }
+        }
+        cause.retain();
+        const cbox = try Value.boxRef(a, cause);
+        return ok(.{ .Exception = .{
+            .fqn = try runtime.strInit(a, fqn),
+            .message = message,
+            .cause = cbox.cell,
+            .identity = ctx.host.allocInstanceId(),
+            .suppressed = (try ValueList.init(a, .empty)).cell,
+        } });
+    }
+    return buildException(ctx, fqn);
 }
 pub fn excn_no_when(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return buildException(ctx, "kotlin.NoWhenBranchMatchedException");
