@@ -284,9 +284,16 @@ pub fn string_to_byte_array(ctx: *CallCtx) Allocator.Error!EvalResult {
             return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
         }
     }
-    const byte_start = charToByteOffset(s, @intCast(start));
-    const byte_end = charToByteOffset(s, @intCast(end));
-    const slice = s[byte_start..byte_end];
+    // Slice in UTF-16-unit space (decode → slice → re-encode) so a range that
+    // splits an astral char's surrogate pair yields the expected lone
+    // surrogate, then encode that.
+    var unit_list: std.ArrayList(u16) = .empty;
+    defer unit_list.deinit(ctx.allocator);
+    var uv = Utf16View{ .bytes = s };
+    while (uv.next()) |u| try unit_list.append(ctx.allocator, u);
+    const slice_owned = try runtime.charUnitsToString(ctx.allocator, unit_list.items[@intCast(start)..@intCast(end)]);
+    defer ctx.allocator.free(slice_owned);
+    const slice = slice_owned;
     // A lone surrogate (stored as WTF-8) is not valid UTF-8: encodeToByteArray
     // replaces it with U+FFFD by default, or throws CharacterCodingException
     // when `throwOnInvalidSequence` is set. Any Bool argument is that flag.
@@ -2742,22 +2749,66 @@ fn utf8Lossy(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < bytes.len) {
-        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
-            try appendScalar(allocator, &out, 0xFFFD);
-            i += 1;
-            continue;
-        };
-        if (i + len > bytes.len) {
-            try appendScalar(allocator, &out, 0xFFFD);
+        const b0 = bytes[i];
+        if (b0 < 0x80) {
+            try out.append(allocator, b0);
             i += 1;
             continue;
         }
-        if (std.unicode.utf8Decode(bytes[i .. i + len])) |cp| {
-            try appendScalar(allocator, &out, cp);
-            i += len;
-        } else |_| {
-            try appendScalar(allocator, &out, 0xFFFD);
+        // Unicode "U+FFFD substitution of maximal subparts" (Table 3-7): a lead
+        // byte fixes the sequence length and the valid range of its first
+        // continuation; the rest must be 80-BF. An ill-formed sequence emits
+        // ONE U+FFFD for its maximal valid prefix, then resumes at the first
+        // byte that broke it. C0/C1 and F5-FF are never lead bytes.
+        var length: usize = 0;
+        var lo2: u8 = 0x80;
+        var hi2: u8 = 0xBF;
+        if (b0 >= 0xC2 and b0 <= 0xDF) {
+            length = 2;
+        } else if (b0 == 0xE0) {
+            length = 3;
+            lo2 = 0xA0;
+        } else if (b0 >= 0xE1 and b0 <= 0xEF) {
+            // ED A0-BF 80-BF structurally encodes a surrogate: like the JVM
+            // decoder, consume the whole 3-byte sequence and emit a single
+            // U+FFFD for the surrogate code point (utf8Decode rejects it), rather
+            // than splitting per the stricter WHATWG maximal-subpart rule.
+            length = 3;
+        } else if (b0 == 0xF0) {
+            length = 4;
+            lo2 = 0x90;
+        } else if (b0 >= 0xF1 and b0 <= 0xF3) {
+            length = 4;
+        } else if (b0 == 0xF4) {
+            length = 4;
+            hi2 = 0x8F; // <= U+10FFFF
+        } else {
+            try appendScalar(allocator, &out, 0xFFFD); // invalid lead byte
             i += 1;
+            continue;
+        }
+        var consumed: usize = 1;
+        var well_formed = true;
+        while (consumed < length) : (consumed += 1) {
+            if (i + consumed >= bytes.len) {
+                well_formed = false;
+                break;
+            }
+            const bc = bytes[i + consumed];
+            const lo: u8 = if (consumed == 1) lo2 else 0x80;
+            const hi: u8 = if (consumed == 1) hi2 else 0xBF;
+            if (bc < lo or bc > hi) {
+                well_formed = false;
+                break;
+            }
+        }
+        if (well_formed) {
+            const cp = std.unicode.utf8Decode(bytes[i .. i + length]) catch 0xFFFD;
+            try appendScalar(allocator, &out, cp);
+            i += length;
+        } else {
+            try appendScalar(allocator, &out, 0xFFFD);
+            i += consumed; // maximal subpart length (>= 1)
         }
     }
     return out.toOwnedSlice(allocator);
