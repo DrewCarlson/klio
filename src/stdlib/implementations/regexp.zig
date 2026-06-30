@@ -468,11 +468,23 @@ const Parser = struct {
                 }
                 return self.node(.{ .literal = val });
             },
-            // `\1`..`\9`: a backreference to a capture group. A single digit
-            // index (Kotlin's `captureLargestValidIndex` behavior: a trailing
-            // `\12` backs off to group 1 then a literal `2`).
+            // `\1`..`\9`: a backreference to a capture group. The first digit
+            // always begins a reference (a forward reference to a not-yet-opened
+            // group is legal and matches empty); further digits extend it only
+            // while the index names a group opened so far — Kotlin's
+            // `captureLargestValidIndex` dialect, so `\12` with one group is
+            // group 1 then a literal `2`, while `\11` with 12 groups is group 11.
             '1', '2', '3', '4', '5', '6', '7', '8', '9' => {
-                return self.node(.{ .backref = @intCast(e - '0') });
+                var num: usize = @intCast(e - '0');
+                while (self.peek()) |p| {
+                    if (p < '0' or p > '9') break;
+                    const nn = num * 10 + @as(usize, @intCast(p - '0'));
+                    if (nn < self.next_group) {
+                        num = nn;
+                        _ = self.bump();
+                    } else break;
+                }
+                return self.node(.{ .backref = num });
             },
             else => return self.node(.{ .literal = escapeChar(e) }),
         }
