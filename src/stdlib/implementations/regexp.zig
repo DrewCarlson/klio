@@ -369,6 +369,14 @@ const Parser = struct {
 
         var index: usize = 0;
         if (capturing) {
+            // A duplicate capture-group name is invalid.
+            if (name) |nm| {
+                for (self.names.items) |existing| {
+                    if (existing) |en| {
+                        if (std.mem.eql(u8, en, nm)) return ParseError.InvalidPattern;
+                    }
+                }
+            }
             index = self.next_group;
             self.next_group += 1;
             try self.names.append(self.allocator, name);
@@ -395,6 +403,8 @@ const Parser = struct {
         }
         if (self.peek() != close) return ParseError.InvalidPattern;
         _ = self.bump();
+        // An empty group name (`(?<>…)`) is invalid.
+        if (buf.items.len == 0) return ParseError.InvalidPattern;
         return buf.toOwnedSlice(self.allocator);
     }
 
