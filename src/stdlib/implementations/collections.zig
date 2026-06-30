@@ -6449,6 +6449,35 @@ pub fn array_fill(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 
+/// In-place `reverse()` / `reverse(fromIndex, toIndex)` for an array. The
+/// unsigned `reverse()` stdlib body delegates to `storage.reverse()`, which
+/// does not reach the array's elements here, so the unsigned arrays bind this.
+pub fn array_reverse(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("reverse requires an array receiver");
+    const arr = ctx.args[0].Array;
+    const len: i64 = @intCast(arr.len());
+    const from = switch (try arrayOptIndex(a, ctx, 1, 0, "reverse")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    const to = switch (try arrayOptIndex(a, ctx, 2, len, "reverse")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    if (from < 0 or to > len) {
+        return indexOob(a, try fmt(a, "reverse: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
+    }
+    if (from > to) {
+        return illegalArg(a, try fmt(a, "reverse: fromIndex {d} > toIndex {d}", .{ from, to }));
+    }
+    const buf = try arr.snapshot(a);
+    defer if (runtime.freeScratch()) a.free(buf);
+    std.mem.reverse(Value, buf[@intCast(from)..@intCast(to)]);
+    try arr.writeBack(a, buf);
+    return ok(Value.Unit);
+}
+
 pub fn array_sort(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sort requires an array receiver");
