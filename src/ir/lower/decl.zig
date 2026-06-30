@@ -961,6 +961,16 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         }
     }
     try bindParams(&b, names.items);
+    // Labeled-receiver alias: `this@<fn>` names this function's receiver. A
+    // qualified `this@fn` in a nested lambda (e.g.
+    // `sequence { for (x in this@mine) ... }`) then captures this receiver
+    // rather than resolving the lambda's own `this` (the builder scope).
+    if (names.items.len != 0 and std.mem.eql(u8, names.items[0], "this")) {
+        if (b.resolve("this")) |this_reg| {
+            const label = try std.fmt.allocPrint(a, "this@{s}", .{f.name.name});
+            try b.bind(label, this_reg);
+        }
+    }
     // A param whose declared type is a receiver-typed function
     // (`block: T.() -> R`) carries that fact so a bare call `block(...)`
     // inside the body lowers to a member-call with the enclosing `this`

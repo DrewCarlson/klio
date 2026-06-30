@@ -550,6 +550,33 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .AnonFun => return lowerAnonFun(b, expr),
         .This => |t| {
+            if (t.qualifier) |q| {
+                // A labeled receiver `this@fn` for an enclosing (extension)
+                // function: resolve / capture the `this@<fn>` slot bound at
+                // that function's entry — possibly through nested lambdas — so
+                // it is the function's receiver, not the lambda's own `this`.
+                const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{q.name});
+                if (b.resolve(label)) |r| return r;
+                if (b.knowsOuter(label)) {
+                    const idx = try b.recordCapture(label);
+                    const dst2 = b.allocReg();
+                    try b.push(.{ .LoadCapture = .{ .dst = dst2, .idx = idx } });
+                    try b.bind(label, dst2);
+                    return dst2;
+                }
+                // Otherwise a class-name label (`this@Outer`): walk at runtime
+                // from the nearest `this` over the class/outer chain.
+                const this_reg = b.resolve("this") orelse blk: {
+                    const idx = try b.recordCapture("this");
+                    const dst = b.allocReg();
+                    try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+                    break :blk dst;
+                };
+                const nm = try b.module.internConst(b.allocator, .{ .String = q.name });
+                const dst = b.allocReg();
+                try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm } });
+                return dst;
+            }
             // `this` bare resolves to the implicit first param, or the
             // captured `this` slot inside a lambda body.
             const this_reg = b.resolve("this") orelse blk: {
@@ -558,12 +585,6 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
                 break :blk dst;
             };
-            if (t.qualifier) |q| {
-                const nm = try b.module.internConst(b.allocator, .{ .String = q.name });
-                const dst = b.allocReg();
-                try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm } });
-                return dst;
-            }
             return this_reg;
         },
         .Super => {
