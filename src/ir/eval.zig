@@ -2886,6 +2886,23 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 return .cont;
             }
             const recv = frame.read(cm.receiver);
+            // Fast path: a range iterator's `hasNext()`/`next()`. The universal
+            // `for (x in range)` desugaring calls these once per element; the
+            // inline handler avoids the member-dispatch hashmap probes that
+            // otherwise dominate tight integer loops.
+            if (recv == .RangeIter) {
+                if (constStr(frame.module, cm.name)) |nm| {
+                    if (rangeIterFast(allocator, &recv, nm, cm.n_args)) |r| {
+                        switch (r) {
+                            .ok => |rv| {
+                                try frame.write(cm.dst, rv);
+                                return .cont;
+                            },
+                            .err => |e| return raiseStep(frame, e),
+                        }
+                    }
+                }
+            }
             // A method borrows its receiver for the call's whole duration.
             // Pin it: the dispatched body may, via the coroutine machinery,
             // drop every other reference to the receiver (e.g. a job
@@ -3831,6 +3848,64 @@ fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u32
 /// load with the intrinsics' ownership (`coll_array_get`/`coll_list_get`:
 /// retain the borrowed element). Returns `null` (fall through to the slow path,
 /// which reproduces the exact diagnostic) for any other shape.
+/// The element Value for a range cursor (mirrors the interp_ir `rangeElem`,
+/// kept here so the for-loop fast path needs no host round-trip).
+inline fn rangeElemEval(cur: i64, kind: runtime.RangeKind) Value {
+    return switch (kind) {
+        .Int => Value.newInt(cur),
+        .Long => .{ .Long = cur },
+        .Char => .{ .Char = @truncate(@as(u64, @bitCast(cur))) },
+        .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(cur))) },
+        .ULong => .{ .ULong = @bitCast(cur) },
+    };
+}
+
+/// Inline `hasNext()` / `next()` for a `.RangeIter` receiver. The for-loop over
+/// any integer/char range desugars to `iterator()` + per-iteration
+/// `hasNext()`/`next()` member calls; handling them here skips the full member
+/// dispatch (and its per-call hashmap probes), which dominates tight loops.
+/// Returns the result for hasNext/next, or null to fall through for any other
+/// method. Mirrors `host_call_member.rangeIterMember`.
+inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []const u8, n_args: u32) ?EvalResult {
+    if (n_args != 0) return null;
+    const is_has_next = std.mem.eql(u8, name, "hasNext");
+    const is_next = std.mem.eql(u8, name, "next");
+    if (!is_has_next and !is_next) return null;
+    const ri = recv.RangeIter;
+    const done = blk: {
+        const dg = ri.done.borrow();
+        defer dg.deinit();
+        break :blk dg.get().*;
+    };
+    const cur = blk: {
+        const cg = ri.cur.borrow();
+        defer cg.deinit();
+        break :blk cg.get().*;
+    };
+    const more = !done and ri.step != 0 and ri.kind.inBounds(cur, ri.end, ri.step);
+    if (is_has_next) return ok(.{ .Bool = more });
+    // next()
+    if (!more) {
+        const exc = Value{ .Exception = .{
+            .fqn = runtime.strInit(allocator, "kotlin.NoSuchElementException") catch return null,
+            .message = runtime.strInit(allocator, "iterator exhausted") catch null,
+            .cause = null,
+        } };
+        return errResult(.{ .Throw = exc });
+    }
+    const adv = cur +| ri.step;
+    if (cur == ri.end or adv == cur) {
+        const dg = ri.done.borrowMut();
+        dg.get().* = true;
+        dg.deinit();
+    } else {
+        const cg = ri.cur.borrowMut();
+        cg.get().* = adv;
+        cg.deinit();
+    }
+    return ok(rangeElemEval(cur, ri.kind));
+}
+
 inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
     if (idx_v.* != .Int) return null;
     const idx = idx_v.Int;
