@@ -3470,7 +3470,10 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                 kv.value.retain();
                 const k = try Value.boxRef(allocator, kv.key);
                 const v = try Value.boxRef(allocator, kv.value);
-                try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = null } });
+                // A mutable map's iterator yields live entries: `setValue`
+                // writes through, and `MutableIterator.remove` deletes from the
+                // backing via this reference (the `items` list is a snapshot).
+                try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = if (m.mutable) m.entries else null } });
             }
             const src_mc = g.get().mod_count;
             g.deinit();
@@ -4693,6 +4696,26 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const g = it.items.borrowMut();
         defer g.deinit();
         if (p - 1 < g.get().items.len) {
+            const removed = g.get().items[p - 1];
+            // A map iterator's element is a live MapEntry over a snapshot list;
+            // also delete the entry from the backing map (by key).
+            if (removed == .MapEntry) {
+                if (removed.MapEntry.backing) |entries| {
+                    const eg = entries.borrowMut();
+                    defer eg.deinit();
+                    const key = removed.MapEntry.key.asPtr();
+                    for (eg.get().pairs.items, 0..) |*slot, i| {
+                        if (Value.structuralEq(&slot.key, key)) {
+                            if (runtime.reclaimEnabled()) {
+                                slot.key.release(allocator);
+                                slot.value.release(allocator);
+                            }
+                            _ = eg.get().pairs.orderedRemove(i);
+                            break;
+                        }
+                    }
+                }
+            }
             _ = g.get().orderedRemove(p - 1);
             const pmg = it.pos.borrowMut();
             pmg.get().* = p - 1;
