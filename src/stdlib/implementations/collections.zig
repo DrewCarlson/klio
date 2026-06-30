@@ -1483,7 +1483,9 @@ pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
     };
     const copy = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(copy);
-    if (try sortValuesNatural(a, copy)) |e| return e;
+    // Host-aware so a list of user `Comparable` instances sorts through their
+    // `compareTo` (sortValuesNatural only handles builtin scalars).
+    if (try sortListHostAware(ctx, copy)) |e| return e;
     writeBackItems(it, a, copy) catch return error.OutOfMemory;
     return ok(Value.Unit);
 }
@@ -3657,19 +3659,46 @@ fn sortListHostAware(ctx: *CallCtx, items: []Value) Error!?EvalResult {
         }
     }
     if (!needs_host) return sortValuesNatural(a, items);
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const o = switch (try compareHostAware(ctx, items[j - 1], items[j])) {
-                .order => |o| o,
-                .err => |e| return e,
-            };
-            if (o == .gt) {
-                std.mem.swap(Value, &items[j - 1], &items[j]);
-                j -= 1;
-            } else break;
+    // Stable bottom-up merge sort: O(n log n) host comparisons. An insertion
+    // sort here is O(n²) and times out on large host-comparable lists.
+    const n = items.len;
+    if (n < 2) return null;
+    const buf = try a.alloc(Value, n);
+    defer if (runtime.freeScratch()) a.free(buf);
+    var width: usize = 1;
+    while (width < n) : (width *= 2) {
+        var lo: usize = 0;
+        while (lo < n) : (lo += 2 * width) {
+            const mid = @min(lo + width, n);
+            const hi = @min(lo + 2 * width, n);
+            var i = lo;
+            var j = mid;
+            var k = lo;
+            while (i < mid and j < hi) {
+                const o = switch (try compareHostAware(ctx, items[i], items[j])) {
+                    .order => |o| o,
+                    .err => |e| return e,
+                };
+                // Take the left run on a tie so the sort stays stable.
+                if (o != .gt) {
+                    buf[k] = items[i];
+                    i += 1;
+                } else {
+                    buf[k] = items[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            while (i < mid) : ({
+                i += 1;
+                k += 1;
+            }) buf[k] = items[i];
+            while (j < hi) : ({
+                j += 1;
+                k += 1;
+            }) buf[k] = items[j];
         }
+        @memcpy(items[0..n], buf[0..n]);
     }
     return null;
 }
