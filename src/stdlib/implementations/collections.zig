@@ -1282,30 +1282,42 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    if (ctx.args.len != 2) return arityErr("associateBy expects (receiver, block)");
+    // `associateBy(keySelector)` or `associateBy(keySelector, valueTransform)`.
+    if (ctx.args.len != 2 and ctx.args.len != 3) return arityErr("associateBy expects (receiver, keySelector[, valueTransform])");
     const items = switch (try iterableItems(a, ctx.args[0], "associateBy")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
     defer if (runtime.freeScratch()) a.free(items);
-    const block = ctx.args[1];
+    const key_block = ctx.args[1];
+    const has_value_transform = ctx.args.len == 3;
     var entries: std.ArrayList(MapPair) = .empty;
     for (items) |v| {
-        const key = switch (try invoke(ctx, &block, &.{v})) {
+        const key = switch (try invoke(ctx, &key_block, &.{v})) {
             .value => |val| val,
             .err => |e| return e,
         };
-        // key is owned (invoke result); v is a borrowed receiver element, so
-        // the map owns its own ref to it. On overwrite, drop the displaced value.
+        // The value is `valueTransform(v)` (owned) or the element itself
+        // (borrowed — the map takes its own ref). key is owned either way.
+        var value = v;
+        var value_owned = false;
+        if (has_value_transform) {
+            const value_block = ctx.args[2];
+            value = switch (try invoke(ctx, &value_block, &.{v})) {
+                .value => |val| val,
+                .err => |e| return e,
+            };
+            value_owned = true;
+        }
         if (findKeyIndexBoxed(entries.items, &key)) |i| {
             if (runtime.reclaimEnabled()) {
                 entries.items[i].value.release(a);
-                v.retain();
+                if (!value_owned) value.retain();
             }
-            entries.items[i].value = v;
+            entries.items[i].value = value;
         } else {
-            if (runtime.reclaimEnabled()) v.retain();
-            try entries.append(a, .{ .key = key, .value = v });
+            if (runtime.reclaimEnabled() and !value_owned) value.retain();
+            try entries.append(a, .{ .key = key, .value = value });
         }
     }
     return ok(try makeMapFromArrayList(a, entries, false));
