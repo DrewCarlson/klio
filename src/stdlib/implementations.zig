@@ -1110,6 +1110,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.String.trimMargin", .f = string.string_trim_margin },
     .{ .fqn = "kotlin.String.lines", .f = string.string_lines },
     .{ .fqn = "kotlin.String.toCharArray", .f = string.string_to_char_array },
+    .{ .fqn = "kotlin.text.StringBuilder.toCharArray", .f = string.string_to_char_array },
     .{ .fqn = "kotlin.String.toLong", .f = string.string_to_long },
     .{ .fqn = "kotlin.String.toLongOrNull", .f = string.string_to_long_or_null },
     .{ .fqn = "kotlin.String.toDoubleOrNull", .f = string.string_to_double_or_null },
