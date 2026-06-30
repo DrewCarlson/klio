@@ -2707,68 +2707,10 @@ pub fn coll_array_join_to_string(ctx: *CallCtx) Error!EvalResult {
     return joinToStringImpl(ctx, items, false);
 }
 
-/// Render a value the way Kotlin's collection `toString` does: each element
-/// through its own `toString` (so a nested user/stdlib `Instance` — e.g. a
-/// `RingBuffer` or a user `Comparable` — renders via its overridden/inherited
-/// toString rather than the shallow `ClassName@id` form). Recurses through
-/// builtin List/Set/Map so nested instances at any depth render.
-fn displayHostAware(ctx: *CallCtx, v: Value) Error![]u8 {
-    const a = ctx.allocator;
-    switch (v) {
-        .Instance => {
-            if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |m| {
-                if (m == .ok and m.ok == .String) {
-                    const g = m.ok.String.borrow();
-                    defer g.deinit();
-                    return try a.dupe(u8, g.get().bytes);
-                }
-            }
-            return try display(a, v);
-        },
-        .List => |c| return displaySeqHostAware(ctx, c.items, "[", "]"),
-        .Set => |c| return displaySeqHostAware(ctx, c.items, "[", "]"),
-        .Map => |m| {
-            const g = m.entries.borrow();
-            defer g.deinit();
-            var out: std.ArrayList(u8) = .empty;
-            try out.append(a, '{');
-            for (g.get().pairs.items, 0..) |kv, i| {
-                if (i > 0) try out.appendSlice(a, ", ");
-                const kp = try displayHostAware(ctx, kv.key);
-                defer if (runtime.freeScratch()) a.free(kp);
-                try out.appendSlice(a, kp);
-                try out.append(a, '=');
-                const vp = try displayHostAware(ctx, kv.value);
-                defer if (runtime.freeScratch()) a.free(vp);
-                try out.appendSlice(a, vp);
-            }
-            try out.append(a, '}');
-            return out.toOwnedSlice(a);
-        },
-        else => return display(a, v),
-    }
-}
-
-fn displaySeqHostAware(ctx: *CallCtx, items: ValueList, open: []const u8, close: []const u8) Error![]u8 {
-    const a = ctx.allocator;
-    const g = items.borrow();
-    defer g.deinit();
-    var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(a, open);
-    for (g.get().items, 0..) |e, i| {
-        if (i > 0) try out.appendSlice(a, ", ");
-        const piece = try displayHostAware(ctx, e);
-        defer if (runtime.freeScratch()) a.free(piece);
-        try out.appendSlice(a, piece);
-    }
-    try out.appendSlice(a, close);
-    return out.toOwnedSlice(a);
-}
-
 fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
-    const buf = try displayHostAware(ctx, ctx.args[0]);
+    const buf = try display(a, ctx.args[0]);
     const s = try makeStringOwned(a, buf);
     if (runtime.freeScratch()) a.free(buf);
     return ok(s);
