@@ -1731,6 +1731,30 @@ pub fn match_result_group_values(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
     return ok(try makeList(ctx.allocator, items.items, false));
 }
 
+pub fn match_result_destructured(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const m = switch (matchArg(ctx.args, "MatchResult.destructured")) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
+    const groups = m.asPtr().groups;
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(ctx.allocator);
+    // `MatchResult.Destructured` exposes the capture groups (index 1..) through
+    // `component1()..componentN()` and `toList()`. klio models it as the
+    // group-value list: a `List`'s own `componentN()` / `toList()` then satisfy
+    // the `Destructured` contract (group N at component N).
+    if (groups.len > 1) {
+        for (groups[1..]) |g| {
+            if (g) |gd| {
+                try items.append(ctx.allocator, .{ .String = gd.value.clone() });
+            } else {
+                try items.append(ctx.allocator, try makeString(ctx.allocator, ""));
+            }
+        }
+    }
+    return ok(try makeList(ctx.allocator, items.items, false));
+}
+
 pub fn match_result_groups(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const m = switch (matchArg(ctx.args, "MatchResult.groups")) {
         .ok => |v| v,

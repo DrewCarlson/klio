@@ -1405,6 +1405,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.text.MatchResult.range", .f = regexp.match_result_range },
     .{ .fqn = "kotlin.text.MatchResult.groupValues", .f = regexp.match_result_group_values },
     .{ .fqn = "kotlin.text.MatchResult.groups", .f = regexp.match_result_groups },
+    .{ .fqn = "kotlin.text.MatchResult.destructured", .f = regexp.match_result_destructured },
     .{ .fqn = "kotlin.text.MatchResult.next", .f = regexp.match_result_next },
     .{ .fqn = "kotlin.text.MatchResult.toString", .f = regexp.match_result_to_string },
     .{ .fqn = "kotlin.text.MatchGroup.value", .f = regexp.match_group_value },
