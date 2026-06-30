@@ -2882,6 +2882,42 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const ast_type_args = call.type_args;
     const is_infix = call.is_infix;
 
+    // A bare ctor callee naming a nested class must bind the one in THIS
+    // enclosing-class chain, not a same-simple-name nested class in a sibling
+    // outer class. Walk the owner's FQN, and for each prefix that is itself a
+    // CLASS (never a package — so a same-package top-level is left alone),
+    // check for a nested `<prefix>.<name>`. Only rewrite when it differs from
+    // the bare resolution (a genuine collision), to the qualified path.
+    if (!is_infix and ast_type_args.len == 0 and callee.* == .Path and
+        callee.Path.segments.len == 1 and b.resolve(callee.Path.segments[0].name) == null)
+    {
+        const cname = callee.Path.segments[0].name;
+        if (b.ownerClass()) |owner| resolve: {
+            const ocid = b.module.classId(owner) orelse break :resolve;
+            if (ocid.int() >= b.module.classes.items.len) break :resolve;
+            const bare = b.module.classIdIndexed(cname, b.self_package, callee.Path.segments[0].span.file);
+            var prefix: []const u8 = b.module.classes.items[ocid.int()].fqn;
+            while (std.mem.lastIndexOfScalar(u8, prefix, '.')) |dot| {
+                prefix = prefix[0..dot];
+                if (b.module.classIdByFqn(prefix) == null) continue; // package, not a class
+                const cand = try std.fmt.allocPrint(b.allocator, "{s}.{s}", .{ prefix, cname });
+                const cand_cid = b.module.classIdByFqn(cand);
+                if (cand_cid != null and (bare == null or cand_cid.?.int() != bare.?.int())) {
+                    var segs: std.ArrayList(ast.Ident) = .empty;
+                    var it = std.mem.splitScalar(u8, cand, '.');
+                    while (it.next()) |seg| try segs.append(b.allocator, .{ .name = seg, .span = callee.Path.segments[0].span });
+                    const new_callee = try b.allocator.create(Expr);
+                    new_callee.* = Expr{ .Path = .{ .segments = try segs.toOwnedSlice(b.allocator), .span = callee.Path.span } };
+                    var new_call = call;
+                    new_call.callee = new_callee;
+                    const rewritten = Expr{ .Call = new_call };
+                    return lowerCallGeneral(b, &rewritten);
+                }
+                b.allocator.free(cand);
+            }
+        }
+    }
+
     // Inline expansion (suspend-inline only).
     if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1) {
         const nm = callee.Path.segments[0].name;
