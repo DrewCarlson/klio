@@ -439,6 +439,20 @@ const Parser = struct {
             'B' => return self.node(.{ .word_boundary = false }),
             'A' => return self.node(.anchor_start),
             'z', 'Z' => return self.node(.anchor_end),
+            // `\0`, `\0n`, `\0nn`, `\0mnn`: an octal character escape (Java
+            // dialect). `\0` alone is NUL; up to three further octal digits
+            // give the code point (`\0141` is octal 141 = 'a').
+            '0' => {
+                var val: u21 = 0;
+                var count: usize = 0;
+                while (count < 3) : (count += 1) {
+                    const p = self.peek() orelse break;
+                    if (p < '0' or p > '7') break;
+                    val = val * 8 + @as(u21, @intCast(p - '0'));
+                    _ = self.bump();
+                }
+                return self.node(.{ .literal = val });
+            },
             else => return self.node(.{ .literal = escapeChar(e) }),
         }
     }

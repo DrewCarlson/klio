@@ -19,10 +19,9 @@ public fun assertTypeEquals(expected: Any?, actual: Any?) {
 }
 
 // Regex / numeric platform-capability flags the common tests gate on. KLIO's
-// regex engine accepts escaping an arbitrary character but, like the JS
-// dialect, does not recognize octal literals; its `Float` arithmetic enforces
-// the 32-bit range.
+// regex engine accepts escaping an arbitrary character and octal character
+// literals (Java dialect); its `Float` arithmetic enforces the 32-bit range.
 public val isFloat32RangeEnforced: Boolean = true
-public val supportsOctalLiteralInRegex: Boolean get() = false
+public val supportsOctalLiteralInRegex: Boolean get() = true
 public val supportsEscapeAnyCharInRegex: Boolean get() = true
 public val regexSplitUnicodeCodePointHandling: Boolean get() = false
