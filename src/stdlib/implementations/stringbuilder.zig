@@ -930,7 +930,15 @@ pub fn string_builder_reverse(ctx: *CallCtx) Allocator.Error!EvalResult {
 pub fn string_builder_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.substring"));
-    const start = if (ctx.args.len > 1) ctx.args[1].asI64() else null;
+    // `subSequence(range: IntRange)` — a single range argument whose `first`
+    // and `last + 1` are the substring bounds.
+    const is_range = ctx.args.len == 2 and ctx.args[1] == .Range;
+    const start = if (is_range)
+        @as(?i64, ctx.args[1].Range.start)
+    else if (ctx.args.len > 1)
+        ctx.args[1].asI64()
+    else
+        null;
     if (start == null) return errResult(.{ .Type = "substring start must be Int" });
 
     const g = sb.borrow();
@@ -940,7 +948,9 @@ pub fn string_builder_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer a.free(units);
     const n: i64 = @intCast(units.len);
     var end: i64 = n;
-    if (ctx.args.len > 2) {
+    if (is_range) {
+        end = ctx.args[1].Range.end + 1;
+    } else if (ctx.args.len > 2) {
         if (ctx.args[2].isIntegral()) {
             end = ctx.args[2].asI64().?;
         } else {
