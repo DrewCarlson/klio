@@ -560,6 +560,9 @@ fn isBuiltinThrowableName(name: []const u8) bool {
         "NumberFormatException",    "NoSuchElementException",
         "ConcurrentModificationException", "UnsupportedOperationException",
         "CancellationException",
+        "ArrayIndexOutOfBoundsException", "StringIndexOutOfBoundsException",
+        "UninitializedPropertyAccessException", "NoWhenBranchMatchedException",
+        "NegativeArraySizeException",
     };
     for (names) |n| {
         if (std.mem.eql(u8, name, n)) return true;

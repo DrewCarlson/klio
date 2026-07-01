@@ -1079,6 +1079,7 @@ pub fn isBuiltinThrowableFqn(fqn: []const u8) bool {
         "kotlin.NoSuchElementException",          "kotlin.NumberFormatException",
         "kotlin.UnsupportedOperationException",   "kotlin.NoWhenBranchMatchedException",
         "kotlin.ConcurrentModificationException", "kotlin.AssertionError",
+        "kotlin.UninitializedPropertyAccessException",
     };
     for (names) |n| {
         if (std.mem.eql(u8, fqn, n)) return true;
