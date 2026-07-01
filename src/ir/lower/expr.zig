@@ -3339,6 +3339,21 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (callee.* == .Member) {
         return lowerMemberCallFallback(b, expr);
     }
+    // A bare single-name call that no earlier path resolved, but whose name
+    // could be a member of an implicit receiver (a lambda's captured outer
+    // `this`), must dispatch member-first — not fall to a bare-name value load
+    // that binds a same-named top-level global. Otherwise `error(msg)` inside a
+    // `runCatching { }` binds `kotlin.error` instead of the enclosing class's
+    // own `error`.
+    if (callee.* == .Path and callee.Path.segments.len == 1) {
+        const nm0 = callee.Path.segments[0].name;
+        // Only reroute a name that is ACTUALLY an own/enclosing member — not
+        // merely "an unknown receiver could have it" — so a top-level helper
+        // (`testEquals`) called in a lambda is left on the global path.
+        if (b.resolve(nm0) == null and inReceiverContext(b) and b.hasEnclosingMember(nm0)) {
+            if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+        }
+    }
     const callee_r = try lowerExpr(b, callee);
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
