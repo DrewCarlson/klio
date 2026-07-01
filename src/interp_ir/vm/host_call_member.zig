@@ -2734,17 +2734,21 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // `r.contains(x)` on a Range.
     if (std.mem.eql(u8, name, "contains") and args.len == 1 and receiver.* == .Range) {
         const r = receiver.Range;
+        // A descending progression (step < 0) has start > end; the membership
+        // bounds run low..high regardless of iteration direction.
+        const lo = if (r.step > 0) r.start else r.end;
+        const hi = if (r.step > 0) r.end else r.start;
         const inside = blk: {
             if (args[0] == .Char and r.kind == .Char) {
                 const cv: i64 = @intCast(args[0].Char);
-                break :blk cv >= r.start and cv <= r.end and @rem(cv - r.start, r.step) == 0;
+                break :blk cv >= lo and cv <= hi and @rem(cv - r.start, r.step) == 0;
             }
             if (args[0].asI64()) |v| {
                 // Widen the step-alignment difference: `v - r.start` overflows
                 // i64 for a range spanning most of the type (`MIN..MAX`), which
                 // Kotlin's `in` check tolerates.
                 const diff = @as(i128, v) - @as(i128, r.start);
-                break :blk v >= r.start and v <= r.end and @rem(diff, @as(i128, r.step)) == 0;
+                break :blk v >= lo and v <= hi and @rem(diff, @as(i128, r.step)) == 0;
             }
             break :blk false;
         };
