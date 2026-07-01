@@ -1967,11 +1967,13 @@ pub const Value = union(enum) {
             "NoSuchElementException",          "NumberFormatException",
             "UnsupportedOperationException",   "UninitializedPropertyAccessException",
             "ConcurrentModificationException", "NoWhenBranchMatchedException",
-            "NegativeArraySizeException",
+            "NegativeArraySizeException",                "CancellationException",
         };
         if (std.mem.eql(u8, name, "RuntimeException") and matchesAny(tail, &runtime_exc)) return true;
         if (std.mem.eql(u8, name, "IndexOutOfBoundsException") and
             matchesAny(tail, &.{ "ArrayIndexOutOfBoundsException", "StringIndexOutOfBoundsException" })) return true;
+        // CancellationException : IllegalStateException : RuntimeException.
+        if (std.mem.eql(u8, name, "IllegalStateException") and std.mem.eql(u8, tail, "CancellationException")) return true;
         return false;
     }
 
