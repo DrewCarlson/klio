@@ -523,6 +523,13 @@ pub fn upperScalar(c: u21) u21 {
 /// `Char.equals(other, ignoreCase = true)`: equal if the upper-cased units
 /// match, or failing that the lower-cased upper-cased units match (Kotlin's
 /// rule, which also pairs characters that share a lowercase form).
+/// The single-char lowercase of `c`, honoring the İ (U+0130) -> 'i' special
+/// mapping that `char_lowercase_char` applies but the raw lowercase_map omits.
+fn lowerScalarSingle(c: u21) u21 {
+    if (c == 0x0130) return 0x69;
+    return singleCaseChar(c, &lowercase_map);
+}
+
 pub fn charEqIgnoreCase(a_unit: u16, b_unit: u16) bool {
     if (a_unit == b_unit) return true;
     const a = charUnitToScalar(a_unit) orelse return false;
@@ -530,7 +537,9 @@ pub fn charEqIgnoreCase(a_unit: u16, b_unit: u16) bool {
     const a_up = singleCaseChar(a, &uppercase_map);
     const b_up = singleCaseChar(b, &uppercase_map);
     if (a_up == b_up) return true;
-    return singleCaseChar(a_up, &lowercase_map) == singleCaseChar(b_up, &lowercase_map);
+    // Kotlin's Char.equals(ignoreCase) compares lowercase(uppercase(x)); the
+    // İ -> 'i' step makes {I, i, İ, ı} one case-insensitive group.
+    return lowerScalarSingle(a_up) == lowerScalarSingle(b_up);
 }
 
 fn singleCasedChar(ctx: *CallCtx, comptime what: []const u8, map: []const CaseEntry) EvalResult {

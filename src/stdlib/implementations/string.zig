@@ -858,6 +858,21 @@ pub fn string_none(ctx: *CallCtx) Allocator.Error!EvalResult {
 
 /// `String.equals(other, ignoreCase = false)`.
 pub fn string_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
+    // `String?.equals(other, ignoreCase)` on a null receiver: equal iff `other`
+    // is also null (the bodyless expect would otherwise evaluate to Unit).
+    if (ctx.args.len > 0 and ctx.args[0] == .Null) {
+        return .{ .ok = .{ .Bool = ctx.args.len > 1 and ctx.args[1] == .Null } };
+    }
+    // `Char.equals(other: Char, ignoreCase)` shares the `kotlin.text.equals`
+    // FQN with `String?.equals`; dispatch it by receiver kind.
+    if (ctx.args.len > 0 and ctx.args[0] == .Char) {
+        var ceq = false;
+        if (ctx.args.len > 1 and ctx.args[1] == .Char) {
+            const ic = ctx.args.len > 2 and ctx.args[2] == .Bool and ctx.args[2].Bool;
+            ceq = if (ic) char.charEqIgnoreCase(ctx.args[0].Char, ctx.args[1].Char) else ctx.args[0].Char == ctx.args[1].Char;
+        }
+        return .{ .ok = .{ .Bool = ceq } };
+    }
     const r = try recvString(ctx.allocator, ctx.args, "String.equals");
     const s = switch (r) {
         .ok => |v| v,
@@ -2838,6 +2853,11 @@ fn mapCase(allocator: Allocator, s: []const u8, upper: bool) Allocator.Error![]u
             i += 1;
             continue;
         };
+        if (if (upper) scalarToUpperMulti(cp) else scalarToLowerMulti(cp)) |seq| {
+            for (seq) |mc| try appendScalar(allocator, &out, mc);
+            i = end;
+            continue;
+        }
         const mapped = if (upper) scalarToUpper(cp) else scalarToLower(cp);
         try appendScalar(allocator, &out, @intCast(mapped));
         i = end;
@@ -2871,7 +2891,38 @@ fn scalarToLower(cp: u21) u21 {
     // Cyrillic (0x410-0x42F).
     if (cp >= 0x410 and cp <= 0x42F) return cp + 0x20;
     if (cp >= 0x400 and cp <= 0x40F) return cp + 0x50;
+    // Deseret (supplementary plane): capitals -> smalls.
+    if (cp >= 0x10400 and cp <= 0x10427) return cp + 0x28;
     return cp;
+}
+
+/// Unicode SpecialCasing unconditional multi-character upper-casings — a
+/// single scalar whose upper-case form is a sequence (`ß` -> `SS`, the `ﬀ`…`ﬆ`
+/// ligatures). `String.uppercase()` / `Char.uppercase()` apply these; the 1:1
+/// `scalarToUpper` cannot express an expansion.
+fn scalarToUpperMulti(cp: u21) ?[]const u21 {
+    return switch (cp) {
+        0x00DF => &.{ 'S', 'S' }, // ß LATIN SMALL LETTER SHARP S
+        0xFB00 => &.{ 'F', 'F' }, // ﬀ
+        0xFB01 => &.{ 'F', 'I' }, // ﬁ
+        0xFB02 => &.{ 'F', 'L' }, // ﬂ
+        0xFB03 => &.{ 'F', 'F', 'I' }, // ﬃ
+        0xFB04 => &.{ 'F', 'F', 'L' }, // ﬄ
+        0xFB05 => &.{ 'S', 'T' }, // ﬅ LATIN SMALL LIGATURE LONG S T
+        0xFB06 => &.{ 'S', 'T' }, // ﬆ LATIN SMALL LIGATURE ST
+        // Greek small letters with dialytika + tonos -> capital + combining marks.
+        0x0390 => &.{ 0x0399, 0x0308, 0x0301 }, // ΐ
+        0x03B0 => &.{ 0x03A5, 0x0308, 0x0301 }, // ΰ
+        else => null,
+    };
+}
+
+/// Unicode SpecialCasing unconditional multi-character lower-casings.
+fn scalarToLowerMulti(cp: u21) ?[]const u21 {
+    return switch (cp) {
+        0x0130 => &.{ 0x0069, 0x0307 }, // İ -> i + COMBINING DOT ABOVE
+        else => null,
+    };
 }
 
 /// Upper-case a single Unicode scalar (inverse of `scalarToLower`'s ranges).
@@ -2885,6 +2936,8 @@ fn scalarToUpper(cp: u21) u21 {
     if (cp >= 0x3B1 and cp <= 0x3C9 and cp != 0x3C2) return cp - 0x20;
     if (cp >= 0x430 and cp <= 0x44F) return cp - 0x20;
     if (cp >= 0x450 and cp <= 0x45F) return cp - 0x50;
+    // Deseret (supplementary plane): smalls -> capitals.
+    if (cp >= 0x10428 and cp <= 0x1044F) return cp - 0x28;
     return cp;
 }
 

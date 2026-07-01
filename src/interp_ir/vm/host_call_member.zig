@@ -2607,8 +2607,9 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (try classCompanionAndEnum(self, allocator, receiver, name, args)) |r| return r;
     }
 
-    // Null-receiver `equals`.
-    if (receiver.* == .Null and std.mem.eql(u8, name, "equals") and args.len == 1) {
+    // Null-receiver `equals` — 1-arg `Any?.equals` and 2-arg
+    // `String?.equals(other, ignoreCase)` both reduce to `other === null`.
+    if (receiver.* == .Null and std.mem.eql(u8, name, "equals") and args.len >= 1) {
         return .{ .ok = boolVal(args[0] == .Null) };
     }
     // Null-receiver `toString()` (`null.toString()` is the string "null"); the
@@ -7413,6 +7414,60 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
     return null;
 }
 
+/// A minimal `KClass` value carrying just a simple name (the last FQN
+/// segment) and the fully-qualified name. Enough for `simpleName`,
+/// `qualifiedName`, and FQN-keyed equality — used to give a builtin value or a
+/// classId-less type a class literal.
+fn syntheticClassFromFqn(allocator: Allocator, fqn: []const u8) Allocator.Error!Value {
+    const dot = std.mem.lastIndexOfScalar(u8, fqn, '.');
+    const simple = if (dot) |i| fqn[i + 1 ..] else fqn;
+    const cd = try ObjRef(ClassDef).init(allocator, .{
+        .name = try allocator.dupe(u8, simple),
+        .fqn = try allocator.dupe(u8, fqn),
+        .annotation_names = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .body_properties = &.{},
+        .init_blocks = &.{},
+        .init_block_property_positions = &.{},
+        .is_data = false,
+        .is_value = false,
+        .is_object = false,
+        .is_enum = false,
+        .is_sealed = false,
+        .supertype_names = &.{},
+        .parent = null,
+        .interfaces = &.{},
+        .is_interface = false,
+        .is_fun_interface = false,
+        .parent_ctor_args = &.{},
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .is_anonymous = false,
+        .secondary_ctors = &.{},
+        .enum_entries = &.{},
+        .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .nested_classes = &.{},
+        .captured_env = try ObjRef(runtime.Env).init(allocator, runtime.Env.init(allocator)),
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
+        .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+    });
+    return .{ .Class = cd };
+}
+
+/// True when `simple` names an unsigned primitive-array type, whose bare name
+/// lowers to a constructor value (no IR classId) rather than a class.
+fn isUnsignedArrayName(simple: []const u8) bool {
+    const known = [_][]const u8{ "UIntArray", "ULongArray", "UByteArray", "UShortArray" };
+    for (known) |k| {
+        if (std.mem.eql(u8, simple, k)) return true;
+    }
+    return false;
+}
+
 pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     // `X::class` is a class reference — return the class itself. For an
     // instance receiver, reach into the runtime ClassDef.
@@ -7422,7 +7477,28 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             defer ig.deinit();
             return .{ .ok = .{ .Class = ig.get().class.clone() } };
         }
-        return .{ .ok = receiver.* };
+        // A `Type::class` value is already a class literal.
+        if (receiver.* == .Class) return .{ .ok = receiver.* };
+        // An unsigned-array TYPE literal lowers to its constructor
+        // (`ULongArray::class`): recover the type name from the constructor.
+        if (receiver.* == .Intrinsic) {
+            const dot = std.mem.lastIndexOfScalar(u8, receiver.Intrinsic.fqn, '.');
+            const simple = if (dot) |i| receiver.Intrinsic.fqn[i + 1 ..] else receiver.Intrinsic.fqn;
+            if (isUnsignedArrayName(simple)) return .{ .ok = try syntheticClassFromFqn(allocator, receiver.Intrinsic.fqn) };
+            return .{ .ok = receiver.* };
+        }
+        if (receiver.* == .Function) {
+            if (isUnsignedArrayName(receiver.Function.decl.name.name)) {
+                const fqn = try std.fmt.allocPrint(allocator, "kotlin.{s}", .{receiver.Function.decl.name.name});
+                return .{ .ok = try syntheticClassFromFqn(allocator, fqn) };
+            }
+            return .{ .ok = receiver.* };
+        }
+        // `value::class` — the runtime KClass of a plain (non-callable) value.
+        switch (receiver.*) {
+            .IrClosure, .BoundMethod, .BoundUserMethod => return .{ .ok = receiver.* },
+            else => return .{ .ok = try syntheticClassFromFqn(allocator, receiver.typeFqn()) },
+        }
     }
     // `recv::method` produces a callable wrapper backed by a synthetic
     // Instance carrying `__bound_receiver__` + `__bound_name__`; the

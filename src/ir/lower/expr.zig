@@ -540,6 +540,28 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
                 return dst;
             }
+            // `X::class` where `X` is a bare type/constructor name that has no
+            // IR classId (e.g. an unsigned array `ULongArray`) must load the
+            // type reference directly. Routing it through `lowerReceiver` ->
+            // the implicit-`this` path inside a method would emit `this.X(...)`
+            // and invoke the constructor instead of taking the class literal.
+            if (std.mem.eql(u8, mr.name.name, "class") and
+                mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1)
+            {
+                const rn = mr.receiver.Path.segments[0].name;
+                if (b.resolve(rn) == null and !b.knowsOuter(rn) and
+                    b.module.classId(rn) == null and !b.hasOwnMember(rn) and
+                    !isTopLevelProp(rn))
+                {
+                    const rr = b.allocReg();
+                    const rnm = try b.module.internConst(b.allocator, .{ .String = rn });
+                    try b.push(.{ .LoadGlobal = .{ .dst = rr, .name = rnm } });
+                    const dst = b.allocReg();
+                    const cnm = try b.module.internConst(b.allocator, .{ .String = "class" });
+                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = rr, .name = cnm } });
+                    return dst;
+                }
+            }
             const recv = try lowerReceiver(b, mr.receiver);
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = mr.name.name });
@@ -3317,6 +3339,21 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (callee.* == .Member) {
         return lowerMemberCallFallback(b, expr);
     }
+    // A bare single-name call that no earlier path resolved, but whose name
+    // could be a member of an implicit receiver (a lambda's captured outer
+    // `this`), must dispatch member-first — not fall to a bare-name value load
+    // that binds a same-named top-level global. Otherwise `error(msg)` inside a
+    // `runCatching { }` binds `kotlin.error` instead of the enclosing class's
+    // own `error`.
+    if (callee.* == .Path and callee.Path.segments.len == 1) {
+        const nm0 = callee.Path.segments[0].name;
+        // Only reroute a name that is ACTUALLY an own/enclosing member — not
+        // merely "an unknown receiver could have it" — so a top-level helper
+        // (`testEquals`) called in a lambda is left on the global path.
+        if (b.resolve(nm0) == null and inReceiverContext(b) and b.hasEnclosingMember(nm0)) {
+            if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+        }
+    }
     const callee_r = try lowerExpr(b, callee);
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
@@ -3912,10 +3949,20 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
         b.module.funcId(name0) != null;
     if (shadowed_by_local) {
         const callee_r = try resolveCapture(b, name0);
-        const this_reg: ?Reg = if (b.knowsOuter("this") or b.capturesThisSlot())
-            try resolveCapture(b, "this")
+        // Only a captured local *extension* function or a receiver-lambda param
+        // takes the enclosing receiver as a leading `this`; a plain captured
+        // local function (`fun check(a, b)` called from inside a `repeat { }`
+        // lambda) must dispatch as a bare value, or `callValueWithThis`'s
+        // receiver-fills-param heuristic shifts the enclosing `this` into the
+        // first value parameter.
+        const wants_this = b.isLocalExtFn(name0) or b.isReceiverLambdaParam(name0);
+        const this_reg: ?Reg = if (wants_this)
+            (if (b.knowsOuter("this") or b.capturesThisSlot())
+                try resolveCapture(b, "this")
+            else
+                b.resolve("this"))
         else
-            b.resolve("this");
+            null;
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const dst = b.allocReg();
@@ -4128,6 +4175,23 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
             // neither reaches here.)
             if (indexDeferReason(index_res) == .ambiguous_tier) {
                 try recordAmbiguousCall(b, name0, segments[0].span, index_res);
+            }
+            // A resolved top-level EXTENSION that a member of the implicit
+            // receiver could shadow must not bind statically: a member of the
+            // receiver (including a builtin like `StringBuilder.append`)
+            // outranks a same-named top-level extension. Route through the
+            // deferred member-first path — exactly as when the index does not
+            // resolve the name — so the member wins. Binding here would let a
+            // generic `T.append(vararg CharSequence?)` shadow the member and
+            // self-recurse.
+            {
+                const is_ext = if (b.module.funcById(func_id)) |f|
+                    (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this"))
+                else
+                    false;
+                if (is_ext and inReceiverContext(b) and memberShadowPossible(b, name0)) {
+                    if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+                }
             }
             // Prefer the index's unique FQN-qualified target when it
             // resolves, except for a receiver-matched extension pick,
@@ -4483,6 +4547,23 @@ fn heurPickInexact(b: *FuncBuilder, fid: FuncId, want: usize) bool {
 fn inReceiverContext(b: *const FuncBuilder) bool {
     return b.capturesThisSlot() or b.resolve("this") != null or b.ownerClass() != null or
         b.isParamThunk() or b.recvTy() != null;
+}
+
+/// Whether a bare name in an implicit-receiver context could bind to a member
+/// of that receiver, so a static bind to a same-named top-level function would
+/// wrongly shadow it. Used to decide whether to defer a resolved bare call to
+/// the runtime member-first walk (`CallMemberOrGlobal`).
+///
+/// A lambda / scope-function / parameter-thunk / extension body has an implicit
+/// receiver whose concrete type is unknown at lowering time — it may be a
+/// builtin (e.g. `StringBuilder`) whose members are not in `class_member_names`
+/// — so such a body always defers. A plain method body's receiver is the
+/// enclosing class(es), checked precisely by `hasEnclosingMember`. Any other
+/// in-scope receiver falls back to the program-wide member-name set.
+fn memberShadowPossible(b: *const FuncBuilder, name: []const u8) bool {
+    if (b.capturesThisSlot() or b.isParamThunk() or b.recvTy() != null) return true;
+    if (b.hasEnclosingMember(name)) return true;
+    return b.module.registry.class_member_names.contains(name);
 }
 
 var or_audit_checked: bool = false;
@@ -4841,7 +4922,7 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
     {
         const name0 = callee.Path.segments[0].name;
         if (inReceiverContext(b) and !was_cast and ast_type_args.len == 0 and
-            b.module.registry.class_member_names.contains(name0))
+            memberShadowPossible(b, name0))
         {
             const this_idx = try b.recordCapture("this");
             const broad_masks: ?[]u32 = blk: {
@@ -4965,6 +5046,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
     const args = call.args;
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
+
 
     // Synthesise a Path("this") arg expr then lower the run.
     const sp = exprSpan(callee);
