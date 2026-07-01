@@ -1,343 +1,394 @@
-# Dispatch & Name-Resolution Unification
+# Resolved IR — Static Representation, One Engine, Tiered Execution
 
-Goal: one source of truth for "what does this name resolve to" and one execution
-path, regardless of run-vs-test, pack-vs-source-vs-stdlib, or inline-vs-regular.
-Stdlib code is functional from the stdlib pack and resolves exactly like user code;
-native intrinsics exist only as the backing implementation of a stdlib declaration
-reached through the normal resolved symbol, never as a parallel resolution path or a
-name-list shortcut. No escape hatches for stdlib in the interpreter.
+## North star
 
-This plan supersedes the earlier RC-1..RC-5 sketch. Every root cause below was
-confirmed against the current code with a live reproduction (the repro names are the
-verification ratchet in the phase plan).
+KLIO should turn scripts into **as static a representation as possible without
+eliminating the runtime's dynamic nature.** Concretely:
 
-## Root causes
+- Loading a script produces a **resolved IR**: every call, variable access, field
+  access, and type test carries direct, fully-qualified information (a `FuncId`, a
+  method slot, a declaring-class + field slot, a `ClassId`) wherever that can be
+  determined statically — not a name to be re-looked-up at runtime.
+- Type checking / validation is an **optional** pass that (a) powers tooling
+  (syntax/type/resolution diagnostics, go-to-definition, hover types) and (b) feeds
+  its results back into lowering so *more* of the IR resolves statically.
+- What genuinely cannot be resolved statically (runtime-polymorphic receivers,
+  unknown scope-function receiver types) stays dynamic — but as a resolved
+  *candidate set* or a *virtual slot*, never a bare name probe.
 
-- **RC-A — no canonical index.** There is no single signature index over all
-  provenances populated before any body lowers. `func_name_index` is built in the
-  wrong order and consulted while incomplete. Within a single build, class bodies
-  lower (`interp_ir/build.zig:1470`) before the phase-1 header loop (`:1489-1561`),
-  so `funcsBySimpleName`/`funcId`/`decl_user_arity` are empty for user top-level
-  funcs when any class method (including a `@Test` method) lowers. The `klio run`
-  extend path pre-seeds the index via `cloneForExtend` (which *does* carry
-  `func_index`, `ir.zig:1142-1150`), masking the bug for stdlib names; `klio test`
-  goes straight to `buildModuleFiles` with no pre-seed, exposing it for everything.
-  Members and inline members get no arity-queryable index entry at all. The index is
-  consulted as a refiner, not a primary, so even when complete it cannot bind a
-  target the heuristic ladder declined. *This is the true root of run-vs-test
-  divergence — not the base->extend handoff the old plan blamed.*
-  Evidence: `factRun`; measured 5 `func_index` entries during user-body lowering.
+Stdlib code is ordinary code from the stdlib pack and resolves exactly like user
+code; native intrinsics exist only as the backing implementation of a resolved
+stdlib declaration, never as a parallel resolution path or a name-list shortcut.
+
+This document supersedes the earlier RC-1..RC-5 sketch. Every root cause below was
+confirmed against the current code with a live reproduction.
+
+## The completeness invariant — no escape hatches
+
+The purpose of this work is to **retire the entire accumulation of highly-specific
+branches** that patch individual execution / stdlib / resolution-ordering issues.
+Every one of those was added only because resolution was incomplete (RC-A), type-blind
+(RC-B), or decided by a program-wide name set instead of the receiver type (RC-C). A
+principled engine makes them unnecessary; their **deletion is the acceptance test** —
+if a hatch cannot be deleted, the engine is not yet correct there.
+
+Two things must be distinguished so this stays precise:
+
+- **Legitimate** — a native intrinsic as the *backing implementation* of a resolved
+  stdlib declaration, reached through the normal resolved symbol. These stay. The
+  declaration is registered once; the engine routes to it by type.
+- **A hatch (must die)** — any name-list, FQN pattern, or per-method special-case
+  branch used as a *resolution shortcut* or a *dispatch fixup* that papers over the
+  index / applicability / receiver-type resolver being incomplete. These go.
+
+The catalog to delete (grown by the stdlib grind, not only the RC-H lists):
+`isAliasName`, the two duplicate builtin-supertype tables, the three Throwable lists,
+`class_member_names`, `prefer_member`, `concreteSibling`, `tailrec_fn_names` as a
+gate, `shadowed_inline_names`, `isPrimitiveConv`, `CONTROL_INTRINSICS`,
+`isKnownPackage`/`shippedFqnHead` discriminators, the broad-`kotlin.text.X` vs
+`kotlin.text.StringBuilder.<m>`-specific registration split (dispatch by type removes
+the need to register per-overload), the `.names` argument-name tables used to force a
+binding the resolver should compute, and the assorted per-method dispatch fixups in
+`host_call_member.zig` (the inline `.Range` `contains`, unsigned-array synth cases,
+etc.). Each deletion is gated on `KLIO_RESOLVE_AUDIT` zero-disagreement + the full
+sweep; a hatch that *can't* be removed pins the next fix.
+
+The structural invariant this enforces: **resolution is a pure function of (call site,
+sig index, receiver type)** — zero name-list lookups remain in the dispatch/resolution
+path, and any two run-modes (lazy lowering, eager typeck, runtime) pick the same target
+for every non-runtime-polymorphic call.
+
+## The three-tier static/dynamic boundary
+
+Every call and access lowers to exactly one tier. The tiers *are* the boundary
+between "static as possible" and "still dynamic where it must be":
+
+1. **exact** — a direct target. `Call(FuncId)`, `GetField(class_id, slot)`,
+   `Is(ClassId)`. Fully static: top-level funcs, final/non-virtual members, resolved
+   extensions, locals, resolved property backing fields.
+2. **virtual** — the *slot* is static, the *leaf* is runtime. `CallVirtual(recv,
+   slot)` where `slot` is a method key on a known declaring type; the concrete
+   override is chosen at runtime. This is how **dynamic dispatch is preserved while
+   still carrying full type/signature/slot information** — open classes, interfaces.
+3. **deferred** — the genuine escape valve. `CallMemberOrGlobal(candidate_set)` when
+   the receiver's type is unknown at lowering (e.g. a `with(x){ … }` scope-function
+   body). Carries the *resolved candidate set*, not a bare name. This tier shrinks
+   toward zero as the eager engine (typeck) runs.
+
+"Static as possible" = the engine collapses tier 3 → tier 1/2 wherever it can prove
+the type. "Dynamic preserved" = tiers 2 and 3 still exist by design.
+
+## One engine, two modes
+
+There are **not** two systems (a resolver and a type-checker). There is **one
+inference/resolution engine** run in two modes:
+
+- **lazy mode** — the lowering default (`klio run`/`test`). Run the engine locally,
+  keep what resolves, tolerate gaps. Literals, `val x = Ctor()`, declared params,
+  direct member chains → tier 1/2. The genuinely-hard residual (scope-function
+  receiver types, generic instantiation across lambdas, smart-cast-dependent
+  dispatch) stays tier 3. Reaches ~90% static **without running typeck at all** —
+  the runtime is tolerant of the residual.
+- **eager mode** — the type-check / validation pass (`klio check`, LSP, a strict
+  mode). Run the *same* engine over the whole tree, compute every expression's type,
+  record `Span→Type` + `Span→FuncId`, emit diagnostics. Collapses the residual
+  tier-3 into tier 1/2 and is the **only** source of tooling diagnostics.
+
+Consequences:
+
+- Typeck is the **amplifier**, not the foundation. The index + applicability is the
+  foundation (a mostly-resolved runnable IR needs no typeck run); typeck resolves the
+  hard last ~10% and produces diagnostics.
+- The error/reporting infrastructure already built becomes the **diagnostics layer of
+  the eager mode** — reused, not discarded, not an independent type system.
+- Because both modes are the *same* engine, `run` and `check` cannot disagree on a
+  resolution. This is what makes RC-G real and kills the three-drifting-oracle
+  problem below.
+
+## Execution engine — resolved IR → bytecode → JIT
+
+The resolved IR is the single source every execution tier consumes.
+
+- **Today:** the IR is already register-based and block-structured; all references
+  are `enum(u32)` integer indices (`Reg`/`FuncId`/`ClassId`/`ConstId`/`BlockId`,
+  `ir.zig`), and blocks already have a byte-encoded serialized form (the lazy-IR
+  `deferred_func_section`). Execution walks `[]Block` of `[]Inst` (a `union(enum)`),
+  dispatching per instruction. This is in-memory bytecode in all but the dispatch
+  loop.
+- **Flat bytecode (optional, post-resolution):** linearize the resolved IR into a
+  flat instruction stream with a switch / computed-goto (direct-threaded) dispatch
+  loop and superinstruction fusion. Payoff is bounded and specific: tighter dispatch
+  (~1.3–2× on dispatch-bound non-loop code), compactness, and **encoding unification**
+  — the flat stream is simultaneously executed *and* serialized. Its value is
+  proportional to how resolved the operands are: tier-1 becomes a direct indexed
+  dispatch, tier-2 a vtable-slot op, tier-3 the (now-rare) probe. Linearizing before
+  resolving only encodes slow probes compactly, so this phase follows resolution and
+  is gated on a measurement that the baseline dispatch loop is a real bottleneck (our
+  measurements show the interpreter is largely compute-bound; the transformational
+  perf already came from the loop JIT at 60–79× and the structural method-dispatch
+  fixes at 10–12×).
+- **JIT (exists):** `src/ir/jit_loop.zig` compiles hot loops/functions from the same
+  resolved IR. Bytecode baseline and JIT coexist — JIT owns hot regions, the baseline
+  owns the rest.
+
+**The bytecode stream and the serialized artifact are the same object** (see
+Serialization). So "flat bytecode" and "separate serializable artifact" are one
+decision with one answer.
+
+## Serialization (pack sections already reserved)
+
+The pack format already reserves the sections this needs — `sources`, `ast`,
+`resolved`, `typeck`, `symbols`, `bindings` — and the schema already has a
+`TypeckBundle` of sorted `(Span, Type)` pairs (`src/pack/schema.zig`,
+`src/pack/format.zig`). They are **empty today**: no `resolved` bundle is emitted,
+`write.zig` doesn't populate them, and typeck never runs to fill `typeck`.
+
+Serialization is therefore a **later optimization, decoupled from the in-memory
+resolved-IR work**, justified only by startup speed (skip re-lowering the stdlib per
+run) and RSS (compact on-disk form). It is **not on the correctness path**. When we
+want it, we populate the reserved sections — the linearized resolved bytecode becomes
+the `resolved` section, typeck's `Span→Type`/`Span→FuncId` maps become `typeck`, the
+sig index becomes `symbols`. No new format is invented.
+
+## Root causes (the means)
+
+- **RC-A — no canonical index.** No single signature index over all provenances
+  populated before any body lowers. `func_name_index` is built in the wrong order and
+  consulted while incomplete: class bodies lower (`interp_ir/build.zig:1470`) before
+  the phase-1 header loop (`:1489-1561`), so `funcsBySimpleName`/`funcId`/
+  `decl_user_arity` are empty for user top-level funcs when any class method (incl. a
+  `@Test` method) lowers. The `klio run` extend path pre-seeds the index via
+  `cloneForExtend` (`ir.zig:1142-1150`), masking the bug; `klio test` goes straight to
+  `buildModuleFiles` with no pre-seed, exposing it. Members and inline members get no
+  arity-queryable entry at all. The index is consulted as a refiner, not a primary.
+  *This is the true root of run-vs-test divergence.* Evidence: `factRun`.
 
 - **RC-B — no shared, type-aware applicability.** Applicability/overload matching is
   reimplemented at least three times (lowering ladder, runtime global scorer, runtime
-  member scorer) with no shared core, and the lowering ladder is **arity-only and
-  type-blind**. `shadowedByClass` + `findCand`/`arityMatch` (`expr.zig:4324-4364`)
-  bind `Box(5)` to `fun Box(String)`; only `overload_match.zig:124`
-  `builtinKindMismatch` rejects it at runtime, and only when the call deferred (empty
-  index). The runtime re-rank (`pickOverloadCached`, `host_call_func.zig:1266`) is a
-  safety net, not a fix: bypassed by exact casts (`eval.zig:2586`), `TailCallFunc`
-  (no re-pick), and any lowering-only decision (class-vs-factory). `src/ir/applicability.zig`
-  does not exist. Evidence: `factRun` (crashes under run, passes under test).
+  member scorer) with no shared core, and the lowering ladder is arity-only and
+  type-blind. `shadowedByClass` + `findCand`/`arityMatch` (`expr.zig:4324-4364`) bind
+  `Box(5)` to `fun Box(String)`; only `overload_match.zig:124` `builtinKindMismatch`
+  rejects it at runtime, and only when the call deferred. The runtime re-rank
+  (`pickOverloadCached`, `host_call_func.zig:1266`) is a safety net bypassed by exact
+  casts (`eval.zig:2586`), `TailCallFunc`, and any lowering-only decision.
+  `src/ir/applicability.zig` does not exist. Evidence: `factRun`.
 
 - **RC-C — member-vs-global by a program-wide name set.** The decision uses
   `class_member_names` (a union over ALL pack+user classes) plus `inReceiverContext`,
-  not the enclosing receiver TYPE's actual members. Six gate sites
+  not the enclosing receiver TYPE's members. Six gate sites
   (`expr.zig:1099,3804,3961,4521,4931,4979`). `inReceiverContext` is true for any
   method body, false for top-level `main`, so identical bodies lower to different IR
-  under run vs test. `emitBareFuncCall` deliberately discards a statically-resolved
-  FuncId and defers to runtime, so run==test output only because the runtime probe
-  re-derives the answer. The `de327622` arity-aware `prefer_member` fix closed the
-  0-arg-member-shadows-1-arg-global case but not the structural over-broadness.
-  Evidence: `crossmember.kt`.
+  under run vs test. Evidence: `crossmember.kt`. This is the root of the null/broad
+  receiver static-dispatch cluster (`orEmpty`, `minus`, local-ext-shadows-stdlib).
 
 - **RC-D — name-keyed field storage.** `InstanceData.fields` is a flat
-  `ArrayList(Field{name,value})` keyed by name only (`class.zig:318-353`);
-  `define` overwrites. A subclass field with a parent's name destroys/aliases the
-  parent's backing cell (`materializeInstance` writes bottom-up,
-  `host_instances.zig:2378-2422`). Kotlin needs two distinct backing fields keyed by
-  (declaring class, name) for a shadow, but one shared cell for an override. The
-  current model cannot represent the distinction. This is a value-layer root cause
-  below the dispatch layer; it reproduces byte-identically run-vs-test. Evidence:
-  `c_shadow` prints 2/2/2/2, expected 1/2/1/1.
+  `ArrayList(Field{name,value})` keyed by name only (`class.zig:318-353`); `define`
+  overwrites. A subclass field with a parent's name aliases the parent's cell. Kotlin
+  needs two distinct cells keyed by (declaring class, name) for a shadow, one shared
+  cell for an override. A value-layer root cause below the dispatch layer; reproduces
+  byte-identically run-vs-test. Evidence: `c_shadow` prints 2/2/2/2, expected 1/2/1/1.
 
-- **RC-E — non-final vararg on the positional path.** The positional dispatch path
-  packs varargs only when the vararg is the LAST parameter (`packVarargArgs`,
-  `host_call_func.zig:93`; member twin `host_call_member.zig:374`). A non-final
-  vararg followed by a defaulted param crashes on a purely-positional call (pads the
-  trailing default first, then the packer no-ops, leaving an unpacked Int in the
-  vararg slot). The named binder `callFuncNamed` handles mid-list varargs correctly;
-  the two binders disagree on a Kotlin-legal shape. Evidence: `e_vararg`
-  (`report("T4",6,7,8)` crashes; adding any named arg fixes it).
+- **RC-E — non-final vararg on the positional path.** The positional binders pack
+  varargs only when the vararg is LAST (`host_call_func.zig:93`, member twin
+  `host_call_member.zig:374`). A non-final vararg before a defaulted param crashes on
+  a purely-positional call. The named binder handles it. Evidence: `e_vararg`.
+  *(Landed — see below.)*
 
 - **RC-F — reified inference is return-type-only.** `inferReifiedTypeArgs`
-  (`inline_call.zig:276-313`) unifies only `f.return_type` against the expected type,
-  never value-parameter types, so a reified `T` inferable only from a lambda
-  parameter annotation stays unbound and `x is T` degenerates to always-true.
-  Evidence: `j2` (`classify(7){ s: String -> s }` prints `is`, expected `no`).
+  (`inline_call.zig:276-313`) unifies only `f.return_type`, so a reified `T` inferable
+  only from a lambda parameter annotation stays unbound and `x is T` is always-true.
+  Evidence: `j2`. *(Landed — see below.)*
 
 - **RC-G — typeck resolution discarded.** Typeck resolves overloads internally
-  (`checkOverloadedCall` picks a `*const FnSig`) but never records the target;
-  `TypeCheck` exposes no `Span->FuncId` map (`check.zig:72-88`), and `klio run`/`test`
-  never invoke typecheck. Three overload oracles (typeck Type-based, lowering
-  arity+tier, runtime value-class) share no resolved-symbol channel; a call can be
-  type-checked against one overload and executed against another with no diagnostic.
+  (`checkOverloadedCall`) but records nothing; `TypeCheck` exposes no `Span→FuncId`
+  map (`check.zig:72-88`), and `klio run`/`test` never invoke typeck. Three overload
+  oracles share no resolved-symbol channel. **The one-engine-two-modes design is the
+  fix:** typeck is the eager mode of the same engine, so there is one oracle recorded
+  once.
 
-- **RC-H — hatch name-lists.** A web of hardcoded name-lists papers over the seams
-  left by RC-A and RC-B: `isAliasName` (41 names, 4 gate sites), two near-duplicate
-  inconsistent builtin-supertype tables (`builtinSupersFor` vs `builtinHeadAccepts`),
-  three inconsistent Throwable lists, the `concreteSibling` same-simple-name abstract
-  redirect, `tailrec_fn_names`, `shadowed_inline_names`, `isPrimitiveConv`,
-  `CONTROL_INTRINSICS`. These are CLAUDE.md-forbidden symptom-hiding. They exist only
-  because the index is incomplete and applicability is not shared/type-aware; deleting
+- **RC-H — hatch name-lists.** `isAliasName` (41 names), two near-duplicate
+  builtin-supertype tables, three Throwable lists, `concreteSibling`, `tailrec_fn_names`,
+  `shadowed_inline_names`, `isPrimitiveConv`, `CONTROL_INTRINSICS`. These exist only
+  because the index is incomplete and applicability isn't shared/type-aware. Deleting
   them is the proof those fixes are complete.
 
 ## Target architecture
 
-1. **One canonical signature index (RC-A).** A per-FuncId `DeclSig` in `ir.zig`
+1. **One canonical signature index (RC-A).** A per-`FuncId` `DeclSig` in `ir.zig`
    (subsuming `decl_user_arity`/`decl_user_sig`/`decl_user_params`): `{ fqn, package,
-   simple_name, kind: {top_level,member,ctor,factory,extension}, enclosing_class,
-   receiver_ty, params: []ParamSig{name, ty, has_default, is_vararg, is_function_typed},
-   type_params: []{name, is_reified}, is_inline, is_suspend, low_priority }`.
-   `ParamSig.ty` rendered by the same `loweredTypeRef` phase-1 already uses. A new
-   **phase 0** in `buildModuleWithOverrides` registers a `DeclSig` for every
+   simple_name, kind, enclosing_class, receiver_ty, params: []ParamSig{name, ty,
+   has_default, is_vararg, is_function_typed}, type_params, is_inline, is_suspend }`.
+   A new **phase 0** in `buildModuleWithOverrides` registers a `DeclSig` for every
    declaration — top-level funcs, constructors (keyed by class simple name), member
-   methods (signatures only), inline funcs (top-level and member) — BEFORE the
-   class-lowering loop and phase-1. Three phases: (0) sig registration over all decls,
-   (1) class body lowering, (2) top-level body lowering. Member+ctor sigs baked into
-   the image. `runTestFiles` routed through the same extend/image assembly as `run`.
-   After this, `funcsBySimpleName` returns the full source+pack+stdlib+inline+member+ctor
-   candidate set in every entry point, order-independent.
+   methods, inline funcs — BEFORE class-lowering and phase-1. Three phases: (0) sig
+   registration over all decls, (1) class body lowering, (2) top-level body lowering.
+   `runTestFiles` routed through the same extend/image assembly as `run`.
 
-2. **One type-aware applicability function (RC-B, RC-E).** New `src/ir/applicability.zig`:
-   `pub fn applicable(sig, args: []const ArgShape, scope) ?Score`. `ArgShape = { ty:
-   ?TypeRef, is_lambda, lambda_arity, lambda_param_types, is_named: ?[]const u8,
-   is_spread }`, populated from lowering (lowered expr type / literal kind), runtime
-   (value class name), or typeck (checked Type lowered to TypeRef). `applicable` folds
-   in one place: named-arg-to-distinct-param, default padding, vararg packing at ANY
-   position, trailing-lambda-out-of-sequence binding to the last function-typed param,
-   and per-arg type scoring (lifting `overloadScoreArg` + `builtinKindMismatch`).
-   The two builtin-supertype tables merge into one canonical relation derived from the
-   class hierarchy where possible. Three callers, one function: lowering's
-   `resolveCall`, runtime `pickOverload`/`pickMethodOverload`, typeck `checkOverloadedCall`.
+2. **One type-aware applicability function (RC-B, RC-E).** New
+   `src/ir/applicability.zig`: `pub fn applicable(sig, args: []const ArgShape, scope)
+   ?Score`. `ArgShape = { ty: ?TypeRef, is_lambda, lambda_arity, lambda_param_types,
+   is_named, is_spread }`, populated from lowering (lowered expr type / literal kind),
+   runtime (value class name), or the eager engine (checked Type lowered to TypeRef).
+   Folds in one place: named-arg-to-param, default padding, vararg packing at ANY
+   position, trailing-lambda binding, per-arg type scoring. The two builtin-supertype
+   tables merge into one relation derived from the hierarchy. Three callers, one
+   function: lowering's `resolveCall`, runtime `pickOverload`/`pickMethodOverload`,
+   eager `checkOverloadedCall`.
 
-3. **`Module.resolveCall` — one resolver, index primary (RC-A, RC-B).** Replaces the
-   two-oracle asymmetry. Tiers candidates by Kotlin scope (`bareCallTier`), ranks the
-   best non-empty tier by `applicable`, returns `Resolution{ target: FuncId,
-   confidence: {exact, runtime_polymorphic}, candidate_set }`. A unique best -> resolved
-   `Call`. A genuine tie or runtime-only receiver -> `CallMemberOrGlobal` carrying the
-   candidate set (not a name probe). The heuristic ladder, `preferredBareTarget`,
-   `resolveBareCallIndexed`-as-refiner, and the inline-vs-noninline split all collapse
-   into this. Constructors are ordinary candidates, so class-vs-factory is a normal
-   overload set, not a `shadowedByClass` branch.
+3. **`Module.resolveCall` — one resolver, index primary (RC-A, RC-B).** Tiers
+   candidates by Kotlin scope, ranks the best non-empty tier by `applicable`, returns
+   `Resolution{ target: FuncId, confidence: {exact, virtual, deferred},
+   candidate_set }` — the three tiers above. A unique best → resolved `Call`/
+   `CallVirtual`. A tie or runtime-only receiver → `CallMemberOrGlobal` carrying the
+   candidate set. The heuristic ladder, `preferredBareTarget`,
+   `resolveBareCallIndexed`-as-refiner, and the inline-vs-noninline split collapse into
+   this. Constructors are ordinary candidates.
 
 4. **Member-vs-global by enclosing-receiver type (RC-C).** Delete `class_member_names`
-   (registry field + 6 gate sites) and the `inReceiverContext` switch as the
-   discriminator. A bare call inside a method queries the enclosing receiver type's
-   member set via the sig index (`kind==member && enclosing_class==this_class`, walking
-   the receiver's supertype closure by ClassId). Member-shadowable iff THIS receiver
-   type (or a supertype) has an applicable member of that name+shape. Pure function of
-   (call-site receiver type, sig index); independent of main-vs-`@Test`.
-   `emitBareFuncCall`'s downgrade is deleted. `CallMemberOrGlobal` survives only for
-   genuinely runtime-polymorphic receivers.
+   and the `inReceiverContext` discriminator. A bare call inside a method queries the
+   enclosing receiver type's member set via the sig index (walking the supertype
+   closure by `ClassId`). Member-shadowable iff THIS receiver type (or a supertype) has
+   an applicable member of that name+shape. Pure function of (call-site receiver type,
+   sig index); independent of main-vs-`@Test`.
 
-5. **Distinct-keyed inherited fields + super/method-walk fixes (RC-D).** Change
-   `InstanceData.Field` key from name to `(declaring_class: ClassId, name)`. `get/set/
-   define` take an optional declaring-class qualifier. An override writes under the
-   most-derived class only (one cell — preserves override semantics); a shadow writes a
-   separate cell keyed by its own declaring class (override-vs-shadow detected at
-   construction via the `override` modifier). A bare `x` in a method of class C resolves
-   to the C-or-nearest-supertype-that-declares-stored-`x` cell; `super.x` reads the
-   parent's cell; external `(b as Base).x` reads via the static type. Also fix
-   `firstSupertypeName` to skip interfaces (`host_call_member.zig:6901`, the
-   `super.method` bug) and FQN-qualify the method walk after the first hop.
+5. **Distinct-keyed inherited fields (RC-D) → the exact/virtual field tiers.** Change
+   `InstanceData.Field` key from name to `(declaring_class: ClassId, name)`, exposed as
+   a resolved `slot`. An override writes one cell (most-derived); a shadow writes a
+   separate cell. A bare `x` in a method of class C resolves to the C-or-nearest-
+   supertype cell; `super.x` reads the parent's; `(b as Base).x` reads via static type.
+   Also fix `firstSupertypeName` to skip interfaces (`host_call_member.zig:6901`) and
+   FQN-qualify the method walk after the first hop.
 
 6. **Position-agnostic vararg packing (RC-E).** Unify the positional and named binders
-   onto `applicability.zig`'s position-agnostic bind step; `internArgNames` stops
-   collapsing all-positional to empty for a non-final-vararg sig. Deletes the
-   positional/named divergence.
+   onto `applicability.zig`'s position-agnostic bind step. *(Landed.)*
 
-7. **Reified inference from parameter positions (RC-F).** Extend `inferReifiedTypeArgs`
-   to unify each declared value-parameter type (recursing into function-typed params'
-   parameter lists) against actual argument / lambda-parameter-annotation types before
-   the return-type fallback. Reuse `unifyTypeParam`.
+7. **Reified inference from parameter positions (RC-F).** *(Landed.)*
 
-8. **Typeck records + reuses resolution (RC-G).** Add `TypeCheck.resolved_calls:
-   Span->FuncId`. `checkOverloadedCall` calls the shared `resolveCall`/`applicable`
-   over the assembled sig index. Minimum: audit-assert typeck pick == lowering pick.
-   Full: lowering consumes `resolved_calls`. The dead TYPECK pack section is wired or
-   deleted.
+8. **Eager mode records + reuses resolution (RC-G).** `TypeCheck.resolved_calls:
+   Span→FuncId` + `Span→Type`. The eager engine calls the shared `resolveCall`/
+   `applicable`. Lowering consumes `resolved_calls` when present (typeck-informed
+   fidelity) and runs the same engine lazily when absent. Records feed the pack
+   `typeck` section.
 
 9. **Delete the hatches (RC-H) — the completeness proof.** After 1-5 land: delete
    `isAliasName`, the merged-away duplicate builtin table, `class_member_names`,
-   `prefer_member`, `contract_with_msg`/`CONTROL_INTRINSICS`, `tailrec_fn_names` as an
-   overload gate (TailCallFunc re-picks via `applicable`), the `concreteSibling` redirect
-   (abstract instantiation becomes a diagnostic), `isPrimitiveConv`, and the Throwable
-   lists (route via `resolvedNativeForm`/FQN). Each deletion gated on
-   `KLIO_RESOLVE_AUDIT` zero-disagreement + the full sweep.
+   `prefer_member`, `CONTROL_INTRINSICS`, `tailrec_fn_names` as an overload gate, the
+   `concreteSibling` redirect (abstract instantiation → diagnostic), `isPrimitiveConv`,
+   and the Throwable lists. Each deletion gated on `KLIO_RESOLVE_AUDIT`
+   zero-disagreement + the full sweep.
 
-## Phases (each independently shippable; hatches removed only after subsumed)
+10. **(Optional, post-resolution) flat bytecode + serialization.** Linearize the
+    resolved IR into a flat threaded-dispatch stream; the same stream populates the
+    pack `resolved` section. Gated on a dispatch-bottleneck measurement; unifies the
+    in-memory `Inst` union with the lazy-IR byte section into one canonical stream.
 
-- **P0 — Unblock the run-vs-test parity harness.** Root-cause why `assertEquals`/etc do
-  not resolve under `klio test` (likely RC-A surfacing for pack top-level funcs). Make
-  `tests/fixtures/test_runner/sample_test.kt` pass. Files: `cli/commands.zig`,
-  `cli/stdlib_image.zig`, `stdlib_pack/*`, `interp_ir/build.zig`.
-- **P1 — DeclSig + sig phase 0 (RC-A).** Additive; `resolveCall` not yet switched.
-  Verify: `KLIO_RESOLVE_AUDIT` shows tier_count>0 for user top-level funcs called from
-  methods under `klio test`; image round-trip; full sweep unchanged.
-- **P2 — `applicability.zig` (RC-B, RC-E).** Lift the type-aware scorer + position-agnostic
-  bind; merge the two builtin tables. Runtime callers switch first. Verify: `e_vararg`
-  passes under run AND test; named-arg corpus unchanged.
+## Working rule for this plan
+
+Per CLAUDE.md ("Scope and regressions") and the user's directive: these are **big
+coupled changes**, not green-preserving slivers. RC-A and RC-C must land **together**
+(completing the index during class-body lowering flips member-vs-global decisions, so
+the reorder is only safe once member-vs-global is receiver-type-aware — a P1-alone
+attempt regressed −16, documented below). The canonical count is expected to dip for
+several commits before climbing past the old baseline. Land the big change, then drive
+it green. Root-causing still holds: never hide a failure; only the stay-green-every-
+commit constraint is relaxed.
+
+## Phases (big coupled changes, not shipped as unused abstractions)
+
+- **P0 — Parity harness + unblock `klio test` resolution.** *(Landed.)* Each fixture
+  emitted twice (`fun main` and `@Test`), byte-identical stdout. `kotlin.test` resolves
+  under `klio test`.
+- **P1+P4 (coupled) — canonical index (RC-A) + member-vs-global by receiver type
+  (RC-C).** Build the phase-0 `DeclSig` index; switch member-vs-global to receiver-type
+  membership; delete `class_member_names`. Expect a mid-flight dip. Verify: `factRun`
+  5/5 and `crossmember.kt` no downgrade under run AND test; run-vs-test parity harness
+  byte-identical.
+- **P2 — `applicability.zig` (RC-B, RC-E).** One shared type-aware scorer +
+  position-agnostic bind; merge the two builtin tables. Runtime callers switch first.
+  Verify: `e_vararg` under run AND test; overload-by-type cluster (sumOf,
+  compareToIgnoreCase, minus, NaN minOf/maxOf) resolves.
 - **P3 — `Module.resolveCall`, switch bare-call emission (RC-A, RC-B).** Shadow behind
-  `KLIO_RESOLVE_AUDIT` to zero disagreement, then switch. Verify: `factRun` prints 5/5
-  under run AND test.
-- **P4 — Member-vs-global by receiver-type membership (RC-C); delete `class_member_names`.**
-  Verify: run-vs-test parity harness byte-identical; `crossmember.kt` no longer downgrades.
+  `KLIO_RESOLVE_AUDIT` to zero disagreement, then switch. Verify: `factRun` 5/5.
 - **P5 — Distinct-keyed inherited fields (RC-D) + super/method-walk fixes.** Verify:
-  `c_shadow` 1/2/1/1; override still woof/4; `super.method` interface-skip correct.
-- **P6 — Reified inference from parameter positions (RC-F).** Verify: `j2`/`j4` correct;
-  controls stay correct.
-- **P7 — Typeck records + reuses resolution (RC-G).** Verify: typeck-vs-lowering zero
-  disagreement on the corpus; `klio check` diagnostics unchanged.
-- **P8 — Delete the hatch name-lists (RC-H).** Each deletion audit-gated + full sweep;
-  user class named `Error`/`Random` constructs correctly; abstract instantiation
-  diagnoses.
+  `c_shadow` 1/2/1/1; override still correct; `super.method` interface-skip correct.
+- **P6 — Reified inference from parameter positions (RC-F).** *(Landed.)*
+- **P7 — Eager mode records + reuses resolution (RC-G).** Typeck runs the shared
+  engine, records `Span→FuncId`/`Span→Type`, emits diagnostics; lowering consumes them.
+  Verify: typeck-vs-lowering zero disagreement; `klio check` diagnostics wired.
+- **P8 — Delete the hatch name-lists (RC-H).** Each deletion audit-gated + full sweep.
+- **P9 — (Optional) flat bytecode + pack `resolved`/`typeck`/`symbols` serialization.**
+  Gated on a dispatch-bottleneck measurement and a startup/RSS justification.
 
 ## Verification
 
-- **Ratchet:** stdlib commonTest baseline (`stdlib_commontest.zig`, currently >=1455).
-  Risky phases run the FULL sweep; raise the baseline only after a real fix; a phase that
-  drops the count is rejected, not accommodated.
+- **Ratchet:** stdlib commonTest baseline (`stdlib_commontest.zig`). Risky phases run
+  the FULL sweep; the baseline is raised only after a real fix. A phase may *temporarily*
+  drop the count (big coupled changes) but must climb past the prior baseline before the
+  phase is called done.
 - **`KLIO_RESOLVE_AUDIT` zero-disagreement** before switching any resolution path and
-  before each hatch deletion. Extend it to flag type-blind agreement (index and heuristic
-  agreeing on a wrong pick — the `factRun` blind spot) via an applicability-confidence field.
-- **Run-vs-test parity harness** (built in P0, required from P4): each fixture body emitted
-  twice — `fun main(){...}` and `class T{ @Test fun t(){...} }` — asserting byte-identical
-  stdout. Throw-on-mismatch `@Test` bodies as a fallback if assert resolution is partial.
-- **Repro ratchet:** the four headline crashes locked as corpus tests that currently FAIL
-  and must pass post-fix, each under BOTH run and test, each failing if its fix is reverted:
-  `factRun` -> 5/5; `e_vararg` -> `T4 [6,7,8] end`; `c_shadow` -> 1/2/1/1; `j2` -> is/no.
-- **Structural invariants** after the design lands: (a) every bare-call resolution is a pure
-  function of (call site, sig index); (b) `funcsBySimpleName` at file=0 == at any later file;
-  (c) zero name-list lookups remain in the dispatch path; (d) runtime pick == lowering pick
+  before each hatch deletion; extended to flag type-blind agreement (index+heuristic
+  agreeing on a wrong pick — the `factRun` blind spot).
+- **Run-vs-test parity harness** (P0, required from P1+P4): each fixture emitted twice,
+  byte-identical stdout.
+- **Repro ratchet:** `factRun` → 5/5; `e_vararg` → `T4 [6,7,8] end`; `c_shadow` →
+  1/2/1/1; `j2` → is/no. Each under BOTH run and test, each failing if its fix reverts.
+- **Structural invariants:** (a) every bare-call resolution is a pure function of (call
+  site, sig index); (b) `funcsBySimpleName` at file=0 == at any later file; (c) zero
+  name-list lookups in the dispatch path; (d) runtime pick == lowering pick == eager pick
   for every non-runtime-polymorphic call.
-- **Negative tests:** abstract instantiation emits a diagnostic (not a `concreteSibling`
-  redirect); a user class named `Error`/`Exception`/`Random` constructs via its own
-  declaration; named args on a function-typed value diagnose rather than silently drop.
+- **Negative tests:** abstract instantiation diagnoses; a user class named
+  `Error`/`Exception`/`Random` constructs via its own declaration; named args on a
+  function-typed value diagnose rather than silently drop.
 
-## P4 investigation (member-vs-global by receiver type) — deferred, design captured
+## P1+P4 investigation (findings that constrain the real fix)
 
-A full attempt landed and was reverted. Findings that constrain the real fix:
+A full attempt landed and was reverted. Findings:
 
-- **P4 fixes no user-visible bug.** The `class_member_names` gate is over-broad but the
-  runtime `CallMemberOrGlobal` probe already resolves to the correct target — output is
-  identical across `klio run` and `klio test` (the full sweep exercises both;
-  `stdlib_commontest`=1756, e2e green). The divergence is IR-level only.
 - **The lowerer is largely untyped**, so a scope-function receiver's type
   (`with(x){ memberOfX() }`) is unknown at the call site — which is *why* the runtime
-  probe exists. A naive `class_member_names` → `hasOwnMember` swap regresses scope-receiver
-  member calls (verified: `with(Box()){ greet() }` bound the top-level `greet`).
-- **A workable signal exists**: a `receiverRebindActive()` on the FuncBuilder —
-  `capturesThisSlot() or isParamThunk()` (a lambda/anon/thunk body's `this` is a
-  scope/receiver of unknown type) OR the in-scope `this` resolves at a scope depth other
-  than the function's own-`this` scope (captured via `own_this_scope` set right after a
-  method/extension binds params). With it, the member-shadowable gate narrows safely in
-  plain method bodies (fixes the spurious `@Test` downgrade) while keeping the
+  probe exists and why the eager mode (typeck) is the amplifier that removes it. A naive
+  `class_member_names` → `hasOwnMember` swap regresses scope-receiver member calls
+  (`with(Box()){ greet() }` bound the top-level `greet`).
+- **A workable signal exists:** `receiverRebindActive()` on the FuncBuilder —
+  `capturesThisSlot() or isParamThunk()` OR the in-scope `this` resolving at a scope
+  depth other than the function's own-`this` scope (`own_this_scope`). It narrows the
+  member-shadowable gate safely in plain method bodies while keeping the
   over-approximation where a non-enclosing receiver is in scope.
-- **The divergence's other half is RC-A index ordering (P1).** Even with the gate fixed,
-  a top-level function called from a `@Test` method still `defer`s under test because the
-  index isn't complete when class bodies lower. The P1 reorder (top-level headers before
-  class bodies) fixes that — but it cascades: making the index complete during class-body
-  lowering flips OTHER member-preference decisions. Fixed so far: the member-shadowable
-  gate (expr.zig ~4581) and `prefer_member` (extended to enclosing/outer-class members).
-  STILL regressing: a bare outer-member call inside a stdlib INNER class
-  (`AbstractMutableList.IteratorImpl` reaching the list's `get`) resolves to a global once
-  the index is complete — a deeper inner-class outer-member path needs the same
-  receiver-type-aware treatment. P1 + P4 must land together with EVERY member-preference
-  site made receiver-type-aware; this is the substantial work remaining.
+- **P1 and P4 are coupled.** Completing the index during class-body lowering flips
+  member-vs-global decisions because the lowering still decides by the heuristic. The
+  reorder alone regressed a stdlib inner-class outer-member call
+  (`AbstractMutableList.IteratorImpl` reaching the list's `get`). P1+P4 must land
+  together with EVERY member-preference site made receiver-type-aware. Reproduced as the
+  nested-`it` −16 in the grind campaign: the reorder makes method-body bare calls resolve
+  statically (`emitBareFuncCall`→global) instead of via runtime `CallMemberOrGlobal`
+  (member-first), changing overload resolution for ~16 tests. That −16 is the coupling,
+  not a bug in the reorder.
 
 Resume by reinstating `receiverRebindActive`/`own_this_scope`, the gate + `prefer_member`
-changes, and the P1 reorder, then driving the inner-class outer-member site (and any the
-full sweep surfaces) to green before committing — audit-gated, sweep-verified.
+changes, and the index reorder together, driving the inner-class outer-member site (and
+any the full sweep surfaces) to green — accepting a mid-flight dip.
 
-## Landed RC-F fix (reified inference from parameter positions)
+## Landed slices
 
-`inferReifiedTypeArgs` inferred a reified type parameter only by unifying the
-function's RETURN type against the call's expected type, so a reified `T` that
-appears only in a value parameter (e.g. `block: (T) -> String`) stayed unbound
-and `x is T` degenerated to always-true. It now first unifies each declared
-value-parameter type against the actual argument — a function-typed parameter
-against the lambda literal's parameter annotations (`{ s: String -> … }`) —
-before the return-type fallback. Explicit `<T>` arguments still win (filled
-before inference). Locked by `examples/reified_param_inference.kt`.
-
-## Landed RC-B slice (type-aware class-vs-factory)
-
-A same-name factory function and a constructor of the SAME arity were
-disambiguated arity-only, so `Box(5)` (ctor `Box(Int)`) bound the factory
-`fun Box(s: String)` type-blind and crashed on `s.length`. `shadowedByClass`
-now consults the candidate factory's declared parameter types
-(`decl_user_sig`) against the literal argument kinds: a factory whose parameter
-type definitely cannot accept a literal argument (an `Int` literal against a
-`String` parameter) is not applicable, so the call constructs the class.
-Conservative — only a literal-vs-builtin kind mismatch flips the decision; an
-unknown argument or parameter type never disproves. Locked by
-`examples/class_factory_overload.kt`. The full RC-B/RC-A consolidation
-(`Module.resolveCall` with constructors as first-class index candidates and one
-shared type-aware applicability over lowering+runtime+member) remains the bulk
-of P3.
-
-## Landed RC-E fix (non-final vararg)
-
-A `vararg` parameter before a trailing defaulted parameter, called positionally,
-crashed: the binders only collapsed a vararg in the LAST parameter, so the middle
-positional args were never packed (`report("T4", 6, 7, 8)` left an `Int` in the
-`items: Array` slot). Fixed by making the binders vararg-position-aware:
-- `callFuncNamed` enters its reorder-aware binder when the callee has a non-final
-  vararg (not only when an argument is named); `hasNonFinalVararg` gates it.
-- `pickMethodOverload`'s single-candidate applicability binds the prefix
-  positionally, the vararg consumes the remaining positional args, and the
-  post-vararg params take defaults — instead of type-checking a vararg-bound arg
-  against a post-vararg parameter.
-- `invokeMethodFuncId` routes a non-final-vararg member call through the
-  reorder-aware func binder rather than the trailing-collapse fast path.
-Locked by `examples/vararg_nonfinal.kt`. The broader RC-B consolidation (one
-shared `applicability.zig` over the lowering/runtime/member scorers + merging the
-two builtin-supertype tables) folds into P3, co-designed with `resolveCall`'s
-needs rather than shipped as an unused abstraction.
-
-## Landed RC-A fixes
-
-- **Cross-package class-name collision** — `reserveClass` deduped class stubs by SIMPLE
-  name, so two classes sharing a simple name across packages (`kotlinx.io.Segment` public
-  + concrete vs `kotlinx.coroutines.internal.Segment` internal + abstract) collapsed onto
-  one slot; whichever pack reserved first won, and the loser's own `Name(args)`
-  construction sites misresolved to the winner (here: to the abstract twin's companion
-  `invoke`). Fixed with `reserveClassFqn` (FQN-keyed reservation) + FQN-aware stub reuse
-  in `addClass`, plus `shadowedByClass` now resolving through the scope-tiered
-  `classIdIndexed` rather than the simple-name-global `classId`. This surfaced as a
-  `kotlinx.io` ByteChannel failure/deadlock under co-loaded `kotlinx.coroutines` and is
-  locked by `tests/fixtures/dispatch/class_name_collision.kt`.
-
-## Sequencing note: P1 must land WITH P4
-
-The intra-build reorder (register top-level headers before class bodies lower) is NOT
-safely additive: completing the index during class-body lowering changes member-vs-global
-decisions, because the lowering still decides member-vs-global by the heuristic
-(`class_member_names` global set + `prefer_member`), not by the receiver type. The reorder
-alone regressed a stdlib inner-class call (`AbstractMutableList.IteratorImpl` resolving a
-bare `get` to the wrong target). So P1 (the reorder) is folded into P4: the index is made
-complete during class lowering only once member-vs-global is decided by the enclosing
-receiver type (RC-C). Until then the build keeps the original order (class bodies before
-top-level headers).
-
-## Prior progress (carried from the RC-1..RC-5 sketch)
-
-- Step 4 (commit `fea12203`) — removed the `intrinsic_owns_all`/`intrinsicOwnsBareName`
-  hatch; `compareValues`/`compareValuesBy` resolve as ordinary symbols.
-- Arity-aware member-vs-global (commit `de327622`) — `collectMemberArities` +
-  `own_member_arity` mask; a 0-arg member no longer shadows a 1-arg top-level fn. Fixes
-  `requireNotNull`/`checkNotNull`. This is RC-C's arity core; the structural name-set gate
-  remains (addressed by P4).
-- The old plan's RC-4 attribution (base->extend `func_index` drop) was wrong:
-  `cloneForExtend` already carries `func_index`. The real root is intra-build phase
-  ordering (RC-A) plus `klio test` not routing through the extend assembly.
+- **RC-F (reified inference from parameter positions).** `inferReifiedTypeArgs` now
+  unifies each declared value-parameter type (recursing into function-typed params'
+  parameter lists) against actual argument / lambda-parameter-annotation types before
+  the return-type fallback. Locked by `examples/reified_param_inference.kt`.
+- **RC-B slice (type-aware class-vs-factory).** `shadowedByClass` consults the candidate
+  factory's declared parameter types against the literal argument kinds; a factory whose
+  parameter type cannot accept a literal argument is not applicable, so `Box(5)`
+  constructs the class. Locked by `examples/class_factory_overload.kt`.
+- **RC-E (non-final vararg).** The binders are vararg-position-aware: `callFuncNamed`
+  enters its reorder-aware binder on a non-final vararg; `pickMethodOverload` binds the
+  prefix positionally, the vararg consumes the remaining positional args, post-vararg
+  params take defaults; `invokeMethodFuncId` routes a non-final-vararg member call
+  through the reorder-aware binder. Locked by `examples/vararg_nonfinal.kt`.
+- **RC-A slices.** Cross-package class-name collision (`reserveClassFqn` FQN-keyed
+  reservation + FQN-aware stub reuse; `shadowedByClass` resolves through
+  `classIdIndexed`). Locked by `tests/fixtures/dispatch/class_name_collision.kt`.
+  Step 4 (`fea12203`) removed the `intrinsic_owns_all` hatch. Arity-aware
+  member-vs-global (`de327622`, `collectMemberArities` + `own_member_arity` mask): a
+  0-arg member no longer shadows a 1-arg top-level fn. The old plan's base→extend
+  `func_index` drop attribution was wrong: `cloneForExtend` carries `func_index`; the
+  real root is intra-build phase ordering (RC-A) plus `klio test` not routing through
+  the extend assembly.
