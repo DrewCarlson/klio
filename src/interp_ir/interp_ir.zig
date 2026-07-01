@@ -1080,6 +1080,7 @@ pub fn isBuiltinThrowableFqn(fqn: []const u8) bool {
         "kotlin.UnsupportedOperationException",   "kotlin.NoWhenBranchMatchedException",
         "kotlin.ConcurrentModificationException", "kotlin.AssertionError",
         "kotlin.UninitializedPropertyAccessException",
+        "kotlin.coroutines.cancellation.CancellationException",
     };
     for (names) |n| {
         if (std.mem.eql(u8, fqn, n)) return true;
