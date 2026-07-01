@@ -5774,6 +5774,16 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
     const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
+    // Kotlin resolves an extension call against the receiver's STATIC type. When
+    // the receiver is a plain local whose declared type is known, pass that head
+    // so dispatch picks e.g. `String?.orEmpty` over `Collection?.orEmpty` for a
+    // `String?`-typed null receiver (which has no runtime type to key on).
+    var static_recv: ?ConstId = null;
+    if (receiver.* == .Path and receiver.Path.segments.len == 1) {
+        if (b.localDeclType(receiver.Path.segments[0].name)) |decl_ty| {
+            static_recv = try b.module.internConst(b.allocator, .{ .String = typeHead(decl_ty) });
+        }
+    }
     try b.push(.{ .CallMember = .{
         .dst = dst,
         .receiver = recv,
@@ -5781,6 +5791,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
+        .static_recv = static_recv,
     } });
     return dst;
 }
