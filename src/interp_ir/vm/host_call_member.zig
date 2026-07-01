@@ -6459,15 +6459,9 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                 const fits = staticReceiverApplicable(self, allocator, sname, c.fid, &c.func.params[0].ty) orelse true;
                 if (fits) filtered.append(allocator, c) catch {};
             }
-            // Apply the static filter only when it leaves a candidate; a static
-            // type with no matching loaded extension falls back to the
-            // unfiltered set rather than failing the call outright.
-            if (filtered.items.len != 0) {
-                candidates.deinit(allocator);
-                candidates = filtered;
-            } else {
-                filtered.deinit(allocator);
-            }
+            candidates.deinit(allocator);
+            candidates = filtered;
+            if (candidates.items.len == 0) return null;
         }
         // Lenient pass: keep candidates whose receiver match cannot be
         // proven (erased generics) — but a definite DISPROOF still drops
