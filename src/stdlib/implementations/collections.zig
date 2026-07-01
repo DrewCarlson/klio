@@ -505,6 +505,13 @@ fn kotlinFloatTotalCmp(x: f64, y: f64) Order {
 
 /// Compare two values by Kotlin's natural ordering.
 fn compareValues(a: Allocator, x: Value, y: Value) Error!CompareOutcome {
+    // Nullable ordering (Kotlin `compareValues`): null sorts before any
+    // non-null value; two nulls are equal. A nullable selector
+    // (`sortedBy { if (...) null else it.length }`) relies on this.
+    if (x == .Null or y == .Null) {
+        if (x == .Null and y == .Null) return .{ .order = .eq };
+        return .{ .order = if (x == .Null) .lt else .gt };
+    }
     if (x.isNumeric() and y.isNumeric()) {
         if (x.isIntegral() and y.isIntegral()) {
             // Unsigned operands compare by magnitude; reading them as i64 would
