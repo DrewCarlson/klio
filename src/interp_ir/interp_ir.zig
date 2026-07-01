@@ -370,6 +370,15 @@ pub const ProgramImage = struct {
             // the bindings and resolve each fqn to its funcs (all overloads share
             // the receiverless fqn), touching the lazy func table only for
             // same-simple-name candidates instead of sweeping it whole.
+            //
+            // One exception: a body-bearing GENERIC overload (every value param
+            // typed by the func's own type parameters) sharing its FQN with a
+            // same-arity concrete-typed sibling keeps its body. The intrinsic
+            // implements the concrete family's semantics (`kotlin.comparisons.
+            // minOf(Double, Double)` propagates NaN); the generic family's
+            // semantics differ (`minOf<T : Comparable<T>>` is the compareTo
+            // total order), so collapsing the generic body onto the intrinsic
+            // erases the distinction the overload split exists for.
             var bk = bindings.table.keyIterator();
             while (bk.next()) |fqn_k| {
                 const fqn = fqn_k.*;
@@ -378,6 +387,7 @@ pub const ProgramImage = struct {
                 for (module.funcsBySimpleName(simple)) |cand| {
                     const cf = module.funcById(cand) orelse continue;
                     if (std.mem.eql(u8, cf.fqn, fqn)) {
+                        if (genericOverloadKeepsBody(module, cand, cf)) continue;
                         try self.resolved_native.put(cand.int(), intrinsic);
                     }
                 }
@@ -421,6 +431,56 @@ pub const ProgramImage = struct {
         if (self.bodylessNativeForm(bindings, f.fqn, f.name)) |intrinsic| {
             try self.resolved_native.put(fid.int(), intrinsic);
         }
+    }
+
+    /// User arity of a func (value params, excluding a synthesized `this`).
+    fn funcValueArity(f: *const ir.Func) usize {
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) return f.params.len - 1;
+        return f.params.len;
+    }
+
+    /// Whether every value parameter of `f` is typed by one of the func's
+    /// own declared type parameters (`fun <T : Comparable<T>> minOf(a: T,
+    /// b: T)`). The registry's `func_type_params` carries the declared
+    /// type-parameter names.
+    fn funcHasGenericSig(module: *const Module, fid: FuncId, f: *const ir.Func) bool {
+        const tps = module.registry.func_type_params.get(fid) orelse return false;
+        if (tps.items.len == 0) return false;
+        const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        if (f.params.len == off) return false;
+        for (f.params[off..]) |*p| {
+            var is_tp = false;
+            for (tps.items) |tp| {
+                if (std.mem.eql(u8, p.ty.name, tp)) {
+                    is_tp = true;
+                    break;
+                }
+            }
+            if (!is_tp) return false;
+        }
+        return true;
+    }
+
+    /// The narrow native-marking escape: a body-bearing, non-extension,
+    /// generic-signature overload whose FQN group also holds a same-arity
+    /// NON-generic sibling keeps its Kotlin body instead of being marked
+    /// `resolved_native`. Scoped tightly so intrinsic-over-body funcs stay
+    /// intrinsic: bodyless stubs, extensions, all-generic families
+    /// (`listOf`), and generic funcs with no concrete same-arity namesake
+    /// all keep today's marking.
+    fn genericOverloadKeepsBody(module: *const Module, fid: FuncId, f: *const ir.Func) bool {
+        if (!f.hasBody()) return false;
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) return false;
+        if (!funcHasGenericSig(module, fid, f)) return false;
+        const arity = funcValueArity(f);
+        for (module.funcsBySimpleName(f.name)) |sid| {
+            if (sid.int() == fid.int()) continue;
+            const g = module.funcById(sid) orelse continue;
+            if (!std.mem.eql(u8, g.fqn, f.fqn)) continue;
+            if (funcValueArity(g) != arity) continue;
+            if (!funcHasGenericSig(module, sid, g)) return true;
+        }
+        return false;
     }
 
     /// The native form a bodyless decl's per-call ladder would have

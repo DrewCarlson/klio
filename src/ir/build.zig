@@ -400,6 +400,20 @@ pub const FuncBuilder = struct {
     pending_lambda_broad_mask: u32 = 0,
     pending_arg_broad_masks: ?[]const u32 = null,
 
+    /// Per-argument flags: the callee parameter's declared function type
+    /// takes only values typed by the callee's own type parameters
+    /// (`f2t: (T, T) -> T` on `fun <T : Comparable<T>> ...`). A `::name`
+    /// reference in such a slot denotes the GENERIC overload of `name`
+    /// (kotlinc substitutes the call-site type argument, so only the
+    /// generic candidate applies). `pending_ref_fn_generic` is the flag
+    /// for the argument being lowered right now; `pending_arg_fn_generic`
+    /// the per-argument source the arg-run reads, set by the call site.
+    pending_ref_fn_generic: bool = false,
+    pending_arg_fn_generic: ?[]const bool = null,
+
+    /// See `setHasOwnTypeParams`.
+    has_own_type_params: bool = false,
+
     pub fn init(allocator: Allocator, module: *Module) Allocator.Error!FuncBuilder {
         var self = FuncBuilder{
             .allocator = allocator,
@@ -985,6 +999,17 @@ pub const FuncBuilder = struct {
     pub fn inheritLocalExtFns(self: *FuncBuilder, names: *const StringSet) Allocator.Error!void {
         var it = names.keyIterator();
         while (it.next()) |k| try self.local_ext_fns.put(k.*, {});
+    }
+    /// The function being built declares its own type parameters
+    /// (`fun <T : Comparable<T>> ...`). Comparisons inside such a body on
+    /// operands with no concrete static type follow Kotlin's generic
+    /// typing: they dispatch `compareTo` (total order), not the primitive
+    /// IEEE comparison.
+    pub fn setHasOwnTypeParams(self: *FuncBuilder, on: bool) void {
+        self.has_own_type_params = on;
+    }
+    pub fn hasOwnTypeParams(self: *const FuncBuilder) bool {
+        return self.has_own_type_params;
     }
     pub fn markGenericTypedParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.generic_typed_params.put(name, {});
