@@ -9,9 +9,14 @@ Each module owns its unit tests as `test {}` blocks inside its
 binary per file for process isolation. They cover happy paths, edge
 cases, and every diagnostic the code can emit.
 
-```sh
-zig build test
-```
+The suite is split by cost:
+
+- `zig build test` — the fast module unit tests only (seconds). Use
+  this in the inner dev loop.
+- `zig build itest` — the integration suite: it interprets whole
+  programs (the `parity` sweep, `e2e`, `stdlib_commontest`, etc.), so
+  it takes minutes. Run one in isolation with `zig build itest-<name>`.
+- `zig build test-all` — both. This is what CI runs.
 
 ## 2. Negative tests
 
@@ -37,7 +42,8 @@ auto-install (the parity tests then skip).
 
 The `e2e` module runs every `examples/*.kt` in-process against the
 checked-in expected output under `tests/corpus/expected/`, so the
-example corpus is part of `zig build test`.
+example corpus is part of `zig build itest` (it interprets programs,
+so it rides the integration suite, not the fast unit step).
 
 The corpus only grows. Removing a `.kt` from it is a deliberate act
 that requires reviewer sign-off.

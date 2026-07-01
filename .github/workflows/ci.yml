@@ -73,8 +73,8 @@ jobs:
       # while the second universe's optimizing compiles cost tens of minutes
       # on a 4-vCPU runner. One universe here; the ReleaseSafe configuration
       # runs in the harness-release workflow (manual / nightly).
-      - name: zig build test
-        run: zig build test -Dharness-optimize=Debug --summary all
+      - name: zig build test-all
+        run: zig build test-all -Dharness-optimize=Debug --summary all
 
       - name: save zig build + test state
         if: always()

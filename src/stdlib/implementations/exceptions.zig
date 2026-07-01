@@ -285,6 +285,14 @@ fn freeException(exc: anytype) void {
     if (exc.suppressed) |s| (ValueList{ .cell = s }).deinit();
 }
 
+/// Free the handles a `makeException` result owns in a test — its `fqn`,
+/// optional `message`, and the eagerly-allocated `suppressed` list.
+fn freeMade(v: Value) void {
+    v.Exception.fqn.deinit();
+    if (v.Exception.message) |m| m.deinit();
+    if (v.Exception.suppressed) |s| (ValueList{ .cell = s }).deinit();
+}
+
 test "build exception with no arguments" {
     var ctx = noopCtx(&.{});
     const r = try excn_illegal_state(&ctx);
@@ -341,10 +349,7 @@ test "single non-string argument is rendered into the message" {
 
 test "single throwable argument is treated as the cause" {
     const inner = try makeException(testing.allocator, "kotlin.IllegalStateException", "inner");
-    defer {
-        inner.Exception.fqn.deinit();
-        if (inner.Exception.message) |m| m.deinit();
-    }
+    defer freeMade(inner);
     const args = [_]Value{inner};
     var ctx = noopCtx(&args);
     const r = try excn_runtime(&ctx);
@@ -362,7 +367,7 @@ test "single throwable argument is treated as the cause" {
 
 test "message and cause arguments" {
     const cause = try makeException(testing.allocator, "kotlin.Throwable", null);
-    defer cause.Exception.fqn.deinit();
+    defer freeMade(cause);
     const msg = try runtime.strInit(testing.allocator, "outer");
     defer msg.deinit();
     const args = [_]Value{ .{ .String = msg }, cause };
@@ -405,7 +410,7 @@ test "instance cause argument is accepted" {
     // so exercise the acceptance path via the same branch using an Exception
     // and confirm the dedicated Instance branch compiles by type.
     const cause = try makeException(testing.allocator, "kotlin.RuntimeException", null);
-    defer cause.Exception.fqn.deinit();
+    defer freeMade(cause);
     const msg = try runtime.strInit(testing.allocator, "m");
     defer msg.deinit();
     const args = [_]Value{ .{ .String = msg }, cause };
@@ -419,10 +424,7 @@ test "instance cause argument is accepted" {
 
 test "throwable message accessor returns the message" {
     const inner = try makeException(testing.allocator, "kotlin.Exception", "hi");
-    defer {
-        inner.Exception.fqn.deinit();
-        if (inner.Exception.message) |m| m.deinit();
-    }
+    defer freeMade(inner);
     const args = [_]Value{inner};
     var ctx = noopCtx(&args);
     const r = try throwable_message(&ctx);
@@ -438,7 +440,7 @@ test "throwable message accessor returns the message" {
 
 test "throwable message accessor yields null when absent" {
     const inner = try makeException(testing.allocator, "kotlin.Exception", null);
-    defer inner.Exception.fqn.deinit();
+    defer freeMade(inner);
     const args = [_]Value{inner};
     var ctx = noopCtx(&args);
     const r = try throwable_message(&ctx);
@@ -456,10 +458,7 @@ test "throwable message rejects a non-throwable receiver" {
 
 test "throwable toString renders fqn and message" {
     const inner = try makeException(testing.allocator, "kotlin.IllegalStateException", "bad");
-    defer {
-        inner.Exception.fqn.deinit();
-        if (inner.Exception.message) |m| m.deinit();
-    }
+    defer freeMade(inner);
     const args = [_]Value{inner};
     var ctx = noopCtx(&args);
     const r = try throwable_to_string(&ctx);
@@ -474,7 +473,7 @@ test "throwable toString renders fqn and message" {
 
 test "throwable toString renders fqn alone when message is absent" {
     const inner = try makeException(testing.allocator, "kotlin.Throwable", null);
-    defer inner.Exception.fqn.deinit();
+    defer freeMade(inner);
     const args = [_]Value{inner};
     var ctx = noopCtx(&args);
     const r = try throwable_to_string(&ctx);
@@ -489,7 +488,7 @@ test "throwable toString renders fqn alone when message is absent" {
 
 test "addSuppressed records nothing and returns Unit" {
     const inner = try makeException(testing.allocator, "kotlin.Throwable", null);
-    defer inner.Exception.fqn.deinit();
+    defer freeMade(inner);
     const args = [_]Value{inner};
     var ctx = noopCtx(&args);
     const r = try throwable_add_suppressed(&ctx);
@@ -535,7 +534,7 @@ test "cause accessor returns the cause value" {
 
 test "cause accessor yields null when absent" {
     const inner = try makeException(testing.allocator, "kotlin.Throwable", null);
-    defer inner.Exception.fqn.deinit();
+    defer freeMade(inner);
     const args = [_]Value{inner};
     var ctx = noopCtx(&args);
     const r = try throwable_cause(&ctx);
@@ -553,10 +552,7 @@ test "cause accessor rejects a non-throwable receiver" {
 
 test "make exception copies fqn and message into fresh handles" {
     const exc = try makeException(testing.allocator, "kotlin.Error", "oops");
-    defer {
-        exc.Exception.fqn.deinit();
-        if (exc.Exception.message) |m| m.deinit();
-    }
+    defer freeMade(exc);
     const fg = exc.Exception.fqn.borrow();
     defer fg.deinit();
     try testing.expectEqualStrings("kotlin.Error", fg.get().bytes);
