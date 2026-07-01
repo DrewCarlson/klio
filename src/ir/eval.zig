@@ -2197,42 +2197,6 @@ fn isBoundRefInstance(v: *const Value) bool {
     return std.mem.startsWith(u8, cg.get().name, "$bound_ref$");
 }
 
-/// Host-aware positional equality of two builtin Lists: an element that is
-/// itself a List recurses, and an element that is an `Instance` (e.g. a user
-/// `Comparable`, or a stdlib `RingBuffer`/view implementing `List`) compares
-/// through its own `equals` — `structuralEqBoxed` alone treats an Instance and a
-/// builtin List as unequal even when the Instance's `equals` says otherwise.
-fn collEqHostAware(comptime H: type, host: *H, allocator: Allocator, l: *const Value, r: *const Value) Allocator.Error!EvalResult {
-    const lg = l.List.items.borrow();
-    defer lg.deinit();
-    const rg = r.List.items.borrow();
-    defer rg.deinit();
-    const la = lg.get().items;
-    const lb = rg.get().items;
-    if (la.len != lb.len) return ok(.{ .Bool = false });
-    for (la, lb) |x, y| {
-        var eq: bool = false;
-        if (x == .List and y == .List) {
-            switch (try collEqHostAware(H, host, allocator, &x, &y)) {
-                .ok => |v| eq = v.Bool,
-                .err => |e| return errResult(e),
-            }
-        } else if (x == .Instance or y == .Instance) {
-            const x_inst = x == .Instance;
-            const recv = if (!x_inst and y == .Instance) &y else &x;
-            const arg = if (!x_inst and y == .Instance) x else y;
-            switch (try host.callMember(allocator, recv, "equals", &.{arg})) {
-                .ok => |v| eq = (v == .Bool and v.Bool),
-                .err => |e| return errResult(e),
-            }
-        } else {
-            eq = Value.structuralEqBoxed(&x, &y);
-        }
-        if (!eq) return ok(.{ .Bool = false });
-    }
-    return ok(.{ .Bool = true });
-}
-
 fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
     switch (inst.*) {
         .SuspendResumePoint => {
@@ -2448,20 +2412,6 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             {
                 const both_null = l == .Null and r == .Null;
                 const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !both_null else both_null;
-                try frame.write(bo.dst, .{ .Bool = b });
-                return .cont;
-            }
-            // Two builtin Lists compare element-wise; an element that is an
-            // Instance (or nested List) needs host-aware equality, which the
-            // structural `applyBinop` path below cannot do.
-            if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
-                l == .List and r == .List)
-            {
-                const eq = switch (try collEqHostAware(H, host, allocator, &l, &r)) {
-                    .ok => |v| v.Bool,
-                    .err => |e| return raiseStep(frame, e),
-                };
-                const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
                 try frame.write(bo.dst, .{ .Bool = b });
                 return .cont;
             }
