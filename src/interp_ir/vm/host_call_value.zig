@@ -488,7 +488,86 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
 }
 
 pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    _ = arg_names;
+    // A Class callee constructed with named arguments (e.g. a local class
+    // `Box(bb = true)` that skips a defaulted parameter) must reorder + default-
+    // fill; callValue constructs positionally and would shift values into the
+    // wrong fields.
+    if (callee.* == .Class) {
+        var any_named = false;
+        for (arg_names) |n| {
+            if (n != null) {
+                any_named = true;
+                break;
+            }
+        }
+        if (any_named) {
+            const cls = callee.Class;
+            const cls_name = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                break :blk g.get().name;
+            };
+            const cls_fqn = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                break :blk g.get().fqn;
+            };
+            const class_id: ?ir.ClassId = blk: {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                if (mg.get().classIdByFqn(cls_fqn)) |cid| break :blk cid;
+                for (mg.get().class_index.items) |entry| {
+                    if (std.mem.eql(u8, entry.name, cls_name)) break :blk entry.id;
+                }
+                break :blk null;
+            };
+            if (class_id) |cid| {
+                return host_instances.newInstanceNamed(self, allocator, cid, args, arg_names, null);
+            }
+            // Local class (not in the module index): reorder named args and fill
+            // literal defaults into a positional vector, then construct through
+            // callValue's positional direct-allocation path.
+            var positional: []Value = &.{};
+            {
+                const g = cls.borrow();
+                defer g.deinit();
+                const pp = g.get().primary_params;
+                const n = pp.len;
+                var reordered = try allocator.alloc(?Value, n);
+                defer allocator.free(reordered);
+                for (reordered) |*s| s.* = null;
+                var next_pos: usize = 0;
+                for (args, 0..) |v, i| {
+                    if (i < arg_names.len and arg_names[i] != null) {
+                        const nm = arg_names[i].?;
+                        for (pp, 0..) |p, idx| {
+                            if (std.mem.eql(u8, p.name, nm)) {
+                                reordered[idx] = v;
+                                break;
+                            }
+                        }
+                    } else {
+                        while (next_pos < n and reordered[next_pos] != null) next_pos += 1;
+                        if (next_pos < n) {
+                            reordered[next_pos] = v;
+                            next_pos += 1;
+                        }
+                    }
+                }
+                positional = try allocator.alloc(Value, n);
+                for (reordered, 0..) |slot, idx| {
+                    positional[idx] = if (slot) |v|
+                        v
+                    else if (pp[idx].default) |e|
+                        (simpleLiteral(allocator, e.get()) orelse Value.Null)
+                    else
+                        Value.Null;
+                }
+            }
+            defer allocator.free(positional);
+            return callValue(self, allocator, callee, positional);
+        }
+    }
     return callValue(self, allocator, callee, args);
 }
 
