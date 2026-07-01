@@ -205,6 +205,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.String.toFloatOrNull", .f = string.string_to_float_or_null },
     .{ .fqn = "kotlin.String.plus", .f = string.string_plus },
     .{ .fqn = "kotlin.String.equals", .f = string.string_equals },
+    .{ .fqn = "kotlin.text.equals", .f = string.string_equals },
     .{ .fqn = "kotlin.String.repeat", .f = string.string_repeat },
     .{ .fqn = "kotlin.String.replace", .f = string.string_replace },
     .{ .fqn = "kotlin.String.reversed", .f = string.string_reversed },
