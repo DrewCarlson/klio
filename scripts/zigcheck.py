@@ -35,10 +35,11 @@ GRAPH = {
     "parser": ["ast", "diagnostics", "lexer", "span"],
     "jit": [],
     "ir": ["span", "ast", "types", "runtime", "diagnostics", "jit"],
+    "applicability": ["ir", "span"],
     "stdlib": ["runtime", "pack"],
     "cfa": ["ast", "diagnostics", "lexer", "parser", "span", "types"],
     "resolver": ["span", "ast", "diagnostics", "types", "stdlib"],
-    "interp_ir": ["ir", "runtime", "ast", "span", "stdlib", "diagnostics"],
+    "interp_ir": ["ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability"],
     "stdlib_pack": ["pack", "stdlib", "stdlib_embedded"],
     # build.zig generates the real embedded pack; isolated checks use the
     # no-bytes stub so the cwd source checkout stays the pack source.
@@ -64,6 +65,7 @@ GRAPH = {
 # Modules whose root source does not follow the src/<mod>/<mod>.zig pattern.
 PATH_OVERRIDES = {
     "stdlib_embedded": "src/stdlib_pack/embedded_stub.zig",
+    "applicability": "src/ir/applicability.zig",
 }
 
 

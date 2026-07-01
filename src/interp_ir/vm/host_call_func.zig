@@ -11,6 +11,7 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
+const applicability = @import("applicability");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
@@ -646,6 +647,145 @@ fn pickOverloadCached(self: *VmHost, module: *const Module, func: FuncId, args: 
     return pickOverload(self, module, func, args);
 }
 
+var resolve_audit_checked: bool = false;
+var resolve_audit_enabled: bool = false;
+
+/// Cached `KLIO_RESOLVE_AUDIT` gate (read once, mirrors `orAuditOn` in
+/// `ir/lower/expr.zig`).
+fn resolveAuditOn() bool {
+    if (!resolve_audit_checked) {
+        resolve_audit_checked = true;
+        const a = std.heap.page_allocator;
+        if (runtime.procEnvGetVar(a, "KLIO_RESOLVE_AUDIT") catch null) |v| {
+            a.free(v);
+            resolve_audit_enabled = true;
+        }
+    }
+    return resolve_audit_enabled;
+}
+
+/// Build an `ArgShape` describing one runtime value for the shared applicability
+/// scorer. Named args are not threaded into the positional `pickOverload`
+/// path, so `named` stays null here.
+fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
+    const arity: ?u8 = switch (v.*) {
+        .IrClosure => |c| if (self.closures.get(c.id)) |info| std.math.cast(u8, info.n_params) else null,
+        .Function => |f| std.math.cast(u8, f.decl.params.len),
+        .Class => 0,
+        else => null,
+    };
+    return .{
+        .runtime_class = overload_match.runtimeHead(v),
+        .is_null = v.* == .Null,
+        .is_lambda = valueIsCallable(v),
+        .lambda_arity = arity,
+        .func_typed = std.mem.startsWith(u8, v.typeFqn(), "kotlin.Function"),
+        .value = @ptrCast(v),
+    };
+}
+
+/// `applicability.ApplicabilityScope.refine`: wraps `refineByDeclaredArgs`.
+fn applicRefineCb(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyopaque) ?i32 {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const v: *const Value = @ptrCast(@alignCast(value));
+    return overload_match.refineByDeclaredArgs(self, param_ty, v);
+}
+
+/// `applicability.ApplicabilityScope.subtype`: the instance-supertype BFS from
+/// `overloadScoreArg`, returning the match depth (or null when the value is not
+/// an instance or `target` is never reached).
+fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8) ?i32 {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const arg: *const Value = @ptrCast(@alignCast(value));
+    if (arg.* != .Instance) return null;
+    var queue: std.ArrayList(QItem) = .empty;
+    defer queue.deinit(self.allocator);
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(self.allocator);
+    queue.append(self.allocator, .{ .name = overload_match.runtimeHead(arg), .depth = 0 }) catch return null;
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cur = queue.items[head];
+        var already = false;
+        for (seen.items) |s| {
+            if (std.mem.eql(u8, s, cur.name)) {
+                already = true;
+                break;
+            }
+        }
+        if (already) continue;
+        seen.append(self.allocator, cur.name) catch return null;
+        if (std.mem.eql(u8, cur.name, target)) return cur.depth;
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(cur.name)) |def_ref| {
+            const dg = def_ref.borrow();
+            defer dg.deinit();
+            for (dg.get().supertype_names) |sup| {
+                queue.append(self.allocator, .{ .name = sup, .depth = cur.depth + 1 }) catch return null;
+            }
+        }
+    }
+    return null;
+}
+
+/// Per-candidate `SigView` for the shared applicability scorer, read straight
+/// off the `Func` (the same sources the legacy `overloadScore` reads).
+fn sigViewOfFunc(self: *VmHost, module: *const Module, cand: FuncId) ?applicability.SigView {
+    const f = funcAt(module, cand) orelse return null;
+    return .{
+        .params = f.params,
+        .defaults = funcDefaults(self, cand),
+        .has_body = f.hasBody(),
+        .low_priority = f.low_priority,
+    };
+}
+
+/// Sentinel printed for an inapplicable (null) score in the audit line.
+const AUDIT_NA: i32 = std.math.minInt(i32);
+
+fn optScoreEq(a: ?i32, b: ?i32) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.? == b.?;
+}
+
+/// Dual-compute audit: for each candidate compute both the legacy
+/// `overloadScore` and the shared `applicable()`, and log any per-candidate
+/// point mismatch. Because the winner is a pure function of the per-candidate
+/// scores and the scan order, per-candidate agreement implies winner
+/// agreement. Runs only under `KLIO_RESOLVE_AUDIT`; changes no behavior.
+fn auditPickOverload(
+    self: *VmHost,
+    module: *const Module,
+    name: []const u8,
+    candidates: []const FuncId,
+    args: []const Value,
+) void {
+    var shapes_buf: [32]applicability.ArgShape = undefined;
+    if (args.len > shapes_buf.len) return;
+    for (args, 0..) |*a, i| shapes_buf[i] = shapeOfValue(self, a);
+    const shapes = shapes_buf[0..args.len];
+
+    const scope = applicability.ApplicabilityScope{
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCb,
+        .subtype = applicSubtypeCb,
+    };
+
+    for (candidates) |cand| {
+        const legacy: ?i32 = overloadScore(self, module, cand, args);
+        const sig = sigViewOfFunc(self, module, cand) orelse continue;
+        const applic: ?i32 = if (applicability.applicable(&sig, shapes, scope)) |sc| sc.points else null;
+        if (!optScoreEq(legacy, applic)) {
+            std.debug.print(
+                "[KLIO_RESOLVE_AUDIT] scorer name={s} cand_fid={d} legacy={d} applic={d} divergent={d}\n",
+                .{ name, cand.int(), legacy orelse AUDIT_NA, applic orelse AUDIT_NA, @as(u8, 1) },
+            );
+        }
+    }
+}
+
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
     const f = funcAt(module, func) orelse return null;
     const name = f.name;
@@ -667,6 +807,11 @@ fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []cons
             }
         }
     }
+
+    // Additive dual-compute audit; the legacy `overloadScore` above stays the
+    // live selection.
+    if (resolveAuditOn()) auditPickOverload(self, module, name, candidates, args);
+
     return best_func;
 }
 

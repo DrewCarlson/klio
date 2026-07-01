@@ -248,7 +248,7 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
     return .unknown;
 }
 
-fn runtimeHead(v: *const Value) []const u8 {
+pub fn runtimeHead(v: *const Value) []const u8 {
     return switch (v.*) {
         .Instance => |i| blk: {
             const g = i.borrow();

@@ -8,7 +8,16 @@ const Mod = struct {
     name: []const u8,
     deps: []const []const u8 = &.{},
     tested: bool = false,
+    /// Root source override for a module that does not live at the default
+    /// `src/{name}/{name}.zig` (e.g. a shared file that sits inside another
+    /// module's directory).
+    src: ?[]const u8 = null,
 };
+
+/// Build-root-relative root source path for a module.
+fn modSource(b: *std.Build, m: Mod) []const u8 {
+    return m.src orelse b.fmt("src/{s}/{s}.zig", .{ m.name, m.name });
+}
 
 const mod_list = [_]Mod{
     .{ .name = "span", .tested = true },
@@ -21,10 +30,14 @@ const mod_list = [_]Mod{
     .{ .name = "parser", .deps = &.{ "ast", "diagnostics", "lexer", "span" }, .tested = true },
     .{ .name = "jit", .tested = true },
     .{ .name = "ir", .deps = &.{ "span", "ast", "types", "runtime", "diagnostics", "jit" }, .tested = true },
+    // Shared overload-resolution applicability engine. Lives inside the ir
+    // module's directory but is its own module (it depends on ir for TypeRef /
+    // Param / FuncId) so the runtime scorers can import it.
+    .{ .name = "applicability", .deps = &.{ "ir", "span" }, .src = "src/ir/applicability.zig", .tested = true },
     .{ .name = "stdlib", .deps = &.{ "runtime", "pack" }, .tested = true },
     .{ .name = "cfa", .deps = &.{ "ast", "diagnostics", "lexer", "parser", "span", "types" }, .tested = true },
     .{ .name = "resolver", .deps = &.{ "span", "ast", "diagnostics", "types", "stdlib" }, .tested = true },
-    .{ .name = "interp_ir", .deps = &.{ "ir", "runtime", "ast", "span", "stdlib", "diagnostics" }, .tested = true },
+    .{ .name = "interp_ir", .deps = &.{ "ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability" }, .tested = true },
     .{ .name = "stdlib_pack", .deps = &.{ "pack", "stdlib" }, .tested = true },
     .{ .name = "stdlib_gen", .deps = &.{ "pack", "stdlib" }, .tested = true },
     .{ .name = "kotlinx_atomicfu", .deps = &.{ "runtime", "stdlib" }, .tested = true },
@@ -282,7 +295,7 @@ pub fn build(b: *std.Build) void {
 
     for (mod_list) |m| {
         const mod = b.addModule(m.name, .{
-            .root_source_file = b.path(b.fmt("src/{s}/{s}.zig", .{ m.name, m.name })),
+            .root_source_file = b.path(modSource(b, m)),
             .target = target,
             .optimize = optimize,
         });
@@ -321,7 +334,7 @@ pub fn build(b: *std.Build) void {
     } else {
         for (mod_list) |m| {
             const mod = b.createModule(.{
-                .root_source_file = b.path(b.fmt("src/{s}/{s}.zig", .{ m.name, m.name })),
+                .root_source_file = b.path(modSource(b, m)),
                 .target = target,
                 .optimize = harness_optimize,
             });
