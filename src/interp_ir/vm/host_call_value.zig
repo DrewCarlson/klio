@@ -209,12 +209,22 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             defer g.deinit();
             const cdef = g.get();
             var i: usize = 0;
-            while (i < cdef.primary_params.len and i < args.len) : (i += 1) {
-                if (cdef.primary_params[i].property != null) {
+            while (i < cdef.primary_params.len) : (i += 1) {
+                if (cdef.primary_params[i].property == null) continue;
+                if (i < args.len) {
                     // The instance owns one ref per primary-ctor field; `args[i]`
                     // is a borrow of the caller's register, so retain.
                     if (runtime.reclaimEnabled()) args[i].retain();
                     try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = args[i] });
+                } else {
+                    // An omitted trailing parameter takes its (literal) default;
+                    // without this the field is simply absent (a later access
+                    // fails "get_field" instead of reading the default value).
+                    const dv: Value = if (cdef.primary_params[i].default) |e|
+                        (simpleLiteral(allocator, e.get()) orelse Value.Null)
+                    else
+                        Value.Null;
+                    try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = dv });
                 }
             }
             // Body-property defaults for runtime-registered local
