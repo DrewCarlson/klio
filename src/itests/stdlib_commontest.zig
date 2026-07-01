@@ -112,6 +112,49 @@ fn passedCount(stdout: []const u8) ?usize {
     return std.fmt.parseInt(usize, stdout[start..end], 10) catch null;
 }
 
+/// Extract the symbol name from `import test.<pkg>.<Name>` (null otherwise).
+fn importedTestName(line: []const u8) ?[]const u8 {
+    const t = std.mem.trim(u8, line, " \t\r");
+    if (!std.mem.startsWith(u8, t, "import ")) return null;
+    var rest = std.mem.trim(u8, t["import ".len..], " \t\r");
+    if (!std.mem.startsWith(u8, rest, "test.")) return null;
+    if (std.mem.indexOfAny(u8, rest, " \t")) |sp| rest = rest[0..sp];
+    rest = std.mem.trimEnd(u8, rest, ";");
+    const dot = std.mem.lastIndexOfScalar(u8, rest, '.') orelse return null;
+    const name = rest[dot + 1 ..];
+    if (name.len == 0 or std.mem.eql(u8, name, "*")) return null;
+    return name;
+}
+
+fn isIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// Whether `hay` contains `word` bounded by non-identifier characters.
+fn hasWord(hay: []const u8, word: []const u8) bool {
+    if (word.len == 0) return false;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, i, word)) |p| {
+        const before_ok = p == 0 or !isIdentChar(hay[p - 1]);
+        const after = p + word.len;
+        const after_ok = after >= hay.len or !isIdentChar(hay[after]);
+        if (before_ok and after_ok) return true;
+        i = p + 1;
+    }
+    return false;
+}
+
+/// Whether `content` has a top-level declaration line naming `name`.
+fn declaresTopLevel(content: []const u8, name: []const u8) bool {
+    const kws = [_][]const u8{ "val", "var", "fun", "class", "object", "interface", "typealias", "enum" };
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        if (!hasWord(line, name)) continue;
+        for (kws) |kw| if (hasWord(line, kw)) return true;
+    }
+    return false;
+}
+
 var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 test "stdlib commonTest pass count holds at or above the ratchet baseline" {
@@ -145,6 +188,37 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
         if (fileHasTest(a, io, p)) try targets.append(a, p) else try support.append(a, p);
     }
 
+    // A `@Test` file may also export a top-level helper (e.g. a shared
+    // Comparator) that tests in another directory import via `import test.X.Y`.
+    // The real Kotlin module compiles every file together; mirror that by
+    // compiling the UNIQUE provider of each imported `test.*` symbol as extra
+    // context. Ambiguous names (declared by more than one target) are skipped
+    // so no name clash is introduced.
+    var imported_names: std.StringHashMap(void) = .init(a);
+    for (targets.items) |t| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, t, a, .unlimited) catch continue;
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |line| {
+            if (importedTestName(line)) |n| try imported_names.put(n, {});
+        }
+    }
+    var provider: std.StringHashMap([]const u8) = .init(a);
+    var ambiguous: std.StringHashMap(void) = .init(a);
+    for (targets.items) |t| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, t, a, .unlimited) catch continue;
+        var kit = imported_names.keyIterator();
+        while (kit.next()) |k| {
+            if (!declaresTopLevel(bytes, k.*)) continue;
+            if (provider.contains(k.*)) {
+                try ambiguous.put(k.*, {});
+            } else {
+                try provider.put(k.*, t);
+            }
+        }
+    }
+    var ait = ambiguous.keyIterator();
+    while (ait.next()) |k| _ = provider.remove(k.*);
+
     var total_passed: usize = 0;
     var build_blocked: usize = 0;
     for (targets.items) |target| {
@@ -169,6 +243,22 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
             if (std.mem.eql(u8, sibling, target)) continue;
             const sdir = std.fs.path.dirname(sibling) orelse "";
             if (std.mem.eql(u8, sdir, tdir)) try argv.append(a, sibling);
+        }
+        // Cross-directory providers of imported `test.*` symbols.
+        {
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, target, a, .unlimited) catch "";
+            var seen: std.StringHashMap(void) = .init(a);
+            var it = std.mem.splitScalar(u8, bytes, '\n');
+            while (it.next()) |line| {
+                const n = importedTestName(line) orelse continue;
+                const pf = provider.get(n) orelse continue;
+                if (std.mem.eql(u8, pf, target)) continue;
+                const pdir = std.fs.path.dirname(pf) orelse "";
+                if (std.mem.eql(u8, pdir, tdir)) continue;
+                if (seen.contains(pf)) continue;
+                try seen.put(pf, {});
+                try argv.append(a, pf);
+            }
         }
         try argv.append(a, target);
         const r = try runKlio(a, io, &env, argv.items);
