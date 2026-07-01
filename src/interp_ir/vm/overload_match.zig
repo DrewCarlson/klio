@@ -191,6 +191,41 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
         }
     }
 
+    // Ranges: `..` (step 1) is an XRange/ClosedRange/XProgression/Iterable;
+    // downTo / stepped (step != 1) is only an XProgression/Iterable. Decide
+    // here (ignoring the element type argument, which is always the range's
+    // own element kind) so `x downTo y` picks the Iterable overload, not the
+    // XRange one.
+    if (v.* == .Range) {
+        const r = v.Range;
+        const prog: []const u8 = switch (r.kind) {
+            .Int => "IntProgression",
+            .Long => "LongProgression",
+            .Char => "CharProgression",
+            .UInt => "UIntProgression",
+            .ULong => "ULongProgression",
+        };
+        const rng: []const u8 = switch (r.kind) {
+            .Int => "IntRange",
+            .Long => "LongRange",
+            .Char => "CharRange",
+            .UInt => "UIntRange",
+            .ULong => "ULongRange",
+        };
+        if (std.mem.eql(u8, head, "Iterable") or std.mem.eql(u8, head, prog)) return .proven;
+        if (r.step == 1 and (std.mem.eql(u8, head, rng) or
+            std.mem.eql(u8, head, "ClosedRange") or std.mem.eql(u8, head, "OpenEndRange"))) return .proven;
+        // Named a range-family type this value is not.
+        for ([_][]const u8{
+            "IntRange",         "LongRange",        "CharRange",       "UIntRange",
+            "ULongRange",       "IntProgression",   "LongProgression", "CharProgression",
+            "UIntProgression",  "ULongProgression", "ClosedRange",     "OpenEndRange",
+        }) |fam| {
+            if (std.mem.eql(u8, head, fam)) return .disproven;
+        }
+        return .unknown;
+    }
+
     const v_ty = runtimeHead(v);
     if (std.mem.eql(u8, head, v_ty) or builtinHeadAccepts(head, v_ty)) {
         const args = realArgs(ty.args);

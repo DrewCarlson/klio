@@ -2001,12 +2001,19 @@ pub const Value = union(enum) {
             .Char => matchesAny(name, &.{ "Char", "Any", "Comparable" }),
             .Unit => matchesAny(name, &.{ "Unit", "Any" }),
             .Null => false,
+            // A `..` range (step 1) is an XRange and a ClosedRange; a `downTo`
+            // or `step`ped progression (step != 1) is only an XProgression.
             .Range => |r| switch (r.kind) {
-                .Int => matchesAny(name, &.{ "IntRange", "IntProgression", "ClosedRange", "Iterable", "Any" }),
-                .Long => matchesAny(name, &.{ "LongRange", "LongProgression", "ClosedRange", "Iterable", "Any" }),
-                .Char => matchesAny(name, &.{ "CharRange", "CharProgression", "ClosedRange", "Iterable", "Any" }),
-                .UInt => matchesAny(name, &.{ "UIntRange", "UIntProgression", "ClosedRange", "Iterable", "Any" }),
-                .ULong => matchesAny(name, &.{ "ULongRange", "ULongProgression", "ClosedRange", "Iterable", "Any" }),
+                .Int => matchesAny(name, &.{ "IntProgression", "Iterable", "Any" }) or
+                    (r.step == 1 and matchesAny(name, &.{ "IntRange", "ClosedRange" })),
+                .Long => matchesAny(name, &.{ "LongProgression", "Iterable", "Any" }) or
+                    (r.step == 1 and matchesAny(name, &.{ "LongRange", "ClosedRange" })),
+                .Char => matchesAny(name, &.{ "CharProgression", "Iterable", "Any" }) or
+                    (r.step == 1 and matchesAny(name, &.{ "CharRange", "ClosedRange" })),
+                .UInt => matchesAny(name, &.{ "UIntProgression", "Iterable", "Any" }) or
+                    (r.step == 1 and matchesAny(name, &.{ "UIntRange", "ClosedRange" })),
+                .ULong => matchesAny(name, &.{ "ULongProgression", "Iterable", "Any" }) or
+                    (r.step == 1 and matchesAny(name, &.{ "ULongRange", "ClosedRange" })),
             },
             .List => |l| blk: {
                 if (std.mem.eql(u8, name, "EnumEntries")) break :blk l.enum_entries;
