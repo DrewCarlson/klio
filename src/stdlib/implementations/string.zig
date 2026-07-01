@@ -3022,10 +3022,13 @@ fn normalizeNewlines(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
 
 /// Join lines with `\n` and trim leading/trailing empty lines (trimIndent).
 fn joinTrimBlank(allocator: Allocator, lines: []const []const u8) Allocator.Error![]u8 {
+    // Kotlin's trimIndent drops ONLY the first line if it is blank and the last
+    // line if it is blank — not every leading/trailing blank line. Dropping all
+    // of them loses the trailing newline of a block that ends in a blank line.
     var start: usize = 0;
     var stop: usize = lines.len;
-    while (start < stop and lines[start].len == 0) start += 1;
-    while (stop > start and lines[stop - 1].len == 0) stop -= 1;
+    if (start < stop and lines[start].len == 0) start += 1;
+    if (stop > start and lines[stop - 1].len == 0) stop -= 1;
     return joinLines(allocator, lines[start..stop]);
 }
 
