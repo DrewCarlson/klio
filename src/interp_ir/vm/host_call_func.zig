@@ -11,6 +11,7 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
+const applicability = @import("applicability");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
@@ -646,27 +647,131 @@ fn pickOverloadCached(self: *VmHost, module: *const Module, func: FuncId, args: 
     return pickOverload(self, module, func, args);
 }
 
+/// Build an `ArgShape` describing one runtime value for the shared applicability
+/// scorer. Named args are not threaded into the positional `pickOverload`
+/// path, so `named` stays null here.
+fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
+    const arity: ?u8 = switch (v.*) {
+        .IrClosure => |c| if (self.closures.get(c.id)) |info| std.math.cast(u8, info.n_params) else null,
+        .Function => |f| std.math.cast(u8, f.decl.params.len),
+        .Class => 0,
+        else => null,
+    };
+    return .{
+        .runtime_class = overload_match.runtimeHead(v),
+        .is_null = v.* == .Null,
+        .is_lambda = valueIsCallable(v),
+        .lambda_arity = arity,
+        .func_typed = std.mem.startsWith(u8, v.typeFqn(), "kotlin.Function"),
+        .value = @ptrCast(v),
+    };
+}
+
+/// `applicability.ApplicabilityScope.refine`: wraps `refineByDeclaredArgs`.
+fn applicRefineCb(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyopaque) ?i32 {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const v: *const Value = @ptrCast(@alignCast(value));
+    return overload_match.refineByDeclaredArgs(self, param_ty, v);
+}
+
+/// `applicability.ApplicabilityScope.subtype`: the instance-supertype BFS from
+/// `overloadScoreArg`, returning the match depth (or null when the value is not
+/// an instance or `target` is never reached).
+fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8) ?i32 {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const arg: *const Value = @ptrCast(@alignCast(value));
+    if (arg.* != .Instance) return null;
+    var queue: std.ArrayList(QItem) = .empty;
+    defer queue.deinit(self.allocator);
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(self.allocator);
+    queue.append(self.allocator, .{ .name = overload_match.runtimeHead(arg), .depth = 0 }) catch return null;
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cur = queue.items[head];
+        var already = false;
+        for (seen.items) |s| {
+            if (std.mem.eql(u8, s, cur.name)) {
+                already = true;
+                break;
+            }
+        }
+        if (already) continue;
+        seen.append(self.allocator, cur.name) catch return null;
+        if (std.mem.eql(u8, cur.name, target)) return cur.depth;
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(cur.name)) |def_ref| {
+            const dg = def_ref.borrow();
+            defer dg.deinit();
+            for (dg.get().supertype_names) |sup| {
+                queue.append(self.allocator, .{ .name = sup, .depth = cur.depth + 1 }) catch return null;
+            }
+        }
+    }
+    return null;
+}
+
+/// Per-candidate `SigView` for the shared applicability scorer, read straight
+/// off the `Func` (the same sources the legacy `overloadScore` reads).
+fn sigViewOfFunc(self: *VmHost, module: *const Module, cand: FuncId) ?applicability.SigView {
+    const f = funcAt(module, cand) orelse return null;
+    return .{
+        .params = f.params,
+        .defaults = funcDefaults(self, cand),
+        .has_body = f.hasBody(),
+        .low_priority = f.low_priority,
+    };
+}
+
+/// Applicability points for one positional candidate via the shared scorer, or
+/// null when it does not bind. The `-1` under-application penalty is folded into
+/// `points` by `applicable()`, so the caller keys directly on the result.
+fn positionalPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: []const applicability.ArgShape, scope: applicability.ApplicabilityScope) ?i32 {
+    const sig = sigViewOfFunc(self, module, cand) orelse return null;
+    const sc = applicability.applicable(&sig, shapes, scope) orelse return null;
+    return sc.points;
+}
+
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
     const f = funcAt(module, func) orelse return null;
     const name = f.name;
     const candidates = module.funcsBySimpleName(name);
     if (candidates.len < 2) return null;
 
+    var shapes_buf: [24]applicability.ArgShape = undefined;
+    var shapes_heap: ?[]applicability.ArgShape = null;
+    defer if (shapes_heap) |h| self.allocator.free(h);
+    const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
+        shapes_buf[0..args.len]
+    else blk: {
+        const h = self.allocator.alloc(applicability.ArgShape, args.len) catch return null;
+        shapes_heap = h;
+        break :blk h;
+    };
+    for (args, 0..) |*a, i| shapes[i] = shapeOfValue(self, a);
+    const scope = applicability.ApplicabilityScope{
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCb,
+        .subtype = applicSubtypeCb,
+    };
+
     var best_func: ?FuncId = null;
     var best_score: i32 = 0;
-    if (overloadScore(self, module, func, args)) |s| {
+    if (positionalPoints(self, module, func, shapes, scope)) |s| {
         best_func = func;
         best_score = s;
     }
     for (candidates) |cand| {
         if (cand.int() == func.int()) continue;
-        if (overloadScore(self, module, cand, args)) |total| {
+        if (positionalPoints(self, module, cand, shapes, scope)) |total| {
             if (best_func == null or total > best_score) {
                 best_func = cand;
                 best_score = total;
             }
         }
     }
+
     return best_func;
 }
 
@@ -943,103 +1048,29 @@ fn composableEval(
     return res;
 }
 
-/// Single named-argument call dispatch flow.
-/// Score a candidate overload for a named call: every named argument must map
-/// to a distinct parameter and type-fit, positional args fill the rest, and
-/// every unfilled parameter must be defaultable. `null` rejects the candidate.
-/// Fewer defaults used scores higher (the more specific overload wins).
-///
-/// `recv_external` means the call site supplies an implicit extension receiver
-/// (the enclosing frame's `this`) that is NOT among `args`: an extension
-/// candidate's leading `this` parameter is then receiver-filled rather than
-/// requiring a positional/named arg. A trailing callable positional argument
-/// (the `f(x) { … }` lambda) binds to the last function-typed parameter, not
-/// the next sequential slot — matching Kotlin's trailing-lambda rule.
-fn scoreNamedCandidate(
-    self: *VmHost,
-    module: *const Module,
-    cand: FuncId,
-    args: []const Value,
-    arg_names: []const ?[]const u8,
-    recv_external: bool,
-) ?i32 {
-    const cf = funcAt(module, cand) orelse return null;
-    // A bodyless declaration is only a valid named-call target when it
-    // backs a native intrinsic (a `expect`/`actual` whose actual klio
-    // supplies as a host function, e.g. `String.replaceFirst(oldChar,
-    // newChar, ignoreCase)`); otherwise it is an unimplemented `expect`
-    // and must never be picked.
-    if (!cf.hasBody() and resolvedNativeForm(self, cand) == null and lookupIntrinsic(self, cf.fqn) == null) return null;
-    const params = cf.params;
-    if (params.len > 64) return null;
-    var filled = [_]bool{false} ** 64;
-    var total: i32 = 0;
+/// Per-candidate `SigView` for the shared applicability scorer on the NAMED
+/// path. Unlike `sigViewOfFunc`, a bodyless declaration backed by a native
+/// intrinsic (a resolved-native form or a same-FQN host intrinsic) is
+/// selectable, so `has_body` folds that predicate in (mirroring the named
+/// scorer's leading bodyless guard).
+fn sigViewOfNamed(self: *VmHost, module: *const Module, cand: FuncId) ?applicability.SigView {
+    const f = funcAt(module, cand) orelse return null;
+    const selectable = f.hasBody() or resolvedNativeForm(self, cand) != null or lookupIntrinsic(self, f.fqn) != null;
+    return .{
+        .params = f.params,
+        .defaults = funcDefaults(self, cand),
+        .has_body = selectable,
+        .low_priority = f.low_priority,
+    };
+}
 
-    const is_ext = paramIsThis(params);
-    // An implicit extension receiver fills the leading `this` parameter; a
-    // positional arg never lands on it.
-    if (is_ext and recv_external) filled[0] = true;
-
-    for (args, 0..) |a, i| {
-        const nm = if (i < arg_names.len) arg_names[i] else null;
-        const n = nm orelse continue;
-        var pos: ?usize = null;
-        for (params, 0..) |p, pi| {
-            if (std.mem.eql(u8, p.name, n)) {
-                pos = pi;
-                break;
-            }
-        }
-        const p = pos orelse return null; // a named arg with no matching param
-        if (filled[p]) return null;
-        // The named-parameter presence is the hard discriminator; the type
-        // score only ranks among the survivors, so an unscoreable arg (a
-        // generic/function-typed param, or an `Array` passed to a `vararg`)
-        // stays neutral rather than rejecting an otherwise-valid overload.
-        total += overloadScoreArg(self, &params[p].ty, &a) orelse 0;
-        filled[p] = true;
-    }
-
-    // A trailing positional callable binds to the last function-typed
-    // parameter (`module: Application.() -> Unit`), out of sequence.
-    var trailing_lambda: ?usize = null;
-    if (args.len > 0) {
-        const last = args.len - 1;
-        const last_named = last < arg_names.len and arg_names[last] != null;
-        const last_param = params.len - 1;
-        if (!last_named and params.len > 0 and !filled[last_param] and
-            isFunctionType(&params[last_param].ty) and valueIsCallable(&args[last]))
-        {
-            total += overloadScoreArg(self, &params[last_param].ty, &args[last]) orelse 0;
-            filled[last_param] = true;
-            trailing_lambda = last;
-        }
-    }
-
-    const has_vararg = lastIsVararg(params);
-    var pidx: usize = 0;
-    for (args, 0..) |a, i| {
-        const nm = if (i < arg_names.len) arg_names[i] else null;
-        if (nm != null) continue;
-        if (trailing_lambda != null and i == trailing_lambda.?) continue;
-        while (pidx < params.len and filled[pidx]) pidx += 1;
-        if (pidx >= params.len) {
-            if (has_vararg) continue;
-            return null; // too many positional args
-        }
-        total += overloadScoreArg(self, &params[pidx].ty, &a) orelse 0;
-        filled[pidx] = true;
-        pidx += 1;
-    }
-
-    const defaults = funcDefaults(self, cand);
-    for (params, 0..) |p, pi| {
-        if (filled[pi] or p.is_vararg) continue;
-        const has_default = defaults != null and pi < defaults.?.len and defaults.?[pi] != null;
-        if (!has_default) return null;
-        total -= 1;
-    }
-    return total;
+/// Applicability points for one named-call candidate via the shared scorer, or
+/// null when it does not bind. Binding output is not needed at pick time, so no
+/// `arg_to_param_buf` is threaded.
+fn namedPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: []const applicability.ArgShape, scope: applicability.ApplicabilityScope) ?i32 {
+    const sig = sigViewOfNamed(self, module, cand) orelse return null;
+    const sc = applicability.applicable(&sig, shapes, scope) orelse return null;
+    return sc.points;
 }
 
 /// Re-pick the overload for a named call. The IR resolves the call site to one
@@ -1067,15 +1098,39 @@ pub fn pickNamedOverloadId(
     const f0 = funcAt(module, func) orelse return null;
     const candidates = module.funcsBySimpleName(f0.name);
     if (candidates.len < 2) return null;
+
+    var shapes_buf: [24]applicability.ArgShape = undefined;
+    var shapes_heap: ?[]applicability.ArgShape = null;
+    defer if (shapes_heap) |h| self.allocator.free(h);
+    const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
+        shapes_buf[0..args.len]
+    else blk: {
+        const h = self.allocator.alloc(applicability.ArgShape, args.len) catch return null;
+        shapes_heap = h;
+        break :blk h;
+    };
+    for (args, 0..) |*a, i| {
+        shapes[i] = shapeOfValue(self, a);
+        shapes[i].named = if (i < arg_names.len) arg_names[i] else null;
+    }
+    const scope = applicability.ApplicabilityScope{
+        .named = true,
+        .recv_external = recv_external,
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCb,
+        .subtype = applicSubtypeCb,
+    };
+
     var best: ?FuncId = null;
     var best_score: i32 = std.math.minInt(i32);
     for (candidates) |cand| {
-        const score = scoreNamedCandidate(self, module, cand, args, arg_names, recv_external) orelse continue;
+        const score = namedPoints(self, module, cand, shapes, scope) orelse continue;
         if (best == null or score > best_score) {
             best = cand;
             best_score = score;
         }
     }
+
     return best;
 }
 

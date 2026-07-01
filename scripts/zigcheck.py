@@ -34,11 +34,12 @@ GRAPH = {
     "pack": ["ast", "span", "types"],
     "parser": ["ast", "diagnostics", "lexer", "span"],
     "jit": [],
-    "ir": ["span", "ast", "types", "runtime", "diagnostics", "jit"],
+    "ir": ["span", "ast", "types", "runtime", "diagnostics", "jit", "applicability"],
+    "applicability": ["ir", "span"],
     "stdlib": ["runtime", "pack"],
     "cfa": ["ast", "diagnostics", "lexer", "parser", "span", "types"],
     "resolver": ["span", "ast", "diagnostics", "types", "stdlib"],
-    "interp_ir": ["ir", "runtime", "ast", "span", "stdlib", "diagnostics"],
+    "interp_ir": ["ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability"],
     "stdlib_pack": ["pack", "stdlib", "stdlib_embedded"],
     # build.zig generates the real embedded pack; isolated checks use the
     # no-bytes stub so the cwd source checkout stays the pack source.
@@ -64,6 +65,7 @@ GRAPH = {
 # Modules whose root source does not follow the src/<mod>/<mod>.zig pattern.
 PATH_OVERRIDES = {
     "stdlib_embedded": "src/stdlib_pack/embedded_stub.zig",
+    "applicability": "src/ir/applicability.zig",
 }
 
 
@@ -110,7 +112,10 @@ def build_cmd(root, root_override, build_only, mods):
         if m == root:
             continue
         for d in GRAPH[m]:
-            cmd += ["--dep", d]
+            # The root module is named "root"; a module that depends on it
+            # (e.g. applicability -> ir when `ir` is the root) must alias the
+            # import name to that module so the cycle resolves.
+            cmd += ["--dep", f"{d}=root" if d == root else d]
         cmd += [f"-M{m}={path(m)}"]
     if build_only:
         cmd += ["-femit-bin=/dev/null"]

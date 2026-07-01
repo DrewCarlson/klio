@@ -1,0 +1,1157 @@
+//! Shared overload-resolution applicability engine.
+//!
+//! One `applicable()` function scores a single candidate signature against a
+//! list of actual arguments described by `ArgShape`. Each caller (lowering
+//! ladder, runtime global/member scorers, eager typeck) populates the
+//! `ArgShape` fields it can prove at its phase and leaves the rest null; the
+//! scorer folds arity / default / vararg / trailing-lambda binding and the
+//! per-argument point values in one place.
+//!
+//! This first slice reproduces the runtime *global* scorer
+//! (`host_call_func.zig` `overloadScore` / `overloadScoreArg` /
+//! `builtinSupersFor`) verbatim, reading from `ArgShape` instead of a
+//! `*const Value`. The two runtime deltas that depend on the live value
+//! (declared-generic-argument / function-shape refinement, and instance
+//! subtype distance) are supplied by the caller through the `ApplicabilityScope`
+//! callbacks; when a callback is null (lowering / eager) the argument is treated
+//! as UNKNOWN — it contributes its base points and is never disproven.
+
+const std = @import("std");
+
+const ir = @import("ir");
+
+const TypeRef = ir.TypeRef;
+const Param = ir.Param;
+const FuncId = ir.FuncId;
+
+// -------------------------------------------------------------------------
+// Input shape.
+// -------------------------------------------------------------------------
+
+pub const LiteralKind = enum { numeric, string, boolean, char };
+
+/// Everything a caller can know about one actual argument at overload-pick
+/// time. A plain value struct: it borrows, never allocates. A field left null
+/// means "this caller could not prove anything here" and downgrades that
+/// argument from proven to unknown (never to disproven).
+pub const ArgShape = struct {
+    /// Declared / checked static type, when the caller has one (eager typeck,
+    /// and the synthesized member-receiver slot). Runtime value args leave it
+    /// null and score off `runtime_class`.
+    ty: ?TypeRef = null,
+
+    /// The argument is callable per `valueIsCallable`
+    /// (IrClosure/Function/Intrinsic/BoundMethod/PropertyRef) — drives the
+    /// trailing-lambda binding gate.
+    is_lambda: bool = false,
+
+    /// Declared arg arity when the callable is an IrClosure / Function / class
+    /// ctor ref (the legacy `arg_arity` switch: IrClosure -> n_params, Function
+    /// -> params.len, Class -> 0); null otherwise. Feeds the FunctionN score.
+    lambda_arity: ?u8 = null,
+
+    /// The value's runtime typeFqn starts with "kotlin.Function"
+    /// (Function/IrClosure/Intrinsic/BoundMethod/BoundUserMethod). Part of the
+    /// per-arg callable gate for callables that carry no `lambda_arity`.
+    func_typed: bool = false,
+
+    /// Declared lambda parameter types when the caller can see them. Unused by
+    /// the runtime path (the refine callback re-derives them from the value);
+    /// carried for the eager caller of a later step.
+    lambda_param_types: ?[]const TypeRef = null,
+
+    /// Named-argument name for this slot (`x = ...`), else null (positional).
+    named: ?[]const u8 = null,
+
+    /// The argument is a spread (`*arr`) feeding a vararg.
+    is_spread: bool = false,
+
+    /// The argument value is `Null`. Only the runtime callers set it.
+    is_null: bool = false,
+
+    /// Runtime class simple-name of the argument value (the class name for an
+    /// Instance, else `simpleName(typeFqn)`). Only the runtime callers set it;
+    /// it drives head-match, numeric widening, builtin-supertype and
+    /// instance-subtype scoring.
+    runtime_class: ?[]const u8 = null,
+
+    /// Literal-kind classification for an AST literal argument (lowering).
+    literal_kind: ?LiteralKind = null,
+
+    /// Runtime `*const Value` pointer, opaque here, passed straight through to
+    /// the `ApplicabilityScope` refinement callbacks. Only the runtime callers
+    /// populate it.
+    value: ?*const anyopaque = null,
+};
+
+// -------------------------------------------------------------------------
+// Output shape.
+// -------------------------------------------------------------------------
+
+/// Where each supplied arg landed, plus which params take defaults / vararg
+/// packing bounds. Only the scalar trailing-lambda / vararg fields are filled
+/// in this slice; the slice fields are materialized by the per-caller adapter
+/// steps (which thread a scratch buffer).
+pub const Binding = struct {
+    arg_to_param: []const u16 = &.{},
+    default_params: []const u16 = &.{},
+    vararg_param: ?u16 = null,
+    vararg_lo: u16 = 0,
+    vararg_hi: u16 = 0,
+    trailing_lambda_param: ?u16 = null,
+};
+
+/// A ranked applicability verdict. `null` from `applicable()` == inapplicable
+/// (a definite mismatch: an arity no default / vararg fixes, or a per-arg
+/// disproven type). Never returned for mere lack of information.
+pub const Score = struct {
+    /// Sum of per-arg points, with the legacy conventions folded in: exact-head
+    /// 100, numeric widen 40/30, callable-arity 90, builtin-super 75-dist,
+    /// subtype 60-dist, Any 10, SAM 8, type-param 5, Unit 1, refinement +delta,
+    /// and the -1 under-application penalty when defaults are used.
+    points: i32,
+
+    /// Count of args scored from proven (`ty`/`runtime_class` present) vs
+    /// unknown evidence. Secondary tiebreak only; the global scanner keys on
+    /// `points`.
+    proven_args: u16 = 0,
+    unknown_args: u16 = 0,
+
+    /// The call supplied exactly one arg per parameter (no defaults used).
+    exact_arity: bool = false,
+
+    /// The candidate is `@LowPriorityInOverloadResolution` / HIDDEN. Carried,
+    /// not pre-applied; each caller keeps its own convention.
+    low_priority: bool = false,
+
+    /// True when this candidate is a member rather than an extension/top-level.
+    is_member: bool = false,
+
+    /// Extension-only lexicographic ranking tuple, populated only when a later
+    /// caller sets extension ranking. null here.
+    ext_key: ?[8]i32 = null,
+
+    /// P2 binding side-channel the caller consumes.
+    binding: Binding = .{},
+};
+
+/// Per-candidate signature view. `DeclSig` does not exist yet; this carries the
+/// slices the scorer reads directly off an `ir.Func`.
+pub const SigView = struct {
+    /// Declared parameters (`ty`, `name`, `is_vararg`).
+    params: []const Param,
+    /// Default-thunk table for the candidate (`func_defaults`): `defaults[i] !=
+    /// null` means param `i` has a default. Null means no defaults at all.
+    defaults: ?[]const ?FuncId = null,
+    /// The candidate has an IR body (a bodyless expect / native stub is never
+    /// selectable).
+    has_body: bool = true,
+    /// `@LowPriorityInOverloadResolution` / error-level `@Deprecated`.
+    low_priority: bool = false,
+    /// Member (implicit-receiver) candidate rather than extension/top-level.
+    is_member: bool = false,
+    /// Extension / member-extension candidate.
+    is_extension: bool = false,
+    /// The candidate's `FuncId`, used by the extension ranking for the
+    /// stable `neg_fid` tiebreak and to skip self in the `spec` count.
+    fid: ?FuncId = null,
+    /// Declaring package path — feeds the extension ranking's `is_user`
+    /// tier (`""` or an unknown package is user code).
+    package: []const u8 = "",
+};
+
+/// Runtime-value refinement callbacks and phase flags, injected by the caller.
+/// The runtime callers pass `ctx = *VmHost` and wrap `refineByDeclaredArgs` /
+/// the instance-subtype BFS; lowering / eager leave them null.
+pub const ApplicabilityScope = struct {
+    is_extension: bool = false,
+    check_low_priority: bool = false,
+
+    /// Select the runtime NAMED-ARGUMENT scoring conventions
+    /// (`host_call_func.zig` `scoreNamedCandidate`): each arg's `named` binds to
+    /// its distinct same-named parameter, positional args fill the rest (a final
+    /// vararg absorbing the overflow), and every unfilled non-vararg parameter
+    /// must be defaultable. Unlike the positional/member scorers, a per-arg type
+    /// mismatch is NEUTRAL (scores 0) rather than disqualifying: named-parameter
+    /// presence is the hard discriminator, the type score only ranks survivors.
+    named: bool = false,
+
+    /// A named call whose site supplies an implicit extension receiver (the
+    /// enclosing frame's `this`) that is not among the args: the candidate's
+    /// leading `this` parameter is receiver-filled rather than arg-bound.
+    recv_external: bool = false,
+
+    /// Optional caller-provided scratch for the named path's `Binding.arg_to_param`
+    /// (which parameter each supplied arg bound to). Left null when the caller
+    /// does not need the binding; when set, `applicable()` writes through it and
+    /// points `Binding.arg_to_param` at the filled prefix.
+    arg_to_param_buf: ?[]u16 = null,
+
+    /// Select the runtime *member* per-arg + candidate scoring conventions
+    /// (`host_call_member.zig`): no `$bound_ref$` callable head, a
+    /// `Function`-parse failure scores 20 (not 8), a callable against a
+    /// definitely-non-function concrete param disqualifies, the instance
+    /// subtype tier scores `75 - min(depth, 20)` (not `60 - min(depth, 50)`),
+    /// a short all-upper-or-digit head is a type parameter, the base score is
+    /// 0 (no under-application `-1`), and the receiver slot (`params[0].name ==
+    /// "this"`) is skipped before value scoring.
+    member: bool = false,
+
+    /// Extension ranking: fill `Score.ext_key` (mirrors `scoreExtCandidates`).
+    /// Implies member per-arg scoring; the receiver is `params[0]` and is
+    /// scored into the key, value args bind `params[1..]`.
+    rank_extensions: bool = false,
+
+    /// Extension receiver value shape (its `runtime_class`/`value` drive
+    /// `recv_score`/`recv_match`). Required when `rank_extensions`.
+    receiver: ?ArgShape = null,
+
+    /// All candidates in the extension overload set, for the `spec`
+    /// (supertype-specificity count) tier. Each entry's `params[0].ty` is the
+    /// declared receiver head; `fid` skips the candidate against itself.
+    all_candidates: ?[]const SigView = null,
+
+    /// Opaque context (a `*VmHost`) threaded to the callbacks.
+    ctx: ?*anyopaque = null,
+
+    /// `refineByDeclaredArgs`: declared-generic / function-shape delta for a
+    /// head-accepted (arg, param) pair. Returns the score delta, or null to
+    /// disqualify the candidate.
+    refine: ?*const fn (*anyopaque, *const TypeRef, *const anyopaque) ?i32 = null,
+
+    /// Instance-subtype distance: the BFS depth from the value's runtime class
+    /// to `target` through the class supertype closure, or null when the value
+    /// is not an instance or `target` is not reached.
+    subtype: ?*const fn (*anyopaque, *const anyopaque, []const u8) ?i32 = null,
+
+    /// `isFunctionTypeRefResolved`: function-typed param test with typealias
+    /// indirection resolved, for the member trailing-lambda gate. Null falls
+    /// back to the static `isFunctionTypeRef`.
+    func_type: ?*const fn (*anyopaque, *const TypeRef) bool = null,
+
+    /// `extReceiverSpecificity(receiver, ty_name)`: the extension `recv_match`
+    /// tier.
+    ext_recv_match: ?*const fn (*anyopaque, *const anyopaque, []const u8) i32 = null,
+
+    /// `isSubtypeName(a, b)`: whether receiver head `a` is a proper subtype of
+    /// `b`, for the extension `spec` tier.
+    ext_is_subtype_name: ?*const fn (*anyopaque, []const u8, []const u8) bool = null,
+
+    /// Owner rank for a member-extension nearer on the enclosing-`this` chain.
+    ext_owner_rank: ?*const fn (*anyopaque, FuncId) i32 = null,
+
+    /// `stdlib.isKnownPackage(package)`: a shipped/pack namesake; the negation
+    /// (plus the empty package) is the extension `is_user` tier.
+    ext_known_package: ?*const fn ([]const u8) bool = null,
+};
+
+// -------------------------------------------------------------------------
+// The merged builtin-assignability relation (design §3, the UNION table).
+// -------------------------------------------------------------------------
+
+/// Map a concrete runtime/value head to the ordered list of nominal supertypes
+/// it satisfies; the list position is the scoring distance. The union of the
+/// three previously-divergent tables (`builtinSupersFor`, `builtinSupers`,
+/// `builtinHeadAccepts`) — the `Collection`, `StringBuilder` and range rows
+/// missing from one or another are added back here.
+pub fn builtinSupersOf(concrete: []const u8) []const []const u8 {
+    const eq = std.mem.eql;
+    const s = simpleName(concrete);
+    if (eq(u8, s, "List"))
+        return &.{ "Collection", "Iterable", "MutableList", "MutableCollection", "MutableIterable" };
+    if (eq(u8, s, "MutableList"))
+        return &.{ "List", "Collection", "Iterable", "MutableCollection", "MutableIterable" };
+    if (eq(u8, s, "Collection"))
+        return &.{ "Iterable", "MutableCollection", "MutableIterable" };
+    if (eq(u8, s, "Set"))
+        return &.{ "Collection", "Iterable", "MutableSet", "MutableCollection", "MutableIterable" };
+    if (eq(u8, s, "MutableSet"))
+        return &.{ "Set", "Collection", "Iterable", "MutableCollection", "MutableIterable" };
+    if (eq(u8, s, "Map")) return &.{"MutableMap"};
+    if (eq(u8, s, "MutableMap")) return &.{"Map"};
+    if (eq(u8, s, "IntRange"))
+        return &.{ "IntProgression", "ClosedRange", "Iterable", "OpenEndRange" };
+    if (eq(u8, s, "LongRange"))
+        return &.{ "LongProgression", "ClosedRange", "Iterable", "OpenEndRange" };
+    if (eq(u8, s, "CharRange"))
+        return &.{ "CharProgression", "ClosedRange", "Iterable", "OpenEndRange" };
+    if (eq(u8, s, "IntProgression") or eq(u8, s, "LongProgression") or eq(u8, s, "CharProgression"))
+        return &.{"Iterable"};
+    if (eq(u8, s, "String"))
+        return &.{ "CharSequence", "Comparable" };
+    if (eq(u8, s, "StringBuilder"))
+        return &.{ "CharSequence", "Appendable" };
+    return &.{};
+}
+
+// -------------------------------------------------------------------------
+// Small helpers (ported from the global scorer verbatim).
+// -------------------------------------------------------------------------
+
+pub fn simpleName(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    return name;
+}
+
+fn allAsciiUpper(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isUpper(c)) return false;
+    }
+    return true;
+}
+
+/// The member scorer's short-type-parameter test allows digits (`T1`, `A2`),
+/// unlike the global scorer's `allAsciiUpper`.
+fn allUpperOrDigit(s: []const u8) bool {
+    for (s) |c| {
+        if (!(std.ascii.isUpper(c) or std.ascii.isDigit(c))) return false;
+    }
+    return true;
+}
+
+/// Port of `host_call_member.zig` `isTopOrGenericType`: a maximally-unspecific
+/// receiver/param head (`Any`/`Unit`/`FunctionN`/short type parameter). Drives
+/// the extension `param_spec` tier.
+fn isTopOrGenericType(ty_name: []const u8) bool {
+    var pn = simpleName(ty_name);
+    pn = std.mem.trimEnd(u8, pn, "?");
+    if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
+    if (std.mem.startsWith(u8, pn, "Function")) return true;
+    if (pn.len > 0 and pn.len <= 2 and allUpperOrDigit(pn)) return true;
+    return false;
+}
+
+/// Port of `host_call_member.zig` `isDefinitelyNonFunctionTypeName`: a
+/// concrete builtin a callable argument can never satisfy, so the member
+/// scorer disqualifies the candidate (a sibling function-typed overload wins).
+fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
+    const names = [_][]const u8{
+        "String",         "CharSequence",     "Boolean",  "Char",        "Byte",  "Short",
+        "Int",            "Long",             "Float",    "Double",      "UByte", "UShort",
+        "UInt",           "ULong",            "Number",   "Collection",  "MutableCollection",
+        "Iterable",       "MutableIterable",  "List",     "MutableList", "Set",   "MutableSet",
+        "Map",            "MutableMap",       "Array",    "Sequence",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, pn, n)) return true;
+    }
+    return false;
+}
+
+/// Function-typed param test: the caller's typealias-resolving callback when
+/// present (member/extension), else the static name check.
+fn scopeIsFunctionType(scope: *const ApplicabilityScope, ty: *const TypeRef) bool {
+    if (scope.func_type) |cb| return cb(scope.ctx.?, ty);
+    return isFunctionTypeRef(ty);
+}
+
+fn sameFid(a: ?FuncId, b: ?FuncId) bool {
+    const x = a orelse return false;
+    const y = b orelse return false;
+    return x.int() == y.int();
+}
+
+/// A `TypeRef` denoting a Kotlin function type (mirrors `interp_ir.isFunctionType`).
+fn isFunctionTypeRef(ty: *const TypeRef) bool {
+    const n = simpleName(ty.name);
+    return std.mem.startsWith(u8, n, "Function") or
+        std.mem.indexOf(u8, ty.name, "->") != null;
+}
+
+fn paramHasDefault(sig: *const SigView, i: usize) bool {
+    // A null `defaults` slice is the lowering adapter (`sigViewForApplicability`):
+    // it cannot read the `ProgramImage`-side default-thunk table, so it carries
+    // the flag on the params instead. The runtime callers always set a non-null
+    // `defaults` and never reach this fallback.
+    const defs = sig.defaults orelse
+        return i < sig.params.len and sig.params[i].has_default;
+    return i < defs.len and defs[i] != null;
+}
+
+/// Declared-generic / function-shape refinement delta. Null callback (lowering
+/// / eager) contributes no delta and never disqualifies.
+fn refineDelta(scope: *const ApplicabilityScope, param_ty: *const TypeRef, arg: *const ArgShape) ?i32 {
+    const cb = scope.refine orelse return 0;
+    const v = arg.value orelse return 0;
+    return cb(scope.ctx.?, param_ty, v);
+}
+
+/// Instance-subtype BFS depth to `target`, or null (not an instance / not
+/// reached / no callback).
+fn subtypeDepth(scope: *const ApplicabilityScope, arg: *const ArgShape, target: []const u8) ?i32 {
+    const cb = scope.subtype orelse return null;
+    const v = arg.value orelse return null;
+    return cb(scope.ctx.?, v, target);
+}
+
+/// Value-independent fallback for a caller that could not prove a runtime head
+/// (lowering / eager). Never disqualifies (returns a base, never null).
+fn unknownArgScore(nm: []const u8) i32 {
+    if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
+    if (nm.len <= 2 and allAsciiUpper(nm)) return 5;
+    if (std.mem.eql(u8, nm, "Unit")) return 1;
+    return 10;
+}
+
+// -------------------------------------------------------------------------
+// Per-argument scoring (mirror of `overloadScoreArg`).
+// -------------------------------------------------------------------------
+
+/// Score one (param, arg) pair. Higher is better; null disqualifies the
+/// candidate. Reproduces `host_call_func.zig` `overloadScoreArg` reading from
+/// `ArgShape`, deferring value-dependent deltas to the scope callbacks.
+fn scoreArg(param_ty: *const TypeRef, arg: *const ArgShape, scope: *const ApplicabilityScope) ?i32 {
+    const nm = param_ty.name;
+    const member = scope.member;
+
+    // Runtime head of the argument. A caller that could not prove one
+    // (lowering / eager) scores the arg as unknown.
+    const v_ty = arg.runtime_class orelse return unknownArgScore(nm);
+
+    if (std.mem.eql(u8, nm, v_ty)) {
+        const d = refineDelta(scope, param_ty, arg) orelse return null;
+        return 100 + d;
+    }
+    if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
+    if (arg.is_null and param_ty.nullable) return 50;
+
+    // Numeric widening: Int -> Long, Int -> Double/Float, Long -> Double.
+    if (std.mem.eql(u8, nm, "Long") and std.mem.eql(u8, v_ty, "Int")) return 40;
+    if ((std.mem.eql(u8, nm, "Double") or std.mem.eql(u8, nm, "Float")) and std.mem.eql(u8, v_ty, "Int")) return 30;
+    if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
+
+    // A callable argument against a function-typed parameter. The member
+    // scorer does not treat a `$bound_ref$` head as callable.
+    const arg_arity: ?usize = if (arg.lambda_arity) |n| @as(usize, n) else null;
+    const is_bound_ref = !member and std.mem.startsWith(u8, v_ty, "$bound_ref$");
+    const is_callable = arg_arity != null or is_bound_ref or arg.func_typed;
+    if (is_callable) {
+        if (std.mem.startsWith(u8, nm, "Function")) {
+            const expected = nm["Function".len..];
+            if (std.fmt.parseInt(usize, expected, 10)) |want| {
+                if (arg_arity) |got| {
+                    if (got == want or got == want + 1) {
+                        const d = refineDelta(scope, param_ty, arg) orelse return null;
+                        return 90 + d;
+                    }
+                    return 20;
+                }
+                return 20;
+            } else |_| {
+                // Member: a `Function`-head with no parseable arity scores 20.
+                // Global: fall through to the SAM-conversion score below.
+                if (member) return 20;
+            }
+        }
+        // Member only: a callable can never bind a concrete non-function
+        // parameter type, so the candidate is disqualified (a sibling
+        // function-typed overload wins).
+        if (member and isDefinitelyNonFunctionTypeName(simpleName(nm))) return null;
+        return 8;
+    }
+
+    // Subtype: an instance argument whose class transitively extends /
+    // implements the parameter's nominal type (distance-weighted). The member
+    // scorer scores `75 - min(depth, 20)`; the global scorer `60 - min(depth, 50)`.
+    if (subtypeDepth(scope, arg, nm)) |depth| {
+        if (member) {
+            const d: i32 = if (depth > 20) 20 else depth;
+            return 75 - d;
+        }
+        const d: i32 = if (depth > 50) 50 else depth;
+        return 60 - d;
+    }
+
+    // Builtin runtime types satisfy their nominal supertypes (§3 union table).
+    const builtin_supers = builtinSupersOf(v_ty);
+    const nm_simple = simpleName(nm);
+    for (builtin_supers, 0..) |sup, pos| {
+        if (std.mem.eql(u8, sup, nm) or std.mem.eql(u8, sup, nm_simple)) {
+            const dist: i32 = if (pos > 20) 20 else @intCast(pos);
+            const d = refineDelta(scope, param_ty, arg) orelse return null;
+            return 75 - dist + d;
+        }
+    }
+
+    // Generic single-letter type-parameter — accept any (member allows digits).
+    const short_typaram = if (member) allUpperOrDigit(nm) else allAsciiUpper(nm);
+    if (nm.len <= 2 and short_typaram) return 5;
+    // Unit param type — accept anything but rank lowest.
+    if (std.mem.eql(u8, nm, "Unit")) return 1;
+    return null;
+}
+
+fn argIsProven(arg: *const ArgShape) bool {
+    return arg.runtime_class != null or arg.ty != null;
+}
+
+// -------------------------------------------------------------------------
+// Candidate scoring (mirror of `overloadScore`).
+// -------------------------------------------------------------------------
+
+/// Score one candidate against the actual args. Returns null on a definite
+/// mismatch. Reproduces `host_call_func.zig` `overloadScore`: the arity /
+/// default / trailing-lambda gates and the positional per-arg scoring, with the
+/// under-application `-1` folded into `points`.
+pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
+    if (scope.named) return applicableNamed(sig, args, scope);
+    if (scope.rank_extensions) return applicableExtension(sig, args, scope);
+    if (scope.member) return applicableMember(sig, args, scope);
+
+    const params = sig.params;
+
+    // A bodyless `expect` / native / abstract stub is never selectable.
+    if (!sig.has_body) return null;
+
+    const last_vararg = params.len > 0 and params[params.len - 1].is_vararg;
+    if (params.len < args.len and !last_vararg) return null;
+
+    // Trailing-lambda rule: the last arg binds out of sequence to the last
+    // function-typed parameter, provided the gap is all-defaulted.
+    if (params.len > args.len and args.len > 0 and
+        isFunctionTypeRef(&params[params.len - 1].ty) and
+        args[args.len - 1].is_lambda)
+    {
+        const lead = args.len - 1;
+        const last_param = params.len - 1;
+        if (lead <= last_param) {
+            var gap_defaulted = true;
+            var i = lead;
+            while (i < last_param) : (i += 1) {
+                if (!paramHasDefault(sig, i)) {
+                    gap_defaulted = false;
+                    break;
+                }
+            }
+            if (!gap_defaulted) return null;
+            var total: i32 = -1;
+            var proven: u16 = 0;
+            var unknown: u16 = 0;
+            var k: usize = 0;
+            while (k < lead) : (k += 1) {
+                const sc = scoreArg(&params[k].ty, &args[k], &scope) orelse return null;
+                total += sc;
+                if (argIsProven(&args[k])) proven += 1 else unknown += 1;
+            }
+            const ls = scoreArg(&params[last_param].ty, &args[lead], &scope) orelse return null;
+            total += ls;
+            if (argIsProven(&args[lead])) proven += 1 else unknown += 1;
+            return .{
+                .points = total,
+                .proven_args = proven,
+                .unknown_args = unknown,
+                .exact_arity = false,
+                .low_priority = sig.low_priority,
+                .is_member = sig.is_member,
+                .binding = .{ .trailing_lambda_param = @intCast(last_param) },
+            };
+        }
+    }
+
+    // Under-applied: every unfilled parameter must carry a default.
+    if (params.len > args.len) {
+        var all_defaulted = true;
+        var i = args.len;
+        while (i < params.len) : (i += 1) {
+            if (!paramHasDefault(sig, i)) {
+                all_defaulted = false;
+                break;
+            }
+        }
+        if (!all_defaulted) return null;
+    }
+
+    var total: i32 = if (params.len == args.len) 0 else -1;
+    var proven: u16 = 0;
+    var unknown: u16 = 0;
+    var idx: usize = 0;
+    while (idx < params.len and idx < args.len) : (idx += 1) {
+        const sc = scoreArg(&params[idx].ty, &args[idx], &scope) orelse return null;
+        total += sc;
+        if (argIsProven(&args[idx])) proven += 1 else unknown += 1;
+    }
+    return .{
+        .points = total,
+        .proven_args = proven,
+        .unknown_args = unknown,
+        .exact_arity = params.len == args.len,
+        .low_priority = sig.low_priority,
+        .is_member = sig.is_member,
+        .binding = .{},
+    };
+}
+
+// -------------------------------------------------------------------------
+// Runtime MEMBER scorer (mirror of `pickMethodOverload`'s per-candidate body).
+// -------------------------------------------------------------------------
+
+/// Score one member candidate against the value args. `sig.params` includes
+/// the implicit `this` slot (skipped when `params[0].name == "this"`); value
+/// args score against the remaining `effective` params. The base score is 0
+/// (no under-application `-1`); the caller applies the `+5` exact-arity bonus
+/// and the `-1000` low-priority penalty from `Score.exact_arity`/`low_priority`.
+fn applicableMember(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
+    const params = sig.params;
+    const skip: usize = if (params.len > 0 and std.mem.eql(u8, params[0].name, "this")) 1 else 0;
+    const effective = params[skip..];
+
+    // Trailing-lambda rule: `recv.f(a, …) { lambda }` binds the trailing
+    // lambda to the LAST function-typed param with the gap all-defaulted.
+    if (args.len < effective.len and args.len > 0 and effective.len > 0 and
+        scopeIsFunctionType(&scope, &effective[effective.len - 1].ty) and
+        args[args.len - 1].is_lambda)
+    {
+        const lead = args.len - 1;
+        const last_param = effective.len - 1;
+        var gap_defaulted = true;
+        var k: usize = lead;
+        while (k < last_param) : (k += 1) {
+            if (!paramHasDefault(sig, skip + k)) {
+                gap_defaulted = false;
+                break;
+            }
+        }
+        if (gap_defaulted) {
+            var total: i32 = 0;
+            var proven: u16 = 0;
+            var unknown: u16 = 0;
+            var j: usize = 0;
+            while (j < lead) : (j += 1) {
+                const sc = scoreArg(&effective[j].ty, &args[j], &scope) orelse return null;
+                total += sc;
+                if (argIsProven(&args[j])) proven += 1 else unknown += 1;
+            }
+            const ls = scoreArg(&effective[last_param].ty, &args[lead], &scope) orelse return null;
+            total += ls;
+            if (argIsProven(&args[lead])) proven += 1 else unknown += 1;
+            return .{
+                .points = total,
+                .proven_args = proven,
+                .unknown_args = unknown,
+                .exact_arity = false,
+                .low_priority = sig.low_priority,
+                .is_member = sig.is_member,
+                .binding = .{ .trailing_lambda_param = @intCast(skip + last_param) },
+            };
+        }
+        // Gap not all-defaulted: fall through to the plain arity check (the
+        // legacy loop does not `continue` here).
+    }
+
+    // Over-supply with no vararg tail cannot bind (the multi-candidate member
+    // path does not pack a trailing vararg here).
+    if (args.len > effective.len) return null;
+    // Under-application: every unfilled param must carry a default.
+    if (args.len < effective.len) {
+        var k: usize = args.len;
+        while (k < effective.len) : (k += 1) {
+            if (!paramHasDefault(sig, skip + k)) return null;
+        }
+    }
+
+    var total: i32 = 0;
+    var proven: u16 = 0;
+    var unknown: u16 = 0;
+    var i: usize = 0;
+    while (i < args.len and i < effective.len) : (i += 1) {
+        const sc = scoreArg(&effective[i].ty, &args[i], &scope) orelse return null;
+        total += sc;
+        if (argIsProven(&args[i])) proven += 1 else unknown += 1;
+    }
+    return .{
+        .points = total,
+        .proven_args = proven,
+        .unknown_args = unknown,
+        .exact_arity = args.len == effective.len,
+        .low_priority = sig.low_priority,
+        .is_member = sig.is_member,
+        .binding = .{},
+    };
+}
+
+// -------------------------------------------------------------------------
+// Runtime EXTENSION ranking (mirror of `scoreExtCandidates`'s per-candidate
+// `ExtKey` build). Always returns a Score with `ext_key` filled — an
+// inapplicable candidate is not dropped here, it ranks lowest via
+// `ext_key[0] == 0`, exactly as the legacy loop keeps every candidate.
+// -------------------------------------------------------------------------
+
+fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
+    const params = sig.params;
+    const want = args.len + 1; // receiver + value args
+    const recv = scope.receiver;
+
+    // Receiver score (`overloadScoreArg(params[0], receiver)`), saturating
+    // *1000 into the numeric `score` tier.
+    const recv_score: i32 = if (params.len > 0 and recv != null)
+        (scoreArg(&params[0].ty, &recv.?, &scope) orelse -1)
+    else
+        -1;
+    var score: i32 = recv_score *| 1000;
+
+    var applic: i32 = 1;
+    var param_spec: i32 = 0;
+    var proven: u16 = 0;
+    var unknown: u16 = 0;
+    for (args, 0..) |*a, idx| {
+        if (params.len > idx + 1) {
+            const arg_score = scoreArg(&params[idx + 1].ty, a, &scope);
+            if (arg_score == null and !params[idx + 1].has_default and !params[idx + 1].is_vararg) applic = 0;
+            score += arg_score orelse -1;
+            if (!isTopOrGenericType(params[idx + 1].ty.name)) param_spec += 1;
+            if (argIsProven(a)) proven += 1 else unknown += 1;
+        }
+    }
+    // Every param past the supplied args must be defaulted or vararg.
+    if (want < params.len) {
+        var k: usize = want;
+        while (k < params.len) : (k += 1) {
+            if (!params[k].has_default and !params[k].is_vararg) {
+                applic = 0;
+                break;
+            }
+        }
+    }
+    if (params.len == want) score += 5;
+
+    // Receiver specificity (`extReceiverSpecificity`).
+    const recv_match: i32 = blk: {
+        const cb = scope.ext_recv_match orelse break :blk 0;
+        const rv = if (recv) |r| r.value else null;
+        break :blk cb(scope.ctx.?, rv orelse break :blk 0, if (params.len > 0) params[0].ty.name else "");
+    };
+
+    // Subtype specificity: how many other candidates' receivers are supertypes
+    // of this one.
+    var spec: i32 = 0;
+    if (scope.all_candidates) |cands| {
+        if (scope.ext_is_subtype_name) |cb| {
+            const my_recv = if (params.len > 0) params[0].ty.name else "";
+            for (cands) |*o| {
+                if (sameFid(sig.fid, o.fid)) continue;
+                const o_recv = if (o.params.len > 0) o.params[0].ty.name else "";
+                if (cb(scope.ctx.?, my_recv, o_recv)) spec += 1;
+            }
+        }
+    }
+
+    // Owner rank (member-extension nearer on the enclosing-`this` chain).
+    const owner_rank: i32 = blk: {
+        const cb = scope.ext_owner_rank orelse break :blk 0;
+        const fid = sig.fid orelse break :blk 0;
+        break :blk cb(scope.ctx.?, fid);
+    };
+
+    // Stable discriminator: lowest FuncId, negated so smaller ranks higher.
+    const neg_fid: i32 = if (sig.fid) |fid|
+        -@as(i32, @intCast(@as(u32, @intCast(fid.int())) & 0x7fff_ffff))
+    else
+        0;
+
+    // A user-program extension outranks a shipped namesake of equal
+    // applicability. The empty package is always user code.
+    const is_user: i32 = blk: {
+        if (sig.package.len == 0) break :blk 1;
+        const cb = scope.ext_known_package orelse break :blk 1;
+        break :blk @intFromBool(!cb(sig.package));
+    };
+
+    const key: [8]i32 = .{ applic, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid };
+    return .{
+        .points = score,
+        .proven_args = proven,
+        .unknown_args = unknown,
+        .exact_arity = params.len == want,
+        .low_priority = sig.low_priority,
+        .is_member = sig.is_member,
+        .ext_key = key,
+        .binding = .{},
+    };
+}
+
+// -------------------------------------------------------------------------
+// Runtime NAMED-ARGUMENT scorer (mirror of `host_call_func.zig`
+// `scoreNamedCandidate`). A named/defaulted/reordered call binds each `named`
+// arg to its distinct same-named parameter, positional args fill the remaining
+// slots (a trailing callable binds out of sequence to the last function-typed
+// param, a final vararg absorbs positional overflow), and every unfilled
+// non-vararg parameter must be defaultable. A per-arg type mismatch scores 0
+// (neutral) instead of disqualifying the candidate; only a named arg that no
+// parameter accepts, a doubly-filled parameter, or an over-supplied
+// non-vararg call is a hard reject. When `scope.arg_to_param_buf` is set, the
+// parameter each supplied arg bound to is recorded through it.
+// -------------------------------------------------------------------------
+
+fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
+    const params = sig.params;
+    // A bodyless declaration is only selectable when it backs a native
+    // intrinsic; the caller folds that into `sig.has_body`.
+    if (!sig.has_body) return null;
+    if (params.len > 64) return null;
+
+    var filled = [_]bool{false} ** 64;
+    var total: i32 = 0;
+    var proven: u16 = 0;
+    var unknown: u16 = 0;
+    const bind = scope.arg_to_param_buf;
+
+    // An implicit extension receiver fills the leading `this` parameter; no
+    // positional arg lands on it.
+    const is_ext = params.len > 0 and std.mem.eql(u8, params[0].name, "this");
+    if (is_ext and scope.recv_external) filled[0] = true;
+
+    // Named arguments bind to their distinct same-named parameter.
+    for (args, 0..) |*a, i| {
+        const n = a.named orelse continue;
+        var pos: ?usize = null;
+        for (params, 0..) |p, pi| {
+            if (std.mem.eql(u8, p.name, n)) {
+                pos = pi;
+                break;
+            }
+        }
+        const p = pos orelse return null; // a named arg with no matching param
+        if (filled[p]) return null;
+        total += scoreArg(&params[p].ty, a, &scope) orelse 0;
+        if (argIsProven(a)) proven += 1 else unknown += 1;
+        filled[p] = true;
+        if (bind) |bb| {
+            if (i < bb.len) bb[i] = @intCast(p);
+        }
+    }
+
+    // A trailing positional callable binds to the last function-typed
+    // parameter, out of sequence.
+    var trailing_lambda: ?usize = null;
+    if (args.len > 0 and params.len > 0) {
+        const last = args.len - 1;
+        const last_named = args[last].named != null;
+        const last_param = params.len - 1;
+        if (!last_named and !filled[last_param] and
+            isFunctionTypeRef(&params[last_param].ty) and args[last].is_lambda)
+        {
+            total += scoreArg(&params[last_param].ty, &args[last], &scope) orelse 0;
+            if (argIsProven(&args[last])) proven += 1 else unknown += 1;
+            filled[last_param] = true;
+            trailing_lambda = last;
+            if (bind) |bb| {
+                if (last < bb.len) bb[last] = @intCast(last_param);
+            }
+        }
+    }
+
+    // Vararg-aware positional walk.
+    const has_vararg = params.len > 0 and params[params.len - 1].is_vararg;
+    var pidx: usize = 0;
+    for (args, 0..) |*a, i| {
+        if (a.named != null) continue;
+        if (trailing_lambda != null and i == trailing_lambda.?) continue;
+        while (pidx < params.len and filled[pidx]) pidx += 1;
+        if (pidx >= params.len) {
+            if (has_vararg) {
+                if (bind) |bb| {
+                    if (i < bb.len) bb[i] = @intCast(params.len - 1);
+                }
+                continue;
+            }
+            return null; // too many positional args
+        }
+        total += scoreArg(&params[pidx].ty, a, &scope) orelse 0;
+        if (argIsProven(a)) proven += 1 else unknown += 1;
+        if (bind) |bb| {
+            if (i < bb.len) bb[i] = @intCast(pidx);
+        }
+        filled[pidx] = true;
+        pidx += 1;
+    }
+
+    // Every unfilled non-vararg parameter must be defaultable.
+    for (params, 0..) |p, pi| {
+        if (filled[pi] or p.is_vararg) continue;
+        if (!paramHasDefault(sig, pi)) return null;
+        total -= 1;
+    }
+
+    return .{
+        .points = total,
+        .proven_args = proven,
+        .unknown_args = unknown,
+        .exact_arity = false,
+        .low_priority = sig.low_priority,
+        .is_member = sig.is_member,
+        .binding = .{ .arg_to_param = if (bind) |bb| bb[0..@min(args.len, bb.len)] else &.{} },
+    };
+}
+
+// -------------------------------------------------------------------------
+// Tests.
+// -------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn tref(name: []const u8) TypeRef {
+    return .{ .name = name, .nullable = false, .args = &.{} };
+}
+
+fn oneParam(name: []const u8) [1]Param {
+    return .{.{ .name = "x", .ty = tref(name), .default = null }};
+}
+
+test {
+    testing.refAllDecls(@This());
+}
+
+test "applicable: exact head match scores 100" {
+    const p = oneParam("Int");
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    const sc = applicable(&sig, &args, .{}).?;
+    try testing.expectEqual(@as(i32, 100), sc.points);
+    try testing.expect(sc.exact_arity);
+}
+
+test "applicable: extra positional arg without vararg is inapplicable" {
+    const p = oneParam("Int");
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{ .{ .runtime_class = "Int" }, .{ .runtime_class = "Int" } };
+    try testing.expect(applicable(&sig, &args, .{}) == null);
+}
+
+test "applicable: Int arg widens to Long param" {
+    const p = oneParam("Long");
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    const sc = applicable(&sig, &args, .{}).?;
+    try testing.expectEqual(@as(i32, 40), sc.points);
+}
+
+test "applicable: under-application without a default is inapplicable" {
+    const p = [_]Param{
+        .{ .name = "a", .ty = tref("Int"), .default = null },
+        .{ .name = "b", .ty = tref("Int"), .default = null },
+    };
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    try testing.expect(applicable(&sig, &args, .{}) == null);
+}
+
+test "applicable: under-application with a default scores with the -1 penalty" {
+    const p = [_]Param{
+        .{ .name = "a", .ty = tref("Int"), .default = null },
+        .{ .name = "b", .ty = tref("Int"), .default = null },
+    };
+    const defaults = [_]?FuncId{ null, FuncId.from(0) };
+    const sig = SigView{ .params = &p, .defaults = &defaults };
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    const sc = applicable(&sig, &args, .{}).?;
+    // 100 (exact head) - 1 (under-application) == 99.
+    try testing.expectEqual(@as(i32, 99), sc.points);
+    try testing.expect(!sc.exact_arity);
+}
+
+test "applicable: null defaults falls back to the param has_default flag" {
+    // The lowering adapter (`sigViewForApplicability`) leaves `defaults` null
+    // and carries the default on the param, so under-application still ranks.
+    var p = [_]Param{
+        .{ .name = "a", .ty = tref("Int"), .default = null },
+        .{ .name = "b", .ty = tref("Int"), .default = null },
+    };
+    p[1].has_default = true;
+    const sig = SigView{ .params = &p, .defaults = null };
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    const sc = applicable(&sig, &args, .{}).?;
+    // 100 (exact head) - 1 (under-application) == 99.
+    try testing.expectEqual(@as(i32, 99), sc.points);
+    try testing.expect(!sc.exact_arity);
+    // Without the flag the same under-application is inapplicable.
+    p[1].has_default = false;
+    try testing.expect(applicable(&sig, &args, .{}) == null);
+}
+
+test "builtinSupersOf: union table adds Collection and StringBuilder rows" {
+    try testing.expectEqual(@as(usize, 3), builtinSupersOf("Collection").len);
+    try testing.expectEqualStrings("CharSequence", builtinSupersOf("StringBuilder")[0]);
+    try testing.expectEqual(@as(usize, 0), builtinSupersOf("Nope").len);
+}
+
+test "applicable: bodyless candidate is never selectable" {
+    const p = oneParam("Int");
+    const sig = SigView{ .params = &p, .has_body = false };
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    try testing.expect(applicable(&sig, &args, .{}) == null);
+}
+
+// --- member scorer ----------------------------------------------------------
+
+test "applicable member: receiver slot skipped, base 0 (no under-application -1), exact_arity" {
+    const p = [_]Param{
+        .{ .name = "this", .ty = tref("Box"), .default = null },
+        .{ .name = "x", .ty = tref("Int"), .default = null },
+    };
+    const sig = SigView{ .params = &p, .is_member = true };
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    const sc = applicable(&sig, &args, .{ .member = true }).?;
+    // Exact head match; base 0 (no +5 pre-applied, no -1), exact_arity carried.
+    try testing.expectEqual(@as(i32, 100), sc.points);
+    try testing.expect(sc.exact_arity);
+    try testing.expect(sc.is_member);
+}
+
+test "applicable member: under-application via the defaults table is applicable" {
+    const p = [_]Param{
+        .{ .name = "this", .ty = tref("Box"), .default = null },
+        .{ .name = "x", .ty = tref("Int"), .default = null },
+        .{ .name = "y", .ty = tref("Int"), .default = null },
+    };
+    // Defaults table is indexed by full lowered position (incl. `this`).
+    const defaults = [_]?FuncId{ null, null, FuncId.from(0) };
+    const sig = SigView{ .params = &p, .defaults = &defaults, .is_member = true };
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    const sc = applicable(&sig, &args, .{ .member = true }).?;
+    // Member base is 0 (no -1); only one arg scored (100), y defaulted.
+    try testing.expectEqual(@as(i32, 100), sc.points);
+    try testing.expect(!sc.exact_arity);
+}
+
+test "applicable member: callable arg vs concrete non-function param disqualifies (global scores 8)" {
+    const p = [_]Param{
+        .{ .name = "this", .ty = tref("Logger"), .default = null },
+        .{ .name = "msg", .ty = tref("String"), .default = null },
+    };
+    const sig = SigView{ .params = &p, .is_member = true };
+    const args = [_]ArgShape{.{ .runtime_class = "Function0", .func_typed = true, .is_lambda = true }};
+    // Member: `isDefinitelyNonFunctionTypeName("String")` disqualifies.
+    try testing.expect(applicable(&sig, &args, .{ .member = true }) == null);
+    // Global: the same callable arg scores the SAM-conversion 8 (no receiver
+    // skip, so use a one-param sig).
+    const gp = oneParam("String");
+    const gsig = SigView{ .params = &gp };
+    const gsc = applicable(&gsig, &args, .{}).?;
+    try testing.expectEqual(@as(i32, 8), gsc.points);
+}
+
+var mock_subtype_depth: i32 = 3;
+fn mockSubtype(_: *anyopaque, _: *const anyopaque, _: []const u8) ?i32 {
+    return mock_subtype_depth;
+}
+
+test "applicable member vs global: instance subtype tier formula differs" {
+    var dummy: u8 = 0;
+    const p = oneParam("Bar");
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{.{ .runtime_class = "Foo", .value = @ptrCast(&dummy) }};
+    mock_subtype_depth = 3;
+    const gscope = ApplicabilityScope{ .subtype = mockSubtype, .ctx = @ptrCast(&dummy) };
+    const mscope = ApplicabilityScope{ .member = true, .subtype = mockSubtype, .ctx = @ptrCast(&dummy) };
+    try testing.expectEqual(@as(i32, 57), applicable(&sig, &args, gscope).?.points); // 60 - min(3,50)
+    try testing.expectEqual(@as(i32, 72), applicable(&sig, &args, mscope).?.points); // 75 - min(3,20)
+}
+
+// --- extension ranking ------------------------------------------------------
+
+test "applicable extension: ext_key mirrors ExtKey tuple" {
+    const p = [_]Param{
+        .{ .name = "this", .ty = tref("Animal"), .default = null },
+        .{ .name = "other", .ty = tref("Animal"), .default = null },
+    };
+    const sig = SigView{ .params = &p, .is_extension = true, .fid = FuncId.from(7), .package = "" };
+    const recv = ArgShape{ .runtime_class = "Animal" };
+    const args = [_]ArgShape{.{ .runtime_class = "Animal" }};
+    const scope = ApplicabilityScope{
+        .member = true,
+        .rank_extensions = true,
+        .is_extension = true,
+        .receiver = recv,
+    };
+    const sc = applicable(&sig, &args, scope).?;
+    const key = sc.ext_key.?;
+    // { applicable, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid }
+    try testing.expectEqual(@as(i32, 1), key[0]); // applicable
+    try testing.expectEqual(@as(i32, 1), key[1]); // is_user (empty package)
+    try testing.expectEqual(@as(i32, 0), key[2]); // spec (no all_candidates)
+    try testing.expectEqual(@as(i32, 0), key[3]); // recv_match (no callback)
+    // recv head-match 100 * 1000 + arg head-match 100 + exact-arity 5.
+    try testing.expectEqual(@as(i32, 100105), key[4]);
+    try testing.expectEqual(@as(i32, 0), key[5]); // owner_rank (no callback)
+    try testing.expectEqual(@as(i32, 1), key[6]); // param_spec (Animal concrete)
+    try testing.expectEqual(@as(i32, -7), key[7]); // neg_fid
+    try testing.expect(sc.exact_arity);
+}
+
+test "applicable extension: under-applied param that is neither default nor vararg is inapplicable tier" {
+    const p = [_]Param{
+        .{ .name = "this", .ty = tref("Animal"), .default = null },
+        .{ .name = "a", .ty = tref("Int"), .default = null },
+        .{ .name = "b", .ty = tref("Int"), .default = null },
+    };
+    const sig = SigView{ .params = &p, .is_extension = true, .fid = FuncId.from(3) };
+    const recv = ArgShape{ .runtime_class = "Animal" };
+    // want = 2, params.len = 3, param b (idx 2) is neither default nor vararg.
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    const scope = ApplicabilityScope{ .member = true, .rank_extensions = true, .is_extension = true, .receiver = recv };
+    const sc = applicable(&sig, &args, scope).?;
+    try testing.expectEqual(@as(i32, 0), sc.ext_key.?[0]); // applicable tier = 0
+}
+
+// --- named-argument scorer ---------------------------------------------------
+
+test "applicable named: reordered named args bind by name and record the binding" {
+    const p = [_]Param{
+        .{ .name = "a", .ty = tref("Int"), .default = null },
+        .{ .name = "b", .ty = tref("Int"), .default = null },
+    };
+    const sig = SigView{ .params = &p };
+    // Call `f(b = 1, a = 2)` — supplied out of declared order.
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Int", .named = "b" },
+        .{ .runtime_class = "Int", .named = "a" },
+    };
+    var bind_buf: [2]u16 = undefined;
+    const scope = ApplicabilityScope{ .named = true, .arg_to_param_buf = &bind_buf };
+    const sc = applicable(&sig, &args, scope).?;
+    // Two exact head matches; named scorer carries no exact-arity flag.
+    try testing.expectEqual(@as(i32, 200), sc.points);
+    try testing.expectEqual(@as(u16, 1), sc.binding.arg_to_param[0]); // b -> param 1
+    try testing.expectEqual(@as(u16, 0), sc.binding.arg_to_param[1]); // a -> param 0
+}
+
+test "applicable named: a name matching no parameter is a hard reject" {
+    const p = oneParam("Int");
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{.{ .runtime_class = "Int", .named = "nope" }};
+    try testing.expect(applicable(&sig, &args, .{ .named = true }) == null);
+}
+
+test "applicable named: a per-arg type mismatch is neutral (scores 0), not disqualifying" {
+    const p = [_]Param{
+        .{ .name = "x", .ty = tref("Int"), .default = null },
+        .{ .name = "y", .ty = tref("String"), .default = null },
+    };
+    const sig = SigView{ .params = &p };
+    // `y = <Int>` type-mismatches the String param but is not rejected; it
+    // scores 0 and the candidate stays applicable (named presence is the
+    // discriminator).
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Int", .named = "x" },
+        .{ .runtime_class = "Int", .named = "y" },
+    };
+    const sc = applicable(&sig, &args, .{ .named = true }).?;
+    // x exact 100 + y neutral 0.
+    try testing.expectEqual(@as(i32, 100), sc.points);
+}
+
+test "applicable named: unfilled non-default parameter is a reject; a default pads with -1" {
+    const p = [_]Param{
+        .{ .name = "a", .ty = tref("Int"), .default = null },
+        .{ .name = "b", .ty = tref("Int"), .default = null },
+    };
+    const args = [_]ArgShape{.{ .runtime_class = "Int", .named = "a" }};
+    // No default for b -> reject.
+    const sig_nd = SigView{ .params = &p };
+    try testing.expect(applicable(&sig_nd, &args, .{ .named = true }) == null);
+    // b defaulted -> applicable with the -1 default-padding penalty.
+    const defaults = [_]?FuncId{ null, FuncId.from(0) };
+    const sig_d = SigView{ .params = &p, .defaults = &defaults };
+    const sc = applicable(&sig_d, &args, .{ .named = true }).?;
+    try testing.expectEqual(@as(i32, 99), sc.points); // 100 - 1
+}

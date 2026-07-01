@@ -8,6 +8,7 @@ const std = @import("std");
 const ast = @import("ast");
 const runtime = @import("runtime");
 const ir = @import("../ir.zig");
+const applicability = @import("applicability");
 const build = @import("../build.zig");
 
 const helpers = @import("helpers.zig");
@@ -506,7 +507,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
             } else if (b.module.funcId(pr.name.name) != null or b.module.classId(pr.name.name) != null) {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
-            } else if (isAliasName(pr.name.name) and !member_shadows_ref) {
+            } else if (ir.isAliasName(pr.name.name) and !member_shadows_ref) {
                 // `::minOf` / `::maxOf` / `::listOf` … name a stdlib host
                 // intrinsic. A bare `LoadGlobal` resolves it to its
                 // `.Intrinsic` callable value; binding it to the enclosing
@@ -3831,6 +3832,52 @@ fn argLitKind(e: *const Expr) ?LitKind {
     };
 }
 
+/// Declared parameter arity of a single lambda / anon-fun argument
+/// expression, or null when it is neither. A zero-`->` `{ … }` (its `it`
+/// injected by the parser) reports 0 — the literal declares no parameters,
+/// so overload resolution treats it as a `() -> R` handler.
+fn astArgLambdaArity(arg: *const Expr) ?u8 {
+    return switch (arg.*) {
+        .Lambda => |l| if (l.implicit_it) @as(u8, 0) else @intCast(l.params.len),
+        .AnonFun => |af| @intCast(af.params.len),
+        else => null,
+    };
+}
+
+/// One argument's applicability `ArgShape` at LOWERING time. Only the
+/// fields lowering can prove cheaply and soundly are populated — named /
+/// spread / lambda binding shape and a literal kind; `ty` /
+/// `runtime_class` / `lambda_param_types` / `value` stay null, so the
+/// shared scorer treats the arg as UNKNOWN (base points, never disproven)
+/// wherever the type is not statically decidable.
+fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicability.ArgShape {
+    _ = b;
+    return .{
+        .named = name,
+        .is_spread = arg.* == .Spread,
+        .is_lambda = arg.* == .Lambda or arg.* == .AnonFun,
+        .lambda_arity = astArgLambdaArity(arg),
+        .literal_kind = if (argLitKind(arg)) |k| switch (k) {
+            .numeric => .numeric,
+            .string => .string,
+            .boolean => .boolean,
+            .char => .char,
+        } else null,
+    };
+}
+
+/// Build the `[]ArgShape` for a call's argument list once, before the
+/// `resolveCall` query, replacing the per-rung `findCand` / `arityMatch`
+/// walks. Borrows from `b.allocator` (a lowering scratch arena).
+fn buildArgShapes(b: *FuncBuilder, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error![]applicability.ArgShape {
+    const shapes = try b.allocator.alloc(applicability.ArgShape, args.len);
+    for (args, 0..) |*a, i| {
+        const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+        shapes[i] = shapeOfAstArg(b, a, nm);
+    }
+    return shapes;
+}
+
 /// Builtin value kind a declared parameter type accepts, or null when unknown
 /// (a user class, a type parameter, `Any`, …) — those never disprove.
 fn paramLitKind(type_name: []const u8) ?LitKind {
@@ -4043,76 +4090,26 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
         }
     }
 
-    // Arity-aware bare-call lookup.
+    // Bare-call resolution through the unified resolver. `resolveCall` folds
+    // the scope index, the applicability ladder and the member-vs-global emit
+    // decision into one query; the switch below routes its verdict to a single
+    // emitter.
     const want = args.len;
     const cands = b.module.funcsBySimpleName(name0);
     const last_arg_lambda = lastArgIsLambda(args);
 
-    const name_is_alias = isAliasName(name0);
-
+    // An own member applicable to this call outranks a same-named top-level
+    // function: defer to the member-dispatch path (`lowerImplicitThisCall`). A
+    // cast at the call site commits to a specific overload and overrides.
     const prefer_member = b.resolve("this") != null and b.hasOwnMember(name0) and
         b.ownMemberApplicable(name0, args.len) and
         b.resolve(name0) == null and !b.isLocalFn(name0) and !b.isLocalExtFn(name0);
 
     const cast_pick: ?FuncId = try overloadPickByCast(b, cands, args, want);
 
-    var bare_func_id: ?FuncId = null;
-    var rung: HeurRung = .none;
-    if (!(prefer_member and cast_pick == null)) {
-        bare_func_id = cast_pick;
-        if (bare_func_id != null) rung = .cast;
-        if (bare_func_id == null) {
-            bare_func_id = findCand(b, cands, want, .non_ext_arity);
-            if (bare_func_id != null) rung = .non_ext_arity;
-        }
-        if (bare_func_id == null) {
-            bare_func_id = findCand(b, cands, want, .ext_arity);
-            if (bare_func_id != null) rung = .ext_arity;
-        }
-        if (bare_func_id == null and last_arg_lambda) {
-            bare_func_id = findCand(b, cands, want, .ext_arity_tl);
-            if (bare_func_id != null) rung = .ext_arity_tl;
-        }
-        if (bare_func_id == null and last_arg_lambda) {
-            bare_func_id = findCand(b, cands, want, .non_ext_arity_tl);
-            if (bare_func_id != null) rung = .non_ext_arity_tl;
-        }
-        if (bare_func_id == null and !name_is_alias) {
-            bare_func_id = try fallbackByDeclArity(b, cands, name0, want, segments[0].span.file, &rung);
-        }
-    }
-
-    // Prefer the same-name extension overload whose receiver matches the
-    // enclosing extension's declared receiver.
-    if (bare_func_id) |chosen| {
-        if (b.recvTy()) |recv| {
-            if (!matchesRecv(b, chosen, recv)) {
-                var i: usize = 0;
-                var found: ?FuncId = null;
-                while (i < cands.len) : (i += 1) {
-                    if (arityMatch(b, cands[i], want) and matchesRecv(b, cands[i], recv)) {
-                        found = cands[i];
-                        break;
-                    }
-                }
-                if (found) |fnd| {
-                    bare_func_id = fnd;
-                    rung = .recv_rebind;
-                }
-            }
-        }
-    }
-
-    const was_cast = cast_pick != null and bare_func_id != null and bare_func_id.? == cast_pick.?;
-
-    // Symbol-index resolution (the PRIMARY path): resolve the bare name as
-    // a pure function of (caller package, caller imports, complete header
-    // set). Where it resolves to a unique target the lowered call binds by
-    // exact FQN; otherwise the order-based heuristic pick above is retained
-    // as the fallback. The index is a faithful superset — it never selects
-    // a different target than the heuristic for a name it resolves; the
-    // KLIO_RESOLVE_AUDIT detector below proves zero divergence over the
-    // green corpus.
+    // The index classification, for the ambiguity / out-of-scope diagnostics.
+    // A cast at the call site pre-picks a same-tier overload, so an ambiguity
+    // or type-overload deferral is not reported.
     var index_res = b.module.resolveBareCallIndexed(
         name0,
         b.self_package,
@@ -4120,92 +4117,68 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
         want,
         last_arg_lambda,
     );
-    // A same-tier same-arity overload set the call site disambiguates
-    // with an `as` cast is not an ambiguity: the cast already picked the
-    // target. Reclassify so the strict gate and the ambiguity diagnostic
-    // never fire on a cast-resolved call.
     if (cast_pick != null) {
         const r = indexDeferReason(index_res);
         if (r == .ambiguous_tier or r == .type_overload) {
             index_res.outcome = .{ .deferred = .cast_disambiguated };
         }
     }
-    const index_pick = index_res.pick();
-    resolveAudit(b, name0, segments[0].span.file, want, last_arg_lambda, bare_func_id, rung, index_res, shadowed_by_class, prefer_member);
 
-    // A known stdlib host-intrinsic global (alias) (`min`, `max`, …) whose simple
-    // name also has a user overload that does NOT apply to this call (e.g.
-    // `min(Int, Int)` against the unsigned `min(UInt, UInt)` in UMath): the
-    // overload resolution above found no applicable user candidate
-    // (`bare_func_id == null`), but the name still resolves to the intrinsic
-    // global. Bind it directly. Without this, an enclosing receiver context
-    // would fall through to a `this.<name>` redispatch that invokes the
-    // receiver itself, since no class declares the name as a member.
-    if (bare_func_id == null and !shadowed_by_class and inReceiverContext(b) and
-        isAliasName(name0) and !b.module.registry.class_member_names.contains(name0) and
+    if (prefer_member and cast_pick == null) return null;
+
+    const shapes = try buildArgShapes(b, args, ast_arg_names);
+    defer b.allocator.free(shapes);
+    const ctx = resolveCtxFor(b, name0, ast_type_args, cast_pick);
+    const res = try b.module.resolveCall(b.allocator, name0, b.self_package, segments[0].span.file, shapes, last_arg_lambda, ctx);
+    defer b.allocator.free(res.candidate_set);
+    const was_cast = cast_pick != null and res.target != null and cast_pick.?.int() == res.target.?.int();
+
+    // A known stdlib host-intrinsic global (alias) whose user overloads do not
+    // apply to this call still resolves to the intrinsic global. In a receiver
+    // context, bind it directly — no class declares the name as a member, so a
+    // `this.<name>` redispatch would invoke the receiver itself.
+    if (res.target == null and !shadowed_by_class and inReceiverContext(b) and
+        ir.isAliasName(name0) and !b.module.registry.class_member_names.contains(name0) and
         b.resolve(name0) == null and !b.knowsOuter(name0))
     {
-        orEmitAudit(b, "alias_global_no_overload", "LoadGlobal", name0);
-        const callee_r = b.allocReg();
-        const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-        try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
-        const run = try lowerArgRun(b, args);
-        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-        const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
-        const dst = b.allocReg();
-        try b.push(.{ .CallValue = .{
-            .dst = dst,
-            .callee = callee_r,
-            .args = run[0],
-            .n_args = run[1],
-            .arg_names = arg_names,
-            .type_args = type_args,
-        } });
-        return dst;
+        return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
     }
-    if (bare_func_id) |func_id| {
+
+    if (res.target) |target| {
         if (!shadowed_by_class) {
-            // The call binds a bare top-level function. If the index saw
-            // two same-tier same-arity candidates with identical
-            // parameter signatures, the reference is ambiguous — nothing
-            // at lowering or at runtime can tell them apart. Record a
-            // lowering diagnostic for the build driver to surface.
-            // (Type-distinguishable overload sets classify as
-            // `type_overload`, cast-picked ones as `cast_disambiguated`;
-            // neither reaches here.)
             if (indexDeferReason(index_res) == .ambiguous_tier) {
                 try recordAmbiguousCall(b, name0, segments[0].span, index_res);
             }
-            // A resolved top-level EXTENSION that a member of the implicit
-            // receiver could shadow must not bind statically: a member of the
-            // receiver (including a builtin like `StringBuilder.append`)
-            // outranks a same-named top-level extension. Route through the
-            // deferred member-first path — exactly as when the index does not
-            // resolve the name — so the member wins. Binding here would let a
-            // generic `T.append(vararg CharSequence?)` shadow the member and
-            // self-recurse.
-            {
-                const is_ext = if (b.module.funcById(func_id)) |f|
-                    (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this"))
-                else
-                    false;
-                if (is_ext and inReceiverContext(b) and memberShadowPossible(b, name0)) {
-                    if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
-                }
-            }
-            // Prefer the index's unique FQN-qualified target when it
-            // resolves, except for a receiver-matched extension pick,
-            // which stays with the heuristic — receiver-based resolution
-            // is the heuristic's domain and the index never models it.
-            const final_id = preferredBareTarget(b, func_id, index_pick);
-            // A target in a package the caller cannot see is an
-            // unresolved reference (kotlinc rejects the call); the
-            // diagnostic fails the program before it runs.
-            _ = try recordOutOfScopeCall(b, name0, segments[0].span, final_id, index_res);
-            return try emitBareFuncCall(b, expr, final_id, was_cast);
+            // A target in a package the caller cannot see is an unresolved
+            // reference (kotlinc rejects the call); the diagnostic fails the
+            // program before it runs.
+            _ = try recordOutOfScopeCall(b, name0, segments[0].span, target, index_res);
+            return switch (res.emit_form) {
+                .Call => try emitCall(b, expr, target, was_cast),
+                .CallMember => try emitCallMember(b, expr, target, was_cast),
+                .CallMemberOrGlobal => try emitMemberOrGlobal(b, expr, target, was_cast),
+                // Phase C never emits a value call with a committed target.
+                .CallValue => unreachable,
+            };
         }
     }
     return null;
+}
+
+/// The receiver-context bits `resolveCall` folds into its emit-form decision,
+/// read once from the builder. Shared by the live path and the audit shadow so
+/// both query `resolveCall` identically.
+fn resolveCtxFor(b: *FuncBuilder, name0: []const u8, ast_type_args: []const ast.TypeRef, cast_pick: ?FuncId) ir.Module.ResolveCtx {
+    return .{
+        .in_receiver_context = inReceiverContext(b),
+        .unknown_receiver = b.capturesThisSlot() or b.isParamThunk() or b.recvTy() != null,
+        .enclosing_has_member = b.hasEnclosingMember(name0),
+        .has_type_args = ast_type_args.len != 0,
+        .cast_pick = cast_pick,
+        .recv_ty = b.recvTy(),
+        .is_value_capture = b.knowsOuter(name0) and b.resolve(name0) == null,
+        .in_tailrec_body = b.tailrecSelf() != null,
+    };
 }
 
 fn indexDeferReason(res: ir.Module.BareCallResolution) ?ir.Module.ResolveDeferReason {
@@ -4669,15 +4642,6 @@ fn fqnOf(b: *FuncBuilder, id: FuncId) []const u8 {
     return "<invalid>";
 }
 
-fn matchesRecv(b: *FuncBuilder, fid: FuncId, recv: []const u8) bool {
-    const f = b.module.funcById(fid) orelse return false;
-    if (!f.hasBody()) return false;
-    if (f.params.len == 0) return false;
-    return std.mem.eql(u8, f.params[0].name, "this") and std.mem.eql(u8, f.params[0].ty.name, recv);
-}
-
-const CandKind = enum { non_ext_arity, ext_arity, ext_arity_tl, non_ext_arity_tl };
-
 /// Which rung of the order-based bare-call heuristic produced the pick.
 /// Carried into the resolve audit so a corpus sweep counts per-rung
 /// reachability — the survey evidence behind keeping (or deleting) each
@@ -4696,20 +4660,6 @@ const HeurRung = enum {
     recv_rebind,
 };
 
-fn findCand(b: *FuncBuilder, cands: []const FuncId, want: usize, kind: CandKind) ?FuncId {
-    for (cands) |fid| {
-        const non_ext = isNonExt(b, fid);
-        const not_low = isNotLow(b, fid);
-        switch (kind) {
-            .non_ext_arity => if (non_ext and arityMatch(b, fid, want) and not_low) return fid,
-            .ext_arity => if (!non_ext and arityMatch(b, fid, want) and not_low) return fid,
-            .ext_arity_tl => if (!non_ext and arityMatchTl(b, fid, want) and not_low) return fid,
-            .non_ext_arity_tl => if (non_ext and arityMatchTl(b, fid, want) and not_low) return fid,
-        }
-    }
-    return null;
-}
-
 fn userParams(f: *const Func) usize {
     if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) {
         return f.params.len - 1;
@@ -4717,107 +4667,9 @@ fn userParams(f: *const Func) usize {
     return f.params.len;
 }
 
-fn arityMatch(b: *FuncBuilder, fid: FuncId, want: usize) bool {
-    const f = b.module.funcById(fid) orelse return false;
-    const last_not_vararg = f.params.len == 0 or !f.params[f.params.len - 1].is_vararg;
-    return f.hasBody() and last_not_vararg and userParams(f) == want;
-}
-
-fn arityMatchTl(b: *FuncBuilder, fid: FuncId, want: usize) bool {
-    const f = b.module.funcById(fid) orelse return false;
-    const up = userParams(f);
-    const last_is_fn = f.params.len != 0 and std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
-    if (!f.hasBody() or !last_is_fn or up < want or want < 1) return false;
-    const this_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-    const lead = want - 1;
-    const last_user = up - 1;
-    var i = lead;
-    while (i < last_user) : (i += 1) {
-        if (this_off + i >= f.params.len or !f.params[this_off + i].has_default) return false;
-    }
-    return true;
-}
-
 fn isNonExt(b: *FuncBuilder, fid: FuncId) bool {
     const f = b.module.funcById(fid) orelse return true;
     return f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this");
-}
-
-fn isNotLow(b: *FuncBuilder, fid: FuncId) bool {
-    const f = b.module.funcById(fid) orelse return false;
-    return !f.low_priority;
-}
-
-fn declArity(b: *FuncBuilder, fid: FuncId) ?u32 {
-    return b.module.decl_user_params.get(fid.int());
-}
-
-fn fallbackByDeclArity(b: *FuncBuilder, cands: []const FuncId, name0: []const u8, want: usize, file: ir.FileId, rung: *HeurRung) Allocator.Error!?FuncId {
-    const fallback = b.module.funcId(name0);
-    const want_u32: u32 = @intCast(want);
-    const fallback_fits = blk: {
-        if (fallback) |fid| {
-            if (declArity(b, fid)) |n| break :blk n == want_u32;
-        }
-        break :blk true;
-    };
-    // A fallback in a package the caller cannot see never outranks an
-    // in-scope extension candidate of matching declared arity: Kotlin
-    // does not resolve the invisible function at all, while the
-    // extension may bind through an implicit receiver (the stdlib's own
-    // `firstOrNull(predicate)` inside `CharSequence.find` must not bind
-    // a user file's root-package `firstOrNull`).
-    if (fallback) |fid| {
-        const tier = b.module.bareCallTierOf(fid, name0, b.self_package, file) orelse 255;
-        if (tier == ir.Module.other_package_tier) {
-            for (cands) |cid| {
-                if (isNonExt(b, cid)) continue;
-                if (declArity(b, cid) != want_u32) continue;
-                const ct = b.module.bareCallTierOf(cid, name0, b.self_package, file) orelse continue;
-                if (ct < ir.Module.other_package_tier) {
-                    rung.* = .decl_arity_ext;
-                    return cid;
-                }
-            }
-        }
-    }
-    if (fallback_fits) {
-        if (fallback != null) rung.* = .decl_arity_order;
-        return fallback;
-    }
-    // Prefer a candidate whose declared arity fits.
-    for (cands) |fid| {
-        if (isNonExt(b, fid) and declArity(b, fid) == want_u32) {
-            rung.* = .decl_arity_non_ext;
-            return fid;
-        }
-    }
-    for (cands) |fid| {
-        if (!isNonExt(b, fid) and declArity(b, fid) == want_u32) {
-            rung.* = .decl_arity_ext;
-            return fid;
-        }
-    }
-    // No same-name candidate's declared arity matches a call that supplies
-    // arguments, and the only candidates are extensions whose declared
-    // value arity is zero (e.g. `Iterator<T>.iterator()`): such an
-    // extension cannot bind a call that passes a trailing lambda. Binding
-    // it anyway prepends the lambda's receiver and fails at runtime. Decline
-    // so the bare call falls through to a global of this name — the inline
-    // builder intrinsic (`kotlin.sequences.iterator`) that actually accepts
-    // the lambda — exactly as the lambda-free `sequence { }` global resolves.
-    if (want > 0) {
-        var all_ext_zero_arity = cands.len != 0;
-        for (cands) |fid| {
-            if (isNonExt(b, fid) or declArity(b, fid) != 0) {
-                all_ext_zero_arity = false;
-                break;
-            }
-        }
-        if (all_ext_zero_arity) return null;
-    }
-    if (fallback != null) rung.* = .decl_arity_order;
-    return fallback;
 }
 
 /// Whether the enclosing class (or any of its supertypes) declares a member
@@ -4829,26 +4681,6 @@ fn enclosingDeclaresMember(b: *const FuncBuilder, name: []const u8) bool {
     const oc = b.ownerClass() orelse return false;
     const methods = b.module.registry.hierarchy_methods.get(oc) orelse return false;
     return methods.contains(name);
-}
-
-fn isAliasName(name: []const u8) bool {
-    const names = [_][]const u8{
-        "maxOf",           "minOf",      "max",                 "min",
-        "print",           "println",    "listOf",              "mutableListOf",
-        "arrayListOf",     "setOf",      "mutableSetOf",        "hashSetOf",
-        "linkedSetOf",     "mapOf",      "mutableMapOf",        "hashMapOf",
-        "linkedMapOf",     "arrayOf",    "arrayOfNulls",        "emptyArray",
-        "emptyList",       "emptySet",   "emptyMap",            "listOfNotNull",
-        "setOfNotNull",    "buildList",  "buildSet",            "buildMap",
-        "buildString",     "TODO",       "error",               "compareValues",
-        "compareValuesBy", "compareBy",  "compareByDescending", "naturalOrder",
-        "reverseOrder",    "sequenceOf", "emptySequence",       "generateSequence",
-        "sequence",
-    };
-    for (names) |n| {
-        if (std.mem.eql(u8, name, n)) return true;
-    }
-    return false;
 }
 
 /// True when `f` shares its simple name and arity with another overload whose
@@ -4873,8 +4705,12 @@ fn overloadParamTypeConflicts(module: *const Module, f: *const Func, pidx: usize
     return false;
 }
 
-/// Emit a resolved bare-name `Call` (or the receiver-prepended forms).
-fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
+/// The `Call` emit form: a resolved bare-name static call. A committed
+/// non-extension target lowers to a direct `Call` (or a `TailCallFunc` in a
+/// tailrec body); an extension target routes through `emitExtBareCall`, which
+/// prepends `this`. `resolveCall` has already decided this is a static call, so
+/// the member-vs-global walk lives in `emitMemberOrGlobal`, not here.
+fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
     const args = call.args;
@@ -4911,44 +4747,10 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         b.switchTo(dead);
         return b.emitConst(.Unit);
     }
-    // kotlinc resolves a bare call scope-by-scope, innermost receiver
-    // first: a member function — or an invoke-convention member property
-    // — of a runtime implicit receiver outranks the package-scope
-    // function. Where some class declares a member of this name and a
-    // receiver is (or may be bound) in scope, the call decides at
-    // runtime, carrying the lowering-resolved FuncId as the exact global
-    // arm. Cast-disambiguated and type-argumented calls keep the static
-    // form (their resolution is already exact).
-    {
-        const name0 = callee.Path.segments[0].name;
-        if (inReceiverContext(b) and !was_cast and ast_type_args.len == 0 and
-            memberShadowPossible(b, name0))
-        {
-            const this_idx = try b.recordCapture("this");
-            const broad_masks: ?[]u32 = blk: {
-                const f = b.module.funcById(func_id) orelse break :blk null;
-                const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-                break :blk try argLambdaBroadMasks(b, f, args, ast_arg_names, recv_off);
-            };
-            defer if (broad_masks) |m| b.allocator.free(m);
-            b.pending_arg_broad_masks = broad_masks;
-            const run = try lowerArgRun(b, args);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-            const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-            const dst = b.allocReg();
-            orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
-            try b.push(.{ .CallMemberOrGlobal = .{
-                .dst = dst,
-                .this_idx = this_idx,
-                .name = nm,
-                .args = run[0],
-                .n_args = run[1],
-                .arg_names = arg_names,
-                .func = func_id,
-            } });
-            return dst;
-        }
-    }
+    // A bare call a runtime implicit receiver could shadow is routed by
+    // `resolveCall` to the `CallMemberOrGlobal` emit form (`emitMemberOrGlobal`),
+    // never here: reaching `emitCall` means the resolver already committed to the
+    // static call, so this emitter only ever emits the direct `Call`.
     const arg_arity: ?[]const i16 = blk: {
         if (b.module.funcById(func_id)) |f| {
             const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
@@ -4999,6 +4801,91 @@ fn emitBareFuncCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cas
         .arg_names = arg_names,
         .type_args = type_args,
         .exact = was_cast,
+    } });
+    return dst;
+}
+
+/// The `CallMember` emit form: a resolved extension bound on the implicit
+/// `this` with member precedence — a member of the receiver outranks the
+/// same-named top-level extension. Routes through `emitExtBareCall`, which
+/// selects the static-receiver `CallMember` (or, for a vararg trailing-lambda
+/// gap / cast, the prepended static `Call`). With no `this` in scope the bind
+/// degrades to the static `Call` of `emitCall`.
+fn emitCallMember(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
+    if (try resolveThisForBareCall(b)) |this_reg| {
+        return emitExtBareCall(b, expr, func_id, this_reg, was_cast);
+    }
+    return emitCall(b, expr, func_id, was_cast);
+}
+
+/// The `CallMemberOrGlobal` emit form: the bare name dispatches member-first on
+/// the runtime implicit receiver, falling back to the resolved global. A
+/// non-extension target carries its resolved `func` as the global arm; a
+/// resolved extension a member could shadow defers to the pure member-first
+/// walk (`lowerUnresolvedBareCall`), which carries no static arm.
+fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
+    const call = expr.Call;
+    const callee = call.callee;
+    const args = call.args;
+    const ast_arg_names = call.arg_names;
+    const ast_type_args = call.type_args;
+    const name0 = callee.Path.segments[0].name;
+
+    if (!isNonExt(b, func_id)) {
+        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+        return emitCall(b, expr, func_id, was_cast);
+    }
+
+    const this_idx = try b.recordCapture("this");
+    const broad_masks: ?[]u32 = blk: {
+        const f = b.module.funcById(func_id) orelse break :blk null;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        break :blk try argLambdaBroadMasks(b, f, args, ast_arg_names, recv_off);
+    };
+    defer if (broad_masks) |m| b.allocator.free(m);
+    b.pending_arg_broad_masks = broad_masks;
+    const run = try lowerArgRun(b, args);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+    const dst = b.allocReg();
+    orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
+    try b.push(.{ .CallMemberOrGlobal = .{
+        .dst = dst,
+        .this_idx = this_idx,
+        .name = nm,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+        .func = func_id,
+    } });
+    return dst;
+}
+
+/// The `CallValue` emit form for a bare name with no committed target: load the
+/// global by name and invoke it. Used for a host-intrinsic alias whose user
+/// overloads do not apply (no class declares the name as a member).
+fn emitValueCall(
+    b: *FuncBuilder,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    name0: []const u8,
+) Allocator.Error!Reg {
+    orEmitAudit(b, "alias_global_no_overload", "LoadGlobal", name0);
+    const callee_r = b.allocReg();
+    const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+    try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
+    const run = try lowerArgRun(b, args);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+    const dst = b.allocReg();
+    try b.push(.{ .CallValue = .{
+        .dst = dst,
+        .callee = callee_r,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+        .type_args = type_args,
     } });
     return dst;
 }
@@ -5126,19 +5013,10 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
         const uarg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nmc = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
         const dst = b.allocReg();
-        if (b.capturesThisSlot()) {
-            const this_idx = try b.recordCapture("this");
-            orEmitAudit(b, "ext_bare_call_lambda", "CallMemberOrGlobal", callee.Path.segments[0].name);
-            try b.push(.{ .CallMemberOrGlobal = .{
-                .dst = dst,
-                .this_idx = this_idx,
-                .name = nmc,
-                .args = uargs[0],
-                .n_args = uargs[1],
-                .arg_names = uarg_names,
-            } });
-            return dst;
-        }
+        // A captured-`this` receiver context routes through `emitMemberOrGlobal`
+        // (the `CallMemberOrGlobal` emit form), never here — `resolveCall` never
+        // reaches the static-receiver `CallMember` bind for such a call.
+        //
         // Inside an extension body the implicit `this` has the
         // extension's declared receiver type; record it so dispatch
         // resolves extensions against the STATIC type, as kotlinc does.
@@ -5303,7 +5181,7 @@ fn lowerImplicitThisCall(
     // known top-level stdlib function (a host intrinsic, absent from
     // `funcsBySimpleName`): a `@Test fun listOfNotNull()` method calling the
     // top-level `listOfNotNull(...)` must fall through on the arity miss.
-    if (b.module.funcsBySimpleName(name0).len != 0 or isAliasName(name0)) {
+    if (b.module.funcsBySimpleName(name0).len != 0 or ir.isAliasName(name0)) {
         const this_idx = try b.recordCapture("this");
         orEmitAudit(b, "implicit_this_call_global_fallback", "CallMemberOrGlobal", name0);
         try b.push(.{ .CallMemberOrGlobal = .{
@@ -5428,7 +5306,7 @@ fn lowerUnresolvedBareCall(
     // the implicit receiver. Bind the global directly: routing it through
     // `CallMemberOrGlobal` would let the member/extension probe treat it as an
     // extension on `this` and prepend the receiver into its varargs.
-    if (isAliasName(name0) and !b.module.registry.class_member_names.contains(name0)) {
+    if (ir.isAliasName(name0) and !b.module.registry.class_member_names.contains(name0)) {
         orEmitAudit(b, "unresolved_bare_call", "LoadGlobal", name0);
         const callee_r = b.allocReg();
         const nm0 = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -6028,6 +5906,45 @@ fn freeFunc(func: Func) void {
     }
     testing.allocator.free(func.blocks);
     if (func.capture_order.len != 0) testing.allocator.free(func.capture_order);
+}
+
+test "buildArgShapes: literal, lambda, spread, and named argument shapes" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+
+    const lit = Expr{ .IntLit = .{ .value = 7, .kind = .Int, .span = dummySpan() } };
+    var lam_params = [_]ast.Ident{.{ .name = "x", .span = dummySpan() }};
+    const lam = Expr{ .Lambda = .{
+        .params = &lam_params,
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    var spread_inner = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
+    const spread = Expr{ .Spread = .{ .expr = &spread_inner, .span = dummySpan() } };
+
+    const args = [_]Expr{ lit, lam, spread };
+    const names = [_]?[]const u8{ null, "block", null };
+    const shapes = try buildArgShapes(&b, &args, &names);
+    defer b.allocator.free(shapes);
+
+    try testing.expectEqual(@as(usize, 3), shapes.len);
+    // Literal Int argument: numeric literal kind, not a lambda / spread.
+    try testing.expect(shapes[0].literal_kind == .numeric);
+    try testing.expect(!shapes[0].is_lambda);
+    try testing.expect(!shapes[0].is_spread);
+    try testing.expect(shapes[0].named == null);
+    try testing.expect(shapes[0].lambda_arity == null);
+    // Named lambda argument: one declared param, bound to name "block".
+    try testing.expect(shapes[1].is_lambda);
+    try testing.expectEqual(@as(?u8, 1), shapes[1].lambda_arity);
+    try testing.expectEqualStrings("block", shapes[1].named.?);
+    try testing.expect(shapes[1].literal_kind == null);
+    // Spread argument.
+    try testing.expect(shapes[2].is_spread);
+    try testing.expect(!shapes[2].is_lambda);
+    try testing.expect(shapes[2].named == null);
 }
 
 test "lowers null literal" {
