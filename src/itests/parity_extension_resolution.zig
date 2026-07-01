@@ -519,3 +519,30 @@ test "bare_call_applicable_inner_candidate_throw_propagates" {
     ;
     try assertKlio("bare_call_ran_throw_propagates", src, "caught boom1\n");
 }
+
+test "fn_typed_receiver_ext_bare_call_binds_top_level" {
+    // Inside an extension on a *function type*, a bare call to a top-level
+    // function must bind that function statically: the receiver is a
+    // callable with no members, so nothing can shadow the top-level target.
+    // Deferring to the runtime member-first walk lets the SAM arm invoke the
+    // receiver itself with the call's arguments (the kotlinx.coroutines
+    // `runSafely` wedge: the coroutine body ran in place of the same-file
+    // helper and the completion was never resumed).
+    const src =
+        \\fun relayParcel(tag: String, block: () -> Unit) {
+        \\    println("top:" + tag)
+        \\    block()
+        \\}
+        \\
+        \\fun ((String, () -> Unit) -> Unit).fire(tag: String) {
+        \\    relayParcel(tag) { println("armed") }
+        \\}
+        \\
+        \\fun main() {
+        \\    val f: (String, () -> Unit) -> Unit = { t, _ -> println("receiver:" + t) }
+        \\    f.fire("x")
+        \\}
+        \\
+    ;
+    try assertKlio("fn_typed_recv_bare_call", src, "top:x\narmed\n");
+}

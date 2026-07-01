@@ -4474,7 +4474,8 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
 fn resolveCtxFor(b: *FuncBuilder, name0: []const u8, ast_type_args: []const ast.TypeRef, cast_pick: ?FuncId) ir.Module.ResolveCtx {
     return .{
         .in_receiver_context = inReceiverContext(b),
-        .unknown_receiver = b.capturesThisSlot() or b.isParamThunk() or b.recvTy() != null,
+        .unknown_receiver = b.capturesThisSlot() or b.isParamThunk() or
+            (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name0)),
         .enclosing_has_member = b.hasEnclosingMember(name0),
         .has_type_args = ast_type_args.len != 0,
         .cast_pick = cast_pick,
@@ -4825,6 +4826,20 @@ fn inReceiverContext(b: *const FuncBuilder) bool {
         b.isParamThunk() or b.recvTy() != null;
 }
 
+/// An extension declared on a *function type* (`(suspend () -> T).start…`)
+/// has a receiver with no members a bare call could bind: a function value's
+/// only member surface is `invoke`/`call`. Deferring a resolved top-level call
+/// to the runtime member-first walk from such a body is not just unnecessary,
+/// it is wrong — the runtime's SAM arm invokes a callable receiver for any
+/// member name no extension claims, so `runSafely(completion) { … }` inside
+/// `startCoroutineCancellable` would call the suspend block itself instead of
+/// the same-file top-level `runSafely`, silently discarding the completion.
+fn fnTypedRecvCannotShadow(b: *const FuncBuilder, name: []const u8) bool {
+    const rt = b.recvTy() orelse return false;
+    if (!std.mem.eql(u8, rt, "<function>")) return false;
+    return !std.mem.eql(u8, name, "invoke") and !std.mem.eql(u8, name, "call");
+}
+
 /// Whether a bare name in an implicit-receiver context could bind to a member
 /// of that receiver, so a static bind to a same-named top-level function would
 /// wrongly shadow it. Used to decide whether to defer a resolved bare call to
@@ -4837,7 +4852,8 @@ fn inReceiverContext(b: *const FuncBuilder) bool {
 /// enclosing class(es), checked precisely by `hasEnclosingMember`. Any other
 /// in-scope receiver falls back to the program-wide member-name set.
 fn memberShadowPossible(b: *const FuncBuilder, name: []const u8) bool {
-    if (b.capturesThisSlot() or b.isParamThunk() or b.recvTy() != null) return true;
+    if (b.capturesThisSlot() or b.isParamThunk() or
+        (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name))) return true;
     if (b.hasEnclosingMember(name)) return true;
     return b.module.registry.class_member_names.contains(name);
 }
