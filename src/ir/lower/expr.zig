@@ -5583,6 +5583,26 @@ fn lowerFqnGlobalCall(
     return null;
 }
 
+/// The simple head of a type name: drop a package qualifier and any generic
+/// arguments (`kotlin.collections.Iterable<Int>` -> `Iterable`).
+fn typeHead(s: []const u8) []const u8 {
+    var t = s;
+    if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
+    if (std.mem.lastIndexOfScalar(u8, t, '.')) |dot| t = t[dot + 1 ..];
+    return std.mem.trim(u8, t, " ");
+}
+
+/// The static-type head of a call argument when it is a plain local whose
+/// declared type is known — used to disambiguate cast-rebound overloads by
+/// parameter type (an `Iterable<Int>` arg must not bind an `IntRange` param).
+fn argStaticHead(b: *FuncBuilder, a: *const Expr) ?[]const u8 {
+    if (a.* != .Path) return null;
+    const p = a.Path;
+    if (p.segments.len != 1) return null;
+    if (b.localDeclType(p.segments[0].name)) |t| return typeHead(t);
+    return null;
+}
+
 /// The fallback member-call path: local-callable shadowing, super, cast-receiver
 /// static dispatch, and plain CallMember.
 fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
@@ -5681,6 +5701,12 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         const cast_ty = receiver.As.ty;
         const want_user = args.len;
         var chosen: ?FuncId = null;
+        // Among candidates matching the cast receiver type and arity, prefer the
+        // one whose parameter-type heads match the argument static-type heads.
+        // A bare first-match would bind e.g. an `Iterable<Int>` argument to an
+        // `IntRange` parameter (distinct, non-assignable types) when both slice
+        // overloads share the receiver type and arity.
+        var chosen_score: i32 = -1;
         for (b.module.funcsBySimpleName(name.name)) |fid| {
             const f = b.module.funcById(fid) orelse continue;
             if (!f.hasBody()) continue;
@@ -5703,9 +5729,16 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
                 if (want_user > user) break :blk f.params.len != 0 and f.params[f.params.len - 1].is_vararg;
                 break :blk false;
             };
-            if (arity_ok) {
+            if (!arity_ok) continue;
+            var score: i32 = 0;
+            for (args, 0..) |*a, i| {
+                if (i + 1 >= f.params.len) break;
+                const at = argStaticHead(b, a) orelse continue;
+                if (std.mem.eql(u8, at, typeHead(f.params[i + 1].ty.name))) score += 2;
+            }
+            if (score > chosen_score) {
                 chosen = fid;
-                break;
+                chosen_score = score;
             }
         }
         if (chosen) |func_id| {

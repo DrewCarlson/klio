@@ -974,6 +974,12 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         }
     }
     try bindParams(&b, names.items);
+    // Record each declared parameter's static type head so a cast-rebound call
+    // can disambiguate overloads by an argument that names a parameter (an
+    // `Iterable<Int>` parameter must not bind an `IntRange`-typed overload slot).
+    for (f.params) |*p| {
+        try b.setLocalDeclType(p.name.name, p.ty.name.name);
+    }
     // Labeled-receiver alias: `this@<fn>` names this function's receiver. A
     // qualified `this@fn` in a nested lambda (e.g.
     // `sequence { for (x in this@mine) ... }`) then captures this receiver
