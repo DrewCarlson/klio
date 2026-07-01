@@ -28,7 +28,7 @@ ACTUALS = [
 # Only the new scorer/member audit lines — NOT the pre-existing lowering
 # resolve-detector (`call`/`inline`/`ref` ... grade=tier_correction), which is
 # the index correcting the heuristic and is expected/informational.
-DIV = re.compile(r"\] (member|scorer|named) ")
+DIV = re.compile(r"\] (member|scorer|named|call2) ")
 NORM = [
     (re.compile(r"name=\S+"), "name=X"),
     (re.compile(r"_fid=\d+"), "_fid=N"),

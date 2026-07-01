@@ -8,6 +8,7 @@ const std = @import("std");
 const ast = @import("ast");
 const runtime = @import("runtime");
 const ir = @import("../ir.zig");
+const applicability = @import("applicability");
 const build = @import("../build.zig");
 
 const helpers = @import("helpers.zig");
@@ -3831,6 +3832,52 @@ fn argLitKind(e: *const Expr) ?LitKind {
     };
 }
 
+/// Declared parameter arity of a single lambda / anon-fun argument
+/// expression, or null when it is neither. A zero-`->` `{ … }` (its `it`
+/// injected by the parser) reports 0 — the literal declares no parameters,
+/// so overload resolution treats it as a `() -> R` handler.
+fn astArgLambdaArity(arg: *const Expr) ?u8 {
+    return switch (arg.*) {
+        .Lambda => |l| if (l.implicit_it) @as(u8, 0) else @intCast(l.params.len),
+        .AnonFun => |af| @intCast(af.params.len),
+        else => null,
+    };
+}
+
+/// One argument's applicability `ArgShape` at LOWERING time. Only the
+/// fields lowering can prove cheaply and soundly are populated — named /
+/// spread / lambda binding shape and a literal kind; `ty` /
+/// `runtime_class` / `lambda_param_types` / `value` stay null, so the
+/// shared scorer treats the arg as UNKNOWN (base points, never disproven)
+/// wherever the type is not statically decidable.
+fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicability.ArgShape {
+    _ = b;
+    return .{
+        .named = name,
+        .is_spread = arg.* == .Spread,
+        .is_lambda = arg.* == .Lambda or arg.* == .AnonFun,
+        .lambda_arity = astArgLambdaArity(arg),
+        .literal_kind = if (argLitKind(arg)) |k| switch (k) {
+            .numeric => .numeric,
+            .string => .string,
+            .boolean => .boolean,
+            .char => .char,
+        } else null,
+    };
+}
+
+/// Build the `[]ArgShape` for a call's argument list once, before the
+/// `resolveCall` query, replacing the per-rung `findCand` / `arityMatch`
+/// walks. Borrows from `b.allocator` (a lowering scratch arena).
+fn buildArgShapes(b: *FuncBuilder, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error![]applicability.ArgShape {
+    const shapes = try b.allocator.alloc(applicability.ArgShape, args.len);
+    for (args, 0..) |*a, i| {
+        const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+        shapes[i] = shapeOfAstArg(b, a, nm);
+    }
+    return shapes;
+}
+
 /// Builtin value kind a declared parameter type accepts, or null when unknown
 /// (a user class, a type parameter, `Any`, …) — those never disprove.
 fn paramLitKind(type_name: []const u8) ?LitKind {
@@ -4132,6 +4179,9 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     }
     const index_pick = index_res.pick();
     resolveAudit(b, name0, segments[0].span.file, want, last_arg_lambda, bare_func_id, rung, index_res, shadowed_by_class, prefer_member);
+    if (!shadowed_by_class) {
+        try call2Audit(b, name0, segments[0].span.file, args, ast_arg_names, ast_type_args, bare_func_id, index_res, was_cast, cast_pick);
+    }
 
     // A known stdlib host-intrinsic global (alias) (`min`, `max`, …) whose simple
     // name also has a user overload that does NOT apply to this call (e.g.
@@ -4667,6 +4717,114 @@ fn resolveAuditLog(b: *FuncBuilder, name: []const u8, heuristic: ?FuncId, index:
 fn fqnOf(b: *FuncBuilder, id: FuncId) []const u8 {
     if (b.module.funcById(id)) |f| return f.fqn;
     return "<invalid>";
+}
+
+const EmitForm = ir.Module.EmitForm;
+const LegacyPick = struct { fid: ?FuncId, form: EmitForm };
+
+/// The IR emission form `lowerUnresolvedBareCall` would pick for `name0` in a
+/// receiver context — the classifier shadow of that emitter, no side effects.
+fn legacyUnresolvedForm(b: *FuncBuilder, name0: []const u8, ast_type_args: []const ast.TypeRef) EmitForm {
+    if (isLowerAnonCapture(name0)) return .CallValue;
+    if (isPrimitiveConv(name0) and b.resolve("this") != null) return .CallMember;
+    if (ast_type_args.len != 0 and emptyContainerCreatorArity(name0) != 0 and
+        b.module.funcId(name0) == null and !b.module.registry.class_member_names.contains(name0)) return .CallValue;
+    if (!inReceiverContext(b)) return .CallValue;
+    if (isAliasName(name0) and !b.module.registry.class_member_names.contains(name0)) return .CallValue;
+    return .CallMemberOrGlobal;
+}
+
+/// The form `emitExtBareCall` would pick for an extension `final_id`.
+fn legacyEmitExtForm(b: *FuncBuilder, args: []const Expr, ast_arg_names: []const ?[]const u8, final_id: FuncId, was_cast: bool) EmitForm {
+    const params_len = if (b.module.funcById(final_id)) |f| f.params.len else 0;
+    const synth_names_needed = params_len != 0 and args.len >= 1 and
+        (1 + args.len) < params_len and allNull(ast_arg_names) and lastArgIsLambda(args);
+    if (!synth_names_needed and !was_cast) {
+        if (b.capturesThisSlot()) return .CallMemberOrGlobal;
+        return .CallMember;
+    }
+    return .Call;
+}
+
+/// The (target, form) `emitBareFuncCall` would emit for a resolved `final_id`.
+fn legacyEmitBareForm(b: *FuncBuilder, name0: []const u8, args: []const Expr, ast_arg_names: []const ?[]const u8, ast_type_args: []const ast.TypeRef, final_id: FuncId, was_cast: bool) LegacyPick {
+    if (!isNonExt(b, final_id)) {
+        const this_avail = b.resolve("this") != null or b.knowsOuter("this") or b.capturesThisSlot();
+        if (this_avail) return .{ .fid = final_id, .form = legacyEmitExtForm(b, args, ast_arg_names, final_id, was_cast) };
+        // No `this` in scope — falls through to the static Call arms below.
+    }
+    const callee_is_tailrec = blk: {
+        if (b.module.funcById(final_id)) |f| {
+            if (f.is_tailrec) break :blk true;
+        }
+        for (b.module.tailrec_fn_names.items) |n| {
+            if (std.mem.eql(u8, n, name0)) break :blk true;
+        }
+        break :blk false;
+    };
+    if (b.tailrecSelf() != null and callee_is_tailrec and allNull(ast_arg_names)) {
+        return .{ .fid = final_id, .form = .Call };
+    }
+    if (inReceiverContext(b) and !was_cast and ast_type_args.len == 0 and memberShadowPossible(b, name0)) {
+        return .{ .fid = final_id, .form = .CallMemberOrGlobal };
+    }
+    return .{ .fid = final_id, .form = .Call };
+}
+
+/// The (target, form) the legacy `lowerPathCall` bound path emits for a
+/// resolved `bare_func_id`: the ext member-first defer, or the
+/// `preferredBareTarget`-refined `emitBareFuncCall` shape.
+fn legacyBoundPickForm(b: *FuncBuilder, name0: []const u8, args: []const Expr, ast_arg_names: []const ?[]const u8, ast_type_args: []const ast.TypeRef, bare_func_id: FuncId, index_pick: ?FuncId, was_cast: bool) LegacyPick {
+    if (!isNonExt(b, bare_func_id) and inReceiverContext(b) and memberShadowPossible(b, name0)) {
+        return .{ .fid = bare_func_id, .form = legacyUnresolvedForm(b, name0, ast_type_args) };
+    }
+    const final_id = preferredBareTarget(b, bare_func_id, index_pick);
+    return legacyEmitBareForm(b, name0, args, ast_arg_names, ast_type_args, final_id, was_cast);
+}
+
+/// Shadow the `resolveCall` result against the legacy bound pick and emit a
+/// `call2` divergence line on any target / emit-form mismatch. The legacy
+/// ladder stays the live pick; this only compares. Gated to the bound path
+/// (`bare_func_id != null`) — the legacy "pick" the migration is judged on.
+fn call2Audit(
+    b: *FuncBuilder,
+    name0: []const u8,
+    file: ir.FileId,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    bare_func_id: ?FuncId,
+    index_res: ir.Module.BareCallResolution,
+    was_cast: bool,
+    cast_pick: ?FuncId,
+) Allocator.Error!void {
+    if (!resolveAuditOn()) return;
+    const heur = bare_func_id orelse return;
+
+    const legacy = legacyBoundPickForm(b, name0, args, ast_arg_names, ast_type_args, heur, index_res.pick(), was_cast);
+
+    const shapes = try buildArgShapes(b, args, ast_arg_names);
+    defer b.allocator.free(shapes);
+    const ctx = ir.Module.ResolveCtx{
+        .in_receiver_context = inReceiverContext(b),
+        .unknown_receiver = b.capturesThisSlot() or b.isParamThunk() or b.recvTy() != null,
+        .enclosing_has_member = b.hasEnclosingMember(name0),
+        .has_type_args = ast_type_args.len != 0,
+        .cast_pick = cast_pick,
+        .recv_ty = b.recvTy(),
+        .is_value_capture = b.knowsOuter(name0) and b.resolve(name0) == null,
+    };
+    const rc = try b.module.resolveCall(b.allocator, name0, b.self_package, file, shapes, lastArgIsLambda(args), ctx);
+    defer b.allocator.free(rc.candidate_set);
+
+    const legacy_fid: i64 = if (legacy.fid) |f| @intCast(f.int()) else -1;
+    const rc_fid: i64 = if (rc.target) |f| @intCast(f.int()) else -1;
+    const divergent = legacy_fid != rc_fid or legacy.form != rc.emit_form;
+    if (!divergent) return;
+    std.debug.print(
+        "[KLIO_RESOLVE_AUDIT] call2 name={s} legacy_fid={d} rc_fid={d} legacy_form={s} rc_form={s} divergent={d}\n",
+        .{ name0, legacy_fid, rc_fid, @tagName(legacy.form), @tagName(rc.emit_form), @intFromBool(divergent) },
+    );
 }
 
 fn matchesRecv(b: *FuncBuilder, fid: FuncId, recv: []const u8) bool {
@@ -6028,6 +6186,45 @@ fn freeFunc(func: Func) void {
     }
     testing.allocator.free(func.blocks);
     if (func.capture_order.len != 0) testing.allocator.free(func.capture_order);
+}
+
+test "buildArgShapes: literal, lambda, spread, and named argument shapes" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+
+    const lit = Expr{ .IntLit = .{ .value = 7, .kind = .Int, .span = dummySpan() } };
+    var lam_params = [_]ast.Ident{.{ .name = "x", .span = dummySpan() }};
+    const lam = Expr{ .Lambda = .{
+        .params = &lam_params,
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    var spread_inner = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
+    const spread = Expr{ .Spread = .{ .expr = &spread_inner, .span = dummySpan() } };
+
+    const args = [_]Expr{ lit, lam, spread };
+    const names = [_]?[]const u8{ null, "block", null };
+    const shapes = try buildArgShapes(&b, &args, &names);
+    defer b.allocator.free(shapes);
+
+    try testing.expectEqual(@as(usize, 3), shapes.len);
+    // Literal Int argument: numeric literal kind, not a lambda / spread.
+    try testing.expect(shapes[0].literal_kind == .numeric);
+    try testing.expect(!shapes[0].is_lambda);
+    try testing.expect(!shapes[0].is_spread);
+    try testing.expect(shapes[0].named == null);
+    try testing.expect(shapes[0].lambda_arity == null);
+    // Named lambda argument: one declared param, bound to name "block".
+    try testing.expect(shapes[1].is_lambda);
+    try testing.expectEqual(@as(?u8, 1), shapes[1].lambda_arity);
+    try testing.expectEqualStrings("block", shapes[1].named.?);
+    try testing.expect(shapes[1].literal_kind == null);
+    // Spread argument.
+    try testing.expect(shapes[2].is_spread);
+    try testing.expect(!shapes[2].is_lambda);
+    try testing.expect(shapes[2].named == null);
 }
 
 test "lowers null literal" {

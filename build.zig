@@ -29,10 +29,12 @@ const mod_list = [_]Mod{
     .{ .name = "pack", .deps = &.{ "ast", "span", "types" }, .tested = true },
     .{ .name = "parser", .deps = &.{ "ast", "diagnostics", "lexer", "span" }, .tested = true },
     .{ .name = "jit", .tested = true },
-    .{ .name = "ir", .deps = &.{ "span", "ast", "types", "runtime", "diagnostics", "jit" }, .tested = true },
+    .{ .name = "ir", .deps = &.{ "span", "ast", "types", "runtime", "diagnostics", "jit", "applicability" }, .tested = true },
     // Shared overload-resolution applicability engine. Lives inside the ir
     // module's directory but is its own module (it depends on ir for TypeRef /
-    // Param / FuncId) so the runtime scorers can import it.
+    // Param / FuncId) so the runtime scorers can import it. `ir` in turn
+    // imports it for the lowering-time `resolveCall` scorer; Zig permits the
+    // module cycle since neither side forms a comptime dependency loop.
     .{ .name = "applicability", .deps = &.{ "ir", "span" }, .src = "src/ir/applicability.zig", .tested = true },
     .{ .name = "stdlib", .deps = &.{ "runtime", "pack" }, .tested = true },
     .{ .name = "cfa", .deps = &.{ "ast", "diagnostics", "lexer", "parser", "span", "types" }, .tested = true },

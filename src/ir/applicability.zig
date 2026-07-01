@@ -359,7 +359,12 @@ fn isFunctionTypeRef(ty: *const TypeRef) bool {
 }
 
 fn paramHasDefault(sig: *const SigView, i: usize) bool {
-    const defs = sig.defaults orelse return false;
+    // A null `defaults` slice is the lowering adapter (`sigViewForApplicability`):
+    // it cannot read the `ProgramImage`-side default-thunk table, so it carries
+    // the flag on the params instead. The runtime callers always set a non-null
+    // `defaults` and never reach this fallback.
+    const defs = sig.defaults orelse
+        return i < sig.params.len and sig.params[i].has_default;
     return i < defs.len and defs[i] != null;
 }
 
@@ -942,6 +947,25 @@ test "applicable: under-application with a default scores with the -1 penalty" {
     // 100 (exact head) - 1 (under-application) == 99.
     try testing.expectEqual(@as(i32, 99), sc.points);
     try testing.expect(!sc.exact_arity);
+}
+
+test "applicable: null defaults falls back to the param has_default flag" {
+    // The lowering adapter (`sigViewForApplicability`) leaves `defaults` null
+    // and carries the default on the param, so under-application still ranks.
+    var p = [_]Param{
+        .{ .name = "a", .ty = tref("Int"), .default = null },
+        .{ .name = "b", .ty = tref("Int"), .default = null },
+    };
+    p[1].has_default = true;
+    const sig = SigView{ .params = &p, .defaults = null };
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    const sc = applicable(&sig, &args, .{}).?;
+    // 100 (exact head) - 1 (under-application) == 99.
+    try testing.expectEqual(@as(i32, 99), sc.points);
+    try testing.expect(!sc.exact_arity);
+    // Without the flag the same under-application is inapplicable.
+    p[1].has_default = false;
+    try testing.expect(applicable(&sig, &args, .{}) == null);
 }
 
 test "builtinSupersOf: union table adds Collection and StringBuilder rows" {

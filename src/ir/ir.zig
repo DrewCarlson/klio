@@ -11,6 +11,7 @@ const std = @import("std");
 const span = @import("span");
 const ast = @import("ast");
 const runtime = @import("runtime");
+const applicability = @import("applicability");
 const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
@@ -1481,6 +1482,31 @@ pub const Module = struct {
         return f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
     }
 
+    /// The applicability `SigView` for a candidate at LOWERING time
+    /// (distinct from the module-internal `SigView` above, which the
+    /// index uses only for the `sameUserSig` identity check). Strips a
+    /// leading synthesized `this` so the shared scorer ranks value args
+    /// against user parameters, and returns null for a bodyless stub —
+    /// those are ranked by the INDEX arity gate, never here.
+    ///
+    /// `func_defaults` lives on `ProgramImage`, not on `Module`, so the
+    /// lowering adapter cannot read it; it carries defaults on the params
+    /// (`paramHasDefault`'s null-`defaults` fallback).
+    fn sigViewForApplicability(self: *const Module, id: FuncId) ?applicability.SigView {
+        const f = self.funcById(id) orelse return null;
+        if (!f.hasBody()) return null;
+        const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
+        return .{
+            .params = f.params[off..],
+            .defaults = null,
+            .has_body = true,
+            .low_priority = f.low_priority,
+            .is_member = off == 1 and f.kind == .instance_method,
+            .is_extension = off == 1,
+            .fid = id,
+            .package = f.package,
+        };
+    }
 
     /// Why the symbol index declined to resolve a bare call. Every
     /// deferral carries one of these so an audit sweep can prove that
@@ -1873,6 +1899,360 @@ pub const Module = struct {
         else
             .arity_mismatch;
         return .{ .outcome = .{ .deferred = reason }, .tier = best_tier, .tier_count = 0 };
+    }
+
+    // -----------------------------------------------------------------
+    // `resolveCall` — the single index-primary, type-aware, 3-tier
+    // bare-call resolver (docs/plans/p3-resolvecall-design.md §1). Built
+    // additively and shadowed behind KLIO_RESOLVE_AUDIT against the
+    // current lowering ladder until zero-disagreement; the legacy ladder
+    // stays the live pick until the flip.
+    // -----------------------------------------------------------------
+
+    /// The three-tier static/dynamic boundary as a resolver verdict.
+    ///   exact   — a committed static target; the emitted IR is a direct Call.
+    ///   virtual — the slot / candidate is static, the leaf chosen at runtime
+    ///             (member-vs-global on an implicit receiver, or a receiver-
+    ///             bound extension): CallMember / CallMemberOrGlobal.
+    ///   deferred— no static target: unknown receiver or no unique applicable
+    ///             candidate; the runtime probe.
+    pub const Confidence = enum { exact, virtual, deferred };
+
+    /// The IR emission shape the lowerer switches on — one enum in place of
+    /// the per-path re-decision across emitBareFuncCall / emitExtBareCall /
+    /// lowerImplicitThisCall / lowerUnresolvedBareCall.
+    pub const EmitForm = enum {
+        Call,
+        CallMember,
+        CallMemberOrGlobal,
+        CallValue,
+    };
+
+    /// A resolved bare call: the committed target (null on a pure deferral),
+    /// its confidence, the IR emission form, the in-scope candidate set for
+    /// the runtime walk / diagnostics, and the index classification carried
+    /// through unchanged.
+    pub const Resolution = struct {
+        target: ?FuncId,
+        confidence: Confidence,
+        emit_form: EmitForm,
+        candidate_set: []const FuncId = &.{},
+        reason: ?ResolveDeferReason = null,
+        tier: u8 = 255,
+        tier_count: usize = 0,
+    };
+
+    /// The receiver-context bits the lowerer computes on the FuncBuilder,
+    /// passed in so `resolveCall` stays a pure function of (call site, sig
+    /// index, receiver context) and never reaches into FuncBuilder. Each
+    /// field maps 1:1 to an existing lowering gate.
+    pub const ResolveCtx = struct {
+        in_receiver_context: bool = false,
+        unknown_receiver: bool = false,
+        enclosing_has_member: bool = false,
+        has_type_args: bool = false,
+        cast_pick: ?FuncId = null,
+        recv_ty: ?[]const u8 = null,
+        is_value_capture: bool = false,
+    };
+
+    fn isNonExtFid(self: *const Module, id: FuncId) bool {
+        const f = self.funcById(id) orelse return true;
+        return !funcHasImplicitThis(f);
+    }
+
+    /// Body-bearing, last-param-not-vararg, user arity == want — the body-side
+    /// gate `expr.zig`'s `arityMatch` applies, mirrored here so the receiver
+    /// rebind ranks candidates identically.
+    fn arityMatchFid(self: *const Module, id: FuncId, want: usize) bool {
+        const f = self.funcById(id) orelse return false;
+        if (!f.hasBody()) return false;
+        if (f.params.len != 0 and f.params[f.params.len - 1].is_vararg) return false;
+        return funcUserArity(f) == want;
+    }
+
+    /// The candidate's declared receiver head equals `recv` — a body-bearing
+    /// extension whose synthesized `this` matches the enclosing receiver.
+    fn matchesRecvFid(self: *const Module, id: FuncId, recv: []const u8) bool {
+        const f = self.funcById(id) orelse return false;
+        if (!f.hasBody() or f.params.len == 0) return false;
+        return std.mem.eql(u8, f.params[0].name, "this") and
+            std.mem.eql(u8, f.params[0].ty.name, recv);
+    }
+
+    /// Phase B — the applicability ladder over the simple-name candidate set,
+    /// reproducing the order-based heuristic rungs (non-ext exact, ext exact,
+    /// ext trailing-lambda, non-ext trailing-lambda) with the shared
+    /// `applicable()` as the per-candidate gate. Body-bearing candidates only;
+    /// stubs are the INDEX's domain. Returns null when no candidate applies.
+    fn phaseBLadder(self: *const Module, name: []const u8, args: []const applicability.ArgShape) ?FuncId {
+        const scope = applicability.ApplicabilityScope{};
+        var best: ?FuncId = null;
+        var best_rung: u8 = 255;
+        for (self.funcsBySimpleName(name)) |id| {
+            const f = self.funcById(id) orelse continue;
+            if (f.low_priority) continue;
+            if (f.params.len != 0 and f.params[f.params.len - 1].is_vararg) continue;
+            const sv = self.sigViewForApplicability(id) orelse continue;
+            const sc = applicability.applicable(&sv, args, scope) orelse continue;
+            const is_ext = funcHasImplicitThis(f);
+            const rung: u8 = if (sc.exact_arity)
+                (if (is_ext) 1 else 0)
+            else if (sc.binding.trailing_lambda_param != null)
+                (if (is_ext) 2 else 3)
+            else
+                continue; // under-applied default shape — the heuristic defers it
+            if (rung < best_rung) {
+                best_rung = rung;
+                best = id;
+            }
+        }
+        return best;
+    }
+
+    fn declArityOf(self: *const Module, id: FuncId) ?u32 {
+        return self.decl_user_params.get(id.int());
+    }
+
+    /// A known stdlib host-intrinsic global alias (`min`, `listOf`, …). A bare
+    /// call to such a name whose ladder rungs find no body candidate is left
+    /// to the lowerer's intrinsic routing, not the declared-arity fallback —
+    /// mirrors `expr.zig`'s `isAliasName` so `resolveCall` gates the fallback
+    /// the same way `lowerPathCall` does.
+    fn isAliasNameFor(name: []const u8) bool {
+        const names = [_][]const u8{
+            "maxOf",           "minOf",      "max",                 "min",
+            "print",           "println",    "listOf",              "mutableListOf",
+            "arrayListOf",     "setOf",      "mutableSetOf",        "hashSetOf",
+            "linkedSetOf",     "mapOf",      "mutableMapOf",        "hashMapOf",
+            "linkedMapOf",     "arrayOf",    "arrayOfNulls",        "emptyArray",
+            "emptyList",       "emptySet",   "emptyMap",            "listOfNotNull",
+            "setOfNotNull",    "buildList",  "buildSet",            "buildMap",
+            "buildString",     "TODO",       "error",               "compareValues",
+            "compareValuesBy", "compareBy",  "compareByDescending", "naturalOrder",
+            "reverseOrder",    "sequenceOf", "emptySequence",       "generateSequence",
+            "sequence",
+        };
+        for (names) |n| {
+            if (std.mem.eql(u8, name, n)) return true;
+        }
+        return false;
+    }
+
+    /// The declared-arity fallback, reproducing `expr.zig`'s
+    /// `fallbackByDeclArity`: the order-based `funcId` pick when its declared
+    /// arity fits (or is unknown), otherwise a same-declared-arity candidate,
+    /// with the out-of-scope-fallback-over-in-scope-extension and the
+    /// all-extension-zero-arity guards. Covers the header-stub / intrinsic-
+    /// backed forms the body-only ladder cannot rank. The alias gate stays
+    /// caller-side (a bare alias with no ladder pick leaves the legacy target
+    /// null, which the audit does not compare).
+    fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize) ?FuncId {
+        const fallback = self.funcId(name);
+        const want_u32: u32 = @intCast(want);
+        const fallback_fits = blk: {
+            if (fallback) |fid| {
+                if (self.declArityOf(fid)) |n| break :blk n == want_u32;
+            }
+            break :blk true;
+        };
+        if (fallback) |fid| {
+            const tier = self.bareCallTierOf(fid, name, caller_pkg, caller_file) orelse 255;
+            if (tier == other_package_tier) {
+                for (self.funcsBySimpleName(name)) |cid| {
+                    if (self.isNonExtFid(cid)) continue;
+                    if (self.declArityOf(cid) != want_u32) continue;
+                    const ct = self.bareCallTierOf(cid, name, caller_pkg, caller_file) orelse continue;
+                    if (ct < other_package_tier) return cid;
+                }
+            }
+        }
+        if (fallback_fits) return fallback;
+        for (self.funcsBySimpleName(name)) |fid| {
+            if (self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32) return fid;
+        }
+        for (self.funcsBySimpleName(name)) |fid| {
+            if (!self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32) return fid;
+        }
+        if (want > 0) {
+            var all_ext_zero_arity = self.funcsBySimpleName(name).len != 0;
+            for (self.funcsBySimpleName(name)) |fid| {
+                if (self.isNonExtFid(fid) or self.declArityOf(fid) != 0) {
+                    all_ext_zero_arity = false;
+                    break;
+                }
+            }
+            if (all_ext_zero_arity) return null;
+        }
+        return fallback;
+    }
+
+    /// Index-refined target: the heuristic's ladder pick refined by the
+    /// index's unique FQN target, except a receiver-matched extension the
+    /// index (blind to receivers) would override with its non-extension
+    /// namesake, which the extension retains (`preferredBareTarget`).
+    fn preferredBareTargetLike(self: *const Module, heur: FuncId, index_pick: ?FuncId) FuncId {
+        const idx = index_pick orelse return heur;
+        if (!self.isNonExtFid(heur) and self.isNonExtFid(idx)) return heur;
+        return idx;
+    }
+
+    /// The in-scope candidate set (scopeTier <= `tier`) in sig-index order,
+    /// borrowed from `alloc`. Carried on the virtual / deferred forms for the
+    /// runtime member-first walk and the ambiguity / out-of-scope diagnostics.
+    fn candidateSet(
+        self: *const Module,
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+        tier: u8,
+    ) std.mem.Allocator.Error![]const FuncId {
+        if (tier == 255) return &.{};
+        var list: std.ArrayList(FuncId) = .empty;
+        for (self.funcsBySimpleName(name)) |id| {
+            const f = self.funcById(id) orelse continue;
+            if (self.bareCallTier(f, name, caller_pkg, caller_file) <= tier)
+                try list.append(alloc, id);
+        }
+        return list.toOwnedSlice(alloc);
+    }
+
+    /// The lowest scope tier among the rankable (body, or stub with a declared
+    /// arity record) candidates named `name`, or 255 when none exists.
+    fn lowestVisibleTier(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
+        var best: u8 = 255;
+        for (self.funcsBySimpleName(name)) |id| {
+            const f = self.funcById(id) orelse continue;
+            if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
+            const t = self.bareCallTier(f, name, caller_pkg, caller_file);
+            if (t < best) best = t;
+        }
+        return best;
+    }
+
+    /// Resolve a bare `name` call to a `Resolution{ target, confidence,
+    /// emit_form, candidate_set }` — a pure function of (call site, sig index,
+    /// receiver context). The INDEX (`resolveBareCallIndexed`) establishes the
+    /// winning tier and unique FQN target; the APPLICABILITY ladder ranks the
+    /// tier; the emit form is derived from `(outcome, ctx)` exactly once.
+    ///
+    /// While the legacy lowering ladder stays authoritative (the audited
+    /// migration), `resolveCall` reproduces its pick: the heuristic ladder is
+    /// the primary selector and the index refines it through
+    /// `preferredBareTargetLike`, exactly as `lowerPathCall` does today. The
+    /// flip to index-primary is a later slice.
+    pub fn resolveCall(
+        self: *const Module,
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+        args: []const applicability.ArgShape,
+        last_arg_lambda: bool,
+        ctx: ResolveCtx,
+    ) std.mem.Allocator.Error!Resolution {
+        // Phase A — INDEX (authoritative when it resolves a unique FQN target).
+        var ires = self.resolveBareCallIndexed(name, caller_pkg, caller_file, args.len, last_arg_lambda);
+        if (ctx.cast_pick != null) {
+            switch (ires.outcome) {
+                .deferred => |r| {
+                    if (r == .ambiguous_tier or r == .type_overload)
+                        ires.outcome = .{ .deferred = .cast_disambiguated };
+                },
+                .resolved => {},
+            }
+        }
+        const reason: ?ResolveDeferReason = switch (ires.outcome) {
+            .resolved => null,
+            .deferred => |r| r,
+        };
+        const index_pick = ires.pick();
+
+        // Phase B — APPLICABILITY ladder. A cast at the call site pre-picks the
+        // overload; otherwise the applicable() ladder ranks the body candidates,
+        // then a declared-arity fallback covers the header-stub / intrinsic-
+        // backed forms the ladder (body-only) cannot rank.
+        var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args);
+        if (heur == null and ctx.cast_pick == null and !isAliasNameFor(name)) {
+            heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len);
+        }
+        // Prefer the same-name extension overload whose declared receiver
+        // matches the enclosing extension's receiver.
+        if (heur) |chosen| {
+            if (ctx.recv_ty) |recv| {
+                if (!self.matchesRecvFid(chosen, recv)) {
+                    for (self.funcsBySimpleName(name)) |cid| {
+                        if (self.arityMatchFid(cid, args.len) and self.matchesRecvFid(cid, recv)) {
+                            heur = cid;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        const target: ?FuncId = if (heur) |h| self.preferredBareTargetLike(h, index_pick) else null;
+        const tier: u8 = if (ires.tier != 255) ires.tier else self.lowestVisibleTier(name, caller_pkg, caller_file);
+
+        // Phase C — EMIT FORM.
+        return self.emitFormFor(alloc, name, caller_pkg, caller_file, target, tier, reason, ires.tier_count, ctx);
+    }
+
+    /// Phase C — the single member-vs-global decision, folding the receiver
+    /// gates once. `Call → exact`, `CallMember`/`CallMemberOrGlobal → virtual`
+    /// (target non-null) or `deferred` (target null), `CallValue → deferred`.
+    fn emitFormFor(
+        self: *const Module,
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+        target: ?FuncId,
+        tier: u8,
+        reason: ?ResolveDeferReason,
+        tier_count: usize,
+        ctx: ResolveCtx,
+    ) std.mem.Allocator.Error!Resolution {
+        const member_shadowable = ctx.unknown_receiver or ctx.enclosing_has_member or
+            self.registry.class_member_names.contains(name);
+        const cast_static = if (ctx.cast_pick) |cp| (if (target) |t| cp.int() == t.int() else false) else false;
+        if (target) |t| {
+            const is_ext = if (self.funcById(t)) |f| funcHasImplicitThis(f) else false;
+            if (is_ext) {
+                // Extension member-first defer: in a receiver context a member of
+                // the implicit receiver could shadow the extension, so it
+                // dispatches member-first. Unlike the non-extension gate, a cast
+                // or explicit type arguments do NOT suppress this.
+                if (ctx.in_receiver_context and member_shadowable) {
+                    const cs = try self.candidateSet(alloc, name, caller_pkg, caller_file, tier);
+                    return .{ .target = t, .confidence = .virtual, .emit_form = .CallMemberOrGlobal, .candidate_set = cs, .reason = reason, .tier = tier, .tier_count = tier_count };
+                }
+                // Static-receiver extension bind: a cast keeps the static Call,
+                // otherwise the member-precedence CallMember on `this`.
+                if (cast_static) {
+                    return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
+                }
+                return .{ .target = t, .confidence = .virtual, .emit_form = .CallMember, .reason = reason, .tier = tier, .tier_count = tier_count };
+            }
+            // Non-extension: the member-shadowable gate, suppressed by a cast or
+            // explicit type arguments (the static-resolution forms).
+            const static_ok = cast_static or ctx.has_type_args;
+            const shadow = ctx.in_receiver_context and member_shadowable and !static_ok;
+            if (!shadow) {
+                return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
+            }
+            const cs = try self.candidateSet(alloc, name, caller_pkg, caller_file, tier);
+            return .{ .target = t, .confidence = .virtual, .emit_form = .CallMemberOrGlobal, .candidate_set = cs, .reason = reason, .tier = tier, .tier_count = tier_count };
+        }
+        if (ctx.is_value_capture) {
+            return .{ .target = null, .confidence = .deferred, .emit_form = .CallValue, .reason = reason, .tier = tier, .tier_count = tier_count };
+        }
+        if (ctx.in_receiver_context) {
+            const cs = try self.candidateSet(alloc, name, caller_pkg, caller_file, tier);
+            return .{ .target = null, .confidence = .deferred, .emit_form = .CallMemberOrGlobal, .candidate_set = cs, .reason = reason, .tier = tier, .tier_count = tier_count };
+        }
+        return .{ .target = null, .confidence = .deferred, .emit_form = .CallValue, .reason = reason, .tier = tier, .tier_count = tier_count };
     }
 
     /// Value-position bare-reference resolution: resolve `name` (a bare
@@ -3030,6 +3410,77 @@ test "symbol index distinguishes a stub overload by its declared types" {
 
     const got = m.resolveBareCallIndexed("h2", "app", FileId.from(0), 1, false);
     try testing.expectEqual(Module.ResolveDeferReason.type_overload, deferReasonOf(got).?);
+}
+
+test "resolveCall: an exact non-extension resolves to a static Call" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    const g = try pushTestFunc(&m, a, "g", "app.g", "app", 1);
+    try m.rebuildFuncNameIndex(a);
+    const args = [_]applicability.ArgShape{.{}};
+    const res = try m.resolveCall(a, "g", "app", FileId.from(0), &args, false, .{});
+    defer a.free(res.candidate_set);
+    try testing.expectEqual(Module.EmitForm.Call, res.emit_form);
+    try testing.expectEqual(Module.Confidence.exact, res.confidence);
+    try testing.expectEqual(g.int(), res.target.?.int());
+}
+
+test "resolveCall: a resolved extension in a receiver context defers to CallMemberOrGlobal" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // The only candidate is an extension; the index never resolves an ext, so
+    // Phase B's ladder picks it and Phase C routes it to the member-first walk.
+    const ext = try pushTestFuncOpts(&m, a, "ext", "app.ext", "app", 1, .{ .extension = true });
+    try m.rebuildFuncNameIndex(a);
+    const args = [_]applicability.ArgShape{.{}};
+    const res = try m.resolveCall(a, "ext", "app", FileId.from(0), &args, false, .{
+        .in_receiver_context = true,
+        .unknown_receiver = true,
+    });
+    defer a.free(res.candidate_set);
+    try testing.expectEqual(Module.EmitForm.CallMemberOrGlobal, res.emit_form);
+    try testing.expectEqual(Module.Confidence.virtual, res.confidence);
+    try testing.expectEqual(ext.int(), res.target.?.int());
+}
+
+test "resolveCall: a type-distinguishable stub overload defers to a receiver probe" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // Two same-arity stubs of different declared types under an intrinsic-
+    // alias name: the index classifies type_overload; the applicability ladder
+    // is body-only and the declared-arity fallback is gated off for aliases,
+    // so Phase B finds nothing and the call defers to the runtime probe.
+    const s1 = try pushTestFuncOpts(&m, a, "minOf", "app.minOf", "app", 0, .{ .stub = true });
+    try m.decl_user_arity.put(s1.int(), .{ .required = 1, .total = 1, .has_vararg = false });
+    try putTestDeclSig(&m, a, s1, "Int", 1);
+    const s2 = try pushTestFuncOpts(&m, a, "minOf", "app.x.minOf", "app", 0, .{ .stub = true });
+    try m.decl_user_arity.put(s2.int(), .{ .required = 1, .total = 1, .has_vararg = false });
+    try putTestDeclSig(&m, a, s2, "String", 1);
+    try m.rebuildFuncNameIndex(a);
+    const args = [_]applicability.ArgShape{.{}};
+    const res = try m.resolveCall(a, "minOf", "app", FileId.from(0), &args, false, .{ .in_receiver_context = true });
+    defer a.free(res.candidate_set);
+    try testing.expectEqual(Module.ResolveDeferReason.type_overload, res.reason.?);
+    try testing.expect(res.target == null);
+    try testing.expectEqual(Module.EmitForm.CallMemberOrGlobal, res.emit_form);
+    try testing.expectEqual(Module.Confidence.deferred, res.confidence);
+}
+
+test "resolveCall: a shadowed value capture defers to CallValue" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // No same-name top-level function exists; the name is a captured local.
+    try m.rebuildFuncNameIndex(a);
+    const args = [_]applicability.ArgShape{.{}};
+    const res = try m.resolveCall(a, "cb", "app", FileId.from(0), &args, false, .{ .is_value_capture = true });
+    defer a.free(res.candidate_set);
+    try testing.expectEqual(Module.EmitForm.CallValue, res.emit_form);
+    try testing.expectEqual(Module.Confidence.deferred, res.confidence);
+    try testing.expect(res.target == null);
 }
 
 test "symbol index never resolves an extension form" {
