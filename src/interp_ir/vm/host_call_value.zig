@@ -578,6 +578,113 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
             return callValue(self, allocator, callee, positional);
         }
     }
+    // A local function / lambda value (`IrClosure`) called with named arguments
+    // that skip a defaulted parameter must reorder + default-fill against the
+    // closure body's value parameters; callValue binds positionally and would
+    // otherwise land a named arg in the wrong slot (`check(a, b, expectedMod = x)`
+    // dropping `x` into `expectedFd`). Mirrors the direct-FuncId path in
+    // callFuncNamed.
+    if (callee.* == .IrClosure) {
+        var any_named = false;
+        for (arg_names) |n| {
+            if (n != null) {
+                any_named = true;
+                break;
+            }
+        }
+        if (any_named) {
+            if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+                const module_ref = self.module.clone();
+                defer module_ref.deinit();
+                const module = info.module orelse module_ref.asPtr();
+                if (module.funcById(info.body_func)) |func| {
+                    const np = info.n_params;
+                    // Named args address the value parameters (`params[0..np]`);
+                    // a vararg among them keeps the positional path below, whose
+                    // callValue vararg packing is already correct.
+                    var has_vararg = false;
+                    for (func.params[0..@min(np, func.params.len)]) |p| {
+                        if (p.is_vararg) {
+                            has_vararg = true;
+                            break;
+                        }
+                    }
+                    if (np != 0 and func.params.len >= np and !has_vararg) {
+                        const params = func.params[0..np];
+                        var slots = try allocator.alloc(?Value, np);
+                        defer allocator.free(slots);
+                        for (slots) |*s| s.* = null;
+                        // Bind named arguments to their declared slots.
+                        for (args, 0..) |a, i| {
+                            if (i < arg_names.len) {
+                                if (arg_names[i]) |nm| {
+                                    for (params, 0..) |p, pos| {
+                                        if (std.mem.eql(u8, p.name, nm)) {
+                                            slots[pos] = a;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Fill unnamed positional args into the remaining slots.
+                        var pidx: usize = 0;
+                        for (args, 0..) |a, i| {
+                            const is_named = i < arg_names.len and arg_names[i] != null;
+                            if (is_named) continue;
+                            while (pidx < np and slots[pidx] != null) pidx += 1;
+                            if (pidx < np) {
+                                slots[pidx] = a;
+                                pidx += 1;
+                            }
+                        }
+                        // Materialize a full positional vector, evaluating each
+                        // omitted slot's default-arg thunk (holes as well as the
+                        // tail). Keyed by main-module ids, so a sub-module closure
+                        // has no defaults table.
+                        const defaults: ?[]?FuncId = blk: {
+                            if (info.module != null) break :blk null;
+                            const pg = self.prog.borrow();
+                            defer pg.deinit();
+                            break :blk pg.get().func_defaults.get(info.body_func.int());
+                        };
+                        var positional: std.ArrayList(Value) = .empty;
+                        defer positional.deinit(allocator);
+                        for (slots, 0..) |slot, i| {
+                            if (slot) |v| {
+                                try positional.append(allocator, v);
+                                continue;
+                            }
+                            const dfid: ?FuncId = if (defaults) |d| (if (i < d.len) d[i] else null) else null;
+                            if (dfid) |fid| {
+                                const dfunc = module.funcById(fid) orelse {
+                                    const msg = try std.fmt.allocPrint(allocator, "default-arg FuncId {d} out of range", .{fid.int()});
+                                    return .{ .err = .{ .Type = msg } };
+                                };
+                                // Seed the first bound arg as a capture so a
+                                // receiver-referencing default thunk resolves,
+                                // mirroring padArgsWithDefaults.
+                                var captures: std.ArrayList(Value) = .empty;
+                                if (positional.items.len != 0) {
+                                    try captures.append(allocator, positional.items[0]);
+                                }
+                                var args_copy: std.ArrayList(Value) = .empty;
+                                try args_copy.appendSlice(allocator, positional.items);
+                                const r = try ir.eval.evalWithCaptures(VmHost, allocator, module, dfunc, args_copy, captures, self);
+                                switch (r) {
+                                    .ok => |v| try positional.append(allocator, v),
+                                    .err => |e| return .{ .err = e },
+                                }
+                            } else {
+                                try positional.append(allocator, Value.Null);
+                            }
+                        }
+                        return callValue(self, allocator, callee, positional.items);
+                    }
+                }
+            }
+        }
+    }
     return callValue(self, allocator, callee, args);
 }
 

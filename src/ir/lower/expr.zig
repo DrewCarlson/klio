@@ -3949,10 +3949,20 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
         b.module.funcId(name0) != null;
     if (shadowed_by_local) {
         const callee_r = try resolveCapture(b, name0);
-        const this_reg: ?Reg = if (b.knowsOuter("this") or b.capturesThisSlot())
-            try resolveCapture(b, "this")
+        // Only a captured local *extension* function or a receiver-lambda param
+        // takes the enclosing receiver as a leading `this`; a plain captured
+        // local function (`fun check(a, b)` called from inside a `repeat { }`
+        // lambda) must dispatch as a bare value, or `callValueWithThis`'s
+        // receiver-fills-param heuristic shifts the enclosing `this` into the
+        // first value parameter.
+        const wants_this = b.isLocalExtFn(name0) or b.isReceiverLambdaParam(name0);
+        const this_reg: ?Reg = if (wants_this)
+            (if (b.knowsOuter("this") or b.capturesThisSlot())
+                try resolveCapture(b, "this")
+            else
+                b.resolve("this"))
         else
-            b.resolve("this");
+            null;
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const dst = b.allocReg();
