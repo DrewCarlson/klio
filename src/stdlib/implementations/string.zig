@@ -1906,14 +1906,15 @@ pub fn string_trim_indent(ctx: *CallCtx) Allocator.Error!EvalResult {
     const mi = min_indent orelse 0;
     var out_lines: std.ArrayList([]const u8) = .empty;
     defer out_lines.deinit(ctx.allocator);
-    for (lines.items) |l| {
-        if (lineAllWhitespace(l)) {
-            try out_lines.append(ctx.allocator, "");
-        } else {
-            try out_lines.append(ctx.allocator, try dropLeadingChars(ctx.allocator, l, mi));
-        }
+    // Drop the first line and the last line if blank; every other line (blank or
+    // not) keeps whatever remains after removing the common indent — so a blank
+    // line wider than the common indent retains its extra whitespace.
+    const last_idx = lines.items.len - 1;
+    for (lines.items, 0..) |l, idx| {
+        if ((idx == 0 or idx == last_idx) and lineAllWhitespace(l)) continue;
+        try out_lines.append(ctx.allocator, try dropLeadingChars(ctx.allocator, l, mi));
     }
-    return .{ .ok = try newString(ctx.allocator, try joinTrimBlank(ctx.allocator, out_lines.items)) };
+    return .{ .ok = try newString(ctx.allocator, try joinLines(ctx.allocator, out_lines.items)) };
 }
 
 /// Drop the first `n` Unicode scalars from `l`. Owned slice.
@@ -3021,17 +3022,6 @@ fn normalizeNewlines(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
 }
 
 /// Join lines with `\n` and trim leading/trailing empty lines (trimIndent).
-fn joinTrimBlank(allocator: Allocator, lines: []const []const u8) Allocator.Error![]u8 {
-    // Kotlin's trimIndent drops ONLY the first line if it is blank and the last
-    // line if it is blank — not every leading/trailing blank line. Dropping all
-    // of them loses the trailing newline of a block that ends in a blank line.
-    var start: usize = 0;
-    var stop: usize = lines.len;
-    if (start < stop and lines[start].len == 0) start += 1;
-    if (stop > start and lines[stop - 1].len == 0) stop -= 1;
-    return joinLines(allocator, lines[start..stop]);
-}
-
 fn joinLines(allocator: Allocator, lines: []const []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
