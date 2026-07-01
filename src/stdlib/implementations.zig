@@ -223,6 +223,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.CharSequence.padEnd", .f = string.string_pad_end },
     .{ .fqn = "kotlin.String.chunked", .f = string.string_chunked },
     .{ .fqn = "kotlin.String.split", .f = string.string_split },
+    .{ .fqn = "kotlin.text.split", .f = string.string_split },
     .{ .fqn = "kotlin.String.splitToSequence", .f = string.string_split_to_sequence },
     .{ .fqn = "kotlin.CharSequence.splitToSequence", .f = string.string_split_to_sequence },
     .{ .fqn = "kotlin.String.toDouble", .f = string.string_to_double },
