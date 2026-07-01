@@ -540,6 +540,28 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
                 return dst;
             }
+            // `X::class` where `X` is a bare type/constructor name that has no
+            // IR classId (e.g. an unsigned array `ULongArray`) must load the
+            // type reference directly. Routing it through `lowerReceiver` ->
+            // the implicit-`this` path inside a method would emit `this.X(...)`
+            // and invoke the constructor instead of taking the class literal.
+            if (std.mem.eql(u8, mr.name.name, "class") and
+                mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1)
+            {
+                const rn = mr.receiver.Path.segments[0].name;
+                if (b.resolve(rn) == null and !b.knowsOuter(rn) and
+                    b.module.classId(rn) == null and !b.hasOwnMember(rn) and
+                    !isTopLevelProp(rn))
+                {
+                    const rr = b.allocReg();
+                    const rnm = try b.module.internConst(b.allocator, .{ .String = rn });
+                    try b.push(.{ .LoadGlobal = .{ .dst = rr, .name = rnm } });
+                    const dst = b.allocReg();
+                    const cnm = try b.module.internConst(b.allocator, .{ .String = "class" });
+                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = rr, .name = cnm } });
+                    return dst;
+                }
+            }
             const recv = try lowerReceiver(b, mr.receiver);
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = mr.name.name });

@@ -7414,6 +7414,60 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
     return null;
 }
 
+/// An unsigned primitive-array type (`UIntArray`, `ULongArray`, `UByteArray`,
+/// `UShortArray`) has no IR classId — only the signed arrays do — so its bare
+/// name lowers to the constructor intrinsic/function rather than a class
+/// value. Wrap that as a minimal `KClass` so `X::class.simpleName` reads the
+/// type name and map-key equality (by FQN) matches, like the signed arrays.
+fn syntheticUnsignedArrayClass(allocator: Allocator, name_or_fqn: []const u8) Allocator.Error!?Value {
+    const dot = std.mem.lastIndexOfScalar(u8, name_or_fqn, '.');
+    const simple = if (dot) |i| name_or_fqn[i + 1 ..] else name_or_fqn;
+    const known = [_][]const u8{ "UIntArray", "ULongArray", "UByteArray", "UShortArray" };
+    var matched = false;
+    for (known) |k| {
+        if (std.mem.eql(u8, simple, k)) {
+            matched = true;
+            break;
+        }
+    }
+    if (!matched) return null;
+    const cd = try ObjRef(ClassDef).init(allocator, .{
+        .name = try allocator.dupe(u8, simple),
+        .fqn = try std.fmt.allocPrint(allocator, "kotlin.{s}", .{simple}),
+        .annotation_names = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .body_properties = &.{},
+        .init_blocks = &.{},
+        .init_block_property_positions = &.{},
+        .is_data = false,
+        .is_value = false,
+        .is_object = false,
+        .is_enum = false,
+        .is_sealed = false,
+        .supertype_names = &.{},
+        .parent = null,
+        .interfaces = &.{},
+        .is_interface = false,
+        .is_fun_interface = false,
+        .parent_ctor_args = &.{},
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .is_anonymous = false,
+        .secondary_ctors = &.{},
+        .enum_entries = &.{},
+        .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .nested_classes = &.{},
+        .captured_env = try ObjRef(runtime.Env).init(allocator, runtime.Env.init(allocator)),
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
+        .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+    });
+    return .{ .Class = cd };
+}
+
 pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     // `X::class` is a class reference — return the class itself. For an
     // instance receiver, reach into the runtime ClassDef.
@@ -7422,6 +7476,12 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             const ig = receiver.Instance.borrow();
             defer ig.deinit();
             return .{ .ok = .{ .Class = ig.get().class.clone() } };
+        }
+        if (receiver.* == .Intrinsic) {
+            if (try syntheticUnsignedArrayClass(allocator, receiver.Intrinsic.fqn)) |c| return .{ .ok = c };
+        }
+        if (receiver.* == .Function) {
+            if (try syntheticUnsignedArrayClass(allocator, receiver.Function.decl.name.name)) |c| return .{ .ok = c };
         }
         return .{ .ok = receiver.* };
     }
