@@ -12,6 +12,7 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
+const applicability = @import("applicability");
 
 const vmhost = @import("vmhost.zig");
 const host_globals = @import("host_globals.zig");
@@ -19,6 +20,7 @@ const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const trace = @import("trace.zig");
 const overload_match = @import("overload_match.zig");
+const host_call_func = @import("host_call_func.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -1775,6 +1777,369 @@ fn builtinSupers(nm: []const u8) []const []const u8 {
     return &.{};
 }
 
+// -------------------------------------------------------------------------
+// Shared applicability engine — dual-compute audit (KLIO_RESOLVE_AUDIT).
+//
+// The legacy `pickMethodOverload` / `scoreExtCandidates` selection stays the
+// live path. When the audit gate is on, the shared `applicable()` is computed
+// alongside per candidate and any divergence (per-candidate points / ext_key /
+// chosen winner) is logged. Nothing here changes behavior.
+// -------------------------------------------------------------------------
+
+/// `ArgShape` for one runtime value, in the MEMBER scorer's conventions:
+/// `lambda_arity` from an `IrClosure` only (never `Function`/`Class`, mirroring
+/// `overloadScoreArg`), and `is_lambda` from `isCallable` (the trailing-lambda
+/// gate), not the broader `valueIsCallable`.
+fn shapeOfValueMember(self: *VmHost, v: *const Value) applicability.ArgShape {
+    const arity: ?u8 = switch (v.*) {
+        .IrClosure => |c| if (self.closures.get(@intCast(c.id))) |info| std.math.cast(u8, info.n_params) else null,
+        else => null,
+    };
+    return .{
+        .runtime_class = overload_match.runtimeHead(v),
+        .is_null = v.* == .Null,
+        .is_lambda = isCallable(v),
+        .lambda_arity = arity,
+        .func_typed = std.mem.startsWith(u8, v.typeFqn(), "kotlin.Function"),
+        .value = @ptrCast(v),
+    };
+}
+
+/// Per-candidate `SigView` for the shared scorer, read off the `Func`.
+fn sigViewOfMember(self: *VmHost, f: *const Func, is_ext: bool) applicability.SigView {
+    return .{
+        .params = f.params,
+        .defaults = funcDefaults(self, f),
+        .has_body = f.hasBody(),
+        .low_priority = f.low_priority,
+        .is_member = !is_ext,
+        .is_extension = is_ext,
+        .fid = f.id,
+        .package = f.package,
+    };
+}
+
+/// `ApplicabilityScope.refine`: wraps `refineByDeclaredArgs`.
+fn applicRefineCbM(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyopaque) ?i32 {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const v: *const Value = @ptrCast(@alignCast(value));
+    return overload_match.refineByDeclaredArgs(self, param_ty, v);
+}
+
+/// `ApplicabilityScope.subtype`: the member instance-subtype BFS
+/// (`instanceSubtypeDistance`, simple-name matched — unlike the global BFS).
+fn applicSubtypeCbM(ctx: *anyopaque, value: *const anyopaque, target: []const u8) ?i32 {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const arg: *const Value = @ptrCast(@alignCast(value));
+    if (arg.* != .Instance) return null;
+    const dist = instanceSubtypeDistance(self, arg, target) orelse return null;
+    return @intCast(@min(dist, @as(usize, std.math.maxInt(i32))));
+}
+
+/// `ApplicabilityScope.func_type`: `isFunctionTypeRefResolved`.
+fn applicFuncTypeCbM(ctx: *anyopaque, ty: *const TypeRef) bool {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    return isFunctionTypeRefResolved(self, ty);
+}
+
+/// `ApplicabilityScope.ext_recv_match`: `extReceiverSpecificity`.
+fn applicExtRecvMatchCb(ctx: *anyopaque, value: *const anyopaque, ty_name: []const u8) i32 {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const v: *const Value = @ptrCast(@alignCast(value));
+    return extReceiverSpecificity(self, v, ty_name);
+}
+
+/// `ApplicabilityScope.ext_is_subtype_name`: `isSubtypeName`.
+fn applicExtSubtypeNameCb(ctx: *anyopaque, a: []const u8, b: []const u8) bool {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    return isSubtypeName(self, self.allocator, a, b);
+}
+
+/// `ApplicabilityScope.ext_owner_rank`: member-extension enclosing-chain rank.
+fn applicExtOwnerRankCb(ctx: *anyopaque, fid: FuncId) i32 {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const owner: []const u8 = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        if (!isMemberExt(mod, fid)) return 0;
+        break :blk mod.registry.member_ext_owner_class.get(fid) orelse return 0;
+    };
+    var chain = enclosingChainClassOrder(self, self.allocator) catch return 0;
+    defer chain.deinit(self.allocator);
+    for (chain.items, 0..) |co, pos| {
+        if (std.mem.eql(u8, co, owner)) {
+            return @as(i32, @intCast(chain.items.len)) - @as(i32, @intCast(pos));
+        }
+    }
+    return 0;
+}
+
+/// `ApplicabilityScope.ext_known_package`: `stdlib.isKnownPackage`.
+fn applicKnownPackageCb(pkg: []const u8) bool {
+    return stdlib.isKnownPackage(pkg);
+}
+
+fn optScoreEqM(a: ?i32, b: ?i32) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.? == b.?;
+}
+
+const AUDIT_NA: i32 = std.math.minInt(i32);
+
+/// Raw per-candidate member score (before the `+5` exact / `-1000` low-priority
+/// adjustments), reproducing the multi-candidate `pickMethodOverload` body for
+/// one candidate. `null` = the candidate does not bind. AUDIT ONLY.
+const LegacyMemberScore = struct { points: i32, exact_arity: bool };
+
+fn legacyMemberCandScore(self: *VmHost, f: *const Func, args: []const Value) ?LegacyMemberScore {
+    const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    const effective = f.params[skip..];
+    if (args.len < effective.len and args.len > 0 and effective.len > 0 and
+        isFunctionTypeRefResolved(self, &effective[effective.len - 1].ty) and
+        isCallable(&args[args.len - 1]))
+    {
+        const lead = args.len - 1;
+        const last_param = effective.len - 1;
+        const defaults = funcDefaults(self, f);
+        var gap_defaulted = true;
+        var k: usize = lead;
+        while (k < last_param) : (k += 1) {
+            if (!paramHasDefault(defaults, skip + k)) {
+                gap_defaulted = false;
+                break;
+            }
+        }
+        if (gap_defaulted) {
+            var total: i32 = 0;
+            var ok = true;
+            var j: usize = 0;
+            while (j < lead) : (j += 1) {
+                if (overloadScoreArg(self, &effective[j].ty, &args[j])) |s| total += s else {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                if (overloadScoreArg(self, &effective[last_param].ty, &args[lead])) |s| total += s else ok = false;
+            }
+            if (ok) return .{ .points = total, .exact_arity = false };
+            return null;
+        }
+    }
+    if (args.len > effective.len) return null;
+    if (args.len < effective.len) {
+        const defaults = funcDefaults(self, f);
+        var k: usize = args.len;
+        while (k < effective.len) : (k += 1) {
+            if (!paramHasDefault(defaults, skip + k)) return null;
+        }
+    }
+    var score: i32 = 0;
+    var i: usize = 0;
+    while (i < args.len and i < effective.len) : (i += 1) {
+        if (overloadScoreArg(self, &effective[i].ty, &args[i])) |s| score += s else return null;
+    }
+    return .{ .points = score, .exact_arity = args.len == effective.len };
+}
+
+fn appliedMemberScore(pts: i32, exact_arity: bool, low_priority: bool) i32 {
+    var s = pts;
+    if (exact_arity) s += 5;
+    if (low_priority) s -= 1000;
+    return s;
+}
+
+/// Dual-compute audit for the multi-candidate `pickMethodOverload` scorer.
+fn auditMemberOverload(self: *VmHost, candidates: []const Func, args: []const Value, legacy_best: ?Func) void {
+    var shapes_buf: [32]applicability.ArgShape = undefined;
+    if (args.len > shapes_buf.len) return;
+    for (args, 0..) |*a, i| shapes_buf[i] = shapeOfValueMember(self, a);
+    const shapes = shapes_buf[0..args.len];
+
+    const scope = applicability.ApplicabilityScope{
+        .member = true,
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCbM,
+        .subtype = applicSubtypeCbM,
+        .func_type = applicFuncTypeCbM,
+    };
+
+    var applic_best: ?Func = null;
+    var applic_best_score: i32 = std.math.minInt(i32);
+    const name: []const u8 = if (candidates.len > 0) candidates[0].name else "";
+
+    for (candidates) |f| {
+        const legacy = legacyMemberCandScore(self, &f, args);
+        var sig = sigViewOfMember(self, &f, false);
+        const applic = applicability.applicable(&sig, shapes, scope);
+
+        const legacy_pts: ?i32 = if (legacy) |l| l.points else null;
+        const applic_pts: ?i32 = if (applic) |s| s.points else null;
+        var divergent = !optScoreEqM(legacy_pts, applic_pts);
+        if (legacy != null and applic != null) {
+            if (legacy.?.exact_arity != applic.?.exact_arity) divergent = true;
+            if (f.low_priority != applic.?.low_priority) divergent = true;
+        }
+        if (divergent) {
+            std.debug.print(
+                "[KLIO_RESOLVE_AUDIT] member name={s} cand_fid={d} legacy={d} applic={d} ext_legacy=- ext_applic=- divergent=1\n",
+                .{ name, f.id.int(), legacy_pts orelse AUDIT_NA, applic_pts orelse AUDIT_NA },
+            );
+        }
+        if (applic) |s| {
+            const applied = appliedMemberScore(s.points, s.exact_arity, s.low_priority);
+            if (applic_best == null or applied > applic_best_score) {
+                applic_best_score = applied;
+                applic_best = f;
+            }
+        }
+    }
+
+    const lw: i64 = if (legacy_best) |b| @intCast(b.id.int()) else -1;
+    const aw: i64 = if (applic_best) |b| @intCast(b.id.int()) else -1;
+    if (lw != aw) {
+        std.debug.print(
+            "[KLIO_RESOLVE_AUDIT] member name={s} winner legacy_fid={d} applic_fid={d} divergent=1\n",
+            .{ name, lw, aw },
+        );
+    }
+}
+
+/// The legacy per-candidate `ExtKey`, factored out of `scoreExtCandidates` so
+/// the live loop and the audit share one source of truth.
+fn extKeyForCandidate(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    candidates: []const Candidate,
+    args: []const Value,
+    want: usize,
+    idx: usize,
+    chain_owners: *const std.ArrayList([]const u8),
+) ExtKey {
+    const c = candidates[idx];
+    const f = c.func;
+    const recv_score = overloadScoreArg(self, &f.params[0].ty, receiver) orelse -1;
+    var score: i32 = recv_score *| 1000;
+    var param_spec: i32 = 0;
+    var applic: i32 = 1;
+    for (args, 0..) |*a, i| {
+        if (f.params.len > i + 1) {
+            const arg_score = overloadScoreArg(self, &f.params[i + 1].ty, a);
+            if (arg_score == null and !f.params[i + 1].has_default and !f.params[i + 1].is_vararg) {
+                applic = 0;
+            }
+            score += arg_score orelse -1;
+            if (!isTopOrGenericType(f.params[i + 1].ty.name)) param_spec += 1;
+        }
+    }
+    if (want < f.params.len) {
+        var k = want;
+        while (k < f.params.len) : (k += 1) {
+            if (!f.params[k].has_default and !f.params[k].is_vararg) {
+                applic = 0;
+                break;
+            }
+        }
+    }
+    if (f.params.len == want) score += 5;
+    const recv_match = extReceiverSpecificity(self, receiver, f.params[0].ty.name);
+    var spec: i32 = 0;
+    for (candidates, 0..) |o, j| {
+        if (j == idx) continue;
+        if (isSubtypeName(self, allocator, f.params[0].ty.name, o.func.params[0].ty.name)) spec += 1;
+    }
+    var owner_rank: i32 = 0;
+    {
+        const mg = self.module.borrow();
+        const mod = mg.get();
+        if (isMemberExt(mod, c.fid)) {
+            if (mod.registry.member_ext_owner_class.get(c.fid)) |owner| {
+                for (chain_owners.items, 0..) |co, pos| {
+                    if (std.mem.eql(u8, co, owner)) {
+                        owner_rank = @as(i32, @intCast(chain_owners.items.len)) - @as(i32, @intCast(pos));
+                        break;
+                    }
+                }
+            }
+        }
+        mg.deinit();
+    }
+    const neg_fid: i32 = -@as(i32, @intCast(@intFromEnum(c.fid) & 0x7fff_ffff));
+    const is_user: i32 = @intFromBool(f.package.len == 0 or !stdlib.isKnownPackage(f.package));
+    return .{ applic, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid };
+}
+
+/// Dual-compute audit for the extension ranking `scoreExtCandidates`.
+fn auditScoreExt(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    candidates: []const Candidate,
+    args: []const Value,
+    want: usize,
+    chain_owners: *const std.ArrayList([]const u8),
+    legacy_best: ?Candidate,
+) void {
+    var shapes_buf: [32]applicability.ArgShape = undefined;
+    if (args.len > shapes_buf.len) return;
+    for (args, 0..) |*a, i| shapes_buf[i] = shapeOfValueMember(self, a);
+    const shapes = shapes_buf[0..args.len];
+
+    var sig_buf: [64]applicability.SigView = undefined;
+    if (candidates.len > sig_buf.len) return;
+    for (candidates, 0..) |c, i| sig_buf[i] = sigViewOfMember(self, &c.func, true);
+    const all_sigs = sig_buf[0..candidates.len];
+
+    const recv_shape = shapeOfValueMember(self, receiver);
+    const scope = applicability.ApplicabilityScope{
+        .member = true,
+        .rank_extensions = true,
+        .is_extension = true,
+        .receiver = recv_shape,
+        .all_candidates = all_sigs,
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCbM,
+        .subtype = applicSubtypeCbM,
+        .ext_recv_match = applicExtRecvMatchCb,
+        .ext_is_subtype_name = applicExtSubtypeNameCb,
+        .ext_owner_rank = applicExtOwnerRankCb,
+        .ext_known_package = applicKnownPackageCb,
+    };
+
+    var applic_best: ?Candidate = null;
+    var applic_best_key: ExtKey = .{std.math.minInt(i32)} ** 8;
+    const name: []const u8 = if (candidates.len > 0) candidates[0].func.name else "";
+
+    for (candidates, 0..) |c, idx| {
+        const legacy_key = extKeyForCandidate(self, allocator, receiver, candidates, args, want, idx, chain_owners);
+        var sig = all_sigs[idx];
+        const applic = applicability.applicable(&sig, shapes, scope) orelse continue;
+        const applic_key = applic.ext_key.?;
+        if (!std.mem.eql(i32, &legacy_key, &applic_key)) {
+            std.debug.print(
+                "[KLIO_RESOLVE_AUDIT] member name={s} cand_fid={d} legacy={d} applic={d} ext_legacy={any} ext_applic={any} divergent=1\n",
+                .{ name, c.fid.int(), legacy_key[4], applic_key[4], legacy_key, applic_key },
+            );
+        }
+        if (applic_best == null or extKeyGreater(applic_key, applic_best_key)) {
+            applic_best = c;
+            applic_best_key = applic_key;
+        }
+    }
+
+    const lw: i64 = if (legacy_best) |b| @intCast(b.fid.int()) else -1;
+    const aw: i64 = if (applic_best) |b| @intCast(b.fid.int()) else -1;
+    if (lw != aw) {
+        std.debug.print(
+            "[KLIO_RESOLVE_AUDIT] member name={s} winner legacy_fid={d} applic_fid={d} divergent=1\n",
+            .{ name, lw, aw },
+        );
+    }
+}
+
 /// Default-arg thunk slots recorded for `f` (indexed by lowered-param
 /// position, including the implicit `this` slot), or `null` when none.
 fn funcDefaults(self: *VmHost, f: *const Func) ?[]const ?FuncId {
@@ -2178,6 +2543,9 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
             checkFuncInRange(self, "pickMethodOverload", w.id);
         }
     }
+    // Additive dual-compute audit; the legacy scoring above stays the live
+    // selection.
+    if (host_call_func.resolveAuditOn()) auditMemberOverload(self, candidates, args, best);
     return best;
 }
 
@@ -6673,90 +7041,20 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
     var best: ?Candidate = null;
     var best_key: ExtKey = .{std.math.minInt(i32)} ** 8;
     for (candidates, 0..) |c, idx| {
-        const f = c.func;
-        const recv_score = overloadScoreArg(self, &f.params[0].ty, receiver) orelse -1;
-        var score: i32 = recv_score *| 1000;
-        var param_spec: i32 = 0;
-        // Applicability is Kotlin's hard gate: a candidate whose declared
-        // parameter type a supplied value argument definitely does not
-        // satisfy is removed from the overload set before any specificity
-        // ranking. Without this the receiver-specificity tier could elect an
-        // inapplicable sibling whose receiver matches more tightly (e.g.
-        // `install(RoutingRoot, …)` selecting `Application.install(plugin:
-        // ContentNegotiation, …)` over the generic `Plugin` overload).
-        var applicable: i32 = 1;
-        for (args, 0..) |*a, i| {
-            if (f.params.len > i + 1) {
-                const arg_score = overloadScoreArg(self, &f.params[i + 1].ty, a);
-                if (arg_score == null and !f.params[i + 1].has_default and !f.params[i + 1].is_vararg) {
-                    applicable = 0;
-                }
-                score += arg_score orelse -1;
-                // A concrete (non-top, non-generic) param type that the arg
-                // satisfies is more specific than a top/`Any`/`T` param.
-                if (!isTopOrGenericType(f.params[i + 1].ty.name)) param_spec += 1;
-            }
-        }
-        // Every parameter past the supplied arguments must be defaulted or
-        // vararg, or the candidate cannot bind this call — a 5-param private
-        // `findAnyOf(strings, startIndex, ignoreCase, last)` is not applicable
-        // to `findAnyOf(strings)`, so the 3-param public sibling wins.
-        if (want < f.params.len) {
-            var k = want;
-            while (k < f.params.len) : (k += 1) {
-                if (!f.params[k].has_default and !f.params[k].is_vararg) {
-                    applicable = 0;
-                    break;
-                }
-            }
-        }
-        if (f.params.len == want) score += 5;
-        // Receiver specificity: most-specific receiver-type match wins.
-        const recv_match = extReceiverSpecificity(self, receiver, f.params[0].ty.name);
-        // Subtype specificity: how many other candidates' receiver types are
-        // supertypes of this one.
-        var spec: i32 = 0;
-        for (candidates, 0..) |o, j| {
-            if (j == idx) continue;
-            if (isSubtypeName(self, allocator, f.params[0].ty.name, o.func.params[0].ty.name)) spec += 1;
-        }
-        // Owner rank.
-        var owner_rank: i32 = 0;
-        {
-            const mg = self.module.borrow();
-            const mod = mg.get();
-            if (isMemberExt(mod, c.fid)) {
-                if (mod.registry.member_ext_owner_class.get(c.fid)) |owner| {
-                    for (chain_owners.items, 0..) |co, pos| {
-                        if (std.mem.eql(u8, co, owner)) {
-                            owner_rank = @as(i32, @intCast(chain_owners.items.len)) - @as(i32, @intCast(pos));
-                            break;
-                        }
-                    }
-                }
-            }
-            mg.deinit();
-        }
-        // Stable final discriminator: lowest FuncId. Negated so a smaller id
-        // ranks higher, guaranteeing a unique winner.
-        const neg_fid: i32 = -@as(i32, @intCast(@intFromEnum(c.fid) & 0x7fff_ffff));
-        // A user-program extension outranks a shipped (stdlib / installed-pack)
-        // namesake of equal applicability: a same-package declaration sits at a
-        // higher resolution tier than a default- or import-visible one, so it
-        // wins before receiver/argument specificity is even weighed. The empty
-        // package is always user code (every shipped/pack symbol is packaged),
-        // so the common default-package case skips the registry scan.
-        const is_user: i32 = @intFromBool(f.package.len == 0 or !stdlib.isKnownPackage(f.package));
-        const key: ExtKey = .{ applicable, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid };
+        // The per-candidate ExtKey — applicability is Kotlin's hard gate
+        // (`ext_key[0]`), then user-vs-shipped, subtype specificity, receiver
+        // specificity, the numeric score, owner rank, parameter specificity,
+        // and the stable lowest-FuncId discriminator.
+        const key = extKeyForCandidate(self, allocator, receiver, candidates, args, want, idx, &chain_owners);
         if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
-            tied.append(self.allocator, f) catch {};
+            tied.append(self.allocator, c.func) catch {};
         }
         if (best == null or extKeyGreater(key, best_key)) {
             best = c;
             best_key = key;
             if (check_inv) {
                 tied.clearRetainingCapacity();
-                tied.append(self.allocator, f) catch {};
+                tied.append(self.allocator, c.func) catch {};
             }
         }
     }
@@ -6766,6 +7064,11 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
             checkOverloadUnique(name, &w.func, tied.items);
             checkFuncInRange(self, "scoreExtCandidates", w.fid);
         }
+    }
+    // Additive dual-compute audit; the legacy ranking above stays the live
+    // selection.
+    if (host_call_func.resolveAuditOn()) {
+        auditScoreExt(self, allocator, receiver, candidates, args, want, &chain_owners, best);
     }
     return best;
 }

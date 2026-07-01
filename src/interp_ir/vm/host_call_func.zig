@@ -651,8 +651,9 @@ var resolve_audit_checked: bool = false;
 var resolve_audit_enabled: bool = false;
 
 /// Cached `KLIO_RESOLVE_AUDIT` gate (read once, mirrors `orAuditOn` in
-/// `ir/lower/expr.zig`).
-fn resolveAuditOn() bool {
+/// `ir/lower/expr.zig`). Shared with the runtime member/extension audit in
+/// `host_call_member.zig` so there is a single env read.
+pub fn resolveAuditOn() bool {
     if (!resolve_audit_checked) {
         resolve_audit_checked = true;
         const a = std.heap.page_allocator;
