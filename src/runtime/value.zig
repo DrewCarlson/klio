@@ -2285,6 +2285,7 @@ pub const Value = union(enum) {
             .Set => |x| if (b.* == .Set) return ValueList.ptrEq(x.items, b.Set.items),
             .Map => |x| if (b.* == .Map) return MapEntries.ptrEq(x.entries, b.Map.entries),
             .Array => |x| if (b.* == .Array) return x.identity() == b.Array.identity(),
+            .StringBuilder => |x| if (b.* == .StringBuilder) return x.identity() == b.StringBuilder.identity(),
             .Intrinsic => |x| {
                 if (b.* == .Intrinsic) return std.mem.eql(u8, x.fqn, b.Intrinsic.fqn);
                 if (b.* == .CoroutineSuspended) return std.mem.eql(u8, x.fqn, "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED");
