@@ -167,6 +167,26 @@ pub const ApplicabilityScope = struct {
     is_extension: bool = false,
     check_low_priority: bool = false,
 
+    /// Select the runtime NAMED-ARGUMENT scoring conventions
+    /// (`host_call_func.zig` `scoreNamedCandidate`): each arg's `named` binds to
+    /// its distinct same-named parameter, positional args fill the rest (a final
+    /// vararg absorbing the overflow), and every unfilled non-vararg parameter
+    /// must be defaultable. Unlike the positional/member scorers, a per-arg type
+    /// mismatch is NEUTRAL (scores 0) rather than disqualifying: named-parameter
+    /// presence is the hard discriminator, the type score only ranks survivors.
+    named: bool = false,
+
+    /// A named call whose site supplies an implicit extension receiver (the
+    /// enclosing frame's `this`) that is not among the args: the candidate's
+    /// leading `this` parameter is receiver-filled rather than arg-bound.
+    recv_external: bool = false,
+
+    /// Optional caller-provided scratch for the named path's `Binding.arg_to_param`
+    /// (which parameter each supplied arg bound to). Left null when the caller
+    /// does not need the binding; when set, `applicable()` writes through it and
+    /// points `Binding.arg_to_param` at the filled prefix.
+    arg_to_param_buf: ?[]u16 = null,
+
     /// Select the runtime *member* per-arg + candidate scoring conventions
     /// (`host_call_member.zig`): no `$bound_ref$` callable head, a
     /// `Function`-parse failure scores 20 (not 8), a callable against a
@@ -469,6 +489,7 @@ fn argIsProven(arg: *const ArgShape) bool {
 /// default / trailing-lambda gates and the positional per-arg scoring, with the
 /// under-application `-1` folded into `points`.
 pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
+    if (scope.named) return applicableNamed(sig, args, scope);
     if (scope.rank_extensions) return applicableExtension(sig, args, scope);
     if (scope.member) return applicableMember(sig, args, scope);
 
@@ -744,6 +765,120 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
 }
 
 // -------------------------------------------------------------------------
+// Runtime NAMED-ARGUMENT scorer (mirror of `host_call_func.zig`
+// `scoreNamedCandidate`). A named/defaulted/reordered call binds each `named`
+// arg to its distinct same-named parameter, positional args fill the remaining
+// slots (a trailing callable binds out of sequence to the last function-typed
+// param, a final vararg absorbs positional overflow), and every unfilled
+// non-vararg parameter must be defaultable. A per-arg type mismatch scores 0
+// (neutral) instead of disqualifying the candidate; only a named arg that no
+// parameter accepts, a doubly-filled parameter, or an over-supplied
+// non-vararg call is a hard reject. When `scope.arg_to_param_buf` is set, the
+// parameter each supplied arg bound to is recorded through it.
+// -------------------------------------------------------------------------
+
+fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
+    const params = sig.params;
+    // A bodyless declaration is only selectable when it backs a native
+    // intrinsic; the caller folds that into `sig.has_body`.
+    if (!sig.has_body) return null;
+    if (params.len > 64) return null;
+
+    var filled = [_]bool{false} ** 64;
+    var total: i32 = 0;
+    var proven: u16 = 0;
+    var unknown: u16 = 0;
+    const bind = scope.arg_to_param_buf;
+
+    // An implicit extension receiver fills the leading `this` parameter; no
+    // positional arg lands on it.
+    const is_ext = params.len > 0 and std.mem.eql(u8, params[0].name, "this");
+    if (is_ext and scope.recv_external) filled[0] = true;
+
+    // Named arguments bind to their distinct same-named parameter.
+    for (args, 0..) |*a, i| {
+        const n = a.named orelse continue;
+        var pos: ?usize = null;
+        for (params, 0..) |p, pi| {
+            if (std.mem.eql(u8, p.name, n)) {
+                pos = pi;
+                break;
+            }
+        }
+        const p = pos orelse return null; // a named arg with no matching param
+        if (filled[p]) return null;
+        total += scoreArg(&params[p].ty, a, &scope) orelse 0;
+        if (argIsProven(a)) proven += 1 else unknown += 1;
+        filled[p] = true;
+        if (bind) |bb| {
+            if (i < bb.len) bb[i] = @intCast(p);
+        }
+    }
+
+    // A trailing positional callable binds to the last function-typed
+    // parameter, out of sequence.
+    var trailing_lambda: ?usize = null;
+    if (args.len > 0 and params.len > 0) {
+        const last = args.len - 1;
+        const last_named = args[last].named != null;
+        const last_param = params.len - 1;
+        if (!last_named and !filled[last_param] and
+            isFunctionTypeRef(&params[last_param].ty) and args[last].is_lambda)
+        {
+            total += scoreArg(&params[last_param].ty, &args[last], &scope) orelse 0;
+            if (argIsProven(&args[last])) proven += 1 else unknown += 1;
+            filled[last_param] = true;
+            trailing_lambda = last;
+            if (bind) |bb| {
+                if (last < bb.len) bb[last] = @intCast(last_param);
+            }
+        }
+    }
+
+    // Vararg-aware positional walk.
+    const has_vararg = params.len > 0 and params[params.len - 1].is_vararg;
+    var pidx: usize = 0;
+    for (args, 0..) |*a, i| {
+        if (a.named != null) continue;
+        if (trailing_lambda != null and i == trailing_lambda.?) continue;
+        while (pidx < params.len and filled[pidx]) pidx += 1;
+        if (pidx >= params.len) {
+            if (has_vararg) {
+                if (bind) |bb| {
+                    if (i < bb.len) bb[i] = @intCast(params.len - 1);
+                }
+                continue;
+            }
+            return null; // too many positional args
+        }
+        total += scoreArg(&params[pidx].ty, a, &scope) orelse 0;
+        if (argIsProven(a)) proven += 1 else unknown += 1;
+        if (bind) |bb| {
+            if (i < bb.len) bb[i] = @intCast(pidx);
+        }
+        filled[pidx] = true;
+        pidx += 1;
+    }
+
+    // Every unfilled non-vararg parameter must be defaultable.
+    for (params, 0..) |p, pi| {
+        if (filled[pi] or p.is_vararg) continue;
+        if (!paramHasDefault(sig, pi)) return null;
+        total -= 1;
+    }
+
+    return .{
+        .points = total,
+        .proven_args = proven,
+        .unknown_args = unknown,
+        .exact_arity = false,
+        .low_priority = sig.low_priority,
+        .is_member = sig.is_member,
+        .binding = .{ .arg_to_param = if (bind) |bb| bb[0..@min(args.len, bb.len)] else &.{} },
+    };
+}
+
+// -------------------------------------------------------------------------
 // Tests.
 // -------------------------------------------------------------------------
 
@@ -932,4 +1067,67 @@ test "applicable extension: under-applied param that is neither default nor vara
     const scope = ApplicabilityScope{ .member = true, .rank_extensions = true, .is_extension = true, .receiver = recv };
     const sc = applicable(&sig, &args, scope).?;
     try testing.expectEqual(@as(i32, 0), sc.ext_key.?[0]); // applicable tier = 0
+}
+
+// --- named-argument scorer ---------------------------------------------------
+
+test "applicable named: reordered named args bind by name and record the binding" {
+    const p = [_]Param{
+        .{ .name = "a", .ty = tref("Int"), .default = null },
+        .{ .name = "b", .ty = tref("Int"), .default = null },
+    };
+    const sig = SigView{ .params = &p };
+    // Call `f(b = 1, a = 2)` — supplied out of declared order.
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Int", .named = "b" },
+        .{ .runtime_class = "Int", .named = "a" },
+    };
+    var bind_buf: [2]u16 = undefined;
+    const scope = ApplicabilityScope{ .named = true, .arg_to_param_buf = &bind_buf };
+    const sc = applicable(&sig, &args, scope).?;
+    // Two exact head matches; named scorer carries no exact-arity flag.
+    try testing.expectEqual(@as(i32, 200), sc.points);
+    try testing.expectEqual(@as(u16, 1), sc.binding.arg_to_param[0]); // b -> param 1
+    try testing.expectEqual(@as(u16, 0), sc.binding.arg_to_param[1]); // a -> param 0
+}
+
+test "applicable named: a name matching no parameter is a hard reject" {
+    const p = oneParam("Int");
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{.{ .runtime_class = "Int", .named = "nope" }};
+    try testing.expect(applicable(&sig, &args, .{ .named = true }) == null);
+}
+
+test "applicable named: a per-arg type mismatch is neutral (scores 0), not disqualifying" {
+    const p = [_]Param{
+        .{ .name = "x", .ty = tref("Int"), .default = null },
+        .{ .name = "y", .ty = tref("String"), .default = null },
+    };
+    const sig = SigView{ .params = &p };
+    // `y = <Int>` type-mismatches the String param but is not rejected; it
+    // scores 0 and the candidate stays applicable (named presence is the
+    // discriminator).
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Int", .named = "x" },
+        .{ .runtime_class = "Int", .named = "y" },
+    };
+    const sc = applicable(&sig, &args, .{ .named = true }).?;
+    // x exact 100 + y neutral 0.
+    try testing.expectEqual(@as(i32, 100), sc.points);
+}
+
+test "applicable named: unfilled non-default parameter is a reject; a default pads with -1" {
+    const p = [_]Param{
+        .{ .name = "a", .ty = tref("Int"), .default = null },
+        .{ .name = "b", .ty = tref("Int"), .default = null },
+    };
+    const args = [_]ArgShape{.{ .runtime_class = "Int", .named = "a" }};
+    // No default for b -> reject.
+    const sig_nd = SigView{ .params = &p };
+    try testing.expect(applicable(&sig_nd, &args, .{ .named = true }) == null);
+    // b defaulted -> applicable with the -1 default-padding penalty.
+    const defaults = [_]?FuncId{ null, FuncId.from(0) };
+    const sig_d = SigView{ .params = &p, .defaults = &defaults };
+    const sc = applicable(&sig_d, &args, .{ .named = true }).?;
+    try testing.expectEqual(@as(i32, 99), sc.points); // 100 - 1
 }

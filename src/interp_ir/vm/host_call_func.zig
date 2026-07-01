@@ -1108,6 +1108,7 @@ fn scoreNamedCandidate(
     args: []const Value,
     arg_names: []const ?[]const u8,
     recv_external: bool,
+    arg_to_param: ?[]u16,
 ) ?i32 {
     const cf = funcAt(module, cand) orelse return null;
     // A bodyless declaration is only a valid named-call target when it
@@ -1144,6 +1145,9 @@ fn scoreNamedCandidate(
         // stays neutral rather than rejecting an otherwise-valid overload.
         total += overloadScoreArg(self, &params[p].ty, &a) orelse 0;
         filled[p] = true;
+        if (arg_to_param) |b| {
+            if (i < b.len) b[i] = @intCast(p);
+        }
     }
 
     // A trailing positional callable binds to the last function-typed
@@ -1159,6 +1163,9 @@ fn scoreNamedCandidate(
             total += overloadScoreArg(self, &params[last_param].ty, &args[last]) orelse 0;
             filled[last_param] = true;
             trailing_lambda = last;
+            if (arg_to_param) |b| {
+                if (last < b.len) b[last] = @intCast(last_param);
+            }
         }
     }
 
@@ -1170,10 +1177,18 @@ fn scoreNamedCandidate(
         if (trailing_lambda != null and i == trailing_lambda.?) continue;
         while (pidx < params.len and filled[pidx]) pidx += 1;
         if (pidx >= params.len) {
-            if (has_vararg) continue;
+            if (has_vararg) {
+                if (arg_to_param) |b| {
+                    if (i < b.len) b[i] = @intCast(params.len - 1);
+                }
+                continue;
+            }
             return null; // too many positional args
         }
         total += overloadScoreArg(self, &params[pidx].ty, &a) orelse 0;
+        if (arg_to_param) |b| {
+            if (i < b.len) b[i] = @intCast(pidx);
+        }
         filled[pidx] = true;
         pidx += 1;
     }
@@ -1186,6 +1201,92 @@ fn scoreNamedCandidate(
         total -= 1;
     }
     return total;
+}
+
+/// Per-candidate `SigView` for the shared applicability scorer on the NAMED
+/// path. Unlike `sigViewOfFunc`, a bodyless declaration backed by a native
+/// intrinsic (a resolved-native form or a same-FQN host intrinsic) is
+/// selectable, so `has_body` folds that predicate in (mirroring the named
+/// scorer's leading bodyless guard).
+fn sigViewOfNamed(self: *VmHost, module: *const Module, cand: FuncId) ?applicability.SigView {
+    const f = funcAt(module, cand) orelse return null;
+    const selectable = f.hasBody() or resolvedNativeForm(self, cand) != null or lookupIntrinsic(self, f.fqn) != null;
+    return .{
+        .params = f.params,
+        .defaults = funcDefaults(self, cand),
+        .has_body = selectable,
+        .low_priority = f.low_priority,
+    };
+}
+
+/// Dual-compute audit for the named-argument scorer: for each candidate compute
+/// both the legacy `scoreNamedCandidate` and the shared `applicable()` (named
+/// mode), and log any mismatch of per-candidate points, arg->param binding, or
+/// the chosen winner. Runs only under `KLIO_RESOLVE_AUDIT`; changes no behavior.
+fn auditPickNamed(
+    self: *VmHost,
+    module: *const Module,
+    name: []const u8,
+    candidates: []const FuncId,
+    args: []const Value,
+    arg_names: []const ?[]const u8,
+    recv_external: bool,
+    legacy_best: ?FuncId,
+) void {
+    var shapes_buf: [32]applicability.ArgShape = undefined;
+    if (args.len > shapes_buf.len) return;
+    for (args, 0..) |*a, i| {
+        shapes_buf[i] = shapeOfValue(self, a);
+        shapes_buf[i].named = if (i < arg_names.len) arg_names[i] else null;
+    }
+    const shapes = shapes_buf[0..args.len];
+
+    var applic_bind_buf: [32]u16 = undefined;
+    const scope = applicability.ApplicabilityScope{
+        .named = true,
+        .recv_external = recv_external,
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCb,
+        .subtype = applicSubtypeCb,
+        .arg_to_param_buf = applic_bind_buf[0..args.len],
+    };
+
+    var applic_best: ?FuncId = null;
+    var applic_best_score: i32 = std.math.minInt(i32);
+
+    for (candidates) |cand| {
+        var legacy_bind_buf: [32]u16 = undefined;
+        const legacy = scoreNamedCandidate(self, module, cand, args, arg_names, recv_external, legacy_bind_buf[0..args.len]);
+        const sig = sigViewOfNamed(self, module, cand) orelse continue;
+        const applic = applicability.applicable(&sig, shapes, scope);
+        const applic_pts: ?i32 = if (applic) |s| s.points else null;
+
+        var bind_div: u8 = 0;
+        if (legacy != null and applic != null) {
+            if (!std.mem.eql(u16, legacy_bind_buf[0..args.len], applic_bind_buf[0..args.len])) bind_div = 1;
+        }
+        if (!optScoreEq(legacy, applic_pts) or bind_div == 1) {
+            std.debug.print(
+                "[KLIO_RESOLVE_AUDIT] named name={s} cand_fid={d} legacy={d} applic={d} bind_div={d} divergent={d}\n",
+                .{ name, cand.int(), legacy orelse AUDIT_NA, applic_pts orelse AUDIT_NA, bind_div, @as(u8, 1) },
+            );
+        }
+        if (applic_pts) |pts| {
+            if (applic_best == null or pts > applic_best_score) {
+                applic_best = cand;
+                applic_best_score = pts;
+            }
+        }
+    }
+
+    const lw: i64 = if (legacy_best) |b| @intCast(b.int()) else -1;
+    const aw: i64 = if (applic_best) |b| @intCast(b.int()) else -1;
+    if (lw != aw) {
+        std.debug.print(
+            "[KLIO_RESOLVE_AUDIT] named name={s} winner legacy_fid={d} applic_fid={d} divergent=1\n",
+            .{ name, lw, aw },
+        );
+    }
 }
 
 /// Re-pick the overload for a named call. The IR resolves the call site to one
@@ -1216,12 +1317,17 @@ pub fn pickNamedOverloadId(
     var best: ?FuncId = null;
     var best_score: i32 = std.math.minInt(i32);
     for (candidates) |cand| {
-        const score = scoreNamedCandidate(self, module, cand, args, arg_names, recv_external) orelse continue;
+        const score = scoreNamedCandidate(self, module, cand, args, arg_names, recv_external, null) orelse continue;
         if (best == null or score > best_score) {
             best = cand;
             best_score = score;
         }
     }
+
+    // Additive dual-compute audit; the legacy `scoreNamedCandidate` above stays
+    // the live selection.
+    if (resolveAuditOn()) auditPickNamed(self, module, f0.name, candidates, args, arg_names, recv_external, best);
+
     return best;
 }
 
