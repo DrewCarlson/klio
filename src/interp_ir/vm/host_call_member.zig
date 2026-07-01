@@ -2607,8 +2607,9 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (try classCompanionAndEnum(self, allocator, receiver, name, args)) |r| return r;
     }
 
-    // Null-receiver `equals`.
-    if (receiver.* == .Null and std.mem.eql(u8, name, "equals") and args.len == 1) {
+    // Null-receiver `equals` — the 1-arg `Any?.equals` and the 2-arg
+    // `String?.equals(other, ignoreCase)` both reduce to `other === null`.
+    if (receiver.* == .Null and std.mem.eql(u8, name, "equals") and args.len >= 1) {
         return .{ .ok = boolVal(args[0] == .Null) };
     }
     // Null-receiver `toString()` (`null.toString()` is the string "null"); the

@@ -858,6 +858,21 @@ pub fn string_none(ctx: *CallCtx) Allocator.Error!EvalResult {
 
 /// `String.equals(other, ignoreCase = false)`.
 pub fn string_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
+    // `String?.equals(other, ignoreCase)` on a null receiver: equal iff `other`
+    // is also null (the bodyless expect would otherwise evaluate to Unit).
+    if (ctx.args.len > 0 and ctx.args[0] == .Null) {
+        return .{ .ok = .{ .Bool = ctx.args.len > 1 and ctx.args[1] == .Null } };
+    }
+    // `Char.equals(other: Char, ignoreCase)` shares the `kotlin.text.equals`
+    // FQN with `String?.equals`; dispatch it by receiver kind.
+    if (ctx.args.len > 0 and ctx.args[0] == .Char) {
+        var eq = false;
+        if (ctx.args.len > 1 and ctx.args[1] == .Char) {
+            const ic = ctx.args.len > 2 and ctx.args[2] == .Bool and ctx.args[2].Bool;
+            eq = if (ic) char.charEqIgnoreCase(ctx.args[0].Char, ctx.args[1].Char) else ctx.args[0].Char == ctx.args[1].Char;
+        }
+        return .{ .ok = .{ .Bool = eq } };
+    }
     const r = try recvString(ctx.allocator, ctx.args, "String.equals");
     const s = switch (r) {
         .ok => |v| v,
