@@ -1954,6 +1954,11 @@ pub const Module = struct {
         cast_pick: ?FuncId = null,
         recv_ty: ?[]const u8 = null,
         is_value_capture: bool = false,
+        /// The caller sits in a tailrec function body (`tailrecSelf() != null`).
+        /// A positional call to a tailrec target from such a body emits a static
+        /// tail `Call`, ahead of the member-shadowable walk — the receiver
+        /// gate never re-routes a tail call.
+        in_tailrec_body: bool = false,
     };
 
     fn isNonExtFid(self: *const Module, id: FuncId) bool {
@@ -2196,7 +2201,20 @@ pub const Module = struct {
         const tier: u8 = if (ires.tier != 255) ires.tier else self.lowestVisibleTier(name, caller_pkg, caller_file);
 
         // Phase C — EMIT FORM.
-        return self.emitFormFor(alloc, name, caller_pkg, caller_file, target, tier, reason, ires.tier_count, ctx);
+        return self.emitFormFor(alloc, name, caller_pkg, caller_file, target, tier, reason, ires.tier_count, args, ctx);
+    }
+
+    /// Whether a bare call to `name` binding target `id` is a tail call: the
+    /// target itself is `tailrec`, or the name is one of the module's known
+    /// tailrec functions (mirrors `expr.zig`'s legacy tail-call gate).
+    fn calleeIsTailrec(self: *const Module, id: FuncId, name: []const u8) bool {
+        if (self.funcById(id)) |f| {
+            if (f.is_tailrec) return true;
+        }
+        for (self.tailrec_fn_names.items) |n| {
+            if (std.mem.eql(u8, n, name)) return true;
+        }
+        return false;
     }
 
     /// Phase C — the single member-vs-global decision, folding the receiver
@@ -2212,6 +2230,7 @@ pub const Module = struct {
         tier: u8,
         reason: ?ResolveDeferReason,
         tier_count: usize,
+        args: []const applicability.ArgShape,
         ctx: ResolveCtx,
     ) std.mem.Allocator.Error!Resolution {
         const member_shadowable = ctx.unknown_receiver or ctx.enclosing_has_member or
@@ -2234,6 +2253,12 @@ pub const Module = struct {
                     return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
                 }
                 return .{ .target = t, .confidence = .virtual, .emit_form = .CallMember, .reason = reason, .tier = tier, .tier_count = tier_count };
+            }
+            // A positional tail call to a tailrec target from a tailrec body
+            // emits a static `Call` (lowered to a `TailCallFunc`), ahead of the
+            // member-shadowable gate — a tail call is never redispatched.
+            if (ctx.in_tailrec_body and self.calleeIsTailrec(t, name) and allShapeNamesNull(args)) {
+                return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
             }
             // Non-extension: the member-shadowable gate, suppressed by a cast or
             // explicit type arguments (the static-resolution forms).
@@ -2545,6 +2570,15 @@ pub const Module = struct {
         return id;
     }
 };
+
+/// Whether every argument shape is positional (no named argument) — the
+/// `allNull(arg_names)` gate a tail-call / trailing-lambda binding needs.
+fn allShapeNamesNull(args: []const applicability.ArgShape) bool {
+    for (args) |a| {
+        if (a.named != null) return false;
+    }
+    return true;
+}
 
 /// True when `head` is the first dotted segment of `fqn` and `fqn` has
 /// at least one further segment — i.e. `fqn` is `head.<rest>`, so `head`
