@@ -1365,7 +1365,16 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
     for (names, 0..) |type_name, idx| {
         const arg_name: []const u8 = if (idx < type_args.len) type_args[idx] else "";
         if (arg_name.len == 0) continue;
-        const cls_value = host_globals.lookupGlobal(self, arg_name);
+        // Class table first: a type argument names a type, so it binds the
+        // `.Class` value even when the bare name's global is a constructor
+        // intrinsic (exception classes). This is the same identity the
+        // inline splice resolves for its reified binding.
+        const cls_value: ?Value = blk: {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            if (cg.get().get(arg_name)) |c| break :blk Value{ .Class = c.clone() };
+            break :blk host_globals.lookupGlobal(self, arg_name);
+        };
         const prev = blk: {
             const g = self.globals.borrow();
             defer g.deinit();

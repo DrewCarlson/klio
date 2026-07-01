@@ -2732,7 +2732,16 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return lowerCallWithWritebackMember(b, callee, args, ast_arg_names);
     }
     // Top-level fn call passing a closure-mutating lambda, path callee.
+    // An inline callee that must be spliced keeps its splice: the lambda
+    // body lowers in the caller's own frame (a compound assign on a
+    // captured `val` is a `plusAssign` member call, not a write, and a
+    // real `var` write lands on the boxed cell), and routing the call
+    // through the writeback dispatch instead would drop the reified
+    // type-argument binding (`assertFailsWith<E> { ts += d }`).
     if (callee.* == .Path and try anyLambdaWritesOuter(b, args)) {
+        if (try tryBareInlineExpansion(b, expr)) |r| {
+            return r;
+        }
         return lowerCallWithWritebackPath(b, callee, args, ast_arg_names, ast_type_args);
     }
 
@@ -3157,6 +3166,71 @@ fn ctorParamShadowsVarargMethod(b: *FuncBuilder, name: []const u8) bool {
     return false;
 }
 
+/// Bare-path inline expansion: splice an inline-lambda parameter's body,
+/// the reified overload an explicit `<T>` argument binds, or the resolved
+/// inline target of a bare call. Returns null when the callee is not a
+/// bare path or no splice applies, leaving the call to the normal
+/// dispatch paths. Called from `lowerCallGeneral` and, first, from the
+/// outer-writing-lambda arm of `lowerCall`: an inline function that must
+/// be spliced (reified, suspend, non-local return) keeps its splice even
+/// when a lambda argument assigns to an outer name, because the spliced
+/// body lowers the write in the caller's own frame, and skipping the
+/// splice would drop the reified type-argument binding entirely.
+fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
+    const call = expr.Call;
+    const callee = call.callee;
+    const args = call.args;
+    const ast_arg_names = call.arg_names;
+    const ast_type_args = call.type_args;
+    if (call.is_infix or callee.* != .Path or callee.Path.segments.len != 1) return null;
+    const nm = callee.Path.segments[0].name;
+    if (b.inlineLambdaFor(nm)) |lam| {
+        return try spliceInlineLambda(b, lam, args);
+    }
+    const inline_call_shape = CallShape{
+        .want = args.len,
+        .last_is_lambda = lastArgIsLambdaOrAnon(args),
+        .trailing_lambda_arity = trailingLambdaArity(args),
+    };
+    // An explicit `<T>` argument binds a reified parameter, so a reified
+    // inline overload of this shape outranks a non-reified `KClass<T>`
+    // namesake (which would lower `<T>` as a constructor value instead of
+    // binding `T::class`). Splice the reified overload directly.
+    if (ast_type_args.len != 0) {
+        if (inline_state.reifiedInlineFnAstFor(nm, inline_call_shape)) |rf| {
+            if (bareInlineNeedsSplice(b, nm, rf, args)) {
+                const expected = b.peekExpected();
+                const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+                if (try tryInlineCallWithTypeArgs(b, nm, rf, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
+                    return r;
+                }
+            }
+        }
+    }
+    if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
+        // A reified inline overload whose type parameter lives only in
+        // the trailing lambda's parameter list (`T.(R) -> Unit`) cannot
+        // bind that parameter from a lambda that declares fewer
+        // arguments — `post("/p") { … }` against
+        // `post<reified R>(path, RoutingContext.(R) -> Unit)`. Kotlin
+        // drops such an overload (R unconstrained) and resolves the call
+        // to a non-reified namesake; decline the splice so the normal
+        // call path picks the plain `post(path, RoutingHandler)`.
+        const reified_underfilled = ast_type_args.len == 0 and
+            anyReified(f.type_params) and
+            inline_call_shape.trailing_lambda_arity != null and
+            reifiedNeedsLambdaArity(b, f, inline_call_shape.trailing_lambda_arity.?);
+        if (!reified_underfilled and bareInlineNeedsSplice(b, nm, f, args)) {
+            const expected = b.peekExpected();
+            const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+            if (try tryInlineCallWithTypeArgs(b, nm, f, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
+                return r;
+            }
+        }
+    }
+    return null;
+}
+
 fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -3202,52 +3276,8 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     }
 
     // Inline expansion (suspend-inline only).
-    if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1) {
-        const nm = callee.Path.segments[0].name;
-        if (b.inlineLambdaFor(nm)) |lam| {
-            return spliceInlineLambda(b, lam, args);
-        }
-        const inline_call_shape = CallShape{
-            .want = args.len,
-            .last_is_lambda = lastArgIsLambdaOrAnon(args),
-            .trailing_lambda_arity = trailingLambdaArity(args),
-        };
-        // An explicit `<T>` argument binds a reified parameter, so a reified
-        // inline overload of this shape outranks a non-reified `KClass<T>`
-        // namesake (which would lower `<T>` as a constructor value instead of
-        // binding `T::class`). Splice the reified overload directly.
-        if (ast_type_args.len != 0) {
-            if (inline_state.reifiedInlineFnAstFor(nm, inline_call_shape)) |rf| {
-                if (bareInlineNeedsSplice(b, nm, rf, args)) {
-                    const expected = b.peekExpected();
-                    const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-                    if (try tryInlineCallWithTypeArgs(b, nm, rf, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
-                        return r;
-                    }
-                }
-            }
-        }
-        if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
-            // A reified inline overload whose type parameter lives only in
-            // the trailing lambda's parameter list (`T.(R) -> Unit`) cannot
-            // bind that parameter from a lambda that declares fewer
-            // arguments — `post("/p") { … }` against
-            // `post<reified R>(path, RoutingContext.(R) -> Unit)`. Kotlin
-            // drops such an overload (R unconstrained) and resolves the call
-            // to a non-reified namesake; decline the splice so the normal
-            // call path picks the plain `post(path, RoutingHandler)`.
-            const reified_underfilled = ast_type_args.len == 0 and
-                anyReified(f.type_params) and
-                inline_call_shape.trailing_lambda_arity != null and
-                reifiedNeedsLambdaArity(b, f, inline_call_shape.trailing_lambda_arity.?);
-            if (!reified_underfilled and bareInlineNeedsSplice(b, nm, f, args)) {
-                const expected = b.peekExpected();
-                const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-                if (try tryInlineCallWithTypeArgs(b, nm, f, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
-                    return r;
-                }
-            }
-        }
+    if (try tryBareInlineExpansion(b, expr)) |r| {
+        return r;
     }
 
     // Inside an inline-extension splice, a bare call to a member of the
