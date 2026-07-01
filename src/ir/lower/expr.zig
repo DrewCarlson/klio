@@ -2043,10 +2043,25 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
         const f = b.module.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
         if (!(f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
-        if (userParams(f) != user_arg_count) continue;
+        if (userParams(f) < user_arg_count) continue;
         const last = f.params[f.params.len - 1];
         if (last.is_vararg) continue;
-        if (fnTypeArityAlias(b, last.ty) != null) return fid;
+        if (fnTypeArityAlias(b, last.ty) == null) continue;
+        // Under-applied (`launch { … }` against `launch(context = …,
+        // start = …, block)`): the trailing lambda binds the last param
+        // out of sequence, so every skipped parameter must be defaulted.
+        if (userParams(f) != user_arg_count) {
+            var i: usize = user_arg_count; // leading args fill params[1..user_arg_count]
+            var gap_defaulted = true;
+            while (i < f.params.len - 1) : (i += 1) {
+                if (!f.params[i].has_default) {
+                    gap_defaulted = false;
+                    break;
+                }
+            }
+            if (!gap_defaulted) continue;
+        }
+        return fid;
     }
     return null;
 }
@@ -2732,7 +2747,16 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return lowerCallWithWritebackMember(b, callee, args, ast_arg_names);
     }
     // Top-level fn call passing a closure-mutating lambda, path callee.
+    // An inline callee that must be spliced keeps its splice: the lambda
+    // body lowers in the caller's own frame (a compound assign on a
+    // captured `val` is a `plusAssign` member call, not a write, and a
+    // real `var` write lands on the boxed cell), and routing the call
+    // through the writeback dispatch instead would drop the reified
+    // type-argument binding (`assertFailsWith<E> { ts += d }`).
     if (callee.* == .Path and try anyLambdaWritesOuter(b, args)) {
+        if (try tryBareInlineExpansion(b, expr)) |r| {
+            return r;
+        }
         return lowerCallWithWritebackPath(b, callee, args, ast_arg_names, ast_type_args);
     }
 
@@ -3157,6 +3181,71 @@ fn ctorParamShadowsVarargMethod(b: *FuncBuilder, name: []const u8) bool {
     return false;
 }
 
+/// Bare-path inline expansion: splice an inline-lambda parameter's body,
+/// the reified overload an explicit `<T>` argument binds, or the resolved
+/// inline target of a bare call. Returns null when the callee is not a
+/// bare path or no splice applies, leaving the call to the normal
+/// dispatch paths. Called from `lowerCallGeneral` and, first, from the
+/// outer-writing-lambda arm of `lowerCall`: an inline function that must
+/// be spliced (reified, suspend, non-local return) keeps its splice even
+/// when a lambda argument assigns to an outer name, because the spliced
+/// body lowers the write in the caller's own frame, and skipping the
+/// splice would drop the reified type-argument binding entirely.
+fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
+    const call = expr.Call;
+    const callee = call.callee;
+    const args = call.args;
+    const ast_arg_names = call.arg_names;
+    const ast_type_args = call.type_args;
+    if (call.is_infix or callee.* != .Path or callee.Path.segments.len != 1) return null;
+    const nm = callee.Path.segments[0].name;
+    if (b.inlineLambdaFor(nm)) |lam| {
+        return try spliceInlineLambda(b, lam, args);
+    }
+    const inline_call_shape = CallShape{
+        .want = args.len,
+        .last_is_lambda = lastArgIsLambdaOrAnon(args),
+        .trailing_lambda_arity = trailingLambdaArity(args),
+    };
+    // An explicit `<T>` argument binds a reified parameter, so a reified
+    // inline overload of this shape outranks a non-reified `KClass<T>`
+    // namesake (which would lower `<T>` as a constructor value instead of
+    // binding `T::class`). Splice the reified overload directly.
+    if (ast_type_args.len != 0) {
+        if (inline_state.reifiedInlineFnAstFor(nm, inline_call_shape)) |rf| {
+            if (bareInlineNeedsSplice(b, nm, rf, args)) {
+                const expected = b.peekExpected();
+                const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+                if (try tryInlineCallWithTypeArgs(b, nm, rf, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
+                    return r;
+                }
+            }
+        }
+    }
+    if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
+        // A reified inline overload whose type parameter lives only in
+        // the trailing lambda's parameter list (`T.(R) -> Unit`) cannot
+        // bind that parameter from a lambda that declares fewer
+        // arguments — `post("/p") { … }` against
+        // `post<reified R>(path, RoutingContext.(R) -> Unit)`. Kotlin
+        // drops such an overload (R unconstrained) and resolves the call
+        // to a non-reified namesake; decline the splice so the normal
+        // call path picks the plain `post(path, RoutingHandler)`.
+        const reified_underfilled = ast_type_args.len == 0 and
+            anyReified(f.type_params) and
+            inline_call_shape.trailing_lambda_arity != null and
+            reifiedNeedsLambdaArity(b, f, inline_call_shape.trailing_lambda_arity.?);
+        if (!reified_underfilled and bareInlineNeedsSplice(b, nm, f, args)) {
+            const expected = b.peekExpected();
+            const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+            if (try tryInlineCallWithTypeArgs(b, nm, f, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
+                return r;
+            }
+        }
+    }
+    return null;
+}
+
 fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -3202,52 +3291,8 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     }
 
     // Inline expansion (suspend-inline only).
-    if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1) {
-        const nm = callee.Path.segments[0].name;
-        if (b.inlineLambdaFor(nm)) |lam| {
-            return spliceInlineLambda(b, lam, args);
-        }
-        const inline_call_shape = CallShape{
-            .want = args.len,
-            .last_is_lambda = lastArgIsLambdaOrAnon(args),
-            .trailing_lambda_arity = trailingLambdaArity(args),
-        };
-        // An explicit `<T>` argument binds a reified parameter, so a reified
-        // inline overload of this shape outranks a non-reified `KClass<T>`
-        // namesake (which would lower `<T>` as a constructor value instead of
-        // binding `T::class`). Splice the reified overload directly.
-        if (ast_type_args.len != 0) {
-            if (inline_state.reifiedInlineFnAstFor(nm, inline_call_shape)) |rf| {
-                if (bareInlineNeedsSplice(b, nm, rf, args)) {
-                    const expected = b.peekExpected();
-                    const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-                    if (try tryInlineCallWithTypeArgs(b, nm, rf, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
-                        return r;
-                    }
-                }
-            }
-        }
-        if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
-            // A reified inline overload whose type parameter lives only in
-            // the trailing lambda's parameter list (`T.(R) -> Unit`) cannot
-            // bind that parameter from a lambda that declares fewer
-            // arguments — `post("/p") { … }` against
-            // `post<reified R>(path, RoutingContext.(R) -> Unit)`. Kotlin
-            // drops such an overload (R unconstrained) and resolves the call
-            // to a non-reified namesake; decline the splice so the normal
-            // call path picks the plain `post(path, RoutingHandler)`.
-            const reified_underfilled = ast_type_args.len == 0 and
-                anyReified(f.type_params) and
-                inline_call_shape.trailing_lambda_arity != null and
-                reifiedNeedsLambdaArity(b, f, inline_call_shape.trailing_lambda_arity.?);
-            if (!reified_underfilled and bareInlineNeedsSplice(b, nm, f, args)) {
-                const expected = b.peekExpected();
-                const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-                if (try tryInlineCallWithTypeArgs(b, nm, f, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
-                    return r;
-                }
-            }
-        }
+    if (try tryBareInlineExpansion(b, expr)) |r| {
+        return r;
     }
 
     // Inside an inline-extension splice, a bare call to a member of the
@@ -3558,12 +3603,19 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (try lowerImplicitThisCall(b, callee, args, ast_arg_names)) |r| return r;
     }
 
-    // Unresolved bare-name call.
+    // Unresolved bare-name call. Reaching here means the resolver above
+    // declined to commit a target, so in a receiver context the call must
+    // still dispatch member-first even when a same-named top-level function
+    // exists in the index (a bare `close(permission)` inside a NodeList
+    // member-extension reaches the receiver's inherited member, not a
+    // same-named extension elsewhere); a bare-name value load would miss
+    // receiver METHODS entirely. Outside a receiver context an indexed name
+    // keeps the value-call fallback, which binds the resolved global.
     if (callee.* == .Path and callee.Path.segments.len == 1 and
         b.resolve(callee.Path.segments[0].name) == null and
         !b.knowsOuter(callee.Path.segments[0].name) and
         b.module.classId(callee.Path.segments[0].name) == null and
-        b.module.funcId(callee.Path.segments[0].name) == null)
+        (b.module.funcId(callee.Path.segments[0].name) == null or inReceiverContext(b)))
     {
         if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
     }
@@ -4444,7 +4496,8 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
 fn resolveCtxFor(b: *FuncBuilder, name0: []const u8, ast_type_args: []const ast.TypeRef, cast_pick: ?FuncId) ir.Module.ResolveCtx {
     return .{
         .in_receiver_context = inReceiverContext(b),
-        .unknown_receiver = b.capturesThisSlot() or b.isParamThunk() or b.recvTy() != null,
+        .unknown_receiver = b.capturesThisSlot() or b.isParamThunk() or
+            (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name0)),
         .enclosing_has_member = b.hasEnclosingMember(name0),
         .has_type_args = ast_type_args.len != 0,
         .cast_pick = cast_pick,
@@ -4791,8 +4844,25 @@ fn heurPickInexact(b: *FuncBuilder, fid: FuncId, want: usize) bool {
 /// decidable: kotlinc rejects resolving a bare name against a *caller's*
 /// receiver (dynamic scope), so those sites emit the static global form.
 fn inReceiverContext(b: *const FuncBuilder) bool {
-    return b.capturesThisSlot() or b.resolve("this") != null or b.ownerClass() != null or
+    // A binding named `this` that is an ordinary user parameter (backtick-
+    // quoted on a receiver-less function) is not a dispatch receiver.
+    const this_binding = !b.this_is_plain_param and b.resolve("this") != null;
+    return b.capturesThisSlot() or this_binding or b.ownerClass() != null or
         b.isParamThunk() or b.recvTy() != null;
+}
+
+/// An extension declared on a *function type* (`(suspend () -> T).start…`)
+/// has a receiver with no members a bare call could bind: a function value's
+/// only member surface is `invoke`/`call`. Deferring a resolved top-level call
+/// to the runtime member-first walk from such a body is not just unnecessary,
+/// it is wrong — the runtime's SAM arm invokes a callable receiver for any
+/// member name no extension claims, so `runSafely(completion) { … }` inside
+/// `startCoroutineCancellable` would call the suspend block itself instead of
+/// the same-file top-level `runSafely`, silently discarding the completion.
+fn fnTypedRecvCannotShadow(b: *const FuncBuilder, name: []const u8) bool {
+    const rt = b.recvTy() orelse return false;
+    if (!std.mem.eql(u8, rt, "<function>")) return false;
+    return !std.mem.eql(u8, name, "invoke") and !std.mem.eql(u8, name, "call");
 }
 
 /// Whether a bare name in an implicit-receiver context could bind to a member
@@ -4807,7 +4877,8 @@ fn inReceiverContext(b: *const FuncBuilder) bool {
 /// enclosing class(es), checked precisely by `hasEnclosingMember`. Any other
 /// in-scope receiver falls back to the program-wide member-name set.
 fn memberShadowPossible(b: *const FuncBuilder, name: []const u8) bool {
-    if (b.capturesThisSlot() or b.isParamThunk() or b.recvTy() != null) return true;
+    if (b.capturesThisSlot() or b.isParamThunk() or
+        (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name))) return true;
     if (b.hasEnclosingMember(name)) return true;
     return b.module.registry.class_member_names.contains(name);
 }
@@ -5124,7 +5195,19 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     };
     defer if (broad_masks) |m| b.allocator.free(m);
     b.pending_arg_broad_masks = broad_masks;
-    const run = try lowerArgRun(b, args);
+    // The dispatch is deferred, but the trailing lambda's static shape comes
+    // from the committed global candidate: read the per-arg lambda arities
+    // from it so a `T.() -> R` receiver lambda drops its synthetic `it` here
+    // exactly as on the static-call path (`it` then resolves to the
+    // enclosing lambda's, matching kotlinc).
+    const arg_arity: ?[]const i16 = blk: {
+        if (b.module.funcById(func_id)) |f| {
+            const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            break :blk try argFnArities(b, f, args, ast_arg_names, recv_off);
+        }
+        break :blk null;
+    };
+    const run = try lowerArgRunWithArity(b, args, arg_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
@@ -5618,11 +5701,34 @@ fn lowerUnresolvedBareCall(
     // so the capture slot is empty and the bare member misses its own
     // receiver. This is the `is JobSupport -> invokeOnCompletionInternal(…)`
     // shape — a bare member call on the extension's smart-cast receiver.
+    // The only `this` in scope is an ordinary user parameter named `this`:
+    // no implicit receiver exists, so the bare name binds a global or is an
+    // unresolved reference at runtime — never a member of the parameter.
+    if (b.this_is_plain_param and b.recvTy() == null and b.ownerClass() == null and
+        !b.capturesThisSlot())
+    {
+        return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
+    }
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
     orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);
+    // No committed target, but a trailing lambda's expected shape still has
+    // a static answer: read the per-arg lambda arities from the same-name
+    // overload that hosts it at this arity, so a `T.() -> R` handler drops
+    // its synthetic `it` here too (`launch { … }` deferred inside a
+    // receiver context) and `it` resolves to the enclosing lambda's.
+    const bare_arity: ?[]const i16 = blk: {
+        if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
+            if (overloadHostingTrailingLambda(b, name0, args.len)) |fid| {
+                if (b.module.funcById(fid)) |f| {
+                    break :blk try argFnArities(b, f, args, ast_arg_names, 1);
+                }
+            }
+        }
+        break :blk null;
+    };
     if (b.resolve("this")) |this_reg| {
-        const run = try lowerArgRun(b, args);
+        const run = try lowerArgRunWithArity(b, args, bare_arity);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         try b.push(.{ .CallMemberOrGlobal = .{
             .dst = dst,
@@ -5636,7 +5742,7 @@ fn lowerUnresolvedBareCall(
         return dst;
     }
     const this_idx = try b.recordCapture("this");
-    const run = try lowerArgRun(b, args);
+    const run = try lowerArgRunWithArity(b, args, bare_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     try b.push(.{ .CallMemberOrGlobal = .{
         .dst = dst,

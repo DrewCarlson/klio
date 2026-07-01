@@ -18,7 +18,7 @@ Exit 0 iff no divergence line is found.
 """
 import argparse, concurrent.futures, os, re, subprocess, sys
 
-ROOT = "/workspace/klio"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_ROOT = os.path.join(ROOT, "kotlin/libraries/stdlib/test")
 ACTUALS = [
     "tests/stdlib_commontest_actuals/PlatformActuals.kt",

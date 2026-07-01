@@ -340,6 +340,11 @@ pub const FuncBuilder = struct {
     /// reference that resolves to nothing here is an unresolved reference,
     /// matching kotlinc, rather than a silent null.
     it_suppressed: bool = false,
+    /// The binding named `this` in this frame is an ordinary user parameter
+    /// (a backtick-quoted `` `this` `` param on a receiver-less function),
+    /// not a dispatch receiver: bare calls must not member-dispatch through
+    /// it (kotlinc rejects them as unresolved).
+    this_is_plain_param: bool = false,
     /// Span of the lambda literal whose `it` was suppressed, for the
     /// unresolved-reference diagnostic.
     it_suppressed_span: ?ast.Span = null,
