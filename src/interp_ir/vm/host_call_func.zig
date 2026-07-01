@@ -647,24 +647,6 @@ fn pickOverloadCached(self: *VmHost, module: *const Module, func: FuncId, args: 
     return pickOverload(self, module, func, args);
 }
 
-var resolve_audit_checked: bool = false;
-var resolve_audit_enabled: bool = false;
-
-/// Cached `KLIO_RESOLVE_AUDIT` gate (read once, mirrors `orAuditOn` in
-/// `ir/lower/expr.zig`). Shared with the runtime member/extension audit in
-/// `host_call_member.zig` so there is a single env read.
-pub fn resolveAuditOn() bool {
-    if (!resolve_audit_checked) {
-        resolve_audit_checked = true;
-        const a = std.heap.page_allocator;
-        if (runtime.procEnvGetVar(a, "KLIO_RESOLVE_AUDIT") catch null) |v| {
-            a.free(v);
-            resolve_audit_enabled = true;
-        }
-    }
-    return resolve_audit_enabled;
-}
-
 /// Build an `ArgShape` describing one runtime value for the shared applicability
 /// scorer. Named args are not threaded into the positional `pickOverload`
 /// path, so `named` stays null here.
@@ -742,49 +724,13 @@ fn sigViewOfFunc(self: *VmHost, module: *const Module, cand: FuncId) ?applicabil
     };
 }
 
-/// Sentinel printed for an inapplicable (null) score in the audit line.
-const AUDIT_NA: i32 = std.math.minInt(i32);
-
-fn optScoreEq(a: ?i32, b: ?i32) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return a.? == b.?;
-}
-
-/// Dual-compute audit: for each candidate compute both the legacy
-/// `overloadScore` and the shared `applicable()`, and log any per-candidate
-/// point mismatch. Because the winner is a pure function of the per-candidate
-/// scores and the scan order, per-candidate agreement implies winner
-/// agreement. Runs only under `KLIO_RESOLVE_AUDIT`; changes no behavior.
-fn auditPickOverload(
-    self: *VmHost,
-    module: *const Module,
-    name: []const u8,
-    candidates: []const FuncId,
-    args: []const Value,
-) void {
-    var shapes_buf: [32]applicability.ArgShape = undefined;
-    if (args.len > shapes_buf.len) return;
-    for (args, 0..) |*a, i| shapes_buf[i] = shapeOfValue(self, a);
-    const shapes = shapes_buf[0..args.len];
-
-    const scope = applicability.ApplicabilityScope{
-        .ctx = @ptrCast(self),
-        .refine = applicRefineCb,
-        .subtype = applicSubtypeCb,
-    };
-
-    for (candidates) |cand| {
-        const legacy: ?i32 = overloadScore(self, module, cand, args);
-        const sig = sigViewOfFunc(self, module, cand) orelse continue;
-        const applic: ?i32 = if (applicability.applicable(&sig, shapes, scope)) |sc| sc.points else null;
-        if (!optScoreEq(legacy, applic)) {
-            std.debug.print(
-                "[KLIO_RESOLVE_AUDIT] scorer name={s} cand_fid={d} legacy={d} applic={d} divergent={d}\n",
-                .{ name, cand.int(), legacy orelse AUDIT_NA, applic orelse AUDIT_NA, @as(u8, 1) },
-            );
-        }
-    }
+/// Applicability points for one positional candidate via the shared scorer, or
+/// null when it does not bind. The `-1` under-application penalty is folded into
+/// `points` by `applicable()`, so the caller keys directly on the result.
+fn positionalPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: []const applicability.ArgShape, scope: applicability.ApplicabilityScope) ?i32 {
+    const sig = sigViewOfFunc(self, module, cand) orelse return null;
+    const sc = applicability.applicable(&sig, shapes, scope) orelse return null;
+    return sc.points;
 }
 
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
@@ -793,25 +739,38 @@ fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []cons
     const candidates = module.funcsBySimpleName(name);
     if (candidates.len < 2) return null;
 
+    var shapes_buf: [24]applicability.ArgShape = undefined;
+    var shapes_heap: ?[]applicability.ArgShape = null;
+    defer if (shapes_heap) |h| self.allocator.free(h);
+    const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
+        shapes_buf[0..args.len]
+    else blk: {
+        const h = self.allocator.alloc(applicability.ArgShape, args.len) catch return null;
+        shapes_heap = h;
+        break :blk h;
+    };
+    for (args, 0..) |*a, i| shapes[i] = shapeOfValue(self, a);
+    const scope = applicability.ApplicabilityScope{
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCb,
+        .subtype = applicSubtypeCb,
+    };
+
     var best_func: ?FuncId = null;
     var best_score: i32 = 0;
-    if (overloadScore(self, module, func, args)) |s| {
+    if (positionalPoints(self, module, func, shapes, scope)) |s| {
         best_func = func;
         best_score = s;
     }
     for (candidates) |cand| {
         if (cand.int() == func.int()) continue;
-        if (overloadScore(self, module, cand, args)) |total| {
+        if (positionalPoints(self, module, cand, shapes, scope)) |total| {
             if (best_func == null or total > best_score) {
                 best_func = cand;
                 best_score = total;
             }
         }
     }
-
-    // Additive dual-compute audit; the legacy `overloadScore` above stays the
-    // live selection.
-    if (resolveAuditOn()) auditPickOverload(self, module, name, candidates, args);
 
     return best_func;
 }
@@ -1089,120 +1048,6 @@ fn composableEval(
     return res;
 }
 
-/// Single named-argument call dispatch flow.
-/// Score a candidate overload for a named call: every named argument must map
-/// to a distinct parameter and type-fit, positional args fill the rest, and
-/// every unfilled parameter must be defaultable. `null` rejects the candidate.
-/// Fewer defaults used scores higher (the more specific overload wins).
-///
-/// `recv_external` means the call site supplies an implicit extension receiver
-/// (the enclosing frame's `this`) that is NOT among `args`: an extension
-/// candidate's leading `this` parameter is then receiver-filled rather than
-/// requiring a positional/named arg. A trailing callable positional argument
-/// (the `f(x) { … }` lambda) binds to the last function-typed parameter, not
-/// the next sequential slot — matching Kotlin's trailing-lambda rule.
-fn scoreNamedCandidate(
-    self: *VmHost,
-    module: *const Module,
-    cand: FuncId,
-    args: []const Value,
-    arg_names: []const ?[]const u8,
-    recv_external: bool,
-    arg_to_param: ?[]u16,
-) ?i32 {
-    const cf = funcAt(module, cand) orelse return null;
-    // A bodyless declaration is only a valid named-call target when it
-    // backs a native intrinsic (a `expect`/`actual` whose actual klio
-    // supplies as a host function, e.g. `String.replaceFirst(oldChar,
-    // newChar, ignoreCase)`); otherwise it is an unimplemented `expect`
-    // and must never be picked.
-    if (!cf.hasBody() and resolvedNativeForm(self, cand) == null and lookupIntrinsic(self, cf.fqn) == null) return null;
-    const params = cf.params;
-    if (params.len > 64) return null;
-    var filled = [_]bool{false} ** 64;
-    var total: i32 = 0;
-
-    const is_ext = paramIsThis(params);
-    // An implicit extension receiver fills the leading `this` parameter; a
-    // positional arg never lands on it.
-    if (is_ext and recv_external) filled[0] = true;
-
-    for (args, 0..) |a, i| {
-        const nm = if (i < arg_names.len) arg_names[i] else null;
-        const n = nm orelse continue;
-        var pos: ?usize = null;
-        for (params, 0..) |p, pi| {
-            if (std.mem.eql(u8, p.name, n)) {
-                pos = pi;
-                break;
-            }
-        }
-        const p = pos orelse return null; // a named arg with no matching param
-        if (filled[p]) return null;
-        // The named-parameter presence is the hard discriminator; the type
-        // score only ranks among the survivors, so an unscoreable arg (a
-        // generic/function-typed param, or an `Array` passed to a `vararg`)
-        // stays neutral rather than rejecting an otherwise-valid overload.
-        total += overloadScoreArg(self, &params[p].ty, &a) orelse 0;
-        filled[p] = true;
-        if (arg_to_param) |b| {
-            if (i < b.len) b[i] = @intCast(p);
-        }
-    }
-
-    // A trailing positional callable binds to the last function-typed
-    // parameter (`module: Application.() -> Unit`), out of sequence.
-    var trailing_lambda: ?usize = null;
-    if (args.len > 0) {
-        const last = args.len - 1;
-        const last_named = last < arg_names.len and arg_names[last] != null;
-        const last_param = params.len - 1;
-        if (!last_named and params.len > 0 and !filled[last_param] and
-            isFunctionType(&params[last_param].ty) and valueIsCallable(&args[last]))
-        {
-            total += overloadScoreArg(self, &params[last_param].ty, &args[last]) orelse 0;
-            filled[last_param] = true;
-            trailing_lambda = last;
-            if (arg_to_param) |b| {
-                if (last < b.len) b[last] = @intCast(last_param);
-            }
-        }
-    }
-
-    const has_vararg = lastIsVararg(params);
-    var pidx: usize = 0;
-    for (args, 0..) |a, i| {
-        const nm = if (i < arg_names.len) arg_names[i] else null;
-        if (nm != null) continue;
-        if (trailing_lambda != null and i == trailing_lambda.?) continue;
-        while (pidx < params.len and filled[pidx]) pidx += 1;
-        if (pidx >= params.len) {
-            if (has_vararg) {
-                if (arg_to_param) |b| {
-                    if (i < b.len) b[i] = @intCast(params.len - 1);
-                }
-                continue;
-            }
-            return null; // too many positional args
-        }
-        total += overloadScoreArg(self, &params[pidx].ty, &a) orelse 0;
-        if (arg_to_param) |b| {
-            if (i < b.len) b[i] = @intCast(pidx);
-        }
-        filled[pidx] = true;
-        pidx += 1;
-    }
-
-    const defaults = funcDefaults(self, cand);
-    for (params, 0..) |p, pi| {
-        if (filled[pi] or p.is_vararg) continue;
-        const has_default = defaults != null and pi < defaults.?.len and defaults.?[pi] != null;
-        if (!has_default) return null;
-        total -= 1;
-    }
-    return total;
-}
-
 /// Per-candidate `SigView` for the shared applicability scorer on the NAMED
 /// path. Unlike `sigViewOfFunc`, a bodyless declaration backed by a native
 /// intrinsic (a resolved-native form or a same-FQN host intrinsic) is
@@ -1219,74 +1064,13 @@ fn sigViewOfNamed(self: *VmHost, module: *const Module, cand: FuncId) ?applicabi
     };
 }
 
-/// Dual-compute audit for the named-argument scorer: for each candidate compute
-/// both the legacy `scoreNamedCandidate` and the shared `applicable()` (named
-/// mode), and log any mismatch of per-candidate points, arg->param binding, or
-/// the chosen winner. Runs only under `KLIO_RESOLVE_AUDIT`; changes no behavior.
-fn auditPickNamed(
-    self: *VmHost,
-    module: *const Module,
-    name: []const u8,
-    candidates: []const FuncId,
-    args: []const Value,
-    arg_names: []const ?[]const u8,
-    recv_external: bool,
-    legacy_best: ?FuncId,
-) void {
-    var shapes_buf: [32]applicability.ArgShape = undefined;
-    if (args.len > shapes_buf.len) return;
-    for (args, 0..) |*a, i| {
-        shapes_buf[i] = shapeOfValue(self, a);
-        shapes_buf[i].named = if (i < arg_names.len) arg_names[i] else null;
-    }
-    const shapes = shapes_buf[0..args.len];
-
-    var applic_bind_buf: [32]u16 = undefined;
-    const scope = applicability.ApplicabilityScope{
-        .named = true,
-        .recv_external = recv_external,
-        .ctx = @ptrCast(self),
-        .refine = applicRefineCb,
-        .subtype = applicSubtypeCb,
-        .arg_to_param_buf = applic_bind_buf[0..args.len],
-    };
-
-    var applic_best: ?FuncId = null;
-    var applic_best_score: i32 = std.math.minInt(i32);
-
-    for (candidates) |cand| {
-        var legacy_bind_buf: [32]u16 = undefined;
-        const legacy = scoreNamedCandidate(self, module, cand, args, arg_names, recv_external, legacy_bind_buf[0..args.len]);
-        const sig = sigViewOfNamed(self, module, cand) orelse continue;
-        const applic = applicability.applicable(&sig, shapes, scope);
-        const applic_pts: ?i32 = if (applic) |s| s.points else null;
-
-        var bind_div: u8 = 0;
-        if (legacy != null and applic != null) {
-            if (!std.mem.eql(u16, legacy_bind_buf[0..args.len], applic_bind_buf[0..args.len])) bind_div = 1;
-        }
-        if (!optScoreEq(legacy, applic_pts) or bind_div == 1) {
-            std.debug.print(
-                "[KLIO_RESOLVE_AUDIT] named name={s} cand_fid={d} legacy={d} applic={d} bind_div={d} divergent={d}\n",
-                .{ name, cand.int(), legacy orelse AUDIT_NA, applic_pts orelse AUDIT_NA, bind_div, @as(u8, 1) },
-            );
-        }
-        if (applic_pts) |pts| {
-            if (applic_best == null or pts > applic_best_score) {
-                applic_best = cand;
-                applic_best_score = pts;
-            }
-        }
-    }
-
-    const lw: i64 = if (legacy_best) |b| @intCast(b.int()) else -1;
-    const aw: i64 = if (applic_best) |b| @intCast(b.int()) else -1;
-    if (lw != aw) {
-        std.debug.print(
-            "[KLIO_RESOLVE_AUDIT] named name={s} winner legacy_fid={d} applic_fid={d} divergent=1\n",
-            .{ name, lw, aw },
-        );
-    }
+/// Applicability points for one named-call candidate via the shared scorer, or
+/// null when it does not bind. Binding output is not needed at pick time, so no
+/// `arg_to_param_buf` is threaded.
+fn namedPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: []const applicability.ArgShape, scope: applicability.ApplicabilityScope) ?i32 {
+    const sig = sigViewOfNamed(self, module, cand) orelse return null;
+    const sc = applicability.applicable(&sig, shapes, scope) orelse return null;
+    return sc.points;
 }
 
 /// Re-pick the overload for a named call. The IR resolves the call site to one
@@ -1314,19 +1098,38 @@ pub fn pickNamedOverloadId(
     const f0 = funcAt(module, func) orelse return null;
     const candidates = module.funcsBySimpleName(f0.name);
     if (candidates.len < 2) return null;
+
+    var shapes_buf: [24]applicability.ArgShape = undefined;
+    var shapes_heap: ?[]applicability.ArgShape = null;
+    defer if (shapes_heap) |h| self.allocator.free(h);
+    const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
+        shapes_buf[0..args.len]
+    else blk: {
+        const h = self.allocator.alloc(applicability.ArgShape, args.len) catch return null;
+        shapes_heap = h;
+        break :blk h;
+    };
+    for (args, 0..) |*a, i| {
+        shapes[i] = shapeOfValue(self, a);
+        shapes[i].named = if (i < arg_names.len) arg_names[i] else null;
+    }
+    const scope = applicability.ApplicabilityScope{
+        .named = true,
+        .recv_external = recv_external,
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCb,
+        .subtype = applicSubtypeCb,
+    };
+
     var best: ?FuncId = null;
     var best_score: i32 = std.math.minInt(i32);
     for (candidates) |cand| {
-        const score = scoreNamedCandidate(self, module, cand, args, arg_names, recv_external, null) orelse continue;
+        const score = namedPoints(self, module, cand, shapes, scope) orelse continue;
         if (best == null or score > best_score) {
             best = cand;
             best_score = score;
         }
     }
-
-    // Additive dual-compute audit; the legacy `scoreNamedCandidate` above stays
-    // the live selection.
-    if (resolveAuditOn()) auditPickNamed(self, module, f0.name, candidates, args, arg_names, recv_external, best);
 
     return best;
 }

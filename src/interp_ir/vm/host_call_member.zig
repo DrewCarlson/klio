@@ -912,7 +912,7 @@ fn extReceiverSpecificity(self: *VmHost, receiver: *const Value, ty_name: []cons
     }
     if (receiver.isRuntimeType(pn)) return 100;
     const v_ty = simpleName(receiver.typeFqn());
-    for (builtinSupers(v_ty), 0..) |s, pos| {
+    for (applicability.builtinSupersOf(v_ty), 0..) |s, pos| {
         if (std.mem.eql(u8, s, pn)) {
             const d: i32 = @intCast(@min(pos, @as(usize, 50)));
             return 90 - d;
@@ -1688,7 +1688,7 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     // arg matches a `CharSequence` param, a `List` matches `Iterable`,
     // etc.). Key the supertype list on the *argument's* value type and
     // check whether the *parameter* name is among them.
-    const builtin_supers = builtinSupers(v_ty);
+    const builtin_supers = applicability.builtinSupersOf(v_ty);
     const nm_simple = simpleName(nm);
     for (builtin_supers, 0..) |s, pos| {
         if (std.mem.eql(u8, s, nm) or std.mem.eql(u8, s, nm_simple)) {
@@ -1740,50 +1740,13 @@ fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const u8)
     return null;
 }
 
-fn builtinSupers(nm: []const u8) []const []const u8 {
-    const s = simpleName(nm);
-    if (std.mem.eql(u8, s, "List")) {
-        return &.{ "Collection", "Iterable", "MutableList", "MutableCollection", "MutableIterable" };
-    } else if (std.mem.eql(u8, s, "MutableList")) {
-        return &.{ "List", "Collection", "Iterable", "MutableCollection", "MutableIterable" };
-    } else if (std.mem.eql(u8, s, "Collection")) {
-        return &.{ "Iterable", "MutableCollection", "MutableIterable" };
-    } else if (std.mem.eql(u8, s, "Set")) {
-        return &.{ "Collection", "Iterable", "MutableSet", "MutableCollection", "MutableIterable" };
-    } else if (std.mem.eql(u8, s, "MutableSet")) {
-        return &.{ "Set", "Collection", "Iterable", "MutableCollection", "MutableIterable" };
-    } else if (std.mem.eql(u8, s, "Map")) {
-        return &.{"MutableMap"};
-    } else if (std.mem.eql(u8, s, "MutableMap")) {
-        return &.{"Map"};
-    } else if (std.mem.eql(u8, s, "IntRange")) {
-        return &.{ "IntProgression", "ClosedRange", "Iterable", "OpenEndRange" };
-    } else if (std.mem.eql(u8, s, "LongRange")) {
-        return &.{ "LongProgression", "ClosedRange", "Iterable", "OpenEndRange" };
-    } else if (std.mem.eql(u8, s, "CharRange")) {
-        return &.{ "CharProgression", "ClosedRange", "Iterable", "OpenEndRange" };
-    } else if (std.mem.eql(u8, s, "IntProgression") or std.mem.eql(u8, s, "LongProgression") or std.mem.eql(u8, s, "CharProgression")) {
-        return &.{"Iterable"};
-    } else if (std.mem.eql(u8, s, "String")) {
-        return &.{ "CharSequence", "Comparable" };
-    } else if (std.mem.eql(u8, s, "StringBuilder")) {
-        // A StringBuilder is a CharSequence (and Appendable). Without this an
-        // overload taking `CharSequence` scores inapplicable for a StringBuilder
-        // argument, so overload resolution falls to the lowest-FuncId tiebreak
-        // and elects a `Char`/first-declared sibling — `sb.startsWith(sb)` bound
-        // `startsWith(Char)` instead of `startsWith(CharSequence)`.
-        return &.{ "CharSequence", "Appendable" };
-    }
-    return &.{};
-}
-
 // -------------------------------------------------------------------------
-// Shared applicability engine — dual-compute audit (KLIO_RESOLVE_AUDIT).
+// Shared applicability engine — member / extension adapters.
 //
-// The legacy `pickMethodOverload` / `scoreExtCandidates` selection stays the
-// live path. When the audit gate is on, the shared `applicable()` is computed
-// alongside per candidate and any divergence (per-candidate points / ext_key /
-// chosen winner) is logged. Nothing here changes behavior.
+// `pickMethodOverload` and `scoreExtCandidates` select through the shared
+// `applicable()` engine. These adapters project a runtime value into an
+// `ArgShape`, a `Func` into a `SigView`, and wrap the value-dependent
+// refinement / subtype / extension-ranking callbacks the engine invokes.
 // -------------------------------------------------------------------------
 
 /// `ArgShape` for one runtime value, in the MEMBER scorer's conventions:
@@ -1880,264 +1843,11 @@ fn applicKnownPackageCb(pkg: []const u8) bool {
     return stdlib.isKnownPackage(pkg);
 }
 
-fn optScoreEqM(a: ?i32, b: ?i32) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return a.? == b.?;
-}
-
-const AUDIT_NA: i32 = std.math.minInt(i32);
-
-/// Raw per-candidate member score (before the `+5` exact / `-1000` low-priority
-/// adjustments), reproducing the multi-candidate `pickMethodOverload` body for
-/// one candidate. `null` = the candidate does not bind. AUDIT ONLY.
-const LegacyMemberScore = struct { points: i32, exact_arity: bool };
-
-fn legacyMemberCandScore(self: *VmHost, f: *const Func, args: []const Value) ?LegacyMemberScore {
-    const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-    const effective = f.params[skip..];
-    if (args.len < effective.len and args.len > 0 and effective.len > 0 and
-        isFunctionTypeRefResolved(self, &effective[effective.len - 1].ty) and
-        isCallable(&args[args.len - 1]))
-    {
-        const lead = args.len - 1;
-        const last_param = effective.len - 1;
-        const defaults = funcDefaults(self, f);
-        var gap_defaulted = true;
-        var k: usize = lead;
-        while (k < last_param) : (k += 1) {
-            if (!paramHasDefault(defaults, skip + k)) {
-                gap_defaulted = false;
-                break;
-            }
-        }
-        if (gap_defaulted) {
-            var total: i32 = 0;
-            var ok = true;
-            var j: usize = 0;
-            while (j < lead) : (j += 1) {
-                if (overloadScoreArg(self, &effective[j].ty, &args[j])) |s| total += s else {
-                    ok = false;
-                    break;
-                }
-            }
-            if (ok) {
-                if (overloadScoreArg(self, &effective[last_param].ty, &args[lead])) |s| total += s else ok = false;
-            }
-            if (ok) return .{ .points = total, .exact_arity = false };
-            return null;
-        }
-    }
-    if (args.len > effective.len) return null;
-    if (args.len < effective.len) {
-        const defaults = funcDefaults(self, f);
-        var k: usize = args.len;
-        while (k < effective.len) : (k += 1) {
-            if (!paramHasDefault(defaults, skip + k)) return null;
-        }
-    }
-    var score: i32 = 0;
-    var i: usize = 0;
-    while (i < args.len and i < effective.len) : (i += 1) {
-        if (overloadScoreArg(self, &effective[i].ty, &args[i])) |s| score += s else return null;
-    }
-    return .{ .points = score, .exact_arity = args.len == effective.len };
-}
-
 fn appliedMemberScore(pts: i32, exact_arity: bool, low_priority: bool) i32 {
     var s = pts;
     if (exact_arity) s += 5;
     if (low_priority) s -= 1000;
     return s;
-}
-
-/// Dual-compute audit for the multi-candidate `pickMethodOverload` scorer.
-fn auditMemberOverload(self: *VmHost, candidates: []const Func, args: []const Value, legacy_best: ?Func) void {
-    var shapes_buf: [32]applicability.ArgShape = undefined;
-    if (args.len > shapes_buf.len) return;
-    for (args, 0..) |*a, i| shapes_buf[i] = shapeOfValueMember(self, a);
-    const shapes = shapes_buf[0..args.len];
-
-    const scope = applicability.ApplicabilityScope{
-        .member = true,
-        .ctx = @ptrCast(self),
-        .refine = applicRefineCbM,
-        .subtype = applicSubtypeCbM,
-        .func_type = applicFuncTypeCbM,
-    };
-
-    var applic_best: ?Func = null;
-    var applic_best_score: i32 = std.math.minInt(i32);
-    const name: []const u8 = if (candidates.len > 0) candidates[0].name else "";
-
-    for (candidates) |f| {
-        const legacy = legacyMemberCandScore(self, &f, args);
-        var sig = sigViewOfMember(self, &f, false);
-        const applic = applicability.applicable(&sig, shapes, scope);
-
-        const legacy_pts: ?i32 = if (legacy) |l| l.points else null;
-        const applic_pts: ?i32 = if (applic) |s| s.points else null;
-        var divergent = !optScoreEqM(legacy_pts, applic_pts);
-        if (legacy != null and applic != null) {
-            if (legacy.?.exact_arity != applic.?.exact_arity) divergent = true;
-            if (f.low_priority != applic.?.low_priority) divergent = true;
-        }
-        if (divergent) {
-            std.debug.print(
-                "[KLIO_RESOLVE_AUDIT] member name={s} cand_fid={d} legacy={d} applic={d} ext_legacy=- ext_applic=- divergent=1\n",
-                .{ name, f.id.int(), legacy_pts orelse AUDIT_NA, applic_pts orelse AUDIT_NA },
-            );
-        }
-        if (applic) |s| {
-            const applied = appliedMemberScore(s.points, s.exact_arity, s.low_priority);
-            if (applic_best == null or applied > applic_best_score) {
-                applic_best_score = applied;
-                applic_best = f;
-            }
-        }
-    }
-
-    const lw: i64 = if (legacy_best) |b| @intCast(b.id.int()) else -1;
-    const aw: i64 = if (applic_best) |b| @intCast(b.id.int()) else -1;
-    if (lw != aw) {
-        std.debug.print(
-            "[KLIO_RESOLVE_AUDIT] member name={s} winner legacy_fid={d} applic_fid={d} divergent=1\n",
-            .{ name, lw, aw },
-        );
-    }
-}
-
-/// The legacy per-candidate `ExtKey`, factored out of `scoreExtCandidates` so
-/// the live loop and the audit share one source of truth.
-fn extKeyForCandidate(
-    self: *VmHost,
-    allocator: Allocator,
-    receiver: *const Value,
-    candidates: []const Candidate,
-    args: []const Value,
-    want: usize,
-    idx: usize,
-    chain_owners: *const std.ArrayList([]const u8),
-) ExtKey {
-    const c = candidates[idx];
-    const f = c.func;
-    const recv_score = overloadScoreArg(self, &f.params[0].ty, receiver) orelse -1;
-    var score: i32 = recv_score *| 1000;
-    var param_spec: i32 = 0;
-    var applic: i32 = 1;
-    for (args, 0..) |*a, i| {
-        if (f.params.len > i + 1) {
-            const arg_score = overloadScoreArg(self, &f.params[i + 1].ty, a);
-            if (arg_score == null and !f.params[i + 1].has_default and !f.params[i + 1].is_vararg) {
-                applic = 0;
-            }
-            score += arg_score orelse -1;
-            if (!isTopOrGenericType(f.params[i + 1].ty.name)) param_spec += 1;
-        }
-    }
-    if (want < f.params.len) {
-        var k = want;
-        while (k < f.params.len) : (k += 1) {
-            if (!f.params[k].has_default and !f.params[k].is_vararg) {
-                applic = 0;
-                break;
-            }
-        }
-    }
-    if (f.params.len == want) score += 5;
-    const recv_match = extReceiverSpecificity(self, receiver, f.params[0].ty.name);
-    var spec: i32 = 0;
-    for (candidates, 0..) |o, j| {
-        if (j == idx) continue;
-        if (isSubtypeName(self, allocator, f.params[0].ty.name, o.func.params[0].ty.name)) spec += 1;
-    }
-    var owner_rank: i32 = 0;
-    {
-        const mg = self.module.borrow();
-        const mod = mg.get();
-        if (isMemberExt(mod, c.fid)) {
-            if (mod.registry.member_ext_owner_class.get(c.fid)) |owner| {
-                for (chain_owners.items, 0..) |co, pos| {
-                    if (std.mem.eql(u8, co, owner)) {
-                        owner_rank = @as(i32, @intCast(chain_owners.items.len)) - @as(i32, @intCast(pos));
-                        break;
-                    }
-                }
-            }
-        }
-        mg.deinit();
-    }
-    const neg_fid: i32 = -@as(i32, @intCast(@intFromEnum(c.fid) & 0x7fff_ffff));
-    const is_user: i32 = @intFromBool(f.package.len == 0 or !stdlib.isKnownPackage(f.package));
-    return .{ applic, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid };
-}
-
-/// Dual-compute audit for the extension ranking `scoreExtCandidates`.
-fn auditScoreExt(
-    self: *VmHost,
-    allocator: Allocator,
-    receiver: *const Value,
-    candidates: []const Candidate,
-    args: []const Value,
-    want: usize,
-    chain_owners: *const std.ArrayList([]const u8),
-    legacy_best: ?Candidate,
-) void {
-    var shapes_buf: [32]applicability.ArgShape = undefined;
-    if (args.len > shapes_buf.len) return;
-    for (args, 0..) |*a, i| shapes_buf[i] = shapeOfValueMember(self, a);
-    const shapes = shapes_buf[0..args.len];
-
-    var sig_buf: [64]applicability.SigView = undefined;
-    if (candidates.len > sig_buf.len) return;
-    for (candidates, 0..) |c, i| sig_buf[i] = sigViewOfMember(self, &c.func, true);
-    const all_sigs = sig_buf[0..candidates.len];
-
-    const recv_shape = shapeOfValueMember(self, receiver);
-    const scope = applicability.ApplicabilityScope{
-        .member = true,
-        .rank_extensions = true,
-        .is_extension = true,
-        .receiver = recv_shape,
-        .all_candidates = all_sigs,
-        .ctx = @ptrCast(self),
-        .refine = applicRefineCbM,
-        .subtype = applicSubtypeCbM,
-        .ext_recv_match = applicExtRecvMatchCb,
-        .ext_is_subtype_name = applicExtSubtypeNameCb,
-        .ext_owner_rank = applicExtOwnerRankCb,
-        .ext_known_package = applicKnownPackageCb,
-    };
-
-    var applic_best: ?Candidate = null;
-    var applic_best_key: ExtKey = .{std.math.minInt(i32)} ** 8;
-    const name: []const u8 = if (candidates.len > 0) candidates[0].func.name else "";
-
-    for (candidates, 0..) |c, idx| {
-        const legacy_key = extKeyForCandidate(self, allocator, receiver, candidates, args, want, idx, chain_owners);
-        var sig = all_sigs[idx];
-        const applic = applicability.applicable(&sig, shapes, scope) orelse continue;
-        const applic_key = applic.ext_key.?;
-        if (!std.mem.eql(i32, &legacy_key, &applic_key)) {
-            std.debug.print(
-                "[KLIO_RESOLVE_AUDIT] member name={s} cand_fid={d} legacy={d} applic={d} ext_legacy={any} ext_applic={any} divergent=1\n",
-                .{ name, c.fid.int(), legacy_key[4], applic_key[4], legacy_key, applic_key },
-            );
-        }
-        if (applic_best == null or extKeyGreater(applic_key, applic_best_key)) {
-            applic_best = c;
-            applic_best_key = applic_key;
-        }
-    }
-
-    const lw: i64 = if (legacy_best) |b| @intCast(b.fid.int()) else -1;
-    const aw: i64 = if (applic_best) |b| @intCast(b.fid.int()) else -1;
-    if (lw != aw) {
-        std.debug.print(
-            "[KLIO_RESOLVE_AUDIT] member name={s} winner legacy_fid={d} applic_fid={d} divergent=1\n",
-            .{ name, lw, aw },
-        );
-    }
 }
 
 /// Default-arg thunk slots recorded for `f` (indexed by lowered-param
@@ -2429,6 +2139,25 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         }
         return f;
     }
+    var shapes_buf: [24]applicability.ArgShape = undefined;
+    var shapes_heap: ?[]applicability.ArgShape = null;
+    defer if (shapes_heap) |h| self.allocator.free(h);
+    const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
+        shapes_buf[0..args.len]
+    else blk: {
+        const h = self.allocator.alloc(applicability.ArgShape, args.len) catch return null;
+        shapes_heap = h;
+        break :blk h;
+    };
+    for (args, 0..) |*a, i| shapes[i] = shapeOfValueMember(self, a);
+    const scope = applicability.ApplicabilityScope{
+        .member = true,
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCbM,
+        .subtype = applicSubtypeCbM,
+        .func_type = applicFuncTypeCbM,
+    };
+
     var best: ?Func = null;
     var best_score: i32 = std.math.minInt(i32);
     // Track candidates that scored equal to the current best, for the
@@ -2438,94 +2167,11 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
     var tied: std.ArrayList(Func) = .empty;
     defer tied.deinit(self.allocator);
     for (candidates) |f| {
-        const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-        const effective = f.params[skip..];
-        // Trailing-lambda rule: a `recv.f(a, …) { lambda }` call binds the
-        // trailing lambda to the LAST function-typed param, with the
-        // intermediate gap defaulted.
-        if (args.len < effective.len and args.len > 0 and
-            effective.len > 0 and isFunctionTypeRefResolved(self, &effective[effective.len - 1].ty) and
-            isCallable(&args[args.len - 1]))
-        {
-            const lead = args.len - 1;
-            const last_param = effective.len - 1;
-            const defaults = funcDefaults(self, &f);
-            var gap_defaulted = true;
-            var k: usize = lead;
-            while (k < last_param) : (k += 1) {
-                if (!paramHasDefault(defaults, skip + k)) {
-                    gap_defaulted = false;
-                    break;
-                }
-            }
-            if (gap_defaulted) {
-                var total: i32 = 0;
-                var ok = true;
-                var j: usize = 0;
-                while (j < lead) : (j += 1) {
-                    if (overloadScoreArg(self, &effective[j].ty, &args[j])) |s| {
-                        total += s;
-                    } else {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok) {
-                    if (overloadScoreArg(self, &effective[last_param].ty, &args[lead])) |s| {
-                        total += s;
-                    } else ok = false;
-                }
-                if (ok) {
-                    // A `@Deprecated(HIDDEN)` / low-priority overload is
-                    // only kotlinc's pick when no ordinary candidate
-                    // applies; rank it strictly below every ordinary one.
-                    if (f.low_priority) total -= 1000;
-                    if (check_inv and total == best_score) tied.append(self.allocator, f) catch {};
-                    if (total > best_score) {
-                        best_score = total;
-                        best = f;
-                        if (check_inv) {
-                            tied.clearRetainingCapacity();
-                            tied.append(self.allocator, f) catch {};
-                        }
-                    }
-                }
-                continue;
-            }
-        }
-        // Accept an exact-arity match, or a call supplying fewer args when
-        // every unsupplied trailing parameter has a default.
-        if (args.len > effective.len) continue;
-        if (args.len < effective.len) {
-            const defaults = funcDefaults(self, &f);
-            var all_defaulted = true;
-            var k: usize = args.len;
-            while (k < effective.len) : (k += 1) {
-                if (!paramHasDefault(defaults, skip + k)) {
-                    all_defaulted = false;
-                    break;
-                }
-            }
-            if (!all_defaulted) continue;
-        }
-        var score: i32 = 0;
-        var ok = true;
-        var i: usize = 0;
-        while (i < args.len and i < effective.len) : (i += 1) {
-            if (overloadScoreArg(self, &effective[i].ty, &args[i])) |s| {
-                score += s;
-            } else {
-                ok = false;
-                break;
-            }
-        }
-        if (!ok) continue;
-        // Prefer an exact-arity overload over one relying on defaults.
-        if (args.len == effective.len) score += 5;
-        // A `@Deprecated(HIDDEN)` / low-priority overload is only
-        // kotlinc's pick when no ordinary candidate applies; rank it
-        // strictly below every ordinary one.
-        if (f.low_priority) score -= 1000;
+        var sig = sigViewOfMember(self, &f, false);
+        const applic = applicability.applicable(&sig, shapes, scope) orelse continue;
+        // The `+5` exact-arity bonus and `-1000` low-priority penalty are the
+        // member caller's tiebreaks, applied from the returned `Score`.
+        const score = appliedMemberScore(applic.points, applic.exact_arity, applic.low_priority);
         if (check_inv and score == best_score) tied.append(self.allocator, f) catch {};
         if (score > best_score) {
             best_score = score;
@@ -2543,9 +2189,6 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
             checkFuncInRange(self, "pickMethodOverload", w.id);
         }
     }
-    // Additive dual-compute audit; the legacy scoring above stays the live
-    // selection.
-    if (host_call_func.resolveAuditOn()) auditMemberOverload(self, candidates, args, best);
     return best;
 }
 
@@ -6895,7 +6538,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     } else if (unique_exact != null) {
         chosen = unique_exact;
     } else {
-        chosen = try scoreExtCandidates(self, allocator, receiver, candidates.items, args, want);
+        chosen = try scoreExtCandidates(self, allocator, receiver, candidates.items, args);
     }
 
     if (chosen == null) return null;
@@ -7031,9 +6674,33 @@ fn extKeyGreater(a: ExtKey, b: ExtKey) bool {
     return false;
 }
 
-fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Value, candidates: []const Candidate, args: []const Value, want: usize) Allocator.Error!?Candidate {
-    var chain_owners = try enclosingChainClassOrder(self, allocator);
-    defer chain_owners.deinit(allocator);
+fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Value, candidates: []const Candidate, args: []const Value) Allocator.Error!?Candidate {
+    var shapes_buf: [24]applicability.ArgShape = undefined;
+    const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
+        shapes_buf[0..args.len]
+    else try allocator.alloc(applicability.ArgShape, args.len);
+    defer if (args.len > shapes_buf.len) allocator.free(shapes);
+    for (args, 0..) |*a, i| shapes[i] = shapeOfValueMember(self, a);
+
+    const all_sigs = try allocator.alloc(applicability.SigView, candidates.len);
+    defer allocator.free(all_sigs);
+    for (candidates, 0..) |c, i| all_sigs[i] = sigViewOfMember(self, &c.func, true);
+
+    const recv_shape = shapeOfValueMember(self, receiver);
+    const scope = applicability.ApplicabilityScope{
+        .member = true,
+        .rank_extensions = true,
+        .is_extension = true,
+        .receiver = recv_shape,
+        .all_candidates = all_sigs,
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCbM,
+        .subtype = applicSubtypeCbM,
+        .ext_recv_match = applicExtRecvMatchCb,
+        .ext_is_subtype_name = applicExtSubtypeNameCb,
+        .ext_owner_rank = applicExtOwnerRankCb,
+        .ext_known_package = applicKnownPackageCb,
+    };
 
     const check_inv = trace.invariantsEnabled();
     var tied: std.ArrayList(Func) = .empty;
@@ -7045,7 +6712,7 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // (`ext_key[0]`), then user-vs-shipped, subtype specificity, receiver
         // specificity, the numeric score, owner rank, parameter specificity,
         // and the stable lowest-FuncId discriminator.
-        const key = extKeyForCandidate(self, allocator, receiver, candidates, args, want, idx, &chain_owners);
+        const key = (applicability.applicable(&all_sigs[idx], shapes, scope) orelse continue).ext_key.?;
         if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
             tied.append(self.allocator, c.func) catch {};
         }
@@ -7064,11 +6731,6 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
             checkOverloadUnique(name, &w.func, tied.items);
             checkFuncInRange(self, "scoreExtCandidates", w.fid);
         }
-    }
-    // Additive dual-compute audit; the legacy ranking above stays the live
-    // selection.
-    if (host_call_func.resolveAuditOn()) {
-        auditScoreExt(self, allocator, receiver, candidates, args, want, &chain_owners, best);
     }
     return best;
 }
@@ -7516,7 +7178,7 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
     }
     if (candidates.items.len == 0) return null;
     if (candidates.items.len == 1) return candidates.items[0].fid;
-    const chosen = scoreExtCandidates(self, allocator, receiver, candidates.items, args, want) catch return null;
+    const chosen = scoreExtCandidates(self, allocator, receiver, candidates.items, args) catch return null;
     return if (chosen) |c| c.fid else null;
 }
 
