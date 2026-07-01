@@ -861,6 +861,7 @@ pub fn lowerMethodWithPrivate(
         placed.id = id;
         placed.kind = .member_extension;
         try module.funcs.append(a, placed);
+        try registerFuncTypeParams(module, f, id);
         const nm = f.name.name;
         try module.func_index.append(a, .{ .name = nm, .id = id });
         try funcNameIndexPush(module, nm, id);
@@ -890,8 +891,21 @@ pub fn lowerMethodWithPrivate(
     placed.id = id;
     placed.kind = .instance_method;
     try module.funcs.append(a, placed);
+    try registerFuncTypeParams(module, f, id);
     try recordMethodParamDefaults(module, f, id, owner_class, own_members);
     return placed;
+}
+
+/// Register a declaration's type-parameter names in the module registry so
+/// generic-signature checks (a callee-generic `::name` slot, the generic
+/// native-marking escape, call-site type-arg binding) see methods the same
+/// way they see top-level functions.
+fn registerFuncTypeParams(module: *Module, f: *const ast.Function, id: FuncId) Allocator.Error!void {
+    if (f.type_params.len == 0) return;
+    const a = module.registry.allocator;
+    var tp_names: std.ArrayList([]const u8) = .empty;
+    for (f.type_params) |*tp| try tp_names.append(a, tp.name.name);
+    try module.registry.func_type_params.put(id, tp_names);
 }
 
 pub fn lowerFunctionBodyWithImplicitOwner(
@@ -1012,6 +1026,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         var tp_names = StringSet.init(a);
         defer tp_names.deinit();
         for (f.type_params) |*tp| try tp_names.put(tp.name.name, {});
+        b.setHasOwnTypeParams(f.type_params.len != 0);
         for (f.params) |*p| {
             if (p.ty.function == null and !p.ty.nullable and tp_names.contains(p.ty.name.name)) {
                 try b.markGenericTypedParam(p.name.name);

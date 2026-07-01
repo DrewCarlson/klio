@@ -393,6 +393,82 @@ fn unknownArgScore(nm: []const u8) i32 {
     return 10;
 }
 
+/// Declared-type evidence for a (param, arg) pair whose runtime head is
+/// unknown: the caller proved the argument's declared static head (a local /
+/// parameter with a known declared type). STRICTLY ADDITIVE — a head match
+/// earns the head-match score, a type-parameter-typed argument head-matches a
+/// type-parameter-typed parameter (`a: T` inside `fun <T : Comparable<T>>`
+/// against `minOf(a: T, b: T)`), and anything else returns null so the caller
+/// falls back to the unknown base. Declared-type evidence can therefore only
+/// ever ADD points for a matching candidate; it never disqualifies one.
+pub fn tyEvidenceScore(param_name: []const u8, arg_ty_name: []const u8, member: bool) ?i32 {
+    const pn = std.mem.trimEnd(u8, simpleName(param_name), "?");
+    const an = std.mem.trimEnd(u8, simpleName(arg_ty_name), "?");
+    if (pn.len == 0 or an.len == 0) return null;
+    if (std.mem.eql(u8, pn, an)) return 100;
+    const p_tp = pn.len <= 2 and (if (member) allUpperOrDigit(pn) else allAsciiUpper(pn));
+    const a_tp = an.len <= 2 and (if (member) allUpperOrDigit(an) else allAsciiUpper(an));
+    if (p_tp and a_tp) return 100;
+    return null;
+}
+
+/// A builtin numeric head (the widths `paramLitKind`-style matching folds
+/// together for evidence purposes).
+fn isNumericHead(pn: []const u8) bool {
+    const names = [_][]const u8{
+        "Int",  "Long",  "Short",  "Byte",  "Double", "Float",
+        "UInt", "ULong", "UShort", "UByte", "Number",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, pn, n)) return true;
+    }
+    return false;
+}
+
+/// Literal-kind evidence for a (param, literal arg) pair: a numeric literal
+/// matches any numeric parameter head, a string literal `String` /
+/// `CharSequence`, and so on. Null (no conclusion) otherwise — like the
+/// declared-type evidence, this only ever adds preference.
+fn literalEvidenceScore(param_name: []const u8, kind: LiteralKind) ?i32 {
+    const pn = std.mem.trimEnd(u8, simpleName(param_name), "?");
+    const hit = switch (kind) {
+        .numeric => isNumericHead(pn),
+        .string => std.mem.eql(u8, pn, "String") or std.mem.eql(u8, pn, "CharSequence"),
+        .boolean => std.mem.eql(u8, pn, "Boolean"),
+        .char => std.mem.eql(u8, pn, "Char"),
+    };
+    return if (hit) 100 else null;
+}
+
+/// Lowering-time evidence bonus for ranking same-rung candidates in the
+/// bare-call ladder: the sum of per-arg evidence scores — a declared-type
+/// head match (100), a declared numeric head against a numeric parameter of
+/// another width (80, so an exact head still outranks it), or a literal-kind
+/// match (100). Zero whenever no argument carries evidence, so a call with
+/// no static facts ranks exactly as before — evidence only ever ADDS
+/// preference for a matching candidate, never demotes or disqualifies one.
+pub fn tyEvidenceBonus(params: []const Param, args: []const ArgShape) i32 {
+    var total: i32 = 0;
+    for (args, 0..) |*a, i| {
+        if (i >= params.len) break;
+        if (a.runtime_class != null) continue;
+        if (a.ty) |aty| {
+            if (tyEvidenceScore(params[i].ty.name, aty.name, false)) |s| {
+                total += s;
+            } else {
+                const pn = std.mem.trimEnd(u8, simpleName(params[i].ty.name), "?");
+                const an = std.mem.trimEnd(u8, simpleName(aty.name), "?");
+                if (isNumericHead(pn) and isNumericHead(an)) total += 80;
+            }
+            continue;
+        }
+        if (a.literal_kind) |k| {
+            if (literalEvidenceScore(params[i].ty.name, k)) |s| total += s;
+        }
+    }
+    return total;
+}
+
 // -------------------------------------------------------------------------
 // Per-argument scoring (mirror of `overloadScoreArg`).
 // -------------------------------------------------------------------------
@@ -405,8 +481,14 @@ fn scoreArg(param_ty: *const TypeRef, arg: *const ArgShape, scope: *const Applic
     const member = scope.member;
 
     // Runtime head of the argument. A caller that could not prove one
-    // (lowering / eager) scores the arg as unknown.
-    const v_ty = arg.runtime_class orelse return unknownArgScore(nm);
+    // (lowering / eager) scores from declared-type evidence when the shape
+    // carries it — additive-only, never disqualifying — else as unknown.
+    const v_ty = arg.runtime_class orelse {
+        if (arg.ty) |aty| {
+            if (tyEvidenceScore(nm, aty.name, member)) |s| return s;
+        }
+        return unknownArgScore(nm);
+    };
 
     if (std.mem.eql(u8, nm, v_ty)) {
         const d = refineDelta(scope, param_ty, arg) orelse return null;
@@ -972,6 +1054,55 @@ test "builtinSupersOf: union table adds Collection and StringBuilder rows" {
     try testing.expectEqual(@as(usize, 3), builtinSupersOf("Collection").len);
     try testing.expectEqualStrings("CharSequence", builtinSupersOf("StringBuilder")[0]);
     try testing.expectEqual(@as(usize, 0), builtinSupersOf("Nope").len);
+}
+
+test "declared-type evidence: head match scores 100, mismatch stays unknown (never disqualifies)" {
+    const p = oneParam("Double");
+    const sig = SigView{ .params = &p };
+    // Exact declared head.
+    const hit = [_]ArgShape{.{ .ty = tref("Double") }};
+    try testing.expectEqual(@as(i32, 100), applicable(&sig, &hit, .{}).?.points);
+    // Mismatching declared head falls back to the unknown base — the
+    // candidate stays applicable (additive-only rule).
+    const miss = [_]ArgShape{.{ .ty = tref("String") }};
+    try testing.expectEqual(@as(i32, 10), applicable(&sig, &miss, .{}).?.points);
+}
+
+test "declared-type evidence: type-param arg head-matches a type-param param" {
+    const p = oneParam("T");
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{.{ .ty = tref("T") }};
+    try testing.expectEqual(@as(i32, 100), applicable(&sig, &args, .{}).?.points);
+    // Against a concrete param the same arg is unknown, not disproven.
+    const pc = oneParam("UInt");
+    const sigc = SigView{ .params = &pc };
+    try testing.expectEqual(@as(i32, 10), applicable(&sigc, &args, .{}).?.points);
+}
+
+test "tyEvidenceBonus: zero without evidence, promotes matching candidates only" {
+    const generic = [_]Param{
+        .{ .name = "a", .ty = tref("T"), .default = null },
+        .{ .name = "b", .ty = tref("T"), .default = null },
+    };
+    const numeric = [_]Param{
+        .{ .name = "a", .ty = tref("UInt"), .default = null },
+        .{ .name = "b", .ty = tref("UInt"), .default = null },
+    };
+    // No evidence: every candidate scores zero (ranking unchanged).
+    const blank = [_]ArgShape{ .{}, .{} };
+    try testing.expectEqual(@as(i32, 0), tyEvidenceBonus(&generic, &blank));
+    try testing.expectEqual(@as(i32, 0), tyEvidenceBonus(&numeric, &blank));
+    // `T`-declared args promote the generic candidate, not the numeric one.
+    const t_args = [_]ArgShape{ .{ .ty = tref("T") }, .{ .ty = tref("T") } };
+    try testing.expectEqual(@as(i32, 200), tyEvidenceBonus(&generic, &t_args));
+    try testing.expectEqual(@as(i32, 0), tyEvidenceBonus(&numeric, &t_args));
+    // Numeric literals promote numeric params, cross-width Double decls too.
+    const lit_args = [_]ArgShape{ .{ .literal_kind = .numeric }, .{ .literal_kind = .numeric } };
+    try testing.expectEqual(@as(i32, 200), tyEvidenceBonus(&numeric, &lit_args));
+    try testing.expectEqual(@as(i32, 0), tyEvidenceBonus(&generic, &lit_args));
+    const d_args = [_]ArgShape{ .{ .ty = tref("Double") }, .{ .ty = tref("Double") } };
+    try testing.expectEqual(@as(i32, 160), tyEvidenceBonus(&numeric, &d_args));
+    try testing.expectEqual(@as(i32, 0), tyEvidenceBonus(&generic, &d_args));
 }
 
 test "applicable: bodyless candidate is never selectable" {

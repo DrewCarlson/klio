@@ -909,6 +909,13 @@ pub const Module = struct {
     /// registration so resolution diagnostics can point at the
     /// conflicting declarations. Lowering-only; not serialized.
     decl_span: std.AutoHashMap(u32, Span),
+    /// Top-level `FuncId`s (keyed by `FuncId.int()`) whose declaration
+    /// carries a source body, recorded at phase-1 header registration.
+    /// Distinguishes a real function from a bodyless `expect` / header
+    /// stub while phase 2 has not placed the bodies yet (the in-memory
+    /// two-phase build a `klio test` module lowers user files against).
+    /// Lowering-only; not serialized.
+    decl_ast_body: std.AutoHashMap(u32, void),
     /// Lowering-time resolution diagnostics: ambiguous bare calls the
     /// symbol index refused to pick among. Recorded during lowering and
     /// surfaced by the build driver before the program runs. The name
@@ -1022,6 +1029,7 @@ pub const Module = struct {
             .decl_user_arity = std.AutoHashMap(u32, DeclArity).init(allocator),
             .decl_user_sig = std.AutoHashMap(u32, []TypeRef).init(allocator),
             .decl_span = std.AutoHashMap(u32, Span).init(allocator),
+            .decl_ast_body = std.AutoHashMap(u32, void).init(allocator),
         };
     }
 
@@ -1120,6 +1128,7 @@ pub const Module = struct {
             self.decl_user_sig.deinit();
         }
         self.decl_span.deinit();
+        self.decl_ast_body.deinit();
         self.resolve_diags.deinit(allocator);
     }
 
@@ -1182,6 +1191,10 @@ pub const Module = struct {
         {
             var it = self.decl_span.iterator();
             while (it.next()) |e| try out.decl_span.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.decl_ast_body.keyIterator();
+            while (it.next()) |k| try out.decl_ast_body.put(k.*, {});
         }
         try out.resolve_diags.appendSlice(a, self.resolve_diags.items);
         return out;
@@ -1940,6 +1953,14 @@ pub const Module = struct {
         reason: ?ResolveDeferReason = null,
         tier: u8 = 255,
         tier_count: usize = 0,
+        /// Every positional argument carried declared-type evidence whose
+        /// head PROVED the target's parameter (exact head, or type-param
+        /// against type-param). Such a static pick is final — the emitted
+        /// `Call` is `exact`, so the runtime's value-typed overload re-pick
+        /// (which cannot see the call site's static types) never overrides
+        /// it (`minOf(a, b)` with `a: T` stays on the generic overload even
+        /// though the runtime args are `Double`).
+        ty_proven: bool = false,
     };
 
     /// The receiver-context bits the lowerer computes on the FuncBuilder,
@@ -1994,6 +2015,7 @@ pub const Module = struct {
         const scope = applicability.ApplicabilityScope{};
         var best: ?FuncId = null;
         var best_rung: u8 = 255;
+        var best_bonus: i32 = 0;
         for (self.funcsBySimpleName(name)) |id| {
             const f = self.funcById(id) orelse continue;
             if (f.low_priority) continue;
@@ -2007,8 +2029,15 @@ pub const Module = struct {
                 (if (is_ext) 2 else 3)
             else
                 continue; // under-applied default shape — the heuristic defers it
-            if (rung < best_rung) {
+            // Declared-type evidence breaks same-rung ties: an argument whose
+            // declared head matches the candidate's parameter head promotes
+            // that candidate (`minOf(a, b)` with `a: T` picks the generic
+            // overload). Zero for every candidate when no arg carries
+            // evidence, so evidence-free calls rank exactly as before.
+            const bonus = applicability.tyEvidenceBonus(sv.params, args);
+            if (rung < best_rung or (rung == best_rung and bonus > best_bonus)) {
                 best_rung = rung;
+                best_bonus = bonus;
                 best = id;
             }
         }
@@ -2177,7 +2206,28 @@ pub const Module = struct {
         const tier: u8 = if (ires.tier != 255) ires.tier else self.lowestVisibleTier(name, caller_pkg, caller_file);
 
         // Phase C — EMIT FORM.
-        return self.emitFormFor(alloc, name, caller_pkg, caller_file, target, tier, reason, ires.tier_count, args, ctx);
+        var res = try self.emitFormFor(alloc, name, caller_pkg, caller_file, target, tier, reason, ires.tier_count, args, ctx);
+        if (res.emit_form == .Call) {
+            if (res.target) |t| res.ty_proven = self.tyProvenPick(t, args);
+        }
+        return res;
+    }
+
+    /// Whether every positional argument carries declared-type evidence whose
+    /// head proves the target's parameter (see `Resolution.ty_proven`). Exact
+    /// arity, all-positional, no runtime shapes — the strict form only.
+    fn tyProvenPick(self: *const Module, id: FuncId, args: []const applicability.ArgShape) bool {
+        if (args.len == 0) return false;
+        const f = self.funcById(id) orelse return false;
+        const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
+        if (f.params.len - off != args.len) return false;
+        for (args, 0..) |*a, i| {
+            if (a.named != null or a.runtime_class != null) return false;
+            const aty = a.ty orelse return false;
+            const s = applicability.tyEvidenceScore(f.params[off + i].ty.name, aty.name, false) orelse return false;
+            if (s < 100) return false;
+        }
+        return true;
     }
 
     /// Whether a bare call to `name` binding target `id` is a tail call: the

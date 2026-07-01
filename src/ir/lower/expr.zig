@@ -495,6 +495,25 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             } else if (ref_pick) |fid| {
                 _ = try recordOutOfScopeRef(b, pr.name.name, pr.name.span, fqnOf(b, fid), b.module.bareRefTier(pr.name.name, b.self_package, pr.name.span.file));
             }
+            // `::name` in a slot whose declared function type is written
+            // entirely in the callee's type parameters
+            // (`totalOrderMinOf2<Comparable<Any>>(::minOf)` against
+            // `f2t: (T, T) -> T`) denotes the GENERIC overload: kotlinc
+            // substitutes the call-site type argument, so only the generic
+            // candidate is applicable. Bind the reference by id; a numeric
+            // or otherwise-typed slot keeps the plain alias/global forms.
+            if (class_pick == null and ref_pick == null and b.pending_ref_fn_generic and
+                !member_shadows_ref and ref_arity >= 0)
+            {
+                if (genericRefTarget(b, pr.name.name, @intCast(ref_arity))) |fid| {
+                    const fqn_n = if (b.module.funcById(fid)) |f|
+                        try b.module.internConst(b.allocator, .{ .String = f.fqn })
+                    else
+                        nm;
+                    try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = fqn_n, .func = fid } });
+                    return dst;
+                }
+            }
             if (class_pick) |cid| {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cid } });
             } else if (ref_pick) |fid| {
@@ -768,8 +787,17 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     }
 
     // Comparison on a generic type-parameter operand → `a.compareTo(b) <op> 0`.
+    // Inside a function that declares its own type parameters, an operand
+    // with no concrete static type (`var min = iterator.next()` in the
+    // generic `minOrNull` body) is `T`-typed under Kotlin's inference, so
+    // the comparison also follows the `compareTo` total order — the IEEE
+    // primitive comparison applies only where a numeric static type is
+    // established (a literal, or a local with a numeric declared type or
+    // literal initializer).
     if ((op == .Lt or op == .Le or op == .Gt or op == .Ge) and
-        (isGenericOperand(b, lhs) or isGenericOperand(b, rhs)))
+        (isGenericOperand(b, lhs) or isGenericOperand(b, rhs) or
+            (b.hasOwnTypeParams() and
+                !staticallyOrderedOperand(b, lhs) and !staticallyOrderedOperand(b, rhs))))
     {
         const recv = try lowerExpr(b, lhs);
         const arg_slot = b.allocReg();
@@ -809,6 +837,21 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
 fn isGenericOperand(b: *FuncBuilder, e: *const Expr) bool {
     return e.* == .Path and e.Path.segments.len == 1 and
         b.isGenericTypedParam(e.Path.segments[0].name);
+}
+
+/// A comparison operand with an established concrete static type: a literal,
+/// or a plain local/param whose declared type is a known builtin value head
+/// or whose recorded initializer is a literal. Such an operand keeps the
+/// primitive `BinOp` comparison inside a generic function; everything else
+/// there is `T`-typed under Kotlin's inference and dispatches `compareTo`.
+fn staticallyOrderedOperand(b: *FuncBuilder, e: *const Expr) bool {
+    if (argLitKind(e) != null) return true;
+    if (e.* == .Path and e.Path.segments.len == 1) {
+        const n = e.Path.segments[0].name;
+        if (b.localDeclType(n)) |t| return paramLitKind(t) != null;
+        if (b.localInitExpr(n)) |ie| return argLitKind(ie) != null;
+    }
+    return false;
 }
 
 /// Write `val` back to the lvalue `target` (shared by prefix ++/-- and the
@@ -1722,6 +1765,11 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // recurses so a nested lambda does not inherit it.
     const lambda_broad_mask = b.pending_lambda_broad_mask;
     b.pending_lambda_broad_mask = 0;
+    // Callee-generic slot flag: the expected function type's parameters are
+    // all the callee's own type parameters, so this lambda's params carry
+    // Kotlin's generic static typing. Consumed the same way.
+    const lambda_fn_generic = b.pending_ref_fn_generic;
+    b.pending_ref_fn_generic = false;
     // A lambda assigned to a typed binding (`val h: Ctx.() -> Unit = { … }`)
     // never reaches the call-argument arity path; derive the arity from the
     // binding's functional type so a `T.() -> R` receiver lambda (zero value
@@ -1772,6 +1820,16 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
     }
+    // Params of a callee-generic slot (unannotated only — an explicit
+    // annotation is the stronger static fact and wins).
+    var generic_names: std.ArrayList([]const u8) = .empty;
+    defer generic_names.deinit(b.allocator);
+    if (lambda_fn_generic and !suppress_it) {
+        for (eff_params, 0..) |p, i| {
+            const annotated = i < eff_param_tys.len and eff_param_tys[i] != null;
+            if (!annotated) try generic_names.append(b.allocator, p.name);
+        }
+    }
     // `outer_names` / `inherited_rlp` ownership passes into the lambda lower.
     const outer_names = try b.visibleNames();
     const inherited_rlp = try b.receiverLambdaParamNames();
@@ -1796,6 +1854,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         suppress_it,
         if (suppress_it) lam.span else null,
         broad_names.items,
+        generic_names.items,
     );
     const body_func = lowered.func;
     const captured_names = lowered.captures;
@@ -2076,6 +2135,191 @@ fn argLambdaBroadMasks(b: *FuncBuilder, func: *const Func, args: []const Expr, a
         return null;
     }
     return out;
+}
+
+/// Whether a callee parameter's declared function type takes only values
+/// typed by the callee's own type parameters (`f2t: (T, T) -> T` inside
+/// `fun <T : Comparable<T>> ...`). A callable reference in such a slot
+/// denotes the GENERIC overload of the referenced name: kotlinc substitutes
+/// the call-site type argument, so only the generic candidate applies.
+fn fnTypeIsCalleeGeneric(b: *FuncBuilder, func: *const Func, ty: ir.TypeRef, arity: i16) bool {
+    if (arity <= 0) return false;
+    const tps = b.module.registry.func_type_params.get(func.id) orelse return false;
+    if (tps.items.len == 0) return false;
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return false;
+    const n: usize = @intCast(arity);
+    // The lowered encoding is `[#suspend?] [receiver?] params… ret [#markers]`.
+    var hi: usize = ty.args.len;
+    while (hi > 0 and ty.args[hi - 1].name.len != 0 and ty.args[hi - 1].name[0] == '#') hi -= 1;
+    var lo: usize = 0;
+    if (lo < hi and std.mem.eql(u8, ty.args[lo].name, "#suspend")) lo += 1;
+    const remaining = hi - lo;
+    var pstart = lo;
+    if (remaining == n + 2) {
+        pstart = lo + 1;
+    } else if (remaining != n + 1) {
+        return false;
+    }
+    var i: usize = 0;
+    while (i < n and pstart + i < hi) : (i += 1) {
+        var hit = false;
+        for (tps.items) |tp| {
+            if (std.mem.eql(u8, ty.args[pstart + i].name, tp)) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) return false;
+    }
+    return true;
+}
+
+/// Per-argument callee-generic function-type flags for a call dispatched to
+/// `func`, parallel to `args` and aligned exactly like `argFnArities`.
+fn argFnGenericFlags(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]bool {
+    if (args.len == 0) return null;
+    for (arg_names) |an| if (an != null) return null;
+    for (args) |*a| if (a.* == .Spread) return null;
+    if (func.params.len < recv_offset) return null;
+    const params = func.params[recv_offset..];
+    const out = try b.allocator.alloc(bool, args.len);
+    for (out) |*o| o.* = false;
+    const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
+    if (trailing_lambda and args.len <= params.len) {
+        var i: usize = 0;
+        while (i + 1 < args.len) : (i += 1) {
+            out[i] = fnTypeIsCalleeGeneric(b, func, params[i].ty, fnTypeArityAlias(b, params[i].ty) orelse -1);
+        }
+        out[args.len - 1] = fnTypeIsCalleeGeneric(b, func, params[params.len - 1].ty, fnTypeArityAlias(b, params[params.len - 1].ty) orelse -1);
+    } else if (args.len == params.len) {
+        for (params, out) |p, *o| o.* = fnTypeIsCalleeGeneric(b, func, p.ty, fnTypeArityAlias(b, p.ty) orelse -1);
+    } else {
+        b.allocator.free(out);
+        return null;
+    }
+    return out;
+}
+
+/// The unique body-bearing generic overload of `name` with `arity` value
+/// params (every one typed by the func's own type parameters), or null when
+/// none or several exist. The target a callee-generic `::name` slot binds.
+///
+/// Reads the placed `Func` when phase 2 has lowered the body, else the
+/// phase-1 header metadata (`decl_user_sig` + `decl_ast_body`) — the
+/// in-memory two-phase build lowers user files while the stdlib funcs are
+/// still header stubs, and the answer must not depend on that state.
+fn genericRefTarget(b: *FuncBuilder, name: []const u8, arity: usize) ?FuncId {
+    var found: ?FuncId = null;
+    cands: for (b.module.funcsBySimpleName(name)) |id| {
+        const f = b.module.funcById(id) orelse continue;
+        // An extension (a placed leading `this`, or a header stub's
+        // synthesized receiver param) never binds a bare `::name`.
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+        const tps = b.module.registry.func_type_params.get(id) orelse continue;
+        if (tps.items.len == 0) continue;
+        if (f.hasBody()) {
+            if (f.params.len != arity or arity == 0) continue;
+            if (f.params[f.params.len - 1].is_vararg) continue;
+            for (f.params) |*p| {
+                if (!nameInList(p.ty.name, tps.items)) continue :cands;
+            }
+        } else {
+            // Phase-1 header stub: judge by the declared metadata, so the
+            // answer is the same whether the body is placed yet or not.
+            if (!b.module.decl_ast_body.contains(id.int())) continue;
+            const sig = b.module.decl_user_sig.get(id.int()) orelse continue;
+            if (sig.len != arity or arity == 0) continue;
+            if (b.module.decl_user_arity.get(id.int())) |da| {
+                if (da.has_vararg) continue;
+            }
+            for (sig) |*ty| {
+                if (!nameInList(ty.name, tps.items)) continue :cands;
+            }
+        }
+        if (found != null) return null;
+        found = id;
+    }
+    return found;
+}
+
+fn nameInList(name: []const u8, list: []const []const u8) bool {
+    for (list) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
+
+/// The container head of a receiver that is a stdlib factory call over
+/// statically generic-typed values (`arrayOf(a, b)` where every arg is a
+/// generic-typed param), or null. Such a receiver's element type is the
+/// enclosing type parameter, so a member call on it resolves against the
+/// GENERIC extension overload — the concrete-element specializations
+/// (`Array<out Double>`) are statically inapplicable.
+fn receiverGenericElemHead(b: *FuncBuilder, receiver: *const Expr) ?[]const u8 {
+    if (receiver.* != .Call) return null;
+    const rc = receiver.Call;
+    if (rc.callee.* != .Path or rc.callee.Path.segments.len != 1) return null;
+    const factory = rc.callee.Path.segments[0].name;
+    if (b.resolve(factory) != null or b.isLocalFn(factory)) return null;
+    const head: []const u8 = if (std.mem.eql(u8, factory, "arrayOf"))
+        "Array"
+    else if (std.mem.eql(u8, factory, "listOf") or std.mem.eql(u8, factory, "mutableListOf") or
+        std.mem.eql(u8, factory, "arrayListOf"))
+        "List"
+    else if (std.mem.eql(u8, factory, "setOf") or std.mem.eql(u8, factory, "mutableSetOf"))
+        "Set"
+    else if (std.mem.eql(u8, factory, "sequenceOf"))
+        "Sequence"
+    else
+        return null;
+    if (rc.args.len == 0) return null;
+    for (rc.args) |*a| {
+        if (a.* != .Path or a.Path.segments.len != 1) return null;
+        if (!b.isGenericTypedParam(a.Path.segments[0].name)) return null;
+    }
+    return head;
+}
+
+/// The unique generic extension overload of `name` applicable to a
+/// `recv_head` receiver with `user_arity` value args: a candidate with its
+/// own type parameters whose declared receiver head equals `recv_head`
+/// (or one of its builtin supertypes when no exact head exists). Judged
+/// from the placed `Func` or the phase-1 header metadata, like
+/// `genericRefTarget`.
+fn genericExtTarget(b: *FuncBuilder, name: []const u8, recv_head: []const u8, user_arity: usize) ?FuncId {
+    var exact: ?FuncId = null;
+    var exact_n: usize = 0;
+    var sup: ?FuncId = null;
+    var sup_n: usize = 0;
+    for (b.module.funcsBySimpleName(name)) |id| {
+        const f = b.module.funcById(id) orelse continue;
+        const tps = b.module.registry.func_type_params.get(id) orelse continue;
+        if (tps.items.len == 0) continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        const arity_ok = blk: {
+            if (f.hasBody()) break :blk f.params.len - 1 == user_arity;
+            if (!b.module.decl_ast_body.contains(id.int())) break :blk false;
+            const n = b.module.decl_user_params.get(id.int()) orelse break :blk false;
+            break :blk n == user_arity;
+        };
+        if (!arity_ok) continue;
+        const cand_head = typeHead(f.params[0].ty.name);
+        if (std.mem.eql(u8, cand_head, recv_head)) {
+            exact = id;
+            exact_n += 1;
+            continue;
+        }
+        for (applicability.builtinSupersOf(recv_head)) |s| {
+            if (std.mem.eql(u8, cand_head, s)) {
+                sup = id;
+                sup_n += 1;
+                break;
+            }
+        }
+    }
+    if (exact_n == 1) return exact;
+    if (exact_n == 0 and sup_n == 1) return sup;
+    return null;
 }
 
 /// `argFnArities` for a constructor call: the per-argument expected lambda
@@ -3846,24 +4090,51 @@ fn astArgLambdaArity(arg: *const Expr) ?u8 {
 
 /// One argument's applicability `ArgShape` at LOWERING time. Only the
 /// fields lowering can prove cheaply and soundly are populated — named /
-/// spread / lambda binding shape and a literal kind; `ty` /
-/// `runtime_class` / `lambda_param_types` / `value` stay null, so the
-/// shared scorer treats the arg as UNKNOWN (base points, never disproven)
-/// wherever the type is not statically decidable.
+/// spread / lambda binding shape, a literal kind, and the declared-type
+/// head of a plain local/param argument; `runtime_class` /
+/// `lambda_param_types` / `value` stay null, so the shared scorer treats
+/// the arg as UNKNOWN (base points, never disproven) wherever the type is
+/// not statically decidable. Declared-type evidence is additive-only in
+/// the scorer: it can promote a head-matching candidate but never
+/// disqualify one.
 fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicability.ArgShape {
-    _ = b;
     return .{
         .named = name,
         .is_spread = arg.* == .Spread,
         .is_lambda = arg.* == .Lambda or arg.* == .AnonFun,
         .lambda_arity = astArgLambdaArity(arg),
-        .literal_kind = if (argLitKind(arg)) |k| switch (k) {
+        .literal_kind = if (argEvidenceLitKind(b, arg)) |k| switch (k) {
             .numeric => .numeric,
             .string => .string,
             .boolean => .boolean,
             .char => .char,
         } else null,
+        .ty = argDeclTypeRef(b, arg),
     };
+}
+
+/// Literal-kind evidence for an argument: the argument itself is a literal,
+/// or it names a local whose recorded initializer is one (`val x = 1.0;
+/// f(x)`). Evidence only, never disproving.
+fn argEvidenceLitKind(b: *FuncBuilder, arg: *const Expr) ?LitKind {
+    if (argLitKind(arg)) |k| return k;
+    if (arg.* == .Path and arg.Path.segments.len == 1) {
+        if (b.localInitExpr(arg.Path.segments[0].name)) |init_e| {
+            return argLitKind(init_e);
+        }
+    }
+    return null;
+}
+
+/// Declared-type head of a single-segment Path argument naming a local /
+/// parameter whose declared type is known (`b.localDeclType`), as a `TypeRef`
+/// for the shared scorer's declared-type evidence. Null for anything else.
+fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    if (arg.* != .Path) return null;
+    const p = arg.Path;
+    if (p.segments.len != 1) return null;
+    const t = b.localDeclType(p.segments[0].name) orelse return null;
+    return .{ .name = t, .nullable = false, .args = &.{} };
 }
 
 /// Build the `[]ArgShape` for a call's argument list once, before the
@@ -4154,7 +4425,9 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
             // program before it runs.
             _ = try recordOutOfScopeCall(b, name0, segments[0].span, target, index_res);
             return switch (res.emit_form) {
-                .Call => try emitCall(b, expr, target, was_cast),
+                // A fully type-proven pick is as final as a cast pick: the
+                // runtime's value-typed overload re-pick must not override it.
+                .Call => try emitCall(b, expr, target, was_cast or res.ty_proven),
                 .CallMember => try emitCallMember(b, expr, target, was_cast),
                 .CallMemberOrGlobal => try emitMemberOrGlobal(b, expr, target, was_cast),
                 // Phase C never emits a value call with a committed target.
@@ -4783,6 +5056,13 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     };
     defer if (broad_masks) |m| b.allocator.free(m);
     b.pending_arg_broad_masks = broad_masks;
+    const fn_generic: ?[]bool = blk: {
+        const f = b.module.funcById(func_id) orelse break :blk null;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        break :blk try argFnGenericFlags(b, f, args, ast_arg_names, recv_off);
+    };
+    defer if (fn_generic) |m| b.allocator.free(m);
+    b.pending_arg_fn_generic = fn_generic;
     const run = try lowerArgRunFull(b, args, arg_arity, param_ty_names);
     // A trailing lambda always binds the target's last (function-typed)
     // parameter. When a vararg parameter precedes it, positional binding
@@ -5149,6 +5429,12 @@ fn lowerImplicitThisCall(
             (try argFnArities(b, pf, args, ast_arg_names, if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0))
         else
             null;
+        const priv_fn_generic: ?[]bool = if (b.module.funcById(fid)) |pf|
+            (try argFnGenericFlags(b, pf, args, ast_arg_names, if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0))
+        else
+            null;
+        defer if (priv_fn_generic) |m| b.allocator.free(m);
+        b.pending_arg_fn_generic = priv_fn_generic;
         const run = try lowerArgRunWithArity(b, args, priv_arity);
         try b.push(.{ .Move = .{ .dst = args_start, .src = this_reg } });
         var user_arg_names = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
@@ -5716,6 +6002,39 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             // (which keys on the receiver's runtime type) cannot flip a
             // `(this as CharSequence).f()` back onto the `String.f` namesake
             // and recurse.
+            try b.push(.{ .Call = .{
+                .dst = dst,
+                .func = func_id,
+                .args = start,
+                .n_args = @intCast(arg_regs.len),
+                .arg_names = arg_names,
+                .type_args = type_args,
+                .exact = true,
+            } });
+            return dst;
+        }
+    }
+
+    // A member call on a factory receiver over statically generic-typed
+    // values (`arrayOf(a, b).minOrNull()` with `a: T` inside
+    // `fun <T : Comparable<T>> ...`) binds the GENERIC extension overload
+    // statically. The runtime receiver (a boxed array of Doubles) is
+    // byte-identical to a concrete `Array<Double>`, so only this static
+    // bind can keep the generic call site on its `compareTo` total-order
+    // path while the concrete sites keep the specialized (NaN-propagating)
+    // intrinsic form. kotlinc resolves exactly this way: with `T` elements
+    // the `Array<out Double>` overload is not applicable.
+    if (receiverGenericElemHead(b, receiver)) |recv_head| {
+        if (genericExtTarget(b, name.name, recv_head, args.len)) |func_id| {
+            const recv_reg = try lowerReceiver(b, receiver);
+            const arg_regs = try b.allocator.alloc(Reg, args.len + 1);
+            defer b.allocator.free(arg_regs);
+            arg_regs[0] = recv_reg;
+            for (args, 0..) |*a, i| arg_regs[i + 1] = try lowerExpr(b, a);
+            const start = try packContiguous(b, arg_regs);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+            const dst = b.allocReg();
             try b.push(.{ .Call = .{
                 .dst = dst,
                 .func = func_id,

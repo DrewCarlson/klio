@@ -190,6 +190,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
         false,
         null,
         &.{},
+        &.{},
     );
 }
 
@@ -213,6 +214,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     suppress_it: bool,
     it_span: ?ast.Span,
     broad_coll_params: []const []const u8,
+    generic_typed_params: []const []const u8,
 ) Allocator.Error!LoweredLambda {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
@@ -288,6 +290,14 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     // even over a runtime `Set`; record it so the operator lowering coerces it.
     for (broad_coll_params) |pname| {
         try b.markBroadCollectionLocal(pname);
+    }
+    // A lambda parameter whose expected type (from the callee parameter's
+    // function type) is one of the callee's own type parameters carries
+    // Kotlin's generic static typing: comparisons on it follow the
+    // `compareTo` total order, and a container built from such values is
+    // statically generic-elemental.
+    for (generic_typed_params) |pname| {
+        try b.markGenericTypedParam(pname);
     }
     const result = try expr.lowerBlock(&b, body);
     b.terminate(.{ .Return = result });

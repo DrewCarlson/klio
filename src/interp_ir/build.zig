@@ -1546,6 +1546,16 @@ fn buildModuleWithOverrides(
                 try module.decl_user_sig.put(id.int(), sig);
             }
             try module.decl_span.put(id.int(), f.span);
+            if (f.body != null) try module.decl_ast_body.put(id.int(), {});
+            // Type-parameter names, registered at header time so a body
+            // lowered before this declaration's own (a forward reference,
+            // or any earlier decl calling into it) already sees the
+            // generic signature through the registry.
+            if (f.type_params.len != 0) {
+                var tp_names: std.ArrayList([]const u8) = .empty;
+                for (f.type_params) |*tp| try tp_names.append(a, tp.name.name);
+                try module.registry.func_type_params.put(id, tp_names);
+            }
             // Key the inline-fn AST by the header stub's FuncId, so a
             // bare call the symbol index resolves to this declaration
             // splices exactly this declaration.
@@ -2352,9 +2362,13 @@ fn buildModuleWithOverrides(
     {
         var it = func_type_params.iterator();
         while (it.next()) |e| {
+            const fid = FuncId.from(e.key_ptr.*);
+            // Header-time registration (the phase-1 stub loop) already put
+            // this build's entries; only seed-carried ones land here.
+            if (module.registry.func_type_params.contains(fid)) continue;
             var list: std.ArrayList([]const u8) = .empty;
             try list.appendSlice(a, e.value_ptr.*);
-            try module.registry.func_type_params.put(FuncId.from(e.key_ptr.*), list);
+            try module.registry.func_type_params.put(fid, list);
         }
     }
     {
