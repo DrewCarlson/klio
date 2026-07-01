@@ -1473,19 +1473,6 @@ fn buildModuleWithOverrides(
             }
         }
     }
-    // Lower each class.
-    var empty_set = StringSet.init(a);
-    defer empty_set.deinit();
-    for (decls) |*d| {
-        if (d.* == .Class) {
-            const c = &d.Class;
-            const extras: *const StringSet = nested_outer_members.getPtr(c.name.name) orelse &empty_set;
-            const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
-            const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
-            _ = try ir.lower.lowerClassWithExtrasFqnPkg(module, c, &file_classes, extras, cfqn, cls_pkg);
-        }
-    }
-
     // Phase 1 of two-phase consumption: register every top-level
     // function's HEADER — its package-qualified FQN, declaring package,
     // and receiver type — into the complete header set BEFORE any body is
@@ -1566,6 +1553,23 @@ fn buildModuleWithOverrides(
                 try ir.lower.registerInlineFnId(id.int(), FF(ast.Function).fromPtr(f));
             }
             try stub_ids.append(a, id);
+        }
+    }
+
+    // Lower each class after the top-level function headers are registered,
+    // so a class method body's bare call to a sibling top-level function
+    // resolves against the complete header set. The receiver-type member
+    // gate keeps a same-named implicit-receiver member preferred over the
+    // now-visible global.
+    var empty_set = StringSet.init(a);
+    defer empty_set.deinit();
+    for (decls) |*d| {
+        if (d.* == .Class) {
+            const c = &d.Class;
+            const extras: *const StringSet = nested_outer_members.getPtr(c.name.name) orelse &empty_set;
+            const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+            const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+            _ = try ir.lower.lowerClassWithExtrasFqnPkg(module, c, &file_classes, extras, cfqn, cls_pkg);
         }
     }
 
