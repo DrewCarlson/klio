@@ -56,7 +56,19 @@ const Utf16Iter = struct {
             self.pos += 1;
             return unit;
         }
-        const cp = std.unicode.utf8Decode(self.bytes[self.pos .. self.pos + len]) catch {
+        const cp: u21 = std.unicode.utf8Decode(self.bytes[self.pos .. self.pos + len]) catch cp_blk: {
+            // A lone surrogate is stored as WTF-8 (`ED A0..BF 80..BF` for
+            // U+D800..DFFF), which strict UTF-8 decoding rejects. Decode the
+            // three-byte form by hand so it yields its true UTF-16 code-unit
+            // value (`"퟿" < "\uD800"`) rather than the leading byte.
+            if (len == 3) {
+                const b0 = self.bytes[self.pos];
+                const b1 = self.bytes[self.pos + 1];
+                const b2 = self.bytes[self.pos + 2];
+                if ((b0 & 0xF0) == 0xE0 and (b1 & 0xC0) == 0x80 and (b2 & 0xC0) == 0x80) {
+                    break :cp_blk (@as(u21, b0 & 0x0F) << 12) | (@as(u21, b1 & 0x3F) << 6) | (@as(u21, b2 & 0x3F));
+                }
+            }
             const unit: u16 = self.bytes[self.pos];
             self.pos += 1;
             return unit;
