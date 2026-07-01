@@ -418,7 +418,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the klio binary");
     run_step.dependOn(&run_cmd.step);
 
-    const test_step = b.step("test", "Run all ported module tests");
+    const test_step = b.step("test", "Run the fast module unit tests");
+    const itest_step = b.step("itest", "Run the integration test suite (slow — interprets whole programs)");
     const itest_bin_step = b.step("itest-bin", "Build+install standalone itest binaries for stress looping");
     for (mod_list) |m| {
         if (!m.tested) continue;
@@ -459,7 +460,7 @@ pub fn build(b: *std.Build) void {
                     declareDataDirs(b, run_t, &data_memo, &kotlinx_pack_dirs);
                 }
                 declareDataDirs(b, run_t, &data_memo, spec.dirs);
-                test_step.dependOn(&run_t.step);
+                itest_step.dependOn(&run_t.step);
                 // Targeted iteration: run just this itest (and build only its
                 // dependency closure), e.g. `zig build itest-parity_object_init`.
                 const one = b.step(
@@ -498,8 +499,14 @@ pub fn build(b: *std.Build) void {
             run_t.setCwd(b.path("."));
             declareDataDirs(b, run_t, &data_memo, &.{"tests/fixtures/bench_corpus"});
         }
-        test_step.dependOn(&run_t.step);
+        // Module tests that interpret whole programs (e2e, bench) are as slow
+        // as the integration suite; keep them off the fast `test` step.
+        if (runs_programs) itest_step.dependOn(&run_t.step) else test_step.dependOn(&run_t.step);
     }
+
+    const test_all_step = b.step("test-all", "Run the unit tests and the integration suite");
+    test_all_step.dependOn(test_step);
+    test_all_step.dependOn(itest_step);
 }
 
 /// Attach the build-time-generated stdlib pack to one module universe:

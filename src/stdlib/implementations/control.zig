@@ -304,6 +304,8 @@ fn freeException(e: anytype) void {
         // frees them on the final `deinit`; do not free the bytes manually.
         m.deinit();
     }
+    if (e.cause) |c| (runtime.ValueBox{ .cell = c }).deinit();
+    if (e.suppressed) |s| (runtime.ValueList{ .cell = s }).deinit();
 }
 
 test "buildList freezes a populated list" {

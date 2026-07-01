@@ -58,8 +58,8 @@ jobs:
       # -j3: the ReleaseSafe optimizing compiles and the heaviest harness
       # steps peak at several GB each; four concurrent jobs can exhaust the
       # 16GB runner.
-      - name: zig build test
-        run: zig build test -j3 --summary all
+      - name: zig build test-all
+        run: zig build test-all -j3 --summary all
 
       - name: save zig build + test state
         if: always()

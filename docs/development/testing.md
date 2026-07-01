@@ -9,9 +9,26 @@ Each module owns its unit tests as `test {}` blocks inside its
 binary per file for process isolation. They cover happy paths, edge
 cases, and every diagnostic the code can emit.
 
-```sh
-zig build test
-```
+The suite is split by cost:
+
+- `zig build test` — the fast module unit tests only (seconds). Use
+  this in the inner dev loop.
+- `zig build itest` — the integration suite: it interprets whole
+  programs (the `parity` sweep, `e2e`, `stdlib_commontest`, etc.), so
+  it takes minutes. Run one in isolation with `zig build itest-<name>`.
+- `zig build test-all` — both. This is what CI runs.
+
+Fast resolution-audit cycle: the overload-resolution unification work
+(`docs/resolution-unification-plan.md`) verifies a scorer slice with
+`scripts/resolve_audit_sweep.py --build`, not the ~18-minute ReleaseSafe
+canonical. It rebuilds the fast Debug `klio` (~2s incremental) and sweeps the
+whole stdlib commonTest corpus with `KLIO_RESOLVE_AUDIT=1`, reporting every
+`[KLIO_RESOLVE_AUDIT] <member|scorer> ... divergent=1` line where the shared
+`applicable()` disagrees with the legacy scorer (~2 minutes, 32-way). Zero
+divergence proves the shared engine reproduces the legacy scorer before the
+flip — a stronger check than the flaky ±3 canonical count. Reserve the
+ReleaseSafe canonical (`zig build itest-stdlib_commontest`) for the flip
+milestones.
 
 ## 2. Negative tests
 
@@ -37,7 +54,8 @@ auto-install (the parity tests then skip).
 
 The `e2e` module runs every `examples/*.kt` in-process against the
 checked-in expected output under `tests/corpus/expected/`, so the
-example corpus is part of `zig build test`.
+example corpus is part of `zig build itest` (it interprets programs,
+so it rides the integration suite, not the fast unit step).
 
 The corpus only grows. Removing a `.kt` from it is a deliberate act
 that requires reviewer sign-off.
