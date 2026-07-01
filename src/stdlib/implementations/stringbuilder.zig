@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const string = @import("string.zig");
 
 const Value = runtime.Value;
 const RuntimeError = runtime.RuntimeError;
@@ -997,6 +998,24 @@ pub fn string_builder_set_char_at(ctx: *CallCtx) Allocator.Error!EvalResult {
 pub fn string_builder_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.replace"));
+    // The CharSequence `replace(oldValue, newValue[, ignoreCase])` and
+    // `replace(regex, replacement/transform)` extensions share this name with the
+    // Java `replace(start: Int, end: Int, str)` range mutator; a non-integer
+    // second argument is one of the extensions — snapshot the receiver as a
+    // String and route it to the String intrinsic.
+    if (ctx.args.len > 1 and !ctx.args[1].isIntegral()) {
+        const str_val: Value = blk: {
+            const sg = sb.borrow();
+            defer sg.deinit();
+            break :blk .{ .String = try runtime.strInit(a, sg.get().items) };
+        };
+        const new_args = try a.dupe(Value, ctx.args);
+        defer a.free(new_args);
+        new_args[0] = str_val;
+        var new_ctx = ctx.*;
+        new_ctx.args = new_args;
+        return string.string_replace(&new_ctx);
+    }
     const start = if (ctx.args.len > 1) ctx.args[1].asI64() else null;
     if (start == null) return errResult(.{ .Type = "replace start must be Int" });
     const end0 = if (ctx.args.len > 2) ctx.args[2].asI64() else null;
