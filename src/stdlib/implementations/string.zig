@@ -2891,6 +2891,8 @@ fn scalarToLower(cp: u21) u21 {
     // Cyrillic (0x410-0x42F).
     if (cp >= 0x410 and cp <= 0x42F) return cp + 0x20;
     if (cp >= 0x400 and cp <= 0x40F) return cp + 0x50;
+    // Deseret (supplementary plane): capitals -> smalls.
+    if (cp >= 0x10400 and cp <= 0x10427) return cp + 0x28;
     return cp;
 }
 
@@ -2908,6 +2910,9 @@ fn scalarToUpperMulti(cp: u21) ?[]const u21 {
         0xFB04 => &.{ 'F', 'F', 'L' }, // ﬄ
         0xFB05 => &.{ 'S', 'T' }, // ﬅ LATIN SMALL LIGATURE LONG S T
         0xFB06 => &.{ 'S', 'T' }, // ﬆ LATIN SMALL LIGATURE ST
+        // Greek small letters with dialytika + tonos -> capital + combining marks.
+        0x0390 => &.{ 0x0399, 0x0308, 0x0301 }, // ΐ
+        0x03B0 => &.{ 0x03A5, 0x0308, 0x0301 }, // ΰ
         else => null,
     };
 }
@@ -2931,6 +2936,8 @@ fn scalarToUpper(cp: u21) u21 {
     if (cp >= 0x3B1 and cp <= 0x3C9 and cp != 0x3C2) return cp - 0x20;
     if (cp >= 0x430 and cp <= 0x44F) return cp - 0x20;
     if (cp >= 0x450 and cp <= 0x45F) return cp - 0x50;
+    // Deseret (supplementary plane): smalls -> capitals.
+    if (cp >= 0x10428 and cp <= 0x1044F) return cp - 0x28;
     return cp;
 }
 
