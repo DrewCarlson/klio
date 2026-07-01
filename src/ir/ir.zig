@@ -2019,30 +2019,6 @@ pub const Module = struct {
         return self.decl_user_params.get(id.int());
     }
 
-    /// A known stdlib host-intrinsic global alias (`min`, `listOf`, …). A bare
-    /// call to such a name whose ladder rungs find no body candidate is left
-    /// to the lowerer's intrinsic routing, not the declared-arity fallback —
-    /// mirrors `expr.zig`'s `isAliasName` so `resolveCall` gates the fallback
-    /// the same way `lowerPathCall` does.
-    fn isAliasNameFor(name: []const u8) bool {
-        const names = [_][]const u8{
-            "maxOf",           "minOf",      "max",                 "min",
-            "print",           "println",    "listOf",              "mutableListOf",
-            "arrayListOf",     "setOf",      "mutableSetOf",        "hashSetOf",
-            "linkedSetOf",     "mapOf",      "mutableMapOf",        "hashMapOf",
-            "linkedMapOf",     "arrayOf",    "arrayOfNulls",        "emptyArray",
-            "emptyList",       "emptySet",   "emptyMap",            "listOfNotNull",
-            "setOfNotNull",    "buildList",  "buildSet",            "buildMap",
-            "buildString",     "TODO",       "error",               "compareValues",
-            "compareValuesBy", "compareBy",  "compareByDescending", "naturalOrder",
-            "reverseOrder",    "sequenceOf", "emptySequence",       "generateSequence",
-            "sequence",
-        };
-        for (names) |n| {
-            if (std.mem.eql(u8, name, n)) return true;
-        }
-        return false;
-    }
 
     /// The declared-arity fallback, reproducing `expr.zig`'s
     /// `fallbackByDeclArity`: the order-based `funcId` pick when its declared
@@ -2179,7 +2155,7 @@ pub const Module = struct {
         // then a declared-arity fallback covers the header-stub / intrinsic-
         // backed forms the ladder (body-only) cannot rank.
         var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args);
-        if (heur == null and ctx.cast_pick == null and !isAliasNameFor(name)) {
+        if (heur == null and ctx.cast_pick == null and !isAliasName(name)) {
             heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len);
         }
         // Prefer the same-name extension overload whose declared receiver
@@ -2570,6 +2546,31 @@ pub const Module = struct {
         return id;
     }
 };
+
+/// A known stdlib host-intrinsic global alias (`min`, `listOf`, …). A bare call
+/// to such a name whose overload set has no applicable body candidate routes to
+/// the runtime intrinsic rather than a declared-arity fallback. Shared by
+/// `resolveCall` (the Phase-B fallback gate) and the lowerer's alias / value-ref
+/// paths so both classify the same names.
+pub fn isAliasName(name: []const u8) bool {
+    const names = [_][]const u8{
+        "maxOf",           "minOf",      "max",                 "min",
+        "print",           "println",    "listOf",              "mutableListOf",
+        "arrayListOf",     "setOf",      "mutableSetOf",        "hashSetOf",
+        "linkedSetOf",     "mapOf",      "mutableMapOf",        "hashMapOf",
+        "linkedMapOf",     "arrayOf",    "arrayOfNulls",        "emptyArray",
+        "emptyList",       "emptySet",   "emptyMap",            "listOfNotNull",
+        "setOfNotNull",    "buildList",  "buildSet",            "buildMap",
+        "buildString",     "TODO",       "error",               "compareValues",
+        "compareValuesBy", "compareBy",  "compareByDescending", "naturalOrder",
+        "reverseOrder",    "sequenceOf", "emptySequence",       "generateSequence",
+        "sequence",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
 
 /// Whether every argument shape is positional (no named argument) — the
 /// `allNull(arg_names)` gate a tail-call / trailing-lambda binding needs.
