@@ -237,11 +237,18 @@ recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof
    `anyReceiverClassDeclares` — hierarchy-precise for plain method bodies,
    program-wide otherwise; the five direct-bind guards route through it.
    `class_member_names` is now read ONLY in those two helpers' unknown-receiver
-   fallbacks and Phase C's `!receiver_known` arm. REMAINING: explicit-receiver
-   (`obj.foo()`) membership via DeclSig — the ktor server chain (now fully
-   fixed: six mechanisms, see commits d0a9242f..d710630b) was the concrete
-   evidence — and the eventual `class_member_names` deletion once the erased
-   fallbacks can go.
+   fallbacks and Phase C's `!receiver_known` arm — that pair is P7's deletion
+   precondition. REMAINING (one item): explicit-receiver (`obj.foo()`) static
+   typing — ATTEMPTED and reverted with a precise finding: `CallMember.
+   static_recv`'s established meaning in the member-dispatch walk is the
+   extension-BODY receiver (the emitExtBareCall shape), and tagging arbitrary
+   qualified receivers with their declared type hangs member self-dispatch
+   (MutableCollectionsTest looped in irMethodWalk). The slice needs either a
+   SEPARATE instruction field (`declared_recv`) consumed only by the extension
+   selection, or an audit of every static_recv consumer disambiguating the two
+   meanings. Declared-type evidence now carries nullability (local_decl_nullable)
+   as groundwork. The ktor server chain (fully fixed: six mechanisms, commits
+   d0a9242f..d710630b) remains the concrete evidence for this item.
 4. **P5** distinct-keyed inherited fields (RC-D; `c_shadow` 1/2/1/1). **P7** eager
    typeck records+reuses resolution (RC-G) — also unlocks index-primary/type-aware
    resolveCall and the full NaN-style static-overload class. **P8** hatch deletion
