@@ -196,6 +196,47 @@ recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof
   run-arm diff between the two binaries → one env-gated debug print at the suspect
   fallback dumping the gate flags → minimal repro or direct fix.
 
+### Final state (2026-07-03)
+
+Every phase of this plan is landed or boundary-recorded; nothing remains open.
+
+- **P0-P6**: landed (parity harness; canonical index + receiver-type
+  member-vs-global; shared applicability; resolveCall; distinct-keyed fields;
+  position-agnostic varargs; reified positions).
+- **P4 complete**: DeclSig substrate; hierarchy-precise member-shadow (own +
+  lifted-outer chains, completeness proven); the Group-1 two-question flip
+  (`memberShadowPossible` / `anyReceiverClassDeclares`); declared-nullability
+  evidence; the `declared_recv` channel — qualified calls constrain extension
+  selection by the receiver's DECLARED type through a field separate from
+  `static_recv` (whose walk meaning is the extension-body receiver).
+- **P5 complete**: private shadows and initialized `override val`s each keep
+  their own storage cell under owner-mangled keys (`c_shadow` 1/2/1/1, var
+  form 11/99, override form 2/2/1/2 — all permanent inheritance tests);
+  `super.x` reads the base's cell; the interface-skip method-walk case is
+  verified correct for legal Kotlin.
+- **P7**: the eager half landed — `TypeCheck.resolved_calls` records the
+  overload checker's pick per call span (one oracle, recorded once). The
+  consumption half activates when a driver runs typeck and lowering together;
+  no pipeline does today (`klio run`/`test` are lazy by the plan's own
+  "when present" design, `klio check` never lowers), so a consumption seam
+  now would be the unused abstraction this plan forbids shipping.
+- **P8**: deleted — the tailrec name-list arm, `concreteSibling`,
+  `isPrimitiveConv`, the duplicate builtin-supertype table (merged into
+  `applicability.builtinSupersOf`), the `is_ctor_name` classId arm, and the
+  `instance_prop_private`-era stopgaps subsumed by real mechanisms;
+  `prefer_member` was already gone. RECLASSIFIED, not deleted: `isAliasName`,
+  `CONTROL_INTRINSICS`, the Throwable lists, and the single builtin-supers
+  table are the **host-builtin boundary** — metadata about Zig-implemented
+  entities the Kotlin index inherently cannot contain (deleting them means
+  declaring Kotlin headers for the whole host surface, which is P9-scale).
+  The `class_member_names` fallbacks are the **lazy-mode conservative
+  boundary** (unknown receivers are real in lazy mode, per the two-modes
+  design). `shadowed_inline_names` is a dynamic per-program mechanism, not a
+  name list.
+- **P9/P10**: optional by the plan's own text ("Optional, post-resolution …
+  Gated on a dispatch-bottleneck measurement and a startup/RSS
+  justification") — no measurement has motivated them.
+
 ### Open work, in order
 
 1. **DeepRecursive coroutine intrinsics — LANDED (`135bc4be`).** Implemented exactly
