@@ -82,6 +82,24 @@ fixed on `main` with the mechanism, not the symptom:
 - The lazy-forest resolver held one global section, so loading a second stdlib
   image in one process (the parity harness loads both gate variants) re-pointed
   earlier refs at the wrong tables — slot-registered sections, `ee0a0489`.
+- A capitalized bare callee skipped member dispatch outright (ktor's
+  `HttpResponseValidator { … }` DSL extension) — gate on a class actually
+  existing, `8619b33c`; the scope-qualified property walk picked an unrelated
+  private supertype getter (`HttpClientEngineBase`'s `closed` vs the
+  `HttpClientEngine` interface's private `closed`) — privates skip the virtual
+  walk via `instance_prop_private`, `5bfd4125`.
+
+Still open from the same fallout window (worktree-bisected to before this
+sweep; both reproduce at the pre-sweep baseline `36405ff4`):
+
+- ktor_client_get / ktor_server: `HttpClient().close()` reads its private
+  `closed = atomic(false)` field as a raw `Boolean` (isolated repros of every
+  suspected shape pass; needs instance-field-table instrumentation).
+- e2e corpus 13/140 (was 14/140 pre-sweep): 11 compose examples fail with
+  `unresolved global Recomposer/Composition/mutableStateOf`; `flow_operators`
+  and `sequence_iterator_builder` fail with `Vm::get_field … on
+  kotlin.Function` — a bare name resolving to a function value where an
+  instance was expected.
 
 Everything below is committed to `main`. The stdlib commonTest canonical is at
 **2010 passed / 102 files / 0 build-blocked** (pre-campaign baseline 2006; the dip-and-
