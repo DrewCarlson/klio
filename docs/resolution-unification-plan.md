@@ -198,27 +198,24 @@ recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof
 
 ### Open work, in order
 
-1. **DeepRecursive coroutine intrinsics** (stdlib `DeepRecursiveTest` 1/8, all
-   "Suspended"; task #21 carries the full design). `runCallLoop` is PLAIN code driving
-   suspend blocks; klio's `startBlock` (`kotlin-klio/kotlin-coroutines/Intrinsics.kt:108`)
-   expects an enclosing pump, so with none the `.Suspended` unwinds to the harness.
-   Design: (a) engine fn `coroutineStartRootOrSuspended` in
-   `src/interp_ir/vm/coroutines.zig` — the `driveResumed` SHAPE (coroPush/claimNow/
-   scope-guard; evalClosureRaw; on `.Suspended` → `park` + `pumpLoop(persist=true)` +
-   `pumpExit(persist=true)`, which persists the parked root under its armed slot) →
-   returns root value or `Value.CoroutineSuspended`; (b) the RESUME half already exists
-   (`coroutineResumeExternal` → `PersistedParked.take(slot)` → `driveResumed`
-   re-drives on the calling thread and re-persists on re-park — the ktor write-side
-   proves it); (c) Kotlin-side `startBlock`: if `__klio_co_hasDriver()` (new tiny
-   intrinsic: `coroTop() != null`) keep today's code byte-for-byte (in-pump ecosystem
-   untouched); else call `__klio_co_startRootOrSuspended(completion) { ... }` with a
-   captured `suspended` flag delivering async completion to the completion
-   continuation; (d) registry entries for both intrinsics in
-   `src/stdlib/implementations.zig` (+`result.zig`), mirroring `coro_run_root`'s arg
-   shape. Intrinsics.kt is a stdlib ACTUAL (via `stdlib_sources.zig`) — plain
-   `zig build` suffices. Known accepted limit: DeepRecursive invoked INSIDE an
-   enclosing pump keeps the parking model. Verify: DeepRecursiveTest 8/8; the
-   coroutine spot suites + ktor/concurrency itests MUST stay green; litmus sweep.
+1. **DeepRecursive coroutine intrinsics — LANDED (`135bc4be`).** Implemented exactly
+   per the design: `coroutineStartRootOrSuspended` + `coroutineHasDriver` engine fns,
+   the `__klio_co_startRootOrSuspended` / `__klio_co_hasDriver` intrinsics, and the
+   `startBlock` branch with the captured-`suspended`-flag completion delivery. The
+   landing surfaced a second mechanism: DeepRecursive's trampoline unwinds one resume
+   per recursion level, and each resume of a PERSISTED coroutine nested a whole native
+   `driveResumed` (bus error near depth 2000) — `adoptPersisted` now folds such
+   resumes into the live pump as ready coroutines (the resume-chain flattener, klio's
+   analogue of `BaseContinuationImpl.resumeWith`'s loop); `depth(100000)` completes
+   with linear cost. Verified: coroutine_smoke 9/9, coroutines_realistic 22/22,
+   ktor_channel_async, concurrency_stress, stdlib_image all green; litmus at the
+   4-failure baseline. Residuals: (a) the **stdlib-gate closure hole** — an
+   implicit-package stdlib file (`kotlin/util/DeepRecursive.kt`) depends on a
+   gated-out package (`kotlin.coroutines.intrinsics`), so a program with NO imports
+   gets zero candidates for `startCoroutineUninterceptedOrReturn`; the gate should
+   chase included files' own imports transitively; (b) deep unwinds cost ~0.6 ms/level
+   under the Debug interpreter (linear, but the 100k stdlib case wants the ReleaseSafe
+   harness).
 2. **P2 loose ends**: `callNamedOverload` (host_call_func.zig ~1424) still uses legacy
    `overloadScore` — `applicable()` is genuinely MORE PERMISSIVE for one input
    (`assertContentEquals`, legacy=null vs applic=275); reconcile before unifying. The
