@@ -50,8 +50,13 @@ gate, `shadowed_inline_names`, `isPrimitiveConv`, `CONTROL_INTRINSICS`,
 the need to register per-overload), the `.names` argument-name tables used to force a
 binding the resolver should compute, and the assorted per-method dispatch fixups in
 `host_call_member.zig` (the inline `.Range` `contains`, unsigned-array synth cases,
-etc.). Each deletion is gated on `KLIO_RESOLVE_AUDIT` zero-disagreement + the full
-sweep; a hatch that *can't* be removed pins the next fix.
+etc.). Two stopgaps from the post-flip sweep join the catalog: the `is_ctor_name`
+class-exists gate in `execCallMemberOrGlobal` (a capitalized bare callee should be
+resolved by the index, not a runtime capitalization heuristic) and the
+`instance_prop_private` walk skip (a resolved property slot makes the virtual walk
+itself unnecessary) — both deletable once P4/P7 land. Each deletion is gated on
+`KLIO_RESOLVE_AUDIT` zero-disagreement + the full sweep; a hatch that *can't* be
+removed pins the next fix.
 
 The structural invariant this enforces: **resolution is a pure function of (call site,
 sig index, receiver type)** — zero name-list lookups remain in the dispatch/resolution
