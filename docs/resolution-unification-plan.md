@@ -224,10 +224,17 @@ recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof
    host_instances binders (3 sites) and the `extensionFnFallback` pre-filter
    (host_call_member ~6526) — audit and fold those into `ArgShape` scoring the same
    way. The `overload_match.zig` tri-state helpers stay (legitimate backing).
-3. **P4 completion**: `class_member_names` survives only as the last-resort arm of
-   `memberShadowPossible`/Phase C; replace with receiver-type-precise membership
-   (needs the cross-FILE supertype member visibility that the litmus root exposed —
-   `own_members` is file-local, e.g. `NodeList : LockFreeLinkedListHead` across files).
+3. **P4 completion — first slice LANDED (`5d5d4ebb`)**: the central member-shadow gate
+   (`memberShadowPossible` + Phase C, via `ResolveCtx.receiver_known`) now keys on the
+   owner class AND its lifted-outer chain through the new `HierarchyShadowSet` registry
+   (all member kinds, transitive cross-file supertypes, completeness proven — an
+   unresolvable chain stays conservative). Substrate: the unified per-FuncId `DeclSig`
+   (`dbec6ecb`) with the member half filled at class-body lowering. Two dip-and-recover
+   lessons recorded in the commit: methods-only sets and owner-only chains both
+   mis-bind. REMAINING for full P4: the other five Group-1 `class_member_names` reads
+   (alias binds, out-of-scope verdicts, prop reads, container creators — flip one
+   coherent question at a time with per-file canonical diffs), explicit-receiver
+   (`obj.foo()`) membership via DeclSig, and then the `class_member_names` deletion.
 4. **P5** distinct-keyed inherited fields (RC-D; `c_shadow` 1/2/1/1). **P7** eager
    typeck records+reuses resolution (RC-G) — also unlocks index-primary/type-aware
    resolveCall and the full NaN-style static-overload class. **P8** hatch deletion
