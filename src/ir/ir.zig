@@ -426,6 +426,12 @@ pub const Inst = union(enum) {
         /// receiver-lambda (`collect` in `FlowCollector.()`) can miss the
         /// lambda receiver and bind the outer one.
         recv: ?Reg = null,
+        /// The enclosing extension's declared receiver type head, recorded at
+        /// lowering so the runtime walk resolves same-name extensions against
+        /// the STATIC type, as kotlinc does — even when the executing frame is
+        /// a synthesized closure (a suspend body) whose own kind carries no
+        /// receiver.
+        static_recv: ?ConstId = null,
     },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host.store_global` so a
@@ -2028,6 +2034,14 @@ pub const Module = struct {
     /// gate `expr.zig`'s `arityMatch` applies, mirrored here so the receiver
     /// rebind ranks candidates identically.
     fn arityMatchFid(self: *const Module, id: FuncId, want: usize) bool {
+        // Canonical record first: stub-safe during two-phase / pack lowering
+        // (the lowered body params do not exist yet, but the declaration's
+        // arity is known from phase-1).
+        if (self.decl_sigs.get(id.int())) |ds| {
+            if (!ds.has_body) return false;
+            if (ds.arity.has_vararg) return false;
+            return ds.arity.total == want;
+        }
         const f = self.funcById(id) orelse return false;
         if (!f.hasBody()) return false;
         if (f.params.len != 0 and f.params[f.params.len - 1].is_vararg) return false;
@@ -2037,8 +2051,15 @@ pub const Module = struct {
     /// The candidate's declared receiver head equals `recv` — a body-bearing
     /// extension whose synthesized `this` matches the enclosing receiver.
     fn matchesRecvFid(self: *const Module, id: FuncId, recv: []const u8) bool {
+        // The canonical record first: it carries the declared receiver even
+        // while the candidate is a phase-1 header stub (two-phase and pack
+        // lowering resolve bodies against stubs, so a body requirement here
+        // would blind the receiver-match rule exactly when it matters).
+        if (self.decl_sigs.get(id.int())) |ds| {
+            if (ds.receiver_ty) |rt| return std.mem.eql(u8, rt.name, recv);
+        }
         const f = self.funcById(id) orelse return false;
-        if (!f.hasBody() or f.params.len == 0) return false;
+        if (f.params.len == 0) return false;
         return std.mem.eql(u8, f.params[0].name, "this") and
             std.mem.eql(u8, f.params[0].ty.name, recv);
     }
@@ -2226,12 +2247,16 @@ pub const Module = struct {
         }
         // Prefer the same-name extension overload whose declared receiver
         // matches the enclosing extension's receiver.
+        var heur_recv_matched = false;
         if (heur) |chosen| {
             if (ctx.recv_ty) |recv| {
-                if (!self.matchesRecvFid(chosen, recv)) {
+                if (self.matchesRecvFid(chosen, recv)) {
+                    heur_recv_matched = true;
+                } else {
                     for (self.funcsBySimpleName(name)) |cid| {
                         if (self.arityMatchFid(cid, args.len) and self.matchesRecvFid(cid, recv)) {
                             heur = cid;
+                            heur_recv_matched = true;
                             break;
                         }
                     }
@@ -2239,13 +2264,36 @@ pub const Module = struct {
             }
         }
 
-        const target: ?FuncId = if (heur) |h| self.preferredBareTargetLike(h, index_pick) else null;
+        // A receiver-matched pick is Kotlin's static resolution: inside
+        // `FlowCollector<T>.emitAllImpl`, bare `ensureActive()` binds the
+        // FlowCollector extension, never the Job one the index may have
+        // ranked first. Only an index pick with the SAME declared receiver
+        // may still take precedence.
+        const target: ?FuncId = if (heur) |h| blk: {
+            if (heur_recv_matched) {
+                const idx_also_matches = if (index_pick) |ip|
+                    self.matchesRecvFid(ip, ctx.recv_ty.?)
+                else
+                    false;
+                if (!idx_also_matches) break :blk h;
+            }
+            break :blk self.preferredBareTargetLike(h, index_pick);
+        } else null;
         const tier: u8 = if (ires.tier != 255) ires.tier else self.lowestVisibleTier(name, caller_pkg, caller_file);
 
         // Phase C — EMIT FORM.
         var res = try self.emitFormFor(alloc, name, caller_pkg, caller_file, target, tier, reason, ires.tier_count, args, ctx);
         if (res.emit_form == .Call) {
-            if (res.target) |t| res.ty_proven = self.tyProvenPick(t, args);
+            // A declared-receiver-matched extension pick is Kotlin's static
+            // resolution — final like a cast pick; the runtime value-typed
+            // re-pick must not override it (a fun-interface receiver arrives
+            // as a plain closure and would mis-score against unrelated
+            // receiver types).
+            const recv_final = heur_recv_matched and if (res.target) |t|
+                (if (heur) |h| t.int() == h.int() else false)
+            else
+                false;
+            if (res.target) |t| res.ty_proven = self.tyProvenPick(t, args) or recv_final;
         }
         return res;
     }

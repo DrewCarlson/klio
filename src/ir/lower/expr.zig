@@ -2985,6 +2985,7 @@ fn lowerCallWithWritebackPath(
                     .n_args = @intCast(arg_regs.len),
                     .arg_names = an,
                     .func = bound_id,
+                    .static_recv = try cmgStaticRecv(b),
                 } });
                 return dst;
             }
@@ -3000,6 +3001,7 @@ fn lowerCallWithWritebackPath(
                     .arg_names = an,
                     .func = bound_id,
                     .recv = tr,
+                    .static_recv = try cmgStaticRecv(b),
                 } });
                 return dst;
             }
@@ -3371,6 +3373,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .n_args = run[1],
                         .arg_names = arg_names,
                         .recv = bound_this,
+                        .static_recv = try cmgStaticRecv(b),
                     } });
                     return dst;
                 } else if (b.knowsOuter("this") or b.capturesThisSlot()) {
@@ -3387,6 +3390,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .args = run[0],
                         .n_args = run[1],
                         .arg_names = arg_names,
+                        .static_recv = try cmgStaticRecv(b),
                     } });
                     return dst;
                 }
@@ -3592,6 +3596,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .n_args = run[1],
                     .arg_names = arg_names,
                     .class = class_id,
+                    .static_recv = try cmgStaticRecv(b),
                 } });
             }
             return dst;
@@ -5253,6 +5258,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
     orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
+    const cmg_static_recv: ?ConstId = try cmgStaticRecv(b);
     try b.push(.{ .CallMemberOrGlobal = .{
         .dst = dst,
         .this_idx = this_idx,
@@ -5261,8 +5267,17 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         .n_args = run[1],
         .arg_names = arg_names,
         .func = func_id,
+        .static_recv = cmg_static_recv,
     } });
     return dst;
+}
+
+
+/// The receiver-type tag for a deferred member-or-global bare call: the
+/// enclosing extension's declared receiver head, when this body has one.
+fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
+    const rt = b.recvTy() orelse return null;
+    return try b.module.internConst(b.allocator, .{ .String = rt });
 }
 
 /// The `CallValue` emit form for a bare name with no committed target: load the
@@ -5602,6 +5617,7 @@ fn lowerImplicitThisCall(
             .args = run[0],
             .n_args = run[1],
             .arg_names = arg_names,
+            .static_recv = try cmgStaticRecv(b),
         } });
         return dst;
     }
@@ -5779,6 +5795,7 @@ fn lowerUnresolvedBareCall(
             .n_args = run[1],
             .arg_names = arg_names,
             .recv = this_reg,
+            .static_recv = try cmgStaticRecv(b),
         } });
         return dst;
     }
@@ -5792,6 +5809,7 @@ fn lowerUnresolvedBareCall(
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
+        .static_recv = try cmgStaticRecv(b),
     } });
     return dst;
 }
