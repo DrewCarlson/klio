@@ -41,11 +41,9 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
 
 fn runKlio(
     allocator: std.mem.Allocator,
-    io: std.Io,
     env: *std.process.Environ.Map,
     argv: []const []const u8,
 ) !struct { term: std.process.Child.Term, stdout: []u8, stderr: []u8 } {
-    _ = io;
     // A fresh threaded io per spawn keeps each run's timeout timer clean.
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
@@ -67,16 +65,23 @@ fn runKlio(
 
 fn installKotlinTestPack(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
     std.Io.Dir.cwd().createDirPath(io, home) catch {};
-    const b = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "build", "kotlin-klio/klio-kotlin-test" });
+    const b = try runKlio(allocator, env, &.{ klioBin(env), "pack", "build", "kotlin-klio/klio-kotlin-test" });
     if (b.term != .exited or b.term.exited != 0) {
         std.debug.print("stdlib_commontest: pack build failed:\n{s}\n", .{b.stderr});
         return error.PackBuildFailed;
     }
-    const i = try runKlio(allocator, io, env, &.{ klioBin(env), "pack", "install", "target/packs/kotlin.test.klio-pack" });
+    const i = try runKlio(allocator, env, &.{ klioBin(env), "pack", "install", "target/packs/kotlin.test.klio-pack" });
     if (i.term != .exited or i.term.exited != 0) {
         std.debug.print("stdlib_commontest: pack install failed:\n{s}\n", .{i.stderr});
         return error.PackInstallFailed;
     }
+}
+
+/// Concurrent child count. Each child is one `klio test` process; the pool
+/// keeps the cores busy while the slowest files run.
+fn workerCount() usize {
+    const cores = std.Thread.getCpuCount() catch 4;
+    return std.math.clamp(cores, 1, 8);
 }
 
 /// Recursively collect every `.kt` under `dir`, skipping the `js/` platform
@@ -219,20 +224,24 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     var ait = ambiguous.keyIterator();
     while (ait.next()) |k| _ = provider.remove(k.*);
 
-    var total_passed: usize = 0;
-    var build_blocked: usize = 0;
+    // Build every child's argv up front (file reads stay on the shared
+    // arena), then drain the queue with a worker pool. Each child is one
+    // isolated `klio test` process, so the only cross-thread state is the
+    // two counters.
+    //
+    // Each child is bounded with `timeout`: a test file that makes the
+    // interpreter hang (infinite loop, not a crash) must not stall the
+    // whole suite. A killed child yields no summary -> counted as blocked.
+    //
+    // A test file's top-level helpers (a shared `data class Sortable`, an
+    // `assertAlmostEquals`) frequently live in a *sibling* test file that
+    // also carries its own `@Test`s — the real Kotlin module compiles
+    // every file together. Compile every same-directory sibling target as
+    // context so those helpers resolve, and restrict the run to this
+    // target's own tests with `--only-file` so siblings' tests do not
+    // double-count.
+    var jobs: std.ArrayList([]const []const u8) = .empty;
     for (targets.items) |target| {
-        // Bound each child with `timeout`: a test file that makes the
-        // interpreter hang (infinite loop, not a crash) must not stall the
-        // whole suite. A killed child yields no summary -> counted as blocked.
-        //
-        // A test file's top-level helpers (a shared `data class Sortable`, an
-        // `assertAlmostEquals`) frequently live in a *sibling* test file that
-        // also carries its own `@Test`s — the real Kotlin module compiles
-        // every file together. Compile every same-directory sibling target as
-        // context so those helpers resolve, and restrict the run to this
-        // target's own tests with `--only-file` so siblings' tests do not
-        // double-count.
         const tdir = std.fs.path.dirname(target) orelse "";
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
@@ -261,16 +270,49 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
             }
         }
         try argv.append(a, target);
-        const r = try runKlio(a, io, &env, argv.items);
-        if (passedCount(r.stdout)) |p| {
-            total_passed += p;
-        } else {
-            build_blocked += 1;
-        }
+        try jobs.append(a, try argv.toOwnedSlice(a));
     }
+
+    var next = std.atomic.Value(usize).init(0);
+    var total_passed = std.atomic.Value(usize).init(0);
+    var build_blocked = std.atomic.Value(usize).init(0);
+    const Pool = struct {
+        fn worker(
+            queue: []const []const []const u8,
+            penv: *std.process.Environ.Map,
+            pnext: *std.atomic.Value(usize),
+            ppassed: *std.atomic.Value(usize),
+            pblocked: *std.atomic.Value(usize),
+        ) void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            while (true) {
+                const i = pnext.fetchAdd(1, .monotonic);
+                if (i >= queue.len) return;
+                _ = arena.reset(.retain_capacity);
+                const r = runKlio(arena.allocator(), penv, queue[i]) catch {
+                    _ = pblocked.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                if (passedCount(r.stdout)) |p| {
+                    _ = ppassed.fetchAdd(p, .monotonic);
+                } else {
+                    _ = pblocked.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+    var threads: std.ArrayList(std.Thread) = .empty;
+    for (0..workerCount()) |_| {
+        try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
+            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &build_blocked,
+        }));
+    }
+    for (threads.items) |t| t.join();
+
     std.debug.print(
         "stdlib_commontest: {d} passed across {d} files, {d} build-blocked (baseline {d})\n",
-        .{ total_passed, targets.items.len, build_blocked, BASELINE },
+        .{ total_passed.load(.monotonic), targets.items.len, build_blocked.load(.monotonic), BASELINE },
     );
-    try std.testing.expect(total_passed >= BASELINE);
+    try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
 }

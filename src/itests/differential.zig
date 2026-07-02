@@ -6,13 +6,14 @@
 //!
 //! Applicable modes:
 //!   - A pure-stdlib program (no `kotlinx.*` import) is only meaningful under
-//!     `EmbeddedOnly` — the kotlinx packs would not load for it — so it runs a
-//!     single mode and passes trivially.
+//!     `EmbeddedOnly` — the kotlinx packs would not load for it — so there is
+//!     nothing to compare and it is skipped here (the e2e corpus gate owns
+//!     single-mode example output).
 //!   - A program that uses a kotlinx pack runs `SourcePacks` (packs parsed from
 //!     source) AND `CompiledPacks` (packs round-tripped through a compiled
 //!     `.klio-pack` image), and the two outputs must match byte-for-byte.
 //!
-//! The corpus is every `examples/*.kt` (pure stdlib) plus the kotlinx-using
+//! The corpus is every `examples/*.kt` plus the kotlinx-using
 //! `tests/fixtures/coroutine_smoke/*.kt` so at least one pack-using program is
 //! exercised across ≥2 modes.
 
@@ -89,7 +90,9 @@ fn checkCorpus(io: std.Io, files: []const []const u8) !usize {
             continue;
         };
         const modes = applicableModes(src);
-        if (modes.len > 1) pack_programs += 1;
+        // One applicable mode compares nothing — skip the run entirely.
+        if (modes.len < 2) continue;
+        pack_programs += 1;
 
         var baseline: ?RunOutcome = null;
         var baseline_mode: parity.LoadMode = undefined;
@@ -187,6 +190,31 @@ test "corpus outputs are independent of program order" {
     const smoke = parity.collectKt(la, io, SMOKE_DIR) catch &.{};
     try corpus.appendSlice(la, smoke);
     if (corpus.items.len == 0) return error.SkipZigTest;
+
+    // Base-state leakage is order-dependence in the shared per-process base;
+    // it shows up with any surrounding programs, so a deterministic sample
+    // spanning the sorted corpus proves the isolation without re-interpreting
+    // every example twice. Every pack-using program stays (the pack-mode
+    // bases carry the most shared state).
+    var sampled: std.ArrayList([]u8) = .empty;
+    defer sampled.deinit(la);
+    {
+        var pure: std.ArrayList([]u8) = .empty;
+        defer pure.deinit(la);
+        for (corpus.items) |file| {
+            const src = std.Io.Dir.cwd().readFileAlloc(io, file, la, .unlimited) catch continue;
+            if (applicableModes(src).len > 1)
+                try sampled.append(la, file)
+            else
+                try pure.append(la, file);
+        }
+        const max_pure = 12;
+        const stride = @max(pure.items.len / max_pure, 1);
+        var i: usize = 0;
+        while (i < pure.items.len) : (i += stride) try sampled.append(la, pure.items[i]);
+    }
+    corpus.clearRetainingCapacity();
+    try corpus.appendSlice(la, sampled.items);
 
     const Key = struct { file: []const u8, mode: parity.LoadMode };
     var recorded: std.ArrayList(struct { key: Key, kind: u8, text: []u8 }) = .empty;

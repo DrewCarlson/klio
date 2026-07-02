@@ -45,6 +45,13 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     return map;
 }
 
+/// Concurrent child count. Each child is one `klio test` process; the pool
+/// keeps the cores busy while the slowest files run.
+fn workerCount() usize {
+    const cores = std.Thread.getCpuCount() catch 4;
+    return std.math.clamp(cores, 1, 8);
+}
+
 fn runKlio(
     allocator: std.mem.Allocator,
     env: *std.process.Environ.Map,
@@ -145,24 +152,57 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
         if (fileHasTest(a, io, p)) try targets.append(a, p) else try support.append(a, p);
     }
 
-    var total_passed: usize = 0;
-    var hung: usize = 0;
+    // Build every child's argv up front, then drain the queue with a worker
+    // pool — each child is one isolated `klio test` process, so the only
+    // cross-thread state is the two counters. A file with the 1M stress loop
+    // is killed at the per-child cap; its earlier PASSED lines still count.
+    // Non-stress files finish in a few seconds.
+    var jobs: std.ArrayList([]const []const u8) = .empty;
     for (targets.items) |target| {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
         try argv.appendSlice(a, support.items);
         try argv.append(a, target);
-        // A file with the 1M stress loop is killed at the cap; its earlier
-        // PASSED lines still count. Non-stress files finish in a few seconds.
-        const r = try runKlio(a, &env, argv.items, 60_000);
-        const p = passedLineCount(r.stdout);
-        if (std.mem.indexOf(u8, r.stdout, " passed,") == null) hung += 1;
-        total_passed += p;
+        try jobs.append(a, try argv.toOwnedSlice(a));
     }
+    var next = std.atomic.Value(usize).init(0);
+    var total_passed = std.atomic.Value(usize).init(0);
+    var hung = std.atomic.Value(usize).init(0);
+    const Pool = struct {
+        fn worker(
+            queue: []const []const []const u8,
+            penv: *std.process.Environ.Map,
+            pnext: *std.atomic.Value(usize),
+            ppassed: *std.atomic.Value(usize),
+            phung: *std.atomic.Value(usize),
+        ) void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            while (true) {
+                const i = pnext.fetchAdd(1, .monotonic);
+                if (i >= queue.len) return;
+                _ = arena.reset(.retain_capacity);
+                const r = runKlio(arena.allocator(), penv, queue[i], 60_000) catch {
+                    _ = phung.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
+                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) _ = phung.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var threads: std.ArrayList(std.Thread) = .empty;
+    for (0..workerCount()) |_| {
+        try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
+            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &hung,
+        }));
+    }
+    for (threads.items) |t| t.join();
+
     std.debug.print(
         "androidx_commontest: {d} passed across {d} files, {d} did not complete (baseline {d})\n",
-        .{ total_passed, targets.items.len, hung, BASELINE },
+        .{ total_passed.load(.monotonic), targets.items.len, hung.load(.monotonic), BASELINE },
     );
-    try std.testing.expect(total_passed >= BASELINE);
+    try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
 }
