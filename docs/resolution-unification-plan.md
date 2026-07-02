@@ -232,9 +232,18 @@ recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof
    (`dbec6ecb`) with the member half filled at class-body lowering. Two dip-and-recover
    lessons recorded in the commit: methods-only sets and owner-only chains both
    mis-bind. REMAINING for full P4: the other five Group-1 `class_member_names` reads
-   (alias binds, out-of-scope verdicts, prop reads, container creators — flip one
-   coherent question at a time with per-file canonical diffs), explicit-receiver
-   (`obj.foo()`) membership via DeclSig, and then the `class_member_names` deletion.
+   — with a lesson from an attempted-and-reverted wholesale flip: they split into
+   TWO questions, (a) "could this receiver's member shadow the name"
+   (`memberShadowPossible`, unknown-receiver arms included) and (b) "does ANY
+   class declare the name" (the alias / container-creator guards, which bind
+   direct in receiver contexts precisely when no class declares it — no
+   unknown-receiver arm; routing them through (a) broke the fn-typed-receiver
+   rule and flow_operators). The (b) sites need a narrower helper:
+   hierarchy-precise when the receiver type is known, the global set otherwise.
+   Then explicit-receiver (`obj.foo()`) membership via DeclSig — the parked ktor
+   server chain (tasks #7/#14: install mis-picks, object-singleton simple-name
+   collisions) is the concrete evidence for why identity-keyed resolution must
+   replace simple-name keying — and finally the `class_member_names` deletion.
 4. **P5** distinct-keyed inherited fields (RC-D; `c_shadow` 1/2/1/1). **P7** eager
    typeck records+reuses resolution (RC-G) — also unlocks index-primary/type-aware
    resolveCall and the full NaN-style static-overload class. **P8** hatch deletion
