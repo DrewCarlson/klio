@@ -16,7 +16,13 @@ The suite is split by cost:
 - `zig build itest` — the integration suite: it interprets whole
   programs (the `parity` sweep, `e2e`, `stdlib_commontest`, etc.), so
   it takes minutes. Run one in isolation with `zig build itest-<name>`.
-- `zig build test-all` — both. This is what CI runs.
+- `zig build test-all` — both.
+- `-Ditest-shard=K/N` — run only shard K of the integration suite. The
+  suites (plus `e2e` and `bench`) are packed into N weight-balanced
+  bins from the `weight` field on each `Itest` entry in `build.zig`;
+  CI fans the suite across parallel shard jobs this way, with the unit
+  tests as their own fast job. Keep the weights of the heavy suites
+  roughly current when their cost changes materially.
 
 Fast resolution-audit cycle: the overload-resolution unification work
 (`docs/resolution-unification-plan.md`) verifies a scorer slice with
@@ -101,6 +107,17 @@ Two mechanisms keep the suite fast:
   `fast`/`fallback` line per program. The
   `parity_stdlib_isolation` itest and the differential's
   order-independence test gate cross-program contamination.
+- **Build-time baked parity bases.** The `parity-base-gen` build step
+  bakes the EmbeddedOnly bases (both stdlib gate variants) to
+  `zig-out/parity-base/embedded-gate{0,1}.klio-image` once per build,
+  and every parity-data run step points its processes at them via
+  `KLIO_PARITY_BASE_IMAGES`, so each test binary loads the lowered
+  stdlib instead of re-parsing and re-lowering it at startup. The
+  image bytes are declared run-step cache inputs, and any read or
+  decode failure falls back to the per-process source build. When
+  running an installed `zig-out/bin/itest-*` binary by hand, export
+  `KLIO_PARITY_BASE_IMAGES=zig-out/parity-base` to keep the fast
+  startup.
 - **Baked stdlib image (the CLI's equivalent).** `klio run` serializes
   the same kind of lowered base to `~/.klio/cache` on first use and
   loads + extends it on every later run (`src/interp_ir/image.zig`,
