@@ -229,6 +229,19 @@ fn funcAt(self: *VmHost, fid: FuncId, comptime ctx: []const u8) Allocator.Error!
     } };
 }
 
+/// The storage key for `prop` declared by `cls`: the owner-mangled
+/// registry key when the property is a recorded private SHADOW of a
+/// supertype's same-name declaration (its own distinct cell, Kotlin
+/// semantics), else the plain name. The mangled slice is the registry's
+/// own stable key.
+fn shadowFieldKey(self: *VmHost, cls: []const u8, prop: []const u8) []const u8 {
+    var buf: [256]u8 = undefined;
+    const probe = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ cls, prop }) catch return prop;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return mg.get().registry.private_shadow_props.getKey(probe) orelse prop;
+}
+
 /// Evaluate `func` against `args`, returning its result. The module
 /// handle is borrowed for the call's duration.
 fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator.Error!EvalResult {
@@ -2199,7 +2212,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                         retainFieldList(&fields, allocator, pp[k].name);
                         // The instance owns one ref to each primary-ctor field.
                         if (runtime.reclaimEnabled()) fv.retain();
-                        try fields.append(allocator, .{ .name = pp[k].name, .value = fv });
+                        try fields.append(allocator, .{ .name = shadowFieldKey(self, cls_name, pp[k].name), .value = fv });
                     }
                 }
                 dg.deinit();
@@ -2422,7 +2435,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                             };
                             v = try maybeProvideDelegate(self, allocator, cls_name, prop_name, &inst_value, v);
                             const g = inst.borrowMut();
-                            try g.get().define(allocator, prop_name, v);
+                            try g.get().define(allocator, shadowFieldKey(self, cls_name, prop_name), v);
                             g.deinit();
                         },
                     }
@@ -2435,7 +2448,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                     if (init_expr) |ie| {
                         const v = (try simpleLiteral(allocator, ie.get())) orelse Value.Null;
                         const g = inst.borrowMut();
-                        try g.get().define(allocator, prop_name, v);
+                        try g.get().define(allocator, shadowFieldKey(self, cls_name, prop_name), v);
                         g.deinit();
                     } else {
                         const skip = blk: {

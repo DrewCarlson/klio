@@ -495,6 +495,23 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             const owner = rest[0..sep];
             const prop = rest[sep + 1 ..];
             const mptr: *const Module = self.module.asPtr();
+            // A private SHADOW of a supertype's same-name declaration has
+            // its own storage cell under the owner-mangled key; the
+            // declaring class's own reads address exactly that cell (the
+            // base class's plain cell stays untouched by the shadow).
+            if (receiver.* == .Instance) {
+                const is_shadow = blk: {
+                    const mg2 = self.module.borrow();
+                    defer mg2.deinit();
+                    break :blk mg2.get().registry.private_shadow_props.getKey(rest) != null;
+                };
+                if (is_shadow) {
+                    const g2 = receiver.Instance.borrow();
+                    const owned = g2.get().get(rest);
+                    g2.deinit();
+                    if (owned) |v| return ok(v);
+                }
+            }
             if (receiver.* == .Instance) {
                 var cur: ?[]const u8 = className(receiver.Instance);
                 var seen: std.ArrayList([]const u8) = .empty;

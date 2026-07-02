@@ -200,3 +200,57 @@ test "private_member_not_overridden" {
     ;
     try assertKlio("private_not_overridden", src, "S:P-hidden\n");
 }
+
+// A private property shadowing a same-name declaration in a supertype has
+// its OWN storage cell: the base class's methods keep reading the base's
+// value, the derived class's methods its own (kotlinc: private members do
+// not override; each declaration is distinct storage).
+test "private_shadow_field_distinct_cells" {
+    const src =
+        \\
+        \\open class Base {
+        \\    private val x = 1
+        \\    fun baseRead(): Int = x
+        \\}
+        \\class Derived : Base() {
+        \\    private val x = 2
+        \\    fun derivedRead(): Int = x
+        \\}
+        \\fun main() {
+        \\    val d = Derived()
+        \\    println(d.baseRead())
+        \\    println(d.derivedRead())
+        \\    val b: Base = d
+        \\    println(b.baseRead())
+        \\    println(Derived().baseRead())
+        \\}
+        \\
+    ;
+    try assertKlio("c_shadow", src, "1\n2\n1\n1\n");
+}
+
+// The var form: writes inside each class land on that class's own cell.
+test "private_shadow_var_writes_own_cell" {
+    const src =
+        \\
+        \\open class Base {
+        \\    private var x = 10
+        \\    fun bump() { x += 1 }
+        \\    fun baseRead(): Int = x
+        \\}
+        \\class Derived : Base() {
+        \\    private var x = 20
+        \\    fun set(v: Int) { x = v }
+        \\    fun derivedRead(): Int = x
+        \\}
+        \\fun main() {
+        \\    val d = Derived()
+        \\    d.bump()
+        \\    d.set(99)
+        \\    println(d.baseRead())
+        \\    println(d.derivedRead())
+        \\}
+        \\
+    ;
+    try assertKlio("c_shadow_var", src, "11\n99\n");
+}

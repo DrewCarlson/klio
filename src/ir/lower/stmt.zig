@@ -692,9 +692,17 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 // Method-body `this.field` write — route
                 // SetField on the receiver so the bare-
                 // name assign reaches the instance, not
-                // a synthetic global.
+                // a synthetic global. A private SHADOW of a
+                // supertype's same-name property writes ITS OWN
+                // owner-mangled cell, never the base class's.
                 const this_reg = b.resolve("this").?;
-                const field = try b.module.internConst(b.allocator, .{ .String = seg });
+                const store_name: []const u8 = blk: {
+                    const oc = b.ownerClass() orelse break :blk seg;
+                    var kb: [256]u8 = undefined;
+                    const probe = std.fmt.bufPrint(&kb, "{s}\x1f{s}", .{ oc, seg }) catch break :blk seg;
+                    break :blk b.module.registry.private_shadow_props.getKey(probe) orelse seg;
+                };
+                const field = try b.module.internConst(b.allocator, .{ .String = store_name });
                 try b.push(.{ .SetField = .{
                     .receiver = this_reg,
                     .field = field,

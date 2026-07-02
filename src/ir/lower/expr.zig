@@ -6259,6 +6259,16 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
     const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
+    // Kotlin resolves the member-vs-extension question against the
+    // receiver's DECLARED type; carry it for the extension-selection
+    // filter (a channel separate from static_recv, whose meaning is the
+    // extension-body receiver). Nullable declared receivers stay untagged
+    // (null-receiver extensions keep their own dispatch rules).
+    const declared_recv: ?ConstId = blk: {
+        const t = argDeclTypeRef(b, receiver) orelse break :blk null;
+        if (t.nullable or std.mem.endsWith(u8, t.name, "?")) break :blk null;
+        break :blk try b.module.internConst(b.allocator, .{ .String = t.name });
+    };
     try b.push(.{ .CallMember = .{
         .dst = dst,
         .receiver = recv,
@@ -6266,6 +6276,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
+        .declared_recv = declared_recv,
     } });
     return dst;
 }
