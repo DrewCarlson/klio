@@ -988,6 +988,14 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         }
     }
     try bindParams(&b, names.items);
+    // A user parameter literally named `this` (backtick-quoted in source) on
+    // a receiver-less function is an ordinary value binding, not a dispatch
+    // receiver: bare calls in the body must not member-dispatch through it.
+    if (implicit_params.len == 0 and owner_class == null) {
+        for (f.params) |*p| {
+            if (std.mem.eql(u8, p.name.name, "this")) b.this_is_plain_param = true;
+        }
+    }
     // Record each declared parameter's static type head so a cast-rebound call
     // can disambiguate overloads by an argument that names a parameter (an
     // `Iterable<Int>` parameter must not bind an `IntRange`-typed overload slot).

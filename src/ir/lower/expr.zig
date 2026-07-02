@@ -4844,7 +4844,10 @@ fn heurPickInexact(b: *FuncBuilder, fid: FuncId, want: usize) bool {
 /// decidable: kotlinc rejects resolving a bare name against a *caller's*
 /// receiver (dynamic scope), so those sites emit the static global form.
 fn inReceiverContext(b: *const FuncBuilder) bool {
-    return b.capturesThisSlot() or b.resolve("this") != null or b.ownerClass() != null or
+    // A binding named `this` that is an ordinary user parameter (backtick-
+    // quoted on a receiver-less function) is not a dispatch receiver.
+    const this_binding = !b.this_is_plain_param and b.resolve("this") != null;
+    return b.capturesThisSlot() or this_binding or b.ownerClass() != null or
         b.isParamThunk() or b.recvTy() != null;
 }
 
@@ -5698,6 +5701,14 @@ fn lowerUnresolvedBareCall(
     // so the capture slot is empty and the bare member misses its own
     // receiver. This is the `is JobSupport -> invokeOnCompletionInternal(…)`
     // shape — a bare member call on the extension's smart-cast receiver.
+    // The only `this` in scope is an ordinary user parameter named `this`:
+    // no implicit receiver exists, so the bare name binds a global or is an
+    // unresolved reference at runtime — never a member of the parameter.
+    if (b.this_is_plain_param and b.recvTy() == null and b.ownerClass() == null and
+        !b.capturesThisSlot())
+    {
+        return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
+    }
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
     orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);
