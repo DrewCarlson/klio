@@ -302,6 +302,12 @@ pub const Inst = union(enum) {
         /// dispatch must not bind a runtime subtype's same-name
         /// extension when this is set.
         static_recv: ?ConstId = null,
+        /// The receiver expression's DECLARED type head (a typed local/param,
+        /// an unsafe cast), consumed ONLY by the extension-selection filter:
+        /// Kotlin resolves member-vs-extension against the static type. Never
+        /// touches the member walk (unlike `static_recv`, whose meaning is
+        /// the extension-BODY receiver).
+        declared_recv: ?ConstId = null,
     },
     /// Instantiate a class.
     NewInstance: struct {
@@ -2829,6 +2835,13 @@ pub const ModuleRegistry = struct {
     /// declares or inherits (transitively over supertypes). Lets the
     /// lowerer honor Kotlin's separate function/property namespaces.
     hierarchy_methods: std.StringHashMap(std.StringHashMap(void)),
+    /// Private stored properties that SHADOW a same-name declaration in a
+    /// strict supertype, keyed "Class\x1fprop". Kotlin gives a shadow its
+    /// own storage cell (a private base field and a private derived field
+    /// are distinct); construction stores these under the owner-mangled
+    /// key and the scope-qualified read/write paths address exactly that
+    /// cell, so the base class's cell is never clobbered. Lowering-only.
+    private_shadow_props: std.StringHashMap(void),
     /// Per-class transitive member-NAME set for the member-shadow gate —
     /// every kind a bare name could bind through the implicit receiver —
     /// plus whether the supertype chain fully resolved (`complete`). An
@@ -2943,6 +2956,7 @@ pub const ModuleRegistry = struct {
             .top_level_delegated_props = std.StringHashMap(void).init(allocator),
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
             .hierarchy_shadow_names = std.StringHashMap(HierarchyShadowSet).init(allocator),
+            .private_shadow_props = std.StringHashMap(void).init(allocator),
             .member_method_fids = std.StringHashMap(FuncId).init(allocator),
             .class_member_names = std.StringHashMap(void).init(allocator),
             .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
@@ -2978,6 +2992,9 @@ pub const ModuleRegistry = struct {
             self.func_type_param_bounds.deinit();
         }
         self.top_level_delegated_props.deinit();
+        {
+            self.private_shadow_props.deinit();
+        }
         {
             var itsn = self.hierarchy_shadow_names.valueIterator();
             while (itsn.next()) |v| v.names.deinit();
@@ -3087,6 +3104,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.hierarchy_methods.iterator();
             while (it.next()) |e| try out.hierarchy_methods.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.private_shadow_props.keyIterator();
+            while (it.next()) |k| try out.private_shadow_props.put(k.*, {});
         }
         {
             var it = self.hierarchy_shadow_names.iterator();

@@ -2938,8 +2938,11 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 }
             }
             const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(frame.module, sid) else null;
+            const declared_recv: ?[]const u8 = if (cm.declared_recv) |did| constStr(frame.module, did) else null;
             const res = if (static_recv) |sname|
                 host.callMemberNamedStatic(allocator, &recv, name_str, arg_values, names, sname)
+            else if (declared_recv != null)
+                host.callMemberNamedDeclared(allocator, &recv, name_str, arg_values, names, declared_recv)
             else
                 host.callMemberNamed(allocator, &recv, name_str, arg_values, names);
             if (pushed_enclosing) popEnclosing();
@@ -4924,6 +4927,10 @@ pub const NullHost = struct {
         return self.callMemberNamed(allocator, receiver, name, args, arg_names);
     }
 
+    pub fn callMemberNamedDeclared(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+        _ = declared_recv;
+        return self.callMemberNamed(allocator, receiver, name, args, arg_names);
+    }
     pub fn callMemberNamedStatic(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
         _ = static_recv;
         return self.callMemberNamed(allocator, receiver, name, args, arg_names);

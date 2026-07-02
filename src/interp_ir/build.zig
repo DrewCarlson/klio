@@ -1288,6 +1288,60 @@ fn buildModuleWithOverrides(
             try module.registry.class_super_names.put(e.key_ptr.*, try chain.toOwnedSlice(a));
         }
     }
+    // Private stored properties shadowing a strict supertype's same-name
+    // declaration get their own storage cell (Kotlin semantics): record
+    // them so construction and the scope-qualified accessors use the
+    // owner-mangled key.
+    {
+        var it = file_classes.iterator();
+        while (it.next()) |e| {
+            const cname = e.key_ptr.*;
+            const chain = module.registry.class_super_names.get(cname) orelse continue;
+            if (chain.len == 0) continue;
+            const c = e.value_ptr.get();
+            var prop_i: usize = 0;
+            _ = &prop_i;
+            const record = struct {
+                fn f(mod: *ir.Module, al: Allocator, cls: []const u8, sups: []const []const u8, fc: *const FileClasses, pname: []const u8) Allocator.Error!void {
+                    for (sups) |sup| {
+                        const sref = fc.get(sup) orelse continue;
+                        const sc = sref.get();
+                        var declares = false;
+                        for (sc.primary_params) |*sp| {
+                            if (sp.property != null and std.mem.eql(u8, sp.name.name, pname)) declares = true;
+                        }
+                        for (sc.members) |*sm| {
+                            if (sm.* != .Property) continue;
+                            const sp = sm.Property;
+                            // Only a STORED supertype property forces distinct
+                            // cells; an abstract or getter-only declaration has
+                            // no backing field to protect.
+                            if (sp.getter != null or sp.delegate != null or sp.is_abstract) continue;
+                            if (sp.init == null) continue;
+                            if (std.mem.eql(u8, sp.name.name, pname)) declares = true;
+                        }
+                        if (declares) {
+                            const key = try std.fmt.allocPrint(al, "{s}\x1f{s}", .{ cls, pname });
+                            try mod.registry.private_shadow_props.put(key, {});
+                            return;
+                        }
+                    }
+                }
+            }.f;
+            for (c.primary_params) |*p| {
+                if (p.property != null and p.visibility == .Private) {
+                    try record(module, a, cname, chain, &file_classes, p.name.name);
+                }
+            }
+            for (c.members) |*m| {
+                if (m.* != .Property) continue;
+                const pr = m.Property;
+                if (pr.visibility != .Private) continue;
+                if (pr.getter != null or pr.delegate != null) continue;
+                try record(module, a, cname, chain, &file_classes, pr.name.name);
+            }
+        }
+    }
     // `nested_object_aliases` is needed by the lowerer; install on registry.
     {
         var it = nested_object_aliases.iterator();

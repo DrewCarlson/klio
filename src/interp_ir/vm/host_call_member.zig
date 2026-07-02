@@ -2399,7 +2399,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
 /// stays available as the resolver's later lenient pass and as the
 /// explicit-dispatch default.
 fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool) Allocator.Error!EvalResult {
-    return callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, null, false);
+    return callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, null, false, null);
 }
 
 /// An `IrClosure`/`Function` field's declared parameter count, or null when
@@ -2465,7 +2465,7 @@ fn varargShadowedFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *con
     return try callValueRec(self, allocator, &field_val, args);
 }
 
-fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool) Allocator.Error!EvalResult {
+fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
     // A function-typed property shadowed by a same-named vararg method: invoke
     // the property when the call's argument shape matches it (see the helper).
     if (try varargShadowedFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
@@ -3038,7 +3038,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // may shadow it — the by-name extension re-pick must not re-select a
     // sibling overload the static evidence excluded.
     if (!no_ext) {
-        if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext, static_recv)) |r| return r;
+        if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv)) |r| return r;
     }
 
     // Class-delegation forwarding (swallow all errors).
@@ -6490,7 +6490,7 @@ pub fn delegatedInterfaceDeclares(self: *VmHost, allocator: Allocator, inst: Obj
 
 const Candidate = struct { fid: FuncId, func: Func };
 
-fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8) Allocator.Error!?EvalResult {
+fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
     const want = args.len + 1;
     var visible_owners = try enclosingOwnerSet(self, allocator);
     defer visible_owners.deinit();
@@ -6565,6 +6565,11 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             if (!recv_fits) continue;
             if (!extArityApplicable(self, &c.func, want)) continue;
             if (candidateArgsDisproven(self, &c.func, args)) continue;
+            // Kotlin selects extensions against the receiver's DECLARED
+            // type: a definite static mismatch drops the candidate.
+            if (declared_recv) |dn| {
+                if (staticReceiverApplicable(self, allocator, dn, c.fid, &c.func.params[0].ty) == false) continue;
+            }
             filtered.append(allocator, c) catch {};
         }
         candidates.deinit(allocator);
@@ -6596,6 +6601,9 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             for (candidates.items) |c| {
                 if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) continue;
                 if (candidateArgsDisproven(self, &c.func, args)) continue;
+                if (declared_recv) |dn| {
+                    if (staticReceiverApplicable(self, allocator, dn, c.fid, &c.func.params[0].ty) == false) continue;
+                }
                 filtered.append(allocator, c) catch {};
             }
             candidates.deinit(allocator);
@@ -7011,14 +7019,14 @@ fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: *con
 // -------------------------------------------------------------------------
 
 pub fn callMemberNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, null, false);
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, null, false, null);
 }
 
 /// `callMemberNamed` with the receiver's DECLARED type head (a bare call
 /// on the implicit `this` of an extension body). Extension dispatch then
 /// resolves against the static type, as kotlinc does.
 pub fn callMemberNamedStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, static_recv, false);
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, static_recv, false, null);
 }
 
 /// Per-receiver probe for the bare-name resolver's innermost-first
@@ -7036,7 +7044,7 @@ pub fn callMemberNamedStatic(self: *VmHost, allocator: Allocator, receiver: *con
 /// `fun I.helper()` a bare `describe()` binds `I.describe` even when the
 /// runtime value is a subtype with its own `describe` extension.
 pub fn callMemberStrictExt(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, false);
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, false, null);
 }
 
 /// Whether the committed extension target's declared receiver definitely
@@ -7068,16 +7076,22 @@ pub fn committedExtReceiverProven(self: *VmHost, allocator: Allocator, fid: Func
 /// fallback suppressed, for a call whose extension target the lowering
 /// already committed.
 pub fn callMemberMembersOnly(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, true);
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, true, null);
 }
 
 /// The lenient members-only pass (erasure-unprovable receivers), extension
 /// fallback still suppressed.
 pub fn callMemberMembersOnlyLenient(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, static_recv, true);
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, static_recv, true, null);
 }
 
-fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool) Allocator.Error!EvalResult {
+/// Member dispatch with the receiver's DECLARED type constraining only the
+/// extension selection (Kotlin's static member-vs-extension resolution).
+pub fn callMemberNamedDeclared(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, null, false, declared_recv);
+}
+
+fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
     var any_named = false;
     for (arg_names) |n| {
         if (n != null) any_named = true;
@@ -7104,7 +7118,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
             }
         }
         const filled = [_]Value{ .{ .Int = @intCast(start) }, .{ .Int = @intCast(end) } };
-        return try callMemberInnerStatic(self, allocator, receiver, name, &filled, strict_ext, static_recv, no_ext);
+        return try callMemberInnerStatic(self, allocator, receiver, name, &filled, strict_ext, static_recv, no_ext, declared_recv);
     }
 
     // Stdlib intrinsic dispatch with named args.
@@ -7146,7 +7160,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     }
 
     // Positional dispatch first.
-    const primary = try callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext);
+    const primary = try callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv);
     if (!(primary == .err and primary.err == .Unimplemented)) return primary;
 
     // Class-hierarchy method walk for a class-qualified lowered name.
