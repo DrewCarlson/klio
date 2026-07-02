@@ -2043,10 +2043,25 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
         const f = b.module.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
         if (!(f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
-        if (userParams(f) != user_arg_count) continue;
+        if (userParams(f) < user_arg_count) continue;
         const last = f.params[f.params.len - 1];
         if (last.is_vararg) continue;
-        if (fnTypeArityAlias(b, last.ty) != null) return fid;
+        if (fnTypeArityAlias(b, last.ty) == null) continue;
+        // Under-applied (`launch { … }` against `launch(context = …,
+        // start = …, block)`): the trailing lambda binds the last param
+        // out of sequence, so every skipped parameter must be defaulted.
+        if (userParams(f) != user_arg_count) {
+            var i: usize = user_arg_count; // leading args fill params[1..user_arg_count]
+            var gap_defaulted = true;
+            while (i < f.params.len - 1) : (i += 1) {
+                if (!f.params[i].has_default) {
+                    gap_defaulted = false;
+                    break;
+                }
+            }
+            if (!gap_defaulted) continue;
+        }
+        return fid;
     }
     return null;
 }
@@ -5177,7 +5192,19 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     };
     defer if (broad_masks) |m| b.allocator.free(m);
     b.pending_arg_broad_masks = broad_masks;
-    const run = try lowerArgRun(b, args);
+    // The dispatch is deferred, but the trailing lambda's static shape comes
+    // from the committed global candidate: read the per-arg lambda arities
+    // from it so a `T.() -> R` receiver lambda drops its synthetic `it` here
+    // exactly as on the static-call path (`it` then resolves to the
+    // enclosing lambda's, matching kotlinc).
+    const arg_arity: ?[]const i16 = blk: {
+        if (b.module.funcById(func_id)) |f| {
+            const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            break :blk try argFnArities(b, f, args, ast_arg_names, recv_off);
+        }
+        break :blk null;
+    };
+    const run = try lowerArgRunWithArity(b, args, arg_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
@@ -5674,8 +5701,23 @@ fn lowerUnresolvedBareCall(
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
     orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);
+    // No committed target, but a trailing lambda's expected shape still has
+    // a static answer: read the per-arg lambda arities from the same-name
+    // overload that hosts it at this arity, so a `T.() -> R` handler drops
+    // its synthetic `it` here too (`launch { … }` deferred inside a
+    // receiver context) and `it` resolves to the enclosing lambda's.
+    const bare_arity: ?[]const i16 = blk: {
+        if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
+            if (overloadHostingTrailingLambda(b, name0, args.len)) |fid| {
+                if (b.module.funcById(fid)) |f| {
+                    break :blk try argFnArities(b, f, args, ast_arg_names, 1);
+                }
+            }
+        }
+        break :blk null;
+    };
     if (b.resolve("this")) |this_reg| {
-        const run = try lowerArgRun(b, args);
+        const run = try lowerArgRunWithArity(b, args, bare_arity);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         try b.push(.{ .CallMemberOrGlobal = .{
             .dst = dst,
@@ -5689,7 +5731,7 @@ fn lowerUnresolvedBareCall(
         return dst;
     }
     const this_idx = try b.recordCapture("this");
-    const run = try lowerArgRun(b, args);
+    const run = try lowerArgRunWithArity(b, args, bare_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     try b.push(.{ .CallMemberOrGlobal = .{
         .dst = dst,
