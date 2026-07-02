@@ -3428,7 +3428,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // the member/extension passes are skipped only when the name really
     // names a class.
     const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]) and
-        (cmg.class != null or frame.module.classId(name_str) != null);
+        cmg.class != null;
     var committed_ext_h: ?FuncId = null;
     var committed_recv_h: ?Value = null;
     var resolved: ?Value = null;
