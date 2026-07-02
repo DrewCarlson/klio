@@ -4188,6 +4188,15 @@ fn argEvidenceLitKind(b: *FuncBuilder, arg: *const Expr) ?LitKind {
 /// parameter whose declared type is known (`b.localDeclType`), as a `TypeRef`
 /// for the shared scorer's declared-type evidence. Null for anything else.
 fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    // An unsafe cast fixes the argument's static type for overload
+    // resolution — kotlinc sees exactly the cast target. That is the
+    // documented way to force a sibling overload (ktor's deprecated
+    // `P.install` delegates with `install(plugin as Plugin<P, B, F>,
+    // configure)`; without the cast evidence the call binds itself and
+    // recurses forever).
+    if (arg.* == .As and !arg.As.safe) {
+        return .{ .name = loweredTypeName(b, &arg.As.ty), .nullable = arg.As.ty.nullable, .args = &.{} };
+    }
     if (arg.* != .Path) return null;
     const p = arg.Path;
     if (p.segments.len != 1) return null;
