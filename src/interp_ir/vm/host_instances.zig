@@ -126,21 +126,6 @@ fn classDefByQualifiedSuffix(self: *VmHost, qualified: []const u8) ?ObjRef(Class
     return best;
 }
 
-/// First concrete (non-abstract, non-interface) class sharing `name`.
-fn concreteSibling(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
-    const g = self.classes.borrow();
-    defer g.deinit();
-    var it = g.get().valueIterator();
-    while (it.next()) |d| {
-        const dg = d.borrow();
-        const cd = dg.get();
-        const match = std.mem.eql(u8, cd.name, name) and !cd.is_abstract and !cd.is_interface;
-        dg.deinit();
-        if (match) return d.clone();
-    }
-    return null;
-}
-
 /// Class-keyed side tables hold one entry under the class's simple name
 /// and (when it differs) one under its FQN. A caller that knows the
 /// resolved FQN resolves through it exclusively — the simple-name entry
@@ -239,7 +224,8 @@ fn shadowFieldKey(self: *VmHost, cls: []const u8, prop: []const u8) []const u8 {
     const probe = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ cls, prop }) catch return prop;
     const mg = self.module.borrow();
     defer mg.deinit();
-    return mg.get().registry.private_shadow_props.getKey(probe) orelse prop;
+    if (mg.get().registry.private_shadow_props.getKey(probe)) |k| return k;
+    return mg.get().registry.override_cell_props.getKey(probe) orelse prop;
 }
 
 /// Evaluate `func` against `args`, returning its result. The module
@@ -1219,19 +1205,6 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     };
     defer class_def.deinit();
 
-    // Abstract / interface collision redirect.
-    if (classDefIsAbstract(class_def)) {
-        if (concreteSibling(self, ir_name)) |d| {
-            class_def.deinit();
-            class_def = d;
-        }
-    }
-    if (classDefIsInterface(class_def)) {
-        if (concreteSibling(self, ir_name)) |d| {
-            class_def.deinit();
-            class_def = d;
-        }
-    }
     if (classDefIsAbstract(class_def)) {
         return throwInstantiation(self, allocator, "Cannot create an instance of an abstract class: {s}", classDefName(class_def));
     }

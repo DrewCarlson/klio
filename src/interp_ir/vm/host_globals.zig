@@ -210,6 +210,24 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
         clearObjectState(self, name);
         return .{ .ok = null };
     };
+    // An object singleton is never an interface or abstract class; a
+    // simple-name pick resolving to one is a collision with a nested/
+    // scoped object the flat index cannot rank. Decline so the caller's
+    // scope walk continues.
+    {
+        const bad = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const m = mg.get();
+            if (class_id.int() >= m.classes.items.len) break :blk true;
+            const c = &m.classes.items[class_id.int()];
+            break :blk c.is_abstract;
+        };
+        if (bad) {
+            clearObjectState(self, name);
+            return .{ .ok = null };
+        }
+    }
 
     const r = self.newInstance(allocator, class_id, &.{}, null) catch |e| {
         clearObjectState(self, name);
@@ -277,6 +295,20 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
         if (class_id.int() >= m.classes.items.len) return .{ .ok = null };
         break :blk .{ m.classes.items[class_id.int()].fqn, m.classes.items[class_id.int()].name };
     };
+    // An object singleton is never an interface or abstract class: a
+    // simple-name pick that resolves to one is a collision with a nested/
+    // scoped object the flat index cannot rank (CoroutineContext.Key vs a
+    // nested `object Key`). Decline so the caller's scope walk continues.
+    {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(fqn) orelse cg.get().get(simple)) |d| {
+            const dg = d.borrow();
+            const bad = dg.get().is_interface or dg.get().is_abstract;
+            dg.deinit();
+            if (bad) return .{ .ok = null };
+        }
+    }
     while (true) {
         {
             const g = self.globals.borrow();

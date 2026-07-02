@@ -2345,15 +2345,14 @@ pub const Module = struct {
         return true;
     }
 
-    /// Whether a bare call to `name` binding target `id` is a tail call: the
-    /// target itself is `tailrec`, or the name is one of the module's known
-    /// tailrec functions (mirrors `expr.zig`'s legacy tail-call gate).
+    /// Whether a bare call binding target `id` is a tail call: exactly when
+    /// the committed target itself is `tailrec`. (The name-list arm this
+    /// replaced could mark a call to a non-tailrec target as a tail call
+    /// just because a same-name sibling was tailrec.)
     fn calleeIsTailrec(self: *const Module, id: FuncId, name: []const u8) bool {
+        _ = name;
         if (self.funcById(id)) |f| {
             if (f.is_tailrec) return true;
-        }
-        for (self.tailrec_fn_names.items) |n| {
-            if (std.mem.eql(u8, n, name)) return true;
         }
         return false;
     }
@@ -2842,6 +2841,11 @@ pub const ModuleRegistry = struct {
     /// key and the scope-qualified read/write paths address exactly that
     /// cell, so the base class's cell is never clobbered. Lowering-only.
     private_shadow_props: std.StringHashMap(void),
+    /// Initialized `override val/var` properties whose supertype STORES the
+    /// same name, keyed "Class\x1fprop". Each class keeps its own backing
+    /// cell (JVM semantics): reads dispatch to the most-derived cell,
+    /// `super.x` reads the base's plain cell. Lowering-only.
+    override_cell_props: std.StringHashMap(void),
     /// Per-class transitive member-NAME set for the member-shadow gate —
     /// every kind a bare name could bind through the implicit receiver —
     /// plus whether the supertype chain fully resolved (`complete`). An
@@ -2957,6 +2961,7 @@ pub const ModuleRegistry = struct {
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
             .hierarchy_shadow_names = std.StringHashMap(HierarchyShadowSet).init(allocator),
             .private_shadow_props = std.StringHashMap(void).init(allocator),
+            .override_cell_props = std.StringHashMap(void).init(allocator),
             .member_method_fids = std.StringHashMap(FuncId).init(allocator),
             .class_member_names = std.StringHashMap(void).init(allocator),
             .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
@@ -2994,6 +2999,7 @@ pub const ModuleRegistry = struct {
         self.top_level_delegated_props.deinit();
         {
             self.private_shadow_props.deinit();
+            self.override_cell_props.deinit();
         }
         {
             var itsn = self.hierarchy_shadow_names.valueIterator();
@@ -3108,6 +3114,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.private_shadow_props.keyIterator();
             while (it.next()) |k| try out.private_shadow_props.put(k.*, {});
+        }
+        {
+            var it = self.override_cell_props.keyIterator();
+            while (it.next()) |k| try out.override_cell_props.put(k.*, {});
         }
         {
             var it = self.hierarchy_shadow_names.iterator();

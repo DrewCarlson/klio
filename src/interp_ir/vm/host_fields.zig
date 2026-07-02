@@ -1759,6 +1759,50 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         }
         return try evalGetter(self, allocator, fid, receiver.*);
     }
+    // Most-derived override cell: an initialized `override val/var` keeps
+    // its own backing cell under the owner-mangled key (JVM semantics);
+    // reads dispatch to the nearest class in the runtime chain that owns
+    // one. `super.x` reads the base's plain cell, which the override's
+    // store never touches.
+    if (blk: {
+        const pg = self.module.borrow();
+        defer pg.deinit();
+        break :blk pg.get().registry.override_cell_props.count() != 0;
+    }) {
+        var cur2: ?[]const u8 = blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk cg.get().name;
+        };
+        var hops: u8 = 0;
+        while (cur2) |cn2| : (hops += 1) {
+            if (hops > 16) break;
+            var kb: [256]u8 = undefined;
+            const probe = std.fmt.bufPrint(&kb, "{s}\x1f{s}", .{ cn2, name }) catch break;
+            const is_cell = blk: {
+                const pg = self.module.borrow();
+                defer pg.deinit();
+                break :blk pg.get().registry.override_cell_props.contains(probe);
+            };
+            if (is_cell) {
+                const g = inst.borrow();
+                const owned = g.get().get(probe);
+                g.deinit();
+                if (owned) |v| return ok(v);
+            }
+            cur2 = blk: {
+                const cg = self.classes.borrow();
+                defer cg.deinit();
+                const d = cg.get().get(cn2) orelse break :blk null;
+                const dg = d.borrow();
+                defer dg.deinit();
+                const sups = dg.get().supertype_names;
+                break :blk if (sups.len != 0) sups[0] else null;
+            };
+        }
+    }
     // Raw instance slot.
     const slot: ?Value = blk: {
         const g = inst.borrow();

@@ -1150,14 +1150,14 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .dst = cls,
                     .this_idx = this_idx,
                     .name = n,
-                    .class = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file),
+                    .class = scopedClassIdForRead(b, name0, segments[0].span.file),
                 } });
             } else {
                 orEmitAudit(b, "class_name_value", "LoadGlobal", name0);
                 try b.push(.{ .LoadGlobal = .{
                     .dst = cls,
                     .name = n,
-                    .class = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file),
+                    .class = scopedClassIdForRead(b, name0, segments[0].span.file),
                 } });
             }
             const dst = b.allocReg();
@@ -5141,7 +5141,6 @@ fn overloadParamTypeConflicts(module: *const Module, f: *const Func, pidx: usize
 /// the member-vs-global walk lives in `emitMemberOrGlobal`, not here.
 fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
-    const callee = call.callee;
     const args = call.args;
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
@@ -5163,9 +5162,6 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     const callee_is_tailrec = blk: {
         if (b.module.funcById(func_id)) |f| {
             if (f.is_tailrec) break :blk true;
-        }
-        for (b.module.tailrec_fn_names.items) |n| {
-            if (std.mem.eql(u8, n, callee.Path.segments[0].name)) break :blk true;
         }
         break :blk false;
     };
@@ -5314,6 +5310,34 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
 
 /// The receiver-type tag for a deferred member-or-global bare call: the
 /// enclosing extension's declared receiver head, when this body has one.
+
+/// The class id a bare classifier read binds, innermost first: a NESTED
+/// class/object of the enclosing class chain (registered under its lifted
+/// `Outer$Name` key, invisible to the flat index) beats the package-scope
+/// pick — `object E : Base(Key)` inside a class declaring `object Key`
+/// reads ITS OWN Key, not `CoroutineContext.Key` from a wildcard import.
+fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
+    if (b.ownerClass()) |oc| {
+        var owner: ?[]const u8 = oc;
+        var hops: u8 = 0;
+        while (owner) |ow| : (hops += 1) {
+            if (hops > 8) break;
+            var kb: [256]u8 = undefined;
+            const mangled = std.fmt.bufPrint(&kb, "{s}${s}", .{ ow, name0 }) catch break;
+            if (b.module.classId(mangled)) |cid| return cid;
+            owner = if (std.mem.lastIndexOfScalar(u8, ow, '$')) |sep| ow[0..sep] else null;
+        }
+    }
+    // A receiver context whose owner chain is unknown here (a super-arg /
+    // default-value thunk, a lambda) may still see a NESTED classifier the
+    // flat index cannot rank; committing the package-scope pick would
+    // override the runtime's scope walk with the wrong declaration
+    // (CoroutineContext.Key shadowing a nested `object Key`). Decline —
+    // the name-keyed runtime path owns the scoped resolution.
+    if (inReceiverContext(b)) return null;
+    return b.module.classIdIndexed(name0, b.self_package, file);
+}
+
 fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
     const rt = b.recvTy() orelse return null;
     return try b.module.internConst(b.allocator, .{ .String = rt });
@@ -5699,23 +5723,6 @@ fn lowerUnresolvedBareCall(
         } });
         return dst;
     }
-    if (isPrimitiveConv(name0)) {
-        if (b.resolve("this")) |this_reg| {
-            const run = try lowerArgRun(b, args);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-            const dst = b.allocReg();
-            const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-            try b.push(.{ .CallMember = .{
-                .dst = dst,
-                .receiver = this_reg,
-                .name = nm,
-                .args = run[0],
-                .n_args = run[1],
-                .arg_names = arg_names,
-            } });
-            return dst;
-        }
-    }
     // A stdlib container creator (`emptyList<String>()`) called with type
     // args inside a method body. The name is a host-intrinsic global, never
     // a class member, so the runtime `this.<name>()` redispatch the general
@@ -5853,17 +5860,6 @@ fn lowerUnresolvedBareCall(
         .static_recv = try cmgStaticRecv(b),
     } });
     return dst;
-}
-
-fn isPrimitiveConv(name: []const u8) bool {
-    const names = [_][]const u8{
-        "toInt",  "toLong",    "toByte", "toShort", "toDouble", "toFloat",
-        "toChar", "toBoolean", "toUInt", "toULong", "toUByte",  "toUShort",
-    };
-    for (names) |n| {
-        if (std.mem.eql(u8, name, n)) return true;
-    }
-    return false;
 }
 
 /// Built-in stdlib companion shortcuts: `Result.success(x)`, `Result.failure(e)`.
