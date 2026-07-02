@@ -377,6 +377,31 @@ pub fn runTestFiles(
         return 1;
     }
 
+    // Fast path: assemble against the baked stdlib image. The prepared
+    // map holds the user files as its trailing entries, so `--only-file`
+    // FileIds are recovered from the tail positions. Falls back to the
+    // legacy whole-module build when the cache misses or the program
+    // cannot extend the base (e.g. files declaring expect/actual).
+    {
+        const prev_reclaim = runtime.reclaimEnabled();
+        if (!runtime.reclaimRequested()) runtime.setReclaim(false);
+        defer runtime.setReclaim(prev_reclaim);
+        if (stdlib_image.tryPrepare(gpa, files.items, features)) |prep| {
+            var image_fids: std.ArrayList(u32) = .empty;
+            defer image_fids.deinit(gpa);
+            const base_count = prep.map.files.items.len - files.items.len;
+            for (files.items, 0..) |path, i| {
+                for (only_files) |of| {
+                    if (std.mem.eql(u8, path, of) or std.mem.endsWith(u8, path, of)) {
+                        image_fids.append(gpa, @intCast(base_count + i)) catch return 1;
+                        break;
+                    }
+                }
+            }
+            return runTestsOnBuilt(gpa, prep.built, prep.bindings, prep.map, prep.user_asts, image_fids.items);
+        }
+    }
+
     var map = SourceMap.init(gpa);
     defer map.deinit();
 
@@ -418,14 +443,33 @@ pub fn runTestFiles(
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
 
-    var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
+    const built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
+    return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items);
+}
+
+/// Tail shared by the legacy and image test paths: surface lowering-time
+/// resolution diagnostics, materialize a Vm, install bindings, then
+/// discover and run the `@Test` functions in `user_asts`.
+fn runTestsOnBuilt(
+    gpa: std.mem.Allocator,
+    built_in: interp_ir.build.BuiltModule,
+    bindings: HostBindings,
+    map: *const SourceMap,
+    user_asts: []const KotlinFile,
+    only_fids: []const u32,
+) u8 {
+    const prev_reclaim = runtime.reclaimEnabled();
+    if (!runtime.reclaimRequested()) runtime.setReclaim(false);
+    defer runtime.setReclaim(prev_reclaim);
+
+    var built = built_in;
     {
         const mg = built.module.borrow();
         defer mg.deinit();
         const rdiags = mg.get().resolve_diags.items;
         if (rdiags.len != 0) {
             for (rdiags) |d| {
-                const msg = d.render(gpa, &map) catch return 1;
+                const msg = d.render(gpa, map) catch return 1;
                 defer gpa.free(msg);
                 io.printStderr(gpa, "{s}\n", .{msg});
             }
@@ -436,9 +480,9 @@ pub fn runTestFiles(
     const fb = Vm.fromBuilt(gpa, &built) catch return 1;
     var vm = fb.vm;
     defer vm.deinit();
-    vm.setInstalledBindings(loaded.bindings) catch return 1;
+    vm.setInstalledBindings(bindings) catch return 1;
 
-    span.active_map = &map;
+    span.active_map = map;
     defer span.active_map = null;
 
     var stdout = io.StdoutSink{};
@@ -447,11 +491,11 @@ pub fn runTestFiles(
     var report = runtime.runOnBigStack(TestRunCtx, test_runner.Report, testRunEntry, .{
         .gpa = gpa,
         .vm = &vm,
-        .user_asts = user_asts.items,
+        .user_asts = user_asts,
         .out = stdout.output(),
         .time_mode = interp_ir.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
-        .only_fids = only_fids.items,
+        .only_fids = only_fids,
     });
     defer report.deinit(gpa);
 

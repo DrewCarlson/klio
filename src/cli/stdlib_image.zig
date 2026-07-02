@@ -67,6 +67,9 @@ pub const Prepared = struct {
     built: BuiltModule,
     map: *const SourceMap,
     bindings: HostBindings,
+    /// The user files parsed onto `map` (their FileIds are the trailing
+    /// entries, after the base's). `klio test` discovers tests in these.
+    user_asts: []const KotlinFile,
 };
 
 fn getEnvVar(allocator: Allocator, name: []const u8) ?[]u8 {
@@ -604,7 +607,7 @@ fn finishFromLoaded(
         if (bindings.resolve(fqn)) |f| bindings.register(fqn, f) catch {};
     }
 
-    return .{ .built = built, .map = map, .bindings = bindings };
+    return .{ .built = built, .map = map, .bindings = bindings, .user_asts = user2.asts };
 }
 
 /// Cold path: run the full legacy dependency load on a fresh map, lower
@@ -679,7 +682,7 @@ fn bakeAndPrepare(
     map.files.appendSlice(map.arena.allocator(), dep_map.files.items) catch return null;
     const user2 = parseUserFiles(gpa, map, paths, user.texts) orelse return null;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, base, user2.asts) catch return null;
-    return .{ .built = built, .map = map, .bindings = deps.bindings };
+    return .{ .built = built, .map = map, .bindings = deps.bindings, .user_asts = user2.asts };
 }
 
 // ---------------------------------------------------------------------

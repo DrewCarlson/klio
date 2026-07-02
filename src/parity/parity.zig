@@ -1605,6 +1605,37 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!
 }
 
 fn buildBaseEntry(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+    if (try loadBakedBase(a, io, mode, mask, full)) |entry| return entry;
+    return buildBaseEntryFromSource(a, io, mode, mask, full);
+}
+
+/// Load a build-time-baked dependency base for this key. The build graph
+/// owns freshness: the generator re-runs whenever the stdlib sources or the
+/// interpreter modules change, and each test run step's cache manifest
+/// covers the image bytes. Only the EmbeddedOnly bases are baked; other
+/// keys — and any read/decode failure — take the source build below.
+fn loadBakedBase(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+    if (mode != .EmbeddedOnly or mask != 0) return null;
+    const dir = (runtime.procEnvGetVar(a, "KLIO_PARITY_BASE_IMAGES") catch null) orelse return null;
+    const path = try std.fmt.allocPrint(a, "{s}/embedded-gate{d}.klio-image", .{ dir, @intFromBool(full) });
+    const bytes = readFileOpt(a, io, path) orelse return null;
+    const loaded = (try interp_ir.image.load(a, bytes)) orelse return null;
+    for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
+    const entry = try a.create(BaseEntry);
+    entry.* = .{ .base = loaded.base, .map = loaded.map };
+    return entry;
+}
+
+/// Build the EmbeddedOnly dependency base for one stdlib-gate variant and
+/// bake it to image bytes. Null when the base is not snapshot-safe or holds
+/// state outside the serializable surface. Entry point for the build-time
+/// generator; always builds from source (never round-trips a prior image).
+pub fn bakeEmbeddedBase(allocator: Allocator, io: Io, full: bool) Allocator.Error!?[]u8 {
+    const entry = (try buildBaseEntryFromSource(allocator, io, .EmbeddedOnly, 0, full)) orelse return null;
+    return try interp_ir.image.bake(allocator, entry.base, entry.map, .{});
+}
+
+fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
     const map = try a.create(SourceMap);
     map.* = SourceMap.init(a);
 

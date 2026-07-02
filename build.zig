@@ -384,6 +384,36 @@ pub fn build(b: *std.Build) void {
         wireEmbeddedPack(b, &harness_mods, target, harness_optimize, embedded_pack);
     }
 
+    // Bake the parity harness's EmbeddedOnly dependency bases once per
+    // build. Every parity-pipeline test process then loads the lowered
+    // stdlib base from the image instead of re-parsing and re-lowering
+    // ~4500 declarations; the generator re-runs exactly when the stdlib
+    // sources or the interpreter modules change.
+    const base_gen = b.addExecutable(.{
+        .name = "parity-base-gen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/parity/base_gen.zig"),
+            .target = target,
+            .optimize = harness_optimize,
+            .imports = &.{
+                .{ .name = "parity", .module = harness_mods.get("parity").? },
+            },
+        }),
+    });
+    const base_gen_run = b.addRunArtifact(base_gen);
+    base_gen_run.setCwd(b.path("."));
+    const base_images = base_gen_run.addOutputDirectoryArg("parity-base");
+    for (stdlib_sources.CURATED_UPSTREAM_SOURCES) |rel|
+        base_gen_run.addFileInput(b.path(b.fmt("{s}/{s}", .{ stdlib_sources.UPSTREAM_STDLIB_ROOT, rel })));
+    for (stdlib_sources.KLIO_STDLIB_ACTUAL_FILES) |rel|
+        base_gen_run.addFileInput(b.path(b.fmt("{s}/{s}", .{ stdlib_sources.KLIO_STDLIB_DIR, rel })));
+    const base_images_install = b.addInstallDirectory(.{
+        .source_dir = base_images,
+        .install_dir = .prefix,
+        .install_subdir = "parity-base",
+    });
+    const base_images_path = b.getInstallPath(.prefix, "parity-base");
+
     // Install the compiled static library to zig-out/lib/libzstd.a so
     // per-module verification (scripts/zigcheck.py) can link the extern
     // ZSTD_* symbols without re-running the whole build graph.
@@ -473,6 +503,10 @@ pub fn build(b: *std.Build) void {
                 if (spec.parity_data) {
                     declareDataDirs(b, run_t, &data_memo, &stdlib_data_dirs);
                     declareDataDirs(b, run_t, &data_memo, &kotlinx_pack_dirs);
+                    run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
+                    run_t.step.dependOn(&base_images_install.step);
+                    run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));
+                    run_t.addFileInput(base_images.path(b, "embedded-gate1.klio-image"));
                 }
                 declareDataDirs(b, run_t, &data_memo, spec.dirs);
                 itest_step.dependOn(&run_t.step);
@@ -513,6 +547,14 @@ pub fn build(b: *std.Build) void {
         } else if (std.mem.eql(u8, m.name, "bench")) {
             run_t.setCwd(b.path("."));
             declareDataDirs(b, run_t, &data_memo, &.{"tests/fixtures/bench_corpus"});
+        }
+        // e2e and bench run programs through the in-process parity pipeline:
+        // point them at the baked dependency bases like the parity itests.
+        if (runs_programs) {
+            run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
+            run_t.step.dependOn(&base_images_install.step);
+            run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));
+            run_t.addFileInput(base_images.path(b, "embedded-gate1.klio-image"));
         }
         // Module tests that interpret whole programs (e2e, bench) are as slow
         // as the integration suite; keep them off the fast `test` step.
