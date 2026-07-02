@@ -75,6 +75,21 @@ internal fun __klio_co_popScope() {}
 @PublishedApi
 internal fun __klio_co_runRoot(scope: Any?, block: () -> Unit): Unit = block()
 
+// Whether a cooperative driver pump is live on this thread. The start
+// intrinsics branch on this: with a driver, an undispatched block joins
+// the enclosing pump; without one it must become its own root.
+@PublishedApi
+internal fun __klio_co_hasDriver(): Boolean = false
+
+// Run `block` as a fresh coroutine root when no driver pump encloses the
+// call (DeepRecursive's plain `runCallLoop` drives suspend blocks through
+// `startCoroutineUninterceptedOrReturn` from ordinary code). Returns the
+// block's value on synchronous completion, or COROUTINE_SUSPENDED when
+// the root parked — the eventual resume arrives through the continuation
+// captured at the suspension point and re-drives the parked activation.
+@PublishedApi
+internal fun <T> __klio_co_startRootOrSuspended(scope: Any?, block: () -> T): Any? = block()
+
 // --- the continuation klio hands to a suspendCoroutine block -------
 
 @PublishedApi

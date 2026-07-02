@@ -792,6 +792,24 @@ pub const CooperativeInterceptor = struct {
         return token;
     }
 
+    /// Adopt a persisted parked activation into THIS pump, ready to run
+    /// with `value` as its resume — the resume-chain flattener. A resume
+    /// targeting a persisted coroutine while a pump is live on this
+    /// thread must not nest a fresh drive inside the current activation:
+    /// each unwind hop would stack a whole native driver (DeepRecursive's
+    /// trampoline unwinds thousands of hops). Adopted here, the pump loop
+    /// drives it after the current activation completes, exactly like a
+    /// slot-owned resume. The entry takes ownership of `scope_delta`.
+    pub fn adoptPersisted(self: *CooperativeInterceptor, state_in: SuspendState, scope_delta: []Value, value: Value) Allocator.Error!void {
+        var state = state_in;
+        self.next_token += 1;
+        const token = self.next_token;
+        state.token = token;
+        try self.parked.put(token, .{ .state = state, .wake_at = INDEFINITE, .scope_delta = scope_delta });
+        try self.token_resume_value.put(token, value);
+        try self.ready.append(self.allocator, token);
+    }
+
     /// Seam: record the slot the next indefinitely-parked activation is
     /// waiting on (set by `__kxco_parkSlot`). Also registers the slot →
     /// driver mapping so a worker thread can route its completion resume
@@ -2032,6 +2050,62 @@ pub fn coroutineRunRoot(self: *VmIntrinsicHost, scope: ?*const Value, block: *co
     return driveRoot(self, block, if (scope) |s| s else &unit, out, true);
 }
 
+/// Whether an enclosing cooperative driver is live on this thread. The
+/// Kotlin start intrinsics branch on this: with a driver, an undispatched
+/// block joins the enclosing pump; without one, it must become its own
+/// root (`coroutineStartRootOrSuspended`).
+pub fn coroutineHasDriver() bool {
+    return coroTop() != null;
+}
+
+/// Run `block` as a fresh root on this thread with NO enclosing driver
+/// (`DeepRecursive`'s plain `runCallLoop` driving suspend blocks through
+/// `startCoroutineUninterceptedOrReturn`). A synchronous completion
+/// returns the block's value directly. A genuine suspension parks the
+/// root, pumps to quiescence, persists the parked root under its armed
+/// slot (`pumpExit` persist mode), and returns `Value.CoroutineSuspended`
+/// — the eventual async completion arrives through the continuation
+/// captured at the suspension point (`coroutineResumeExternal` →
+/// `PersistedParked.take` → `driveResumed`), exactly like the ktor
+/// ByteChannel write side.
+pub fn coroutineStartRootOrSuspended(self: *VmIntrinsicHost, scope: ?*const Value, block: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
+    const a = self.allocator;
+    try coroPush(a);
+    if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
+    const scope_depth = active_scope_stack.items.len;
+    defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
+    const unit: Value = .Unit;
+    const scope_v: *const Value = if (scope) |s| s else &unit;
+    const guard = ActiveScopeGuard.enter(scope_v);
+    defer guard.leave();
+
+    var root_value: ?Value = null;
+    var root_token: ?u64 = null;
+    const root_scope_base = activeScopeDepth();
+    switch (try intrinsic_host.evalClosureRaw(self, block, &.{}, scope_v, out)) {
+        .ok => |v| root_value = v,
+        .err => |e| switch (e) {
+            .Suspended => |st| root_token = try park(a, st, root_scope_base),
+            .Throw => |v| {
+                try pumpExit(self, out, true);
+                return .{ .err = .{ .Thrown = v } };
+            },
+            else => {
+                try pumpExit(self, out, true);
+                return .{ .err = mapDriverErr(a, e) };
+            },
+        },
+    }
+    if (try pumpLoop(self, scope_v, out, true, &root_token, &root_value)) |err_result| {
+        return err_result;
+    }
+    try pumpExit(self, out, true);
+    // Root still parked after quiescence: it is persisted awaiting an
+    // external resume — report suspension to the Kotlin caller.
+    if (root_token != null) return .{ .ok = Value.CoroutineSuspended };
+    return .{ .ok = root_value orelse Value.Unit };
+}
+
 pub fn coroutineLaunch(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
     _ = scope;
     if (coroTop()) |top| {
@@ -2116,19 +2190,30 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
             // Mailbox closed: the owner just exited and persisted its
             // parked coroutines strictly before closing.
             if (PersistedParked.take(slot)) |pe| {
-                try driveResumed(self, pe.state, value, pe.scope_delta, out);
-                coroStackAllocator().free(pe.scope_delta);
+                if (coroTop()) |top| {
+                    try top.adoptPersisted(pe.state, pe.scope_delta, value);
+                } else {
+                    try driveResumed(self, pe.state, value, pe.scope_delta, out);
+                    coroStackAllocator().free(pe.scope_delta);
+                }
             }
             // No persisted state either: the waiter was abandoned with
             // its driver (a runBlocking exit) — nowhere to land.
             return;
         }
         // The coroutine parked inside a driven root that already
-        // returned; its state was persisted. Claim it (single winner)
-        // and drive it to quiescence on this thread under a fresh pump —
-        // the cross-pump resume that lets a coroutine continue on a
-        // different OS thread.
+        // returned; its state was persisted. With a pump live on this
+        // thread, adopt it there (the resume-chain flattener: nesting a
+        // fresh drive per unwind hop stacks native drivers thousands
+        // deep under DeepRecursive's trampoline). Otherwise claim it
+        // (single winner) and drive it to quiescence on this thread
+        // under a fresh pump — the cross-pump resume that lets a
+        // coroutine continue on a different OS thread.
         if (PersistedParked.take(slot)) |pe| {
+            if (coroTop()) |top| {
+                try top.adoptPersisted(pe.state, pe.scope_delta, value);
+                return;
+            }
             try driveResumed(self, pe.state, value, pe.scope_delta, out);
             coroStackAllocator().free(pe.scope_delta);
             return;

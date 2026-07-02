@@ -394,6 +394,13 @@ fn ivRunBlocking(ctx: *anyopaque, block: *const Value, scope: *const Value, out:
 fn ivCoroutineRunRoot(ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
     return intrinsic_host.coroutineRunRoot(ip(ctx), scope, block, out);
 }
+fn ivCoroutineStartRootOrSuspended(ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
+    return intrinsic_host.coroutineStartRootOrSuspended(ip(ctx), scope, block, out);
+}
+fn ivCoroutineHasDriver(ctx: *anyopaque) bool {
+    _ = ctx;
+    return coroutines.coroutineHasDriver();
+}
 fn ivCoroutineLaunch(ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineLaunch(ip(ctx), block, scope, out);
 }
@@ -450,6 +457,8 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .new_synth_instance = ivNewSynthInstance,
     .run_blocking = ivRunBlocking,
     .coroutine_run_root = ivCoroutineRunRoot,
+    .coroutine_start_root_or_suspended = ivCoroutineStartRootOrSuspended,
+    .coroutine_has_driver = ivCoroutineHasDriver,
     .coroutine_launch = ivCoroutineLaunch,
     .coroutine_arm_slot = ivCoroutineArmSlot,
     .coroutine_disarm_slot = ivCoroutineDisarmSlot,

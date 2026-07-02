@@ -322,6 +322,28 @@ pub fn coro_run_root(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ctx.host.coroutineRunRoot(null, &block, ctx.out);
 }
 
+/// `__klio_co_startRootOrSuspended(scope, block)` — run `block` as a
+/// fresh root when no driver pump encloses the call (DeepRecursive's
+/// plain loop driving suspend blocks). Returns the block's value, or
+/// COROUTINE_SUSPENDED when the root parked awaiting an external resume.
+pub fn coro_start_root_or_suspended(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) {
+        return .{ .err = .{ .Type = "__klio_co_startRootOrSuspended: missing block" } };
+    }
+    const block = ctx.args[ctx.args.len - 1];
+    if (ctx.args.len >= 2) {
+        const scope = ctx.args[0];
+        return ctx.host.coroutineStartRootOrSuspended(&scope, &block, ctx.out);
+    }
+    return ctx.host.coroutineStartRootOrSuspended(null, &block, ctx.out);
+}
+
+/// `__klio_co_hasDriver()` — whether a cooperative driver pump is live on
+/// this thread (the start intrinsics' in-pump / own-root branch).
+pub fn coro_has_driver(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return .{ .ok = .{ .Bool = ctx.host.coroutineHasDriver() } };
+}
+
 /// `Result.getOrThrow()` — the success value, or rethrow the
 /// captured failure. Core to `Continuation.resumeWith`.
 pub fn result_get_or_throw(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
