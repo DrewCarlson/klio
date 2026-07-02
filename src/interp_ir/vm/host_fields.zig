@@ -1961,9 +1961,17 @@ fn resolveInstanceGetter(
         {
             const pg = self.prog.borrow();
             const hit = lookupPairFunc(pg.get().instance_prop_getters, cn, name);
+            // A PRIVATE property never participates in inheritance: a read
+            // that may bind a private getter arrives scope-qualified
+            // (`$sgetter$<owner>`) and resolves in that walk; the inherited
+            // chain here must skip it so a base/interface private getter
+            // cannot shadow a subclass's own stored field (ktor:
+            // HttpClientEngine's private `closed` getter vs
+            // HttpClientEngineBase's field-backed atomic `closed`).
+            const private_here = lookupPairFunc(pg.get().instance_prop_private, cn, name) != null;
             pg.deinit();
-            if (hit) |fid| {
-                found = fid;
+            if (hit != null and !private_here) {
+                found = hit.?;
                 break;
             }
         }
