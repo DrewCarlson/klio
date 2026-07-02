@@ -26,17 +26,24 @@ jobs:
             step: test
             shard: unit
           # The integration suite fans across weight-balanced shards
-          # (see -Ditest-shard in build.zig). All shards compile from the
-          # same restored cache; each runs ~a third of the suite.
+          # (see -Ditest-shard in build.zig; weights are CI-runner-scaled).
+          # Each shard restores its own banked cache and runs ~a fifth of
+          # the suite.
           - name: itest shard 0
-            step: itest -Ditest-shard=0/3
+            step: itest -Ditest-shard=0/5
             shard: itest0
           - name: itest shard 1
-            step: itest -Ditest-shard=1/3
+            step: itest -Ditest-shard=1/5
             shard: itest1
           - name: itest shard 2
-            step: itest -Ditest-shard=2/3
+            step: itest -Ditest-shard=2/5
             shard: itest2
+          - name: itest shard 3
+            step: itest -Ditest-shard=3/5
+            shard: itest3
+          - name: itest shard 4
+            step: itest -Ditest-shard=4/5
+            shard: itest4
     steps:
       # The kotlin-klio/*/upstream vendor trees (kotlinx + ktor sources the
       # interpreter consumes at runtime) are submodules; without them every

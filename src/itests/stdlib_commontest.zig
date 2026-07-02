@@ -240,8 +240,28 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     // context so those helpers resolve, and restrict the run to this
     // target's own tests with `--only-file` so siblings' tests do not
     // double-count.
+    // KLIO_COMMONTEST_SHARD=K/N slices the sorted target list by stride so
+    // CI fans this suite across parallel jobs; sibling-context resolution
+    // still sees the full target set. The ratchet applies proportionally
+    // (with a small slack for uneven per-file pass counts) when sharded.
+    var shard_k: usize = 0;
+    var shard_n: usize = 1;
+    if (runtime.getenvSlice("KLIO_COMMONTEST_SHARD")) |s| {
+        if (std.mem.indexOfScalar(u8, s, '/')) |sep| {
+            const k = std.fmt.parseInt(usize, s[0..sep], 10) catch 0;
+            const n = std.fmt.parseInt(usize, s[sep + 1 ..], 10) catch 1;
+            if (n != 0 and k < n) {
+                shard_k = k;
+                shard_n = n;
+            }
+        }
+    }
+
     var jobs: std.ArrayList([]const []const u8) = .empty;
-    for (targets.items) |target| {
+    var my_targets: usize = 0;
+    for (targets.items, 0..) |target, ti| {
+        if (ti % shard_n != shard_k) continue;
+        my_targets += 1;
         const tdir = std.fs.path.dirname(target) orelse "";
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
@@ -310,9 +330,21 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     }
     for (threads.items) |t| t.join();
 
+    // Sharded: a coarse ratchet — passes cluster in the big files, so a
+    // stride slice's share of the total swings ±25% around proportional.
+    // The slice gate catches collapse-class regressions; the EXACT ratchet
+    // is enforced by every unsharded run (local test-all, nightly).
+    const min_pass = if (shard_n == 1)
+        BASELINE
+    else
+        (BASELINE * my_targets / targets.items.len) * 70 / 100;
     std.debug.print(
-        "stdlib_commontest: {d} passed across {d} files, {d} build-blocked (baseline {d})\n",
-        .{ total_passed.load(.monotonic), targets.items.len, build_blocked.load(.monotonic), BASELINE },
+        "stdlib_commontest: {d} passed across {d}/{d} files (shard {d}/{d}), {d} build-blocked (min {d}, baseline {d})\n",
+        .{
+            total_passed.load(.monotonic), my_targets,                       targets.items.len,
+            shard_k,                       shard_n,                          build_blocked.load(.monotonic),
+            min_pass,                      BASELINE,
+        },
     );
-    try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
+    try std.testing.expect(total_passed.load(.monotonic) >= min_pass);
 }
