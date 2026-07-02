@@ -4206,7 +4206,7 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     const p = arg.Path;
     if (p.segments.len != 1) return null;
     if (b.localDeclType(p.segments[0].name)) |t| {
-        return .{ .name = t, .nullable = false, .args = &.{} };
+        return .{ .name = t, .nullable = b.localDeclNullable(p.segments[0].name), .args = &.{} };
     }
     // A bare class name used as a value is its companion object: carry the
     // owner class's head as type evidence so `install(RoutingRoot, ...)`

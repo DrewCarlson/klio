@@ -163,6 +163,7 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
     // local receiver (`val resp = client.get(url); resp.body<T>()`).
     if (p.ty) |ty| {
         try b.setLocalDeclType(p.name.name, ty.name.name);
+        if (ty.nullable) try b.setLocalDeclNullable(p.name.name);
         if (ty.function == null and helpers.isBroadCollectionTypeName(ty.name.name)) {
             try b.markBroadCollectionLocal(p.name.name);
         }
