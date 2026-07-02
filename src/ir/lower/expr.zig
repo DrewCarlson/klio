@@ -3588,12 +3588,19 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (try lowerImplicitThisCall(b, callee, args, ast_arg_names)) |r| return r;
     }
 
-    // Unresolved bare-name call.
+    // Unresolved bare-name call. Reaching here means the resolver above
+    // declined to commit a target, so in a receiver context the call must
+    // still dispatch member-first even when a same-named top-level function
+    // exists in the index (a bare `close(permission)` inside a NodeList
+    // member-extension reaches the receiver's inherited member, not a
+    // same-named extension elsewhere); a bare-name value load would miss
+    // receiver METHODS entirely. Outside a receiver context an indexed name
+    // keeps the value-call fallback, which binds the resolved global.
     if (callee.* == .Path and callee.Path.segments.len == 1 and
         b.resolve(callee.Path.segments[0].name) == null and
         !b.knowsOuter(callee.Path.segments[0].name) and
         b.module.classId(callee.Path.segments[0].name) == null and
-        b.module.funcId(callee.Path.segments[0].name) == null)
+        (b.module.funcId(callee.Path.segments[0].name) == null or inReceiverContext(b)))
     {
         if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
     }
