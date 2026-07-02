@@ -511,6 +511,14 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     if (vfid) |fid| {
                         if (fid.int() < mptr.funcCount()) return evalGetter(self, allocator, fid, receiver.*);
                     }
+                    // The virtual walk models subclass overrides only: stop at
+                    // the lexical owner. Above it, a same-named supertype
+                    // property is a different declaration the owner's scope
+                    // never referenced (ktor: HttpClientEngineBase's private
+                    // field-backed `closed` vs the HttpClientEngine
+                    // interface's private `closed` getter); the field/member
+                    // fallback below resolves genuinely inherited properties.
+                    if (std.mem.eql(u8, cn, owner)) break;
                     cur = firstSupertype(self, cn);
                 }
             }
