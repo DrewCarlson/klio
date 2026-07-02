@@ -216,11 +216,14 @@ recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof
    chase included files' own imports transitively; (b) deep unwinds cost ~0.6 ms/level
    under the Debug interpreter (linear, but the 100k stdlib case wants the ReleaseSafe
    harness).
-2. **P2 loose ends**: `callNamedOverload` (host_call_func.zig ~1424) still uses legacy
-   `overloadScore` — `applicable()` is genuinely MORE PERMISSIVE for one input
-   (`assertContentEquals`, legacy=null vs applic=275); reconcile before unifying. The
-   member `overloadScoreArg` pre-filter in `extensionFnFallback` (~6526) is likewise
-   unaudited. The `overload_match.zig` tri-state helpers stay (legitimate backing).
+2. **P2 loose ends**: `callNamedOverload` — LANDED (`9ab882d1`): dual-compute audit
+   at zero divergence over the full sweep, flipped onto
+   `positionalPoints`/`applicable()`, legacy `overloadScore` deleted (the historical
+   `assertContentEquals` divergence no longer reproduces after the trailing-lambda
+   engine fixes). REMAINING: the per-arg `overloadScoreArg` still backs the
+   host_instances binders (3 sites) and the `extensionFnFallback` pre-filter
+   (host_call_member ~6526) — audit and fold those into `ArgShape` scoring the same
+   way. The `overload_match.zig` tri-state helpers stay (legitimate backing).
 3. **P4 completion**: `class_member_names` survives only as the last-resort arm of
    `memberShadowPossible`/Phase C; replace with receiver-type-precise membership
    (needs the cross-FILE supertype member visibility that the litmus root exposed —
