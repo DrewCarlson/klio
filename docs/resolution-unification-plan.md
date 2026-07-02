@@ -58,6 +58,142 @@ sig index, receiver type)** — zero name-list lookups remain in the dispatch/re
 path, and any two run-modes (lazy lowering, eager typeck, runtime) pick the same target
 for every non-runtime-polymorphic call.
 
+## Execution status (as of 2026-07-02, HEAD f9ec89f0)
+
+Everything below is committed to `main`. The stdlib commonTest canonical is at
+**2010 passed / 102 files / 0 build-blocked** (pre-campaign baseline 2006; the dip-and-
+recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof) → 2001 →
+2005 (P3 flip) → 2010). The four previously-wedged integration suites
+(ktor_channel_async, concurrency_stress, stdlib_image, parity_threaded_litmus) all pass.
+
+### Landed
+
+- **Test-suite split** (`77c72071`): `zig build test` = fast unit tests (~5s);
+  `zig build itest` = integration suite; `zig build test-all` = both (CI + nightly).
+- **P1 — canonical index ordering** (`f0bcf680`): top-level function headers register
+  BEFORE class-body lowering, so method bodies resolve against the complete index.
+  Includes the `memberShadowPossible` guard (a resolved top-level extension a member
+  could shadow defers to the runtime member-first walk).
+- **P2 — one shared applicability engine** (`45cfb7d4` design; `1f45c590`/`6adbf93a`/
+  `ac12ba20` audit slices; `7f232070` fast sweep tool; `4416a752` flip):
+  `src/ir/applicability.zig` (`ArgShape`/`Score`/`SigView`/`ApplicabilityScope`/
+  `builtinSupersOf`/`applicable()`) is the LIVE scorer for `pickOverload`,
+  `pickNamedOverloadId`, `pickMethodOverload`, and `scoreExtCandidates`. Each was
+  proven zero-divergence over all 102 stdlib files before flipping; the legacy scorers
+  and the duplicate member builtin-supertype table are deleted (~535 lines).
+- **P3 — `Module.resolveCall`** (`6f9be02c` shadowed; `11cc3bc3` flip; `8cc7e264`
+  ladder retired): bare-call lowering is ONE path — `buildArgShapes` →
+  `resolveCall` (Phase A index → Phase B applicability → Phase C emit form, all in
+  `ir.zig` ~2145) → four pure emitters (`emitCall`/`emitCallMember`/
+  `emitMemberOrGlobal`/`emitValueCall`). The heuristic ladder (`findCand`/`arityMatch`/
+  `arityMatchTl`/`fallbackByDeclArity`/`preferredBareTarget`/`HeurRung`) is deleted
+  (~340 lines). `ResolveCtx` carries the receiver-context bits incl. `in_tailrec_body`.
+  NOTE: as built, resolveCall is LADDER-primary (reproduces the legacy pick exactly,
+  proven by the `call2` audit); the design's index-primary/type-aware refinement waits
+  on static types (P7). Declared-type evidence (`ArgShape.ty`) is used ADDITIVE-ONLY.
+- **Surfaced-regression ledger** (P1/P3 completing the index exposed latent same-name
+  resolution bugs; each fixed forward, no reverts):
+  - `T.append(vararg CharSequence?)` self-recursion in StringBuilder builders →
+    the P1 member-precedence guard (`f0bcf680`).
+  - `error(msg)` in a `runCatching{}` lambda binding `kotlin.error` over the class
+    member → bare-name calls to ACTUAL own/enclosing members dispatch member-first
+    (`8ad59646`); gate on `hasEnclosingMember`, NOT "unknown receiver could have it"
+    (the broad version regressed −229 by stealing top-level helpers and inline params).
+  - FloorDivMod: IrClosure named-arg reorder + `shadowed_by_local` no longer prepends
+    `this` for a plain captured local fn (`fc54c9dd`).
+  - NaN total order (`f356d963`): new `kotlin-klio/kotlin-comparisons/
+    ComparisonsActuals.kt` (the common `_Comparisons.kt` is all bodyless expects —
+    there was NO body to resolve to); `Resolution.ty_proven` → `Call{exact}` so the
+    runtime value-typed re-pick cannot override a declared-type-proven pick;
+    `linkResolvedForms` guard narrowed so a generic body-bearing overload sharing an
+    FQN with an intrinsic binding keeps its body. NaNPropagationTest 28/28.
+  - TestTimeSource reified splice (`e7457a11`): the outer-writing-lambda writeback
+    pre-dispatch ran before inline expansion (stealing the reified binding), and
+    `callFuncTyped`'s type-arg bind used raw `lookupGlobal` (ctor Intrinsic instead of
+    the Class). Locked by `examples/reified.kt` `probeAfterFailure`.
+  - ktor event-loop wedge (`d57e853f`): `runSafely` inside the function-typed-receiver
+    extension `startCoroutineCancellable` deferred to the runtime probe, whose SAM arm
+    invoked the suspend BLOCK instead of the top-level fn → coroutine completed
+    nothing, `runBlocking` parked forever. Function-typed receivers (except
+    `invoke`/`call`) are excluded from `unknown_receiver`. Regression test in
+    `parity_extension_resolution`.
+  - threaded_litmus cluster, 25 programs (`f9ec89f0`): when resolveCall DEFERS
+    (target=null), the downstream member-first path was gated on
+    `funcId(name)==null` — false post-P1 whenever ANY top-level fn shares the name
+    (bare `close(permission)` in JobSupport's `NodeList.notifyCompletion`
+    member-extension, member inherited from another FILE so `own_members` cannot see
+    it) → fell to a bare-name VALUE load whose this-lookup misses METHODS. A
+    resolver-deferred bare call in a receiver context now routes member-first
+    regardless of the index.
+
+### Verification infrastructure (use these; the canonical alone is NOT enough)
+
+- `python3 scripts/resolve_audit_sweep.py --build` — ~2 min: Debug rebuild + all 102
+  stdlib commonTest files under `KLIO_RESOLVE_AUDIT`, greps
+  `] (member|scorer|named|call2) ... divergent=1`. Zero divergence is the scorer-
+  equivalence proof. THE fast loop for scorer/resolver changes.
+- **threaded-litmus sweep** — ~1 min, REQUIRED for any resolution/dispatch change (the
+  canonical has zero threaded-dispatcher coverage and missed a 25-program cluster):
+  `ls tests/fixtures/threaded_litmus/*.kt | xargs -P8 -I{} sh -c 'timeout 25
+  ./zig-out/bin/klio run {} >/dev/null 2>&1 || echo {} failed'`.
+  Baseline: exactly 4 pre-existing failures (`tl_dispatched_failure_join`,
+  `tl_dispatched_failure_no_join`, `tl_io_elastic`, `tl_early_error_with_thread`).
+- Per-file stdlib run: `./zig-out/bin/klio test --only-file=<F> tests/
+  stdlib_commontest_actuals/{PlatformActuals,EncodingActuals,JsCollectionFactories}.kt
+  <same-dir sibling .kt files> <F>` (drop same-dir siblings ONLY if double-registration
+  conflicts appear; the canonical harness dedupes).
+- Milestone gates: `zig build itest-stdlib_commontest` (the canonical, ReleaseSafe,
+  ~18 min) and `zig build itest` (everything; currently ~14+ min AFTER the wedge fix —
+  runtime cost flagged to be addressed separately).
+- Diagnosis pattern (worked 3×): A/B fixture sweep vs the pre-campaign baseline
+  `d2a927db` → bisect ONE deterministic representative → `KLIO_OR_AUDIT` emit-site +
+  run-arm diff between the two binaries → one env-gated debug print at the suspect
+  fallback dumping the gate flags → minimal repro or direct fix.
+
+### Open work, in order
+
+1. **DeepRecursive coroutine intrinsics** (stdlib `DeepRecursiveTest` 1/8, all
+   "Suspended"; task #21 carries the full design). `runCallLoop` is PLAIN code driving
+   suspend blocks; klio's `startBlock` (`kotlin-klio/kotlin-coroutines/Intrinsics.kt:108`)
+   expects an enclosing pump, so with none the `.Suspended` unwinds to the harness.
+   Design: (a) engine fn `coroutineStartRootOrSuspended` in
+   `src/interp_ir/vm/coroutines.zig` — the `driveResumed` SHAPE (coroPush/claimNow/
+   scope-guard; evalClosureRaw; on `.Suspended` → `park` + `pumpLoop(persist=true)` +
+   `pumpExit(persist=true)`, which persists the parked root under its armed slot) →
+   returns root value or `Value.CoroutineSuspended`; (b) the RESUME half already exists
+   (`coroutineResumeExternal` → `PersistedParked.take(slot)` → `driveResumed`
+   re-drives on the calling thread and re-persists on re-park — the ktor write-side
+   proves it); (c) Kotlin-side `startBlock`: if `__klio_co_hasDriver()` (new tiny
+   intrinsic: `coroTop() != null`) keep today's code byte-for-byte (in-pump ecosystem
+   untouched); else call `__klio_co_startRootOrSuspended(completion) { ... }` with a
+   captured `suspended` flag delivering async completion to the completion
+   continuation; (d) registry entries for both intrinsics in
+   `src/stdlib/implementations.zig` (+`result.zig`), mirroring `coro_run_root`'s arg
+   shape. Intrinsics.kt is a stdlib ACTUAL (via `stdlib_sources.zig`) — plain
+   `zig build` suffices. Known accepted limit: DeepRecursive invoked INSIDE an
+   enclosing pump keeps the parking model. Verify: DeepRecursiveTest 8/8; the
+   coroutine spot suites + ktor/concurrency itests MUST stay green; litmus sweep.
+2. **P2 loose ends**: `callNamedOverload` (host_call_func.zig ~1424) still uses legacy
+   `overloadScore` — `applicable()` is genuinely MORE PERMISSIVE for one input
+   (`assertContentEquals`, legacy=null vs applic=275); reconcile before unifying. The
+   member `overloadScoreArg` pre-filter in `extensionFnFallback` (~6526) is likewise
+   unaudited. The `overload_match.zig` tri-state helpers stay (legitimate backing).
+3. **P4 completion**: `class_member_names` survives only as the last-resort arm of
+   `memberShadowPossible`/Phase C; replace with receiver-type-precise membership
+   (needs the cross-FILE supertype member visibility that the litmus root exposed —
+   `own_members` is file-local, e.g. `NodeList : LockFreeLinkedListHead` across files).
+4. **P5** distinct-keyed inherited fields (RC-D; `c_shadow` 1/2/1/1). **P7** eager
+   typeck records+reuses resolution (RC-G) — also unlocks index-primary/type-aware
+   resolveCall and the full NaN-style static-overload class. **P8** hatch deletion
+   (the completeness invariant; includes `isAliasName`, `isPrimitiveConv`,
+   `CONTROL_INTRINSICS`, the Throwable lists). **P9** optional flat bytecode +
+   pack serialization.
+5. Litmus baseline residue (pre-existing, NOT from this campaign): the 4 fixtures
+   above fail at `d2a927db` too; uninvestigated.
+6. Non-resolution stdlib residuals (windowed/RingBuffer, orEmpty static dispatch,
+   local-fn overload-by-type, entry-CME, sequence streaming) are tracked in the
+   stdlib-grind memory notes, out of scope here.
+
 ## The three-tier static/dynamic boundary
 
 Every call and access lowers to exactly one tier. The tiers *are* the boundary
