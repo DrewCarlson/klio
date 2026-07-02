@@ -231,19 +231,17 @@ recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof
    unresolvable chain stays conservative). Substrate: the unified per-FuncId `DeclSig`
    (`dbec6ecb`) with the member half filled at class-body lowering. Two dip-and-recover
    lessons recorded in the commit: methods-only sets and owner-only chains both
-   mis-bind. REMAINING for full P4: the other five Group-1 `class_member_names` reads
-   — with a lesson from an attempted-and-reverted wholesale flip: they split into
-   TWO questions, (a) "could this receiver's member shadow the name"
-   (`memberShadowPossible`, unknown-receiver arms included) and (b) "does ANY
-   class declare the name" (the alias / container-creator guards, which bind
-   direct in receiver contexts precisely when no class declares it — no
-   unknown-receiver arm; routing them through (a) broke the fn-typed-receiver
-   rule and flow_operators). The (b) sites need a narrower helper:
-   hierarchy-precise when the receiver type is known, the global set otherwise.
-   Then explicit-receiver (`obj.foo()`) membership via DeclSig — the parked ktor
-   server chain (tasks #7/#14: install mis-picks, object-singleton simple-name
-   collisions) is the concrete evidence for why identity-keyed resolution must
-   replace simple-name keying — and finally the `class_member_names` deletion.
+   mis-bind. Group-1 flip COMPLETE: the (a) question ("could this receiver's
+   member shadow the name") is `memberShadowPossible`; the (b) question ("does
+   any class this receiver could be declare the name") is
+   `anyReceiverClassDeclares` — hierarchy-precise for plain method bodies,
+   program-wide otherwise; the five direct-bind guards route through it.
+   `class_member_names` is now read ONLY in those two helpers' unknown-receiver
+   fallbacks and Phase C's `!receiver_known` arm. REMAINING: explicit-receiver
+   (`obj.foo()`) membership via DeclSig — the ktor server chain (now fully
+   fixed: six mechanisms, see commits d0a9242f..d710630b) was the concrete
+   evidence — and the eventual `class_member_names` deletion once the erased
+   fallbacks can go.
 4. **P5** distinct-keyed inherited fields (RC-D; `c_shadow` 1/2/1/1). **P7** eager
    typeck records+reuses resolution (RC-G) — also unlocks index-primary/type-aware
    resolveCall and the full NaN-style static-overload class. **P8** hatch deletion
