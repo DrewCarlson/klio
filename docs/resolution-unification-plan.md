@@ -58,7 +58,30 @@ sig index, receiver type)** — zero name-list lookups remain in the dispatch/re
 path, and any two run-modes (lazy lowering, eager typeck, runtime) pick the same target
 for every non-runtime-polymorphic call.
 
-## Execution status (as of 2026-07-02, HEAD f9ec89f0)
+## Execution status (as of 2026-07-02, HEAD 0a77d0fe)
+
+### Post-flip regression sweep (fixed forward)
+
+The first full-suite sweep after the flip surfaced five latent breaks; all are
+fixed on `main` with the mechanism, not the symptom:
+
+- `value::class` on a builtin throwable collapsed to `kotlin.Throwable`
+  (static `typeFqn` instead of the exception's dynamic `fqn`) — `43b7cbd5`.
+- `applicableExtension` bound args purely positionally: a lambda-only call
+  (`produce {}`) marked every candidate inapplicable and the ranking decayed
+  to noise tiers, picking the deprecated `produce(context: Job, …)` overload.
+  The extension scorer now applies the trailing-lambda-to-last-param rule with
+  the defaulted-gap check, like the member and global scorers — `143c1da3`.
+- Deferred bare calls (`CallMemberOrGlobal`) lowered arguments with no
+  expected-arity readout, so a trailing receiver lambda kept its parser-
+  injected `it` bound to the receiver (`repeat(3) { launch { ch.send(it) } }`
+  sent the coroutine). Both deferred emit paths now read per-arg lambda
+  arities; `overloadHostingTrailingLambda` accepts a defaulted gap — `07e0debe`.
+- A backtick-quoted user parameter named `this` created a receiver context and
+  bare calls member-dispatched through it; kotlinc rejects them — `0a77d0fe`.
+- The lazy-forest resolver held one global section, so loading a second stdlib
+  image in one process (the parity harness loads both gate variants) re-pointed
+  earlier refs at the wrong tables — slot-registered sections, `ee0a0489`.
 
 Everything below is committed to `main`. The stdlib commonTest canonical is at
 **2010 passed / 102 files / 0 build-blocked** (pre-campaign baseline 2006; the dip-and-

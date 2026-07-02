@@ -3421,9 +3421,14 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // when that is empty — the enclosing function's `this` *parameter*.
     const direct_this: ?Value = if (cmg.recv) |r| frame.read(r) else null;
     const this_val = if (direct_this) |dt| dt else implicitThisValue(frame, cmg.this_idx, true);
-    // A bare callee whose name starts uppercase is a constructor / type,
-    // never an instance member.
-    const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]);
+    // A bare callee whose name starts uppercase is usually a constructor /
+    // type — but only when such a type exists. Kotlin has no capitalization
+    // rule: DSL-style functions are capitalized (ktor's
+    // `HttpResponseValidator { … }` is an extension on HttpClientConfig), so
+    // the member/extension passes are skipped only when the name really
+    // names a class.
+    const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]) and
+        (cmg.class != null or frame.module.classId(name_str) != null);
     var resolved: ?Value = null;
     var first_real_err: ?EvalError = null;
     // A bare `name` bound to a captured callable in the innermost
