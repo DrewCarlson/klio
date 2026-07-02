@@ -154,9 +154,16 @@ pub fn resetReceiverThreadLocals() void {
     host_impl.resetReceiverTls();
     coroutines.resetReceiverTls();
     compose.resetAtRunBoundary();
-    // Drop the AST-address-keyed anon-`object` site caches: their keys and
-    // thunk sub-modules belong to the finished run and must not be reused by
-    // the next one in the same process (tests, repeated CLI runs).
+}
+
+/// Drop the process-global anon-`object` site caches: their keys and thunk
+/// sub-modules belong to the finished run and must not be reused by the next
+/// one in the same process (tests, repeated CLI runs). PROGRAM boundary only —
+/// never from a Vm deinit: transient Vms (worker-pool tasks, nested drivers)
+/// tear down while the program's classes registry still holds the site names
+/// as live map keys, and freeing them there is a use-after-free on the next
+/// anon-object instantiation.
+pub fn resetRunGlobalCaches() void {
     host_instances.resetAnonSiteCache();
 }
 

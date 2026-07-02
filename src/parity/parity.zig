@@ -1867,6 +1867,7 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     // Catch any receiver/coroutine thread-local state leaked from a prior run
     // on this thread before assembling the next program.
     interp_ir.resetReceiverThreadLocals();
+    interp_ir.resetRunGlobalCaches();
     // Drop the previous program's JIT state: the per-program arena is about to be
     // recycled, so a reused `*Func` address must not inherit stale native code.
     interp_ir.resetJitForTest();
