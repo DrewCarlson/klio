@@ -88,6 +88,10 @@ const Itest = struct {
     /// on Debug `testing.allocator` leak/UAF fidelity set this false and
     /// stay on the default optimize mode.
     interprets: bool = true,
+    /// Relative run cost for `-Ditest-shard` bin packing (rough CPU-seconds
+    /// of a Debug run; only the ratios matter). Keep the heavy suites'
+    /// weights roughly current so the shards stay balanced.
+    weight: u16 = 1,
 };
 
 const itests_files = [_]Itest{
@@ -99,14 +103,14 @@ const itests_files = [_]Itest{
     .{ .name = "parity_closures_advanced" },
     .{ .name = "parity_closures_deep" },
     .{ .name = "parity_collections_intensive" },
-    .{ .name = "parity_conformance", .dirs = &.{"tests/fixtures/conformance"} },
-    .{ .name = "parity_coroutine_smoke", .dirs = &.{"tests/fixtures/coroutine_smoke"} },
-    .{ .name = "parity_corpus_pinned", .dirs = &.{"tests/fixtures/parity_corpus"} },
-    .{ .name = "parity_coroutines_realistic" },
+    .{ .name = "parity_conformance", .dirs = &.{"tests/fixtures/conformance"}, .weight = 12 },
+    .{ .name = "parity_coroutine_smoke", .dirs = &.{"tests/fixtures/coroutine_smoke"}, .weight = 5 },
+    .{ .name = "parity_corpus_pinned", .dirs = &.{"tests/fixtures/parity_corpus"}, .weight = 30 },
+    .{ .name = "parity_coroutines_realistic", .weight = 6 },
     .{ .name = "parity_data_class_features" },
     .{ .name = "parity_dsl_operators" },
     .{ .name = "parity_exceptions_and_flow" },
-    .{ .name = "parity_extension_resolution" },
+    .{ .name = "parity_extension_resolution", .weight = 8 },
     .{ .name = "parity_functional_patterns" },
     .{ .name = "parity_generics_advanced" },
     .{ .name = "parity_inheritance_dispatch" },
@@ -114,18 +118,18 @@ const itests_files = [_]Itest{
     .{ .name = "parity_interfaces_visibility" },
     .{ .name = "parity_iterables_special" },
     .{ .name = "parity_kotlinx_io_read" },
-    .{ .name = "parity_lambdas_and_dispatch" },
+    .{ .name = "parity_lambdas_and_dispatch", .weight = 6 },
     .{ .name = "parity_maps_intensive" },
     .{ .name = "parity_named_args_defaults" },
     .{ .name = "parity_nullability_deep" },
-    .{ .name = "parity_object_init" },
+    .{ .name = "parity_object_init", .weight = 8 },
     .{ .name = "parity_operator_edge_cases" },
     .{ .name = "parity_properties_accessors" },
     .{ .name = "parity_ranges_arrays" },
     .{ .name = "parity_sealed_when_patterns" },
     .{ .name = "parity_string_processing" },
     .{ .name = "parity_strings_numbers" },
-    .{ .name = "parity_stdlib_isolation" },
+    .{ .name = "parity_stdlib_isolation", .weight = 15 },
     .{ .name = "parity_suspend_shapes" },
     .{ .name = "parity_threaded_litmus", .dirs = &.{"tests/fixtures/threaded_litmus"} },
     .{ .name = "parity_type_system_shapes" },
@@ -134,9 +138,9 @@ const itests_files = [_]Itest{
     .{ .name = "parser_corpus", .parity_data = false, .interprets = false },
     .{ .name = "runtime_objref_threads", .parity_data = false, .interprets = false },
     .{ .name = "typeck_negative", .parity_data = false, .interprets = false, .dirs = &.{"tests/fixtures/typeck_negative"} },
-    .{ .name = "check_examples", .dirs = &.{"examples"} },
-    .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" } },
-    .{ .name = "fuzz_closures_suspend", .fuzz_env = true },
+    .{ .name = "check_examples", .dirs = &.{"examples"}, .weight = 6 },
+    .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" }, .weight = 30 },
+    .{ .name = "fuzz_closures_suspend", .fuzz_env = true, .weight = 12 },
     // End-to-end ktor gate: child `klio` + in-test HTTP server + installed packs.
     .{ .name = "ktor_client_get", .parity_data = false, .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-atomicfu",
@@ -144,7 +148,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-ktor",
-    } },
+    }, .weight = 15 },
     // Async ByteChannel gate: upstream channel write side (Slot suspension
     // protocol) through child `klio` + installed packs.
     .{ .name = "ktor_channel_async", .parity_data = false, .needs_exe = true, .dirs = &.{
@@ -152,7 +156,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-ktor",
-    } },
+    }, .weight = 22 },
     // End-to-end ktor server gate: a background child `klio` runs
     // `embeddedServer` (routing, params, headers, status, typed JSON) while
     // the test drives it as the HTTP client over real sockets.
@@ -162,7 +166,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-ktor",
-    } },
+    }, .weight = 23 },
     // Threaded stress gate for the pack concurrency primitives
     // (ConcurrentMap/Attributes computeIfAbsent once-only, the ktor locks
     // actuals, ByteChannel written from a Default worker) through child
@@ -172,17 +176,17 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-ktor",
-    } },
+    }, .weight = 17 },
     // Reified inline Json extension shapes through the installed pack
     // (kotlinc-verified expected output; the in-process parity harness
     // does not fold in the serialization pack).
     .{ .name = "json_reified_inline", .parity_data = false, .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-serialization",
-    } },
+    }, .weight = 3 },
     // Baked stdlib image gate: bake -> hit -> fallback -> staleness ->
     // corruption through a child `klio` against a scratch HOME, plus the
     // in-process bake/load round trip.
-    .{ .name = "stdlib_image", .needs_exe = true },
+    .{ .name = "stdlib_image", .needs_exe = true, .weight = 8 },
     // Bootstrapping proof: Kotlin's own stdlib commonTest sources run through
     // a child `klio test` against the installed kotlin.test pack.
     .{ .name = "stdlib_commontest", .needs_exe = true, .dirs = &.{
@@ -190,14 +194,14 @@ const itests_files = [_]Itest{
         "kotlin/libraries/kotlin.test",
         "kotlin/libraries/stdlib/test",
         "tests/stdlib_commontest_actuals",
-    } },
+    }, .weight = 90 },
     // androidx.collection's own commonTest sources run through a child
     // `klio test` against the installed androidx.collection pack.
     .{ .name = "androidx_collection_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-androidx-collection",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    } },
+    }, .weight = 150 },
 };
 
 /// Read by every parity-pipeline run: the stdlib pack is built at runtime from
@@ -466,6 +470,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the fast module unit tests");
     const itest_step = b.step("itest", "Run the integration test suite (slow — interprets whole programs)");
     const itest_bin_step = b.step("itest-bin", "Build+install standalone itest binaries for stress looping");
+
+    // -Ditest-shard=K/N partitions the integration suite (the itest binaries
+    // plus the e2e and bench module tests) into N weight-balanced bins and
+    // attaches only bin K to the `itest` step, so CI fans the suite across
+    // parallel jobs. Without the option every suite runs. Assignment is
+    // greedy over descending declared weights, so it is deterministic for a
+    // given suite list.
+    const shards = ItestShards.fromOption(b);
     for (mod_list) |m| {
         if (!m.tested) continue;
         if (std.mem.eql(u8, m.name, "itests")) {
@@ -509,7 +521,7 @@ pub fn build(b: *std.Build) void {
                     run_t.addFileInput(base_images.path(b, "embedded-gate1.klio-image"));
                 }
                 declareDataDirs(b, run_t, &data_memo, spec.dirs);
-                itest_step.dependOn(&run_t.step);
+                if (shards.includes(spec.name)) itest_step.dependOn(&run_t.step);
                 // Targeted iteration: run just this itest (and build only its
                 // dependency closure), e.g. `zig build itest-parity_object_init`.
                 const one = b.step(
@@ -558,13 +570,73 @@ pub fn build(b: *std.Build) void {
         }
         // Module tests that interpret whole programs (e2e, bench) are as slow
         // as the integration suite; keep them off the fast `test` step.
-        if (runs_programs) itest_step.dependOn(&run_t.step) else test_step.dependOn(&run_t.step);
+        if (runs_programs) {
+            if (shards.includes(m.name)) itest_step.dependOn(&run_t.step);
+        } else {
+            test_step.dependOn(&run_t.step);
+        }
     }
 
     const test_all_step = b.step("test-all", "Run the unit tests and the integration suite");
     test_all_step.dependOn(test_step);
     test_all_step.dependOn(itest_step);
 }
+
+/// Weight-balanced sharding of the integration suite for `-Ditest-shard=K/N`.
+/// The suite list is the itest binaries plus the e2e and bench module tests;
+/// e2e is by far the heaviest module test and gets its own static weight.
+const ItestShards = struct {
+    /// null = no sharding (every suite included).
+    selected: ?std.StringHashMap(void),
+
+    const e2e_weight: u16 = 40;
+    const bench_weight: u16 = 8;
+
+    fn fromOption(b: *std.Build) ItestShards {
+        const raw = b.option([]const u8, "itest-shard", "Run only shard K of N of the integration suite (format K/N)") orelse
+            return .{ .selected = null };
+        const slash = std.mem.indexOfScalar(u8, raw, '/') orelse badShardOption(raw);
+        const k = std.fmt.parseInt(usize, raw[0..slash], 10) catch badShardOption(raw);
+        const n = std.fmt.parseInt(usize, raw[slash + 1 ..], 10) catch badShardOption(raw);
+        if (n == 0 or k >= n) badShardOption(raw);
+
+        const Suite = struct { name: []const u8, weight: u16 };
+        var suites: std.ArrayList(Suite) = .empty;
+        for (itests_files) |spec|
+            suites.append(b.allocator, .{ .name = spec.name, .weight = spec.weight }) catch @panic("oom");
+        suites.append(b.allocator, .{ .name = "e2e", .weight = e2e_weight }) catch @panic("oom");
+        suites.append(b.allocator, .{ .name = "bench", .weight = bench_weight }) catch @panic("oom");
+        // Descending weight, name-tiebroken: deterministic greedy packing.
+        std.mem.sort(Suite, suites.items, {}, struct {
+            fn lt(_: void, x: Suite, y: Suite) bool {
+                if (x.weight != y.weight) return x.weight > y.weight;
+                return std.mem.lessThan(u8, x.name, y.name);
+            }
+        }.lt);
+
+        const bin_totals = b.allocator.alloc(u64, n) catch @panic("oom");
+        @memset(bin_totals, 0);
+        var selected = std.StringHashMap(void).init(b.allocator);
+        for (suites.items) |s| {
+            var lightest: usize = 0;
+            for (bin_totals, 0..) |w, i| {
+                if (w < bin_totals[lightest]) lightest = i;
+            }
+            bin_totals[lightest] += s.weight;
+            if (lightest == k) selected.put(s.name, {}) catch @panic("oom");
+        }
+        return .{ .selected = selected };
+    }
+
+    fn includes(self: *const ItestShards, name: []const u8) bool {
+        const sel = self.selected orelse return true;
+        return sel.contains(name);
+    }
+
+    fn badShardOption(raw: []const u8) noreturn {
+        std.debug.panic("-Ditest-shard expects K/N with K < N, got `{s}`", .{raw});
+    }
+};
 
 /// Attach the build-time-generated stdlib pack to one module universe:
 /// `stdlib_pack` imports `stdlib_embedded`, whose root embeds the generated

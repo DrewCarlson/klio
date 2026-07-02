@@ -6,11 +6,37 @@ on:
   pull_request:
     branches: [main]
 
+# A superseded push to the same ref cancels the older run instead of
+# queueing a full battery behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-and-test:
-    name: zig build + test
+  test:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Fast signal: the module unit tests (seconds of run time).
+          - name: unit tests
+            step: test
+            shard: unit
+          # The integration suite fans across weight-balanced shards
+          # (see -Ditest-shard in build.zig). All shards compile from the
+          # same restored cache; each runs ~a third of the suite.
+          - name: itest shard 0
+            step: itest -Ditest-shard=0/3
+            shard: itest0
+          - name: itest shard 1
+            step: itest -Ditest-shard=1/3
+            shard: itest1
+          - name: itest shard 2
+            step: itest -Ditest-shard=2/3
+            shard: itest2
     steps:
       # The kotlin-klio/*/upstream vendor trees (kotlinx + ktor sources the
       # interpreter consumes at runtime) are submodules; without them every
@@ -26,9 +52,6 @@ jobs:
           set -euo pipefail
           curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ
           echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
-
-      - name: zig version
-        run: zig version
 
       # The interpreter reads upstream Kotlin stdlib sources from kotlin/ at
       # runtime (the stdlib pack is built from them). The `kotlin` submodule is
@@ -49,32 +72,31 @@ jobs:
       # zstd tarball, compiled artifacts) and the project-local .zig-cache
       # (build artifacts plus the test run-step result manifests, so unchanged
       # test steps are cache hits in CI exactly as they are locally). Keyed
-      # per-commit with prefix restore so every run starts from the nearest
-      # prior cache. Restore and save are split so the save runs even when
-      # the job fails or times out -- a partial compile still banks progress
-      # for the next run instead of restarting cold forever.
+      # per-commit-and-shard with prefix restore so every run starts from the
+      # nearest prior cache; the shard suffix keeps concurrent saves from
+      # racing on one key. Restore and save are split so the save runs even
+      # when the job fails or times out -- a partial compile still banks
+      # progress for the next run instead of restarting cold forever.
       - name: restore zig build + test state
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cache/zig
             .zig-cache
-          key: zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
+          key: zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-${{ github.sha }}
           restore-keys: |
+            zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-
             zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-
-
-      - name: zig build
-        run: zig build
 
       # -Dharness-optimize=Debug: locally the program-running harness binaries
       # compile a second ReleaseSafe module universe so interpreted test
       # programs run ~5x faster across thousands of iterations. CI runs each
-      # step once, so the slower Debug interpreter costs a couple of minutes
-      # while the second universe's optimizing compiles cost tens of minutes
-      # on a 4-vCPU runner. One universe here; the ReleaseSafe configuration
-      # runs in the harness-release workflow (manual / nightly).
-      - name: zig build test-all
-        run: zig build test-all -Dharness-optimize=Debug --summary all
+      # step once, so the slower Debug interpreter costs minutes while the
+      # second universe's optimizing compiles cost tens of minutes on a
+      # 4-vCPU runner. One universe here; the ReleaseSafe configuration runs
+      # in the harness-release workflow (manual / weekly).
+      - name: zig build ${{ matrix.step }}
+        run: zig build ${{ matrix.step }} -Dharness-optimize=Debug --summary all
 
       - name: save zig build + test state
         if: always()
@@ -83,4 +105,4 @@ jobs:
           path: |
             ~/.cache/zig
             .zig-cache
-          key: zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
+          key: zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-${{ github.sha }}
