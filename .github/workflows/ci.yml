@@ -88,6 +88,23 @@ jobs:
             zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-
             zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-
 
+      # The zig caches only ever grow (zig has no cache GC): a restored cache
+      # near the runner's free-disk budget leaves no room for this shard's
+      # build products and the job dies with ENOSPC. Past the budget, start
+      # fresh — the per-shard save then banks a compact cache for later runs.
+      - name: prune oversized zig caches
+        run: |
+          set -euo pipefail
+          for d in .zig-cache "$HOME/.cache/zig"; do
+            [ -d "$d" ] || continue
+            kb=$(du -sk "$d" | cut -f1)
+            if [ "$kb" -gt 5242880 ]; then
+              echo "pruning $d (${kb} KB exceeds the 5 GB budget)"
+              rm -rf "$d"
+            fi
+          done
+          df -h / | tail -1
+
       # -Dharness-optimize=Debug: locally the program-running harness binaries
       # compile a second ReleaseSafe module universe so interpreted test
       # programs run ~5x faster across thousands of iterations. CI runs each
