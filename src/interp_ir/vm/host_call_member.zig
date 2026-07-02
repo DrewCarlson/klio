@@ -7459,6 +7459,13 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             }
             return .{ .ok = receiver.* };
         }
+        // A builtin throwable carries its dynamic class in its `fqn` field;
+        // the static `typeFqn` would collapse every one to `kotlin.Throwable`.
+        if (receiver.* == .Exception) {
+            const g = receiver.Exception.fqn.borrow();
+            defer g.deinit();
+            return .{ .ok = try syntheticClassFromFqn(allocator, g.get().bytes) };
+        }
         // `value::class` — the runtime KClass of a plain (non-callable) value.
         switch (receiver.*) {
             .IrClosure, .BoundMethod, .BoundUserMethod => return .{ .ok = receiver.* },
