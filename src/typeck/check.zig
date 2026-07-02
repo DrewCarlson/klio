@@ -80,10 +80,20 @@ pub const TypeCheck = struct {
     /// visits. Consumers (notably the dataflow analyses in `cfa`)
     /// read this to ground reachability / VIA / smart-cast queries.
     cfgs: std.AutoHashMap(Span, Cfg),
+    /// The signature the overload checker CHOSE for each overloaded call,
+    /// keyed by call span and rendered compactly ("arity=N;p0=Int;...;ret=T").
+    /// The eager half of the one-engine-two-modes design: recorded once,
+    /// consumable by lowering-side audits and typeck-informed evidence.
+    resolved_calls: std.AutoHashMap(Span, []const u8),
 
     /// Look up the type assigned to an expression by span.
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
         return self.types.getPtr(sp);
+    }
+
+    /// The rendered signature the checker resolved for the call at `sp`.
+    pub fn resolvedCallOf(self: *const TypeCheck, sp: Span) ?[]const u8 {
+        return self.resolved_calls.get(sp);
     }
 };
 
@@ -107,6 +117,7 @@ pub fn typecheck(
         .types = tc.types,
         .diagnostics = tc.diagnostics,
         .cfgs = tc.cfgs,
+        .resolved_calls = tc.resolved_calls,
     };
 }
 
@@ -217,6 +228,7 @@ pub fn typecheckModule(
         .types = tc.types,
         .diagnostics = tc.diagnostics,
         .cfgs = tc.cfgs,
+        .resolved_calls = tc.resolved_calls,
     };
 }
 
@@ -599,6 +611,8 @@ pub const Checker = struct {
     allocator: Allocator,
     resolution: *const Resolution,
     types: std.AutoHashMap(Span, Type),
+    /// Chosen-overload record per call span (see TypeCheck.resolved_calls).
+    resolved_calls: std.AutoHashMap(Span, []const u8),
     /// Spans whose recorded type is `Nothing`, maintained alongside `types`.
     /// The reachability queries only need to know where control diverges,
     /// so they consult this small set instead of walking the full map.

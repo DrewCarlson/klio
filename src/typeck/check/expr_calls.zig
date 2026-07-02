@@ -497,6 +497,24 @@ pub fn checkCrossinlineArgReturns(
 /// back to the first arity-matching signature when no candidate's parameter
 /// types are a clean fit, and to the first declared signature when even
 /// arity has no match.
+/// Record the signature the overload procedure CHOSE for `call_span` —
+/// the eager engine's resolution record (one oracle, recorded once). The
+/// render is compact and comparison-stable: arity, parameter type heads,
+/// and the return head.
+fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig) void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(self.allocator);
+    buf.print(self.allocator, "arity={d}", .{sig.params.len}) catch return;
+    for (sig.params, 0..) |*pt, i| {
+        buf.print(self.allocator, ";p{d}={f}", .{ i, pt.* }) catch return;
+    }
+    buf.print(self.allocator, ";ret={f}", .{sig.return_ty}) catch return;
+    const rendered = self.allocator.dupe(u8, buf.items) catch return;
+    self.resolved_calls.put(call_span, rendered) catch {
+        self.allocator.free(rendered);
+    };
+}
+
 pub fn checkOverloadedCall(
     self: *Checker,
     sigs: []const FnSig,
@@ -597,6 +615,7 @@ pub fn checkOverloadedCall(
         }
         try checkArityAndArgs(self, sig, args, call_span);
         try enforceSuspendColoring(self, sig.is_suspend, "function", call_span);
+        recordResolvedCall(self, call_span, sig);
         if (has_type_args or sig.type_param_count == 0) {
             return sig.return_ty.clone(self.allocator);
         }
@@ -757,6 +776,7 @@ pub fn checkOverloadedCall(
         return .Unresolved;
     }
     const sig = chosen orelse arity_match.?;
+    recordResolvedCall(self, call_span, sig);
     if (has_type_args) {
         try decl_mod.checkTypeArgBounds(self, sig, type_args);
     }

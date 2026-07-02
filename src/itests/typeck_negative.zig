@@ -719,3 +719,33 @@ test "neg_dsl_marker_nested_shadow" {
 test "neg_suspend_delegate_get_value" {
     try expectFixtureCode("neg_suspend_delegate_get_value.kt", "T0114");
 }
+
+// The eager engine's resolution record: the overload checker's pick is
+// recorded per call span (one oracle, recorded once) so lowering-side
+// audits and typeck-informed evidence can consume it.
+test "overload checker records its pick per call span" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\fun pick(x: Int): String = "int"
+        \\fun pick(x: String): String = "string"
+        \\fun main() {
+        \\    val r = pick(42)
+        \\    println(r)
+        \\}
+        \\
+    ;
+    var lx = try Lexer.init(a, FileId.from(0), src);
+    const lexed = try lx.tokenize();
+    const p = Parser.new(a, FileId.from(0), src, lexed.tokens);
+    const file = p.parseFile();
+    var r = try resolver.resolve(a, &file);
+    var tc = try typeck.typecheck(a, &file, &r);
+    var it = tc.resolved_calls.iterator();
+    var found = false;
+    while (it.next()) |e| {
+        if (std.mem.indexOf(u8, e.value_ptr.*, "p0=Int") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
