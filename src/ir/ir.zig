@@ -2345,15 +2345,14 @@ pub const Module = struct {
         return true;
     }
 
-    /// Whether a bare call to `name` binding target `id` is a tail call: the
-    /// target itself is `tailrec`, or the name is one of the module's known
-    /// tailrec functions (mirrors `expr.zig`'s legacy tail-call gate).
+    /// Whether a bare call binding target `id` is a tail call: exactly when
+    /// the committed target itself is `tailrec`. (The name-list arm this
+    /// replaced could mark a call to a non-tailrec target as a tail call
+    /// just because a same-name sibling was tailrec.)
     fn calleeIsTailrec(self: *const Module, id: FuncId, name: []const u8) bool {
+        _ = name;
         if (self.funcById(id)) |f| {
             if (f.is_tailrec) return true;
-        }
-        for (self.tailrec_fn_names.items) |n| {
-            if (std.mem.eql(u8, n, name)) return true;
         }
         return false;
     }

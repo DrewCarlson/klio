@@ -5141,7 +5141,6 @@ fn overloadParamTypeConflicts(module: *const Module, f: *const Func, pidx: usize
 /// the member-vs-global walk lives in `emitMemberOrGlobal`, not here.
 fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
-    const callee = call.callee;
     const args = call.args;
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
@@ -5163,9 +5162,6 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     const callee_is_tailrec = blk: {
         if (b.module.funcById(func_id)) |f| {
             if (f.is_tailrec) break :blk true;
-        }
-        for (b.module.tailrec_fn_names.items) |n| {
-            if (std.mem.eql(u8, n, callee.Path.segments[0].name)) break :blk true;
         }
         break :blk false;
     };
