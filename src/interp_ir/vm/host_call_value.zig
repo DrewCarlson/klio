@@ -461,6 +461,35 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 .err => |e| return .{ .err = e },
             };
         };
+        // Non-final vararg (Kotlin allows `vararg` before a trailing
+        // function param): positionally, the declared params AFTER the
+        // vararg take the LAST args and everything between the fixed
+        // prefix and them packs into the vararg's Array. The static call
+        // path binds this shape through the reorder-aware binder; a value
+        // call must bind it identically.
+        nonfinal: {
+            if (func.params.len < 2) break :nonfinal;
+            var vi: usize = func.params.len;
+            for (func.params, 0..) |*pp, i| {
+                if (pp.is_vararg) {
+                    vi = i;
+                    break;
+                }
+            }
+            if (vi >= func.params.len - 1) break :nonfinal;
+            const trailing = func.params.len - vi - 1;
+            if (args.len < vi + trailing) break :nonfinal;
+            const var_count = args.len - vi - trailing;
+            if (var_count == 1 and args[vi] == .Array) break :nonfinal;
+            var packed_args: std.ArrayList(Value) = .empty;
+            try packed_args.appendSlice(allocator, args[vi .. vi + var_count]);
+            const items = try ValueList.init(allocator, packed_args);
+            call_args.deinit(allocator);
+            call_args = .empty;
+            try call_args.appendSlice(allocator, args[0..vi]);
+            try call_args.append(allocator, runtime.ArrayData.fromBoxedList(items));
+            try call_args.appendSlice(allocator, args[vi + var_count ..]);
+        }
         if (func.params.len != 0) {
             const last = func.params[func.params.len - 1];
             if (last.is_vararg and args.len > info.n_params) {
