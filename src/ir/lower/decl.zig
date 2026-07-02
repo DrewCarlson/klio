@@ -1027,6 +1027,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // `Iterable<Int>` parameter must not bind an `IntRange`-typed overload slot).
     for (f.params) |*p| {
         try b.setLocalDeclType(p.name.name, p.ty.name.name);
+        if (p.ty.nullable) try b.setLocalDeclNullable(p.name.name);
     }
     // Labeled-receiver alias: `this@<fn>` names this function's receiver. A
     // qualified `this@fn` in a nested lambda (e.g.

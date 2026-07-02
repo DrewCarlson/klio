@@ -39,6 +39,7 @@ pub const compose = @import("vm/compose.zig");
 /// run boundary. Called by `Vm.deinit` and by the public runners so leaked
 /// cross-run state is a loud Debug failure.
 pub const resetReceiverThreadLocals = vmhost.resetReceiverThreadLocals;
+pub const resetRunGlobalCaches = vmhost.resetRunGlobalCaches;
 /// Drop this thread's per-function JIT state between programs (the test/parity
 /// harness runs many programs in one process on recycled module memory).
 pub const resetJitForTest = ir.jit_loop.resetForTest;

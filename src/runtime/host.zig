@@ -74,6 +74,12 @@ pub const IntrinsicHost = struct {
         run_blocking: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
         /// Drive a `startCoroutine` root block. `null` => default.
         coroutine_run_root: ?*const fn (ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
+        /// Start `block` as a fresh root with no enclosing driver; returns
+        /// the block's value or `Value.CoroutineSuspended` when the root
+        /// parked (persisted for a later external resume).
+        coroutine_start_root_or_suspended: ?*const fn (ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
+        /// Whether a cooperative driver pump is live on this thread.
+        coroutine_has_driver: ?*const fn (ctx: *anyopaque) bool = null,
         /// Spawn a child coroutine. `null` => default (run eagerly).
         coroutine_launch: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_arm_slot: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
@@ -148,6 +154,16 @@ pub const IntrinsicHost = struct {
     pub fn coroutineRunRoot(self: IntrinsicHost, scope: ?*const Value, block: *const Value, out: Output) !EvalResult {
         if (self.vtable.coroutine_run_root) |f| return f(self.ctx, scope, block, out);
         return self.invokeCallable(block, &.{}, out);
+    }
+
+    pub fn coroutineStartRootOrSuspended(self: IntrinsicHost, scope: ?*const Value, block: *const Value, out: Output) !EvalResult {
+        if (self.vtable.coroutine_start_root_or_suspended) |f| return f(self.ctx, scope, block, out);
+        return self.invokeCallable(block, &.{}, out);
+    }
+
+    pub fn coroutineHasDriver(self: IntrinsicHost) bool {
+        if (self.vtable.coroutine_has_driver) |f| return f(self.ctx);
+        return false;
     }
 
     pub fn coroutineLaunch(self: IntrinsicHost, block: *const Value, scope: *const Value, out: Output) !?RuntimeError {

@@ -1398,6 +1398,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.coroutines.__klio_co_park", .f = result.coro_park },
     .{ .fqn = "kotlin.coroutines.__klio_co_resume", .f = result.coro_resume },
     .{ .fqn = "kotlin.coroutines.__klio_co_runRoot", .f = result.coro_run_root },
+    .{ .fqn = "kotlin.coroutines.__klio_co_startRootOrSuspended", .f = result.coro_start_root_or_suspended },
+    .{ .fqn = "kotlin.coroutines.__klio_co_hasDriver", .f = result.coro_has_driver },
     .{ .fqn = "kotlin.coroutines.__klio_co_pushScope", .f = result.coro_push_scope },
     .{ .fqn = "kotlin.coroutines.__klio_co_popScope", .f = result.coro_pop_scope },
     .{ .fqn = "kotlin.text.Regex", .f = regexp.regex_ctor },

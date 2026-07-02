@@ -154,9 +154,16 @@ pub fn resetReceiverThreadLocals() void {
     host_impl.resetReceiverTls();
     coroutines.resetReceiverTls();
     compose.resetAtRunBoundary();
-    // Drop the AST-address-keyed anon-`object` site caches: their keys and
-    // thunk sub-modules belong to the finished run and must not be reused by
-    // the next one in the same process (tests, repeated CLI runs).
+}
+
+/// Drop the process-global anon-`object` site caches: their keys and thunk
+/// sub-modules belong to the finished run and must not be reused by the next
+/// one in the same process (tests, repeated CLI runs). PROGRAM boundary only —
+/// never from a Vm deinit: transient Vms (worker-pool tasks, nested drivers)
+/// tear down while the program's classes registry still holds the site names
+/// as live map keys, and freeing them there is a use-after-free on the next
+/// anon-object instantiation.
+pub fn resetRunGlobalCaches() void {
     host_instances.resetAnonSiteCache();
 }
 
@@ -273,6 +280,10 @@ pub const VmHost = struct {
     pub const callMemberNamed = host_call_member.callMemberNamed;
     pub const callMemberNamedStatic = host_call_member.callMemberNamedStatic;
     pub const callMemberStrictExt = host_call_member.callMemberStrictExt;
+    pub const callMemberMembersOnly = host_call_member.callMemberMembersOnly;
+    pub const callMemberMembersOnlyLenient = host_call_member.callMemberMembersOnlyLenient;
+    pub const committedExtReceiverDisproven = host_call_member.committedExtReceiverDisproven;
+    pub const committedExtReceiverProven = host_call_member.committedExtReceiverProven;
     pub const resolveMemberFuncId = host_call_member.resolveMemberFuncId;
     pub const hostHasMember = host_call_member.hostHasMember;
     pub const cmgGlobalSkip = host_call_member.cmgGlobalSkip;
@@ -394,6 +405,13 @@ fn ivRunBlocking(ctx: *anyopaque, block: *const Value, scope: *const Value, out:
 fn ivCoroutineRunRoot(ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
     return intrinsic_host.coroutineRunRoot(ip(ctx), scope, block, out);
 }
+fn ivCoroutineStartRootOrSuspended(ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
+    return intrinsic_host.coroutineStartRootOrSuspended(ip(ctx), scope, block, out);
+}
+fn ivCoroutineHasDriver(ctx: *anyopaque) bool {
+    _ = ctx;
+    return coroutines.coroutineHasDriver();
+}
 fn ivCoroutineLaunch(ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineLaunch(ip(ctx), block, scope, out);
 }
@@ -450,6 +468,8 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .new_synth_instance = ivNewSynthInstance,
     .run_blocking = ivRunBlocking,
     .coroutine_run_root = ivCoroutineRunRoot,
+    .coroutine_start_root_or_suspended = ivCoroutineStartRootOrSuspended,
+    .coroutine_has_driver = ivCoroutineHasDriver,
     .coroutine_launch = ivCoroutineLaunch,
     .coroutine_arm_slot = ivCoroutineArmSlot,
     .coroutine_disarm_slot = ivCoroutineDisarmSlot,

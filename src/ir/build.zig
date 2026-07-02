@@ -292,6 +292,7 @@ pub const FuncBuilder = struct {
     /// Declared type annotation per local (`val resp: HttpResponse`),
     /// used by inline-overload receiver narrowing.
     local_decl_types: std.StringHashMap([]const u8),
+    local_decl_nullable: std.StringHashMap(void),
     /// Recorded initializer expression per un-annotated local, so the
     /// narrowing can infer a type from the init call's return type. The
     /// AST outlives the lowering pass.
@@ -442,6 +443,7 @@ pub const FuncBuilder = struct {
             .local_fns = StringSet.init(allocator),
             .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
             .local_decl_types = std.StringHashMap([]const u8).init(allocator),
+            .local_decl_nullable = std.StringHashMap(void).init(allocator),
             .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
             .local_ext_fns = StringSet.init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
@@ -495,6 +497,7 @@ pub const FuncBuilder = struct {
         }
         self.local_fns.deinit();
         self.local_decl_types.deinit();
+        self.local_decl_nullable.deinit();
         self.local_init_exprs.deinit();
         self.local_ext_fns.deinit();
         self.receiver_lambda_params.deinit();
@@ -945,6 +948,16 @@ pub const FuncBuilder = struct {
     pub fn setLocalDeclType(self: *FuncBuilder, name: []const u8, ty: []const u8) Allocator.Error!void {
         try self.local_decl_types.put(name, ty);
         _ = self.local_init_exprs.remove(name);
+    }
+    /// Record that the local's DECLARED type is nullable (`Array<String>?`);
+    /// the head-name table above cannot carry it without disturbing its
+    /// consumers. Read by the qualified-call static-receiver tag, which must
+    /// not constrain null-receiver extension dispatch.
+    pub fn setLocalDeclNullable(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.local_decl_nullable.put(name, {});
+    }
+    pub fn localDeclNullable(self: *const FuncBuilder, name: []const u8) bool {
+        return self.local_decl_nullable.contains(name);
     }
     pub fn setLocalInitExpr(self: *FuncBuilder, name: []const u8, e: *const ast.Expr) Allocator.Error!void {
         try self.local_init_exprs.put(name, e);

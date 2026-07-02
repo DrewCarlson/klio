@@ -147,7 +147,7 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // property keeps the name-keyed read — the property wins in
             // value position.
             const cls_pick: ?ir.ClassId = if (isTopLevelProp(n))
-                null
+                b.module.classIdExactImport(n, segments[0].span.file)
             else
                 b.module.classIdIndexed(n, b.self_package, segments[0].span.file);
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cls_pick } });
@@ -1154,7 +1154,11 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 } });
             } else {
                 orEmitAudit(b, "class_name_value", "LoadGlobal", name0);
-                try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = n } });
+                try b.push(.{ .LoadGlobal = .{
+                    .dst = cls,
+                    .name = n,
+                    .class = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file),
+                } });
             }
             const dst = b.allocReg();
             const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
@@ -1222,7 +1226,8 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // and a receiver is (or may be bound) in scope, the read decides
         // at runtime instead.
         if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
-            !(inReceiverContext(b) and b.module.registry.class_member_names.contains(name0)))
+            b.module.classIdExactImport(name0, segments[0].span.file) == null and
+            !(inReceiverContext(b) and anyReceiverClassDeclares(b, name0)))
         {
             // A bare read whose only declaration is an unimported
             // cross-package property is unresolved (kotlinc rejects it).
@@ -3623,7 +3628,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.module.classId(callee.Path.segments[0].name) == null and
         (b.module.funcId(callee.Path.segments[0].name) == null or inReceiverContext(b)))
     {
-        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
     }
 
     // Built-in stdlib companion shortcuts: `Result.success(x)` etc.
@@ -3654,7 +3659,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // merely "an unknown receiver could have it" — so a top-level helper
         // (`testEquals`) called in a lambda is left on the global path.
         if (b.resolve(nm0) == null and inReceiverContext(b) and b.hasEnclosingMember(nm0)) {
-            if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+            if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
         }
     }
     const callee_r = try lowerExpr(b, callee);
@@ -4200,8 +4205,17 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* != .Path) return null;
     const p = arg.Path;
     if (p.segments.len != 1) return null;
-    const t = b.localDeclType(p.segments[0].name) orelse return null;
-    return .{ .name = t, .nullable = false, .args = &.{} };
+    if (b.localDeclType(p.segments[0].name)) |t| {
+        return .{ .name = t, .nullable = b.localDeclNullable(p.segments[0].name), .args = &.{} };
+    }
+    // A bare class name used as a value is its companion object: carry the
+    // owner class's head as type evidence so `install(RoutingRoot, ...)`
+    // cannot bind an overload whose parameter is an unrelated object type.
+    const nm = p.segments[0].name;
+    if (b.resolve(nm) == null and !b.knowsOuter(nm) and b.module.classId(nm) != null) {
+        return .{ .name = nm, .nullable = false, .args = &.{} };
+    }
+    return null;
 }
 
 /// Build the `[]ArgShape` for a call's argument list once, before the
@@ -4476,7 +4490,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     // context, bind it directly — no class declares the name as a member, so a
     // `this.<name>` redispatch would invoke the receiver itself.
     if (res.target == null and !shadowed_by_class and inReceiverContext(b) and
-        ir.isAliasName(name0) and !b.module.registry.class_member_names.contains(name0) and
+        ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0) and
         b.resolve(name0) == null and !b.knowsOuter(name0))
     {
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
@@ -4634,7 +4648,7 @@ fn recordOutOfScopeCall(
     // the only package-scope candidate is unimported. kotlinc resolves
     // `fun Source.discard() { request(count) }` to the receiver's
     // `request` member, not the package-scope `request` function.
-    if (inReceiverContext(b) and b.module.registry.class_member_names.contains(name)) return false;
+    if (inReceiverContext(b) and anyReceiverClassDeclares(b, name)) return false;
     // Only the index's own out-of-scope verdicts count: a unique
     // exact-arity match, or a tier-5 candidate set (identical or
     // type-distinct). Loose-shape deferrals (arity/default/vararg/
@@ -4931,6 +4945,22 @@ fn ownerChainShadowContains(b: *const FuncBuilder, owner: []const u8, name: []co
 /// member-shadow question is answered by its own hierarchy rather than
 /// the program-wide name universe. Mirrored into `ResolveCtx` so
 /// `resolveCall`'s Phase C asks the identical question.
+/// The direct-bind guards' question — "does any class this context's
+/// receiver could be declare `name` as a member". Unlike
+/// `memberShadowPossible`, an unknown-receiver context (lambda, thunk,
+/// extension body) does NOT answer true: the alias / container-creator /
+/// prop-read guards bind DIRECT precisely when no class declares the name,
+/// and only a plain method body (receiver types statically known) may
+/// narrow the program-wide universe to its own+outer hierarchies.
+fn anyReceiverClassDeclares(b: *const FuncBuilder, name: []const u8) bool {
+    if (receiverTypeKnown(b, name)) {
+        if (b.ownerClass()) |oc| {
+            if (ownerChainShadowContains(b, oc, name)) |ans| return ans;
+        }
+    }
+    return b.module.registry.class_member_names.contains(name);
+}
+
 fn receiverTypeKnown(b: *const FuncBuilder, name0: []const u8) bool {
     if (b.capturesThisSlot() or b.isParamThunk() or
         (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name0))) return false;
@@ -5238,7 +5268,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     const name0 = callee.Path.segments[0].name;
 
     if (!isNonExt(b, func_id)) {
-        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, func_id)) |r| return r;
         return emitCall(b, expr, func_id, was_cast);
     }
 
@@ -5649,6 +5679,7 @@ fn lowerUnresolvedBareCall(
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
     ast_type_args: []const ast.TypeRef,
+    static_ext: ?FuncId,
 ) Allocator.Error!?Reg {
     const name0 = callee.Path.segments[0].name;
     // A bare call to a name the enclosing anon object closes over.
@@ -5693,7 +5724,7 @@ fn lowerUnresolvedBareCall(
     // proofs. Bind the global value directly and carry the type args so the
     // creation-site stamp (`runtime.attachDeclaredElemTypes`) runs.
     if (ast_type_args.len != 0 and emptyContainerCreatorArity(name0) != 0 and
-        b.module.funcId(name0) == null and !b.module.registry.class_member_names.contains(name0))
+        b.module.funcId(name0) == null and !anyReceiverClassDeclares(b, name0))
     {
         orEmitAudit(b, "container_creator_typed", "LoadGlobal", name0);
         const callee_r = b.allocReg();
@@ -5741,7 +5772,7 @@ fn lowerUnresolvedBareCall(
     // the implicit receiver. Bind the global directly: routing it through
     // `CallMemberOrGlobal` would let the member/extension probe treat it as an
     // extension on `this` and prepend the receiver into its varargs.
-    if (ir.isAliasName(name0) and !b.module.registry.class_member_names.contains(name0)) {
+    if (ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0)) {
         orEmitAudit(b, "unresolved_bare_call", "LoadGlobal", name0);
         const callee_r = b.allocReg();
         const nm0 = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -5804,6 +5835,7 @@ fn lowerUnresolvedBareCall(
             .n_args = run[1],
             .arg_names = arg_names,
             .recv = this_reg,
+            .func = static_ext,
             .static_recv = try cmgStaticRecv(b),
         } });
         return dst;

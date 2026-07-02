@@ -206,6 +206,7 @@ pub fn runModuleFiles(
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
     interp_ir.resetReceiverThreadLocals();
+    interp_ir.resetRunGlobalCaches();
     if (tryImagePath(gpa, paths, features)) |code| return code;
     var map = SourceMap.init(gpa);
     defer map.deinit();
@@ -249,6 +250,7 @@ pub fn runFileIrVm(
     // Catch any receiver/coroutine thread-local state leaked from a prior run
     // on this thread before assembling the next program.
     interp_ir.resetReceiverThreadLocals();
+    interp_ir.resetRunGlobalCaches();
     if (tryImagePath(gpa, &.{path}, features)) |code| return code;
     var map = SourceMap.init(gpa);
     defer map.deinit();
@@ -362,6 +364,7 @@ pub fn runTestFiles(
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
     interp_ir.resetReceiverThreadLocals();
+    interp_ir.resetRunGlobalCaches();
 
     var files: std.ArrayList([]const u8) = .empty;
     defer {

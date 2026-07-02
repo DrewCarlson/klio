@@ -319,6 +319,10 @@ pub fn coroutineRunRoot(self: *VmIntrinsicHost, scope: ?*const Value, block: *co
     return coroutines.coroutineRunRoot(self, scope, block, out);
 }
 
+pub fn coroutineStartRootOrSuspended(self: *VmIntrinsicHost, scope: ?*const Value, block: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
+    return coroutines.coroutineStartRootOrSuspended(self, scope, block, out);
+}
+
 pub fn coroutineLaunch(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
     return coroutines.coroutineLaunch(self, block, scope, out);
 }
