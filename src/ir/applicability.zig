@@ -775,17 +775,40 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     var param_spec: i32 = 0;
     var proven: u16 = 0;
     var unknown: u16 = 0;
+    // Trailing-lambda rule (same as the member scorer): `recv.f(a, …) { … }`
+    // binds the trailing lambda to the LAST function-typed param, provided
+    // every skipped parameter in between carries a default. Without this, a
+    // lambda-only call scores the lambda against `params[1]` and marks the
+    // real block parameter unfilled, so every candidate looks inapplicable
+    // and the ranking decays to the noise tiers of the key.
+    var lambda_param: ?usize = null;
+    if (args.len > 0 and params.len > want and
+        scopeIsFunctionType(&scope, &params[params.len - 1].ty) and
+        args[args.len - 1].is_lambda)
+    {
+        var gap_defaulted = true;
+        var g: usize = want - 1;
+        while (g < params.len - 1) : (g += 1) {
+            if (!params[g].has_default and !params[g].is_vararg) {
+                gap_defaulted = false;
+                break;
+            }
+        }
+        if (gap_defaulted) lambda_param = params.len - 1;
+    }
     for (args, 0..) |*a, idx| {
-        if (params.len > idx + 1) {
-            const arg_score = scoreArg(&params[idx + 1].ty, a, &scope);
-            if (arg_score == null and !params[idx + 1].has_default and !params[idx + 1].is_vararg) applic = 0;
+        const pidx = if (lambda_param != null and idx == args.len - 1) lambda_param.? else idx + 1;
+        if (params.len > pidx) {
+            const arg_score = scoreArg(&params[pidx].ty, a, &scope);
+            if (arg_score == null and !params[pidx].has_default and !params[pidx].is_vararg) applic = 0;
             score += arg_score orelse -1;
-            if (!isTopOrGenericType(params[idx + 1].ty.name)) param_spec += 1;
+            if (!isTopOrGenericType(params[pidx].ty.name)) param_spec += 1;
             if (argIsProven(a)) proven += 1 else unknown += 1;
         }
     }
-    // Every param past the supplied args must be defaulted or vararg.
-    if (want < params.len) {
+    // Every param past the supplied args must be defaulted or vararg (when
+    // the trailing lambda fills the last param, its gap was checked above).
+    if (want < params.len and lambda_param == null) {
         var k: usize = want;
         while (k < params.len) : (k += 1) {
             if (!params[k].has_default and !params[k].is_vararg) {
@@ -1222,6 +1245,35 @@ test "applicable extension: under-applied param that is neither default nor vara
     const scope = ApplicabilityScope{ .member = true, .rank_extensions = true, .is_extension = true, .receiver = recv };
     const sc = applicable(&sig, &args, scope).?;
     try testing.expectEqual(@as(i32, 0), sc.ext_key.?[0]); // applicable tier = 0
+}
+
+test "applicable extension: trailing lambda binds to the last function-typed param over a defaulted gap" {
+    // The `produce {}` shape: f(ctx: Ctx = …, cap: Int = …, block: () -> T)
+    // called with only a trailing lambda must be fully applicable, while a
+    // sibling whose first param lacks a default must not be.
+    const good = [_]Param{
+        .{ .name = "this", .ty = tref("Scope"), .default = null },
+        .{ .name = "ctx", .ty = tref("Ctx"), .default = null, .has_default = true },
+        .{ .name = "cap", .ty = tref("Int"), .default = null, .has_default = true },
+        .{ .name = "block", .ty = tref("Function0"), .default = null },
+    };
+    const bad = [_]Param{
+        .{ .name = "this", .ty = tref("Scope"), .default = null },
+        .{ .name = "ctx", .ty = tref("Job"), .default = null },
+        .{ .name = "cap", .ty = tref("Int"), .default = null, .has_default = true },
+        .{ .name = "block", .ty = tref("Function0"), .default = null },
+    };
+    const recv = ArgShape{ .runtime_class = "Scope" };
+    const args = [_]ArgShape{.{ .runtime_class = "Function0", .func_typed = true, .is_lambda = true }};
+    const scope = ApplicabilityScope{ .member = true, .rank_extensions = true, .is_extension = true, .receiver = recv };
+
+    const good_sig = SigView{ .params = &good, .is_extension = true, .fid = FuncId.from(1) };
+    const good_sc = applicable(&good_sig, &args, scope).?;
+    try testing.expectEqual(@as(i32, 1), good_sc.ext_key.?[0]);
+
+    const bad_sig = SigView{ .params = &bad, .is_extension = true, .fid = FuncId.from(2) };
+    const bad_sc = applicable(&bad_sig, &args, scope).?;
+    try testing.expectEqual(@as(i32, 0), bad_sc.ext_key.?[0]);
 }
 
 // --- named-argument scorer ---------------------------------------------------
