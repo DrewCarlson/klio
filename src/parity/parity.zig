@@ -1151,12 +1151,17 @@ pub const LoadedProgram = struct {
 const PackSource = struct { path: []u8, text: []u8 };
 
 /// The in-repo kotlinx pack directories, in load order.
-fn kotlinxPackDirs(arena: Allocator) Allocator.Error![3][]u8 {
+/// Number of in-repo packs the parity pipeline can load from source.
+pub const N_PACK_DIRS = 5;
+
+fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
     const ws = try workspaceRoot(arena);
     return .{
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-coroutines" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-atomicfu" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-io" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-runtime" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-androidx-collection" }),
     };
 }
 
@@ -1173,22 +1178,12 @@ fn collectKotlinxPackSources(
 ) Allocator.Error!SResult([]PackSource) {
     var out: std.ArrayList(PackSource) = .empty;
     defer out.deinit(arena);
-    for (pack_dirs) |pack_dir| {
-        const lib_id = (try manifestLibraryId(arena, io, pack_dir)) orelse try arena.alloc(u8, 0);
-        var wanted = false;
-        var it = import_prefixes.keyIterator();
-        while (it.next()) |imp_ptr| {
-            const imp = imp_ptr.*;
-            if (std.mem.eql(u8, imp, lib_id) or
-                startsWithDot(arena, imp, lib_id) or
-                startsWithDot(arena, lib_id, imp))
-            {
-                wanted = true;
-                break;
-            }
-        }
-        if (std.mem.eql(u8, lib_id, "kotlinx.atomicfu") and imports_coroutines) wanted = true;
-        if (!wanted) continue;
+    // One selection authority: the same import-prefix + manifest-dependency
+    // closure the baked-base key uses, so collected content can never
+    // diverge from the base identity.
+    const mask = try packMaskFor(io, import_prefixes, imports_coroutines, arena);
+    for (pack_dirs, 0..) |pack_dir, idx| {
+        if (mask & (@as(u8, 1) << @intCast(idx)) == 0) continue;
 
         const sources = switch (try collectManifestSources(arena, io, pack_dir)) {
             .err => |e| return .{ .err = e },
@@ -1405,9 +1400,9 @@ var base_lock: runtime.SpinMutex = .{};
 var base_arena_state: ?*std.heap.ArenaAllocator = null;
 /// key (mode|mask|gate byte) -> entry, or null when the base for that key
 /// could not be snapshotted (callers then always take the fallback).
-var base_entries: ?std.AutoHashMap(u8, ?*const BaseEntry) = null;
+var base_entries: ?std.AutoHashMap(u16, ?*const BaseEntry) = null;
 var stdlib_meta_cache: ?StdlibMeta = null;
-var pack_meta_cache: [3]?PackMeta = .{ null, null, null };
+var pack_meta_cache: [N_PACK_DIRS]?PackMeta = @splat(null);
 
 /// Package universe of the embedded stdlib bundle, for the load gate.
 const StdlibMeta = struct {
@@ -1419,10 +1414,14 @@ const StdlibMeta = struct {
 const PackMeta = struct {
     lib_id: []const u8,
     import_prefixes: []const []const u8,
+    /// `[[deps]]` ids from the pack manifest (transitively chased when
+    /// selecting packs: importing compose pulls kotlinx.coroutines and
+    /// androidx.collection even though the program never names them).
+    deps: []const []const u8,
 };
 
-fn baseKey(mode: LoadMode, mask: u8, full: bool) u8 {
-    return (@as(u8, @intFromEnum(mode)) << 4) | (mask << 1) | @intFromBool(full);
+fn baseKey(mode: LoadMode, mask: u8, full: bool) u16 {
+    return (@as(u16, @intFromEnum(mode)) << 8) | (@as(u16, mask) << 1) | @intFromBool(full);
 }
 
 /// `KLIO_TRACE_STDLIB_BASE=1` prints one fast/fallback line per program.
@@ -1534,8 +1533,37 @@ fn packMeta(io: Io, idx: usize) Allocator.Error!*const PackMeta {
             while (it.next()) |k| try prefixes.append(a, k.*);
         },
     }
-    pack_meta_cache[idx] = .{ .lib_id = lib_id, .import_prefixes = try prefixes.toOwnedSlice(a) };
+    pack_meta_cache[idx] = .{
+        .lib_id = lib_id,
+        .import_prefixes = try prefixes.toOwnedSlice(a),
+        .deps = try manifestDepIds(a, io, dir),
+    };
     return &pack_meta_cache[idx].?;
+}
+
+/// `[[deps]]` ids declared by a pack manifest ("stdlib" included; the
+/// mask closure simply finds no pack dir for it).
+fn manifestDepIds(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    defer out.deinit(allocator);
+    const toml_path = try std.fs.path.join(allocator, &.{ pack_dir, "klio.toml" });
+    defer allocator.free(toml_path);
+    const toml = readFileOpt(allocator, io, toml_path) orelse return try out.toOwnedSlice(allocator);
+    var in_deps = false;
+    var it = std.mem.splitScalar(u8, toml, '\n');
+    while (it.next()) |line| {
+        const l = std.mem.trim(u8, std.mem.sliceTo(line, '#'), " \t\r\n");
+        if (std.mem.startsWith(u8, l, "[")) {
+            in_deps = std.mem.eql(u8, l, "[[deps]]");
+            continue;
+        }
+        if (in_deps and std.mem.startsWith(u8, l, "id")) {
+            const rest = std.mem.trimStart(u8, l[2..], " =");
+            const v = std.mem.trim(u8, std.mem.trim(u8, rest, " \t\r\n"), "\"");
+            if (v.len != 0) try out.append(allocator, try allocator.dupe(u8, v));
+        }
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 /// Which in-repo packs `import_prefixes` pulls in, as a bitmask over
@@ -1544,7 +1572,7 @@ fn packMeta(io: Io, idx: usize) Allocator.Error!*const PackMeta {
 fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_coroutines: bool, scratch: Allocator) Allocator.Error!u8 {
     var mask: u8 = 0;
     var idx: usize = 0;
-    while (idx < 3) : (idx += 1) {
+    while (idx < N_PACK_DIRS) : (idx += 1) {
         const meta = try packMeta(io, idx);
         var wanted = false;
         var it = import_prefixes.keyIterator();
@@ -1561,6 +1589,29 @@ fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_
         if (std.mem.eql(u8, meta.lib_id, "kotlinx.atomicfu") and imports_coroutines) wanted = true;
         if (wanted) mask |= @as(u8, 1) << @intCast(idx);
     }
+    // Manifest-dependency closure: a selected pack pulls the packs its
+    // klio.toml declares, transitively (compose -> kotlinx.coroutines +
+    // androidx.collection -> kotlinx.atomicfu).
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var i: usize = 0;
+        while (i < N_PACK_DIRS) : (i += 1) {
+            if (mask & (@as(u8, 1) << @intCast(i)) == 0) continue;
+            const m = try packMeta(io, i);
+            for (m.deps) |dep| {
+                var j: usize = 0;
+                while (j < N_PACK_DIRS) : (j += 1) {
+                    if (mask & (@as(u8, 1) << @intCast(j)) != 0) continue;
+                    const jm = try packMeta(io, j);
+                    if (std.mem.eql(u8, jm.lib_id, dep)) {
+                        mask |= @as(u8, 1) << @intCast(j);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
     return mask;
 }
 
@@ -1576,7 +1627,7 @@ fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask:
         }
     }
     var idx: usize = 0;
-    while (idx < 3) : (idx += 1) {
+    while (idx < N_PACK_DIRS) : (idx += 1) {
         if (mask & (@as(u8, 1) << @intCast(idx)) == 0) continue;
         const pmeta = try packMeta(io, idx);
         for (pmeta.import_prefixes) |imp| {
@@ -1595,7 +1646,7 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!
     defer base_lock.unlock();
 
     const a = baseArenaAllocator();
-    if (base_entries == null) base_entries = std.AutoHashMap(u8, ?*const BaseEntry).init(std.heap.page_allocator);
+    if (base_entries == null) base_entries = std.AutoHashMap(u16, ?*const BaseEntry).init(std.heap.page_allocator);
     const key = baseKey(mode, mask, full);
     if (base_entries.?.get(key)) |hit| return hit;
 
