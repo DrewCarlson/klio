@@ -1227,7 +1227,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // at runtime instead.
         if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
             b.module.classIdExactImport(name0, segments[0].span.file) == null and
-            !(inReceiverContext(b) and b.module.registry.class_member_names.contains(name0)))
+            !(inReceiverContext(b) and anyReceiverClassDeclares(b, name0)))
         {
             // A bare read whose only declaration is an unimported
             // cross-package property is unresolved (kotlinc rejects it).
@@ -4490,7 +4490,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     // context, bind it directly — no class declares the name as a member, so a
     // `this.<name>` redispatch would invoke the receiver itself.
     if (res.target == null and !shadowed_by_class and inReceiverContext(b) and
-        ir.isAliasName(name0) and !b.module.registry.class_member_names.contains(name0) and
+        ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0) and
         b.resolve(name0) == null and !b.knowsOuter(name0))
     {
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
@@ -4648,7 +4648,7 @@ fn recordOutOfScopeCall(
     // the only package-scope candidate is unimported. kotlinc resolves
     // `fun Source.discard() { request(count) }` to the receiver's
     // `request` member, not the package-scope `request` function.
-    if (inReceiverContext(b) and b.module.registry.class_member_names.contains(name)) return false;
+    if (inReceiverContext(b) and anyReceiverClassDeclares(b, name)) return false;
     // Only the index's own out-of-scope verdicts count: a unique
     // exact-arity match, or a tier-5 candidate set (identical or
     // type-distinct). Loose-shape deferrals (arity/default/vararg/
@@ -4945,6 +4945,22 @@ fn ownerChainShadowContains(b: *const FuncBuilder, owner: []const u8, name: []co
 /// member-shadow question is answered by its own hierarchy rather than
 /// the program-wide name universe. Mirrored into `ResolveCtx` so
 /// `resolveCall`'s Phase C asks the identical question.
+/// The direct-bind guards' question — "does any class this context's
+/// receiver could be declare `name` as a member". Unlike
+/// `memberShadowPossible`, an unknown-receiver context (lambda, thunk,
+/// extension body) does NOT answer true: the alias / container-creator /
+/// prop-read guards bind DIRECT precisely when no class declares the name,
+/// and only a plain method body (receiver types statically known) may
+/// narrow the program-wide universe to its own+outer hierarchies.
+fn anyReceiverClassDeclares(b: *const FuncBuilder, name: []const u8) bool {
+    if (receiverTypeKnown(b, name)) {
+        if (b.ownerClass()) |oc| {
+            if (ownerChainShadowContains(b, oc, name)) |ans| return ans;
+        }
+    }
+    return b.module.registry.class_member_names.contains(name);
+}
+
 fn receiverTypeKnown(b: *const FuncBuilder, name0: []const u8) bool {
     if (b.capturesThisSlot() or b.isParamThunk() or
         (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name0))) return false;
@@ -5708,7 +5724,7 @@ fn lowerUnresolvedBareCall(
     // proofs. Bind the global value directly and carry the type args so the
     // creation-site stamp (`runtime.attachDeclaredElemTypes`) runs.
     if (ast_type_args.len != 0 and emptyContainerCreatorArity(name0) != 0 and
-        b.module.funcId(name0) == null and !b.module.registry.class_member_names.contains(name0))
+        b.module.funcId(name0) == null and !anyReceiverClassDeclares(b, name0))
     {
         orEmitAudit(b, "container_creator_typed", "LoadGlobal", name0);
         const callee_r = b.allocReg();
@@ -5756,7 +5772,7 @@ fn lowerUnresolvedBareCall(
     // the implicit receiver. Bind the global directly: routing it through
     // `CallMemberOrGlobal` would let the member/extension probe treat it as an
     // extension on `this` and prepend the receiver into its varargs.
-    if (ir.isAliasName(name0) and !b.module.registry.class_member_names.contains(name0)) {
+    if (ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0)) {
         orEmitAudit(b, "unresolved_bare_call", "LoadGlobal", name0);
         const callee_r = b.allocReg();
         const nm0 = try b.module.internConst(b.allocator, .{ .String = name0 });
