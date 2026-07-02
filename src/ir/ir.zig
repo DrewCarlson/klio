@@ -916,6 +916,13 @@ pub const Module = struct {
     /// two-phase build a `klio test` module lowers user files against).
     /// Lowering-only; not serialized.
     decl_ast_body: std.AutoHashMap(u32, void),
+    /// Unified per-`FuncId` declaration record — the canonical-index
+    /// substrate for receiver-type membership queries and exact static
+    /// binds. Top-level functions fill at phase-1 header registration;
+    /// class members fill during class-body lowering (the piece the
+    /// split `decl_user_*` tables never covered). Lowering-only; not
+    /// serialized.
+    decl_sigs: std.AutoHashMap(u32, DeclSig),
     /// Lowering-time resolution diagnostics: ambiguous bare calls the
     /// symbol index refused to pick among. Recorded during lowering and
     /// surfaced by the build driver before the program runs. The name
@@ -932,6 +939,25 @@ pub const Module = struct {
         required: u32,
         total: u32,
         has_vararg: bool,
+    };
+
+    /// One declaration's resolved signature record (see `decl_sigs`).
+    pub const DeclSig = struct {
+        /// Enclosing class for an instance method / member extension,
+        /// null for top-level declarations.
+        enclosing_class: ?ClassId = null,
+        /// Declared extension receiver type (structural), else null.
+        receiver_ty: ?TypeRef = null,
+        /// Declared user-parameter `(required, total, has_vararg)`.
+        arity: DeclArity,
+        /// Declared user-parameter structural types (`loweredTypeRef`),
+        /// excluding any implicit receiver slot.
+        sig: []const TypeRef = &.{},
+        kind: FuncKind = .plain,
+        is_inline: bool = false,
+        is_suspend: bool = false,
+        /// The declaration carries a source body.
+        has_body: bool = false,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -1030,6 +1056,7 @@ pub const Module = struct {
             .decl_user_sig = std.AutoHashMap(u32, []TypeRef).init(allocator),
             .decl_span = std.AutoHashMap(u32, Span).init(allocator),
             .decl_ast_body = std.AutoHashMap(u32, void).init(allocator),
+            .decl_sigs = std.AutoHashMap(u32, DeclSig).init(allocator),
         };
     }
 
@@ -1129,6 +1156,7 @@ pub const Module = struct {
         }
         self.decl_span.deinit();
         self.decl_ast_body.deinit();
+        self.decl_sigs.deinit();
         self.resolve_diags.deinit(allocator);
     }
 
@@ -1195,6 +1223,10 @@ pub const Module = struct {
         {
             var it = self.decl_ast_body.keyIterator();
             while (it.next()) |k| try out.decl_ast_body.put(k.*, {});
+        }
+        {
+            var it = self.decl_sigs.iterator();
+            while (it.next()) |e| try out.decl_sigs.put(e.key_ptr.*, e.value_ptr.*);
         }
         try out.resolve_diags.appendSlice(a, self.resolve_diags.items);
         return out;

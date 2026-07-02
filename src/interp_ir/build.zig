@@ -1531,6 +1531,7 @@ fn buildModuleWithOverrides(
             try gop.value_ptr.append(a, id);
             if (f.is_tailrec) try module.tailrec_fn_names.append(a, f.name.name);
             try module.decl_user_params.put(id.int(), @intCast(f.params.len));
+            var arity: ir.Module.DeclArity = undefined;
             {
                 var has_vararg = false;
                 var required: u32 = 0;
@@ -1538,8 +1539,10 @@ fn buildModuleWithOverrides(
                     if (p.is_vararg) has_vararg = true;
                     if (p.default == null and !p.is_vararg) required += 1;
                 }
-                try module.decl_user_arity.put(id.int(), .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg });
+                arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg };
+                try module.decl_user_arity.put(id.int(), arity);
             }
+            var decl_sig: []ir.TypeRef = &.{};
             {
                 // Declared parameter types at full structural
                 // granularity, rendered by the SAME lowering body params
@@ -1551,7 +1554,17 @@ fn buildModuleWithOverrides(
                     sig[i] = try ir.lower.decl.loweredTypeRef(a, &p.ty, true);
                 }
                 try module.decl_user_sig.put(id.int(), sig);
+                decl_sig = sig;
             }
+            try module.decl_sigs.put(id.int(), .{
+                .receiver_ty = if (f.receiver_type) |*rt| try ir.lower.decl.loweredTypeRef(a, rt, true) else null,
+                .arity = arity,
+                .sig = decl_sig,
+                .kind = if (f.receiver_type != null) .top_level_extension else .plain,
+                .is_inline = f.is_inline,
+                .is_suspend = f.is_suspend,
+                .has_body = f.body != null,
+            });
             try module.decl_span.put(id.int(), f.span);
             if (f.body != null) try module.decl_ast_body.put(id.int(), {});
             // Type-parameter names, registered at header time so a body
