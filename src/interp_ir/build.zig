@@ -218,6 +218,11 @@ pub const BuiltModule = struct {
     instance_prop_getters: PairFuncMap,
     /// Custom-setter `FuncIds`, keyed the same as getters.
     instance_prop_setters: PairFuncMap,
+    /// Getter-backed body properties declared `private`, keyed the same as
+    /// getters. A private property never participates in override dispatch,
+    /// so the scope-qualified property walk skips these on any class other
+    /// than the lexical owner.
+    instance_prop_private: PairFuncMap,
     /// Parent-ctor argument thunks per class.
     parent_ctor_args: std.StringHashMap([]FuncId),
     /// `init { ... }` blocks per class. Each `FuncId` takes `this`.
@@ -265,6 +270,7 @@ pub const BuiltModule = struct {
         self.body_prop_inits.deinit();
         self.instance_prop_getters.deinit();
         self.instance_prop_setters.deinit();
+        self.instance_prop_private.deinit();
         self.parent_ctor_args.deinit();
         self.init_blocks.deinit();
         self.top_level_props.deinit(self.allocator);
@@ -302,6 +308,7 @@ fn emptyBuilt(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) Built
         .body_prop_inits = PairFuncMap.init(allocator),
         .instance_prop_getters = PairFuncMap.init(allocator),
         .instance_prop_setters = PairFuncMap.init(allocator),
+        .instance_prop_private = PairFuncMap.init(allocator),
         .parent_ctor_args = std.StringHashMap([]FuncId).init(allocator),
         .init_blocks = std.StringHashMap([]FuncId).init(allocator),
         .top_level_props = .empty,
@@ -752,6 +759,25 @@ fn collectHierarchyMethodNames(start: []const u8, by_name: *const FileClasses, o
         if (m.* == .Function) try out.put(m.Function.name.name, {});
     }
     for (c.supertypes) |*st| try collectHierarchyMethodNames(st.name.name, by_name, out, seen);
+}
+
+/// Transitive member-NAME set for the member-shadow gate: every kind a bare
+/// name could bind through the implicit receiver (functions, properties,
+/// primary-ctor `val`/`var` params, nested-object/companion members), walked
+/// through the supertype chain. Returns false when any supertype in the
+/// chain is not resolvable from this build's class set — the set is then
+/// INCOMPLETE and must not be used to prove non-shadowability.
+fn collectHierarchyShadowNames(start: []const u8, by_name: *const FileClasses, out: *StringSet, seen: *StringSet) Allocator.Error!bool {
+    const gop = try seen.getOrPut(start);
+    if (gop.found_existing) return true;
+    const ref = by_name.get(start) orelse return false;
+    const c = ref.get();
+    try collectClassMemberNamesInto(out, c.primary_params, c.members);
+    var complete = true;
+    for (c.supertypes) |*st| {
+        if (!try collectHierarchyShadowNames(st.name.name, by_name, out, seen)) complete = false;
+    }
+    return complete;
 }
 
 /// Collect a class's transitive supertype simple names, nearest first:
@@ -1211,6 +1237,23 @@ fn buildModuleWithOverrides(
             try module.registry.hierarchy_methods.put(cname.*, methods);
         }
     }
+    // Per-class transitive shadow-name set (all member kinds) for the
+    // receiver-type-precise member-shadow gate, with the completeness bit
+    // that keeps an unresolvable supertype chain conservative. Lookups fall
+    // back to the program-wide set when a class has no entry (image-loaded
+    // base classes: their method bodies' emissions were baked with the full
+    // tables, so they never consult this).
+    {
+        var it = file_classes.keyIterator();
+        while (it.next()) |cname| {
+            if (module.registry.hierarchy_shadow_names.contains(cname.*)) continue;
+            var names = StringSet.init(a);
+            var seen = StringSet.init(a);
+            defer seen.deinit();
+            const complete = try collectHierarchyShadowNames(cname.*, &file_classes, &names, &seen);
+            try module.registry.hierarchy_shadow_names.put(cname.*, .{ .names = names, .complete = complete });
+        }
+    }
     // Program-wide member-name universe: every name some class declares
     // as a member (function, property, primary-ctor property, companion /
     // nested-object member). A bare name in a receiver context is only
@@ -1524,6 +1567,7 @@ fn buildModuleWithOverrides(
             try gop.value_ptr.append(a, id);
             if (f.is_tailrec) try module.tailrec_fn_names.append(a, f.name.name);
             try module.decl_user_params.put(id.int(), @intCast(f.params.len));
+            var arity: ir.Module.DeclArity = undefined;
             {
                 var has_vararg = false;
                 var required: u32 = 0;
@@ -1531,8 +1575,10 @@ fn buildModuleWithOverrides(
                     if (p.is_vararg) has_vararg = true;
                     if (p.default == null and !p.is_vararg) required += 1;
                 }
-                try module.decl_user_arity.put(id.int(), .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg });
+                arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg };
+                try module.decl_user_arity.put(id.int(), arity);
             }
+            var decl_sig: []ir.TypeRef = &.{};
             {
                 // Declared parameter types at full structural
                 // granularity, rendered by the SAME lowering body params
@@ -1544,7 +1590,17 @@ fn buildModuleWithOverrides(
                     sig[i] = try ir.lower.decl.loweredTypeRef(a, &p.ty, true);
                 }
                 try module.decl_user_sig.put(id.int(), sig);
+                decl_sig = sig;
             }
+            try module.decl_sigs.put(id.int(), .{
+                .receiver_ty = if (f.receiver_type) |*rt| try ir.lower.decl.loweredTypeRef(a, rt, true) else null,
+                .arity = arity,
+                .sig = decl_sig,
+                .kind = if (f.receiver_type != null) .top_level_extension else .plain,
+                .is_inline = f.is_inline,
+                .is_suspend = f.is_suspend,
+                .has_body = f.body != null,
+            });
             try module.decl_span.put(id.int(), f.span);
             if (f.body != null) try module.decl_ast_body.put(id.int(), {});
             // Type-parameter names, registered at header time so a body
@@ -1666,6 +1722,7 @@ fn buildModuleWithOverrides(
     var body_prop_inits = if (seed) |*s| s.body_prop_inits else PairFuncMap.init(a);
     var instance_prop_getters = if (seed) |*s| s.instance_prop_getters else PairFuncMap.init(a);
     var instance_prop_setters = if (seed) |*s| s.instance_prop_setters else PairFuncMap.init(a);
+    var instance_prop_private = if (seed) |*s| s.instance_prop_private else PairFuncMap.init(a);
     var delegated_body_props = if (seed) |*s| s.delegated_body_props else StrPairSet.init(a);
     var primary_ctor_default_thunks = if (seed) |*s| s.primary_ctor_default_thunks else std.StringHashMap([]?FuncId).init(a);
     for (decls) |*d| {
@@ -1750,6 +1807,12 @@ fn buildModuleWithOverrides(
                 const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
                 if (!std.mem.eql(u8, cfqn, c.name.name)) {
                     try instance_prop_getters.put(.{ .a = cfqn, .b = p.name.name }, fid);
+                }
+                if (p.visibility == .Private) {
+                    try instance_prop_private.put(.{ .a = c.name.name, .b = p.name.name }, fid);
+                    if (!std.mem.eql(u8, cfqn, c.name.name)) {
+                        try instance_prop_private.put(.{ .a = cfqn, .b = p.name.name }, fid);
+                    }
                 }
             }
             if (p.setter) |setter| {
@@ -2388,6 +2451,7 @@ fn buildModuleWithOverrides(
         .classes = classes,
         .body_prop_inits = body_prop_inits,
         .instance_prop_getters = instance_prop_getters,
+        .instance_prop_private = instance_prop_private,
         .instance_prop_setters = instance_prop_setters,
         .parent_ctor_args = parent_ctor_args,
         .init_blocks = init_blocks,
@@ -3050,6 +3114,7 @@ fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!Buil
     try copyPairMap(&out.body_prop_inits, &base.body_prop_inits);
     try copyPairMap(&out.instance_prop_getters, &base.instance_prop_getters);
     try copyPairMap(&out.instance_prop_setters, &base.instance_prop_setters);
+    try copyPairMap(&out.instance_prop_private, &base.instance_prop_private);
     try copyStrMap([]FuncId, &out.parent_ctor_args, &base.parent_ctor_args);
     try copyStrMap([]FuncId, &out.init_blocks, &base.init_blocks);
     try out.top_level_props.appendSlice(a, base.top_level_props.items);

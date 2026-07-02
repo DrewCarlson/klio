@@ -16,9 +16,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      # Submodules are populated explicitly, not by the checkout action's
+      # recursive fetch, which exits git 128 on the sparse `update = none`
+      # vendor trees that do not exist at clone time (kotlin/compose/androidx/
+      # mosaic). A plain update fetches the regular kotlinx + ktor trees and
+      # cleanly skips the `update = none` ones.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          submodules: recursive
+
+      - name: fetch vendored submodules (kotlinx + ktor)
+        run: git submodule update --init --recursive
 
       - name: install zig 0.16.0
         run: |

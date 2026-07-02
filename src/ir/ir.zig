@@ -426,6 +426,12 @@ pub const Inst = union(enum) {
         /// receiver-lambda (`collect` in `FlowCollector.()`) can miss the
         /// lambda receiver and bind the outer one.
         recv: ?Reg = null,
+        /// The enclosing extension's declared receiver type head, recorded at
+        /// lowering so the runtime walk resolves same-name extensions against
+        /// the STATIC type, as kotlinc does — even when the executing frame is
+        /// a synthesized closure (a suspend body) whose own kind carries no
+        /// receiver.
+        static_recv: ?ConstId = null,
     },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host.store_global` so a
@@ -916,6 +922,13 @@ pub const Module = struct {
     /// two-phase build a `klio test` module lowers user files against).
     /// Lowering-only; not serialized.
     decl_ast_body: std.AutoHashMap(u32, void),
+    /// Unified per-`FuncId` declaration record — the canonical-index
+    /// substrate for receiver-type membership queries and exact static
+    /// binds. Top-level functions fill at phase-1 header registration;
+    /// class members fill during class-body lowering (the piece the
+    /// split `decl_user_*` tables never covered). Lowering-only; not
+    /// serialized.
+    decl_sigs: std.AutoHashMap(u32, DeclSig),
     /// Lowering-time resolution diagnostics: ambiguous bare calls the
     /// symbol index refused to pick among. Recorded during lowering and
     /// surfaced by the build driver before the program runs. The name
@@ -932,6 +945,25 @@ pub const Module = struct {
         required: u32,
         total: u32,
         has_vararg: bool,
+    };
+
+    /// One declaration's resolved signature record (see `decl_sigs`).
+    pub const DeclSig = struct {
+        /// Enclosing class for an instance method / member extension,
+        /// null for top-level declarations.
+        enclosing_class: ?ClassId = null,
+        /// Declared extension receiver type (structural), else null.
+        receiver_ty: ?TypeRef = null,
+        /// Declared user-parameter `(required, total, has_vararg)`.
+        arity: DeclArity,
+        /// Declared user-parameter structural types (`loweredTypeRef`),
+        /// excluding any implicit receiver slot.
+        sig: []const TypeRef = &.{},
+        kind: FuncKind = .plain,
+        is_inline: bool = false,
+        is_suspend: bool = false,
+        /// The declaration carries a source body.
+        has_body: bool = false,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -1030,6 +1062,7 @@ pub const Module = struct {
             .decl_user_sig = std.AutoHashMap(u32, []TypeRef).init(allocator),
             .decl_span = std.AutoHashMap(u32, Span).init(allocator),
             .decl_ast_body = std.AutoHashMap(u32, void).init(allocator),
+            .decl_sigs = std.AutoHashMap(u32, DeclSig).init(allocator),
         };
     }
 
@@ -1129,6 +1162,7 @@ pub const Module = struct {
         }
         self.decl_span.deinit();
         self.decl_ast_body.deinit();
+        self.decl_sigs.deinit();
         self.resolve_diags.deinit(allocator);
     }
 
@@ -1195,6 +1229,10 @@ pub const Module = struct {
         {
             var it = self.decl_ast_body.keyIterator();
             while (it.next()) |k| try out.decl_ast_body.put(k.*, {});
+        }
+        {
+            var it = self.decl_sigs.iterator();
+            while (it.next()) |e| try out.decl_sigs.put(e.key_ptr.*, e.value_ptr.*);
         }
         try out.resolve_diags.appendSlice(a, self.resolve_diags.items);
         return out;
@@ -1971,6 +2009,11 @@ pub const Module = struct {
         in_receiver_context: bool = false,
         unknown_receiver: bool = false,
         enclosing_has_member: bool = false,
+        /// The body's receiver type is statically known (a plain method
+        /// body): the member-shadow question was answered precisely by its
+        /// own hierarchy in `enclosing_has_member`, so Phase C must not
+        /// widen it back through the program-wide member-name universe.
+        receiver_known: bool = false,
         has_type_args: bool = false,
         cast_pick: ?FuncId = null,
         recv_ty: ?[]const u8 = null,
@@ -1991,6 +2034,14 @@ pub const Module = struct {
     /// gate `expr.zig`'s `arityMatch` applies, mirrored here so the receiver
     /// rebind ranks candidates identically.
     fn arityMatchFid(self: *const Module, id: FuncId, want: usize) bool {
+        // Canonical record first: stub-safe during two-phase / pack lowering
+        // (the lowered body params do not exist yet, but the declaration's
+        // arity is known from phase-1).
+        if (self.decl_sigs.get(id.int())) |ds| {
+            if (!ds.has_body) return false;
+            if (ds.arity.has_vararg) return false;
+            return ds.arity.total == want;
+        }
         const f = self.funcById(id) orelse return false;
         if (!f.hasBody()) return false;
         if (f.params.len != 0 and f.params[f.params.len - 1].is_vararg) return false;
@@ -2000,8 +2051,15 @@ pub const Module = struct {
     /// The candidate's declared receiver head equals `recv` — a body-bearing
     /// extension whose synthesized `this` matches the enclosing receiver.
     fn matchesRecvFid(self: *const Module, id: FuncId, recv: []const u8) bool {
+        // The canonical record first: it carries the declared receiver even
+        // while the candidate is a phase-1 header stub (two-phase and pack
+        // lowering resolve bodies against stubs, so a body requirement here
+        // would blind the receiver-match rule exactly when it matters).
+        if (self.decl_sigs.get(id.int())) |ds| {
+            if (ds.receiver_ty) |rt| return std.mem.eql(u8, rt.name, recv);
+        }
         const f = self.funcById(id) orelse return false;
-        if (!f.hasBody() or f.params.len == 0) return false;
+        if (f.params.len == 0) return false;
         return std.mem.eql(u8, f.params[0].name, "this") and
             std.mem.eql(u8, f.params[0].ty.name, recv);
     }
@@ -2189,12 +2247,16 @@ pub const Module = struct {
         }
         // Prefer the same-name extension overload whose declared receiver
         // matches the enclosing extension's receiver.
+        var heur_recv_matched = false;
         if (heur) |chosen| {
             if (ctx.recv_ty) |recv| {
-                if (!self.matchesRecvFid(chosen, recv)) {
+                if (self.matchesRecvFid(chosen, recv)) {
+                    heur_recv_matched = true;
+                } else {
                     for (self.funcsBySimpleName(name)) |cid| {
                         if (self.arityMatchFid(cid, args.len) and self.matchesRecvFid(cid, recv)) {
                             heur = cid;
+                            heur_recv_matched = true;
                             break;
                         }
                     }
@@ -2202,13 +2264,36 @@ pub const Module = struct {
             }
         }
 
-        const target: ?FuncId = if (heur) |h| self.preferredBareTargetLike(h, index_pick) else null;
+        // A receiver-matched pick is Kotlin's static resolution: inside
+        // `FlowCollector<T>.emitAllImpl`, bare `ensureActive()` binds the
+        // FlowCollector extension, never the Job one the index may have
+        // ranked first. Only an index pick with the SAME declared receiver
+        // may still take precedence.
+        const target: ?FuncId = if (heur) |h| blk: {
+            if (heur_recv_matched) {
+                const idx_also_matches = if (index_pick) |ip|
+                    self.matchesRecvFid(ip, ctx.recv_ty.?)
+                else
+                    false;
+                if (!idx_also_matches) break :blk h;
+            }
+            break :blk self.preferredBareTargetLike(h, index_pick);
+        } else null;
         const tier: u8 = if (ires.tier != 255) ires.tier else self.lowestVisibleTier(name, caller_pkg, caller_file);
 
         // Phase C — EMIT FORM.
         var res = try self.emitFormFor(alloc, name, caller_pkg, caller_file, target, tier, reason, ires.tier_count, args, ctx);
         if (res.emit_form == .Call) {
-            if (res.target) |t| res.ty_proven = self.tyProvenPick(t, args);
+            // A declared-receiver-matched extension pick is Kotlin's static
+            // resolution — final like a cast pick; the runtime value-typed
+            // re-pick must not override it (a fun-interface receiver arrives
+            // as a plain closure and would mis-score against unrelated
+            // receiver types).
+            const recv_final = heur_recv_matched and if (res.target) |t|
+                (if (heur) |h| t.int() == h.int() else false)
+            else
+                false;
+            if (res.target) |t| res.ty_proven = self.tyProvenPick(t, args) or recv_final;
         }
         return res;
     }
@@ -2260,7 +2345,7 @@ pub const Module = struct {
         ctx: ResolveCtx,
     ) std.mem.Allocator.Error!Resolution {
         const member_shadowable = ctx.unknown_receiver or ctx.enclosing_has_member or
-            self.registry.class_member_names.contains(name);
+            (!ctx.receiver_known and self.registry.class_member_names.contains(name));
         const cast_static = if (ctx.cast_pick) |cp| (if (target) |t| cp.int() == t.int() else false) else false;
         if (target) |t| {
             const is_ext = if (self.funcById(t)) |f| funcHasImplicitThis(f) else false;
@@ -2720,6 +2805,11 @@ pub const ModuleRegistry = struct {
     /// declares or inherits (transitively over supertypes). Lets the
     /// lowerer honor Kotlin's separate function/property namespaces.
     hierarchy_methods: std.StringHashMap(std.StringHashMap(void)),
+    /// Per-class transitive member-NAME set for the member-shadow gate —
+    /// every kind a bare name could bind through the implicit receiver —
+    /// plus whether the supertype chain fully resolved (`complete`). An
+    /// incomplete set must not prove non-shadowability. Lowering-only.
+    hierarchy_shadow_names: std.StringHashMap(HierarchyShadowSet),
     /// `"<class>\x00<method>\x00<userArity>"` → the lowered method's FuncId,
     /// populated incrementally as each class's method bodies are lowered. Lets
     /// a method body statically reach a SIBLING member method's lowered
@@ -2814,6 +2904,12 @@ pub const ModuleRegistry = struct {
         bound: []const u8,
     };
 
+    /// One class's transitive shadow-name set + chain completeness.
+    pub const HierarchyShadowSet = struct {
+        names: std.StringHashMap(void),
+        complete: bool,
+    };
+
     pub fn init(allocator: Allocator) ModuleRegistry {
         return .{
             .companion_singletons = std.StringHashMap([]const u8).init(allocator),
@@ -2822,6 +2918,7 @@ pub const ModuleRegistry = struct {
             .func_type_param_bounds = std.AutoHashMap(FuncId, []const TypeParamBound).init(allocator),
             .top_level_delegated_props = std.StringHashMap(void).init(allocator),
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
+            .hierarchy_shadow_names = std.StringHashMap(HierarchyShadowSet).init(allocator),
             .member_method_fids = std.StringHashMap(FuncId).init(allocator),
             .class_member_names = std.StringHashMap(void).init(allocator),
             .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
@@ -2857,6 +2954,11 @@ pub const ModuleRegistry = struct {
             self.func_type_param_bounds.deinit();
         }
         self.top_level_delegated_props.deinit();
+        {
+            var itsn = self.hierarchy_shadow_names.valueIterator();
+            while (itsn.next()) |v| v.names.deinit();
+            self.hierarchy_shadow_names.deinit();
+        }
         {
             var it = self.hierarchy_methods.valueIterator();
             while (it.next()) |inner| inner.deinit();
@@ -2961,6 +3063,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.hierarchy_methods.iterator();
             while (it.next()) |e| try out.hierarchy_methods.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.hierarchy_shadow_names.iterator();
+            while (it.next()) |e| try out.hierarchy_shadow_names.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.class_member_names.keyIterator();

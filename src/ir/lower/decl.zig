@@ -538,6 +538,32 @@ pub fn lowerClassWithExtras(
                     gop.value_ptr.* = placed.id;
                 }
             }
+            // Unified declaration record: the member half of the canonical
+            // index (the split decl_user_* tables cover only top-level
+            // declarations). Keys receiver-type membership queries and
+            // exact static member binds.
+            {
+                var has_vararg = false;
+                var required: u32 = 0;
+                for (f.params) |*p| {
+                    if (p.is_vararg) has_vararg = true;
+                    if (p.default == null and !p.is_vararg) required += 1;
+                }
+                const msig = try a.alloc(ir.TypeRef, f.params.len);
+                for (f.params, 0..) |*p, i| {
+                    msig[i] = try loweredTypeRef(a, &p.ty, true);
+                }
+                try module.decl_sigs.put(placed.id.int(), .{
+                    .enclosing_class = module.classId(c.name.name),
+                    .receiver_ty = if (f.receiver_type) |*rt| try loweredTypeRef(a, rt, true) else null,
+                    .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
+                    .sig = msig,
+                    .kind = if (f.receiver_type != null) .member_extension else .instance_method,
+                    .is_inline = f.is_inline,
+                    .is_suspend = f.is_suspend,
+                    .has_body = true,
+                });
+            }
             if (f.visibility == .Private) {
                 try private_method_fids.put(f.name.name, placed.id);
             }

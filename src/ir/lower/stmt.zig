@@ -259,6 +259,9 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         else
             null;
         const inherited_lef = try b.localExtFnNames();
+        const encl_recv = b.capturesThisSlot() or
+            (!b.this_is_plain_param and b.resolve("this") != null) or
+            b.ownerClass() != null or b.isParamThunk() or b.recvTy() != null;
         const lowered = try lowerLambdaBodyCapturingKindWith(
             b.module,
             param_idents,
@@ -269,6 +272,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             &outer_boxed,
             tailrec_self,
             true,
+            encl_recv,
             inherited_rlp,
             inherited_lef,
             enclosing_owner,

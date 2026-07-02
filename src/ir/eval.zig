@@ -3457,6 +3457,12 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // same-name extension. Hand the declared head to the strict
         // probe for exactly that candidate.
         const static_recv_ty: ?[]const u8 = blk: {
+            // The lowering-recorded declared receiver wins: the executing
+            // frame may be a synthesized closure (a suspend body) whose own
+            // kind says nothing about the extension receiver.
+            if (cmg.static_recv) |sc| {
+                if (constStr(frame.module, sc)) |sname| break :blk sname;
+            }
             switch (frame.func.kind) {
                 .top_level_extension, .member_extension => {},
                 else => break :blk null,
@@ -3466,8 +3472,11 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         };
         // Strict pass: members and receiver-compatible extensions of each
         // candidate, innermost first — the kotlinc candidate order.
-        for (cands) |c| {
-            const hint: ?[]const u8 = if (static_recv_ty != null and sameReceiver(c.v, this_val))
+        for (cands, 0..) |c, ci| {
+            // The lowering-recorded receiver type describes the innermost
+            // implicit receiver — the first candidate — regardless of the
+            // wrapper identity a suspend transform gave the value.
+            const hint: ?[]const u8 = if (static_recv_ty != null and (ci == 0 or sameReceiver(c.v, this_val)))
                 static_recv_ty
             else
                 null;
@@ -3496,8 +3505,15 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // extension-receiver match. Runs only after every receiver missed
         // strictly, so an unprovable pick never outranks a real member.
         if (resolved == null) {
-            for (cands) |c| {
-                switch (try host.callMemberNamed(allocator, &c.v, name_str, arg_values, names)) {
+            for (cands, 0..) |c, ci| {
+                const lhint: ?[]const u8 = if (static_recv_ty != null and (ci == 0 or sameReceiver(c.v, this_val)))
+                    static_recv_ty
+                else
+                    null;
+                switch (if (lhint) |sn|
+                    try host.callMemberNamedStatic(allocator, &c.v, name_str, arg_values, names, sn)
+                else
+                    try host.callMemberNamed(allocator, &c.v, name_str, arg_values, names)) {
                     .ok => |v| {
                         orAudit("CallMemberOrGlobal", name_str, "member_lenient", c.depth, &c.v);
                         resolved = v;

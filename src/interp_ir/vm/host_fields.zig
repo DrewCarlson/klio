@@ -509,16 +509,23 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         break :blk lookupPairFunc(pg.get().instance_prop_getters, cn, prop);
                     };
                     if (vfid) |fid| {
-                        if (fid.int() < mptr.funcCount()) return evalGetter(self, allocator, fid, receiver.*);
+                        // A private property never participates in override
+                        // dispatch: a same-named private declared anywhere but
+                        // the lexical owner is a different declaration (ktor:
+                        // HttpClientEngineBase's field-backed `closed` vs the
+                        // HttpClientEngine interface's private `closed`
+                        // getter). Skip it and keep walking; public inherited
+                        // getters (JobSupport's `isActive` read from a
+                        // subclass frame) still resolve through the chain.
+                        const foreign_private = !std.mem.eql(u8, cn, owner) and blk: {
+                            const pg = self.prog.borrow();
+                            defer pg.deinit();
+                            break :blk lookupPairFunc(pg.get().instance_prop_private, cn, prop) != null;
+                        };
+                        if (!foreign_private and fid.int() < mptr.funcCount()) {
+                            return evalGetter(self, allocator, fid, receiver.*);
+                        }
                     }
-                    // The virtual walk models subclass overrides only: stop at
-                    // the lexical owner. Above it, a same-named supertype
-                    // property is a different declaration the owner's scope
-                    // never referenced (ktor: HttpClientEngineBase's private
-                    // field-backed `closed` vs the HttpClientEngine
-                    // interface's private `closed` getter); the field/member
-                    // fallback below resolves genuinely inherited properties.
-                    if (std.mem.eql(u8, cn, owner)) break;
                     cur = firstSupertype(self, cn);
                 }
             }
@@ -1921,18 +1928,12 @@ fn resolveInstanceGetter(
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
     defer seen.deinit();
-    if (own_is_qualified) {
-        const cg = self.classes.borrow();
-        if (cg.get().get(firstSupertypeOf(inst) orelse class_name)) |d| {
-            const dg = d.borrow();
-            for (dg.get().supertype_names) |sn| queue.append(allocator, sn) catch {};
-            dg.deinit();
-        }
-        cg.deinit();
-        try queue.append(allocator, firstSupertypeOf(inst) orelse class_name);
-    } else {
-        try queue.append(allocator, class_name);
-    }
+    // Seed with the receiver's own class and let the loop expand supers —
+    // nearest-first. Pre-pushing the first supertype's OWN supers ahead of
+    // it inverted the order: Route's default `selector get() = null` getter
+    // was found before RoutingNode's stored ctor-param property could break
+    // the walk, so the interface default shadowed the override's field.
+    try queue.append(allocator, class_name);
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const cn = queue.items[head];
@@ -1954,9 +1955,17 @@ fn resolveInstanceGetter(
         {
             const pg = self.prog.borrow();
             const hit = lookupPairFunc(pg.get().instance_prop_getters, cn, name);
+            // A PRIVATE property never participates in inheritance: a read
+            // that may bind a private getter arrives scope-qualified
+            // (`$sgetter$<owner>`) and resolves in that walk; the inherited
+            // chain here must skip it so a base/interface private getter
+            // cannot shadow a subclass's own stored field (ktor:
+            // HttpClientEngine's private `closed` getter vs
+            // HttpClientEngineBase's field-backed atomic `closed`).
+            const private_here = lookupPairFunc(pg.get().instance_prop_private, cn, name) != null;
             pg.deinit();
-            if (hit) |fid| {
-                found = fid;
+            if (hit != null and !private_here) {
+                found = hit.?;
                 break;
             }
         }
