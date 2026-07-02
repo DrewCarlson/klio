@@ -569,9 +569,15 @@ pub fn build(b: *std.Build) void {
             run_t.addFileInput(base_images.path(b, "embedded-gate1.klio-image"));
         }
         // Module tests that interpret whole programs (e2e, bench) are as slow
-        // as the integration suite; keep them off the fast `test` step.
+        // as the integration suite; keep them off the fast `test` step. A
+        // named step (`zig build itest-e2e`) supports targeted iteration.
         if (runs_programs) {
             if (shards.includes(m.name)) itest_step.dependOn(&run_t.step);
+            const one = b.step(
+                b.fmt("itest-{s}", .{m.name}),
+                b.fmt("Run the {s} module test", .{m.name}),
+            );
+            one.dependOn(&run_t.step);
         } else {
             test_step.dependOn(&run_t.step);
         }

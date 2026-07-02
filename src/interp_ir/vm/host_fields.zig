@@ -509,16 +509,23 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         break :blk lookupPairFunc(pg.get().instance_prop_getters, cn, prop);
                     };
                     if (vfid) |fid| {
-                        if (fid.int() < mptr.funcCount()) return evalGetter(self, allocator, fid, receiver.*);
+                        // A private property never participates in override
+                        // dispatch: a same-named private declared anywhere but
+                        // the lexical owner is a different declaration (ktor:
+                        // HttpClientEngineBase's field-backed `closed` vs the
+                        // HttpClientEngine interface's private `closed`
+                        // getter). Skip it and keep walking; public inherited
+                        // getters (JobSupport's `isActive` read from a
+                        // subclass frame) still resolve through the chain.
+                        const foreign_private = !std.mem.eql(u8, cn, owner) and blk: {
+                            const pg = self.prog.borrow();
+                            defer pg.deinit();
+                            break :blk lookupPairFunc(pg.get().instance_prop_private, cn, prop) != null;
+                        };
+                        if (!foreign_private and fid.int() < mptr.funcCount()) {
+                            return evalGetter(self, allocator, fid, receiver.*);
+                        }
                     }
-                    // The virtual walk models subclass overrides only: stop at
-                    // the lexical owner. Above it, a same-named supertype
-                    // property is a different declaration the owner's scope
-                    // never referenced (ktor: HttpClientEngineBase's private
-                    // field-backed `closed` vs the HttpClientEngine
-                    // interface's private `closed` getter); the field/member
-                    // fallback below resolves genuinely inherited properties.
-                    if (std.mem.eql(u8, cn, owner)) break;
                     cur = firstSupertype(self, cn);
                 }
             }

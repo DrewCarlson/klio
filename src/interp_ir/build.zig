@@ -218,6 +218,11 @@ pub const BuiltModule = struct {
     instance_prop_getters: PairFuncMap,
     /// Custom-setter `FuncIds`, keyed the same as getters.
     instance_prop_setters: PairFuncMap,
+    /// Getter-backed body properties declared `private`, keyed the same as
+    /// getters. A private property never participates in override dispatch,
+    /// so the scope-qualified property walk skips these on any class other
+    /// than the lexical owner.
+    instance_prop_private: PairFuncMap,
     /// Parent-ctor argument thunks per class.
     parent_ctor_args: std.StringHashMap([]FuncId),
     /// `init { ... }` blocks per class. Each `FuncId` takes `this`.
@@ -265,6 +270,7 @@ pub const BuiltModule = struct {
         self.body_prop_inits.deinit();
         self.instance_prop_getters.deinit();
         self.instance_prop_setters.deinit();
+        self.instance_prop_private.deinit();
         self.parent_ctor_args.deinit();
         self.init_blocks.deinit();
         self.top_level_props.deinit(self.allocator);
@@ -302,6 +308,7 @@ fn emptyBuilt(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) Built
         .body_prop_inits = PairFuncMap.init(allocator),
         .instance_prop_getters = PairFuncMap.init(allocator),
         .instance_prop_setters = PairFuncMap.init(allocator),
+        .instance_prop_private = PairFuncMap.init(allocator),
         .parent_ctor_args = std.StringHashMap([]FuncId).init(allocator),
         .init_blocks = std.StringHashMap([]FuncId).init(allocator),
         .top_level_props = .empty,
@@ -1666,6 +1673,7 @@ fn buildModuleWithOverrides(
     var body_prop_inits = if (seed) |*s| s.body_prop_inits else PairFuncMap.init(a);
     var instance_prop_getters = if (seed) |*s| s.instance_prop_getters else PairFuncMap.init(a);
     var instance_prop_setters = if (seed) |*s| s.instance_prop_setters else PairFuncMap.init(a);
+    var instance_prop_private = if (seed) |*s| s.instance_prop_private else PairFuncMap.init(a);
     var delegated_body_props = if (seed) |*s| s.delegated_body_props else StrPairSet.init(a);
     var primary_ctor_default_thunks = if (seed) |*s| s.primary_ctor_default_thunks else std.StringHashMap([]?FuncId).init(a);
     for (decls) |*d| {
@@ -1750,6 +1758,12 @@ fn buildModuleWithOverrides(
                 const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
                 if (!std.mem.eql(u8, cfqn, c.name.name)) {
                     try instance_prop_getters.put(.{ .a = cfqn, .b = p.name.name }, fid);
+                }
+                if (p.visibility == .Private) {
+                    try instance_prop_private.put(.{ .a = c.name.name, .b = p.name.name }, fid);
+                    if (!std.mem.eql(u8, cfqn, c.name.name)) {
+                        try instance_prop_private.put(.{ .a = cfqn, .b = p.name.name }, fid);
+                    }
                 }
             }
             if (p.setter) |setter| {
@@ -2388,6 +2402,7 @@ fn buildModuleWithOverrides(
         .classes = classes,
         .body_prop_inits = body_prop_inits,
         .instance_prop_getters = instance_prop_getters,
+        .instance_prop_private = instance_prop_private,
         .instance_prop_setters = instance_prop_setters,
         .parent_ctor_args = parent_ctor_args,
         .init_blocks = init_blocks,
@@ -3050,6 +3065,7 @@ fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!Buil
     try copyPairMap(&out.body_prop_inits, &base.body_prop_inits);
     try copyPairMap(&out.instance_prop_getters, &base.instance_prop_getters);
     try copyPairMap(&out.instance_prop_setters, &base.instance_prop_setters);
+    try copyPairMap(&out.instance_prop_private, &base.instance_prop_private);
     try copyStrMap([]FuncId, &out.parent_ctor_args, &base.parent_ctor_args);
     try copyStrMap([]FuncId, &out.init_blocks, &base.init_blocks);
     try out.top_level_props.appendSlice(a, base.top_level_props.items);

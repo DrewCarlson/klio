@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -719,6 +719,7 @@ const BuiltImage = struct {
     body_prop_inits: []PairFuncEntry,
     instance_prop_getters: []PairFuncEntry,
     instance_prop_setters: []PairFuncEntry,
+    instance_prop_private: []PairFuncEntry = &.{},
     parent_ctor_args: []NameFuncs,
     init_blocks: []NameFuncs,
     top_level_props: []build.NameFunc,
@@ -1376,6 +1377,7 @@ fn builtToImage(a: Allocator, b: *const BuiltModule, out: *BuiltImage) Allocator
     out.body_prop_inits = try pairFuncToSlice(a, &b.body_prop_inits);
     out.instance_prop_getters = try pairFuncToSlice(a, &b.instance_prop_getters);
     out.instance_prop_setters = try pairFuncToSlice(a, &b.instance_prop_setters);
+    out.instance_prop_private = try pairFuncToSlice(a, &b.instance_prop_private);
     out.parent_ctor_args = try nameFuncsToSlice(a, &b.parent_ctor_args);
     out.init_blocks = try nameFuncsToSlice(a, &b.init_blocks);
     out.top_level_props = b.top_level_props.items;
@@ -2078,6 +2080,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
     for (img.body_prop_inits) |entry| try out.body_prop_inits.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     for (img.instance_prop_getters) |entry| try out.instance_prop_getters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     for (img.instance_prop_setters) |entry| try out.instance_prop_setters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    for (img.instance_prop_private) |entry| try out.instance_prop_private.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     for (img.parent_ctor_args) |entry| try out.parent_ctor_args.put(entry.name, @constCast(entry.funcs));
     for (img.init_blocks) |entry| try out.init_blocks.put(entry.name, @constCast(entry.funcs));
     try out.top_level_props.appendSlice(a, img.top_level_props);

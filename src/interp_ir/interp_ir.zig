@@ -99,6 +99,8 @@ pub const ProgramImage = struct {
     body_prop_inits: PairFuncMap,
     instance_prop_getters: PairFuncMap,
     instance_prop_setters: PairFuncMap,
+    /// Getter-backed body properties declared `private` (never virtual).
+    instance_prop_private: PairFuncMap,
     parent_ctor_args: std.StringHashMap([]FuncId),
     init_blocks: std.StringHashMap([]FuncId),
     extension_props: PairFuncMap,
@@ -253,6 +255,7 @@ pub const ProgramImage = struct {
             .body_prop_inits = PairFuncMap.init(allocator),
             .instance_prop_getters = PairFuncMap.init(allocator),
             .instance_prop_setters = PairFuncMap.init(allocator),
+            .instance_prop_private = PairFuncMap.init(allocator),
             .parent_ctor_args = std.StringHashMap([]FuncId).init(allocator),
             .init_blocks = std.StringHashMap([]FuncId).init(allocator),
             .extension_props = PairFuncMap.init(allocator),
@@ -284,6 +287,7 @@ pub const ProgramImage = struct {
         self.body_prop_inits.deinit();
         self.instance_prop_getters.deinit();
         self.instance_prop_setters.deinit();
+        self.instance_prop_private.deinit();
         self.parent_ctor_args.deinit();
         self.init_blocks.deinit();
         self.extension_props.deinit();

@@ -119,6 +119,10 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         prog.instance_prop_setters = built.instance_prop_setters;
         built.instance_prop_setters = build.PairFuncMap.init(allocator);
 
+        prog.instance_prop_private.deinit();
+        prog.instance_prop_private = built.instance_prop_private;
+        built.instance_prop_private = build.PairFuncMap.init(allocator);
+
         prog.parent_ctor_args.deinit();
         prog.parent_ctor_args = built.parent_ctor_args;
         built.parent_ctor_args = std.StringHashMap([]FuncId).init(allocator);
