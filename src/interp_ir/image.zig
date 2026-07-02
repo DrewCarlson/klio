@@ -104,6 +104,12 @@ fn isForestField(comptime T: type) bool {
 /// must stay inline).
 var bake_forest_map: ?*const std.AutoHashMap(usize, runtime.forest.ForestRef) = null;
 
+/// Decl-index base of the forest slot reserved for the image currently being
+/// loaded. Refs are baked image-local; `decodeForestField` adds this while the
+/// root payload decodes (zero outside a load — the self-contained per-decl /
+/// per-func sections carry no lazy refs, so runtime decodes are unaffected).
+var load_forest_rebase: u32 = 0;
+
 /// Encode a `ForestField`: tag 0 + `(decl, ord)` when the pointer resolves to a
 /// forest node (the lazy path), else tag 1 + the node encoded inline (synthetic
 /// nodes outside `lifted_decls`, and any encode with no forest map installed —
@@ -137,7 +143,7 @@ fn decodeForestField(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
     if (tag == 0) {
         const decl: u32 = @intCast(try d.varint());
         const ord: u32 = @intCast(try d.varint());
-        out.* = .{ .ref = .{ .decl = decl, .ord = ord } };
+        out.* = .{ .ref = .{ .decl = decl + load_forest_rebase, .ord = ord } };
     } else {
         const ptr = try d.a.create(Child);
         try decodeInto(Child, d, ptr);
@@ -1730,6 +1736,15 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
     }
 
     decode_stats_on = if (@import("builtin").link_libc) (std.c.getenv("KLIO_DECODE_STATS") != null) else false;
+    // Reserve this image's forest slot before decoding: every `ForestRef`
+    // in the payload is image-local and rebases onto the slot as it
+    // decodes, so bases from several images coexist in one process.
+    const slot = runtime.forest.reserveSlot() orelse {
+        load_failure = "forest slot registry full";
+        return null;
+    };
+    load_forest_rebase = runtime.forest.slotBase(slot);
+    defer load_forest_rebase = 0;
     const snap0 = runtime.allocTrackSnapshot();
     var d = Decoder{ .a = a, .buf = bytes[payload_start .. payload_start + payload_len] };
     const root = a.create(ImageRoot) catch return error.OutOfMemory;
@@ -1748,17 +1763,18 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
     dumpDecodeStats();
 
     const snap1 = runtime.allocTrackSnapshot();
-    const loaded = try baseFromRoot(a, root);
+    const loaded = try baseFromRoot(a, root, slot);
     runtime.allocTrackReportPhase("image.baseFromRoot", snap1);
     if (loaded == null) load_failure = "inconsistent tables";
     return loaded;
 }
 
-fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
+fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error!?Loaded {
     // Install the lazy-forest resolver first: building the base below resolves
     // forest refs (e.g. `inline_ids`), so the section/offset table and decode
     // hook must be live before any `ForestField.get()`.
-    runtime.forest.setSection(root.lifted_decl_section, root.lifted_decl_offsets, a, decodeLiftedDeclReg);
+    runtime.forest.fillSlot(slot, root.lifted_decl_section, root.lifted_decl_offsets, a, decodeLiftedDeclReg);
+    const rebase = runtime.forest.slotBase(slot);
 
     const map = try a.create(SourceMap);
     map.* = SourceMap.init(a);
@@ -1801,17 +1817,21 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot) Allocator.Error!?Loaded {
             }
             break :blk ids;
         },
+        // The name-index tables decode as plain `ForestRef` structs (not
+        // `ForestField`s), so their image-local decl indexes rebase here.
         .inline_by_name = blk: {
             const out = try a.alloc(StdlibBase.InlineNames, root.inline_by_name.len);
             for (root.inline_by_name, 0..) |entry, i| {
-                out[i] = .{ .k = entry.k, .v = entry.v };
+                const refs = try a.alloc(runtime.forest.ForestRef, entry.v.len);
+                for (entry.v, 0..) |r, j| refs[j] = .{ .decl = r.decl + rebase, .ord = r.ord };
+                out[i] = .{ .k = entry.k, .v = refs };
             }
             break :blk out;
         },
         .file_classes = blk: {
             const out = try a.alloc(StdlibBase.ClassRef, root.file_classes.len);
             for (root.file_classes, 0..) |entry, i| {
-                out[i] = .{ .k = entry.k, .v = entry.v };
+                out[i] = .{ .k = entry.k, .v = .{ .decl = entry.v.decl + rebase, .ord = entry.v.ord } };
             }
             break :blk out;
         },
@@ -2405,11 +2425,11 @@ test "forest resolver resolves a ForestRef to the decoded node" {
     const fn_ord: u32 = enc.nodes.get(.{ .addr = @intFromPtr(&decl.Function), .ty = typeId(ast.Function) }).?;
 
     const offsets = [_]u32{0};
-    runtime.forest.setSection(enc.out.items, &offsets, a, decodeLiftedDeclReg);
-    const got = runtime.forest.resolveFunction(.{ .decl = 0, .ord = fn_ord }) orelse return error.TestUnexpectedResult;
+    const base = runtime.forest.setSection(enc.out.items, &offsets, a, decodeLiftedDeclReg);
+    const got = runtime.forest.resolveFunction(.{ .decl = base, .ord = fn_ord }) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("f", got.name.name);
     // A second resolve hits the memo (same decoded pointer).
-    const got2 = runtime.forest.resolveFunction(.{ .decl = 0, .ord = fn_ord }).?;
+    const got2 = runtime.forest.resolveFunction(.{ .decl = base, .ord = fn_ord }).?;
     try testing.expect(got == got2);
 }
 
