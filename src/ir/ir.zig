@@ -2003,6 +2003,11 @@ pub const Module = struct {
         in_receiver_context: bool = false,
         unknown_receiver: bool = false,
         enclosing_has_member: bool = false,
+        /// The body's receiver type is statically known (a plain method
+        /// body): the member-shadow question was answered precisely by its
+        /// own hierarchy in `enclosing_has_member`, so Phase C must not
+        /// widen it back through the program-wide member-name universe.
+        receiver_known: bool = false,
         has_type_args: bool = false,
         cast_pick: ?FuncId = null,
         recv_ty: ?[]const u8 = null,
@@ -2292,7 +2297,7 @@ pub const Module = struct {
         ctx: ResolveCtx,
     ) std.mem.Allocator.Error!Resolution {
         const member_shadowable = ctx.unknown_receiver or ctx.enclosing_has_member or
-            self.registry.class_member_names.contains(name);
+            (!ctx.receiver_known and self.registry.class_member_names.contains(name));
         const cast_static = if (ctx.cast_pick) |cp| (if (target) |t| cp.int() == t.int() else false) else false;
         if (target) |t| {
             const is_ext = if (self.funcById(t)) |f| funcHasImplicitThis(f) else false;
@@ -2752,6 +2757,11 @@ pub const ModuleRegistry = struct {
     /// declares or inherits (transitively over supertypes). Lets the
     /// lowerer honor Kotlin's separate function/property namespaces.
     hierarchy_methods: std.StringHashMap(std.StringHashMap(void)),
+    /// Per-class transitive member-NAME set for the member-shadow gate —
+    /// every kind a bare name could bind through the implicit receiver —
+    /// plus whether the supertype chain fully resolved (`complete`). An
+    /// incomplete set must not prove non-shadowability. Lowering-only.
+    hierarchy_shadow_names: std.StringHashMap(HierarchyShadowSet),
     /// `"<class>\x00<method>\x00<userArity>"` → the lowered method's FuncId,
     /// populated incrementally as each class's method bodies are lowered. Lets
     /// a method body statically reach a SIBLING member method's lowered
@@ -2846,6 +2856,12 @@ pub const ModuleRegistry = struct {
         bound: []const u8,
     };
 
+    /// One class's transitive shadow-name set + chain completeness.
+    pub const HierarchyShadowSet = struct {
+        names: std.StringHashMap(void),
+        complete: bool,
+    };
+
     pub fn init(allocator: Allocator) ModuleRegistry {
         return .{
             .companion_singletons = std.StringHashMap([]const u8).init(allocator),
@@ -2854,6 +2870,7 @@ pub const ModuleRegistry = struct {
             .func_type_param_bounds = std.AutoHashMap(FuncId, []const TypeParamBound).init(allocator),
             .top_level_delegated_props = std.StringHashMap(void).init(allocator),
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
+            .hierarchy_shadow_names = std.StringHashMap(HierarchyShadowSet).init(allocator),
             .member_method_fids = std.StringHashMap(FuncId).init(allocator),
             .class_member_names = std.StringHashMap(void).init(allocator),
             .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
@@ -2889,6 +2906,11 @@ pub const ModuleRegistry = struct {
             self.func_type_param_bounds.deinit();
         }
         self.top_level_delegated_props.deinit();
+        {
+            var itsn = self.hierarchy_shadow_names.valueIterator();
+            while (itsn.next()) |v| v.names.deinit();
+            self.hierarchy_shadow_names.deinit();
+        }
         {
             var it = self.hierarchy_methods.valueIterator();
             while (it.next()) |inner| inner.deinit();
@@ -2993,6 +3015,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.hierarchy_methods.iterator();
             while (it.next()) |e| try out.hierarchy_methods.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.hierarchy_shadow_names.iterator();
+            while (it.next()) |e| try out.hierarchy_shadow_names.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.class_member_names.keyIterator();

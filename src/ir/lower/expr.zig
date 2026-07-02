@@ -4498,7 +4498,11 @@ fn resolveCtxFor(b: *FuncBuilder, name0: []const u8, ast_type_args: []const ast.
         .in_receiver_context = inReceiverContext(b),
         .unknown_receiver = b.capturesThisSlot() or b.isParamThunk() or
             (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name0)),
-        .enclosing_has_member = b.hasEnclosingMember(name0),
+        .enclosing_has_member = b.hasEnclosingMember(name0) or blk: {
+            const oc = b.ownerClass() orelse break :blk false;
+            break :blk (ownerChainShadowContains(b, oc, name0) orelse false);
+        },
+        .receiver_known = receiverTypeKnown(b, name0),
         .has_type_args = ast_type_args.len != 0,
         .cast_pick = cast_pick,
         .recv_ty = b.recvTy(),
@@ -4873,14 +4877,50 @@ fn fnTypedRecvCannotShadow(b: *const FuncBuilder, name: []const u8) bool {
 /// A lambda / scope-function / parameter-thunk / extension body has an implicit
 /// receiver whose concrete type is unknown at lowering time — it may be a
 /// builtin (e.g. `StringBuilder`) whose members are not in `class_member_names`
-/// — so such a body always defers. A plain method body's receiver is the
-/// enclosing class(es), checked precisely by `hasEnclosingMember`. Any other
-/// in-scope receiver falls back to the program-wide member-name set.
+/// — so such a body always defers. A plain method body's receiver type IS
+/// known: its own hierarchy (cross-file supertypes included, through the
+/// transitive per-class member set) decides precisely — a member of some
+/// unrelated class elsewhere in the program cannot shadow this call. Only a
+/// receiver whose type is genuinely unknown falls back to the program-wide
+/// member-name set.
 fn memberShadowPossible(b: *const FuncBuilder, name: []const u8) bool {
     if (b.capturesThisSlot() or b.isParamThunk() or
         (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name))) return true;
     if (b.hasEnclosingMember(name)) return true;
+    if (b.ownerClass()) |oc| {
+        if (ownerChainShadowContains(b, oc, name)) |shadowed| return shadowed;
+    }
     return b.module.registry.class_member_names.contains(name);
+}
+
+/// Whether `name` is a member anywhere along the owner class's hierarchy
+/// OR any of its lifted outer classes' hierarchies (`A$B$C` also checks
+/// `A$B` and `A` — a nested class's method body sees the outer classes as
+/// implicit receivers). Null when any set along the chain is missing or
+/// incomplete: the caller must then stay conservative.
+fn ownerChainShadowContains(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?bool {
+    var found = false;
+    var end = owner.len;
+    while (true) {
+        const hs = b.module.registry.hierarchy_shadow_names.get(owner[0..end]) orelse return null;
+        if (!hs.complete) return null;
+        if (name.len != 0 and hs.names.contains(name)) found = true;
+        const dollar = std.mem.lastIndexOfScalar(u8, owner[0..end], '$') orelse break;
+        end = dollar;
+    }
+    return found;
+}
+
+/// The receiver type at this body is statically known (a plain method
+/// body with no unknown-receiver context layered on top), so the
+/// member-shadow question is answered by its own hierarchy rather than
+/// the program-wide name universe. Mirrored into `ResolveCtx` so
+/// `resolveCall`'s Phase C asks the identical question.
+fn receiverTypeKnown(b: *const FuncBuilder, name0: []const u8) bool {
+    if (b.capturesThisSlot() or b.isParamThunk() or
+        (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name0))) return false;
+    const oc = b.ownerClass() orelse return false;
+    return ownerChainShadowContains(b, oc, "") != null;
 }
 
 var or_audit_checked: bool = false;

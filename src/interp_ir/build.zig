@@ -761,6 +761,25 @@ fn collectHierarchyMethodNames(start: []const u8, by_name: *const FileClasses, o
     for (c.supertypes) |*st| try collectHierarchyMethodNames(st.name.name, by_name, out, seen);
 }
 
+/// Transitive member-NAME set for the member-shadow gate: every kind a bare
+/// name could bind through the implicit receiver (functions, properties,
+/// primary-ctor `val`/`var` params, nested-object/companion members), walked
+/// through the supertype chain. Returns false when any supertype in the
+/// chain is not resolvable from this build's class set — the set is then
+/// INCOMPLETE and must not be used to prove non-shadowability.
+fn collectHierarchyShadowNames(start: []const u8, by_name: *const FileClasses, out: *StringSet, seen: *StringSet) Allocator.Error!bool {
+    const gop = try seen.getOrPut(start);
+    if (gop.found_existing) return true;
+    const ref = by_name.get(start) orelse return false;
+    const c = ref.get();
+    try collectClassMemberNamesInto(out, c.primary_params, c.members);
+    var complete = true;
+    for (c.supertypes) |*st| {
+        if (!try collectHierarchyShadowNames(st.name.name, by_name, out, seen)) complete = false;
+    }
+    return complete;
+}
+
 /// Collect a class's transitive supertype simple names, nearest first:
 /// each direct supertype, then that supertype's own chain. A supertype
 /// whose declaration is not in `by_name` (a pack-internal or built-in
@@ -1216,6 +1235,23 @@ fn buildModuleWithOverrides(
             defer seen.deinit();
             try collectHierarchyMethodNames(cname.*, &file_classes, &methods, &seen);
             try module.registry.hierarchy_methods.put(cname.*, methods);
+        }
+    }
+    // Per-class transitive shadow-name set (all member kinds) for the
+    // receiver-type-precise member-shadow gate, with the completeness bit
+    // that keeps an unresolvable supertype chain conservative. Lookups fall
+    // back to the program-wide set when a class has no entry (image-loaded
+    // base classes: their method bodies' emissions were baked with the full
+    // tables, so they never consult this).
+    {
+        var it = file_classes.keyIterator();
+        while (it.next()) |cname| {
+            if (module.registry.hierarchy_shadow_names.contains(cname.*)) continue;
+            var names = StringSet.init(a);
+            var seen = StringSet.init(a);
+            defer seen.deinit();
+            const complete = try collectHierarchyShadowNames(cname.*, &file_classes, &names, &seen);
+            try module.registry.hierarchy_shadow_names.put(cname.*, .{ .names = names, .complete = complete });
         }
     }
     // Program-wide member-name universe: every name some class declares
