@@ -717,10 +717,16 @@ pub const FuncBuilder = struct {
     pub fn isLambdaBody(self: *const FuncBuilder) bool {
         return self.is_lambda_body;
     }
-    pub fn setOuterNamesNamedLocalFn(self: *FuncBuilder, names: StringSet) void {
+    /// A named local function has no implicit receiver of its own; its
+    /// body sees exactly the receivers its ENCLOSING body sees. The
+    /// lambda-body flag (which makes every bare call defer to the runtime
+    /// member-first walk) is set only when the enclosing context actually
+    /// has a receiver — a local fn in a plain function resolves bare
+    /// calls statically, exactly like a top-level body.
+    pub fn setOuterNamesNamedLocalFn(self: *FuncBuilder, names: StringSet, enclosing_has_receiver: bool) void {
         self.outer_names.deinit();
         self.outer_names = names;
-        self.is_lambda_body = true;
+        self.is_lambda_body = enclosing_has_receiver;
         self.is_named_local_fn = true;
     }
     pub fn isNamedLocalFn(self: *const FuncBuilder) bool {

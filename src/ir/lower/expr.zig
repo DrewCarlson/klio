@@ -1848,6 +1848,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         &outer_boxed,
         null,
         false,
+        false,
         inherited_rlp,
         inherited_lef,
         enclosing_owner,

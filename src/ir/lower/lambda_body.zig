@@ -152,6 +152,7 @@ pub fn lowerLambdaBodyCapturingKind(
         outer_boxed,
         tailrec_self,
         false,
+        false,
         inherited_rlp,
         inherited_lef,
         enclosing_owner,
@@ -170,6 +171,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
     outer_boxed: *const StringSet,
     tailrec_self: ?[]const u8,
     is_named_local_fn: bool,
+    named_local_encl_recv: bool,
     inherited_rlp: StringSet,
     inherited_lef: StringSet,
     enclosing_owner: ?EnclosingOwner,
@@ -184,6 +186,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
         outer_boxed,
         tailrec_self,
         is_named_local_fn,
+        named_local_encl_recv,
         inherited_rlp,
         inherited_lef,
         enclosing_owner,
@@ -208,6 +211,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     outer_boxed: *const StringSet,
     tailrec_self: ?[]const u8,
     is_named_local_fn: bool,
+    named_local_encl_recv: bool,
     inherited_rlp: StringSet,
     inherited_lef: StringSet,
     enclosing_owner: ?EnclosingOwner,
@@ -230,7 +234,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         b.setEnclosingMembers(eo.members);
     }
     if (is_named_local_fn) {
-        b.setOuterNamesNamedLocalFn(outer);
+        b.setOuterNamesNamedLocalFn(outer, named_local_encl_recv);
     } else if (is_lambda) {
         b.setOuterNames(outer);
     } else {
