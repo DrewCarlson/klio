@@ -5695,23 +5695,6 @@ fn lowerUnresolvedBareCall(
         } });
         return dst;
     }
-    if (isPrimitiveConv(name0)) {
-        if (b.resolve("this")) |this_reg| {
-            const run = try lowerArgRun(b, args);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-            const dst = b.allocReg();
-            const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-            try b.push(.{ .CallMember = .{
-                .dst = dst,
-                .receiver = this_reg,
-                .name = nm,
-                .args = run[0],
-                .n_args = run[1],
-                .arg_names = arg_names,
-            } });
-            return dst;
-        }
-    }
     // A stdlib container creator (`emptyList<String>()`) called with type
     // args inside a method body. The name is a host-intrinsic global, never
     // a class member, so the runtime `this.<name>()` redispatch the general
@@ -5849,17 +5832,6 @@ fn lowerUnresolvedBareCall(
         .static_recv = try cmgStaticRecv(b),
     } });
     return dst;
-}
-
-fn isPrimitiveConv(name: []const u8) bool {
-    const names = [_][]const u8{
-        "toInt",  "toLong",    "toByte", "toShort", "toDouble", "toFloat",
-        "toChar", "toBoolean", "toUInt", "toULong", "toUByte",  "toUShort",
-    };
-    for (names) |n| {
-        if (std.mem.eql(u8, name, n)) return true;
-    }
-    return false;
 }
 
 /// Built-in stdlib companion shortcuts: `Result.success(x)`, `Result.failure(e)`.
