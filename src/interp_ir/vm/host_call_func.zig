@@ -489,7 +489,7 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     }
 
     // Builtin runtime types satisfy their nominal supertypes.
-    const builtin_supers: []const []const u8 = builtinSupersFor(v_ty);
+    const builtin_supers: []const []const u8 = applicability.builtinSupersOf(v_ty);
     const nm_simple = simpleName(nm);
     for (builtin_supers, 0..) |s, pos| {
         if (std.mem.eql(u8, s, nm) or std.mem.eql(u8, s, nm_simple)) {
@@ -509,21 +509,6 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
 
 const QItem = struct { name: []const u8, depth: i32 };
 
-fn builtinSupersFor(v_ty: []const u8) []const []const u8 {
-    const eq = std.mem.eql;
-    if (eq(u8, v_ty, "List")) return &.{ "Collection", "Iterable", "MutableList", "MutableCollection", "MutableIterable" };
-    if (eq(u8, v_ty, "MutableList")) return &.{ "List", "Collection", "Iterable", "MutableCollection", "MutableIterable" };
-    if (eq(u8, v_ty, "Set")) return &.{ "Collection", "Iterable", "MutableSet", "MutableCollection", "MutableIterable" };
-    if (eq(u8, v_ty, "MutableSet")) return &.{ "Set", "Collection", "Iterable", "MutableCollection", "MutableIterable" };
-    if (eq(u8, v_ty, "Map")) return &.{"MutableMap"};
-    if (eq(u8, v_ty, "MutableMap")) return &.{"Map"};
-    if (eq(u8, v_ty, "IntRange")) return &.{ "IntProgression", "ClosedRange", "Iterable", "OpenEndRange" };
-    if (eq(u8, v_ty, "LongRange")) return &.{ "LongProgression", "ClosedRange", "Iterable", "OpenEndRange" };
-    if (eq(u8, v_ty, "CharRange")) return &.{ "CharProgression", "ClosedRange", "Iterable", "OpenEndRange" };
-    if (eq(u8, v_ty, "IntProgression") or eq(u8, v_ty, "LongProgression") or eq(u8, v_ty, "CharProgression")) return &.{"Iterable"};
-    if (eq(u8, v_ty, "String")) return &.{ "CharSequence", "Comparable" };
-    return &.{};
-}
 
 
 /// When the target function shares its name with siblings, pick the best
