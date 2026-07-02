@@ -525,69 +525,6 @@ fn builtinSupersFor(v_ty: []const u8) []const []const u8 {
     return &.{};
 }
 
-/// Score a single candidate's applicability for `args`. `null` means
-/// inapplicable; a higher score means a better match.
-fn overloadScore(self: *VmHost, module: *const Module, cand: FuncId, args: []const Value) ?i32 {
-    const f = funcAt(module, cand) orelse return null;
-    // A bodyless `expect` declaration must never be selected over a
-    // body-carrying sibling or the host intrinsic backing the name.
-    if (!f.hasBody()) return null;
-    const last_vararg = lastIsVararg(f.params);
-    if (f.params.len < args.len and !last_vararg) return null;
-
-    // Trailing-lambda rule (mirrors `call_func`).
-    if (f.params.len > args.len and args.len > 0 and
-        isFunctionType(&f.params[f.params.len - 1].ty) and
-        valueIsCallable(&args[args.len - 1]))
-    {
-        const lead = args.len - 1;
-        const last_param = f.params.len - 1;
-        if (lead <= last_param) {
-            const defaults = funcDefaults(self, cand);
-            var gap_defaulted = true;
-            var i = lead;
-            while (i < last_param) : (i += 1) {
-                const has = defaults != null and i < defaults.?.len and defaults.?[i] != null;
-                if (!has) {
-                    gap_defaulted = false;
-                    break;
-                }
-            }
-            if (!gap_defaulted) return null;
-            var total: i32 = -1;
-            var k: usize = 0;
-            while (k < lead) : (k += 1) {
-                const s = overloadScoreArg(self, &f.params[k].ty, &args[k]) orelse return null;
-                total += s;
-            }
-            const ls = overloadScoreArg(self, &f.params[last_param].ty, &args[lead]) orelse return null;
-            total += ls;
-            return total;
-        }
-    }
-
-    if (f.params.len > args.len) {
-        const defaults = funcDefaults(self, cand);
-        var all_defaulted = true;
-        var i = args.len;
-        while (i < f.params.len) : (i += 1) {
-            const has = defaults != null and i < defaults.?.len and defaults.?[i] != null;
-            if (!has) {
-                all_defaulted = false;
-                break;
-            }
-        }
-        if (!all_defaulted) return null;
-    }
-
-    var total: i32 = if (f.params.len == args.len) 0 else -1;
-    var idx: usize = 0;
-    while (idx < f.params.len and idx < args.len) : (idx += 1) {
-        const s = overloadScoreArg(self, &f.params[idx].ty, &args[idx]) orelse return null;
-        total += s;
-    }
-    return total;
-}
 
 /// When the target function shares its name with siblings, pick the best
 /// match for the runtime arg types. `null` when there is nothing better.
@@ -1426,14 +1363,25 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     }
     if (candidates.items.len < 2) return .{ .ok = null };
 
-    // Pick the best body-carrying overload by runtime arg types.
+    // Pick the best body-carrying overload by runtime arg types through
+    // the shared applicability engine (proven zero-divergence against the
+    // legacy scorer over the full sweep before the flip).
+    if (args.len > 24) return .{ .ok = null };
+    var shapes_buf: [24]applicability.ArgShape = undefined;
+    const shapes = shapes_buf[0..args.len];
+    for (args, 0..) |*a, i| shapes[i] = shapeOfValue(self, a);
+    const scope = applicability.ApplicabilityScope{
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCb,
+        .subtype = applicSubtypeCb,
+    };
     var best_func: ?FuncId = null;
     var best_score: i32 = 0;
     for (candidates.items) |cand| {
-        if (overloadScore(self, module, cand, args)) |score| {
-            if (best_func == null or score > best_score) {
+        if (positionalPoints(self, module, cand, shapes, scope)) |total| {
+            if (best_func == null or total > best_score) {
                 best_func = cand;
-                best_score = score;
+                best_score = total;
             }
         }
     }
