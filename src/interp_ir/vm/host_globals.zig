@@ -262,6 +262,100 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
     }
 }
 
+/// Id-directed singleton access, keyed by the class's FQN so a same-named
+/// top-level value in another package can never satisfy (or be shadowed
+/// by) this object's first access: `import ...server...ContentNegotiation`
+/// must construct THE imported object even while the client package binds
+/// the same simple name to a val. Publishes under the FQN, plus the simple
+/// name when that is still unbound (uncollided readers keep the name key).
+pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.Error!MaybeValueResult {
+    const allocator = self.allocator;
+    const fqn: []const u8, const simple: []const u8 = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const m = mg.get();
+        if (class_id.int() >= m.classes.items.len) return .{ .ok = null };
+        break :blk .{ m.classes.items[class_id.int()].fqn, m.classes.items[class_id.int()].name };
+    };
+    while (true) {
+        {
+            const g = self.globals.borrow();
+            defer g.deinit();
+            if (g.get().lookup(fqn)) |v| {
+                if (v == .Instance) return .{ .ok = v };
+            }
+        }
+        switch (claimObjectInit(self, fqn)) {
+            .construct => {},
+            .reentrant => |inst| return .{ .ok = inst },
+            .failed => return .{ .err = try fileInitFailedThrow(allocator, null) },
+            .wait => {
+                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
+                continue;
+            },
+        }
+        {
+            const published: ?Value = blk: {
+                const g = self.globals.borrow();
+                defer g.deinit();
+                break :blk g.get().lookup(fqn);
+            };
+            if (published) |v| {
+                if (v == .Instance) {
+                    clearObjectState(self, fqn);
+                    return .{ .ok = v };
+                }
+            }
+        }
+        break;
+    }
+    const r = self.newInstance(allocator, class_id, &.{}, null) catch |e| {
+        clearObjectState(self, fqn);
+        return e;
+    };
+    switch (r) {
+        .ok => |inst| {
+            if (inst != .Instance) {
+                clearObjectState(self, fqn);
+                return .{ .ok = inst };
+            }
+            // A companion's enclosing class is its `outer` (same wiring as
+            // the name-keyed path): `this`-relative resolution inside
+            // companion members must see the owning class's statics.
+            if (std.mem.indexOf(u8, simple, "$Companion$")) |sep| {
+                const outer_name = simple[0..sep];
+                const outer_def: ?ObjRef(ClassDef) = blk: {
+                    const cg = self.classes.borrow();
+                    defer cg.deinit();
+                    if (cg.get().get(outer_name)) |c| break :blk c.clone();
+                    break :blk null;
+                };
+                if (outer_def) |od| {
+                    const ig = inst.Instance.borrowMut();
+                    defer ig.deinit();
+                    ig.get().outer = .{ .Class = od };
+                }
+            }
+            {
+                const g = self.globals.borrowMut();
+                defer g.deinit();
+                g.get().define(fqn, inst) catch {};
+                if (g.get().lookup(simple) == null) g.get().define(simple, inst) catch {};
+            }
+            clearObjectState(self, fqn);
+            return .{ .ok = inst };
+        },
+        .err => |e| {
+            markObjectFailed(self, fqn);
+            switch (e) {
+                .Throw => |cause| return .{ .err = try fileInitFailedThrow(allocator, cause) },
+                else => return .{ .err = e },
+            }
+        },
+    }
+}
+
 /// Non-throwing gate for resolution chains that cannot carry an error
 /// (`lookupGlobal`, pack-native lookups). An init failure resolves to
 /// null here; the throwing read paths surface it.
@@ -633,12 +727,58 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                     break :blk null;
                 };
                 if (singleton_name) |sn| {
+                    def.deinit();
+                    if (is_object) {
+                        // Identity-keyed: an already-built singleton reads
+                        // by FQN. Unbuilt, the name-keyed throwing path owns
+                        // first construction (its claim carries the init
+                        // failure with its cause) — EXCEPT when the simple
+                        // name is already bound to a FOREIGN value (a
+                        // cross-package top-level val colliding with the
+                        // imported object): then only the id-directed path
+                        // can ever construct it.
+                        {
+                            const gg = self.globals.borrow();
+                            defer gg.deinit();
+                            if (gg.get().lookup(f)) |v| {
+                                if (v == .Instance) return v;
+                            }
+                        }
+                        const simple_bound: ?Value = blk: {
+                            const gg = self.globals.borrow();
+                            defer gg.deinit();
+                            break :blk gg.get().lookup(sn);
+                        };
+                        // Our own singleton published under the simple name
+                        // (the name-keyed first construction) is not a
+                        // collision — return it, never rebuild.
+                        if (simple_bound) |v| {
+                            if (v == .Instance) {
+                                const icls: ?[]const u8 = blk: {
+                                    const g2 = v.Instance.borrow();
+                                    defer g2.deinit();
+                                    const cg2 = g2.get().class.borrow();
+                                    defer cg2.deinit();
+                                    break :blk cg2.get().fqn;
+                                };
+                                if (icls != null and std.mem.eql(u8, icls.?, f)) return v;
+                            }
+                        }
+                        const collided = simple_bound != null;
+                        if (collided) {
+                            const rr = ensureObjectSingletonById(self, cid) catch return null;
+                            return switch (rr) {
+                                .ok => |maybe| if (maybe) |v| (if (v == .Instance) v else null) else null,
+                                .err => null,
+                            };
+                        }
+                        return null;
+                    }
                     const published: ?Value = blk: {
                         const gg = self.globals.borrow();
                         defer gg.deinit();
                         break :blk gg.get().lookup(sn);
                     };
-                    def.deinit();
                     if (published) |v| {
                         if (v == .Instance) return v;
                     }
