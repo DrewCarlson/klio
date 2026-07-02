@@ -1928,18 +1928,12 @@ fn resolveInstanceGetter(
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
     defer seen.deinit();
-    if (own_is_qualified) {
-        const cg = self.classes.borrow();
-        if (cg.get().get(firstSupertypeOf(inst) orelse class_name)) |d| {
-            const dg = d.borrow();
-            for (dg.get().supertype_names) |sn| queue.append(allocator, sn) catch {};
-            dg.deinit();
-        }
-        cg.deinit();
-        try queue.append(allocator, firstSupertypeOf(inst) orelse class_name);
-    } else {
-        try queue.append(allocator, class_name);
-    }
+    // Seed with the receiver's own class and let the loop expand supers —
+    // nearest-first. Pre-pushing the first supertype's OWN supers ahead of
+    // it inverted the order: Route's default `selector get() = null` getter
+    // was found before RoutingNode's stored ctor-param property could break
+    // the walk, so the interface default shadowed the override's field.
+    try queue.append(allocator, class_name);
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const cn = queue.items[head];
