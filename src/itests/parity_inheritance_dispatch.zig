@@ -254,3 +254,29 @@ test "private_shadow_var_writes_own_cell" {
     ;
     try assertKlio("c_shadow_var", src, "11\n99\n");
 }
+
+// An initialized `override val` keeps its own backing cell alongside the
+// base's (JVM semantics): virtual reads see the override, `super.x` reads
+// the base class's own initialized value.
+test "override_val_super_reads_base_cell" {
+    const src =
+        \\
+        \\open class Base {
+        \\    open val x = 1
+        \\    fun baseRead(): Int = x
+        \\}
+        \\class Derived : Base() {
+        \\    override val x = 2
+        \\    fun superRead(): Int = super.x
+        \\}
+        \\fun main() {
+        \\    val d = Derived()
+        \\    println(d.x)
+        \\    println(d.baseRead())
+        \\    println(d.superRead())
+        \\    println((d as Base).x)
+        \\}
+        \\
+    ;
+    try assertKlio("c_shadow_override", src, "2\n2\n1\n2\n");
+}

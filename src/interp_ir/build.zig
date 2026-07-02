@@ -1302,7 +1302,7 @@ fn buildModuleWithOverrides(
             var prop_i: usize = 0;
             _ = &prop_i;
             const record = struct {
-                fn f(mod: *ir.Module, al: Allocator, cls: []const u8, sups: []const []const u8, fc: *const FileClasses, pname: []const u8) Allocator.Error!void {
+                fn f(mod: *ir.Module, al: Allocator, cls: []const u8, sups: []const []const u8, fc: *const FileClasses, pname: []const u8, as_override: bool) Allocator.Error!void {
                     for (sups) |sup| {
                         const sref = fc.get(sup) orelse continue;
                         const sc = sref.get();
@@ -1322,23 +1322,37 @@ fn buildModuleWithOverrides(
                         }
                         if (declares) {
                             const key = try std.fmt.allocPrint(al, "{s}\x1f{s}", .{ cls, pname });
-                            try mod.registry.private_shadow_props.put(key, {});
+                            if (as_override) {
+                                try mod.registry.override_cell_props.put(key, {});
+                            } else {
+                                try mod.registry.private_shadow_props.put(key, {});
+                            }
                             return;
                         }
                     }
                 }
             }.f;
             for (c.primary_params) |*p| {
-                if (p.property != null and p.visibility == .Private) {
-                    try record(module, a, cname, chain, &file_classes, p.name.name);
+                if (p.property == null) continue;
+                if (p.visibility == .Private) {
+                    try record(module, a, cname, chain, &file_classes, p.name.name, false);
+                } else {
+                    // A non-private ctor-param property matching a STORED
+                    // supertype property is necessarily an `override`
+                    // (kotlinc rejects the shadow form) — the parser does
+                    // not carry the modifier on params.
+                    try record(module, a, cname, chain, &file_classes, p.name.name, true);
                 }
             }
             for (c.members) |*m| {
                 if (m.* != .Property) continue;
                 const pr = m.Property;
-                if (pr.visibility != .Private) continue;
                 if (pr.getter != null or pr.delegate != null) continue;
-                try record(module, a, cname, chain, &file_classes, pr.name.name);
+                if (pr.visibility == .Private) {
+                    try record(module, a, cname, chain, &file_classes, pr.name.name, false);
+                } else if (pr.is_override and pr.init != null) {
+                    try record(module, a, cname, chain, &file_classes, pr.name.name, true);
+                }
             }
         }
     }

@@ -239,7 +239,8 @@ fn shadowFieldKey(self: *VmHost, cls: []const u8, prop: []const u8) []const u8 {
     const probe = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ cls, prop }) catch return prop;
     const mg = self.module.borrow();
     defer mg.deinit();
-    return mg.get().registry.private_shadow_props.getKey(probe) orelse prop;
+    if (mg.get().registry.private_shadow_props.getKey(probe)) |k| return k;
+    return mg.get().registry.override_cell_props.getKey(probe) orelse prop;
 }
 
 /// Evaluate `func` against `args`, returning its result. The module
