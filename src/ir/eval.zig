@@ -3429,6 +3429,8 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // names a class.
     const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]) and
         (cmg.class != null or frame.module.classId(name_str) != null);
+    var committed_ext_h: ?FuncId = null;
+    var committed_recv_h: ?Value = null;
     var resolved: ?Value = null;
     var first_real_err: ?EvalError = null;
     // A bare `name` bound to a captured callable in the innermost
@@ -3470,6 +3472,54 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             const idx = frameThisParam(frame) orelse break :blk null;
             break :blk frame.func.params[idx].ty.name;
         };
+        // A lowering-committed EXTENSION target: Kotlin selects extensions
+        // statically, so the runtime walk may only let true MEMBERS shadow
+        // it — the by-name extension fallback and the overload re-pick must
+        // not re-select a sibling the static evidence excluded (ktor's
+        // deprecated P.install delegates to its cast-picked sibling; a
+        // by-runtime-type re-pick binds the deprecated overload again and
+        // recurses without bound).
+        const committed_ext: ?FuncId = blk: {
+            const fid = cmg.func orelse break :blk null;
+            // Engage the static commitment only for the self-name shape: a
+            // bare call to the very name of the function it sits in, where
+            // the by-name extension re-pick can re-enter the caller instead
+            // of the sibling the lowering (cast evidence, receiver match)
+            // committed — ktor's deprecated P.install delegating to its
+            // Pipeline sibling recursed without bound. Every other deferred
+            // call keeps the runtime walk's full re-selection.
+            if (!std.mem.eql(u8, frame.func.name, name_str)) break :blk null;
+            if (fid.int() == frame.func.id.int()) break :blk null;
+            const cf = frame.module.funcById(fid) orelse break :blk null;
+            if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk fid;
+            break :blk null;
+        };
+        // The committed target binds the FIRST candidate receiver (walk
+        // order, innermost first) its declared receiver does not exclude —
+        // a bare call inside a companion-scoped context must skip the
+        // companion and land on the outer instance exactly like the
+        // name-based walk would. No fitting receiver: fall back to the
+        // name-based resolution entirely (the lowering pick can be wrong;
+        // the runtime walk corrects it).
+        committed_ext_h = null;
+        if (committed_ext) |fid| {
+            for (cands) |c| {
+                if (host.committedExtReceiverProven(allocator, fid, &c.v)) {
+                    committed_ext_h = fid;
+                    committed_recv_h = c.v;
+                    break;
+                }
+            }
+            if (committed_ext_h == null) {
+                for (cands) |c| {
+                    if (!host.committedExtReceiverDisproven(fid, &c.v)) {
+                        committed_ext_h = fid;
+                        committed_recv_h = c.v;
+                        break;
+                    }
+                }
+            }
+        }
         // Strict pass: members and receiver-compatible extensions of each
         // candidate, innermost first — the kotlinc candidate order.
         for (cands, 0..) |c, ci| {
@@ -3480,7 +3530,10 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 static_recv_ty
             else
                 null;
-            switch (try host.callMemberStrictExt(allocator, &c.v, name_str, arg_values, names, hint)) {
+            switch (if (committed_ext_h != null)
+                try host.callMemberMembersOnly(allocator, &c.v, name_str, arg_values, names, hint)
+            else
+                try host.callMemberStrictExt(allocator, &c.v, name_str, arg_values, names, hint)) {
                 .ok => |v| {
                     orAudit("CallMemberOrGlobal", name_str, "member", c.depth, &c.v);
                     resolved = v;
@@ -3510,7 +3563,9 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     static_recv_ty
                 else
                     null;
-                switch (if (lhint) |sn|
+                switch (if (committed_ext_h != null)
+                    try host.callMemberMembersOnlyLenient(allocator, &c.v, name_str, arg_values, names, lhint)
+                else if (lhint) |sn|
                     try host.callMemberNamedStatic(allocator, &c.v, name_str, arg_values, names, sn)
                 else
                     try host.callMemberNamed(allocator, &c.v, name_str, arg_values, names)) {
@@ -3534,6 +3589,22 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         }
     }
     var result: Value = undefined;
+    if (resolved == null) {
+        if (committed_ext_h) |fid| {
+            var ext_args = try allocator.alloc(Value, arg_values.len + 1);
+            defer allocator.free(ext_args);
+            ext_args[0] = committed_recv_h orelse this_val;
+            for (arg_values, 0..) |av, i| ext_args[i + 1] = av;
+            switch (try host.callFunc(allocator, frame.module, fid, ext_args)) {
+                .ok => |v| {
+                    orAudit("CallMemberOrGlobal", name_str, "committed_ext", -1, null);
+                    try frame.write(cmg.dst, v);
+                    return .cont;
+                },
+                .err => |e| return raiseStep(frame, e),
+            }
+        }
+    }
     if (resolved) |v| {
         result = v;
     } else {
@@ -3557,9 +3628,20 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             // simple-name lookup remains the unresolved fallback. A
             // runtime-scoped shadowing capture outranks the static pick,
             // as on the load form.
-            const by_id: ?Value = if ((cmg.class != null or cmg.func != null) and
+            // A committed EXTENSION func is not a plain global value — it
+            // needs its receiver prepended, which the committed-ext leg
+            // above handles (or declines). Only a non-extension func (or a
+            // class) may bind by id here; a receiverless value invocation
+            // of an extension misbinds every parameter.
+            const by_id_func: ?FuncId = blk: {
+                const fid = cmg.func orelse break :blk null;
+                const cf = frame.module.funcById(fid) orelse break :blk null;
+                if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk null;
+                break :blk fid;
+            };
+            const by_id: ?Value = if ((cmg.class != null or by_id_func != null) and
                 !host.isShadowingCapture(name_str))
-                host.lookupGlobalById(allocator, cmg.func, cmg.class)
+                host.lookupGlobalById(allocator, by_id_func, cmg.class)
             else
                 null;
             const global = if (by_id != null) by_id else switch (try host.lookupGlobalThrowing(allocator, name_str)) {
@@ -4816,6 +4898,27 @@ pub const NullHost = struct {
         return self.callMember(allocator, receiver, name, args);
     }
 
+    pub fn committedExtReceiverProven(self: *NullHost, allocator: Allocator, fid: FuncId, recv: *const Value) bool {
+        _ = self;
+        _ = allocator;
+        _ = fid;
+        _ = recv;
+        return false;
+    }
+    pub fn committedExtReceiverDisproven(self: *NullHost, fid: FuncId, recv: *const Value) bool {
+        _ = self;
+        _ = fid;
+        _ = recv;
+        return true;
+    }
+    pub fn callMemberMembersOnlyLenient(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+        _ = static_recv;
+        return self.callMemberNamed(allocator, receiver, name, args, arg_names);
+    }
+    pub fn callMemberMembersOnly(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+        _ = static_recv;
+        return self.callMemberNamed(allocator, receiver, name, args, arg_names);
+    }
     pub fn callMemberStrictExt(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
         _ = static_recv;
         return self.callMemberNamed(allocator, receiver, name, args, arg_names);

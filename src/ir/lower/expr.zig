@@ -147,7 +147,7 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // property keeps the name-keyed read — the property wins in
             // value position.
             const cls_pick: ?ir.ClassId = if (isTopLevelProp(n))
-                null
+                b.module.classIdExactImport(n, segments[0].span.file)
             else
                 b.module.classIdIndexed(n, b.self_package, segments[0].span.file);
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cls_pick } });
@@ -1154,7 +1154,11 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 } });
             } else {
                 orEmitAudit(b, "class_name_value", "LoadGlobal", name0);
-                try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = n } });
+                try b.push(.{ .LoadGlobal = .{
+                    .dst = cls,
+                    .name = n,
+                    .class = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file),
+                } });
             }
             const dst = b.allocReg();
             const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
@@ -1222,6 +1226,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // and a receiver is (or may be bound) in scope, the read decides
         // at runtime instead.
         if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
+            b.module.classIdExactImport(name0, segments[0].span.file) == null and
             !(inReceiverContext(b) and b.module.registry.class_member_names.contains(name0)))
         {
             // A bare read whose only declaration is an unimported
@@ -3623,7 +3628,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.module.classId(callee.Path.segments[0].name) == null and
         (b.module.funcId(callee.Path.segments[0].name) == null or inReceiverContext(b)))
     {
-        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
     }
 
     // Built-in stdlib companion shortcuts: `Result.success(x)` etc.
@@ -3654,7 +3659,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // merely "an unknown receiver could have it" — so a top-level helper
         // (`testEquals`) called in a lambda is left on the global path.
         if (b.resolve(nm0) == null and inReceiverContext(b) and b.hasEnclosingMember(nm0)) {
-            if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+            if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
         }
     }
     const callee_r = try lowerExpr(b, callee);
@@ -4200,8 +4205,17 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* != .Path) return null;
     const p = arg.Path;
     if (p.segments.len != 1) return null;
-    const t = b.localDeclType(p.segments[0].name) orelse return null;
-    return .{ .name = t, .nullable = false, .args = &.{} };
+    if (b.localDeclType(p.segments[0].name)) |t| {
+        return .{ .name = t, .nullable = false, .args = &.{} };
+    }
+    // A bare class name used as a value is its companion object: carry the
+    // owner class's head as type evidence so `install(RoutingRoot, ...)`
+    // cannot bind an overload whose parameter is an unrelated object type.
+    const nm = p.segments[0].name;
+    if (b.resolve(nm) == null and !b.knowsOuter(nm) and b.module.classId(nm) != null) {
+        return .{ .name = nm, .nullable = false, .args = &.{} };
+    }
+    return null;
 }
 
 /// Build the `[]ArgShape` for a call's argument list once, before the
@@ -5238,7 +5252,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     const name0 = callee.Path.segments[0].name;
 
     if (!isNonExt(b, func_id)) {
-        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+        if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, func_id)) |r| return r;
         return emitCall(b, expr, func_id, was_cast);
     }
 
@@ -5649,6 +5663,7 @@ fn lowerUnresolvedBareCall(
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
     ast_type_args: []const ast.TypeRef,
+    static_ext: ?FuncId,
 ) Allocator.Error!?Reg {
     const name0 = callee.Path.segments[0].name;
     // A bare call to a name the enclosing anon object closes over.
@@ -5804,6 +5819,7 @@ fn lowerUnresolvedBareCall(
             .n_args = run[1],
             .arg_names = arg_names,
             .recv = this_reg,
+            .func = static_ext,
             .static_recv = try cmgStaticRecv(b),
         } });
         return dst;

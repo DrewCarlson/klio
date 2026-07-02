@@ -1092,6 +1092,86 @@ fn receiverIsFunctionShaped(self: *VmHost, receiver: *const Value, pn: []const u
 }
 
 /// Is `pn` a declared type parameter of `fid`?
+/// A type-parameter extension receiver constrains dispatch by its declared
+/// bound: when the candidate's receiver head is one of its own type params
+/// and the runtime receiver's hierarchy provably excludes the bound head,
+/// the candidate is not applicable (kotlinc never considers
+/// `fun <P : Pipeline<...>> P.install` on a value that is not a Pipeline).
+/// Any positional value argument the candidate's declared parameter type
+/// definitely excludes (kotlinc applicability covers arguments, not just
+/// the receiver: `install(RoutingRoot, ...)` can never bind the overload
+/// whose plugin parameter is the unrelated ContentNegotiation object).
+/// Whether the instance's class hierarchy declares a member named `invoke`.
+/// klio accepts such an instance where a function-typed parameter is
+/// declared (`listOf("a","b").map(tagger)`), so the argument-applicability
+/// filter must not disprove it — the pre-existing dispatch arms keep their
+/// stricter surface (SAM targets and bound references only).
+fn instanceHierarchyHasInvoke(self: *VmHost, v: *const Value) bool {
+    if (v.* != .Instance) return false;
+    var cls: []const u8 = undefined;
+    {
+        const g = v.Instance.borrow();
+        const cg = g.get().class.borrow();
+        cls = cg.get().name;
+        cg.deinit();
+        g.deinit();
+    }
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    if (mg.get().registry.hierarchy_methods.get(cls)) |hm| {
+        return hm.contains("invoke");
+    }
+    return false;
+}
+
+fn candidateArgsDisproven(self: *VmHost, f: *const Func, args: []const Value) bool {
+    if (f.params.len <= 1 or args.len == 0) return false;
+    // A vararg tail repositions everything after it; decline.
+    for (f.params) |*pp| {
+        if (pp.is_vararg) return false;
+    }
+    var n = args.len;
+    // Trailing-lambda binding: a callable last argument bound to the LAST
+    // function-typed parameter over a defaulted gap (`joinTo(out, "&") {..}`)
+    // adjudicates the positional prefix only.
+    if (isCallable(&args[args.len - 1]) and
+        isFunctionTypeRef(&f.params[f.params.len - 1].ty) and
+        args.len < f.params.len - 1)
+    {
+        n = args.len - 1;
+    }
+    for (args[0..n], 0..) |*a, i| {
+        if (i + 1 >= f.params.len) break;
+        const pty = &f.params[i + 1].ty;
+        if (std.mem.startsWith(u8, pty.name, "Function") and instanceHierarchyHasInvoke(self, a)) continue;
+        if (argDefinitelyNotParamType(self, pty, a)) return true;
+    }
+    return false;
+}
+
+fn receiverViolatesTypeParamBound(self: *VmHost, fid: FuncId, param_ty: *const TypeRef, receiver: *const Value) bool {
+    const pn0 = std.mem.trimEnd(u8, simpleName(param_ty.name), "?");
+    if (!typeParamOf(self, fid, pn0)) return false;
+    const bounds: []const ir.ModuleRegistry.TypeParamBound = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().registry.func_type_param_bounds.get(fid) orelse return false;
+    };
+    for (bounds) |b| {
+        if (!std.mem.eql(u8, b.param, pn0)) continue;
+        var bn = simpleName(b.bound);
+        if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
+        bn = std.mem.trimEnd(u8, std.mem.trim(u8, bn, " "), "?");
+        if (std.mem.eql(u8, bn, "Any")) continue;
+        // A runtime Instance carries its full hierarchy: require the
+        // positive proof. Non-instance receivers (erased lambdas, boxed
+        // primitives against interface bounds) stay undecided here — the
+        // strict prover owns those.
+        if (receiver.* == .Instance and !receiverImplementsHead(self, receiver, bn)) return true;
+    }
+    return false;
+}
+
 fn typeParamOf(self: *VmHost, fid: FuncId, pn: []const u8) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -2031,6 +2111,30 @@ fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *cons
         g.deinit();
         if (!known) return false;
     }
+    // The lowering-recorded transitive chain includes interface links the
+    // runtime classes map never registers (interfaces are not instantiated),
+    // so it decides cases the BFS below would silently truncate: a companion
+    // implementing Plugin through the BaseApplicationPlugin interface IS-A
+    // Plugin.
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().registry.class_super_names.get(start)) |chain| {
+            const tailMatch = struct {
+                fn m(cur: []const u8, want: []const u8) bool {
+                    if (std.mem.eql(u8, cur, want)) return true;
+                    return cur.len > want.len and cur[cur.len - want.len - 1] == '$' and
+                        std.mem.endsWith(u8, cur, want);
+                }
+            }.m;
+            // Positive proof only: a chain may itself truncate at a pack
+            // boundary, so its silence never upgrades to definite mismatch.
+            if (tailMatch(start, pn)) return false;
+            for (chain) |sup| {
+                if (tailMatch(sup, pn)) return false;
+            }
+        }
+    }
     const a = self.allocator;
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(a);
@@ -2295,7 +2399,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
 /// stays available as the resolver's later lenient pass and as the
 /// explicit-dispatch default.
 fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool) Allocator.Error!EvalResult {
-    return callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, null);
+    return callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, null, false);
 }
 
 /// An `IrClosure`/`Function` field's declared parameter count, or null when
@@ -2361,7 +2465,7 @@ fn varargShadowedFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *con
     return try callValueRec(self, allocator, &field_val, args);
 }
 
-fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool) Allocator.Error!EvalResult {
     // A function-typed property shadowed by a same-named vararg method: invoke
     // the property when the call's argument shape matches it (see the helper).
     if (try varargShadowedFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
@@ -2929,7 +3033,13 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
 
     // Extension-fn fallback.
-    if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext, static_recv)) |r| return r;
+    // A members-only probe (the caller holds a lowering-committed extension
+    // target): Kotlin selects extensions statically, so only a true member
+    // may shadow it — the by-name extension re-pick must not re-select a
+    // sibling overload the static evidence excluded.
+    if (!no_ext) {
+        if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext, static_recv)) |r| return r;
+    }
 
     // Class-delegation forwarding (swallow all errors).
     if (receiver.* == .Instance) {
@@ -6454,6 +6564,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                 try strictReceiverProven(self, allocator, receiver, c.fid, &c.func.params[0].ty);
             if (!recv_fits) continue;
             if (!extArityApplicable(self, &c.func, want)) continue;
+            if (candidateArgsDisproven(self, &c.func, args)) continue;
             filtered.append(allocator, c) catch {};
         }
         candidates.deinit(allocator);
@@ -6480,6 +6591,17 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         // and the runtime receiver's full hierarchy excludes it, kotlinc
         // never considers the extension (`Pipeline.execute` is not a
         // candidate on a coroutine receiver).
+        {
+            var filtered: std.ArrayList(Candidate) = .empty;
+            for (candidates.items) |c| {
+                if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) continue;
+                if (candidateArgsDisproven(self, &c.func, args)) continue;
+                filtered.append(allocator, c) catch {};
+            }
+            candidates.deinit(allocator);
+            candidates = filtered;
+            if (candidates.items.len == 0) return null;
+        }
         var any_compat = false;
         for (candidates.items) |c| {
             if (receiverCompatibleWithParam(receiver, &c.func.params[0].ty) and
@@ -6889,14 +7011,14 @@ fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: *con
 // -------------------------------------------------------------------------
 
 pub fn callMemberNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, null);
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, null, false);
 }
 
 /// `callMemberNamed` with the receiver's DECLARED type head (a bare call
 /// on the implicit `this` of an extension body). Extension dispatch then
 /// resolves against the static type, as kotlinc does.
 pub fn callMemberNamedStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, static_recv);
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, static_recv, false);
 }
 
 /// Per-receiver probe for the bare-name resolver's innermost-first
@@ -6914,10 +7036,48 @@ pub fn callMemberNamedStatic(self: *VmHost, allocator: Allocator, receiver: *con
 /// `fun I.helper()` a bare `describe()` binds `I.describe` even when the
 /// runtime value is a subtype with its own `describe` extension.
 pub fn callMemberStrictExt(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv);
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, false);
 }
 
-fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+/// Whether the committed extension target's declared receiver definitely
+/// excludes `recv` — the deferred direct-call leg falls back to name-based
+/// resolution instead of executing a target the receiver cannot satisfy.
+pub fn committedExtReceiverDisproven(self: *VmHost, fid: FuncId, recv: *const Value) bool {
+    const mg = self.module.borrow();
+    const f = mg.get().funcById(fid);
+    mg.deinit();
+    const ff = f orelse return true;
+    if (ff.params.len == 0) return true;
+    if (receiverViolatesTypeParamBound(self, fid, &ff.params[0].ty, recv)) return true;
+    return argDefinitelyNotParamType(self, &ff.params[0].ty, recv);
+}
+
+/// The committed extension target's declared receiver is strictly PROVEN
+/// by `recv` (the walk's pass-1 criterion; erasure-unprovable receivers
+/// fall to the not-disproven pass).
+pub fn committedExtReceiverProven(self: *VmHost, allocator: Allocator, fid: FuncId, recv: *const Value) bool {
+    const mg = self.module.borrow();
+    const f = mg.get().funcById(fid);
+    mg.deinit();
+    const ff = f orelse return false;
+    if (ff.params.len == 0) return false;
+    return strictReceiverProven(self, allocator, recv, fid, &ff.params[0].ty) catch false;
+}
+
+/// Members-only dispatch: the strict member walk with the extension
+/// fallback suppressed, for a call whose extension target the lowering
+/// already committed.
+pub fn callMemberMembersOnly(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, true);
+}
+
+/// The lenient members-only pass (erasure-unprovable receivers), extension
+/// fallback still suppressed.
+pub fn callMemberMembersOnlyLenient(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
+    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, static_recv, true);
+}
+
+fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool) Allocator.Error!EvalResult {
     var any_named = false;
     for (arg_names) |n| {
         if (n != null) any_named = true;
@@ -6944,7 +7104,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
             }
         }
         const filled = [_]Value{ .{ .Int = @intCast(start) }, .{ .Int = @intCast(end) } };
-        return try callMemberInnerStatic(self, allocator, receiver, name, &filled, strict_ext, static_recv);
+        return try callMemberInnerStatic(self, allocator, receiver, name, &filled, strict_ext, static_recv, no_ext);
     }
 
     // Stdlib intrinsic dispatch with named args.
@@ -6986,7 +7146,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     }
 
     // Positional dispatch first.
-    const primary = try callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, static_recv);
+    const primary = try callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext);
     if (!(primary == .err and primary.err == .Unimplemented)) return primary;
 
     // Class-hierarchy method walk for a class-qualified lowered name.

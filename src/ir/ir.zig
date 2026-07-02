@@ -1504,6 +1504,23 @@ pub const Module = struct {
     /// reference site, over its FQN and declaring package. Shared by
     /// `bareCallTier` and `classIdIndexed` so both kinds rank under the
     /// same Kotlin scoping order.
+    /// The class/object this file EXACT-imports under `name` (tier-0
+    /// resolution only). A read where a same-named top-level property would
+    /// otherwise win by default still binds an explicitly imported
+    /// classifier — kotlinc gives the exact import precedence over a
+    /// cross-package property (ktor: `import ...server...ContentNegotiation`
+    /// must not read the client package's same-named top-level val).
+    pub fn classIdExactImport(self: *const Module, name: []const u8, caller_file: FileId) ?ClassId {
+        for (self.class_index.items) |entry| {
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            const c = idGet(Class, self.classes.items, entry.id.int()) orelse continue;
+            for (self.importAliasPathsIn(caller_file, name)) |p| {
+                if (std.mem.eql(u8, p.fqn, c.fqn)) return entry.id;
+            }
+        }
+        return null;
+    }
+
     fn scopeTier(self: *const Module, fqn: []const u8, pkg: []const u8, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
         for (self.importAliasPathsIn(caller_file, name)) |p| {
             if (std.mem.eql(u8, p.fqn, fqn)) return 0;
@@ -2255,6 +2272,13 @@ pub const Module = struct {
                 } else {
                     for (self.funcsBySimpleName(name)) |cid| {
                         if (self.arityMatchFid(cid, args.len) and self.matchesRecvFid(cid, recv)) {
+                            // Receiver preference never overrides argument
+                            // applicability: a candidate one of the args'
+                            // type evidence excludes is not Kotlin's pick
+                            // no matter how well its receiver matches.
+                            if (self.sigViewForApplicability(cid)) |sv| {
+                                if (applicability.applicable(&sv, args, .{}) == null) continue;
+                            }
                             heur = cid;
                             heur_recv_matched = true;
                             break;
