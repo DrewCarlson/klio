@@ -3257,6 +3257,9 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
 
 /// Whether any registered class's fqn ends in `.{name}` or `${name}` (a
 /// nested/companion class reachable by simple name from some scope).
+/// The nesting tree's conservative complement: splice windows whose owner
+/// chain is unknown cannot walk the tree, so this module-wide probe keeps
+/// a capitalized bare call from being mis-claimed as a member call.
 fn anyClassNamed(b: *FuncBuilder, name: []const u8) bool {
     for (b.module.classes.items) |*c| {
         const fqn = c.fqn;

@@ -2756,13 +2756,17 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         cg.deinit();
         const mg = self.module.borrow();
         const mod = mg.get();
-        const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
-        defer if (runtime.freeScratch()) allocator.free(fqn_probe);
-        var class_id = mod.classIdByFqn(fqn_probe);
-        if (class_id == null and !std.mem.eql(u8, cname, cfqn)) {
-            const name_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
-            defer if (runtime.freeScratch()) allocator.free(name_probe);
-            class_id = mod.classIdByFqn(name_probe);
+        // The nesting tree answers directly from the receiver's class id;
+        // the string-joined fqn probes remain only for classes the tree
+        // could not link (a legacy simple-name stub parent).
+        var class_id: ?ir.ClassId = blk: {
+            const rid = mod.classIdByFqn(cfqn) orelse mod.classId(cname) orelse break :blk null;
+            break :blk mod.classIdNestedIn(rid, name);
+        };
+        if (class_id == null) {
+            const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+            defer if (runtime.freeScratch()) allocator.free(fqn_probe);
+            class_id = mod.classIdByFqn(fqn_probe);
         }
         if (class_id == null) class_id = mod.classId(name);
         mg.deinit();
@@ -7202,13 +7206,14 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         cg.deinit();
         const mg = self.module.borrow();
         const mod = mg.get();
-        const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
-        defer if (runtime.freeScratch()) allocator.free(fqn_probe);
-        var class_id = mod.classIdByFqn(fqn_probe);
-        if (class_id == null and !std.mem.eql(u8, cname, cfqn)) {
-            const name_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
-            defer if (runtime.freeScratch()) allocator.free(name_probe);
-            class_id = mod.classIdByFqn(name_probe);
+        var class_id: ?ir.ClassId = blk: {
+            const rid = mod.classIdByFqn(cfqn) orelse mod.classId(cname) orelse break :blk null;
+            break :blk mod.classIdNestedIn(rid, name);
+        };
+        if (class_id == null) {
+            const fqn_probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
+            defer if (runtime.freeScratch()) allocator.free(fqn_probe);
+            class_id = mod.classIdByFqn(fqn_probe);
         }
         mg.deinit();
         if (class_id) |cid| {
