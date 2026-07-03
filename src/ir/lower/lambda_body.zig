@@ -303,6 +303,21 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     for (generic_typed_params) |pname| {
         try b.markGenericTypedParam(pname);
     }
+    // A local fn's params get the same classification a top-level fn's do
+    // in decl.zig: a param declared with an extension-function type
+    // (`toList: T.() -> List<*>`) is a receiver-lambda param, so a bare
+    // call `toList(array)` in the body binds `array` as the RECEIVER
+    // instead of invoking the value receiverless.
+    for (params, 0..) |pname, pi| {
+        if (pi >= param_tys.len) break;
+        const t = param_tys[pi] orelse continue;
+        if (t.function) |fnty| {
+            if (fnty.receiver != null) {
+                try b.markReceiverLambdaParam(pname.name);
+                try b.markReceiverLambdaArity(pname.name, fnty.params.len);
+            }
+        }
+    }
     const result = try expr.lowerBlock(&b, body);
     b.terminate(.{ .Return = result });
     const captured = try b.allocator.dupe([]const u8, b.capturesTaken());

@@ -302,6 +302,7 @@ pub const FuncBuilder = struct {
     /// must dispatch with the enclosing `this` as the implicit
     /// receiver.
     receiver_lambda_params: StringSet,
+    receiver_lambda_arity: std.StringHashMap(usize),
     /// Params (and locals) whose declared type is an unconstrained
     /// generic type-parameter (`T` of a `fun <T : Comparable<T>>`).
     /// Kotlin desugars a comparison operator on such an operand to
@@ -447,6 +448,7 @@ pub const FuncBuilder = struct {
             .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
             .local_ext_fns = StringSet.init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
+            .receiver_lambda_arity = std.StringHashMap(usize).init(allocator),
             .generic_typed_params = StringSet.init(allocator),
             .non_fn_params = StringSet.init(allocator),
             .reified_type_binds = StringRegMap.init(allocator),
@@ -501,6 +503,7 @@ pub const FuncBuilder = struct {
         self.local_init_exprs.deinit();
         self.local_ext_fns.deinit();
         self.receiver_lambda_params.deinit();
+        self.receiver_lambda_arity.deinit();
         self.generic_typed_params.deinit();
         self.non_fn_params.deinit();
         self.reified_type_binds.deinit();
@@ -993,6 +996,16 @@ pub const FuncBuilder = struct {
     }
     pub fn markReceiverLambdaParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.receiver_lambda_params.put(name, {});
+    }
+    /// The declared NON-receiver arity of a receiver-lambda param
+    /// (`f: T.(A) -> R` has arity 1). Disambiguates a call `f(x)`:
+    /// with arity 0 the single arg is the RECEIVER (`x.f()`), with
+    /// arity 1 it is the parameter (`this.f(x)`).
+    pub fn markReceiverLambdaArity(self: *FuncBuilder, name: []const u8, n: usize) Allocator.Error!void {
+        try self.receiver_lambda_arity.put(name, n);
+    }
+    pub fn receiverLambdaArity(self: *const FuncBuilder, name: []const u8) ?usize {
+        return self.receiver_lambda_arity.get(name);
     }
     pub fn isReceiverLambdaParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.receiver_lambda_params.contains(name);

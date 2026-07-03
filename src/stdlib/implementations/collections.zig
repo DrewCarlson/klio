@@ -6141,6 +6141,22 @@ fn longHash(bits: i64) i32 {
     return @bitCast(@as(u32, @truncate(@as(u64, @bitCast(bits ^ @as(i64, @bitCast(u >> 32)))))));
 }
 
+/// `kotlinValueHash` with member dispatch: a user instance's own
+/// hashCode() override participates, as on the JVM.
+fn valueHashDispatch(ctx: *CallCtx, v: Value) i32 {
+    switch (v) {
+        .Instance, .Exception => {
+            const r = ctx.host.invokeMethod(&v, "hashCode", &.{}, ctx.out) catch return kotlinValueHash(v);
+            if (r) |res| switch (res) {
+                .ok => |hv| if (hv == .Int) return @truncate(hv.Int),
+                .err => {},
+            };
+            return kotlinValueHash(v);
+        },
+        else => return kotlinValueHash(v),
+    }
+}
+
 fn kotlinValueHash(v: Value) i32 {
     return switch (v) {
         .Null, .Unit => 0,
@@ -6206,7 +6222,7 @@ pub fn array_content_hash_code(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(items);
     var result: i32 = 1;
     for (items) |e| {
-        result = result *% 31 +% kotlinValueHash(e);
+        result = result *% 31 +% valueHashDispatch(ctx, e);
     }
     return ok(.{ .Int = result });
 }
@@ -6285,18 +6301,18 @@ pub fn array_content_deep_equals(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .Bool = deepEq(recv, other) });
 }
 
-fn deepHashElement(v: Value) i32 {
+fn deepHashElement(ctx: *CallCtx, v: Value) i32 {
     switch (v) {
         .Array => |arr| {
             var result: i32 = 1;
             const n = arr.len();
             var i: usize = 0;
             while (i < n) : (i += 1) {
-                result = result *% 31 +% deepHashElement(arr.get(i));
+                result = result *% 31 +% deepHashElement(ctx, arr.get(i));
             }
             return result;
         },
-        else => return kotlinValueHash(v),
+        else => return valueHashDispatch(ctx, v),
     }
 }
 
@@ -6304,7 +6320,7 @@ pub fn array_content_deep_hash_code(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return typeErr("contentDeepHashCode requires a receiver");
     const recv = ctx.args[0];
     if (recv == .Null) return ok(.{ .Int = 0 });
-    return ok(.{ .Int = deepHashElement(recv) });
+    return ok(.{ .Int = deepHashElement(ctx, recv) });
 }
 
 pub fn array_contains(ctx: *CallCtx) Error!EvalResult {

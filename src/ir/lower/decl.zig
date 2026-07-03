@@ -1049,6 +1049,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         if (p.ty.function) |ft| {
             if (ft.receiver != null) {
                 try b.markReceiverLambdaParam(p.name.name);
+                if (p.ty.function) |fnty| try b.markReceiverLambdaArity(p.name.name, fnty.params.len);
             }
         }
     }

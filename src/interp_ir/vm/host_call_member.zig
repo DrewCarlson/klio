@@ -473,6 +473,59 @@ fn allUppercase(s: []const u8) bool {
 // overload_match.zig, shared with the declared-type scorer refinement.
 const builtinKindMismatch = overload_match.builtinKindMismatch;
 
+/// `kotlinHashCode` with member dispatch for user instances: containers
+/// fold their elements' USER hashCode() overrides, exactly as the JVM
+/// does. Non-container scalars delegate to the pure hash.
+fn hashWithDispatch(self: *VmHost, allocator: Allocator, v: *const Value) Allocator.Error!i32 {
+    switch (v.*) {
+        .Instance, .Exception => {
+            const r = try callMember(self, allocator, v, "hashCode", &.{});
+            switch (r) {
+                .ok => |hv| {
+                    if (hv == .Int) return @truncate(hv.Int);
+                    return kotlinHashCode(v);
+                },
+                .err => return kotlinHashCode(v),
+            }
+        },
+        .List => |l| {
+            const g = l.items.borrow();
+            defer g.deinit();
+            var h: i32 = 1;
+            for (g.get().items) |*e| h = h *% 31 +% try hashWithDispatch(self, allocator, e);
+            return h;
+        },
+        .Array => |arr| {
+            var h: i32 = 1;
+            const n = arr.len();
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                var e = arr.get(i);
+                h = h *% 31 +% try hashWithDispatch(self, allocator, &e);
+            }
+            return h;
+        },
+        .Set => |st| {
+            const g = st.items.borrow();
+            defer g.deinit();
+            var h: i32 = 0;
+            for (g.get().items) |*e| h = h +% try hashWithDispatch(self, allocator, e);
+            return h;
+        },
+        .Map => |m| {
+            const g = m.entries.borrow();
+            defer g.deinit();
+            var h: i32 = 0;
+            for (g.get().pairs.items) |*kv| h = h +% ((try hashWithDispatch(self, allocator, &kv.key)) ^ (try hashWithDispatch(self, allocator, &kv.value)));
+            return h;
+        },
+        .Pair => |pr| return (try hashWithDispatch(self, allocator, pr.first.asPtr())) *% 31 +% try hashWithDispatch(self, allocator, pr.second.asPtr()),
+        .Triple => |t| return ((try hashWithDispatch(self, allocator, t.first.asPtr())) *% 31 +% try hashWithDispatch(self, allocator, t.second.asPtr())) *% 31 +% try hashWithDispatch(self, allocator, t.third.asPtr()),
+        .MapEntry => |e| return (try hashWithDispatch(self, allocator, e.key.asPtr())) ^ (try hashWithDispatch(self, allocator, e.value.asPtr())),
+        else => return kotlinHashCode(v),
+    }
+}
+
 /// Kotlin-faithful `hashCode()` for builtin value types.
 pub fn kotlinHashCode(v: *const Value) i32 {
     return switch (v.*) {
@@ -487,9 +540,10 @@ pub fn kotlinHashCode(v: *const Value) i32 {
         .UInt => |x| @bitCast(x),
         .Long => |l| @truncate(l ^ @as(i64, @bitCast(@as(u64, @bitCast(l)) >> 32))),
         .ULong => |u| @truncate(@as(i64, @bitCast(u ^ (u >> 32)))),
-        .Float => |f| @bitCast(f),
+        // Java's to*Bits canonicalizes every NaN payload before hashing.
+        .Float => |f| if (std.math.isNan(f)) @as(i32, @bitCast(@as(u32, 0x7fc0_0000))) else @bitCast(f),
         .Double => |d| blk: {
-            const b: i64 = @bitCast(d);
+            const b: i64 = if (std.math.isNan(d)) @bitCast(@as(u64, 0x7ff8_0000_0000_0000)) else @bitCast(d);
             break :blk @truncate(b ^ @as(i64, @bitCast(@as(u64, @bitCast(b)) >> 32)));
         },
         .String => |s| blk: {
@@ -3009,11 +3063,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
-    // `hashCode()` on a builtin value type.
+    // `hashCode()` on a builtin value type. Containers hash their
+    // elements through member dispatch so a user class's hashCode()
+    // override participates (kotlin: listOf(x).hashCode() folds
+    // x.hashCode()).
     if (args.len == 0 and std.mem.eql(u8, name, "hashCode") and
         receiver.* != .Instance and receiver.* != .Class and receiver.* != .PropertyRef)
     {
-        return .{ .ok = Value.newInt(@as(i64, kotlinHashCode(receiver))) };
+        return .{ .ok = Value.newInt(@as(i64, try hashWithDispatch(self, allocator, receiver))) };
     }
 
     // Stdlib member dispatch (type-FQN + package extension probes).

@@ -4065,7 +4065,29 @@ fn lowerValueInvocation(
             try b.push(.{ .CellGet = .{ .dst = c, .cell = reg } });
             callee_reg = c;
         }
-        // A bare call to a receiver-typed function param.
+        // A bare call to a receiver-typed function param. With explicit
+        // positional args the FIRST one is the receiver (`f: T.() -> R`
+        // called `f(x)` means `x.f()`); with none, the enclosing `this`.
+        if (b.isReceiverLambdaParam(name0) and args.len >= 1 and
+            ast_arg_names.len >= 1 and ast_arg_names[0] == null and blk: {
+                const ar = b.receiverLambdaArity(name0) orelse break :blk false;
+                break :blk args.len == ar + 1;
+            })
+        {
+            const recv_r = try lowerExpr(b, &args[0]);
+            const run = try lowerArgRun(b, args[1..]);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names[1..]);
+            const dst = b.allocReg();
+            try b.push(.{ .CallValueWithThis = .{
+                .dst = dst,
+                .callee = callee_reg,
+                .receiver = recv_r,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
         if (b.isReceiverLambdaParam(name0)) {
             const this_reg = try resolveThisForBareCallNoBind(b);
             if (this_reg) |tr| {
