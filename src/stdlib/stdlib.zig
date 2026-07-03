@@ -134,14 +134,15 @@ pub const IMPLICIT_ALIASES = [_]Alias{
 /// Member dispatch uses this to resolve a bare call inside a method / lambda
 /// body to the global intrinsic instead of prepending the enclosing receiver
 /// as a spurious first element.
+pub const ARRAY_BUILDERS = [_][]const u8{
+    "arrayOf",      "arrayOfNulls",  "emptyArray",    "byteArrayOf",
+    "ubyteArrayOf", "shortArrayOf",  "ushortArrayOf", "intArrayOf",
+    "uintArrayOf",  "longArrayOf",   "ulongArrayOf",  "charArrayOf",
+    "floatArrayOf", "doubleArrayOf", "booleanArrayOf",
+};
+
 pub fn isArrayBuilder(name: []const u8) bool {
-    const builders = [_][]const u8{
-        "arrayOf",      "arrayOfNulls",  "emptyArray",    "byteArrayOf",
-        "ubyteArrayOf", "shortArrayOf",  "ushortArrayOf", "intArrayOf",
-        "uintArrayOf",  "longArrayOf",   "ulongArrayOf",  "charArrayOf",
-        "floatArrayOf", "doubleArrayOf", "booleanArrayOf",
-    };
-    for (builders) |b| {
+    for (ARRAY_BUILDERS) |b| {
         if (std.mem.eql(u8, b, name)) return true;
     }
     return false;

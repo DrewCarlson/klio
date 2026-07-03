@@ -852,6 +852,17 @@ pub threadlocal var pending_eager_types: ?std.AutoHashMap(span.Span, EagerTypeHe
 pub const EagerTypeHead = struct { name: []const u8, nullable: bool };
 /// Receiver-lambda channel: body-block span -> receiver class head.
 pub threadlocal var pending_eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null;
+/// Fn-typed lambda-param shapes: param ident span -> {has_receiver, arity}.
+pub threadlocal var pending_eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null;
+
+pub const EagerParamShape = struct { has_receiver: bool, arity: u16 };
+
+fn headAllUpper(s_: []const u8) bool {
+    for (s_) |c| {
+        if (!std.ascii.isUpper(c)) return false;
+    }
+    return true;
+}
 
 pub const Module = struct {
     funcs: std.ArrayList(Func) = .empty,
@@ -915,6 +926,15 @@ pub const Module = struct {
     /// Typeck's per-expression type heads (the E2.1 evidence seam).
     eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null,
     eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
+    /// Extension-candidate index: receiver head -> the extension NAMES
+    /// declared on it, plus the generic-receiver names (`fun <T> T.also`)
+    /// that apply to every head. Rebuilt lazily when the func table has
+    /// grown. Answers the E4c membership question the hierarchy sets
+    /// cannot: could ANY extension named N serve receiver head H?
+    ext_names_by_recv_head: ?std.StringHashMap(std.StringHashMap(void)) = null,
+    generic_ext_names: ?std.StringHashMap(void) = null,
+    ext_index_funcs_len: usize = 0,
+    eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
@@ -1118,6 +1138,10 @@ pub const Module = struct {
             out__.eager_recv_heads = per;
             pending_eager_recv_heads = null;
         }
+        if (pending_eager_param_shapes) |pep| {
+            out__.eager_param_shapes = pep;
+            pending_eager_param_shapes = null;
+        }
         return out__;
     }
 
@@ -1204,6 +1228,13 @@ pub const Module = struct {
         if (self.eager_calls) |*m| m.deinit();
         if (self.eager_types) |*m| m.deinit();
         if (self.eager_recv_heads) |*m| m.deinit();
+        if (self.ext_names_by_recv_head) |*m| {
+            var vit = m.valueIterator();
+            while (vit.next()) |v| v.deinit();
+            m.deinit();
+        }
+        if (self.generic_ext_names) |*m| m.deinit();
+        if (self.eager_param_shapes) |*m| m.deinit();
         if (self.class_children) |*m| {
             var itc = m.valueIterator();
             while (itc.next()) |v| v.deinit();
@@ -1381,6 +1412,69 @@ pub const Module = struct {
         const et = &(self.eager_types orelse return null);
         return et.get(sp);
     }
+    /// The declared shape of the fn-typed lambda param declared at `sp`.
+    pub fn eagerParamShapeOf(self: *const Module, sp: span.Span) ?EagerParamShape {
+        const m = &(self.eager_param_shapes orelse return null);
+        return m.get(sp);
+    }
+    /// Could ANY extension named `name` serve receiver head `head`?
+    /// Chain-aware: the head's supertype chain and the builtin-supertype
+    /// table are consulted, and generic-receiver extensions answer true
+    /// for every head. Conservative on staleness: the index rebuilds when
+    /// the func table has grown since the last build.
+    pub fn extCouldApply(self: *Module, allocator: Allocator, head: []const u8, name: []const u8) bool {
+        if (self.ext_names_by_recv_head == null or self.ext_index_funcs_len != self.funcs.items.len) {
+            self.rebuildExtIndex(allocator) catch return true;
+        }
+        if (self.generic_ext_names.?.contains(name)) return true;
+        const idx = &self.ext_names_by_recv_head.?;
+        if (idx.get(head)) |set| {
+            if (set.contains(name)) return true;
+        }
+        for (applicability.builtinSupersOf(head)) |sup| {
+            if (idx.get(sup)) |set| {
+                if (set.contains(name)) return true;
+            }
+        }
+        if (self.registry.class_super_names.get(head)) |chain| {
+            for (chain) |sup| {
+                if (idx.get(sup)) |set| {
+                    if (set.contains(name)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn rebuildExtIndex(self: *Module, allocator: Allocator) Allocator.Error!void {
+        if (self.ext_names_by_recv_head) |*m| {
+            var vit = m.valueIterator();
+            while (vit.next()) |v| v.deinit();
+            m.deinit();
+        }
+        if (self.generic_ext_names) |*m| m.deinit();
+        var idx = std.StringHashMap(std.StringHashMap(void)).init(allocator);
+        var gen = std.StringHashMap(void).init(allocator);
+        for (self.funcs.items) |*f| {
+            const is_ext = f.kind == .top_level_extension or f.kind == .member_extension;
+            if (!is_ext) continue;
+            if (f.params.len == 0) continue;
+            const head = f.params[0].ty.name;
+            // A short all-uppercase head is a type parameter: the
+            // extension applies to every receiver.
+            if (head.len <= 2 and headAllUpper(head)) {
+                try gen.put(f.name, {});
+                continue;
+            }
+            const gop = try idx.getOrPut(head);
+            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(allocator);
+            try gop.value_ptr.put(f.name, {});
+        }
+        self.ext_names_by_recv_head = idx;
+        self.generic_ext_names = gen;
+        self.ext_index_funcs_len = self.funcs.items.len;
+    }
+
     /// The receiver class head typeck bound for the lambda body at `sp`.
     pub fn eagerRecvHeadOf(self: *const Module, sp: span.Span) ?[]const u8 {
         const m = &(self.eager_recv_heads orelse return null);
@@ -2296,12 +2390,23 @@ pub const Module = struct {
     /// backed forms the body-only ladder cannot rank. The alias gate stays
     /// caller-side (a bare alias with no ladder pick leaves the legacy target
     /// null, which the audit does not compare).
-    fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize) ?FuncId {
+    /// Whether a candidate's DECLARED signature can bind the call's argument
+    /// shapes. The declared-arity fallback ranks header stubs the body-only
+    /// ladder cannot see; without this check it picks by arity alone and an
+    /// `Int` argument binds a same-arity `String` parameter (`Box(s.length)`
+    /// inside `fun Box(s: String)` self-recursing past the constructor). No
+    /// signature view, or no refuting evidence, keeps the candidate.
+    fn declSigCompatible(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) bool {
+        const sv = self.sigViewForApplicability(fid) orelse return true;
+        return applicability.applicable(&sv, args, .{}) != null;
+    }
+
+    fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize, args: []const applicability.ArgShape) ?FuncId {
         const fallback = self.funcId(name);
         const want_u32: u32 = @intCast(want);
         const fallback_fits = blk: {
             if (fallback) |fid| {
-                if (self.declArityOf(fid)) |n| break :blk n == want_u32;
+                if (self.declArityOf(fid)) |n| break :blk n == want_u32 and self.declSigCompatible(fid, args);
             }
             break :blk true;
         };
@@ -2311,6 +2416,7 @@ pub const Module = struct {
                 for (self.funcsBySimpleName(name)) |cid| {
                     if (self.isNonExtFid(cid)) continue;
                     if (self.declArityOf(cid) != want_u32) continue;
+                    if (!self.declSigCompatible(cid, args)) continue;
                     const ct = self.bareCallTierOf(cid, name, caller_pkg, caller_file) orelse continue;
                     if (ct < other_package_tier) return cid;
                 }
@@ -2318,10 +2424,10 @@ pub const Module = struct {
         }
         if (fallback_fits) return fallback;
         for (self.funcsBySimpleName(name)) |fid| {
-            if (self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32) return fid;
+            if (self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32 and self.declSigCompatible(fid, args)) return fid;
         }
         for (self.funcsBySimpleName(name)) |fid| {
-            if (!self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32) return fid;
+            if (!self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32 and self.declSigCompatible(fid, args)) return fid;
         }
         if (want > 0) {
             var all_ext_zero_arity = self.funcsBySimpleName(name).len != 0;
@@ -2424,7 +2530,7 @@ pub const Module = struct {
         // backed forms the ladder (body-only) cannot rank.
         var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args);
         if (heur == null and ctx.cast_pick == null and !isAliasName(name)) {
-            heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len);
+            heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len, args);
         }
         // Prefer the same-name extension overload whose declared receiver
         // matches the enclosing extension's receiver.
@@ -2869,11 +2975,23 @@ pub const Module = struct {
     }
 };
 
-/// A known stdlib host-intrinsic global alias (`min`, `listOf`, …). A bare call
-/// to such a name whose overload set has no applicable body candidate routes to
-/// the runtime intrinsic rather than a declared-arity fallback. Shared by
-/// `resolveCall` (the Phase-B fallback gate) and the lowerer's alias / value-ref
-/// paths so both classify the same names.
+/// A known stdlib host-served global alias (`min`, `listOf`, …). A bare call
+/// to such a name whose overload set has no applicable body candidate routes
+/// to the runtime global rather than a declared-arity fallback. Shared by
+/// `resolveCall` (the Phase-B fallback gate) and the lowerer's alias /
+/// value-ref paths so both classify the same names.
+///
+/// This name list is a cataloged hatch (resolution-unification plan, RC-H /
+/// P10). A registry-derived replacement was attempted and measured unsound
+/// three ways: the intrinsic registry maps FQNs to function pointers with no
+/// declaration shape, so it cannot distinguish a value-position global
+/// (`kotlin.collections.listOf`) from a package-level link binding for a
+/// bodyless receiver-formed declaration (`kotlin.text.nativeIndexOf` binds
+/// `String.nativeIndexOf`), and the implicit-alias table covers only part of
+/// this surface (`reverseOrder`, the array builders are absent). The
+/// classification these call sites need lives in DECLARATIONS the current
+/// pipeline drops — P10 (the no-holes symbol table) restores those
+/// declarations and deletes this list outright.
 pub fn isAliasName(name: []const u8) bool {
     const names = [_][]const u8{
         "maxOf",           "minOf",      "max",                 "min",
@@ -2886,7 +3004,8 @@ pub fn isAliasName(name: []const u8) bool {
         "buildString",     "TODO",       "error",               "compareValues",
         "compareValuesBy", "compareBy",  "compareByDescending", "naturalOrder",
         "reverseOrder",    "sequenceOf", "emptySequence",       "generateSequence",
-        "sequence",
+        "sequence",        "iterator",   "readLine",            "sortedSetOf",
+        "sortedMapOf",
     };
     for (names) |n| {
         if (std.mem.eql(u8, name, n)) return true;
@@ -3857,6 +3976,7 @@ test "resolveCall: a type-distinguishable stub overload defers to a receiver pro
     // alias name: the index classifies type_overload; the applicability ladder
     // is body-only and the declared-arity fallback is gated off for aliases,
     // so Phase B finds nothing and the call defers to the runtime probe.
+
     const s1 = try pushTestFuncOpts(&m, a, "minOf", "app.minOf", "app", 0, .{ .stub = true });
     try m.decl_user_arity.put(s1.int(), .{ .required = 1, .total = 1, .has_vararg = false });
     try putTestDeclSig(&m, a, s1, "Int", 1);

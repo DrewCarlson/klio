@@ -155,21 +155,6 @@ pub fn isTopLevelProp(name: []const u8) bool {
     return false;
 }
 
-/// True when `name` is a collection factory whose stdlib Kotlin source the
-/// build driver intentionally drops in favor of a host intrinsic, leaving it
-/// with no lowered `FuncId`. Such a name is always the global factory, never a
-/// member, so a bare value-position read must not take the `this.<name>`
-/// GetField shortcut. Keep in sync with build.zig `isCollectionFactoryName`.
-pub fn isDroppedStdlibFactory(name: []const u8) bool {
-    const names = [_][]const u8{
-        "linkedMapOf",   "hashMapOf",   "linkedStringMapOf", "hashSetOf",
-        "linkedSetOf",   "sortedSetOf", "sortedMapOf",       "arrayListOf",
-        "listOfNotNull", "setOfNotNull",
-    };
-    for (names) |k| if (std.mem.eql(u8, name, k)) return true;
-    return false;
-}
-
 /// Install the suspend-inline-fn AST table for the current build. Each
 /// simple name maps to all its inline overloads (declaration order) so a
 /// call site can disambiguate a function-param overload from a
