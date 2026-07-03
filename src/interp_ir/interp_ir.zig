@@ -865,6 +865,11 @@ pub const ObjectInitState = union(enum) {
 /// OS thread, like `ThreadTable`; the cell's writer lock serializes the
 /// claim that makes first-access construction once-only across threads.
 pub const ObjectStates = ObjRef(std.StringHashMap(ObjectInitState));
+/// Id-keyed singleton table: `ClassId.int() -> published singleton`. The
+/// authoritative read for id-committed class/object/companion value reads;
+/// the name-keyed `globals` publication remains as the view user-code name
+/// reads resolve through. Publication order: id table first, then names.
+pub const SingletonsById = ObjRef(std.AutoHashMap(u32, runtime.Value));
 
 /// Vm-level errors. Carried as data, mirroring Rust's `VmError`.
 pub const VmError = union(enum) {
@@ -929,6 +934,7 @@ pub const Vm = struct {
     threads: ThreadTable,
     /// Lazy `object` / companion first-access init states.
     object_states: ObjectStates,
+    singletons_by_id: SingletonsById,
     allocator: Allocator,
 
     pub const new = run_mod.vmNew;
@@ -967,6 +973,7 @@ pub const SendableVmSeed = struct {
     out_sink: SharedOutput,
     threads: ThreadTable,
     object_states: ObjectStates,
+    singletons_by_id: SingletonsById,
     allocator: Allocator,
 
     /// Materialize a child `Vm` on the current (new) OS thread.
@@ -985,6 +992,7 @@ pub const SendableVmSeed = struct {
             .out_sink = self.out_sink,
             .threads = self.threads,
             .object_states = self.object_states,
+            .singletons_by_id = self.singletons_by_id,
             .allocator = self.allocator,
         };
     }

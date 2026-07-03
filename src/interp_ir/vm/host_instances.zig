@@ -410,6 +410,7 @@ fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []con
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
+        .singletons_by_id = self.singletons_by_id.clone(),
         .allocator = self.allocator,
     };
     defer {

@@ -260,6 +260,11 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
             // waiter that re-checks `globals` after the entry vanishes
             // always finds the singleton.
             {
+                const sg = self.singletons_by_id.borrowMut();
+                defer sg.deinit();
+                sg.get().put(class_id.int(), inst) catch {};
+            }
+            {
                 const g = self.globals.borrowMut();
                 defer g.deinit();
                 g.get().define(name, inst) catch {};
@@ -368,6 +373,11 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
                     defer ig.deinit();
                     ig.get().outer = .{ .Class = od };
                 }
+            }
+            {
+                const sg = self.singletons_by_id.borrowMut();
+                defer sg.deinit();
+                sg.get().put(class_id.int(), inst) catch {};
             }
             {
                 const g = self.globals.borrowMut();
@@ -513,6 +523,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
+        .singletons_by_id = self.singletons_by_id.clone(),
         .allocator = self.allocator,
     };
     defer {
@@ -720,6 +731,29 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
         if (funcValueById(self, allocator, fid)) |v| return v;
     }
     if (class) |cid| {
+        // The id table is the authoritative singleton read: publication
+        // under a name can never shadow what a committed class id yields.
+        if (!ctor_ref) {
+            const sg = self.singletons_by_id.borrow();
+            const own = sg.get().get(cid.int());
+            sg.deinit();
+            if (own) |v| return v;
+            // A class with a companion answers with the companion's
+            // published singleton by ID as well.
+            const comp_id: ?ir.ClassId = blk: {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                const m = mg.get();
+                if (cid.int() >= m.classes.items.len) break :blk null;
+                break :blk m.classIdNestedIn(cid, "Companion");
+            };
+            if (comp_id) |cc| {
+                const sg2 = self.singletons_by_id.borrow();
+                const cv = sg2.get().get(cc.int());
+                sg2.deinit();
+                if (cv) |v| return v;
+            }
+        }
         const fqn: ?[]const u8 = blk: {
             const mg = self.module.borrow();
             defer mg.deinit();

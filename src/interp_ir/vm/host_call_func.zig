@@ -163,6 +163,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
+        .singletons_by_id = self.singletons_by_id.clone(),
         .allocator = self.allocator,
     };
     defer {
@@ -177,6 +178,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         intrinsic.out_sink.deinit();
         intrinsic.threads.deinit();
         intrinsic.object_states.deinit();
+        intrinsic.singletons_by_id.deinit();
     }
     var ctx = CallCtx{
         .args = args,

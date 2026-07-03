@@ -185,6 +185,7 @@ pub const SharedHandles = struct {
     out_sink: SharedOutput,
     threads: ThreadTable,
     object_states: ObjectStates,
+    singletons_by_id: root.SingletonsById,
     allocator: Allocator,
 
     /// Borrow the shared handles a live `VmHost` holds, without cloning.
@@ -201,6 +202,7 @@ pub const SharedHandles = struct {
             .out_sink = host.out_sink,
             .threads = host.threads,
             .object_states = host.object_states,
+            .singletons_by_id = host.singletons_by_id,
             .allocator = host.allocator,
         };
     }
@@ -219,6 +221,7 @@ pub const SharedHandles = struct {
             .out_sink = host.out_sink,
             .threads = host.threads,
             .object_states = host.object_states,
+            .singletons_by_id = host.singletons_by_id,
             .allocator = host.allocator,
         };
     }
@@ -241,6 +244,7 @@ pub const VmHost = struct {
     out_sink: SharedOutput,
     threads: ThreadTable,
     object_states: ObjectStates,
+    singletons_by_id: root.SingletonsById,
     allocator: Allocator,
 
     /// Build a transient `VmHost` that BORROWS another host/Vm's shared
@@ -263,6 +267,7 @@ pub const VmHost = struct {
             .out_sink = state.out_sink,
             .threads = state.threads,
             .object_states = state.object_states,
+            .singletons_by_id = state.singletons_by_id,
             .allocator = state.allocator,
         };
     }
@@ -341,6 +346,7 @@ pub const VmIntrinsicHost = struct {
     out_sink: SharedOutput,
     threads: ThreadTable,
     object_states: ObjectStates,
+    singletons_by_id: root.SingletonsById,
     allocator: Allocator,
 
     /// Build a transient `VmIntrinsicHost` that BORROWS another host's shared
@@ -360,6 +366,7 @@ pub const VmIntrinsicHost = struct {
             .out_sink = state.out_sink,
             .threads = state.threads,
             .object_states = state.object_states,
+            .singletons_by_id = state.singletons_by_id,
             .allocator = state.allocator,
         };
     }

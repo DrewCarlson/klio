@@ -207,6 +207,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .out_sink = self.out_sink,
         .threads = self.threads,
         .object_states = self.object_states,
+        .singletons_by_id = self.singletons_by_id,
         .allocator = allocator,
     };
     var ctx = CallCtx{
