@@ -4546,7 +4546,17 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     if (eagerAuditOn() and runtime.getenvSlice("KLIO_EAGER_HITS") != null) {
         std.debug.print("[EAGER-PROBE] '{s}' f{d}:{d}-{d} map={}\n", .{ name0, segments[0].span.file.int(), segments[0].span.start, segments[0].span.end, b.module.eager_calls != null });
     }
+    var res_final = res;
     if (b.module.eagerCallTarget(segments[0].span)) |eager_fid| {
+        // Consumption: the typeck-decided target is type-derived and
+        // overload-precise where the lazy engine is shape-based; prefer
+        // it. `ty_proven` pins the pick against runtime value-typed
+        // re-picks, matching a cast-disambiguated call.
+        if (res.target == null or res.target.?.int() != eager_fid.int()) {
+            res_final.target = eager_fid;
+            res_final.ty_proven = true;
+            if (res_final.emit_form != .Call) res_final.emit_form = .Call;
+        }
         if (eagerAuditOn()) {
             const lazy: ?FuncId = res.target;
             if (runtime.getenvSlice("KLIO_EAGER_HITS") != null) {
@@ -4554,25 +4564,27 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
             }
             if (lazy == null or lazy.?.int() != eager_fid.int()) {
                 const lazy_str: i64 = if (lazy) |l| @intCast(l.int()) else -1;
-                std.debug.print("[EAGER-AUDIT] call '{s}': eager={d} lazy={d}\n", .{ name0, eager_fid.int(), lazy_str });
+                const efqn: []const u8 = if (b.module.funcById(eager_fid)) |f| f.fqn else "?";
+                const lfqn: []const u8 = if (lazy) |l| (if (b.module.funcById(l)) |f| f.fqn else "?") else "-";
+                std.debug.print("[EAGER-AUDIT] call '{s}': eager={d}({s}) lazy={d}({s})\n", .{ name0, eager_fid.int(), efqn, lazy_str, lfqn });
             }
         }
     }
-    defer b.allocator.free(res.candidate_set);
-    const was_cast = cast_pick != null and res.target != null and cast_pick.?.int() == res.target.?.int();
+    defer b.allocator.free(res_final.candidate_set);
+    const was_cast = cast_pick != null and res_final.target != null and cast_pick.?.int() == res_final.target.?.int();
 
     // A known stdlib host-intrinsic global (alias) whose user overloads do not
     // apply to this call still resolves to the intrinsic global. In a receiver
     // context, bind it directly — no class declares the name as a member, so a
     // `this.<name>` redispatch would invoke the receiver itself.
-    if (res.target == null and !shadowed_by_class and inReceiverContext(b) and
+    if (res_final.target == null and !shadowed_by_class and inReceiverContext(b) and
         ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0) and
         b.resolve(name0) == null and !b.knowsOuter(name0))
     {
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
     }
 
-    if (res.target) |target| {
+    if (res_final.target) |target| {
         if (!shadowed_by_class) {
             if (indexDeferReason(index_res) == .ambiguous_tier) {
                 try recordAmbiguousCall(b, name0, segments[0].span, index_res);
@@ -4581,10 +4593,10 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
             // reference (kotlinc rejects the call); the diagnostic fails the
             // program before it runs.
             _ = try recordOutOfScopeCall(b, name0, segments[0].span, target, index_res);
-            return switch (res.emit_form) {
+            return switch (res_final.emit_form) {
                 // A fully type-proven pick is as final as a cast pick: the
                 // runtime's value-typed overload re-pick must not override it.
-                .Call => try emitCall(b, expr, target, was_cast or res.ty_proven),
+                .Call => try emitCall(b, expr, target, was_cast or res_final.ty_proven),
                 .CallMember => try emitCallMember(b, expr, target, was_cast),
                 .CallMemberOrGlobal => try emitMemberOrGlobal(b, expr, target, was_cast),
                 // Phase C never emits a value call with a committed target.

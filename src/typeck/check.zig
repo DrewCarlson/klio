@@ -477,6 +477,10 @@ pub const FnSig = struct {
     decl_span: ?Span,
     /// True when declared with the `suspend` modifier.
     is_suspend: bool,
+    /// Declared with an extension receiver (`fun T.f()`): a bare call to
+    /// it inside a receiver scope competes with candidates typeck's flat
+    /// name registry cannot see, so its pick never enters the eager channel.
+    is_extension: bool = false,
     /// True when the function is declared `inline` and the parameter at the
     /// same index is marked `crossinline`.
     is_crossinline_param: []bool,

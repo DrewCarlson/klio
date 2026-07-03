@@ -502,6 +502,20 @@ pub fn checkCrossinlineArgReturns(
 /// render is compact and comparison-stable: arity, parameter type heads,
 /// and the return head.
 fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig) void {
+    // Package-visibility gate: the flat name registry is package-blind, so
+    // a same-name declaration from an unrelated package can win here that
+    // Kotlin scoping would never see (a packageless `apply` shadowing
+    // `kotlin.apply` for a caller inside the stdlib). Record only when the
+    // declaration is in the caller's own package or a default-imported
+    // `kotlin*` package.
+    if (sig.decl_span) |ds| {
+        const decl_pkg = self.file_packages.get(ds.file.int()) orelse "";
+        const call_pkg = self.file_packages.get(call_span.file.int()) orelse "";
+        const same = std.mem.eql(u8, decl_pkg, call_pkg);
+        const default_imported = std.mem.eql(u8, decl_pkg, "kotlin") or
+            std.mem.startsWith(u8, decl_pkg, "kotlin.");
+        if (!same and !default_imported) return;
+    }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(self.allocator);
     buf.print(self.allocator, "arity={d}", .{sig.params.len}) catch return;
@@ -642,7 +656,7 @@ fn checkOverloadedCallRec(
         }
         try checkArityAndArgs(self, sig, args, call_span);
         try enforceSuspendColoring(self, sig.is_suspend, "function", call_span);
-        if (record) recordResolvedCall(self, call_span, sig);
+        if (record and !sig.is_extension) recordResolvedCall(self, call_span, sig);
         if (has_type_args or sig.type_param_count == 0) {
             return sig.return_ty.clone(self.allocator);
         }
@@ -806,7 +820,7 @@ fn checkOverloadedCallRec(
     // Record only a DECIDED pick: the arity-match fallback is a guess
     // (any same-arity overload), and a guess in the eager channel would
     // override the runtime engine's evidence-based answer.
-    if (record and chosen != null) recordResolvedCall(self, call_span, sig);
+    if (record and chosen != null and !sig.is_extension) recordResolvedCall(self, call_span, sig);
     if (has_type_args) {
         try decl_mod.checkTypeArgBounds(self, sig, type_args);
     }
