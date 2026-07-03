@@ -111,10 +111,29 @@ probes (`argDeclTypeRef`, `local_decl_types`, `local_decl_nullable`).
   same shape of prerequisite: the channel's trust surface must cover the
   heuristic's full decision context first (here: typeck needs the
   inherited-member view). The E4 queue and each item's prerequisite:
-  implicit-this redirect (needs inherited member_sigs), closure +1-arity
-  rebind (needs declared-shape coverage measurement), CallMemberOrValue
-  exact emission (needs the same member view), the applicability
-  literal-coercion gap (needs its own canonical-gated fix).
+  QUEUE STATE:
+  - implicit-this redirect: LANDED — the record gate walks declared AND
+    inherited members (classChainHasMember), and a channel-committed
+    .plain target skips the redirect.
+  - closure +1-arity rebind: INSTRUMENTED ([REBIND] under
+    KLIO_REBIND_AUDIT). Zero firings measured across the examples corpus,
+    the stdlib solo files, and ktor server startup; the remaining
+    precondition before narrowing is a live-request measurement (the
+    arm's documented consumer is the ktor pipeline invoking receiver
+    lambdas value-style, which only fires under real HTTP traffic).
+  - CallMemberOrValue exact emission: DESIGNED, not yet implemented. The
+    local-callable arm can emit the exact form when two channels agree:
+    the receiver's head (eagerTypeOf / lambda receiver head) answers the
+    member question via the hierarchy sets, and the param-shape channel
+    gives the callable's declared shape. Where both answer, emit
+    CallMember or CallValueWithThis directly; the member-or-value race
+    remains only for silent-channel spans.
+  - literal-coercion gap: NEUTRALIZED — the only live path was eager
+    primitive fills, which the channel excludes. The enhancement that
+    would let primitives fill is a numeric-family-aware evidence
+    comparison in applicability (Int evidence vs Byte param is not
+    definite for literal-typed values); worthwhile, canonical-gated,
+    not urgent.
  With seams live, each runtime heuristic is
   narrowed to the truly-dynamic residue or deleted, battery-gated:
   - `CallMemberOrValue`'s invocability guessing → exact emission per typeck
