@@ -103,7 +103,19 @@ probes (`argDeclTypeRef`, `local_decl_types`, `local_decl_nullable`).
   disagreements across the corpus battery; the audit stays wired as the
   permanent regression tripwire.
 
-- **E4 — Heuristic replacement.** With seams live, each runtime heuristic is
+- **E4 — Heuristic replacement.** STATUS of the first attempt: narrowing
+  the implicit-this redirect on a channel-committed plain target broke
+  eager-ON ArraysTest — typeck's member-shadow record gate checks only
+  DECLARED members per class, not INHERITED ones, so a channel record can
+  exist where a real inherited member shadows. Every E4 narrowing has the
+  same shape of prerequisite: the channel's trust surface must cover the
+  heuristic's full decision context first (here: typeck needs the
+  inherited-member view). The E4 queue and each item's prerequisite:
+  implicit-this redirect (needs inherited member_sigs), closure +1-arity
+  rebind (needs declared-shape coverage measurement), CallMemberOrValue
+  exact emission (needs the same member view), the applicability
+  literal-coercion gap (needs its own canonical-gated fix).
+ With seams live, each runtime heuristic is
   narrowed to the truly-dynamic residue or deleted, battery-gated:
   - `CallMemberOrValue`'s invocability guessing → exact emission per typeck
     (member, value-with-receiver, or ctor), the guessing arm kept only for
