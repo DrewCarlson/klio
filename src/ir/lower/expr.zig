@@ -5063,9 +5063,30 @@ fn fnTypedRecvCannotShadow(b: *const FuncBuilder, name: []const u8) bool {
 /// unrelated class elsewhere in the program cannot shadow this call. Only a
 /// receiver whose type is genuinely unknown falls back to the program-wide
 /// member-name set.
+/// The E2.3 precise answer for a lambda/thunk context: does the
+/// typeck-recorded receiver head's hierarchy declare `name`? Null when
+/// no head is recorded or its shadow set is missing/incomplete — the
+/// caller stays conservative.
+fn lambdaRecvHeadDeclares(b: *const FuncBuilder, name: []const u8) ?bool {
+    const h = eagerLambdaRecvHead(b) orelse return null;
+    const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse return null;
+    if (!hs.complete) return null;
+    return hs.names.contains(name);
+}
+
 fn memberShadowPossible(b: *const FuncBuilder, name: []const u8) bool {
     if (b.capturesThisSlot() or b.isParamThunk() or
-        (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name))) return true;
+        (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name))) {
+        // E2.3: the recorded receiver head answers precisely; when it
+        // does NOT declare the name, the remaining implicit receivers
+        // (enclosing class, outer chain) are checked below instead of
+        // answering a blanket true.
+        if (lambdaRecvHeadDeclares(b, name)) |ans| {
+            if (ans) return true;
+        } else {
+            return true;
+        }
+    }
     if (b.hasEnclosingMember(name)) return true;
     if (b.ownerClass()) |oc| {
         if (ownerChainShadowContains(b, oc, name)) |shadowed| return shadowed;
@@ -5109,14 +5130,52 @@ fn anyReceiverClassDeclares(b: *const FuncBuilder, name: []const u8) bool {
             if (ownerChainShadowContains(b, oc, name)) |ans| return ans;
         }
     }
+    // E2.3: a lambda context whose receiver head is recorded answers from
+    // that head plus the enclosing chain — the program-wide name universe
+    // is the fallback only when neither is known.
+    if (lambdaRecvHeadDeclares(b, name)) |ans| {
+        if (ans) return true;
+        if (b.ownerClass()) |oc| {
+            if (ownerChainShadowContains(b, oc, name)) |a2| return a2;
+        }
+        return false;
+    }
     return b.module.registry.class_member_names.contains(name);
 }
 
 fn receiverTypeKnown(b: *const FuncBuilder, name0: []const u8) bool {
     if (b.capturesThisSlot() or b.isParamThunk() or
-        (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name0))) return false;
+        (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name0))) {
+        // E2.3: a receiver-LAMBDA body whose receiver head typeck
+        // recorded is a known-receiver context — the membership walk can
+        // answer from that head instead of the conservative fallback.
+        // Audit-only until the sweep is adjudicated.
+        if (recvheadAuditOn()) {
+            if (eagerLambdaRecvHead(b)) |h| {
+                const precise = b.module.registry.hierarchy_shadow_names.get(h) != null;
+                std.debug.print("[RECVHEAD-AUDIT] '{s}' head={s} hier={}\n", .{ name0, h, precise });
+            }
+        }
+        return false;
+    }
     const oc = b.ownerClass() orelse return false;
     return ownerChainShadowContains(b, oc, "") != null;
+}
+
+/// The typeck-recorded receiver head for this builder's lambda body.
+fn eagerLambdaRecvHead(b: *const FuncBuilder) ?[]const u8 {
+    const sp = b.body_span orelse return null;
+    return b.module.eagerRecvHeadOf(sp);
+}
+
+fn recvheadAuditOn() bool {
+    const S = struct {
+        var cached: ?bool = null;
+    };
+    if (S.cached) |v| return v;
+    const on = runtime.getenvSlice("KLIO_RECVHEAD_AUDIT") != null;
+    S.cached = on;
+    return on;
 }
 
 var or_audit_checked: bool = false;

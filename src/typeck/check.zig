@@ -87,6 +87,7 @@ pub const TypeCheck = struct {
     /// of the one-engine-two-modes design: recorded once, consumable by
     /// lowering-side audits and typeck-informed evidence.
     resolved_calls: std.AutoHashMap(Span, ResolvedCall),
+    lambda_recv_heads: std.AutoHashMap(Span, []const u8),
 
     /// Look up the type assigned to an expression by span.
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
@@ -127,6 +128,7 @@ pub fn typecheck(
         .diagnostics = tc.diagnostics,
         .cfgs = tc.cfgs,
         .resolved_calls = tc.resolved_calls,
+        .lambda_recv_heads = tc.lambda_recv_heads,
     };
 }
 
@@ -238,6 +240,7 @@ pub fn typecheckModule(
         .diagnostics = tc.diagnostics,
         .cfgs = tc.cfgs,
         .resolved_calls = tc.resolved_calls,
+        .lambda_recv_heads = tc.lambda_recv_heads,
     };
 }
 
@@ -626,6 +629,10 @@ pub const Checker = struct {
     types: std.AutoHashMap(Span, Type),
     /// Chosen-overload record per call span (see TypeCheck.resolved_calls).
     resolved_calls: std.AutoHashMap(Span, ResolvedCall),
+    /// Receiver-lambda bodies keyed by their BLOCK span -> the receiver
+    /// class head typeck bound `this` to. The eager channel that lets
+    /// lowering answer member-vs-global precisely inside lambda bodies.
+    lambda_recv_heads: std.AutoHashMap(Span, []const u8),
     /// Spans whose recorded type is `Nothing`, maintained alongside `types`.
     /// The reachability queries only need to know where control diverges,
     /// so they consult this small set instead of walking the full map.

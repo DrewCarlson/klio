@@ -222,6 +222,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
 ) Allocator.Error!LoweredLambda {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
+    b.setBodySpan(body.span);
     b.it_suppressed = suppress_it;
     b.it_suppressed_span = it_span;
     // Carry the lexically enclosing class (and its member-name set) so a

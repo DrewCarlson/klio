@@ -70,6 +70,10 @@ pub const FunctionType = struct {
     /// Distinguishes `suspend (T) -> R` from `(T) -> R`. These are distinct
     /// function types; one is not assignable to the other.
     is_suspend: bool,
+    /// The extension receiver's head name for `T.() -> R` shapes; null for
+    /// plain function types. Carried so a receiver lambda checked against
+    /// this type can bind `this` to the right class.
+    receiver_head: ?[]const u8 = null,
 };
 
 /// A Kotlin type.

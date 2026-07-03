@@ -2069,6 +2069,7 @@ pub fn checkLambdaInPlace(
             }
             try self.dsl_receiver_stack.append(self.allocator, .{ .name = cn, .markers = markers });
             try self.class_stack.append(self.allocator, cn);
+            self.lambda_recv_heads.put(body.span, cn) catch {};
             const actual_ret = try expr_mod.checkBlock(self, body, null);
             _ = self.class_stack.pop();
             var popped = self.dsl_receiver_stack.pop().?;
@@ -2121,6 +2122,12 @@ pub fn checkLambdaShaped(
             for (f.params) |*p| try param_tys.append(self.allocator, try p.clone(self.allocator));
             ret_expected = try f.return_type.clone(self.allocator);
             is_suspend = f.is_suspend;
+            // A receiver lambda: record its body's receiver head for the
+            // eager channel (member-vs-global inside the body answers
+            // from this head).
+            if (f.receiver_head) |h| {
+                self.lambda_recv_heads.put(body.span, h) catch {};
+            }
         } else {
             const count = @max(params.len, 1);
             var i: usize = 0;
