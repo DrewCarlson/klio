@@ -618,7 +618,42 @@ pub fn computeEagerCalls(
         }
     }
     if (audit) std.debug.print("[EAGER] {d} call resolutions recorded\n", .{n});
+    // The companion evidence channel: per-expression type heads. Only
+    // decisive heads enter (scalars, String, named classes, nullable
+    // wrappers of those) — a Function/TypeParam/Unresolved answer would
+    // override AST evidence with mush.
+    var tout = std.AutoHashMap(span_mod.Span, ir.EagerTypeHead).init(gpa);
+    var tit = tc.types.iterator();
+    var tn: usize = 0;
+    while (tit.next()) |e| {
+        const head = eagerHeadOf(e.value_ptr, false) orelse continue;
+        tout.put(e.key_ptr.*, head) catch continue;
+        tn += 1;
+    }
+    if (audit) std.debug.print("[EAGER] {d} type heads recorded\n", .{tn});
+    ir.pending_eager_types = tout;
     return out;
+}
+
+fn eagerHeadOf(t: *const typeck.check.Type, nullable: bool) ?ir.EagerTypeHead {
+    return switch (t.*) {
+        .Boolean => .{ .name = "Boolean", .nullable = nullable },
+        .Byte => .{ .name = "Byte", .nullable = nullable },
+        .Short => .{ .name = "Short", .nullable = nullable },
+        .Int => .{ .name = "Int", .nullable = nullable },
+        .Long => .{ .name = "Long", .nullable = nullable },
+        .UByte => .{ .name = "UByte", .nullable = nullable },
+        .UShort => .{ .name = "UShort", .nullable = nullable },
+        .UInt => .{ .name = "UInt", .nullable = nullable },
+        .ULong => .{ .name = "ULong", .nullable = nullable },
+        .Float => .{ .name = "Float", .nullable = nullable },
+        .Double => .{ .name = "Double", .nullable = nullable },
+        .Char => .{ .name = "Char", .nullable = nullable },
+        .String => .{ .name = "String", .nullable = nullable },
+        .Nullable => |inner| eagerHeadOf(inner, true),
+        .Generic => |g| .{ .name = g.name, .nullable = nullable },
+        else => null,
+    };
 }
 
 fn runBuilt(

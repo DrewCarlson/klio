@@ -75,7 +75,11 @@ probes (`argDeclTypeRef`, `local_decl_types`, `local_decl_nullable`).
   the full battery; the lazy path stays the fallback for spans typeck did
   not answer:
   1. **Declared-type evidence**: receiver/argument typing consults
-     `Span → Type` ahead of the AST string probes.
+     `Span → Type` ahead of the AST string probes. STATUS: the channel is
+     built (Module.eagerTypeOf) but consumption is parked — typeck's
+     permissive inference can return wrong container heads (a ByteArray
+     value typed Iterable), and a wrong head disproves valid candidates.
+     Flipping requires a dedicated type-head audit at zero disagreement.
   2. **Bare-call commitment**: `resolveCall` consults the identity channel
      first; a typeck-committed target lowers as a direct call — the deferred
      CMG form is emitted only where typeck also had no answer.

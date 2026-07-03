@@ -844,6 +844,12 @@ const FuncIdMap = std.AutoHashMap;
 /// resolution BEFORE the module exists (lowering starts inside the build),
 /// parks it here, and the next module created on this thread adopts it.
 pub threadlocal var pending_eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null;
+/// Companion channel: per-expression static TYPE HEADS from typeck
+/// (`Span(expr) -> {head, nullable}`), the declared-type evidence the
+/// applicability engine otherwise reconstructs from AST string probes.
+pub threadlocal var pending_eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null;
+
+pub const EagerTypeHead = struct { name: []const u8, nullable: bool };
 
 pub const Module = struct {
     funcs: std.ArrayList(Func) = .empty,
@@ -904,6 +910,8 @@ pub const Module = struct {
     /// (`KLIO_EAGER=1`). Lowering composes it with `func_by_decl_span`;
     /// absent spans keep the lazy path.
     eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null,
+    /// Typeck's per-expression type heads (the E2.1 evidence seam).
+    eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
@@ -1099,6 +1107,10 @@ pub const Module = struct {
             out__.eager_calls = pec;
             pending_eager_calls = null;
         }
+        if (pending_eager_types) |pet| {
+            out__.eager_types = pet;
+            pending_eager_types = null;
+        }
         return out__;
     }
 
@@ -1183,6 +1195,7 @@ pub const Module = struct {
         if (self.class_parent) |*m| m.deinit();
         if (self.func_by_decl_span) |*m| m.deinit();
         if (self.eager_calls) |*m| m.deinit();
+        if (self.eager_types) |*m| m.deinit();
         if (self.class_children) |*m| {
             var itc = m.valueIterator();
             while (itc.next()) |v| v.deinit();
@@ -1354,6 +1367,11 @@ pub const Module = struct {
     pub fn installEagerCalls(self: *Module, m: std.AutoHashMap(span.Span, span.Span)) void {
         if (self.eager_calls) |*old_m| old_m.deinit();
         self.eager_calls = m;
+    }
+    /// Typeck's static type head for the expression at `sp`, if recorded.
+    pub fn eagerTypeOf(self: *const Module, sp: span.Span) ?EagerTypeHead {
+        const et = &(self.eager_types orelse return null);
+        return et.get(sp);
     }
     /// The typeck-resolved target FuncId for the call at `callee_span`:
     /// eager record composed with the lowered-declaration identity map.
