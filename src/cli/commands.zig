@@ -636,19 +636,11 @@ pub fn computeEagerCalls(
 }
 
 fn eagerHeadOf(t: *const typeck.check.Type, nullable: bool) ?ir.EagerTypeHead {
+    // Primitive scalar heads stay OUT of the channel: the applicability
+    // engine treats primitive evidence as exact, but a literal's type
+    // coerces to the parameter's primitive (an Int literal fills a
+    // `vararg Byte` slot), and the head cannot carry literalness.
     return switch (t.*) {
-        .Boolean => .{ .name = "Boolean", .nullable = nullable },
-        .Byte => .{ .name = "Byte", .nullable = nullable },
-        .Short => .{ .name = "Short", .nullable = nullable },
-        .Int => .{ .name = "Int", .nullable = nullable },
-        .Long => .{ .name = "Long", .nullable = nullable },
-        .UByte => .{ .name = "UByte", .nullable = nullable },
-        .UShort => .{ .name = "UShort", .nullable = nullable },
-        .UInt => .{ .name = "UInt", .nullable = nullable },
-        .ULong => .{ .name = "ULong", .nullable = nullable },
-        .Float => .{ .name = "Float", .nullable = nullable },
-        .Double => .{ .name = "Double", .nullable = nullable },
-        .Char => .{ .name = "Char", .nullable = nullable },
         .String => .{ .name = "String", .nullable = nullable },
         .Nullable => |inner| eagerHeadOf(inner, true),
         .Generic => |g| .{ .name = g.name, .nullable = nullable },

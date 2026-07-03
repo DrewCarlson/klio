@@ -75,11 +75,16 @@ probes (`argDeclTypeRef`, `local_decl_types`, `local_decl_nullable`).
   the full battery; the lazy path stays the fallback for spans typeck did
   not answer:
   1. **Declared-type evidence**: receiver/argument typing consults
-     `Span → Type` ahead of the AST string probes. STATUS: the channel is
-     built (Module.eagerTypeOf) but consumption is parked — typeck's
-     permissive inference can return wrong container heads (a ByteArray
-     value typed Iterable), and a wrong head disproves valid candidates.
-     Flipping requires a dedicated type-head audit at zero disagreement.
+     `Span → Type` ahead of the AST string probes. STATUS: LIVE,
+     additive-only with primitives excluded. The type-head audit showed
+     the only both-exist deltas are the legitimate declared-wider class
+     (kotlinc resolves against the STATIC DECLARED type, so the AST
+     answer wins where both exist); the fill channel's one failure class
+     was literal-typed primitive evidence breaking exact-match
+     applicability — a head cannot carry literalness, so primitive heads
+     never fill. FOLLOW-UP (E4 queue): the applicability engine's
+     literal-coercion gap (primitive evidence treated as exact) is a real
+     lazy-engine issue deserving its own fix.
   2. **Bare-call commitment**: `resolveCall` consults the identity channel
      first; a typeck-committed target lowers as a direct call — the deferred
      CMG form is emitted only where typeck also had no answer.

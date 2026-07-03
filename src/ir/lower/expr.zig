@@ -4255,9 +4255,48 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // NOT feed evidence yet: typeck's permissive inference can hand back
     // a wrong container head (a ByteArray value typed Iterable), and a
     // wrong head DISPROVES valid candidates downstream. The seam flips
-    // only after a type-head audit reaches zero disagreement, mirroring
-    // the call channel's per-class trust discipline.
-    return argDeclTypeRefLazy(b, arg);
+    // only after the type-head audit below reaches zero disagreement,
+    // mirroring the call channel's per-class trust discipline.
+    var lazy_ans = argDeclTypeRefLazy(b, arg);
+    // E2.1, ADDITIVE-ONLY: typeck's head fills in where the AST probes
+    // have no answer; the declared (AST) answer always wins when both
+    // exist — kotlinc resolves overloads against the STATIC DECLARED
+    // type, and the audit shows the only both-exist deltas are the
+    // legitimate declared-wider-vs-inferred-narrower class.
+    if (lazy_ans == null) {
+        if (b.module.eagerTypeOf(arg.span())) |th| {
+            if (typeheadAuditOn()) {
+                const sp = arg.span();
+                std.debug.print("[TYPEHEAD-FILL] f{d}:{d} typeck={s}{s}\n", .{ sp.file.int(), sp.start, th.name, if (th.nullable) @as([]const u8, "?") else "" });
+            }
+            lazy_ans = .{ .name = th.name, .nullable = th.nullable, .args = &.{} };
+        }
+    }
+    if (typeheadAuditOn()) {
+        if (b.module.eagerTypeOf(arg.span())) |th| {
+            if (lazy_ans) |la| {
+                if (!std.mem.eql(u8, la.name, th.name) or la.nullable != th.nullable) {
+                    const sp = arg.span();
+                    std.debug.print("[TYPEHEAD-AUDIT] f{d}:{d} ast={s}{s} typeck={s}{s}\n", .{
+                        sp.file.int(),           sp.start,
+                        la.name,                 if (la.nullable) @as([]const u8, "?") else "",
+                        th.name,                 if (th.nullable) @as([]const u8, "?") else "",
+                    });
+                }
+            }
+        }
+    }
+    return lazy_ans;
+}
+
+fn typeheadAuditOn() bool {
+    const S = struct {
+        var cached: ?bool = null;
+    };
+    if (S.cached) |v| return v;
+    const on = runtime.getenvSlice("KLIO_TYPEHEAD_AUDIT") != null;
+    S.cached = on;
+    return on;
 }
 
 fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
