@@ -19,6 +19,7 @@
 //! lost-update or double-init race reproduces reliably.
 const std = @import("std");
 const parity = @import("parity");
+const runtime = @import("runtime");
 
 /// The litmus corpus directory, relative to the workspace root (cwd).
 const LITMUS_DIR = "tests/fixtures/threaded_litmus";
@@ -367,4 +368,45 @@ test "threaded_litmus_suite_is_complete" {
             return e;
         };
     }
+}
+
+// The eager pipeline is a fidelity upgrade, never a behavior change: the
+// same program produces byte-identical output with and without
+// KLIO_EAGER=1 (typeck ahead of lowering + the identity-channel records).
+test "eager pipeline output parity" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var threaded: std.Io.Threaded = .init(al, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src =
+        "fun pick(x: Int): String = \"int:\" + x\n" ++
+        "fun pick(x: String): String = \"string:\" + x\n" ++
+        "fun <T> pick(x: List<T>): String = \"list:\" + x.size\n" ++
+        "fun main() {\n" ++
+        "    println(pick(42))\n" ++
+        "    println(pick(\"y\"))\n" ++
+        "    println(pick(listOf(1, 2)))\n" ++
+        "}\n";
+    std.Io.Dir.cwd().createDirPath(io, "/tmp/klio_eager_itest") catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "/tmp/klio_eager_itest/e1.kt", .data = src }) catch return error.WriteFailed;
+
+    var env = std.process.Environ.Map.init(al);
+    runtime.procEnvPutAllInto(al, &env);
+    const bin = env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
+    const lazy = std.process.run(al, io, .{
+        .argv = &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" },
+        .environ_map = &env,
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
+    }) catch return error.SpawnFailed;
+    try env.put("KLIO_EAGER", "1");
+    const eager = std.process.run(al, io, .{
+        .argv = &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" },
+        .environ_map = &env,
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
+    }) catch return error.SpawnFailed;
+    try std.testing.expectEqualStrings("int:42\nstring:y\nlist:2\n", lazy.stdout);
+    try std.testing.expectEqualStrings(lazy.stdout, eager.stdout);
 }

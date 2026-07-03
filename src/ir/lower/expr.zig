@@ -3272,6 +3272,18 @@ fn anyClassNamed(b: *FuncBuilder, name: []const u8) bool {
     return false;
 }
 
+
+/// Whether the eager-vs-lazy audit is enabled (`KLIO_EAGER_AUDIT=1`).
+fn eagerAuditOn() bool {
+    const S = struct {
+        var cached: ?bool = null;
+    };
+    if (S.cached) |v| return v;
+    const on = runtime.getenvSlice("KLIO_EAGER_AUDIT") != null;
+    S.cached = on;
+    return on;
+}
+
 fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -4528,6 +4540,18 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     defer b.allocator.free(shapes);
     const ctx = resolveCtxFor(b, name0, ast_type_args, cast_pick);
     const res = try b.module.resolveCall(b.allocator, name0, b.self_package, segments[0].span.file, shapes, last_arg_lambda, ctx);
+    // Eager audit: where typeck recorded a pick for this call site,
+    // compare it against the engine's answer. Audit-only — behavior
+    // flips seam by seam once disagreement is at zero.
+    if (b.module.eagerCallTarget(segments[0].span)) |eager_fid| {
+        if (eagerAuditOn()) {
+            const lazy: ?FuncId = res.target;
+            if (lazy == null or lazy.?.int() != eager_fid.int()) {
+                const lazy_str: i64 = if (lazy) |l| @intCast(l.int()) else -1;
+                std.debug.print("[EAGER-AUDIT] call '{s}': eager={d} lazy={d}\n", .{ name0, eager_fid.int(), lazy_str });
+            }
+        }
+    }
     defer b.allocator.free(res.candidate_set);
     const was_cast = cast_pick != null and res.target != null and cast_pick.?.int() == res.target.?.int();
 

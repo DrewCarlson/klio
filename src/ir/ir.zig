@@ -894,6 +894,11 @@ pub const Module = struct {
     /// `Span(call) -> decl_span` record, this gives lowering an exact,
     /// type-derived target per call site with no shared symbol table.
     func_by_decl_span: ?std.AutoHashMap(span.Span, FuncId) = null,
+    /// The eager pipeline's per-call resolution: `Span(callee) ->
+    /// Span(decl)` converted from typeck's records by the driver
+    /// (`KLIO_EAGER=1`). Lowering composes it with `func_by_decl_span`;
+    /// absent spans keep the lazy path.
+    eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
@@ -1167,6 +1172,7 @@ pub const Module = struct {
         if (self.class_fqn_map) |*m| m.deinit();
         if (self.class_parent) |*m| m.deinit();
         if (self.func_by_decl_span) |*m| m.deinit();
+        if (self.eager_calls) |*m| m.deinit();
         if (self.class_children) |*m| {
             var itc = m.valueIterator();
             while (itc.next()) |v| v.deinit();
@@ -1334,6 +1340,19 @@ pub const Module = struct {
     /// through the lexical parents. Answers nested classes, nested objects,
     /// and companions uniformly — the string-mangled `$`/`.` probes derive
     /// from the same FQNs this tree was built from.
+    /// Install the eager per-call resolution (driver-owned map).
+    pub fn installEagerCalls(self: *Module, m: std.AutoHashMap(span.Span, span.Span)) void {
+        if (self.eager_calls) |*old_m| old_m.deinit();
+        self.eager_calls = m;
+    }
+    /// The typeck-resolved target FuncId for the call at `callee_span`:
+    /// eager record composed with the lowered-declaration identity map.
+    pub fn eagerCallTarget(self: *const Module, callee_span: span.Span) ?FuncId {
+        const ec = &(self.eager_calls orelse return null);
+        const decl = ec.get(callee_span) orelse return null;
+        return self.funcByDeclSpan(decl);
+    }
+
     /// Record a lowered declaration's identity (its AST name-span).
     pub fn recordFuncDeclSpan(self: *Module, allocator: Allocator, decl_span: span.Span, id: FuncId) Allocator.Error!void {
         if (self.func_by_decl_span == null) {
