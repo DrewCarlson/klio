@@ -2969,6 +2969,10 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // shadow the real member.
             const fb_invocable = switch (fb) {
                 .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod, .PropertyRef => true,
+                // A class value is its constructor (`::Char` bound to an
+                // `Int.() -> Char` param): invocable, receiver becomes the
+                // first positional argument below.
+                .Class => true,
                 // A bound/unbound callable reference (`Long::toByte`,
                 // `recv::method`) is a `$bound_ref$<name>` synth instance: it
                 // is invocable, so `recv.refParam()` invokes the reference
@@ -2979,7 +2983,22 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             };
             if (fb_invocable and !host.hostHasMember(&recv, name_str)) {
                 orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
-                switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
+                if (fb == .Class) {
+                    // Constructors take no receiver: `65.f()` with
+                    // `f = ::Char` is `Char(65)`.
+                    const adapted = try allocator.alloc(Value, user_args.len + 1);
+                    defer allocator.free(adapted);
+                    adapted[0] = recv;
+                    @memcpy(adapted[1..], user_args);
+                    const nn = try allocator.alloc(?[]const u8, names.len + 1);
+                    defer allocator.free(nn);
+                    nn[0] = null;
+                    @memcpy(nn[1..], names);
+                    switch (try host.callValueNamed(allocator, &fb, adapted, nn)) {
+                        .ok => |rv| try frame.write(cmv.dst, rv),
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                } else switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
                     .ok => |rv| try frame.write(cmv.dst, rv),
                     .err => |e| return raiseStep(frame, e),
                 }

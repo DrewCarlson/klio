@@ -3254,6 +3254,21 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
     return null;
 }
 
+
+/// Whether any registered class's fqn ends in `.{name}` or `${name}` (a
+/// nested/companion class reachable by simple name from some scope).
+fn anyClassNamed(b: *FuncBuilder, name: []const u8) bool {
+    for (b.module.classes.items) |*c| {
+        const fqn = c.fqn;
+        if (fqn.len > name.len and std.mem.endsWith(u8, fqn, name)) {
+            const sep = fqn[fqn.len - name.len - 1];
+            if (sep == '.' or sep == '$') return true;
+        }
+        if (std.mem.eql(u8, c.name, name)) return true;
+    }
+    return false;
+}
+
 fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -3332,8 +3347,14 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // member of its class, or an extension whose declared receiver is
             // compatible with the *known* receiver-type chain. Dispatch it
             // straight onto the bound receiver register.
-            const binds_this = b.hasOwnMember(nm) or
-                (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain));
+            // A NESTED CLASS's name sits in the own-member set but a
+            // capitalized bare call to it is a CONSTRUCTOR, never a
+            // method on `this` — leave it to the ctor resolution.
+            const is_scoped_class = nm.len > 0 and std.ascii.isUpper(nm[0]) and
+                (scopedClassIdForRead(b, nm, callee.Path.segments[0].span.file) != null or
+                    b.module.classId(nm) != null or anyClassNamed(b, nm));
+            const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or
+                (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain)));
             if (binds_this) {
                 if (b.resolve("this")) |bound_this| {
                     const run = try lowerArgRun(b, args);
@@ -5345,9 +5366,13 @@ fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.C
         while (owner) |ow| : (hops += 1) {
             if (hops > 8) break;
             var kb: [256]u8 = undefined;
-            const mangled = std.fmt.bufPrint(&kb, "{s}${s}", .{ ow, name0 }) catch break;
+            // Nested classes register dot-qualified, companions with `$`.
+            const dotted = std.fmt.bufPrint(&kb, "{s}.{s}", .{ ow, name0 }) catch break;
+            if (b.module.classId(dotted)) |cid| return cid;
+            var kb2: [256]u8 = undefined;
+            const mangled = std.fmt.bufPrint(&kb2, "{s}${s}", .{ ow, name0 }) catch break;
             if (b.module.classId(mangled)) |cid| return cid;
-            owner = if (std.mem.lastIndexOfScalar(u8, ow, '$')) |sep| ow[0..sep] else null;
+            owner = if (std.mem.lastIndexOfAny(u8, ow, "$.")) |sep| ow[0..sep] else null;
         }
     }
     // A receiver context whose owner chain is unknown here (a super-arg /
