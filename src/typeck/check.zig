@@ -81,20 +81,29 @@ pub const TypeCheck = struct {
     /// read this to ground reachability / VIA / smart-cast queries.
     cfgs: std.AutoHashMap(Span, Cfg),
     /// The signature the overload checker CHOSE for each overloaded call,
-    /// keyed by call span and rendered compactly ("arity=N;p0=Int;...;ret=T").
-    /// The eager half of the one-engine-two-modes design: recorded once,
-    /// consumable by lowering-side audits and typeck-informed evidence.
-    resolved_calls: std.AutoHashMap(Span, []const u8),
+    /// keyed by call span: the declaring function's name-span (the identity
+    /// channel — lowering composes it with its own decl-span -> FuncId map)
+    /// plus the compact render ("arity=N;p0=Int;...;ret=T"). The eager half
+    /// of the one-engine-two-modes design: recorded once, consumable by
+    /// lowering-side audits and typeck-informed evidence.
+    resolved_calls: std.AutoHashMap(Span, ResolvedCall),
 
     /// Look up the type assigned to an expression by span.
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
         return self.types.getPtr(sp);
     }
 
-    /// The rendered signature the checker resolved for the call at `sp`.
-    pub fn resolvedCallOf(self: *const TypeCheck, sp: Span) ?[]const u8 {
+    /// The resolution the checker recorded for the call at `sp`.
+    pub fn resolvedCallOf(self: *const TypeCheck, sp: Span) ?ResolvedCall {
         return self.resolved_calls.get(sp);
     }
+};
+
+/// One recorded overload decision: the chosen declaration's identity and
+/// its comparison-stable render.
+pub const ResolvedCall = struct {
+    decl_span: ?Span,
+    render: []const u8,
 };
 
 /// Public entry point. `resolution` is the resolver's output for the same
@@ -612,7 +621,7 @@ pub const Checker = struct {
     resolution: *const Resolution,
     types: std.AutoHashMap(Span, Type),
     /// Chosen-overload record per call span (see TypeCheck.resolved_calls).
-    resolved_calls: std.AutoHashMap(Span, []const u8),
+    resolved_calls: std.AutoHashMap(Span, ResolvedCall),
     /// Spans whose recorded type is `Nothing`, maintained alongside `types`.
     /// The reachability queries only need to know where control diverges,
     /// so they consult this small set instead of walking the full map.

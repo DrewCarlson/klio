@@ -745,7 +745,11 @@ test "overload checker records its pick per call span" {
     var it = tc.resolved_calls.iterator();
     var found = false;
     while (it.next()) |e| {
-        if (std.mem.indexOf(u8, e.value_ptr.*, "p0=Int") != null) found = true;
+        if (std.mem.indexOf(u8, e.value_ptr.render, "p0=Int") != null) {
+            found = true;
+            // The identity channel: the pick names its declaration.
+            try std.testing.expect(e.value_ptr.decl_span != null);
+        }
     }
     try std.testing.expect(found);
 }

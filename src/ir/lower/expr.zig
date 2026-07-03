@@ -515,7 +515,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
             if (class_pick) |cid| {
-                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cid } });
+                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cid, .ctor_ref = true } });
             } else if (ref_pick) |fid| {
                 const n = blk: {
                     if (b.module.funcById(fid)) |f| {
@@ -3254,6 +3254,36 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
     return null;
 }
 
+
+/// Whether any registered class's fqn ends in `.{name}` or `${name}` (a
+/// nested/companion class reachable by simple name from some scope).
+/// The nesting tree's conservative complement: splice windows whose owner
+/// chain is unknown cannot walk the tree, so this module-wide probe keeps
+/// a capitalized bare call from being mis-claimed as a member call.
+fn anyClassNamed(b: *FuncBuilder, name: []const u8) bool {
+    for (b.module.classes.items) |*c| {
+        const fqn = c.fqn;
+        if (fqn.len > name.len and std.mem.endsWith(u8, fqn, name)) {
+            const sep = fqn[fqn.len - name.len - 1];
+            if (sep == '.' or sep == '$') return true;
+        }
+        if (std.mem.eql(u8, c.name, name)) return true;
+    }
+    return false;
+}
+
+
+/// Whether the eager-vs-lazy audit is enabled (`KLIO_EAGER_AUDIT=1`).
+fn eagerAuditOn() bool {
+    const S = struct {
+        var cached: ?bool = null;
+    };
+    if (S.cached) |v| return v;
+    const on = runtime.getenvSlice("KLIO_EAGER_AUDIT") != null;
+    S.cached = on;
+    return on;
+}
+
 fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -3332,8 +3362,14 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // member of its class, or an extension whose declared receiver is
             // compatible with the *known* receiver-type chain. Dispatch it
             // straight onto the bound receiver register.
-            const binds_this = b.hasOwnMember(nm) or
-                (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain));
+            // A NESTED CLASS's name sits in the own-member set but a
+            // capitalized bare call to it is a CONSTRUCTOR, never a
+            // method on `this` — leave it to the ctor resolution.
+            const is_scoped_class = nm.len > 0 and std.ascii.isUpper(nm[0]) and
+                (scopedClassIdForRead(b, nm, callee.Path.segments[0].span.file) != null or
+                    b.module.classId(nm) != null or anyClassNamed(b, nm));
+            const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or
+                (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain)));
             if (binds_this) {
                 if (b.resolve("this")) |bound_this| {
                     const run = try lowerArgRun(b, args);
@@ -4065,7 +4101,29 @@ fn lowerValueInvocation(
             try b.push(.{ .CellGet = .{ .dst = c, .cell = reg } });
             callee_reg = c;
         }
-        // A bare call to a receiver-typed function param.
+        // A bare call to a receiver-typed function param. With explicit
+        // positional args the FIRST one is the receiver (`f: T.() -> R`
+        // called `f(x)` means `x.f()`); with none, the enclosing `this`.
+        if (b.isReceiverLambdaParam(name0) and args.len >= 1 and
+            ast_arg_names.len >= 1 and ast_arg_names[0] == null and blk: {
+                const ar = b.receiverLambdaArity(name0) orelse break :blk false;
+                break :blk args.len == ar + 1;
+            })
+        {
+            const recv_r = try lowerExpr(b, &args[0]);
+            const run = try lowerArgRun(b, args[1..]);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names[1..]);
+            const dst = b.allocReg();
+            try b.push(.{ .CallValueWithThis = .{
+                .dst = dst,
+                .callee = callee_reg,
+                .receiver = recv_r,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
         if (b.isReceiverLambdaParam(name0)) {
             const this_reg = try resolveThisForBareCallNoBind(b);
             if (this_reg) |tr| {
@@ -4482,6 +4540,18 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     defer b.allocator.free(shapes);
     const ctx = resolveCtxFor(b, name0, ast_type_args, cast_pick);
     const res = try b.module.resolveCall(b.allocator, name0, b.self_package, segments[0].span.file, shapes, last_arg_lambda, ctx);
+    // Eager audit: where typeck recorded a pick for this call site,
+    // compare it against the engine's answer. Audit-only — behavior
+    // flips seam by seam once disagreement is at zero.
+    if (b.module.eagerCallTarget(segments[0].span)) |eager_fid| {
+        if (eagerAuditOn()) {
+            const lazy: ?FuncId = res.target;
+            if (lazy == null or lazy.?.int() != eager_fid.int()) {
+                const lazy_str: i64 = if (lazy) |l| @intCast(l.int()) else -1;
+                std.debug.print("[EAGER-AUDIT] call '{s}': eager={d} lazy={d}\n", .{ name0, eager_fid.int(), lazy_str });
+            }
+        }
+    }
     defer b.allocator.free(res.candidate_set);
     const was_cast = cast_pick != null and res.target != null and cast_pick.?.int() == res.target.?.int();
 
@@ -5318,14 +5388,11 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
 /// reads ITS OWN Key, not `CoroutineContext.Key` from a wildcard import.
 fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
     if (b.ownerClass()) |oc| {
-        var owner: ?[]const u8 = oc;
-        var hops: u8 = 0;
-        while (owner) |ow| : (hops += 1) {
-            if (hops > 8) break;
-            var kb: [256]u8 = undefined;
-            const mangled = std.fmt.bufPrint(&kb, "{s}${s}", .{ ow, name0 }) catch break;
-            if (b.module.classId(mangled)) |cid| return cid;
-            owner = if (std.mem.lastIndexOfScalar(u8, ow, '$')) |sep| ow[0..sep] else null;
+        // Resolve the OWNER to an id once (its lifted simple name is in the
+        // class index), then answer through the nesting tree — the one
+        // scoped classifier lookup, no string-mangled probing.
+        if (b.module.classId(oc)) |owner_id| {
+            if (b.module.classIdNestedIn(owner_id, name0)) |cid| return cid;
         }
     }
     // A receiver context whose owner chain is unknown here (a super-arg /
