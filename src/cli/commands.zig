@@ -618,7 +618,34 @@ pub fn computeEagerCalls(
         }
     }
     if (audit) std.debug.print("[EAGER] {d} call resolutions recorded\n", .{n});
+    // The companion evidence channel: per-expression type heads. Only
+    // decisive heads enter (scalars, String, named classes, nullable
+    // wrappers of those) — a Function/TypeParam/Unresolved answer would
+    // override AST evidence with mush.
+    var tout = std.AutoHashMap(span_mod.Span, ir.EagerTypeHead).init(gpa);
+    var tit = tc.types.iterator();
+    var tn: usize = 0;
+    while (tit.next()) |e| {
+        const head = eagerHeadOf(e.value_ptr, false) orelse continue;
+        tout.put(e.key_ptr.*, head) catch continue;
+        tn += 1;
+    }
+    if (audit) std.debug.print("[EAGER] {d} type heads recorded\n", .{tn});
+    ir.pending_eager_types = tout;
     return out;
+}
+
+fn eagerHeadOf(t: *const typeck.check.Type, nullable: bool) ?ir.EagerTypeHead {
+    // Primitive scalar heads stay OUT of the channel: the applicability
+    // engine treats primitive evidence as exact, but a literal's type
+    // coerces to the parameter's primitive (an Int literal fills a
+    // `vararg Byte` slot), and the head cannot carry literalness.
+    return switch (t.*) {
+        .String => .{ .name = "String", .nullable = nullable },
+        .Nullable => |inner| eagerHeadOf(inner, true),
+        .Generic => |g| .{ .name = g.name, .nullable = nullable },
+        else => null,
+    };
 }
 
 fn runBuilt(

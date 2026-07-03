@@ -4251,6 +4251,55 @@ fn argEvidenceLitKind(b: *FuncBuilder, arg: *const Expr) ?LitKind {
 /// parameter whose declared type is known (`b.localDeclType`), as a `TypeRef`
 /// for the shared scorer's declared-type evidence. Null for anything else.
 fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    // The E2.1 type-head channel exists (Module.eagerTypeOf) but does
+    // NOT feed evidence yet: typeck's permissive inference can hand back
+    // a wrong container head (a ByteArray value typed Iterable), and a
+    // wrong head DISPROVES valid candidates downstream. The seam flips
+    // only after the type-head audit below reaches zero disagreement,
+    // mirroring the call channel's per-class trust discipline.
+    var lazy_ans = argDeclTypeRefLazy(b, arg);
+    // E2.1, ADDITIVE-ONLY: typeck's head fills in where the AST probes
+    // have no answer; the declared (AST) answer always wins when both
+    // exist — kotlinc resolves overloads against the STATIC DECLARED
+    // type, and the audit shows the only both-exist deltas are the
+    // legitimate declared-wider-vs-inferred-narrower class.
+    if (lazy_ans == null) {
+        if (b.module.eagerTypeOf(arg.span())) |th| {
+            if (typeheadAuditOn()) {
+                const sp = arg.span();
+                std.debug.print("[TYPEHEAD-FILL] f{d}:{d} typeck={s}{s}\n", .{ sp.file.int(), sp.start, th.name, if (th.nullable) @as([]const u8, "?") else "" });
+            }
+            lazy_ans = .{ .name = th.name, .nullable = th.nullable, .args = &.{} };
+        }
+    }
+    if (typeheadAuditOn()) {
+        if (b.module.eagerTypeOf(arg.span())) |th| {
+            if (lazy_ans) |la| {
+                if (!std.mem.eql(u8, la.name, th.name) or la.nullable != th.nullable) {
+                    const sp = arg.span();
+                    std.debug.print("[TYPEHEAD-AUDIT] f{d}:{d} ast={s}{s} typeck={s}{s}\n", .{
+                        sp.file.int(),           sp.start,
+                        la.name,                 if (la.nullable) @as([]const u8, "?") else "",
+                        th.name,                 if (th.nullable) @as([]const u8, "?") else "",
+                    });
+                }
+            }
+        }
+    }
+    return lazy_ans;
+}
+
+fn typeheadAuditOn() bool {
+    const S = struct {
+        var cached: ?bool = null;
+    };
+    if (S.cached) |v| return v;
+    const on = runtime.getenvSlice("KLIO_TYPEHEAD_AUDIT") != null;
+    S.cached = on;
+    return on;
+}
+
+fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // An unsafe cast fixes the argument's static type for overload
     // resolution — kotlinc sees exactly the cast target. That is the
     // documented way to force a sibling overload (ktor's deprecated
@@ -4547,7 +4596,21 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
         std.debug.print("[EAGER-PROBE] '{s}' f{d}:{d}-{d} map={}\n", .{ name0, segments[0].span.file.int(), segments[0].span.start, segments[0].span.end, b.module.eager_calls != null });
     }
     var res_final = res;
-    if (b.module.eagerCallTarget(segments[0].span)) |eager_fid| {
+    if (b.module.eagerCallTarget(segments[0].span)) |eager_fid| eager: {
+        // A pick that resolves the call back to the ENCLOSING declaration
+        // while the lazy engine chose otherwise is distrusted: stdlib
+        // overload families delegate to same-name siblings, and a
+        // mis-picked self-target recurses forever.
+        if (b.self_decl_span) |sds| {
+            const ec = &(b.module.eager_calls.?);
+            if (ec.get(segments[0].span)) |decl| {
+                if (decl.file.int() == sds.file.int() and decl.start == sds.start and decl.end == sds.end and
+                    (res.target == null or res.target.?.int() != eager_fid.int()))
+                {
+                    break :eager;
+                }
+            }
+        }
         // Consumption: the typeck-decided target is type-derived and
         // overload-precise where the lazy engine is shape-based; prefer
         // it. `ty_proven` pins the pick against runtime value-typed

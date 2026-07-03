@@ -163,7 +163,7 @@ pub fn checkCall(
             if (is_builder) {
                 self.builder_inference_active = true;
             }
-            const result = try checkOverloadedCallRecorded(self, sigs_list.items, args, arg_names, type_args, callee.span());
+            const result = try checkOverloadedCallRecorded(self, sigs_list.items, args, arg_names, type_args, callee.span(), name);
             self.builder_inference_active = prev_bi;
             return result;
         }
@@ -501,13 +501,32 @@ pub fn checkCrossinlineArgReturns(
 /// the eager engine's resolution record (one oracle, recorded once). The
 /// render is compact and comparison-stable: arity, parameter type heads,
 /// and the return head.
-fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig) void {
+fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record_name: []const u8) void {
+    // A vararg overload family needs the engine's packing logic to pick
+    // (typeck's MSC can prefer a fixed-arity sibling for a vararg call);
+    // vararg picks stay out of the channel.
+    for (sig.is_vararg) |v| if (v) return;
     // Package-visibility gate: the flat name registry is package-blind, so
     // a same-name declaration from an unrelated package can win here that
     // Kotlin scoping would never see (a packageless `apply` shadowing
     // `kotlin.apply` for a caller inside the stdlib). Record only when the
     // declaration is in the caller's own package or a default-imported
     // `kotlin*` package.
+    // Member-shadow gate: a bare call inside a class whose enclosing
+    // chain declares a same-name MEMBER resolves to the member by Kotlin
+    // scoping — the top-level registry's answer is out-ranked, so it
+    // must not enter the channel (`fun error(...)` on a test class beats
+    // default-imported `kotlin.error`).
+    {
+        var ci: usize = self.class_stack.items.len;
+        while (ci > 0) {
+            ci -= 1;
+            const cname = self.class_stack.items[ci];
+            if (self.classes.get(cname)) |info| {
+                if (info.member_sigs.contains(record_name)) return;
+            }
+        }
+    }
     if (sig.decl_span) |ds| {
         const decl_pkg = self.file_packages.get(ds.file.int()) orelse "";
         const call_pkg = self.file_packages.get(call_span.file.int()) orelse "";
@@ -551,8 +570,9 @@ pub fn checkOverloadedCallRecorded(
     arg_names: []const ?[]const u8,
     type_args: []const TypeRef,
     call_span: Span,
+    record_name: []const u8,
 ) Allocator.Error!Type {
-    return checkOverloadedCallRec(self, sigs, args, arg_names, type_args, call_span, true);
+    return checkOverloadedCallRecImpl(self, sigs, args, arg_names, type_args, call_span, true, record_name);
 }
 
 fn checkOverloadedCallRec(
@@ -563,6 +583,19 @@ fn checkOverloadedCallRec(
     type_args: []const TypeRef,
     call_span: Span,
     record: bool,
+) Allocator.Error!Type {
+    return checkOverloadedCallRecImpl(self, sigs, args, arg_names, type_args, call_span, record, "");
+}
+
+fn checkOverloadedCallRecImpl(
+    self: *Checker,
+    sigs: []const FnSig,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const TypeRef,
+    call_span: Span,
+    record: bool,
+    record_name: []const u8,
 ) Allocator.Error!Type {
     // Crossinline-lambda non-local-return diagnostic (T0056). If any
     // overload candidate marks the current arg position `crossinline` and
@@ -656,7 +689,10 @@ fn checkOverloadedCallRec(
         }
         try checkArityAndArgs(self, sig, args, call_span);
         try enforceSuspendColoring(self, sig.is_suspend, "function", call_span);
-        if (record and !sig.is_extension) recordResolvedCall(self, call_span, sig);
+        // Filtered-to-one from an overload SET is not a typed decision —
+        // named-arg/type-arg filtering alone picked it. Only a genuinely
+        // non-overloaded name records here.
+        if (record and sigs.len == 1 and !sig.is_extension) recordResolvedCall(self, call_span, sig, record_name);
         if (has_type_args or sig.type_param_count == 0) {
             return sig.return_ty.clone(self.allocator);
         }
@@ -820,7 +856,36 @@ fn checkOverloadedCallRec(
     // Record only a DECIDED pick: the arity-match fallback is a guess
     // (any same-arity overload), and a guess in the eager channel would
     // override the runtime engine's evidence-based answer.
-    if (record and chosen != null and !sig.is_extension) recordResolvedCall(self, call_span, sig);
+    // An Unresolved argument fits every candidate, so a decision reached
+    // with one in play is not evidence-backed enough for the channel
+    // (`assertContentEquals(sequenceOf(..), ..)` must not commit the
+    // Array overload because the sequence typed as Unresolved).
+    const args_decisive = blk: {
+        for (arg_tys.items) |*t| {
+            var core: *const Type = t;
+            while (core.* == .Nullable) core = core.Nullable;
+            switch (core.*) {
+                .Unresolved, .TypeParam => break :blk false,
+                else => {},
+            }
+        }
+        break :blk true;
+    };
+    if (record and chosen != null and args_decisive and !sig.is_extension) {
+        if (std.c.getenv("KLIO_EAGER_HITS") != null) {
+            std.debug.print("[REC-MSC] '{s}' args:", .{record_name});
+            for (arg_tys.items) |*t| switch (t.*) {
+                .Generic => |g| std.debug.print(" G:{s}", .{g.name}),
+                .Nullable => |inner| switch (inner.*) {
+                    .Generic => |g| std.debug.print(" N.G:{s}", .{g.name}),
+                    else => std.debug.print(" N.{s}", .{@tagName(inner.*)}),
+                },
+                else => std.debug.print(" {s}", .{@tagName(t.*)}),
+            };
+            std.debug.print("\n", .{});
+        }
+        recordResolvedCall(self, call_span, sig, record_name);
+    }
     if (has_type_args) {
         try decl_mod.checkTypeArgBounds(self, sig, type_args);
     }

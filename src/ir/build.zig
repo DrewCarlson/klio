@@ -7,6 +7,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const ir = @import("ir.zig");
+const span_mod = @import("span");
 
 const Allocator = std.mem.Allocator;
 
@@ -268,6 +269,11 @@ pub const FuncBuilder = struct {
     /// function itself. Self-calls are lowered as `Terminator.TailJump`
     /// to keep the stack flat across recursion.
     tailrec_self: ?[]const u8 = null,
+    /// The AST name-span of the declaration this builder lowers — the
+    /// eager seam refuses a typeck pick that resolves a call back to the
+    /// ENCLOSING declaration when the lazy engine chose otherwise (a
+    /// self-delegating overload mis-picked as self recurses forever).
+    self_decl_span: ?span_mod.Span = null,
     /// Whether the tailrec function carries an implicit leading `this`
     /// param (instance method / extension). A bare recursive call keeps
     /// the same receiver, so the tail jump's arg run must lead with it.
@@ -933,6 +939,9 @@ pub const FuncBuilder = struct {
     }
     pub fn isParamThunk(self: *const FuncBuilder) bool {
         return self.is_param_thunk;
+    }
+    pub fn setSelfDeclSpan(self: *FuncBuilder, sp: span_mod.Span) void {
+        self.self_decl_span = sp;
     }
     pub fn setTailrecSelf(self: *FuncBuilder, name: []const u8) void {
         self.tailrec_self = name;

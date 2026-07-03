@@ -75,7 +75,16 @@ probes (`argDeclTypeRef`, `local_decl_types`, `local_decl_nullable`).
   the full battery; the lazy path stays the fallback for spans typeck did
   not answer:
   1. **Declared-type evidence**: receiver/argument typing consults
-     `Span → Type` ahead of the AST string probes.
+     `Span → Type` ahead of the AST string probes. STATUS: LIVE,
+     additive-only with primitives excluded. The type-head audit showed
+     the only both-exist deltas are the legitimate declared-wider class
+     (kotlinc resolves against the STATIC DECLARED type, so the AST
+     answer wins where both exist); the fill channel's one failure class
+     was literal-typed primitive evidence breaking exact-match
+     applicability — a head cannot carry literalness, so primitive heads
+     never fill. FOLLOW-UP (E4 queue): the applicability engine's
+     literal-coercion gap (primitive evidence treated as exact) is a real
+     lazy-engine issue deserving its own fix.
   2. **Bare-call commitment**: `resolveCall` consults the identity channel
      first; a typeck-committed target lowers as a direct call — the deferred
      CMG form is emitted only where typeck also had no answer.
@@ -94,7 +103,41 @@ probes (`argDeclTypeRef`, `local_decl_types`, `local_decl_nullable`).
   disagreements across the corpus battery; the audit stays wired as the
   permanent regression tripwire.
 
-- **E4 — Heuristic replacement.** With seams live, each runtime heuristic is
+- **E4 — Heuristic replacement.** STATUS of the first attempt: narrowing
+  the implicit-this redirect on a channel-committed plain target broke
+  eager-ON ArraysTest — typeck's member-shadow record gate checks only
+  DECLARED members per class, not INHERITED ones, so a channel record can
+  exist where a real inherited member shadows. Every E4 narrowing has the
+  same shape of prerequisite: the channel's trust surface must cover the
+  heuristic's full decision context first (here: typeck needs the
+  inherited-member view). The E4 queue and each item's prerequisite:
+  QUEUE STATE:
+  - implicit-this redirect: LANDED — the record gate walks declared AND
+    inherited members (classChainHasMember), and a channel-committed
+    .plain target skips the redirect.
+  - closure +1-arity rebind: MEASURED AND KEPT. Under live HTTP traffic
+    the ktor pipeline fires it 174 times across a short request set —
+    the arm IS the runtime's receiver-binding for host-driven
+    invocations, not a deletable heuristic. The hardening path is to
+    thread declared receiver-shapes into ClosureInfo (an explicit
+    has_receiver bit from the lambda's declared type) so the binding
+    stops being an arity+capture guess; queued as an enhancement.
+  - CallMemberOrValue exact emission: ATTEMPTED and reverted with the
+    finding — the hierarchy sets can disprove declared/inherited MEMBERS
+    but the runtime member leg also serves EXTENSIONS (stdlib extensions
+    on the receiver's type win over a local callable in Kotlin's
+    qualified-call ranking), so "hierarchy lacks the name" does not mean
+    "no member can win": the MinMax family lost one test per file to a
+    local shadowing a real extension. The precondition is an
+    extension-aware membership answer (the ext-candidate index by
+    receiver head), not just the hierarchy sets.
+  - literal-coercion gap: NEUTRALIZED — the only live path was eager
+    primitive fills, which the channel excludes. The enhancement that
+    would let primitives fill is a numeric-family-aware evidence
+    comparison in applicability (Int evidence vs Byte param is not
+    definite for literal-typed values); worthwhile, canonical-gated,
+    not urgent.
+ With seams live, each runtime heuristic is
   narrowed to the truly-dynamic residue or deleted, battery-gated:
   - `CallMemberOrValue`'s invocability guessing → exact emission per typeck
     (member, value-with-receiver, or ctor), the guessing arm kept only for

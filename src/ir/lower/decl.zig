@@ -1065,6 +1065,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         var tp_names = StringSet.init(a);
         defer tp_names.deinit();
         for (f.type_params) |*tp| try tp_names.put(tp.name.name, {});
+        b.setSelfDeclSpan(f.name.span);
         b.setHasOwnTypeParams(f.type_params.len != 0);
         for (f.params) |*p| {
             if (p.ty.function == null and !p.ty.nullable and tp_names.contains(p.ty.name.name)) {
