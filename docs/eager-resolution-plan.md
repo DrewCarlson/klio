@@ -121,13 +121,15 @@ probes (`argDeclTypeRef`, `local_decl_types`, `local_decl_nullable`).
     precondition before narrowing is a live-request measurement (the
     arm's documented consumer is the ktor pipeline invoking receiver
     lambdas value-style, which only fires under real HTTP traffic).
-  - CallMemberOrValue exact emission: DESIGNED, not yet implemented. The
-    local-callable arm can emit the exact form when two channels agree:
-    the receiver's head (eagerTypeOf / lambda receiver head) answers the
-    member question via the hierarchy sets, and the param-shape channel
-    gives the callable's declared shape. Where both answer, emit
-    CallMember or CallValueWithThis directly; the member-or-value race
-    remains only for silent-channel spans.
+  - CallMemberOrValue exact emission: ATTEMPTED and reverted with the
+    finding — the hierarchy sets can disprove declared/inherited MEMBERS
+    but the runtime member leg also serves EXTENSIONS (stdlib extensions
+    on the receiver's type win over a local callable in Kotlin's
+    qualified-call ranking), so "hierarchy lacks the name" does not mean
+    "no member can win": the MinMax family lost one test per file to a
+    local shadowing a real extension. The precondition is an
+    extension-aware membership answer (the ext-candidate index by
+    receiver head), not just the hierarchy sets.
   - literal-coercion gap: NEUTRALIZED — the only live path was eager
     primitive fills, which the channel excludes. The enhancement that
     would let primitives fill is a numeric-family-aware evidence
