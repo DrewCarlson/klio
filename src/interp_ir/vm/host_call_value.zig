@@ -987,12 +987,14 @@ fn makeIntrinsicHost(self: *VmHost) VmIntrinsicHost {
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
+        .singletons_by_id = self.singletons_by_id.clone(),
         .allocator = self.allocator,
     };
 }
 
 fn intrinsicHostDeinit(h: *VmIntrinsicHost) void {
     h.object_states.deinit();
+    h.singletons_by_id.deinit();
     h.module.deinit();
     h.closures.deinit();
     h.globals.deinit();

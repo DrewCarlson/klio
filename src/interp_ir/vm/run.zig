@@ -69,6 +69,7 @@ pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
         .out_sink = try SharedOutput.new(allocator),
         .threads = try root.ThreadTable.init(allocator, std.AutoHashMap(u64, root.ThreadEntry).init(allocator)),
         .object_states = try root.ObjectStates.init(allocator, std.StringHashMap(root.ObjectInitState).init(allocator)),
+        .singletons_by_id = try root.SingletonsById.init(allocator, std.AutoHashMap(u32, runtime.Value).init(allocator)),
         .allocator = allocator,
     };
 }
@@ -237,6 +238,7 @@ fn sharedHandles(self: *Vm) vmhost.SharedHandles {
         .out_sink = self.out_sink,
         .threads = self.threads,
         .object_states = self.object_states,
+        .singletons_by_id = self.singletons_by_id,
         .allocator = self.allocator,
     };
 }
@@ -275,6 +277,7 @@ pub fn vmSpawnChild(self: *Vm) SendableVmSeed {
         .out_sink = self.out_sink.clone(),
         .threads = self.threads.clone(),
         .object_states = self.object_states.clone(),
+        .singletons_by_id = self.singletons_by_id.clone(),
         .allocator = self.allocator,
     };
 }
@@ -311,6 +314,7 @@ fn gcMarkAllVms(m: *runtime.gc.Marker) void {
         // Object/companion singletons captured mid-construction, anon-object
         // method receivers, and the program image's default-value Values.
         m.shade(&vm.object_states.cell.hdr);
+        m.shade(&vm.singletons_by_id.cell.hdr);
         m.shade(&vm.anon_methods.cell.hdr);
         m.shade(&vm.prog.cell.hdr);
     }
@@ -787,6 +791,7 @@ pub fn vmDeinit(self: *Vm) void {
         self.out_sink.deinit();
         self.threads.deinit();
         self.object_states.deinit();
+        self.singletons_by_id.deinit();
     }
     // The receiver/coroutine thread-locals are balanced within a run; assert
     // they are empty at the boundary and clear them so leaked-across-runs
