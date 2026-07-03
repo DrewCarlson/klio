@@ -889,6 +889,11 @@ pub const Module = struct {
     /// answers every scoped classifier lookup — no `$`/`.` string-mangled
     /// probing at use sites.
     class_parent: ?std.AutoHashMap(ClassId, ClassId) = null,
+    /// The identity channel's lowering half: each lowered declaration's
+    /// AST name-span maps to its FuncId. Composed with typeck's
+    /// `Span(call) -> decl_span` record, this gives lowering an exact,
+    /// type-derived target per call site with no shared symbol table.
+    func_by_decl_span: ?std.AutoHashMap(span.Span, FuncId) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
@@ -1161,6 +1166,7 @@ pub const Module = struct {
         if (self.class_id_map) |*m| m.deinit();
         if (self.class_fqn_map) |*m| m.deinit();
         if (self.class_parent) |*m| m.deinit();
+        if (self.func_by_decl_span) |*m| m.deinit();
         if (self.class_children) |*m| {
             var itc = m.valueIterator();
             while (itc.next()) |v| v.deinit();
@@ -1328,6 +1334,19 @@ pub const Module = struct {
     /// through the lexical parents. Answers nested classes, nested objects,
     /// and companions uniformly — the string-mangled `$`/`.` probes derive
     /// from the same FQNs this tree was built from.
+    /// Record a lowered declaration's identity (its AST name-span).
+    pub fn recordFuncDeclSpan(self: *Module, allocator: Allocator, decl_span: span.Span, id: FuncId) Allocator.Error!void {
+        if (self.func_by_decl_span == null) {
+            self.func_by_decl_span = std.AutoHashMap(span.Span, FuncId).init(allocator);
+        }
+        try self.func_by_decl_span.?.put(decl_span, id);
+    }
+    /// The FuncId lowered for the declaration at `decl_span`, if any.
+    pub fn funcByDeclSpan(self: *const Module, decl_span: span.Span) ?FuncId {
+        const m = &(self.func_by_decl_span orelse return null);
+        return m.get(decl_span);
+    }
+
     pub fn classIdNestedIn(self: *const Module, owner: ClassId, name: []const u8) ?ClassId {
         const cm = &(self.class_children orelse return null);
         const pm = &(self.class_parent orelse return null);

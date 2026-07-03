@@ -620,6 +620,7 @@ pub fn lowerFunctionWithFile(
     const id = module.nextFuncId();
     var placed = func;
     placed.id = id;
+    try module.recordFuncDeclSpan(a, f.name.span, id);
     const nm = f.name.name;
     try module.func_index.append(a, .{ .name = nm, .id = id });
     try funcNameIndexPush(module, nm, id);
@@ -885,6 +886,7 @@ pub fn lowerMethodWithPrivate(
         const id = module.nextFuncId();
         var placed = func;
         placed.id = id;
+        try module.recordFuncDeclSpan(a, f.name.span, id);
         placed.kind = .member_extension;
         try module.funcs.append(a, placed);
         try registerFuncTypeParams(module, f, id);
@@ -915,6 +917,7 @@ pub fn lowerMethodWithPrivate(
     const id = module.nextFuncId();
     var placed = func;
     placed.id = id;
+    try module.recordFuncDeclSpan(a, f.name.span, id);
     placed.kind = .instance_method;
     try module.funcs.append(a, placed);
     try registerFuncTypeParams(module, f, id);

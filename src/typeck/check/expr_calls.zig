@@ -510,7 +510,7 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig) void {
     }
     buf.print(self.allocator, ";ret={f}", .{sig.return_ty}) catch return;
     const rendered = self.allocator.dupe(u8, buf.items) catch return;
-    self.resolved_calls.put(call_span, rendered) catch {
+    self.resolved_calls.put(call_span, .{ .decl_span = sig.decl_span, .render = rendered }) catch {
         self.allocator.free(rendered);
     };
 }
