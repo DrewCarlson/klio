@@ -852,6 +852,10 @@ pub threadlocal var pending_eager_types: ?std.AutoHashMap(span.Span, EagerTypeHe
 pub const EagerTypeHead = struct { name: []const u8, nullable: bool };
 /// Receiver-lambda channel: body-block span -> receiver class head.
 pub threadlocal var pending_eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null;
+/// Fn-typed lambda-param shapes: param ident span -> {has_receiver, arity}.
+pub threadlocal var pending_eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null;
+
+pub const EagerParamShape = struct { has_receiver: bool, arity: u16 };
 
 pub const Module = struct {
     funcs: std.ArrayList(Func) = .empty,
@@ -915,6 +919,7 @@ pub const Module = struct {
     /// Typeck's per-expression type heads (the E2.1 evidence seam).
     eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null,
     eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
+    eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
@@ -1118,6 +1123,10 @@ pub const Module = struct {
             out__.eager_recv_heads = per;
             pending_eager_recv_heads = null;
         }
+        if (pending_eager_param_shapes) |pep| {
+            out__.eager_param_shapes = pep;
+            pending_eager_param_shapes = null;
+        }
         return out__;
     }
 
@@ -1204,6 +1213,7 @@ pub const Module = struct {
         if (self.eager_calls) |*m| m.deinit();
         if (self.eager_types) |*m| m.deinit();
         if (self.eager_recv_heads) |*m| m.deinit();
+        if (self.eager_param_shapes) |*m| m.deinit();
         if (self.class_children) |*m| {
             var itc = m.valueIterator();
             while (itc.next()) |v| v.deinit();
@@ -1380,6 +1390,11 @@ pub const Module = struct {
     pub fn eagerTypeOf(self: *const Module, sp: span.Span) ?EagerTypeHead {
         const et = &(self.eager_types orelse return null);
         return et.get(sp);
+    }
+    /// The declared shape of the fn-typed lambda param declared at `sp`.
+    pub fn eagerParamShapeOf(self: *const Module, sp: span.Span) ?EagerParamShape {
+        const m = &(self.eager_param_shapes orelse return null);
+        return m.get(sp);
     }
     /// The receiver class head typeck bound for the lambda body at `sp`.
     pub fn eagerRecvHeadOf(self: *const Module, sp: span.Span) ?[]const u8 {

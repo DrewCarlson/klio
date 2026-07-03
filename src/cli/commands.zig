@@ -637,6 +637,11 @@ pub fn computeEagerCalls(
     while (rit.next()) |e| rout.put(e.key_ptr.*, e.value_ptr.*) catch {};
     if (audit) std.debug.print("[EAGER] {d} lambda receiver heads recorded\n", .{rout.count()});
     ir.pending_eager_recv_heads = rout;
+    var pout = std.AutoHashMap(span_mod.Span, ir.EagerParamShape).init(gpa);
+    var pit = tc.lambda_param_shapes.iterator();
+    while (pit.next()) |e| pout.put(e.key_ptr.*, .{ .has_receiver = e.value_ptr.has_receiver, .arity = e.value_ptr.arity }) catch {};
+    if (audit) std.debug.print("[EAGER] {d} param shapes recorded\n", .{pout.count()});
+    ir.pending_eager_param_shapes = pout;
     return out;
 }
 

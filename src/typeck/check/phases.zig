@@ -59,6 +59,7 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .types = std.AutoHashMap(root.Span, root.Type).init(allocator),
         .resolved_calls = std.AutoHashMap(root.Span, root.ResolvedCall).init(allocator),
         .lambda_recv_heads = std.AutoHashMap(root.Span, []const u8).init(allocator),
+        .lambda_param_shapes = std.AutoHashMap(root.Span, root.ParamShape).init(allocator),
         .nothing_spans = std.AutoHashMap(root.Span, void).init(allocator),
         .nothing_by_fn = std.AutoHashMap(root.Span, std.AutoHashMap(root.Span, void)).init(allocator),
         .nothing_epoch = 0,

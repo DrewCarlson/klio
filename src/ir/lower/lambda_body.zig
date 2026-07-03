@@ -311,7 +311,16 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     // instead of invoking the value receiverless.
     for (params, 0..) |pname, pi| {
         if (pi >= param_tys.len) break;
-        const t = param_tys[pi] orelse continue;
+        const t = param_tys[pi] orelse {
+            // E2.4: an unannotated param's declared shape from typeck.
+            if (b.module.eagerParamShapeOf(pname.span)) |shape| {
+                if (shape.has_receiver) {
+                    try b.markReceiverLambdaParam(pname.name);
+                    try b.markReceiverLambdaArity(pname.name, shape.arity);
+                }
+            }
+            continue;
+        };
         if (t.function) |fnty| {
             if (fnty.receiver != null) {
                 try b.markReceiverLambdaParam(pname.name);

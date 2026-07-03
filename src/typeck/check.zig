@@ -88,6 +88,7 @@ pub const TypeCheck = struct {
     /// lowering-side audits and typeck-informed evidence.
     resolved_calls: std.AutoHashMap(Span, ResolvedCall),
     lambda_recv_heads: std.AutoHashMap(Span, []const u8),
+    lambda_param_shapes: std.AutoHashMap(Span, ParamShape),
 
     /// Look up the type assigned to an expression by span.
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
@@ -102,6 +103,9 @@ pub const TypeCheck = struct {
 
 /// One recorded overload decision: the chosen declaration's identity and
 /// its comparison-stable render.
+/// A function-typed parameter's declared shape.
+pub const ParamShape = struct { has_receiver: bool, arity: u16 };
+
 pub const ResolvedCall = struct {
     decl_span: ?Span,
     render: []const u8,
@@ -129,6 +133,7 @@ pub fn typecheck(
         .cfgs = tc.cfgs,
         .resolved_calls = tc.resolved_calls,
         .lambda_recv_heads = tc.lambda_recv_heads,
+        .lambda_param_shapes = tc.lambda_param_shapes,
     };
 }
 
@@ -241,6 +246,7 @@ pub fn typecheckModule(
         .cfgs = tc.cfgs,
         .resolved_calls = tc.resolved_calls,
         .lambda_recv_heads = tc.lambda_recv_heads,
+        .lambda_param_shapes = tc.lambda_param_shapes,
     };
 }
 
@@ -633,6 +639,10 @@ pub const Checker = struct {
     /// class head typeck bound `this` to. The eager channel that lets
     /// lowering answer member-vs-global precisely inside lambda bodies.
     lambda_recv_heads: std.AutoHashMap(Span, []const u8),
+    /// Function-typed lambda PARAMS keyed by the param ident's span: the
+    /// declared shape (receiver-ness + arity) for params the AST leaves
+    /// unannotated (`{ f -> f(x) }` against an expected function type).
+    lambda_param_shapes: std.AutoHashMap(Span, ParamShape),
     /// Spans whose recorded type is `Nothing`, maintained alongside `types`.
     /// The reachability queries only need to know where control diverges,
     /// so they consult this small set instead of walking the full map.

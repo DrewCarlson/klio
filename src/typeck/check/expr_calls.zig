@@ -2128,6 +2128,19 @@ pub fn checkLambdaShaped(
             if (f.receiver_head) |h| {
                 self.lambda_recv_heads.put(body.span, h) catch {};
             }
+            // Function-typed params the AST leaves unannotated: record
+            // their declared shape keyed by the param ident's span.
+            for (params, 0..) |p2, i| {
+                if (i >= f.params.len) break;
+                const pt = &f.params[i];
+                const core: *const Type = if (pt.* == .Nullable) pt.Nullable else pt;
+                if (core.* == .Function) {
+                    self.lambda_param_shapes.put(p2.span, .{
+                        .has_receiver = core.Function.receiver_head != null,
+                        .arity = @intCast(core.Function.params.len),
+                    }) catch {};
+                }
+            }
         } else {
             const count = @max(params.len, 1);
             var i: usize = 0;
