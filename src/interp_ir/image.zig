@@ -989,8 +989,15 @@ pub fn bake(
             fn_hdr_enc.resetRegistry();
             try encodeValue(ir.Func, &fn_hdr_enc, f);
             if (f.deferred_offset == 0 and f.blocks.len == 0) try bodyless.append(a, @intCast(i));
-            const h = if (std.mem.indexOfScalar(u8, f.fqn, '.')) |dot| f.fqn[0..dot] else f.fqn;
-            if (h.len != 0) try heads.put(h, {});
+            // Only a DOTTED fqn contributes a package head. A dotless
+            // name is not package-qualified: recording it whole would
+            // make every bare stdlib func name (`done`, `run`, …) a
+            // "package", flattening any user `x.member` read whose `x`
+            // collides into an unresolvable dotted global.
+            if (std.mem.indexOfScalar(u8, f.fqn, '.')) |dot| {
+                const h = f.fqn[0..dot];
+                if (h.len != 0) try heads.put(h, {});
+            }
         }
         root.func_header_section = fn_hdr_enc.out.items;
         root.func_header_offsets = offs;
