@@ -117,7 +117,7 @@ pub fn substituteTypeParams(
             for (f.params, params) |*p, *dst| dst.* = try substituteTypeParams(allocator, p, subst);
             const ret = try allocator.create(Type);
             ret.* = try substituteTypeParams(allocator, f.return_type, subst);
-            return .{ .Function = .{ .params = params, .return_type = ret, .is_suspend = f.is_suspend } };
+            return .{ .Function = .{ .params = params, .return_type = ret, .is_suspend = f.is_suspend, .receiver_head = f.receiver_head } };
         },
         .Range => |inner| {
             const ret = try allocator.create(Type);
@@ -159,7 +159,7 @@ pub fn convertTypeRefWithTparams(
         for (ft.params, params) |*p, *dst| dst.* = try convertTypeRefWithTparams(allocator, p, tparams);
         const ret = try allocator.create(Type);
         ret.* = try convertTypeRefWithTparams(allocator, &ft.ret, tparams);
-        const func: Type = .{ .Function = .{ .params = params, .return_type = ret, .is_suspend = ft.is_suspend } };
+        const func: Type = .{ .Function = .{ .params = params, .return_type = ret, .is_suspend = ft.is_suspend, .receiver_head = if (ft.receiver) |*r| r.name.name else null } };
         return if (t.nullable) func.asNullable(allocator) else func;
     }
     if (t.type_args.len != 0) {

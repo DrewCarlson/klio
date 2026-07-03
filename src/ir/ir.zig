@@ -850,6 +850,8 @@ pub threadlocal var pending_eager_calls: ?std.AutoHashMap(span.Span, span.Span) 
 pub threadlocal var pending_eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null;
 
 pub const EagerTypeHead = struct { name: []const u8, nullable: bool };
+/// Receiver-lambda channel: body-block span -> receiver class head.
+pub threadlocal var pending_eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null;
 
 pub const Module = struct {
     funcs: std.ArrayList(Func) = .empty,
@@ -912,6 +914,7 @@ pub const Module = struct {
     eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null,
     /// Typeck's per-expression type heads (the E2.1 evidence seam).
     eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null,
+    eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
@@ -1111,6 +1114,10 @@ pub const Module = struct {
             out__.eager_types = pet;
             pending_eager_types = null;
         }
+        if (pending_eager_recv_heads) |per| {
+            out__.eager_recv_heads = per;
+            pending_eager_recv_heads = null;
+        }
         return out__;
     }
 
@@ -1196,6 +1203,7 @@ pub const Module = struct {
         if (self.func_by_decl_span) |*m| m.deinit();
         if (self.eager_calls) |*m| m.deinit();
         if (self.eager_types) |*m| m.deinit();
+        if (self.eager_recv_heads) |*m| m.deinit();
         if (self.class_children) |*m| {
             var itc = m.valueIterator();
             while (itc.next()) |v| v.deinit();
@@ -1372,6 +1380,11 @@ pub const Module = struct {
     pub fn eagerTypeOf(self: *const Module, sp: span.Span) ?EagerTypeHead {
         const et = &(self.eager_types orelse return null);
         return et.get(sp);
+    }
+    /// The receiver class head typeck bound for the lambda body at `sp`.
+    pub fn eagerRecvHeadOf(self: *const Module, sp: span.Span) ?[]const u8 {
+        const m = &(self.eager_recv_heads orelse return null);
+        return m.get(sp);
     }
     /// The typeck-resolved target FuncId for the call at `callee_span`:
     /// eager record composed with the lowered-declaration identity map.

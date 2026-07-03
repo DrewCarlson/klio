@@ -274,6 +274,9 @@ pub const FuncBuilder = struct {
     /// ENCLOSING declaration when the lazy engine chose otherwise (a
     /// self-delegating overload mis-picked as self recurses forever).
     self_decl_span: ?span_mod.Span = null,
+    /// The AST block span of the lambda/fn body this builder lowers —
+    /// the key into the eager receiver-head channel.
+    body_span: ?span_mod.Span = null,
     /// Whether the tailrec function carries an implicit leading `this`
     /// param (instance method / extension). A bare recursive call keeps
     /// the same receiver, so the tail jump's arg run must lead with it.
@@ -942,6 +945,9 @@ pub const FuncBuilder = struct {
     }
     pub fn setSelfDeclSpan(self: *FuncBuilder, sp: span_mod.Span) void {
         self.self_decl_span = sp;
+    }
+    pub fn setBodySpan(self: *FuncBuilder, sp: span_mod.Span) void {
+        self.body_span = sp;
     }
     pub fn setTailrecSelf(self: *FuncBuilder, name: []const u8) void {
         self.tailrec_self = name;

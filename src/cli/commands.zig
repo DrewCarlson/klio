@@ -632,6 +632,11 @@ pub fn computeEagerCalls(
     }
     if (audit) std.debug.print("[EAGER] {d} type heads recorded\n", .{tn});
     ir.pending_eager_types = tout;
+    var rout = std.AutoHashMap(span_mod.Span, []const u8).init(gpa);
+    var rit = tc.lambda_recv_heads.iterator();
+    while (rit.next()) |e| rout.put(e.key_ptr.*, e.value_ptr.*) catch {};
+    if (audit) std.debug.print("[EAGER] {d} lambda receiver heads recorded\n", .{rout.count()});
+    ir.pending_eager_recv_heads = rout;
     return out;
 }
 
