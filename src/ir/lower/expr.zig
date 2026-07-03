@@ -1150,14 +1150,14 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .dst = cls,
                     .this_idx = this_idx,
                     .name = n,
-                    .class = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file),
+                    .class = scopedClassIdForRead(b, name0, segments[0].span.file),
                 } });
             } else {
                 orEmitAudit(b, "class_name_value", "LoadGlobal", name0);
                 try b.push(.{ .LoadGlobal = .{
                     .dst = cls,
                     .name = n,
-                    .class = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file),
+                    .class = scopedClassIdForRead(b, name0, segments[0].span.file),
                 } });
             }
             const dst = b.allocReg();
@@ -5310,6 +5310,34 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
 
 /// The receiver-type tag for a deferred member-or-global bare call: the
 /// enclosing extension's declared receiver head, when this body has one.
+
+/// The class id a bare classifier read binds, innermost first: a NESTED
+/// class/object of the enclosing class chain (registered under its lifted
+/// `Outer$Name` key, invisible to the flat index) beats the package-scope
+/// pick — `object E : Base(Key)` inside a class declaring `object Key`
+/// reads ITS OWN Key, not `CoroutineContext.Key` from a wildcard import.
+fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
+    if (b.ownerClass()) |oc| {
+        var owner: ?[]const u8 = oc;
+        var hops: u8 = 0;
+        while (owner) |ow| : (hops += 1) {
+            if (hops > 8) break;
+            var kb: [256]u8 = undefined;
+            const mangled = std.fmt.bufPrint(&kb, "{s}${s}", .{ ow, name0 }) catch break;
+            if (b.module.classId(mangled)) |cid| return cid;
+            owner = if (std.mem.lastIndexOfScalar(u8, ow, '$')) |sep| ow[0..sep] else null;
+        }
+    }
+    // A receiver context whose owner chain is unknown here (a super-arg /
+    // default-value thunk, a lambda) may still see a NESTED classifier the
+    // flat index cannot rank; committing the package-scope pick would
+    // override the runtime's scope walk with the wrong declaration
+    // (CoroutineContext.Key shadowing a nested `object Key`). Decline —
+    // the name-keyed runtime path owns the scoped resolution.
+    if (inReceiverContext(b)) return null;
+    return b.module.classIdIndexed(name0, b.self_package, file);
+}
+
 fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
     const rt = b.recvTy() orelse return null;
     return try b.module.internConst(b.allocator, .{ .String = rt });
