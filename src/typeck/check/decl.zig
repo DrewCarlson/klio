@@ -298,6 +298,7 @@ pub fn signatureOf(self: *Checker, f: *const Function) Allocator.Error!FnSig {
         .param_class_names = param_class_names,
         .decl_span = f.name.span,
         .is_suspend = f.is_suspend,
+        .is_extension = f.receiver_type != null,
         .is_crossinline_param = is_crossinline_param,
     };
 }

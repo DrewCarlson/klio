@@ -1630,6 +1630,7 @@ fn buildModuleWithOverrides(
                 .low_priority = ir.lower.decl.isLowPriorityOverload(f),
             });
             try module.func_index.append(a, .{ .name = f.name.name, .id = id });
+            try module.recordFuncDeclSpan(a, f.name.span, id);
             const gop = try module.func_name_index.getOrPut(f.name.name);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(a, id);

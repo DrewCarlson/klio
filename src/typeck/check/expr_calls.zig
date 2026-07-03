@@ -163,7 +163,7 @@ pub fn checkCall(
             if (is_builder) {
                 self.builder_inference_active = true;
             }
-            const result = try checkOverloadedCall(self, sigs_list.items, args, arg_names, type_args, callee.span());
+            const result = try checkOverloadedCallRecorded(self, sigs_list.items, args, arg_names, type_args, callee.span());
             self.builder_inference_active = prev_bi;
             return result;
         }
@@ -502,6 +502,20 @@ pub fn checkCrossinlineArgReturns(
 /// render is compact and comparison-stable: arity, parameter type heads,
 /// and the return head.
 fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig) void {
+    // Package-visibility gate: the flat name registry is package-blind, so
+    // a same-name declaration from an unrelated package can win here that
+    // Kotlin scoping would never see (a packageless `apply` shadowing
+    // `kotlin.apply` for a caller inside the stdlib). Record only when the
+    // declaration is in the caller's own package or a default-imported
+    // `kotlin*` package.
+    if (sig.decl_span) |ds| {
+        const decl_pkg = self.file_packages.get(ds.file.int()) orelse "";
+        const call_pkg = self.file_packages.get(call_span.file.int()) orelse "";
+        const same = std.mem.eql(u8, decl_pkg, call_pkg);
+        const default_imported = std.mem.eql(u8, decl_pkg, "kotlin") or
+            std.mem.startsWith(u8, decl_pkg, "kotlin.");
+        if (!same and !default_imported) return;
+    }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(self.allocator);
     buf.print(self.allocator, "arity={d}", .{sig.params.len}) catch return;
@@ -522,6 +536,33 @@ pub fn checkOverloadedCall(
     arg_names: []const ?[]const u8,
     type_args: []const TypeRef,
     call_span: Span,
+) Allocator.Error!Type {
+    return checkOverloadedCallRec(self, sigs, args, arg_names, type_args, call_span, false);
+}
+
+/// As `checkOverloadedCall`; `record` marks a call form whose candidate
+/// set is COMPLETE from typeck's view (a bare top-level overload set), so
+/// the pick may enter the eager channel. Qualified member/extension calls
+/// see a partial set here and must not record.
+pub fn checkOverloadedCallRecorded(
+    self: *Checker,
+    sigs: []const FnSig,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const TypeRef,
+    call_span: Span,
+) Allocator.Error!Type {
+    return checkOverloadedCallRec(self, sigs, args, arg_names, type_args, call_span, true);
+}
+
+fn checkOverloadedCallRec(
+    self: *Checker,
+    sigs: []const FnSig,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const TypeRef,
+    call_span: Span,
+    record: bool,
 ) Allocator.Error!Type {
     // Crossinline-lambda non-local-return diagnostic (T0056). If any
     // overload candidate marks the current arg position `crossinline` and
@@ -615,7 +656,7 @@ pub fn checkOverloadedCall(
         }
         try checkArityAndArgs(self, sig, args, call_span);
         try enforceSuspendColoring(self, sig.is_suspend, "function", call_span);
-        recordResolvedCall(self, call_span, sig);
+        if (record and !sig.is_extension) recordResolvedCall(self, call_span, sig);
         if (has_type_args or sig.type_param_count == 0) {
             return sig.return_ty.clone(self.allocator);
         }
@@ -776,7 +817,10 @@ pub fn checkOverloadedCall(
         return .Unresolved;
     }
     const sig = chosen orelse arity_match.?;
-    recordResolvedCall(self, call_span, sig);
+    // Record only a DECIDED pick: the arity-match fallback is a guess
+    // (any same-arity overload), and a guess in the eager channel would
+    // override the runtime engine's evidence-based answer.
+    if (record and chosen != null and !sig.is_extension) recordResolvedCall(self, call_span, sig);
     if (has_type_args) {
         try decl_mod.checkTypeArgBounds(self, sig, type_args);
     }
