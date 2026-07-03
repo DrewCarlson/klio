@@ -501,6 +501,39 @@ pub fn checkCrossinlineArgReturns(
 /// the eager engine's resolution record (one oracle, recorded once). The
 /// render is compact and comparison-stable: arity, parameter type heads,
 /// and the return head.
+
+/// Whether `class_name` declares or inherits a member named `name` —
+/// the full Kotlin shadow surface, walked over the checker's ClassInfo
+/// supertype links (bounded; cycles cut by the visit list).
+fn classChainHasMember(self: *Checker, class_name: []const u8, name: []const u8) bool {
+    var frontier: [24][]const u8 = undefined;
+    var seen: [24][]const u8 = undefined;
+    var fl: usize = 0;
+    var sl: usize = 0;
+    frontier[fl] = class_name;
+    fl += 1;
+    while (fl > 0) {
+        fl -= 1;
+        const cn = frontier[fl];
+        var dup = false;
+        for (seen[0..sl]) |v| {
+            if (std.mem.eql(u8, v, cn)) dup = true;
+        }
+        if (dup) continue;
+        if (sl >= seen.len) break;
+        seen[sl] = cn;
+        sl += 1;
+        const info = self.classes.get(cn) orelse continue;
+        if (info.member_sigs.contains(name)) return true;
+        for (info.supertypes.items) |sup| {
+            if (fl >= frontier.len) break;
+            frontier[fl] = sup;
+            fl += 1;
+        }
+    }
+    return false;
+}
+
 fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record_name: []const u8) void {
     // A vararg overload family needs the engine's packing logic to pick
     // (typeck's MSC can prefer a fixed-arity sibling for a vararg call);
@@ -513,18 +546,16 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     // declaration is in the caller's own package or a default-imported
     // `kotlin*` package.
     // Member-shadow gate: a bare call inside a class whose enclosing
-    // chain declares a same-name MEMBER resolves to the member by Kotlin
-    // scoping — the top-level registry's answer is out-ranked, so it
-    // must not enter the channel (`fun error(...)` on a test class beats
-    // default-imported `kotlin.error`).
+    // chain declares OR INHERITS a same-name MEMBER resolves to the
+    // member by Kotlin scoping — the top-level registry's answer is
+    // out-ranked, so it must not enter the channel (`fun error(...)` on
+    // a test class beats default-imported `kotlin.error`; an inherited
+    // method shadows just the same).
     {
         var ci: usize = self.class_stack.items.len;
         while (ci > 0) {
             ci -= 1;
-            const cname = self.class_stack.items[ci];
-            if (self.classes.get(cname)) |info| {
-                if (info.member_sigs.contains(record_name)) return;
-            }
+            if (classChainHasMember(self, self.class_stack.items[ci], record_name)) return;
         }
     }
     if (sig.decl_span) |ds| {

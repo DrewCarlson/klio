@@ -5789,6 +5789,17 @@ fn lowerImplicitThisCall(
     if (segments.len != 1) return null;
     const name0 = segments[0].name;
     if (b.resolve(name0) != null or b.knowsOuter(name0) or !b.hasOwnMember(name0)) return null;
+    // E4: when the eager channel committed this call to a PLAIN top-level
+    // function, the same-named own member does not shadow it — kotlin
+    // scoping resolved the other way, and the record gate now checks the
+    // full declared+inherited member surface, so a surviving record means
+    // no member (own or inherited) shadows. The redirect stands where the
+    // channel is silent or names a method.
+    if (b.module.eagerCallTarget(segments[0].span)) |efid| {
+        if (b.module.funcById(efid)) |ef| {
+            if (ef.kind == .plain) return null;
+        }
+    }
     // A same-named member that cannot bind this call's arity (a 0-arg
     // `requireNotNull()` for a 1-arg `requireNotNull(x)`) does not shadow the
     // top-level function: defer to the global-resolution path instead of

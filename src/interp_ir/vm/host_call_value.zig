@@ -367,6 +367,12 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             break :blk null;
         };
         if (!last_vararg and args.len == info.n_params + 1 and this_cap_idx != null) {
+            // E4b instrument: measure how often the runtime arity-guess
+            // rebind still fires — the lowering's declared-shape emission
+            // should shrink this to lambdas with no recorded shape.
+            if (runtime.getenvSlice("KLIO_REBIND_AUDIT") != null) {
+                std.debug.print("[REBIND] fn={s} n_params={d}\n", .{ func.name, info.n_params });
+            }
             const this_idx = this_cap_idx.?;
             // The closure's captured `this` (before the explicit
             // receiver overrides it) is the lexically-enclosing
