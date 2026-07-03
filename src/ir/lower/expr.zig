@@ -5361,18 +5361,11 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
 /// reads ITS OWN Key, not `CoroutineContext.Key` from a wildcard import.
 fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
     if (b.ownerClass()) |oc| {
-        var owner: ?[]const u8 = oc;
-        var hops: u8 = 0;
-        while (owner) |ow| : (hops += 1) {
-            if (hops > 8) break;
-            var kb: [256]u8 = undefined;
-            // Nested classes register dot-qualified, companions with `$`.
-            const dotted = std.fmt.bufPrint(&kb, "{s}.{s}", .{ ow, name0 }) catch break;
-            if (b.module.classId(dotted)) |cid| return cid;
-            var kb2: [256]u8 = undefined;
-            const mangled = std.fmt.bufPrint(&kb2, "{s}${s}", .{ ow, name0 }) catch break;
-            if (b.module.classId(mangled)) |cid| return cid;
-            owner = if (std.mem.lastIndexOfAny(u8, ow, "$.")) |sep| ow[0..sep] else null;
+        // Resolve the OWNER to an id once (its lifted simple name is in the
+        // class index), then answer through the nesting tree — the one
+        // scoped classifier lookup, no string-mangled probing.
+        if (b.module.classId(oc)) |owner_id| {
+            if (b.module.classIdNestedIn(owner_id, name0)) |cid| return cid;
         }
     }
     // A receiver context whose owner chain is unknown here (a super-arg /

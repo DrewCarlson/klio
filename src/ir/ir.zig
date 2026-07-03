@@ -883,6 +883,13 @@ pub const Module = struct {
     /// maps to `class_id_ambiguous` so the lookup returns null (the scan's
     /// ambiguity guard). Built with `class_id_map`; null until then.
     class_fqn_map: ?std.StringHashMap(ClassId) = null,
+    /// The classifier NESTING TREE, derived once from FQNs: for each class,
+    /// its lexical parent class (null for top-level) and, per parent, the
+    /// children keyed by their last FQN segment. One id-keyed structure
+    /// answers every scoped classifier lookup — no `$`/`.` string-mangled
+    /// probing at use sites.
+    class_parent: ?std.AutoHashMap(ClassId, ClassId) = null,
+    class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
     /// to `Inst.Call { func }` instead of LoadGlobal+CallValue.
@@ -1153,6 +1160,12 @@ pub const Module = struct {
         self.class_index.deinit(allocator);
         if (self.class_id_map) |*m| m.deinit();
         if (self.class_fqn_map) |*m| m.deinit();
+        if (self.class_parent) |*m| m.deinit();
+        if (self.class_children) |*m| {
+            var itc = m.valueIterator();
+            while (itc.next()) |v| v.deinit();
+            m.deinit();
+        }
         self.func_index.deinit(allocator);
         var it = self.func_name_index.valueIterator();
         while (it.next()) |list| list.deinit(allocator);
@@ -1277,6 +1290,64 @@ pub const Module = struct {
         }
         if (self.class_fqn_map) |*old| old.deinit();
         self.class_fqn_map = fm;
+
+        // The nesting tree. A class's parent is the class whose FQN is its
+        // own FQN minus the last segment; children key by that last segment.
+        // Lifted `$` simple names alias into the same tree (a companion's
+        // `Outer$Companion$Key` reaches the child keyed `Key` under Outer's
+        // id), so both spellings resolve through ONE structure.
+        var pm = std.AutoHashMap(ClassId, ClassId).init(allocator);
+        var cm = std.AutoHashMap(ClassId, std.StringHashMap(ClassId)).init(allocator);
+        for (self.classes.items) |c| {
+            const dot = std.mem.lastIndexOfScalar(u8, c.fqn, '.') orelse continue;
+            const parent_fqn = c.fqn[0..dot];
+            const seg = c.fqn[dot + 1 ..];
+            const pid = blk: {
+                const got = fm.get(parent_fqn) orelse break :blk null;
+                if (got.int() == class_id_ambiguous.int()) break :blk null;
+                break :blk got;
+            } orelse continue;
+            try pm.put(c.id, pid);
+            const gop = try cm.getOrPut(pid);
+            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(ClassId).init(allocator);
+            const cg = try gop.value_ptr.getOrPut(seg);
+            if (!cg.found_existing) cg.value_ptr.* = c.id;
+        }
+        if (self.class_parent) |*old| old.deinit();
+        self.class_parent = pm;
+        if (self.class_children) |*old| {
+            var it = old.valueIterator();
+            while (it.next()) |v| v.deinit();
+            old.deinit();
+        }
+        self.class_children = cm;
+    }
+
+    /// ONE scoped classifier lookup: resolve simple `name` against the
+    /// nesting tree starting from `owner` (a class id), walking outward
+    /// through the lexical parents. Answers nested classes, nested objects,
+    /// and companions uniformly — the string-mangled `$`/`.` probes derive
+    /// from the same FQNs this tree was built from.
+    pub fn classIdNestedIn(self: *const Module, owner: ClassId, name: []const u8) ?ClassId {
+        const cm = &(self.class_children orelse return null);
+        const pm = &(self.class_parent orelse return null);
+        var cur: ?ClassId = owner;
+        var hops: u8 = 0;
+        while (cur) |cid| : (hops += 1) {
+            if (hops > 16) break;
+            if (cm.get(cid)) |kids| {
+                if (kids.get(name)) |hit| return hit;
+                // A companion's members are reachable without naming it:
+                // probe one level through a companion child.
+                if (kids.get("Companion")) |comp| {
+                    if (cm.get(comp)) |ckids| {
+                        if (ckids.get(name)) |hit| return hit;
+                    }
+                }
+            }
+            cur = pm.get(cid);
+        }
+        return null;
     }
 
     /// Resolve a class written with a dotted qualifier (`Outer.Inner`) by
