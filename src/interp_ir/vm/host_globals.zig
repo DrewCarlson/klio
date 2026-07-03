@@ -715,7 +715,7 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
 /// re-resolution can swap in a same-simple-name twin. Returns null when
 /// the id carries no runtime value (the caller falls back to the
 /// name-keyed path).
-pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, class: ?ir.ClassId) ?Value {
+pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, class: ?ir.ClassId, ctor_ref: bool) ?Value {
     if (func) |fid| {
         if (funcValueById(self, allocator, fid)) |v| return v;
     }
@@ -752,6 +752,10 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                 // published — first access stays on the name-keyed throwing
                 // path that drives the init gate once.
                 const singleton_name: ?[]const u8 = blk: {
+                    // A constructor reference (`::C`) is the class, never
+                    // the companion; an `object`'s singleton still applies
+                    // (its "constructor" is the singleton itself).
+                    if (ctor_ref and !is_object) break :blk null;
                     const mg = self.module.borrow();
                     defer mg.deinit();
                     if (mg.get().registry.companion_singletons.get(cls_name)) |cn| break :blk cn;

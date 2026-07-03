@@ -515,7 +515,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
             if (class_pick) |cid| {
-                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cid } });
+                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cid, .ctor_ref = true } });
             } else if (ref_pick) |fid| {
                 const n = blk: {
                     if (b.module.funcById(fid)) |f| {

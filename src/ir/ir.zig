@@ -379,7 +379,10 @@ pub const Inst = union(enum) {
     /// resolved the reference to a unique declaration, `func` / `class`
     /// carry that exact identity and the host binds it directly — the
     /// name string remains for traces and as the unresolved fallback.
-    LoadGlobal: struct { dst: Reg, name: ConstId, func: ?FuncId = null, class: ?ClassId = null },
+    /// `ctor_ref`: `::C` denotes the CONSTRUCTOR — the read yields the
+    /// class value even when a companion is published (a value-position
+    /// `C` is the companion singleton).
+    LoadGlobal: struct { dst: Reg, name: ConstId, func: ?FuncId = null, class: ?ClassId = null, ctor_ref: bool = false },
     /// Bare-name read in a receiver context that doesn't resolve as a
     /// local / capture / own member. The runtime searches the implicit
     /// receivers (the captured `this` at `this_idx`, the enclosing-`this`

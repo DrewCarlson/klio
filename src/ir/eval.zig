@@ -3211,7 +3211,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // A lowering-resolved identity binds that exact declaration;
             // the name string is only the unresolved-shape fallback.
             const by_id: ?Value = if (lg.func != null or lg.class != null)
-                host.lookupGlobalById(allocator, lg.func, lg.class)
+                host.lookupGlobalById(allocator, lg.func, lg.class, lg.ctor_ref)
             else
                 null;
             const lg_r: MaybeValueResult = if (by_id != null) .{ .ok = by_id } else try host.lookupGlobalThrowing(allocator, name_str);
@@ -3308,7 +3308,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // pick, mirroring the call form's shadow gate.
             const by_id: ?Value = if (resolved == null and (lt.func != null or lt.class != null) and
                 !host.isShadowingCapture(bare_name))
-                host.lookupGlobalById(allocator, lt.func, lt.class)
+                host.lookupGlobalById(allocator, lt.func, lt.class, false)
             else
                 null;
             var v: Value = undefined;
@@ -3663,7 +3663,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             };
             const by_id: ?Value = if ((cmg.class != null or by_id_func != null) and
                 !host.isShadowingCapture(name_str))
-                host.lookupGlobalById(allocator, by_id_func, cmg.class)
+                host.lookupGlobalById(allocator, by_id_func, cmg.class, false)
             else
                 null;
             const global = if (by_id != null) by_id else switch (try host.lookupGlobalThrowing(allocator, name_str)) {
@@ -5061,7 +5061,8 @@ pub const NullHost = struct {
         return .{ .ok = self.lookupGlobal(name) };
     }
 
-    pub fn lookupGlobalById(self: *NullHost, allocator: Allocator, func: ?FuncId, class: ?ClassId) ?Value {
+    pub fn lookupGlobalById(self: *NullHost, allocator: Allocator, func: ?FuncId, class: ?ClassId, ctor_ref: bool) ?Value {
+        _ = ctor_ref;
         _ = .{ self, allocator, func, class };
         return null;
     }
