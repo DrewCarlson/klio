@@ -840,6 +840,11 @@ const StrPairSet = StrPairMap(void);
 const FuncIdMap = std.AutoHashMap;
 
 /// Top-level container.
+/// The eager pipeline's hand-off: the driver computes the per-call
+/// resolution BEFORE the module exists (lowering starts inside the build),
+/// parks it here, and the next module created on this thread adopts it.
+pub threadlocal var pending_eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null;
+
 pub const Module = struct {
     funcs: std.ArrayList(Func) = .empty,
     /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
@@ -1080,7 +1085,7 @@ pub const Module = struct {
     };
 
     pub fn init(allocator: Allocator) Module {
-        return .{
+        var out__ = Module{
             .func_name_index = std.StringHashMap(std.ArrayList(FuncId)).init(allocator),
             .registry = ModuleRegistry.init(allocator),
             .decl_user_params = std.AutoHashMap(u32, u32).init(allocator),
@@ -1090,6 +1095,11 @@ pub const Module = struct {
             .decl_ast_body = std.AutoHashMap(u32, void).init(allocator),
             .decl_sigs = std.AutoHashMap(u32, DeclSig).init(allocator),
         };
+        if (pending_eager_calls) |pec| {
+            out__.eager_calls = pec;
+            pending_eager_calls = null;
+        }
+        return out__;
     }
 
     /// Mirrors Rust's `#[derive(Default)]` constructor.
@@ -1350,7 +1360,12 @@ pub const Module = struct {
     pub fn eagerCallTarget(self: *const Module, callee_span: span.Span) ?FuncId {
         const ec = &(self.eager_calls orelse return null);
         const decl = ec.get(callee_span) orelse return null;
-        return self.funcByDeclSpan(decl);
+        const got = self.funcByDeclSpan(decl);
+        if (got == null and std.c.getenv("KLIO_EAGER_HITS") != null) {
+            const n: usize = if (self.func_by_decl_span) |m| m.count() else 0;
+            std.debug.print("[EAGER-MISS2] decl f{d}:{d}-{d} not lowered (map n={d})\n", .{ decl.file.int(), decl.start, decl.end, n });
+        }
+        return got;
     }
 
     /// Record a lowered declaration's identity (its AST name-span).

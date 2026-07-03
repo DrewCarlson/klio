@@ -43,6 +43,7 @@ const parser = @import("parser");
 
 const pack = @import("pack");
 const interp_ir = @import("interp_ir");
+const ir_mod = @import("ir");
 const image = interp_ir.image;
 const StdlibBase = interp_ir.build.StdlibBase;
 const BuiltModule = interp_ir.build.BuiltModule;
@@ -600,6 +601,7 @@ fn finishFromLoaded(
     map.files.appendSlice(map.arena.allocator(), loaded.map.files.items) catch return null;
     const user2 = parseUserFiles(gpa, map, paths, user.texts) orelse return null;
 
+    if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user2.asts) catch return null;
 
     var bindings = bindings_in;
@@ -681,6 +683,7 @@ fn bakeAndPrepare(
     map.* = SourceMap.init(gpa);
     map.files.appendSlice(map.arena.allocator(), dep_map.files.items) catch return null;
     const user2 = parseUserFiles(gpa, map, paths, user.texts) orelse return null;
+    if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, base, user2.asts) catch return null;
     return .{ .built = built, .map = map, .bindings = deps.bindings, .user_asts = user2.asts };
 }

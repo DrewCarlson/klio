@@ -391,7 +391,6 @@ pub fn runTestFiles(
         if (!runtime.reclaimRequested()) runtime.setReclaim(false);
         defer runtime.setReclaim(prev_reclaim);
         if (stdlib_image.tryPrepare(gpa, files.items, features)) |prep| {
-            installEagerFromPaths(gpa, &prep.built, files.items, features);
             var image_fids: std.ArrayList(u32) = .empty;
             defer image_fids.deinit(gpa);
             const base_count = prep.map.files.items.len - files.items.len;
@@ -448,12 +447,8 @@ pub fn runTestFiles(
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
 
+    if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
-    if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| {
-        const mg = built.module.borrowMut();
-        mg.get().installEagerCalls(ec);
-        mg.deinit();
-    }
     return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items);
 }
 
@@ -577,7 +572,7 @@ fn collectKtDir(
 /// picks into the span-pair map lowering composes with its own
 /// declaration identities. Fallback-safe by design — any failure returns
 /// null and the run stays lazy (`KLIO_EAGER_AUDIT=1` logs the skip).
-fn computeEagerCalls(
+pub fn computeEagerCalls(
     gpa: std.mem.Allocator,
     combined: []const KotlinFile,
     native_fqns: []const []const u8,
@@ -592,13 +587,35 @@ fn computeEagerCalls(
         if (audit) std.debug.print("[EAGER] typeck failed; staying lazy\n", .{});
         return null;
     };
+    // Only a record whose decl_span IS a function declaration's name-span
+    // in the typechecked sources composes soundly: a builtin-header FnSig
+    // carries a synthetic span that can collide with real coordinates.
+    var declared = std.AutoHashMap(span_mod.Span, void).init(gpa);
+    defer declared.deinit();
+    for (combined) |*kf| {
+        for (kf.decls) |*d| {
+            switch (d.*) {
+                .Function => |*f| declared.put(f.name.span, {}) catch {},
+                .Class => |*c| {
+                    for (c.members) |*mm| {
+                        if (mm.* == .Function) declared.put(mm.Function.name.span, {}) catch {};
+                    }
+                },
+                else => {},
+            }
+        }
+    }
     var out = std.AutoHashMap(span_mod.Span, span_mod.Span).init(gpa);
     var it = tc.resolved_calls.iterator();
     var n: usize = 0;
     while (it.next()) |e| {
         const decl = e.value_ptr.decl_span orelse continue;
+        if (!declared.contains(decl)) continue;
         out.put(e.key_ptr.*, decl) catch continue;
         n += 1;
+        if (runtime.getenvSlice("KLIO_EAGER_HITS") != null) {
+            std.debug.print("[EAGER-REC] call f{d}:{d}-{d} -> decl f{d}:{d}-{d}\n", .{ e.key_ptr.file.int(), e.key_ptr.start, e.key_ptr.end, decl.file.int(), decl.start, decl.end });
+        }
     }
     if (audit) std.debug.print("[EAGER] {d} call resolutions recorded\n", .{n});
     return out;
@@ -620,12 +637,8 @@ fn runBuilt(
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
 
+    if (computeEagerCalls(gpa, all_asts, &.{})) |ec| ir.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch return 1;
-    if (computeEagerCalls(gpa, all_asts, &.{})) |ec| {
-        const mg = built.module.borrowMut();
-        mg.get().installEagerCalls(ec);
-        mg.deinit();
-    }
     return runBuiltModule(gpa, built, bindings, map, no_main_msg);
 }
 
@@ -642,7 +655,6 @@ fn tryImagePath(
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
     const prepared = stdlib_image.tryPrepare(gpa, paths, features) orelse return null;
-    installEagerFromPaths(gpa, &prepared.built, paths, features);
     const msg = if (paths.len == 1) "error: no main function found" else "runtime error: no main function in module";
     return runBuiltModule(gpa, prepared.built, prepared.bindings, prepared.map, msg);
 }
@@ -650,42 +662,6 @@ fn tryImagePath(
 /// Tail shared by the legacy and image paths: surface lowering-time
 /// resolution diagnostics, materialize a Vm, install bindings, run `main`.
 
-/// Eager install for the image fast path: the prepared module lowered
-/// against the baked base, so re-parse just the user files for typeck.
-/// Mirrors the legacy path's computeEagerCalls; opt-in cost only.
-fn installEagerFromPaths(
-    gpa: std.mem.Allocator,
-    built: *const interp_ir.build.BuiltModule,
-    paths: []const []const u8,
-    features: *const RequestedFeatures,
-) void {
-    if (runtime.getenvSlice("KLIO_EAGER") == null) return;
-    var map = SourceMap.init(gpa);
-    var user_asts: std.ArrayList(KotlinFile) = .empty;
-    defer user_asts.deinit(gpa);
-    for (paths) |path| {
-        const id = load(gpa, &map, path) orelse return;
-        const src = map.get(id).source;
-        var lx = Lexer.init(gpa, id, src) catch return;
-        var lexed = lx.tokenize() catch return;
-        defer lexed.deinit(gpa);
-        if (lexed.diagnostics.hasErrors()) return;
-        const p2 = Parser.new(gpa, id, src, lexed.tokens);
-        const file_ast = p2.parseFile();
-        if (p2.diagnostics.hasErrors()) return;
-        user_asts.append(gpa, file_ast) catch return;
-    }
-    const loaded = loadInstalledPacks(gpa, user_asts.items, &map, features);
-    var combined: std.ArrayList(KotlinFile) = .empty;
-    defer combined.deinit(gpa);
-    combined.appendSlice(gpa, loaded.asts) catch return;
-    combined.appendSlice(gpa, user_asts.items) catch return;
-    if (computeEagerCalls(gpa, combined.items, &.{})) |ec| {
-        const mg = built.module.borrowMut();
-        mg.get().installEagerCalls(ec);
-        mg.deinit();
-    }
-}
 
 fn runBuiltModule(
     gpa: std.mem.Allocator,

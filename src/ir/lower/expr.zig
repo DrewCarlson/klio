@@ -4543,9 +4543,15 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     // Eager audit: where typeck recorded a pick for this call site,
     // compare it against the engine's answer. Audit-only — behavior
     // flips seam by seam once disagreement is at zero.
+    if (eagerAuditOn() and runtime.getenvSlice("KLIO_EAGER_HITS") != null) {
+        std.debug.print("[EAGER-PROBE] '{s}' f{d}:{d}-{d} map={}\n", .{ name0, segments[0].span.file.int(), segments[0].span.start, segments[0].span.end, b.module.eager_calls != null });
+    }
     if (b.module.eagerCallTarget(segments[0].span)) |eager_fid| {
         if (eagerAuditOn()) {
             const lazy: ?FuncId = res.target;
+            if (runtime.getenvSlice("KLIO_EAGER_HITS") != null) {
+                std.debug.print("[EAGER-HIT] '{s}'\n", .{name0});
+            }
             if (lazy == null or lazy.?.int() != eager_fid.int()) {
                 const lazy_str: i64 = if (lazy) |l| @intCast(l.int()) else -1;
                 std.debug.print("[EAGER-AUDIT] call '{s}': eager={d} lazy={d}\n", .{ name0, eager_fid.int(), lazy_str });
