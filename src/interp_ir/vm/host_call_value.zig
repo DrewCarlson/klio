@@ -10,6 +10,7 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const ast = @import("ast");
+const stdlib = @import("stdlib");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
@@ -55,6 +56,55 @@ fn isCompanionInstance(v: Value) bool {
         std.mem.endsWith(u8, cg.get().fqn, ".Companion");
 }
 
+/// Whether the companion surface itself serves `name`, so a
+/// `Type::name` reference stays BOUND to the companion instead of
+/// consuming its first argument as the receiver. A real IR member, a
+/// companion-FQN intrinsic (`kotlin.Double.Companion.fromBits`), or a
+/// declared companion-receiver extension header all count — the last
+/// two are what `hostHasMember` alone cannot see, which mis-classified
+/// `Double.Companion::fromBits` as an unbound instance-method ref.
+fn companionServesName(self: *VmHost, rv: *const Value, name: []const u8) bool {
+    if (host_call_member.hostHasMember(self, rv, name)) return true;
+    if (rv.* != .Instance) return false;
+    var fqn_buf: [256]u8 = undefined;
+    var simple_buf: [128]u8 = undefined;
+    const probes: ?struct { fqn: []const u8, recv: []const u8 } = blk: {
+        const g = rv.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        const cls_fqn = cg.get().fqn;
+        if (!std.mem.endsWith(u8, cls_fqn, ".Companion")) break :blk null;
+        const fqn = std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ cls_fqn, name }) catch break :blk null;
+        // The declared receiver form is the FQN's `Type.Companion` tail
+        // (`kotlin.Double.Companion` -> `Double.Companion`).
+        const owner = cls_fqn[0 .. cls_fqn.len - ".Companion".len];
+        const owner_simple = if (std.mem.lastIndexOfScalar(u8, owner, '.')) |d| owner[d + 1 ..] else owner;
+        const recv = std.fmt.bufPrint(&simple_buf, "{s}.Companion", .{owner_simple}) catch break :blk null;
+        break :blk .{ .fqn = fqn, .recv = recv };
+    };
+    const p = probes orelse return false;
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        const bg = pg.get().installed_bindings.borrow();
+        defer bg.deinit();
+        if (bg.get().resolve(p.fqn) != null) return true;
+    }
+    if (stdlib.implementation(p.fqn) != null) return true;
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        for (mod.funcsBySimpleName(name)) |fid| {
+            const sig = mod.decl_sigs.get(fid.int()) orelse continue;
+            const rt = sig.receiver_ty orelse continue;
+            if (std.mem.eql(u8, rt.name, p.recv)) return true;
+        }
+    }
+    return false;
+}
+
 /// Single callable-value dispatch over the value variants.
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     if (callee.* == .Intrinsic) {
@@ -88,9 +138,15 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             // instance. Both are type-like; route the first argument as the
             // receiver when the named member is an instance method rather than a
             // companion member.
-            const type_like = (rv == .Class) or
+            // An unsigned-array type name in value position lowers to its
+            // constructor FUNCTION (`ULongArray::sortDescending`); treat
+            // an uppercase-named function receiver as the type itself.
+            const fn_type_like = rv == .Function and
+                rv.Function.decl.name.name.len > 0 and
+                std.ascii.isUpper(rv.Function.decl.name.name[0]);
+            const type_like = (rv == .Class) or fn_type_like or
                 (rv == .Instance and isCompanionInstance(rv) and
-                    !host_call_member.hostHasMember(self, &rv, name));
+                    !companionServesName(self, &rv, name));
             if (type_like and args.len != 0) {
                 const first = args[0];
                 const rest = args[1..];
@@ -881,6 +937,28 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
             return r;
         }
     }
+    // A member-reference value (`Type::method`, `obj::method`) invoked
+    // with an explicit receiver — an extension-function-typed parameter
+    // (`sortDescending: TArray.(Int, Int) -> Unit` fed
+    // `ULongArray::sortDescending`, then `array.sortDescending(from, to)`).
+    // The explicit receiver dispatches the member walk with the args
+    // passed through; the intrinsic-host fallback below drops them.
+    if (callee.* == .Instance) {
+        var name_v: ?Value = null;
+        {
+            const snap = callee.Instance.borrow();
+            defer snap.deinit();
+            name_v = snap.get().get("__bound_name__");
+        }
+        if (name_v != null and name_v.? == .String) {
+            const name = blk: {
+                const g = name_v.?.String.borrow();
+                defer g.deinit();
+                break :blk g.get().bytes;
+            };
+            return host_call_member.callMember(self, allocator, this_value, name, args);
+        }
+    }
     var sink = self.out_sink.clone();
     defer sink.deinit();
     var intrinsic = makeIntrinsicHost(self);
@@ -950,6 +1028,47 @@ pub fn callableReceiverShape(self: *VmHost, v: *const Value) ?ReceiverShape {
     _ = self;
     _ = v;
     return null;
+}
+
+/// The declared positional-parameter count of a callable value, or null
+/// when the shape is unknown (intrinsics, bound refs). Consulted by the
+/// `CallMemberOrValue` value arm: a local callable that cannot take the
+/// call's args (a `TArray.(Int, Int) -> Unit` param invoked as
+/// `receiver.name()`) is not a candidate — Kotlin resolves the
+/// extension instead of Null-padding the local's parameters.
+pub fn callableAcceptsArgs(self: *VmHost, v: *const Value, n_args: usize) ?bool {
+    switch (v.*) {
+        .IrClosure => |c| {
+            const info = self.closures.get(@intCast(c.id)) orelse return null;
+            // A local FUNCTION lowers as a closure too and may carry
+            // defaults or a vararg; its body func's declared arity is
+            // authoritative (`String.endsWithCs(suffix, ignoreCase =
+            // false)` accepts one arg). A plain lambda has no DeclSig —
+            // its param count is exact.
+            var required: usize = info.n_params;
+            var total: usize = info.n_params;
+            var has_vararg = false;
+            {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                if (mg.get().decl_sigs.get(info.body_func.int())) |sig| {
+                    required = sig.arity.required;
+                    total = sig.arity.total;
+                    has_vararg = sig.arity.has_vararg;
+                }
+            }
+            // The receiver may arrive through `this` (args bind the
+            // params directly) or fill the first param (args + 1).
+            inline for ([_]usize{ 0, 1 }) |extra| {
+                const k = n_args + extra;
+                if (k >= required and (k <= total or has_vararg)) return true;
+            }
+            return false;
+        },
+        // Function declarations, intrinsics, and bound refs are opaque
+        // here; the value arm stays unguarded for them.
+        else => return null,
+    }
 }
 
 pub fn closureNeedsThisCapture(self: *VmHost, v: *const Value) bool {

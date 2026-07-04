@@ -322,6 +322,7 @@ pub const VmHost = struct {
     pub const buildClosure = host_call_value.buildClosure;
     pub const buildAstLambdaWithFlagFuncid = host_call_value.buildAstLambdaWithFlagFuncid;
     pub const callableReceiverShape = host_call_value.callableReceiverShape;
+    pub const callableAcceptsArgs = host_call_value.callableAcceptsArgs;
     pub const closureNeedsThisCapture = host_call_value.closureNeedsThisCapture;
     pub const overrideClosureThis = host_call_value.overrideClosureThis;
     pub const callFunc = host_call_func.callFunc;

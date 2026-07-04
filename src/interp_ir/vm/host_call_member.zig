@@ -1106,6 +1106,19 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
     return false;
 }
 
+/// Whether the DECLARED signature refuses `n_args` user args outright:
+/// fewer than the required count (params without defaults), or more
+/// than total without a vararg. Conservative — a missing `DeclSig`
+/// refuses nothing.
+fn declArityRefuses(self: *VmHost, fid: FuncId, n_args: usize) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const sig = mg.get().decl_sigs.get(fid.int()) orelse return false;
+    if (n_args < sig.arity.required) return true;
+    if (n_args > sig.arity.total and !sig.arity.has_vararg) return true;
+    return false;
+}
+
 /// Can the candidate take `want` positional args (receiver included)?
 /// Exact arity fits; extra declared params must each carry a default or
 /// be a vararg; extra args only fit a trailing vararg.
@@ -6669,6 +6682,14 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             for (candidates.items) |c| {
                 if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) continue;
                 if (candidateArgsDisproven(self, &c.func, args)) continue;
+                // Arity applicability holds in the lenient pass too: a
+                // candidate that REQUIRES more args than supplied cannot
+                // take this call — Null-padding it silently runs the
+                // wrong overload (`subList(..).sortDescending()` bound
+                // the `(fromIndex, toIndex)` variant with Null indices).
+                // Judged by the DECLARED arity (required/vararg), which
+                // is authoritative where per-fid default thunks are not.
+                if (declArityRefuses(self, c.fid, args.len)) continue;
                 if (declared_recv) |dn| {
                     if (staticReceiverApplicable(self, allocator, dn, c.fid, &c.func.params[0].ty) == false) continue;
                 }
@@ -6772,6 +6793,15 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
 
     if (!defer_to_property and !defer_to_iterable) {
         const c = chosen.?;
+        if (trace.enabled(name)) {
+            const d = funcDefaults(self, &c.func);
+            trace.emit("map=ext_fallback_pick name={s} fqn={s} fid={d} strict={} nparams={d} ndefaults={d} recv_ty={s}", .{
+                name,                          c.func.fqn,
+                c.fid.int(),                   strict_ext,
+                c.func.params.len,             if (d) |dd| dd.len else 0,
+                c.func.params[0].ty.name,
+            });
+        }
         const all = try prependReceiver(allocator, receiver, args);
         defer if (runtime.freeScratch()) allocator.free(all);
         const mg = self.module.borrow();
