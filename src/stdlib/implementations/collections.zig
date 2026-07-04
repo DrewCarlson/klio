@@ -1813,27 +1813,54 @@ fn arraySizeArg(a: Allocator, v: Value, what: []const u8) Error!SizeOutcome {
 
 fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, default: Value) Error!EvalResult {
     const a = ctx.allocator;
-    if (ctx.args.len == 0 or ctx.args.len > 2) {
+    // A bare ctor call inside an extension body routes through the member
+    // walk, which prepends the implicit receiver — the constructor takes
+    // none. Strip a leading array when the REMAINING args form a valid
+    // ctor shape ((size), (size, init), or the storage-wrapping array).
+    var call_args = ctx.args;
+    if (call_args.len >= 2 and call_args[0] == .Array) {
+        const rest = call_args[1..];
+        const rest_valid = (rest.len == 1 and (rest[0] == .Array or rest[0].asI64() != null)) or
+            (rest.len == 2 and rest[0].asI64() != null);
+        if (rest_valid) call_args = rest;
+    }
+    if (call_args.len == 0 or call_args.len > 2) {
         return arityErr(try fmt(a, "{s} expects (size) or (size, init)", .{name}));
     }
     // Storage-wrapping unsigned-array constructor: `UIntArray(intArray)` (and
     // the UByte/UShort/ULong siblings, what `asUIntArray()` lowers to) shares
     // the signed array's packed buffer as an unsigned view — mutations through
     // either alias, matching Kotlin's inline value-class storage.
-    if (ctx.args.len == 1 and prim != null and ctx.args[0] == .Array) {
-        const arr = ctx.args[0].Array;
+    if (call_args.len == 1 and prim != null and call_args[0] == .Array) {
+        const arr = call_args[0].Array;
         if (arr.prim) |src| {
             const is_view = (prim.? == .UByte and src == .Byte) or
                 (prim.? == .UShort and src == .Short) or
                 (prim.? == .UInt and src == .Int) or
-                (prim.? == .ULong and src == .Long);
+                (prim.? == .ULong and src == .Long) or
+                // Same-kind wrap (`UIntArray(uintArray)`) passes through.
+                prim.? == src;
             if (is_view) switch (arr.storage) {
                 .scalars => |pb| return ok(.{ .Array = .{ .storage = .{ .scalars = pb.clone() }, .prim = prim.? } }),
-                .boxed => {},
+                // A boxed signed buffer (a `copyOf` that materialized
+                // Values) reinterprets element-wise: same bits, unsigned
+                // tags, packed storage so indexed reads come back tagged.
+                .boxed => {
+                    const buf = try arr.snapshot(a);
+                    defer if (runtime.freeScratch()) a.free(buf);
+                    const k = prim.?;
+                    var pb = runtime.PrimBuf{ .kind = k };
+                    errdefer pb.bytes.deinit(a);
+                    try pb.bytes.appendNTimes(a, 0, buf.len * k.elemSize());
+                    for (buf, 0..) |v, i| {
+                        pb.setAs(i, v, src);
+                    }
+                    return ok(.{ .Array = .{ .storage = .{ .scalars = try ObjRef(runtime.PrimBuf).initOwned(a, pb) }, .prim = k } });
+                },
             };
         }
     }
-    const n = switch (try arraySizeArg(a, ctx.args[0], name)) {
+    const n = switch (try arraySizeArg(a, call_args[0], name)) {
         .n => |v| v,
         .err => |e| return e,
     };
@@ -1847,8 +1874,8 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
         var pb = runtime.PrimBuf{ .kind = k };
         errdefer pb.bytes.deinit(a);
         try pb.bytes.appendNTimes(a, 0, un * k.elemSize());
-        if (ctx.args.len == 2) {
-            const block = ctx.args[1];
+        if (call_args.len == 2) {
+            const block = call_args[1];
             var i: usize = 0;
             while (i < un) : (i += 1) {
                 const v = switch (try invoke(ctx, &block, &.{Value.newInt(@intCast(i))})) {
@@ -1864,13 +1891,13 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
         } });
     }
 
-    if (ctx.args.len == 1) {
+    if (call_args.len == 1) {
         var list: std.ArrayList(Value) = .empty;
         var i: i64 = 0;
         while (i < n) : (i += 1) try list.append(a, default);
         return ok(try makeArrayFromArrayList(a, list, null));
     }
-    const block = ctx.args[1];
+    const block = call_args[1];
     var list: std.ArrayList(Value) = .empty;
     // The accumulated results live only in `list` (no frame register holds
     // them) and the per-element `invoke` reaches a GC safe point, so pin the

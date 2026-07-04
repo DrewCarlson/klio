@@ -879,7 +879,12 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
         mg.deinit();
         if (fqn) |f| {
             if (isIntrinsicClass(f)) {
-                const first_is_array = args.len > 0 and args[0] == .Array and !std.mem.eql(u8, f, "kotlin.String");
+                // Unsigned arrays take the intrinsic for the array-arg
+                // form too: `UIntArray(intArray)` is the storage-wrapping
+                // constructor (an unsigned VIEW over the signed buffer),
+                // which the source value-class instance cannot represent.
+                const unsigned_wrap = std.mem.startsWith(u8, f, "kotlin.U") and std.mem.endsWith(u8, f, "Array");
+                const first_is_array = args.len > 0 and args[0] == .Array and !unsigned_wrap and !std.mem.eql(u8, f, "kotlin.String");
                 if (!first_is_array) {
                     if (lookupIntrinsic(self, f)) |intrinsic| {
                         return dispatchIntrinsic(self, f, intrinsic, args);
@@ -1149,6 +1154,8 @@ fn isIntrinsicClass(fqn: []const u8) bool {
         "kotlin.ShortArray",              "kotlin.ByteArray",
         "kotlin.FloatArray",              "kotlin.DoubleArray",
         "kotlin.BooleanArray",            "kotlin.CharArray",
+        "kotlin.UIntArray",               "kotlin.ULongArray",
+        "kotlin.UShortArray",             "kotlin.UByteArray",
         "kotlin.Array",                   "kotlin.String",
     };
     for (names) |n| {
