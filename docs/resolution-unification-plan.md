@@ -265,6 +265,35 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
       `inline_state.isDroppedStdlibFactory` (its premise — no lowered `FuncId` —
       is now false) and both factory name-list helpers. Verified: full dual gate
       green, inventory unchanged at 117, eager ON/OFF byte-identical.
+
+      *Step-2 status (2026-07-04, IN TREE, uncommitted — verification
+      incomplete):* the header-only-bodyless slice. Phase 2 of the module
+      build now SKIPS body-null functions (`f.body == null` keeps the
+      phase-1 stub: declared params, empty blocks), so `hasBody()` is false
+      and `linkBodyless` settles their executable form — before this, every
+      retained header got a manufactured one-block `return Unit` body that
+      shadowed real dispatch (the landmine class behind
+      `ArraysTest.copyRangeInto`/`sortStable`/`shuffle` and friends).
+      Measured effect: eager-OFF inventory 117 → 102; ArraysTest 6 → 0 and
+      CollectionTest 3 → 0 solo. The first gate over the slice crashed
+      (`func.blocks[0]` on len 0): a static `Call` bound to an unsettleable
+      bodyless header (`kotlin.collections.fill` — receiver-formed, no impl
+      under its lowered FQN, no body sibling) fell through `callFunc` into
+      the evaluator. Fixed at the mechanism in `callFunc`'s bodyless ladder:
+      a receiver-formed unsettled header dispatches through the member walk
+      on its bound receiver (where the member-form intrinsics live); a
+      receiverless one returns Unit (the pre-slice shape). The filtered e2e
+      repro (compose_frame_clock) passes with the fix. REMAINING before this
+      slice can commit: full e2e + ktor suites, the eager-ON canonical (the
+      crashed gate showed ArraysTest/CollectionTest/EnumEntriesFactoryTest/
+      NumbersTest at -1 under KLIO_EAGER=1 — re-verify post-fix), and one
+      full dual gate expecting inventory ~102 with ON/OFF identical.
+      Also recorded: the expect-with-impl drops in `retainDecl` stay for
+      now — the registry's member-form registrations (`kotlin.String.repeat`)
+      do not align with the lowered receiverless form (`kotlin.text.repeat`),
+      so a retained header the link cannot bind hijacks member dispatch;
+      declaration-aligned registry entries (or the step-2 manifest) are the
+      precondition, and the `retainDecl` comment marks it.
    2. **Host-only functions get declarations.** The few intrinsics with no Kotlin
       source (`arrayOf` family, platform helpers) get real Kotlin header
       declarations in a klio-authored manifest file lowered like source, so every
