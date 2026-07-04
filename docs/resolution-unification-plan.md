@@ -254,12 +254,17 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
    candidate sets are built from declarations in scope, receivers first, then
    package/default-import scope; spec PDFs restored under
    `kotlin-language-spec/`). Three steps:
-   1. **Retain every intrinsic-backed source declaration.** Delete `retainDecl`'s
+   1. **Retain every intrinsic-backed source declaration — LANDED.** `retainDecl`'s
       function drop-lists (`isSequenceFactoryName`, `isCollectionFactoryName`, the
-      `emptyList`/`emptySet`/`emptyMap` drops); the declarations lower like any
-      other source and `linkResolvedForms` binds them `resolved_native` — the
-      mechanism that already works for `require`/`minOf`-with-source today.
-      `expect` drops remain only where an `actual` replaces the declaration.
+      `emptyList`/`emptySet`/`emptyMap` drops) are deleted; the declarations lower
+      like any other source and `linkResolvedForms` binds them `resolved_native` —
+      the mechanism that already works for `require`/`minOf`-with-source.
+      `expect` drops remain only where an `actual` replaces the declaration (the
+      remaining expect-with-impl drops are step 2's manifest territory:
+      `nativeIndexOf` et al). First unlocked hatch deletions shipped with it:
+      `inline_state.isDroppedStdlibFactory` (its premise — no lowered `FuncId` —
+      is now false) and both factory name-list helpers. Verified: full dual gate
+      green, inventory unchanged at 117, eager ON/OFF byte-identical.
    2. **Host-only functions get declarations.** The few intrinsics with no Kotlin
       source (`arrayOf` family, platform helpers) get real Kotlin header
       declarations in a klio-authored manifest file lowered like source, so every

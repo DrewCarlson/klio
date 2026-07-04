@@ -2895,23 +2895,12 @@ fn retainDecl(
     switch (d.*) {
         .Function => |*f| {
             if (!f.is_expect and std.mem.eql(u8, f.name.name, "suspendCoroutineUninterceptedOrReturn") and f.is_inline and f.is_suspend) return false;
-            if (!f.is_expect and f.params.len == 0 and
-                (std.mem.eql(u8, f.name.name, "emptyList") or std.mem.eql(u8, f.name.name, "emptySet") or std.mem.eql(u8, f.name.name, "emptyMap")))
-            {
-                const expected = try std.fmt.allocPrint(a, "kotlin.collections.{s}", .{f.name.name});
-                const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
-                if (std.mem.eql(u8, fqn, expected) and stdlib.implementation(expected) != null) return false;
-            }
-            if (!f.is_expect and isSequenceFactoryName(f.name.name)) {
-                const expected = try std.fmt.allocPrint(a, "kotlin.sequences.{s}", .{f.name.name});
-                const fqn = func_fqn_overrides.get(f.span);
-                if (fqn != null and std.mem.eql(u8, fqn.?, expected)) return false;
-            }
-            if (!f.is_expect and isCollectionFactoryName(f.name.name)) {
-                const expected = try std.fmt.allocPrint(a, "kotlin.collections.{s}", .{f.name.name});
-                const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
-                if (std.mem.eql(u8, fqn, expected) and stdlib.implementation(expected) != null) return false;
-            }
+            // Intrinsic-backed declarations are RETAINED (the no-holes
+            // symbol table): the declaration lowers like any other source
+            // and `linkResolvedForms` binds its executable form to the
+            // host implementation (`resolved_native`), so resolution sees
+            // one complete declaration table and never needs to know the
+            // body is native.
             if (!f.is_expect) return true;
             if (actual_func_names.contains(f.name.name)) return false;
             const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
@@ -2933,22 +2922,7 @@ fn retainDecl(
     }
 }
 
-fn isSequenceFactoryName(n: []const u8) bool {
-    return std.mem.eql(u8, n, "generateSequence") or std.mem.eql(u8, n, "sequenceOf") or
-        std.mem.eql(u8, n, "emptySequence") or std.mem.eql(u8, n, "sequence") or std.mem.eql(u8, n, "iterator");
-}
 
-fn isCollectionFactoryName(n: []const u8) bool {
-    const names = [_][]const u8{
-        "linkedMapOf",    "hashMapOf",   "linkedStringMapOf", "hashSetOf",
-        "linkedSetOf",    "sortedSetOf", "sortedMapOf",       "arrayListOf",
-        "listOfNotNull",  "setOfNotNull",
-    };
-    for (names) |k| {
-        if (std.mem.eql(u8, n, k)) return true;
-    }
-    return false;
-}
 
 // -------------------------------------------------------------------------
 // Once-per-process dependency base: the stdlib (+ pack) files are lowered

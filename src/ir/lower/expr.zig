@@ -67,7 +67,6 @@ const isPackageHead = literals.isPackageHead;
 const isPkgRoot = literals.isPkgRoot;
 
 const isTopLevelProp = inline_state.isTopLevelProp;
-const isDroppedStdlibFactory = inline_state.isDroppedStdlibFactory;
 const inlineFnAst = inline_state.inlineFnAst;
 const inlineFnAstForRecv = inline_state.inlineFnAstForRecv;
 const CallShape = inline_state.CallShape;
@@ -1269,7 +1268,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // plain extension receiver does not lexically see — the
             // runtime walk below resolves member-vs-global with the right
             // receiver scope.
-            const is_known_global = b.module.funcId(name0) != null or isTopLevelProp(name0) or isDroppedStdlibFactory(name0);
+            const is_known_global = b.module.funcId(name0) != null or isTopLevelProp(name0);
             // Inside a lambda body the lexical `this` is the lambda's own
             // receiver, which for a scope function (`buildString { … }`,
             // `with(x) { … }`) is the scope receiver — not the enclosing class
