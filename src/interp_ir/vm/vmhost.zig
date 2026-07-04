@@ -329,6 +329,7 @@ pub const VmHost = struct {
     pub const callFuncTyped = host_call_func.callFuncTyped;
     pub const callNamedOverload = host_call_func.callNamedOverload;
     pub const pickNamedOverloadId = host_call_func.pickNamedOverloadId;
+    pub const bareUnsettledHeaderNoOp = host_call_func.bareUnsettledHeaderNoOp;
 };
 
 /// Stdlib `CallCtx` host adapter for native Vm dispatch. HOF bindings

@@ -6567,6 +6567,12 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
             if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
+            // An unsettled bodyless header is not executable — selecting
+            // it would re-enter `callFunc`'s bodyless ladder and cycle,
+            // and it must not outrank a real serving in a later walk arm.
+            // A call statically bound to such a header no-ops in
+            // `callFunc`'s bodyless arm; here it simply never competes.
+            if (!host_call_func.executableForm(self, mod, fid, want)) continue;
             try candidates.append(allocator, .{ .fid = fid, .func = f });
         }
     }

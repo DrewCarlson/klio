@@ -1744,6 +1744,16 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* == .Function) {
             const f = &d.Function;
+            // A header-only declaration (a retained `expect`) keeps its
+            // phase-1 stub — declared params, empty blocks — so
+            // `hasBody()` stays false and `linkBodyless` settles its
+            // executable form (native binding or body-sibling redirect).
+            // Lowering it would manufacture a one-block `return Unit`
+            // body that shadows the real dispatch.
+            if (f.body == null) {
+                stub_cursor += 1;
+                continue;
+            }
             const stub_pkg = module.funcByIdMut(stub_ids.items[stub_cursor]).?.package;
             const prev_pkg = ir.lower.decl.setLowerSelfPackage(stub_pkg);
             const func = try ir.lower.lowerFunctionBodyInto(module, f, &file_classes);
@@ -2904,6 +2914,14 @@ fn retainDecl(
             if (!f.is_expect) return true;
             if (actual_func_names.contains(f.name.name)) return false;
             const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
+            // Expect-with-implementation drops remain — the next no-holes
+            // slice. Retaining them requires the link to bind each header
+            // under its LOWERED fqn, and the registry's member-form
+            // registrations (`kotlin.String.repeat`) do not align with the
+            // receiverless lowered form (`kotlin.text.repeat`); a retained
+            // header the link cannot bind hijacks member dispatch. The
+            // registry needs declaration-aligned entries (or the manifest)
+            // before these drops can die.
             if (stdlib.implementation(fqn) != null) return false;
             if (f.receiver_type == null) {
                 const kotlin_fqn = try std.fmt.allocPrint(a, "kotlin.{s}", .{f.name.name});

@@ -237,6 +237,45 @@ pub fn resolvedNativeForm(self: *VmHost, func: FuncId) ?StdlibFn {
     return g.get().resolvedNativeForm(func);
 }
 
+/// Whether `func` can actually run: it has a lowered body, or the link
+/// settled an executable form for it (native binding, same-FQN host
+/// intrinsic, or a body-sibling redirect at this arity). An unsettled
+/// header is not executable — a by-name walk that selects one re-enters
+/// `callFunc`'s bodyless ladder and cycles.
+pub fn executableForm(self: *VmHost, module: *const Module, func: FuncId, argc: usize) bool {
+    const f = funcAt(module, func) orelse return false;
+    if (f.hasBody()) return true;
+    if (resolvedNativeForm(self, func) != null) return true;
+    if (lookupIntrinsic(self, f.fqn) != null) return true;
+    const g = self.prog.borrow();
+    defer g.deinit();
+    return g.get().resolvedRedirectTarget(module, func, argc) != null;
+}
+
+/// Whether a deferred bare call that missed every dispatch arm names a
+/// declared-but-unsettled header (an `expect` whose platform `actual` is
+/// outside the compiled source set, e.g. ktor's
+/// `HttpClient.platformResponseDefaultTransformers`). Such a call is a
+/// no-op returning Unit — the shape the manufactured empty bodies
+/// produced before header-only declarations stayed bodyless — instead of
+/// an unresolved-global error. Consulted only at the very end of the
+/// deferred-call ladder, so any real serving wins first.
+pub fn bareUnsettledHeaderNoOp(self: *VmHost, module: *const Module, name: []const u8, argc: usize) bool {
+    for (module.funcsBySimpleName(name)) |fid| {
+        const f = funcAt(module, fid) orelse continue;
+        if (f.hasBody()) continue;
+        const receiver_formed = paramIsThis(f.params);
+        const want = if (receiver_formed) argc + 1 else argc;
+        if (f.params.len < want) continue;
+        if (executableForm(self, module, fid, want)) continue;
+        if (trace.enabled(name)) {
+            trace.emit("map=bare_unsettled_noop name={s} fqn={s}", .{ name, f.fqn });
+        }
+        return true;
+    }
+    return false;
+}
+
 /// The prefix sequence the DELETED `callFunc` bodyless ladder probed, in
 /// its exact order. This list intentionally differs from
 /// `ProgramImage.bare_probe_packages` (the deleted `lookupGlobal` ladder's
@@ -788,6 +827,33 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
             trace.emit("map=bodyless_native name={s} fqn={s}", .{ f.name, f.fqn });
         }
         return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
+    }
+
+    // A bodyless declaration the link could NOT settle. A receiver-formed
+    // one is a member-form intrinsic's header (`Array<T>.fill` is served
+    // under the receiver type's member surface, not a package-level FQN):
+    // dispatch it through the member walk on its bound receiver. A walk
+    // MISS (the canonical `Vm::call_member` message — nothing serves the
+    // name, e.g. an `expect` whose platform `actual` is outside the pack's
+    // source set) is a no-op returning Unit, the shape the manufactured
+    // empty bodies produced before header-only declarations stayed
+    // bodyless. A receiverless one returns Unit the same way.
+    if (!f.hasBody()) {
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this") and args_in.len != 0) {
+            if (trace.enabled(f.name)) {
+                trace.emit("map=bodyless_member name={s} fqn={s}", .{ f.name, f.fqn });
+            }
+            const r = try host_call_member.callMember(self, allocator, &args_in[0], f.name, args_in[1..]);
+            if (r == .err and r.err == .Unimplemented) {
+                const m = r.err.Unimplemented;
+                if (std.mem.indexOf(u8, m, "Vm::call_member") != null) {
+                    if (runtime.freeScratch()) allocator.free(m);
+                    return .{ .ok = .Unit };
+                }
+            }
+            return r;
+        }
+        return .{ .ok = .Unit };
     }
 
     // Mis-bound type-specialized overload fallback. A bare call is lowered
