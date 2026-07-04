@@ -2390,12 +2390,23 @@ pub const Module = struct {
     /// backed forms the body-only ladder cannot rank. The alias gate stays
     /// caller-side (a bare alias with no ladder pick leaves the legacy target
     /// null, which the audit does not compare).
-    fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize) ?FuncId {
+    /// Whether a candidate's DECLARED signature can bind the call's argument
+    /// shapes. The declared-arity fallback ranks header stubs the body-only
+    /// ladder cannot see; without this check it picks by arity alone and an
+    /// `Int` argument binds a same-arity `String` parameter (`Box(s.length)`
+    /// inside `fun Box(s: String)` self-recursing past the constructor). No
+    /// signature view, or no refuting evidence, keeps the candidate.
+    fn declSigCompatible(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) bool {
+        const sv = self.sigViewForApplicability(fid) orelse return true;
+        return applicability.applicable(&sv, args, .{}) != null;
+    }
+
+    fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize, args: []const applicability.ArgShape) ?FuncId {
         const fallback = self.funcId(name);
         const want_u32: u32 = @intCast(want);
         const fallback_fits = blk: {
             if (fallback) |fid| {
-                if (self.declArityOf(fid)) |n| break :blk n == want_u32;
+                if (self.declArityOf(fid)) |n| break :blk n == want_u32 and self.declSigCompatible(fid, args);
             }
             break :blk true;
         };
@@ -2405,6 +2416,7 @@ pub const Module = struct {
                 for (self.funcsBySimpleName(name)) |cid| {
                     if (self.isNonExtFid(cid)) continue;
                     if (self.declArityOf(cid) != want_u32) continue;
+                    if (!self.declSigCompatible(cid, args)) continue;
                     const ct = self.bareCallTierOf(cid, name, caller_pkg, caller_file) orelse continue;
                     if (ct < other_package_tier) return cid;
                 }
@@ -2412,10 +2424,10 @@ pub const Module = struct {
         }
         if (fallback_fits) return fallback;
         for (self.funcsBySimpleName(name)) |fid| {
-            if (self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32) return fid;
+            if (self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32 and self.declSigCompatible(fid, args)) return fid;
         }
         for (self.funcsBySimpleName(name)) |fid| {
-            if (!self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32) return fid;
+            if (!self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32 and self.declSigCompatible(fid, args)) return fid;
         }
         if (want > 0) {
             var all_ext_zero_arity = self.funcsBySimpleName(name).len != 0;
@@ -2518,7 +2530,7 @@ pub const Module = struct {
         // backed forms the ladder (body-only) cannot rank.
         var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args);
         if (heur == null and ctx.cast_pick == null and !isAliasName(name)) {
-            heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len);
+            heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len, args);
         }
         // Prefer the same-name extension overload whose declared receiver
         // matches the enclosing extension's receiver.
@@ -2963,11 +2975,23 @@ pub const Module = struct {
     }
 };
 
-/// A known stdlib host-intrinsic global alias (`min`, `listOf`, …). A bare call
-/// to such a name whose overload set has no applicable body candidate routes to
-/// the runtime intrinsic rather than a declared-arity fallback. Shared by
-/// `resolveCall` (the Phase-B fallback gate) and the lowerer's alias / value-ref
-/// paths so both classify the same names.
+/// A known stdlib host-served global alias (`min`, `listOf`, …). A bare call
+/// to such a name whose overload set has no applicable body candidate routes
+/// to the runtime global rather than a declared-arity fallback. Shared by
+/// `resolveCall` (the Phase-B fallback gate) and the lowerer's alias /
+/// value-ref paths so both classify the same names.
+///
+/// This name list is a cataloged hatch (resolution-unification plan, RC-H /
+/// P10). A registry-derived replacement was attempted and measured unsound
+/// three ways: the intrinsic registry maps FQNs to function pointers with no
+/// declaration shape, so it cannot distinguish a value-position global
+/// (`kotlin.collections.listOf`) from a package-level link binding for a
+/// bodyless receiver-formed declaration (`kotlin.text.nativeIndexOf` binds
+/// `String.nativeIndexOf`), and the implicit-alias table covers only part of
+/// this surface (`reverseOrder`, the array builders are absent). The
+/// classification these call sites need lives in DECLARATIONS the current
+/// pipeline drops — P10 (the no-holes symbol table) restores those
+/// declarations and deletes this list outright.
 pub fn isAliasName(name: []const u8) bool {
     const names = [_][]const u8{
         "maxOf",           "minOf",      "max",                 "min",
@@ -2980,7 +3004,8 @@ pub fn isAliasName(name: []const u8) bool {
         "buildString",     "TODO",       "error",               "compareValues",
         "compareValuesBy", "compareBy",  "compareByDescending", "naturalOrder",
         "reverseOrder",    "sequenceOf", "emptySequence",       "generateSequence",
-        "sequence",
+        "sequence",        "iterator",   "readLine",            "sortedSetOf",
+        "sortedMapOf",
     };
     for (names) |n| {
         if (std.mem.eql(u8, name, n)) return true;
@@ -3951,6 +3976,7 @@ test "resolveCall: a type-distinguishable stub overload defers to a receiver pro
     // alias name: the index classifies type_overload; the applicability ladder
     // is body-only and the declared-arity fallback is gated off for aliases,
     // so Phase B finds nothing and the call defers to the runtime probe.
+
     const s1 = try pushTestFuncOpts(&m, a, "minOf", "app.minOf", "app", 0, .{ .stub = true });
     try m.decl_user_arity.put(s1.int(), .{ .required = 1, .total = 1, .has_vararg = false });
     try putTestDeclSig(&m, a, s1, "Int", 1);

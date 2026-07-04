@@ -1598,18 +1598,44 @@ fn buildModuleWithOverrides(
             const f = &d.Function;
             const id = module.nextFuncId();
             const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
+            // The header stub carries the full declared parameter list (the
+            // same `loweredTypeRef` rendering the phase-2 body install uses),
+            // not just a receiver placeholder: class methods lower between
+            // phase 1 and phase 2, and their call-site shape decisions — a
+            // trailing lambda's expected arity, default-gap checks — read
+            // `Func.params` and must see the declared signature, not an
+            // empty stub.
             var stub_params: []Param = &.{};
-            if (f.receiver_type) |rt| {
-                const ps = try a.alloc(Param, 1);
-                ps[0] = .{
-                    .name = "this",
-                    .ty = .{ .name = rt.name.name, .nullable = rt.nullable, .args = &.{} },
-                    .default = null,
-                    .is_property = false,
-                    .is_vararg = false,
-                    .has_default = false,
-                };
-                stub_params = ps;
+            {
+                const has_recv = f.receiver_type != null;
+                const n = f.params.len + @intFromBool(has_recv);
+                if (n != 0) {
+                    const ps = try a.alloc(Param, n);
+                    var pi: usize = 0;
+                    if (f.receiver_type) |*rt| {
+                        ps[0] = .{
+                            .name = "this",
+                            .ty = try ir.lower.decl.loweredTypeRef(a, rt, true),
+                            .default = null,
+                            .is_property = false,
+                            .is_vararg = false,
+                            .has_default = false,
+                        };
+                        pi = 1;
+                    }
+                    for (f.params) |*p| {
+                        ps[pi] = .{
+                            .name = p.name.name,
+                            .ty = try ir.lower.decl.loweredTypeRef(a, &p.ty, true),
+                            .default = null,
+                            .is_property = false,
+                            .is_vararg = p.is_vararg,
+                            .has_default = p.default != null,
+                        };
+                        pi += 1;
+                    }
+                    stub_params = ps;
+                }
             }
             try module.funcs.append(a, .{
                 .id = id,

@@ -1796,6 +1796,8 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // arity (-1, an unconstrained value position) keeps the single-`it`
     // binding unchanged.
     const suppress_it = lam.implicit_it and expected_arity == 0;
+    if (orAuditOn() and lam.implicit_it)
+        std.debug.print("[IT-AUDIT] lambda span={d}..{d} expected_arity={d} suppress={}\n", .{ lam.body.span.start, lam.body.span.end, expected_arity, suppress_it });
     const eff_params: []const ast.Ident = if (suppress_it) &.{} else lam.params;
     const eff_param_tys: []const ?ast.TypeRef = if (suppress_it) &.{} else lam.param_tys;
     // Names of lambda params (including the implicit `it`) whose effective
@@ -2043,21 +2045,54 @@ fn reifiedNeedsLambdaArity(b: *FuncBuilder, f: *const ast.Function, lambda_arity
     return fn_arity > lambda_arity;
 }
 
+/// Whether any same-named lowered candidate is an extension whose value-
+/// parameter shape can bind this call's argument count through an implicit
+/// receiver — `to(x)` inside a class is `this.to(x)`, so the receiver-bound
+/// candidate keeps the bare call on the member/extension dispatch path. The
+/// host global serves the call only when no receiver-bound binding is
+/// possible (no such candidate, or none fits the arity: `iterator { … }`
+/// against the zero-arg `Map.iterator()` family).
+fn extensionCandidateFitsArity(b: *FuncBuilder, name: []const u8, user_arg_count: usize) bool {
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        const user_params = f.params.len - 1;
+        var required: usize = 0;
+        var has_vararg = false;
+        for (f.params[1..]) |*p| {
+            if (p.is_vararg) {
+                has_vararg = true;
+                continue;
+            }
+            if (!p.has_default) required += 1;
+        }
+        if (has_vararg) {
+            if (user_arg_count >= required) return true;
+        } else if (user_arg_count >= required and user_arg_count <= user_params) {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
     const list = b.module.func_name_index.get(name) orelse return null;
     for (list.items) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
-        if (!(f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
-        if (userParams(f) < user_arg_count) continue;
+        // Both shapes host a trailing lambda: an extension/member (leading
+        // `this`) and a plain top-level fn — the offset generalizes.
+        const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        const user_params = f.params.len - off;
+        if (user_params < user_arg_count) continue;
         const last = f.params[f.params.len - 1];
         if (last.is_vararg) continue;
         if (fnTypeArityAlias(b, last.ty) == null) continue;
         // Under-applied (`launch { … }` against `launch(context = …,
         // start = …, block)`): the trailing lambda binds the last param
         // out of sequence, so every skipped parameter must be defaulted.
-        if (userParams(f) != user_arg_count) {
-            var i: usize = user_arg_count; // leading args fill params[1..user_arg_count]
+        if (user_params != user_arg_count) {
+            var i: usize = off + user_arg_count - 1; // leading args fill params[off..]
             var gap_defaulted = true;
             while (i < f.params.len - 1) : (i += 1) {
                 if (!f.params[i].has_default) {
@@ -3588,10 +3623,39 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     // Whether a single-segment class-name call resolves to the constructor.
     const shadowed_by_class = try shadowedByClass(b, callee, args);
+    // A constructible same-named class competing with the function
+    // candidates: a static commit to the function is only sound when the
+    // pick is type-proven; otherwise the deferred class-carrying form
+    // below lets the runtime decide ctor-vs-factory on the actual
+    // argument types (`Box(s.length)` constructs `Box(Int)`, not the
+    // `fun Box(s: String)` factory the arity-only view would pick).
+    const class_competes = callee.* == .Path and callee.Path.segments.len == 1 and
+        !shadowed_by_class and blk: {
+            const cid = b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file) orelse break :blk false;
+            if (cid.int() >= b.module.classes.items.len) break :blk false;
+            const cls = &b.module.classes.items[cid.int()];
+            // An abstract/interface/sealed class never constructs, so it
+            // does not compete with the function candidates.
+            if (cls.is_abstract) break :blk false;
+            // The class competes only when its primary constructor can
+            // actually take this argument count — a `HexFormat { … }`
+            // builder call beside a multi-param internal constructor has
+            // no constructor candidate and commits statically.
+            var required: usize = 0;
+            var has_vararg = false;
+            for (cls.primary_params) |*p| {
+                if (p.is_vararg) {
+                    has_vararg = true;
+                    continue;
+                }
+                if (!p.has_default) required += 1;
+            }
+            break :blk args.len >= required and (has_vararg or args.len <= cls.primary_params.len);
+        };
 
     // Path-callee with a registered top-level fn → Call{func}.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
-        if (try lowerPathCall(b, expr, shadowed_by_class)) |r| return r;
+        if (try lowerPathCall(b, expr, shadowed_by_class, class_competes)) |r| return r;
     }
 
     // Path-callee with a registered class name. The indexed lookup binds
@@ -4352,14 +4416,22 @@ fn paramLitKind(type_name: []const u8) ?LitKind {
 }
 
 /// True when a same-name factory's declared parameter types DEFINITELY cannot
-/// accept the literal argument kinds (e.g. an `Int` literal against a `String`
-/// parameter) — so the bare `Name(args)` constructs the class rather than
-/// calling the factory. Conservative: an unknown argument or parameter kind
-/// never disproves, so only a literal-vs-builtin mismatch flips the decision.
-fn factorySigRejectsArgs(sig: []const ir.TypeRef, args: []const Expr) bool {
+/// accept the argument kinds — so the bare `Name(args)` constructs the class
+/// rather than calling the factory. The argument kind comes from the same
+/// evidence the shared scorer sees: a literal (direct or through a recorded
+/// local initializer), a declared local/param type head, or the typeck
+/// type-head channel (`Box(s.length)` inside `fun Box(s: String)` proves Int
+/// against the factory's String and constructs the class). Conservative: an
+/// unknown argument or parameter kind never disproves, so only a
+/// known-kind-vs-builtin mismatch flips the decision.
+fn factorySigRejectsArgs(b: *FuncBuilder, sig: []const ir.TypeRef, args: []const Expr) bool {
     for (args, 0..) |*a, i| {
         if (i >= sig.len) break;
-        const ak = argLitKind(a) orelse continue;
+        var ak_opt = argEvidenceLitKind(b, a);
+        if (ak_opt == null) {
+            if (argDeclTypeRef(b, a)) |ty| ak_opt = paramLitKind(ty.name);
+        }
+        const ak = ak_opt orelse continue;
         const pk = paramLitKind(sig[i].name) orelse continue;
         if (ak != pk) return true;
     }
@@ -4385,6 +4457,44 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
     // `NewInstance` that aborts on the abstract class at run time.
     if (cid.int() < b.module.classes.items.len and b.module.classes.items[cid.int()].is_abstract) return false;
     const nargs = args.len;
+    // Scope rule (spec: overload resolution walks scopes inside-out): inside
+    // the class's own body — including its companion — the class's
+    // constructor is a nearer-scope candidate than any same-named
+    // package-level factory, so an applicable constructor decides the call.
+    // `Path(normalized)` inside `Path.of` binds the private constructor; the
+    // `fun Path(String)` factory calling back into `of` would recurse.
+    if (b.ownerClass()) |oc| {
+        // A companion body's owner is the lifted companion class; its name is
+        // the class name with one or more `$Companion` suffixes. Stripping
+        // them recovers the class whose scope the call sits in.
+        var oc_base: []const u8 = oc;
+        while (std.mem.endsWith(u8, oc_base, "$Companion")) {
+            oc_base = oc_base[0 .. oc_base.len - "$Companion".len];
+        }
+        const in_own_scope = std.mem.eql(u8, oc_base, name) or blk: {
+            if (cid.int() < b.module.classes.items.len) {
+                if (b.module.classes.items[cid.int()].companion) |comp| {
+                    if (comp.int() < b.module.classes.items.len) {
+                        break :blk std.mem.eql(u8, b.module.classes.items[comp.int()].name, oc);
+                    }
+                }
+            }
+            break :blk false;
+        };
+        if (in_own_scope and cid.int() < b.module.classes.items.len) {
+            const ps = b.module.classes.items[cid.int()].primary_params;
+            var required: usize = 0;
+            var has_vararg = false;
+            for (ps) |*p| {
+                if (p.is_vararg) {
+                    has_vararg = true;
+                    continue;
+                }
+                if (!p.has_default) required += 1;
+            }
+            if (nargs >= required and (has_vararg or nargs <= ps.len)) return true;
+        }
+    }
     if (lastArgIsLambda(args)) {
         // A trailing lambda routes to a same-named factory with a
         // function-typed param to receive it; only when none fits is it a ctor.
@@ -4422,7 +4532,7 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
                 // what tells `Box(5)` (ctor `Box(Int)`) from the same-arity
                 // factory `fun Box(s: String)`.
                 if (b.module.decl_user_sig.get(entry.id.int())) |sig| {
-                    if (factorySigRejectsArgs(sig, args)) continue;
+                    if (factorySigRejectsArgs(b, sig, args)) continue;
                 }
                 any_factory_applicable = true;
                 break;
@@ -4441,7 +4551,7 @@ fn anyFunctionParam(params: []const ir.Param) bool {
 
 /// Path-callee bare-name → Call ladder. Returns null when no top-level fn /
 /// the class path should handle it instead.
-fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Allocator.Error!?Reg {
+fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, class_competes: bool) Allocator.Error!?Reg {
     const call = expr.Call;
     const callee = call.callee;
     const args = call.args;
@@ -4642,6 +4752,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
     // `this.<name>` redispatch would invoke the receiver itself.
     if (res_final.target == null and !shadowed_by_class and inReceiverContext(b) and
         ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0) and
+        !extensionCandidateFitsArity(b, name0, args.len) and
         b.resolve(name0) == null and !b.knowsOuter(name0))
     {
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
@@ -4649,6 +4760,11 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool) Al
 
     if (res_final.target) |target| {
         if (!shadowed_by_class) {
+            // A constructible same-named class competes with this pick and
+            // the pick is not type-proven: yield to the class arm's deferred
+            // class-carrying emission, where the runtime decides
+            // ctor-vs-factory on the actual argument types.
+            if (class_competes and !res_final.ty_proven and !was_cast) return null;
             if (indexDeferReason(index_res) == .ambiguous_tier) {
                 try recordAmbiguousCall(b, name0, segments[0].span, index_res);
             }
@@ -5997,7 +6113,9 @@ fn lowerUnresolvedBareCall(
     // the implicit receiver. Bind the global directly: routing it through
     // `CallMemberOrGlobal` would let the member/extension probe treat it as an
     // extension on `this` and prepend the receiver into its varargs.
-    if (ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0)) {
+    if (ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0) and
+        !extensionCandidateFitsArity(b, name0, args.len))
+    {
         orEmitAudit(b, "unresolved_bare_call", "LoadGlobal", name0);
         const callee_r = b.allocReg();
         const nm0 = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -6043,7 +6161,13 @@ fn lowerUnresolvedBareCall(
         if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
             if (overloadHostingTrailingLambda(b, name0, args.len)) |fid| {
                 if (b.module.funcById(fid)) |f| {
-                    break :blk try argFnArities(b, f, args, ast_arg_names, 1);
+                    // The receiver offset depends on the candidate's own
+                    // shape: a top-level fn has no leading `this`, and a
+                    // blanket offset misaligned every arity (the trailing
+                    // `() -> T` block read past the params, kept its
+                    // synthetic `it`, and shadowed the enclosing one).
+                    const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+                    break :blk try argFnArities(b, f, args, ast_arg_names, off);
                 }
             }
         }
