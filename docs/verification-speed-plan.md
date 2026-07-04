@@ -14,7 +14,7 @@ and decisions here.
 | one-edit rebuild, ReleaseSafe harness | **83 s** | 100% single-core — whole-program LLVM codegen, no parallelism |
 | one-edit rebuild, Debug harness (`-Dharness-optimize=Debug`) | **16 s** | 5.2× faster than ReleaseSafe |
 | `-fincremental` one-shot | 21 s | worse than plain — incremental state dies with the process |
-| `--watch -fincremental` | untested-interactive | died with BrokenPipe under piped/background use; try in a real terminal |
+| `--watch -fincremental` | **BROKEN — do not use** | see below |
 | one commontest child (ArrayDequeTest), ReleaseSafe | **7.9 s** | dominated by re-lowering ~40 same-dir sibling files per child |
 | same child, Debug interpreter | **34 s** | 4.3× runtime penalty — sweeps must stay ReleaseSafe |
 | full dual commontest gate (old way) | ~20 min | 4 full sweeps × ~106 children |
@@ -24,8 +24,10 @@ and decisions here.
 ## The iteration playbook (use these, not the old habits)
 
 - **Edit-repro loop** (fixing one bug, running one program):
-  `zig build klio-harness -Dharness-optimize=Debug` → 16 s per rebuild.
-  The Debug interpreter is ~4× slower per run — fine for single repros.
+  `zig build klio-harness -Dharness-optimize=Debug` → 16 s per rebuild,
+  installs as `zig-out/bin/klio-harness-Debug` (non-ReleaseSafe modes get
+  their own name so they can never shadow the sweep binary). The Debug
+  interpreter is ~4× slower per run — fine for single repros.
 - **Targeted commontest check** (one file, both eager modes):
   `python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest --eager both`
 - **One suite**: `zig build itest-<name>` (builds and runs just that suite).
@@ -46,11 +48,17 @@ and decisions here.
    children per directory (one process compiles siblings once, runs each
    target's tests with successive `--only-file` filters).
 2. **Whole-program LLVM rebuild on one edit** (83 s ReleaseSafe, single
-   core). Mitigated by the Debug playbook; real fixes to evaluate:
-   `--watch -fincremental` daemon in the user's terminal (state persists
-   across edits), and tracking zig's aarch64 self-hosted backend for
-   Debug (may already be active — the 16 s Debug build is acceptable
-   either way).
+   core). Mitigated by the Debug playbook. `--watch -fincremental` was
+   tried and is BROKEN for this graph (zig 0.16.0): the incremental-built
+   `stdlib-embed-gen` tool failed to spawn as `InvalidExe` when its run
+   step fired, and the daemon (a resident build runner plus per-artifact
+   compile servers) survives its stdout pipe closing, refires on every
+   source-mtime change, and reinstalls its binary over `zig-out/bin` —
+   it silently replaced the ReleaseSafe harness with a Debug one 20
+   minutes after the experiment "ended". Distinct per-optimize binary
+   names now bound the blast radius (`klio-harness-Debug`), but do not
+   run a watch daemon until zig's incremental exe emission is reliable
+   for run-step tools; re-evaluate on the next zig upgrade.
 3. **itest-bin all-or-nothing**: ~56 ReleaseSafe links. Per-suite steps
    already exist (`zig build itest-<name>`); itest-bin stays a CI/stress
    tool. Consider trimming the default suite list or splitting

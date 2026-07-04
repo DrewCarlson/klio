@@ -451,8 +451,16 @@ pub fn build(b: *std.Build) void {
     // Harness-optimized `klio` for the child-spawning itests: each spawned
     // program pays the embedded-stdlib assembly, so those tests point at
     // this binary (via KLIO_ITEST_BIN) instead of the Debug install.
+    // A non-default optimize mode gets its own binary name
+    // (`klio-harness-Debug`), so an edit-loop Debug build can never
+    // silently replace the ReleaseSafe binary the sweep scripts target
+    // (a resident `--watch` daemon did exactly that once).
+    const harness_bin_name = if (harness_optimize == .ReleaseSafe)
+        "klio-harness"
+    else
+        b.fmt("klio-harness-{s}", .{@tagName(harness_optimize)});
     const harness_exe = b.addExecutable(.{
-        .name = "klio-harness",
+        .name = harness_bin_name,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -527,7 +535,7 @@ pub fn build(b: *std.Build) void {
                 if (spec.needs_exe) {
                     const hinst = b.addInstallArtifact(harness_exe, .{});
                     run_t.step.dependOn(&hinst.step);
-                    run_t.setEnvironmentVariable("KLIO_ITEST_BIN", "zig-out/bin/klio-harness");
+                    run_t.setEnvironmentVariable("KLIO_ITEST_BIN", b.fmt("zig-out/bin/{s}", .{harness_bin_name}));
                     run_t.has_side_effects = true;
                 }
                 if (spec.parity_data) {
