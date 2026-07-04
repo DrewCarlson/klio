@@ -977,6 +977,16 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         };
         defer for (probes) |p| allocator.free(p);
         for (probes) |probe| {
+            // A bare UPPERCASE name read as a field is a companion/type
+            // reference (`Char` in value position inside a method); the
+            // root `kotlin.<Name>` binding for such a name is the type's
+            // CONSTRUCTOR/conversion intrinsic, never a property — invoking
+            // it with the receiver converts the receiver (Type error).
+            // Type-qualified constant probes (`kotlin.Int.MAX_VALUE`) stay.
+            if (name.len > 0 and std.ascii.isUpper(name[0])) {
+                const dot = std.mem.lastIndexOfScalar(u8, probe, '.') orelse 0;
+                if (std.mem.eql(u8, probe[0..dot], "kotlin")) continue;
+            }
             if (lookupIntrinsic(self, probe)) |func| {
                 const args = [_]Value{receiver.*};
                 const r = try dispatchIntrinsic(self, allocator, probe, func, &args);

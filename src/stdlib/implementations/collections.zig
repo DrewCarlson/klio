@@ -892,6 +892,19 @@ pub fn coll_shuffled(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeList(a, items, false));
 }
 
+/// `Array.shuffle()` (and the primitive/unsigned array variants) —
+/// Fisher-Yates in place, optionally seeded by a `Random` argument.
+pub fn array_shuffle(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("shuffle requires an array receiver");
+    const arr = ctx.args[0].Array;
+    const buf = try arr.snapshot(a);
+    defer if (runtime.freeScratch()) a.free(buf);
+    if (try shuffleInPlace(ctx, buf)) |e| return .{ .err = e };
+    try arr.writeBack(a, buf);
+    return ok(Value.Unit);
+}
+
 /// `MutableList.shuffle()` — shuffle in place.
 pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
@@ -1800,27 +1813,54 @@ fn arraySizeArg(a: Allocator, v: Value, what: []const u8) Error!SizeOutcome {
 
 fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, default: Value) Error!EvalResult {
     const a = ctx.allocator;
-    if (ctx.args.len == 0 or ctx.args.len > 2) {
+    // A bare ctor call inside an extension body routes through the member
+    // walk, which prepends the implicit receiver — the constructor takes
+    // none. Strip a leading array when the REMAINING args form a valid
+    // ctor shape ((size), (size, init), or the storage-wrapping array).
+    var call_args = ctx.args;
+    if (call_args.len >= 2 and call_args[0] == .Array) {
+        const rest = call_args[1..];
+        const rest_valid = (rest.len == 1 and (rest[0] == .Array or rest[0].asI64() != null)) or
+            (rest.len == 2 and rest[0].asI64() != null);
+        if (rest_valid) call_args = rest;
+    }
+    if (call_args.len == 0 or call_args.len > 2) {
         return arityErr(try fmt(a, "{s} expects (size) or (size, init)", .{name}));
     }
     // Storage-wrapping unsigned-array constructor: `UIntArray(intArray)` (and
     // the UByte/UShort/ULong siblings, what `asUIntArray()` lowers to) shares
     // the signed array's packed buffer as an unsigned view — mutations through
     // either alias, matching Kotlin's inline value-class storage.
-    if (ctx.args.len == 1 and prim != null and ctx.args[0] == .Array) {
-        const arr = ctx.args[0].Array;
+    if (call_args.len == 1 and prim != null and call_args[0] == .Array) {
+        const arr = call_args[0].Array;
         if (arr.prim) |src| {
             const is_view = (prim.? == .UByte and src == .Byte) or
                 (prim.? == .UShort and src == .Short) or
                 (prim.? == .UInt and src == .Int) or
-                (prim.? == .ULong and src == .Long);
+                (prim.? == .ULong and src == .Long) or
+                // Same-kind wrap (`UIntArray(uintArray)`) passes through.
+                prim.? == src;
             if (is_view) switch (arr.storage) {
                 .scalars => |pb| return ok(.{ .Array = .{ .storage = .{ .scalars = pb.clone() }, .prim = prim.? } }),
-                .boxed => {},
+                // A boxed signed buffer (a `copyOf` that materialized
+                // Values) reinterprets element-wise: same bits, unsigned
+                // tags, packed storage so indexed reads come back tagged.
+                .boxed => {
+                    const buf = try arr.snapshot(a);
+                    defer if (runtime.freeScratch()) a.free(buf);
+                    const k = prim.?;
+                    var pb = runtime.PrimBuf{ .kind = k };
+                    errdefer pb.bytes.deinit(a);
+                    try pb.bytes.appendNTimes(a, 0, buf.len * k.elemSize());
+                    for (buf, 0..) |v, i| {
+                        pb.setAs(i, v, src);
+                    }
+                    return ok(.{ .Array = .{ .storage = .{ .scalars = try ObjRef(runtime.PrimBuf).initOwned(a, pb) }, .prim = k } });
+                },
             };
         }
     }
-    const n = switch (try arraySizeArg(a, ctx.args[0], name)) {
+    const n = switch (try arraySizeArg(a, call_args[0], name)) {
         .n => |v| v,
         .err => |e| return e,
     };
@@ -1834,8 +1874,8 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
         var pb = runtime.PrimBuf{ .kind = k };
         errdefer pb.bytes.deinit(a);
         try pb.bytes.appendNTimes(a, 0, un * k.elemSize());
-        if (ctx.args.len == 2) {
-            const block = ctx.args[1];
+        if (call_args.len == 2) {
+            const block = call_args[1];
             var i: usize = 0;
             while (i < un) : (i += 1) {
                 const v = switch (try invoke(ctx, &block, &.{Value.newInt(@intCast(i))})) {
@@ -1851,13 +1891,13 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
         } });
     }
 
-    if (ctx.args.len == 1) {
+    if (call_args.len == 1) {
         var list: std.ArrayList(Value) = .empty;
         var i: i64 = 0;
         while (i < n) : (i += 1) try list.append(a, default);
         return ok(try makeArrayFromArrayList(a, list, null));
     }
-    const block = ctx.args[1];
+    const block = call_args[1];
     var list: std.ArrayList(Value) = .empty;
     // The accumulated results live only in `list` (no frame register holds
     // them) and the per-element `invoke` reaches a GC safe point, so pin the
@@ -3777,17 +3817,31 @@ pub fn coll_list_sum(ctx: *CallCtx) Error!EvalResult {
 /// Int/Short/Byte -> Int (wrapping, like Kotlin).
 fn sumValues(a: Allocator, items: []const Value, what: []const u8) Error!EvalResult {
     var acc_i: i64 = 0;
+    var acc_u: u64 = 0;
     var acc_f: f64 = 0;
     var any_long = false;
     var any_float = false;
     var any_double = false;
+    // Unsigned sums keep their unsigned width (`Iterable<UInt>.sum()` is
+    // UInt with u32 wrap; UByte/UShort widen to UInt; ULong stays ULong).
+    var any_unsigned = false;
+    var any_ulong = false;
     for (items) |v| {
         switch (v) {
             .Long => {
                 any_long = true;
                 acc_i +%= v.asI64().?;
             },
-            .Int, .Short, .Byte, .UByte, .UShort, .UInt, .ULong => acc_i +%= v.asI64() orelse @intCast(v.asU64() orelse 0),
+            .Int, .Short, .Byte => acc_i +%= v.asI64().?,
+            .UByte, .UShort, .UInt => {
+                any_unsigned = true;
+                acc_u +%= v.asU64().?;
+            },
+            .ULong => {
+                any_unsigned = true;
+                any_ulong = true;
+                acc_u +%= v.asU64().?;
+            },
             .Float => {
                 any_float = true;
                 acc_f += v.asF64().?;
@@ -3804,19 +3858,22 @@ fn sumValues(a: Allocator, items: []const Value, what: []const u8) Error!EvalRes
     }
     if (any_double) return ok(.{ .Double = acc_f + @as(f64, @floatFromInt(acc_i)) });
     if (any_float) return ok(.{ .Float = @floatCast(acc_f + @as(f64, @floatFromInt(acc_i))) });
+    if (any_unsigned) {
+        if (any_ulong) return ok(.{ .ULong = acc_u });
+        return ok(.{ .UInt = @truncate(acc_u) });
+    }
     if (any_long) return ok(.{ .Long = acc_i });
     return ok(Value.newInt(@as(i32, @truncate(acc_i))));
 }
 
 pub fn coll_list_average(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, "List.average")) {
+    if (ctx.args.len == 0) return typeErr("average requires a receiver");
+    const items = switch (try iterableItems(a, ctx.args[0], "average")) {
         .items => |x| x,
         .err => |e| return e,
     };
-    const g = it.borrow();
-    defer g.deinit();
-    const items = g.get().items;
+    defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) return ok(.{ .Double = std.math.nan(f64) });
     var sum: f64 = 0.0;
     var n: i64 = 0;
@@ -3848,11 +3905,13 @@ pub fn coll_list_min(ctx: *CallCtx) Error!EvalResult {
 
 fn collListMinMaxCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, what)) {
+    // Iterable-generic: the erased receiver-type-arg decline routes
+    // Set/Array receivers here through the Iterable/Set-form probes.
+    if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
+    const items = switch (try iterableItems(a, ctx.args[0], what)) {
         .items => |x| x,
         .err => |e| return e,
     };
-    const items = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) {
         if (or_null) return ok(Value.Null);

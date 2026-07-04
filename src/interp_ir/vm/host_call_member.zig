@@ -2611,7 +2611,24 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
 
     // Static call on an Intrinsic receiver: probe `<fqn>.<name>`.
+    // `Any` surface on a type-in-value-position value (`val c: Any =
+    // UByte; c.toString()` — the companion reference lowers to the
+    // type's constructor/conversion FUNCTION in a class context):
+    // identity string, never the conversion itself.
+    if (receiver.* == .Function and std.mem.eql(u8, name, "toString") and args.len == 0) {
+        const dn = receiver.Function.decl.name.name;
+        if (dn.len > 0 and std.ascii.isUpper(dn[0])) {
+            return .{ .ok = try strVal(allocator, dn) };
+        }
+    }
     if (receiver.* == .Intrinsic) {
+        // Same surface for the intrinsic-valued form.
+        if (std.mem.eql(u8, name, "toString") and args.len == 0) {
+            return .{ .ok = try strVal(allocator, receiver.Intrinsic.fqn) };
+        }
+        if (std.mem.eql(u8, name, "hashCode") and args.len == 0) {
+            return .{ .ok = Value.newInt(@as(i64, @intCast(@intFromPtr(receiver.Intrinsic.fqn.ptr) & 0x7fffffff))) };
+        }
         const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ receiver.Intrinsic.fqn, name });
         defer if (runtime.freeScratch()) allocator.free(probe);
         if (lookupIntrinsic(self, probe)) |func| {
@@ -2624,6 +2641,13 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const cname = cg.get().name;
         const cfqn = cg.get().fqn;
         cg.deinit();
+        // `Any.toString` on a class/companion value: the class label,
+        // never a same-named number intrinsic (`kotlin.UByte.toString`
+        // expects a UByte receiver, not the type).
+        if (std.mem.eql(u8, name, "toString") and args.len == 0) {
+            const label = try std.fmt.allocPrint(allocator, "class {s}", .{cname});
+            return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, label) } };
+        }
         const probe_simple = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
         const probe_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
         // `dispatchIntrinsic` borrows the key for the call only; free both
@@ -2931,6 +2955,19 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 const cv: i64 = @intCast(args[0].Char);
                 break :blk cv >= lo and cv <= hi and @rem(cv - r.start, r.step) == 0;
             }
+            // Unsigned ranges span the full u64 space stored as raw i64
+            // bits; the membership compare must be unsigned
+            // (`0uL until ULong.MAX_VALUE` has end bits -2).
+            if (r.kind == .ULong or r.kind == .UInt) {
+                const uv: u64 = args[0].asU64() orelse
+                    (if (args[0].asI64()) |sv| @as(u64, @bitCast(sv)) else break :blk false);
+                const us: u64 = @bitCast(r.start);
+                const ue: u64 = @bitCast(r.end);
+                const ulo = @min(us, ue);
+                const uhi = @max(us, ue);
+                const diff = @as(i128, uv) - @as(i128, us);
+                break :blk uv >= ulo and uv <= uhi and @rem(diff, @as(i128, r.step)) == 0;
+            }
             if (args[0].asI64()) |v| {
                 // Widen the step-alignment difference: `v - r.start` overflows
                 // i64 for a range spanning most of the type (`MIN..MAX`), which
@@ -2981,6 +3018,15 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
     if (receiver.* == .Array) {
         if (try arrayShapeOps(self, allocator, receiver, name, args)) |r| return r;
+        // `Any.toString` on an array is the identity string (no member
+        // or extension overrides it): the same `fqn@identity` form
+        // instances use. Notably NOT the contents — a self-referencing
+        // array's `toString()` must not recurse
+        // (ArraysTest.contentDeepToStringNoRecursion).
+        if (std.mem.eql(u8, name, "toString") and args.len == 0) {
+            const s = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ receiver.typeFqn(), receiver.Array.identity() });
+            return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
+        }
     }
 
     // Indexed get/set on Array.
@@ -3253,7 +3299,9 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
 
     // Iterable fallback.
-    if (receiver.* == .Instance and !iterable_fallback_active and hostHasMember(self, receiver, "iterator")) {
+    if (receiver.* == .Instance and !iterable_fallback_active and
+        (hostHasMember(self, receiver, "iterator") or samIterableInstance(self, allocator, receiver)))
+    {
         const p1 = try std.fmt.allocPrint(allocator, "kotlin.collections.Iterable.{s}", .{name});
         defer if (runtime.freeScratch()) allocator.free(p1);
         var matched: []const u8 = p1;
@@ -6070,6 +6118,31 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
 }
 
+/// A SAM-converted `Sequence { ... }` / `Iterable { ... }` instance: its
+/// `iterator` is served through `__sam_target__` rather than an IR
+/// method, so `hostHasMember(.., "iterator")` cannot see it. The
+/// iterable fallback drains these like any other iterator-bearing
+/// instance.
+fn samIterableInstance(self: *VmHost, allocator: Allocator, receiver: *const Value) bool {
+    const class_name = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        // A SAM conversion carries the lambda under `__sam_target__`; a
+        // lowered fun-interface object carries `iterator` as a callable
+        // field; a full anon `object : Sequence<T>` registers `iterator`
+        // in the anon-method table. Any of them can be drained.
+        if (g.get().get("__sam_target__") != null) break :blk null;
+        if (g.get().get("iterator")) |f| {
+            if (isCallable(&f)) break :blk null;
+        }
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().name;
+    };
+    const cn = class_name orelse return true;
+    return lookupAnonMethod(self, allocator, cn, "iterator/0", "iterator") != null;
+}
+
 fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     _ = self;
     const inst = receiver.Instance;
@@ -6142,7 +6215,41 @@ inline fn probeFqn(buf: []u8, prefix: []const u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}.{s}", .{ prefix, name }) catch buf[0..0];
 }
 
+/// Whether the call selects a DECLARED lambda-taking overload the
+/// member-form intrinsic cannot represent: the last arg is callable, a
+/// body-bearing receiver-formed declaration named `name` fits the call
+/// arity exactly with a function-typed last parameter, AND a shorter
+/// non-lambda sibling declaration also exists (the shape the intrinsic
+/// actually implements — `copyOf(newSize)` vs
+/// `copyOf(newSize, init)`). Without the sibling requirement every HOF
+/// intrinsic (`map`, `filter`) would fall off its fast path.
+fn declaredLambdaOverloadWins(self: *VmHost, name: []const u8, args: []const Value) bool {
+    if (args.len == 0 or !isCallable(&args[args.len - 1])) return false;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    var lambda_exact = false;
+    var shorter_plain = false;
+    for (mod.funcsBySimpleName(name)) |fid| {
+        const f = funcAt(mod, fid) orelse continue;
+        if (!(f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+        const last_is_fn = std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
+        if (f.hasBody() and f.params.len == args.len + 1 and last_is_fn) {
+            lambda_exact = true;
+        }
+        if (f.params.len < args.len + 1 and (f.params.len == 1 or !last_is_fn)) {
+            shorter_plain = true;
+        }
+        if (lambda_exact and shorter_plain) return true;
+    }
+    return false;
+}
+
 fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    // A declared lambda-taking overload the intrinsic surface cannot
+    // express wins resolution; decline so the walk's extension fallback
+    // runs its body (declaration decides, the registry only serves).
+    if (declaredLambdaOverloadWins(self, name, args)) return null;
     const type_fqn = receiver.typeFqn();
     // Resolution cache: for a non-`Instance`, non-array-builder receiver, the
     // winning intrinsic (or "none") is a pure function of (type, name,
@@ -6761,6 +6868,33 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     }
 
     if (chosen == null) return null;
+
+    // An erased receiver-TYPE-ARG tie is undecidable here: sibling
+    // overloads that differ ONLY in the receiver's element type
+    // (`Sequence<UInt>.sum()` vs `Sequence<Int>.sum()` — same head, same
+    // params) select by a static type argument the runtime receiver does
+    // not carry. Picking one silently runs the wrong element arithmetic;
+    // decline instead so the walk's element-tag-aware arms (the
+    // iterable/list intrinsic fallbacks) serve the call dynamically.
+    {
+        const c = chosen.?;
+        const crt = &c.func.params[0].ty;
+        if (crt.args.len != 0) {
+            for (candidates.items) |o| {
+                if (o.fid.int() == c.fid.int()) continue;
+                const ort = &o.func.params[0].ty;
+                if (!std.mem.eql(u8, ort.name, crt.name)) continue;
+                if (o.func.params.len != c.func.params.len) continue;
+                if (ort.args.len != crt.args.len or ort.args.len == 0) continue;
+                if (!std.mem.eql(u8, ort.args[0].name, crt.args[0].name)) {
+                    if (trace.enabled(name)) {
+                        trace.emit("map=erased_recv_tie_decline name={s} a={s} b={s}", .{ name, c.func.fqn, o.func.fqn });
+                    }
+                    return null;
+                }
+            }
+        }
+    }
 
     // Defer to a function-typed enclosing property when the chosen
     // member-extension's receiver doesn't accept the actual receiver.

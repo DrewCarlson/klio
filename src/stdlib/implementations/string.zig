@@ -1642,17 +1642,32 @@ pub fn string_windowed(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer ctx.allocator.free(chars);
     const size: usize = @intCast(size_i);
     const step_u: usize = @intCast(step);
+    // The `transform` variant (`windowed(size, step, partialWindows,
+    // transform)` — positional slot 4 after the named-args reorder or a
+    // trailing lambda) maps each window through the callable.
+    const transform: ?Value = if (ctx.args.len > 4) ctx.args[4] else null;
     var out: std.ArrayList(Value) = .empty;
     errdefer out.deinit(ctx.allocator);
     var i: usize = 0;
     while (i < chars.len) {
         const end = i + size;
+        var window: ?Value = null;
         if (end <= chars.len) {
-            try out.append(ctx.allocator, try newString(ctx.allocator, try charUnitsToString(ctx.allocator, chars[i..end])));
+            window = try newString(ctx.allocator, try charUnitsToString(ctx.allocator, chars[i..end]));
         } else if (partial) {
-            try out.append(ctx.allocator, try newString(ctx.allocator, try charUnitsToString(ctx.allocator, chars[i..])));
+            window = try newString(ctx.allocator, try charUnitsToString(ctx.allocator, chars[i..]));
         } else {
             break;
+        }
+        if (window) |w| {
+            if (transform) |t| {
+                switch (try ctx.host.invokeCallable(&t, &.{w}, ctx.out)) {
+                    .ok => |v| try out.append(ctx.allocator, v),
+                    .err => |e| return .{ .err = e },
+                }
+            } else {
+                try out.append(ctx.allocator, w);
+            }
         }
         i += step_u;
     }
