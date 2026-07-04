@@ -2931,6 +2931,19 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 const cv: i64 = @intCast(args[0].Char);
                 break :blk cv >= lo and cv <= hi and @rem(cv - r.start, r.step) == 0;
             }
+            // Unsigned ranges span the full u64 space stored as raw i64
+            // bits; the membership compare must be unsigned
+            // (`0uL until ULong.MAX_VALUE` has end bits -2).
+            if (r.kind == .ULong or r.kind == .UInt) {
+                const uv: u64 = args[0].asU64() orelse
+                    (if (args[0].asI64()) |sv| @as(u64, @bitCast(sv)) else break :blk false);
+                const us: u64 = @bitCast(r.start);
+                const ue: u64 = @bitCast(r.end);
+                const ulo = @min(us, ue);
+                const uhi = @max(us, ue);
+                const diff = @as(i128, uv) - @as(i128, us);
+                break :blk uv >= ulo and uv <= uhi and @rem(diff, @as(i128, r.step)) == 0;
+            }
             if (args[0].asI64()) |v| {
                 // Widen the step-alignment difference: `v - r.start` overflows
                 // i64 for a range spanning most of the type (`MIN..MAX`), which

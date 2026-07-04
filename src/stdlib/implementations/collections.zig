@@ -3868,13 +3868,12 @@ fn sumValues(a: Allocator, items: []const Value, what: []const u8) Error!EvalRes
 
 pub fn coll_list_average(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, "List.average")) {
+    if (ctx.args.len == 0) return typeErr("average requires a receiver");
+    const items = switch (try iterableItems(a, ctx.args[0], "average")) {
         .items => |x| x,
         .err => |e| return e,
     };
-    const g = it.borrow();
-    defer g.deinit();
-    const items = g.get().items;
+    defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) return ok(.{ .Double = std.math.nan(f64) });
     var sum: f64 = 0.0;
     var n: i64 = 0;
@@ -3906,11 +3905,13 @@ pub fn coll_list_min(ctx: *CallCtx) Error!EvalResult {
 
 fn collListMinMaxCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, what)) {
+    // Iterable-generic: the erased receiver-type-arg decline routes
+    // Set/Array receivers here through the Iterable/Set-form probes.
+    if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
+    const items = switch (try iterableItems(a, ctx.args[0], what)) {
         .items => |x| x,
         .err => |e| return e,
     };
-    const items = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(items);
     if (items.len == 0) {
         if (or_null) return ok(Value.Null);
