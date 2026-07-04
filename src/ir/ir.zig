@@ -857,6 +857,13 @@ pub threadlocal var pending_eager_param_shapes: ?std.AutoHashMap(span.Span, Eage
 
 pub const EagerParamShape = struct { has_receiver: bool, arity: u16 };
 
+fn headAllUpper(s_: []const u8) bool {
+    for (s_) |c| {
+        if (!std.ascii.isUpper(c)) return false;
+    }
+    return true;
+}
+
 pub const Module = struct {
     funcs: std.ArrayList(Func) = .empty,
     /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
@@ -919,6 +926,14 @@ pub const Module = struct {
     /// Typeck's per-expression type heads (the E2.1 evidence seam).
     eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null,
     eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
+    /// Extension-candidate index: receiver head -> the extension NAMES
+    /// declared on it, plus the generic-receiver names (`fun <T> T.also`)
+    /// that apply to every head. Rebuilt lazily when the func table has
+    /// grown. Answers the E4c membership question the hierarchy sets
+    /// cannot: could ANY extension named N serve receiver head H?
+    ext_names_by_recv_head: ?std.StringHashMap(std.StringHashMap(void)) = null,
+    generic_ext_names: ?std.StringHashMap(void) = null,
+    ext_index_funcs_len: usize = 0,
     eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name → `FuncId`.
@@ -1213,6 +1228,12 @@ pub const Module = struct {
         if (self.eager_calls) |*m| m.deinit();
         if (self.eager_types) |*m| m.deinit();
         if (self.eager_recv_heads) |*m| m.deinit();
+        if (self.ext_names_by_recv_head) |*m| {
+            var vit = m.valueIterator();
+            while (vit.next()) |v| v.deinit();
+            m.deinit();
+        }
+        if (self.generic_ext_names) |*m| m.deinit();
         if (self.eager_param_shapes) |*m| m.deinit();
         if (self.class_children) |*m| {
             var itc = m.valueIterator();
@@ -1396,6 +1417,64 @@ pub const Module = struct {
         const m = &(self.eager_param_shapes orelse return null);
         return m.get(sp);
     }
+    /// Could ANY extension named `name` serve receiver head `head`?
+    /// Chain-aware: the head's supertype chain and the builtin-supertype
+    /// table are consulted, and generic-receiver extensions answer true
+    /// for every head. Conservative on staleness: the index rebuilds when
+    /// the func table has grown since the last build.
+    pub fn extCouldApply(self: *Module, allocator: Allocator, head: []const u8, name: []const u8) bool {
+        if (self.ext_names_by_recv_head == null or self.ext_index_funcs_len != self.funcs.items.len) {
+            self.rebuildExtIndex(allocator) catch return true;
+        }
+        if (self.generic_ext_names.?.contains(name)) return true;
+        const idx = &self.ext_names_by_recv_head.?;
+        if (idx.get(head)) |set| {
+            if (set.contains(name)) return true;
+        }
+        for (applicability.builtinSupersOf(head)) |sup| {
+            if (idx.get(sup)) |set| {
+                if (set.contains(name)) return true;
+            }
+        }
+        if (self.registry.class_super_names.get(head)) |chain| {
+            for (chain) |sup| {
+                if (idx.get(sup)) |set| {
+                    if (set.contains(name)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn rebuildExtIndex(self: *Module, allocator: Allocator) Allocator.Error!void {
+        if (self.ext_names_by_recv_head) |*m| {
+            var vit = m.valueIterator();
+            while (vit.next()) |v| v.deinit();
+            m.deinit();
+        }
+        if (self.generic_ext_names) |*m| m.deinit();
+        var idx = std.StringHashMap(std.StringHashMap(void)).init(allocator);
+        var gen = std.StringHashMap(void).init(allocator);
+        for (self.funcs.items) |*f| {
+            const is_ext = f.kind == .top_level_extension or f.kind == .member_extension;
+            if (!is_ext) continue;
+            if (f.params.len == 0) continue;
+            const head = f.params[0].ty.name;
+            // A short all-uppercase head is a type parameter: the
+            // extension applies to every receiver.
+            if (head.len <= 2 and headAllUpper(head)) {
+                try gen.put(f.name, {});
+                continue;
+            }
+            const gop = try idx.getOrPut(head);
+            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(allocator);
+            try gop.value_ptr.put(f.name, {});
+        }
+        self.ext_names_by_recv_head = idx;
+        self.generic_ext_names = gen;
+        self.ext_index_funcs_len = self.funcs.items.len;
+    }
+
     /// The receiver class head typeck bound for the lambda body at `sp`.
     pub fn eagerRecvHeadOf(self: *const Module, sp: span.Span) ?[]const u8 {
         const m = &(self.eager_recv_heads orelse return null);

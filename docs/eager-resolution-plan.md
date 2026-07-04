@@ -122,15 +122,18 @@ probes (`argDeclTypeRef`, `local_decl_types`, `local_decl_nullable`).
     thread declared receiver-shapes into ClosureInfo (an explicit
     has_receiver bit from the lambda's declared type) so the binding
     stops being an arity+capture guess; queued as an enhancement.
-  - CallMemberOrValue exact emission: ATTEMPTED and reverted with the
-    finding — the hierarchy sets can disprove declared/inherited MEMBERS
-    but the runtime member leg also serves EXTENSIONS (stdlib extensions
-    on the receiver's type win over a local callable in Kotlin's
-    qualified-call ranking), so "hierarchy lacks the name" does not mean
-    "no member can win": the MinMax family lost one test per file to a
-    local shadowing a real extension. The precondition is an
-    extension-aware membership answer (the ext-candidate index by
-    receiver head), not just the hierarchy sets.
+  - CallMemberOrValue exact emission: attempted twice, reverted twice,
+    each with a measured finding. First: the hierarchy sets cannot
+    disprove EXTENSIONS (stdlib extensions on the receiver's type win
+    over a local callable — the MinMax family measured it). Second: the
+    extension-candidate index (Module.extCouldApply — landed, kept) is
+    itself unsound at lowering time against the IMAGE's lazily-decoded
+    func headers: a deferred `IntArray.min` header carries no receiver
+    param until its body decodes, so the index answered "no extension"
+    while one existed (`elements.min()` bound the Int param named `min`).
+    The TRUE precondition is header-complete func metadata at lowering
+    time — the old plan's P9 (resolved/flat sections) territory. The
+    race stays until then.
   - literal-coercion gap: NEUTRALIZED — the only live path was eager
     primitive fills, which the channel excludes. The enhancement that
     would let primitives fill is a numeric-family-aware evidence
