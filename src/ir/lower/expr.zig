@@ -559,14 +559,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
                 return dst;
             }
-            // `X::class` where `X` is a bare type/constructor name that has no
-            // IR classId (e.g. an unsigned array `ULongArray`) must load the
-            // type reference directly. Routing it through `lowerReceiver` ->
-            // the implicit-`this` path inside a method would emit `this.X(...)`
-            // and invoke the constructor instead of taking the class literal.
-            if (std.mem.eql(u8, mr.name.name, "class") and
-                mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1)
-            {
+            // `X::member` where `X` is a bare type/constructor name that has
+            // no IR classId (e.g. an unsigned array `ULongArray`) must load
+            // the type reference directly. Routing it through
+            // `lowerReceiver` -> the implicit-`this` path inside a method
+            // would emit `this.X(...)` and invoke the constructor instead of
+            // taking the type value (`UIntArray::copyInto` inside a test
+            // class constructed a UIntArray from the ref's first use).
+            if (mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1) {
                 const rn = mr.receiver.Path.segments[0].name;
                 if (b.resolve(rn) == null and !b.knowsOuter(rn) and
                     b.module.classId(rn) == null and !b.hasOwnMember(rn) and
@@ -576,7 +576,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     const rnm = try b.module.internConst(b.allocator, .{ .String = rn });
                     try b.push(.{ .LoadGlobal = .{ .dst = rr, .name = rnm } });
                     const dst = b.allocReg();
-                    const cnm = try b.module.internConst(b.allocator, .{ .String = "class" });
+                    const cnm = try b.module.internConst(b.allocator, .{ .String = mr.name.name });
                     try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = rr, .name = cnm } });
                     return dst;
                 }
@@ -5548,7 +5548,10 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     // vararg, so the trailing lambda is the only filler). Name the lambda
     // to the last parameter so the runtime binds it correctly.
     const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
-    const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+    var type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+    if (type_args.len == 0) {
+        if (try spliceReifiedTypeArgs(b, func_id)) |stamped| type_args = stamped;
+    }
     const dst = b.allocReg();
     try b.push(.{ .Call = .{
         .dst = dst,
@@ -5560,6 +5563,27 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
         .exact = was_cast,
     } });
     return dst;
+}
+
+/// Static type args synthesized from the enclosing splice's reified
+/// substitution: when the call site wrote none and every declared
+/// type-parameter name of `func_id` is bound in the active reified name
+/// map, the substituted names stamp the call (`enumEntriesIntrinsic()`
+/// inside a spliced `enumEntries<E>()` body gets `<E>` — the runtime
+/// typed dispatch is blind otherwise). Null when not fully bound.
+fn spliceReifiedTypeArgs(b: *FuncBuilder, func_id: FuncId) Allocator.Error!?[]ConstId {
+    if (b.reified_type_names.count() == 0) return null;
+    const tps = b.module.registry.func_type_params.get(func_id) orelse return null;
+    if (tps.items.len == 0) return null;
+    const out = try b.allocator.alloc(ConstId, tps.items.len);
+    for (tps.items, out) |tp, *slot| {
+        const actual = b.resolveReifiedTypeName(tp) orelse {
+            b.allocator.free(out);
+            return null;
+        };
+        slot.* = try b.module.internConst(b.allocator, .{ .String = actual });
+    }
+    return out;
 }
 
 /// The `CallMember` emit form: a resolved extension bound on the implicit

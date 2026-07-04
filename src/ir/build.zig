@@ -332,6 +332,10 @@ pub const FuncBuilder = struct {
     /// inside a spliced `sleepWhile<reified TaskType>` body) chains
     /// through this instead of a global lookup of the parameter name.
     reified_type_binds: StringRegMap,
+    /// Splice-scoped reified type-parameter NAME substitutions (`T` ->
+    /// `E`), recorded alongside `reified_type_binds` so nested calls in
+    /// the spliced body can be stamped with static type args.
+    reified_type_names: std.StringHashMap([]const u8),
     /// Stack of user `finally { … }` blocks (innermost on top) whose
     /// lexical scope encloses the current cursor. A `return X` reached
     /// during inline expansion replays each finally body inline before
@@ -461,6 +465,7 @@ pub const FuncBuilder = struct {
             .generic_typed_params = StringSet.init(allocator),
             .non_fn_params = StringSet.init(allocator),
             .reified_type_binds = StringRegMap.init(allocator),
+            .reified_type_names = std.StringHashMap([]const u8).init(allocator),
             .is_lambda_body = false,
             .is_anon_fn_body = false,
             .is_named_local_fn = false,
@@ -516,6 +521,7 @@ pub const FuncBuilder = struct {
         self.generic_typed_params.deinit();
         self.non_fn_params.deinit();
         self.reified_type_binds.deinit();
+        self.reified_type_names.deinit();
         self.finally_stack.deinit(a);
         self.inline_return.deinit(a);
         self.inline_stack.deinit(a);
@@ -1094,6 +1100,24 @@ pub const FuncBuilder = struct {
     }
     pub fn resolveReifiedType(self: *const FuncBuilder, name: []const u8) ?Reg {
         return self.reified_type_binds.get(name);
+    }
+    /// Record a splice's reified type-parameter NAME substitution
+    /// (`T` -> the call's actual type name); returns the shadowed
+    /// mapping so the splice restores it on exit.
+    pub fn bindReifiedTypeName(self: *FuncBuilder, name: []const u8, actual: []const u8) Allocator.Error!?[]const u8 {
+        const prev = self.reified_type_names.get(name);
+        try self.reified_type_names.put(name, actual);
+        return prev;
+    }
+    pub fn restoreReifiedTypeName(self: *FuncBuilder, name: []const u8, prev: ?[]const u8) void {
+        if (prev) |v| {
+            self.reified_type_names.put(name, v) catch {};
+        } else {
+            _ = self.reified_type_names.remove(name);
+        }
+    }
+    pub fn resolveReifiedTypeName(self: *const FuncBuilder, name: []const u8) ?[]const u8 {
+        return self.reified_type_names.get(name);
     }
     pub fn pushFinally(self: *FuncBuilder, block: ast.Block) Allocator.Error!void {
         try self.finally_stack.append(self.allocator, block);

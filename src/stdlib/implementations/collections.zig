@@ -892,6 +892,19 @@ pub fn coll_shuffled(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeList(a, items, false));
 }
 
+/// `Array.shuffle()` (and the primitive/unsigned array variants) —
+/// Fisher-Yates in place, optionally seeded by a `Random` argument.
+pub fn array_shuffle(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("shuffle requires an array receiver");
+    const arr = ctx.args[0].Array;
+    const buf = try arr.snapshot(a);
+    defer if (runtime.freeScratch()) a.free(buf);
+    if (try shuffleInPlace(ctx, buf)) |e| return .{ .err = e };
+    try arr.writeBack(a, buf);
+    return ok(Value.Unit);
+}
+
 /// `MutableList.shuffle()` — shuffle in place.
 pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;

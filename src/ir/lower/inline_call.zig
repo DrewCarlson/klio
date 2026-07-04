@@ -865,10 +865,24 @@ pub fn tryInlineCallWithTypeArgs(
     const ReifiedRestore = struct { name: []const u8, prev: ?Reg };
     var reified_restores: std.ArrayList(ReifiedRestore) = .empty;
     defer reified_restores.deinit(b.allocator);
+    // NAME substitutions for the splice's reified params (`T` -> `E`),
+    // consumed by `emitCall`/`emitExtBareCall` to stamp static type args
+    // onto nested calls in the spliced body — the body's
+    // `enumEntriesIntrinsic()` otherwise reaches the runtime with no type
+    // information at all.
+    const NameRestore = struct { name: []const u8, prev: ?[]const u8 };
+    var reified_name_restores: std.ArrayList(NameRestore) = .empty;
+    defer reified_name_restores.deinit(b.allocator);
+    defer for (reified_name_restores.items) |nr| b.restoreReifiedTypeName(nr.name, nr.prev);
     for (f.type_params, 0..) |tp, tp_idx| {
         if (!tp.is_reified) continue;
         const arg = if (tp_idx < effective_type_args.len) effective_type_args[tp_idx] else null;
         var cls_reg_opt: ?Reg = null;
+        if (arg) |a| {
+            const substituted = b.resolveReifiedTypeName(a.name.name) orelse a.name.name;
+            const nprev = try b.bindReifiedTypeName(tp.name.name, substituted);
+            try reified_name_restores.append(b.allocator, .{ .name = tp.name.name, .prev = nprev });
+        }
         if (arg) |a| {
             // A type argument naming an *enclosing splice's* reified
             // parameter chains lexically: `trySuspend<TaskType>(...)`

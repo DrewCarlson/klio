@@ -2981,6 +2981,15 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
     if (receiver.* == .Array) {
         if (try arrayShapeOps(self, allocator, receiver, name, args)) |r| return r;
+        // `Any.toString` on an array is the identity string (no member
+        // or extension overrides it): the same `fqn@identity` form
+        // instances use. Notably NOT the contents — a self-referencing
+        // array's `toString()` must not recurse
+        // (ArraysTest.contentDeepToStringNoRecursion).
+        if (std.mem.eql(u8, name, "toString") and args.len == 0) {
+            const s = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ receiver.typeFqn(), receiver.Array.identity() });
+            return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
+        }
     }
 
     // Indexed get/set on Array.
@@ -6142,7 +6151,41 @@ inline fn probeFqn(buf: []u8, prefix: []const u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}.{s}", .{ prefix, name }) catch buf[0..0];
 }
 
+/// Whether the call selects a DECLARED lambda-taking overload the
+/// member-form intrinsic cannot represent: the last arg is callable, a
+/// body-bearing receiver-formed declaration named `name` fits the call
+/// arity exactly with a function-typed last parameter, AND a shorter
+/// non-lambda sibling declaration also exists (the shape the intrinsic
+/// actually implements — `copyOf(newSize)` vs
+/// `copyOf(newSize, init)`). Without the sibling requirement every HOF
+/// intrinsic (`map`, `filter`) would fall off its fast path.
+fn declaredLambdaOverloadWins(self: *VmHost, name: []const u8, args: []const Value) bool {
+    if (args.len == 0 or !isCallable(&args[args.len - 1])) return false;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    var lambda_exact = false;
+    var shorter_plain = false;
+    for (mod.funcsBySimpleName(name)) |fid| {
+        const f = funcAt(mod, fid) orelse continue;
+        if (!(f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+        const last_is_fn = std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
+        if (f.hasBody() and f.params.len == args.len + 1 and last_is_fn) {
+            lambda_exact = true;
+        }
+        if (f.params.len < args.len + 1 and (f.params.len == 1 or !last_is_fn)) {
+            shorter_plain = true;
+        }
+        if (lambda_exact and shorter_plain) return true;
+    }
+    return false;
+}
+
 fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    // A declared lambda-taking overload the intrinsic surface cannot
+    // express wins resolution; decline so the walk's extension fallback
+    // runs its body (declaration decides, the registry only serves).
+    if (declaredLambdaOverloadWins(self, name, args)) return null;
     const type_fqn = receiver.typeFqn();
     // Resolution cache: for a non-`Instance`, non-array-builder receiver, the
     // winning intrinsic (or "none") is a pure function of (type, name,
