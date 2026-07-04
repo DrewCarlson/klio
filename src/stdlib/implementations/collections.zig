@@ -1607,7 +1607,7 @@ pub fn coll_iter_sorted_with(ctx: *CallCtx) Error!EvalResult {
             break :blk steps_g.get().len == 0;
         };
         if (empty) {
-            if (try sortValuesNaturalDesc(a, items, descending)) |e| return e;
+            if (try sortListHostAwareDesc(ctx, items, descending)) |e| return e;
             return ok(try makeList(a, items, false));
         }
     }
@@ -3648,6 +3648,14 @@ fn compareHostAware(ctx: *CallCtx, x: Value, y: Value) Error!CompareOutcome {
 
 /// Sort with optional host-aware compareTo for Instance items. Stable.
 fn sortListHostAware(ctx: *CallCtx, items: []Value) Error!?EvalResult {
+    return sortListHostAwareDesc(ctx, items, false);
+}
+
+/// `sortListHostAware` with a natural-order direction: `descending`
+/// flips the comparison (the empty-step `reverseOrder()` comparator over
+/// host-comparable elements), keeping the sort stable — equal elements
+/// hold their original order in both directions, matching kotlinc.
+fn sortListHostAwareDesc(ctx: *CallCtx, items: []Value, descending: bool) Error!?EvalResult {
     const a = ctx.allocator;
     var needs_host = false;
     for (items) |v| {
@@ -3656,7 +3664,7 @@ fn sortListHostAware(ctx: *CallCtx, items: []Value) Error!?EvalResult {
             break;
         }
     }
-    if (!needs_host) return sortValuesNatural(a, items);
+    if (!needs_host) return sortValuesNaturalDesc(a, items, descending);
     // Stable bottom-up merge sort: O(n log n) host comparisons. An insertion
     // sort here is O(n²) and times out on large host-comparable lists.
     const n = items.len;
@@ -3673,10 +3681,11 @@ fn sortListHostAware(ctx: *CallCtx, items: []Value) Error!?EvalResult {
             var j = mid;
             var k = lo;
             while (i < mid and j < hi) {
-                const o = switch (try compareHostAware(ctx, items[i], items[j])) {
+                const raw = switch (try compareHostAware(ctx, items[i], items[j])) {
                     .order => |o| o,
                     .err => |e| return e,
                 };
+                const o = if (descending) reverseOrder(raw) else raw;
                 // Take the left run on a tie so the sort stays stable.
                 if (o != .gt) {
                     buf[k] = items[i];
@@ -6639,6 +6648,22 @@ pub fn array_sort_with(ctx: *CallCtx) Error!EvalResult {
     const buf = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(buf);
     const sub = buf[@intCast(from)..@intCast(to)];
+    // An empty-step natural/reversed Comparator (`naturalOrder()`,
+    // `reverseOrder()` — the body of `sortDescending`) sorts by the
+    // elements' own order, host-aware so user `Comparable.compareTo`
+    // dispatches; its `compare` surface cannot see the host.
+    if (comparator == .Comparator) {
+        const empty = blk: {
+            const steps_g = comparator.Comparator.steps.borrow();
+            defer steps_g.deinit();
+            break :blk steps_g.get().len == 0;
+        };
+        if (empty) {
+            if (try sortListHostAwareDesc(ctx, sub, comparator.Comparator.descending)) |e| return e;
+            try arr.writeBack(a, buf);
+            return ok(Value.Unit);
+        }
+    }
     var i: usize = 1;
     while (i < sub.len) : (i += 1) {
         var j = i;

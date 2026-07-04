@@ -134,6 +134,8 @@ def run_one(binary, target, support, targets, provider, texts, eager):
         env["KLIO_EAGER"] = "1"
     else:
         env.pop("KLIO_EAGER", None)
+    if os.environ.get("KLIO_SWEEP_DEBUG"):
+        print("ARGV", "\n".join(argv), file=sys.stderr)
     try:
         p = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=900, env=env)
     except subprocess.TimeoutExpired:
@@ -153,12 +155,17 @@ def run_one(binary, target, support, targets, provider, texts, eager):
     return target, passed, fails
 
 
-def sweep(binary, targets, support, provider, texts, eager, jobs):
+def sweep(binary, run_targets, all_targets, support, provider, texts, eager, jobs):
+    # Sibling context always comes from ALL targets: a `--filter` narrows
+    # which files RUN, never which files compile alongside them — a
+    # filtered child missing its same-directory siblings loses their
+    # helper declarations (`Sortable`, `assertAlmostEquals`) and fails
+    # differently than the full suite.
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
         futs = {
-            ex.submit(run_one, binary, t, support, targets, provider, texts, eager): t
-            for t in targets
+            ex.submit(run_one, binary, t, support, all_targets, provider, texts, eager): t
+            for t in run_targets
         }
         for f in concurrent.futures.as_completed(futs):
             target, passed, fails = f.result()
@@ -203,7 +210,7 @@ def main():
     modes = {"off": [False], "on": [True], "both": [False, True]}[args.eager]
     per_mode = {}
     for eager in modes:
-        results = sweep(args.binary, matched, support, provider, texts, eager, args.jobs)
+        results = sweep(args.binary, matched, targets, support, provider, texts, eager, args.jobs)
         per_mode[eager] = results
         label = "eager-on" if eager else "eager-off"
         lines = render(results, args.passes)

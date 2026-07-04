@@ -341,24 +341,32 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         where every Kotlin platform's constant evaluation yields the
         canonical positive quiet NaN. Unary minus on NaN now keeps the
         canonical form (eval `Neg` arm + `num_unary_minus`).
-      - **Cross-file test-class helpers still misresolve** (deterministic
-        per binary): `Sortable(...)` ctor and `assertSorted` from sibling
-        test files fail from inside lambda bodies
-        (ArraysTest/CollectionTest sortStable/sortByStable/sortedWith,
-        `unresolved global Sortable`), `EnumEntriesFactoryTest` returns
-        Unit where a list is expected, `sizeInBitsAndBytes` Type error,
-        CollectionTest.abstractCollectionToArray `get_field size`. These
-        are the current named remainder of the fromBits class.
-      - **Resolution is nondeterministic ACROSS PROCESSES.** The same
-        binary produced sortStable=`Unimplemented` (and no
-        sortByStable/sortedWith failures) in one full-sweep run and
-        `unresolved global Sortable` ×2 + sortedWith in later runs;
-        NumbersTest.floatFitsInFloatArray flips between passing and
-        `unresolved global assertAlmostEquals`. Suspect pointer-order /
-        hash-iteration-dependent candidate ordering somewhere in
-        resolution. This wobbles the inventory count itself (119 vs 121
-        shapes) and must be root-caused before inventory deltas can be
-        trusted to single-test precision.
+      - **The "nondeterminism" scare was tool error — RETRACTED.**
+        `commontest-sweep.py --filter` narrowed the target list that also
+        supplied each child's sibling context, so filtered runs compiled
+        WITHOUT their same-directory siblings and failed on the siblings'
+        helper declarations (`unresolved global Sortable`,
+        `assertAlmostEquals`, `assertSorted`). Fixed: a filter narrows
+        what RUNS, never what compiles alongside. Resolution outcomes are
+        deterministic per argv — verified by exact-argv reruns. The
+        119-inventory numbers from full sweeps were always correct.
+      - **Descending natural-order sorts over host-comparable elements —
+        FIXED.** `sortWith`/`sortedWith` with an empty-step
+        `reverseOrder()` comparator (the body of `sortDescending`) took
+        the scalar-only natural sort and returned `Unimplemented` on user
+        `Comparable` instances; `sortListHostAwareDesc` runs the stable
+        host-aware merge sort with the direction flip, and
+        `array_sort_with`/`iterSortedWith` route empty-step comparators
+        through it. ArraysTest.sortStable passes.
+      - **Named remainder** (real, deterministic): ArraysTest
+        contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
+        copyRangeInto (`UIntArray expects an Int size`),
+        copyOfWithInitializer, sortDescendingRangeInPlace (unsigned
+        subrange sort ignores its from/to), sortedTests (`toArray` on
+        `kotlin.String`), shuffle (Illegal value);
+        NumbersTest.sizeInBitsAndBytes (Type); EnumEntriesFactoryTest ×3;
+        CollectionTest abstractCollectionToArray / sumOf /
+        plusCollectionInference / toStringContainingThis.
       Also recorded: the remaining expect-with-impl drops in `retainDecl`
       stay until the registry carries declaration-aligned entries (the
       `retainDecl` comment marks it); `kotlin.String.repeat` vs
