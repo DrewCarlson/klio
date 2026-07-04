@@ -316,6 +316,49 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
       a request, a second HttpRequestBuilder replays the get-block closure
       chain and dies on `plusAssign` on `kotlin.coroutines.CombinedContext`;
       suspend-resume/replay-shaped, needs its own root-cause session.
+
+      *Follow-up findings (2026-07-04, after the slice landed):*
+      - **Link-time receiver-qualified settling is a dead end — do not
+        retry it.** An experiment taught `linkBodyless` to probe the
+        registry under `<pkg>.<Receiver>.<name>`; the link audit showed
+        ~40 headers settling, and any call site that LOST its receiver at
+        lowering (bare/companion calls binding one shared header fid for
+        every receiver's overload) then silently ran the wrong type's
+        intrinsic — `Double.fromBits` through `float_from_bits`. A
+        unique-receiver guard still cascaded (newly-executable headers
+        started competing in the extension fallback). Reverted whole. The
+        per-call bodyless arm (member walk on the actual receiver) is the
+        receiver-faithful mechanism; the missing piece is call sites
+        CARRYING their receivers — P10 step 3, not link work.
+      - **Bound companion references — FIXED (`61975f46`).**
+        `Double.Companion::fromBits` was classified unbound because
+        `hostHasMember` cannot see intrinsic-backed companion surface;
+        `companionServesName` (host_call_value.zig) also consults the
+        companion-FQN registry probe and declared companion-receiver
+        headers. NumbersTest.doubleToBits/floatToBits pass.
+      - **Canonical NaN — FIXED (`61975f46`).** Upstream declares
+        `Double.NaN = -(0.0/0.0)`; KLIO's negation did the IEEE sign flip
+        where every Kotlin platform's constant evaluation yields the
+        canonical positive quiet NaN. Unary minus on NaN now keeps the
+        canonical form (eval `Neg` arm + `num_unary_minus`).
+      - **Cross-file test-class helpers still misresolve** (deterministic
+        per binary): `Sortable(...)` ctor and `assertSorted` from sibling
+        test files fail from inside lambda bodies
+        (ArraysTest/CollectionTest sortStable/sortByStable/sortedWith,
+        `unresolved global Sortable`), `EnumEntriesFactoryTest` returns
+        Unit where a list is expected, `sizeInBitsAndBytes` Type error,
+        CollectionTest.abstractCollectionToArray `get_field size`. These
+        are the current named remainder of the fromBits class.
+      - **Resolution is nondeterministic ACROSS PROCESSES.** The same
+        binary produced sortStable=`Unimplemented` (and no
+        sortByStable/sortedWith failures) in one full-sweep run and
+        `unresolved global Sortable` ×2 + sortedWith in later runs;
+        NumbersTest.floatFitsInFloatArray flips between passing and
+        `unresolved global assertAlmostEquals`. Suspect pointer-order /
+        hash-iteration-dependent candidate ordering somewhere in
+        resolution. This wobbles the inventory count itself (119 vs 121
+        shapes) and must be root-caused before inventory deltas can be
+        trusted to single-test precision.
       Also recorded: the remaining expect-with-impl drops in `retainDecl`
       stay until the registry carries declaration-aligned entries (the
       `retainDecl` comment marks it); `kotlin.String.repeat` vs
