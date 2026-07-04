@@ -115,12 +115,13 @@ probes (`argDeclTypeRef`, `local_decl_types`, `local_decl_nullable`).
   - implicit-this redirect: LANDED — the record gate walks declared AND
     inherited members (classChainHasMember), and a channel-committed
     .plain target skips the redirect.
-  - closure +1-arity rebind: INSTRUMENTED ([REBIND] under
-    KLIO_REBIND_AUDIT). Zero firings measured across the examples corpus,
-    the stdlib solo files, and ktor server startup; the remaining
-    precondition before narrowing is a live-request measurement (the
-    arm's documented consumer is the ktor pipeline invoking receiver
-    lambdas value-style, which only fires under real HTTP traffic).
+  - closure +1-arity rebind: MEASURED AND KEPT. Under live HTTP traffic
+    the ktor pipeline fires it 174 times across a short request set —
+    the arm IS the runtime's receiver-binding for host-driven
+    invocations, not a deletable heuristic. The hardening path is to
+    thread declared receiver-shapes into ClosureInfo (an explicit
+    has_receiver bit from the lambda's declared type) so the binding
+    stops being an arity+capture guess; queued as an enhancement.
   - CallMemberOrValue exact emission: ATTEMPTED and reverted with the
     finding — the hierarchy sets can disprove declared/inherited MEMBERS
     but the runtime member leg also serves EXTENSIONS (stdlib extensions
