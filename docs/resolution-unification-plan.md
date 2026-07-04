@@ -377,6 +377,21 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         kotlinx extension, caught by threaded_litmus). Also in the batch:
         `sortListHostAwareDesc` covers `array_sort_with`'s empty-step
         comparators (ArraysTest.sortDescendingRangeInPlace).
+      - **Reified type args do not survive the inline splice.**
+        `enumEntries<E>()` splices (inline + reified), binding `T` as a
+        RUNTIME class value (`bindReifiedType` + StoreGlobal) — but the
+        spliced body's `enumEntriesIntrinsic()` call emits with no static
+        type args, so the typed dispatch arm never sees `E` and the
+        unsettled header no-ops to Unit. `callFuncTyped` now serves
+        `enumEntries`/`enumEntriesIntrinsic` like `enumValues` (fixed
+        EnumEntriesFactoryTest.testEquality — the direct CallTyped
+        shape); the two remaining cases need the splice to STAMP
+        substituted type args onto nested calls whose callee's
+        type-parameter names are bound in the active reified
+        substitution (`effective_type_args` knows the names at splice
+        time; record them alongside the reg binding and consult at
+        call-emit). P10 step-3 adjacent — do it as lowering work, not
+        another runtime probe.
       - **Named remainder** (real, deterministic, 115 total): ArraysTest
         contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
         copyRangeInto (`UIntArray expects an Int size`),
