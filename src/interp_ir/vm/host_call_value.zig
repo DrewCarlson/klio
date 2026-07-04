@@ -138,7 +138,13 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             // instance. Both are type-like; route the first argument as the
             // receiver when the named member is an instance method rather than a
             // companion member.
-            const type_like = (rv == .Class) or
+            // An unsigned-array type name in value position lowers to its
+            // constructor FUNCTION (`ULongArray::sortDescending`); treat
+            // an uppercase-named function receiver as the type itself.
+            const fn_type_like = rv == .Function and
+                rv.Function.decl.name.name.len > 0 and
+                std.ascii.isUpper(rv.Function.decl.name.name[0]);
+            const type_like = (rv == .Class) or fn_type_like or
                 (rv == .Instance and isCompanionInstance(rv) and
                     !companionServesName(self, &rv, name));
             if (type_like and args.len != 0) {
@@ -931,6 +937,28 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
             return r;
         }
     }
+    // A member-reference value (`Type::method`, `obj::method`) invoked
+    // with an explicit receiver — an extension-function-typed parameter
+    // (`sortDescending: TArray.(Int, Int) -> Unit` fed
+    // `ULongArray::sortDescending`, then `array.sortDescending(from, to)`).
+    // The explicit receiver dispatches the member walk with the args
+    // passed through; the intrinsic-host fallback below drops them.
+    if (callee.* == .Instance) {
+        var name_v: ?Value = null;
+        {
+            const snap = callee.Instance.borrow();
+            defer snap.deinit();
+            name_v = snap.get().get("__bound_name__");
+        }
+        if (name_v != null and name_v.? == .String) {
+            const name = blk: {
+                const g = name_v.?.String.borrow();
+                defer g.deinit();
+                break :blk g.get().bytes;
+            };
+            return host_call_member.callMember(self, allocator, this_value, name, args);
+        }
+    }
     var sink = self.out_sink.clone();
     defer sink.deinit();
     var intrinsic = makeIntrinsicHost(self);
@@ -1000,6 +1028,47 @@ pub fn callableReceiverShape(self: *VmHost, v: *const Value) ?ReceiverShape {
     _ = self;
     _ = v;
     return null;
+}
+
+/// The declared positional-parameter count of a callable value, or null
+/// when the shape is unknown (intrinsics, bound refs). Consulted by the
+/// `CallMemberOrValue` value arm: a local callable that cannot take the
+/// call's args (a `TArray.(Int, Int) -> Unit` param invoked as
+/// `receiver.name()`) is not a candidate — Kotlin resolves the
+/// extension instead of Null-padding the local's parameters.
+pub fn callableAcceptsArgs(self: *VmHost, v: *const Value, n_args: usize) ?bool {
+    switch (v.*) {
+        .IrClosure => |c| {
+            const info = self.closures.get(@intCast(c.id)) orelse return null;
+            // A local FUNCTION lowers as a closure too and may carry
+            // defaults or a vararg; its body func's declared arity is
+            // authoritative (`String.endsWithCs(suffix, ignoreCase =
+            // false)` accepts one arg). A plain lambda has no DeclSig —
+            // its param count is exact.
+            var required: usize = info.n_params;
+            var total: usize = info.n_params;
+            var has_vararg = false;
+            {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                if (mg.get().decl_sigs.get(info.body_func.int())) |sig| {
+                    required = sig.arity.required;
+                    total = sig.arity.total;
+                    has_vararg = sig.arity.has_vararg;
+                }
+            }
+            // The receiver may arrive through `this` (args bind the
+            // params directly) or fill the first param (args + 1).
+            inline for ([_]usize{ 0, 1 }) |extra| {
+                const k = n_args + extra;
+                if (k >= required and (k <= total or has_vararg)) return true;
+            }
+            return false;
+        },
+        // Function declarations, intrinsics, and bound refs are opaque
+        // here; the value arm stays unguarded for them.
+        else => return null,
+    }
 }
 
 pub fn closureNeedsThisCapture(self: *VmHost, v: *const Value) bool {

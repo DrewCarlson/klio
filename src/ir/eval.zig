@@ -2981,7 +2981,18 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 .Instance => isBoundRefInstance(&fb) or host.hostHasMember(&fb, "invoke") or host.callableReceiverShape(&fb) != null,
                 else => false,
             };
-            if (fb_invocable and !host.hostHasMember(&recv, name_str)) {
+            // A local callable whose declared arity provably cannot take
+            // the supplied args is not the primary candidate — Kotlin
+            // resolves the member/extension instead
+            // (`subList(..).sortDescending()` next to a
+            // `sortDescending: TArray.(Int, Int) -> Unit` param must
+            // dispatch the extension, not Null-pad the local). The proof
+            // is conservative (closure shapes without a DeclSig can hide
+            // defaults), so a canonical member MISS still falls back to
+            // invoking the local.
+            const fb_misfit = fb_invocable and
+                (host.callableAcceptsArgs(&fb, user_args.len) orelse true) == false;
+            if (fb_invocable and !fb_misfit and !host.hostHasMember(&recv, name_str)) {
                 orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
                 if (fb == .Class) {
                     // Constructors take no receiver: `65.f()` with
@@ -3004,7 +3015,20 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 }
             } else {
                 orAudit("CallMemberOrValue", name_str, "member", 0, &recv);
-                switch (try host.callMemberNamed(allocator, &recv, name_str, user_args, names)) {
+                const r = try host.callMemberNamed(allocator, &recv, name_str, user_args, names);
+                if (fb_misfit and r == .err and r.err == .Unimplemented and
+                    std.mem.indexOf(u8, r.err.Unimplemented, "Vm::") != null)
+                {
+                    // Nothing else serves the name: the local wins after
+                    // all (its acceptance proof was wrong — a hidden
+                    // default). Discard the miss and invoke it.
+                    freeDispatchMissMsg(allocator, r.err.Unimplemented);
+                    orAudit("CallMemberOrValue", name_str, "value_after_miss", -1, &recv);
+                    switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
+                        .ok => |rv| try frame.write(cmv.dst, rv),
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                } else switch (r) {
                     .ok => |rv| try frame.write(cmv.dst, rv),
                     .err => |e| return raiseStep(frame, e),
                 }
@@ -5177,6 +5201,11 @@ pub const NullHost = struct {
     pub fn bareUnsettledHeaderNoOp(self: *NullHost, module: *const Module, name: []const u8, argc: usize) bool {
         _ = .{ self, module, name, argc };
         return false;
+    }
+
+    pub fn callableAcceptsArgs(self: *NullHost, v: *const Value, n_args: usize) ?bool {
+        _ = .{ self, v, n_args };
+        return null;
     }
 
     pub fn callableReceiverShape(self: *NullHost, v: *const Value) ?ReceiverShape {
