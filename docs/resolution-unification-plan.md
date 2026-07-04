@@ -358,15 +358,34 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         host-aware merge sort with the direction flip, and
         `array_sort_with`/`iterSortedWith` route empty-step comparators
         through it. ArraysTest.sortStable passes.
-      - **Named remainder** (real, deterministic): ArraysTest
+      - **Inapplicable local callables yield to extensions — FIXED
+        (`4ef74e32`), inventory 119 → 115 dual-identical.** The
+        `CallMemberOrValue` value arm invoked a same-named local lambda
+        regardless of arity, Null-padding its params
+        (`subList(..).sortDescending()` next to a
+        `sortDescending: TArray.(Int, Int) -> Unit` param ran the local
+        with Null indices; the walk then bound the `(fromIndex, toIndex)`
+        Array variant for the list because the LENIENT extension pass had
+        no arity check at all). Three pieces: `callableAcceptsArgs`
+        (closure applicability via the body func's DeclSig — local
+        functions lower as closures and may carry defaults),
+        member/extension-first dispatch for proven misfits with a
+        canonical-miss fallback to the local (the proof is conservative),
+        and `declArityRefuses` in the lenient extension pass (DECLARED
+        required/vararg — per-fid default thunks are not authoritative
+        for pack functions; judging by them broke every defaulted
+        kotlinx extension, caught by threaded_litmus). Also in the batch:
+        `sortListHostAwareDesc` covers `array_sort_with`'s empty-step
+        comparators (ArraysTest.sortDescendingRangeInPlace).
+      - **Named remainder** (real, deterministic, 115 total): ArraysTest
         contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
         copyRangeInto (`UIntArray expects an Int size`),
-        copyOfWithInitializer, sortDescendingRangeInPlace (unsigned
-        subrange sort ignores its from/to), sortedTests (`toArray` on
-        `kotlin.String`), shuffle (Illegal value);
-        NumbersTest.sizeInBitsAndBytes (Type); EnumEntriesFactoryTest ×3;
-        CollectionTest abstractCollectionToArray / sumOf /
-        plusCollectionInference / toStringContainingThis.
+        copyOfWithInitializer, sortedTests (`toArray` on
+        `kotlin.String`), shuffle (now an Illegal-value assertion deeper
+        in the test); NumbersTest.sizeInBitsAndBytes (Type);
+        EnumEntriesFactoryTest ×3; CollectionTest
+        abstractCollectionToArray / sumOf / plusCollectionInference /
+        toStringContainingThis.
       Also recorded: the remaining expect-with-impl drops in `retainDecl`
       stay until the registry carries declaration-aligned entries (the
       `retainDecl` comment marks it); `kotlin.String.repeat` vs
