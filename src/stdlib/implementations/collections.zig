@@ -4297,6 +4297,42 @@ pub fn coll_list_plus_element(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeListBorrowed(a, out, false));
 }
 
+/// `Iterable<T>.minus` / `plus` — the STATIC-Iterable surface (returns a
+/// List regardless of the runtime collection kind, as kotlinc resolves
+/// for a receiver whose declared type is Iterable). Reads the receiver
+/// through `iterableItems` and reuses the List core.
+pub fn coll_iterable_minus(ctx: *CallCtx) Error!EvalResult {
+    return iterableListOpAdapter(ctx, coll_list_minus, "Iterable.minus");
+}
+
+pub fn coll_iterable_plus(ctx: *CallCtx) Error!EvalResult {
+    return iterableListOpAdapter(ctx, coll_list_plus, "Iterable.plus");
+}
+
+/// Adapt an arbitrary iterable receiver to the List-receiver core: the
+/// receiver materializes to a fresh builtin List value, the remaining
+/// args pass through.
+fn iterableListOpAdapter(ctx: *CallCtx, comptime core: fn (*CallCtx) Error!EvalResult, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
+    if (ctx.args[0] == .List) return core(ctx);
+    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    var list: std.ArrayList(Value) = .empty;
+    try list.appendSlice(a, items);
+    if (runtime.freeScratch()) a.free(items);
+    const recv = try makeListFromArrayList(a, list, false);
+    var new_args = try a.alloc(Value, ctx.args.len);
+    defer if (runtime.freeScratch()) a.free(new_args);
+    new_args[0] = recv;
+    @memcpy(new_args[1..], ctx.args[1..]);
+    var sub = ctx.*;
+    sub.args = new_args;
+    return core(&sub);
+}
+
 pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "List.minus")) {

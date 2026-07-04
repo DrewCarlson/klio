@@ -785,6 +785,20 @@ fn collectHierarchyShadowNames(start: []const u8, by_name: *const FileClasses, o
 /// whose declaration is not in `by_name` (a pack-internal or built-in
 /// base) still records its name — its own ancestors are simply
 /// unknowable from here.
+/// The declared head of a class property's type, substituting a class
+/// type-parameter name with its upper bound's head. Null when nothing
+/// static is known (no bound, unresolvable).
+fn classPropHead(c: *const ast.Class, ty: *const ast.TypeRef) ?[]const u8 {
+    const head = ty.name.name;
+    for (c.type_params) |*tp| {
+        if (std.mem.eql(u8, tp.name.name, head)) {
+            const ub = tp.upper_bound orelse return null;
+            return ub.name.name;
+        }
+    }
+    return head;
+}
+
 fn collectHierarchySuperNames(a: Allocator, c: *const ast.Class, by_name: *const FileClasses, out: *std.ArrayList([]const u8), seen: *StringSet) Allocator.Error!void {
     for (c.supertypes) |*st| {
         const nm = st.name.name;
@@ -1273,6 +1287,44 @@ fn buildModuleWithOverrides(
     // way a declared member would — otherwise the stdlib file fails to resolve
     // whenever a test package happens to declare a top-level `data`.
     try module.registry.class_member_names.put("data", {});
+    // Per-class property DECLARED type heads, with class type-parameter
+    // names substituted by their bound's head (`data: T` in
+    // `IterableTests<T : Iterable<String>>` records `Iterable`; an
+    // init-inferred property takes the declared return type of the member
+    // function its initializer calls). A call on the property then
+    // resolves against the STATIC type, as kotlinc does.
+    for (decls) |*d| {
+        if (d.* != .Class) continue;
+        const c = &d.Class;
+        for (c.primary_params) |*pp| {
+            if (pp.property == null) continue;
+            if (classPropHead(c, &pp.ty)) |head| {
+                try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = pp.name.name }, head);
+            }
+        }
+        for (c.members) |*m| {
+            if (m.* != .Property) continue;
+            const prop = m.Property;
+            const ty_opt: ?*const ast.TypeRef = if (prop.ty) |*t| t else blk: {
+                const init_expr = &(prop.init orelse break :blk null);
+                if (init_expr.* != .Call) break :blk null;
+                const callee = init_expr.Call.callee;
+                if (callee.* != .Path or callee.Path.segments.len != 1) break :blk null;
+                const fname = callee.Path.segments[0].name;
+                for (c.members) |*fm| {
+                    if (fm.* != .Function) continue;
+                    if (!std.mem.eql(u8, fm.Function.name.name, fname)) continue;
+                    if (fm.Function.return_type) |*rt| break :blk rt;
+                    break :blk null;
+                }
+                break :blk null;
+            };
+            const ty = ty_opt orelse continue;
+            if (classPropHead(c, ty)) |head| {
+                try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+            }
+        }
+    }
     // Per-class transitive supertype-name chain, nearest first, so body
     // lowering can rank extension receivers against the enclosing class
     // before the IR-side supertype slots are filled.

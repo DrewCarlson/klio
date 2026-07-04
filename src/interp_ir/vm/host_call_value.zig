@@ -588,6 +588,43 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
     return .{ .err = .{ .Unimplemented = msg } };
 }
 
+/// `callValueNamed` with explicit call-site type arguments preserved
+/// through a deferred bare-call form. One consumer today: an unsigned
+/// element-type argument coerces integral args before the intrinsic
+/// (`arrayOf<ULong>(1u, 2u)` — the literal's default tag is UInt and
+/// kotlinc types it by its expected type).
+pub fn callValueNamedTyped(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8) Allocator.Error!EvalResult {
+    if (type_args.len == 1 and args.len != 0) {
+        const tn = type_args[0];
+        const is_intrinsic_array = callee.* == .Intrinsic and std.mem.endsWith(u8, callee.Intrinsic.fqn, "arrayOf");
+        if (is_intrinsic_array) {
+            const kind: u2 = if (std.mem.eql(u8, tn, "ULong"))
+                0
+            else if (std.mem.eql(u8, tn, "UInt"))
+                1
+            else if (std.mem.eql(u8, tn, "UShort"))
+                2
+            else if (std.mem.eql(u8, tn, "UByte"))
+                3
+            else {
+                return callValueNamed(self, allocator, callee, args, arg_names);
+            };
+            const retagged = try allocator.alloc(Value, args.len);
+            defer if (runtime.freeScratch()) allocator.free(retagged);
+            for (args, retagged) |v, *slot| {
+                slot.* = if (v.asU64()) |u| switch (kind) {
+                    0 => Value{ .ULong = u },
+                    1 => Value{ .UInt = @truncate(u) },
+                    2 => Value{ .UShort = @truncate(u) },
+                    3 => Value{ .UByte = @truncate(u) },
+                } else v;
+            }
+            return callValueNamed(self, allocator, callee, retagged, arg_names);
+        }
+    }
+    return callValueNamed(self, allocator, callee, args, arg_names);
+}
+
 pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     // A Class callee constructed with named arguments (e.g. a local class
     // `Box(bb = true)` that skips a defaulted parameter) must reorder + default-
@@ -796,6 +833,24 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
         const id = callee.IrClosure.id;
         const captures = callee.IrClosure.captures;
         if (self.closures.get(@intCast(id))) |info| {
+            // A named LOCAL FUNCTION lowers as a closure but is not a
+            // receiver lambda: the caller's `this` reaches its body
+            // lexically (captures), never as an argument. The
+            // receiver-binding heuristics below would corrupt its
+            // positional args (a `vararg values + trailing lambda`
+            // local fn got the test instance spliced in). Dispatch it
+            // as a plain value call.
+            {
+                const module_ref = self.module.clone();
+                defer module_ref.deinit();
+                const module = info.module orelse module_ref.asPtr();
+                if (module.funcById(info.body_func)) |bf| {
+                    const takes_receiver = bf.params.len != 0 and std.mem.eql(u8, bf.params[0].name, "this");
+                    if (!std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver) {
+                        return callValue(self, allocator, callee, args);
+                    }
+                }
+            }
             const this_idx: ?usize = blk: {
                 for (info.capture_names, 0..) |n, i| {
                     if (std.mem.eql(u8, n, "this")) break :blk i;

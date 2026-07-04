@@ -58,9 +58,33 @@ pub fn isBroadCollectionTypeName(name: []const u8) bool {
 /// (see `isBroadCollectionTypeName`).
 pub fn isBroadCollectionReceiver(b: *const FuncBuilder, e: *const Expr) bool {
     return switch (e.*) {
-        .Path => |p| p.segments.len == 1 and b.isBroadCollectionLocal(p.segments[0].name),
+        .Path => |p| p.segments.len == 1 and
+            (b.isBroadCollectionLocal(p.segments[0].name) or
+                isBroadCollectionClassProp(b, p.segments[0].name)),
         else => false,
     };
+}
+
+/// Whether a bare name reads an enclosing-class PROPERTY whose declared
+/// type head (type-parameter bounds substituted at registration) is a
+/// broad collection — `data` in `IterableTests<T : Iterable<String>>`.
+/// Kotlin resolves `data - x` against the static Iterable, producing a
+/// List regardless of the runtime collection kind.
+fn isBroadCollectionClassProp(b: *const FuncBuilder, name: []const u8) bool {
+    if (b.resolve(name) != null or b.knowsOuter(name)) return false;
+    const owner = b.ownerClass() orelse return false;
+    const heads = b.module.registry.class_prop_type_heads;
+    const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
+    var idx: usize = 0;
+    while (idx <= chain.len) : (idx += 1) {
+        const cls = if (idx == 0) owner else chain[idx - 1];
+        if (heads.get(.{ .a = cls, .b = name })) |head| {
+            return std.mem.eql(u8, head, "Iterable") or
+                std.mem.eql(u8, head, "Collection") or
+                std.mem.eql(u8, head, "MutableCollection");
+        }
+    }
+    return false;
 }
 
 /// When `recv_expr` is statically a broad collection, emit `recv.toList()` and

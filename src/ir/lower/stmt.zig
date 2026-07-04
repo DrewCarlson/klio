@@ -279,6 +279,19 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             enclosing_owner,
         );
         const body_func = lowered.func;
+        // The lambda-body lowering builds params with `is_vararg = false`
+        // (lambdas cannot declare varargs) — a local FUNCTION can, and the
+        // closure invocation's vararg packing keys on the flag. Stamp the
+        // declared flags back onto the lowered body func.
+        {
+            const offset = @intFromBool(is_ext);
+            if (b.module.funcByIdMut(body_func)) |bf| {
+                for (f.params, 0..) |p, i| {
+                    const pi = offset + i;
+                    if (pi < bf.params.len) bf.params[pi].is_vararg = p.is_vararg;
+                }
+            }
+        }
         const captured_names = lowered.captures;
         const captures = try b.allocator.alloc(Reg, captured_names.len);
         for (captured_names, captures) |n, *slot| slot.* = try resolveCapture(b, n);
