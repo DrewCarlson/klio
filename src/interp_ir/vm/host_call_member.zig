@@ -3262,7 +3262,9 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
 
     // Iterable fallback.
-    if (receiver.* == .Instance and !iterable_fallback_active and hostHasMember(self, receiver, "iterator")) {
+    if (receiver.* == .Instance and !iterable_fallback_active and
+        (hostHasMember(self, receiver, "iterator") or samIterableInstance(self, allocator, receiver)))
+    {
         const p1 = try std.fmt.allocPrint(allocator, "kotlin.collections.Iterable.{s}", .{name});
         defer if (runtime.freeScratch()) allocator.free(p1);
         var matched: []const u8 = p1;
@@ -6079,6 +6081,31 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
 }
 
+/// A SAM-converted `Sequence { ... }` / `Iterable { ... }` instance: its
+/// `iterator` is served through `__sam_target__` rather than an IR
+/// method, so `hostHasMember(.., "iterator")` cannot see it. The
+/// iterable fallback drains these like any other iterator-bearing
+/// instance.
+fn samIterableInstance(self: *VmHost, allocator: Allocator, receiver: *const Value) bool {
+    const class_name = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        // A SAM conversion carries the lambda under `__sam_target__`; a
+        // lowered fun-interface object carries `iterator` as a callable
+        // field; a full anon `object : Sequence<T>` registers `iterator`
+        // in the anon-method table. Any of them can be drained.
+        if (g.get().get("__sam_target__") != null) break :blk null;
+        if (g.get().get("iterator")) |f| {
+            if (isCallable(&f)) break :blk null;
+        }
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().name;
+    };
+    const cn = class_name orelse return true;
+    return lookupAnonMethod(self, allocator, cn, "iterator/0", "iterator") != null;
+}
+
 fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     _ = self;
     const inst = receiver.Instance;
@@ -6804,6 +6831,33 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     }
 
     if (chosen == null) return null;
+
+    // An erased receiver-TYPE-ARG tie is undecidable here: sibling
+    // overloads that differ ONLY in the receiver's element type
+    // (`Sequence<UInt>.sum()` vs `Sequence<Int>.sum()` — same head, same
+    // params) select by a static type argument the runtime receiver does
+    // not carry. Picking one silently runs the wrong element arithmetic;
+    // decline instead so the walk's element-tag-aware arms (the
+    // iterable/list intrinsic fallbacks) serve the call dynamically.
+    {
+        const c = chosen.?;
+        const crt = &c.func.params[0].ty;
+        if (crt.args.len != 0) {
+            for (candidates.items) |o| {
+                if (o.fid.int() == c.fid.int()) continue;
+                const ort = &o.func.params[0].ty;
+                if (!std.mem.eql(u8, ort.name, crt.name)) continue;
+                if (o.func.params.len != c.func.params.len) continue;
+                if (ort.args.len != crt.args.len or ort.args.len == 0) continue;
+                if (!std.mem.eql(u8, ort.args[0].name, crt.args[0].name)) {
+                    if (trace.enabled(name)) {
+                        trace.emit("map=erased_recv_tie_decline name={s} a={s} b={s}", .{ name, c.func.fqn, o.func.fqn });
+                    }
+                    return null;
+                }
+            }
+        }
+    }
 
     // Defer to a function-typed enclosing property when the chosen
     // member-extension's receiver doesn't accept the actual receiver.

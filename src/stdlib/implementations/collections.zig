@@ -3790,17 +3790,31 @@ pub fn coll_list_sum(ctx: *CallCtx) Error!EvalResult {
 /// Int/Short/Byte -> Int (wrapping, like Kotlin).
 fn sumValues(a: Allocator, items: []const Value, what: []const u8) Error!EvalResult {
     var acc_i: i64 = 0;
+    var acc_u: u64 = 0;
     var acc_f: f64 = 0;
     var any_long = false;
     var any_float = false;
     var any_double = false;
+    // Unsigned sums keep their unsigned width (`Iterable<UInt>.sum()` is
+    // UInt with u32 wrap; UByte/UShort widen to UInt; ULong stays ULong).
+    var any_unsigned = false;
+    var any_ulong = false;
     for (items) |v| {
         switch (v) {
             .Long => {
                 any_long = true;
                 acc_i +%= v.asI64().?;
             },
-            .Int, .Short, .Byte, .UByte, .UShort, .UInt, .ULong => acc_i +%= v.asI64() orelse @intCast(v.asU64() orelse 0),
+            .Int, .Short, .Byte => acc_i +%= v.asI64().?,
+            .UByte, .UShort, .UInt => {
+                any_unsigned = true;
+                acc_u +%= v.asU64().?;
+            },
+            .ULong => {
+                any_unsigned = true;
+                any_ulong = true;
+                acc_u +%= v.asU64().?;
+            },
             .Float => {
                 any_float = true;
                 acc_f += v.asF64().?;
@@ -3817,6 +3831,10 @@ fn sumValues(a: Allocator, items: []const Value, what: []const u8) Error!EvalRes
     }
     if (any_double) return ok(.{ .Double = acc_f + @as(f64, @floatFromInt(acc_i)) });
     if (any_float) return ok(.{ .Float = @floatCast(acc_f + @as(f64, @floatFromInt(acc_i))) });
+    if (any_unsigned) {
+        if (any_ulong) return ok(.{ .ULong = acc_u });
+        return ok(.{ .UInt = @truncate(acc_u) });
+    }
     if (any_long) return ok(.{ .Long = acc_i });
     return ok(Value.newInt(@as(i32, @truncate(acc_i))));
 }
