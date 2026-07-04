@@ -266,34 +266,103 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
       is now false) and both factory name-list helpers. Verified: full dual gate
       green, inventory unchanged at 117, eager ON/OFF byte-identical.
 
-      *Step-2 status (2026-07-04, IN TREE, uncommitted — verification
-      incomplete):* the header-only-bodyless slice. Phase 2 of the module
-      build now SKIPS body-null functions (`f.body == null` keeps the
-      phase-1 stub: declared params, empty blocks), so `hasBody()` is false
-      and `linkBodyless` settles their executable form — before this, every
-      retained header got a manufactured one-block `return Unit` body that
-      shadowed real dispatch (the landmine class behind
-      `ArraysTest.copyRangeInto`/`sortStable`/`shuffle` and friends).
-      Measured effect: eager-OFF inventory 117 → 102; ArraysTest 6 → 0 and
-      CollectionTest 3 → 0 solo. The first gate over the slice crashed
-      (`func.blocks[0]` on len 0): a static `Call` bound to an unsettleable
-      bodyless header (`kotlin.collections.fill` — receiver-formed, no impl
-      under its lowered FQN, no body sibling) fell through `callFunc` into
-      the evaluator. Fixed at the mechanism in `callFunc`'s bodyless ladder:
-      a receiver-formed unsettled header dispatches through the member walk
-      on its bound receiver (where the member-form intrinsics live); a
-      receiverless one returns Unit (the pre-slice shape). The filtered e2e
-      repro (compose_frame_clock) passes with the fix. REMAINING before this
-      slice can commit: full e2e + ktor suites, the eager-ON canonical (the
-      crashed gate showed ArraysTest/CollectionTest/EnumEntriesFactoryTest/
-      NumbersTest at -1 under KLIO_EAGER=1 — re-verify post-fix), and one
-      full dual gate expecting inventory ~102 with ON/OFF identical.
-      Also recorded: the expect-with-impl drops in `retainDecl` stay for
-      now — the registry's member-form registrations (`kotlin.String.repeat`)
-      do not align with the lowered receiverless form (`kotlin.text.repeat`),
-      so a retained header the link cannot bind hijacks member dispatch;
-      declaration-aligned registry entries (or the step-2 manifest) are the
-      precondition, and the `retainDecl` comment marks it.
+      *Step-2, first slice — LANDED (2026-07-04): headers stay bodyless.*
+      Phase 2 of the module build SKIPS body-null functions (`f.body ==
+      null` keeps the phase-1 stub: declared params, empty blocks), so
+      `hasBody()` is false and `linkBodyless` settles their executable
+      form — before this, every retained header got a manufactured
+      one-block `return Unit` body that shadowed real dispatch. The
+      unsettled-header dispatch semantics live in exactly three places:
+      (a) `executableForm` (host_call_func.zig) — body ∨ resolved-native ∨
+      same-FQN intrinsic ∨ body-sibling redirect; (b) `extensionFnFallback`
+      skips non-executable candidates at collection (an unsettled header
+      never competes, and can no longer cycle the walk — the cycle killed
+      ktor_client_get via `HttpClient.platformResponseDefaultTransformers`,
+      an `expect` whose platform `actual` is outside the pack's source
+      set); (c) a call that still lands on an unsettled header no-ops to
+      Unit — statically-bound calls in `callFunc`'s bodyless arm (member
+      walk first, canonical miss → Unit), deferred bare calls via
+      `bareUnsettledHeaderNoOp` at the very end of `CallMemberOrGlobal`'s
+      ladder (eval.zig), before the unresolved-global raise. One hard
+      lesson recorded: converting the walk's canonical miss to Unit INSIDE
+      the walk is wrong — the `Vm::call_member` miss message is a protocol
+      that downstream fallbacks pattern-match (the compound-assign
+      `plusAssign`→`plus` chain, singleton forwarding); the no-op belongs
+      only at ladder ends.
+      Verified: unit suite green; e2e, check_examples, litmus set
+      (threaded_litmus, corpus_pinned, lambdas_and_dispatch,
+      inheritance_dispatch, extension_resolution, object_init), ktor_server,
+      ktor_channel_async, concurrency_stress all green; full dual
+      stdlib-commontest gate byte-identical eager ON/OFF (perfile and
+      perfail), and the four files that crashed the pre-fix gate
+      (ArraysTest/CollectionTest/EnumEntriesFactoryTest/NumbersTest) run to
+      completion under both modes. Honest inventory: 119 failures both
+      modes. The earlier "117 → 102" claim did not survive the crash fix —
+      the 102 was measured on a tree whose walk-bounce could crash or
+      serve by recursion luck; against the last comparable sweep (122):
+      9 fixed, 6 surfaced. The 6 (ArraysTest.contentDeepToStringNoRecursion,
+      ArraysTest.shuffle, CollectionTest.abstractCollectionToArray,
+      CollectionTest.toStringContainingThis, NumbersTest.doubleToBits,
+      NumbersTest.floatToBits) are one class: an expect-with-impl header the
+      step-1 drop conditions missed (e.g. `Double.Companion.fromBits` — its
+      lowered FQN does not match the registry's member-form registration),
+      so the retained header hijacks a call site whose serving used to come
+      from the manufactured body's mis-bound-overload intrinsic fallback
+      (`f.hasBody()`-gated, now skipped). Fix is the already-planned step-2
+      precondition — declaration-aligned registry entries / the manifest —
+      NOT six point patches.
+      Known-red, pre-existing (verified identical at the pre-slice commit
+      via stash): ktor_client_get (all 4 tests) — after the engine executes
+      a request, a second HttpRequestBuilder replays the get-block closure
+      chain and dies on `plusAssign` on `kotlin.coroutines.CombinedContext`;
+      suspend-resume/replay-shaped, needs its own root-cause session.
+
+      *Follow-up findings (2026-07-04, after the slice landed):*
+      - **Link-time receiver-qualified settling is a dead end — do not
+        retry it.** An experiment taught `linkBodyless` to probe the
+        registry under `<pkg>.<Receiver>.<name>`; the link audit showed
+        ~40 headers settling, and any call site that LOST its receiver at
+        lowering (bare/companion calls binding one shared header fid for
+        every receiver's overload) then silently ran the wrong type's
+        intrinsic — `Double.fromBits` through `float_from_bits`. A
+        unique-receiver guard still cascaded (newly-executable headers
+        started competing in the extension fallback). Reverted whole. The
+        per-call bodyless arm (member walk on the actual receiver) is the
+        receiver-faithful mechanism; the missing piece is call sites
+        CARRYING their receivers — P10 step 3, not link work.
+      - **Bound companion references — FIXED (`61975f46`).**
+        `Double.Companion::fromBits` was classified unbound because
+        `hostHasMember` cannot see intrinsic-backed companion surface;
+        `companionServesName` (host_call_value.zig) also consults the
+        companion-FQN registry probe and declared companion-receiver
+        headers. NumbersTest.doubleToBits/floatToBits pass.
+      - **Canonical NaN — FIXED (`61975f46`).** Upstream declares
+        `Double.NaN = -(0.0/0.0)`; KLIO's negation did the IEEE sign flip
+        where every Kotlin platform's constant evaluation yields the
+        canonical positive quiet NaN. Unary minus on NaN now keeps the
+        canonical form (eval `Neg` arm + `num_unary_minus`).
+      - **Cross-file test-class helpers still misresolve** (deterministic
+        per binary): `Sortable(...)` ctor and `assertSorted` from sibling
+        test files fail from inside lambda bodies
+        (ArraysTest/CollectionTest sortStable/sortByStable/sortedWith,
+        `unresolved global Sortable`), `EnumEntriesFactoryTest` returns
+        Unit where a list is expected, `sizeInBitsAndBytes` Type error,
+        CollectionTest.abstractCollectionToArray `get_field size`. These
+        are the current named remainder of the fromBits class.
+      - **Resolution is nondeterministic ACROSS PROCESSES.** The same
+        binary produced sortStable=`Unimplemented` (and no
+        sortByStable/sortedWith failures) in one full-sweep run and
+        `unresolved global Sortable` ×2 + sortedWith in later runs;
+        NumbersTest.floatFitsInFloatArray flips between passing and
+        `unresolved global assertAlmostEquals`. Suspect pointer-order /
+        hash-iteration-dependent candidate ordering somewhere in
+        resolution. This wobbles the inventory count itself (119 vs 121
+        shapes) and must be root-caused before inventory deltas can be
+        trusted to single-test precision.
+      Also recorded: the remaining expect-with-impl drops in `retainDecl`
+      stay until the registry carries declaration-aligned entries (the
+      `retainDecl` comment marks it); `kotlin.String.repeat` vs
+      `kotlin.text.repeat` is the canonical mismatch example.
    2. **Host-only functions get declarations.** The few intrinsics with no Kotlin
       source (`arrayOf` family, platform helpers) get real Kotlin header
       declarations in a klio-authored manifest file lowered like source, so every

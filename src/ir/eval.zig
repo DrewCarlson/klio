@@ -3678,8 +3678,18 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 }
             } else {
                 if (first_real_err) |fre| return raiseStep(frame, fre);
-                const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                return raiseStep(frame, .{ .Unbound = msg });
+                // Every arm missed, but the name is a declared header the
+                // link could not settle (an `expect` with no compiled
+                // `actual`): the call is a no-op, the shape its
+                // manufactured empty body produced before header-only
+                // declarations stayed bodyless.
+                if (host.bareUnsettledHeaderNoOp(frame.module, name_str, arg_values.len)) {
+                    orAudit("CallMemberOrGlobal", name_str, "unsettled_header_noop", -1, null);
+                    result = .Unit;
+                } else {
+                    const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
+                    return raiseStep(frame, .{ .Unbound = msg });
+                }
             }
         }
     }
@@ -5157,6 +5167,11 @@ pub const NullHost = struct {
         _ = .{ self, module, args, arg_names, recv_external };
         _ = func;
         return null;
+    }
+
+    pub fn bareUnsettledHeaderNoOp(self: *NullHost, module: *const Module, name: []const u8, argc: usize) bool {
+        _ = .{ self, module, name, argc };
+        return false;
     }
 
     pub fn callableReceiverShape(self: *NullHost, v: *const Value) ?ReceiverShape {
