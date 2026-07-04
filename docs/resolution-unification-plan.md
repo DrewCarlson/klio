@@ -392,6 +392,21 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         time; record them alongside the reg binding and consult at
         call-emit). P10 step-3 adjacent — do it as lowering work, not
         another runtime probe.
+      - **Checkpoint 2026-07-05: inventory 97, dual-identical, gate green
+        at every commit.** The batch since 115: bound companion refs,
+        canonical NaN, local-callable applicability + lenient declared
+        arity, `Type::member` receiver loading, declared-lambda-overload
+        precedence over arity-blind intrinsics, splice-reified type-arg
+        stamping, Array shuffle/toString, windowed/chunked transform,
+        erased receiver-type-arg ties declining to element-tag-aware
+        dynamic arms (Iterable/Set/Array sum-min-max-average now
+        registered and iterable-generic), unsigned array views tagging
+        through the subscript fast path and wrap ctors, explicit type
+        args surviving deferred/value dispatch (unsigned literal
+        coercion), unsigned range membership. Remaining in-test-only
+        mysteries (sizeInBitsAndBytes Type, sortedTests toArray-on-String,
+        compareToIgnoreCase overflow) share a local-fn + test-class
+        context pattern — investigate with child-level traces.
       - **Named remainder** (real, deterministic, 115 total): ArraysTest
         contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
         copyRangeInto (`UIntArray expects an Int size`),
