@@ -6,59 +6,63 @@ loop: redundant build work, redundant test children, slow interpreted
 iterations, cache pathology. This is the working document; keep measurements
 and decisions here.
 
-## Observed costs (2026-07-04 session, M-series 10-core/64 GB, macOS)
+## Measurements (2026-07-04, M-series 10-core/64 GB, macOS, zig 0.16.0)
 
-- `zig build klio-harness` after one edit in `src/interp_ir/vm`: minutes per
-  rebuild (ReleaseSafe via LLVM), and the session needed six of them.
-- `zig build itest-bin`: ~56 standalone binaries, each linking the whole
-  interpreter (ReleaseSafe); first build ~30+ min, warm rebuild after an
-  interp edit still relinks every binary.
-- Dual stdlib-commontest gate: 4 full sweeps (perfile/perfail × eager ON/OFF),
-  each spawning ~106 `klio test` children; each child re-parses and re-lowers
-  its sibling files and any needed packs (the baked stdlib image covers only
-  the stdlib).
-- Two optimize universes by design (`optimize=Debug` for unit tests,
-  `harness-optimize=ReleaseSafe` for program-running harnesses); an explicit
-  `-Dharness-optimize=Debug` run builds a third graph.
-- `.zig-cache` measured at **152 GB** (no GC); CI already wipes past 5 GB
-  because unbounded caches killed jobs.
+| Operation | Cost | Notes |
+| --- | --- | --- |
+| `zig build klio-harness` no-op | **0.7 s** | healthy; the 1:37 outlier right after a cache prune is one-time revalidation |
+| one-edit rebuild, ReleaseSafe harness | **83 s** | 100% single-core — whole-program LLVM codegen, no parallelism |
+| one-edit rebuild, Debug harness (`-Dharness-optimize=Debug`) | **16 s** | 5.2× faster than ReleaseSafe |
+| `-fincremental` one-shot | 21 s | worse than plain — incremental state dies with the process |
+| `--watch -fincremental` | untested-interactive | died with BrokenPipe under piped/background use; try in a real terminal |
+| one commontest child (ArrayDequeTest), ReleaseSafe | **7.9 s** | dominated by re-lowering ~40 same-dir sibling files per child |
+| same child, Debug interpreter | **34 s** | 4.3× runtime penalty — sweeps must stay ReleaseSafe |
+| full dual commontest gate (old way) | ~20 min | 4 full sweeps × ~106 children |
+| single-file dual gate (`commontest-sweep.py --filter X --eager both`) | **~16 s** | new tool |
+| `.zig-cache` growth | ~68 GB/day under heavy iteration | 152 GB found; no GC |
 
-## Hypotheses to measure (in order)
+## The iteration playbook (use these, not the old habits)
 
-1. **Cache pathology**: does a 152 GB `.zig-cache` slow hash/lookup or disk?
-   Measure warm no-op `zig build klio-harness` before/after a cache reset.
-2. **Link dominance**: for a one-file interp edit, how much of the harness
-   rebuild is LLVM codegen vs link? (`zig build --verbose` timing / `-ftime-report`.)
-   If link-dominated: fewer, thinner binaries.
-3. **Per-binary duplication in itest-bin**: do the 56 binaries share object
-   cache (same flags → hits) and only pay links, or recompile? If links: stop
-   installing all 56 by default; build-on-demand per suite.
-4. **Debug-backend iteration builds**: Zig 0.16 self-hosted backend for
-   Debug on aarch64-macos — is a Debug harness build seconds instead of
-   minutes, and is the Debug interpreter fast enough for the sweeps
-   (commontest child ~0.4s parity cost claimed in CI notes)? If yes: default
-   local verification to Debug harness, keep ReleaseSafe for perf-sensitive
-   suites and CI-weekly.
-5. **Child-process redundancy**: commontest children re-lower sibling targets
-   and packs per child. Extend the baked-image fast path (relax
-   `canExtendBase` — known open item), or run targets in-process batches.
-6. **Sweep granularity**: perfail/perfile rerun all ~106 files to answer
-   questions about 4; need a single-file/filtered mode (`--only-file` exists —
-   the sweep tooling just never exposes it).
+- **Edit-repro loop** (fixing one bug, running one program):
+  `zig build klio-harness -Dharness-optimize=Debug` → 16 s per rebuild.
+  The Debug interpreter is ~4× slower per run — fine for single repros.
+- **Targeted commontest check** (one file, both eager modes):
+  `python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest --eager both`
+- **One suite**: `zig build itest-<name>` (builds and runs just that suite).
+  Never run `zig build itest-bin` (all ~56 binaries) during iteration.
+- **Full gate before a commit**: `scripts/gate.sh` (unit + litmus set + e2e +
+  examples + ktor/concurrency + commontest dual sweep). `--no-sweep` skips
+  the slow tail.
+- **Cache**: `scripts/prune-zig-cache.sh [days]` (default 2) whenever
+  `.zig-cache` bothers you; safe at any time, first build after pays a
+  revalidation pass (~90 s).
 
-## Decisions / work items
+## Root causes still open (in impact order)
 
-- [ ] Measure 1-6 above; record numbers here.
-- [ ] Pick the default local iteration universe (likely Debug self-hosted
-      harness + ReleaseSafe only where measured necessary).
-- [ ] itest-bin: per-suite named build steps instead of all-56 default.
-- [ ] Cache policy: bounded local cache (periodic prune or `--cache-dir`
-      rotation), matching the CI 5 GB wipe.
-- [ ] Filtered sweep mode for commontest (single file / file list, both eager
-      modes in one invocation).
-- [ ] Fold the session gate scripts (litmus set + dual sweep) into a checked-in
-      `scripts/` entry point so every session stops rebuilding its own harness.
+1. **Per-child sibling re-lowering** (commontest): each child re-parses and
+   re-lowers every same-directory sibling (~40 files in `collections/`) —
+   ~7 s of the 7.9 s child. Fixes: extend the baked-image fast path to
+   cover sibling sets (relax `canExtendBase` — known open item), or batch
+   children per directory (one process compiles siblings once, runs each
+   target's tests with successive `--only-file` filters).
+2. **Whole-program LLVM rebuild on one edit** (83 s ReleaseSafe, single
+   core). Mitigated by the Debug playbook; real fixes to evaluate:
+   `--watch -fincremental` daemon in the user's terminal (state persists
+   across edits), and tracking zig's aarch64 self-hosted backend for
+   Debug (may already be active — the 16 s Debug build is acceptable
+   either way).
+3. **itest-bin all-or-nothing**: ~56 ReleaseSafe links. Per-suite steps
+   already exist (`zig build itest-<name>`); itest-bin stays a CI/stress
+   tool. Consider trimming the default suite list or splitting
+   fast/slow tiers if CI time regresses.
+4. **Cache GC**: no upstream GC; `scripts/prune-zig-cache.sh` is the local
+   policy (CI already wipes past 5 GB). Consider a launchd/cron weekly run.
 
 ## Log
 
 - 2026-07-04: plan created; directive recorded in session memory.
+- 2026-07-04: measurements above; shipped `scripts/commontest-sweep.py`
+  (filtered dual-eager sweeps, replaces session-local perfile/perfail),
+  `scripts/gate.sh` (one full-gate entry point), `scripts/prune-zig-cache.sh`
+  (152 GB → 68 GB on first run). Old Rust-era `klio-parity-sweep.sh` and
+  `klio-guard.sh` still reference cargo — candidates for deletion or port.
