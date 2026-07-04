@@ -10,6 +10,7 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const ast = @import("ast");
+const stdlib = @import("stdlib");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
@@ -55,6 +56,55 @@ fn isCompanionInstance(v: Value) bool {
         std.mem.endsWith(u8, cg.get().fqn, ".Companion");
 }
 
+/// Whether the companion surface itself serves `name`, so a
+/// `Type::name` reference stays BOUND to the companion instead of
+/// consuming its first argument as the receiver. A real IR member, a
+/// companion-FQN intrinsic (`kotlin.Double.Companion.fromBits`), or a
+/// declared companion-receiver extension header all count — the last
+/// two are what `hostHasMember` alone cannot see, which mis-classified
+/// `Double.Companion::fromBits` as an unbound instance-method ref.
+fn companionServesName(self: *VmHost, rv: *const Value, name: []const u8) bool {
+    if (host_call_member.hostHasMember(self, rv, name)) return true;
+    if (rv.* != .Instance) return false;
+    var fqn_buf: [256]u8 = undefined;
+    var simple_buf: [128]u8 = undefined;
+    const probes: ?struct { fqn: []const u8, recv: []const u8 } = blk: {
+        const g = rv.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        const cls_fqn = cg.get().fqn;
+        if (!std.mem.endsWith(u8, cls_fqn, ".Companion")) break :blk null;
+        const fqn = std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ cls_fqn, name }) catch break :blk null;
+        // The declared receiver form is the FQN's `Type.Companion` tail
+        // (`kotlin.Double.Companion` -> `Double.Companion`).
+        const owner = cls_fqn[0 .. cls_fqn.len - ".Companion".len];
+        const owner_simple = if (std.mem.lastIndexOfScalar(u8, owner, '.')) |d| owner[d + 1 ..] else owner;
+        const recv = std.fmt.bufPrint(&simple_buf, "{s}.Companion", .{owner_simple}) catch break :blk null;
+        break :blk .{ .fqn = fqn, .recv = recv };
+    };
+    const p = probes orelse return false;
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        const bg = pg.get().installed_bindings.borrow();
+        defer bg.deinit();
+        if (bg.get().resolve(p.fqn) != null) return true;
+    }
+    if (stdlib.implementation(p.fqn) != null) return true;
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        for (mod.funcsBySimpleName(name)) |fid| {
+            const sig = mod.decl_sigs.get(fid.int()) orelse continue;
+            const rt = sig.receiver_ty orelse continue;
+            if (std.mem.eql(u8, rt.name, p.recv)) return true;
+        }
+    }
+    return false;
+}
+
 /// Single callable-value dispatch over the value variants.
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     if (callee.* == .Intrinsic) {
@@ -90,7 +140,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             // companion member.
             const type_like = (rv == .Class) or
                 (rv == .Instance and isCompanionInstance(rv) and
-                    !host_call_member.hostHasMember(self, &rv, name));
+                    !companionServesName(self, &rv, name));
             if (type_like and args.len != 0) {
                 const first = args[0];
                 const rest = args[1..];

@@ -72,8 +72,11 @@ pub fn num_unary_minus(ctx: *CallCtx) Allocator.Error!EvalResult {
         // `Byte`/`Short.unaryMinus()` widen to `Int` (Kotlin).
         .Short => |x| ok(.{ .Int = -@as(i32, x) }),
         .Byte => |x| ok(.{ .Int = -@as(i32, x) }),
-        .Float => |x| ok(.{ .Float = -x }),
-        .Double => |x| ok(.{ .Double = -x }),
+        // Negating NaN keeps the canonical quiet NaN (matches the eval
+        // `Neg` arm: `Double.NaN` is upstream `-(0.0/0.0)` and the
+        // commonTest pins its raw bits to the canonical positive form).
+        .Float => |x| ok(.{ .Float = if (std.math.isNan(x)) std.math.nan(f32) else -x }),
+        .Double => |x| ok(.{ .Double = if (std.math.isNan(x)) std.math.nan(f64) else -x }),
         else => .{ .err = .{ .Type = "unaryMinus requires a signed numeric receiver" } },
     };
 }

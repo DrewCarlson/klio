@@ -4253,8 +4253,13 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
         .Neg => switch (v.*) {
             .Int => |i| return ok(.{ .Int = -%i }),
             .Long => |l| return ok(.{ .Long = -%l }),
-            .Double => |d| return ok(.{ .Double = -d }),
-            .Float => |f| return ok(.{ .Float = -f }),
+            // Negating NaN keeps the canonical quiet NaN instead of the
+            // IEEE sign-bit flip: `Double.NaN` is declared upstream as
+            // `-(0.0/0.0)` and every platform's constant evaluation yields
+            // the canonical positive NaN (the commonTest pins
+            // `Double.NaN.toRawBits() == 0x7FF8000000000000`).
+            .Double => |d| return ok(.{ .Double = if (std.math.isNan(d)) std.math.nan(f64) else -d }),
+            .Float => |f| return ok(.{ .Float = if (std.math.isNan(f)) std.math.nan(f32) else -f }),
             // `Byte`/`Short.unaryMinus()` widen to `Int` (Kotlin).
             .Byte => |b| return ok(.{ .Int = -@as(i32, b) }),
             .Short => |s| return ok(.{ .Int = -@as(i32, s) }),
