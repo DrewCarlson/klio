@@ -239,6 +239,46 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
 
 ### Open work, in order
 
+0. **P10 — the no-holes symbol table (intrinsics become symbols). THE PRIORITY.**
+   The direct order (2026-07-04): get resolution and execution in line with the
+   official Kotlin compiler so building on KLIO starts from a correct base — stop
+   the whack-a-mole. The root cause the whole hatch pile patches: intrinsic-backed
+   names are HOLES in the declaration table (`retainDecl` drops their source), so
+   every resolution layer needs a side-channel to know the host serves them, and
+   the intrinsic registry maps FQNs to function POINTERS with no declaration
+   shape — it cannot answer resolution questions (`kotlin.text.nativeIndexOf`
+   binds a receiver-formed helper; `kotlin.collections.listOf` is a value-position
+   global; the registry cannot tell them apart, measured 2026-07-04). kotlinc has
+   no such concept: resolution is one pure function over one complete symbol
+   table, and native-ness is a codegen/link detail (spec: Overload resolution —
+   candidate sets are built from declarations in scope, receivers first, then
+   package/default-import scope; spec PDFs restored under
+   `kotlin-language-spec/`). Three steps:
+   1. **Retain every intrinsic-backed source declaration.** Delete `retainDecl`'s
+      function drop-lists (`isSequenceFactoryName`, `isCollectionFactoryName`, the
+      `emptyList`/`emptySet`/`emptyMap` drops); the declarations lower like any
+      other source and `linkResolvedForms` binds them `resolved_native` — the
+      mechanism that already works for `require`/`minOf`-with-source today.
+      `expect` drops remain only where an `actual` replaces the declaration.
+   2. **Host-only functions get declarations.** The few intrinsics with no Kotlin
+      source (`arrayOf` family, platform helpers) get real Kotlin header
+      declarations in a klio-authored manifest file lowered like source, so every
+      callable the runtime can serve has a `FuncId` + `DeclSig`. After this the
+      intrinsic registry is consulted at exactly one place — link time — never
+      during resolution.
+   3. **Bare-call resolution = the spec's scope walk over the one table.** Locals
+      → members of the receiver chain → extensions in scope → package → default
+      imports, with constructors in the candidate set (RC-A's ctor `DeclSig`s,
+      keyed by class simple name), decided eagerly at lowering; the deferred
+      runtime arms shrink to genuinely runtime-polymorphic receivers.
+   **Acceptance (the completeness invariant):** DELETE `ir.host_bare_global_check`
+   + `installHostBareGlobals` (the 2026-07-04 stopgap classifier), the alias
+   arms, `shadowedByClass`'s literal-kind mini-resolver and the `class_competes`
+   interim gate, and CMG's `is_ctor_name` — plus spec-derived conformance
+   fixtures for the scope walk (bare calls vs members vs extensions vs
+   default-imports; ctor-vs-factory by argument type per the `Box`/`Tag`/`Pt`
+   corpus). A hatch that cannot be deleted pins the next fix.
+
 1. **DeepRecursive coroutine intrinsics — LANDED (`135bc4be`).** Implemented exactly
    per the design: `coroutineStartRootOrSuspended` + `coroutineHasDriver` engine fns,
    the `__klio_co_startRootOrSuspended` / `__klio_co_hasDriver` intrinsics, and the
@@ -455,6 +495,26 @@ sig index becomes `symbols`. No new format is invented.
   `shadowed_inline_names`, `isPrimitiveConv`, `CONTROL_INTRINSICS`. These exist only
   because the index is incomplete and applicability isn't shared/type-aware. Deleting
   them is the proof those fixes are complete.
+
+  *Progress:* `isAliasName`'s hand list is deleted. The classifier is now an
+  injected hook (`ir.host_bare_global_check`) built once per process from the
+  implicit-alias table filtered by an existing implementation — exactly the
+  set `vmNew` pre-installs into globals — so lowering and runtime classify
+  bare host globals from one authority. The wider intrinsic registry is
+  deliberately not swept into it: its package-level FQNs double as link-time
+  bindings for bodyless receiver-formed declarations (`kotlin.text.nativeIndexOf`
+  binds `String.nativeIndexOf`), and the registry carries no declaration shape
+  to tell the two apart — the measured cost of intrinsics being holes instead
+  of symbols, and the direct motivation for the north star above. The
+  `to`/`downTo`-style exclusions stopped being a list too: the bare-call arms
+  now ask `extensionCandidateFitsArity` (a same-named extension candidate
+  whose value-parameter shape fits the argument count keeps the call on
+  receiver-bound dispatch), answered from the now-complete phase-1 headers.
+  Still cataloged for the same treatment: `stdlib.isToplevelFunction`'s
+  `receiver_infix` exclusions, `isArrayBuilder`, `retainDecl`'s
+  `isSequenceFactoryName`/`isCollectionFactoryName` curation lists,
+  `emptyContainerCreatorArity`, and `ir.Module.default_import_packages`
+  (mirrored from `stdlib.IMPLICITLY_IMPORTED_PACKAGES`, sync-tested only).
 
 ## Target architecture
 
