@@ -1254,10 +1254,14 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
 }
 
 pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
-    // Reified enum reflection: `enumValues<T>()` / `enumValueOf<T>(name)`.
+    // Reified enum reflection: `enumValues<T>()` / `enumValueOf<T>(name)` /
+    // `enumEntries<T>()` (whose inline body survives as the
+    // `enumEntriesIntrinsic` header — an `expect` with no compiled
+    // `actual`, served here from the reified type argument).
     if (funcAt(module, func)) |f| {
         if (std.mem.startsWith(u8, f.fqn, "kotlin") and
-            (std.mem.eql(u8, f.name, "enumValues") or std.mem.eql(u8, f.name, "enumValueOf")))
+            (std.mem.eql(u8, f.name, "enumValues") or std.mem.eql(u8, f.name, "enumValueOf") or
+                std.mem.eql(u8, f.name, "enumEntries") or std.mem.eql(u8, f.name, "enumEntriesIntrinsic")))
         {
             if (type_args.len > 0 and type_args[0].len != 0) {
                 const tn = type_args[0];
@@ -1273,7 +1277,10 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
                         const cd = cls.borrow();
                         const is_enum = cd.get().is_enum;
                         if (is_enum) {
-                            if (std.mem.eql(u8, f.name, "enumValues")) {
+                            if (std.mem.eql(u8, f.name, "enumValues") or
+                                std.mem.eql(u8, f.name, "enumEntries") or
+                                std.mem.eql(u8, f.name, "enumEntriesIntrinsic"))
+                            {
                                 var items: std.ArrayList(Value) = .empty;
                                 for (cd.get().enum_entries) |entry| {
                                     // The List owns one reference per element;

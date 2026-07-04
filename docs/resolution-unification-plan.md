@@ -341,24 +341,174 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         where every Kotlin platform's constant evaluation yields the
         canonical positive quiet NaN. Unary minus on NaN now keeps the
         canonical form (eval `Neg` arm + `num_unary_minus`).
-      - **Cross-file test-class helpers still misresolve** (deterministic
-        per binary): `Sortable(...)` ctor and `assertSorted` from sibling
-        test files fail from inside lambda bodies
-        (ArraysTest/CollectionTest sortStable/sortByStable/sortedWith,
-        `unresolved global Sortable`), `EnumEntriesFactoryTest` returns
-        Unit where a list is expected, `sizeInBitsAndBytes` Type error,
-        CollectionTest.abstractCollectionToArray `get_field size`. These
-        are the current named remainder of the fromBits class.
-      - **Resolution is nondeterministic ACROSS PROCESSES.** The same
-        binary produced sortStable=`Unimplemented` (and no
-        sortByStable/sortedWith failures) in one full-sweep run and
-        `unresolved global Sortable` ×2 + sortedWith in later runs;
-        NumbersTest.floatFitsInFloatArray flips between passing and
-        `unresolved global assertAlmostEquals`. Suspect pointer-order /
-        hash-iteration-dependent candidate ordering somewhere in
-        resolution. This wobbles the inventory count itself (119 vs 121
-        shapes) and must be root-caused before inventory deltas can be
-        trusted to single-test precision.
+      - **The "nondeterminism" scare was tool error — RETRACTED.**
+        `commontest-sweep.py --filter` narrowed the target list that also
+        supplied each child's sibling context, so filtered runs compiled
+        WITHOUT their same-directory siblings and failed on the siblings'
+        helper declarations (`unresolved global Sortable`,
+        `assertAlmostEquals`, `assertSorted`). Fixed: a filter narrows
+        what RUNS, never what compiles alongside. Resolution outcomes are
+        deterministic per argv — verified by exact-argv reruns. The
+        119-inventory numbers from full sweeps were always correct.
+      - **Descending natural-order sorts over host-comparable elements —
+        FIXED.** `sortWith`/`sortedWith` with an empty-step
+        `reverseOrder()` comparator (the body of `sortDescending`) took
+        the scalar-only natural sort and returned `Unimplemented` on user
+        `Comparable` instances; `sortListHostAwareDesc` runs the stable
+        host-aware merge sort with the direction flip, and
+        `array_sort_with`/`iterSortedWith` route empty-step comparators
+        through it. ArraysTest.sortStable passes.
+      - **Inapplicable local callables yield to extensions — FIXED
+        (`4ef74e32`), inventory 119 → 115 dual-identical.** The
+        `CallMemberOrValue` value arm invoked a same-named local lambda
+        regardless of arity, Null-padding its params
+        (`subList(..).sortDescending()` next to a
+        `sortDescending: TArray.(Int, Int) -> Unit` param ran the local
+        with Null indices; the walk then bound the `(fromIndex, toIndex)`
+        Array variant for the list because the LENIENT extension pass had
+        no arity check at all). Three pieces: `callableAcceptsArgs`
+        (closure applicability via the body func's DeclSig — local
+        functions lower as closures and may carry defaults),
+        member/extension-first dispatch for proven misfits with a
+        canonical-miss fallback to the local (the proof is conservative),
+        and `declArityRefuses` in the lenient extension pass (DECLARED
+        required/vararg — per-fid default thunks are not authoritative
+        for pack functions; judging by them broke every defaulted
+        kotlinx extension, caught by threaded_litmus). Also in the batch:
+        `sortListHostAwareDesc` covers `array_sort_with`'s empty-step
+        comparators (ArraysTest.sortDescendingRangeInPlace).
+      - **Reified type args do not survive the inline splice.**
+        `enumEntries<E>()` splices (inline + reified), binding `T` as a
+        RUNTIME class value (`bindReifiedType` + StoreGlobal) — but the
+        spliced body's `enumEntriesIntrinsic()` call emits with no static
+        type args, so the typed dispatch arm never sees `E` and the
+        unsettled header no-ops to Unit. `callFuncTyped` now serves
+        `enumEntries`/`enumEntriesIntrinsic` like `enumValues` (fixed
+        EnumEntriesFactoryTest.testEquality — the direct CallTyped
+        shape); the two remaining cases need the splice to STAMP
+        substituted type args onto nested calls whose callee's
+        type-parameter names are bound in the active reified
+        substitution (`effective_type_args` knows the names at splice
+        time; record them alongside the reg binding and consult at
+        call-emit). P10 step-3 adjacent — do it as lowering work, not
+        another runtime probe.
+      - **Checkpoint 2026-07-05: inventory 97, dual-identical, gate green
+        at every commit.** The batch since 115: bound companion refs,
+        canonical NaN, local-callable applicability + lenient declared
+        arity, `Type::member` receiver loading, declared-lambda-overload
+        precedence over arity-blind intrinsics, splice-reified type-arg
+        stamping, Array shuffle/toString, windowed/chunked transform,
+        erased receiver-type-arg ties declining to element-tag-aware
+        dynamic arms (Iterable/Set/Array sum-min-max-average now
+        registered and iterable-generic), unsigned array views tagging
+        through the subscript fast path and wrap ctors, explicit type
+        args surviving deferred/value dispatch (unsigned literal
+        coercion), unsigned range membership. Remaining in-test-only
+        mysteries (sizeInBitsAndBytes Type, sortedTests toArray-on-String,
+        compareToIgnoreCase overflow) share a local-fn + test-class
+        context pattern — investigate with child-level traces.
+      - **Checkpoint 2026-07-05b: inventory 94 dual-identical.** ArraysTest,
+        NumbersTest, UnsignedArraysTest, RandomTest fully green. Landed
+        since 97: type-in-value-position Any surface (uppercase field
+        reads skip constructor intrinsics; Class/Function/Intrinsic
+        toString), local functions keep vararg shape through closure
+        lowering (non-final-vararg reorder route in callFunc,
+        callFuncFast exclusion, named-local-fn bypass in
+        callValueWithThis).
+        The two big remaining clusters, root-caused and ready to
+        implement:
+        1. **Set/Iterable `minus` family (12 tests)** — kotlinc resolves
+           `data - "foo"` against `data`'s STATIC type (`T : Iterable`
+           bound → `Iterable.minus` → List); KLIO dispatches dynamically
+           on the runtime Set (→ Set). Needs a static-receiver-head
+           channel at lowering: class-property declared types resolved
+           through class type-parameter BOUNDS, feeding the binop/member
+           lowering (`static_recv`-style) so the walk picks the
+           bound-typed overload. P10 step-3 shaped.
+        2. **windowed-over-Iterable tail (3 tests) + likely more** — the
+           source `windowedIterator` yields the raw `RingBuffer` for the
+           last partial window (by design — it IS a List on JVM);
+           `assertEquals(listOf(6), window)` needs List↔list-like-Instance
+           equality bridging (drain the AbstractList-subclass instance and
+           compare elements), the same bridge the LinkedStringSet
+           `minus`-display mismatches hint at for Sets.
+      - **Checkpoint 2026-07-05c: IterableTests fully green (static-head
+        channel landed, `0bb6b7fb`); inventory ~79.** SequenceTest (13) is
+        the next cluster, design ready:
+        * Six `Type` failures = scan / runningFold / runningReduce /
+          zipWithNext / chunked / windowed are NOT streaming `SeqOp`s —
+          they batch-materialize, and the tests run them over the
+          INFINITE `generateSequence(0){it+1}`. Implement as stateful
+          streaming ops in `src/stdlib/implementations/sequence.zig`'s
+          pull driver (the `st.indices/taken/...` state arrays gain
+          per-op Value state: Scan{initial,op} emits acc (initial first),
+          RunningReduce{op}, ZipWithNext{transform?} keeps prev,
+          Chunked{size,transform?} and Windowed{size,step,partial,
+          transform?} keep a buffer and need an END-OF-SOURCE FLUSH hook
+          in the driver plus emit-cardinality handling (buffer-until-full
+          → emit). Extend the streamability gate + the member arms that
+          append `SeqOp`s (host_call_member ~5290 region) + `SeqOp`
+          gcTrace for captured Values.
+        * ConstrainedOnceSequence trio: `iterator` member missing on the
+          wrapper + constrain-once IllegalStateException on second
+          iteration.
+        * flatten on Sequence; Sequence.minus laziness
+          (minusIsLazyIterated); orEmpty returning [] instead of the
+          Sequence.
+      - **Checkpoint 2026-07-05d: inventory ~70 dual-identical.**
+        SequenceTest 13→2 (scan family lazy via source, IteratorFn SAM
+        source, constrain-once actual + hatch deletion, generateSequence
+        one-shot/seed-fn semantics). decl_sigs ride the stdlib image
+        (DeclSigLite): every declared-signature mechanism now works in
+        image-loaded runs — bake-vs-image nondeterminism killed. Hatches
+        deleted this arc: constrainOnce no-op; Set/Iterable min-max
+        family served by declarations. NOTE: kotlin.test packs are
+        INSTALLED state under ~/.klio/packs — never delete .klio
+        wholesale (restore: klio pack build kotlin-klio/klio-kotlin-test
+        + pack install, both homes).
+        Remaining clusters, mechanisms identified:
+        * StringTest 6 / ContainerBuilder 6 — orEmpty null-receiver
+          overload pick; build-list identity ("is not same"), subList
+          views, map-entry setValue guard.
+        * ReversedViews 5 + ArrayDeque 5 — need source-class instances
+          (views with write-through; ArrayDeque internalStructure) —
+          the P10 de-hatching direction.
+        * Anon-capture chain bug (blocks Sequence.minus laziness +
+          GroupingTest countEach): a lambda inside a runtime-lowered
+          anon-object method reads enclosing-fn captures as Null; bare
+          member reads inside stdlib anon methods can hit package
+          intrinsics (`iterator` → the builder). Root in the
+          buildObject → lowerMethod capture threading.
+        * PropertyReference 4 (bound property refs), KClass 3
+          (safeCast, qualifiedName), Regex 3 (options field, matchAt
+          bounds, empty-match split around surrogates), EnumEntries
+          factory 3, GroupingTest others (local-fn-on-String ext
+          countVowels, groupingProducers recursion depth).
+      - **Checkpoint 2026-07-05e: inventory ~63 (from 66 pre-anon-fix;
+        full sweep pending).** Landed since 66: anon-object capture chain
+        (resolveCapture anon branch, labeled-receiver capture without
+        scope caching) — the WHOLE stdlib object-expression family works
+        (Sequence.minus lazy + family, FilteringSequence nested anons,
+        Grouping fold/reduce/countEach); Type::localExt references;
+        keyed Grouping.fold passes the key; nullable declared receivers
+        carry their head (String?.orEmpty picks by static type); user
+        CharSequence implementations re-dispatch text ops via toString.
+        StringTest's remaining 5 all pass standalone — they need
+        in-test-class replication (local operator funs shadowing `in`,
+        StringBuilder-wrapped args via withTwoCharSequenceArgs); use the
+        MiniSizes.kt technique. SequenceTest.orEmpty residue =
+        emptySequence() must be a per-process singleton for identity
+        asserts. ContainerBuilder "is not same" trio = same singleton
+        story for emptyList/Set/Map after build of empty builders.
+      - **Named remainder** (real, deterministic, 115 total): ArraysTest
+        contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
+        copyRangeInto (`UIntArray expects an Int size`),
+        copyOfWithInitializer, sortedTests (`toArray` on
+        `kotlin.String`), shuffle (now an Illegal-value assertion deeper
+        in the test); NumbersTest.sizeInBitsAndBytes (Type);
+        EnumEntriesFactoryTest ×3; CollectionTest
+        abstractCollectionToArray / sumOf / plusCollectionInference /
+        toStringContainingThis.
       Also recorded: the remaining expect-with-impl drops in `retainDecl`
       stay until the registry carries declaration-aligned entries (the
       `retainDecl` comment marks it); `kotlin.String.repeat` vs
