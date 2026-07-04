@@ -441,6 +441,10 @@ pub const Inst = union(enum) {
         /// a synthesized closure (a suspend body) whose own kind carries no
         /// receiver.
         static_recv: ?ConstId = null,
+        /// Explicit call-site type arguments (`arrayOf<ULong>(...)`),
+        /// preserved through the deferred form so the global leg can
+        /// type its dispatch (unsigned literal coercion, reified serving).
+        type_args: []ConstId = &.{},
     },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host.store_global` so a

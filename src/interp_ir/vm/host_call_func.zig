@@ -1254,6 +1254,46 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
 }
 
 pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
+    // `arrayOf<ULong>(1u, 2u)` — an unsigned literal carries its DEFAULT
+    // tag (UInt) and the explicit element-type argument must coerce it,
+    // exactly as kotlinc types the literal by its expected type. Retag
+    // integral args to the requested unsigned width before dispatch.
+    if (type_args.len == 1 and funcAt(module, func) != null) {
+        const f = funcAt(module, func).?;
+        if (std.mem.eql(u8, f.name, "arrayOf") and std.mem.startsWith(u8, f.fqn, "kotlin")) {
+            const want: ?Value = switch (type_args[0].len) {
+                0 => null,
+                else => if (std.mem.eql(u8, type_args[0], "ULong"))
+                    Value{ .ULong = 0 }
+                else if (std.mem.eql(u8, type_args[0], "UInt"))
+                    Value{ .UInt = 0 }
+                else if (std.mem.eql(u8, type_args[0], "UShort"))
+                    Value{ .UShort = 0 }
+                else if (std.mem.eql(u8, type_args[0], "UByte"))
+                    Value{ .UByte = 0 }
+                else
+                    null,
+            };
+            if (want) |w| {
+                const retagged = try allocator.alloc(Value, args.len);
+                defer if (runtime.freeScratch()) allocator.free(retagged);
+                for (args, retagged) |v, *slot| {
+                    slot.* = if (v.asU64()) |u| switch (w) {
+                        .ULong => Value{ .ULong = u },
+                        .UInt => Value{ .UInt = @truncate(u) },
+                        .UShort => Value{ .UShort = @truncate(u) },
+                        .UByte => Value{ .UByte = @truncate(u) },
+                        else => v,
+                    } else v;
+                }
+                return callFuncTypedInner(self, allocator, module, func, retagged, arg_names, type_args, exact);
+            }
+        }
+    }
+    return callFuncTypedInner(self, allocator, module, func, args, arg_names, type_args, exact);
+}
+
+fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
     // Reified enum reflection: `enumValues<T>()` / `enumValueOf<T>(name)` /
     // `enumEntries<T>()` (whose inline body survives as the
     // `enumEntriesIntrinsic` header — an `expect` with no compiled

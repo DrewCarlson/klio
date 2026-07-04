@@ -2790,7 +2790,20 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // receiver-split / `this`-capture binding above. Pushing the
             // dynamic caller's `this` would hand the body a receiver it
             // never lexically saw.
-            const result = host.callValueNamed(allocator, &callee_v, arg_values_list.items, names_list.items);
+            const result = blk: {
+                // Explicit call-site type args reach the host so an
+                // unsigned element-type argument can coerce integral
+                // literals before the intrinsic (`arrayOf<ULong>(1u)`).
+                if (cv.type_args.len != 0) {
+                    var ta_buf: [4][]const u8 = undefined;
+                    const n_ta = @min(cv.type_args.len, ta_buf.len);
+                    for (cv.type_args[0..n_ta], ta_buf[0..n_ta]) |cid, *slot| {
+                        slot.* = constStr(frame.module, cid) orelse "";
+                    }
+                    break :blk host.callValueNamedTyped(allocator, &callee_v, arg_values_list.items, names_list.items, ta_buf[0..n_ta]);
+                }
+                break :blk host.callValueNamed(allocator, &callee_v, arg_values_list.items, names_list.items);
+            };
             switch (try result) {
                 .ok => |rv| {
                     var out = rv;
@@ -3696,7 +3709,20 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             };
             if (global) |callee| {
                 orAudit("CallMemberOrGlobal", name_str, if (by_id != null) "global_id" else "global", -1, null);
-                switch (try host.callValueNamed(allocator, &callee, arg_values, names)) {
+                // Explicit call-site type args survive the deferred form;
+                // a typed value dispatch lets the host coerce unsigned
+                // literals / serve reified intrinsics by them.
+                if (cmg.type_args.len != 0) {
+                    var ta_buf: [4][]const u8 = undefined;
+                    const n_ta = @min(cmg.type_args.len, ta_buf.len);
+                    for (cmg.type_args[0..n_ta], ta_buf[0..n_ta]) |cid, *slot| {
+                        slot.* = constStr(frame.module, cid) orelse "";
+                    }
+                    switch (try host.callValueNamedTyped(allocator, &callee, arg_values, names, ta_buf[0..n_ta])) {
+                        .ok => |v| result = v,
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                } else switch (try host.callValueNamed(allocator, &callee, arg_values, names)) {
                     .ok => |v| result = v,
                     .err => |e| return raiseStep(frame, e),
                 }
@@ -5209,6 +5235,11 @@ pub const NullHost = struct {
     pub fn callableAcceptsArgs(self: *NullHost, v: *const Value, n_args: usize) ?bool {
         _ = .{ self, v, n_args };
         return null;
+    }
+
+    pub fn callValueNamedTyped(self: *NullHost, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8) Allocator.Error!EvalResult {
+        _ = type_args;
+        return self.callValueNamed(allocator, callee, args, arg_names);
     }
 
     pub fn callableReceiverShape(self: *NullHost, v: *const Value) ?ReceiverShape {

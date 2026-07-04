@@ -6209,6 +6209,7 @@ fn lowerUnresolvedBareCall(
             .recv = this_reg,
             .func = static_ext,
             .static_recv = try cmgStaticRecv(b),
+            .type_args = try internTypeArgs(b.allocator, b.module, ast_type_args),
         } });
         return dst;
     }
@@ -6223,6 +6224,7 @@ fn lowerUnresolvedBareCall(
         .n_args = run[1],
         .arg_names = arg_names,
         .static_recv = try cmgStaticRecv(b),
+        .type_args = try internTypeArgs(b.allocator, b.module, ast_type_args),
     } });
     return dst;
 }
