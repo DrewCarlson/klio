@@ -3855,6 +3855,9 @@ fn sequenceMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
                 return .{ .ok = try stdlib.makeSeqIter(allocator, fresh) };
             }
         }
+        if (stdlib.oneShotConsumeCheck(allocator, receiver.*) catch null) |re| {
+            return .{ .err = try mapRuntimeError(allocator, re) };
+        }
         var sv = receiver.*;
         if (runtime.reclaimEnabled()) sv.retain();
         return .{ .ok = try stdlib.makeSeqIter(allocator, sv) };
@@ -5194,6 +5197,25 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
                 st.gen_started = true;
                 if (gen.seed) |s| {
                     var sv = s.asPtr().*;
+                    if (gen.seed_is_fn) {
+                        var intr = makeIntrinsicHost(self);
+                        defer deinitIntrinsicHost(&intr);
+                        const ih = intr.intrinsicHost();
+                        const r = try ih.invokeCallable(&sv, &.{}, out);
+                        switch (r) {
+                            .ok => |rv| {
+                                if (rv == .Null) {
+                                    st.done = true;
+                                    return .done;
+                                }
+                                var v = rv;
+                                if (runtime.reclaimEnabled()) v.retain();
+                                st.gen_cur = v;
+                                return .{ .value = v };
+                            },
+                            .err => |re| return .{ .err = try mapRuntimeError(allocator, re) },
+                        }
+                    }
                     if (runtime.reclaimEnabled()) sv.retain();
                     st.gen_cur = sv;
                     return .{ .value = sv };

@@ -347,11 +347,17 @@ pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const data = try ObjRef(SequenceData).init(ctx.allocator, .{
             .source = .{ .Generate = .{ .seed = null, .next = next } },
             .ops = &.{},
+            // The nullary form is stateful: the source constrains it to
+            // one consumption.
+            .one_shot = true,
         });
         return ok(.{ .Sequence = data });
     }
     if (args.len == 2 and isLambdaLike(args[1])) {
         var seed: ?ValueBox = null;
+        // `generateSequence(seedFunction, nextFunction)`: the seed is a
+        // producer invoked at each iteration start.
+        const seed_is_fn = isLambdaLike(args[0]);
         if (args[0] != .Null) {
             args[0].retain();
             seed = try Value.boxRef(ctx.allocator, args[0]);
@@ -359,7 +365,7 @@ pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         args[1].retain();
         const next = try Value.boxRef(ctx.allocator, args[1]);
         const data = try ObjRef(SequenceData).init(ctx.allocator, .{
-            .source = .{ .Generate = .{ .seed = seed, .next = next } },
+            .source = .{ .Generate = .{ .seed = seed, .next = next, .seed_is_fn = seed_is_fn } },
             .ops = &.{},
         });
         return ok(.{ .Sequence = data });
@@ -628,6 +634,7 @@ fn materialiseSequenceBounded(
     if (seq_val.* != .Sequence) {
         return .{ .err = .{ .Type = "materialise_sequence: not a Sequence" } };
     }
+    if (try collections.oneShotConsumeCheck(allocator, seq_val.*)) |e| return .{ .err = e };
     const sg = seq_val.Sequence.borrow();
     defer sg.deinit();
     const seq = sg.get();
@@ -694,6 +701,19 @@ fn materialiseSequenceBounded(
             .Generate => |gen| {
                 var cur: ?Value = if (gen.seed) |s| blk: {
                     const sv = s.asPtr().*;
+                    if (gen.seed_is_fn) {
+                        const r = try invokeCallable(host, &sv, &.{}, out);
+                        switch (r) {
+                            .ok => |rv| {
+                                if (rv == .Null) break :blk null;
+                                break :blk rv;
+                            },
+                            .err => |e| {
+                                output.deinit(allocator);
+                                return .{ .err = e };
+                            },
+                        }
+                    }
                     sv.retain();
                     break :blk sv;
                 } else null;
@@ -815,6 +835,19 @@ fn materialiseSequenceBounded(
             const limit: usize = 1024;
             var cur: ?Value = if (gen.seed) |s| blk: {
                 const sv = s.asPtr().*;
+                if (gen.seed_is_fn) {
+                    const r = try invokeCallable(host, &sv, &.{}, out);
+                    switch (r) {
+                        .ok => |rv| {
+                            if (rv == .Null) break :blk null;
+                            break :blk rv;
+                        },
+                        .err => |e| {
+                            items.deinit(allocator);
+                            return .{ .err = e };
+                        },
+                    }
+                }
                 sv.retain();
                 break :blk sv;
             } else null;

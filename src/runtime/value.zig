@@ -984,6 +984,11 @@ pub const SeqIterStateRef = ObjRef(SeqIterState);
 pub const SequenceData = struct {
     source: SequenceSource,
     ops: []SeqOp,
+    /// `generateSequence { … }` (nullary form) consumes once: the second
+    /// iteration throws IllegalStateException, matching the source's
+    /// `.constrainOnce()`.
+    one_shot: bool = false,
+    consumed: bool = false,
 
     /// GC out-edges: the lazy source (eager items, or the seed/step generator
     /// closures) and every pipeline op's lambda. Without this a `Sequence` held
@@ -1023,8 +1028,10 @@ pub const SequenceSource = union(enum) {
     /// Eager-known elements (`asSequence` / `sequenceOf`).
     Items: ValueSlice,
     /// `generateSequence(seed) { it -> next }`. `seed` is null for the
-    /// nullary form.
-    Generate: struct { seed: ?ValueBox, next: ValueBox },
+    /// nullary form. `seed_is_fn` marks the `generateSequence(seedFn,
+    /// next)` form: the boxed seed is a producer invoked at each
+    /// iteration start.
+    Generate: struct { seed: ?ValueBox, next: ValueBox, seed_is_fn: bool = false },
     /// `sequence { yield(...) }` / `iterator { ... }` — a lazy coroutine
     /// builder driven one element at a time.
     Builder: BuilderStateRef,

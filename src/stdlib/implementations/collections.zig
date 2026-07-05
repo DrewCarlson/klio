@@ -3118,6 +3118,25 @@ fn seqCall(host: IntrinsicHost, f: *const Value, args: []const Value, out: Outpu
     };
 }
 
+/// A one-shot sequence (`generateSequence { … }`) consumes once; the
+/// second iteration throws, matching the source's `.constrainOnce()`.
+/// Marks the sequence consumed on first use.
+pub fn oneShotConsumeCheck(a: Allocator, seq_val: Value) Error!?RuntimeError {
+    {
+        const g = seq_val.Sequence.borrow();
+        defer g.deinit();
+        if (!g.get().one_shot) return null;
+        if (g.get().consumed) {
+            const exc = try makeException(a, "kotlin.IllegalStateException", "This sequence can be consumed only once.");
+            return .{ .Thrown = exc };
+        }
+    }
+    const gm = seq_val.Sequence.borrowMut();
+    defer gm.deinit();
+    gm.get().consumed = true;
+    return null;
+}
+
 pub fn materialiseSequence(a: Allocator, host: IntrinsicHost, out: Output, seq_val: Value) Error!SeqOutcome {
     return materialiseSequenceBounded(a, host, out, seq_val, null);
 }
@@ -3126,6 +3145,7 @@ pub fn materialiseSequenceBounded(a: Allocator, host: IntrinsicHost, out: Output
     if (seq_val != .Sequence) {
         return .{ .err = .{ .Type = "materialise_sequence: not a Sequence" } };
     }
+    if (try oneShotConsumeCheck(a, seq_val)) |e| return .{ .err = e };
     const seq_g = seq_val.Sequence.borrow();
     defer seq_g.deinit();
     const seq = seq_g.get().*;
@@ -3332,6 +3352,14 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
         .Generate => |gen| {
             var cur: ?Value = if (gen.seed) |s| blk: {
                 const sv = s.asPtr().*;
+                if (gen.seed_is_fn) {
+                    const r = switch (try seqCall(host, &sv, &.{}, out)) {
+                        .value => |v| v,
+                        .err => |e| return .{ .err = e },
+                    };
+                    if (r == .Null) return .{ .items = try a.alloc(Value, 0) };
+                    break :blk r;
+                }
                 sv.retain();
                 break :blk sv;
             } else null;
@@ -3424,6 +3452,14 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             const limit: usize = 1024;
             var cur: ?Value = if (gen.seed) |s| blk: {
                 const sv = s.asPtr().*;
+                if (gen.seed_is_fn) {
+                    const r = switch (try seqCall(host, &sv, &.{}, out)) {
+                        .value => |v| v,
+                        .err => |e| return .{ .err = e },
+                    };
+                    if (r == .Null) break :blk null;
+                    break :blk r;
+                }
                 sv.retain();
                 break :blk sv;
             } else null;
