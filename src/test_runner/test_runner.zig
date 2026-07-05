@@ -322,6 +322,15 @@ fn describeThrow(gpa: Allocator, v: Value) []const u8 {
 }
 
 fn record(st: *RunState, display: []const u8, outcome: Outcome, detail: ?[]const u8) Allocator.Error!void {
+    // Stream per-test progress to stderr as each test completes — the
+    // stdout report stays a single post-run block (consumers parse it),
+    // but a long corpus run is observable while it happens.
+    const tag = switch (outcome) {
+        .passed => "PASSED",
+        .failed => "FAILED",
+        .skipped => "SKIPPED",
+    };
+    std.debug.print("[test] {s} {s}\n", .{ display, tag });
     try st.results.append(st.gpa, .{
         .display = try st.gpa.dupe(u8, display),
         .outcome = outcome,
