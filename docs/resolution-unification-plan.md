@@ -520,29 +520,43 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         gate), ContainerBuilder 3 (subList live views — agent design
         recorded), CollectionTest 3, Uuid 2, Exception 2, StringTest ~2
         (local fn overload selection — agent design recorded), singles.
-      - **EXACT STATE 2026-07-05 (session end, work stopped mid-batch).**
-        LAST GREEN COMMIT: 2bfaeef9 — inventory 45 dual-identical
-        (119 at session start), gate green, ratchet raised to 2080.
-        THE WORKING TREE ON TOP OF IT IS GATE-RED: batch-3 is staged but
-        has one unresolved regression — the three compose e2e programs
-        (compose_frame_clock / compose_snapshot_flow / compose_stateflow)
-        fail with `Vm::get_field storage on kotlin.Array`. Trigger: the
-        new `MutableList<T>.fill/shuffle` actuals in
-        kotlin-klio/kotlin-collections/CollectionsActuals.kt changed the
-        `fill` candidate set, and some compose-pack callsite
-        (PersistentVector/Recomposer use `Array.fill`) now binds the
-        UIntArray.fill SOURCE decl (reads `.storage`). Two disproof
-        guards were added (extensionFnFallback lenient pass +
-        callNamedOverload via builtinReceiverDisproven in
-        host_call_member.zig) but the failing path goes through NEITHER
-        — next probe: run examples/compose_frame_clock.kt under
-        KLIO_TRACE_RESOLVE=fill KLIO_TRACE_PATH=1 to find the actual
-        dispatch arm (suspect: pack-module static pick or the walk's
-        intrinsic probe order). Fallback option if it resists: drop just
-        the `fill` actual (keep shuffle), which restores gate-green at
-        the cost of MutableCollectionTest.listFill.
-        BATCH-3 STAGED IN THE TREE (all module tests green, units green;
-        only the compose regression blocks the gate):
+      - **EXACT STATE 2026-07-05 (batch-3 landed + compose regression
+        root-caused and fixed): 36 failures dual-identical** (45 at
+        2bfaeef9, 119 at session start), gate green, ratchet 2080 holds
+        (~2114 passes).
+        The compose regression's real mechanism: the failing dispatch arm
+        was `resolveExtOverloadLocal` (host_call_member.zig), the
+        named-arg extension picker behind `userMethodNamed` — the third
+        path, reached by `content.fill(null, fromIndex=…, toIndex=…)` in
+        MutableVector.kt after `stdlibNamedDispatch`'s probe chain broke
+        on `kotlin.collections.fill` (paramNames hit, intrinsic miss →
+        loop break). It collected candidates with NO receiver disproof,
+        so the four unsigned-array `fill` source decls (the only
+        surviving same-name source candidates once the MutableList.fill
+        actual shifted the set) were scored on a plain `Array` receiver
+        and UIntArray.fill won. Fix: the candidate loop now applies the
+        same disproof trio as the lenient ext pass
+        (`receiverViolatesTypeParamBound`, `builtinReceiverDisproven`,
+        `argDefinitelyNotParamType` on the receiver). Landing it exposed
+        a LATENT bug in `builtinReceiverDisproven` itself: it compared
+        the declared receiver ("UByteArray") against the prim view's
+        ELEMENT name (`PrimitiveArrayKind.simpleName()` = "UByte"), so
+        every genuine unsigned-array receiver was disproven against its
+        own extensions — harmless on the old cold path, a 40+-failure
+        sweep regression on the hot one. Fixed to compare
+        `simpleName(view.typeFqn())`; unit test pins the relation. Net:
+        the trio also fixed real mis-binds (MutableCollectionTest
+        listFill now passes; ArraysTest sortedTests /
+        contentDeepToStringNoRecursion / copyRangeInto /
+        copyOfWithInitializer and NumbersTest.sizeInBitsAndBytes cleared
+        with batch-3).
+        Verification-loop lesson recorded: `commontest-sweep.py
+        --filter` matches fewer files than the filter list suggests —
+        trust only full-sweep counts for regression verdicts; and the
+        gate's sweep step does NOT enforce the 2080 ratchet (that lives
+        in itest-stdlib_commontest only), so GATE GREEN alone does not
+        prove the ratchet.
+        BATCH-3 (landed with the above):
         * emptySequence() process singleton (arena profile) + reset hook.
         * subList live-view read-through (Value.refreshSublistView +
           call sites; arena-only, reclaim guarded).
@@ -644,17 +658,31 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
             (DurationTest.parseAndFormatInUnits).
         19. GroupingTest.groupingProducers: sourceIterator recursion on
             the Grouping synth — undiagnosed.
-        20. SequenceTest.orEmpty residue should be fixed by the staged
-            emptySequence singleton — verify with the batch.
-      - **Named remainder** (real, deterministic, 115 total): ArraysTest
-        contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
-        copyRangeInto (`UIntArray expects an Int size`),
-        copyOfWithInitializer, sortedTests (`toArray` on
-        `kotlin.String`), shuffle (now an Illegal-value assertion deeper
-        in the test); NumbersTest.sizeInBitsAndBytes (Type);
-        EnumEntriesFactoryTest ×3; CollectionTest
-        abstractCollectionToArray / sumOf / plusCollectionInference /
-        toStringContainingThis.
+        20. SequenceTest.orEmpty residue — VERIFIED NOT fixed by the
+            emptySequence singleton (still fails post-batch: `Expected
+            <Sequence>, actual <Sequence>` — an identity, not type,
+            mismatch); still open.
+      - **Named remainder (the full 36, post-batch, dual-identical)**:
+        ArraysTest.orEmptyNull (pre-existing at 2bfaeef9, verified via
+        worktree build); Base64Test.common; CollectionTest
+        abstractCollectionToArray / plusCollectionInference / sumOf;
+        ConcurrentModificationTest mutableList / subList;
+        ContainerBuilderTest buildList / buildMap / listBuilderSubList;
+        CoroutineContextTest.testInterceptor;
+        CoroutinesReferenceValuesTest.testBadClass;
+        DurationTest.parseAndFormatInUnits; EnumEntriesFactoryTest ×3;
+        EnumEntriesListTest ×2; ExceptionTest ×2;
+        GroupingTest.groupingProducers;
+        KTypeProjectionTest.constructorArgumentsValidation;
+        MapTest.modifiedBackingMapOfEntry; MutableCollectionTest.shuffle
+        (`lastIndex` on ArrayDeque.Companion); PropertyReferenceTest
+        extensionProperties / covariantProperties / memberProperties;
+        ReversedViewsTest.testIteratorRemove;
+        SequenceBuilderTest testExceptionInCoroutine /
+        testParallelIteration; SequenceTest.orEmpty; SetOperationsTest
+        intersectByteArray / intersectShortArray;
+        StringBuilderTest.overflow; StringTest.compareToIgnoreCase;
+        UuidTest.parseInvalid. Every one maps to a backlog item above.
       Also recorded: the remaining expect-with-impl drops in `retainDecl`
       stay until the registry carries declaration-aligned entries (the
       `retainDecl` comment marks it); `kotlin.String.repeat` vs

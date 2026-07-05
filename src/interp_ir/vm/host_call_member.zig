@@ -7105,7 +7105,10 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
             for (unsigned_arrays) |ua| {
                 if (std.mem.eql(u8, declared, ua)) {
                     const view = arr.prim orelse return true;
-                    return !std.mem.eql(u8, view.simpleName(), declared);
+                    // Compare against the ARRAY type name: the kind's
+                    // simpleName is the element ("UByte"), never the
+                    // declared receiver ("UByteArray").
+                    return !std.mem.eql(u8, simpleName(view.typeFqn()), declared);
                 }
             }
             return false;
@@ -8016,6 +8019,13 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
             if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
+            // A candidate whose declared receiver definitely excludes this
+            // runtime receiver is not applicable at all (kotlinc drops it):
+            // `UIntArray.fill` never binds a plain `Array` receiver even when
+            // no other overload survives the walk.
+            if (receiverViolatesTypeParamBound(self, fid, &f.params[0].ty, receiver)) continue;
+            if (builtinReceiverDisproven(receiver, f.params[0].ty.name)) continue;
+            if (argDefinitelyNotParamType(self, &f.params[0].ty, receiver)) continue;
             // Full applicability under the actual binding (kotlinc semantics):
             // each supplied name must hit a declared param, positional args
             // fill leading params (with the trailing-lambda rule), every
@@ -8031,9 +8041,18 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
             candidates.append(allocator, .{ .fid = fid, .func = f }) catch {};
         }
     }
+    if (trace.enabled(name)) {
+        for (candidates.items) |c| {
+            const recv_ty = if (c.func.params.len > 0) c.func.params[0].ty.name else "?";
+            trace.emit("extLocal cand fid={d} fqn={s} recv_ty={s} nparams={d}", .{ c.fid.int(), c.func.fqn, recv_ty, c.func.params.len });
+        }
+    }
     if (candidates.items.len == 0) return null;
     if (candidates.items.len == 1) return candidates.items[0].fid;
     const chosen = scoreExtCandidates(self, allocator, receiver, candidates.items, args) catch return null;
+    if (trace.enabled(name)) {
+        if (chosen) |c| trace.emit("extLocal chose fid={d} fqn={s} recv_ty={s}", .{ c.fid.int(), c.func.fqn, c.func.params[0].ty.name });
+    }
     return if (chosen) |c| c.fid else null;
 }
 
@@ -8707,6 +8726,18 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
 }
 
 const testing = std.testing;
+
+test "unsigned prim-array kinds resolve to their ARRAY receiver name" {
+    // builtinReceiverDisproven compares a declared unsigned-array receiver
+    // against simpleName(view.typeFqn()); the kind's own simpleName is the
+    // ELEMENT name and must never be used for that comparison.
+    const kinds = [_]runtime.PrimitiveArrayKind{ .UInt, .ULong, .UShort, .UByte };
+    const names = [_][]const u8{ "UIntArray", "ULongArray", "UShortArray", "UByteArray" };
+    for (kinds, names) |k, n| {
+        try std.testing.expectEqualStrings(n, simpleName(k.typeFqn()));
+        try std.testing.expect(!std.mem.eql(u8, k.simpleName(), n));
+    }
+}
 
 test "simpleName returns the trailing dotted segment" {
     try testing.expectEqualStrings("C", simpleName("a.b.C"));
