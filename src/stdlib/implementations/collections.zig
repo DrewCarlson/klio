@@ -345,12 +345,30 @@ fn thrown(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!EvalResult 
 /// `UnsupportedOperationException` (Kotlin: a `List`/`Set`/`Map` built read-only
 /// rejects `add`/`remove`/`set`/`put`/`clear`). Returns the thrown result when
 /// `args[0]` is an immutable collection, else null so the caller proceeds.
+/// High bit of a shared `mod_count`: the builder that owned this counter
+/// froze (`build*` returned), so every VIEW sharing the cell is
+/// read-only from now on even though its own `mutable` flag was minted
+/// while the builder was live.
+pub const FROZEN_MOD_BIT: u64 = 1 << 63;
+
+fn modCountFrozen(mc: ?ObjRef(u64)) bool {
+    const cell = mc orelse return false;
+    const g = cell.borrow();
+    defer g.deinit();
+    return (g.get().* & FROZEN_MOD_BIT) != 0;
+}
+
 fn readOnlyMutationGuard(a: Allocator, args: []const Value) Error!?EvalResult {
     if (args.len == 0) return null;
     const read_only = switch (args[0]) {
-        .List => |l| !l.mutable,
-        .Set => |s| !s.mutable,
-        .Map => |m| !m.mutable,
+        .List => |l| !l.mutable or modCountFrozen(l.mod_count),
+        .Set => |s| !s.mutable or modCountFrozen(s.mod_count),
+        .Map => |m| blk: {
+            if (!m.mutable) break :blk true;
+            const g = m.entries.borrow();
+            defer g.deinit();
+            break :blk modCountFrozen(g.get().mod_count);
+        },
         else => false,
     };
     if (!read_only) return null;
@@ -596,6 +614,7 @@ fn recvListItems(a: Allocator, args: []const Value, what: []const u8) Error!List
         // An array `.asList()` view re-reads its scalar source so later array
         // writes show through before any read of `items`.
         args[0].refreshArrayView();
+        args[0].refreshSublistView();
         return .{ .items = args[0].List.items };
     }
     return .{ .err = typeErr(try fmt(a, "{s} requires a List receiver", .{what})) };
@@ -716,6 +735,7 @@ pub fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcom
     switch (v) {
         .List, .Set, .Array => {
             if (v == .List) (&v).refreshArrayView();
+            if (v == .List) (&v).refreshSublistView();
             const items = switch (v) {
                 .List => |l| try snapshotItems(a, l.items),
                 .Set => |s| try snapshotItems(a, s.items),
@@ -4378,6 +4398,7 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .List) return typeErr("subList requires a List receiver");
     const recv = ctx.args[0];
     recv.refreshArrayView();
+    recv.refreshSublistView();
     const from = if (ctx.args.len > 1) (ctx.args[1].asI64() orelse return typeErr("subList requires Int fromIndex")) else return typeErr("subList requires Int fromIndex");
     const to = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse return typeErr("subList requires Int toIndex")) else return typeErr("subList requires Int toIndex");
     // A subList over a subList flattens to a direct window on the same root
@@ -5089,6 +5110,38 @@ pub fn coll_map_to_mutable_map(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_map_to_map(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Map) return typeErr("toMap requires a Map receiver");
+    // `toMap(destination)`: merge into the supplied mutable map and
+    // return IT (live, mutable), never a read-only snapshot.
+    if (ctx.args.len >= 2 and ctx.args[1] == .Map) {
+        const src = try snapshotEntries(a, ctx.args[0].Map.entries);
+        defer if (runtime.freeScratch()) a.free(src);
+        const dest = ctx.args[1];
+        const g = dest.Map.entries.borrowMut();
+        defer g.deinit();
+        for (src) |kv| {
+            var found = false;
+            for (g.get().pairs.items) |*slot| {
+                if (eqBoxed(&slot.key, &kv.key)) {
+                    if (runtime.reclaimEnabled()) {
+                        kv.value.retain();
+                        slot.value.release(a);
+                    }
+                    slot.value = kv.value;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (runtime.reclaimEnabled()) {
+                    kv.key.retain();
+                    kv.value.retain();
+                }
+                try g.get().pairs.append(a, kv);
+                try g.get().noteAppended(a, g.get().pairs.items.len - 1);
+            }
+        }
+        return ok(dest);
+    }
     return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), false));
 }
 

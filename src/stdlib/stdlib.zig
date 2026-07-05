@@ -50,6 +50,7 @@ pub const materialise_sequence_bounded = implementations.materialise_sequence_bo
 pub const makeSeqIter = implementations.sequence.makeSeqIter;
 pub const oneShotConsumeCheck = implementations.collections.oneShotConsumeCheck;
 pub const resetEmptyCollectionSingletons = implementations.collections.resetEmptyCollectionSingletons;
+pub const resetEmptySequenceSingleton = implementations.sequence.resetEmptySequenceSingleton;
 pub const freshBuilderSeq = implementations.collections.freshBuilderSeq;
 pub const primitive_companion_const = implementations.primitive_companion_const;
 pub const compareUtf16 = text.compareUtf16;

@@ -1657,6 +1657,12 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
                 for (dg.get().supertype_names) |sn| try queue.append(allocator, sn);
             }
         }
+        // An inner class reaches the lexically ENCLOSING class's
+        // companion too (AbstractList.ListIteratorImpl's init calls
+        // checkPositionIndex on AbstractList's companion).
+        if (std.mem.lastIndexOfAny(u8, cname, ".$")) |sep| {
+            if (sep > 0) try queue.append(allocator, cname[0..sep]);
+        }
     }
     return null;
 }
@@ -3755,6 +3761,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
     // An array `.asList()` view re-reads its scalar source so the iterator
     // snapshot reflects later array writes.
     receiver.refreshArrayView();
+    receiver.refreshSublistView();
     switch (receiver.*) {
         .List => |l| {
             // A mutable list shares its backing so `MutableIterator.remove()`
@@ -4462,6 +4469,20 @@ fn ordToInt(o: Ordering) i64 {
     };
 }
 
+/// Natural-order compare falling back to the user `compareTo` when the
+/// pair is not builtin-comparable (Uuid, user Comparable classes).
+fn compareValuesHostAware(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!union(enum) { ord: Ordering, err: EvalError } {
+    if (compareValuesBuiltin(a, b)) |o| return .{ .ord = o };
+    const r = try callMemberRec(self, allocator, a, "compareTo", &.{b.*});
+    switch (r) {
+        .ok => |v| {
+            const i = v.asI64() orelse return .{ .err = try typeErr(allocator, "incomparable values", .{}) };
+            return .{ .ord = if (i < 0) .lt else if (i > 0) .gt else .eq };
+        },
+        .err => |e| return .{ .err = e },
+    }
+}
+
 /// Builtin natural-order comparison. `null` when the pair is not
 /// builtin-comparable (mirrors `compare_values` rejecting Instances).
 fn compareValuesBuiltin(a: *const Value, b: *const Value) ?Ordering {
@@ -4518,7 +4539,10 @@ fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Value,
         const descending = cmp.descending;
         sg.deinit();
         if (steps.len == 0) {
-            ord = compareValuesBuiltin(&a, &b) orelse return .{ .err = try typeErr(allocator, "incomparable values", .{}) };
+            ord = switch (try compareValuesHostAware(self, allocator, &a, &b)) {
+                .ord => |o| o,
+                .err => |e| return .{ .err = e },
+            };
         } else {
             for (steps) |step| {
                 const sel = step.selector;
@@ -4557,7 +4581,10 @@ fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Value,
                         };
                         break :blk if (nval < 0) .lt else if (nval > 0) .gt else .eq;
                     }
-                    break :blk compareValuesBuiltin(&ka, &kb) orelse return .{ .err = try typeErr(allocator, "incomparable values", .{}) };
+                    break :blk switch (try compareValuesHostAware(self, allocator, &ka, &kb)) {
+                        .ord => |o| o,
+                        .err => |e| return .{ .err = e },
+                    };
                 };
                 const flipped = if (step.descending) flipOrd(o) else o;
                 if (flipped != .eq) {
@@ -6445,8 +6472,21 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     }
     if (args.len == 0 and std.mem.eql(u8, name, "hashCode")) {
         const g = inst.borrow();
-        defer g.deinit();
-        return .{ .ok = Value.newInt(@bitCast(g.get().identity)) };
+        // A data/value class without a hashCode override hashes
+        // structurally, not by identity — a value class implementing an
+        // interface that redeclares hashCode still has value semantics.
+        const structural = blk: {
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk cg.get().is_data or cg.get().is_value;
+        };
+        g.deinit();
+        if (structural) {
+            return .{ .ok = .{ .Int = kotlinHashCode(receiver) } };
+        }
+        const g2 = inst.borrow();
+        defer g2.deinit();
+        return .{ .ok = Value.newInt(@bitCast(g2.get().identity)) };
     }
     if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
         // A user `Map.Entry` implementation with no `equals` override follows
@@ -6455,6 +6495,18 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         // `MapEntry` or another `Map.Entry` instance).
         if (Value.mapEntryContractEq(receiver, &args[0])) |eq| {
             return .{ .ok = boolVal(eq) };
+        }
+        // Data/value classes compare structurally even when an interface
+        // in their hierarchy redeclares equals (ValueTimeMark).
+        {
+            const g = inst.borrow();
+            const cg = g.get().class.borrow();
+            const structural = cg.get().is_data or cg.get().is_value;
+            cg.deinit();
+            g.deinit();
+            if (structural) {
+                return .{ .ok = boolVal(Value.structuralEq(receiver, &args[0])) };
+            }
         }
         if (args[0] == .Instance) {
             return .{ .ok = boolVal(ObjRef(InstanceData).ptrEq(inst, args[0].Instance)) };
@@ -7042,6 +7094,26 @@ pub fn delegatedInterfaceDeclares(self: *VmHost, allocator: Allocator, inst: Obj
 
 const Candidate = struct { fid: FuncId, func: Func };
 
+/// A candidate whose declared receiver names a specific BUILTIN shape a
+/// builtin runtime value definitely is not (UIntArray.fill offered a
+/// plain Array, String.x offered a List). Instances stay unproven —
+/// their hierarchies decide elsewhere.
+pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bool {
+    const unsigned_arrays = [_][]const u8{ "UIntArray", "ULongArray", "UShortArray", "UByteArray" };
+    switch (receiver.*) {
+        .Array => |arr| {
+            for (unsigned_arrays) |ua| {
+                if (std.mem.eql(u8, declared, ua)) {
+                    const view = arr.prim orelse return true;
+                    return !std.mem.eql(u8, view.simpleName(), declared);
+                }
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
     const want = args.len + 1;
     var visible_owners = try enclosingOwnerSet(self, allocator);
@@ -7158,6 +7230,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             var filtered: std.ArrayList(Candidate) = .empty;
             for (candidates.items) |c| {
                 if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) continue;
+                if (builtinReceiverDisproven(receiver, c.func.params[0].ty.name)) continue;
                 if (candidateArgsDisproven(self, &c.func, args)) continue;
                 // Arity applicability holds in the lenient pass too: a
                 // candidate that REQUIRES more args than supplied cannot

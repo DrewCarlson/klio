@@ -2287,6 +2287,9 @@ pub const Value = union(enum) {
             .Result => |x| b.* == .Result and x.ok == b.Result.ok and structuralEq(x.payload.asPtr(), b.Result.payload.asPtr()),
             .Class => |x| b.* == .Class and classFqnEq(x, b.Class),
             .IrClosure => |x| b.* == .IrClosure and x.id == b.IrClosure.id and ValueSlice.ptrEq(x.captures, b.IrClosure.captures),
+            .Comparator => |x| b.* == .Comparator and
+                ObjRef([]ComparatorStep).ptrEq(x.steps, b.Comparator.steps) and
+                x.descending == b.Comparator.descending,
             .BoundMethod => |x| b.* == .BoundMethod and std.mem.eql(u8, x.fqn, b.BoundMethod.fqn) and structuralEq(x.receiver.asPtr(), b.BoundMethod.receiver.asPtr()),
             .Instance => |x| b.* == .Instance and instanceEq(x, b.Instance),
             else => false,
@@ -2538,6 +2541,34 @@ pub const Value = union(enum) {
         var i: usize = 0;
         while (i < n and i < items.len) : (i += 1) {
             items[i] = bg.get().getAs(i, av.view_kind);
+        }
+    }
+
+    /// Re-read a live `subList` window's element cache from the parent
+    /// list so a parent element write shows through on the next view
+    /// access. In-place, clamped to the window; parent structural
+    /// changes not made through the view are undefined in Kotlin and
+    /// fail fast via the shared mod_count.
+    pub fn refreshSublistView(self: *const Value) void {
+        if (self.* != .List) return;
+        // Borrow-overwrite of owned slots: correct only where retain/
+        // release are no-ops (the arena profile; the GC traces the
+        // parent through the backing edge).
+        if (objcell.reclaimEnabled()) return;
+        const b = self.List.backing orelse return;
+        if (b.data != .sublist) return;
+        const sb = b.data.sublist;
+        const pg = sb.parent.borrow();
+        defer pg.deinit();
+        const pitems = pg.get().items;
+        if (sb.from >= pitems.len) return;
+        const avail = @min(sb.from + sb.len, pitems.len) - sb.from;
+        const ig = self.List.items.borrowMut();
+        defer ig.deinit();
+        const items = ig.get().items;
+        var i: usize = 0;
+        while (i < avail and i < items.len) : (i += 1) {
+            items[i] = pitems[sb.from + i];
         }
     }
 

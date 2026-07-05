@@ -5,6 +5,8 @@
 
 package kotlin.collections
 
+import kotlin.random.Random
+
 internal actual fun checkIndexOverflow(index: Int): Int {
     if (index < 0) throw ArithmeticException("Index overflow has happened.")
     return index
@@ -56,3 +58,14 @@ internal actual inline fun <K, V> buildMapInternal(capacity: Int, builderAction:
 // The interpreter's arrays are exact-sized; collection-to-array
 // termination is the identity, as on JS.
 internal actual fun <T> terminateCollectionToArray(collectionSize: Int, array: Array<T>): Array<T> = array
+
+// Platform hooks the baked AbstractCollection.toArray path calls bare;
+// the common implementations serve directly.
+internal actual fun collectionToArray(collection: Collection<*>): Array<Any?> = collectionToArrayCommonImpl(collection)
+internal actual fun <T> collectionToArray(collection: Collection<*>, array: Array<T>): Array<T> = collectionToArrayCommonImpl(collection, array)
+
+public actual fun <T> MutableList<T>.fill(value: T): Unit {
+    for (index in 0..lastIndex) this[index] = value
+}
+
+public actual fun <T> MutableList<T>.shuffle(): Unit = shuffle(Random)

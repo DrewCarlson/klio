@@ -738,7 +738,15 @@ pub fn tryInlineCallWithTypeArgs(
             try helpers.coerceNumericLiteralArg(b, a, p.ty.name.name)
         else
             null;
+        // A lambda argument bound to a declared function-typed param
+        // takes its arity from the declaration — a zero-`->` lambda for
+        // a `() -> R` param must NOT keep the parser's implicit `it`
+        // (which would swallow the first invocation slot as Null).
+        if ((a.* == .Lambda or a.* == .AnonFun) and p.ty.function != null) {
+            b.pending_lambda_arity = @intCast(p.ty.function.?.params.len);
+        }
         const r = coerced orelse try lowerExpr(b, a);
+        b.pending_lambda_arity = -1;
         arg_regs[i] = r;
         // A lambda argument is spliced inline (its body is expanded at the
         // call site), so it is never a closure value to box — skip boxing

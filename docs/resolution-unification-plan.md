@@ -520,6 +520,132 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         gate), ContainerBuilder 3 (subList live views — agent design
         recorded), CollectionTest 3, Uuid 2, Exception 2, StringTest ~2
         (local fn overload selection — agent design recorded), singles.
+      - **EXACT STATE 2026-07-05 (session end, work stopped mid-batch).**
+        LAST GREEN COMMIT: 2bfaeef9 — inventory 45 dual-identical
+        (119 at session start), gate green, ratchet raised to 2080.
+        THE WORKING TREE ON TOP OF IT IS GATE-RED: batch-3 is staged but
+        has one unresolved regression — the three compose e2e programs
+        (compose_frame_clock / compose_snapshot_flow / compose_stateflow)
+        fail with `Vm::get_field storage on kotlin.Array`. Trigger: the
+        new `MutableList<T>.fill/shuffle` actuals in
+        kotlin-klio/kotlin-collections/CollectionsActuals.kt changed the
+        `fill` candidate set, and some compose-pack callsite
+        (PersistentVector/Recomposer use `Array.fill`) now binds the
+        UIntArray.fill SOURCE decl (reads `.storage`). Two disproof
+        guards were added (extensionFnFallback lenient pass +
+        callNamedOverload via builtinReceiverDisproven in
+        host_call_member.zig) but the failing path goes through NEITHER
+        — next probe: run examples/compose_frame_clock.kt under
+        KLIO_TRACE_RESOLVE=fill KLIO_TRACE_PATH=1 to find the actual
+        dispatch arm (suspect: pack-module static pick or the walk's
+        intrinsic probe order). Fallback option if it resists: drop just
+        the `fill` actual (keep shuffle), which restores gate-green at
+        the cost of MutableCollectionTest.listFill.
+        BATCH-3 STAGED IN THE TREE (all module tests green, units green;
+        only the compose regression blocks the gate):
+        * emptySequence() process singleton (arena profile) + reset hook.
+        * subList live-view read-through (Value.refreshSublistView +
+          call sites; arena-only, reclaim guarded).
+        * Builder freeze bit (FROZEN_MOD_BIT in shared mod_count;
+          readOnlyMutationGuard honors it) — leaked builder subLists
+          reject mutation after build().
+        * MutableList.fill/shuffle + collectionToArray×2 actuals
+          (actual-marked; collectionToArray earlier caused a
+          conflicting-overload diagnostic when non-actual — fixed).
+        * Map.toMap(destination) merges into the destination (was:
+          ignored it and returned a read-only snapshot) — root of
+          MapTest.entriesCovariantRemove/nullKeyAndValue UOEs.
+        * Init-block/accessor thunks treat their own `this` as a
+          dispatch receiver (eval own_is_subject fix) — root of the
+          `checkPositionIndex` unresolved trio.
+        * companionWithMember BFS also walks the lexically enclosing
+          class prefix (inner classes reach the outer companion).
+        * Comparator structural equality (shared-steps + descending);
+          comparator compare falls back to user compareTo (Uuid
+          lexicalOrder, naturalOrder over user Comparables).
+        * data/value-class equals/hashCode are structural in
+          anyInstanceFallback even when an interface redeclares them
+          (TimeMarkTest).
+        * Inline-splice lambda args get pending_lambda_arity from the
+          declared function-type param (UuidTest.parseInvalid
+          `assertFailsWith { it() }` shape).
+        AGENT ROOT-CAUSE BACKLOG, DESIGNS RECORDED BUT NOT IMPLEMENTED
+        (all have concrete file/line anchors in this session's agent
+        reports; re-derive with the named repro shapes if needed):
+        1. Local fn OVERLOADS collapse to last declaration (StringTest.
+           compareToIgnoreCase stack overflow): overload-aware binding
+           (mangled alias per overload + call-site selection by named
+           args/arity/static heads) in stmt.zig lowerLocalFnDecl +
+           expr.zig bare-call arms + lambda_body inheritance.
+        2. Enum expected-type propagation (EnumEntriesFactoryTest ×3):
+           per-arg expected types with sibling-arg solving in emitCall/
+           emitMemberOrGlobal (unifyTypeParam against param tys), enum
+           recognition for the oracle, callable-ref-against-expected-
+           fn-type lowering (::enumEntries), plus a loud-failure guard
+           in the enumEntries intrinsic when type args are lost.
+        3. Ext-property DELEGATES dropped by lowering (PropertyReference
+           extensionProperties/covariantProperties): lower `val R.x by
+           expr` delegate thunk in build.zig ext-prop loop + new
+           registry map (recv,name)→fid + read/write probes in
+           host_fields (getValue/setValue through the cached delegate).
+        4. EnumEntriesListTest ordinal faults: deferred bare-call arity
+           readout must see class-member overloads hosting trailing
+           lambdas (overloadHostingTrailingLambda misses members at
+           extension-body sites) — plus contains/indexOf on wrong-typed
+           args should disprove via class type-param bounds and fall to
+           AbstractList iteration.
+        5. Anon side-module overloads (CoroutinesReferenceValuesTest.
+           testBadClass, also latent everywhere): callNamedOverload only
+           scans frame.module.func_index — empty in anon side modules;
+           re-collect from the closure's OWNING module. Plus anon
+           captured-var WRITES don't propagate: ObjectExpr missing from
+           assignedInLambdasExpr (never boxed) and storeGlobal replaces
+           the transient capture layer instead of writing through the
+           Cell.
+        6. Base64Test.common: sibling local fn vs same-named private
+           member — emit CallValueOrMember with the captured local +
+           param-type disproof in its value arm.
+        7. Sequence.zip must be a lazy alternating-pull merge (remove
+           from isSequenceTerminal + lazy pairing source)
+           (SequenceBuilderTest.testParallelIteration).
+        8. builderStep needs a `failed` flag: after a builder body
+           throws, hasNext/next must throw IllegalStateException
+           (testExceptionInCoroutine).
+        9. CoroutineContextTest.testInterceptor: lowerCallSpread must
+           route a bare member-fn callee with *spread through `this`
+           (currently lowers as a field read).
+        10. sumOf must keep the lambda's numeric kind (Long/UInt/ULong/
+            Double accumulator seeded from first result; empty-receiver
+            kind needs lambda return_ty population)
+            (CollectionTest.sumOf).
+        11. plus-inference: `list + (x as Any)` must call plusElement
+            when RHS static head is Any/generic (CollectionTest.
+            plusCollectionInference).
+        12. Local classes never register property ACCESSORS
+            (host_classes.lowerAndRegisterMethods lacks the .Property
+            arm buildObject has) + toTypedArray must re-dispatch a user
+            toArray override (CollectionTest.abstractCollectionToArray).
+        13. Short/Byte literal narrowing (widenNumericLiteral only does
+            Long) (SetOperationsTest.intersectShort/ByteArray).
+        14. MapEntry live read-through + CME (mod_count/exp_mod stamped
+            at creation; value reads through backing; throws
+            ConcurrentModificationException after structural change)
+            (MapTest.modifiedBackingMapOfEntry).
+        15. formatThrowable: JVM printStackTrace shape — Suppressed:
+            sections + dejaVu set + [CIRCULAR REFERENCE:] lines
+            (ExceptionTest ×2).
+        16. kotlin.reflect.typeOf needs a reified intrinsic returning a
+            KType (KTypeProjectionTest).
+        17. StringBuilder append/insert overflow guard: UTF-16 length
+            sum > Int.MAX_VALUE throws OutOfMemoryError
+            (StringBuilderTest.overflow).
+        18. Duration formatToExactDecimals saturates at Long range —
+            exact digit expansion for |value|>=2^63
+            (DurationTest.parseAndFormatInUnits).
+        19. GroupingTest.groupingProducers: sourceIterator recursion on
+            the Grouping synth — undiagnosed.
+        20. SequenceTest.orEmpty residue should be fixed by the staged
+            emptySequence singleton — verify with the batch.
       - **Named remainder** (real, deterministic, 115 total): ArraysTest
         contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
         copyRangeInto (`UIntArray expects an Int size`),

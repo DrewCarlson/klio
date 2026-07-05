@@ -64,7 +64,14 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             return r;
         }
     }
-    if (buildable.List.mod_count) |mc| mc.deinit();
+    if (buildable.List.mod_count) |mc| {
+        // Freeze every live view sharing this counter (a subList leaked
+        // out of the builder must reject mutation after build()).
+        const g = mc.borrowMut();
+        g.get().* |= collections.FROZEN_MOD_BIT;
+        g.deinit();
+        mc.deinit();
+    }
     // An empty build result IS the shared empty singleton (Kotlin's
     // buildList returns EmptyList for size 0; assertSame holds).
     const list_empty = blk: {
@@ -108,7 +115,12 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             return r;
         }
     }
-    if (buildable.Set.mod_count) |mc| mc.deinit();
+    if (buildable.Set.mod_count) |mc| {
+        const g = mc.borrowMut();
+        g.get().* |= collections.FROZEN_MOD_BIT;
+        g.deinit();
+        mc.deinit();
+    }
     const set_empty = blk: {
         const g = buildable.Set.items.borrow();
         defer g.deinit();

@@ -1492,6 +1492,13 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     var best_func: ?FuncId = null;
     var best_score: i32 = 0;
     for (candidates.items) |cand| {
+        // A receiver-taking candidate whose declared receiver names a
+        // builtin shape the first arg definitely is not (UIntArray.fill
+        // offered a plain Array) is disqualified outright.
+        if (funcAt(module, cand)) |cf| {
+            if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
+                host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
+        }
         if (positionalPoints(self, module, cand, shapes, scope)) |total| {
             if (best_func == null or total > best_score) {
                 best_func = cand;

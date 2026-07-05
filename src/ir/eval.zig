@@ -3928,7 +3928,17 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
                 // extension receiver — or a supplied splice receiver — is
                 // subject-like: `fun Owner.Inner.f()` does not put `Inner`'s
                 // enclosing `Owner` instance or companion in scope.
-                const own_is_subject = direct_this != null or switch (frame.func.kind) {
+                // A direct receiver that IS the frame's own `this` param
+                // is a dispatch receiver (an init-block/accessor thunk
+                // carries `this` explicitly), so its nesting tower and
+                // companion stay in scope; only a FOREIGN direct receiver
+                // (a splice/extension subject) suppresses them.
+                const direct_is_frame_recv = if (direct_this) |dt| blk: {
+                    const ti = frameThisParam(frame) orelse break :blk false;
+                    if (ti >= frame.params.items.len) break :blk false;
+                    break :blk sameReceiver(frame.params.items[ti], dt);
+                } else false;
+                const own_is_subject = (direct_this != null and !direct_is_frame_recv) or switch (frame.func.kind) {
                     .top_level_extension, .member_extension => true,
                     else => false,
                 };
@@ -4157,6 +4167,7 @@ inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
             // An array `.asList()` view re-reads its scalar source so a later
             // array write shows through on this indexed load.
             recv.refreshArrayView();
+            recv.refreshSublistView();
             const g = l.items.borrow();
             defer g.deinit();
             const items = g.get().items;

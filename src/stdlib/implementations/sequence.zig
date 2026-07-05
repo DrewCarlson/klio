@@ -312,9 +312,35 @@ pub fn seq_of(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(try makeSequence(ctx.allocator, items));
 }
 
+// emptySequence() is a singleton (Kotlin's EmptySequence object):
+// identity asserts across call sites hold. Arena profile only — under
+// refcount reclaim a process cache reads as a leak.
+var empty_seq_singleton: ?Value = null;
+var empty_seq_root_registered = std.atomic.Value(bool).init(false);
+
+fn gcMarkEmptySeq(m: *runtime.gc.Marker) void {
+    if (empty_seq_singleton) |v| m.shade(&v.Sequence.cell.hdr);
+}
+
+pub fn resetEmptySequenceSingleton() void {
+    empty_seq_singleton = null;
+}
+
 pub fn seq_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const items = try ctx.allocator.alloc(Value, 0);
-    return ok(try makeSequence(ctx.allocator, items));
+    if (runtime.reclaimEnabled()) {
+        const items = try ctx.allocator.alloc(Value, 0);
+        return ok(try makeSequence(ctx.allocator, items));
+    }
+    if (empty_seq_singleton == null) {
+        const items = try ctx.allocator.alloc(Value, 0);
+        const r = try makeSequence(ctx.allocator, items);
+        empty_seq_singleton = r;
+        if (runtime.gc.gc_enabled and !empty_seq_root_registered.swap(true, .monotonic))
+            runtime.gc.registerRoot(gcMarkEmptySeq);
+    }
+    const v = empty_seq_singleton.?;
+    v.retain();
+    return ok(v);
 }
 
 /// `Sequence { () -> Iterator<T> }` — the SAM factory. Lazy and
