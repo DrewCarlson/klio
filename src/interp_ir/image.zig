@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 12;
+pub const FORMAT_VERSION: u32 = 13;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -743,6 +743,7 @@ const BuiltImage = struct {
     top_level_props: []build.NameFunc,
     extension_props: []PairFuncEntry,
     extension_prop_setters: []PairFuncEntry,
+    extension_prop_delegates: []PairFuncEntry = &.{},
     object_names: []const []const u8,
     companion_singletons: []StrKV,
     enum_entry_arg_inits: []build.EnumEntryArgInit,
@@ -1428,6 +1429,7 @@ fn builtToImage(a: Allocator, b: *const BuiltModule, out: *BuiltImage) Allocator
     out.top_level_props = b.top_level_props.items;
     out.extension_props = try pairFuncToSlice(a, &b.extension_props);
     out.extension_prop_setters = try pairFuncToSlice(a, &b.extension_prop_setters);
+    out.extension_prop_delegates = try pairFuncToSlice(a, &b.extension_prop_delegates);
     out.object_names = b.object_names.items;
     out.companion_singletons = try strMapToSlice([]const u8, a, &b.companion_singletons);
     out.enum_entry_arg_inits = b.enum_entry_arg_inits.items;
@@ -2147,6 +2149,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
     try out.top_level_props.appendSlice(a, img.top_level_props);
     for (img.extension_props) |entry| try out.extension_props.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     for (img.extension_prop_setters) |entry| try out.extension_prop_setters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    for (img.extension_prop_delegates) |entry| try out.extension_prop_delegates.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     try out.object_names.appendSlice(a, img.object_names);
     for (img.companion_singletons) |kv| try out.companion_singletons.put(kv.k, kv.v);
     try out.enum_entry_arg_inits.appendSlice(a, img.enum_entry_arg_inits);

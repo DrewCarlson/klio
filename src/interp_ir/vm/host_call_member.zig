@@ -4258,6 +4258,18 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
         if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
         return r;
     }
+    // A bound EXTENSION-property reference (`local::extVal`): the name is
+    // not a member of the receiver's class, but `get()` still reads the
+    // property — the field path resolves extension getters and delegated
+    // extension properties. Only a clean read wins; a miss falls through
+    // to the bound-method forward below.
+    if (std.mem.eql(u8, name, "get") and args.len == 0) {
+        var r = try getFieldRec(self, allocator, &recv_capt, n);
+        if (r == .ok) {
+            if (runtime.reclaimEnabled()) r.ok.retain();
+            return r;
+        }
+    }
     // Bound method reference: forward the call.
     const r = try callMemberRec(self, allocator, &recv_capt, n, args);
     if ((std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) and r == .err and r.err == .Unimplemented) {

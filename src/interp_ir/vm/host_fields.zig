@@ -853,6 +853,14 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (pushed_owner) ir.eval.popEnclosing();
             return r;
         }
+        // Delegated extension property (`val R.x by expr`): materialise
+        // the delegate object once per property, then read through its
+        // `getValue(thisRef, property)`.
+        if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
+            const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
+            const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
+            return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
+        }
     }
     // Reflection-style accessors on `KClass` / `KProperty` values.
     switch (receiver.*) {
@@ -1622,6 +1630,102 @@ pub fn hostHasExtPropSetter(self: *VmHost, allocator: Allocator, receiver: *cons
     };
     const fid = resolveExtensionPropSetter(self, allocator, receiver, recv_simple, name) catch return false;
     return fid != null;
+}
+
+const ExtDelegateHit = struct { key: []const u8, fid: FuncId };
+
+/// Resolve a delegated extension property (`val R.x by expr`) for this
+/// receiver: exact declared receiver, then the instance supertype chain.
+/// Returns the DECLARING registry key alongside the thunk so the cached
+/// delegate object is shared across subtype receivers.
+fn resolveExtPropDelegate(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    recv_simple: []const u8,
+    name: []const u8,
+) Allocator.Error!?ExtDelegateHit {
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (pg.get().extension_prop_delegates.count() == 0) return null;
+        if (lookupPairFunc(pg.get().extension_prop_delegates, recv_simple, name)) |fid| {
+            return .{ .key = recv_simple, .fid = fid };
+        }
+    }
+    if (receiver.* == .Instance) {
+        var queue: std.ArrayList([]const u8) = .empty;
+        defer queue.deinit(allocator);
+        var seen: std.ArrayList([]const u8) = .empty;
+        defer seen.deinit(allocator);
+        {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            for (cg.get().supertype_names) |s| try queue.append(allocator, s);
+        }
+        var head: usize = 0;
+        while (head < queue.items.len) {
+            const sup = queue.items[head];
+            head += 1;
+            if (containsStr(seen.items, sup)) continue;
+            try seen.append(allocator, sup);
+            {
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                if (lookupPairFunc(pg.get().extension_prop_delegates, sup, name)) |fid| {
+                    return .{ .key = sup, .fid = fid };
+                }
+            }
+            const def: ?ObjRef(ClassDef) = blk: {
+                const cg = self.classes.borrow();
+                defer cg.deinit();
+                break :blk cg.get().get(sup);
+            };
+            if (def) |d| {
+                const dg = d.borrow();
+                defer dg.deinit();
+                for (dg.get().supertype_names) |s| try queue.append(allocator, s);
+            }
+        }
+    }
+    return null;
+}
+
+/// The materialised delegate object for a delegated extension property:
+/// run the delegate thunk once and cache the result as a hidden global
+/// keyed by the declaring receiver + property name.
+fn extPropDelegateInstance(
+    self: *VmHost,
+    allocator: Allocator,
+    key: []const u8,
+    name: []const u8,
+    fid: FuncId,
+) Allocator.Error!Value {
+    var kb: [256]u8 = undefined;
+    const cache_name = std.fmt.bufPrint(&kb, "__ext_delegate\x1f{s}\x1f{s}", .{ key, name }) catch
+        return runThunkValue(self, allocator, fid);
+    {
+        const gg = self.globals.borrow();
+        defer gg.deinit();
+        if (gg.get().lookup(cache_name)) |v| return v;
+    }
+    const v = try runThunkValue(self, allocator, fid);
+    const owned_name = try allocator.dupe(u8, cache_name);
+    const g = self.globals.borrowMut();
+    defer g.deinit();
+    g.get().define(owned_name, v) catch {};
+    return v;
+}
+
+fn runThunkValue(self: *VmHost, allocator: Allocator, fid: FuncId) Allocator.Error!Value {
+    const mptr: *const Module = self.module.asPtr();
+    const r = try self.callFunc(allocator, mptr, fid, &.{});
+    return switch (r) {
+        .ok => |v| v,
+        .err => Value.Null,
+    };
 }
 
 fn resolveExtensionPropImpl(
@@ -2398,6 +2502,17 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             }
             const r = try evalSetter(self, allocator, f, setter_recv, value);
             if (pushed_owner) ir.eval.popEnclosing();
+            switch (r) {
+                .ok => return .{ .ok = {} },
+                .err => |e| return .{ .err = e },
+            }
+        }
+        // Delegated extension property (`var R.x by expr`): write through
+        // the cached delegate's `setValue(thisRef, property, value)`.
+        if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, real_name)) |hit| {
+            const d = try extPropDelegateInstance(self, allocator, hit.key, real_name, hit.fid);
+            const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, real_name) } };
+            const r = try self.callMember(allocator, &d, "setValue", &.{ receiver.*, prop_ref, value });
             switch (r) {
                 .ok => return .{ .ok = {} },
                 .err => |e| return .{ .err = e },

@@ -233,6 +233,11 @@ pub const BuiltModule = struct {
     extension_props: PairFuncMap,
     /// Extension-property setters keyed by `(receiver type, prop)`.
     extension_prop_setters: PairFuncMap,
+    /// Delegated extension properties (`val R.x by expr`), keyed by
+    /// `(receiver type, prop)` — the `FuncId` is the 0-arg thunk producing
+    /// the delegate object; reads/writes route through its
+    /// `getValue`/`setValue` with the delegate cached per property.
+    extension_prop_delegates: PairFuncMap,
     /// `FuncId` of the file's `main`, or `null` when there is none.
     main: ?FuncId,
     /// Names of `object Foo { … }` singleton declarations, in source order.
@@ -276,6 +281,7 @@ pub const BuiltModule = struct {
         self.top_level_props.deinit(self.allocator);
         self.extension_props.deinit();
         self.extension_prop_setters.deinit();
+        self.extension_prop_delegates.deinit();
         self.object_names.deinit(self.allocator);
         self.companion_singletons.deinit();
         self.enum_entry_arg_inits.deinit(self.allocator);
@@ -314,6 +320,7 @@ fn emptyBuilt(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) Built
         .top_level_props = .empty,
         .extension_props = PairFuncMap.init(allocator),
         .extension_prop_setters = PairFuncMap.init(allocator),
+        .extension_prop_delegates = PairFuncMap.init(allocator),
         .main = main,
         .object_names = .empty,
         .companion_singletons = std.StringHashMap([]const u8).init(allocator),
@@ -2428,6 +2435,7 @@ fn buildModuleWithOverrides(
     // Top-level + companion/object extension properties.
     var extension_props = if (seed) |*s| s.extension_props else PairFuncMap.init(a);
     var extension_prop_setters = if (seed) |*s| s.extension_prop_setters else PairFuncMap.init(a);
+    var extension_prop_delegates = if (seed) |*s| s.extension_prop_delegates else PairFuncMap.init(a);
     const ExtPropDecl = struct { p: *const ast.Property, owner: ?[]const u8 };
     var ext_prop_decls: std.ArrayList(ExtPropDecl) = .empty;
     defer ext_prop_decls.deinit(a);
@@ -2475,6 +2483,14 @@ fn buildModuleWithOverrides(
             if (epd.owner) |owner| {
                 try module.registry.member_ext_owner_class.put(fid, owner);
             }
+        }
+        if (p.delegate) |delegate| {
+            // `val R.x by expr`: no accessor bodies — the delegate object
+            // (produced once by this thunk, cached per property) serves
+            // reads and writes through its getValue/setValue.
+            const nm = try std.fmt.allocPrint(a, "__ext_prop_delegate_{s}_{s}", .{ recv.name.name, p.name.name });
+            const fid = try ir.lower.lowerExprAsThunk(module, delegate, nm);
+            try extension_prop_delegates.put(.{ .a = recv_key, .b = p.name.name }, fid);
         }
         if (p.setter) |setter| {
             const setter_param_name = if (setter.params.len != 0) setter.params[0].name else "value";
@@ -2614,6 +2630,7 @@ fn buildModuleWithOverrides(
         .init_blocks = init_blocks,
         .top_level_props = top_level_props,
         .extension_props = extension_props,
+        .extension_prop_delegates = extension_prop_delegates,
         .extension_prop_setters = extension_prop_setters,
         .main = main_id,
         .object_names = object_names,
@@ -3258,6 +3275,7 @@ fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!Buil
     try copyStrMap([]FuncId, &out.init_blocks, &base.init_blocks);
     try out.top_level_props.appendSlice(a, base.top_level_props.items);
     try copyPairMap(&out.extension_props, &base.extension_props);
+    try copyPairMap(&out.extension_prop_delegates, &base.extension_prop_delegates);
     try copyPairMap(&out.extension_prop_setters, &base.extension_prop_setters);
     try out.object_names.appendSlice(a, base.object_names.items);
     try copyStrMap([]const u8, &out.companion_singletons, &base.companion_singletons);

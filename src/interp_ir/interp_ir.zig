@@ -106,6 +106,8 @@ pub const ProgramImage = struct {
     init_blocks: std.StringHashMap([]FuncId),
     extension_props: PairFuncMap,
     extension_prop_setters: PairFuncMap,
+    /// Delegated extension properties: (receiver, prop) -> delegate thunk.
+    extension_prop_delegates: PairFuncMap,
     secondary_ctors: std.StringHashMap([]build.SecondaryCtorEntry),
     primary_ctor_default_thunks: std.StringHashMap([]?FuncId),
     /// Names of every top-level `object` / synthesised companion. The
@@ -261,6 +263,7 @@ pub const ProgramImage = struct {
             .init_blocks = std.StringHashMap([]FuncId).init(allocator),
             .extension_props = PairFuncMap.init(allocator),
             .extension_prop_setters = PairFuncMap.init(allocator),
+            .extension_prop_delegates = PairFuncMap.init(allocator),
             .secondary_ctors = std.StringHashMap([]build.SecondaryCtorEntry).init(allocator),
             .primary_ctor_default_thunks = std.StringHashMap([]?FuncId).init(allocator),
             .object_names = std.StringHashMap(void).init(allocator),
@@ -293,6 +296,7 @@ pub const ProgramImage = struct {
         self.init_blocks.deinit();
         self.extension_props.deinit();
         self.extension_prop_setters.deinit();
+        self.extension_prop_delegates.deinit();
         self.secondary_ctors.deinit();
         self.primary_ctor_default_thunks.deinit();
         self.object_names.deinit();
