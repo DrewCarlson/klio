@@ -153,17 +153,51 @@ fn valueTypeHead(v: Value) []const u8 {
 /// overloads by argument type (`AtomicIntArray(size: Int)` vs
 /// `AtomicIntArray(array: IntArray)`). Falls back to the first arity match when
 /// no parameter type distinguishes them.
+fn headInSet(head: []const u8, set: []const []const u8) bool {
+    for (set) |h| {
+        if (std.mem.eql(u8, head, h)) return true;
+    }
+    return false;
+}
+
+const integral_heads = [_][]const u8{ "Int", "Long", "Short", "Byte", "UInt", "ULong", "UShort", "UByte", "Char" };
+const collectionish_heads = [_][]const u8{ "Collection", "MutableCollection", "Iterable", "MutableIterable", "List", "MutableList", "Set", "MutableSet", "Sequence" };
+
 fn chooseSecondaryCtor(entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
     var first: ?root.build.SecondaryCtorEntry = null;
     var best: ?root.build.SecondaryCtorEntry = null;
-    var best_score: i32 = 0;
-    for (entries) |e| {
+    var best_score: i32 = -1;
+    outer: for (entries) |e| {
         if (e.param_count != args.len) continue;
         if (first == null) first = e;
         var score: i32 = 0;
         var i: usize = 0;
         while (i < args.len and i < e.param_type_heads.len) : (i += 1) {
-            if (std.mem.eql(u8, e.param_type_heads[i], valueTypeHead(args[i]))) score += 1;
+            const declared = e.param_type_heads[i];
+            const got = valueTypeHead(args[i]);
+            if (std.mem.eql(u8, declared, got)) {
+                score += 2;
+                continue;
+            }
+            // Family compatibility: a declared Collection/Iterable head
+            // accepts any collection-shaped value; integral heads accept
+            // integral values. A DEFINITE cross-family mismatch (an Int
+            // param offered a List — `ArrayDeque(initialCapacity)` vs
+            // `ArrayDeque(elements)`) disqualifies the candidate so the
+            // right same-arity overload wins regardless of order.
+            const decl_integral = headInSet(declared, &integral_heads);
+            const decl_collish = headInSet(declared, &collectionish_heads);
+            const got_integral = headInSet(got, &integral_heads);
+            const got_collish = headInSet(got, &collectionish_heads);
+            if (decl_collish and got_collish) {
+                score += 1;
+                continue;
+            }
+            if (decl_integral and got_integral) {
+                score += 1;
+                continue;
+            }
+            if ((decl_integral and got_collish) or (decl_collish and got_integral)) continue :outer;
         }
         if (score > best_score) {
             best_score = score;

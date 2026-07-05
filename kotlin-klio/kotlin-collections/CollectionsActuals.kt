@@ -52,3 +52,7 @@ internal actual inline fun <K, V> buildMapInternal(capacity: Int, builderAction:
     map.builderAction()
     return map
 }
+
+// The interpreter's arrays are exact-sized; collection-to-array
+// termination is the identity, as on JS.
+internal actual fun <T> terminateCollectionToArray(collectionSize: Int, array: Array<T>): Array<T> = array
