@@ -696,6 +696,49 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
             emptySequence singleton (still fails post-batch: `Expected
             <Sequence>, actual <Sequence>` — an identity, not type,
             mismatch); still open.
+      - **2026-07-06: ZERO known per-file failures expected (sweep
+        verifying)**. The final six fell to four mechanisms:
+        * Items 2+4+13 COMPLETE (the expected-type engine, implemented as
+          designed): sibling-arg solving records a per-arg-node expected
+          type consumed by the arg-lowering loops (which otherwise
+          deliberately null the hint); the inline splice's existing
+          return-type unification stamps the reified argument. Enum
+          recognition rides class_super_names (enums now record their
+          implicit `Enum` supertype). Same-simple-name enums stamp
+          OWNER-QUALIFIED names resolved by FQN suffix in the runtime enum
+          arm. `::enumEntries` against a declared `() -> EnumEntries<E>`
+          lowers as a zero-arg closure over the stamped call. The deferred
+          CallMemberOrGlobal form carries reified splice substitutions and
+          serves committed bodyless headers through the typed dispatch.
+        * Item 4's dispatch half: class_type_param_bounds (new registry +
+          image FORMAT_VERSION 14) drive the Kotlin collection-stub bridge
+          at resolveInstanceMethod — a candidate whose declared param
+          names a class type param with a bound the runtime arg refutes
+          falls through to the inherited implementation.
+        * ConcurrentModificationTest.subList's last layer: the
+          inner-class OUTER field walk swallowed accessor throws as
+          walkable misses (SubList.size's CME from IteratorImpl.hasNext).
+          Only Unimplemented is a miss now, matching the bare-name walk.
+        * SetOperations (13): Int-tagged list literals narrow to the
+          declared Short/Byte element kind at the callee boundary (the
+          arrayOf<ULong> retag discipline). LESSON (Zig): building a
+          union value from its own current payload in one assignment
+          (`v.* = .{ .Short = @intCast(v.Int) }`) trips result-location
+          clobbering — read into a temp first.
+      - **Perf work (same day, user-directed)**: callNamedOverload's
+        whole-func-index linear scan (the top profile frame) now uses the
+        name index; isKnownPackage memoizes the package set; frame
+        REGISTER BUFFERS pool under the tracing GC via libc storage (the
+        collector traces values through the frame chain and never sweeps
+        foreign buffers) — interpreted-class member ops ~31% faster,
+        whole corpus 709s -> 614s serially. Per-test wall times stream to
+        stderr (`[test] Name PASSED 12ms`). DeepRecursiveTest remains the
+        outlier (~280s: per-level interpreted trampoline machinery;
+        runFrameInner-self ~68% busy with GC off) — the flat-bytecode /
+        per-callsite-caching engine item is the lever, not hot-spot
+        patches. Cross-file interference (~53 failures when the corpus
+        runs as ONE module, kotlinc's actual mode) recorded as a distinct
+        work stream.
       - **2026-07-05 second batch: 28 -> ~6-8 expected (13 measured
         mid-batch, remainder fixed after that sweep)**. Landed, each
         repro-verified (commits 'collections: chained subList live
