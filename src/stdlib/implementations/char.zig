@@ -520,6 +520,14 @@ pub fn upperScalar(c: u21) u21 {
     return singleCaseChar(c, &uppercase_map);
 }
 
+/// Canonical case fold: lowercase(uppercase(c)) with the İ -> 'i' step —
+/// the same equivalence `charEqIgnoreCase` applies. Used by the regex
+/// engine so IGNORE_CASE matches the Char/String ignoreCase paths
+/// (ſ ~ S ~ s, ϴ ~ θ, µ ~ Μ ~ μ).
+pub fn foldScalar(c: u21) u21 {
+    return lowerScalarSingle(singleCaseChar(c, &uppercase_map));
+}
+
 /// `Char.equals(other, ignoreCase = true)`: equal if the upper-cased units
 /// match, or failing that the lower-cased upper-cased units match (Kotlin's
 /// rule, which also pairs characters that share a lowercase form).

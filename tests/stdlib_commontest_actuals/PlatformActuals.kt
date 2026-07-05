@@ -24,7 +24,7 @@ public fun assertTypeEquals(expected: Any?, actual: Any?) {
 public val isFloat32RangeEnforced: Boolean = true
 public val supportsOctalLiteralInRegex: Boolean get() = true
 public val supportsEscapeAnyCharInRegex: Boolean get() = true
-public val regexSplitUnicodeCodePointHandling: Boolean get() = false
+public val regexSplitUnicodeCodePointHandling: Boolean get() = true
 
 // The commonTest backreference-handling enum + descriptor live in
 // `common/test/testUtils.kt`, which the klio harness does not load (it walks

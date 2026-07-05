@@ -1474,8 +1474,16 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     const g = cls.borrow();
     defer g.deinit();
     const cd = g.get();
-    if (std.mem.eql(u8, name, "simpleName")) return ok(.{ .String = try runtime.strInit(allocator, cd.name) });
-    if (std.mem.eql(u8, name, "qualifiedName")) return ok(.{ .String = try runtime.strInit(allocator, cd.fqn) });
+    // An anonymous object's class has no name: both reflective names
+    // are null, matching kotlinc.
+    if (std.mem.eql(u8, name, "simpleName")) {
+        if (cd.is_anonymous) return ok(.Null);
+        return ok(.{ .String = try runtime.strInit(allocator, cd.name) });
+    }
+    if (std.mem.eql(u8, name, "qualifiedName")) {
+        if (cd.is_anonymous) return ok(.Null);
+        return ok(.{ .String = try runtime.strInit(allocator, cd.fqn) });
+    }
     if (std.mem.eql(u8, name, "isData")) return ok(.{ .Bool = cd.is_data });
     if (std.mem.eql(u8, name, "isOpen")) return ok(.{ .Bool = cd.is_open });
     if (std.mem.eql(u8, name, "isAbstract")) return ok(.{ .Bool = cd.is_abstract });

@@ -1126,6 +1126,108 @@ pub fn callableAcceptsArgs(self: *VmHost, v: *const Value, n_args: usize) ?bool 
     }
 }
 
+/// True when a declared parameter type positively excludes `null` — the
+/// "Unit" name is the unannotated-param placeholder, which carries no
+/// information.
+fn nonNullDeclared(t: ir.TypeRef) bool {
+    return !t.nullable and t.name.len != 0 and !std.mem.eql(u8, t.name, "Unit");
+}
+
+/// Whether a callable value can bind this exact call: receiver-aware
+/// declared arity, named arguments, and null arguments against
+/// non-nullable declared parameter types. Returns null when the shape is
+/// unknown (intrinsics, bound refs). Consulted by the `CallMemberOrValue`
+/// value arm: a local callable that cannot take the call is not a
+/// candidate — Kotlin resolves the member/extension instead.
+pub fn callableAcceptsCall(self: *VmHost, v: *const Value, recv: *const Value, args: []const Value, arg_names: []const ?[]const u8) ?bool {
+    switch (v.*) {
+        .IrClosure => |c| {
+            const info = self.closures.get(@intCast(c.id)) orelse return null;
+            var required: usize = info.n_params;
+            var total: usize = info.n_params;
+            var has_vararg = false;
+            var has_decl_sig = false;
+            var exact: ?bool = null;
+            {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                const m = info.module orelse mg.get();
+                if (mg.get().decl_sigs.get(info.body_func.int())) |sig| {
+                    required = sig.arity.required;
+                    total = sig.arity.total;
+                    has_vararg = sig.arity.has_vararg;
+                    has_decl_sig = true;
+                }
+                if (m.funcById(info.body_func)) |bf| {
+                    const receiver_param = bf.params.len != 0 and std.mem.eql(u8, bf.params[0].name, "this");
+                    const shift: usize = @intFromBool(receiver_param);
+                    // A named argument that names no declared parameter
+                    // disqualifies the candidate.
+                    for (arg_names) |maybe| {
+                        const nm = maybe orelse continue;
+                        var found = false;
+                        for (bf.params[shift..]) |*p| {
+                            if (std.mem.eql(u8, p.name, nm)) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) return false;
+                    }
+                    // A null receiver cannot bind a non-nullable declared receiver.
+                    if (receiver_param and recv.* == .Null and nonNullDeclared(bf.params[0].ty)) return false;
+                    // A null argument cannot bind a non-nullable declared param.
+                    for (args, 0..) |a, i| {
+                        if (a != .Null) continue;
+                        var pt: ?ir.TypeRef = null;
+                        if (i < arg_names.len and arg_names[i] != null) {
+                            for (bf.params[shift..]) |*p| {
+                                if (std.mem.eql(u8, p.name, arg_names[i].?)) pt = p.ty;
+                            }
+                        } else if (shift + i < bf.params.len) {
+                            pt = bf.params[shift + i].ty;
+                        }
+                        if (pt) |t| if (nonNullDeclared(t)) return false;
+                    }
+                    // A local fn closure without a DeclSig: its declared
+                    // shape is the body func itself; the receiver always
+                    // fills a leading `this` param, so user args bind the
+                    // rest exactly (minus registered defaults).
+                    if (!has_decl_sig) {
+                        var n_def: usize = 0;
+                        if (mg.get().registry.local_fn_defaults.get(info.body_func)) |slots| {
+                            for (slots.items) |slot| {
+                                if (slot != null) n_def += 1;
+                            }
+                        }
+                        for (bf.params) |*p| {
+                            if (p.is_vararg) has_vararg = true;
+                        }
+                        if (receiver_param) {
+                            const utotal = total - 1;
+                            const ureq = utotal -| n_def;
+                            exact = args.len >= ureq and (args.len <= utotal or has_vararg);
+                        } else {
+                            required -|= n_def;
+                        }
+                    }
+                }
+            }
+            if (exact) |ok_exact| return ok_exact;
+            // The receiver may arrive through `this` (args bind the
+            // params directly) or fill the first param (args + 1).
+            inline for ([_]usize{ 0, 1 }) |extra| {
+                const k = args.len + extra;
+                if (k >= required and (k <= total or has_vararg)) return true;
+            }
+            return false;
+        },
+        // Function declarations, intrinsics, and bound refs are opaque
+        // here; the value arm stays unguarded for them.
+        else => return null,
+    }
+}
+
 pub fn closureNeedsThisCapture(self: *VmHost, v: *const Value) bool {
     _ = self;
     _ = v;

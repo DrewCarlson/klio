@@ -305,7 +305,7 @@ fn defaultValueForPrimary(allocator: Allocator, e: *const ast.Expr) Allocator.Er
             if (segs.len == 1) {
                 const nm = segs[0].name;
                 const eq = std.mem.eql;
-                if (eq(u8, nm, "mutableListOf") or eq(u8, nm, "arrayListOf") or eq(u8, nm, "ArrayList") or eq(u8, nm, "ArrayDeque")) {
+                if (eq(u8, nm, "mutableListOf") or eq(u8, nm, "arrayListOf") or eq(u8, nm, "ArrayList")) {
                     return try emptyList(allocator, true);
                 }
                 if (eq(u8, nm, "listOf") or eq(u8, nm, "emptyList")) {
@@ -1149,7 +1149,7 @@ fn isIntrinsicClass(fqn: []const u8) bool {
         "kotlin.text.StringBuilder",      "kotlin.text.Regex",
         "kotlin.collections.HashMap",     "kotlin.collections.HashSet",
         "kotlin.collections.LinkedHashMap", "kotlin.collections.LinkedHashSet",
-        "kotlin.collections.ArrayList",   "kotlin.collections.ArrayDeque",
+        "kotlin.collections.ArrayList",
         "kotlin.IntArray",                "kotlin.LongArray",
         "kotlin.ShortArray",              "kotlin.ByteArray",
         "kotlin.FloatArray",              "kotlin.DoubleArray",

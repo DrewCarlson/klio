@@ -3018,7 +3018,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // defaults), so a canonical member MISS still falls back to
             // invoking the local.
             const fb_misfit = fb_invocable and
-                (host.callableAcceptsArgs(&fb, user_args.len) orelse true) == false;
+                (host.callableAcceptsCall(&fb, &recv, user_args, names) orelse true) == false;
             if (fb_invocable and !fb_misfit and !host.hostHasMember(&recv, name_str)) {
                 orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
                 if (fb == .Class) {
@@ -3062,14 +3062,30 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             }
         },
         .CallValueOrMember => |cvm| {
-            const callee_v = frame.read(cvm.callee);
+            var callee_v = frame.read(cvm.callee);
+            // A boxed capture holds the callable in a cell; classify the
+            // CONTENT (a captured local fn in a `var` slot is invokable).
+            if (callee_v == .Cell) {
+                const cg = callee_v.Cell.borrow();
+                callee_v = cg.get().*;
+                cg.deinit();
+            }
             const arg_values = try readArgRun(allocator, frame, cvm.args, cvm.n_args);
             defer allocator.free(arg_values);
             const names = try resolveArgNames(allocator, frame.module, cvm.arg_names);
             defer allocator.free(names);
             const invocable = switch (callee_v) {
                 .Function, .Intrinsic, .IrClosure, .BoundMethod, .BoundUserMethod => true,
+                // A class value invoked bare is a constructor call.
+                .Class, .BoundInnerClass, .PropertyRef => true,
                 .Instance => |i| blk: {
+                    {
+                        const g = i.borrow();
+                        defer g.deinit();
+                        // A bound member/constructor reference synth
+                        // (`val lit = Expr::Lit`) is a callable value.
+                        if (g.get().get("__bound_name__") != null) break :blk true;
+                    }
                     const g = i.borrow();
                     defer g.deinit();
                     const cg = g.get().class.borrow();
@@ -5244,6 +5260,11 @@ pub const NullHost = struct {
     pub fn bareUnsettledHeaderNoOp(self: *NullHost, module: *const Module, name: []const u8, argc: usize) bool {
         _ = .{ self, module, name, argc };
         return false;
+    }
+
+    pub fn callableAcceptsCall(self: *NullHost, v: *const Value, recv: *const Value, args2: []const Value, arg_names2: []const ?[]const u8) ?bool {
+        _ = .{ self, v, recv, args2, arg_names2 };
+        return null;
     }
 
     pub fn callableAcceptsArgs(self: *NullHost, v: *const Value, n_args: usize) ?bool {

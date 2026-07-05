@@ -49,6 +49,7 @@ pub const materialise_sequence = implementations.materialise_sequence;
 pub const materialise_sequence_bounded = implementations.materialise_sequence_bounded;
 pub const makeSeqIter = implementations.sequence.makeSeqIter;
 pub const oneShotConsumeCheck = implementations.collections.oneShotConsumeCheck;
+pub const resetEmptyCollectionSingletons = implementations.collections.resetEmptyCollectionSingletons;
 pub const freshBuilderSeq = implementations.collections.freshBuilderSeq;
 pub const primitive_companion_const = implementations.primitive_companion_const;
 pub const compareUtf16 = text.compareUtf16;
@@ -111,7 +112,6 @@ pub const IMPLICIT_ALIASES = [_]Alias{
     .{ .name = "setOfNotNull", .fqn = "kotlin.collections.setOfNotNull" },
     .{ .name = "to", .fqn = "kotlin.to" },
     .{ .name = "ArrayList", .fqn = "kotlin.collections.ArrayList" },
-    .{ .name = "ArrayDeque", .fqn = "kotlin.collections.ArrayDeque" },
     .{ .name = "HashMap", .fqn = "kotlin.collections.HashMap" },
     .{ .name = "HashSet", .fqn = "kotlin.collections.HashSet" },
     .{ .name = "LinkedHashMap", .fqn = "kotlin.collections.LinkedHashMap" },

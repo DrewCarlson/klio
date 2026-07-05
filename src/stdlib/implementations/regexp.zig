@@ -171,6 +171,10 @@ const Node = union(enum) {
     concat: []*Node,
     alternate: []*Node,
     repeat: struct { child: *Node, quant: Quant },
+    /// `(?=...)` / `(?!...)` — zero-width lookahead assertion.
+    lookahead: struct { child: *Node, negated: bool },
+    /// `(?<=...)` / `(?<!...)` — zero-width lookbehind assertion.
+    lookbehind: struct { child: *Node, negated: bool },
     /// Always succeeds, consuming nothing.
     empty,
 };
@@ -348,7 +352,26 @@ const Parser = struct {
                 },
                 '<' => {
                     _ = self.bump();
+                    // `(?<=...)` / `(?<!...)` lookbehind; otherwise a
+                    // named group `(?<name>...)`.
+                    const nc = self.peek() orelse return ParseError.InvalidPattern;
+                    if (nc == '=' or nc == '!') {
+                        _ = self.bump();
+                        const child = try self.parseAlternation();
+                        if (self.bump() != ')') return ParseError.InvalidPattern;
+                        const lb_node = try self.allocator.create(Node);
+                        lb_node.* = .{ .lookbehind = .{ .child = child, .negated = nc == '!' } };
+                        return lb_node;
+                    }
                     name = try self.parseGroupName('>');
+                },
+                '=', '!' => {
+                    const fc = self.bump().?;
+                    const child = try self.parseAlternation();
+                    if (self.bump() != ')') return ParseError.InvalidPattern;
+                    const la_node = try self.allocator.create(Node);
+                    la_node.* = .{ .lookahead = .{ .child = child, .negated = fc == '!' } };
+                    return la_node;
                 },
                 'P' => {
                     _ = self.bump();
@@ -631,12 +654,12 @@ fn compileProgram(allocator: std.mem.Allocator, pattern: []const u8) !?*Program 
 /// One capture slot: byte offsets into the input, or `null` if unset.
 const Capture = struct { start: ?usize = null, end: ?usize = null };
 
-/// ASCII case fold (lowercase). Kotlin/Native folds Unicode too, but the
-/// programs reached here are ASCII-cased; this keeps `IGNORE_CASE` correct
-/// for the common case without a full case table.
+/// Case fold for IGNORE_CASE: ASCII fast path, then the canonical
+/// lowercase(uppercase(c)) fold shared with `Char.equals(ignoreCase)`
+/// (ſ ~ S ~ s, ϴ ~ θ).
 fn foldCp(c: u21) u21 {
     if (c < 0x80) return if (c >= 'A' and c <= 'Z') c + 32 else c;
-    return char_impl.lowerScalar(c);
+    return char_impl.foldScalar(c);
 }
 
 fn upperCp(c: u21) u21 {
@@ -723,6 +746,31 @@ const Matcher = struct {
     /// where the whole tail matched, or null to backtrack.
     fn match(self: *Matcher, node: *const Node, at: usize, k: *const Cont) ?usize {
         switch (node.*) {
+            .lookahead => |la| {
+                var top = TopCont{ .base = .{ .vtable = TopCont.vt } };
+                const hit = self.match(la.child, at, &top.base) != null;
+                if (hit == la.negated) return null;
+                return k.run(self, at);
+            },
+            .lookbehind => |lb| {
+                // The assertion holds when the child matches ending
+                // exactly at `at`, starting at any earlier offset.
+                var hit = false;
+                var st: usize = at;
+                while (true) {
+                    var endc = EndAtCont{ .base = .{ .vtable = EndAtCont.vt }, .want = at };
+                    if (self.match(lb.child, st, &endc.base) != null) {
+                        hit = true;
+                        break;
+                    }
+                    if (st == 0) break;
+                    st -= 1;
+                    // step back over UTF-8 continuation bytes
+                    while (st > 0 and (self.input[st] & 0xC0) == 0x80) st -= 1;
+                }
+                if (hit == lb.negated) return null;
+                return k.run(self, at);
+            },
             .empty => return k.run(self, at),
             .literal => |lit| {
                 const d = self.decode(at) orelse return null;
@@ -876,6 +924,19 @@ const EndCont = struct {
     fn vt(self: *const Cont, m: *Matcher, at: usize) ?usize {
         _ = self;
         return if (at == m.input.len) at else null;
+    }
+};
+
+/// Succeeds only at exactly the wanted offset — the lookbehind child must
+/// end where the assertion sits.
+const EndAtCont = struct {
+    base: Cont,
+    want: usize,
+
+    fn vt(self: *const Cont, m: *Matcher, at: usize) ?usize {
+        _ = m;
+        const self_at: *const EndAtCont = @alignCast(@fieldParentPtr("base", self));
+        return if (at == self_at.want) at else null;
     }
 };
 
@@ -1411,8 +1472,59 @@ fn optionsToFlags(opt_arg: ?Value) Flags {
 pub fn regex_ctor(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const pat = if (ctx.args.len > 0) stringBytes(ctx.args[0]) else null;
     if (pat == null) return typeErr("Regex requires a String pattern");
-    const flags = optionsToFlags(if (ctx.args.len > 1) ctx.args[1] else null);
-    return compileRegexFlags(ctx.allocator, pat.?, flags);
+    const opt_arg: ?Value = if (ctx.args.len > 1) ctx.args[1] else null;
+    const flags = optionsToFlags(opt_arg);
+    const res = try compileRegexFlags(ctx.allocator, pat.?, flags);
+    // Keep the constructor's RegexOption values (the enum singletons) so
+    // `options` reads return them identity-equal.
+    if (res == .ok and res.ok == .Regex) {
+        if (opt_arg) |oa| {
+            var items: std.ArrayList(Value) = .empty;
+            switch (oa) {
+                .Instance => {
+                    oa.retain();
+                    try items.append(ctx.allocator, oa);
+                },
+                .Set => |st| {
+                    const g = st.items.borrow();
+                    defer g.deinit();
+                    for (g.get().items) |v| {
+                        v.retain();
+                        try items.append(ctx.allocator, v);
+                    }
+                },
+                .List => |l| {
+                    const g = l.items.borrow();
+                    defer g.deinit();
+                    for (g.get().items) |v| {
+                        v.retain();
+                        try items.append(ctx.allocator, v);
+                    }
+                },
+                else => {},
+            }
+            res.ok.Regex.asPtr().options = try ValueList.init(ctx.allocator, items);
+        }
+    }
+    return res;
+}
+
+/// `Regex.options` — the RegexOption set the regex was built with.
+pub fn regex_options(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const r = switch (regexArg(ctx.args, "Regex.options")) {
+        .ok => |v| v,
+        .err => |e| return e,
+    };
+    var items: std.ArrayList(Value) = .empty;
+    if (r.asPtr().options) |ol| {
+        const g = ol.borrow();
+        defer g.deinit();
+        for (g.get().items) |v| {
+            v.retain();
+            try items.append(ctx.allocator, v);
+        }
+    }
+    return ok(.{ .Set = .{ .items = try ValueList.init(ctx.allocator, items), .mutable = false, .backing = null } });
 }
 
 pub fn regex_pattern(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -1569,6 +1681,14 @@ pub fn regex_match_at(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const s = sr.asPtr().bytes;
     const idx = if (ctx.args.len > 2) ctx.args[2].asI64() else null;
     if (idx == null) return typeErr("Regex.matchAt requires Int index");
+    {
+        const length = byteToChar(s, s.len);
+        if (idx.? < 0 or idx.? > length) {
+            const msg = try std.fmt.allocPrint(ctx.allocator, "index out of bounds: {d}, input length: {d}", .{ idx.?, length });
+            defer ctx.allocator.free(msg);
+            return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg) } };
+        }
+    }
     const byte = charIndexToByte(s, idx.?);
     const prog = progFromRegex(r) orelse return typeErr("Regex.matchAt requires a Regex receiver");
     if (try runMatch(ctx.allocator, prog, s, byte)) |caps| {

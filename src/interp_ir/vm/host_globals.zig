@@ -901,7 +901,7 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
 
     if (registryHasDelegatedProp(self, name)) {
         if (cached) |v| {
-            if (v == .Instance) {
+            if (v == .Instance or v == .PropertyRef) {
                 const prop_ref = makePropertyRef(allocator, name) catch return null;
                 const r = self.callMember(allocator, &v, "getValue", &.{ Value.Null, prop_ref }) catch return null;
                 if (r == .ok) return r.ok;
@@ -1124,7 +1124,7 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
             break :blk g.get().lookup(name);
         };
         if (existing) |d| {
-            if (d == .Instance) {
+            if (d == .Instance or d == .PropertyRef) {
                 const prop_ref = try makePropertyRef(allocator, name);
                 const r = try self.callMember(allocator, &d, "setValue", &.{ Value.Null, prop_ref, value });
                 if (r == .err) return .{ .err = r.err };
@@ -1229,7 +1229,7 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name: []const u
     // yielded the delegate instead of throwing IllegalStateException.
     if (registryHasDelegatedProp(self, name)) {
         if (raw) |rv| {
-            if (rv == .Instance) {
+            if (rv == .Instance or rv == .PropertyRef) {
                 const prop_ref = try makePropertyRef(allocator, name);
                 const r = try self.callMember(allocator, &rv, "getValue", &.{ Value.Null, prop_ref });
                 switch (r) {
