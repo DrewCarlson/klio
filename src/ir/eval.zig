@@ -412,8 +412,14 @@ fn frameToString(allocator: Allocator, fr: runtime.StackFrame) Allocator.Error![
 }
 
 pub fn formatStackTrace(allocator: Allocator, trace: *const runtime.StackTraceData, out: *std.ArrayList(u8)) Allocator.Error!void {
+    return formatStackTraceIndented(allocator, trace, out, "");
+}
+
+fn formatStackTraceIndented(allocator: Allocator, trace: *const runtime.StackTraceData, out: *std.ArrayList(u8), indent: []const u8) Allocator.Error!void {
     for (trace.frames) |fr| {
-        try out.appendSlice(allocator, "\n    at ");
+        try out.appendSlice(allocator, "\n");
+        try out.appendSlice(allocator, indent);
+        try out.appendSlice(allocator, "    at ");
         const s = try frameToString(allocator, fr);
         defer allocator.free(s);
         try out.appendSlice(allocator, s);
@@ -449,14 +455,30 @@ pub fn stackTraceArray(allocator: Allocator, v: *const Value) Allocator.Error!?V
     return runtime.ArrayData.fromBoxedList(try runtime.ValueList.initOwned(allocator, list));
 }
 
-/// Render a throwable — its `type: message` header, captured stack trace, and
-/// (recursively) its `Caused by:` chain — into `out`. `is_cause` prefixes the
-/// `Caused by:` line; `depth` bounds a self-referential cause cycle.
+/// Render a throwable in the JVM `printStackTrace` shape — the
+/// `type: message` header, captured frames, `Suppressed:` sections
+/// (indented one tab per nesting level), and the `Caused by:` chain — into
+/// `out`. A throwable already printed in this rendering appears as
+/// `[CIRCULAR REFERENCE: <header>]` and is not walked again.
 pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayList(u8), is_cause: bool, depth: u8) Allocator.Error!void {
-    if (depth > 16) return;
+    _ = depth;
     if (is_cause) try out.appendSlice(allocator, "\nCaused by: ");
-    var stk: ?runtime.StackRef = null;
-    var cause: ?Value = null;
+    var deja: std.ArrayList(u64) = .empty;
+    defer deja.deinit(allocator);
+    try formatThrowableEnclosed(allocator, v, out, "", &deja, 0);
+}
+
+/// Stable identity for the dejaVu set; 0 (host-created throwables without
+/// one) opts out of cycle tracking and always prints in full.
+fn throwableIdentity(v: *const Value) u64 {
+    return switch (v.*) {
+        .Exception => |e| e.identity,
+        .Instance => |inst| inst.identity(),
+        else => 0,
+    };
+}
+
+fn appendThrowableHeader(allocator: Allocator, v: *const Value, out: *std.ArrayList(u8)) Allocator.Error!void {
     switch (v.*) {
         .Exception => |e| {
             {
@@ -469,12 +491,6 @@ pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayLis
                 defer mg.deinit();
                 try out.appendSlice(allocator, ": ");
                 try out.appendSlice(allocator, mg.get().bytes);
-            }
-            stk = if (e.stack) |c| runtime.StackRef{ .cell = c } else null;
-            if (e.cause) |c| {
-                const cg = (runtime.ValueBox{ .cell = c }).borrow();
-                defer cg.deinit();
-                cause = cg.get().*;
             }
         },
         .Instance => |inst| {
@@ -493,22 +509,93 @@ pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayLis
                     try out.appendSlice(allocator, sg.get().bytes);
                 }
             }
+        },
+        else => try out.appendSlice(allocator, "<thrown value>"),
+    }
+}
+
+fn formatThrowableEnclosed(
+    allocator: Allocator,
+    v: *const Value,
+    out: *std.ArrayList(u8),
+    indent: []const u8,
+    deja: *std.ArrayList(u64),
+    depth: u8,
+) Allocator.Error!void {
+    if (depth > 16) return;
+    if (v.* != .Exception and v.* != .Instance) {
+        try out.appendSlice(allocator, "<thrown value>");
+        return;
+    }
+    const id = throwableIdentity(v);
+    if (id != 0) {
+        for (deja.items) |seen| {
+            if (seen == id) {
+                try out.appendSlice(allocator, "[CIRCULAR REFERENCE: ");
+                try appendThrowableHeader(allocator, v, out);
+                try out.appendSlice(allocator, "]");
+                return;
+            }
+        }
+        try deja.append(allocator, id);
+    }
+    try appendThrowableHeader(allocator, v, out);
+
+    var stk: ?runtime.StackRef = null;
+    var cause: ?Value = null;
+    switch (v.*) {
+        .Exception => |e| {
+            stk = if (e.stack) |c| runtime.StackRef{ .cell = c } else null;
+            if (e.cause) |c| {
+                const cg = (runtime.ValueBox{ .cell = c }).borrow();
+                defer cg.deinit();
+                cause = cg.get().*;
+            }
+        },
+        .Instance => |inst| {
+            const g = inst.borrow();
+            defer g.deinit();
             stk = g.get().stack;
             if (g.get().get("cause")) |cv| {
                 if (cv != .Null) cause = cv;
             }
         },
-        else => {
-            try out.appendSlice(allocator, "<thrown value>");
-            return;
-        },
+        else => unreachable,
     }
     if (stk) |s| {
         const sg = s.borrow();
         defer sg.deinit();
-        try formatStackTrace(allocator, sg.get(), out);
+        try formatStackTraceIndented(allocator, sg.get(), out, indent);
     }
-    if (cause) |c| try formatThrowable(allocator, &c, out, true, depth + 1);
+
+    // Suppressed sections, one tab deeper than this throwable.
+    var suppressed: std.ArrayList(Value) = .empty;
+    defer suppressed.deinit(allocator);
+    if (v.* == .Exception) {
+        if (v.Exception.suppressed) |sl_cell| {
+            const sl = runtime.ValueList{ .cell = sl_cell };
+            const g = sl.borrow();
+            defer g.deinit();
+            for (g.get().items) |s| try suppressed.append(allocator, s);
+        }
+    }
+    if (suppressed.items.len != 0) {
+        const inner = try std.fmt.allocPrint(allocator, "{s}\t", .{indent});
+        defer allocator.free(inner);
+        for (suppressed.items) |*s| {
+            try out.appendSlice(allocator, "\n");
+            try out.appendSlice(allocator, inner);
+            try out.appendSlice(allocator, "Suppressed: ");
+            try formatThrowableEnclosed(allocator, s, out, inner, deja, depth + 1);
+        }
+    }
+
+    if (cause) |c| {
+        try out.appendSlice(allocator, "\n");
+        try out.appendSlice(allocator, indent);
+        try out.appendSlice(allocator, "Caused by: ");
+        try formatThrowableEnclosed(allocator, &c, out, indent, deja, depth + 1);
+    }
 }
 
 /// Attach a freshly-captured stack trace to a throwable the first time it needs
