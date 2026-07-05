@@ -612,11 +612,25 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
            recognition for the oracle, callable-ref-against-expected-
            fn-type lowering (::enumEntries), plus a loud-failure guard
            in the enumEntries intrinsic when type args are lost.
-        3. Ext-property DELEGATES dropped by lowering (PropertyReference
-           extensionProperties/covariantProperties): lower `val R.x by
-           expr` delegate thunk in build.zig ext-prop loop + new
-           registry map (recv,name)→fid + read/write probes in
-           host_fields (getValue/setValue through the cached delegate).
+        3. LANDED — Ext-property DELEGATES dropped by lowering
+           (PropertyReference extensionProperties / covariantProperties /
+           memberProperties, all three now pass). Implemented per the
+           design: `val R.x by expr` lowers a 0-arg delegate thunk in
+           the interp build ext-prop loop, registered in the new
+           `extension_prop_delegates` (recv,name)→fid map (plumbed
+           through Program, run transfer, AND the baked-image codec —
+           FORMAT_VERSION 12→13), with read/write probes in host_fields
+           that materialise the delegate once (cached as a hidden
+           global keyed by the DECLARING receiver so subtype receivers
+           share it) and route getValue/setValue with a PropertyRef.
+           Two more root causes surfaced beneath: (a) a bound property
+           reference's `get()` required `memberIsProperty`, so a bound
+           EXT-property ref fell through to a member call and died —
+           `get()` now tries the full field path (which resolves ext
+           getters + delegates) before the bound-method forward; (b)
+           `Value.structuralEq` had NO StringBuilder arm, so `==` on
+           the SAME builder was false — now identity, as on the JVM
+           (covariantProperties' CharSequence-typed delegate read).
         4. EnumEntriesListTest ordinal faults: deferred bare-call arity
            readout must see class-member overloads hosting trailing
            lambdas (overloadHostingTrailingLambda misses members at
@@ -678,9 +692,10 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
             emptySequence singleton (still fails post-batch: `Expected
             <Sequence>, actual <Sequence>` — an identity, not type,
             mismatch); still open.
-      - **Now 34 dual-identical** after the local-fn-overload landing:
-        GroupingTest.groupingProducers and StringTest.compareToIgnoreCase
-        cleared from the list below, nothing added.
+      - **Now 31 dual-identical**: the local-fn-overload landing cleared
+        GroupingTest.groupingProducers + StringTest.compareToIgnoreCase
+        (36→34), and the ext-property-delegate landing cleared all three
+        PropertyReferenceTest failures (34→31). Nothing added.
       - **Named remainder (the full 36, post-batch, dual-identical)**:
         ArraysTest.orEmptyNull (pre-existing at 2bfaeef9, verified via
         worktree build); Base64Test.common; CollectionTest

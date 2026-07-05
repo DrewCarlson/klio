@@ -2292,6 +2292,10 @@ pub const Value = union(enum) {
                 x.descending == b.Comparator.descending,
             .BoundMethod => |x| b.* == .BoundMethod and std.mem.eql(u8, x.fqn, b.BoundMethod.fqn) and structuralEq(x.receiver.asPtr(), b.BoundMethod.receiver.asPtr()),
             .Instance => |x| b.* == .Instance and instanceEq(x, b.Instance),
+            // StringBuilder declares no equals override: identity, as on
+            // the JVM — the same builder equals itself, never a sibling
+            // with equal contents.
+            .StringBuilder => |x| b.* == .StringBuilder and x.identity() == b.StringBuilder.identity(),
             else => false,
         };
     }
