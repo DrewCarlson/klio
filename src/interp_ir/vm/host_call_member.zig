@@ -3917,7 +3917,6 @@ fn sequenceMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         if (std.mem.eql(u8, name, "sortedWith") and args.len == 1) break :blk .{ .SortedWith = args[0] };
         break :blk null;
     };
-    if (std.mem.eql(u8, name, "constrainOnce") and args.len == 0) return .{ .ok = receiver.* };
     if (new_op) |op| {
         const g = seq.borrow();
         const src = g.get().source;
