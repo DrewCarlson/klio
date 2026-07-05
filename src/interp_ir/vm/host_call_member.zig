@@ -2115,7 +2115,7 @@ fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     return false;
 }
 
-fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
+pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
     var pn = param_ty.name;
     // A qualified reference (`Owner.Pocket`) names a lifted nested/inner
     // class whose registered name the supertype walk cannot relate;
@@ -2690,6 +2690,9 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             } } } };
         }
         const start: usize = @intCast(idx);
+        if (stdlib.implementations.collections.sublistViewStale(receiver)) {
+            return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) };
+        }
         const cap = try captureModCount(allocator, receiver.List.mod_count);
         // Share the backing list (not a snapshot) so a `MutableListIterator`'s
         // `set`/`add`/`remove` mutate the underlying list, matching Kotlin. The
@@ -2700,7 +2703,8 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             .prim = null,
             .mod_count = cap.mod_count,
             .exp_mod = cap.exp_mod,
-            .mutable = receiver.List.mutable and receiver.List.backing == null,
+            .mutable = receiver.List.mutable and receiver.List.backing == null and
+                !stdlib.implementations.collections.modCountFrozen(receiver.List.mod_count),
         } } };
     }
 
@@ -3164,7 +3168,18 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     if (args.len == 0 and std.mem.eql(u8, name, "hashCode") and
         receiver.* != .Instance and receiver.* != .Class and receiver.* != .PropertyRef)
     {
+        if (stdlib.implementations.collections.sublistViewStale(receiver)) {
+            return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) };
+        }
         return .{ .ok = Value.newInt(@as(i64, try hashWithDispatch(self, allocator, receiver))) };
+    }
+
+    // A stale subList view rejects `equals` too (`SubList.equals` runs
+    // checkForComodification before comparing).
+    if (args.len == 1 and std.mem.eql(u8, name, "equals") and receiver.* == .List and
+        stdlib.implementations.collections.sublistViewStale(receiver))
+    {
+        return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) };
     }
 
     // A DECLARED receiver head overrides the runtime-type surface:
@@ -3399,6 +3414,12 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             matched = p2;
         }
         if (intrinsic) |f| {
+            // `toTypedArray` must observe a user `toArray()` override
+            // before any drain (JS/native `collectionToArray` semantics);
+            // its intrinsic handles Instance receivers itself.
+            if (std.mem.eql(u8, name, "toTypedArray")) {
+                return try dispatchWithReceiver(self, allocator, matched, f, receiver, args);
+            }
             const drained = blk: {
                 iterable_fallback_active = true;
                 defer iterable_fallback_active = false;
@@ -3764,12 +3785,15 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
     receiver.refreshSublistView();
     switch (receiver.*) {
         .List => |l| {
+            if (stdlib.implementations.collections.sublistViewStale(receiver)) {
+                return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) };
+            }
             // A mutable list shares its backing so `MutableIterator.remove()`
             // mutates the source (and the iterating loop observes it); an
             // immutable list snapshots, as before. A live map `values` view is
             // also mutable (no read-only error; CME still fires on concurrent
             // map modification); only a genuinely read-only list snapshots.
-            if (l.mutable) {
+            if (l.mutable and !stdlib.implementations.collections.modCountFrozen(l.mod_count)) {
                 const cap = try captureModCount(allocator, l.mod_count);
                 return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
             }
@@ -3787,7 +3811,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // `keys`/`entries` view is also mutable (its iterator supports
             // remove and reports CME on concurrent map modification); only a
             // genuinely read-only set yields a read-only iterator.
-            if (s.mutable) {
+            if (s.mutable and !stdlib.implementations.collections.modCountFrozen(s.mod_count)) {
                 const cap = try captureModCount(allocator, s.mod_count);
                 return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
             }
@@ -3799,6 +3823,14 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
         },
         .Map => |m| {
             const g = m.entries.borrow();
+            const src_mc = g.get().mod_count;
+            const live = m.mutable and !stdlib.implementations.collections.modCountFrozen(src_mc);
+            const stamp: u64 = blk: {
+                const cell = src_mc orelse break :blk 0;
+                const cg = cell.borrow();
+                defer cg.deinit();
+                break :blk cg.get().*;
+            };
             var items: std.ArrayList(Value) = .empty;
             for (g.get().pairs.items) |kv| {
                 kv.key.retain();
@@ -3808,12 +3840,11 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                 // A mutable map's iterator yields live entries: `setValue`
                 // writes through, and `MutableIterator.remove` deletes from the
                 // backing via this reference (the `items` list is a snapshot).
-                try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = if (m.mutable) m.entries else null } });
+                try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = if (live) m.entries else null, .exp_mod = stamp } });
             }
-            const src_mc = g.get().mod_count;
             g.deinit();
             const cap = try captureModCount(allocator, src_mc);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = m.mutable } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = live } } };
         },
         .Range => |r| {
             return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind, .done = try ObjRef(bool).init(allocator, false) } } };
@@ -3913,6 +3944,31 @@ fn sequenceMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         var sv = receiver.*;
         if (runtime.reclaimEnabled()) sv.retain();
         return .{ .ok = try stdlib.makeSeqIter(allocator, sv) };
+    }
+    // `zip` with a Sequence argument is lazy: a `Merged` source pulls both
+    // children alternately (left, then right, one element per output pair),
+    // so shared-state builders observe `MergingSequence`'s interleave
+    // instead of two full materialisations back to back.
+    if (std.mem.eql(u8, name, "zip") and (args.len == 1 or args.len == 2) and args[0] == .Sequence) {
+        var left = receiver.*;
+        var right = args[0];
+        if (runtime.reclaimEnabled()) {
+            left.retain();
+            right.retain();
+        }
+        const transform: ?runtime.ValueBox = if (args.len == 2) blk: {
+            var t = args[1];
+            if (runtime.reclaimEnabled()) t.retain();
+            break :blk try Value.boxRef(allocator, t);
+        } else null;
+        return .{ .ok = .{ .Sequence = try ObjRef(SequenceData).init(allocator, .{
+            .source = .{ .Merged = .{
+                .left = try Value.boxRef(allocator, left),
+                .right = try Value.boxRef(allocator, right),
+                .transform = transform,
+            } },
+            .ops = &.{},
+        }) } };
     }
     const terminal = isSequenceTerminal(name);
     if (terminal) {
@@ -4927,6 +4983,38 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
             if (std.mem.eql(u8, name, "hashCode") and args.len == 0) return .{ .ok = .{ .Int = kotlinHashCode(receiver) } };
         },
         .MapEntry => |me| {
+            // A live entry (backing set) is a view: after a structural map
+            // change every member access throws CME; before that, reads
+            // resolve the live pair so non-structural value updates show
+            // through (JVM HashMap.Node semantics for reads, common-code
+            // fail-fast semantics for structural changes).
+            if (me.backing) |entries| {
+                const g = entries.borrow();
+                var stale = false;
+                if (g.get().mod_count) |cell| {
+                    const cg = cell.borrow();
+                    stale = cg.get().* != me.exp_mod;
+                    cg.deinit();
+                }
+                if (stale) {
+                    g.deinit();
+                    return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) };
+                }
+                for (g.get().pairs.items) |*slot| {
+                    if (Value.structuralEq(&slot.key, me.key.asPtr())) {
+                        const live = slot.value;
+                        if (!Value.structuralEq(me.value.asPtr(), &live)) {
+                            if (runtime.reclaimEnabled()) {
+                                live.retain();
+                                me.value.asPtr().release(allocator);
+                            }
+                            me.value.asPtr().* = live;
+                        }
+                        break;
+                    }
+                }
+                g.deinit();
+            }
             if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "key")) return extractOwned(me.key);
             if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "value")) return extractOwned(me.value);
             // `Map.Entry` equality contract: compare by key and value, so a
@@ -4983,6 +5071,16 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
         else => {},
     }
     return null;
+}
+
+/// Current structural counter of a map's entries store (0 when uncounted).
+fn mapEntriesCounter(entries: runtime.MapEntries) u64 {
+    const g = entries.borrow();
+    defer g.deinit();
+    const cell = g.get().mod_count orelse return 0;
+    const cg = cell.borrow();
+    defer cg.deinit();
+    return cg.get().*;
 }
 
 const ModCapture = struct { mod_count: ?ObjRef(u64), exp_mod: ?ObjRef(u64) };
@@ -5090,7 +5188,15 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             ig.deinit();
             return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator exhausted") };
         }
-        const v = ig.get().items[p];
+        var v = ig.get().items[p];
+        // A live map entry is re-stamped at yield time, so entries handed
+        // out after an iterator-driven structural change stay readable while
+        // earlier ones fail fast.
+        if (v == .MapEntry) {
+            if (v.MapEntry.backing) |entries| {
+                v.MapEntry.exp_mod = mapEntriesCounter(entries);
+            }
+        }
         // Borrowed element: the backing list still owns it, so retain before
         // handing it to the register that will own the iteration result.
         if (runtime.reclaimEnabled()) v.retain();
@@ -5198,7 +5304,9 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const p = pg.get().*;
         pg.deinit();
         const li = iteratorLastRet(it);
-        if (li < 0) return .{ .ok = .Unit };
+        if (li < 0) {
+            return .{ .err = try throwExc(allocator, "kotlin.IllegalStateException", "remove() called before next()") };
+        }
         const lu: usize = @intCast(li);
         const g = it.items.borrowMut();
         defer g.deinit();
@@ -5369,6 +5477,61 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
                 .ok => |v| .{ .value = v },
                 .err => |e| .{ .err = e },
             };
+        },
+        .Merged => |mz| {
+            if (st.done) return .done;
+            if (st.iter_left == null) {
+                switch (try callMemberRec(self, allocator, &mz.left.asPtr().*, "iterator", &.{})) {
+                    .ok => |v| st.iter_left = v,
+                    .err => |e| return .{ .err = e },
+                }
+                switch (try callMemberRec(self, allocator, &mz.right.asPtr().*, "iterator", &.{})) {
+                    .ok => |v| st.iter_right = v,
+                    .err => |e| return .{ .err = e },
+                }
+            }
+            const lit = st.iter_left.?;
+            const rit = st.iter_right.?;
+            // Strict interleave: left hasNext, right hasNext, left next,
+            // right next — the order `MergingSequence` pulls in.
+            const lh = switch (try callMemberRec(self, allocator, &lit, "hasNext", &.{})) {
+                .ok => |x| x == .Bool and x.Bool,
+                .err => |e| return .{ .err = e },
+            };
+            if (!lh) {
+                st.done = true;
+                return .done;
+            }
+            const rh = switch (try callMemberRec(self, allocator, &rit, "hasNext", &.{})) {
+                .ok => |x| x == .Bool and x.Bool,
+                .err => |e| return .{ .err = e },
+            };
+            if (!rh) {
+                st.done = true;
+                return .done;
+            }
+            const av = switch (try callMemberRec(self, allocator, &lit, "next", &.{})) {
+                .ok => |v| v,
+                .err => |e| return .{ .err = e },
+            };
+            const bv = switch (try callMemberRec(self, allocator, &rit, "next", &.{})) {
+                .ok => |v| v,
+                .err => |e| return .{ .err = e },
+            };
+            if (mz.transform) |t| {
+                var intrinsic = makeIntrinsicHost(self);
+                defer deinitIntrinsicHost(&intrinsic);
+                const ihost = intrinsic.intrinsicHost();
+                const r = try ihost.invokeCallable(&t.asPtr().*, &.{ av, bv }, out);
+                return switch (r) {
+                    .ok => |v| .{ .value = v },
+                    .err => |re| .{ .err = try mapRuntimeError(allocator, re) },
+                };
+            }
+            return .{ .value = .{ .Pair = .{
+                .first = try Value.boxRef(allocator, av),
+                .second = try Value.boxRef(allocator, bv),
+            } } };
         },
         .Generate => |gen| {
             if (st.done) return .done;
@@ -7125,6 +7288,15 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
             }
             return false;
         },
+        // A user instance can never be a builtin array (array types are
+        // final): a `TestCollection` receiver must not bind
+        // `UIntArray.toTypedArray`.
+        .Instance => {
+            if (overload_match.builtinParamKind(declared)) |pk| {
+                return pk == .array;
+            }
+            return false;
+        },
         else => return false,
     }
 }
@@ -8269,7 +8441,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
 /// segment) and the fully-qualified name. Enough for `simpleName`,
 /// `qualifiedName`, and FQN-keyed equality — used to give a builtin value or a
 /// classId-less type a class literal.
-fn syntheticClassFromFqn(allocator: Allocator, fqn: []const u8) Allocator.Error!Value {
+pub fn syntheticClassFromFqn(allocator: Allocator, fqn: []const u8) Allocator.Error!Value {
     const dot = std.mem.lastIndexOfScalar(u8, fqn, '.');
     const simple = if (dot) |i| fqn[i + 1 ..] else fqn;
     const cd = try ObjRef(ClassDef).init(allocator, .{

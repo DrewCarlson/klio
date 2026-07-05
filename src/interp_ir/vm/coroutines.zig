@@ -1432,12 +1432,24 @@ pub fn builderStep(self: *VmIntrinsicHost, state: runtime.BuilderStateRef, out: 
     const a = self.allocator;
 
     var done: bool = undefined;
+    var failed: bool = undefined;
     var scope: Value = undefined;
     {
         const g = state.borrow();
         done = g.get().done;
+        failed = g.get().failed;
         scope = g.get().scope.asPtr().*;
         g.deinit();
+    }
+    // The block already threw out of an earlier pull; a failed iterator
+    // rejects every later pull, matching `SequenceBuilderIterator`.
+    if (failed) {
+        return .{ .err = .{ .Thrown = .{ .Exception = .{
+            .fqn = try runtime.strInit(a, "kotlin.IllegalStateException"),
+            .message = try runtime.strInit(a, "Iterator has failed."),
+            .cause = null,
+            .suppressed = (try runtime.ValueList.init(a, .empty)).cell,
+        } } } };
     }
     if (done) return .done;
 
@@ -1451,6 +1463,7 @@ pub fn builderStep(self: *VmIntrinsicHost, state: runtime.BuilderStateRef, out: 
             .err => |e| {
                 const g = state.borrowMut();
                 g.get().done = true;
+                g.get().failed = errIsThrow(&e);
                 g.deinit();
                 return .{ .err = e };
             },
@@ -1527,6 +1540,7 @@ pub fn builderStep(self: *VmIntrinsicHost, state: runtime.BuilderStateRef, out: 
                                 .err => |de| {
                                     const g = state.borrowMut();
                                     g.get().done = true;
+                                    g.get().failed = errIsThrow(&de);
                                     g.deinit();
                                     return .{ .err = de };
                                 },
@@ -1545,14 +1559,23 @@ pub fn builderStep(self: *VmIntrinsicHost, state: runtime.BuilderStateRef, out: 
                     }
                 },
                 else => {
+                    const mapped = mapDriverErr(a, e);
                     const g = state.borrowMut();
                     g.get().done = true;
+                    g.get().failed = errIsThrow(&mapped);
                     g.deinit();
-                    return .{ .err = mapDriverErr(a, e) };
+                    return .{ .err = mapped };
                 },
             },
         }
     }
+}
+
+/// Whether a pull's error was a Kotlin throw out of the builder block (as
+/// opposed to an interpreter-level failure); only a throw flips the
+/// iterator into the failed state.
+fn errIsThrow(e: *const RuntimeError) bool {
+    return e.* == .Thrown;
 }
 
 /// Hand a freshly-suspended Layer-1 activation to the active interceptor

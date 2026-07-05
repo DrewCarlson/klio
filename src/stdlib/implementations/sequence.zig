@@ -327,6 +327,11 @@ pub fn resetEmptySequenceSingleton() void {
 }
 
 pub fn seq_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    // One process singleton: `emptySequence()` is an object on the JVM,
+    // and `orEmpty()`/`assertEquals` compare it by identity. Under
+    // refcount reclaim the process cache would register as a leak, so
+    // that profile serves fresh values (as the empty-collection
+    // singletons do).
     if (runtime.reclaimEnabled()) {
         const items = try ctx.allocator.alloc(Value, 0);
         return ok(try makeSequence(ctx.allocator, items));
@@ -429,7 +434,7 @@ fn recvSeqEager(args: []const Value, what: []const u8) EagerResult {
     if (data.ops.len != 0) return .none;
     return switch (data.source) {
         .Items => |items| .{ .some = items.clone() },
-        .Generate, .Builder, .IteratorFn => .none,
+        .Generate, .Builder, .IteratorFn, .Merged => .none,
     };
 }
 
@@ -608,6 +613,7 @@ pub fn map_entry_key(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 1 or ctx.args[0] != .MapEntry) {
         return err(.{ .Type = "Map.Entry.key requires a Map.Entry receiver" });
     }
+    if (try collections.mapEntryViewGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     const out = ctx.args[0].MapEntry.key.asPtr().*;
     out.retain();
     return ok(out);
@@ -617,6 +623,7 @@ pub fn map_entry_value(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 1 or ctx.args[0] != .MapEntry) {
         return err(.{ .Type = "Map.Entry.value requires a Map.Entry receiver" });
     }
+    if (try collections.mapEntryViewGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     const out = ctx.args[0].MapEntry.value.asPtr().*;
     out.retain();
     return ok(out);
@@ -626,6 +633,7 @@ pub fn map_entry_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 1 or ctx.args[0] != .MapEntry) {
         return err(.{ .Type = "Map.Entry.toString requires a Map.Entry receiver" });
     }
+    if (try collections.mapEntryViewGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     const s = try ctx.args[0].display(ctx.allocator);
     const ref = try runtime.strInitOwned(ctx.allocator, s);
     return ok(.{ .String = ref });
@@ -831,6 +839,30 @@ fn materialiseSequenceBounded(
                     if (max) |m| if (output.items.len >= m) break;
                 }
             },
+            .Merged => |mz| {
+                var lit: ?Value = null;
+                var rit: ?Value = null;
+                while (true) {
+                    if (takeCapReached(seq.ops, st.taken)) break;
+                    const item = switch (try collections.mergedPullOne(allocator, host, out, mz, &lit, &rit)) {
+                        .value => |v| v,
+                        .done => break,
+                        .err => |e| {
+                            output.deinit(allocator);
+                            return .{ .err = e };
+                        },
+                    };
+                    const pr = try pump(allocator, host, out, item, seq.ops, &st, &output);
+                    switch (pr) {
+                        .cont => |c| if (!c) break,
+                        .err => |e| {
+                            output.deinit(allocator);
+                            return .{ .err = e };
+                        },
+                    }
+                    if (max) |m| if (output.items.len >= m) break;
+                }
+            },
         }
         return .{ .ok = try output.toOwnedSlice(allocator) };
     }
@@ -932,6 +964,20 @@ fn materialiseSequenceBounded(
                     return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
                 switch (nx) {
                     .ok => |item| try items.append(allocator, item),
+                    .err => |e| {
+                        items.deinit(allocator);
+                        return .{ .err = e };
+                    },
+                }
+            }
+        },
+        .Merged => |mz| {
+            var lit: ?Value = null;
+            var rit: ?Value = null;
+            while (true) {
+                switch (try collections.mergedPullOne(allocator, host, out, mz, &lit, &rit)) {
+                    .value => |item| try items.append(allocator, item),
+                    .done => break,
                     .err => |e| {
                         items.deinit(allocator);
                         return .{ .err = e };
