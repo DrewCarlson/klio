@@ -449,6 +449,7 @@ pub fn tryPrepare(
         const tmp = pack_cache.loadInstalledPacksOpts(paa, user.asts, &packs_map, features, .{
             .include_stdlib = false,
             .selection = &sel_tmp,
+            .report_failures = false,
         }).bindings;
         for (sel_tmp.packs.items) |p| {
             const feats = gpa.alloc([]const u8, p.features.len) catch return null;

@@ -99,6 +99,10 @@ pub const LoadOptions = struct {
     include_stdlib: bool = true,
     embedded_report: ?*EmbeddedReport = null,
     selection: ?*Selection = null,
+    /// When false, wanted-but-undecodable installed packs are skipped without
+    /// the stderr warning. Set by secondary loads (the stdlib-image extend
+    /// pass) so a broken pack is reported once per run, not once per load.
+    report_failures: bool = true,
 };
 
 /// `Result<PathBuf, String>` carried as data: `ok` is an owned path and
@@ -476,11 +480,47 @@ const PackCandidate = struct {
     }
 };
 
+/// An installed `.klio-pack` file that could not be decoded (stale format
+/// version, corrupt file, unreadable). Kept so the loader can tell the user
+/// exactly which pack it had to skip when the program's imports want it —
+/// otherwise the run fails later with an unresolved symbol and no hint.
+const FailedPack = struct {
+    path: []u8,
+    msg: []u8,
+
+    fn deinit(self: *FailedPack, allocator: Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.msg);
+    }
+};
+
+/// The library id an installed pack file was named for:
+/// `kotlinx.coroutines-1.11.0.klio-pack` → `kotlinx.coroutines`. Installed
+/// packs are always named `<library_id>-<version>.klio-pack` (see
+/// `installPack`); the version part starts at the first `-` that is followed
+/// by a digit. Returns null when the name does not follow the convention.
+fn packLibIdFromBasename(basename: []const u8) ?[]const u8 {
+    const stem = if (std.mem.endsWith(u8, basename, ".klio-pack"))
+        basename[0 .. basename.len - ".klio-pack".len]
+    else
+        basename;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, stem, i, '-')) |dash| {
+        if (dash + 1 < stem.len and std.ascii.isDigit(stem[dash + 1])) {
+            return if (dash == 0) null else stem[0..dash];
+        }
+        i = dash + 1;
+    }
+    return null;
+}
+
 /// Read every `.klio-pack` file in the cache directory (skipping the
 /// embedded stdlib) and decode its manifest, yielding the set of
 /// candidate packs the fixpoint loader picks from. The returned list and
-/// every candidate are owned by the caller.
-fn collectPackCandidates(allocator: Allocator, cache: []const u8) Allocator.Error![]PackCandidate {
+/// every candidate are owned by the caller. Files that exist but fail to
+/// decode are appended to `failures` (also caller-owned) instead of being
+/// dropped silently.
+fn collectPackCandidates(allocator: Allocator, cache: []const u8, failures: *std.ArrayList(FailedPack)) Allocator.Error![]PackCandidate {
     var candidates: std.ArrayList(PackCandidate) = .empty;
     errdefer {
         for (candidates.items) |*c| c.deinit(allocator);
@@ -499,13 +539,20 @@ fn collectPackCandidates(allocator: Allocator, cache: []const u8) Allocator.Erro
         const path = try std.fs.path.join(allocator, &.{ cache, entry.name });
         var keep_path = false;
         defer if (!keep_path) allocator.free(path);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(fio, path, allocator, .unlimited) catch continue;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(fio, path, allocator, .unlimited) catch {
+            try appendFailure(allocator, failures, path, "the file could not be read", .{});
+            continue;
+        };
         var err: PackError = undefined;
-        var reader = (PackReader.fromBytes(allocator, bytes, &err) catch continue) orelse continue;
+        var reader = ((PackReader.fromBytes(allocator, bytes, &err) catch continue) orelse {
+            try appendFailure(allocator, failures, path, "{f}", .{err});
+            continue;
+        });
         const payload = (reader.readSection(section_names.MANIFEST, &err) catch {
             reader.deinit();
             continue;
         }) orelse {
+            try appendFailure(allocator, failures, path, "the manifest section is missing or unreadable", .{});
             reader.deinit();
             continue;
         };
@@ -514,6 +561,7 @@ fn collectPackCandidates(allocator: Allocator, cache: []const u8) Allocator.Erro
             reader.deinit();
             continue;
         }) orelse {
+            try appendFailure(allocator, failures, path, "the manifest failed to decode", .{});
             payload.deinit(allocator);
             reader.deinit();
             continue;
@@ -523,6 +571,19 @@ fn collectPackCandidates(allocator: Allocator, cache: []const u8) Allocator.Erro
         try candidates.append(allocator, .{ .pack = reader, .manifest = manifest, .path = path });
     }
     return candidates.toOwnedSlice(allocator);
+}
+
+fn appendFailure(
+    allocator: Allocator,
+    failures: *std.ArrayList(FailedPack),
+    path: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) Allocator.Error!void {
+    const msg = try std.fmt.allocPrint(allocator, fmt, args);
+    errdefer allocator.free(msg);
+    const path_dup = try allocator.dupe(u8, path);
+    try failures.append(allocator, .{ .path = path_dup, .msg = msg });
 }
 
 /// Does `rel_path` fall under any of `sources` (each a path prefix
@@ -887,7 +948,12 @@ fn loadInstalledPacksImpl(
     // pass. This lets a pack that transitively depends on another pull
     // its dependency in even when the user imports only the outer
     // library.
-    const candidates = try collectPackCandidates(gpa, cache);
+    var failed_packs: std.ArrayList(FailedPack) = .empty;
+    defer {
+        for (failed_packs.items) |*f| f.deinit(gpa);
+        failed_packs.deinit(gpa);
+    }
+    const candidates = try collectPackCandidates(gpa, cache, &failed_packs);
     defer {
         for (candidates) |*c| c.deinit(gpa);
         gpa.free(candidates);
@@ -1012,6 +1078,26 @@ fn loadInstalledPacksImpl(
             const pp = try known_prefixes.getOrPut(dup);
             if (pp.found_existing) gpa.free(dup) else pp.value_ptr.* = {};
         }
+    }
+
+    // An installed pack the program's imports want but that failed to decode
+    // is a broken environment, not a missing library — say so now, with the
+    // fix, instead of letting the run die later on an unresolved symbol. A
+    // failed pack whose library another candidate already served (a stale
+    // version next to a good one) stays quiet.
+    for (failed_packs.items) |f| {
+        if (!opts.report_failures) break;
+        const base = std.fs.path.basename(f.path);
+        const lib_id = packLibIdFromBasename(base) orelse continue;
+        if (loaded_lib_ids.contains(lib_id)) continue;
+        if (!importPrefixMatches(gpa, &known_prefixes, lib_id)) continue;
+        io.printStderr(
+            gpa,
+            "warning: skipping installed pack {s}: {s}\n" ++
+                "  imports of `{s}` will not resolve from it; rebuild and reinstall the pack\n" ++
+                "  (`klio pack build <libdir>` then `klio pack install <pack>`) or remove the file\n",
+            .{ f.path, f.msg, lib_id },
+        );
     }
 
     if (opts.selection) |sel| {
@@ -1788,4 +1874,24 @@ test "addFeatureReqs splits comma-separated features" {
     try std.testing.expect(set.contains("json"));
     try std.testing.expect(set.contains("cbor"));
     try std.testing.expectEqual(@as(usize, 2), set.count());
+}
+
+test "packLibIdFromBasename strips the version suffix" {
+    try std.testing.expectEqualStrings(
+        "kotlinx.coroutines",
+        packLibIdFromBasename("kotlinx.coroutines-1.11.0.klio-pack").?,
+    );
+    try std.testing.expectEqualStrings(
+        "io.ktor",
+        packLibIdFromBasename("io.ktor-3.5.0.klio-pack").?,
+    );
+    // A pre-release version keeps the id intact: the version part starts at
+    // the FIRST dash followed by a digit.
+    try std.testing.expectEqualStrings(
+        "mylib",
+        packLibIdFromBasename("mylib-1.0.0-beta.klio-pack").?,
+    );
+    // Not the installed naming convention: no version part at all.
+    try std.testing.expect(packLibIdFromBasename("noversion.klio-pack") == null);
+    try std.testing.expect(packLibIdFromBasename("-1.0.0.klio-pack") == null);
 }
