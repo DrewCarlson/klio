@@ -284,6 +284,10 @@ pub fn lowerArgRunFull(
     b.pending_lambda_label = null;
     const prev_expected = b.pushExpected(null);
     for (slots, 0..) |slot, j| {
+        // A sibling-solved expected type applies to exactly one arg node.
+        if (b.sib_expected_site) |site| {
+            if (site == @as(*const anyopaque, @ptrCast(&args[j]))) b.restoreExpected(b.sib_expected_ty);
+        }
         b.pending_lambda_label = call_label;
         b.pending_lambda_arity = if (arg_arity) |aa| (if (j < aa.len) aa[j] else -1) else -1;
         b.pending_lambda_broad_mask = if (b.pending_arg_broad_masks) |m| (if (j < m.len) m[j] else 0) else 0;
@@ -297,6 +301,7 @@ pub fn lowerArgRunFull(
         b.pending_lambda_arity = -1;
         b.pending_lambda_broad_mask = 0;
         b.pending_ref_fn_generic = false;
+        if (b.sib_expected_site != null) b.restoreExpected(null);
         try b.push(.{ .Move = .{ .dst = slot, .src = r } });
     }
     b.pending_arg_broad_masks = null;
@@ -334,6 +339,10 @@ pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]c
     // expected-type hint must not reach a reified inline call here.
     const prev_expected = b.pushExpected(null);
     for (slots, 0..) |slot, j| {
+        // A sibling-solved expected type applies to exactly one arg node.
+        if (b.sib_expected_site) |site| {
+            if (site == @as(*const anyopaque, @ptrCast(&args[j]))) b.restoreExpected(b.sib_expected_ty);
+        }
         b.pending_lambda_label = call_label;
         b.pending_lambda_arity = if (arg_arity) |aa| (if (j < aa.len) aa[j] else -1) else -1;
         b.pending_lambda_broad_mask = if (b.pending_arg_broad_masks) |m| (if (j < m.len) m[j] else 0) else 0;
@@ -343,6 +352,7 @@ pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]c
         b.pending_lambda_arity = -1;
         b.pending_lambda_broad_mask = 0;
         b.pending_ref_fn_generic = false;
+        if (b.sib_expected_site != null) b.restoreExpected(null);
         try b.push(.{ .Move = .{ .dst = slot, .src = r } });
     }
     b.pending_arg_broad_masks = null;

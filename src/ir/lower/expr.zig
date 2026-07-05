@@ -2690,6 +2690,23 @@ fn trailingLambdaArity(args: []const Expr) ?usize {
 }
 
 fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
+    // Sibling-arg expected type: `assertEquals(EmptyEnum.entries,
+    // enumEntries())` — a sibling argument bound to the same declared type
+    // variable statically names an enum, which solves the nested reified
+    // call's expected type. Recorded per-arg-node; the arg-lowering loops
+    // surface it as THAT argument's expected type so the nested inline
+    // splice's return-type unification (the existing reified oracle)
+    // stamps the type argument.
+    const sib_prev_site = b.sib_expected_site;
+    const sib_prev_ty = b.sib_expected_ty;
+    if (solveSiblingExpected(b, expr.Call.callee, expr.Call.args)) |solved| {
+        b.sib_expected_site = @ptrCast(solved.site);
+        b.sib_expected_ty = solved.ty;
+    }
+    defer {
+        b.sib_expected_site = sib_prev_site;
+        b.sib_expected_ty = sib_prev_ty;
+    }
     const call = expr.Call;
     const callee = call.callee;
     const args = call.args;
@@ -5904,6 +5921,120 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     return dst;
 }
 
+/// Sibling-arg reified inference: when an argument of a resolved call is
+/// itself a bare 0-arg call to a single-type-param fn with no type args
+/// (`enumEntries()`), and a SIBLING argument bound to the same declared
+/// type variable statically names an enum (`EmptyEnum.entries`,
+/// `EmptyEnum.values().toList()`), the enum solves the nested call's
+/// reified argument. Records the solution keyed by the nested call's AST
+/// node; `emitCall` consumes it when that node lowers with no type args
+/// of its own.
+const SibSolved = struct { site: *const Expr, ty: ast.TypeRef };
+
+fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr) ?SibSolved {
+    if (callee.* != .Path or callee.Path.segments.len != 1) return null;
+    if (args.len < 2) return null;
+    const outer_name = callee.Path.segments[0].name;
+    var outer: ?*const ir.Func = null;
+    for (b.module.funcsBySimpleName(outer_name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.params.len == args.len or (f.params.len > args.len and f.params.len - args.len <= 1)) {
+            outer = f;
+            break;
+        }
+    }
+    const f = outer orelse return null;
+    const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    for (args, 0..) |*arg, j| {
+        if (arg.* != .Call) continue;
+        const c = arg.Call;
+        if (c.type_args.len != 0 or c.args.len != 0) continue;
+        if (c.callee.* != .Path or c.callee.Path.segments.len != 1) continue;
+        const nested_name = c.callee.Path.segments[0].name;
+        const nested_fid = b.module.funcId(nested_name) orelse continue;
+        const tps = b.module.registry.func_type_params.get(nested_fid) orelse continue;
+        if (tps.items.len != 1) continue;
+        const nested_f = b.module.funcById(nested_fid) orelse continue;
+        // The lowered ir return type keeps only the head (`EnumEntries`);
+        // the splice unifies against the AST declaration's full
+        // `Head<T>`, so the head is all the expected type needs here.
+        if (nested_f.return_ty.name.len == 0) continue;
+        const pj = recv_off + j;
+        if (pj >= f.params.len) continue;
+        const tv = f.params[pj].ty.name;
+        // The declared param type must be a bare type variable shared with
+        // a sibling (`assertEquals(expected: T, actual: T)`).
+        if (tv.len > 2 or !allUppercase(tv)) continue;
+        for (args, 0..) |*sib, k| {
+            if (k == j) continue;
+            const pk = recv_off + k;
+            if (pk >= f.params.len) continue;
+            if (!std.mem.eql(u8, f.params[pk].ty.name, tv)) continue;
+            const enum_name = staticEnumElem(b, sib) orelse continue;
+            // Build `Head<Enum>` as the nested call's expected type; the
+            // inline splice's return-type unification (the existing
+            // reified oracle) solves T from it.
+            var head = nested_f.return_ty.name;
+            if (std.mem.lastIndexOfScalar(u8, head, '.')) |i| head = head[i + 1 ..];
+            const sp = c.callee.Path.segments[0].span;
+            const ta = b.allocator.alloc(ast.TypeArg, 1) catch return null;
+            ta[0] = .{
+                .variance = .Invariant,
+                .is_star = false,
+                .ty = .{ .name = .{ .name = enum_name, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+                .span = sp,
+            };
+            return .{ .site = arg, .ty = .{ .name = .{ .name = head, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null } };
+        }
+    }
+    return null;
+}
+
+/// The enum class statically named by an expression's element type:
+/// `E.entries` and `E.values().toList()` both yield `E` when `E` resolves
+/// to a registered enum class.
+fn staticEnumElem(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
+    switch (e.*) {
+        .Member => |m| {
+            if (std.mem.eql(u8, m.name.name, "entries")) return enumClassOfPath(b, m.receiver);
+            return null;
+        },
+        .Call => |c| {
+            if (c.callee.* != .Member) return null;
+            const outer_m = c.callee.Member;
+            if (!std.mem.eql(u8, outer_m.name.name, "toList")) return null;
+            if (outer_m.receiver.* != .Call) return null;
+            const inner = outer_m.receiver.Call;
+            if (inner.callee.* != .Member) return null;
+            const vm = inner.callee.Member;
+            if (!std.mem.eql(u8, vm.name.name, "values")) return null;
+            return enumClassOfPath(b, vm.receiver);
+        },
+        else => return null,
+    }
+}
+
+fn enumClassOfPath(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
+    var name: []const u8 = undefined;
+    switch (e.*) {
+        .Path => |p| name = p.segments[p.segments.len - 1].name,
+        .Member => |m| name = m.name.name,
+        else => return null,
+    }
+    if (b.module.classId(name) == null) return null;
+    // Enum-ness at lowering: the recorded supertype chain carries
+    // `Enum` for every enum class (the implicit supertype is recorded at
+    // class lowering).
+    const chain = b.module.registry.class_super_names.get(name) orelse return null;
+    for (chain) |sup| {
+        var sn = sup;
+        if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+        if (std.mem.indexOfScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
+        if (std.mem.eql(u8, sn, "Enum")) return name;
+    }
+    return null;
+}
+
 /// Static type args synthesized from the enclosing splice's reified
 /// substitution: when the call site wrote none and every declared
 /// type-parameter name of `func_id` is bound in the active reified name
@@ -5982,6 +6113,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     const dst = b.allocReg();
     orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
     const cmg_static_recv: ?ConstId = try cmgStaticRecv(b);
+    const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
     try b.push(.{ .CallMemberOrGlobal = .{
         .dst = dst,
         .this_idx = this_idx,
@@ -5991,6 +6123,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         .arg_names = arg_names,
         .func = func_id,
         .static_recv = cmg_static_recv,
+        .type_args = type_args,
     } });
     return dst;
 }

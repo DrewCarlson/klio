@@ -153,6 +153,16 @@ fn mapStructuralBump(entries: MapEntries, before: usize) void {
 
 /// A new handle on the map's shared `mod_count`, for a `keys`/`values`/`entries`
 /// view so its iterator fails fast when the source map mutates structurally.
+/// Current structural counter of an entries store (0 when uncounted).
+fn entriesCounterNow(entries: MapEntries) u64 {
+    const g = entries.borrow();
+    defer g.deinit();
+    const cell = g.get().mod_count orelse return 0;
+    const cg = cell.borrow();
+    defer cg.deinit();
+    return cg.get().*;
+}
+
 fn entriesModCountClone(entries: MapEntries) ?ObjRef(u64) {
     const g = entries.borrow();
     defer g.deinit();
@@ -349,9 +359,9 @@ fn thrown(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!EvalResult 
 /// froze (`build*` returned), so every VIEW sharing the cell is
 /// read-only from now on even though its own `mutable` flag was minted
 /// while the builder was live.
-pub const FROZEN_MOD_BIT: u64 = 1 << 63;
+pub const FROZEN_MOD_BIT: u64 = runtime.FROZEN_MOD_BIT;
 
-fn modCountFrozen(mc: ?ObjRef(u64)) bool {
+pub fn modCountFrozen(mc: ?ObjRef(u64)) bool {
     const cell = mc orelse return false;
     const g = cell.borrow();
     defer g.deinit();
@@ -611,6 +621,9 @@ const ListItemsOutcome = union(enum) { items: ValueList, err: EvalResult };
 
 fn recvListItems(a: Allocator, args: []const Value, what: []const u8) Error!ListItemsOutcome {
     if (args.len > 0 and args[0] == .List) {
+        // A live subList view fails fast when its backing changed
+        // structurally not through the view.
+        if (try sublistComodGuard(a, &args[0])) |e| return .{ .err = e };
         // An array `.asList()` view re-reads its scalar source so later array
         // writes show through before any read of `items`.
         args[0].refreshArrayView();
@@ -928,6 +941,7 @@ pub fn array_shuffle(ctx: *CallCtx) Error!EvalResult {
 /// `MutableList.shuffle()` — shuffle in place.
 pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.shuffle")) {
@@ -959,6 +973,33 @@ pub fn coll_iter_filter_not_null(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeListBorrowed(a, result, false));
 }
 
+/// Accumulator kind of a `sumOf` fold — mirrors the Kotlin overload set
+/// (Int, Long, UInt, ULong, Double). The sum keeps the selector's kind:
+/// Int wraps at 32 bits, UInt sums stay UInt, an empty receiver yields
+/// the zero of the selector's declared return type.
+const SumKind = enum { int, long, uint, ulong, double };
+
+fn sumKindFromTyName(name: []const u8) ?SumKind {
+    const simple = if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| name[i + 1 ..] else name;
+    if (std.mem.eql(u8, simple, "Int")) return .int;
+    if (std.mem.eql(u8, simple, "Long")) return .long;
+    if (std.mem.eql(u8, simple, "UInt")) return .uint;
+    if (std.mem.eql(u8, simple, "ULong")) return .ulong;
+    if (std.mem.eql(u8, simple, "Double")) return .double;
+    return null;
+}
+
+fn sumKindOfValue(v: Value) ?SumKind {
+    return switch (v) {
+        .Int, .Short, .Byte => .int,
+        .Long => .long,
+        .UInt, .UShort, .UByte => .uint,
+        .ULong => .ulong,
+        .Double, .Float => .double,
+        else => null,
+    };
+}
+
 pub fn coll_iter_sum_of(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("sumOf expects (receiver, block)");
@@ -968,35 +1009,71 @@ pub fn coll_iter_sum_of(ctx: *CallCtx) Error!EvalResult {
     };
     defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
-    var acc_int: ?i64 = 0;
-    var acc_dbl: ?f64 = null;
+    var kind: ?SumKind = if (ctx.host.callableReturnTy(&block)) |n| sumKindFromTyName(n) else null;
+    var ai: i32 = 0;
+    var al: i64 = 0;
+    var au: u32 = 0;
+    var aul: u64 = 0;
+    var ad: f64 = 0;
     for (items) |v| {
         const r = switch (try invoke(ctx, &block, &.{v})) {
             .value => |val| val,
             .err => |e| return e,
         };
-        if (r.isIntegral()) {
-            const n = r.asI64().?;
-            if (acc_int) |*aa| {
-                aa.* +%= n;
-            } else if (acc_dbl) |*aa| {
-                aa.* += @as(f64, @floatFromInt(n));
-            }
-        } else if (r.isFloating()) {
-            const d = r.asF64().?;
-            if (acc_int) |aa| {
-                acc_dbl = @as(f64, @floatFromInt(aa)) + d;
-                acc_int = null;
-            } else if (acc_dbl) |*aa| {
-                aa.* += d;
-            }
-        } else {
+        const rk = sumKindOfValue(r) orelse {
             const rd = try display(a, r);
-            return typeErr(try fmt(a, "sumOf selector must return Int or Double, got {s}", .{rd}));
+            return typeErr(try fmt(a, "sumOf selector must return a numeric value, got {s}", .{rd}));
+        };
+        if (kind == null) kind = rk;
+        // A wider result kind in the same family widens the running sum.
+        switch (kind.?) {
+            .int => switch (rk) {
+                .long => {
+                    al = ai;
+                    kind = .long;
+                },
+                .double => {
+                    ad = @floatFromInt(ai);
+                    kind = .double;
+                },
+                else => {},
+            },
+            .uint => switch (rk) {
+                .ulong => {
+                    aul = au;
+                    kind = .ulong;
+                },
+                .double => {
+                    ad = @floatFromInt(au);
+                    kind = .double;
+                },
+                else => {},
+            },
+            .long => if (rk == .double) {
+                ad = @floatFromInt(al);
+                kind = .double;
+            },
+            .ulong => if (rk == .double) {
+                ad = @floatFromInt(aul);
+                kind = .double;
+            },
+            .double => {},
+        }
+        switch (kind.?) {
+            .int => ai +%= @as(i32, @truncate(r.asI64() orelse 0)),
+            .long => al +%= r.asI64() orelse 0,
+            .uint => au +%= @as(u32, @truncate(r.asU64() orelse 0)),
+            .ulong => aul +%= r.asU64() orelse 0,
+            .double => ad += r.asF64() orelse 0,
         }
     }
-    if (acc_dbl) |d| return ok(.{ .Double = d });
-    return ok(Value.newInt(acc_int orelse 0));
+    return switch (kind orelse .int) {
+        .int => ok(.{ .Int = ai }),
+        .long => ok(.{ .Long = al }),
+        .uint => ok(.{ .UInt = au }),
+        .ulong => ok(.{ .ULong = aul }),
+        .double => ok(.{ .Double = ad }),
+    };
 }
 
 fn iterMaxMinOfOrNull(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult {
@@ -1520,6 +1597,7 @@ fn invokeComparatorCompare(ctx: *CallCtx, comparator: Value, x: Value, y: Value)
 
 pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.sort")) {
@@ -1583,6 +1661,7 @@ pub fn mergeSortComparator(ctx: *CallCtx, cmp: Value, items: []Value) Error!?Eva
 
 pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.sortWith")) {
@@ -1600,6 +1679,7 @@ pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_fill(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.fill")) {
@@ -1616,6 +1696,7 @@ pub fn coll_mut_list_fill(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_reverse(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.reverse")) {
@@ -2333,6 +2414,18 @@ pub fn coll_to_typed_array(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr("toTypedArray requires a receiver");
     const recv = ctx.args[0];
+    if (recv == .Instance) {
+        // `collectionToArray` dispatches through the collection's `toArray()`
+        // override before falling back to iteration, so a user override
+        // observes the call (AbstractCollection subclasses may cache or
+        // instrument it).
+        if (try ctx.host.invokeMethod(&recv, "toArray", &.{}, ctx.out)) |r| switch (r) {
+            .ok => |v| {
+                if (v == .Array) return ok(v);
+            },
+            .err => |e| return .{ .err = e },
+        };
+    }
     const items = if (recv == .Instance)
         switch (try materialiseIterableInstance(ctx, recv)) {
             .items => |x| x,
@@ -2862,6 +2955,7 @@ pub fn coll_array_join_to_string(ctx: *CallCtx) Error!EvalResult {
 fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
+    if (try sublistComodGuard(a, &ctx.args[0])) |e| return e;
     const buf = try display(a, ctx.args[0]);
     const s = try makeStringOwned(a, buf);
     if (runtime.freeScratch()) a.free(buf);
@@ -2874,6 +2968,7 @@ pub fn coll_list_to_string(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (try readOnlyMutationGuard(a, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
@@ -2911,6 +3006,7 @@ pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_add_first(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
@@ -2928,6 +3024,7 @@ pub fn coll_mut_list_add_first(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_remove_first(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
@@ -2945,6 +3042,7 @@ pub fn coll_mut_list_remove_first(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_remove_last(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
@@ -2960,6 +3058,7 @@ pub fn coll_mut_list_remove_last(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
@@ -2983,6 +3082,7 @@ pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
@@ -3097,26 +3197,100 @@ fn sublistBackingOf(receiver: Value) ?*runtime.CollBackingRef.Cell {
 /// own item-borrow guard has been released (no nested borrow of `items`).
 fn syncSublist(a: Allocator, receiver: Value) void {
     const cell = sublistBackingOf(receiver) orelse return;
+    const cur = counterNowOf(receiver.List.mod_count);
+    syncSublistChain(a, cell, receiver.List.items, cur);
+}
+
+/// Splice a mutated view's cache into its parent window and recurse up
+/// the ancestor chain, growing/shrinking each window and re-stamping each
+/// ancestor's comod expectation. Siblings keep their stale stamp and fail
+/// fast on their next access.
+fn syncSublistChain(a: Allocator, cell: *runtime.CollBackingRef.Cell, view_items: ValueList, cur: u64) void {
+    if (cell.data != .sublist) return;
     const sb = &cell.data.sublist;
     const from = sb.from;
     const old_len = sb.len;
-    const view_g = receiver.List.items.borrow();
-    defer view_g.deinit();
-    const new_items = view_g.get().items;
-    const pg = sb.parent.borrowMut();
-    defer pg.deinit();
-    const plist = pg.get();
-    if (from > plist.items.len) {
-        sb.len = 0;
-        return;
+    {
+        const view_g = view_items.borrow();
+        defer view_g.deinit();
+        const new_items = view_g.get().items;
+        const pg = sb.parent.borrowMut();
+        defer pg.deinit();
+        const plist = pg.get();
+        if (from > plist.items.len) {
+            sb.len = 0;
+            return;
+        }
+        const span = @min(from + old_len, plist.items.len) - from;
+        if (runtime.reclaimEnabled()) {
+            for (plist.items[from .. from + span]) |v| v.release(a);
+            for (new_items) |v| v.retain();
+        }
+        plist.replaceRange(a, from, span, new_items) catch return;
+        sb.len = new_items.len;
+        sb.exp_mod = cur;
     }
-    const span = @min(from + old_len, plist.items.len) - from;
-    if (runtime.reclaimEnabled()) {
-        for (plist.items[from .. from + span]) |v| v.release(a);
-        for (new_items) |v| v.retain();
+    if (sb.parent_backing) |pb| syncSublistChain(a, pb, sb.parent, cur);
+}
+
+/// Current value of a shared structural counter (0 when uncounted).
+pub fn counterNowOf(mc: ?ObjRef(u64)) u64 {
+    const cell = mc orelse return 0;
+    const g = cell.borrow();
+    defer g.deinit();
+    return g.get().*;
+}
+
+/// Whether a live `subList` view's backing changed structurally not
+/// through the view (or a descendant) — the CME predicate. The freeze bit
+/// is masked so a leaked-but-unmodified builder view still reads after
+/// `build()`.
+pub fn sublistViewStale(v: *const Value) bool {
+    return v.sublistViewStale();
+}
+
+/// ConcurrentModificationException when `sublistViewStale`; read choke
+/// points call this before serving.
+pub fn sublistComodGuard(a: Allocator, v: *const Value) Error!?EvalResult {
+    if (!sublistViewStale(v)) return null;
+    return try thrown(a, "kotlin.ConcurrentModificationException", null);
+}
+
+/// Live-entry prologue shared by the `Map.Entry` intrinsics: after a
+/// structural map change every access throws CME; before that, the value
+/// box is refreshed from the live pair so non-structural updates show
+/// through.
+pub fn mapEntryViewGuard(a: Allocator, v: *const Value) Error!?EvalResult {
+    if (v.* != .MapEntry) return null;
+    const me = &v.MapEntry;
+    const entries = me.backing orelse return null;
+    var stale = false;
+    {
+        const g = entries.borrow();
+        defer g.deinit();
+        if (g.get().mod_count) |cell| {
+            const cg = cell.borrow();
+            stale = cg.get().* != me.exp_mod;
+            cg.deinit();
+        }
+        if (!stale) {
+            for (g.get().pairs.items) |*slot| {
+                if (Value.structuralEq(&slot.key, me.key.asPtr())) {
+                    const live = slot.value;
+                    if (!Value.structuralEq(me.value.asPtr(), &live)) {
+                        if (runtime.reclaimEnabled()) {
+                            live.retain();
+                            me.value.asPtr().release(a);
+                        }
+                        me.value.asPtr().* = live;
+                    }
+                    break;
+                }
+            }
+        }
     }
-    plist.replaceRange(a, from, span, new_items) catch return;
-    sb.len = new_items.len;
+    if (stale) return try thrown(a, "kotlin.ConcurrentModificationException", null);
+    return null;
 }
 
 // =====================================================================
@@ -3394,6 +3568,65 @@ fn takeCapReached(ops: []const SeqOp, taken: []const usize) bool {
     return false;
 }
 
+/// One pull from a `Merged` (zip) source: advance the left iterator, then
+/// the right, one element each; either side exhausting ends the merge. The
+/// child iterators are created together on the first pull, so a
+/// shared-state generator observes `MergingSequence`'s strict interleave.
+pub fn mergedPullOne(
+    a: Allocator,
+    host: IntrinsicHost,
+    out: Output,
+    mz: runtime.MergedSource,
+    iter_left: *?Value,
+    iter_right: *?Value,
+) Error!union(enum) { value: Value, done, err: RuntimeError } {
+    if (iter_left.* == null) {
+        const li = (try host.invokeMethod(&mz.left.asPtr().*, "iterator", &.{}, out)) orelse
+            return .{ .err = .{ .Type = "zip: receiver lacks iterator()" } };
+        switch (li) {
+            .ok => |v| iter_left.* = v,
+            .err => |e| return .{ .err = e },
+        }
+        const ri = (try host.invokeMethod(&mz.right.asPtr().*, "iterator", &.{}, out)) orelse
+            return .{ .err = .{ .Type = "zip: argument lacks iterator()" } };
+        switch (ri) {
+            .ok => |v| iter_right.* = v,
+            .err => |e| return .{ .err = e },
+        }
+    }
+    const lit = iter_left.*.?;
+    const rit = iter_right.*.?;
+    const lh = (try host.invokeMethod(&lit, "hasNext", &.{}, out)) orelse
+        return .{ .err = .{ .Type = "zip: iterator lacks hasNext" } };
+    switch (lh) {
+        .ok => |x| if (!(x == .Bool and x.Bool)) return .done,
+        .err => |e| return .{ .err = e },
+    }
+    const rh = (try host.invokeMethod(&rit, "hasNext", &.{}, out)) orelse
+        return .{ .err = .{ .Type = "zip: iterator lacks hasNext" } };
+    switch (rh) {
+        .ok => |x| if (!(x == .Bool and x.Bool)) return .done,
+        .err => |e| return .{ .err = e },
+    }
+    const av = switch ((try host.invokeMethod(&lit, "next", &.{}, out)) orelse
+        return .{ .err = .{ .Type = "zip: iterator lacks next" } }) {
+        .ok => |v| v,
+        .err => |e| return .{ .err = e },
+    };
+    const bv = switch ((try host.invokeMethod(&rit, "next", &.{}, out)) orelse
+        return .{ .err = .{ .Type = "zip: iterator lacks next" } }) {
+        .ok => |v| v,
+        .err => |e| return .{ .err = e },
+    };
+    if (mz.transform) |t| {
+        return switch (try seqCall(host, t.asPtr(), &.{ av, bv }, out)) {
+            .value => |v| .{ .value = v },
+            .err => |e| .{ .err = e },
+        };
+    }
+    return .{ .value = try makePair(a, av, bv) };
+}
+
 fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.SequenceData, max: ?usize) Error!SeqOutcome {
     const n_ops = seq.ops.len;
     var st = PumpState{
@@ -3530,6 +3763,27 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 }
             }
         },
+        .Merged => |mz| {
+            var lit: ?Value = null;
+            var rit: ?Value = null;
+            while (true) {
+                if (takeCapReached(seq.ops, st.taken)) break;
+                const step = try mergedPullOne(a, host, out, mz, &lit, &rit);
+                const item = switch (step) {
+                    .value => |val| val,
+                    .done => break,
+                    .err => |e| return .{ .err = e },
+                };
+                const res = try pumpItem(a, host, out, item, seq.ops, &st, &output);
+                switch (res) {
+                    .cont => |c| if (!c) break,
+                    .err => |e| return .{ .err = e },
+                }
+                if (max) |m| {
+                    if (output.items.len >= m) break;
+                }
+            }
+        },
     }
     return .{ .items = try output.toOwnedSlice(a) };
 }
@@ -3603,6 +3857,17 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                     return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
                 switch (nx) {
                     .ok => |item| try items.append(a, item),
+                    .err => |e| return .{ .err = e },
+                }
+            }
+        },
+        .Merged => |mz| {
+            var lit: ?Value = null;
+            var rit: ?Value = null;
+            while (true) {
+                switch (try mergedPullOne(a, host, out, mz, &lit, &rit)) {
+                    .value => |item| try items.append(a, item),
+                    .done => break,
                     .err => |e| return .{ .err = e },
                 }
             }
@@ -4401,16 +4666,12 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     recv.refreshSublistView();
     const from = if (ctx.args.len > 1) (ctx.args[1].asI64() orelse return typeErr("subList requires Int fromIndex")) else return typeErr("subList requires Int fromIndex");
     const to = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse return typeErr("subList requires Int toIndex")) else return typeErr("subList requires Int toIndex");
-    // A subList over a subList flattens to a direct window on the same root
-    // list, so the chain always splices straight through to the root.
-    var root = recv.List.items;
-    var base_from: usize = 0;
-    var recv_len: usize = listLen(recv.List.items);
-    if (sublistBackingOf(recv)) |cell| {
-        root = cell.data.sublist.parent;
-        base_from = cell.data.sublist.from;
-        recv_len = cell.data.sublist.len;
-    }
+    // A subList over a subList CHAINS: the new view's parent is the
+    // receiver view itself, so growth through the child splices into every
+    // ancestor window on the way to the root (Java's `SubList(parent)`).
+    const parent_items = recv.List.items;
+    const parent_backing = sublistBackingOf(recv);
+    const recv_len: usize = listLen(recv.List.items);
     const len_i: i64 = @intCast(recv_len);
     if (from < 0 or to > len_i) {
         const msg = try fmt(a, "fromIndex: {d}, toIndex: {d}, size: {d}", .{ from, to, len_i });
@@ -4424,17 +4685,23 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
         if (runtime.freeScratch()) a.free(msg);
         return e;
     }
-    const new_from = base_from + @as(usize, @intCast(from));
+    const new_from: usize = @intCast(from);
     const win_len: usize = @intCast(to - from);
     var window: std.ArrayList(Value) = .empty;
     {
-        const rg = root.borrow();
+        const rg = parent_items.borrow();
         defer rg.deinit();
         try window.appendSlice(a, rg.get().items[new_from .. new_from + win_len]);
     }
     if (runtime.reclaimEnabled()) for (window.items) |e| e.retain();
     const mutable = recv.List.mutable;
-    const backing = try CollBackingRef.init(a, .{ .sublist = .{ .parent = root, .from = new_from, .len = win_len } });
+    const backing = try CollBackingRef.init(a, .{ .sublist = .{
+        .parent = parent_items,
+        .parent_backing = parent_backing,
+        .from = new_from,
+        .len = win_len,
+        .exp_mod = counterNowOf(recv.List.mod_count),
+    } });
     // Share the root list's structural counter so a modification of the parent
     // (not through this view) is observed as a ConcurrentModification by this
     // subList's iterators — matching Kotlin's SubList, which tracks root.modCount.
@@ -5312,6 +5579,8 @@ pub fn coll_map_contains_value(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
+    // A read-only map's keys view is read-only too, mirroring `entries`.
+    const writable = ctx.args.len > 0 and ctx.args[0] == .Map and ctx.args[0].Map.mutable;
     const entries = switch (try recvMapEntries(a, ctx.args, "Map.keys")) {
         .entries => |x| x,
         .err => |e| return e,
@@ -5329,10 +5598,12 @@ pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try CollBackingRef.init(a, .{ .map = .{ .entries = entries, .kind = .Keys } });
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = true, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = writable, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
 }
 pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
+    // A read-only map's values view is read-only too, mirroring `entries`.
+    const writable = ctx.args.len > 0 and ctx.args[0] == .Map and ctx.args[0].Map.mutable;
     const entries = switch (try recvMapEntries(a, ctx.args, "Map.values")) {
         .entries => |x| x,
         .err => |e| return e,
@@ -5348,7 +5619,7 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try CollBackingRef.init(a, .{ .map = .{ .entries = entries, .kind = .Values } });
-    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_entries = false, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
+    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = writable, .enum_entries = false, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
 }
 pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -5360,6 +5631,7 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     var map_entries: std.ArrayList(Value) = .empty;
+    const stamp = entriesCounterNow(entries);
     {
         const g = entries.borrow();
         defer g.deinit();
@@ -5370,6 +5642,7 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
                 .key = try Value.boxRef(a, kv.key),
                 .value = try Value.boxRef(a, kv.value),
                 .backing = if (writable) entries else null,
+                .exp_mod = stamp,
             } });
         }
     }
@@ -5887,9 +6160,12 @@ pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
-    const _szb = listLenOf(&ctx.args[0]);
-    defer structuralBump(&ctx.args[0], _szb);
+    // `addAll` bumps the counter even when the argument is empty (JVM
+    // `ArrayList.addAll` touches modCount via ensureCapacity before the
+    // size check), so a live iterator fails fast afterwards.
+    defer bumpModCount(&ctx.args[0]);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.addAll")) {
         .items => |x| x,
@@ -5932,6 +6208,7 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
@@ -5960,6 +6237,7 @@ pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_remove_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
@@ -5972,6 +6250,7 @@ pub fn coll_mut_list_remove_all(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_list_retain_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
@@ -5985,6 +6264,7 @@ pub fn coll_mut_list_retain_all(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_set(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.set")) {

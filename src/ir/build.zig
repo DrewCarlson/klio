@@ -438,6 +438,14 @@ pub const FuncBuilder = struct {
     /// source the arg-run reads (parallel to the args), set by the call site.
     pending_lambda_broad_mask: u32 = 0,
     pending_arg_broad_masks: ?[]const u32 = null,
+    /// Sibling-solved expected type for ONE nested call argument, keyed by
+    /// that argument's AST node (`assertEquals(EmptyEnum.entries,
+    /// enumEntries())` solves `EnumEntries<EmptyEnum>` for the nested
+    /// call). The arg-lowering loops push it as THAT argument's expected
+    /// type — arguments otherwise lower with no expected-type hint.
+    sib_expected_site: ?*const anyopaque = null,
+    sib_expected_ty: ?ast.TypeRef = null,
+
 
     /// Per-argument flags: the callee parameter's declared function type
     /// takes only values typed by the callee's own type parameters

@@ -140,6 +140,10 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         prog.extension_prop_setters = built.extension_prop_setters;
         built.extension_prop_setters = build.PairFuncMap.init(allocator);
 
+        prog.extension_prop_delegates.deinit();
+        prog.extension_prop_delegates = built.extension_prop_delegates;
+        built.extension_prop_delegates = build.PairFuncMap.init(allocator);
+
         prog.secondary_ctors.deinit();
         prog.secondary_ctors = built.secondary_ctors;
         built.secondary_ctors = std.StringHashMap([]build.SecondaryCtorEntry).init(allocator);

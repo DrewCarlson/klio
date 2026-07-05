@@ -245,7 +245,19 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
 // -------------------------------------------------------------------------
 
 pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return getFieldInner(self, allocator, receiver, name, false, false);
+    return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, false));
+}
+
+/// A boxed capture (an anon-object method's captured outer `var` stored
+/// in its capture env as a shared Cell) reads THROUGH the cell — the cell
+/// is a carrier, never a user value.
+fn unwrapCellRead(r: EvalResult) EvalResult {
+    if (r == .ok and r.ok == .Cell) {
+        const cg = r.ok.Cell.borrow();
+        defer cg.deinit();
+        return .{ .ok = cg.get().* };
+    }
+    return r;
 }
 
 /// Per-candidate probe for the bare-name resolver's innermost-first walk:
@@ -257,7 +269,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
 /// out; the walk's own terminal arm decides the global fallback, and
 /// companions ride the walk as their own candidates.
 pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return getFieldInner(self, allocator, receiver, name, false, true);
+    return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true));
 }
 
 /// For the loop JIT: the index of `name` in the receiver's instance field list,
@@ -853,6 +865,14 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (pushed_owner) ir.eval.popEnclosing();
             return r;
         }
+        // Delegated extension property (`val R.x by expr`): materialise
+        // the delegate object once per property, then read through its
+        // `getValue(thisRef, property)`.
+        if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
+            const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
+            const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
+            return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
+        }
     }
     // Reflection-style accessors on `KClass` / `KProperty` values.
     switch (receiver.*) {
@@ -946,7 +966,16 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if (std.mem.eql(u8, name, "size")) {
         switch (receiver.*) {
             .Array => |a| return ok(Value.newInt(@intCast(a.len()))),
-            .List => |l| return ok(Value.newInt(@intCast(listLen(l.items)))),
+            .List => |l| {
+                if (stdlib.implementations.collections.sublistViewStale(receiver)) {
+                    return errRes(.{ .Throw = .{ .Exception = .{
+                        .fqn = try runtime.strInit(allocator, "kotlin.ConcurrentModificationException"),
+                        .message = null,
+                        .cause = null,
+                    } } });
+                }
+                return ok(Value.newInt(@intCast(listLen(l.items))));
+            },
             .Set => |s| return ok(Value.newInt(@intCast(listLen(s.items)))),
             .Map => |m| {
                 const g = m.entries.borrow();
@@ -1196,7 +1225,17 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (o == .Null or o == .Unit) break;
             switch (try getFieldInner(self, allocator, &o, name, suppress_cc_redirect, member_probe)) {
                 .ok => |v| if (v != .Unit) return ok(v),
-                .err => |e| freeFieldMiss(allocator, e),
+                // Only the dispatch-miss sentinel is a walkable miss; a
+                // throw from an accessor that RAN (SubList.size's
+                // ConcurrentModificationException inside an inner-class
+                // method) propagates.
+                .err => |e| {
+                    if (e == .Unimplemented) {
+                        freeFieldMiss(allocator, e);
+                    } else {
+                        return errRes(e);
+                    }
+                },
             }
             cur = switch (o) {
                 .Instance => |i| blk: {
@@ -1622,6 +1661,102 @@ pub fn hostHasExtPropSetter(self: *VmHost, allocator: Allocator, receiver: *cons
     };
     const fid = resolveExtensionPropSetter(self, allocator, receiver, recv_simple, name) catch return false;
     return fid != null;
+}
+
+const ExtDelegateHit = struct { key: []const u8, fid: FuncId };
+
+/// Resolve a delegated extension property (`val R.x by expr`) for this
+/// receiver: exact declared receiver, then the instance supertype chain.
+/// Returns the DECLARING registry key alongside the thunk so the cached
+/// delegate object is shared across subtype receivers.
+fn resolveExtPropDelegate(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    recv_simple: []const u8,
+    name: []const u8,
+) Allocator.Error!?ExtDelegateHit {
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (pg.get().extension_prop_delegates.count() == 0) return null;
+        if (lookupPairFunc(pg.get().extension_prop_delegates, recv_simple, name)) |fid| {
+            return .{ .key = recv_simple, .fid = fid };
+        }
+    }
+    if (receiver.* == .Instance) {
+        var queue: std.ArrayList([]const u8) = .empty;
+        defer queue.deinit(allocator);
+        var seen: std.ArrayList([]const u8) = .empty;
+        defer seen.deinit(allocator);
+        {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            for (cg.get().supertype_names) |s| try queue.append(allocator, s);
+        }
+        var head: usize = 0;
+        while (head < queue.items.len) {
+            const sup = queue.items[head];
+            head += 1;
+            if (containsStr(seen.items, sup)) continue;
+            try seen.append(allocator, sup);
+            {
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                if (lookupPairFunc(pg.get().extension_prop_delegates, sup, name)) |fid| {
+                    return .{ .key = sup, .fid = fid };
+                }
+            }
+            const def: ?ObjRef(ClassDef) = blk: {
+                const cg = self.classes.borrow();
+                defer cg.deinit();
+                break :blk cg.get().get(sup);
+            };
+            if (def) |d| {
+                const dg = d.borrow();
+                defer dg.deinit();
+                for (dg.get().supertype_names) |s| try queue.append(allocator, s);
+            }
+        }
+    }
+    return null;
+}
+
+/// The materialised delegate object for a delegated extension property:
+/// run the delegate thunk once and cache the result as a hidden global
+/// keyed by the declaring receiver + property name.
+fn extPropDelegateInstance(
+    self: *VmHost,
+    allocator: Allocator,
+    key: []const u8,
+    name: []const u8,
+    fid: FuncId,
+) Allocator.Error!Value {
+    var kb: [256]u8 = undefined;
+    const cache_name = std.fmt.bufPrint(&kb, "__ext_delegate\x1f{s}\x1f{s}", .{ key, name }) catch
+        return runThunkValue(self, allocator, fid);
+    {
+        const gg = self.globals.borrow();
+        defer gg.deinit();
+        if (gg.get().lookup(cache_name)) |v| return v;
+    }
+    const v = try runThunkValue(self, allocator, fid);
+    const owned_name = try allocator.dupe(u8, cache_name);
+    const g = self.globals.borrowMut();
+    defer g.deinit();
+    g.get().define(owned_name, v) catch {};
+    return v;
+}
+
+fn runThunkValue(self: *VmHost, allocator: Allocator, fid: FuncId) Allocator.Error!Value {
+    const mptr: *const Module = self.module.asPtr();
+    const r = try self.callFunc(allocator, mptr, fid, &.{});
+    return switch (r) {
+        .ok => |v| v,
+        .err => Value.Null,
+    };
 }
 
 fn resolveExtensionPropImpl(
@@ -2403,6 +2538,17 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                 .err => |e| return .{ .err = e },
             }
         }
+        // Delegated extension property (`var R.x by expr`): write through
+        // the cached delegate's `setValue(thisRef, property, value)`.
+        if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, real_name)) |hit| {
+            const d = try extPropDelegateInstance(self, allocator, hit.key, real_name, hit.fid);
+            const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, real_name) } };
+            const r = try self.callMember(allocator, &d, "setValue", &.{ receiver.*, prop_ref, value });
+            switch (r) {
+                .ok => return .{ .ok = {} },
+                .err => |e| return .{ .err = e },
+            }
+        }
     }
     if (receiver.* == .Instance) {
         const inst = receiver.Instance;
@@ -2502,6 +2648,26 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             }
         }
         {
+            // A boxed capture (an anon-object method writing a captured
+            // outer `var` held in its capture env as a shared Cell) takes
+            // the write THROUGH the cell so the outer scope observes it.
+            const existing: ?Value = blk: {
+                const g = inst.borrow();
+                defer g.deinit();
+                break :blk g.get().get(real_name);
+            };
+            if (existing) |ev| {
+                if (ev == .Cell) {
+                    const cg = ev.Cell.borrowMut();
+                    defer cg.deinit();
+                    if (runtime.reclaimEnabled()) {
+                        value.retain();
+                        cg.get().release(allocator);
+                    }
+                    cg.get().* = value;
+                    return .{ .ok = {} };
+                }
+            }
             // `define` adopts one owned reference, but `value` here is the
             // caller's borrow (the `SetField` opcode reads it straight out of a
             // register). Retain so the field owns its own reference and the
