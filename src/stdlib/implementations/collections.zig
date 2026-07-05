@@ -3367,6 +3367,36 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 cur = nxt;
             }
         },
+        .IteratorFn => |fnbox| {
+            const iter = switch (try seqCall(host, fnbox.asPtr(), &.{}, out)) {
+                .value => |v| v,
+                .err => |e| return .{ .err = e },
+            };
+            while (true) {
+                if (takeCapReached(seq.ops, st.taken)) break;
+                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse
+                    return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
+                const has = switch (hn) {
+                    .ok => |x| x == .Bool and x.Bool,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!has) break;
+                const nx = (try host.invokeMethod(&iter, "next", &.{}, out)) orelse
+                    return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
+                const item = switch (nx) {
+                    .ok => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+                const res = try pumpItem(a, host, out, item, seq.ops, &st, &output);
+                switch (res) {
+                    .cont => |c| if (!c) break,
+                    .err => |e| return .{ .err = e },
+                }
+                if (max) |m| {
+                    if (output.items.len >= m) break;
+                }
+            }
+        },
     }
     return .{ .items = try output.toOwnedSlice(a) };
 }
@@ -3413,6 +3443,27 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 };
                 if (nxt == .Null) break;
                 cur = nxt;
+            }
+        },
+        .IteratorFn => |fnbox| {
+            const iter = switch (try seqCall(host, fnbox.asPtr(), &.{}, out)) {
+                .value => |v| v,
+                .err => |e| return .{ .err = e },
+            };
+            while (true) {
+                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse
+                    return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
+                const has = switch (hn) {
+                    .ok => |x| x == .Bool and x.Bool,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!has) break;
+                const nx = (try host.invokeMethod(&iter, "next", &.{}, out)) orelse
+                    return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
+                switch (nx) {
+                    .ok => |item| try items.append(a, item),
+                    .err => |e| return .{ .err = e },
+                }
             }
         },
     }

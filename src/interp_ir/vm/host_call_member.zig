@@ -3320,6 +3320,21 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     if (receiver.* == .Instance and !iterable_fallback_active and
         (hostHasMember(self, receiver, "iterator") or samIterableInstance(self, allocator, receiver)))
     {
+        // An instance whose class chain implements SEQUENCE keeps
+        // Kotlin's sequence laziness: when a declared Sequence-receiver
+        // extension body serves this name, run that lazy source
+        // implementation instead of the eager drain-to-List.
+        if (instanceImplementsSequence(self, receiver)) {
+            if (sequenceExtBodyFid(self, name, args.len)) |fid| {
+                const mg = self.module.borrow();
+                const mod: *const Module = mg.get();
+                mg.deinit();
+                const new_args = try prependReceiver(allocator, receiver, args);
+                defer if (runtime.freeScratch()) allocator.free(new_args);
+                return try host_call_func.callFunc(self, allocator, mod, fid, new_args);
+            }
+        }
+        {
         const p1 = try std.fmt.allocPrint(allocator, "kotlin.collections.Iterable.{s}", .{name});
         defer if (runtime.freeScratch()) allocator.free(p1);
         var matched: []const u8 = p1;
@@ -3345,6 +3360,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             const new_args = try prependReceiver(allocator, &dv, args);
             defer if (runtime.freeScratch()) allocator.free(new_args);
             return dispatchIntrinsic(self, allocator, matched, f, new_args);
+        }
         }
     }
 
@@ -3923,8 +3939,7 @@ fn isSequenceTerminal(name: []const u8) bool {
         "minBy",           "maxByOrNull",   "minByOrNull", "maxOf",  "minOf",      "joinToString",
         "all",             "contains",      "groupBy", "associate",  "associateBy", "associateWith",
         "partition",       "indexOf",       "indexOfFirst", "toMap", "toHashSet",  "toMutableSet",
-        "windowed",        "chunked",       "zipWithNext", "zip",     "unzip",      "scan",
-        "runningFold",     "runningReduce", "plus",    "minus",      "reduceOrNull", "foldRight",
+        "zip",             "unzip",         "plus",    "minus",      "reduceOrNull", "foldRight",
         "reduceRight",
     };
     for (terms) |t| {
@@ -5146,6 +5161,34 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
                 .err => |re| .{ .err = try mapRuntimeError(allocator, re) },
             };
         },
+        .IteratorFn => |fnbox| {
+            if (st.done) return .done;
+            var intrinsic = makeIntrinsicHost(self);
+            defer deinitIntrinsicHost(&intrinsic);
+            const ihost = intrinsic.intrinsicHost();
+            if (st.iter_obj == null) {
+                const r = try ihost.invokeCallable(&fnbox.asPtr().*, &.{}, out);
+                switch (r) {
+                    .ok => |v| st.iter_obj = v,
+                    .err => |re| return .{ .err = try mapRuntimeError(allocator, re) },
+                }
+            }
+            const iter = st.iter_obj.?;
+            const hn = try callMemberRec(self, allocator, &iter, "hasNext", &.{});
+            const has = switch (hn) {
+                .ok => |x| x == .Bool and x.Bool,
+                .err => |e| return .{ .err = e },
+            };
+            if (!has) {
+                st.done = true;
+                return .done;
+            }
+            const nx = try callMemberRec(self, allocator, &iter, "next", &.{});
+            return switch (nx) {
+                .ok => |v| .{ .value = v },
+                .err => |e| .{ .err = e },
+            };
+        },
         .Generate => |gen| {
             if (st.done) return .done;
             if (!st.gen_started) {
@@ -6291,6 +6334,19 @@ inline fn probeFqn(buf: []u8, prefix: []const u8, name: []const u8) []const u8 {
 /// actually implements — `copyOf(newSize)` vs
 /// `copyOf(newSize, init)`). Without the sibling requirement every HOF
 /// intrinsic (`map`, `filter`) would fall off its fast path.
+/// Element kinds whose arithmetic differs per declared width — the only
+/// erased receiver-type-arg ties resolution must refuse to guess.
+fn numericWidthKind(name: []const u8) bool {
+    const kinds = [_][]const u8{
+        "Int",   "Long", "Short", "Byte",  "Double", "Float",
+        "UInt",  "ULong", "UShort", "UByte", "Char",
+    };
+    for (kinds) |k| {
+        if (std.mem.eql(u8, name, k)) return true;
+    }
+    return false;
+}
+
 fn declaredLambdaOverloadWins(self: *VmHost, name: []const u8, args: []const Value) bool {
     if (args.len == 0 or !isCallable(&args[args.len - 1])) return false;
     const mg = self.module.borrow();
@@ -6311,6 +6367,63 @@ fn declaredLambdaOverloadWins(self: *VmHost, name: []const u8, args: []const Val
         if (lambda_exact and shorter_plain) return true;
     }
     return false;
+}
+
+/// Whether the instance's class (or its recorded supertype chain)
+/// implements `Sequence` — such receivers keep sequence laziness.
+fn instanceImplementsSequence(self: *VmHost, receiver: *const Value) bool {
+    if (receiver.* != .Instance) return false;
+    const cname = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().name;
+    };
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    if (mg.get().registry.class_super_names.get(cname)) |chain| {
+        for (chain) |sup| {
+            if (std.mem.eql(u8, sup, "Sequence")) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether a declared extension with receiver type `Sequence` and a real
+/// body exists for `name` — the lazy source implementation that must win
+/// over eager collection intrinsics for Sequence receivers.
+fn declaredSequenceExtBody(self: *VmHost, name: []const u8) bool {
+    return sequenceExtBodyFid(self, name, null) != null;
+}
+
+/// The declared Sequence-receiver extension with a body for `name` whose
+/// arity accepts `n_args` value arguments (receiver excluded); any arity
+/// when `n_args` is null.
+fn sequenceExtBodyFid(self: *VmHost, name: []const u8, n_args: ?usize) ?FuncId {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    var best: ?FuncId = null;
+    for (mod.funcsBySimpleName(name)) |fid| {
+        const sig = mod.decl_sigs.get(fid.int()) orelse continue;
+        const rt = sig.receiver_ty orelse continue;
+        if (!std.mem.eql(u8, rt.name, "Sequence")) continue;
+        const f = mod.funcById(fid) orelse continue;
+        // Headers decode lazily: judge executability by the settled form
+        // (body, sibling redirect, or native binding), not hasBody().
+        if (n_args) |n| {
+            if (!host_call_func.executableForm(self, mod, fid, n + 1)) continue;
+            // DeclSig arity counts value params only (receiver excluded).
+            if (n < sig.arity.required) continue;
+            if (n > sig.arity.total and !sig.arity.has_vararg) continue;
+            if (best == null or f.params.len < (mod.funcById(best.?) orelse f).params.len) best = fid;
+        } else {
+            if (!host_call_func.executableForm(self, mod, fid, sig.arity.required + 1)) continue;
+            return fid;
+        }
+    }
+    return best;
 }
 
 fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
@@ -6347,6 +6460,12 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
 }
 
 fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, type_fqn: []const u8, cache_key: ?root_mod.ProgramImage.MemberResolveKey) Allocator.Error!?EvalResult {
+    // A Sequence receiver with a DECLARED Sequence-receiver extension body
+    // must run that lazy source implementation — the package probes below
+    // would bind an eager collection intrinsic (`kotlin.collections.chunked`
+    // materializes the receiver, breaking Kotlin's sequence laziness).
+    // Terminal names never reach here (the sequence arm handles them).
+    if (receiver.* == .Sequence and declaredSequenceExtBody(self, name)) return null;
     // Probe FQNs in priority order, formatted into per-call stack buffers (no
     // heap traffic). `kotlin.<name>` etc. are formatted too so one code path
     // builds them all; the storage outlives the loop below.
@@ -6954,6 +7073,11 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                 if (!std.mem.eql(u8, ort.name, crt.name)) continue;
                 if (o.func.params.len != c.func.params.len) continue;
                 if (ort.args.len != crt.args.len or ort.args.len == 0) continue;
+                // Only a NUMERIC-WIDTH element difference is undecidable
+                // (the arithmetic changes per width); container-kind
+                // differences (Sequence<Sequence> vs Sequence<Iterable>
+                // for `flatten`) dispatch fine per element at runtime.
+                if (!numericWidthKind(ort.args[0].name) or !numericWidthKind(crt.args[0].name)) continue;
                 if (!std.mem.eql(u8, ort.args[0].name, crt.args[0].name)) {
                     if (trace.enabled(name)) {
                         trace.emit("map=erased_recv_tie_decline name={s} a={s} b={s}", .{ name, c.func.fqn, o.func.fqn });
