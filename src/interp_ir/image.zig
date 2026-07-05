@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 13;
+pub const FORMAT_VERSION: u32 = 14;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -576,6 +576,7 @@ const RegistryImage = struct {
     enclosing_class: []StrKV,
     func_type_params: []KV(FuncId, []const []const u8),
     func_type_param_bounds: []KV(FuncId, []const ir.ModuleRegistry.TypeParamBound),
+    class_type_param_bounds: []KV([]const u8, []const ir.ModuleRegistry.TypeParamBound),
     top_level_delegated_props: []const []const u8,
     top_level_prop_getters: []KV([]const u8, FuncId),
     hierarchy_methods: []KV([]const u8, []const []const u8),
@@ -1250,6 +1251,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
             break :blk list;
         },
         .func_type_param_bounds = try autoMapToSlice(FuncId, []const ir.ModuleRegistry.TypeParamBound, a, &r.func_type_param_bounds),
+        .class_type_param_bounds = try strMapToSliceKV([]const ir.ModuleRegistry.TypeParamBound, a, &r.class_type_param_bounds),
         .top_level_delegated_props = try setToSlice(a, &r.top_level_delegated_props),
         .top_level_prop_getters = try strMapToSlice(FuncId, a, &r.top_level_prop_getters),
         .hierarchy_methods = blk: {
@@ -1961,6 +1963,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
         try r.func_type_params.put(kv.k, list);
     }
     for (ri.func_type_param_bounds) |kv| try r.func_type_param_bounds.put(kv.k, kv.v);
+    for (ri.class_type_param_bounds) |kv| try r.class_type_param_bounds.put(kv.k, kv.v);
     for (ri.top_level_delegated_props) |k| try r.top_level_delegated_props.put(k, {});
     for (ri.top_level_prop_getters) |kv| try r.top_level_prop_getters.put(kv.k, kv.v);
     for (ri.hierarchy_methods) |kv| {

@@ -3107,6 +3107,13 @@ pub const ModuleRegistry = struct {
     /// bounded type-parameter receiver is proven only when the actual
     /// receiver satisfies every bound; an unbounded one accepts anything.
     func_type_param_bounds: std.AutoHashMap(FuncId, []const TypeParamBound),
+    /// Declared upper bounds of each CLASS's type parameters
+    /// (`class EnumEntriesList<T : Enum<T>>`), keyed by class simple name.
+    /// Method dispatch disproves a wrong-typed argument against a param
+    /// declared as the class type param (the Kotlin collection-stub
+    /// bridge: `indexOf(nonEnum)` on an `EnumEntries` answers -1 through
+    /// the inherited implementation instead of running the override).
+    class_type_param_bounds: std.StringHashMap([]const TypeParamBound),
     /// Top-level property names declared with `by <delegate>`.
     /// Reads/writes route through the stored delegate's `getValue` /
     /// `setValue` methods.
@@ -3245,6 +3252,7 @@ pub const ModuleRegistry = struct {
             .enclosing_class = std.StringHashMap([]const u8).init(allocator),
             .func_type_params = std.AutoHashMap(FuncId, std.ArrayList([]const u8)).init(allocator),
             .func_type_param_bounds = std.AutoHashMap(FuncId, []const TypeParamBound).init(allocator),
+            .class_type_param_bounds = std.StringHashMap([]const TypeParamBound).init(allocator),
             .top_level_delegated_props = std.StringHashMap(void).init(allocator),
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
             .hierarchy_shadow_names = std.StringHashMap(HierarchyShadowSet).init(allocator),
@@ -3284,6 +3292,11 @@ pub const ModuleRegistry = struct {
             var it = self.func_type_param_bounds.valueIterator();
             while (it.next()) |list| a.free(list.*);
             self.func_type_param_bounds.deinit();
+        }
+        {
+            var it = self.class_type_param_bounds.valueIterator();
+            while (it.next()) |list| a.free(list.*);
+            self.class_type_param_bounds.deinit();
         }
         self.top_level_delegated_props.deinit();
         {
@@ -3392,6 +3405,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.func_type_param_bounds.iterator();
             while (it.next()) |e| try out.func_type_param_bounds.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.class_type_param_bounds.iterator();
+            while (it.next()) |e| try out.class_type_param_bounds.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.top_level_delegated_props.keyIterator();
