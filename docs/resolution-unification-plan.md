@@ -500,6 +500,26 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         emptySequence() must be a per-process singleton for identity
         asserts. ContainerBuilder "is not same" trio = same singleton
         story for emptyList/Set/Map after build of empty builders.
+      - **Checkpoint 2026-07-05f: inventory 45 dual-identical (119 at
+        session start; ~98% of ~2150 passing).** Parallel-agent batch
+        model landed: four investigation agents (no builds) produce
+        patch-ready root causes per bucket; patches apply centrally;
+        one build + one gate + one full sweep per batch. Landed:
+        ArrayDeque de-hatched AND fully green (ctor family scoring,
+        terminateCollectionToArray actual, copyInto named args);
+        iterator last-returned protocol; property-reference delegation;
+        KClass cast/safeCast/KClassifier; anon reflective names null;
+        regex fold/lookaround/matchAt/options; String.windowed peel;
+        local-callable call-fit; empty-collection singletons; read-only
+        entry guards; captured-name call arbitration.
+        Remaining tail (no cluster >3): PropertyReference 3 (ext-prop
+        delegates — agent design recorded), EnumEntriesFactory 3 +
+        EnumEntriesList 2 (expected-type propagation into args/callable
+        refs — agent design recorded), MapTest 3 (incl.
+        entriesCovariantRemove regression from the entries-mutability
+        gate), ContainerBuilder 3 (subList live views — agent design
+        recorded), CollectionTest 3, Uuid 2, Exception 2, StringTest ~2
+        (local fn overload selection — agent design recorded), singles.
       - **Named remainder** (real, deterministic, 115 total): ArraysTest
         contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
         copyRangeInto (`UIntArray expects an Int size`),

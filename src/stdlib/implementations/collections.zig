@@ -6304,6 +6304,8 @@ const IdxOutcome = union(enum) { idx: i64, err: EvalResult };
 
 fn arrayOptIndex(a: Allocator, ctx: *CallCtx, idx: usize, default: i64, what: []const u8) Error!IdxOutcome {
     if (idx >= ctx.args.len) return .{ .idx = default };
+    // A named-arg reorder pads omitted middle defaults with Null.
+    if (ctx.args[idx] == .Null) return .{ .idx = default };
     if (ctx.args[idx].asI64()) |v| return .{ .idx = v };
     return .{ .err = typeErr(try fmt(a, "{s}: index argument must be an Int", .{what})) };
 }

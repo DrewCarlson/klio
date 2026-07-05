@@ -16,6 +16,7 @@ const stdlib = @import("stdlib");
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const host_globals = @import("host_globals.zig");
+const host_call_member = @import("host_call_member.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -153,17 +154,51 @@ fn valueTypeHead(v: Value) []const u8 {
 /// overloads by argument type (`AtomicIntArray(size: Int)` vs
 /// `AtomicIntArray(array: IntArray)`). Falls back to the first arity match when
 /// no parameter type distinguishes them.
+fn headInSet(head: []const u8, set: []const []const u8) bool {
+    for (set) |h| {
+        if (std.mem.eql(u8, head, h)) return true;
+    }
+    return false;
+}
+
+const integral_heads = [_][]const u8{ "Int", "Long", "Short", "Byte", "UInt", "ULong", "UShort", "UByte", "Char" };
+const collectionish_heads = [_][]const u8{ "Collection", "MutableCollection", "Iterable", "MutableIterable", "List", "MutableList", "Set", "MutableSet", "Sequence" };
+
 fn chooseSecondaryCtor(entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
     var first: ?root.build.SecondaryCtorEntry = null;
     var best: ?root.build.SecondaryCtorEntry = null;
-    var best_score: i32 = 0;
-    for (entries) |e| {
+    var best_score: i32 = -1;
+    outer: for (entries) |e| {
         if (e.param_count != args.len) continue;
         if (first == null) first = e;
         var score: i32 = 0;
         var i: usize = 0;
         while (i < args.len and i < e.param_type_heads.len) : (i += 1) {
-            if (std.mem.eql(u8, e.param_type_heads[i], valueTypeHead(args[i]))) score += 1;
+            const declared = e.param_type_heads[i];
+            const got = valueTypeHead(args[i]);
+            if (std.mem.eql(u8, declared, got)) {
+                score += 2;
+                continue;
+            }
+            // Family compatibility: a declared Collection/Iterable head
+            // accepts any collection-shaped value; integral heads accept
+            // integral values. A DEFINITE cross-family mismatch (an Int
+            // param offered a List — `ArrayDeque(initialCapacity)` vs
+            // `ArrayDeque(elements)`) disqualifies the candidate so the
+            // right same-arity overload wins regardless of order.
+            const decl_integral = headInSet(declared, &integral_heads);
+            const decl_collish = headInSet(declared, &collectionish_heads);
+            const got_integral = headInSet(got, &integral_heads);
+            const got_collish = headInSet(got, &collectionish_heads);
+            if (decl_collish and got_collish) {
+                score += 1;
+                continue;
+            }
+            if (decl_integral and got_integral) {
+                score += 1;
+                continue;
+            }
+            if ((decl_integral and got_collish) or (decl_collish and got_integral)) continue :outer;
         }
         if (score > best_score) {
             best_score = score;
@@ -2427,7 +2462,26 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                         break :blk g.get().body_properties[prop_idx].init;
                     };
                     if (init_expr) |ie| {
-                        const v = (try simpleLiteral(allocator, ie.get())) orelse Value.Null;
+                        const v = (try simpleLiteral(allocator, ie.get())) orelse blk: {
+                            // A local class's complex initializer was lowered
+                            // as a runtime `$init$` thunk at registration.
+                            const init_name = try std.fmt.allocPrint(allocator, "$init${s}", .{prop_name});
+                            defer allocator.free(init_name);
+                            const has = hblk: {
+                                const key = try anonKey(allocator, cls_name, init_name);
+                                defer allocator.free(key);
+                                const ag = self.anon_methods.borrow();
+                                defer ag.deinit();
+                                break :hblk ag.get().contains(key);
+                            };
+                            if (has) {
+                                switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, &.{})) {
+                                    .ok => |rv| break :blk rv,
+                                    .err => |e| return .{ .err = e },
+                                }
+                            }
+                            break :blk Value.Null;
+                        };
                         const g = inst.borrowMut();
                         try g.get().define(allocator, shadowFieldKey(self, cls_name, prop_name), v);
                         g.deinit();
@@ -2594,7 +2648,7 @@ fn bareCaptureResolvable(expr: *const ast.Expr, pairs: []const NameValue) bool {
 
 /// Synthesize a body-less 0-arg getter/init thunk `Function` from an
 /// accessor or expression body so it can be lowered as an anon method.
-fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef, is_override: bool) ast.Function {
+pub fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef, is_override: bool) ast.Function {
     return .{
         .name = name,
         .receiver_type = null,

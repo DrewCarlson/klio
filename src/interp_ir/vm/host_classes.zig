@@ -15,6 +15,7 @@ const root = @import("../interp_ir.zig");
 const build = @import("../build.zig");
 const FF = runtime.forest.ForestField;
 const VmHost = @import("vmhost.zig").VmHost;
+const host_instances = @import("host_instances.zig");
 
 const Allocator = std.mem.Allocator;
 const Module = ir.Module;
@@ -492,19 +493,52 @@ fn lowerAndRegisterMethods(
     capture_pairs: []const NameValue,
 ) Allocator.Error!void {
     for (class.members) |*m| {
-        if (m.* != .Function) continue;
-        const f = &m.Function;
-        if (f.body == null) continue;
-        const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
-        const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, class.name.name, own_members);
-        const fid = func.id;
-        const caps = try allocator.dupe(NameValue, capture_pairs);
-        const entry: AnonMethodEntry = .{ .module = sub_ref, .func = fid, .captures = caps };
-        const tbl = self.anon_methods.borrowMut();
-        defer tbl.deinit();
-        const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
-        try tbl.get().put(try anonKey(allocator, class.name.name, arity_name), entry);
-        try tbl.get().put(try anonKey(allocator, class.name.name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = caps });
+        switch (m.*) {
+            .Function => |*f| {
+                if (f.body == null) continue;
+                const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, class.name.name, own_members);
+                const fid = func.id;
+                const caps = try allocator.dupe(NameValue, capture_pairs);
+                const entry: AnonMethodEntry = .{ .module = sub_ref, .func = fid, .captures = caps };
+                const tbl = self.anon_methods.borrowMut();
+                defer tbl.deinit();
+                const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
+                try tbl.get().put(try anonKey(allocator, class.name.name, arity_name), entry);
+                try tbl.get().put(try anonKey(allocator, class.name.name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = caps });
+            },
+            // A body property with a custom getter registers its accessor
+            // thunk, exactly as an anonymous object's does — a local class's
+            // `override val size get() = …` is otherwise unreadable.
+            .Property => |p| {
+                if (p.getter) |getter| {
+                    const thunk = host_instances.synthThunk(p.name, getter.body, getter.return_type, p.is_override);
+                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
+                    const fid = func.id;
+                    const caps = try allocator.dupe(NameValue, capture_pairs);
+                    const key = try std.fmt.allocPrint(allocator, "$get${s}", .{p.name.name});
+                    const tbl = self.anon_methods.borrowMut();
+                    defer tbl.deinit();
+                    try tbl.get().put(try anonKey(allocator, class.name.name, key), .{ .module = sub_ref, .func = fid, .captures = caps });
+                }
+                // A complex initializer (`val items = mutableListOf<...>()`)
+                // lowers as a `$init$` thunk the construction pipeline runs;
+                // simple literals stay inline (`simpleLiteral`).
+                if (p.init) |init_expr| {
+                    const thunk = host_instances.synthThunk(p.name, .{ .Expr = init_expr }, p.ty, false);
+                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
+                    const fid = func.id;
+                    const caps = try allocator.dupe(NameValue, capture_pairs);
+                    const key = try std.fmt.allocPrint(allocator, "$init${s}", .{p.name.name});
+                    const tbl = self.anon_methods.borrowMut();
+                    defer tbl.deinit();
+                    try tbl.get().put(try anonKey(allocator, class.name.name, key), .{ .module = sub_ref, .func = fid, .captures = caps });
+                }
+            },
+            else => {},
+        }
     }
 }
 
