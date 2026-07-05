@@ -2372,22 +2372,29 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .UnOp => |u| {
             const v = frame.read(u.operand);
-            // Builtin scalar fast path: `Int.inc()` and friends are final
-            // MEMBERS of the builtin types — a user extension can never
-            // shadow them, so the member/extension probe below (a full
-            // string-keyed dispatch per `i++` in every counting loop) is
-            // semantically dead for these tags.
-            switch (v) {
-                .Int, .Long, .Double, .Float, .Short, .Byte, .Char, .UInt, .ULong, .UShort, .UByte => {
-                    switch (try applyUnop(allocator, u.op, &v)) {
-                        .ok => |out| {
-                            try frame.write(u.dst, out);
-                            return .cont;
-                        },
-                        .err => {},
-                    }
-                },
-                else => {},
+            // Builtin scalar fast path: outside any class scope a scalar's
+            // unary operators are its builtin members and no extension can
+            // shadow them, so the string-keyed probe below (a full member
+            // dispatch per `i++` in every counting loop) is semantically
+            // dead. Inside a class scope a MEMBER EXTENSION operator can
+            // apply (`operator fun Int.unaryPlus()` in a DSL builder —
+            // kotlinc resolves `+1` to it), so any enclosing instance
+            // keeps the probe.
+            const enclosing_possible = frame.enclosing_this.items.len != 0 or
+                (frame.params.items.len > 0 and frame.params.items[0] == .Instance);
+            if (!enclosing_possible) {
+                switch (v) {
+                    .Int, .Long, .Double, .Float, .Short, .Byte, .Char, .UInt, .ULong, .UShort, .UByte => {
+                        switch (try applyUnop(allocator, u.op, &v)) {
+                            .ok => |out| {
+                                try frame.write(u.dst, out);
+                                return .cont;
+                            },
+                            .err => {},
+                        }
+                    },
+                    else => {},
+                }
             }
             const method = switch (u.op) {
                 .Neg => "unaryMinus",
