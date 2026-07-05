@@ -148,6 +148,35 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
     return stdlib.implementation(fqn);
 }
 
+/// See the call site in `callFuncTypedInner`: retag a List of Ints IN
+/// PLACE to Short/Byte when the declared parameter is an iterable of
+/// that narrow kind and every element fits. The literal-typed list is
+/// the only way such a value reaches the param under Kotlin's static
+/// typing, so the retag is faithful.
+fn narrowIntListArg(param_ty: *const TypeRef, arg: *const Value) void {
+    if (arg.* != .List) return;
+    const pn = param_ty.name;
+    const iterable_like = std.mem.eql(u8, pn, "Iterable") or std.mem.eql(u8, pn, "Collection") or
+        std.mem.eql(u8, pn, "List") or std.mem.eql(u8, pn, "MutableList") or std.mem.eql(u8, pn, "Set");
+    if (!iterable_like or param_ty.args.len != 1) return;
+    const en = param_ty.args[0].name;
+    const to_short = std.mem.eql(u8, en, "Short");
+    const to_byte = std.mem.eql(u8, en, "Byte");
+    if (!to_short and !to_byte) return;
+    const g = arg.List.items.borrowMut();
+    defer g.deinit();
+    for (g.get().items) |*v| {
+        if (v.* != .Int) return;
+        const x = v.Int;
+        if (to_short and (x < std.math.minInt(i16) or x > std.math.maxInt(i16))) return;
+        if (to_byte and (x < std.math.minInt(i8) or x > std.math.maxInt(i8))) return;
+    }
+    for (g.get().items) |*v| {
+        const x = v.Int;
+        v.* = if (to_short) .{ .Short = @intCast(x) } else .{ .Byte = @intCast(x) };
+    }
+}
+
 /// Synthetic `KType` instance for a reified type name: `classifier` is the
 /// registered class when one exists (else a minimal KClass), `arguments` is
 /// the empty list, `isMarkedNullable` mirrors a trailing `?`.
@@ -827,6 +856,13 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         trace.emit("call_func {s} fid={d} fqn={s} argc={d}", .{ f.name, func.int(), f.fqn, args_in.len });
     }
 
+    // Expected-type literal narrowing at the callee boundary (see
+    // `narrowIntListArg`).
+    for (f.params, 0..) |*p, i| {
+        if (i >= args_in.len) break;
+        narrowIntListArg(&p.ty, &args_in[i]);
+    }
+
     linkAuditCheck(self, module, func, f, args_in);
 
     // A NON-final vararg (Kotlin allows `vararg` before trailing
@@ -1436,6 +1472,19 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
             const recv = args[0];
             const rest = args[1..];
             return host_call_member.callMember(self, allocator, &recv, fname, rest);
+        }
+    }
+
+    // Expected-type literal narrowing at the callee boundary: kotlinc
+    // types `listOf(5)` as `List<Short>` against a declared
+    // `Iterable<Short>` parameter, so a klio list still carrying the
+    // default Int tags retags its fitting elements to the declared
+    // narrow kind (`shortArrayOf(...).intersect(listOf(5))`). Same
+    // discipline as the `arrayOf<ULong>` retag above.
+    if (funcAt(module, resolved)) |f| {
+        for (f.params, 0..) |*p, i| {
+            if (i >= args.len) break;
+            narrowIntListArg(&p.ty, &args[i]);
         }
     }
 
