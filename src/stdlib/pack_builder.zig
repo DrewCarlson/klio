@@ -120,13 +120,19 @@ fn buildCuratedSources(a: std.mem.Allocator, result: *PackError) std.mem.Allocat
     defer upstream.close(io);
 
     for (CURATED_UPSTREAM_SOURCES) |rel| {
-        const bytes = upstream.readFileAlloc(io, rel, a, .unlimited) catch |e| switch (e) {
+        var bytes: []const u8 = upstream.readFileAlloc(io, rel, a, .unlimited) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 result.* = .{ .Io = "curated stdlib source unreadable" };
                 return null;
             },
         };
+        if (std.mem.eql(u8, rel, stdlib_sources.KOTLIN_VERSION_FILE)) {
+            bytes = (try stampKotlinVersion(a, bytes)) orelse {
+                result.* = .{ .Io = "KotlinVersion placeholder not found; review KOTLIN_RELEASE in stdlib_sources.zig against the pinned kotlin/ tag" };
+                return null;
+            };
+        }
         const rel_path = try std.fmt.allocPrint(a, "stdlib/kotlin/libraries/stdlib/{s}", .{rel});
         try files.append(a, .{ .rel_path = rel_path, .bytes = bytes });
     }
@@ -150,6 +156,32 @@ fn buildCuratedSources(a: std.mem.Allocator, result: *PackError) std.mem.Allocat
     }
 
     return .{ .files = files.items };
+}
+
+/// Rewrites the `KotlinVersion(major, minor, 255)` build placeholder in
+/// `KotlinVersion.kt` to the pinned release triple, mirroring the rewrite
+/// kotlinc's build performs on the same source. Returns null when the
+/// placeholder is absent (a version bump changed the file shape).
+fn stampKotlinVersion(a: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!?[]const u8 {
+    const needle = stdlib_sources.KOTLIN_VERSION_PLACEHOLDER;
+    const idx = std.mem.indexOf(u8, bytes, needle) orelse return null;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, bytes[0..idx]);
+    try out.appendSlice(a, stdlib_sources.KOTLIN_VERSION_STAMPED);
+    try out.appendSlice(a, bytes[idx + needle.len ..]);
+    return try out.toOwnedSlice(a);
+}
+
+test stampKotlinVersion {
+    const a = std.testing.allocator;
+    const src = "fun get(): KotlinVersion = KotlinVersion(2, 4, 255) // stamped";
+    const got = (try stampKotlinVersion(a, src)).?;
+    defer a.free(got);
+    try std.testing.expectEqualStrings(
+        "fun get(): KotlinVersion = KotlinVersion(2, 4, 0) // stamped",
+        got,
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), try stampKotlinVersion(a, "no placeholder here"));
 }
 
 fn symbolEntryToRecord(e: *const root.SymbolEntry) schema.SymbolRecord {

@@ -935,6 +935,9 @@ pub const SeqIterState = struct {
     /// then each step's result), or null before the first pull / once done.
     gen_cur: ?Value = null,
     gen_started: bool = false,
+    /// For an `IteratorFn` source: the Iterator the factory produced for
+    /// THIS iteration (invoked lazily on first pull).
+    iter_obj: ?Value = null,
     /// Per-op streaming counters, indexed by op position. Allocated lazily to
     /// `ops.len`. `Take`/`Drop` counts and `takeWhile`/`dropWhile`/index state.
     taken: []usize = &.{},
@@ -981,6 +984,11 @@ pub const SeqIterStateRef = ObjRef(SeqIterState);
 pub const SequenceData = struct {
     source: SequenceSource,
     ops: []SeqOp,
+    /// `generateSequence { … }` (nullary form) consumes once: the second
+    /// iteration throws IllegalStateException, matching the source's
+    /// `.constrainOnce()`.
+    one_shot: bool = false,
+    consumed: bool = false,
 
     /// GC out-edges: the lazy source (eager items, or the seed/step generator
     /// closures) and every pipeline op's lambda. Without this a `Sequence` held
@@ -995,6 +1003,7 @@ pub const SequenceData = struct {
                 m.shade(&g.next.cell.hdr);
             },
             .Builder => |b| m.shade(&b.cell.hdr),
+            .IteratorFn => |f| m.shade(&f.cell.hdr),
         }
         for (self.ops) |op| switch (op) {
             .Map,
@@ -1019,11 +1028,17 @@ pub const SequenceSource = union(enum) {
     /// Eager-known elements (`asSequence` / `sequenceOf`).
     Items: ValueSlice,
     /// `generateSequence(seed) { it -> next }`. `seed` is null for the
-    /// nullary form.
-    Generate: struct { seed: ?ValueBox, next: ValueBox },
+    /// nullary form. `seed_is_fn` marks the `generateSequence(seedFn,
+    /// next)` form: the boxed seed is a producer invoked at each
+    /// iteration start.
+    Generate: struct { seed: ?ValueBox, next: ValueBox, seed_is_fn: bool = false },
     /// `sequence { yield(...) }` / `iterator { ... }` — a lazy coroutine
     /// builder driven one element at a time.
     Builder: BuilderStateRef,
+    /// `Sequence { () -> Iterator<T> }` — the SAM factory. Each iteration
+    /// invokes the factory for a fresh Iterator and pulls it element by
+    /// element (lazy, re-iterable).
+    IteratorFn: ValueBox,
 };
 
 pub const SeqOp = union(enum) {

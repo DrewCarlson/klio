@@ -2813,6 +2813,11 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         mg.deinit();
         if (!names_extension or own_members.contains(n)) try anon_cap_set.put(n, {});
     }
+    if (runtime.getenvSlice("KLIO_ANON_AUDIT") != null) {
+        std.debug.print("[ANON] site={s} captured=", .{synth_class_name});
+        for (captured_names) |n| std.debug.print("{s},", .{n});
+        std.debug.print("\n", .{});
+    }
     ir.lower.setLowerAnonCaptures(anon_cap_set);
     // `setLowerAnonCaptures` takes ownership; clear it after lowering.
 

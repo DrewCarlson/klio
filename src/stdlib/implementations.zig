@@ -1012,6 +1012,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.sequences.emptySequence", .f = sequence.seq_empty },
     .{ .fqn = "kotlin.sequences.generateSequence", .f = sequence.seq_generate_sequence },
     .{ .fqn = "kotlin.sequences.sequence", .f = sequence.seq_builder },
+    .{ .fqn = "kotlin.sequences.Sequence", .f = sequence.seq_from_iterator_fn },
     .{ .fqn = "kotlin.sequences.iterator", .f = sequence.seq_iterator_builder },
     .{ .fqn = "kotlin.sequences.SequenceScope.yield", .f = sequence.seq_scope_yield },
     .{ .fqn = "kotlin.sequences.SequenceScope.yieldAll", .f = sequence.seq_scope_yield_all },

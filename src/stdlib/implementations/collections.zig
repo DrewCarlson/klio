@@ -1224,7 +1224,12 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
                 };
             } else break :blk initial;
         };
-        const next = switch (try invoke(ctx, &op, &.{ cur, v })) {
+        // The computed-initial overload's operation is keyed:
+        // `fold(initialValueSelector: (K, T) -> R, operation: (K, R, T) -> R)`.
+        const next = switch (if (isCallable(initial))
+            try invoke(ctx, &op, &.{ k, cur, v })
+        else
+            try invoke(ctx, &op, &.{ cur, v })) {
             .value => |val| val,
             .err => |e| return e,
         };
@@ -3118,6 +3123,25 @@ fn seqCall(host: IntrinsicHost, f: *const Value, args: []const Value, out: Outpu
     };
 }
 
+/// A one-shot sequence (`generateSequence { … }`) consumes once; the
+/// second iteration throws, matching the source's `.constrainOnce()`.
+/// Marks the sequence consumed on first use.
+pub fn oneShotConsumeCheck(a: Allocator, seq_val: Value) Error!?RuntimeError {
+    {
+        const g = seq_val.Sequence.borrow();
+        defer g.deinit();
+        if (!g.get().one_shot) return null;
+        if (g.get().consumed) {
+            const exc = try makeException(a, "kotlin.IllegalStateException", "This sequence can be consumed only once.");
+            return .{ .Thrown = exc };
+        }
+    }
+    const gm = seq_val.Sequence.borrowMut();
+    defer gm.deinit();
+    gm.get().consumed = true;
+    return null;
+}
+
 pub fn materialiseSequence(a: Allocator, host: IntrinsicHost, out: Output, seq_val: Value) Error!SeqOutcome {
     return materialiseSequenceBounded(a, host, out, seq_val, null);
 }
@@ -3126,6 +3150,7 @@ pub fn materialiseSequenceBounded(a: Allocator, host: IntrinsicHost, out: Output
     if (seq_val != .Sequence) {
         return .{ .err = .{ .Type = "materialise_sequence: not a Sequence" } };
     }
+    if (try oneShotConsumeCheck(a, seq_val)) |e| return .{ .err = e };
     const seq_g = seq_val.Sequence.borrow();
     defer seq_g.deinit();
     const seq = seq_g.get().*;
@@ -3332,6 +3357,14 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
         .Generate => |gen| {
             var cur: ?Value = if (gen.seed) |s| blk: {
                 const sv = s.asPtr().*;
+                if (gen.seed_is_fn) {
+                    const r = switch (try seqCall(host, &sv, &.{}, out)) {
+                        .value => |v| v,
+                        .err => |e| return .{ .err = e },
+                    };
+                    if (r == .Null) return .{ .items = try a.alloc(Value, 0) };
+                    break :blk r;
+                }
                 sv.retain();
                 break :blk sv;
             } else null;
@@ -3367,6 +3400,36 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 cur = nxt;
             }
         },
+        .IteratorFn => |fnbox| {
+            const iter = switch (try seqCall(host, fnbox.asPtr(), &.{}, out)) {
+                .value => |v| v,
+                .err => |e| return .{ .err = e },
+            };
+            while (true) {
+                if (takeCapReached(seq.ops, st.taken)) break;
+                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse
+                    return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
+                const has = switch (hn) {
+                    .ok => |x| x == .Bool and x.Bool,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!has) break;
+                const nx = (try host.invokeMethod(&iter, "next", &.{}, out)) orelse
+                    return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
+                const item = switch (nx) {
+                    .ok => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+                const res = try pumpItem(a, host, out, item, seq.ops, &st, &output);
+                switch (res) {
+                    .cont => |c| if (!c) break,
+                    .err => |e| return .{ .err = e },
+                }
+                if (max) |m| {
+                    if (output.items.len >= m) break;
+                }
+            }
+        },
     }
     return .{ .items = try output.toOwnedSlice(a) };
 }
@@ -3394,6 +3457,14 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             const limit: usize = 1024;
             var cur: ?Value = if (gen.seed) |s| blk: {
                 const sv = s.asPtr().*;
+                if (gen.seed_is_fn) {
+                    const r = switch (try seqCall(host, &sv, &.{}, out)) {
+                        .value => |v| v,
+                        .err => |e| return .{ .err = e },
+                    };
+                    if (r == .Null) break :blk null;
+                    break :blk r;
+                }
                 sv.retain();
                 break :blk sv;
             } else null;
@@ -3413,6 +3484,27 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 };
                 if (nxt == .Null) break;
                 cur = nxt;
+            }
+        },
+        .IteratorFn => |fnbox| {
+            const iter = switch (try seqCall(host, fnbox.asPtr(), &.{}, out)) {
+                .value => |v| v,
+                .err => |e| return .{ .err = e },
+            };
+            while (true) {
+                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse
+                    return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
+                const has = switch (hn) {
+                    .ok => |x| x == .Bool and x.Bool,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!has) break;
+                const nx = (try host.invokeMethod(&iter, "next", &.{}, out)) orelse
+                    return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
+                switch (nx) {
+                    .ok => |item| try items.append(a, item),
+                    .err => |e| return .{ .err = e },
+                }
             }
         },
     }

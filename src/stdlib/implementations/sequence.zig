@@ -317,6 +317,28 @@ pub fn seq_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(try makeSequence(ctx.allocator, items));
 }
 
+/// `Sequence { () -> Iterator<T> }` — the SAM factory. Lazy and
+/// re-iterable: each iteration invokes the factory for a fresh Iterator.
+pub fn seq_from_iterator_fn(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const args = ctx.args;
+    // The factory lambda is the last callable argument (a receiver may be
+    // prepended by the member walk).
+    var i: usize = args.len;
+    while (i > 0) {
+        i -= 1;
+        if (isLambdaLike(args[i])) {
+            args[i].retain();
+            const f = try Value.boxRef(ctx.allocator, args[i]);
+            const data = try ObjRef(SequenceData).init(ctx.allocator, .{
+                .source = .{ .IteratorFn = f },
+                .ops = &.{},
+            });
+            return ok(.{ .Sequence = data });
+        }
+    }
+    return err(.{ .Type = "Sequence factory expects an iterator-producing function" });
+}
+
 pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const args = ctx.args;
     if (args.len == 1 and isLambdaLike(args[0])) {
@@ -325,11 +347,17 @@ pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const data = try ObjRef(SequenceData).init(ctx.allocator, .{
             .source = .{ .Generate = .{ .seed = null, .next = next } },
             .ops = &.{},
+            // The nullary form is stateful: the source constrains it to
+            // one consumption.
+            .one_shot = true,
         });
         return ok(.{ .Sequence = data });
     }
     if (args.len == 2 and isLambdaLike(args[1])) {
         var seed: ?ValueBox = null;
+        // `generateSequence(seedFunction, nextFunction)`: the seed is a
+        // producer invoked at each iteration start.
+        const seed_is_fn = isLambdaLike(args[0]);
         if (args[0] != .Null) {
             args[0].retain();
             seed = try Value.boxRef(ctx.allocator, args[0]);
@@ -337,7 +365,7 @@ pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         args[1].retain();
         const next = try Value.boxRef(ctx.allocator, args[1]);
         const data = try ObjRef(SequenceData).init(ctx.allocator, .{
-            .source = .{ .Generate = .{ .seed = seed, .next = next } },
+            .source = .{ .Generate = .{ .seed = seed, .next = next, .seed_is_fn = seed_is_fn } },
             .ops = &.{},
         });
         return ok(.{ .Sequence = data });
@@ -375,7 +403,7 @@ fn recvSeqEager(args: []const Value, what: []const u8) EagerResult {
     if (data.ops.len != 0) return .none;
     return switch (data.source) {
         .Items => |items| .{ .some = items.clone() },
-        .Generate, .Builder => .none,
+        .Generate, .Builder, .IteratorFn => .none,
     };
 }
 
@@ -606,6 +634,7 @@ fn materialiseSequenceBounded(
     if (seq_val.* != .Sequence) {
         return .{ .err = .{ .Type = "materialise_sequence: not a Sequence" } };
     }
+    if (try collections.oneShotConsumeCheck(allocator, seq_val.*)) |e| return .{ .err = e };
     const sg = seq_val.Sequence.borrow();
     defer sg.deinit();
     const seq = sg.get();
@@ -672,6 +701,19 @@ fn materialiseSequenceBounded(
             .Generate => |gen| {
                 var cur: ?Value = if (gen.seed) |s| blk: {
                     const sv = s.asPtr().*;
+                    if (gen.seed_is_fn) {
+                        const r = try invokeCallable(host, &sv, &.{}, out);
+                        switch (r) {
+                            .ok => |rv| {
+                                if (rv == .Null) break :blk null;
+                                break :blk rv;
+                            },
+                            .err => |e| {
+                                output.deinit(allocator);
+                                return .{ .err = e };
+                            },
+                        }
+                    }
                     sv.retain();
                     break :blk sv;
                 } else null;
@@ -722,6 +764,47 @@ fn materialiseSequenceBounded(
                     }
                 }
             },
+            .IteratorFn => |fnbox| {
+                const ir = try invokeCallable(host, fnbox.asPtr(), &.{}, out);
+                const iter = switch (ir) {
+                    .ok => |v| v,
+                    .err => |e| {
+                        output.deinit(allocator);
+                        return .{ .err = e };
+                    },
+                };
+                while (true) {
+                    if (takeCapReached(seq.ops, st.taken)) break;
+                    const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse
+                        return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
+                    const has = switch (hn) {
+                        .ok => |x| x == .Bool and x.Bool,
+                        .err => |e| {
+                            output.deinit(allocator);
+                            return .{ .err = e };
+                        },
+                    };
+                    if (!has) break;
+                    const nx = (try host.invokeMethod(&iter, "next", &.{}, out)) orelse
+                        return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
+                    const item = switch (nx) {
+                        .ok => |x| x,
+                        .err => |e| {
+                            output.deinit(allocator);
+                            return .{ .err = e };
+                        },
+                    };
+                    const pr = try pump(allocator, host, out, item, seq.ops, &st, &output);
+                    switch (pr) {
+                        .cont => |c| if (!c) break,
+                        .err => |e| {
+                            output.deinit(allocator);
+                            return .{ .err = e };
+                        },
+                    }
+                    if (max) |m| if (output.items.len >= m) break;
+                }
+            },
         }
         return .{ .ok = try output.toOwnedSlice(allocator) };
     }
@@ -752,6 +835,19 @@ fn materialiseSequenceBounded(
             const limit: usize = 1024;
             var cur: ?Value = if (gen.seed) |s| blk: {
                 const sv = s.asPtr().*;
+                if (gen.seed_is_fn) {
+                    const r = try invokeCallable(host, &sv, &.{}, out);
+                    switch (r) {
+                        .ok => |rv| {
+                            if (rv == .Null) break :blk null;
+                            break :blk rv;
+                        },
+                        .err => |e| {
+                            items.deinit(allocator);
+                            return .{ .err = e };
+                        },
+                    }
+                }
                 sv.retain();
                 break :blk sv;
             } else null;
@@ -779,6 +875,37 @@ fn materialiseSequenceBounded(
                         if (nv == .Null) break;
                         cur = nv;
                     },
+                    .err => |e| {
+                        items.deinit(allocator);
+                        return .{ .err = e };
+                    },
+                }
+            }
+        },
+        .IteratorFn => |fnbox| {
+            const ir = try invokeCallable(host, fnbox.asPtr(), &.{}, out);
+            const iter = switch (ir) {
+                .ok => |v| v,
+                .err => |e| {
+                    items.deinit(allocator);
+                    return .{ .err = e };
+                },
+            };
+            while (true) {
+                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse
+                    return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
+                const has = switch (hn) {
+                    .ok => |x| x == .Bool and x.Bool,
+                    .err => |e| {
+                        items.deinit(allocator);
+                        return .{ .err = e };
+                    },
+                };
+                if (!has) break;
+                const nx = (try host.invokeMethod(&iter, "next", &.{}, out)) orelse
+                    return .{ .err = .{ .Type = "Sequence: iterator lacks next" } };
+                switch (nx) {
+                    .ok => |item| try items.append(allocator, item),
                     .err => |e| {
                         items.deinit(allocator);
                         return .{ .err = e };

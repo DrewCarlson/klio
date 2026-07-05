@@ -548,6 +548,24 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return dst;
         },
         .MemberRef => |mr| {
+            // `String::countVowels` where the member names an in-scope
+            // LOCAL extension function: kotlinc resolves the reference to
+            // that local, not to a member of the type. The local lowered
+            // as a closure bound to its name; the closure takes the
+            // receiver as its first param, exactly the callable shape a
+            // `Type::ext` reference must have.
+            if (!std.mem.eql(u8, mr.name.name, "class") and
+                mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1 and
+                b.isLocalExtFn(mr.name.name))
+            {
+                if (b.resolve(mr.name.name)) |r| return r;
+                if (b.knowsOuter(mr.name.name)) {
+                    const idx = try b.recordCapture(mr.name.name);
+                    const dst = b.allocReg();
+                    try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+                    return dst;
+                }
+            }
             // `Outer::Nested` where `Nested` is a class is a constructor
             // reference, not a bound member ref — load the class value.
             if (!std.mem.eql(u8, mr.name.name, "class") and
@@ -622,6 +640,18 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     const dst2 = b.allocReg();
                     try b.push(.{ .LoadCapture = .{ .dst = dst2, .idx = idx } });
                     try b.bind(label, dst2);
+                    return dst2;
+                }
+                // The enclosing ANON OBJECT closed over the labeled
+                // receiver (`this@minus` inside an anon method): read the
+                // capture. The class-label walk below would resolve to the
+                // anon instance itself. No scope bind: a read inside a
+                // conditional branch must not cache its register for reads
+                // on paths where the branch never ran.
+                if (decl_mod.isLowerAnonCapture(label)) {
+                    const idx = try b.recordCapture(label);
+                    const dst2 = b.allocReg();
+                    try b.push(.{ .LoadCapture = .{ .dst = dst2, .idx = idx } });
                     return dst2;
                 }
                 // Otherwise a class-name label (`this@Outer`): walk at runtime
@@ -6625,12 +6655,15 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // Kotlin resolves the member-vs-extension question against the
     // receiver's DECLARED type; carry it for the extension-selection
     // filter (a channel separate from static_recv, whose meaning is the
-    // extension-body receiver). Nullable declared receivers stay untagged
-    // (null-receiver extensions keep their own dispatch rules).
+    // extension-body receiver). A nullable declared receiver carries its
+    // HEAD too: null-accepting extensions overload by the underlying
+    // type (`String?.orEmpty()` vs `List?.orEmpty()`), and a Null
+    // runtime receiver offers the filter nothing else to go on.
     const declared_recv: ?ConstId = blk: {
         const t = argDeclTypeRef(b, receiver) orelse break :blk null;
-        if (t.nullable or std.mem.endsWith(u8, t.name, "?")) break :blk null;
-        break :blk try b.module.internConst(b.allocator, .{ .String = t.name });
+        const head = std.mem.trimEnd(u8, t.name, "?");
+        if (head.len == 0) break :blk null;
+        break :blk try b.module.internConst(b.allocator, .{ .String = head });
     };
     try b.push(.{ .CallMember = .{
         .dst = dst,

@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 11;
+pub const FORMAT_VERSION: u32 = 12;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -609,11 +609,29 @@ const ModuleImage = struct {
     decl_user_params: []KV(u32, u32),
     decl_user_arity: []KV(u32, Module.DeclArity),
     decl_user_sig: []KV(u32, []ir.TypeRef),
+    decl_sigs: []DeclSigLite,
     decl_span: []KV(u32, Span),
     /// Lazy IR: the self-contained `blocks` of AST-free functions, decoded on
     /// first execution. A deferred function carries its `offset + 1` into this
     /// section in `Func.deferred_offset` (its `blocks` is empty in the image).
     deferred_func_section: []const u8,
+};
+
+/// Name-level projection of `Module.DeclSig` for the image: the runtime
+/// consumers read the receiver head, arity, kind flags and has_body —
+/// the structural `sig`/`enclosing_class` graphs stay bake-only.
+pub const DeclSigLite = struct {
+    fid: u32,
+    /// Receiver type head; empty = no declared receiver.
+    recv_head: []const u8,
+    recv_nullable: bool,
+    required: u32,
+    total: u32,
+    has_vararg: bool,
+    kind: ir.FuncKind,
+    is_inline: bool,
+    is_suspend: bool,
+    has_body: bool,
 };
 
 /// Build-time `Value` reachable from an enum entry or a primitive-zero
@@ -1194,6 +1212,26 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
     out.decl_user_params = try autoMapToSlice(u32, u32, a, &m.decl_user_params);
     out.decl_user_arity = try autoMapToSlice(u32, Module.DeclArity, a, &m.decl_user_arity);
     out.decl_user_sig = try autoMapToSlice(u32, []ir.TypeRef, a, &m.decl_user_sig);
+    {
+        var lites: std.ArrayList(DeclSigLite) = .empty;
+        var it = m.decl_sigs.iterator();
+        while (it.next()) |e| {
+            const ds = e.value_ptr.*;
+            try lites.append(a, .{
+                .fid = e.key_ptr.*,
+                .recv_head = if (ds.receiver_ty) |rt| rt.name else "",
+                .recv_nullable = if (ds.receiver_ty) |rt| rt.nullable else false,
+                .required = @intCast(ds.arity.required),
+                .total = @intCast(ds.arity.total),
+                .has_vararg = ds.arity.has_vararg,
+                .kind = ds.kind,
+                .is_inline = ds.is_inline,
+                .is_suspend = ds.is_suspend,
+                .has_body = ds.has_body,
+            });
+        }
+        out.decl_sigs = try lites.toOwnedSlice(a);
+    }
     out.decl_span = try autoMapToSlice(u32, Span, a, &m.decl_span);
 
     const r = &m.registry;
@@ -1892,6 +1930,22 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (img.decl_user_params) |kv| try out.decl_user_params.put(kv.k, kv.v);
     for (img.decl_user_arity) |kv| try out.decl_user_arity.put(kv.k, kv.v);
     for (img.decl_user_sig) |kv| try out.decl_user_sig.put(kv.k, kv.v);
+    for (img.decl_sigs) |l| {
+        const rt: ?ir.TypeRef = if (l.recv_head.len != 0)
+            .{ .name = l.recv_head, .nullable = l.recv_nullable, .args = &.{} }
+        else
+            null;
+        try out.decl_sigs.put(l.fid, .{
+            .enclosing_class = null,
+            .receiver_ty = rt,
+            .arity = .{ .required = l.required, .total = l.total, .has_vararg = l.has_vararg },
+            .sig = &.{},
+            .kind = l.kind,
+            .is_inline = l.is_inline,
+            .is_suspend = l.is_suspend,
+            .has_body = l.has_body,
+        });
+    }
     for (img.decl_span) |kv| try out.decl_span.put(kv.k, kv.v);
 
     const r = &out.registry;
