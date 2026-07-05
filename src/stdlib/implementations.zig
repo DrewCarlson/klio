@@ -933,6 +933,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.collections.Set.size", .f = collections.coll_set_size },
     .{ .fqn = "kotlin.collections.Set.intersect", .f = collections.coll_set_intersect },
     .{ .fqn = "kotlin.collections.Set.minus", .f = collections.coll_set_minus },
+    .{ .fqn = "kotlin.collections.Iterable.minus", .f = collections.coll_iterable_minus },
+    .{ .fqn = "kotlin.collections.Iterable.plus", .f = collections.coll_iterable_plus },
     .{ .fqn = "kotlin.collections.Set.plus", .f = collections.coll_set_plus },
     .{ .fqn = "kotlin.collections.Map.plus", .f = collections.coll_map_plus },
     .{ .fqn = "kotlin.collections.Map.minus", .f = collections.coll_map_minus },

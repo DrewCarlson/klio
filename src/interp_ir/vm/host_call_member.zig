@@ -3137,6 +3137,24 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         return .{ .ok = Value.newInt(@as(i64, try hashWithDispatch(self, allocator, receiver))) };
     }
 
+    // A DECLARED receiver head overrides the runtime-type surface:
+    // kotlinc resolves against the static type, so `data - "foo"` where
+    // `data: T` is bounded by Iterable dispatches `Iterable.minus`
+    // (returning a List) even when the runtime value is a Set. Only the
+    // generic iterable surfaces divert — a declared List/Set head equals
+    // the runtime surface anyway.
+    if (declared_recv) |dn| {
+        if (std.mem.eql(u8, dn, "Iterable") or std.mem.eql(u8, dn, "Collection") or
+            std.mem.eql(u8, dn, "MutableCollection"))
+        {
+            var buf: [96]u8 = undefined;
+            const fqn = std.fmt.bufPrint(&buf, "kotlin.collections.Iterable.{s}", .{name}) catch buf[0..0];
+            if (lookupIntrinsic(self, fqn)) |func| {
+                return dispatchWithReceiver(self, allocator, fqn, func, receiver, args);
+            }
+        }
+    }
+
     // Stdlib member dispatch (type-FQN + package extension probes).
     if (try stdlibMemberDispatch(self, allocator, receiver, name, args)) |r| return r;
 

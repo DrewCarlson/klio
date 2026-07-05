@@ -3155,6 +3155,13 @@ pub const ModuleRegistry = struct {
     class_super_names: std.StringHashMap([]const []const u8),
     /// Body-property `(class, prop)` pairs declared with `by`.
     delegated_body_props: StrPairSet,
+    /// `(class simple name, property name)` → the property's DECLARED
+    /// type head, with a class type-parameter name substituted by its
+    /// bound's head (`data: T` in `IterableTests<T : Iterable<String>>`
+    /// records `Iterable`). Consumed by the binop/member lowering so a
+    /// call on the property resolves against the static type, as
+    /// kotlinc does.
+    class_prop_type_heads: StrPairMap([]const u8),
     /// `FuncId` → declaring-class simple name for *member extension
     /// functions* (`class C { fun R.f(...) { … } }`). Empty for
     /// top-level extensions.
@@ -3247,6 +3254,7 @@ pub const ModuleRegistry = struct {
             .class_member_names = std.StringHashMap(void).init(allocator),
             .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
             .delegated_body_props = StrPairSet.init(allocator),
+            .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
             .abstract_member_defaults = StrPairMap(std.ArrayList(?FuncId)).init(allocator),
@@ -3304,6 +3312,7 @@ pub const ModuleRegistry = struct {
             self.class_super_names.deinit();
         }
         self.delegated_body_props.deinit();
+        self.class_prop_type_heads.deinit();
         self.member_ext_owner_class.deinit();
         {
             var it = self.local_fn_defaults.valueIterator();
@@ -3415,6 +3424,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.delegated_body_props.keyIterator();
             while (it.next()) |k| try out.delegated_body_props.put(k.*, {});
+        }
+        {
+            var it = self.class_prop_type_heads.iterator();
+            while (it.next()) |e| try out.class_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.member_ext_owner_class.iterator();
