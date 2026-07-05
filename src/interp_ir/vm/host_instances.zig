@@ -16,6 +16,7 @@ const stdlib = @import("stdlib");
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const host_globals = @import("host_globals.zig");
+const host_call_member = @import("host_call_member.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -2461,7 +2462,26 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                         break :blk g.get().body_properties[prop_idx].init;
                     };
                     if (init_expr) |ie| {
-                        const v = (try simpleLiteral(allocator, ie.get())) orelse Value.Null;
+                        const v = (try simpleLiteral(allocator, ie.get())) orelse blk: {
+                            // A local class's complex initializer was lowered
+                            // as a runtime `$init$` thunk at registration.
+                            const init_name = try std.fmt.allocPrint(allocator, "$init${s}", .{prop_name});
+                            defer allocator.free(init_name);
+                            const has = hblk: {
+                                const key = try anonKey(allocator, cls_name, init_name);
+                                defer allocator.free(key);
+                                const ag = self.anon_methods.borrow();
+                                defer ag.deinit();
+                                break :hblk ag.get().contains(key);
+                            };
+                            if (has) {
+                                switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, &.{})) {
+                                    .ok => |rv| break :blk rv,
+                                    .err => |e| return .{ .err = e },
+                                }
+                            }
+                            break :blk Value.Null;
+                        };
                         const g = inst.borrowMut();
                         try g.get().define(allocator, shadowFieldKey(self, cls_name, prop_name), v);
                         g.deinit();
@@ -2628,7 +2648,7 @@ fn bareCaptureResolvable(expr: *const ast.Expr, pairs: []const NameValue) bool {
 
 /// Synthesize a body-less 0-arg getter/init thunk `Function` from an
 /// accessor or expression body so it can be lowered as an anon method.
-fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef, is_override: bool) ast.Function {
+pub fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef, is_override: bool) ast.Function {
     return .{
         .name = name,
         .receiver_type = null,
