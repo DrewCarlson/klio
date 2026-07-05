@@ -2372,6 +2372,23 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .UnOp => |u| {
             const v = frame.read(u.operand);
+            // Builtin scalar fast path: `Int.inc()` and friends are final
+            // MEMBERS of the builtin types — a user extension can never
+            // shadow them, so the member/extension probe below (a full
+            // string-keyed dispatch per `i++` in every counting loop) is
+            // semantically dead for these tags.
+            switch (v) {
+                .Int, .Long, .Double, .Float, .Short, .Byte, .Char, .UInt, .ULong, .UShort, .UByte => {
+                    switch (try applyUnop(allocator, u.op, &v)) {
+                        .ok => |out| {
+                            try frame.write(u.dst, out);
+                            return .cont;
+                        },
+                        .err => {},
+                    }
+                },
+                else => {},
+            }
             const method = switch (u.op) {
                 .Neg => "unaryMinus",
                 .Plus => "unaryPlus",

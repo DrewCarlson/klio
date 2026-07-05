@@ -14,6 +14,7 @@
 //! analysis this implements.
 
 const std = @import("std");
+const clock_mod = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 
 /// Non-generic header prefixed to every `ControlBlock(T)`. The collector reads
@@ -157,14 +158,53 @@ pub fn register(h: *GcHeader, bytes: usize) void {
     if (prev + bytes >= threshold) gc_pending.store(true, .monotonic);
 }
 
-/// Cheap poll at opcode-boundary safe points.
+/// Cheap poll at opcode-boundary safe points. Every ~64k polls it also
+/// probes for IDLE reclamation: a program that bursts (leaving a large
+/// heap) and then goes quiet never crosses the allocation threshold
+/// again, so its garbage would stay committed forever. One bonus
+/// collection per quiescent period returns the heap to its live set (and
+/// the pages to the OS); real allocation activity re-arms the probe.
 pub inline fn pending() bool {
     if (gc_stress) return true;
     if (gc_stress_every != 0) {
         safepoint_counter += 1;
         if (safepoint_counter >= gc_stress_every) return true;
     }
+    idle_tick += 1;
+    if (idle_tick & 0xFFFF == 0) idleProbe();
     return gc_pending.load(.monotonic);
+}
+
+threadlocal var idle_tick: usize = 0;
+/// Wall-clock (ms) when the last collection finished; 0 before the first.
+var last_collect_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+/// Live bytes measured by the last collection.
+var last_live: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+/// The one-shot latch: true once the quiescent-period collection ran;
+/// re-armed (set false) by any collection that saw real allocation.
+var idle_collected: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
+/// Quiescence window before the bonus collection fires.
+const IDLE_COLLECT_MS: u64 = 1000;
+
+fn idleProbe() void {
+    if (gc_pending.load(.monotonic)) return;
+    if (idle_collected.load(.monotonic)) return;
+    // NOTE: registered-cell bytes wildly under-count the real heap (raw
+    // string/array payloads are not cells), so there is no reliable
+    // "worth it" size gate here — the latch already bounds the cost to
+    // one collection per quiescent period.
+    const last = last_collect_ms.load(.monotonic);
+    if (last == 0) return;
+    const now = nowMillis();
+    if (now -| last < IDLE_COLLECT_MS) return;
+    idle_collected.store(true, .monotonic);
+    gc_pending.store(true, .monotonic);
+    if (gc_debug) std.debug.print("[gc] idle collection requested\n", .{});
+}
+
+fn nowMillis() u64 {
+    const ns = clock_mod.monotonicNanos();
+    return @intCast(ns / std.time.ns_per_ms);
 }
 
 /// Called from an opcode-boundary safe point when a collection is pending. In
@@ -420,6 +460,14 @@ pub fn collect() void {
     // sweep so the capture-store cells of dead closures are already gone.
     if (sweepClosureHook) |f| f(cur_epoch);
     gc_pending.store(false, .monotonic);
+    // A collection that saw real allocation re-arms the idle probe, so
+    // the NEXT quiescent period gets its bonus reclamation; the idle
+    // collection itself (near-zero churn) stays latched.
+    if (bytes_since_gc.load(.monotonic) >= threshold_floor / 2) {
+        idle_collected.store(false, .monotonic);
+    }
+    last_live.store(live_bytes, .monotonic);
+    last_collect_ms.store(nowMillis(), .monotonic);
     bytes_since_gc.store(0, .monotonic);
     if (others != 0) stop_flag.store(false, .release);
     threshold = @max(threshold_floor, live_bytes *| 2);
