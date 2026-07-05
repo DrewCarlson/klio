@@ -699,6 +699,26 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     const lhs = bin.lhs;
     const rhs = bin.rhs;
 
+    // `list + (x as Any)`: kotlinc resolves `plus(element: T)` from the
+    // RHS's STATIC type, appending the value as one element even when it
+    // is itself a list at runtime. Route a statically list-headed LHS
+    // with an Any-cast RHS through `plusElement`.
+    if (op == .Add and staticListHead(lhs) and ast_scan.isBoxedToAnyForm(rhs)) {
+        const l = try lowerExpr(b, lhs);
+        const r = try lowerExpr(b, rhs);
+        const args_start = try packContiguous(b, &.{r});
+        const dst = b.allocReg();
+        const nm = try b.module.internConst(b.allocator, .{ .String = "plusElement" });
+        try b.push(.{ .CallMember = .{
+            .dst = dst,
+            .receiver = l,
+            .name = nm,
+            .args = args_start,
+            .n_args = 1,
+        } });
+        return dst;
+    }
+
     // `==` on a boxed operand (an `Any`-typed or generic type-parameter value,
     // e.g. `assertEquals(expected: T, actual: T)`) uses total-order equality —
     // `NaN == NaN` is true and `0.0 != -0.0`, matching boxed `Double.equals`.
@@ -3198,6 +3218,23 @@ fn lowerCallSpread(
                 break :blk try lowerReceiver(b, m.receiver);
             }
         }
+        // A bare callee naming an enclosing-class member fn
+        // (`checkContents(context, *es)` inside another member) dispatches
+        // through `this`, not as a first-class value read (a member fn is
+        // not a field, so the value path dies on `get_field`). A name that
+        // is also a known top-level fn (`maxOf(a, *rest)`) keeps the
+        // global path — the member set over-approximates.
+        if (callee.* == .Path and callee.Path.segments.len == 1) {
+            const name = callee.Path.segments[0].name;
+            if (b.resolve(name) == null and !b.isLocalFn(name) and b.hasEnclosingMember(name) and
+                b.module.funcId(name) == null)
+            {
+                if (try resolveThisForBareCall(b)) |this_reg| {
+                    member_id = try b.module.internConst(b.allocator, .{ .String = name });
+                    break :blk this_reg;
+                }
+            }
+        }
         break :blk try lowerExpr(b, callee);
     };
     const parts = try b.allocator.alloc(SpreadPart, args.len);
@@ -3800,6 +3837,31 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // merely "an unknown receiver could have it" — so a top-level helper
         // (`testEquals`) called in a lambda is left on the global path.
         if (b.resolve(nm0) == null and inReceiverContext(b) and b.hasEnclosingMember(nm0)) {
+            // A captured local fn is a candidate the runtime member walk
+            // cannot see: emit the runtime-arbitrated form. Its value arm
+            // falls to the enclosing member when the closure's declared
+            // params refute the args (`testEncode(codec, bytes, symbols)`
+            // binds the local on String args, the private member on
+            // ByteArray).
+            if (b.knowsOuter(nm0) and call.type_args.len == 0) {
+                if (try resolveThisForBareCallNoBind(b)) |this_reg| {
+                    const cv = try resolveCapture(b, nm0);
+                    const run0 = try lowerArgRun(b, args);
+                    const an0 = try internArgNames(b.allocator, b.module, ast_arg_names);
+                    const nmc = try b.module.internConst(b.allocator, .{ .String = nm0 });
+                    const d0 = b.allocReg();
+                    try b.push(.{ .CallValueOrMember = .{
+                        .dst = d0,
+                        .callee = cv,
+                        .this_recv = this_reg,
+                        .name = nmc,
+                        .args = run0[0],
+                        .n_args = run0[1],
+                        .arg_names = an0,
+                    } });
+                    return d0;
+                }
+            }
             if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
         }
     }
@@ -4368,39 +4430,46 @@ fn lowerValueInvocation(
         }
     }
 
-    // Member-function precedence over a same-named value/param.
+    // Member-function precedence over a same-named value/param. A local
+    // fn with a same-named enclosing member also routes through the
+    // arbitrated form: the value arm wins unless the closure's declared
+    // params refute the args (Kotlin picks the member overload then), so
+    // `testEncode(codec, byteArray, s)` reaches the private member past
+    // the String-typed local.
     const redirect_to_member = blk: {
-        var is_hierarchy_method = false;
-        if (b.ownerClass()) |oc| {
-            if (b.module.registry.hierarchy_methods.get(oc)) |s| {
-                is_hierarchy_method = s.contains(name0);
+        var member_declared = b.hasEnclosingMember(name0);
+        if (!member_declared) {
+            if (b.ownerClass()) |oc| {
+                if (b.module.registry.hierarchy_methods.get(oc)) |s| {
+                    member_declared = s.contains(name0);
+                }
             }
         }
-        break :blk is_hierarchy_method and b.resolve(name0) != null and
-            !b.isLocalFn(name0) and !b.isLocalExtFn(name0) and b.resolve("this") != null;
+        break :blk member_declared and b.resolve(name0) != null and !b.isLocalExtFn(name0);
     };
     if (redirect_to_member) {
-        const this_reg = b.resolve("this").?;
-        var callee_reg = b.resolve(name0).?;
-        if (b.isBoxed(name0)) {
-            const c = b.allocReg();
-            try b.push(.{ .CellGet = .{ .dst = c, .cell = callee_reg } });
-            callee_reg = c;
+        if (try resolveThisForBareCallNoBind(b)) |this_reg| {
+            var callee_reg = b.resolve(name0).?;
+            if (b.isBoxed(name0)) {
+                const c = b.allocReg();
+                try b.push(.{ .CellGet = .{ .dst = c, .cell = callee_reg } });
+                callee_reg = c;
+            }
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+            try b.push(.{ .CallValueOrMember = .{
+                .dst = dst,
+                .callee = callee_reg,
+                .this_recv = this_reg,
+                .name = nm,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
         }
-        const run = try lowerArgRun(b, args);
-        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-        const dst = b.allocReg();
-        const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-        try b.push(.{ .CallValueOrMember = .{
-            .dst = dst,
-            .callee = callee_reg,
-            .this_recv = this_reg,
-            .name = nm,
-            .args = run[0],
-            .n_args = run[1],
-            .arg_names = arg_names,
-        } });
-        return dst;
     }
 
     if (b.resolve(name0)) |reg| {
@@ -4500,6 +4569,22 @@ fn lowerValueInvocation(
 /// Whether a single-segment class-name call resolves to the constructor
 /// rather than a same-named factory function.
 const LitKind = enum { numeric, string, boolean, char };
+
+/// Whether an expression's STATIC type head is definitely a list-family
+/// value: a call to a list factory, or a `listOf(...) + x` chain. Used to
+/// route `list + (rhs as Any)` through `plusElement`.
+fn staticListHead(e: *const Expr) bool {
+    return switch (e.*) {
+        .Call => |c| blk: {
+            if (c.callee.* != .Path or c.callee.Path.segments.len != 1) break :blk false;
+            const n = c.callee.Path.segments[0].name;
+            break :blk std.mem.eql(u8, n, "listOf") or std.mem.eql(u8, n, "mutableListOf") or
+                std.mem.eql(u8, n, "emptyList") or std.mem.eql(u8, n, "arrayListOf");
+        },
+        .Binary => |bi| bi.op == .Add and staticListHead(bi.lhs),
+        else => false,
+    };
+}
 
 /// Definite builtin value kind of a literal argument expression, or null when
 /// the argument's type is not a known literal (so it can never *disprove* a
