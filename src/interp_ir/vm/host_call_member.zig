@@ -2611,7 +2611,24 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
 
     // Static call on an Intrinsic receiver: probe `<fqn>.<name>`.
+    // `Any` surface on a type-in-value-position value (`val c: Any =
+    // UByte; c.toString()` — the companion reference lowers to the
+    // type's constructor/conversion FUNCTION in a class context):
+    // identity string, never the conversion itself.
+    if (receiver.* == .Function and std.mem.eql(u8, name, "toString") and args.len == 0) {
+        const dn = receiver.Function.decl.name.name;
+        if (dn.len > 0 and std.ascii.isUpper(dn[0])) {
+            return .{ .ok = try strVal(allocator, dn) };
+        }
+    }
     if (receiver.* == .Intrinsic) {
+        // Same surface for the intrinsic-valued form.
+        if (std.mem.eql(u8, name, "toString") and args.len == 0) {
+            return .{ .ok = try strVal(allocator, receiver.Intrinsic.fqn) };
+        }
+        if (std.mem.eql(u8, name, "hashCode") and args.len == 0) {
+            return .{ .ok = Value.newInt(@as(i64, @intCast(@intFromPtr(receiver.Intrinsic.fqn.ptr) & 0x7fffffff))) };
+        }
         const probe = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ receiver.Intrinsic.fqn, name });
         defer if (runtime.freeScratch()) allocator.free(probe);
         if (lookupIntrinsic(self, probe)) |func| {
@@ -2624,6 +2641,13 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const cname = cg.get().name;
         const cfqn = cg.get().fqn;
         cg.deinit();
+        // `Any.toString` on a class/companion value: the class label,
+        // never a same-named number intrinsic (`kotlin.UByte.toString`
+        // expects a UByte receiver, not the type).
+        if (std.mem.eql(u8, name, "toString") and args.len == 0) {
+            const label = try std.fmt.allocPrint(allocator, "class {s}", .{cname});
+            return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, label) } };
+        }
         const probe_simple = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cname, name });
         const probe_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cfqn, name });
         // `dispatchIntrinsic` borrows the key for the call only; free both
