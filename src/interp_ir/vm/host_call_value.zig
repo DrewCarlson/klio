@@ -833,6 +833,24 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
         const id = callee.IrClosure.id;
         const captures = callee.IrClosure.captures;
         if (self.closures.get(@intCast(id))) |info| {
+            // A named LOCAL FUNCTION lowers as a closure but is not a
+            // receiver lambda: the caller's `this` reaches its body
+            // lexically (captures), never as an argument. The
+            // receiver-binding heuristics below would corrupt its
+            // positional args (a `vararg values + trailing lambda`
+            // local fn got the test instance spliced in). Dispatch it
+            // as a plain value call.
+            {
+                const module_ref = self.module.clone();
+                defer module_ref.deinit();
+                const module = info.module orelse module_ref.asPtr();
+                if (module.funcById(info.body_func)) |bf| {
+                    const takes_receiver = bf.params.len != 0 and std.mem.eql(u8, bf.params[0].name, "this");
+                    if (!std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver) {
+                        return callValue(self, allocator, callee, args);
+                    }
+                }
+            }
             const this_idx: ?usize = blk: {
                 for (info.capture_names, 0..) |n, i| {
                     if (std.mem.eql(u8, n, "this")) break :blk i;

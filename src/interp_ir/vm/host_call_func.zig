@@ -768,6 +768,7 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     if (f.params.len > 253) return 1;
     if (paramIsThis(f.params) or f.has_receiver_param) return 1;
     if (lastIsVararg(f.params)) return 1;
+    if (hasNonFinalVararg(f.params)) return 1;
     if (funcDefaults(self, func) != null) return 1;
     if (resolvedNativeForm(self, func) != null) return 1;
     if (module.funcsBySimpleName(f.name).len != 1) return 1;
@@ -797,6 +798,19 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     }
 
     linkAuditCheck(self, module, func, f, args_in);
+
+    // A NON-final vararg (Kotlin allows `vararg` before trailing
+    // defaulted / function-typed params) cannot bind by the simple
+    // positional walk — the vararg must absorb the middle args while the
+    // trailing params take the tail (`arrayData(vararg values,
+    // toArray: ...)` called `("a", "b", "c") { ... }`). Route through the
+    // reorder-aware named binder, which handles exactly this shape.
+    if (args_in.len > f.params.len and hasNonFinalVararg(f.params) and f.hasBody()) {
+        const no_names = try allocator.alloc(?[]const u8, args_in.len);
+        defer allocator.free(no_names);
+        @memset(no_names, null);
+        return callFuncNamed(self, allocator, module, func, args_in, no_names);
+    }
 
     // Bodyless `expect` / header-only decl: the link step settled its
     // body siblings (declaration order); the first whose arity fits the
