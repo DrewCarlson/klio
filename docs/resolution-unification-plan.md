@@ -455,6 +455,35 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         * flatten on Sequence; Sequence.minus laziness
           (minusIsLazyIterated); orEmpty returning [] instead of the
           Sequence.
+      - **Checkpoint 2026-07-05d: inventory ~70 dual-identical.**
+        SequenceTest 13→2 (scan family lazy via source, IteratorFn SAM
+        source, constrain-once actual + hatch deletion, generateSequence
+        one-shot/seed-fn semantics). decl_sigs ride the stdlib image
+        (DeclSigLite): every declared-signature mechanism now works in
+        image-loaded runs — bake-vs-image nondeterminism killed. Hatches
+        deleted this arc: constrainOnce no-op; Set/Iterable min-max
+        family served by declarations. NOTE: kotlin.test packs are
+        INSTALLED state under ~/.klio/packs — never delete .klio
+        wholesale (restore: klio pack build kotlin-klio/klio-kotlin-test
+        + pack install, both homes).
+        Remaining clusters, mechanisms identified:
+        * StringTest 6 / ContainerBuilder 6 — orEmpty null-receiver
+          overload pick; build-list identity ("is not same"), subList
+          views, map-entry setValue guard.
+        * ReversedViews 5 + ArrayDeque 5 — need source-class instances
+          (views with write-through; ArrayDeque internalStructure) —
+          the P10 de-hatching direction.
+        * Anon-capture chain bug (blocks Sequence.minus laziness +
+          GroupingTest countEach): a lambda inside a runtime-lowered
+          anon-object method reads enclosing-fn captures as Null; bare
+          member reads inside stdlib anon methods can hit package
+          intrinsics (`iterator` → the builder). Root in the
+          buildObject → lowerMethod capture threading.
+        * PropertyReference 4 (bound property refs), KClass 3
+          (safeCast, qualifiedName), Regex 3 (options field, matchAt
+          bounds, empty-match split around surrogates), EnumEntries
+          factory 3, GroupingTest others (local-fn-on-String ext
+          countVowels, groupingProducers recursion depth).
       - **Named remainder** (real, deterministic, 115 total): ArraysTest
         contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
         copyRangeInto (`UIntArray expects an Int size`),
