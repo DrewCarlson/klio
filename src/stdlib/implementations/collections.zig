@@ -1224,7 +1224,12 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
                 };
             } else break :blk initial;
         };
-        const next = switch (try invoke(ctx, &op, &.{ cur, v })) {
+        // The computed-initial overload's operation is keyed:
+        // `fold(initialValueSelector: (K, T) -> R, operation: (K, R, T) -> R)`.
+        const next = switch (if (isCallable(initial))
+            try invoke(ctx, &op, &.{ k, cur, v })
+        else
+            try invoke(ctx, &op, &.{ cur, v })) {
             .value => |val| val,
             .err => |e| return e,
         };

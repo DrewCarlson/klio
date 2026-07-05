@@ -548,6 +548,24 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return dst;
         },
         .MemberRef => |mr| {
+            // `String::countVowels` where the member names an in-scope
+            // LOCAL extension function: kotlinc resolves the reference to
+            // that local, not to a member of the type. The local lowered
+            // as a closure bound to its name; the closure takes the
+            // receiver as its first param, exactly the callable shape a
+            // `Type::ext` reference must have.
+            if (!std.mem.eql(u8, mr.name.name, "class") and
+                mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1 and
+                b.isLocalExtFn(mr.name.name))
+            {
+                if (b.resolve(mr.name.name)) |r| return r;
+                if (b.knowsOuter(mr.name.name)) {
+                    const idx = try b.recordCapture(mr.name.name);
+                    const dst = b.allocReg();
+                    try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+                    return dst;
+                }
+            }
             // `Outer::Nested` where `Nested` is a class is a constructor
             // reference, not a bound member ref — load the class value.
             if (!std.mem.eql(u8, mr.name.name, "class") and
