@@ -1389,6 +1389,22 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                     const cg = self.classes.borrow();
                     defer cg.deinit();
                     if (cg.get().get(tn)) |c| break :blk Value{ .Class = c.clone() };
+                    // An owner-qualified reified name (`Outer.Nested`): the
+                    // name-keyed table holds one same-simple-name winner, so
+                    // resolve by FQN suffix across the table (cold path —
+                    // reified enum serving only).
+                    if (std.mem.indexOfScalar(u8, tn, '.') != null) {
+                        var it = cg.get().iterator();
+                        while (it.next()) |e| {
+                            const dg = e.value_ptr.borrow();
+                            const fqn = dg.get().fqn;
+                            const hit = std.mem.eql(u8, fqn, tn) or
+                                (fqn.len > tn.len and std.mem.endsWith(u8, fqn, tn) and fqn[fqn.len - tn.len - 1] == '.');
+                            dg.deinit();
+                            if (hit) break :blk Value{ .Class = e.value_ptr.clone() };
+                        }
+                        if (cg.get().get(tn[std.mem.lastIndexOfScalar(u8, tn, '.').? + 1 ..])) |c| break :blk Value{ .Class = c.clone() };
+                    }
                     break :blk host_globals.lookupGlobal(self, tn);
                 };
                 if (cls_value) |cv| {

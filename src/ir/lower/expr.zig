@@ -447,6 +447,12 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .Postfix => return lowerPostfix(b, expr),
         .Labeled => return lowerLabeled(b, expr),
         .PropertyRef => |pr| {
+            // `::enumEntries` against a declared `() -> Head<E>` function
+            // type: the expected return solves the target's single reified
+            // type parameter, and the plain fn VALUE cannot carry it —
+            // lower the reference as a zero-arg closure over the stamped
+            // call instead.
+            if (try reifiedRefClosure(b, pr.name.name, pr.name.span)) |r| return r;
             // `::greet` — a registered top-level fn loads the function value;
             // a tracked local / top-level prop keeps the unbound PropertyRef;
             // an untracked own-receiver member binds a MemberRef. The symbol
@@ -5929,6 +5935,48 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
 /// reified argument. Records the solution keyed by the nested call's AST
 /// node; `emitCall` consumes it when that node lowers with no type args
 /// of its own.
+/// `::name` in a slot whose DECLARED function type solves the referenced
+/// fn's single reified type parameter (`val empty: () -> EnumEntries<E> =
+/// ::enumEntries`): the reference lowers as a zero-arg closure over the
+/// call with the solved type argument stamped — a plain function value
+/// carries no type args, so invoking it later would lose the reification.
+/// AST synthesized from the MODULE allocator (lambda bodies are
+/// runtime-read).
+fn reifiedRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allocator.Error!?Reg {
+    const expected = b.peekExpected() orelse return null;
+    const fnty = expected.function orelse return null;
+    if (fnty.params.len != 0) return null;
+    if (fnty.ret.type_args.len != 1) return null;
+    const fid = b.module.funcId(name) orelse return null;
+    const tps = b.module.registry.func_type_params.get(fid) orelse return null;
+    if (tps.items.len != 1) return null;
+    const ma = b.module.func_name_index.allocator;
+    const segs = try ma.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = try ma.dupe(u8, name), .span = sp };
+    const callee = try ma.create(ast.Expr);
+    callee.* = .{ .Path = .{ .segments = segs, .span = sp } };
+    const ta = try ma.alloc(ast.TypeRef, 1);
+    ta[0] = fnty.ret.type_args[0].ty;
+    const stmts = try ma.alloc(ast.Stmt, 1);
+    stmts[0] = .{ .Expr = .{ .Call = .{
+        .callee = callee,
+        .args = &.{},
+        .arg_names = &.{},
+        .type_args = ta,
+        .is_infix = false,
+        .span = sp,
+    } } };
+    const lam: ast.Expr = .{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = stmts, .span = sp },
+        .span = sp,
+        .implicit_it = false,
+    } };
+    const boxed = try ma.create(ast.Expr);
+    boxed.* = lam;
+    return try lowerExpr(b, boxed);
+}
+
 const SibSolved = struct { site: *const Expr, ty: ast.TypeRef };
 
 fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr) ?SibSolved {
@@ -6016,10 +6064,42 @@ fn staticEnumElem(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
 
 fn enumClassOfPath(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
     var name: []const u8 = undefined;
+    var qual_cid: ?ir.ClassId = null;
+    var owner_hint: ?[]const u8 = null;
     switch (e.*) {
-        .Path => |p| name = p.segments[p.segments.len - 1].name,
-        .Member => |m| name = m.name.name,
+        .Path => |p| {
+            name = p.segments[p.segments.len - 1].name;
+            // A qualified nested reference (`EnumEntriesListTest.EmptyEnum`)
+            // must bind THAT nested class — the simple name may collide
+            // with an unrelated top-level or sibling-nested enum.
+            if (p.segments.len >= 2) {
+                const owner_name = p.segments[p.segments.len - 2].name;
+                owner_hint = owner_name;
+                if (b.module.classId(owner_name)) |oid| {
+                    qual_cid = b.module.classIdNestedIn(oid, name);
+                }
+            }
+        },
+        .Member => |m| {
+            name = m.name.name;
+            if (m.receiver.* == .Path and m.receiver.Path.segments.len >= 1) {
+                const owner_name = m.receiver.Path.segments[m.receiver.Path.segments.len - 1].name;
+                owner_hint = owner_name;
+                if (b.module.classId(owner_name)) |oid| {
+                    qual_cid = b.module.classIdNestedIn(oid, name);
+                }
+            } else if (m.receiver.* == .Member) {
+                owner_hint = m.receiver.Member.name.name;
+            }
+        },
         else => return null,
+    }
+    if (qual_cid) |cid| {
+        if (cid.int() < b.module.classes.items.len) {
+            // The registered (lifted) name is what the runtime type-arg
+            // lookup resolves.
+            name = b.module.classes.items[cid.int()].name;
+        }
     }
     if (b.module.classId(name) == null) return null;
     // Enum-ness at lowering: the recorded supertype chain carries
@@ -6030,7 +6110,15 @@ fn enumClassOfPath(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
         var sn = sup;
         if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
         if (std.mem.indexOfScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
-        if (std.mem.eql(u8, sn, "Enum")) return name;
+        if (!std.mem.eql(u8, sn, "Enum")) continue;
+        // A qualified reference stamps the owner-qualified name: the
+        // simple name may collide with an unrelated same-named enum, and
+        // the runtime resolves the dotted form through the lifted
+        // nested-class key.
+        if (owner_hint) |o| {
+            return std.fmt.allocPrint(b.module.func_name_index.allocator, "{s}.{s}", .{ o, name }) catch name;
+        }
+        return name;
     }
     return null;
 }
@@ -6113,7 +6201,13 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     const dst = b.allocReg();
     orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
     const cmg_static_recv: ?ConstId = try cmgStaticRecv(b);
-    const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+    var type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+    // The deferred form keeps the reified splice substitution too: a
+    // spliced `enumEntriesIntrinsic()` lowered in a receiver context
+    // (a lambda body) is otherwise blind at the runtime intrinsic.
+    if (type_args.len == 0) {
+        if (try spliceReifiedTypeArgs(b, func_id)) |stamped| type_args = stamped;
+    }
     try b.push(.{ .CallMemberOrGlobal = .{
         .dst = dst,
         .this_idx = this_idx,

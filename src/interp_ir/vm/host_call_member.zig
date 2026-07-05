@@ -6378,7 +6378,17 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                 defer candidates.deinit(allocator);
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
-                        if (std.mem.eql(u8, f.name, name) and !f.low_priority) try candidates.append(allocator, f);
+                        if (std.mem.eql(u8, f.name, name) and !f.low_priority) {
+                            // Kotlin collection-stub bridge: a candidate whose
+                            // declared param names a CLASS type param with a
+                            // bound the runtime argument refutes is skipped,
+                            // so the walk falls through to the inherited
+                            // implementation (indexOf(nonEnum) on an
+                            // EnumEntries answers -1 through AbstractList's
+                            // scan, exactly as the generated bridge does).
+                            if (classTypeParamRefutes(self, mod, cur_name, &f, args)) continue;
+                            try candidates.append(allocator, f);
+                        }
                     }
                 }
                 if (pickMethodOverload(self, candidates.items, args)) |f| {
@@ -6396,6 +6406,46 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
         cg.deinit();
     }
     return null;
+}
+
+/// See the candidate loop in `resolveInstanceMethod`: whether a declared
+/// param typed as one of `class_name`'s type parameters has a recorded
+/// upper bound the runtime argument DEFINITIVELY refutes. Positive-proof
+/// only — an unknown/incomplete relation never refutes.
+fn classTypeParamRefutes(self: *VmHost, mod: *const Module, class_name: []const u8, f: *const Func, args: []const Value) bool {
+    const bounds = mod.registry.class_type_param_bounds.get(class_name) orelse return false;
+    const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    if (f.params.len <= recv_off) return false;
+    for (f.params[recv_off..], 0..) |*p, i| {
+        if (i >= args.len) break;
+        const pn = std.mem.trimEnd(u8, simpleName(p.ty.name), "?");
+        for (bounds) |b| {
+            if (!std.mem.eql(u8, b.param, pn)) continue;
+            var bn = simpleName(b.bound);
+            if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
+            bn = std.mem.trimEnd(u8, bn, "?");
+            if (std.mem.eql(u8, bn, "Any")) continue;
+            const arg = &args[i];
+            if (arg.* == .Null) continue;
+            if (std.mem.eql(u8, bn, "Enum")) {
+                // An enum-entry instance's class is is_enum; anything else
+                // can never satisfy an Enum bound.
+                if (arg.* == .Instance) {
+                    const g = arg.Instance.borrow();
+                    const cg = g.get().class.borrow();
+                    const is_enum = cg.get().is_enum;
+                    cg.deinit();
+                    g.deinit();
+                    if (!is_enum) return true;
+                } else {
+                    return true;
+                }
+                continue;
+            }
+            if (arg.* == .Instance and !receiverImplementsHead(self, arg, bn)) return true;
+        }
+    }
+    return false;
 }
 
 /// Invoke an already-resolved user method by `FuncId`: prepend the receiver,

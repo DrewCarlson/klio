@@ -1369,6 +1369,73 @@ pub const FuncBuilder = struct {
         block.insts = new;
     }
 
+    /// Copy-coalescing peephole, run once at `finish`: an instruction
+    /// defining a single-use, single-def temp that is immediately
+    /// followed by `Move{dst = H, src = temp}` in the same block writes
+    /// H directly and the Move disappears. Assignment and argument-run
+    /// lowering produce this shape pervasively (`x = a + b` lowers as
+    /// `BinOp T; Move x <- T`), so the fused form dispatches measurably
+    /// fewer instructions on expression-heavy code. Register facts come
+    /// from the comptime `visitInstRegs` enumeration, so every operand
+    /// position — including `args`+`n_args` contiguous runs — counts.
+    fn fuseSingleUseMoves(self: *FuncBuilder, blocks: []ir.Block) void {
+        const n = self.next_reg;
+        if (n == 0) return;
+        const uses = self.allocator.alloc(u32, n) catch return;
+        defer self.allocator.free(uses);
+        const defs = self.allocator.alloc(u32, n) catch return;
+        defer self.allocator.free(defs);
+        @memset(uses, 0);
+        @memset(defs, 0);
+        const Counter = struct {
+            uses: []u32,
+            defs: []u32,
+            fn cb(c: @This(), r: ir.Reg, is_def: bool) void {
+                const i = r.int();
+                if (i >= c.uses.len) return;
+                if (is_def) c.defs[i] += 1 else c.uses[i] += 1;
+            }
+        };
+        const counter = Counter{ .uses = uses, .defs = defs };
+        for (blocks) |*blk| {
+            for (blk.insts) |*inst| ir.visitInstRegs(inst, counter, Counter.cb);
+            ir.visitTerminatorRegs(&blk.terminator, counter, Counter.cb);
+        }
+        for (blocks) |*blk| {
+            if (blk.insts.len < 2) continue;
+            var w: usize = 0;
+            var i: usize = 0;
+            var fused_any = false;
+            while (i < blk.insts.len) : (i += 1) {
+                var inst = blk.insts[i];
+                if (i + 1 < blk.insts.len and blk.insts[i + 1] == .Move) fuse: {
+                    const mv = blk.insts[i + 1].Move;
+                    const t = mv.src.int();
+                    if (t >= n or uses[t] != 1 or defs[t] != 1) break :fuse;
+                    if (mv.dst.int() == t) break :fuse;
+                    const d = instDefOf(&inst) orelse break :fuse;
+                    if (d.int() != t) break :fuse;
+                    if (!ir.setInstDst(&inst, mv.dst)) break :fuse;
+                    blk.insts[w] = inst;
+                    w += 1;
+                    i += 1; // the Move is gone
+                    fused_any = true;
+                    continue;
+                }
+                blk.insts[w] = inst;
+                w += 1;
+            }
+            if (!fused_any) continue;
+            // Exact-size reallocation: the original slice frees by its
+            // allocated length, so an in-place shrink would corrupt a
+            // size-checked allocator's bookkeeping.
+            const out = self.allocator.alloc(ir.Inst, w) catch continue;
+            @memcpy(out, blk.insts[0..w]);
+            self.allocator.free(blk.insts);
+            blk.insts = out;
+        }
+    }
+
     /// Finalise the current block with a terminator.
     pub fn terminate(self: *FuncBuilder, t: Terminator) void {
         const cur = self.cur.int();
@@ -1395,6 +1462,7 @@ pub const FuncBuilder = struct {
     ) Allocator.Error!Func {
         const n_locals = self.next_reg;
         const blocks = try self.blocks.toOwnedSlice(self.allocator);
+        self.fuseSingleUseMoves(blocks);
         self.blocks = .empty;
         const capture_order = try self.allocator.dupe([]const u8, self.capture_order.items);
         return Func{
@@ -1416,6 +1484,19 @@ pub const FuncBuilder = struct {
         };
     }
 };
+
+/// The `dst` register an instruction defines, when its variant has one.
+fn instDefOf(inst: *const ir.Inst) ?ir.Reg {
+    const Finder = struct {
+        found: *?ir.Reg,
+        fn cb(c: @This(), r: ir.Reg, is_def: bool) void {
+            if (is_def and c.found.* == null) c.found.* = r;
+        }
+    };
+    var found: ?ir.Reg = null;
+    ir.visitInstRegs(inst, Finder{ .found = &found }, Finder.cb);
+    return found;
+}
 
 pub const LoopFrame = struct {
     label: ?[]const u8,

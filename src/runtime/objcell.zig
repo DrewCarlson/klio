@@ -53,21 +53,24 @@ pub const gc = @import("gc.zig");
 /// and restored afterward. It must NEVER be set on a thread that runs on a
 /// leak-checking `testing.allocator`, or a UAF/leak would be masked.
 ///
-/// Threadlocal so a spawned worker inherits the spawning run's mode the
-/// same way the coroutine time mode does: the worker explicitly carries
-/// the flag through the spawn seed and sets it on entry.
-threadlocal var reclaim_tls: bool = true;
+/// Process-wide: the perf profile decides the mode once at startup and
+/// every spawned worker runs the same mode, so a shared atomic replaces
+/// the old threadlocal — `reclaimEnabled()` is read on nearly every
+/// register write and a macOS dyld TLV lookup was ~13% of a pure counting
+/// loop. Monotonic is enough: the value only changes at run boundaries
+/// when no interpreter thread is mid-flight.
+var reclaim_shared: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
 
-/// Set the current thread's `ObjRef.deinit` teardown mode. `true` = full
+/// Set the `ObjRef.deinit` teardown mode. `true` = full
 /// refcount/destroy/`T.deinit` path; `false` = arena fast path (skip
 /// per-cell teardown, the arena reclaims). Defaults to `true`.
 pub fn setReclaim(on: bool) void {
-    reclaim_tls = on;
+    reclaim_shared.store(on, .monotonic);
 }
 
 /// Whether the current thread runs `ObjRef.deinit`'s full teardown path.
 pub fn reclaimEnabled() bool {
-    return reclaim_tls;
+    return reclaim_shared.load(.monotonic);
 }
 
 /// Whether raw host-temporary buffers (scratch arrays, probe FQN strings, error
@@ -80,7 +83,7 @@ pub fn reclaimEnabled() bool {
 /// is a no-op anyway. Keeps the value-graph ownership ops gated on
 /// `reclaimEnabled()` (must stay off under GC) distinct from scratch frees.
 pub fn freeScratch() bool {
-    return reclaim_tls or gc.gc_enabled;
+    return reclaim_shared.load(.monotonic) or gc.gc_enabled;
 }
 
 /// Whether the process was asked to run the freeing reference-counting path
@@ -429,7 +432,7 @@ pub fn ObjRef(comptime T: type) type {
                 // Dupe under reclaim OR GC: in both the cell owns its bytes and
                 // frees them on teardown (refcount `deinit` / GC `gcFinalize`).
                 // Under the pure arena path the slice is stored as-is.
-                if (reclaim_tls or gc.gc_enabled) data = try allocator.dupe(u8, v);
+                if (reclaim_shared.load(.monotonic) or gc.gc_enabled) data = try allocator.dupe(u8, v);
             }
             return initOwned(allocator, data);
         }
@@ -494,7 +497,7 @@ pub fn ObjRef(comptime T: type) type {
         /// real-thread stress configs (which never disable reclaim) keep
         /// the refcount/free discipline that catches UAF/leaks.
         pub fn deinit(self: Self) void {
-            if (!reclaim_tls) return;
+            if (!reclaim_shared.load(.monotonic)) return;
             const prev = self.cell.refcount.fetchSub(1, .release);
             if (detectDoubleFree()) {
                 // Diagnostic mode: never destroy the cell (leak it) so a second

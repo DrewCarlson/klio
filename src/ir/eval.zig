@@ -2372,6 +2372,30 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
         },
         .UnOp => |u| {
             const v = frame.read(u.operand);
+            // Builtin scalar fast path: outside any class scope a scalar's
+            // unary operators are its builtin members and no extension can
+            // shadow them, so the string-keyed probe below (a full member
+            // dispatch per `i++` in every counting loop) is semantically
+            // dead. Inside a class scope a MEMBER EXTENSION operator can
+            // apply (`operator fun Int.unaryPlus()` in a DSL builder —
+            // kotlinc resolves `+1` to it), so any enclosing instance
+            // keeps the probe.
+            const enclosing_possible = frame.enclosing_this.items.len != 0 or
+                (frame.params.items.len > 0 and frame.params.items[0] == .Instance);
+            if (!enclosing_possible) {
+                switch (v) {
+                    .Int, .Long, .Double, .Float, .Short, .Byte, .Char, .UInt, .ULong, .UShort, .UByte => {
+                        switch (try applyUnop(allocator, u.op, &v)) {
+                            .ok => |out| {
+                                try frame.write(u.dst, out);
+                                return .cont;
+                            },
+                            .err => {},
+                        }
+                    },
+                    else => {},
+                }
+            }
             const method = switch (u.op) {
                 .Neg => "unaryMinus",
                 .Plus => "unaryPlus",
@@ -3891,6 +3915,25 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 }
             } else {
                 if (first_real_err) |fre| return raiseStep(frame, fre);
+                // A committed header carrying reified type args serves
+                // through the typed func dispatch (the reified intrinsics
+                // live there) before the unsettled-header no-op —
+                // `enumEntriesIntrinsic()` spliced into a lambda body.
+                if (cmg.func != null and cmg.type_args.len != 0 and comptime @hasDecl(H, "callFuncTyped")) {
+                    var ta_buf: [4][]const u8 = undefined;
+                    const n_ta = @min(cmg.type_args.len, ta_buf.len);
+                    for (cmg.type_args[0..n_ta], ta_buf[0..n_ta]) |tcid, *slot| {
+                        slot.* = constStr(frame.module, tcid) orelse "";
+                    }
+                    orAudit("CallMemberOrGlobal", name_str, "typed_header", -1, null);
+                    switch (try host.callFuncTyped(allocator, frame.module, cmg.func.?, arg_values, names, ta_buf[0..n_ta], false)) {
+                        .ok => |v| {
+                            try frame.write(cmg.dst, v);
+                            return .cont;
+                        },
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
                 // Every arm missed, but the name is a declared header the
                 // link could not settle (an `expect` with no compiled
                 // `actual`): the call is a no-op, the shape its

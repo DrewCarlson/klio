@@ -565,6 +565,81 @@ pub const UnOp = enum {
 };
 
 /// Terminator at the end of every block.
+/// Visit every REGISTER operand of one instruction, generically over the
+/// `Inst` union: plain `Reg` fields, `?Reg`, `[]Reg`, `SpreadPart`
+/// slices, and the `args`+`n_args` contiguous-run convention (each
+/// register of the run is reported). A field named `dst` reports
+/// `is_def = true`. Comptime-generated from the union's own shape, so a
+/// new instruction variant is covered by construction — the foundation
+/// the Move-fusion pass (and any future register analysis) builds on.
+pub fn visitInstRegs(inst: *const Inst, ctx: anytype, comptime cb: fn (@TypeOf(ctx), Reg, bool) void) void {
+    switch (inst.*) {
+        inline else => |*payload| visitPayloadRegs(payload, ctx, cb),
+    }
+}
+
+/// Same enumeration for a block terminator.
+pub fn visitTerminatorRegs(t: *const Terminator, ctx: anytype, comptime cb: fn (@TypeOf(ctx), Reg, bool) void) void {
+    switch (t.*) {
+        inline else => |*payload| visitPayloadRegs(payload, ctx, cb),
+    }
+}
+
+fn visitPayloadRegs(payload: anytype, ctx: anytype, comptime cb: fn (@TypeOf(ctx), Reg, bool) void) void {
+    const P = @TypeOf(payload.*);
+    if (P == Reg) {
+        cb(ctx, payload.*, false);
+        return;
+    }
+    if (P == ?Reg) {
+        if (payload.*) |r| cb(ctx, r, false);
+        return;
+    }
+    switch (@typeInfo(P)) {
+        .@"struct" => |st| {
+            inline for (st.fields) |f| {
+                const is_def = comptime std.mem.eql(u8, f.name, "dst");
+                if (f.type == Reg) {
+                    if (comptime std.mem.eql(u8, f.name, "args")) {
+                        if (comptime @hasField(P, "n_args")) {
+                            var k: u32 = 0;
+                            while (k < payload.n_args) : (k += 1) {
+                                cb(ctx, Reg.from(@field(payload, f.name).int() + k), false);
+                            }
+                            continue;
+                        }
+                    }
+                    cb(ctx, @field(payload, f.name), is_def);
+                } else if (f.type == ?Reg) {
+                    if (@field(payload, f.name)) |r| cb(ctx, r, is_def);
+                } else if (f.type == []Reg or f.type == []const Reg) {
+                    for (@field(payload, f.name)) |r| cb(ctx, r, false);
+                } else if (f.type == []SpreadPart or f.type == []const SpreadPart) {
+                    for (@field(payload, f.name)) |part| cb(ctx, part.reg, false);
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+/// Rewrite an instruction's `dst` register (every variant that has one).
+/// Returns false when the variant carries no `dst`.
+pub fn setInstDst(inst: *Inst, new_dst: Reg) bool {
+    switch (inst.*) {
+        inline else => |*payload| {
+            const P = @TypeOf(payload.*);
+            if (@typeInfo(P) == .@"struct" and @hasField(P, "dst")) {
+                if (@FieldType(P, "dst") == Reg) {
+                    payload.dst = new_dst;
+                    return true;
+                }
+            }
+            return false;
+        },
+    }
+}
+
 pub const Terminator = union(enum) {
     Goto: BlockId,
     Branch: struct {
@@ -3107,6 +3182,13 @@ pub const ModuleRegistry = struct {
     /// bounded type-parameter receiver is proven only when the actual
     /// receiver satisfies every bound; an unbounded one accepts anything.
     func_type_param_bounds: std.AutoHashMap(FuncId, []const TypeParamBound),
+    /// Declared upper bounds of each CLASS's type parameters
+    /// (`class EnumEntriesList<T : Enum<T>>`), keyed by class simple name.
+    /// Method dispatch disproves a wrong-typed argument against a param
+    /// declared as the class type param (the Kotlin collection-stub
+    /// bridge: `indexOf(nonEnum)` on an `EnumEntries` answers -1 through
+    /// the inherited implementation instead of running the override).
+    class_type_param_bounds: std.StringHashMap([]const TypeParamBound),
     /// Top-level property names declared with `by <delegate>`.
     /// Reads/writes route through the stored delegate's `getValue` /
     /// `setValue` methods.
@@ -3245,6 +3327,7 @@ pub const ModuleRegistry = struct {
             .enclosing_class = std.StringHashMap([]const u8).init(allocator),
             .func_type_params = std.AutoHashMap(FuncId, std.ArrayList([]const u8)).init(allocator),
             .func_type_param_bounds = std.AutoHashMap(FuncId, []const TypeParamBound).init(allocator),
+            .class_type_param_bounds = std.StringHashMap([]const TypeParamBound).init(allocator),
             .top_level_delegated_props = std.StringHashMap(void).init(allocator),
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
             .hierarchy_shadow_names = std.StringHashMap(HierarchyShadowSet).init(allocator),
@@ -3284,6 +3367,11 @@ pub const ModuleRegistry = struct {
             var it = self.func_type_param_bounds.valueIterator();
             while (it.next()) |list| a.free(list.*);
             self.func_type_param_bounds.deinit();
+        }
+        {
+            var it = self.class_type_param_bounds.valueIterator();
+            while (it.next()) |list| a.free(list.*);
+            self.class_type_param_bounds.deinit();
         }
         self.top_level_delegated_props.deinit();
         {
@@ -3392,6 +3480,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.func_type_param_bounds.iterator();
             while (it.next()) |e| try out.func_type_param_bounds.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.class_type_param_bounds.iterator();
+            while (it.next()) |e| try out.class_type_param_bounds.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.top_level_delegated_props.keyIterator();
