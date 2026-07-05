@@ -165,6 +165,7 @@ pub fn resetReceiverThreadLocals() void {
 /// anon-object instantiation.
 pub fn resetRunGlobalCaches() void {
     host_instances.resetAnonSiteCache();
+    stdlib.resetEmptyCollectionSingletons();
 }
 
 /// A borrowed view over a `Vm`'s (or another host's) shared program-state
@@ -325,6 +326,7 @@ pub const VmHost = struct {
     pub const buildAstLambdaWithFlagFuncid = host_call_value.buildAstLambdaWithFlagFuncid;
     pub const callableReceiverShape = host_call_value.callableReceiverShape;
     pub const callableAcceptsArgs = host_call_value.callableAcceptsArgs;
+    pub const callableAcceptsCall = host_call_value.callableAcceptsCall;
     pub const closureNeedsThisCapture = host_call_value.closureNeedsThisCapture;
     pub const overrideClosureThis = host_call_value.overrideClosureThis;
     pub const callFunc = host_call_func.callFunc;

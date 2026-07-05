@@ -1987,6 +1987,7 @@ pub fn coll_to_infix(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn coll_list_of(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return ok(try sharedEmptyList(ctx.allocator));
     return ok(try makeList(ctx.allocator, ctx.args, false));
 }
 
@@ -2141,18 +2142,97 @@ pub fn coll_array_as_list(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeList(a, items, false));
 }
 
+// Shared empty read-only collection singletons: emptyList()/emptySet()/
+// emptyMap() and an empty build*/listOf() result all denote one object,
+// so `===`/`assertSame` hold across call sites (Kotlin's EmptyList/
+// EmptySet/EmptyMap objects). Reset at run boundaries — the cells belong
+// to the finished run's allocator.
+var empty_singleton_lock: runtime.SpinMutex = .{};
+var empty_list_singleton: ?Value = null;
+var empty_set_singleton: ?Value = null;
+var empty_map_singleton: ?Value = null;
+var empty_singleton_root_registered = std.atomic.Value(bool).init(false);
+
+fn gcMarkEmptySingletons(m: *runtime.gc.Marker) void {
+    if (empty_list_singleton) |v| m.shade(&v.List.items.cell.hdr);
+    if (empty_set_singleton) |v| m.shade(&v.Set.items.cell.hdr);
+    if (empty_map_singleton) |v| m.shade(&v.Map.entries.cell.hdr);
+}
+
+fn registerEmptySingletonRoot() void {
+    if (runtime.gc.gc_enabled and !empty_singleton_root_registered.swap(true, .monotonic))
+        runtime.gc.registerRoot(gcMarkEmptySingletons);
+}
+
+pub fn sharedEmptyList(a: Allocator) Error!Value {
+    // Under refcount reclaim (unit tests, leak-checked allocators) the
+    // process cache would register as a leak; identity singletons serve
+    // the arena profile, fresh values elsewhere.
+    if (runtime.reclaimEnabled()) return makeList(a, &.{}, false);
+    empty_singleton_lock.lock();
+    defer empty_singleton_lock.unlock();
+    if (empty_list_singleton == null) {
+        empty_list_singleton = try makeList(a, &.{}, false);
+        registerEmptySingletonRoot();
+    }
+    const v = empty_list_singleton.?;
+    v.retain();
+    return v;
+}
+
+pub fn sharedEmptySet(a: Allocator) Error!Value {
+    // Under refcount reclaim (unit tests, leak-checked allocators) the
+    // process cache would register as a leak; identity singletons serve
+    // the arena profile, fresh values elsewhere.
+    if (runtime.reclaimEnabled()) return makeSet(a, &.{}, false);
+    empty_singleton_lock.lock();
+    defer empty_singleton_lock.unlock();
+    if (empty_set_singleton == null) {
+        empty_set_singleton = try makeSet(a, &.{}, false);
+        registerEmptySingletonRoot();
+    }
+    const v = empty_set_singleton.?;
+    v.retain();
+    return v;
+}
+
+pub fn sharedEmptyMap(a: Allocator) Error!Value {
+    // Under refcount reclaim (unit tests, leak-checked allocators) the
+    // process cache would register as a leak; identity singletons serve
+    // the arena profile, fresh values elsewhere.
+    if (runtime.reclaimEnabled()) return makeMap(a, &.{}, false);
+    empty_singleton_lock.lock();
+    defer empty_singleton_lock.unlock();
+    if (empty_map_singleton == null) {
+        empty_map_singleton = try makeMap(a, &.{}, false);
+        registerEmptySingletonRoot();
+    }
+    const v = empty_map_singleton.?;
+    v.retain();
+    return v;
+}
+
+pub fn resetEmptyCollectionSingletons() void {
+    empty_singleton_lock.lock();
+    defer empty_singleton_lock.unlock();
+    empty_list_singleton = null;
+    empty_set_singleton = null;
+    empty_map_singleton = null;
+}
+
 pub fn coll_empty_list(ctx: *CallCtx) Error!EvalResult {
-    return ok(try makeList(ctx.allocator, &.{}, false));
+    return ok(try sharedEmptyList(ctx.allocator));
 }
 
 pub fn coll_set_of(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return ok(try sharedEmptySet(ctx.allocator));
     return ok(try makeSet(ctx.allocator, ctx.args, false));
 }
 pub fn coll_mutable_set_of(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeSet(ctx.allocator, ctx.args, true));
 }
 pub fn coll_empty_set(ctx: *CallCtx) Error!EvalResult {
-    return ok(try makeSet(ctx.allocator, &.{}, false));
+    return ok(try sharedEmptySet(ctx.allocator));
 }
 
 fn mapOfImpl(ctx: *CallCtx, mutable: bool, who: []const u8) Error!EvalResult {
@@ -2188,7 +2268,7 @@ pub fn coll_mutable_map_of(ctx: *CallCtx) Error!EvalResult {
     return mapOfImpl(ctx, true, "mutableMapOf");
 }
 pub fn coll_empty_map(ctx: *CallCtx) Error!EvalResult {
-    return ok(try makeMap(ctx.allocator, &.{}, false));
+    return ok(try sharedEmptyMap(ctx.allocator));
 }
 
 /// Drain any iterable `value` into a fresh slice. Native List/Set copy
@@ -5219,6 +5299,9 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
+    // A read-only map's entries are read-only too: entries carry no
+    // backing (setValue throws) and the view set refuses mutation.
+    const writable = ctx.args.len > 0 and ctx.args[0] == .Map and ctx.args[0].Map.mutable;
     const entries = switch (try recvMapEntries(a, ctx.args, "Map.entries")) {
         .entries => |x| x,
         .err => |e| return e,
@@ -5233,12 +5316,12 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
             try map_entries.append(a, .{ .MapEntry = .{
                 .key = try Value.boxRef(a, kv.key),
                 .value = try Value.boxRef(a, kv.value),
-                .backing = entries,
+                .backing = if (writable) entries else null,
             } });
         }
     }
     const backing = try CollBackingRef.init(a, .{ .map = .{ .entries = entries, .kind = .Entries } });
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = true, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = writable, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
 }
 pub fn coll_map_to_string(ctx: *CallCtx) Error!EvalResult {
     return collToString(ctx, "Map.toString");

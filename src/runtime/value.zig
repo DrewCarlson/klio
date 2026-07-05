@@ -1072,10 +1072,14 @@ pub const RegexData = struct {
     pattern: StringRef,
     /// Opaque compiled-regex handle owned by the host regex binding.
     engine: ?*anyopaque,
+    /// The RegexOption values the regex was constructed with (the
+    /// caller's enum singletons, for identity-equal `options` reads).
+    options: ?ValueList = null,
 
     /// GC out-edge: a live regex keeps its pattern bytes reachable.
     pub fn gcTrace(self: *const RegexData, m: *objcell.gc.Marker) void {
         m.shade(&self.pattern.cell.hdr);
+        if (self.options) |ol| m.shade(&ol.cell.hdr);
     }
 };
 
@@ -1369,6 +1373,10 @@ pub const Value = union(enum) {
     Iterator: struct {
         items: ValueList,
         pos: ObjRef(usize),
+        /// Index of the element the LAST `next()`/`previous()` returned
+        /// (the ListIterator set/remove target), or -1 when none —
+        /// before the first move, and after `add`/`remove`.
+        last_ret: ?ObjRef(i64) = null,
         prim: ?PrimitiveArrayKind,
         /// The source collection's `mod_count` (shared handle) and the value
         /// this iterator captured at creation. `next`/`hasNext` throw
@@ -1487,6 +1495,7 @@ pub const Value = union(enum) {
             .Iterator => |x| {
                 visitor.visit(x.items);
                 visitor.visit(x.pos);
+                if (x.last_ret) |lr| visitor.visit(lr);
                 if (x.mod_count) |mc| visitor.visit(mc);
                 if (x.exp_mod) |em| visitor.visit(em);
             },
@@ -1638,6 +1647,7 @@ pub const Value = union(enum) {
             .Iterator => |x| {
                 releaseValueList(x.items, allocator);
                 x.pos.deinit();
+                if (x.last_ret) |lr| lr.deinit();
                 if (x.mod_count) |mc| mc.deinit();
                 if (x.exp_mod) |em| em.deinit();
             },
@@ -2053,7 +2063,9 @@ pub const Value = union(enum) {
             .Sequence => matchesAny(name, &.{ "Sequence", "Any" }),
             .SeqIter => matchesAny(name, &.{ "Iterator", "Any" }),
             .Iterator => |it| blk: {
-                if (matchesAny(name, &.{ "Iterator", "Any" })) break :blk true;
+                if (matchesAny(name, &.{ "Iterator", "ListIterator", "Any" })) break :blk true;
+                // Mutable-backed iterators satisfy the mutable interfaces.
+                if (it.mutable and matchesAny(name, &.{ "MutableIterator", "MutableListIterator" })) break :blk true;
                 if (it.prim) |p| {
                     break :blk simpleNameMatchesIterator(name, p.simpleName());
                 }
@@ -2076,7 +2088,7 @@ pub const Value = union(enum) {
                 defer g.deinit();
                 break :blk builtinThrowableIsA(g.get().bytes, name);
             },
-            .Class, .BoundInnerClass => matchesAny(name, &.{ "KClass", "kotlin.reflect.KClass", "Any" }),
+            .Class, .BoundInnerClass => matchesAny(name, &.{ "KClass", "kotlin.reflect.KClass", "KClassifier", "kotlin.reflect.KClassifier", "Any" }),
             .Instance => |i| blk: {
                 if (std.mem.eql(u8, name, "Any")) break :blk true;
                 const g = i.borrow();

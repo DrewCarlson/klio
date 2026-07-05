@@ -1605,6 +1605,13 @@ pub fn string_chunked(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = try makeList(ctx.allocator, try out.toOwnedSlice(ctx.allocator), false) };
 }
 
+fn isCallableTransform(v: Value) bool {
+    return switch (v) {
+        .IrClosure, .Function, .Intrinsic => true,
+        else => false,
+    };
+}
+
 pub fn string_windowed(ctx: *CallCtx) Allocator.Error!EvalResult {
     const r = try recvString(ctx.allocator, ctx.args, "String.windowed");
     const s = switch (r) {
@@ -1619,8 +1626,17 @@ pub fn string_windowed(ctx: *CallCtx) Allocator.Error!EvalResult {
         const msg = try std.fmt.allocPrint(ctx.allocator, "size {d} must be greater than zero.", .{size_i});
         return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
+    // Peel a trailing callable as the `transform` (the `windowed(size,
+    // step, partialWindows, transform)` overload). The scalar step /
+    // partialWindows read positionally from the remaining args, so a
+    // trailing lambda with omitted middle defaults binds correctly.
+    var n_scalar = ctx.args.len;
+    const transform: ?Value = if (n_scalar > 2 and isCallableTransform(ctx.args[n_scalar - 1])) blk: {
+        n_scalar -= 1;
+        break :blk ctx.args[n_scalar];
+    } else null;
     var step: i64 = 1;
-    if (ctx.args.len > 2) {
+    if (n_scalar > 2) {
         if (ctx.args[2].isIntegral()) {
             step = ctx.args[2].asI64().?;
         } else {
@@ -1628,9 +1644,10 @@ pub fn string_windowed(ctx: *CallCtx) Allocator.Error!EvalResult {
         }
     }
     var partial = false;
-    if (ctx.args.len > 3) {
+    if (n_scalar > 3) {
         switch (ctx.args[3]) {
             .Bool => |b| partial = b,
+            .Null => {},
             else => return errType("windowed partialWindows must be Bool"),
         }
     }
@@ -1642,10 +1659,6 @@ pub fn string_windowed(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer ctx.allocator.free(chars);
     const size: usize = @intCast(size_i);
     const step_u: usize = @intCast(step);
-    // The `transform` variant (`windowed(size, step, partialWindows,
-    // transform)` — positional slot 4 after the named-args reorder or a
-    // trailing lambda) maps each window through the callable.
-    const transform: ?Value = if (ctx.args.len > 4) ctx.args[4] else null;
     var out: std.ArrayList(Value) = .empty;
     errdefer out.deinit(ctx.allocator);
     var i: usize = 0;

@@ -3791,6 +3791,37 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
         }
     }
+    // A bare call whose name is a bound local / captured outer does not
+    // shadow an implicit receiver's member unless the local is actually
+    // invokable: `subList = subList(0, 4)` inside `buildList { }` calls
+    // the receiver's subList; the captured non-callable `val subList` is
+    // not a candidate. Emit the runtime-arbitrated form (value when
+    // callable, else the member on `this`) — the same arbitration
+    // `redirect_to_member` applies inside a method body.
+    if (callee.* == .Path and callee.Path.segments.len == 1 and call.type_args.len == 0) {
+        const nm0 = callee.Path.segments[0].name;
+        if (!b.isLocalFn(nm0) and !b.isLocalExtFn(nm0) and
+            (b.knowsOuter(nm0) or b.resolve(nm0) != null))
+        {
+            if (try resolveThisForBareCallNoBind(b)) |this_reg| {
+                const cv = try lowerExpr(b, callee);
+                const run0 = try lowerArgRun(b, args);
+                const an0 = try internArgNames(b.allocator, b.module, ast_arg_names);
+                const nmc = try b.module.internConst(b.allocator, .{ .String = nm0 });
+                const d0 = b.allocReg();
+                try b.push(.{ .CallValueOrMember = .{
+                    .dst = d0,
+                    .callee = cv,
+                    .this_recv = this_reg,
+                    .name = nmc,
+                    .args = run0[0],
+                    .n_args = run0[1],
+                    .arg_names = an0,
+                } });
+                return d0;
+            }
+        }
+    }
     const callee_r = try lowerExpr(b, callee);
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);

@@ -21,6 +21,7 @@ const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const trace = @import("trace.zig");
 const overload_match = @import("overload_match.zig");
 const host_call_func = @import("host_call_func.zig");
+const host_fields = @import("host_fields.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -2689,7 +2690,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         // iterator is mutable only when the source list is.
         return .{ .ok = .{ .Iterator = .{
             .items = receiver.List.items.clone(),
-            .pos = try ObjRef(usize).init(allocator, start),
+            .pos = try ObjRef(usize).init(allocator, start), .last_ret = try ObjRef(i64).init(allocator, -1),
             .prim = null,
             .mod_count = cap.mod_count,
             .exp_mod = cap.exp_mod,
@@ -2784,6 +2785,29 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const r = boolVal(args[0].isRuntimeType(cname));
         cg.deinit();
         return .{ .ok = r };
+    }
+    // `KClass.safeCast(value)` / `KClass.cast(value)` — the value itself
+    // on a type match (assertSame identity), else null / a thrown
+    // ClassCastException.
+    if (receiver.* == .Class and args.len == 1 and
+        (std.mem.eql(u8, name, "safeCast") or std.mem.eql(u8, name, "cast")))
+    {
+        const cg = receiver.Class.borrow();
+        const cname = cg.get().name;
+        if (args[0].isRuntimeType(cname)) {
+            cg.deinit();
+            var v = args[0];
+            if (runtime.reclaimEnabled()) v.retain();
+            return .{ .ok = v };
+        }
+        if (std.mem.eql(u8, name, "safeCast")) {
+            cg.deinit();
+            return .{ .ok = .Null };
+        }
+        const msg = try std.fmt.allocPrint(allocator, "Value cannot be cast to {s}", .{cg.get().fqn});
+        defer if (runtime.freeScratch()) allocator.free(msg);
+        cg.deinit();
+        return .{ .err = try throwExc(allocator, "kotlin.ClassCastException", msg) };
     }
 
     // Nested-class construction on a class receiver.
@@ -3740,14 +3764,14 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // map modification); only a genuinely read-only list snapshots.
             if (l.mutable) {
                 const cap = try captureModCount(allocator, l.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
+                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
             }
             // A snapshot iterator (immutable list, or a live map `values` view):
             // still capture `mod_count` so a concurrent structural change to the
             // source (the map) fails the iterator fast.
             const items = try cloneItemsList(allocator, l.items);
             const cap = try captureModCount(allocator, l.mod_count);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
         },
         .Set => |s| {
             // A mutable set shares its backing so `MutableIterator.remove()`
@@ -3758,13 +3782,13 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // genuinely read-only set yields a read-only iterator.
             if (s.mutable) {
                 const cap = try captureModCount(allocator, s.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
+                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
             }
             // Snapshot iterator (immutable set, or a live map `keys`/`entries`
             // view): capture `mod_count` so a concurrent map mutation fails fast.
             const items = try cloneItemsList(allocator, s.items);
             const cap = try captureModCount(allocator, s.mod_count);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
         },
         .Map => |m| {
             const g = m.entries.borrow();
@@ -3782,14 +3806,14 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             const src_mc = g.get().mod_count;
             g.deinit();
             const cap = try captureModCount(allocator, src_mc);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = m.mutable } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = m.mutable } } };
         },
         .Range => |r| {
             return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind, .done = try ObjRef(bool).init(allocator, false) } } };
         },
         .Array => |arr| {
             const items = try cloneArrayItems(allocator, arr);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = arr.prim } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = arr.prim } } };
         },
         .String => |s| {
             const g = s.borrow();
@@ -3797,7 +3821,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             var items: std.ArrayList(Value) = .empty;
             const view = std.unicode.Utf8View.init(g.get().bytes) catch {
                 for (g.get().bytes) |b| try items.append(allocator, .{ .Char = b });
-                return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
+                return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null } } };
             };
             var it = view.iterator();
             while (it.nextCodepoint()) |cp| {
@@ -3809,7 +3833,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                     try items.append(allocator, .{ .Char = @intCast(0xDC00 + (v2 & 0x3FF)) });
                 }
             }
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .prim = null } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null } } };
         },
         else => return null,
     }
@@ -4175,6 +4199,36 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
     if (std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "simpleName")) {
         return null; // handled by get_field
     }
+    // Property-delegation protocol on a bound property reference
+    // (`var x by data::prop` / `by Data::prop`): read/write the
+    // referenced property. A Class-bound ref takes the instance from
+    // the delegation call's thisRef argument.
+    if (std.mem.eql(u8, name, "getValue") and args.len >= 2) {
+        const target: *const Value = if (recv_capt == .Class) &args[0] else &recv_capt;
+        var r = try getFieldRec(self, allocator, target, n);
+        if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+        return r;
+    }
+    if (std.mem.eql(u8, name, "setValue") and args.len >= 3) {
+        const target: *const Value = if (recv_capt == .Class) &args[0] else &recv_capt;
+        return switch (try host_fields.setField(self, allocator, target, n, args[2])) {
+            .ok => .{ .ok = .Unit },
+            .err => |e| .{ .err = e },
+        };
+    }
+    // `ref.set(v)` on a bound mutable property reference.
+    if (std.mem.eql(u8, name, "set") and recv_capt != .Class and args.len == 1) {
+        return switch (try host_fields.setField(self, allocator, &recv_capt, n, args[0])) {
+            .ok => .{ .ok = .Unit },
+            .err => |e| .{ .err = e },
+        };
+    }
+    if (std.mem.eql(u8, name, "set") and recv_capt == .Class and args.len == 2) {
+        return switch (try host_fields.setField(self, allocator, &args[0], n, args[1])) {
+            .ok => .{ .ok = .Unit },
+            .err => |e| .{ .err = e },
+        };
+    }
     if (recv_capt == .Class) {
         if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and args.len != 0) {
             const first = args[0];
@@ -4290,6 +4344,34 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
     }
     if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and args.len == 1) {
         return try getFieldRec(self, allocator, &args[0], pname);
+    }
+    // Property-delegation protocol on an unbound reference
+    // (`var x by ::topVar`, `val y by ::intVar` in a class body): a
+    // member of the delegation thisRef wins, else the top-level slot.
+    if (std.mem.eql(u8, name, "getValue") and args.len >= 2) {
+        if (args[0] == .Instance and memberIsProperty(self, &args[0], pname)) {
+            var r = try getFieldRec(self, allocator, &args[0], pname);
+            if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+            return r;
+        }
+        if (try topLevelPropertyGet(self, allocator, pname)) |r| return r;
+        if (args[0] != .Null) {
+            var r = try getFieldRec(self, allocator, &args[0], pname);
+            if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
+            return r;
+        }
+    }
+    if (std.mem.eql(u8, name, "setValue") and args.len >= 3) {
+        if (args[0] == .Instance and memberIsProperty(self, &args[0], pname)) {
+            return switch (try host_fields.setField(self, allocator, &args[0], pname, args[2])) {
+                .ok => .{ .ok = .Unit },
+                .err => |e| .{ .err = e },
+            };
+        }
+        return switch (try self.storeGlobal(allocator, pname, args[2])) {
+            .ok => .{ .ok = Value.Unit },
+            .err => |e| .{ .err = e },
+        };
     }
     if (std.mem.eql(u8, name, "hashCode") and args.len == 0) {
         return .{ .ok = Value.newInt(@as(i64, valueStructuralHash(receiver))) };
@@ -4814,6 +4896,11 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
             if (std.mem.eql(u8, name, "equals") and args.len == 1) return .{ .ok = boolVal(Value.structuralEqBoxed(receiver, &args[0])) };
             if (std.mem.eql(u8, name, "hashCode") and args.len == 0) return .{ .ok = .{ .Int = kotlinHashCode(receiver) } };
             if (std.mem.eql(u8, name, "setValue")) {
+                // No backing = a read-only map's entry: mutation throws
+                // instead of silently succeeding on the snapshot.
+                if (me.backing == null) {
+                    return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
+                }
                 const new_v = if (args.len > 0) args[0] else Value.Unit;
                 const prev = me.value.asPtr().*;
                 // host-returns-owned: the old value escapes as the result.
@@ -4920,6 +5007,28 @@ fn iteratorOwnStructuralMod(it: anytype) void {
     iteratorResyncMod(it);
 }
 
+fn iteratorSetLast(it: anytype, idx: i64) void {
+    if (it.last_ret) |cell| {
+        const g = cell.borrowMut();
+        g.get().* = idx;
+        g.deinit();
+    }
+}
+
+/// Index the last `next()`/`previous()` returned, or -1 (also for
+/// iterators created before the cell existed).
+fn iteratorLastRet(it: anytype) i64 {
+    if (it.last_ret) |cell| {
+        const g = cell.borrow();
+        defer g.deinit();
+        return g.get().*;
+    }
+    const pg = it.pos.borrow();
+    defer pg.deinit();
+    const p = pg.get().*;
+    return @as(i64, @intCast(p)) - 1;
+}
+
 fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     _ = self;
     const it = receiver.Iterator;
@@ -4950,6 +5059,7 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const pmg = it.pos.borrowMut();
         pmg.get().* = p + 1;
         pmg.deinit();
+        iteratorSetLast(it, @intCast(p));
         return .{ .ok = v };
     }
     // `ListIterator` navigation over the same `items`/`pos` cursor.
@@ -4983,6 +5093,7 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const pmg = it.pos.borrowMut();
         pmg.get().* = p - 1;
         pmg.deinit();
+        iteratorSetLast(it, @as(i64, @intCast(p)) - 1);
         return .{ .ok = v };
     }
     // `MutableListIterator.set(x)` — overwrite the element last returned.
@@ -4993,19 +5104,18 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
         if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
-        pg.deinit();
-        if (p == 0) {
+        const li = iteratorLastRet(it);
+        if (li < 0) {
             return .{ .err = try throwExc(allocator, "kotlin.IllegalStateException", "set() called before next()/previous()") };
         }
+        const lu: usize = @intCast(li);
         const g = it.items.borrowMut();
         defer g.deinit();
-        if (p - 1 < g.get().items.len) {
-            if (runtime.reclaimEnabled()) g.get().items[p - 1].release(allocator);
+        if (lu < g.get().items.len) {
+            if (runtime.reclaimEnabled()) g.get().items[lu].release(allocator);
             var nv = args[0];
             if (runtime.reclaimEnabled()) nv.retain();
-            g.get().items[p - 1] = nv;
+            g.get().items[lu] = nv;
         }
         return .{ .ok = .Unit };
     }
@@ -5031,6 +5141,7 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const pmg = it.pos.borrowMut();
         pmg.get().* = p + 1;
         pmg.deinit();
+        iteratorSetLast(it, -1);
         iteratorOwnStructuralMod(it);
         return .{ .ok = .Unit };
     }
@@ -5047,11 +5158,13 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const pg = it.pos.borrow();
         const p = pg.get().*;
         pg.deinit();
-        if (p == 0) return .{ .ok = .Unit };
+        const li = iteratorLastRet(it);
+        if (li < 0) return .{ .ok = .Unit };
+        const lu: usize = @intCast(li);
         const g = it.items.borrowMut();
         defer g.deinit();
-        if (p - 1 < g.get().items.len) {
-            const removed = g.get().items[p - 1];
+        if (lu < g.get().items.len) {
+            const removed = g.get().items[lu];
             // A map iterator's element is a live MapEntry over a snapshot list;
             // also delete the entry from the backing map (by key).
             if (removed == .MapEntry) {
@@ -5071,10 +5184,16 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
                     }
                 }
             }
-            _ = g.get().orderedRemove(p - 1);
-            const pmg = it.pos.borrowMut();
-            pmg.get().* = p - 1;
-            pmg.deinit();
+            _ = g.get().orderedRemove(lu);
+            // The cursor slides back only when the removed slot was
+            // BEFORE it (remove-after-next); after previous() the cursor
+            // already sits at the removed index.
+            if (lu < p) {
+                const pmg = it.pos.borrowMut();
+                pmg.get().* = p - 1;
+                pmg.deinit();
+            }
+            iteratorSetLast(it, -1);
             iteratorOwnStructuralMod(it);
         }
         return .{ .ok = .Unit };

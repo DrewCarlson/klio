@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const collections = @import("collections.zig");
 
 const Value = runtime.Value;
 const RuntimeError = runtime.RuntimeError;
@@ -64,6 +65,17 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     if (buildable.List.mod_count) |mc| mc.deinit();
+    // An empty build result IS the shared empty singleton (Kotlin's
+    // buildList returns EmptyList for size 0; assertSame holds).
+    const list_empty = blk: {
+        const g = buildable.List.items.borrow();
+        defer g.deinit();
+        break :blk g.get().items.len == 0;
+    };
+    if (list_empty) {
+        buildable.List.items.deinit();
+        return ok(try collections.sharedEmptyList(ctx.allocator));
+    }
     return ok(.{ .List = .{
         .items = buildable.List.items,
         .mutable = false,
@@ -97,6 +109,15 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     if (buildable.Set.mod_count) |mc| mc.deinit();
+    const set_empty = blk: {
+        const g = buildable.Set.items.borrow();
+        defer g.deinit();
+        break :blk g.get().items.len == 0;
+    };
+    if (set_empty) {
+        buildable.Set.items.deinit();
+        return ok(try collections.sharedEmptySet(ctx.allocator));
+    }
     return ok(.{ .Set = .{
         .items = buildable.Set.items,
         .mutable = false,
@@ -122,6 +143,15 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             buildable.Map.entries.deinit();
             return r;
         }
+    }
+    const map_empty = blk: {
+        const g = buildable.Map.entries.borrow();
+        defer g.deinit();
+        break :blk g.get().pairs.items.len == 0;
+    };
+    if (map_empty) {
+        buildable.Map.entries.deinit();
+        return ok(try collections.sharedEmptyMap(ctx.allocator));
     }
     return ok(.{ .Map = .{
         .entries = buildable.Map.entries,

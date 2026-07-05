@@ -462,6 +462,14 @@ pub fn objectClassDeclaresProp(self: *VmHost, class_name: []const u8, name: []co
 /// the singleton when already initialized; construct it on first access
 /// only when its class declares `name` (as a property or function).
 pub fn objectSingletonForMember(self: *VmHost, name: []const u8, member: []const u8) Allocator.Error!MaybeValueResult {
+    // The declares gate applies to the already-initialized fast path too:
+    // an initialized companion (every `newInstance` initializes its
+    // class's companions) must not be offered as the owner of a member
+    // its class never declares, or the speculative probe redirects a call
+    // whose real target is an extension on the original receiver.
+    if (!(objectClassDeclaresProp(self, name, member) or objectClassDeclaresMethod(self, name, member))) {
+        return .{ .ok = null };
+    }
     {
         const g = self.globals.borrow();
         defer g.deinit();
@@ -469,10 +477,7 @@ pub fn objectSingletonForMember(self: *VmHost, name: []const u8, member: []const
             if (v == .Instance) return .{ .ok = v };
         }
     }
-    if (objectClassDeclaresProp(self, name, member) or objectClassDeclaresMethod(self, name, member)) {
-        return ensureObjectSingleton(self, name);
-    }
-    return .{ .ok = null };
+    return ensureObjectSingleton(self, name);
 }
 
 fn clearObjectState(self: *VmHost, name: []const u8) void {
@@ -901,7 +906,7 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
 
     if (registryHasDelegatedProp(self, name)) {
         if (cached) |v| {
-            if (v == .Instance) {
+            if (v == .Instance or v == .PropertyRef) {
                 const prop_ref = makePropertyRef(allocator, name) catch return null;
                 const r = self.callMember(allocator, &v, "getValue", &.{ Value.Null, prop_ref }) catch return null;
                 if (r == .ok) return r.ok;
@@ -945,6 +950,14 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
                     return ob.value;
                 },
             }
+        }
+        // A boxed capture (an anon-object method's captured outer `var`)
+        // reads THROUGH the cell; the cell itself is a carrier, never a
+        // user value.
+        if (v == .Cell) {
+            const cg = v.Cell.borrow();
+            defer cg.deinit();
+            return cg.get().*;
         }
         return v;
     }
@@ -1124,7 +1137,7 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
             break :blk g.get().lookup(name);
         };
         if (existing) |d| {
-            if (d == .Instance) {
+            if (d == .Instance or d == .PropertyRef) {
                 const prop_ref = try makePropertyRef(allocator, name);
                 const r = try self.callMember(allocator, &d, "setValue", &.{ Value.Null, prop_ref, value });
                 if (r == .err) return .{ .err = r.err };
@@ -1172,6 +1185,23 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
                 },
                 .Lazy => {},
             }
+        }
+    }
+
+    // A boxed capture (shared Cell) takes the write THROUGH the cell so
+    // every holder observes it — an anon-object method writing a captured
+    // outer `var` must not replace the binding in its transient capture
+    // layer.
+    if (existing) |ev| {
+        if (ev == .Cell) {
+            const cg = ev.Cell.borrowMut();
+            defer cg.deinit();
+            if (runtime.reclaimEnabled()) {
+                value.retain();
+                cg.get().release(allocator);
+            }
+            cg.get().* = value;
+            return .{ .ok = {} };
         }
     }
 
@@ -1229,7 +1259,7 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name: []const u
     // yielded the delegate instead of throwing IllegalStateException.
     if (registryHasDelegatedProp(self, name)) {
         if (raw) |rv| {
-            if (rv == .Instance) {
+            if (rv == .Instance or rv == .PropertyRef) {
                 const prop_ref = try makePropertyRef(allocator, name);
                 const r = try self.callMember(allocator, &rv, "getValue", &.{ Value.Null, prop_ref });
                 switch (r) {
