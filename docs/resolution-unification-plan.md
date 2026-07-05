@@ -674,14 +674,18 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
             at creation; value reads through backing; throws
             ConcurrentModificationException after structural change)
             (MapTest.modifiedBackingMapOfEntry).
-        15. formatThrowable: JVM printStackTrace shape — Suppressed:
-            sections + dejaVu set + [CIRCULAR REFERENCE:] lines
-            (ExceptionTest ×2).
+        15. LANDED — formatThrowable now renders the JVM enclosed
+            shape: Suppressed: sections (one tab deeper per level),
+            causes at the parent indent, and an identity-keyed dejaVu
+            set emitting [CIRCULAR REFERENCE: <header>] instead of
+            re-walking (both ExceptionTest detailed-trace tests pass).
         16. kotlin.reflect.typeOf needs a reified intrinsic returning a
             KType (KTypeProjectionTest).
-        17. StringBuilder append/insert overflow guard: UTF-16 length
-            sum > Int.MAX_VALUE throws OutOfMemoryError
-            (StringBuilderTest.overflow).
+        17. LANDED — append/insert guard: when the argument's length is
+            knowable (strings, builders, user CharSequences via their
+            `length` property) and the sum exceeds Int.MAX_VALUE, throw
+            OutOfMemoryError before materialising anything
+            (StringBuilderTest.overflow passes).
         18. Duration formatToExactDecimals saturates at Long range —
             exact digit expansion for |value|>=2^63
             (DurationTest.parseAndFormatInUnits).
@@ -692,10 +696,16 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
             emptySequence singleton (still fails post-batch: `Expected
             <Sequence>, actual <Sequence>` — an identity, not type,
             mismatch); still open.
-      - **Now 31 dual-identical**: the local-fn-overload landing cleared
+      - **Now 28 dual-identical**: local-fn overloads cleared
         GroupingTest.groupingProducers + StringTest.compareToIgnoreCase
-        (36→34), and the ext-property-delegate landing cleared all three
-        PropertyReferenceTest failures (34→31). Nothing added.
+        (36→34); ext-property delegates cleared PropertyReferenceTest ×3
+        (34→31); the StringBuilder overflow guard and the JVM
+        printStackTrace shape cleared StringBuilderTest.overflow +
+        ExceptionTest ×2 (31→28). Nothing added at any step. NOTE:
+        SetOperationsTest intersectShort/ByteArray (item 13) is NOT a
+        standalone literal-narrowing patch — `listOf(5)` must infer
+        List<Short> from intersect's `Iterable<Short>` param, i.e. item
+        2's expected-type propagation engine; treat 13 as part of 2.
       - **Named remainder (the full 36, post-batch, dual-identical)**:
         ArraysTest.orEmptyNull (pre-existing at 2bfaeef9, verified via
         worktree build); Base64Test.common; CollectionTest
