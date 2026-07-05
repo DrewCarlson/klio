@@ -610,6 +610,16 @@ pub fn tryInlineCallWithTypeArgs(
     if (b.inlineInProgress(fname)) {
         return null;
     }
+    // `kotlin.reflect.typeOf<T>()` is a reified intrinsic: its source body
+    // is a placeholder throw, and the runtime serves the call from the
+    // reified type argument — never splice it.
+    if (std.mem.eql(u8, fname, "typeOf") and f.params.len == 0 and
+        f.type_params.len == 1 and f.type_params[0].is_reified)
+    {
+        if (f.return_type) |rt| {
+            if (std.mem.endsWith(u8, rt.name.name, "KType")) return null;
+        }
+    }
     // Materialise the body if it is a deferred image marker before reading it.
     inline_state.ensureInlineBody(f);
     const body = if (f.body) |*body_ref| body_ref else return null;

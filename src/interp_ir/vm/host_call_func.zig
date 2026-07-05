@@ -18,6 +18,7 @@ const vmhost = @import("vmhost.zig");
 const trace = @import("trace.zig");
 const host_call_member = @import("host_call_member.zig");
 const host_globals = @import("host_globals.zig");
+const intrinsic_host = @import("intrinsic_host.zig");
 const overload_match = @import("overload_match.zig");
 const compose = @import("compose.zig");
 
@@ -29,6 +30,7 @@ const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const StringRef = runtime.StringRef;
 const ValueList = runtime.ValueList;
+const InstanceData = runtime.InstanceData;
 const RuntimeError = runtime.RuntimeError;
 const StdlibFn = runtime.StdlibFn;
 const CallCtx = runtime.CallCtx;
@@ -144,6 +146,34 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
         if (bg.get().resolve(fqn)) |f| return f;
     }
     return stdlib.implementation(fqn);
+}
+
+/// Synthetic `KType` instance for a reified type name: `classifier` is the
+/// registered class when one exists (else a minimal KClass), `arguments` is
+/// the empty list, `isMarkedNullable` mirrors a trailing `?`.
+fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Allocator.Error!Value {
+    const nullable = std.mem.endsWith(u8, type_name, "?");
+    const base = if (nullable) type_name[0 .. type_name.len - 1] else type_name;
+    const classifier: Value = blk: {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(base)) |c| break :blk Value{ .Class = c.clone() };
+        break :blk try host_call_member.syntheticClassFromFqn(allocator, base);
+    };
+    const empty_args: Value = .{ .List = .{
+        .items = try ValueList.init(allocator, .empty),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    } };
+    var view = VmIntrinsicHost.borrowed(vmhost.SharedHandles.fromHost(self));
+    const id = intrinsic_host.allocInstanceId(&view);
+    const fields = [_]InstanceData.Field{
+        .{ .name = "classifier", .value = classifier },
+        .{ .name = "arguments", .value = empty_args },
+        .{ .name = "isMarkedNullable", .value = .{ .Bool = nullable } },
+    };
+    return intrinsic_host.newSynthInstance(&view, "kotlin.reflect.KType", id, &fields);
 }
 
 /// Build a `VmIntrinsicHost` mirroring `dispatch_intrinsic`'s, drive the
@@ -1379,6 +1409,15 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                 }
             }
         }
+        // Reified `kotlin.reflect.typeOf<T>()`: served from the call's
+        // reified type argument as a synthetic `KType` (classifier + empty
+        // arguments + nullability) instead of executing the stdlib body's
+        // placeholder throw.
+        if (std.mem.eql(u8, f.name, "typeOf") and std.mem.startsWith(u8, f.fqn, "kotlin.reflect") and
+            type_args.len == 1 and type_args[0].len != 0)
+        {
+            return .{ .ok = try makeKTypeValue(self, allocator, type_args[0]) };
+        }
     }
 
     // Overload resolution. Skipped for an `exact` call: the lowering
@@ -1468,11 +1507,16 @@ fn attachDeclaredElemTypes(module: *const Module, func: FuncId, type_args: []con
 }
 
 pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
+    // An anon-object/side-module frame carries no top-level func index;
+    // the overload set lives in the main module, so collect there.
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const eff: *const Module = if (module.func_index.items.len == 0) mg.get() else module;
     // Only intercept genuine overload sets: a single top-level function
     // keeps the plain global-value path.
     var candidates: std.ArrayList(FuncId) = .empty;
     defer candidates.deinit(allocator);
-    for (module.func_index.items) |entry| {
+    for (eff.func_index.items) |entry| {
         if (std.mem.eql(u8, entry.name, name)) try candidates.append(allocator, entry.id);
     }
     if (candidates.items.len < 2) return .{ .ok = null };
@@ -1495,11 +1539,11 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         // A receiver-taking candidate whose declared receiver names a
         // builtin shape the first arg definitely is not (UIntArray.fill
         // offered a plain Array) is disqualified outright.
-        if (funcAt(module, cand)) |cf| {
+        if (funcAt(eff, cand)) |cf| {
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
                 host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
         }
-        if (positionalPoints(self, module, cand, shapes, scope)) |total| {
+        if (positionalPoints(self, eff, cand, shapes, scope)) |total| {
             if (best_func == null or total > best_score) {
                 best_func = cand;
                 best_score = total;
@@ -1512,7 +1556,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         trace.emit("global-overload {s} -> fid={d} (of {d} candidates)", .{ name, func.int(), candidates.items.len });
     }
 
-    const r = try callFuncTyped(self, allocator, module, func, args, arg_names, &.{}, false);
+    const r = try callFuncTyped(self, allocator, eff, func, args, arg_names, &.{}, false);
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = e },
