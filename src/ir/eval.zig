@@ -2397,8 +2397,22 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             }
         },
         .BinOp => |bo| {
-            const l = frame.read(bo.lhs);
-            const r = frame.read(bo.rhs);
+            var l = frame.read(bo.lhs);
+            var r = frame.read(bo.rhs);
+            // A boxed capture is transparent to every operator: the Cell
+            // is a carrier (an anon-object method's captured outer `var`),
+            // never a user value — `result == null` must compare the
+            // content.
+            while (l == .Cell) {
+                const cg = l.Cell.borrow();
+                l = cg.get().*;
+                cg.deinit();
+            }
+            while (r == .Cell) {
+                const cg = r.Cell.borrow();
+                r = cg.get().*;
+                cg.deinit();
+            }
             // StringConcat over a Value.Instance routes the instance
             // through toString so user-defined overrides fire.
             if (bo.op == .StringConcat) {
@@ -3185,7 +3199,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 },
                 else => false,
             };
-            if (invocable) {
+            // A callable whose DECLARED params definitely refute the runtime
+            // args is not the target — Kotlin resolved the call to the
+            // same-named enclosing member overload; fall to the member arm.
+            const refuted = invocable and (comptime @hasDecl(H, "closureParamsDisproven")) and
+                host.closureParamsDisproven(&callee_v, arg_values);
+            if (invocable and !refuted) {
                 if (orAuditOn()) {
                     const name_str = constStr(frame.module, cvm.name) orelse "?";
                     orAudit("CallValueOrMember", name_str, "value", -1, null);
@@ -3484,6 +3503,14 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     },
                     .err => |e| return raiseStep(frame, e),
                 }
+            }
+            // A boxed capture surfaced by the member walk (an anon-object
+            // method's captured outer `var` lands in the instance's capture
+            // env as a shared Cell) reads through the cell.
+            if (v == .Cell) {
+                const cg = v.Cell.borrow();
+                v = cg.get().*;
+                cg.deinit();
             }
             v.retain();
             try frame.write(lt.dst, v);
@@ -4251,6 +4278,9 @@ inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
             },
         },
         .List => |l| {
+            // A stale subList view must fail fast — leave it to the slow
+            // path, whose read guard throws ConcurrentModificationException.
+            if (recv.sublistViewStale()) return null;
             // An array `.asList()` view re-reads its scalar source so a later
             // array write shows through on this indexed load.
             recv.refreshArrayView();
@@ -4816,12 +4846,28 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
             if (l.* == .Float and r.* == .Long) return ok(.{ .Float = @rem(l.Float, @as(f32, @floatFromInt(r.Long))) });
         },
         .Eq, .NotEq, .BoxedEq, .BoxedNotEq => {
+            // A boxed capture compares by its CONTENT: the Cell is a
+            // carrier (an anon-object method's captured outer `var`),
+            // never a user value.
+            var lc = l.*;
+            while (lc == .Cell) {
+                const cg = lc.Cell.borrow();
+                lc = cg.get().*;
+                cg.deinit();
+            }
+            var rc = r.*;
+            while (rc == .Cell) {
+                const cg = rc.Cell.borrow();
+                rc = cg.get().*;
+                cg.deinit();
+            }
+
             // Mixed-width unsigned equality compares by magnitude
             // (`0u == 0uL`); same-tag and signed paths keep structural equality.
             // Mirrors the relational `compareValues` unsigned reconciliation.
-            if (std.meta.activeTag(l.*) != std.meta.activeTag(r.*)) {
-                if (asUnsigned(l)) |lu| {
-                    if (asUnsigned(r)) |ru| {
+            if (std.meta.activeTag(lc) != std.meta.activeTag(rc)) {
+                if (asUnsigned(&lc)) |lu| {
+                    if (asUnsigned(&rc)) |ru| {
                         const eq = lu == ru;
                         const neg = op == .NotEq or op == .BoxedNotEq;
                         return ok(.{ .Bool = if (neg) !eq else eq });
@@ -4829,9 +4875,9 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
                 }
             }
             const eq = if (op == .BoxedEq or op == .BoxedNotEq)
-                Value.structuralEqBoxed(l, r)
+                Value.structuralEqBoxed(&lc, &rc)
             else
-                Value.structuralEq(l, r);
+                Value.structuralEq(&lc, &rc);
             const neg = op == .NotEq or op == .BoxedNotEq;
             return ok(.{ .Bool = if (neg) !eq else eq });
         },
