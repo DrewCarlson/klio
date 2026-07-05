@@ -624,6 +624,18 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     try b.bind(label, dst2);
                     return dst2;
                 }
+                // The enclosing ANON OBJECT closed over the labeled
+                // receiver (`this@minus` inside an anon method): read the
+                // capture. The class-label walk below would resolve to the
+                // anon instance itself. No scope bind: a read inside a
+                // conditional branch must not cache its register for reads
+                // on paths where the branch never ran.
+                if (decl_mod.isLowerAnonCapture(label)) {
+                    const idx = try b.recordCapture(label);
+                    const dst2 = b.allocReg();
+                    try b.push(.{ .LoadCapture = .{ .dst = dst2, .idx = idx } });
+                    return dst2;
+                }
                 // Otherwise a class-name label (`this@Outer`): walk at runtime
                 // from the nearest `this` over the class/outer chain.
                 const this_reg = b.resolve("this") orelse blk: {

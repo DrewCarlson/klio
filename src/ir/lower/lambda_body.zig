@@ -77,6 +77,18 @@ pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
         try b.bind(name, dst);
         return dst;
     }
+    // A name the enclosing ANON OBJECT closes over (a lambda inside an
+    // anon-object method capturing the enclosing function's local, e.g.
+    // `filter { it != element }` in the stdlib's Sequence.minus object):
+    // forward it through this builder's capture slot — the anon method's
+    // captures are supplied by name from the instance at dispatch. The
+    // silent-Unit tail below would bind the lambda's capture to nothing.
+    if (decl.isLowerAnonCapture(name)) {
+        const idx = try b.recordCapture(name);
+        const dst = b.allocReg();
+        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+        return dst;
+    }
     // A zero-parameter / receiver lambda whose `it` was deliberately not
     // bound, and no enclosing lambda supplies one: kotlinc rejects this as
     // an unresolved reference. Record the diagnostic so the build driver

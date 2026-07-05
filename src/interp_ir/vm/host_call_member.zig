@@ -3941,7 +3941,7 @@ fn isSequenceTerminal(name: []const u8) bool {
         "minBy",           "maxByOrNull",   "minByOrNull", "maxOf",  "minOf",      "joinToString",
         "all",             "contains",      "groupBy", "associate",  "associateBy", "associateWith",
         "partition",       "indexOf",       "indexOfFirst", "toMap", "toHashSet",  "toMutableSet",
-        "zip",             "unzip",         "plus",    "minus",      "reduceOrNull", "foldRight",
+        "zip",             "unzip",         "plus",    "reduceOrNull", "foldRight",
         "reduceRight",
     };
     for (terms) |t| {
