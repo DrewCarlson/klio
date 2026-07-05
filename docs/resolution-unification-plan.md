@@ -696,6 +696,70 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
             emptySequence singleton (still fails post-batch: `Expected
             <Sequence>, actual <Sequence>` — an identity, not type,
             mismatch); still open.
+      - **2026-07-05 second batch: 28 -> ~6-8 expected (13 measured
+        mid-batch, remainder fixed after that sweep)**. Landed, each
+        repro-verified (commits 'collections: chained subList live
+        views...' through 'local classes: register property
+        accessors...'):
+        * Collections view family (items 14 + the ContainerBuilder/
+          ConcurrentModification/ReversedViews cluster): subList views
+          CHAIN through their immediate parent (parent_backing +
+          parent-relative windows; syncSublistChain splices ancestors and
+          re-stamps their comod expectation; refreshSublistCell recurses),
+          comod stamps (exp_mod vs shared counter, FROZEN_MOD_BIT masked)
+          guarded at recvListItems / size / iterator creation / hashCode /
+          equals / toString / the fastIndexGet bail; freeze inheritance
+          into iterator minting and keys/values views (+ the missing
+          buildMap freeze); addAll unconditional bump; MapEntry stamped
+          live view (exp_mod, by-key value refresh, yield-time re-stamp);
+          iterator remove-before-next ISE. LESSON: mutator defers
+          (bumpModCount/syncSublist) run on ERROR returns too — comod
+          guards must be hoisted ABOVE the defers or a refused mutation
+          resyncs the stale stamp.
+        * Item 5 (testBadClass): callNamedOverload re-collects from the
+          main module in side-module frames; ObjectExpr member bodies
+          count for capture boxing (both the assigned and referenced
+          scans); storeGlobal/setField write THROUGH Cell bindings;
+          lookupGlobal + the member-walk read unwrap Cells; BinOp is
+          Cell-transparent (the `x == null` null-check fast path compared
+          the raw Cell).
+        * Item 6 (Base64): local-fn-vs-private-member arbitration —
+          CallValueOrMember emitted for captured locals (new spread and
+          bare-call arms) AND for resolved local fns with a same-named
+          enclosing member (redirect_to_member widened: hasEnclosingMember
+          + capture-aware `this`); its value arm falls to the member when
+          closureParamsDisproven refutes the args (array-on-scalar
+          included). REGRESSION LESSON: the bare-spread arm must skip
+          names that are also known top-level fns (`maxOf(a, *rest)`), or
+          the over-approximate member set hijacks global calls
+          (NaNPropagationTest).
+        * Items 7/8: Sequence.zip is a lazy Merged source (strict
+          left-right interleave, transform overload, wired through
+          SeqIter + both materialise paths); builder blocks that throw
+          flip a `failed` flag -> later pulls throw ISE.
+        * Items 9-12, 16-18, 20 + orEmptyNull/parseInvalid/shuffle:
+          spread-through-this; sumOf numeric kinds (callable_return_ty
+          hook + literal lambda return_ty); plusElement for Any-cast RHS;
+          local-class accessor/$init$ thunks + toTypedArray-observes-
+          toArray (Iterable fallback keeps the instance receiver;
+          builtinReceiverDisproven rejects Instance-vs-builtin-array);
+          typeOf<T>() intrinsic (splice-gated, synthetic KType);
+          Duration exact big-integral expansion; Sequence identity
+          equality + singleton; Array?.orEmpty actual; trailing-lambda
+          binding in closure/local-ctor named binders; companion
+          declares-gate on the initialized fast path.
+        * REMAINING (the enum expected-type engine + 1 uncovered layer):
+          EnumEntriesFactoryTest x3 / EnumEntriesListTest x2 /
+          SetOperations intersectShort/ByteArray (items 2+4+13 - the
+          sibling-arg expected-type propagation engine, still not
+          started) and ConcurrentModificationTest.subList, which now
+          fails DEEPER: the earlier ops pass and the ArrayDeque block
+          surfaces `get_field size on AbstractMutableList.IteratorImpl`
+          - the interpreted native-wasm SubList.size getter (private
+          nested class) is not found from the inner IteratorImpl's
+          hasNext during a remove-loop; suspect the nested-private
+          class's accessor registration keying, NOT the new comod
+          machinery (benign deque subList iteration works).
       - **Now 28 dual-identical**: local-fn overloads cleared
         GroupingTest.groupingProducers + StringTest.compareToIgnoreCase
         (36→34); ext-property delegates cleared PropertyReferenceTest ×3
