@@ -310,13 +310,17 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
                 const i = pnext.fetchAdd(1, .monotonic);
                 if (i >= queue.len) return;
                 _ = arena.reset(.retain_capacity);
-                const r = runKlio(arena.allocator(), penv, queue[i]) catch {
+                // The job's target file is the argv tail (jobs append it last).
+                const target = queue[i][queue[i].len - 1];
+                const r = runKlio(arena.allocator(), penv, queue[i]) catch |e| {
+                    std.debug.print("build-blocked (spawn: {t}): {s}\n", .{ e, target });
                     _ = pblocked.fetchAdd(1, .monotonic);
                     continue;
                 };
                 if (passedCount(r.stdout)) |p| {
                     _ = ppassed.fetchAdd(p, .monotonic);
                 } else {
+                    std.debug.print("build-blocked (no pass summary): {s}\n", .{target});
                     _ = pblocked.fetchAdd(1, .monotonic);
                 }
             }
