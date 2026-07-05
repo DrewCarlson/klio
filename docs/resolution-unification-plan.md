@@ -484,6 +484,22 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
           bounds, empty-match split around surrogates), EnumEntries
           factory 3, GroupingTest others (local-fn-on-String ext
           countVowels, groupingProducers recursion depth).
+      - **Checkpoint 2026-07-05e: inventory ~63 (from 66 pre-anon-fix;
+        full sweep pending).** Landed since 66: anon-object capture chain
+        (resolveCapture anon branch, labeled-receiver capture without
+        scope caching) — the WHOLE stdlib object-expression family works
+        (Sequence.minus lazy + family, FilteringSequence nested anons,
+        Grouping fold/reduce/countEach); Type::localExt references;
+        keyed Grouping.fold passes the key; nullable declared receivers
+        carry their head (String?.orEmpty picks by static type); user
+        CharSequence implementations re-dispatch text ops via toString.
+        StringTest's remaining 5 all pass standalone — they need
+        in-test-class replication (local operator funs shadowing `in`,
+        StringBuilder-wrapped args via withTwoCharSequenceArgs); use the
+        MiniSizes.kt technique. SequenceTest.orEmpty residue =
+        emptySequence() must be a per-process singleton for identity
+        asserts. ContainerBuilder "is not same" trio = same singleton
+        story for emptyList/Set/Map after build of empty builders.
       - **Named remainder** (real, deterministic, 115 total): ArraysTest
         contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
         copyRangeInto (`UIntArray expects an Int size`),
