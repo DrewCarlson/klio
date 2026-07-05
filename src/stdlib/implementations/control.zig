@@ -156,6 +156,18 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             return r;
         }
     }
+    {
+        // Freeze every live view sharing this counter (a keys/values/entries
+        // view leaked out of the builder must reject mutation after build()).
+        const g = buildable.Map.entries.borrow();
+        const mc = g.get().mod_count;
+        g.deinit();
+        if (mc) |cell| {
+            const cg = cell.borrowMut();
+            cg.get().* |= collections.FROZEN_MOD_BIT;
+            cg.deinit();
+        }
+    }
     const map_empty = blk: {
         const g = buildable.Map.entries.borrow();
         defer g.deinit();

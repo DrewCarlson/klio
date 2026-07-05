@@ -245,7 +245,19 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
 // -------------------------------------------------------------------------
 
 pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return getFieldInner(self, allocator, receiver, name, false, false);
+    return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, false));
+}
+
+/// A boxed capture (an anon-object method's captured outer `var` stored
+/// in its capture env as a shared Cell) reads THROUGH the cell — the cell
+/// is a carrier, never a user value.
+fn unwrapCellRead(r: EvalResult) EvalResult {
+    if (r == .ok and r.ok == .Cell) {
+        const cg = r.ok.Cell.borrow();
+        defer cg.deinit();
+        return .{ .ok = cg.get().* };
+    }
+    return r;
 }
 
 /// Per-candidate probe for the bare-name resolver's innermost-first walk:
@@ -257,7 +269,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
 /// out; the walk's own terminal arm decides the global fallback, and
 /// companions ride the walk as their own candidates.
 pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return getFieldInner(self, allocator, receiver, name, false, true);
+    return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true));
 }
 
 /// For the loop JIT: the index of `name` in the receiver's instance field list,
@@ -954,7 +966,16 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if (std.mem.eql(u8, name, "size")) {
         switch (receiver.*) {
             .Array => |a| return ok(Value.newInt(@intCast(a.len()))),
-            .List => |l| return ok(Value.newInt(@intCast(listLen(l.items)))),
+            .List => |l| {
+                if (stdlib.implementations.collections.sublistViewStale(receiver)) {
+                    return errRes(.{ .Throw = .{ .Exception = .{
+                        .fqn = try runtime.strInit(allocator, "kotlin.ConcurrentModificationException"),
+                        .message = null,
+                        .cause = null,
+                    } } });
+                }
+                return ok(Value.newInt(@intCast(listLen(l.items))));
+            },
             .Set => |s| return ok(Value.newInt(@intCast(listLen(s.items)))),
             .Map => |m| {
                 const g = m.entries.borrow();
@@ -2617,6 +2638,26 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             }
         }
         {
+            // A boxed capture (an anon-object method writing a captured
+            // outer `var` held in its capture env as a shared Cell) takes
+            // the write THROUGH the cell so the outer scope observes it.
+            const existing: ?Value = blk: {
+                const g = inst.borrow();
+                defer g.deinit();
+                break :blk g.get().get(real_name);
+            };
+            if (existing) |ev| {
+                if (ev == .Cell) {
+                    const cg = ev.Cell.borrowMut();
+                    defer cg.deinit();
+                    if (runtime.reclaimEnabled()) {
+                        value.retain();
+                        cg.get().release(allocator);
+                    }
+                    cg.get().* = value;
+                    return .{ .ok = {} };
+                }
+            }
             // `define` adopts one owned reference, but `value` here is the
             // caller's borrow (the `SetField` opcode reads it straight out of a
             // register). Retain so the field owns its own reference and the

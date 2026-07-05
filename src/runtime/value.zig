@@ -357,7 +357,24 @@ pub const MapViewKind = enum { Keys, Values, Entries };
 ///     instead shares the boxed buffer outright and carries no backing).
 pub const CollBacking = union(enum) {
     map: struct { entries: MapEntries, kind: MapViewKind },
-    sublist: struct { parent: ValueList, from: usize, len: usize },
+    sublist: struct {
+        /// The immediate parent's element storage: the parent VIEW's cache
+        /// for a `sub.subList(...)` chain, or the root list itself.
+        parent: ValueList,
+        /// The immediate parent's own sublist backing when the parent is
+        /// itself a view — write-through and refresh recurse through it to
+        /// the root, updating each ancestor's window (Java's
+        /// `SubList(parent)` chain). Non-owning, like `List.backing`.
+        parent_backing: ?*CollBackingRef.Cell = null,
+        /// Window start/length, PARENT-relative.
+        from: usize,
+        len: usize,
+        /// Shared structural counter value this view last observed. A
+        /// mismatch on access means the backing changed structurally not
+        /// through this view (or a descendant) —
+        /// ConcurrentModificationException.
+        exp_mod: u64 = 0,
+    },
     array: struct { buf: objcell.ObjRef(PrimBuf), view_kind: PrimitiveArrayKind },
 
     /// GC out-edge: keep the source cell reachable while a live view references
@@ -367,7 +384,10 @@ pub const CollBacking = union(enum) {
     pub fn gcTrace(self: *const CollBacking, m: *objcell.gc.Marker) void {
         switch (self.*) {
             .map => |x| m.shade(&x.entries.cell.hdr),
-            .sublist => |x| m.shade(&x.parent.cell.hdr),
+            .sublist => |x| {
+                m.shade(&x.parent.cell.hdr);
+                if (x.parent_backing) |pb| m.shade(&pb.hdr);
+            },
             .array => |x| m.shade(&x.buf.cell.hdr),
         }
     }
@@ -881,6 +901,10 @@ pub const BuilderState = struct {
     started: bool = false,
     /// The block ran to completion (no more elements).
     done: bool = false,
+    /// The block threw. The throw itself propagated out of the pull that
+    /// observed it; every later pull throws IllegalStateException, matching
+    /// `SequenceBuilderIterator`'s failed state.
+    failed: bool = false,
 
     /// GC out-edges: the builder block, the scope Instance, and every Value
     /// the parked continuation's frames keep live (through the suspend-mark
@@ -938,6 +962,10 @@ pub const SeqIterState = struct {
     /// For an `IteratorFn` source: the Iterator the factory produced for
     /// THIS iteration (invoked lazily on first pull).
     iter_obj: ?Value = null,
+    /// For a `Merged` source: the two child iterators, created together on
+    /// the first pull.
+    iter_left: ?Value = null,
+    iter_right: ?Value = null,
     /// Per-op streaming counters, indexed by op position. Allocated lazily to
     /// `ops.len`. `Take`/`Drop` counts and `takeWhile`/`dropWhile`/index state.
     taken: []usize = &.{},
@@ -950,6 +978,8 @@ pub const SeqIterState = struct {
         self.seq.gcMark(m);
         if (self.buffered) |b| b.gcMark(m);
         if (self.gen_cur) |g| g.gcMark(m);
+        if (self.iter_left) |v| v.gcMark(m);
+        if (self.iter_right) |v| v.gcMark(m);
     }
 
     pub fn gcFinalize(self: *SeqIterState, a: std.mem.Allocator) void {
@@ -961,6 +991,8 @@ pub const SeqIterState = struct {
             self.seq.release(a);
             if (self.buffered) |b| b.release(a);
             if (self.gen_cur) |g| g.release(a);
+            if (self.iter_left) |v| v.release(a);
+            if (self.iter_right) |v| v.release(a);
         }
         self.freeBufs(a);
     }
@@ -1004,6 +1036,11 @@ pub const SequenceData = struct {
             },
             .Builder => |b| m.shade(&b.cell.hdr),
             .IteratorFn => |f| m.shade(&f.cell.hdr),
+            .Merged => |z| {
+                m.shade(&z.left.cell.hdr);
+                m.shade(&z.right.cell.hdr);
+                if (z.transform) |t| m.shade(&t.cell.hdr);
+            },
         }
         for (self.ops) |op| switch (op) {
             .Map,
@@ -1039,7 +1076,15 @@ pub const SequenceSource = union(enum) {
     /// invokes the factory for a fresh Iterator and pulls it element by
     /// element (lazy, re-iterable).
     IteratorFn: ValueBox,
+    /// `seq.zip(other)` — the merging source. Each pull advances BOTH child
+    /// iterators one element (left first, then right), so shared-state
+    /// generators observe the strict alternating interleave of
+    /// `MergingSequence`. `transform` (when non-null) maps each (a, b)
+    /// instead of building a Pair.
+    Merged: MergedSource,
 };
+
+pub const MergedSource = struct { left: ValueBox, right: ValueBox, transform: ?ValueBox = null };
 
 pub const SeqOp = union(enum) {
     Map: Value,
@@ -1345,8 +1390,14 @@ pub const Value = union(enum) {
     MapEntry: struct {
         key: ValueBox,
         value: ValueBox,
-        /// When set, the live map's entries: `setValue` writes through.
+        /// When set, the live map's entries: `setValue` writes through and
+        /// reads resolve the live pair by key.
         backing: ?MapEntries,
+        /// The backing counter observed when this entry was handed out
+        /// (creation or iterator `next()`). A later structural change to
+        /// the map makes every member access throw
+        /// ConcurrentModificationException. Meaningful only with `backing`.
+        exp_mod: u64 = 0,
     },
     /// `kotlin.Result<T>`.
     Result: struct {
@@ -2221,6 +2272,8 @@ pub const Value = union(enum) {
             .List => |x| if (b.* == .List) {
                 a.refreshArrayView();
                 b.refreshArrayView();
+                a.refreshSublistView();
+                b.refreshSublistView();
                 return listEqBoxed(x.items, b.List.items);
             },
             .Set => |x| if (b.* == .Set) return setEqBoxed(x.items, b.Set.items),
@@ -2272,6 +2325,8 @@ pub const Value = union(enum) {
             .List => |x| b.* == .List and blk: {
                 a.refreshArrayView();
                 b.refreshArrayView();
+                a.refreshSublistView();
+                b.refreshSublistView();
                 break :blk listEqBoxed(x.items, b.List.items);
             },
             .Set => |x| b.* == .Set and setEqBoxed(x.items, b.Set.items),
@@ -2296,6 +2351,7 @@ pub const Value = union(enum) {
             // the JVM — the same builder equals itself, never a sibling
             // with equal contents.
             .StringBuilder => |x| b.* == .StringBuilder and x.identity() == b.StringBuilder.identity(),
+            .Sequence => |x| b.* == .Sequence and ObjRef(SequenceData).ptrEq(x, b.Sequence),
             else => false,
         };
     }
@@ -2320,6 +2376,7 @@ pub const Value = union(enum) {
             .Map => |x| if (b.* == .Map) return MapEntries.ptrEq(x.entries, b.Map.entries),
             .Array => |x| if (b.* == .Array) return x.identity() == b.Array.identity(),
             .StringBuilder => |x| if (b.* == .StringBuilder) return x.identity() == b.StringBuilder.identity(),
+            .Sequence => |x| if (b.* == .Sequence) return ObjRef(SequenceData).ptrEq(x, b.Sequence),
             .Intrinsic => |x| {
                 if (b.* == .Intrinsic) return std.mem.eql(u8, x.fqn, b.Intrinsic.fqn);
                 if (b.* == .CoroutineSuspended) return std.mem.eql(u8, x.fqn, "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED");
@@ -2407,6 +2464,7 @@ pub const Value = union(enum) {
             },
             .List => |coll| {
                 self.refreshArrayView();
+                self.refreshSublistView();
                 try writeElements(writer, coll.items, &self);
             },
             .Set => |coll| try writeElements(writer, coll.items, &self),
@@ -2553,6 +2611,21 @@ pub const Value = union(enum) {
     /// access. In-place, clamped to the window; parent structural
     /// changes not made through the view are undefined in Kotlin and
     /// fail fast via the shared mod_count.
+    /// Whether a live `subList` view's backing changed structurally not
+    /// through the view (or a descendant) — the CME predicate.
+    pub fn sublistViewStale(self: *const Value) bool {
+        if (self.* != .List) return false;
+        const cell = self.List.backing orelse return false;
+        if (cell.data != .sublist) return false;
+        const mc = self.List.mod_count orelse return false;
+        const cur = blk: {
+            const g = mc.borrow();
+            defer g.deinit();
+            break :blk g.get().*;
+        };
+        return (cur & ~FROZEN_MOD_BIT) != (cell.data.sublist.exp_mod & ~FROZEN_MOD_BIT);
+    }
+
     pub fn refreshSublistView(self: *const Value) void {
         if (self.* != .List) return;
         // Borrow-overwrite of owned slots: correct only where retain/
@@ -2560,20 +2633,7 @@ pub const Value = union(enum) {
         // parent through the backing edge).
         if (objcell.reclaimEnabled()) return;
         const b = self.List.backing orelse return;
-        if (b.data != .sublist) return;
-        const sb = b.data.sublist;
-        const pg = sb.parent.borrow();
-        defer pg.deinit();
-        const pitems = pg.get().items;
-        if (sb.from >= pitems.len) return;
-        const avail = @min(sb.from + sb.len, pitems.len) - sb.from;
-        const ig = self.List.items.borrowMut();
-        defer ig.deinit();
-        const items = ig.get().items;
-        var i: usize = 0;
-        while (i < avail and i < items.len) : (i += 1) {
-            items[i] = pitems[sb.from + i];
-        }
+        refreshSublistCell(b, self.List.items);
     }
 
     pub fn display(self: Value, allocator: std.mem.Allocator) ![]u8 {
@@ -2598,6 +2658,34 @@ pub const ComparatorStep = struct {
         if (self.key_comparator) |kc| kc.gcMark(m);
     }
 };
+
+/// High bit of a shared structural counter: set when a builder freezes its
+/// live views at `build()`. Masked out of comod comparisons so a
+/// leaked-but-unmodified builder view still reads.
+pub const FROZEN_MOD_BIT: u64 = 1 << 63;
+
+/// Recursive body of `refreshSublistView`: refresh the parent view first
+/// (so a root write shows through a whole `subList().subList()` chain),
+/// then copy this window from the parent cache. In-place and clamped —
+/// structural growth flows the other way (`syncSublist`), and structural
+/// changes not made through the view fail fast via the comod stamp.
+fn refreshSublistCell(cell: *CollBackingRef.Cell, view_items: ValueList) void {
+    if (cell.data != .sublist) return;
+    const sb = cell.data.sublist;
+    if (sb.parent_backing) |pb| refreshSublistCell(pb, sb.parent);
+    const pg = sb.parent.borrow();
+    defer pg.deinit();
+    const pitems = pg.get().items;
+    if (sb.from >= pitems.len) return;
+    const avail = @min(sb.from + sb.len, pitems.len) - sb.from;
+    const ig = view_items.borrowMut();
+    defer ig.deinit();
+    const items = ig.get().items;
+    var i: usize = 0;
+    while (i < avail and i < items.len) : (i += 1) {
+        items[i] = pitems[sb.from + i];
+    }
+}
 
 fn writeElements(writer: *std.Io.Writer, items: ValueList, container: *const Value) std.Io.Writer.Error!void {
     const g = items.borrow();
