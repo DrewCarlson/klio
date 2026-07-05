@@ -64,6 +64,8 @@ internal actual fun <T> terminateCollectionToArray(collectionSize: Int, array: A
 internal actual fun collectionToArray(collection: Collection<*>): Array<Any?> = collectionToArrayCommonImpl(collection)
 internal actual fun <T> collectionToArray(collection: Collection<*>, array: Array<T>): Array<T> = collectionToArrayCommonImpl(collection, array)
 
+public actual inline fun <reified T> Array<out T>?.orEmpty(): Array<out T> = this ?: emptyArray<T>()
+
 public actual fun <T> MutableList<T>.fill(value: T): Unit {
     for (index in 0..lastIndex) this[index] = value
 }
