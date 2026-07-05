@@ -407,6 +407,31 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         mysteries (sizeInBitsAndBytes Type, sortedTests toArray-on-String,
         compareToIgnoreCase overflow) share a local-fn + test-class
         context pattern — investigate with child-level traces.
+      - **Checkpoint 2026-07-05b: inventory 94 dual-identical.** ArraysTest,
+        NumbersTest, UnsignedArraysTest, RandomTest fully green. Landed
+        since 97: type-in-value-position Any surface (uppercase field
+        reads skip constructor intrinsics; Class/Function/Intrinsic
+        toString), local functions keep vararg shape through closure
+        lowering (non-final-vararg reorder route in callFunc,
+        callFuncFast exclusion, named-local-fn bypass in
+        callValueWithThis).
+        The two big remaining clusters, root-caused and ready to
+        implement:
+        1. **Set/Iterable `minus` family (12 tests)** — kotlinc resolves
+           `data - "foo"` against `data`'s STATIC type (`T : Iterable`
+           bound → `Iterable.minus` → List); KLIO dispatches dynamically
+           on the runtime Set (→ Set). Needs a static-receiver-head
+           channel at lowering: class-property declared types resolved
+           through class type-parameter BOUNDS, feeding the binop/member
+           lowering (`static_recv`-style) so the walk picks the
+           bound-typed overload. P10 step-3 shaped.
+        2. **windowed-over-Iterable tail (3 tests) + likely more** — the
+           source `windowedIterator` yields the raw `RingBuffer` for the
+           last partial window (by design — it IS a List on JVM);
+           `assertEquals(listOf(6), window)` needs List↔list-like-Instance
+           equality bridging (drain the AbstractList-subclass instance and
+           compare elements), the same bridge the LinkedStringSet
+           `minus`-display mismatches hint at for Sets.
       - **Named remainder** (real, deterministic, 115 total): ArraysTest
         contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
         copyRangeInto (`UIntArray expects an Int size`),
