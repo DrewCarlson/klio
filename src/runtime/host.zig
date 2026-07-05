@@ -111,6 +111,12 @@ pub const IntrinsicHost = struct {
         /// `.done` at completion). `null` => default (`.done`, i.e. an empty
         /// sequence — only the VM host implements real lazy driving).
         builder_step: ?*const fn (ctx: *anyopaque, state: BuilderStateRef, out: Output) std.mem.Allocator.Error!BuilderStepResult = null,
+        /// Declared return-type name of a callable's underlying function
+        /// (`"kotlin.Long"`), or `null` when unknown / not statically
+        /// typed. Numeric-kind-preserving folds (`sumOf`) read it to seed
+        /// an empty-receiver accumulator with the right kind. `null`
+        /// slot => default (`null`).
+        callable_return_ty: ?*const fn (ctx: *anyopaque, callable: *const Value) ?[]const u8 = null,
     };
 
     pub fn invokeCallable(self: IntrinsicHost, callable: *const Value, args: []const Value, out: Output) !EvalResult {
@@ -249,6 +255,11 @@ pub const IntrinsicHost = struct {
     pub fn builderStep(self: IntrinsicHost, state: BuilderStateRef, out: Output) !BuilderStepResult {
         if (self.vtable.builder_step) |f| return f(self.ctx, state, out);
         return .done;
+    }
+
+    pub fn callableReturnTy(self: IntrinsicHost, callable: *const Value) ?[]const u8 {
+        if (self.vtable.callable_return_ty) |f| return f(self.ctx, callable);
+        return null;
     }
 };
 

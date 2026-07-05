@@ -358,7 +358,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     const result = try expr.lowerBlock(&b, body);
     b.terminate(.{ .Return = result });
     const captured = try b.allocator.dupe([]const u8, b.capturesTaken());
-    var func = try b.finish("<lambda>", "<lambda>", build.typeUnit());
+    var func = try b.finish("<lambda>", "<lambda>", literalReturnTy(body) orelse build.typeUnit());
     // Function count is bounded well below u32::MAX; the index is the new FuncId.
     const id = module.nextFuncId();
     func.id = id;
@@ -395,6 +395,44 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         std.mem.eql(u8, placed_params[0].name, "this");
     try module.funcs.append(b.allocator, func);
     return .{ .func = id, .captures = captured };
+}
+
+/// Static return type of a lambda whose body is a single numeric literal
+/// (`{ 1 }`, `{ 1L }`, `{ 1U }`, `{ 1.0 }`). Numeric-kind-preserving folds
+/// (`sumOf`) read it through the host to seed an empty-receiver
+/// accumulator with the right kind; anything non-literal stays the Unit
+/// placeholder, which dispatch treats as no-information.
+fn literalReturnTy(body: *const ast.Block) ?ir.TypeRef {
+    if (body.stmts.len == 0) return null;
+    const last = &body.stmts[body.stmts.len - 1];
+    const e = switch (last.*) {
+        .Expr => |*ex| ex,
+        else => return null,
+    };
+    const name: []const u8 = switch (e.*) {
+        .IntLit => |l| switch (l.kind) {
+            .Int => "kotlin.Int",
+            .Long => "kotlin.Long",
+            .UInt => "kotlin.UInt",
+            .ULong => "kotlin.ULong",
+        },
+        .FloatLit => |l| switch (l.kind) {
+            .Double => "kotlin.Double",
+            .Float => "kotlin.Float",
+        },
+        else => return null,
+    };
+    return .{ .name = name, .nullable = false, .args = &.{} };
+}
+
+test "literalReturnTy classifies single-literal lambda bodies" {
+    const s = ast.Span.init(@enumFromInt(0), 0, 1);
+    var stmts = [_]ast.Stmt{.{ .Expr = .{ .IntLit = .{ .value = 1, .kind = .ULong, .span = s } } }};
+    const blk: ast.Block = .{ .stmts = &stmts, .span = s };
+    const ty = literalReturnTy(&blk) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("kotlin.ULong", ty.name);
+    const empty: ast.Block = .{ .stmts = &.{}, .span = s };
+    try std.testing.expect(literalReturnTy(&empty) == null);
 }
 
 test {
