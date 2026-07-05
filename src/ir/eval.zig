@@ -230,18 +230,31 @@ const REGS_POOL_MAX: usize = 128;
 /// buffer when one is large enough. The returned list owns its backing. Pooled
 /// buffers only ever come from the current top-level evaluation (drained when it
 /// unwinds), so they share its allocator.
+/// Allocator for frame REGISTER BUFFERS. Under the tracing GC the buffers
+/// live outside the GC heap (libc): the collector traces the VALUES through
+/// the frame chain but must never sweep the buffer storage, which lets the
+/// buffer pool work under GC too — previously every interpreted call
+/// allocated a fresh GC-heap buffer and abandoned it, the dominant
+/// allocation churn on call-heavy code. Other profiles keep the run
+/// allocator (the arena never frees; refcount pools as before).
+inline fn regsAlloc(fallback: Allocator) Allocator {
+    if (!runtime.reclaimEnabled() and runtime.gc.gc_enabled) return std.heap.c_allocator;
+    return fallback;
+}
+
 fn acquireRegs(allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
+    const ra = regsAlloc(allocator);
     if (regs_pool.items.len > 0) {
         const buf = regs_pool.items[regs_pool.items.len - 1];
         if (buf.len >= n) {
             regs_pool.items.len -= 1;
             var list: std.ArrayList(Value) = .{ .items = buf[0..0], .capacity = buf.len };
-            list.appendNTimes(allocator, .Unit, n) catch unreachable; // capacity already fits
+            list.appendNTimes(ra, .Unit, n) catch unreachable; // capacity already fits
             return list;
         }
     }
     var regs: std.ArrayList(Value) = .empty;
-    try regs.appendNTimes(allocator, .Unit, n);
+    try regs.appendNTimes(ra, .Unit, n);
     return regs;
 }
 
@@ -252,21 +265,27 @@ fn acquireRegs(allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value
 /// allocator). Only under a freeing backend — the tracing GC owns this memory and
 /// the arena never frees, so neither pools.
 fn releaseRegs(allocator: Allocator, regs: *std.ArrayList(Value)) void {
-    if (runtime.reclaimEnabled() and eval_depth > 0 and regs.capacity > 0 and regs_pool.items.len < REGS_POOL_MAX) {
+    const ra = regsAlloc(allocator);
+    const gc_pool = !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
+    const pool_ok = (gc_pool or (runtime.reclaimEnabled() and eval_depth > 0)) and
+        regs.capacity > 0 and regs_pool.items.len < REGS_POOL_MAX;
+    if (pool_ok) {
         const buf = regs.allocatedSlice();
         regs.* = .empty;
-        regs_pool.append(allocator, buf) catch {
-            allocator.free(buf);
+        regs_pool.append(ra, buf) catch {
+            ra.free(buf);
         };
         return;
     }
-    regs.deinit(allocator);
-    if (eval_depth == 0 and regs_pool.items.len > 0) drainRegsPool(allocator);
+    regs.deinit(ra);
+    if (!gc_pool and eval_depth == 0 and regs_pool.items.len > 0) drainRegsPool(allocator);
 }
 
-/// Free every pooled register buffer. Called when the outermost frame unwinds.
+/// Free every pooled register buffer. Called when the outermost frame unwinds
+/// (never under the GC pool, whose libc buffers persist for the process).
 fn drainRegsPool(allocator: Allocator) void {
-    for (regs_pool.items) |buf| allocator.free(buf);
+    const ra = regsAlloc(allocator);
+    for (regs_pool.items) |buf| ra.free(buf);
     regs_pool.clearRetainingCapacity();
 }
 
@@ -1081,7 +1100,7 @@ const Frame = struct {
     fn write(self: *Frame, r: Reg, v: Value) Allocator.Error!void {
         const idx = r.int();
         if (idx >= self.regs.items.len) {
-            try self.regs.appendNTimes(self.allocator, .Unit, idx + 1 - self.regs.items.len);
+            try self.regs.appendNTimes(regsAlloc(self.allocator), .Unit, idx + 1 - self.regs.items.len);
         }
         if (runtime.reclaimEnabled()) {
             const old = self.regs.items[idx];
@@ -1341,7 +1360,7 @@ pub fn resumeContinuation(
         try frame.activateChainFrom(snap.enclosing_this);
         defer frame.deactivateChain();
         frame.regs.clearRetainingCapacity();
-        try frame.regs.appendSlice(allocator, snap.regs);
+        try frame.regs.appendSlice(regsAlloc(allocator), snap.regs);
         // Kotlin `Continuation.resumeWith(Result.failure(e))` means
         // "resume by throwing `e` at the suspension point". Only the
         // innermost (suspending) frame sees the raw failure Result;
@@ -2169,7 +2188,7 @@ fn runFrameInner(
                 frame.params = new_params;
                 const n = frame.regs.items.len;
                 frame.regs.clearRetainingCapacity();
-                try frame.regs.appendNTimes(allocator, .Unit, n);
+                try frame.regs.appendNTimes(regsAlloc(allocator), .Unit, n);
                 try_stack.clearRetainingCapacity();
                 cur = frame.func.entry;
             },
@@ -2185,7 +2204,7 @@ fn runFrameInner(
                 frame.params.deinit(allocator);
                 frame.params = new_params;
                 frame.regs.clearRetainingCapacity();
-                try frame.regs.appendNTimes(allocator, .Unit, new_func.n_locals);
+                try frame.regs.appendNTimes(regsAlloc(allocator), .Unit, new_func.n_locals);
                 try_stack.clearRetainingCapacity();
                 cur = new_func.entry;
             },
