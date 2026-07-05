@@ -1344,6 +1344,11 @@ fn buildModuleWithOverrides(
             defer seen.deinit();
             try seen.put(e.key_ptr.*, {});
             try collectHierarchySuperNames(a, e.value_ptr.get(), &file_classes, &chain, &seen);
+            // Every enum class IS-A `kotlin.Enum` implicitly; record it so
+            // Enum-receiver ranking and enum recognition see the relation.
+            if (e.value_ptr.get().is_enum and !seen.contains("Enum")) {
+                try chain.append(a, "Enum");
+            }
             try module.registry.class_super_names.put(e.key_ptr.*, try chain.toOwnedSlice(a));
         }
     }
