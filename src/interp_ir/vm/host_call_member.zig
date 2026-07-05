@@ -3316,6 +3316,27 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
+    // CharSequence fallback: a user CharSequence implementation gets the
+    // full text surface by materializing through its own toString() and
+    // re-dispatching on the String — text ops never mutate the receiver.
+    // Runs after the member walk missed, so an op the class itself
+    // declares still wins.
+    if (receiver.* == .Instance and !charseq_fallback_active and
+        instanceImplementsCharSequence(self, receiver))
+    {
+        charseq_fallback_active = true;
+        defer charseq_fallback_active = false;
+        const sres = try callMemberRec(self, allocator, receiver, "toString", &.{});
+        switch (sres) {
+            .ok => |sv| {
+                if (sv == .String) {
+                    return try callMemberRec(self, allocator, &sv, name, args);
+                }
+            },
+            .err => {},
+        }
+    }
+
     // Iterable fallback.
     if (receiver.* == .Instance and !iterable_fallback_active and
         (hostHasMember(self, receiver, "iterator") or samIterableInstance(self, allocator, receiver)))
@@ -6386,6 +6407,28 @@ fn declaredLambdaOverloadWins(self: *VmHost, name: []const u8, args: []const Val
             shorter_plain = true;
         }
         if (lambda_exact and shorter_plain) return true;
+    }
+    return false;
+}
+
+threadlocal var charseq_fallback_active: bool = false;
+
+/// Whether the instance's class chain implements `CharSequence`.
+fn instanceImplementsCharSequence(self: *VmHost, receiver: *const Value) bool {
+    if (receiver.* != .Instance) return false;
+    const cname = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().name;
+    };
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    if (mg.get().registry.class_super_names.get(cname)) |chain| {
+        for (chain) |sup| {
+            if (std.mem.eql(u8, sup, "CharSequence")) return true;
+        }
     }
     return false;
 }
