@@ -432,6 +432,29 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
            equality bridging (drain the AbstractList-subclass instance and
            compare elements), the same bridge the LinkedStringSet
            `minus`-display mismatches hint at for Sets.
+      - **Checkpoint 2026-07-05c: IterableTests fully green (static-head
+        channel landed, `0bb6b7fb`); inventory ~79.** SequenceTest (13) is
+        the next cluster, design ready:
+        * Six `Type` failures = scan / runningFold / runningReduce /
+          zipWithNext / chunked / windowed are NOT streaming `SeqOp`s —
+          they batch-materialize, and the tests run them over the
+          INFINITE `generateSequence(0){it+1}`. Implement as stateful
+          streaming ops in `src/stdlib/implementations/sequence.zig`'s
+          pull driver (the `st.indices/taken/...` state arrays gain
+          per-op Value state: Scan{initial,op} emits acc (initial first),
+          RunningReduce{op}, ZipWithNext{transform?} keeps prev,
+          Chunked{size,transform?} and Windowed{size,step,partial,
+          transform?} keep a buffer and need an END-OF-SOURCE FLUSH hook
+          in the driver plus emit-cardinality handling (buffer-until-full
+          → emit). Extend the streamability gate + the member arms that
+          append `SeqOp`s (host_call_member ~5290 region) + `SeqOp`
+          gcTrace for captured Values.
+        * ConstrainedOnceSequence trio: `iterator` member missing on the
+          wrapper + constrain-once IllegalStateException on second
+          iteration.
+        * flatten on Sequence; Sequence.minus laziness
+          (minusIsLazyIterated); orEmpty returning [] instead of the
+          Sequence.
       - **Named remainder** (real, deterministic, 115 total): ArraysTest
         contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
         copyRangeInto (`UIntArray expects an Int size`),
