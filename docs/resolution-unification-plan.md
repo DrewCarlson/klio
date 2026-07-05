@@ -725,6 +725,26 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
           union value from its own current payload in one assignment
           (`v.* = .{ .Short = @intCast(v.Int) }`) trips result-location
           clobbering — read into a temp first.
+      - **Perf+GC round 2 (2026-07-06, commits 9eb68324/57134116)**:
+        `i++` no longer runs the string-keyed member ladder — scalar
+        unary ops apply natively when no enclosing instance is in scope
+        (member-extension operators like the DSL `Int.unaryPlus` keep the
+        probe; parity-pinned). Counting loops ~5x faster JIT-off
+        (0.95us -> ~0.2us/iter). `reclaimEnabled` is a shared atomic
+        (the per-register-write TLV lookup was ~13% of the loop profile).
+        GC idle reclamation: a burst-then-quiet program pinned its whole
+        burst heap forever (no allocations -> no collection); the
+        safe-point poll now fires ONE bonus collection per quiescent
+        period (1s after the last collect; real allocation re-arms the
+        latch) — the memtail repro drops 576MB -> 34MB, under the
+        hello-world baseline. Phased-allocation RSS is flat across
+        phases (no growth); decommit verified. ReleaseFast harness: ~2x
+        on call/dispatch-heavy code, nothing on pure loops; ship the
+        product binary ReleaseFast, keep CI ReleaseSafe. Remaining
+        engine levers unchanged: copy-propagation/Move fusion at
+        lowering (needs a generic Inst reg-visitor first), per-callsite
+        member-dispatch caching for interpreted-class bodies, flat
+        bytecode.
       - **Perf work (same day, user-directed)**: callNamedOverload's
         whole-func-index linear scan (the top profile frame) now uses the
         name index; isKnownPackage memoizes the package set; frame
