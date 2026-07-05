@@ -610,6 +610,16 @@ pub fn tryInlineCallWithTypeArgs(
     if (b.inlineInProgress(fname)) {
         return null;
     }
+    // `kotlin.reflect.typeOf<T>()` is a reified intrinsic: its source body
+    // is a placeholder throw, and the runtime serves the call from the
+    // reified type argument — never splice it.
+    if (std.mem.eql(u8, fname, "typeOf") and f.params.len == 0 and
+        f.type_params.len == 1 and f.type_params[0].is_reified)
+    {
+        if (f.return_type) |rt| {
+            if (std.mem.endsWith(u8, rt.name.name, "KType")) return null;
+        }
+    }
     // Materialise the body if it is a deferred image marker before reading it.
     inline_state.ensureInlineBody(f);
     const body = if (f.body) |*body_ref| body_ref else return null;
@@ -738,7 +748,15 @@ pub fn tryInlineCallWithTypeArgs(
             try helpers.coerceNumericLiteralArg(b, a, p.ty.name.name)
         else
             null;
+        // A lambda argument bound to a declared function-typed param
+        // takes its arity from the declaration — a zero-`->` lambda for
+        // a `() -> R` param must NOT keep the parser's implicit `it`
+        // (which would swallow the first invocation slot as Null).
+        if ((a.* == .Lambda or a.* == .AnonFun) and p.ty.function != null) {
+            b.pending_lambda_arity = @intCast(p.ty.function.?.params.len);
+        }
         const r = coerced orelse try lowerExpr(b, a);
+        b.pending_lambda_arity = -1;
         arg_regs[i] = r;
         // A lambda argument is spliced inline (its body is expanded at the
         // call site), so it is never a closure value to box — skip boxing

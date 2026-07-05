@@ -304,6 +304,9 @@ const RunState = struct {
     gpa: Allocator,
     plan: *const Plan,
     results: std.ArrayList(TestResult),
+    /// The previous `record`'s monotonic reading; the delta is the
+    /// finished test's wall time in the progress stream.
+    last_record_ns: i128 = 0,
 };
 
 /// Pull a printable `type: message` (or just `type`) out of a thrown value.
@@ -324,13 +327,18 @@ fn describeThrow(gpa: Allocator, v: Value) []const u8 {
 fn record(st: *RunState, display: []const u8, outcome: Outcome, detail: ?[]const u8) Allocator.Error!void {
     // Stream per-test progress to stderr as each test completes — the
     // stdout report stays a single post-run block (consumers parse it),
-    // but a long corpus run is observable while it happens.
+    // but a long corpus run is observable while it happens. The duration
+    // since the previous record is this test's wall time (setup included),
+    // making the stream double as a per-test profile.
     const tag = switch (outcome) {
         .passed => "PASSED",
         .failed => "FAILED",
         .skipped => "SKIPPED",
     };
-    std.debug.print("[test] {s} {s}\n", .{ display, tag });
+    const now_ns = runtime.clockMonotonicNanos();
+    const dur_ms: i128 = if (st.last_record_ns == 0) 0 else @divTrunc(now_ns - st.last_record_ns, std.time.ns_per_ms);
+    st.last_record_ns = now_ns;
+    std.debug.print("[test] {s} {s} {d}ms\n", .{ display, tag, dur_ms });
     try st.results.append(st.gpa, .{
         .display = try st.gpa.dupe(u8, display),
         .outcome = outcome,

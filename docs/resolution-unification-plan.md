@@ -520,15 +520,365 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         gate), ContainerBuilder 3 (subList live views — agent design
         recorded), CollectionTest 3, Uuid 2, Exception 2, StringTest ~2
         (local fn overload selection — agent design recorded), singles.
-      - **Named remainder** (real, deterministic, 115 total): ArraysTest
-        contentDeepToStringNoRecursion (`toString` on `kotlin.Array`),
-        copyRangeInto (`UIntArray expects an Int size`),
-        copyOfWithInitializer, sortedTests (`toArray` on
-        `kotlin.String`), shuffle (now an Illegal-value assertion deeper
-        in the test); NumbersTest.sizeInBitsAndBytes (Type);
-        EnumEntriesFactoryTest ×3; CollectionTest
-        abstractCollectionToArray / sumOf / plusCollectionInference /
-        toStringContainingThis.
+      - **EXACT STATE 2026-07-05 (batch-3 landed + compose regression
+        root-caused and fixed): 36 failures dual-identical** (45 at
+        2bfaeef9, 119 at session start), gate green, ratchet 2080 holds
+        (~2114 passes).
+        The compose regression's real mechanism: the failing dispatch arm
+        was `resolveExtOverloadLocal` (host_call_member.zig), the
+        named-arg extension picker behind `userMethodNamed` — the third
+        path, reached by `content.fill(null, fromIndex=…, toIndex=…)` in
+        MutableVector.kt after `stdlibNamedDispatch`'s probe chain broke
+        on `kotlin.collections.fill` (paramNames hit, intrinsic miss →
+        loop break). It collected candidates with NO receiver disproof,
+        so the four unsigned-array `fill` source decls (the only
+        surviving same-name source candidates once the MutableList.fill
+        actual shifted the set) were scored on a plain `Array` receiver
+        and UIntArray.fill won. Fix: the candidate loop now applies the
+        same disproof trio as the lenient ext pass
+        (`receiverViolatesTypeParamBound`, `builtinReceiverDisproven`,
+        `argDefinitelyNotParamType` on the receiver). Landing it exposed
+        a LATENT bug in `builtinReceiverDisproven` itself: it compared
+        the declared receiver ("UByteArray") against the prim view's
+        ELEMENT name (`PrimitiveArrayKind.simpleName()` = "UByte"), so
+        every genuine unsigned-array receiver was disproven against its
+        own extensions — harmless on the old cold path, a 40+-failure
+        sweep regression on the hot one. Fixed to compare
+        `simpleName(view.typeFqn())`; unit test pins the relation. Net:
+        the trio also fixed real mis-binds (MutableCollectionTest
+        listFill now passes; ArraysTest sortedTests /
+        contentDeepToStringNoRecursion / copyRangeInto /
+        copyOfWithInitializer and NumbersTest.sizeInBitsAndBytes cleared
+        with batch-3).
+        Verification-loop lesson recorded: `commontest-sweep.py
+        --filter` matches fewer files than the filter list suggests —
+        trust only full-sweep counts for regression verdicts; and the
+        gate's sweep step does NOT enforce the 2080 ratchet (that lives
+        in itest-stdlib_commontest only), so GATE GREEN alone does not
+        prove the ratchet.
+        BATCH-3 (landed with the above):
+        * emptySequence() process singleton (arena profile) + reset hook.
+        * subList live-view read-through (Value.refreshSublistView +
+          call sites; arena-only, reclaim guarded).
+        * Builder freeze bit (FROZEN_MOD_BIT in shared mod_count;
+          readOnlyMutationGuard honors it) — leaked builder subLists
+          reject mutation after build().
+        * MutableList.fill/shuffle + collectionToArray×2 actuals
+          (actual-marked; collectionToArray earlier caused a
+          conflicting-overload diagnostic when non-actual — fixed).
+        * Map.toMap(destination) merges into the destination (was:
+          ignored it and returned a read-only snapshot) — root of
+          MapTest.entriesCovariantRemove/nullKeyAndValue UOEs.
+        * Init-block/accessor thunks treat their own `this` as a
+          dispatch receiver (eval own_is_subject fix) — root of the
+          `checkPositionIndex` unresolved trio.
+        * companionWithMember BFS also walks the lexically enclosing
+          class prefix (inner classes reach the outer companion).
+        * Comparator structural equality (shared-steps + descending);
+          comparator compare falls back to user compareTo (Uuid
+          lexicalOrder, naturalOrder over user Comparables).
+        * data/value-class equals/hashCode are structural in
+          anyInstanceFallback even when an interface redeclares them
+          (TimeMarkTest).
+        * Inline-splice lambda args get pending_lambda_arity from the
+          declared function-type param (UuidTest.parseInvalid
+          `assertFailsWith { it() }` shape).
+        AGENT ROOT-CAUSE BACKLOG, DESIGNS RECORDED BUT NOT IMPLEMENTED
+        (all have concrete file/line anchors in this session's agent
+        reports; re-derive with the named repro shapes if needed):
+        1. LANDED — Local fn OVERLOADS collapse to last declaration
+           (StringTest.compareToIgnoreCase stack overflow, also the
+           GroupingTest.groupingProducers recursion in item 19).
+           Implemented exactly per the design: each same-named local
+           decl also binds a module-lifetime mangled name (`name$ovl<k>`)
+           through a dedicated cell registered BEFORE its body lowers
+           (so sibling bodies select against the full set), a
+           disproof-only static selector (arity, named args,
+           literal/declared type heads) at the single-name call arm, and
+           overload-table inheritance into nested lambda bodies.
+           Lifetime lesson: names shipped in AstLambda captured-name
+           lists are read at runtime — allocate from the module
+           allocator, never the builder's. Beneath the recursion sat
+           TWO case-fold bugs the test then exposed: string.zig's
+           hand-rolled scalarToLower/Upper range subsets missed real
+           mappings (KELVIN -> 'k') — now delegated to char.zig's full
+           tables — and both `equals(ignoreCase)` (whole-string
+           lowercase) and the per-unit fold used the wrong rule; both
+           now apply Kotlin's per-char uppercase-then-lowercase fold
+           ('ſ'=='S', 'ϑ'=='ϴ', and "ß" != "SS" via the length gate).
+        2. Enum expected-type propagation (EnumEntriesFactoryTest ×3):
+           per-arg expected types with sibling-arg solving in emitCall/
+           emitMemberOrGlobal (unifyTypeParam against param tys), enum
+           recognition for the oracle, callable-ref-against-expected-
+           fn-type lowering (::enumEntries), plus a loud-failure guard
+           in the enumEntries intrinsic when type args are lost.
+        3. LANDED — Ext-property DELEGATES dropped by lowering
+           (PropertyReference extensionProperties / covariantProperties /
+           memberProperties, all three now pass). Implemented per the
+           design: `val R.x by expr` lowers a 0-arg delegate thunk in
+           the interp build ext-prop loop, registered in the new
+           `extension_prop_delegates` (recv,name)→fid map (plumbed
+           through Program, run transfer, AND the baked-image codec —
+           FORMAT_VERSION 12→13), with read/write probes in host_fields
+           that materialise the delegate once (cached as a hidden
+           global keyed by the DECLARING receiver so subtype receivers
+           share it) and route getValue/setValue with a PropertyRef.
+           Two more root causes surfaced beneath: (a) a bound property
+           reference's `get()` required `memberIsProperty`, so a bound
+           EXT-property ref fell through to a member call and died —
+           `get()` now tries the full field path (which resolves ext
+           getters + delegates) before the bound-method forward; (b)
+           `Value.structuralEq` had NO StringBuilder arm, so `==` on
+           the SAME builder was false — now identity, as on the JVM
+           (covariantProperties' CharSequence-typed delegate read).
+        4. EnumEntriesListTest ordinal faults: deferred bare-call arity
+           readout must see class-member overloads hosting trailing
+           lambdas (overloadHostingTrailingLambda misses members at
+           extension-body sites) — plus contains/indexOf on wrong-typed
+           args should disprove via class type-param bounds and fall to
+           AbstractList iteration.
+        5. Anon side-module overloads (CoroutinesReferenceValuesTest.
+           testBadClass, also latent everywhere): callNamedOverload only
+           scans frame.module.func_index — empty in anon side modules;
+           re-collect from the closure's OWNING module. Plus anon
+           captured-var WRITES don't propagate: ObjectExpr missing from
+           assignedInLambdasExpr (never boxed) and storeGlobal replaces
+           the transient capture layer instead of writing through the
+           Cell.
+        6. Base64Test.common: sibling local fn vs same-named private
+           member — emit CallValueOrMember with the captured local +
+           param-type disproof in its value arm.
+        7. Sequence.zip must be a lazy alternating-pull merge (remove
+           from isSequenceTerminal + lazy pairing source)
+           (SequenceBuilderTest.testParallelIteration).
+        8. builderStep needs a `failed` flag: after a builder body
+           throws, hasNext/next must throw IllegalStateException
+           (testExceptionInCoroutine).
+        9. CoroutineContextTest.testInterceptor: lowerCallSpread must
+           route a bare member-fn callee with *spread through `this`
+           (currently lowers as a field read).
+        10. sumOf must keep the lambda's numeric kind (Long/UInt/ULong/
+            Double accumulator seeded from first result; empty-receiver
+            kind needs lambda return_ty population)
+            (CollectionTest.sumOf).
+        11. plus-inference: `list + (x as Any)` must call plusElement
+            when RHS static head is Any/generic (CollectionTest.
+            plusCollectionInference).
+        12. Local classes never register property ACCESSORS
+            (host_classes.lowerAndRegisterMethods lacks the .Property
+            arm buildObject has) + toTypedArray must re-dispatch a user
+            toArray override (CollectionTest.abstractCollectionToArray).
+        13. Short/Byte literal narrowing (widenNumericLiteral only does
+            Long) (SetOperationsTest.intersectShort/ByteArray).
+        14. MapEntry live read-through + CME (mod_count/exp_mod stamped
+            at creation; value reads through backing; throws
+            ConcurrentModificationException after structural change)
+            (MapTest.modifiedBackingMapOfEntry).
+        15. LANDED — formatThrowable now renders the JVM enclosed
+            shape: Suppressed: sections (one tab deeper per level),
+            causes at the parent indent, and an identity-keyed dejaVu
+            set emitting [CIRCULAR REFERENCE: <header>] instead of
+            re-walking (both ExceptionTest detailed-trace tests pass).
+        16. kotlin.reflect.typeOf needs a reified intrinsic returning a
+            KType (KTypeProjectionTest).
+        17. LANDED — append/insert guard: when the argument's length is
+            knowable (strings, builders, user CharSequences via their
+            `length` property) and the sum exceeds Int.MAX_VALUE, throw
+            OutOfMemoryError before materialising anything
+            (StringBuilderTest.overflow passes).
+        18. Duration formatToExactDecimals saturates at Long range —
+            exact digit expansion for |value|>=2^63
+            (DurationTest.parseAndFormatInUnits).
+        19. LANDED with item 1 — GroupingTest.groupingProducers was the
+            same local-fn-overload collapse (same-named local fns in the
+            test body recursing through the shared binding).
+        20. SequenceTest.orEmpty residue — VERIFIED NOT fixed by the
+            emptySequence singleton (still fails post-batch: `Expected
+            <Sequence>, actual <Sequence>` — an identity, not type,
+            mismatch); still open.
+      - **2026-07-06: ZERO known per-file failures expected (sweep
+        verifying)**. The final six fell to four mechanisms:
+        * Items 2+4+13 COMPLETE (the expected-type engine, implemented as
+          designed): sibling-arg solving records a per-arg-node expected
+          type consumed by the arg-lowering loops (which otherwise
+          deliberately null the hint); the inline splice's existing
+          return-type unification stamps the reified argument. Enum
+          recognition rides class_super_names (enums now record their
+          implicit `Enum` supertype). Same-simple-name enums stamp
+          OWNER-QUALIFIED names resolved by FQN suffix in the runtime enum
+          arm. `::enumEntries` against a declared `() -> EnumEntries<E>`
+          lowers as a zero-arg closure over the stamped call. The deferred
+          CallMemberOrGlobal form carries reified splice substitutions and
+          serves committed bodyless headers through the typed dispatch.
+        * Item 4's dispatch half: class_type_param_bounds (new registry +
+          image FORMAT_VERSION 14) drive the Kotlin collection-stub bridge
+          at resolveInstanceMethod — a candidate whose declared param
+          names a class type param with a bound the runtime arg refutes
+          falls through to the inherited implementation.
+        * ConcurrentModificationTest.subList's last layer: the
+          inner-class OUTER field walk swallowed accessor throws as
+          walkable misses (SubList.size's CME from IteratorImpl.hasNext).
+          Only Unimplemented is a miss now, matching the bare-name walk.
+        * SetOperations (13): Int-tagged list literals narrow to the
+          declared Short/Byte element kind at the callee boundary (the
+          arrayOf<ULong> retag discipline). LESSON (Zig): building a
+          union value from its own current payload in one assignment
+          (`v.* = .{ .Short = @intCast(v.Int) }`) trips result-location
+          clobbering — read into a temp first.
+      - **Engine round 3 (2026-07-06, commits 1a19d0be/13586aa1)**: the
+        comptime register visitor (ir.visitInstRegs — every operand
+        enumerated from the union's own shape) unblocked the Move-fusion
+        peephole at finish (single-use temps write their target
+        directly; ~7% on loops). Field reads memoize per (fqn, name) on
+        the program image, consulted at getFieldInner entry
+        (interpreted-class field code 15-18% faster). DeepRecursive's
+        wall was QUADRATIC, twice over: catch-only try frames never
+        popped on normal flow (fixed with catch_done_for on the join
+        block, image v15 — runCallLoop's per-iteration try/catch grew
+        the stack every level while every Goto scanned it), and each
+        re-suspend copied all pending outer snapshots (fixed with O(1)
+        TailSeg linking). 150k levels: 62s -> 33s shipped (17s with
+        KLIO_GC_EXT=1). The external-bytes Appel accounting is GATED
+        (KLIO_GC_EXT): its collection pressure exposed latent keepalive
+        holes — two real ones fixed (SeqIterState.iter_obj untraced;
+        fresh builder cursors un-rooted during host drive loops), and
+        the gate doubles as a deterministic hole-hunting stress mode.
+        NEXT: sweep under KLIO_GC_EXT=1 + KLIO_GC_POISON=1, fix the
+        remaining holes, then flip the accounting default on. Also
+        discovered: `klio run` (embedded image) leaves
+        startCoroutineUninterceptedOrReturn on fn values to runtime ext
+        resolution which misses — DeepRecursiveFunction works under
+        `klio test` but not `klio run` (repro: scratchpad deeprec2.kt);
+        root-cause the ext-vs-image lowering divergence.
+      - **Perf+GC round 2 (2026-07-06, commits 9eb68324/57134116)**:
+        `i++` no longer runs the string-keyed member ladder — scalar
+        unary ops apply natively when no enclosing instance is in scope
+        (member-extension operators like the DSL `Int.unaryPlus` keep the
+        probe; parity-pinned). Counting loops ~5x faster JIT-off
+        (0.95us -> ~0.2us/iter). `reclaimEnabled` is a shared atomic
+        (the per-register-write TLV lookup was ~13% of the loop profile).
+        GC idle reclamation: a burst-then-quiet program pinned its whole
+        burst heap forever (no allocations -> no collection); the
+        safe-point poll now fires ONE bonus collection per quiescent
+        period (1s after the last collect; real allocation re-arms the
+        latch) — the memtail repro drops 576MB -> 34MB, under the
+        hello-world baseline. Phased-allocation RSS is flat across
+        phases (no growth); decommit verified. ReleaseFast harness: ~2x
+        on call/dispatch-heavy code, nothing on pure loops; ship the
+        product binary ReleaseFast, keep CI ReleaseSafe. Remaining
+        engine levers unchanged: copy-propagation/Move fusion at
+        lowering (needs a generic Inst reg-visitor first), per-callsite
+        member-dispatch caching for interpreted-class bodies, flat
+        bytecode.
+      - **Perf work (same day, user-directed)**: callNamedOverload's
+        whole-func-index linear scan (the top profile frame) now uses the
+        name index; isKnownPackage memoizes the package set; frame
+        REGISTER BUFFERS pool under the tracing GC via libc storage (the
+        collector traces values through the frame chain and never sweeps
+        foreign buffers) — interpreted-class member ops ~31% faster,
+        whole corpus 709s -> 614s serially. Per-test wall times stream to
+        stderr (`[test] Name PASSED 12ms`). DeepRecursiveTest remains the
+        outlier (~280s: per-level interpreted trampoline machinery;
+        runFrameInner-self ~68% busy with GC off) — the flat-bytecode /
+        per-callsite-caching engine item is the lever, not hot-spot
+        patches. Cross-file interference (~53 failures when the corpus
+        runs as ONE module, kotlinc's actual mode) recorded as a distinct
+        work stream.
+      - **2026-07-05 second batch: 28 -> ~6-8 expected (13 measured
+        mid-batch, remainder fixed after that sweep)**. Landed, each
+        repro-verified (commits 'collections: chained subList live
+        views...' through 'local classes: register property
+        accessors...'):
+        * Collections view family (items 14 + the ContainerBuilder/
+          ConcurrentModification/ReversedViews cluster): subList views
+          CHAIN through their immediate parent (parent_backing +
+          parent-relative windows; syncSublistChain splices ancestors and
+          re-stamps their comod expectation; refreshSublistCell recurses),
+          comod stamps (exp_mod vs shared counter, FROZEN_MOD_BIT masked)
+          guarded at recvListItems / size / iterator creation / hashCode /
+          equals / toString / the fastIndexGet bail; freeze inheritance
+          into iterator minting and keys/values views (+ the missing
+          buildMap freeze); addAll unconditional bump; MapEntry stamped
+          live view (exp_mod, by-key value refresh, yield-time re-stamp);
+          iterator remove-before-next ISE. LESSON: mutator defers
+          (bumpModCount/syncSublist) run on ERROR returns too — comod
+          guards must be hoisted ABOVE the defers or a refused mutation
+          resyncs the stale stamp.
+        * Item 5 (testBadClass): callNamedOverload re-collects from the
+          main module in side-module frames; ObjectExpr member bodies
+          count for capture boxing (both the assigned and referenced
+          scans); storeGlobal/setField write THROUGH Cell bindings;
+          lookupGlobal + the member-walk read unwrap Cells; BinOp is
+          Cell-transparent (the `x == null` null-check fast path compared
+          the raw Cell).
+        * Item 6 (Base64): local-fn-vs-private-member arbitration —
+          CallValueOrMember emitted for captured locals (new spread and
+          bare-call arms) AND for resolved local fns with a same-named
+          enclosing member (redirect_to_member widened: hasEnclosingMember
+          + capture-aware `this`); its value arm falls to the member when
+          closureParamsDisproven refutes the args (array-on-scalar
+          included). REGRESSION LESSON: the bare-spread arm must skip
+          names that are also known top-level fns (`maxOf(a, *rest)`), or
+          the over-approximate member set hijacks global calls
+          (NaNPropagationTest).
+        * Items 7/8: Sequence.zip is a lazy Merged source (strict
+          left-right interleave, transform overload, wired through
+          SeqIter + both materialise paths); builder blocks that throw
+          flip a `failed` flag -> later pulls throw ISE.
+        * Items 9-12, 16-18, 20 + orEmptyNull/parseInvalid/shuffle:
+          spread-through-this; sumOf numeric kinds (callable_return_ty
+          hook + literal lambda return_ty); plusElement for Any-cast RHS;
+          local-class accessor/$init$ thunks + toTypedArray-observes-
+          toArray (Iterable fallback keeps the instance receiver;
+          builtinReceiverDisproven rejects Instance-vs-builtin-array);
+          typeOf<T>() intrinsic (splice-gated, synthetic KType);
+          Duration exact big-integral expansion; Sequence identity
+          equality + singleton; Array?.orEmpty actual; trailing-lambda
+          binding in closure/local-ctor named binders; companion
+          declares-gate on the initialized fast path.
+        * REMAINING (the enum expected-type engine + 1 uncovered layer):
+          EnumEntriesFactoryTest x3 / EnumEntriesListTest x2 /
+          SetOperations intersectShort/ByteArray (items 2+4+13 - the
+          sibling-arg expected-type propagation engine, still not
+          started) and ConcurrentModificationTest.subList, which now
+          fails DEEPER: the earlier ops pass and the ArrayDeque block
+          surfaces `get_field size on AbstractMutableList.IteratorImpl`
+          - the interpreted native-wasm SubList.size getter (private
+          nested class) is not found from the inner IteratorImpl's
+          hasNext during a remove-loop; suspect the nested-private
+          class's accessor registration keying, NOT the new comod
+          machinery (benign deque subList iteration works).
+      - **Now 28 dual-identical**: local-fn overloads cleared
+        GroupingTest.groupingProducers + StringTest.compareToIgnoreCase
+        (36→34); ext-property delegates cleared PropertyReferenceTest ×3
+        (34→31); the StringBuilder overflow guard and the JVM
+        printStackTrace shape cleared StringBuilderTest.overflow +
+        ExceptionTest ×2 (31→28). Nothing added at any step. NOTE:
+        SetOperationsTest intersectShort/ByteArray (item 13) is NOT a
+        standalone literal-narrowing patch — `listOf(5)` must infer
+        List<Short> from intersect's `Iterable<Short>` param, i.e. item
+        2's expected-type propagation engine; treat 13 as part of 2.
+      - **Named remainder (the full 36, post-batch, dual-identical)**:
+        ArraysTest.orEmptyNull (pre-existing at 2bfaeef9, verified via
+        worktree build); Base64Test.common; CollectionTest
+        abstractCollectionToArray / plusCollectionInference / sumOf;
+        ConcurrentModificationTest mutableList / subList;
+        ContainerBuilderTest buildList / buildMap / listBuilderSubList;
+        CoroutineContextTest.testInterceptor;
+        CoroutinesReferenceValuesTest.testBadClass;
+        DurationTest.parseAndFormatInUnits; EnumEntriesFactoryTest ×3;
+        EnumEntriesListTest ×2; ExceptionTest ×2;
+        GroupingTest.groupingProducers;
+        KTypeProjectionTest.constructorArgumentsValidation;
+        MapTest.modifiedBackingMapOfEntry; MutableCollectionTest.shuffle
+        (`lastIndex` on ArrayDeque.Companion); PropertyReferenceTest
+        extensionProperties / covariantProperties / memberProperties;
+        ReversedViewsTest.testIteratorRemove;
+        SequenceBuilderTest testExceptionInCoroutine /
+        testParallelIteration; SequenceTest.orEmpty; SetOperationsTest
+        intersectByteArray / intersectShortArray;
+        StringBuilderTest.overflow; StringTest.compareToIgnoreCase;
+        UuidTest.parseInvalid. Every one maps to a backlog item above.
       Also recorded: the remaining expect-with-impl drops in `retainDecl`
       stay until the registry carries declaration-aligned entries (the
       `retainDecl` comment marks it); `kotlin.String.repeat` vs

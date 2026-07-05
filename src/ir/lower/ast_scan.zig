@@ -169,6 +169,28 @@ fn scanLambdaRefsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
             };
         },
         .Member => |m| try scanLambdaRefsExpr(m.receiver, out),
+        // An anonymous object's member bodies reference (and write)
+        // captured outer locals exactly as a lambda body does; a written
+        // capture must box, so its references count here.
+        .ObjectExpr => |o| {
+            for (o.members) |*d| switch (d.*) {
+                .Function => |*f| {
+                    if (f.body) |fb| switch (fb) {
+                        .Block => |blk| {
+                            for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                        },
+                        .Expr => |ex| try collectPathIdents(&ex, out),
+                    };
+                },
+                .Property => |p| {
+                    if (p.init) |*pi| try scanLambdaRefsExpr(pi, out);
+                },
+                else => {},
+            };
+            for (o.init_blocks) |*blk| {
+                for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+            }
+        },
         .Unary => |u| try scanLambdaRefsExpr(u.expr, out),
         .Postfix => |u| try scanLambdaRefsExpr(u.expr, out),
         .Spread => |u| try scanLambdaRefsExpr(u.expr, out),
@@ -330,6 +352,26 @@ fn assignedInLambdasExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
         },
         .Member => |m| try assignedInLambdasExpr(m.receiver, out),
         .MemberRef => |m| try assignedInLambdasExpr(m.receiver, out),
+        // An anonymous object's method bodies write captured outer locals
+        // exactly as a lambda body does (`result = ...` inside an
+        // `object : Continuation<T> { override fun resumeWith(...) }`);
+        // without this the local is never boxed and the write lands on a
+        // transient capture copy.
+        .ObjectExpr => |o| {
+            for (o.members) |*d| switch (d.*) {
+                .Function => |*f| {
+                    if (f.body) |fb| switch (fb) {
+                        .Block => |blk| try collectLambdaBodyAssigns(blk.stmts, out),
+                        .Expr => |ex| try collectAssignTargets(&ex, out),
+                    };
+                },
+                .Property => |p| {
+                    if (p.init) |*pi| try assignedInLambdasExpr(pi, out);
+                },
+                else => {},
+            };
+            for (o.init_blocks) |*blk| try collectLambdaBodyAssigns(blk.stmts, out);
+        },
         .Unary => |u| try assignedInLambdasExpr(u.expr, out),
         .Postfix => |u| try assignedInLambdasExpr(u.expr, out),
         .Spread => |u| try assignedInLambdasExpr(u.expr, out),

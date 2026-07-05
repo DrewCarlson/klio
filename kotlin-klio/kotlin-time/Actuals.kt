@@ -111,6 +111,24 @@ internal actual fun formatToExactDecimals(value: Double, decimals: Int): String 
     val negative = value < 0.0 || (value == 0.0 && 1.0 / value < 0.0)
     val abs = if (negative) -value else value
 
+    // Doubles at or above 2^63 are integral and exceed Long, so the
+    // scale-and-split path below would saturate; expand the exact
+    // binary value to decimal digits instead.
+    if (abs >= 9.223372036854776E18) {
+        val sb = StringBuilder()
+        if (negative) sb.append('-')
+        sb.append(exactIntegralDecimalString(abs))
+        if (decimals > 0) {
+            sb.append('.')
+            var i = 0
+            while (i < decimals) {
+                sb.append('0')
+                i += 1
+            }
+        }
+        return sb.toString()
+    }
+
     val pow = run {
         var p = 1.0
         var i = 0
@@ -152,6 +170,43 @@ internal actual fun formatToExactDecimals(value: Double, decimals: Int): String 
     if (decimals > 0) {
         sb.append('.')
         sb.append(fracDigits)
+    }
+    return sb.toString()
+}
+
+// Exact decimal digits of an integral Double >= 2^63: decompose into
+// mantissa * 2^shift and double a little-endian digit array shift times.
+private fun exactIntegralDecimalString(abs: Double): String {
+    val bits = abs.toRawBits()
+    val expField = ((bits ushr 52) and 0x7FFL).toInt()
+    var mantissa = bits and 0xFFFFFFFFFFFFFL
+    if (expField > 0) mantissa = mantissa or (1L shl 52)
+    var shift = expField - 1075
+
+    val digits = ArrayList<Int>()
+    var m = mantissa
+    while (m > 0L) {
+        digits.add((m % 10L).toInt())
+        m /= 10L
+    }
+    while (shift > 0) {
+        var carry = 0
+        var i = 0
+        while (i < digits.size) {
+            val v = digits[i] * 2 + carry
+            digits[i] = v % 10
+            carry = v / 10
+            i += 1
+        }
+        if (carry > 0) digits.add(carry)
+        shift -= 1
+    }
+
+    val sb = StringBuilder()
+    var i = digits.size - 1
+    while (i >= 0) {
+        sb.append('0' + digits[i])
+        i -= 1
     }
     return sb.toString()
 }

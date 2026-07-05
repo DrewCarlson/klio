@@ -166,6 +166,7 @@ pub fn resetReceiverThreadLocals() void {
 pub fn resetRunGlobalCaches() void {
     host_instances.resetAnonSiteCache();
     stdlib.resetEmptyCollectionSingletons();
+    stdlib.resetEmptySequenceSingleton();
 }
 
 /// A borrowed view over a `Vm`'s (or another host's) shared program-state

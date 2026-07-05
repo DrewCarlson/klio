@@ -5,6 +5,8 @@
 
 package kotlin.collections
 
+import kotlin.random.Random
+
 internal actual fun checkIndexOverflow(index: Int): Int {
     if (index < 0) throw ArithmeticException("Index overflow has happened.")
     return index
@@ -56,3 +58,41 @@ internal actual inline fun <K, V> buildMapInternal(capacity: Int, builderAction:
 // The interpreter's arrays are exact-sized; collection-to-array
 // termination is the identity, as on JS.
 internal actual fun <T> terminateCollectionToArray(collectionSize: Int, array: Array<T>): Array<T> = array
+
+// Platform hooks the baked AbstractCollection.toArray path calls bare;
+// the common implementations serve directly.
+internal actual fun collectionToArray(collection: Collection<*>): Array<Any?> = collectionToArrayCommonImpl(collection)
+internal actual fun <T> collectionToArray(collection: Collection<*>, array: Array<T>): Array<T> = collectionToArrayCommonImpl(collection, array)
+
+public actual inline fun <reified T> Array<out T>?.orEmpty(): Array<out T> = this ?: emptyArray<T>()
+
+public actual fun <T> MutableList<T>.fill(value: T): Unit {
+    for (index in 0..lastIndex) this[index] = value
+}
+
+public actual fun <T> MutableList<T>.shuffle(): Unit = shuffle(Random)
+
+// In-place operations run through the receiver's own get/set, so they work
+// for any MutableList implementation (SnapshotStateList included), not only
+// the interpreter's native list.
+public actual fun <T> MutableList<T>.reverse(): Unit {
+    var left = 0
+    var right = lastIndex
+    while (left < right) {
+        val tmp = this[left]
+        this[left] = this[right]
+        this[right] = tmp
+        left++
+        right--
+    }
+}
+
+public actual fun <T : Comparable<T>> MutableList<T>.sort(): Unit {
+    val sorted = this.sorted()
+    for (index in 0..lastIndex) this[index] = sorted[index]
+}
+
+public actual fun <T> MutableList<T>.sortWith(comparator: Comparator<in T>): Unit {
+    val sorted = this.sortedWith(comparator)
+    for (index in 0..lastIndex) this[index] = sorted[index]
+}

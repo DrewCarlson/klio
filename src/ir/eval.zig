@@ -230,18 +230,31 @@ const REGS_POOL_MAX: usize = 128;
 /// buffer when one is large enough. The returned list owns its backing. Pooled
 /// buffers only ever come from the current top-level evaluation (drained when it
 /// unwinds), so they share its allocator.
+/// Allocator for frame REGISTER BUFFERS. Under the tracing GC the buffers
+/// live outside the GC heap (libc): the collector traces the VALUES through
+/// the frame chain but must never sweep the buffer storage, which lets the
+/// buffer pool work under GC too — previously every interpreted call
+/// allocated a fresh GC-heap buffer and abandoned it, the dominant
+/// allocation churn on call-heavy code. Other profiles keep the run
+/// allocator (the arena never frees; refcount pools as before).
+inline fn regsAlloc(fallback: Allocator) Allocator {
+    if (!runtime.reclaimEnabled() and runtime.gc.gc_enabled) return std.heap.c_allocator;
+    return fallback;
+}
+
 fn acquireRegs(allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
+    const ra = regsAlloc(allocator);
     if (regs_pool.items.len > 0) {
         const buf = regs_pool.items[regs_pool.items.len - 1];
         if (buf.len >= n) {
             regs_pool.items.len -= 1;
             var list: std.ArrayList(Value) = .{ .items = buf[0..0], .capacity = buf.len };
-            list.appendNTimes(allocator, .Unit, n) catch unreachable; // capacity already fits
+            list.appendNTimes(ra, .Unit, n) catch unreachable; // capacity already fits
             return list;
         }
     }
     var regs: std.ArrayList(Value) = .empty;
-    try regs.appendNTimes(allocator, .Unit, n);
+    try regs.appendNTimes(ra, .Unit, n);
     return regs;
 }
 
@@ -252,21 +265,27 @@ fn acquireRegs(allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value
 /// allocator). Only under a freeing backend — the tracing GC owns this memory and
 /// the arena never frees, so neither pools.
 fn releaseRegs(allocator: Allocator, regs: *std.ArrayList(Value)) void {
-    if (runtime.reclaimEnabled() and eval_depth > 0 and regs.capacity > 0 and regs_pool.items.len < REGS_POOL_MAX) {
+    const ra = regsAlloc(allocator);
+    const gc_pool = !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
+    const pool_ok = (gc_pool or (runtime.reclaimEnabled() and eval_depth > 0)) and
+        regs.capacity > 0 and regs_pool.items.len < REGS_POOL_MAX;
+    if (pool_ok) {
         const buf = regs.allocatedSlice();
         regs.* = .empty;
-        regs_pool.append(allocator, buf) catch {
-            allocator.free(buf);
+        regs_pool.append(ra, buf) catch {
+            ra.free(buf);
         };
         return;
     }
-    regs.deinit(allocator);
-    if (eval_depth == 0 and regs_pool.items.len > 0) drainRegsPool(allocator);
+    regs.deinit(ra);
+    if (!gc_pool and eval_depth == 0 and regs_pool.items.len > 0) drainRegsPool(allocator);
 }
 
-/// Free every pooled register buffer. Called when the outermost frame unwinds.
+/// Free every pooled register buffer. Called when the outermost frame unwinds
+/// (never under the GC pool, whose libc buffers persist for the process).
 fn drainRegsPool(allocator: Allocator) void {
-    for (regs_pool.items) |buf| allocator.free(buf);
+    const ra = regsAlloc(allocator);
+    for (regs_pool.items) |buf| ra.free(buf);
     regs_pool.clearRetainingCapacity();
 }
 
@@ -412,8 +431,14 @@ fn frameToString(allocator: Allocator, fr: runtime.StackFrame) Allocator.Error![
 }
 
 pub fn formatStackTrace(allocator: Allocator, trace: *const runtime.StackTraceData, out: *std.ArrayList(u8)) Allocator.Error!void {
+    return formatStackTraceIndented(allocator, trace, out, "");
+}
+
+fn formatStackTraceIndented(allocator: Allocator, trace: *const runtime.StackTraceData, out: *std.ArrayList(u8), indent: []const u8) Allocator.Error!void {
     for (trace.frames) |fr| {
-        try out.appendSlice(allocator, "\n    at ");
+        try out.appendSlice(allocator, "\n");
+        try out.appendSlice(allocator, indent);
+        try out.appendSlice(allocator, "    at ");
         const s = try frameToString(allocator, fr);
         defer allocator.free(s);
         try out.appendSlice(allocator, s);
@@ -449,14 +474,30 @@ pub fn stackTraceArray(allocator: Allocator, v: *const Value) Allocator.Error!?V
     return runtime.ArrayData.fromBoxedList(try runtime.ValueList.initOwned(allocator, list));
 }
 
-/// Render a throwable — its `type: message` header, captured stack trace, and
-/// (recursively) its `Caused by:` chain — into `out`. `is_cause` prefixes the
-/// `Caused by:` line; `depth` bounds a self-referential cause cycle.
+/// Render a throwable in the JVM `printStackTrace` shape — the
+/// `type: message` header, captured frames, `Suppressed:` sections
+/// (indented one tab per nesting level), and the `Caused by:` chain — into
+/// `out`. A throwable already printed in this rendering appears as
+/// `[CIRCULAR REFERENCE: <header>]` and is not walked again.
 pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayList(u8), is_cause: bool, depth: u8) Allocator.Error!void {
-    if (depth > 16) return;
+    _ = depth;
     if (is_cause) try out.appendSlice(allocator, "\nCaused by: ");
-    var stk: ?runtime.StackRef = null;
-    var cause: ?Value = null;
+    var deja: std.ArrayList(u64) = .empty;
+    defer deja.deinit(allocator);
+    try formatThrowableEnclosed(allocator, v, out, "", &deja, 0);
+}
+
+/// Stable identity for the dejaVu set; 0 (host-created throwables without
+/// one) opts out of cycle tracking and always prints in full.
+fn throwableIdentity(v: *const Value) u64 {
+    return switch (v.*) {
+        .Exception => |e| e.identity,
+        .Instance => |inst| inst.identity(),
+        else => 0,
+    };
+}
+
+fn appendThrowableHeader(allocator: Allocator, v: *const Value, out: *std.ArrayList(u8)) Allocator.Error!void {
     switch (v.*) {
         .Exception => |e| {
             {
@@ -469,12 +510,6 @@ pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayLis
                 defer mg.deinit();
                 try out.appendSlice(allocator, ": ");
                 try out.appendSlice(allocator, mg.get().bytes);
-            }
-            stk = if (e.stack) |c| runtime.StackRef{ .cell = c } else null;
-            if (e.cause) |c| {
-                const cg = (runtime.ValueBox{ .cell = c }).borrow();
-                defer cg.deinit();
-                cause = cg.get().*;
             }
         },
         .Instance => |inst| {
@@ -493,22 +528,93 @@ pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayLis
                     try out.appendSlice(allocator, sg.get().bytes);
                 }
             }
+        },
+        else => try out.appendSlice(allocator, "<thrown value>"),
+    }
+}
+
+fn formatThrowableEnclosed(
+    allocator: Allocator,
+    v: *const Value,
+    out: *std.ArrayList(u8),
+    indent: []const u8,
+    deja: *std.ArrayList(u64),
+    depth: u8,
+) Allocator.Error!void {
+    if (depth > 16) return;
+    if (v.* != .Exception and v.* != .Instance) {
+        try out.appendSlice(allocator, "<thrown value>");
+        return;
+    }
+    const id = throwableIdentity(v);
+    if (id != 0) {
+        for (deja.items) |seen| {
+            if (seen == id) {
+                try out.appendSlice(allocator, "[CIRCULAR REFERENCE: ");
+                try appendThrowableHeader(allocator, v, out);
+                try out.appendSlice(allocator, "]");
+                return;
+            }
+        }
+        try deja.append(allocator, id);
+    }
+    try appendThrowableHeader(allocator, v, out);
+
+    var stk: ?runtime.StackRef = null;
+    var cause: ?Value = null;
+    switch (v.*) {
+        .Exception => |e| {
+            stk = if (e.stack) |c| runtime.StackRef{ .cell = c } else null;
+            if (e.cause) |c| {
+                const cg = (runtime.ValueBox{ .cell = c }).borrow();
+                defer cg.deinit();
+                cause = cg.get().*;
+            }
+        },
+        .Instance => |inst| {
+            const g = inst.borrow();
+            defer g.deinit();
             stk = g.get().stack;
             if (g.get().get("cause")) |cv| {
                 if (cv != .Null) cause = cv;
             }
         },
-        else => {
-            try out.appendSlice(allocator, "<thrown value>");
-            return;
-        },
+        else => unreachable,
     }
     if (stk) |s| {
         const sg = s.borrow();
         defer sg.deinit();
-        try formatStackTrace(allocator, sg.get(), out);
+        try formatStackTraceIndented(allocator, sg.get(), out, indent);
     }
-    if (cause) |c| try formatThrowable(allocator, &c, out, true, depth + 1);
+
+    // Suppressed sections, one tab deeper than this throwable.
+    var suppressed: std.ArrayList(Value) = .empty;
+    defer suppressed.deinit(allocator);
+    if (v.* == .Exception) {
+        if (v.Exception.suppressed) |sl_cell| {
+            const sl = runtime.ValueList{ .cell = sl_cell };
+            const g = sl.borrow();
+            defer g.deinit();
+            for (g.get().items) |s| try suppressed.append(allocator, s);
+        }
+    }
+    if (suppressed.items.len != 0) {
+        const inner = try std.fmt.allocPrint(allocator, "{s}\t", .{indent});
+        defer allocator.free(inner);
+        for (suppressed.items) |*s| {
+            try out.appendSlice(allocator, "\n");
+            try out.appendSlice(allocator, inner);
+            try out.appendSlice(allocator, "Suppressed: ");
+            try formatThrowableEnclosed(allocator, s, out, inner, deja, depth + 1);
+        }
+    }
+
+    if (cause) |c| {
+        try out.appendSlice(allocator, "\n");
+        try out.appendSlice(allocator, indent);
+        try out.appendSlice(allocator, "Caused by: ");
+        try formatThrowableEnclosed(allocator, &c, out, indent, deja, depth + 1);
+    }
 }
 
 /// Attach a freshly-captured stack trace to a throwable the first time it needs
@@ -994,7 +1100,7 @@ const Frame = struct {
     fn write(self: *Frame, r: Reg, v: Value) Allocator.Error!void {
         const idx = r.int();
         if (idx >= self.regs.items.len) {
-            try self.regs.appendNTimes(self.allocator, .Unit, idx + 1 - self.regs.items.len);
+            try self.regs.appendNTimes(regsAlloc(self.allocator), .Unit, idx + 1 - self.regs.items.len);
         }
         if (runtime.reclaimEnabled()) {
             const old = self.regs.items[idx];
@@ -1254,7 +1360,7 @@ pub fn resumeContinuation(
         try frame.activateChainFrom(snap.enclosing_this);
         defer frame.deactivateChain();
         frame.regs.clearRetainingCapacity();
-        try frame.regs.appendSlice(allocator, snap.regs);
+        try frame.regs.appendSlice(regsAlloc(allocator), snap.regs);
         // Kotlin `Continuation.resumeWith(Result.failure(e))` means
         // "resume by throwing `e` at the suspension point". Only the
         // innermost (suspending) frame sees the raw failure Result;
@@ -2082,7 +2188,7 @@ fn runFrameInner(
                 frame.params = new_params;
                 const n = frame.regs.items.len;
                 frame.regs.clearRetainingCapacity();
-                try frame.regs.appendNTimes(allocator, .Unit, n);
+                try frame.regs.appendNTimes(regsAlloc(allocator), .Unit, n);
                 try_stack.clearRetainingCapacity();
                 cur = frame.func.entry;
             },
@@ -2098,7 +2204,7 @@ fn runFrameInner(
                 frame.params.deinit(allocator);
                 frame.params = new_params;
                 frame.regs.clearRetainingCapacity();
-                try frame.regs.appendNTimes(allocator, .Unit, new_func.n_locals);
+                try frame.regs.appendNTimes(regsAlloc(allocator), .Unit, new_func.n_locals);
                 try_stack.clearRetainingCapacity();
                 cur = new_func.entry;
             },
@@ -2310,8 +2416,22 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             }
         },
         .BinOp => |bo| {
-            const l = frame.read(bo.lhs);
-            const r = frame.read(bo.rhs);
+            var l = frame.read(bo.lhs);
+            var r = frame.read(bo.rhs);
+            // A boxed capture is transparent to every operator: the Cell
+            // is a carrier (an anon-object method's captured outer `var`),
+            // never a user value — `result == null` must compare the
+            // content.
+            while (l == .Cell) {
+                const cg = l.Cell.borrow();
+                l = cg.get().*;
+                cg.deinit();
+            }
+            while (r == .Cell) {
+                const cg = r.Cell.borrow();
+                r = cg.get().*;
+                cg.deinit();
+            }
             // StringConcat over a Value.Instance routes the instance
             // through toString so user-defined overrides fire.
             if (bo.op == .StringConcat) {
@@ -3098,7 +3218,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 },
                 else => false,
             };
-            if (invocable) {
+            // A callable whose DECLARED params definitely refute the runtime
+            // args is not the target — Kotlin resolved the call to the
+            // same-named enclosing member overload; fall to the member arm.
+            const refuted = invocable and (comptime @hasDecl(H, "closureParamsDisproven")) and
+                host.closureParamsDisproven(&callee_v, arg_values);
+            if (invocable and !refuted) {
                 if (orAuditOn()) {
                     const name_str = constStr(frame.module, cvm.name) orelse "?";
                     orAudit("CallValueOrMember", name_str, "value", -1, null);
@@ -3397,6 +3522,14 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     },
                     .err => |e| return raiseStep(frame, e),
                 }
+            }
+            // A boxed capture surfaced by the member walk (an anon-object
+            // method's captured outer `var` lands in the instance's capture
+            // env as a shared Cell) reads through the cell.
+            if (v == .Cell) {
+                const cg = v.Cell.borrow();
+                v = cg.get().*;
+                cg.deinit();
             }
             v.retain();
             try frame.write(lt.dst, v);
@@ -3928,7 +4061,17 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
                 // extension receiver — or a supplied splice receiver — is
                 // subject-like: `fun Owner.Inner.f()` does not put `Inner`'s
                 // enclosing `Owner` instance or companion in scope.
-                const own_is_subject = direct_this != null or switch (frame.func.kind) {
+                // A direct receiver that IS the frame's own `this` param
+                // is a dispatch receiver (an init-block/accessor thunk
+                // carries `this` explicitly), so its nesting tower and
+                // companion stay in scope; only a FOREIGN direct receiver
+                // (a splice/extension subject) suppresses them.
+                const direct_is_frame_recv = if (direct_this) |dt| blk: {
+                    const ti = frameThisParam(frame) orelse break :blk false;
+                    if (ti >= frame.params.items.len) break :blk false;
+                    break :blk sameReceiver(frame.params.items[ti], dt);
+                } else false;
+                const own_is_subject = (direct_this != null and !direct_is_frame_recv) or switch (frame.func.kind) {
                     .top_level_extension, .member_extension => true,
                     else => false,
                 };
@@ -4154,9 +4297,13 @@ inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
             },
         },
         .List => |l| {
+            // A stale subList view must fail fast — leave it to the slow
+            // path, whose read guard throws ConcurrentModificationException.
+            if (recv.sublistViewStale()) return null;
             // An array `.asList()` view re-reads its scalar source so a later
             // array write shows through on this indexed load.
             recv.refreshArrayView();
+            recv.refreshSublistView();
             const g = l.items.borrow();
             defer g.deinit();
             const items = g.get().items;
@@ -4718,12 +4865,28 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
             if (l.* == .Float and r.* == .Long) return ok(.{ .Float = @rem(l.Float, @as(f32, @floatFromInt(r.Long))) });
         },
         .Eq, .NotEq, .BoxedEq, .BoxedNotEq => {
+            // A boxed capture compares by its CONTENT: the Cell is a
+            // carrier (an anon-object method's captured outer `var`),
+            // never a user value.
+            var lc = l.*;
+            while (lc == .Cell) {
+                const cg = lc.Cell.borrow();
+                lc = cg.get().*;
+                cg.deinit();
+            }
+            var rc = r.*;
+            while (rc == .Cell) {
+                const cg = rc.Cell.borrow();
+                rc = cg.get().*;
+                cg.deinit();
+            }
+
             // Mixed-width unsigned equality compares by magnitude
             // (`0u == 0uL`); same-tag and signed paths keep structural equality.
             // Mirrors the relational `compareValues` unsigned reconciliation.
-            if (std.meta.activeTag(l.*) != std.meta.activeTag(r.*)) {
-                if (asUnsigned(l)) |lu| {
-                    if (asUnsigned(r)) |ru| {
+            if (std.meta.activeTag(lc) != std.meta.activeTag(rc)) {
+                if (asUnsigned(&lc)) |lu| {
+                    if (asUnsigned(&rc)) |ru| {
                         const eq = lu == ru;
                         const neg = op == .NotEq or op == .BoxedNotEq;
                         return ok(.{ .Bool = if (neg) !eq else eq });
@@ -4731,9 +4894,9 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
                 }
             }
             const eq = if (op == .BoxedEq or op == .BoxedNotEq)
-                Value.structuralEqBoxed(l, r)
+                Value.structuralEqBoxed(&lc, &rc)
             else
-                Value.structuralEq(l, r);
+                Value.structuralEq(&lc, &rc);
             const neg = op == .NotEq or op == .BoxedNotEq;
             return ok(.{ .Bool = if (neg) !eq else eq });
         },

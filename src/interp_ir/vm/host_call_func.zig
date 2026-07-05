@@ -18,6 +18,7 @@ const vmhost = @import("vmhost.zig");
 const trace = @import("trace.zig");
 const host_call_member = @import("host_call_member.zig");
 const host_globals = @import("host_globals.zig");
+const intrinsic_host = @import("intrinsic_host.zig");
 const overload_match = @import("overload_match.zig");
 const compose = @import("compose.zig");
 
@@ -29,6 +30,7 @@ const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const StringRef = runtime.StringRef;
 const ValueList = runtime.ValueList;
+const InstanceData = runtime.InstanceData;
 const RuntimeError = runtime.RuntimeError;
 const StdlibFn = runtime.StdlibFn;
 const CallCtx = runtime.CallCtx;
@@ -144,6 +146,63 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
         if (bg.get().resolve(fqn)) |f| return f;
     }
     return stdlib.implementation(fqn);
+}
+
+/// See the call site in `callFuncTypedInner`: retag a List of Ints IN
+/// PLACE to Short/Byte when the declared parameter is an iterable of
+/// that narrow kind and every element fits. The literal-typed list is
+/// the only way such a value reaches the param under Kotlin's static
+/// typing, so the retag is faithful.
+fn narrowIntListArg(param_ty: *const TypeRef, arg: *const Value) void {
+    if (arg.* != .List) return;
+    const pn = param_ty.name;
+    const iterable_like = std.mem.eql(u8, pn, "Iterable") or std.mem.eql(u8, pn, "Collection") or
+        std.mem.eql(u8, pn, "List") or std.mem.eql(u8, pn, "MutableList") or std.mem.eql(u8, pn, "Set");
+    if (!iterable_like or param_ty.args.len != 1) return;
+    const en = param_ty.args[0].name;
+    const to_short = std.mem.eql(u8, en, "Short");
+    const to_byte = std.mem.eql(u8, en, "Byte");
+    if (!to_short and !to_byte) return;
+    const g = arg.List.items.borrowMut();
+    defer g.deinit();
+    for (g.get().items) |*v| {
+        if (v.* != .Int) return;
+        const x = v.Int;
+        if (to_short and (x < std.math.minInt(i16) or x > std.math.maxInt(i16))) return;
+        if (to_byte and (x < std.math.minInt(i8) or x > std.math.maxInt(i8))) return;
+    }
+    for (g.get().items) |*v| {
+        const x = v.Int;
+        v.* = if (to_short) .{ .Short = @intCast(x) } else .{ .Byte = @intCast(x) };
+    }
+}
+
+/// Synthetic `KType` instance for a reified type name: `classifier` is the
+/// registered class when one exists (else a minimal KClass), `arguments` is
+/// the empty list, `isMarkedNullable` mirrors a trailing `?`.
+fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Allocator.Error!Value {
+    const nullable = std.mem.endsWith(u8, type_name, "?");
+    const base = if (nullable) type_name[0 .. type_name.len - 1] else type_name;
+    const classifier: Value = blk: {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(base)) |c| break :blk Value{ .Class = c.clone() };
+        break :blk try host_call_member.syntheticClassFromFqn(allocator, base);
+    };
+    const empty_args: Value = .{ .List = .{
+        .items = try ValueList.init(allocator, .empty),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    } };
+    var view = VmIntrinsicHost.borrowed(vmhost.SharedHandles.fromHost(self));
+    const id = intrinsic_host.allocInstanceId(&view);
+    const fields = [_]InstanceData.Field{
+        .{ .name = "classifier", .value = classifier },
+        .{ .name = "arguments", .value = empty_args },
+        .{ .name = "isMarkedNullable", .value = .{ .Bool = nullable } },
+    };
+    return intrinsic_host.newSynthInstance(&view, "kotlin.reflect.KType", id, &fields);
 }
 
 /// Build a `VmIntrinsicHost` mirroring `dispatch_intrinsic`'s, drive the
@@ -797,6 +856,13 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         trace.emit("call_func {s} fid={d} fqn={s} argc={d}", .{ f.name, func.int(), f.fqn, args_in.len });
     }
 
+    // Expected-type literal narrowing at the callee boundary (see
+    // `narrowIntListArg`).
+    for (f.params, 0..) |*p, i| {
+        if (i >= args_in.len) break;
+        narrowIntListArg(&p.ty, &args_in[i]);
+    }
+
     linkAuditCheck(self, module, func, f, args_in);
 
     // A NON-final vararg (Kotlin allows `vararg` before trailing
@@ -1379,6 +1445,15 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                 }
             }
         }
+        // Reified `kotlin.reflect.typeOf<T>()`: served from the call's
+        // reified type argument as a synthetic `KType` (classifier + empty
+        // arguments + nullability) instead of executing the stdlib body's
+        // placeholder throw.
+        if (std.mem.eql(u8, f.name, "typeOf") and std.mem.startsWith(u8, f.fqn, "kotlin.reflect") and
+            type_args.len == 1 and type_args[0].len != 0)
+        {
+            return .{ .ok = try makeKTypeValue(self, allocator, type_args[0]) };
+        }
     }
 
     // Overload resolution. Skipped for an `exact` call: the lowering
@@ -1397,6 +1472,19 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
             const recv = args[0];
             const rest = args[1..];
             return host_call_member.callMember(self, allocator, &recv, fname, rest);
+        }
+    }
+
+    // Expected-type literal narrowing at the callee boundary: kotlinc
+    // types `listOf(5)` as `List<Short>` against a declared
+    // `Iterable<Short>` parameter, so a klio list still carrying the
+    // default Int tags retags its fitting elements to the declared
+    // narrow kind (`shortArrayOf(...).intersect(listOf(5))`). Same
+    // discipline as the `arrayOf<ULong>` retag above.
+    if (funcAt(module, resolved)) |f| {
+        for (f.params, 0..) |*p, i| {
+            if (i >= args.len) break;
+            narrowIntListArg(&p.ty, &args[i]);
         }
     }
 
@@ -1468,14 +1556,18 @@ fn attachDeclaredElemTypes(module: *const Module, func: FuncId, type_args: []con
 }
 
 pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
+    // An anon-object/side-module frame carries no top-level func index;
+    // the overload set lives in the main module, so collect there.
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const eff: *const Module = if (module.func_index.items.len == 0) mg.get() else module;
     // Only intercept genuine overload sets: a single top-level function
-    // keeps the plain global-value path.
-    var candidates: std.ArrayList(FuncId) = .empty;
-    defer candidates.deinit(allocator);
-    for (module.func_index.items) |entry| {
-        if (std.mem.eql(u8, entry.name, name)) try candidates.append(allocator, entry.id);
-    }
-    if (candidates.items.len < 2) return .{ .ok = null };
+    // keeps the plain global-value path. The name index is the same
+    // authority as `func_index` (every append pairs with a name-index
+    // push); the old per-call linear scan of the whole index was the
+    // hottest frame in the interpreter profile.
+    const candidates = eff.funcsBySimpleName(name);
+    if (candidates.len < 2) return .{ .ok = null };
 
     // Pick the best body-carrying overload by runtime arg types through
     // the shared applicability engine (proven zero-divergence against the
@@ -1491,8 +1583,15 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     };
     var best_func: ?FuncId = null;
     var best_score: i32 = 0;
-    for (candidates.items) |cand| {
-        if (positionalPoints(self, module, cand, shapes, scope)) |total| {
+    for (candidates) |cand| {
+        // A receiver-taking candidate whose declared receiver names a
+        // builtin shape the first arg definitely is not (UIntArray.fill
+        // offered a plain Array) is disqualified outright.
+        if (funcAt(eff, cand)) |cf| {
+            if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
+                host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
+        }
+        if (positionalPoints(self, eff, cand, shapes, scope)) |total| {
             if (best_func == null or total > best_score) {
                 best_func = cand;
                 best_score = total;
@@ -1502,10 +1601,10 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     const func = best_func orelse return .{ .ok = null };
 
     if (trace.enabled(name)) {
-        trace.emit("global-overload {s} -> fid={d} (of {d} candidates)", .{ name, func.int(), candidates.items.len });
+        trace.emit("global-overload {s} -> fid={d} (of {d} candidates)", .{ name, func.int(), candidates.len });
     }
 
-    const r = try callFuncTyped(self, allocator, module, func, args, arg_names, &.{}, false);
+    const r = try callFuncTyped(self, allocator, eff, func, args, arg_names, &.{}, false);
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = e },

@@ -3824,6 +3824,13 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
 
 /// Interpreter hook at function entry: once the function is hot, compile its
 /// whole body and run it natively. Returns the outcome, or null to interpret.
+/// Frame register buffers live outside the GC heap (see `eval.regsAlloc`);
+/// growth here must use the same allocator.
+inline fn regsGrowAlloc(fallback: Allocator) Allocator {
+    if (!runtime.reclaimEnabled() and runtime.gc.gc_enabled) return std.heap.c_allocator;
+    return fallback;
+}
+
 pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
     if (!funcEnabled()) return null;
     const fj = forFunc(func) orelse return null;
@@ -3841,7 +3848,7 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
     const cl = &fj.func_jit.?;
     if (params.len < cl.n_params) return null;
     if (regs.items.len < cl.n_regs) {
-        regs.appendNTimes(allocator, .Unit, cl.n_regs - regs.items.len) catch return null;
+        regs.appendNTimes(regsGrowAlloc(allocator), .Unit, cl.n_regs - regs.items.len) catch return null;
     }
     var stack_slots: [128]i64 = undefined;
     var heap_slots: ?[]i64 = null;
@@ -3889,7 +3896,7 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
     const cl = &entry.?;
 
     if (regs.items.len < cl.n_regs) {
-        regs.appendNTimes(allocator, .Unit, cl.n_regs - regs.items.len) catch return null;
+        regs.appendNTimes(regsGrowAlloc(allocator), .Unit, cl.n_regs - regs.items.len) catch return null;
     }
     // Slots live in a per-activation buffer, never a shared one: a trampolined
     // call can re-enter this hook for a nested hot loop, and that inner run must
