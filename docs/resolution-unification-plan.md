@@ -586,11 +586,26 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         AGENT ROOT-CAUSE BACKLOG, DESIGNS RECORDED BUT NOT IMPLEMENTED
         (all have concrete file/line anchors in this session's agent
         reports; re-derive with the named repro shapes if needed):
-        1. Local fn OVERLOADS collapse to last declaration (StringTest.
-           compareToIgnoreCase stack overflow): overload-aware binding
-           (mangled alias per overload + call-site selection by named
-           args/arity/static heads) in stmt.zig lowerLocalFnDecl +
-           expr.zig bare-call arms + lambda_body inheritance.
+        1. LANDED — Local fn OVERLOADS collapse to last declaration
+           (StringTest.compareToIgnoreCase stack overflow, also the
+           GroupingTest.groupingProducers recursion in item 19).
+           Implemented exactly per the design: each same-named local
+           decl also binds a module-lifetime mangled name (`name$ovl<k>`)
+           through a dedicated cell registered BEFORE its body lowers
+           (so sibling bodies select against the full set), a
+           disproof-only static selector (arity, named args,
+           literal/declared type heads) at the single-name call arm, and
+           overload-table inheritance into nested lambda bodies.
+           Lifetime lesson: names shipped in AstLambda captured-name
+           lists are read at runtime — allocate from the module
+           allocator, never the builder's. Beneath the recursion sat
+           TWO case-fold bugs the test then exposed: string.zig's
+           hand-rolled scalarToLower/Upper range subsets missed real
+           mappings (KELVIN -> 'k') — now delegated to char.zig's full
+           tables — and both `equals(ignoreCase)` (whole-string
+           lowercase) and the per-unit fold used the wrong rule; both
+           now apply Kotlin's per-char uppercase-then-lowercase fold
+           ('ſ'=='S', 'ϑ'=='ϴ', and "ß" != "SS" via the length gate).
         2. Enum expected-type propagation (EnumEntriesFactoryTest ×3):
            per-arg expected types with sibling-arg solving in emitCall/
            emitMemberOrGlobal (unifyTypeParam against param tys), enum
@@ -656,12 +671,16 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
         18. Duration formatToExactDecimals saturates at Long range —
             exact digit expansion for |value|>=2^63
             (DurationTest.parseAndFormatInUnits).
-        19. GroupingTest.groupingProducers: sourceIterator recursion on
-            the Grouping synth — undiagnosed.
+        19. LANDED with item 1 — GroupingTest.groupingProducers was the
+            same local-fn-overload collapse (same-named local fns in the
+            test body recursing through the shared binding).
         20. SequenceTest.orEmpty residue — VERIFIED NOT fixed by the
             emptySequence singleton (still fails post-batch: `Expected
             <Sequence>, actual <Sequence>` — an identity, not type,
             mismatch); still open.
+      - **Now 34 dual-identical** after the local-fn-overload landing:
+        GroupingTest.groupingProducers and StringTest.compareToIgnoreCase
+        cleared from the list below, nothing added.
       - **Named remainder (the full 36, post-batch, dual-identical)**:
         ArraysTest.orEmptyNull (pre-existing at 2bfaeef9, verified via
         worktree build); Base64Test.common; CollectionTest

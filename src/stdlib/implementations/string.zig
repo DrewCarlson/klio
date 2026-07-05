@@ -208,9 +208,14 @@ fn charUnitsEqIgnoreCase(a: u16, b: u16) bool {
     const cb = charUnitToScalar(b);
     if (ca != null and cb != null) {
         if (ca.? == cb.?) return true;
-        if (scalarToLower(ca.?) == scalarToLower(cb.?)) return true;
-        if (scalarToUpper(ca.?) == scalarToUpper(cb.?)) return true;
-        return false;
+        // Kotlin's per-char fold: uppercase both; on a miss, lowercase
+        // the UPPERCASED forms (not the originals — 'ϑ' uppercases to
+        // 'Θ' whose lowercase meets lowercase('ϴ'), while lowercasing
+        // the originals directly never converges).
+        const ua = scalarToUpper(ca.?);
+        const ub = scalarToUpper(cb.?);
+        if (ua == ub) return true;
+        return scalarToLower(ua) == scalarToLower(ub);
     }
     return a == b;
 }
@@ -2896,32 +2901,29 @@ fn mapCase(allocator: Allocator, s: []const u8, upper: bool) Allocator.Error![]u
 /// Case-insensitive Unicode equality via case-folded comparison. Strings
 /// are compared after lower-casing each scalar.
 fn eqIgnoreCaseUnicode(allocator: Allocator, a: []const u8, b: []const u8) Allocator.Error!bool {
-    const la = try mapCase(allocator, a, false);
-    defer allocator.free(la);
-    const lb = try mapCase(allocator, b, false);
-    defer allocator.free(lb);
-    return std.mem.eql(u8, la, lb);
+    // Kotlin's `equals(ignoreCase = true)` folds PER UTF-16 UNIT (each
+    // char uppercased, then lowercased on a miss) — whole-string
+    // lowercasing diverges where a char's lowercase differs but its
+    // uppercase folds ('ſ' vs 'S': lowercase keeps 'ſ', uppercase folds
+    // to 'S'), and multi-char expansions ("ß" vs "SS") must NOT equate.
+    const ua = try utf16Units(allocator, a);
+    defer allocator.free(ua);
+    const ub = try utf16Units(allocator, b);
+    defer allocator.free(ub);
+    if (ua.len != ub.len) return false;
+    for (ua, ub) |x, y| {
+        if (!charUnitsEqIgnoreCase(x, y)) return false;
+    }
+    return true;
 }
 
 /// Lower-case a single Unicode scalar (ASCII + common Latin/Greek/Cyrillic
 /// 1:1 ranges).
 fn scalarToLower(cp: u21) u21 {
     if (cp < 0x80) return std.ascii.toLower(@intCast(cp));
-    // Latin-1 supplement.
-    if (cp >= 0xC0 and cp <= 0xDE and cp != 0xD7) return cp + 0x20;
-    // Latin Extended-A even/odd pairs (0x100-0x17F).
-    if (cp >= 0x100 and cp <= 0x137 and cp % 2 == 0) return cp + 1;
-    if (cp >= 0x139 and cp <= 0x148 and cp % 2 == 1) return cp + 1;
-    if (cp >= 0x14A and cp <= 0x177 and cp % 2 == 0) return cp + 1;
-    if (cp >= 0x179 and cp <= 0x17E and cp % 2 == 1) return cp + 1;
-    // Greek (0x391-0x3A9, excluding 0x3A2).
-    if (cp >= 0x391 and cp <= 0x3A9 and cp != 0x3A2) return cp + 0x20;
-    // Cyrillic (0x410-0x42F).
-    if (cp >= 0x410 and cp <= 0x42F) return cp + 0x20;
-    if (cp >= 0x400 and cp <= 0x40F) return cp + 0x50;
-    // Deseret (supplementary plane): capitals -> smalls.
-    if (cp >= 0x10400 and cp <= 0x10427) return cp + 0x28;
-    return cp;
+    // The full Unicode 1:1 table — a hand-rolled range subset here missed
+    // real mappings (KELVIN SIGN -> 'k' broke compareTo(ignoreCase)).
+    return char.lowerScalar(cp);
 }
 
 /// Unicode SpecialCasing unconditional multi-character upper-casings — a
@@ -2956,17 +2958,8 @@ fn scalarToLowerMulti(cp: u21) ?[]const u21 {
 /// Upper-case a single Unicode scalar (inverse of `scalarToLower`'s ranges).
 fn scalarToUpper(cp: u21) u21 {
     if (cp < 0x80) return std.ascii.toUpper(@intCast(cp));
-    if (cp >= 0xE0 and cp <= 0xFE and cp != 0xF7) return cp - 0x20;
-    if (cp >= 0x101 and cp <= 0x138 and cp % 2 == 1) return cp - 1;
-    if (cp >= 0x13A and cp <= 0x148 and cp % 2 == 0) return cp - 1;
-    if (cp >= 0x14B and cp <= 0x177 and cp % 2 == 1) return cp - 1;
-    if (cp >= 0x17A and cp <= 0x17E and cp % 2 == 0) return cp - 1;
-    if (cp >= 0x3B1 and cp <= 0x3C9 and cp != 0x3C2) return cp - 0x20;
-    if (cp >= 0x430 and cp <= 0x44F) return cp - 0x20;
-    if (cp >= 0x450 and cp <= 0x45F) return cp - 0x50;
-    // Deseret (supplementary plane): smalls -> capitals.
-    if (cp >= 0x10428 and cp <= 0x1044F) return cp - 0x28;
-    return cp;
+    // The full Unicode 1:1 table, matching scalarToLower.
+    return char.upperScalar(cp);
 }
 
 /// Unicode whitespace test matching Rust's `char::is_whitespace` for the
