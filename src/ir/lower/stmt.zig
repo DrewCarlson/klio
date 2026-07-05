@@ -230,6 +230,45 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
     } else null;
     if (body_block) |body| {
         const self_cell = try localFnSelfCell(b, f, &body);
+        // Same-named sibling declarations are OVERLOADS, not rebindings.
+        // Register this declaration's signature and bind its mangled
+        // sibling name to a dedicated cell BEFORE the body lowers, so a
+        // call inside any sibling's body (including this one) selects
+        // the applicable overload — the second `assertCompareResult`
+        // must reach the first, not recurse into itself through the
+        // shared plain-name self-cell. The closure lands in the cell
+        // after it is built, below.
+        const mangled_cell: Reg = mangled_blk: {
+            const ov_tys = try b.allocator.alloc(?[]const u8, f.params.len);
+            const ov_names = try b.allocator.alloc([]const u8, f.params.len);
+            var n_required: usize = 0;
+            var has_vararg = false;
+            for (f.params, 0..) |p, j| {
+                ov_tys[j] = if (p.is_vararg) null else p.ty.name.name;
+                ov_names[j] = p.name.name;
+                if (p.is_vararg) has_vararg = true else if (p.default == null) n_required += 1;
+            }
+            const ordinal = if (b.local_fn_overloads.getPtr(f.name.name)) |l| l.items.len else 0;
+            // Module-lifetime: the mangled name ships inside the AstLambda
+            // instruction's captured-name list, read at runtime.
+            const mangled = try std.fmt.allocPrint(b.module.func_name_index.allocator, "{s}$ovl{d}", .{ f.name.name, ordinal });
+            const null_v = try b.emitConst(.Null);
+            const home = b.allocReg();
+            try b.push(.{ .MakeCell = .{ .dst = home, .src = null_v } });
+            try b.bind(mangled, home);
+            try b.markBoxed(mangled);
+            try b.markLocalFn(mangled);
+            if (f.receiver_type != null) try b.markLocalExtFn(mangled);
+            if (f.params.len != 0) try b.setLocalFnParamTys(mangled, ov_tys);
+            try b.addLocalFnOverload(f.name.name, .{
+                .mangled = mangled,
+                .param_tys = ov_tys,
+                .param_names = ov_names,
+                .n_required = n_required,
+                .has_vararg = has_vararg,
+            });
+            break :mangled_blk home;
+        };
         const outer_names: StringSet = try b.visibleNames();
         const inherited_rlp: StringSet = try b.receiverLambdaParamNames();
         var outer_boxed = try b.boxedVarsSnapshot();
@@ -276,6 +315,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             encl_recv,
             inherited_rlp,
             inherited_lef,
+            &b.local_fn_overloads,
             enclosing_owner,
         );
         const body_func = lowered.func;
@@ -336,6 +376,9 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                 try b.setLocalFnParamTys(f.name.name, tys);
             }
         }
+        // The overload's mangled sibling binding (registered above, before
+        // the body lowered) receives the built closure.
+        try b.push(.{ .CellSet = .{ .cell = mangled_cell, .value = dst } });
     }
     return null;
 }

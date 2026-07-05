@@ -23,6 +23,8 @@ const Param = ir.Param;
 const Terminator = ir.Terminator;
 const TypeRef = ir.TypeRef;
 const StringSet = std.StringHashMap(void);
+/// The per-name local-fn overload registry a nested body inherits.
+pub const LocalFnOverloadTable = std.StringHashMap(std.ArrayList(build.LocalFnOverload));
 
 /// The lexically enclosing class context handed to a lambda body so an
 /// enclosing-class member out-prioritises a same-named imported
@@ -106,6 +108,9 @@ pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
     }
     const dst = b.allocReg();
     const unit = try b.module.internConst(b.allocator, .Unit);
+    if (std.c.getenv("KLIO_TRACE_CAPTURE") != null) {
+        std.debug.print("[CAPTURE] unresolved `{s}` collapses to Unit\n", .{name});
+    }
     try b.push(.{ .Const = .{ .dst = dst, .value = unit } });
     return dst;
 }
@@ -167,6 +172,7 @@ pub fn lowerLambdaBodyCapturingKind(
         false,
         inherited_rlp,
         inherited_lef,
+        null,
         enclosing_owner,
     );
 }
@@ -186,6 +192,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
     named_local_encl_recv: bool,
     inherited_rlp: StringSet,
     inherited_lef: StringSet,
+    inherited_lfo: ?*const LocalFnOverloadTable,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
     return lowerLambdaBodyCapturingKindWithIt(
@@ -201,6 +208,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
         named_local_encl_recv,
         inherited_rlp,
         inherited_lef,
+        inherited_lfo,
         enclosing_owner,
         false,
         null,
@@ -226,6 +234,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     named_local_encl_recv: bool,
     inherited_rlp: StringSet,
     inherited_lef: StringSet,
+    inherited_lfo: ?*const LocalFnOverloadTable,
     enclosing_owner: ?EnclosingOwner,
     suppress_it: bool,
     it_span: ?ast.Span,
@@ -265,6 +274,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     var inherited_ext = inherited_lef;
     defer inherited_ext.deinit();
     try b.inheritLocalExtFns(&inherited_ext);
+    // And for local-fn overload sets: a call in this body to a captured
+    // local fn declared more than once must still select the applicable
+    // sibling by its mangled binding.
+    if (inherited_lfo) |table| {
+        try b.inheritLocalFnOverloads(table);
+    }
     if (tailrec_self) |name| {
         b.setTailrecSelf(name);
     }
