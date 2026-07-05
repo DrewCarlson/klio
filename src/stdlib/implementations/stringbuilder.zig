@@ -185,6 +185,61 @@ fn appendValue(buf: *Buffer, allocator: Allocator, v: Value) Allocator.Error!voi
     }
 }
 
+/// Whether an instance's class directly declares `CharSequence` among its
+/// supertypes — the shapes whose `length` the append/insert overflow guard
+/// consults before materialising any content.
+fn instanceIsCharSequence(v: *const Value) bool {
+    if (v.* != .Instance) return false;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    for (cg.get().supertype_names) |s| {
+        if (std.mem.eql(u8, s, "CharSequence")) return true;
+    }
+    return false;
+}
+
+/// Guard an append/insert of `v` onto `sb`: when the argument's length is
+/// knowable up front (strings, builders, user CharSequences via their
+/// `length` property) and the combined UTF-16 length exceeds
+/// `Int.MAX_VALUE`, throw OutOfMemoryError BEFORE materialising anything —
+/// the JVM builder grows capacity first, so an overflowing CharSequence's
+/// chars are never read.
+fn appendOverflowGuard(ctx: *CallCtx, sb: StringBuilderRef, v: *const Value) Allocator.Error!?EvalResult {
+    const add: i64 = switch (v.*) {
+        .String => |s| blk: {
+            const g = s.borrow();
+            defer g.deinit();
+            break :blk @intCast(g.get().u16_len);
+        },
+        .StringBuilder => |other| blk: {
+            const g = other.borrow();
+            defer g.deinit();
+            break :blk @intCast(g.get().items.len);
+        },
+        .Instance => blk: {
+            if (!instanceIsCharSequence(v)) return null;
+            const r = ctx.host.getProperty(v, "length", ctx.out) catch return null;
+            const res = r orelse return null;
+            switch (res) {
+                .ok => |lv| break :blk lv.asI64() orelse return null,
+                .err => return null,
+            }
+        },
+        else => return null,
+    };
+    const cur: i64 = blk: {
+        const g = sb.borrow();
+        defer g.deinit();
+        break :blk @intCast(g.get().items.len);
+    };
+    if (cur + add > std.math.maxInt(i32)) {
+        return try thrown(ctx.allocator, "kotlin.OutOfMemoryError", "Requested character sequence exceeds the maximum length");
+    }
+    return null;
+}
+
 /// The text `append(value)` / `insert(_, value)` writes for `value`. Owned by
 /// the caller. Unlike `appendValue` this renders a `StringBuilder` as its
 /// content, a `CharArray` as its characters, and any other object via its
@@ -613,6 +668,7 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
     // Render each argument before borrowing the buffer: a user `toString()`
     // must not run while the receiver buffer is held mutably.
     for (ctx.args[1..]) |v| {
+        if (try appendOverflowGuard(ctx, sb, &v)) |oom| return oom;
         const piece = try renderPiece(ctx, v);
         defer a.free(piece);
         const g = sb.borrowMut();
@@ -791,6 +847,7 @@ pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (idx == null) return errResult(.{ .Type = "insert index must be Int" });
     if (ctx.args.len < 3) return errResult(.{ .Arity = "insert requires a value" });
 
+    if (try appendOverflowGuard(ctx, sb, &ctx.args[2])) |oom| return oom;
     const piece_bytes = try renderPiece(ctx, ctx.args[2]);
     defer a.free(piece_bytes);
     var piece: Buffer = .empty;
