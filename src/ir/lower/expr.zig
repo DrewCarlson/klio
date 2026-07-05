@@ -699,6 +699,26 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     const lhs = bin.lhs;
     const rhs = bin.rhs;
 
+    // `list + (x as Any)`: kotlinc resolves `plus(element: T)` from the
+    // RHS's STATIC type, appending the value as one element even when it
+    // is itself a list at runtime. Route a statically list-headed LHS
+    // with an Any-cast RHS through `plusElement`.
+    if (op == .Add and staticListHead(lhs) and ast_scan.isBoxedToAnyForm(rhs)) {
+        const l = try lowerExpr(b, lhs);
+        const r = try lowerExpr(b, rhs);
+        const args_start = try packContiguous(b, &.{r});
+        const dst = b.allocReg();
+        const nm = try b.module.internConst(b.allocator, .{ .String = "plusElement" });
+        try b.push(.{ .CallMember = .{
+            .dst = dst,
+            .receiver = l,
+            .name = nm,
+            .args = args_start,
+            .n_args = 1,
+        } });
+        return dst;
+    }
+
     // `==` on a boxed operand (an `Any`-typed or generic type-parameter value,
     // e.g. `assertEquals(expected: T, actual: T)`) uses total-order equality —
     // `NaN == NaN` is true and `0.0 != -0.0`, matching boxed `Double.equals`.
@@ -1887,6 +1907,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         false,
         inherited_rlp,
         inherited_lef,
+        &b.local_fn_overloads,
         enclosing_owner,
         suppress_it,
         if (suppress_it) lam.span else null,
@@ -3197,6 +3218,23 @@ fn lowerCallSpread(
                 break :blk try lowerReceiver(b, m.receiver);
             }
         }
+        // A bare callee naming an enclosing-class member fn
+        // (`checkContents(context, *es)` inside another member) dispatches
+        // through `this`, not as a first-class value read (a member fn is
+        // not a field, so the value path dies on `get_field`). A name that
+        // is also a known top-level fn (`maxOf(a, *rest)`) keeps the
+        // global path — the member set over-approximates.
+        if (callee.* == .Path and callee.Path.segments.len == 1) {
+            const name = callee.Path.segments[0].name;
+            if (b.resolve(name) == null and !b.isLocalFn(name) and b.hasEnclosingMember(name) and
+                b.module.funcId(name) == null)
+            {
+                if (try resolveThisForBareCall(b)) |this_reg| {
+                    member_id = try b.module.internConst(b.allocator, .{ .String = name });
+                    break :blk this_reg;
+                }
+            }
+        }
         break :blk try lowerExpr(b, callee);
     };
     const parts = try b.allocator.alloc(SpreadPart, args.len);
@@ -3647,6 +3685,17 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // A single-name callee resolving to a local binding / parameter is a
     // value invocation.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
+        // Same-named local-fn siblings are OVERLOADS: when the call's
+        // static facts (arity, argument names, literal/declared type
+        // heads) select exactly one, call through its mangled cell —
+        // reachable both in the declaring scope and as a capture. Calls
+        // no fact separates keep the plain last-decl binding below.
+        const bare = callee.Path.segments[0].name;
+        if (b.localFnOverloads(bare)) |ovs| {
+            if (selectLocalFnOverload(b, ovs, args, ast_arg_names)) |m| {
+                if (try lowerSelectedLocalOverloadCall(b, m, args, ast_arg_names)) |r| return r;
+            }
+        }
         if (try lowerValueInvocation(b, callee, args, ast_arg_names)) |r| return r;
     }
 
@@ -3788,6 +3837,31 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // merely "an unknown receiver could have it" — so a top-level helper
         // (`testEquals`) called in a lambda is left on the global path.
         if (b.resolve(nm0) == null and inReceiverContext(b) and b.hasEnclosingMember(nm0)) {
+            // A captured local fn is a candidate the runtime member walk
+            // cannot see: emit the runtime-arbitrated form. Its value arm
+            // falls to the enclosing member when the closure's declared
+            // params refute the args (`testEncode(codec, bytes, symbols)`
+            // binds the local on String args, the private member on
+            // ByteArray).
+            if (b.knowsOuter(nm0) and call.type_args.len == 0) {
+                if (try resolveThisForBareCallNoBind(b)) |this_reg| {
+                    const cv = try resolveCapture(b, nm0);
+                    const run0 = try lowerArgRun(b, args);
+                    const an0 = try internArgNames(b.allocator, b.module, ast_arg_names);
+                    const nmc = try b.module.internConst(b.allocator, .{ .String = nm0 });
+                    const d0 = b.allocReg();
+                    try b.push(.{ .CallValueOrMember = .{
+                        .dst = d0,
+                        .callee = cv,
+                        .this_recv = this_reg,
+                        .name = nmc,
+                        .args = run0[0],
+                        .n_args = run0[1],
+                        .arg_names = an0,
+                    } });
+                    return d0;
+                }
+            }
             if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
         }
     }
@@ -4112,6 +4186,187 @@ fn inlineCandLabel(f: ?*const ast.Function) []const u8 {
     return if (fp.is_suspend) "plain+suspend" else "plain";
 }
 
+/// The definitely-known static type head of an argument expression, for
+/// local-fn overload selection: literals, lambdas, and locals with a
+/// declared type annotation. Null = unknown (never disproves).
+fn staticArgHead(b: *const FuncBuilder, e: *const Expr) ?[]const u8 {
+    return switch (e.*) {
+        .BoolLit => "Boolean",
+        .StringTemplate => "String",
+        .CharLit => "Char",
+        .IntLit => "Int",
+        .FloatLit => "Double",
+        .Lambda => "->",
+        .Path => |p| blk: {
+            if (p.segments.len != 1) break :blk null;
+            break :blk b.localDeclType(p.segments[0].name);
+        },
+        else => null,
+    };
+}
+
+fn allUppercase(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isUpper(c)) return false;
+    }
+    return s.len != 0;
+}
+
+const numeric_heads = [_][]const u8{
+    "Int", "Long", "Short", "Byte", "Double", "Float",
+    "UInt", "ULong", "UShort", "UByte", "Number",
+};
+
+fn headIsNumeric(h: []const u8) bool {
+    for (numeric_heads) |n| {
+        if (std.mem.eql(u8, h, n)) return true;
+    }
+    return false;
+}
+
+/// Can an argument with static head `h` bind a parameter declared `d`?
+/// Disproof-only: `true` unless both sides are known and definitely
+/// incompatible (numeric literals coerce across the numeric family).
+fn headCompatible(h: []const u8, d_raw: []const u8) bool {
+    const d = std.mem.trimEnd(u8, d_raw, "?");
+    if (std.mem.eql(u8, d, "Any") or std.mem.eql(u8, d, "Unit")) return true;
+    if (d.len > 0 and d.len <= 2 and allUppercase(d)) return true;
+    const d_fn = std.mem.indexOf(u8, d, "->") != null or std.mem.startsWith(u8, d, "Function");
+    if (std.mem.eql(u8, h, "->")) return d_fn;
+    if (d_fn) return false;
+    if (std.mem.eql(u8, h, d)) return true;
+    if (headIsNumeric(h) and headIsNumeric(d)) return true;
+    // The head is a definite literal kind; a differently-named declared
+    // class stays unknown (could be a supertype) — only the builtin
+    // scalar heads disprove each other.
+    const scalars = [_][]const u8{ "Boolean", "String", "Char" };
+    var h_scalar = headIsNumeric(h);
+    var d_scalar = headIsNumeric(d);
+    for (scalars) |s| {
+        if (std.mem.eql(u8, h, s)) h_scalar = true;
+        if (std.mem.eql(u8, d, s)) d_scalar = true;
+    }
+    return !(h_scalar and d_scalar);
+}
+
+/// Statically select among same-named local-fn declarations: arity and
+/// named-argument fit, then literal/declared-type disproof per bound
+/// parameter. Returns the unique survivor's mangled binding, or null
+/// when no signature fact separates the candidates (the caller keeps
+/// the plain last-decl binding).
+fn selectLocalFnOverload(
+    b: *const FuncBuilder,
+    ovs: []const build.LocalFnOverload,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) ?[]const u8 {
+    var survivor: ?*const build.LocalFnOverload = null;
+    var n_survivors: usize = 0;
+    var exact: ?*const build.LocalFnOverload = null;
+    var n_exact: usize = 0;
+    outer: for (ovs) |*ov| {
+        if (args.len < ov.n_required and !ov.has_vararg) continue;
+        if (args.len > ov.param_tys.len and !ov.has_vararg) continue;
+        var bound = [_]bool{false} ** 64;
+        if (ov.param_tys.len > bound.len) continue;
+        var positional: usize = 0;
+        for (args, 0..) |*a, i| {
+            const supplied: ?[]const u8 = if (i < ast_arg_names.len) ast_arg_names[i] else null;
+            var pi: ?usize = null;
+            if (supplied) |nm| {
+                for (ov.param_names, 0..) |pn, k| {
+                    if (std.mem.eql(u8, pn, nm)) {
+                        if (bound[k]) continue :outer;
+                        pi = k;
+                        bound[k] = true;
+                        break;
+                    }
+                }
+                if (pi == null) continue :outer;
+            } else {
+                if (positional < ov.param_tys.len) {
+                    pi = positional;
+                    bound[positional] = true;
+                } else if (!ov.has_vararg) {
+                    continue :outer;
+                }
+                positional += 1;
+            }
+            if (pi) |k| {
+                const d = ov.param_tys[k] orelse continue;
+                const h = staticArgHead(b, a) orelse continue;
+                if (!headCompatible(h, d)) continue :outer;
+            }
+        }
+        survivor = ov;
+        n_survivors += 1;
+        if (args.len == ov.param_tys.len) {
+            exact = ov;
+            n_exact += 1;
+        }
+    }
+    if (n_survivors == 1) return survivor.?.mangled;
+    if (n_exact == 1) return exact.?.mangled;
+    return null;
+}
+
+/// Emit the call to a statically selected local-fn overload through its
+/// mangled cell binding — resolvable in the declaring scope or as a
+/// capture. Null when this scope cannot reach the cell (a forward sibling
+/// reference from a lambda captured before the sibling declared); the
+/// caller falls back to the plain-name binding.
+fn lowerSelectedLocalOverloadCall(
+    b: *FuncBuilder,
+    mangled: []const u8,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?Reg {
+    const cell: Reg = if (b.resolve(mangled)) |r|
+        r
+    else if (b.knowsOuter(mangled))
+        try resolveCapture(b, mangled)
+    else
+        return null;
+    const callee_reg = b.allocReg();
+    try b.push(.{ .CellGet = .{ .dst = callee_reg, .cell = cell } });
+    // A selected local *extension* overload takes the enclosing receiver
+    // as its leading `this` param, like the plain-name ext arm.
+    if (b.isLocalExtFn(mangled)) {
+        const this_reg = try resolveThisForBareCallNoBind(b);
+        if (this_reg) |tr| {
+            const recv = b.allocReg();
+            try b.push(.{ .Move = .{ .dst = recv, .src = tr } });
+            const vals = try b.allocator.alloc(Reg, args.len + 1);
+            defer b.allocator.free(vals);
+            vals[0] = recv;
+            for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
+            const args_start = try packContiguous(b, vals);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            try b.push(.{ .CallValue = .{
+                .dst = dst,
+                .callee = callee_reg,
+                .args = args_start,
+                .n_args = @intCast(vals.len),
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+    }
+    const lfp: ?[]const ?[]const u8 = if (allNull(ast_arg_names)) b.localFnParamTys(mangled) else null;
+    const run = try lowerArgRunFull(b, args, null, lfp);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const dst = b.allocReg();
+    try b.push(.{ .CallValue = .{
+        .dst = dst,
+        .callee = callee_reg,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+    } });
+    return dst;
+}
+
 /// A single-name callee bound as a local / parameter / receiver-lambda-param.
 fn lowerValueInvocation(
     b: *FuncBuilder,
@@ -4175,39 +4430,46 @@ fn lowerValueInvocation(
         }
     }
 
-    // Member-function precedence over a same-named value/param.
+    // Member-function precedence over a same-named value/param. A local
+    // fn with a same-named enclosing member also routes through the
+    // arbitrated form: the value arm wins unless the closure's declared
+    // params refute the args (Kotlin picks the member overload then), so
+    // `testEncode(codec, byteArray, s)` reaches the private member past
+    // the String-typed local.
     const redirect_to_member = blk: {
-        var is_hierarchy_method = false;
-        if (b.ownerClass()) |oc| {
-            if (b.module.registry.hierarchy_methods.get(oc)) |s| {
-                is_hierarchy_method = s.contains(name0);
+        var member_declared = b.hasEnclosingMember(name0);
+        if (!member_declared) {
+            if (b.ownerClass()) |oc| {
+                if (b.module.registry.hierarchy_methods.get(oc)) |s| {
+                    member_declared = s.contains(name0);
+                }
             }
         }
-        break :blk is_hierarchy_method and b.resolve(name0) != null and
-            !b.isLocalFn(name0) and !b.isLocalExtFn(name0) and b.resolve("this") != null;
+        break :blk member_declared and b.resolve(name0) != null and !b.isLocalExtFn(name0);
     };
     if (redirect_to_member) {
-        const this_reg = b.resolve("this").?;
-        var callee_reg = b.resolve(name0).?;
-        if (b.isBoxed(name0)) {
-            const c = b.allocReg();
-            try b.push(.{ .CellGet = .{ .dst = c, .cell = callee_reg } });
-            callee_reg = c;
+        if (try resolveThisForBareCallNoBind(b)) |this_reg| {
+            var callee_reg = b.resolve(name0).?;
+            if (b.isBoxed(name0)) {
+                const c = b.allocReg();
+                try b.push(.{ .CellGet = .{ .dst = c, .cell = callee_reg } });
+                callee_reg = c;
+            }
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+            try b.push(.{ .CallValueOrMember = .{
+                .dst = dst,
+                .callee = callee_reg,
+                .this_recv = this_reg,
+                .name = nm,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
         }
-        const run = try lowerArgRun(b, args);
-        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-        const dst = b.allocReg();
-        const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-        try b.push(.{ .CallValueOrMember = .{
-            .dst = dst,
-            .callee = callee_reg,
-            .this_recv = this_reg,
-            .name = nm,
-            .args = run[0],
-            .n_args = run[1],
-            .arg_names = arg_names,
-        } });
-        return dst;
     }
 
     if (b.resolve(name0)) |reg| {
@@ -4307,6 +4569,22 @@ fn lowerValueInvocation(
 /// Whether a single-segment class-name call resolves to the constructor
 /// rather than a same-named factory function.
 const LitKind = enum { numeric, string, boolean, char };
+
+/// Whether an expression's STATIC type head is definitely a list-family
+/// value: a call to a list factory, or a `listOf(...) + x` chain. Used to
+/// route `list + (rhs as Any)` through `plusElement`.
+fn staticListHead(e: *const Expr) bool {
+    return switch (e.*) {
+        .Call => |c| blk: {
+            if (c.callee.* != .Path or c.callee.Path.segments.len != 1) break :blk false;
+            const n = c.callee.Path.segments[0].name;
+            break :blk std.mem.eql(u8, n, "listOf") or std.mem.eql(u8, n, "mutableListOf") or
+                std.mem.eql(u8, n, "emptyList") or std.mem.eql(u8, n, "arrayListOf");
+        },
+        .Binary => |bi| bi.op == .Add and staticListHead(bi.lhs),
+        else => false,
+    };
+}
 
 /// Definite builtin value kind of a literal argument expression, or null when
 /// the argument's type is not a known literal (so it can never *disprove* a
@@ -7069,6 +7347,30 @@ test "lowers is-check to instance-of" {
     defer freeFunc(func);
     const insts = func.blocks[0].insts;
     try testing.expect(insts[insts.len - 1] == .InstanceOf);
+}
+
+test "headCompatible: literal heads disprove scalar params only" {
+    // Literal Boolean disproves a String param — the local-fn overload
+    // shape that recursed before selection existed.
+    try std.testing.expect(!headCompatible("Boolean", "String"));
+    try std.testing.expect(headCompatible("Boolean", "Boolean"));
+    // Numeric literals coerce across the numeric family.
+    try std.testing.expect(headCompatible("Int", "Long"));
+    try std.testing.expect(headCompatible("Int", "Double"));
+    try std.testing.expect(!headCompatible("Int", "String"));
+    // A lambda binds only function-shaped or generic params.
+    try std.testing.expect(headCompatible("->", "() -> Unit"));
+    try std.testing.expect(headCompatible("->", "T"));
+    try std.testing.expect(!headCompatible("->", "String"));
+    try std.testing.expect(!headCompatible("String", "(Int) -> Int"));
+    // A user class head never disproves another named type (supertypes
+    // are unknown here); generic/Any params accept anything.
+    try std.testing.expect(headCompatible("MyThing", "Other"));
+    try std.testing.expect(headCompatible("String", "Any"));
+    try std.testing.expect(headCompatible("Int", "T"));
+    // Nullable params adjudicate under the underlying head.
+    try std.testing.expect(headCompatible("Boolean", "Boolean?"));
+    try std.testing.expect(!headCompatible("Boolean", "String?"));
 }
 
 test "lowers postfix not-null assert" {

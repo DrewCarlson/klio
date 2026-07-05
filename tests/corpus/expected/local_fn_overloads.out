@@ -1,0 +1,5 @@
+a:1/one/true
+b:3 {a:2/pair/false}
+42
+abab
+b:9 {a:7/lam/false}

@@ -23,6 +23,8 @@ const Param = ir.Param;
 const Terminator = ir.Terminator;
 const TypeRef = ir.TypeRef;
 const StringSet = std.StringHashMap(void);
+/// The per-name local-fn overload registry a nested body inherits.
+pub const LocalFnOverloadTable = std.StringHashMap(std.ArrayList(build.LocalFnOverload));
 
 /// The lexically enclosing class context handed to a lambda body so an
 /// enclosing-class member out-prioritises a same-named imported
@@ -106,6 +108,9 @@ pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
     }
     const dst = b.allocReg();
     const unit = try b.module.internConst(b.allocator, .Unit);
+    if (std.c.getenv("KLIO_TRACE_CAPTURE") != null) {
+        std.debug.print("[CAPTURE] unresolved `{s}` collapses to Unit\n", .{name});
+    }
     try b.push(.{ .Const = .{ .dst = dst, .value = unit } });
     return dst;
 }
@@ -167,6 +172,7 @@ pub fn lowerLambdaBodyCapturingKind(
         false,
         inherited_rlp,
         inherited_lef,
+        null,
         enclosing_owner,
     );
 }
@@ -186,6 +192,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
     named_local_encl_recv: bool,
     inherited_rlp: StringSet,
     inherited_lef: StringSet,
+    inherited_lfo: ?*const LocalFnOverloadTable,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
     return lowerLambdaBodyCapturingKindWithIt(
@@ -201,6 +208,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
         named_local_encl_recv,
         inherited_rlp,
         inherited_lef,
+        inherited_lfo,
         enclosing_owner,
         false,
         null,
@@ -226,6 +234,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     named_local_encl_recv: bool,
     inherited_rlp: StringSet,
     inherited_lef: StringSet,
+    inherited_lfo: ?*const LocalFnOverloadTable,
     enclosing_owner: ?EnclosingOwner,
     suppress_it: bool,
     it_span: ?ast.Span,
@@ -265,6 +274,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     var inherited_ext = inherited_lef;
     defer inherited_ext.deinit();
     try b.inheritLocalExtFns(&inherited_ext);
+    // And for local-fn overload sets: a call in this body to a captured
+    // local fn declared more than once must still select the applicable
+    // sibling by its mangled binding.
+    if (inherited_lfo) |table| {
+        try b.inheritLocalFnOverloads(table);
+    }
     if (tailrec_self) |name| {
         b.setTailrecSelf(name);
     }
@@ -343,7 +358,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     const result = try expr.lowerBlock(&b, body);
     b.terminate(.{ .Return = result });
     const captured = try b.allocator.dupe([]const u8, b.capturesTaken());
-    var func = try b.finish("<lambda>", "<lambda>", build.typeUnit());
+    var func = try b.finish("<lambda>", "<lambda>", literalReturnTy(body) orelse build.typeUnit());
     // Function count is bounded well below u32::MAX; the index is the new FuncId.
     const id = module.nextFuncId();
     func.id = id;
@@ -380,6 +395,44 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         std.mem.eql(u8, placed_params[0].name, "this");
     try module.funcs.append(b.allocator, func);
     return .{ .func = id, .captures = captured };
+}
+
+/// Static return type of a lambda whose body is a single numeric literal
+/// (`{ 1 }`, `{ 1L }`, `{ 1U }`, `{ 1.0 }`). Numeric-kind-preserving folds
+/// (`sumOf`) read it through the host to seed an empty-receiver
+/// accumulator with the right kind; anything non-literal stays the Unit
+/// placeholder, which dispatch treats as no-information.
+fn literalReturnTy(body: *const ast.Block) ?ir.TypeRef {
+    if (body.stmts.len == 0) return null;
+    const last = &body.stmts[body.stmts.len - 1];
+    const e = switch (last.*) {
+        .Expr => |*ex| ex,
+        else => return null,
+    };
+    const name: []const u8 = switch (e.*) {
+        .IntLit => |l| switch (l.kind) {
+            .Int => "kotlin.Int",
+            .Long => "kotlin.Long",
+            .UInt => "kotlin.UInt",
+            .ULong => "kotlin.ULong",
+        },
+        .FloatLit => |l| switch (l.kind) {
+            .Double => "kotlin.Double",
+            .Float => "kotlin.Float",
+        },
+        else => return null,
+    };
+    return .{ .name = name, .nullable = false, .args = &.{} };
+}
+
+test "literalReturnTy classifies single-literal lambda bodies" {
+    const s = ast.Span.init(@enumFromInt(0), 0, 1);
+    var stmts = [_]ast.Stmt{.{ .Expr = .{ .IntLit = .{ .value = 1, .kind = .ULong, .span = s } } }};
+    const blk: ast.Block = .{ .stmts = &stmts, .span = s };
+    const ty = literalReturnTy(&blk) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("kotlin.ULong", ty.name);
+    const empty: ast.Block = .{ .stmts = &.{}, .span = s };
+    try std.testing.expect(literalReturnTy(&empty) == null);
 }
 
 test {

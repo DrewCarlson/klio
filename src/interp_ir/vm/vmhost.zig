@@ -282,6 +282,7 @@ pub const VmHost = struct {
     // every `ir.eval.evalWith(VmHost, ...)` call site.
     pub const callValue = host_call_value.callValue;
     pub const callValueNamed = host_call_value.callValueNamed;
+    pub const closureParamsDisproven = host_call_value.closureParamsDisproven;
     pub const callValueNamedTyped = host_call_value.callValueNamedTyped;
     pub const collectionsEqualHostAware = host_call_member.collectionsEqualHostAware;
     pub const callValueWithThis = host_call_value.callValueWithThis;
@@ -472,6 +473,18 @@ fn ivOsThreadAlive(ctx: *anyopaque, id: u64) bool {
 fn ivBuilderStep(ctx: *anyopaque, state: runtime.BuilderStateRef, out: Output) Allocator.Error!runtime.BuilderStepResult {
     return @import("coroutines.zig").builderStep(ip(ctx), state, out);
 }
+fn ivCallableReturnTy(ctx: *anyopaque, callable: *const Value) ?[]const u8 {
+    const self = ip(ctx);
+    if (callable.* != .IrClosure) return null;
+    const info = self.closures.get(@intCast(callable.IrClosure.id)) orelse return null;
+    const module_ref = self.module.clone();
+    defer module_ref.deinit();
+    const module = info.module orelse module_ref.asPtr();
+    const func = module.funcById(info.body_func) orelse return null;
+    const name = func.return_ty.name;
+    if (name.len == 0 or std.mem.eql(u8, name, "Unit") or std.mem.eql(u8, name, "kotlin.Unit")) return null;
+    return name;
+}
 
 const intrinsic_vtable: IntrinsicHost.VTable = .{
     .invoke_callable = ivInvokeCallable,
@@ -500,6 +513,7 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .join_os_thread = ivJoinOsThread,
     .os_thread_alive = ivOsThreadAlive,
     .builder_step = ivBuilderStep,
+    .callable_return_ty = ivCallableReturnTy,
 };
 
 const testing = std.testing;

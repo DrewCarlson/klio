@@ -171,6 +171,20 @@ pub fn anonScopeRename(name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// One same-named local-function declaration: the mangled binding its
+/// closure is ALSO bound under, plus the static signature facts a call
+/// site selects on. Slices are owned by the declaring builder's allocator.
+pub const LocalFnOverload = struct {
+    mangled: []const u8,
+    /// Positional param type heads, leading `this` receiver dropped;
+    /// null where the parameter is a vararg.
+    param_tys: []const ?[]const u8,
+    param_names: []const []const u8,
+    /// Parameters without defaults — a call must supply at least this many.
+    n_required: usize,
+    has_vararg: bool,
+};
+
 pub const FuncBuilder = struct {
     allocator: Allocator,
     module: *Module,
@@ -298,6 +312,11 @@ pub const FuncBuilder = struct {
     /// Subset of `local_fns` declared as extensions (`fun R.f(...)`);
     /// a bare call must prepend the implicit receiver as `this`.
     local_ext_fns: StringSet,
+    /// Per local-fn NAME: one entry per same-named declaration, in decl
+    /// order. Each overload's closure is additionally bound under a
+    /// mangled name so a call site can select the right sibling — the
+    /// plain name keeps last-decl-wins binding for unresolvable calls.
+    local_fn_overloads: std.StringHashMap(std.ArrayList(LocalFnOverload)),
     /// Declared type annotation per local (`val resp: HttpResponse`),
     /// used by inline-overload receiver narrowing.
     local_decl_types: std.StringHashMap([]const u8),
@@ -460,6 +479,7 @@ pub const FuncBuilder = struct {
             .local_decl_nullable = std.StringHashMap(void).init(allocator),
             .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
             .local_ext_fns = StringSet.init(allocator),
+            .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
             .receiver_lambda_arity = std.StringHashMap(usize).init(allocator),
             .generic_typed_params = StringSet.init(allocator),
@@ -512,6 +532,19 @@ pub const FuncBuilder = struct {
             self.local_fn_param_tys.deinit();
         }
         self.local_fns.deinit();
+        {
+            // `mangled` is module-lifetime (it ships in AstLambda
+            // captured-name lists); only the builder-owned slices free.
+            var it = self.local_fn_overloads.valueIterator();
+            while (it.next()) |list| {
+                for (list.items) |ov| {
+                    a.free(ov.param_tys);
+                    a.free(ov.param_names);
+                }
+                list.deinit(a);
+            }
+            self.local_fn_overloads.deinit();
+        }
         self.local_decl_types.deinit();
         self.local_decl_nullable.deinit();
         self.local_init_exprs.deinit();
@@ -1008,6 +1041,39 @@ pub const FuncBuilder = struct {
     }
     pub fn isLocalFn(self: *const FuncBuilder, name: []const u8) bool {
         return self.local_fns.contains(name);
+    }
+    /// Register one same-named local-fn declaration. Takes ownership of
+    /// `ov`'s slices (they must come from this builder's allocator).
+    pub fn addLocalFnOverload(self: *FuncBuilder, name: []const u8, ov: LocalFnOverload) Allocator.Error!void {
+        const gop = try self.local_fn_overloads.getOrPut(name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.allocator, ov);
+    }
+    /// All same-named declarations seen for `name`, in decl order; null
+    /// unless the name was declared at least twice (a single decl never
+    /// needs selection, so it is not registered).
+    pub fn localFnOverloads(self: *const FuncBuilder, name: []const u8) ?[]const LocalFnOverload {
+        const list = self.local_fn_overloads.getPtr(name) orelse return null;
+        if (list.items.len < 2) return null;
+        return list.items;
+    }
+    /// Seed this builder's overload table from an enclosing scope's, so a
+    /// nested lambda calling a captured local fn still selects among its
+    /// siblings. Entries are shared (the enclosing builder outlives the
+    /// nested body's lowering); the receiving builder must not free them.
+    pub fn inheritLocalFnOverloads(self: *FuncBuilder, table: *const std.StringHashMap(std.ArrayList(LocalFnOverload))) Allocator.Error!void {
+        var it = table.iterator();
+        while (it.next()) |e| {
+            const gop = try self.local_fn_overloads.getOrPut(e.key_ptr.*);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            for (e.value_ptr.items) |ov| {
+                var dup = ov;
+                // `mangled` is module-lifetime — share it.
+                dup.param_tys = try self.allocator.dupe(?[]const u8, ov.param_tys);
+                dup.param_names = try self.allocator.dupe([]const u8, ov.param_names);
+                try gop.value_ptr.append(self.allocator, dup);
+            }
+        }
     }
     pub fn markLocalExtFn(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.local_ext_fns.put(name, {});
