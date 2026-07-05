@@ -51,8 +51,12 @@ fn runKlio(
         .argv = argv,
         .environ_map = env,
         // A test file that makes the interpreter hang (infinite loop, not a
-        // crash) must not stall the suite; cap each child.
-        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(200_000), .clock = .awake } },
+        // crash) must not stall the suite; cap each child. Sized above the
+        // slowest legitimate job (DeepRecursiveTest interprets ~400k
+        // coroutine resumes and needs ~300s solo — the unwind-cost residual
+        // in the resolution-unification plan) so a slow-but-linear pass is
+        // never miscounted as blocked.
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(480_000), .clock = .awake } },
     }) catch |e| {
         // A timed-out (hanging) child is reported as a blocked file, not a
         // hard spawn failure.
@@ -104,6 +108,12 @@ fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayL
 fn fileHasTest(a: std.mem.Allocator, io: std.Io, path: []const u8) bool {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return false;
     return std.mem.indexOf(u8, bytes, "@Test") != null;
+}
+
+/// Number of `@Test` occurrences in a file — the shard-balancing weight.
+fn testCount(a: std.mem.Allocator, io: std.Io, path: []const u8) usize {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return 0;
+    return std.mem.count(u8, bytes, "@Test");
 }
 
 /// Parse the "<n> tests, <p> passed, ..." summary line for the passed count.
@@ -257,10 +267,36 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
         }
     }
 
+    // Weighted shard assignment. Stride slicing splits pass-mass badly —
+    // passes cluster in a few big files, and a slice's share of the total
+    // swung well past the ±25% the coarse ratchet's slack assumes (shard
+    // halves measured 720 vs 1394). Weight each target by its `@Test`
+    // count and greedy-assign to the lightest shard: every shard process
+    // computes the same assignment from the same file contents, and the
+    // weight split lands within a few percent of proportional.
+    const shard_of = try a.alloc(usize, targets.items.len);
+    var my_weight: usize = 0;
+    var total_weight: usize = 0;
+    {
+        const loads = try a.alloc(usize, shard_n);
+        @memset(loads, 0);
+        for (targets.items, 0..) |t, ti| {
+            const w = @max(testCount(a, io, t), 1);
+            total_weight += w;
+            var best: usize = 0;
+            for (loads, 0..) |ld, si| {
+                if (ld < loads[best]) best = si;
+            }
+            shard_of[ti] = best;
+            loads[best] += w;
+        }
+        my_weight = loads[shard_k];
+    }
+
     var jobs: std.ArrayList([]const []const u8) = .empty;
     var my_targets: usize = 0;
     for (targets.items, 0..) |target, ti| {
-        if (ti % shard_n != shard_k) continue;
+        if (shard_of[ti] != shard_k) continue;
         my_targets += 1;
         const tdir = std.fs.path.dirname(target) orelse "";
         var argv: std.ArrayList([]const u8) = .empty;
@@ -334,14 +370,15 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     }
     for (threads.items) |t| t.join();
 
-    // Sharded: a coarse ratchet — passes cluster in the big files, so a
-    // stride slice's share of the total swings ±25% around proportional.
-    // The slice gate catches collapse-class regressions; the EXACT ratchet
-    // is enforced by every unsharded run (local test-all, nightly).
+    // Sharded: a coarse ratchet — the weighted assignment lands each
+    // shard within a few percent of its proportional share, so the slack
+    // only has to absorb pass/fail clustering inside files. The slice
+    // gate catches collapse-class regressions; the EXACT ratchet is
+    // enforced by every unsharded run (local test-all, nightly).
     const min_pass = if (shard_n == 1)
         BASELINE
     else
-        (BASELINE * my_targets / targets.items.len) * 70 / 100;
+        (BASELINE * my_weight / @max(total_weight, 1)) * 80 / 100;
     std.debug.print(
         "stdlib_commontest: {d} passed across {d}/{d} files (shard {d}/{d}), {d} build-blocked (min {d}, baseline {d})\n",
         .{
