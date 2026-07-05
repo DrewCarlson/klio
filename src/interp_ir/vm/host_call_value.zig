@@ -16,6 +16,7 @@ const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_member = @import("host_call_member.zig");
+const overload_match = @import("overload_match.zig");
 const host_fields = @import("host_fields.zig");
 const host_globals = @import("host_globals.zig");
 const host_instances = @import("host_instances.zig");
@@ -284,8 +285,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 }
             }
             // Body-property defaults for runtime-registered local
-            // classes — literal-only inits, since there's no
-            // lowered thunk on a non-IR class.
+            // classes. Literal inits evaluate inline; complex inits were
+            // lowered as `$init$` thunks at class registration and run
+            // below once the instance exists (they may read `this`).
             for (cdef.body_properties) |p| {
                 if (p.init) |init_field| {
                     const v = simpleLiteral(allocator, init_field.get()) orelse Value.Null;
@@ -308,7 +310,34 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             .identity = identity,
             .native_state = null,
         });
-        return .{ .ok = .{ .Instance = inst } };
+        const inst_value: Value = .{ .Instance = inst };
+        {
+            const g = cls.borrow();
+            defer g.deinit();
+            for (g.get().body_properties) |p| {
+                const init_field = p.init orelse continue;
+                if (simpleLiteral(allocator, init_field.get()) != null) continue;
+                const init_name = try std.fmt.allocPrint(allocator, "$init${s}", .{p.name});
+                defer allocator.free(init_name);
+                const has = blk: {
+                    const key = try std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ cls_name, init_name });
+                    defer allocator.free(key);
+                    const ag = self.anon_methods.borrow();
+                    defer ag.deinit();
+                    break :blk ag.get().contains(key);
+                };
+                if (!has) continue;
+                switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, &.{})) {
+                    .ok => |rv| {
+                        const ig = inst.borrowMut();
+                        defer ig.deinit();
+                        _ = ig.get().set(p.name, rv);
+                    },
+                    .err => |e| return .{ .err = e },
+                }
+            }
+        }
+        return .{ .ok = inst_value };
     }
     // Invoking a `Value::PropertyRef` (`::name`). A callable reference
     // to a top-level function (`::tag`) calls that function with the
@@ -674,7 +703,6 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                 var reordered = try allocator.alloc(?Value, n);
                 defer allocator.free(reordered);
                 for (reordered) |*s| s.* = null;
-                var next_pos: usize = 0;
                 for (args, 0..) |v, i| {
                     if (i < arg_names.len and arg_names[i] != null) {
                         const nm = arg_names[i].?;
@@ -684,12 +712,32 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                                 break;
                             }
                         }
-                    } else {
-                        while (next_pos < n and reordered[next_pos] != null) next_pos += 1;
-                        if (next_pos < n) {
-                            reordered[next_pos] = v;
-                            next_pos += 1;
-                        }
+                    }
+                }
+                // A trailing positional callable binds the last ctor param
+                // when it is still unfilled (`LocalClass(a = 1) { ... }`),
+                // mirroring the fn-call trailing-lambda rule.
+                var trailing_lambda: ?usize = null;
+                if (args.len > 0 and n > 0) {
+                    const last = args.len - 1;
+                    const last_named = last < arg_names.len and arg_names[last] != null;
+                    const last_p_fn_shaped = blk: {
+                        const dt = pp[n - 1].declared_type orelse break :blk true;
+                        break :blk std.mem.eql(u8, dt, "<function>") or std.mem.startsWith(u8, dt, "Function");
+                    };
+                    if (!last_named and last_p_fn_shaped and reordered[n - 1] == null and root.valueIsCallable(&args[last])) {
+                        reordered[n - 1] = args[last];
+                        trailing_lambda = last;
+                    }
+                }
+                var next_pos: usize = 0;
+                for (args, 0..) |v, i| {
+                    if (i < arg_names.len and arg_names[i] != null) continue;
+                    if (trailing_lambda != null and i == trailing_lambda.?) continue;
+                    while (next_pos < n and reordered[next_pos] != null) next_pos += 1;
+                    if (next_pos < n) {
+                        reordered[next_pos] = v;
+                        next_pos += 1;
                     }
                 }
                 positional = try allocator.alloc(Value, n);
@@ -755,11 +803,28 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                                 }
                             }
                         }
+                        // A trailing positional callable binds to the last
+                        // function-typed parameter, out of sequence, so the
+                        // intervening defaulted parameters are not consumed
+                        // by it (mirrors callFuncNamed's rule).
+                        var trailing_lambda: ?usize = null;
+                        if (args.len > 0) {
+                            const last = args.len - 1;
+                            const last_named = last < arg_names.len and arg_names[last] != null;
+                            const last_param = np - 1;
+                            if (!last_named and slots[last_param] == null and
+                                root.isFunctionType(&params[last_param].ty) and root.valueIsCallable(&args[last]))
+                            {
+                                slots[last_param] = args[last];
+                                trailing_lambda = last;
+                            }
+                        }
                         // Fill unnamed positional args into the remaining slots.
                         var pidx: usize = 0;
                         for (args, 0..) |a, i| {
                             const is_named = i < arg_names.len and arg_names[i] != null;
                             if (is_named) continue;
+                            if (trailing_lambda != null and i == trailing_lambda.?) continue;
                             while (pidx < np and slots[pidx] != null) pidx += 1;
                             if (pidx < np) {
                                 slots[pidx] = a;
@@ -814,6 +879,41 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
         }
     }
     return callValue(self, allocator, callee, args);
+}
+
+/// Whether a closure's DECLARED value-parameter types definitely refute
+/// the runtime arguments (arity aside — a mismatch there is handled by
+/// binding). Used by `CallValueOrMember`: a captured local fn whose
+/// params refute the args is not the target, so the call falls to the
+/// same-named enclosing member (Kotlin picked the member overload).
+pub fn closureParamsDisproven(self: *VmHost, callee: *const Value, args: []const Value) bool {
+    var v = callee.*;
+    if (v == .Cell) {
+        const cg = v.Cell.borrow();
+        v = cg.get().*;
+        cg.deinit();
+    }
+    if (v != .IrClosure) return false;
+    const info = self.closures.get(@intCast(v.IrClosure.id)) orelse return false;
+    const module_ref = self.module.clone();
+    defer module_ref.deinit();
+    const module = info.module orelse module_ref.asPtr();
+    const func = module.funcById(info.body_func) orelse return false;
+    const np = @min(info.n_params, func.params.len);
+    for (func.params[0..np], 0..) |*p, i| {
+        if (i >= args.len) break;
+        if (p.is_vararg) continue;
+        if (host_call_member.argDefinitelyNotParamType(self, &p.ty, &args[i])) return true;
+        // An array argument on a definite non-array builtin param is a
+        // mismatch the shared helper declines to adjudicate (vararg /
+        // spread ambiguity); a declared non-vararg scalar param is safe.
+        if (args[i] == .Array) {
+            if (overload_match.builtinParamKind(p.ty.name)) |pk| {
+                if (pk != .array) return true;
+            }
+        }
+    }
+    return false;
 }
 
 pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
