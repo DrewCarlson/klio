@@ -6655,12 +6655,15 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // Kotlin resolves the member-vs-extension question against the
     // receiver's DECLARED type; carry it for the extension-selection
     // filter (a channel separate from static_recv, whose meaning is the
-    // extension-body receiver). Nullable declared receivers stay untagged
-    // (null-receiver extensions keep their own dispatch rules).
+    // extension-body receiver). A nullable declared receiver carries its
+    // HEAD too: null-accepting extensions overload by the underlying
+    // type (`String?.orEmpty()` vs `List?.orEmpty()`), and a Null
+    // runtime receiver offers the filter nothing else to go on.
     const declared_recv: ?ConstId = blk: {
         const t = argDeclTypeRef(b, receiver) orelse break :blk null;
-        if (t.nullable or std.mem.endsWith(u8, t.name, "?")) break :blk null;
-        break :blk try b.module.internConst(b.allocator, .{ .String = t.name });
+        const head = std.mem.trimEnd(u8, t.name, "?");
+        if (head.len == 0) break :blk null;
+        break :blk try b.module.internConst(b.allocator, .{ .String = head });
     };
     try b.push(.{ .CallMember = .{
         .dst = dst,
