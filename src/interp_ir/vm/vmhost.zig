@@ -281,6 +281,7 @@ pub const VmHost = struct {
     pub const callValue = host_call_value.callValue;
     pub const callValueNamed = host_call_value.callValueNamed;
     pub const callValueNamedTyped = host_call_value.callValueNamedTyped;
+    pub const collectionsEqualHostAware = host_call_member.collectionsEqualHostAware;
     pub const callValueWithThis = host_call_value.callValueWithThis;
     pub const callMember = host_call_member.callMember;
     pub const callMemberNamed = host_call_member.callMemberNamed;

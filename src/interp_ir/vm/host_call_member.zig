@@ -4684,6 +4684,56 @@ fn collectPairs(allocator: Allocator, out: *std.ArrayList(MapPair), items: runti
     }
 }
 
+/// Element-wise equality for builtin Lists whose elements include user
+/// INSTANCES (a `windowed` tail yields the raw `RingBuffer`, a List on
+/// the JVM). Pure structural equality cannot dispatch the element's
+/// `equals`; this walks pairs, dispatching through the member walk when
+/// either side is an Instance. Returns null when neither operand needs
+/// host dispatch (caller falls back to the pure compare).
+pub fn collectionsEqualHostAware(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) ?bool {
+    if (a.* != .List or b.* != .List) return null;
+    const needs_host = blk: {
+        inline for ([_]*const Value{ a, b }) |v| {
+            const g = v.List.items.borrow();
+            defer g.deinit();
+            for (g.get().items) |e| {
+                if (e == .Instance) break :blk true;
+            }
+        }
+        break :blk false;
+    };
+    if (!needs_host) return null;
+    const ga = a.List.items.borrow();
+    defer ga.deinit();
+    const gb = b.List.items.borrow();
+    defer gb.deinit();
+    const ia = ga.get().items;
+    const ib = gb.get().items;
+    if (ia.len != ib.len) return false;
+    for (ia, ib) |ea, eb| {
+        if (ea == .Instance or eb == .Instance) {
+            const recv = if (ea == .Instance) &ea else &eb;
+            const arg = if (ea == .Instance) eb else ea;
+            const r = callMemberRec(self, allocator, recv, "equals", &.{arg}) catch return false;
+            switch (r) {
+                .ok => |v| {
+                    if (!(v == .Bool and v.Bool)) return false;
+                },
+                .err => return false,
+            }
+            continue;
+        }
+        if (ea == .List or eb == .List) {
+            if (collectionsEqualHostAware(self, allocator, &ea, &eb)) |eq| {
+                if (!eq) return false;
+                continue;
+            }
+        }
+        if (!Value.structuralEqBoxed(&ea, &eb)) return false;
+    }
+    return true;
+}
+
 fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     switch (receiver.*) {
         .Pair => |p| {

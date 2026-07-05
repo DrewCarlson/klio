@@ -2491,6 +2491,20 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     .err => |e| return raiseStep(frame, e),
                 }
             }
+            // Builtin-collection equality whose ELEMENTS include user
+            // instances (a windowed tail yields the raw RingBuffer — a
+            // List on the JVM): pure structural comparison cannot
+            // dispatch the element's `equals`, so ask the host for an
+            // element-wise compare before falling back.
+            if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+                (l == .List or r == .List))
+            {
+                if (host.collectionsEqualHostAware(allocator, &l, &r)) |eq| {
+                    const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
+                    try frame.write(bo.dst, .{ .Bool = b });
+                    return .cont;
+                }
+            }
             switch (try applyBinop(allocator, bo.op, &l, &r)) {
                 .ok => |out| try frame.write(bo.dst, out),
                 .err => |e| return raiseStep(frame, e),
@@ -5240,6 +5254,11 @@ pub const NullHost = struct {
     pub fn callValueNamedTyped(self: *NullHost, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8) Allocator.Error!EvalResult {
         _ = type_args;
         return self.callValueNamed(allocator, callee, args, arg_names);
+    }
+
+    pub fn collectionsEqualHostAware(self: *NullHost, allocator: Allocator, a: *const Value, b: *const Value) ?bool {
+        _ = .{ self, allocator, a, b };
+        return null;
     }
 
     pub fn callableReceiverShape(self: *NullHost, v: *const Value) ?ReceiverShape {
