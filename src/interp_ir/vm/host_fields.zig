@@ -1225,7 +1225,17 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (o == .Null or o == .Unit) break;
             switch (try getFieldInner(self, allocator, &o, name, suppress_cc_redirect, member_probe)) {
                 .ok => |v| if (v != .Unit) return ok(v),
-                .err => |e| freeFieldMiss(allocator, e),
+                // Only the dispatch-miss sentinel is a walkable miss; a
+                // throw from an accessor that RAN (SubList.size's
+                // ConcurrentModificationException inside an inner-class
+                // method) propagates.
+                .err => |e| {
+                    if (e == .Unimplemented) {
+                        freeFieldMiss(allocator, e);
+                    } else {
+                        return errRes(e);
+                    }
+                },
             }
             cur = switch (o) {
                 .Instance => |i| blk: {
