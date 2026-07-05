@@ -1562,13 +1562,12 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     defer mg.deinit();
     const eff: *const Module = if (module.func_index.items.len == 0) mg.get() else module;
     // Only intercept genuine overload sets: a single top-level function
-    // keeps the plain global-value path.
-    var candidates: std.ArrayList(FuncId) = .empty;
-    defer candidates.deinit(allocator);
-    for (eff.func_index.items) |entry| {
-        if (std.mem.eql(u8, entry.name, name)) try candidates.append(allocator, entry.id);
-    }
-    if (candidates.items.len < 2) return .{ .ok = null };
+    // keeps the plain global-value path. The name index is the same
+    // authority as `func_index` (every append pairs with a name-index
+    // push); the old per-call linear scan of the whole index was the
+    // hottest frame in the interpreter profile.
+    const candidates = eff.funcsBySimpleName(name);
+    if (candidates.len < 2) return .{ .ok = null };
 
     // Pick the best body-carrying overload by runtime arg types through
     // the shared applicability engine (proven zero-divergence against the
@@ -1584,7 +1583,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     };
     var best_func: ?FuncId = null;
     var best_score: i32 = 0;
-    for (candidates.items) |cand| {
+    for (candidates) |cand| {
         // A receiver-taking candidate whose declared receiver names a
         // builtin shape the first arg definitely is not (UIntArray.fill
         // offered a plain Array) is disqualified outright.
@@ -1602,7 +1601,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     const func = best_func orelse return .{ .ok = null };
 
     if (trace.enabled(name)) {
-        trace.emit("global-overload {s} -> fid={d} (of {d} candidates)", .{ name, func.int(), candidates.items.len });
+        trace.emit("global-overload {s} -> fid={d} (of {d} candidates)", .{ name, func.int(), candidates.len });
     }
 
     const r = try callFuncTyped(self, allocator, eff, func, args, arg_names, &.{}, false);

@@ -279,12 +279,55 @@ pub fn isConsumptionDeferredSource(rel_path: []const u8) bool {
 pub fn isKnownPackage(package_path: []const u8) bool {
     if (isImplicitlyImportedPackage(package_path)) return true;
     if (extra_known_packages.contains(package_path)) return true;
+    // The mined symbol table and the intrinsic registry are static per
+    // process; the per-query linear scan over both (thousands of string
+    // compares) was a top interpreter-profile frame. Build the set of
+    // every known package path — each symbol's package plus every dotted
+    // prefix of every FQN — once, and answer from it.
+    known_packages_lock.lock();
+    if (!known_packages_built) {
+        buildKnownPackages() catch {
+            known_packages_lock.unlock();
+            return isKnownPackageScan(package_path);
+        };
+        known_packages_built = true;
+    }
+    known_packages_lock.unlock();
+    return known_packages.contains(package_path);
+}
+
+var known_packages: std.StringHashMapUnmanaged(void) = .empty;
+var known_packages_built: bool = false;
+var known_packages_lock: SpinLock = .{};
+
+fn addFqnPrefixes(fqn: []const u8) !void {
+    var i: usize = 0;
+    while (i < fqn.len) : (i += 1) {
+        if (fqn[i] == '.') {
+            try known_packages.put(std.heap.page_allocator, fqn[0..i], {});
+        }
+    }
+}
+
+fn buildKnownPackages() !void {
+    for (generated.stdlibSymbols()) |e| {
+        try known_packages.put(std.heap.page_allocator, e.package, {});
+        try addFqnPrefixes(e.fqn);
+    }
+    // Hand-written intrinsics live outside the mined symbol index. A package
+    // that owns at least one such intrinsic is just as real as a mined one.
+    var it = implementations.allFqns();
+    while (it.next()) |fqn| {
+        try addFqnPrefixes(fqn);
+    }
+}
+
+/// The pre-memoization fallback, kept for the OOM path only.
+fn isKnownPackageScan(package_path: []const u8) bool {
     for (generated.stdlibSymbols()) |e| {
         if (std.mem.eql(u8, e.package, package_path)) return true;
         if (startsWithPrefixDot(e.fqn, package_path)) return true;
     }
-    // Hand-written intrinsics live outside the mined symbol index. A package
-    // that owns at least one such intrinsic is just as real as a mined one.
     var it = implementations.allFqns();
     while (it.next()) |fqn| {
         if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
