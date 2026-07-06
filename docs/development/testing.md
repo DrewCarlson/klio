@@ -25,7 +25,7 @@ The suite is split by cost:
   roughly current when their cost changes materially.
 
 Fast resolution-audit cycle: the overload-resolution unification work
-(`docs/resolution-unification-plan.md`) verifies a scorer slice with
+(`plans/resolution-unification-plan.md`) verifies a scorer slice with
 `scripts/resolve_audit_sweep.py --build`, not the ~18-minute ReleaseSafe
 canonical. It rebuilds the fast Debug `klio` (~2s incremental) and sweeps the
 whole stdlib commonTest corpus with `KLIO_RESOLVE_AUDIT=1`, reporting every

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Fast KLIO_RESOLVE_AUDIT sweep — the quick verification cycle for the
-overload-resolution unification (docs/resolution-unification-plan.md).
+overload-resolution unification (plans/resolution-unification-plan.md).
 
 A scorer slice adds `applicable()` behind a dual-compute audit that logs
 `[KLIO_RESOLVE_AUDIT] <member|scorer> ... divergent=1` whenever the shared

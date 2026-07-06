@@ -1,7 +1,7 @@
 # KLIO Guard / Special-Case Inventory
 
 Status: read-only audit of the live Zig tree at `main`. Builds on
-`docs/analysis/execution-architecture.md` (the three bug classes A/B/C, the
+`plans/analysis/execution-architecture.md` (the three bug classes A/B/C, the
 branch map §3, the unified design §4, the §6 roadmap). Every entry below is
 grounded in a concrete `file:line` citation.
 
