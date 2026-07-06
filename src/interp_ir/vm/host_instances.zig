@@ -1741,6 +1741,23 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
             }
         }
         if (ctor_unsatisfiable) {
+            // The primary ctor cannot take these argument TYPES, but a
+            // secondary ctor might: `LocalDate(Int, Month, Int)` matches the
+            // secondary `(year, month: Month, day)`, not the primary
+            // `(year, monthNumber: Int, day)`. Dispatch the secondary BEFORE
+            // falling to a same-named factory function — a deprecated
+            // `@LowPriorityInOverloadResolution fun Name(...) = Name(...)`
+            // factory would otherwise self-recurse without bound.
+            if (!ctorGuardContains(class_name)) {
+                const cid: ?ClassId = blk: {
+                    const mg = self.module.borrow();
+                    defer mg.deinit();
+                    break :blk mg.get().classIdByFqn(classDefFqn(class_def));
+                };
+                if (cid) |c| {
+                    if (try dispatchSecondaryCtor(self, allocator, c, class_def, effective.items, outer_hint)) |res| return res;
+                }
+            }
             if (try pickFactory(self, allocator, class_name, effective.items, true)) |fid| {
                 const module_ref = self.module.clone();
                 defer module_ref.deinit();
