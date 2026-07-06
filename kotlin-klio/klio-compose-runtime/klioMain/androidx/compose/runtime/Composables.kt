@@ -117,6 +117,17 @@ public fun <T> key(vararg keys: Any?, block: @Composable () -> T): T {
     }
 }
 
+/**
+ * A [CompositionContext] for the current composition, remembered across
+ * recompositions. A subcomposition created with `Composition(applier, context)`
+ * is reparented to it, so it recomposes under the same recomposer as its parent —
+ * the basis for `SubcomposeLayout` (lazy lists, constraint-driven content).
+ */
+public fun rememberCompositionContext(): CompositionContext {
+    val c = requireComposer() as KlioComposer
+    return remember { c.buildContext() }
+}
+
 // ----- node emission -----
 //
 // `ComposeNode` is the primitive every node-based Compose UI is built on: it

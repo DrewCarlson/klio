@@ -104,12 +104,28 @@ composable, recomposition mutates a node prop in place (not rebuild), a conditio
 removes/inserts a node, and `key{}` reorders a node with its remembered state. Promote to
 the e2e corpus.
 
-## 2. Phase N2 — subcomposition (needed by Compose UI, not Mosaic basics)
+## 2. Phase N2 — subcomposition — DONE
 
-`rememberCompositionContext()` + a sub-`Composition` reparented to it, driving
-`SubcomposeLayout` (lazy lists, `BoxWithConstraints`, etc.). The Recomposer must track
-child compositions and recompose them. Skippable for Mosaic's first cut; required before
-`LazyColumn`/constraints-based UI.
+`rememberCompositionContext()` + a sub-`Composition` reparented to it, the primitive
+`SubcomposeLayout` (lazy lists, `BoxWithConstraints`) is built on. Green
+(`examples/compose_subcompose.kt`, baked corpus). What landed (klioMain, no interpreter
+change):
+
+- `abstract class CompositionContext` with an internal `recomposer`; `Recomposer` is now
+  a `CompositionContext` (its own root context). `KlioComposer.buildContext()` returns a
+  `KlioCompositionContext` tied to the composer's recomposer.
+- `rememberCompositionContext(): CompositionContext` (remembered across recompositions).
+- `Composition(applier, parent)` / `Composition(parent)` now take a `CompositionContext`
+  (a `Recomposer` still binds, being one), so a child composition created with a remembered
+  context reparents to the parent's recomposer.
+- The `Recomposer` already tracks every registered composition and `recompose()` drains
+  them all, so a reparented child recomposes under the parent's recomposer with no extra
+  machinery. Verified: a state write only the child read recomposes just the child (its own
+  node tree), the parent untouched.
+
+Still deferred to Compose-UI (§4): the layout-phase-driven subcomposition
+`SubcomposeLayout` itself (compose child content during the parent's measure pass, keyed by
+constraints) — the reparenting primitive is now in place for it.
 
 ## 3. Phase M — the Mosaic pack (terminal UI) — DONE
 

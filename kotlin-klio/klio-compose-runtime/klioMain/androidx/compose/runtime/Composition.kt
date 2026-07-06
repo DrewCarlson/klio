@@ -34,10 +34,24 @@ public interface Composition {
     public fun dispose()
 }
 
+/**
+ * The parent of a composition: the [Recomposer] at the root, or a context from
+ * [rememberCompositionContext] for a subcomposition. A composition created with a
+ * context is reparented to the [recomposer] that drives it, so a subcomposition
+ * recomposes under the same recomposer as its parent.
+ */
+public abstract class CompositionContext {
+    internal abstract val recomposer: Recomposer
+}
+
 public class Recomposer(
     private val effectContext: CoroutineContext = EmptyCoroutineContext,
-) {
+) : CompositionContext() {
     private val compositions: ArrayList<KlioComposition> = ArrayList()
+
+    /** A Recomposer is its own composition context (the root of the tree). */
+    override val recomposer: Recomposer
+        get() = this
 
     private val effectJob: Job = Job()
 
@@ -208,9 +222,18 @@ internal class KlioComposition(
     }
 }
 
-/** Create a logic-only composition (no node emission) driven by [parent]. */
-public fun Composition(parent: Recomposer): Composition = KlioComposition(parent)
+/** A subcomposition's context: reparents its child compositions to [rec]. */
+internal class KlioCompositionContext(private val rec: Recomposer) : CompositionContext() {
+    override val recomposer: Recomposer
+        get() = rec
+}
 
-/** Create a composition that emits into [applier]'s node tree, driven by [parent]. */
-public fun Composition(applier: Applier<*>, parent: Recomposer): Composition =
-    KlioComposition(parent, applier)
+/** Create a logic-only composition (no node emission) driven by [parent]. */
+public fun Composition(parent: CompositionContext): Composition =
+    KlioComposition(parent.recomposer)
+
+/** Create a composition that emits into [applier]'s node tree, driven by [parent]
+ * (a Recomposer at the root, or a subcomposition context from
+ * [rememberCompositionContext]). */
+public fun Composition(applier: Applier<*>, parent: CompositionContext): Composition =
+    KlioComposition(parent.recomposer, applier)

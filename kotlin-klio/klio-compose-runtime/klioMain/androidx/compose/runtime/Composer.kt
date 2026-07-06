@@ -476,6 +476,13 @@ internal class KlioComposer : Composer {
 
     // ----- effects -----
 
+    /** A subcomposition context tied to this composer's recomposer, so a child
+     * composition created from it recomposes under the same recomposer. */
+    fun buildContext(): CompositionContext {
+        val rec = recomposer ?: error("rememberCompositionContext requires a recomposer")
+        return KlioCompositionContext(rec)
+    }
+
     fun recordSideEffect(effect: () -> Unit) {
         sideEffects.add(effect)
     }
