@@ -210,6 +210,13 @@ pub const ProgramImage = struct {
     /// the primitive-arg-type signature (computed only when every arg is a
     /// primitive scalar, where the tag fully determines selection).
     overload_cache: std.AutoHashMap(OverloadKey, u32),
+    /// Field-READ resolution memo, keyed (receiver fqn, field name):
+    /// whether the read runs a custom getter (`getter` FuncId) or lands in
+    /// a stored slot (`stored_idx` into the instance field list, verified
+    /// by name at each hit since instances can define extras dynamically).
+    /// Both facts derive from the static class graph, so one probe here
+    /// replaces the per-read getter BFS + linear slot scan.
+    field_read_cache: std.HashMap(StrPair, FieldReadHit, build.StrPairContext, std.hash_map.default_max_load_percentage),
     allocator: Allocator,
 
     pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool };
@@ -218,6 +225,13 @@ pub const ProgramImage = struct {
     pub const MemberHasKey = struct { class_p: usize, name_p: usize };
     pub const CmgGlobalKey = struct { func_p: usize, class_p: usize, name_p: usize, sig: u64 };
     pub const OverloadKey = struct { module_p: usize, func_p: u32, sig: u64 };
+    pub const FieldReadHit = struct {
+        /// Custom getter to run, `NONE` when the read is a stored slot.
+        getter: u32,
+        /// Stored-slot index, `NONE` when a getter serves the read.
+        stored_idx: u32,
+        pub const NONE: u32 = std.math.maxInt(u32);
+    };
 
     /// Packages a bare global name may bind into implicitly, in
     /// preference order — the prefix order of the deleted `lookupGlobal`
@@ -282,6 +296,7 @@ pub const ProgramImage = struct {
             .host_has_member_cache = std.AutoHashMap(MemberHasKey, bool).init(allocator),
             .cmg_global_cache = std.AutoHashMap(CmgGlobalKey, void).init(allocator),
             .overload_cache = std.AutoHashMap(OverloadKey, u32).init(allocator),
+            .field_read_cache = std.HashMap(StrPair, FieldReadHit, build.StrPairContext, std.hash_map.default_max_load_percentage).init(allocator),
             .allocator = allocator,
         };
     }
@@ -323,6 +338,7 @@ pub const ProgramImage = struct {
         self.host_has_member_cache.deinit();
         self.cmg_global_cache.deinit();
         self.overload_cache.deinit();
+        self.field_read_cache.deinit();
     }
 
     fn clearResolvedRedirects(self: *ProgramImage) void {

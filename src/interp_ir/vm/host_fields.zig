@@ -16,6 +16,7 @@ const vmhost = @import("vmhost.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
+const root = @import("../interp_ir.zig");
 const host_impl = @import("host_impl.zig");
 const host_globals = @import("host_globals.zig");
 const host_call_member = @import("host_call_member.zig");
@@ -380,6 +381,60 @@ fn freeFieldMiss(allocator: Allocator, e: EvalError) void {
 }
 
 fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool) Allocator.Error!EvalResult {
+    // Field-read memo, consulted before the whole ladder: entries exist
+    // ONLY for (class, name) pairs that previously fell through every
+    // earlier arm and resolved in `instanceField` as a custom getter or
+    // stored slot — both facts static per class — so a hit can never
+    // shadow an earlier arm that would have claimed the read. The
+    // stored index re-verifies by name (instances can define extra
+    // slots dynamically); `coroutineContext` stays out (its redirect is
+    // suspend-state-dependent, not class-static).
+    if (receiver.* == .Instance and !std.mem.eql(u8, name, "coroutineContext")) {
+        const inst0 = receiver.Instance;
+        const fqn0 = blk: {
+            const g = inst0.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk cg.get().fqn;
+        };
+        const hit: ?root.ProgramImage.FieldReadHit = blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().field_read_cache.get(.{ .a = fqn0, .b = name });
+        };
+        if (hit) |h| {
+            const NONE = root.ProgramImage.FieldReadHit.NONE;
+            if (h.getter != NONE) {
+                const fid: FuncId = @enumFromInt(h.getter);
+                const mptr: *const Module = self.module.asPtr();
+                if (fid.int() < mptr.funcCount()) {
+                    return try evalGetter(self, allocator, fid, receiver.*);
+                }
+            } else if (h.stored_idx != NONE) {
+                const v: ?Value = blk: {
+                    const g = inst0.borrow();
+                    defer g.deinit();
+                    const fields = g.get().fields.items;
+                    if (h.stored_idx < fields.len and std.mem.eql(u8, fields[h.stored_idx].name, name)) {
+                        break :blk fields[h.stored_idx].value;
+                    }
+                    break :blk null;
+                };
+                if (v) |val| {
+                    if (val == .Null) {
+                        if (storedNullIsLateinit(inst0, name)) {
+                            return try lateinitReadError(allocator, name);
+                        }
+                    }
+                    if (val == .Delegate) {
+                        return try unwrapDelegate(self, allocator, val.Delegate, name);
+                    }
+                    return ok(val);
+                }
+            }
+        }
+    }
     // Progression `first`/`last`/`step` property *reads* (no parens): `first`/
     // `last` return the stored bound even when empty (the `Iterable.first()`/
     // `last()` *functions*, dispatched as calls, still throw on empty); `step`
@@ -1857,6 +1912,18 @@ fn resolveExtensionPropImpl(
 fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, member_probe: bool) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     const class_name = className(inst);
+    // Field-read memo: one probe replaces the delegate walk, the getter
+    // BFS, and the stored-slot scan for a (class, name) already resolved
+    // once. Both cached facts derive from the static class graph; the
+    // stored index re-verifies by name because instances can define
+    // extra slots dynamically.
+    const cache_fqn = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
     // Delegated body property: route through the delegate's `getValue`.
     const delegate_owner: bool = blk: {
         // Almost every program declares zero `by`-delegated body properties;
@@ -1911,6 +1978,7 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             const msg = try std.fmt.allocPrint(allocator, "getter FuncId {d} out of range", .{fid.int()});
             return errRes(.{ .Type = msg });
         }
+        fieldReadCachePut(self, cache_fqn, name, .{ .getter = fid.int(), .stored_idx = root.ProgramImage.FieldReadHit.NONE });
         return try evalGetter(self, allocator, fid, receiver.*);
     }
     // Most-derived override cell: an initialized `override val/var` keeps
@@ -1961,27 +2029,19 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     const slot: ?Value = blk: {
         const g = inst.borrow();
         defer g.deinit();
-        break :blk g.get().get(name);
+        const fields = g.get().fields.items;
+        for (fields, 0..) |f, fi| {
+            if (std.mem.eql(u8, f.name, name)) {
+                fieldReadCachePut(self, cache_fqn, name, .{ .getter = root.ProgramImage.FieldReadHit.NONE, .stored_idx = @intCast(fi) });
+                break :blk f.value;
+            }
+        }
+        break :blk null;
     };
     if (slot) |v| {
         if (v == .Null) {
-            const is_lateinit = blk: {
-                const g = inst.borrow();
-                defer g.deinit();
-                const cg = g.get().class.borrow();
-                defer cg.deinit();
-                for (cg.get().body_properties) |p| {
-                    if (std.mem.eql(u8, p.name, name) and p.is_lateinit) break :blk true;
-                }
-                break :blk false;
-            };
-            if (is_lateinit) {
-                const m = try std.fmt.allocPrint(allocator, "lateinit property {s} has not been initialized", .{name});
-                return errRes(.{ .Throw = .{ .Exception = .{
-                    .fqn = try runtime.strInit(allocator, "kotlin.UninitializedPropertyAccessException"),
-                    .message = try runtime.strInitOwned(allocator, m),
-                    .cause = null,
-                } } });
+            if (storedNullIsLateinit(inst, name)) {
+                return try lateinitReadError(allocator, name);
             }
         }
         // Auto-unwrap instance-level built-in delegates.
@@ -2110,6 +2170,37 @@ fn enclosingCompanionDeclares(self: *VmHost, allocator: Allocator, class_name: [
 /// Resolve an instance custom-getter `FuncId`, applying the
 /// most-derived-stored-property override rule and the package-qualified
 /// own-class FQN-key discipline.
+/// Insert into the field-read memo, capped so synthesized per-evaluation
+/// anonymous classes (fresh fqn each time) cannot grow it unboundedly.
+fn fieldReadCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldReadHit) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    if (pg.get().field_read_cache.count() >= 65536) return;
+    pg.get().field_read_cache.put(.{ .a = fqn, .b = name }, hit) catch {};
+}
+
+/// Whether a stored `.Null` in `name`'s slot means an uninitialized
+/// `lateinit` property (class-declared).
+fn storedNullIsLateinit(inst: ObjRef(InstanceData), name: []const u8) bool {
+    const g = inst.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    for (cg.get().body_properties) |p| {
+        if (std.mem.eql(u8, p.name, name) and p.is_lateinit) return true;
+    }
+    return false;
+}
+
+fn lateinitReadError(allocator: Allocator, name: []const u8) Allocator.Error!EvalResult {
+    const m = try std.fmt.allocPrint(allocator, "lateinit property {s} has not been initialized", .{name});
+    return errRes(.{ .Throw = .{ .Exception = .{
+        .fqn = try runtime.strInit(allocator, "kotlin.UninitializedPropertyAccessException"),
+        .message = try runtime.strInitOwned(allocator, m),
+        .cause = null,
+    } } });
+}
+
 fn resolveInstanceGetter(
     self: *VmHost,
     allocator: Allocator,

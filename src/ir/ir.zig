@@ -565,6 +565,81 @@ pub const UnOp = enum {
 };
 
 /// Terminator at the end of every block.
+/// Visit every REGISTER operand of one instruction, generically over the
+/// `Inst` union: plain `Reg` fields, `?Reg`, `[]Reg`, `SpreadPart`
+/// slices, and the `args`+`n_args` contiguous-run convention (each
+/// register of the run is reported). A field named `dst` reports
+/// `is_def = true`. Comptime-generated from the union's own shape, so a
+/// new instruction variant is covered by construction — the foundation
+/// the Move-fusion pass (and any future register analysis) builds on.
+pub fn visitInstRegs(inst: *const Inst, ctx: anytype, comptime cb: fn (@TypeOf(ctx), Reg, bool) void) void {
+    switch (inst.*) {
+        inline else => |*payload| visitPayloadRegs(payload, ctx, cb),
+    }
+}
+
+/// Same enumeration for a block terminator.
+pub fn visitTerminatorRegs(t: *const Terminator, ctx: anytype, comptime cb: fn (@TypeOf(ctx), Reg, bool) void) void {
+    switch (t.*) {
+        inline else => |*payload| visitPayloadRegs(payload, ctx, cb),
+    }
+}
+
+fn visitPayloadRegs(payload: anytype, ctx: anytype, comptime cb: fn (@TypeOf(ctx), Reg, bool) void) void {
+    const P = @TypeOf(payload.*);
+    if (P == Reg) {
+        cb(ctx, payload.*, false);
+        return;
+    }
+    if (P == ?Reg) {
+        if (payload.*) |r| cb(ctx, r, false);
+        return;
+    }
+    switch (@typeInfo(P)) {
+        .@"struct" => |st| {
+            inline for (st.fields) |f| {
+                const is_def = comptime std.mem.eql(u8, f.name, "dst");
+                if (f.type == Reg) {
+                    if (comptime std.mem.eql(u8, f.name, "args")) {
+                        if (comptime @hasField(P, "n_args")) {
+                            var k: u32 = 0;
+                            while (k < payload.n_args) : (k += 1) {
+                                cb(ctx, Reg.from(@field(payload, f.name).int() + k), false);
+                            }
+                            continue;
+                        }
+                    }
+                    cb(ctx, @field(payload, f.name), is_def);
+                } else if (f.type == ?Reg) {
+                    if (@field(payload, f.name)) |r| cb(ctx, r, is_def);
+                } else if (f.type == []Reg or f.type == []const Reg) {
+                    for (@field(payload, f.name)) |r| cb(ctx, r, false);
+                } else if (f.type == []SpreadPart or f.type == []const SpreadPart) {
+                    for (@field(payload, f.name)) |part| cb(ctx, part.reg, false);
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+/// Rewrite an instruction's `dst` register (every variant that has one).
+/// Returns false when the variant carries no `dst`.
+pub fn setInstDst(inst: *Inst, new_dst: Reg) bool {
+    switch (inst.*) {
+        inline else => |*payload| {
+            const P = @TypeOf(payload.*);
+            if (@typeInfo(P) == .@"struct" and @hasField(P, "dst")) {
+                if (@FieldType(P, "dst") == Reg) {
+                    payload.dst = new_dst;
+                    return true;
+                }
+            }
+            return false;
+        },
+    }
+}
+
 pub const Terminator = union(enum) {
     Goto: BlockId,
     Branch: struct {

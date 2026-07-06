@@ -1015,9 +1015,12 @@ test "var declaration gets a mutable home slot" {
     b.terminate(.{ .Return = null });
     const func = try b.finish("f", "test.f", build.typeUnit());
     defer freeFunc(func);
-    // Trace position marker, then const + move into the home slot.
+    // Trace position marker, then the const fused straight into the home
+    // slot (the single-use `Const T; Move home <- T` pair coalesces at
+    // `finish`).
     try testing.expect(func.blocks[0].insts[0] == .Trace);
-    try testing.expect(func.blocks[0].insts[2] == .Move);
+    try testing.expect(func.blocks[0].insts.len == 2);
+    try testing.expect(func.blocks[0].insts[1] == .Const);
 }
 
 test "any-typed val is marked" {
@@ -1108,9 +1111,11 @@ test "assign to var rebinds through the home slot" {
     defer freeFunc(func);
     // Last instruction is a Move into the home register.
     const insts = func.blocks[0].insts;
+    // The assignment's value fuses straight into the home register (the
+    // single-use `Const T; Move home <- T` pair coalesces at `finish`).
     const last = insts[insts.len - 1];
-    try testing.expect(last == .Move);
-    try testing.expectEqual(home, last.Move.dst);
+    try testing.expect(last == .Const);
+    try testing.expectEqual(home, last.Const.dst);
 }
 
 test "assign to top-level name emits store global" {
