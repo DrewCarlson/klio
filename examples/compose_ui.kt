@@ -19,12 +19,12 @@ fun main() {
     val count = mutableStateOf(0)
 
     val ui = uiRenderer(20, 18) {
-        Column(Modifier.None.background(Color.Gray).padding(1)) {
+        Column(Modifier.None.background(Color.Gray).border(Color.Black).padding(1)) {
             Text("KLIO", Color.Black, Modifier.None)
             Row(Modifier.None.padding(1)) {
-                Box(Modifier.None.size(3, 4).background(Color.Red))
-                Box(Modifier.None.size(3, 4).background(Color.Green))
-                Box(Modifier.None.size(3, 4).background(Color.Blue))
+                Box(Modifier.None.size(3, 4).background(Color.Red).border(Color.White))
+                Box(Modifier.None.size(3, 4).background(Color.Green).border(Color.White))
+                Box(Modifier.None.size(3, 4).background(Color.Blue).border(Color.White))
             }
             Text("N " + count.value, Color.White, Modifier.None)
         }

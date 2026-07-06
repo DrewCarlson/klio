@@ -120,6 +120,15 @@ class PixelCanvas(val width: Int, val height: Int) {
         }
     }
 
+    /** Stroke a 1px outline around the rect (top/bottom rows + left/right cols). */
+    fun strokeRect(x: Int, y: Int, w: Int, h: Int, argb: Int) {
+        if (w <= 0 || h <= 0) return
+        fillRect(x, y, w, 1, argb)
+        fillRect(x, y + h - 1, w, 1, argb)
+        fillRect(x, y, 1, h, argb)
+        fillRect(x + w - 1, y, 1, h, argb)
+    }
+
     fun toAscii(): String {
         val sb = StringBuilder()
         var row = 0
@@ -150,6 +159,7 @@ class Modifier private constructor(
     val fillMaxWidth: Boolean,
     val fillMaxHeight: Boolean,
     val onClick: (() -> Unit)?,
+    val border: Color?,
 ) {
     private fun copy(
         width: Int = this.width,
@@ -159,7 +169,8 @@ class Modifier private constructor(
         fillMaxWidth: Boolean = this.fillMaxWidth,
         fillMaxHeight: Boolean = this.fillMaxHeight,
         onClick: (() -> Unit)? = this.onClick,
-    ): Modifier = Modifier(width, height, padding, background, fillMaxWidth, fillMaxHeight, onClick)
+        border: Color? = this.border,
+    ): Modifier = Modifier(width, height, padding, background, fillMaxWidth, fillMaxHeight, onClick, border)
 
     fun size(w: Int, h: Int): Modifier = copy(width = w, height = h)
     fun width(w: Int): Modifier = copy(width = w)
@@ -170,9 +181,10 @@ class Modifier private constructor(
     fun fillMaxHeight(): Modifier = copy(fillMaxHeight = true)
     fun fillMaxSize(): Modifier = copy(fillMaxWidth = true, fillMaxHeight = true)
     fun clickable(onClick: () -> Unit): Modifier = copy(onClick = onClick)
+    fun border(c: Color): Modifier = copy(border = c)
 
     companion object {
-        val None = Modifier(-1, -1, 0, null, false, false, null)
+        val None = Modifier(-1, -1, 0, null, false, false, null, null)
     }
 }
 
@@ -248,6 +260,8 @@ class LayoutNode {
     fun draw(canvas: PixelCanvas, originX: Int, originY: Int, hits: MutableList<HitRegion>) {
         val bg = modifier.background
         if (bg != null) canvas.fillRect(originX, originY, measuredWidth, measuredHeight, bg.argb)
+        val brd = modifier.border
+        if (brd != null) canvas.strokeRect(originX, originY, measuredWidth, measuredHeight, brd.argb)
         val onClick = modifier.onClick
         if (onClick != null) {
             hits.add(HitRegion(originX, originY, measuredWidth, measuredHeight, onClick))
@@ -335,6 +349,11 @@ fun Box(modifier: Modifier) {
         },
         update = { set(modifier) { this.modifier = it } },
     )
+}
+
+@Composable
+fun Spacer(width: Int, height: Int) {
+    Box(Modifier.None.size(width, height))
 }
 
 @Composable
