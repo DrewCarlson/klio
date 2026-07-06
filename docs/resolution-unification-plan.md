@@ -725,6 +725,31 @@ Every phase of this plan is landed or boundary-recorded; nothing remains open.
           union value from its own current payload in one assignment
           (`v.* = .{ .Short = @intCast(v.Int) }`) trips result-location
           clobbering — read into a temp first.
+      - **Engine round 3 (2026-07-06, commits 1a19d0be/13586aa1)**: the
+        comptime register visitor (ir.visitInstRegs — every operand
+        enumerated from the union's own shape) unblocked the Move-fusion
+        peephole at finish (single-use temps write their target
+        directly; ~7% on loops). Field reads memoize per (fqn, name) on
+        the program image, consulted at getFieldInner entry
+        (interpreted-class field code 15-18% faster). DeepRecursive's
+        wall was QUADRATIC, twice over: catch-only try frames never
+        popped on normal flow (fixed with catch_done_for on the join
+        block, image v15 — runCallLoop's per-iteration try/catch grew
+        the stack every level while every Goto scanned it), and each
+        re-suspend copied all pending outer snapshots (fixed with O(1)
+        TailSeg linking). 150k levels: 62s -> 33s shipped (17s with
+        KLIO_GC_EXT=1). The external-bytes Appel accounting is GATED
+        (KLIO_GC_EXT): its collection pressure exposed latent keepalive
+        holes — two real ones fixed (SeqIterState.iter_obj untraced;
+        fresh builder cursors un-rooted during host drive loops), and
+        the gate doubles as a deterministic hole-hunting stress mode.
+        NEXT: sweep under KLIO_GC_EXT=1 + KLIO_GC_POISON=1, fix the
+        remaining holes, then flip the accounting default on. Also
+        discovered: `klio run` (embedded image) leaves
+        startCoroutineUninterceptedOrReturn on fn values to runtime ext
+        resolution which misses — DeepRecursiveFunction works under
+        `klio test` but not `klio run` (repro: scratchpad deeprec2.kt);
+        root-cause the ext-vs-image lowering divergence.
       - **Perf+GC round 2 (2026-07-06, commits 9eb68324/57134116)**:
         `i++` no longer runs the string-keyed member ladder — scalar
         unary ops apply natively when no enclosing instance is in scope
