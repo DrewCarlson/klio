@@ -15,6 +15,7 @@ const interp_ir = @import("interp_ir");
 const kotlinx_atomicfu = @import("kotlinx_atomicfu");
 const kotlinx_coroutines = @import("kotlinx_coroutines");
 const compose_runtime = @import("compose_runtime");
+const compose_ui = @import("compose_ui");
 const lexer = @import("lexer");
 const pack = @import("pack");
 const parser = @import("parser");
@@ -1364,6 +1365,12 @@ fn packHostBindings(arena: Allocator) Allocator.Error!HostBindings {
         var it = cr.table.iterator();
         while (it.next()) |e| try b.register(e.key_ptr.*, e.value_ptr.*);
         cr.deinit();
+    }
+    {
+        var cu = try compose_ui.hostBindings(arena);
+        var it = cu.table.iterator();
+        while (it.next()) |e| try b.register(e.key_ptr.*, e.value_ptr.*);
+        cu.deinit();
     }
     {
         // Composer-stack intrinsics (interp_ir, touch the implicit-composer TLS).

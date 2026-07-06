@@ -195,14 +195,22 @@ backend does fills + 1px stroke outlines (`Modifier.border`, `PixelCanvas.stroke
 UI renders in a light or dark palette — the material-on-foundation layering, themed by
 CompositionLocal.
 
+**Native rendering sink** (`examples/compose_ui_ppm.kt`, baked corpus): a real host binding
+in `src/compose_ui/compose_ui.zig` (a dedicated Zig module, wired into `mergedHostBindings`
+in `pack_cache.zig` + `build.zig` — kept out of the main interpreter) encodes the rasterized
+pixel buffer into a real **P6 PPM** image (palette-mapped, scaled), writes it to disk, and
+returns an FNV-1a checksum of the encoded bytes. `UiRenderer.savePpm(path, scale)` drives
+it. This is the plan's headless "dumps a PNG/pixel buffer" offscreen surface, in native
+code; a native Skia/skiko binding would slot into the same seam as a richer `DrawScope`.
+
 The real `androidx.compose.ui` is **not** in the vendored sparse checkout (only compose
 `runtime` is), and it is a Skia/native stack of hundreds of files, so these increments are
 a klio-authored ui-core proving the architecture runs on klio end-to-end (layout + draw +
-text + recomposition + pointer input). Still ahead in S (each its own large step): the
-native **Skia** binding (these increments use a software rasterizer, per the plan's "pure
-software rasterizer for a first cut"), real font/glyph shaping, the full `Modifier.Node`
-chain + focus/semantics, windowing + a live input event loop, and vendoring the real
-`compose.ui`/`foundation`/`material`.
+text + recomposition + pointer input + lazy lists + material theming + a native image sink).
+Still ahead in S (each its own large step): a full native **Skia** binding (this uses a
+software rasterizer + a PPM sink, per the plan's "pure software rasterizer for a first cut"),
+real font/glyph shaping, the full `Modifier.Node` chain + focus/semantics, windowing + a
+live input event loop, and vendoring the real `compose.ui`/`foundation`/`material`.
 
 ### Remaining S layers
 

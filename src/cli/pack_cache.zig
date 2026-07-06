@@ -37,6 +37,7 @@ const kotlinx_datetime = @import("kotlinx_datetime");
 const kotlinx_coroutines = @import("kotlinx_coroutines");
 const kotlinx_serialization = @import("kotlinx_serialization");
 const compose_runtime = @import("compose_runtime");
+const compose_ui = @import("compose_ui");
 const interp_ir = @import("interp_ir");
 const ktor_client = @import("ktor_client");
 
@@ -1244,6 +1245,7 @@ pub fn mergedHostBindings(gpa: Allocator) HostBindings {
     mergeInto(&out, kotlinx_coroutines.hostBindings(gpa) catch null);
     mergeInto(&out, kotlinx_serialization.hostBindings(gpa) catch null);
     mergeInto(&out, compose_runtime.hostBindings(gpa) catch null);
+    mergeInto(&out, compose_ui.hostBindings(gpa) catch null);
     // The composer-stack intrinsics live in interp_ir (they touch the VM's
     // implicit-composer threadlocal), registered alongside the pure ones.
     mergeInto(&out, interp_ir.compose.hostBindings(gpa) catch null);
