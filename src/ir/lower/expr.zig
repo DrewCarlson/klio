@@ -561,6 +561,32 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return dst;
         },
         .MemberRef => |mr| {
+            // `TypeName::class` on a bare type name: load the receiver with
+            // constructor-reference semantics so a class that declares a
+            // `companion object` yields the CLASS value, not its companion
+            // singleton. Without `ctor_ref` a class-name read resolves to the
+            // published companion (Kotlin's `C` ⇒ `C.Companion` value rule),
+            // and `.class` then takes the companion's class — so once the
+            // companion is constructed, `C::class` degrades to
+            // `C$Companion$Companion` and `isInstance` / the name diverge.
+            // `.class` is the identity on the resulting class value (and the
+            // object's class for an `object` singleton), so it is kept.
+            if (std.mem.eql(u8, mr.name.name, "class") and
+                mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1)
+            {
+                const rn = mr.receiver.Path.segments[0].name;
+                if (b.resolve(rn) == null and !b.knowsOuter(rn)) {
+                    if (b.module.classId(rn)) |cid| {
+                        const recv = b.allocReg();
+                        const rnm = try b.module.internConst(b.allocator, .{ .String = rn });
+                        try b.push(.{ .LoadGlobal = .{ .dst = recv, .name = rnm, .class = cid, .ctor_ref = true } });
+                        const dst = b.allocReg();
+                        const cnm = try b.module.internConst(b.allocator, .{ .String = "class" });
+                        try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv, .name = cnm } });
+                        return dst;
+                    }
+                }
+            }
             // `String::countVowels` where the member names an in-scope
             // LOCAL extension function: kotlinc resolves the reference to
             // that local, not to a member of the type. The local lowered
@@ -2171,17 +2197,96 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
     return null;
 }
 
+/// Whether any argument in the call is passed by name.
+fn anyNamedArg(arg_names: []const ?[]const u8) bool {
+    for (arg_names) |an| if (an != null) return true;
+    return false;
+}
+
+/// Map each argument to the callee parameter it fills, honoring Kotlin's
+/// named-argument rules: a named argument matches the parameter of that name; an
+/// unnamed trailing lambda binds the last parameter; the remaining unnamed
+/// (positional) arguments fill the still-unassigned parameters left to right.
+/// `params` is the callee's parameter slice with any receiver already removed.
+/// Returns a per-argument target index (parallel to `args`), null for an
+/// argument whose parameter can't be determined. Caller frees the slice.
+fn mapArgsToParams(
+    b: *FuncBuilder,
+    params: []const ir.Param,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+) Allocator.Error!?[]?usize {
+    const out = try b.allocator.alloc(?usize, args.len);
+    for (out) |*o| o.* = null;
+    const used = try b.allocator.alloc(bool, params.len);
+    defer b.allocator.free(used);
+    for (used) |*u| u.* = false;
+    // 1. Named arguments bind their same-named parameter.
+    for (args, 0..) |_, j| {
+        const an = if (j < arg_names.len) arg_names[j] else null;
+        if (an) |name| {
+            for (params, 0..) |p, idx| {
+                if (std.mem.eql(u8, p.name, name)) {
+                    out[j] = idx;
+                    used[idx] = true;
+                    break;
+                }
+            }
+        }
+    }
+    // 2. An unnamed trailing lambda binds the last (still-free) parameter.
+    var trailing_done = false;
+    if (args.len != 0) {
+        const last = args.len - 1;
+        const last_named = last < arg_names.len and arg_names[last] != null;
+        const last_lambda = args[last] == .Lambda or args[last] == .AnonFun;
+        if (!last_named and last_lambda and params.len != 0 and !used[params.len - 1]) {
+            out[last] = params.len - 1;
+            used[params.len - 1] = true;
+            trailing_done = true;
+        }
+    }
+    // 3. Remaining unnamed arguments fill the free parameters front to back.
+    var pidx: usize = 0;
+    for (args, 0..) |_, j| {
+        const an = if (j < arg_names.len) arg_names[j] else null;
+        if (an != null) continue;
+        if (trailing_done and j == args.len - 1) continue;
+        while (pidx < params.len and used[pidx]) pidx += 1;
+        if (pidx < params.len) {
+            out[j] = pidx;
+            used[pidx] = true;
+            pidx += 1;
+        }
+    }
+    return out;
+}
+
 fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]i16 {
     if (args.len == 0) return null;
-    for (arg_names) |an| if (an != null) return null;
     for (args) |*a| if (a.* == .Spread) return null;
     if (func.params.len < recv_offset) return null;
     const params = func.params[recv_offset..];
+    const out = try b.allocator.alloc(i16, args.len);
+    for (out) |*o| o.* = -1;
+    // Named arguments: resolve each lambda's expected arity through its target
+    // parameter (by name) so a receiver lambda passed by name is still detected
+    // as arity-0 — otherwise it is mistaken for an `it`-lambda and its bare
+    // member accesses fall through to unresolved globals.
+    if (anyNamedArg(arg_names)) {
+        const map = (try mapArgsToParams(b, params, args, arg_names)) orelse {
+            b.allocator.free(out);
+            return null;
+        };
+        defer b.allocator.free(map);
+        for (out, map) |*o, m| {
+            if (m) |pi| o.* = fnTypeArityAlias(b, params[pi].ty) orelse -1;
+        }
+        return out;
+    }
     // A trailing lambda fills the last function-typed parameter even when
     // earlier defaulted parameters are omitted; align the trailing lambda
     // with the last parameter and the leading args from the front.
-    const out = try b.allocator.alloc(i16, args.len);
-    for (out) |*o| o.* = -1;
     const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
     if (trailing_lambda and args.len <= params.len) {
         // Leading positional args map 1:1 from the front.
@@ -2194,6 +2299,7 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
     } else if (args.len == params.len) {
         for (params, out) |p, *o| o.* = fnTypeArityAlias(b, p.ty) orelse -1;
     } else {
+        b.allocator.free(out);
         return null;
     }
     return out;
@@ -5111,6 +5217,48 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
                     .exact = false,
                 } });
                 return dst;
+            }
+        }
+    }
+
+    // FQN-precedence for a UNIQUE import whose leaf has MULTIPLE overloads (or is
+    // an intrinsic), so `funcIdByFqn` above found no single FuncId to route to.
+    // `import kotlin.math.max` names 4+ overloads: the import is a real in-scope
+    // symbol, but a same-name unimported `other.max(Dp, Dp)` can still preempt it
+    // in the applicability/fallback ladder (body-bearing, while the intrinsic
+    // overloads are unrankable header stubs). Re-lower the call qualified to the
+    // imported FQN so overload resolution reaches the imported symbol, bypassing
+    // the invisible candidate. Order-independent (decided from this file's imports)
+    // and gated on the import actually naming in-scope funcs, so it never invents
+    // a target.
+    if (imported_func_id == null and !shadowed_by_class and segments.len == 1 and
+        b.module.funcsBySimpleName(name0).len >= 1)
+    {
+        const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
+        if (alias_paths.len == 1 and alias_paths[0].segs.len >= 2) {
+            // The import resolves to real funcs of that FQN (a multi-overload
+            // symbol), OR to a stdlib intrinsic the func index does not enumerate
+            // (`isAliasName`, e.g. kotlin.math.max). Either way the qualified call
+            // reaches it.
+            var import_resolves = ir.isAliasName(name0);
+            if (!import_resolves) {
+                for (b.module.funcsBySimpleName(name0)) |cid| {
+                    const cf = b.module.funcById(cid) orelse continue;
+                    if (std.mem.eql(u8, cf.fqn, alias_paths[0].fqn)) {
+                        import_resolves = true;
+                        break;
+                    }
+                }
+            }
+            if (import_resolves) {
+                const new_segs = try b.allocator.alloc(ast.Ident, alias_paths[0].segs.len);
+                for (alias_paths[0].segs, 0..) |s, i| new_segs[i] = .{ .name = s, .span = segments[0].span };
+                const new_callee = try b.allocator.create(Expr);
+                new_callee.* = Expr{ .Path = .{ .segments = new_segs, .span = callee.Path.span } };
+                var new_call = call;
+                new_call.callee = new_callee;
+                const rewritten = Expr{ .Call = new_call };
+                return try lowerCall(b, &rewritten);
             }
         }
     }

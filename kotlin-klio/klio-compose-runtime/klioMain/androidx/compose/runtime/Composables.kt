@@ -116,3 +116,128 @@ public fun <T> key(vararg keys: Any?, block: @Composable () -> T): T {
         c.endGroup()
     }
 }
+
+// ----- node emission -----
+//
+// `ComposeNode` is the primitive every node-based Compose UI is built on: it
+// emits a node of type T into the composition and diff-applies its properties.
+// Upstream lowers `ComposeNode(factory, update) { content }` to these composer
+// calls; klio's is the same shape against the synchronous `KlioComposer` (which
+// reconciles the applier tree as the node groups open/close). The `E : Applier`
+// type parameter is kept for source compatibility with consumers that name their
+// applier; the runtime resolves the node against the composition's applier.
+
+/**
+ * Diff-applies a node's properties. Each `set`/`update` slot-memoizes its value,
+ * so the property setter runs on first insert and only when the value changes.
+ */
+public class Updater<T>(@JvmField public val composer: Composer) {
+    /** Set [value] via [block], running [block] on insert or when [value] changed. */
+    public fun <V> set(value: V, block: T.(value: V) -> Unit) {
+        val changed = composer.changed(value)
+        if (composer.inserting || changed) {
+            @Suppress("UNCHECKED_CAST")
+            val node = composer.applier!!.current as T
+            node.block(value)
+        }
+    }
+
+    /** Like [set]; distinct name for updates to already-initialized nodes. */
+    public fun <V> update(value: V, block: T.(value: V) -> Unit) {
+        val changed = composer.changed(value)
+        if (composer.inserting || changed) {
+            @Suppress("UNCHECKED_CAST")
+            val node = composer.applier!!.current as T
+            node.block(value)
+        }
+    }
+
+    /** Run [block] on the node only on the initial insert. */
+    public fun init(block: T.() -> Unit) {
+        if (composer.inserting) {
+            @Suppress("UNCHECKED_CAST")
+            val node = composer.applier!!.current as T
+            node.block()
+        }
+    }
+
+    /** Run [block] on the node every pass, unconditionally. */
+    public fun reconcile(block: T.() -> Unit) {
+        @Suppress("UNCHECKED_CAST")
+        val node = composer.applier!!.current as T
+        node.block()
+    }
+}
+
+/** A skippable-content updater: applies node props inside a replaceable group. */
+public class SkippableUpdater<T>(@JvmField public val composer: Composer) {
+    public fun update(block: Updater<T>.() -> Unit) {
+        composer.startReplaceableGroup(0x1e65194f)
+        Updater<T>(composer).block()
+        composer.endReplaceableGroup()
+    }
+}
+
+/** Emit a node of type [T] with no child content. */
+public fun <T, E : Applier<*>> ComposeNode(factory: () -> T, update: Updater<T>.() -> Unit) {
+    val c = requireComposer()
+    c.startNode()
+    if (c.inserting) c.createNode(factory) else c.useNode()
+    Updater<T>(c).update()
+    c.endNode()
+}
+
+/** Emit a node of type [T]; nodes emitted in [content] become its children. */
+public fun <T, E : Applier<*>> ComposeNode(
+    factory: () -> T,
+    update: Updater<T>.() -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val c = requireComposer()
+    c.startNode()
+    if (c.inserting) c.createNode(factory) else c.useNode()
+    Updater<T>(c).update()
+    content()
+    c.endNode()
+}
+
+/** Emit a node of type [T] with a skippable prop updater and child [content]. */
+public fun <T, E : Applier<*>> ComposeNode(
+    factory: () -> T,
+    update: Updater<T>.() -> Unit,
+    skippableUpdate: SkippableUpdater<T>.() -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val c = requireComposer()
+    c.startNode()
+    if (c.inserting) c.createNode(factory) else c.useNode()
+    Updater<T>(c).update()
+    SkippableUpdater<T>(c).skippableUpdate()
+    c.startReplaceableGroup(0x7ab4aae9)
+    content()
+    c.endReplaceableGroup()
+    c.endNode()
+}
+
+/** Emit a reusable node of type [T] with no child content. */
+public fun <T, E : Applier<*>> ReusableComposeNode(factory: () -> T, update: Updater<T>.() -> Unit) {
+    val c = requireComposer()
+    c.startReusableNode()
+    if (c.inserting) c.createNode(factory) else c.useNode()
+    Updater<T>(c).update()
+    c.endNode()
+}
+
+/** Emit a reusable node of type [T]; nodes emitted in [content] become its children. */
+public fun <T, E : Applier<*>> ReusableComposeNode(
+    factory: () -> T,
+    update: Updater<T>.() -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val c = requireComposer()
+    c.startReusableNode()
+    if (c.inserting) c.createNode(factory) else c.useNode()
+    Updater<T>(c).update()
+    content()
+    c.endNode()
+}

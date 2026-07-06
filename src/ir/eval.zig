@@ -2681,6 +2681,27 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 try frame.write(bo.dst, .{ .Bool = b });
                 return .cont;
             }
+            // Collection `==` / `!=`: compare element/entry-wise so a user
+            // `equals` override fires (bare structural equality treats a
+            // non-data Instance by identity, so `setOf(P)==setOf(P)`, map value
+            // equality, and nested collections would be wrong).
+            // Set/Map `==` / `!=`: compare element/entry-wise so a user
+            // `equals` override fires (bare structural equality treats a
+            // non-data Instance by identity, so `setOf(P)==setOf(P)` and map
+            // value equality would be wrong). Restricted to a Set/Map operand:
+            // List equality already dispatches element `equals` via
+            // `collectionsEqualHostAware` and its array/sublist views need the
+            // established path.
+            if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+                isSetOrMap(&l) and isSetOrMap(&r))
+            {
+                if (comptime @hasDecl(H, "deepValueEquals")) {
+                    const eq = try host.deepValueEquals(allocator, &l, &r);
+                    const neg = bo.op == .NotEq or bo.op == .BoxedNotEq;
+                    try frame.write(bo.dst, .{ .Bool = if (neg) !eq else eq });
+                    return .cont;
+                }
+            }
             if (operatorMethod(bo.op)) |method| {
                 if (l == .Instance or r == .Instance) {
                     // `a == b` dispatches `a.equals(b)`, but a builtin
@@ -2690,7 +2711,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     // `equals`), dispatch on the Instance instead. Structural
                     // equality is symmetric, so the result is identical and a
                     // builtin receiver need not implement `equals(Instance)`.
-                    const swap = (bo.op == .Eq or bo.op == .BoxedEq) and l != .Instance and r == .Instance;
+                    const swap = (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) and l != .Instance and r == .Instance;
                     const recv_ptr = if (swap) &r else &l;
                     const arg_val = if (swap) l else r;
                     // Strict extension dispatch: an operator extension whose
@@ -2713,10 +2734,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                                         .err => |e2| return raiseStep(frame, e2),
                                     }
                                     result = l;
-                                } else if (bo.op == .Eq or bo.op == .BoxedEq) {
+                                } else if (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) {
                                     // No user `equals` surface: Kotlin's
-                                    // default is structural/identity equality.
-                                    result = .{ .Bool = if (bo.op == .BoxedEq)
+                                    // default is structural/identity equality
+                                    // (`!=` negates it below).
+                                    const boxed = bo.op == .BoxedEq or bo.op == .BoxedNotEq;
+                                    result = .{ .Bool = if (boxed)
                                         Value.structuralEqBoxed(&l, &r)
                                     else
                                         Value.structuralEq(&l, &r) };
@@ -2733,6 +2756,8 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                         .LessEq => .{ .Bool = if (valueToI64(&result)) |i| i <= 0 else false },
                         .Greater => .{ .Bool = if (valueToI64(&result)) |i| i > 0 else false },
                         .GreaterEq => .{ .Bool = if (valueToI64(&result)) |i| i >= 0 else false },
+                        // `!=`: negate the `equals` result.
+                        .NotEq, .BoxedNotEq => if (result == .Bool) Value{ .Bool = !result.Bool } else result,
                         else => result,
                     };
                     try frame.write(bo.dst, final_val);
@@ -3309,15 +3334,31 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             } else {
                 orAudit("CallMemberOrValue", name_str, "member", 0, &recv);
                 const r = try host.callMemberNamed(allocator, &recv, name_str, user_args, names);
-                if (fb_misfit and r == .err and r.err == .Unimplemented and
-                    std.mem.indexOf(u8, r.err.Unimplemented, "Vm::") != null)
-                {
-                    // Nothing else serves the name: the local wins after
-                    // all (its acceptance proof was wrong — a hidden
-                    // default). Discard the miss and invoke it.
+                const member_missed = r == .err and r.err == .Unimplemented and
+                    std.mem.indexOf(u8, r.err.Unimplemented, "Vm::") != null;
+                // The member exists by name but no overload serves this call
+                // (arity/type). When the same-named local is an invocable
+                // function value, it is the intended target — Kotlin resolves
+                // `up.update()` to a `Up.() -> Unit` param over the 2-arg member
+                // `update(value, block)`. Discard the member miss and invoke the
+                // value (its receiver is the call receiver).
+                if (member_missed and fb_invocable) {
                     freeDispatchMissMsg(allocator, r.err.Unimplemented);
                     orAudit("CallMemberOrValue", name_str, "value_after_miss", -1, &recv);
-                    switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
+                    if (fb == .Class) {
+                        const adapted = try allocator.alloc(Value, user_args.len + 1);
+                        defer allocator.free(adapted);
+                        adapted[0] = recv;
+                        @memcpy(adapted[1..], user_args);
+                        const nn = try allocator.alloc(?[]const u8, names.len + 1);
+                        defer allocator.free(nn);
+                        nn[0] = null;
+                        @memcpy(nn[1..], names);
+                        switch (try host.callValueNamed(allocator, &fb, adapted, nn)) {
+                            .ok => |rv| try frame.write(cmv.dst, rv),
+                            .err => |e| return raiseStep(frame, e),
+                        }
+                    } else switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
                         .ok => |rv| try frame.write(cmv.dst, rv),
                         .err => |e| return raiseStep(frame, e),
                     }
@@ -4786,7 +4827,11 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
 /// user-defined overrides fire; primitives use `renderValue`'s fast
 /// path. Caller owns the returned string.
 fn stringify(comptime H: type, allocator: Allocator, host: *H, v: *const Value) Allocator.Error!union(enum) { ok: []const u8, err: EvalError } {
-    if (v.* == .Instance) {
+    // Instances dispatch their `toString()` override; List/Set/Map dispatch too
+    // so their element `toString()` fires (the fast `renderValue`/`display`
+    // formatter prints `ClassName@id` for a user element). Arrays keep Kotlin's
+    // identity `toString`, so they are not included.
+    if (v.* == .Instance or v.* == .List or v.* == .Set or v.* == .Map) {
         switch (try host.callMember(allocator, v, "toString", &.{})) {
             .ok => |result| {
                 if (result == .String) {
@@ -4835,6 +4880,10 @@ fn typeParamCastPasses(comptime H: type, frame: *const Frame, ty: TypeRef, host:
     return false;
 }
 
+fn isSetOrMap(v: *const Value) bool {
+    return v.* == .Set or v.* == .Map;
+}
+
 fn operatorMethod(op: BinOp) ?[]const u8 {
     return switch (op) {
         .Add => "plus",
@@ -4843,6 +4892,10 @@ fn operatorMethod(op: BinOp) ?[]const u8 {
         .Div => "div",
         .Mod => "rem",
         .Eq, .BoxedEq => "equals",
+        // `!=` dispatches `equals` too, then negates (see the operator-method
+        // caller); without this a user `!=` fell through to structural/identity
+        // comparison and `a != b` was true even when `a == b`.
+        .NotEq, .BoxedNotEq => "equals",
         .Less, .LessEq, .Greater, .GreaterEq => "compareTo",
         .RangeTo => "rangeTo",
         .RangeUntil => "rangeUntil",

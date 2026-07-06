@@ -926,7 +926,12 @@ pub fn tryInlineCallWithTypeArgs(
                 const idx_pick = b.module.classIdIndexed(resolved_name, b.self_package, a.name.span.file);
                 const flat_pick = b.module.classId(resolved_name);
                 const cls_pick: ?ir.ClassId = idx_pick orelse flat_pick;
-                try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name, .class = cls_pick } });
+                // Constructor-ref semantics: a reified type argument binds the
+                // CLASS value, so a type that declares a `companion object`
+                // yields the class (its `T::class`), not the published
+                // companion singleton (which would degrade to
+                // `T$Companion$Companion` after the companion is built).
+                try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name, .class = cls_pick, .ctor_ref = true } });
                 cls_reg_opt = cls_reg;
             }
         } else if (callableRefParamFor(f, ordered, tp.name.name)) |pi| {

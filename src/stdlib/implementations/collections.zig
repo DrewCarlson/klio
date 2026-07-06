@@ -422,11 +422,83 @@ fn eqBoxed(x: *const Value, y: *const Value) bool {
     return Value.structuralEqBoxed(x, y);
 }
 
+/// Value equality that honours a user `equals` override: when either side is a
+/// class Instance, dispatch `x.equals(y)` through the VM (as Kotlin's
+/// membership/dedup do); otherwise structural equality. A non-data class with a
+/// custom `equals` (e.g. klio's `LocalDate`) compares by value, not identity.
+fn eqBoxedH(host: IntrinsicHost, out: Output, x: *const Value, y: *const Value) Error!bool {
+    if (x.* == .Instance or y.* == .Instance) {
+        if (try host.invokeMethod(x, "equals", &.{y.*}, out)) |m| {
+            if (m == .ok and m.ok == .Bool) return m.ok.Bool;
+        }
+    }
+    return eqBoxed(x, y);
+}
+
 fn containsBoxed(items: []const Value, needle: *const Value) bool {
     for (items) |*v| {
         if (eqBoxed(v, needle)) return true;
     }
     return false;
+}
+
+fn containsBoxedH(host: IntrinsicHost, out: Output, items: []const Value, needle: *const Value) Error!bool {
+    for (items) |*v| {
+        if (try eqBoxedH(host, out, v, needle)) return true;
+    }
+    return false;
+}
+
+fn indexOfBoxedH(host: IntrinsicHost, out: Output, items: []const Value, needle: *const Value) Error!?usize {
+    for (items, 0..) |*v, i| {
+        if (try eqBoxedH(host, out, v, needle)) return i;
+    }
+    return null;
+}
+
+fn findKeyIndexBoxedH(host: IntrinsicHost, out: Output, entries: []const MapPair, key: *const Value) Error!?usize {
+    for (entries, 0..) |*kv, i| {
+        if (try eqBoxedH(host, out, &kv.key, key)) return i;
+    }
+    return null;
+}
+
+/// `makeMap` honouring a user `equals` for key dedup (last write wins).
+fn makeMapH(host: IntrinsicHost, out: Output, a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
+    var o: std.ArrayList(MapPair) = .empty;
+    for (entries) |kv| {
+        if (try findKeyIndexBoxedH(host, out, o.items, &kv.key)) |i| {
+            if (runtime.reclaimEnabled()) {
+                o.items[i].value.release(a);
+                kv.value.retain();
+            }
+            o.items[i].value = kv.value;
+        } else {
+            if (runtime.reclaimEnabled()) {
+                kv.key.retain();
+                kv.value.retain();
+            }
+            try o.append(a, kv);
+        }
+    }
+    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = o, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable } };
+}
+
+/// Dedup `items` honouring user `equals` (for setOf/toSet over user objects).
+fn makeSetH(host: IntrinsicHost, out: Output, a: Allocator, items: []const Value, mutable: bool) Error!Value {
+    var deduped: std.ArrayList(Value) = .empty;
+    for (items) |v| {
+        if (!try containsBoxedH(host, out, deduped.items, &v)) {
+            if (runtime.reclaimEnabled()) v.retain();
+            try deduped.append(a, v);
+        }
+    }
+    return .{ .Set = .{
+        .items = try ValueList.init(a, deduped),
+        .mutable = mutable,
+        .backing = null,
+        .mod_count = try modCountFor(a, mutable),
+    } };
 }
 
 /// Reinterpret a numeric `needle` into the element kind of a primitive
@@ -1141,7 +1213,7 @@ pub fn coll_iter_distinct_by(ctx: *CallCtx) Error!EvalResult {
             .value => |val| val,
             .err => |e| return e,
         };
-        if (!containsBoxed(keys.items, &key)) {
+        if (!try containsBoxedH(ctx.host, ctx.out, keys.items, &key)) {
             try keys.append(a, key);
             try result.append(a, v);
         }
@@ -1177,7 +1249,7 @@ pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
         }
         var found = false;
         for (groups.items) |*g| {
-            if (eqBoxed(&g.key, &key)) {
+            if (try eqBoxedH(ctx.host, ctx.out, &g.key, &key)) {
                 try g.vs.append(a, value);
                 found = true;
                 break;
@@ -1281,7 +1353,7 @@ pub fn coll_grouping_each_count(ctx: *CallCtx) Error!EvalResult {
         };
         var found = false;
         for (counts.items) |*c| {
-            if (eqBoxed(&c.key, &k)) {
+            if (try eqBoxedH(ctx.host, ctx.out, &c.key, &k)) {
                 c.n += 1;
                 found = true;
                 break;
@@ -1311,7 +1383,7 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
             .value => |val| val,
             .err => |e| return e,
         };
-        const pos = findKeyIndexBoxed(acc.items, &k);
+        const pos = try findKeyIndexBoxedH(ctx.host, ctx.out, acc.items, &k);
         const cur = if (pos) |p| acc.items[p].value else blk: {
             if (isCallable(initial)) {
                 break :blk switch (try invoke(ctx, &initial, &.{ k, v })) {
@@ -1352,7 +1424,7 @@ pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
             .value => |val| val,
             .err => |e| return e,
         };
-        if (findKeyIndexBoxed(acc.items, &k)) |p| {
+        if (try findKeyIndexBoxedH(ctx.host, ctx.out, acc.items, &k)) |p| {
             const cur = acc.items[p].value;
             const next = switch (try invoke(ctx, &op, &.{ k, cur, v })) {
                 .value => |val| val,
@@ -1397,7 +1469,7 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
             key.retain();
             val.retain();
         }
-        if (findKeyIndexBoxed(entries.items, &key)) |i| {
+        if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &key)) |i| {
             if (runtime.reclaimEnabled()) {
                 entries.items[i].value.release(a);
                 key.release(a); // existing key kept; drop the duplicate's retain
@@ -1440,7 +1512,7 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
             };
             value_owned = true;
         }
-        if (findKeyIndexBoxed(entries.items, &key)) |i| {
+        if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &key)) |i| {
             if (runtime.reclaimEnabled()) {
                 entries.items[i].value.release(a);
                 if (!value_owned) value.retain();
@@ -1471,7 +1543,7 @@ pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
         };
         // val is owned (invoke result); v is a borrowed receiver element used as
         // the key, so the map owns its own ref to it.
-        if (findKeyIndexBoxed(entries.items, &v)) |i| {
+        if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &v)) |i| {
             if (runtime.reclaimEnabled()) entries.items[i].value.release(a);
             entries.items[i].value = val;
         } else {
@@ -2326,10 +2398,10 @@ pub fn coll_empty_list(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_set_of(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return ok(try sharedEmptySet(ctx.allocator));
-    return ok(try makeSet(ctx.allocator, ctx.args, false));
+    return ok(try makeSetH(ctx.host, ctx.out, ctx.allocator, ctx.args, false));
 }
 pub fn coll_mutable_set_of(ctx: *CallCtx) Error!EvalResult {
-    return ok(try makeSet(ctx.allocator, ctx.args, true));
+    return ok(try makeSetH(ctx.host, ctx.out, ctx.allocator, ctx.args, true));
 }
 pub fn coll_empty_set(ctx: *CallCtx) Error!EvalResult {
     return ok(try sharedEmptySet(ctx.allocator));
@@ -2345,7 +2417,7 @@ fn mapOfImpl(ctx: *CallCtx, mutable: bool, who: []const u8) Error!EvalResult {
     // Entries hold borrowed key/value (read from the Pair args the caller owns).
     // Dedupe over the still-borrowed entries, then makeMapBorrowed retains the
     // survivors so the map owns one ref per key+value.
-    return ok(try makeMapBorrowed(a, try dedupeMapInPlace(a, entries), mutable));
+    return ok(try makeMapBorrowed(a, try dedupeMapInPlaceH(ctx.host, ctx.out, a, entries), mutable));
 }
 
 /// Apply make_map dedupe semantics to an already-collected entry list.
@@ -2353,6 +2425,19 @@ fn dedupeMapInPlace(a: Allocator, entries: std.ArrayList(MapPair)) Error!std.Arr
     var out: std.ArrayList(MapPair) = .empty;
     for (entries.items) |kv| {
         if (findKeyIndexBoxed(out.items, &kv.key)) |i| {
+            out.items[i].value = kv.value;
+        } else {
+            try out.append(a, kv);
+        }
+    }
+    return out;
+}
+
+/// `dedupeMapInPlace` honouring a user key `equals` (dispatched through the VM).
+fn dedupeMapInPlaceH(host: IntrinsicHost, out_w: Output, a: Allocator, entries: std.ArrayList(MapPair)) Error!std.ArrayList(MapPair) {
+    var out: std.ArrayList(MapPair) = .empty;
+    for (entries.items) |kv| {
+        if (try findKeyIndexBoxedH(host, out_w, out.items, &kv.key)) |i| {
             out.items[i].value = kv.value;
         } else {
             try out.append(a, kv);
@@ -2449,7 +2534,7 @@ pub fn coll_set_of_not_null(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_sorted_set_of(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const items = try a.dupe(Value, ctx.args);
-    if (try sortValuesNatural(a, items)) |e| return e;
+    if (try sortListHostAware(ctx, items)) |e| return e;
     return ok(try makeSet(a, items, true));
 }
 
@@ -2461,7 +2546,7 @@ pub fn coll_sorted_map_of(ctx: *CallCtx) Error!EvalResult {
         try entries.append(a, .{ .key = v.Pair.first.asPtr().*, .value = v.Pair.second.asPtr().* });
     }
     if (try sortMapByKey(a, entries.items, false)) |e| return e;
-    return ok(try makeMap(a, entries.items, true));
+    return ok(try makeMapH(ctx.host, ctx.out, a, entries.items, true));
 }
 
 /// Insertion sort a map's entries by key (natural order, optional reverse).
@@ -2525,6 +2610,15 @@ pub fn coll_hash_map_ctor(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return ok(try makeMap(a, &.{}, true));
     if (ctx.args.len == 1 and ctx.args[0] == .Map) {
         return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), true));
+    }
+    // `HashMap(map)` over an INTERPRETED Map implementation (a
+    // SnapshotStateMap, a user class): copy through its `entries` view,
+    // exactly as `toMap` does.
+    if (ctx.args.len == 1 and ctx.args[0] == .Instance) {
+        switch (try userMapPairs(ctx, ctx.args[0], "HashMap")) {
+            .entries => |pairs| return ok(try makeMap(a, pairs, true)),
+            .err => |e| return e,
+        }
     }
     // `HashMap(initialCapacity)` / `(initialCapacity, loadFactor)` /
     // `LinkedHashMap(initialCapacity, loadFactor, accessOrder)` — the capacity,
@@ -2673,9 +2767,11 @@ pub fn coll_list_contains(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("contains requires an argument");
     const needle = ctx.args[1];
-    const g = it.borrow();
-    defer g.deinit();
-    return ok(.{ .Bool = containsBoxed(g.get().items, &needle) });
+    // Snapshot before dispatching a user `equals` (re-entering the VM under the
+    // list borrow is unsafe).
+    const items = try snapshotItems(ctx.allocator, it);
+    defer if (runtime.freeScratch()) ctx.allocator.free(items);
+    return ok(.{ .Bool = try containsBoxedH(ctx.host, ctx.out, items, &needle) });
 }
 pub fn coll_list_index_of(ctx: *CallCtx) Error!EvalResult {
     const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.indexOf")) {
@@ -2684,9 +2780,9 @@ pub fn coll_list_index_of(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("indexOf requires an argument");
     const needle = ctx.args[1];
-    const g = it.borrow();
-    defer g.deinit();
-    const pos = indexOfBoxed(g.get().items, &needle);
+    const items = try snapshotItems(ctx.allocator, it);
+    defer if (runtime.freeScratch()) ctx.allocator.free(items);
+    const pos = try indexOfBoxedH(ctx.host, ctx.out, items, &needle);
     return ok(Value.newInt(if (pos) |p| @intCast(p) else -1));
 }
 pub fn coll_iter_index_of_first(ctx: *CallCtx) Error!EvalResult {
@@ -2838,13 +2934,12 @@ pub fn coll_list_last_index_of(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("lastIndexOf requires an argument");
     const needle = ctx.args[1];
-    const g = it.borrow();
-    defer g.deinit();
-    const items = g.get().items;
+    const items = try snapshotItems(ctx.allocator, it);
+    defer if (runtime.freeScratch()) ctx.allocator.free(items);
     var i = items.len;
     while (i > 0) {
         i -= 1;
-        if (eqBoxed(&items[i], &needle)) return ok(Value.newInt(@intCast(i)));
+        if (try eqBoxedH(ctx.host, ctx.out, &items[i], &needle)) return ok(Value.newInt(@intCast(i)));
     }
     return ok(Value.newInt(-1));
 }
@@ -2951,11 +3046,87 @@ pub fn coll_array_join_to_string(ctx: *CallCtx) Error!EvalResult {
     return joinToStringImpl(ctx, items, false);
 }
 
+/// Render one collection element/key/value: a user Instance via its own
+/// `toString()` (dispatched through the VM); everything else via `display`.
+/// Caller owns the returned slice.
+fn elemPiece(ctx: *CallCtx, v: Value) Error![]u8 {
+    const a = ctx.allocator;
+    if (v == .Instance) {
+        if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |mr| {
+            if (mr == .ok and mr.ok == .String) {
+                const g = mr.ok.String.borrow();
+                defer g.deinit();
+                return try a.dupe(u8, g.get().bytes);
+            }
+        }
+    }
+    return try display(a, v);
+}
+
 fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
     if (try sublistComodGuard(a, &ctx.args[0])) |e| return e;
-    const buf = try display(a, ctx.args[0]);
+    const recv = ctx.args[0];
+    if (recv == .Map) {
+        const entries = try snapshotEntries(a, recv.Map.entries);
+        defer a.free(entries);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(a);
+        try out.append(a, '{');
+        for (entries, 0..) |kv, i| {
+            if (i > 0) try out.appendSlice(a, ", ");
+            const kp = if (Value.referenceEq(&kv.key, &recv)) try a.dupe(u8, "(this Map)") else try elemPiece(ctx, kv.key);
+            defer if (runtime.freeScratch()) a.free(kp);
+            try out.appendSlice(a, kp);
+            try out.append(a, '=');
+            const vp = if (Value.referenceEq(&kv.value, &recv)) try a.dupe(u8, "(this Map)") else try elemPiece(ctx, kv.value);
+            defer if (runtime.freeScratch()) a.free(vp);
+            try out.appendSlice(a, vp);
+        }
+        try out.append(a, '}');
+        return ok(try makeStringOwned(a, try out.toOwnedSlice(a)));
+    }
+    // A List/Set element that is a user Instance must render via its own
+    // `toString()` (dispatched through the VM), not the Zig-level `display`
+    // formatter, which prints `ClassName@id` for a non-data class. Primitives
+    // and data classes fall back to `display` (already correct).
+    const items: ?[]Value = switch (recv) {
+        .List => |l| try snapshotItems(a, l.items),
+        .Set => |s| try snapshotItems(a, s.items),
+        else => null,
+    };
+    if (items) |elems| {
+        defer a.free(elems);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(a);
+        try out.append(a, '[');
+        for (elems, 0..) |v, i| {
+            if (i > 0) try out.appendSlice(a, ", ");
+            // A collection that contains itself renders the self-slot as
+            // `(this Collection)` rather than recursing (matches Kotlin).
+            if (Value.referenceEq(&v, &recv)) {
+                try out.appendSlice(a, "(this Collection)");
+                continue;
+            }
+            const piece: []const u8 = if (v == .Instance) blk: {
+                if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |mr| {
+                    if (mr == .ok and mr.ok == .String) {
+                        const g = mr.ok.String.borrow();
+                        defer g.deinit();
+                        break :blk try a.dupe(u8, g.get().bytes);
+                    }
+                }
+                break :blk try display(a, v);
+            } else try display(a, v);
+            try out.appendSlice(a, piece);
+            if (runtime.freeScratch()) a.free(piece);
+        }
+        try out.append(a, ']');
+        const buf = try out.toOwnedSlice(a);
+        return ok(try makeStringOwned(a, buf));
+    }
+    const buf = try display(a, recv);
     const s = try makeStringOwned(a, buf);
     if (runtime.freeScratch()) a.free(buf);
     return ok(s);
@@ -4036,7 +4207,7 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
             var seen: std.ArrayList(Value) = .empty;
             var nx: std.ArrayList(Value) = .empty;
             for (items) |v| {
-                if (!containsBoxed(seen.items, &v)) {
+                if (!try containsBoxedH(host, out, seen.items, &v)) {
                     try seen.append(a, v);
                     try nx.append(a, v);
                 }
@@ -4051,7 +4222,7 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
                     .value => |x| x,
                     .err => |e| return .{ .err = e },
                 };
-                if (!containsBoxed(seen.items, &key)) {
+                if (!try containsBoxedH(host, out, seen.items, &key)) {
                     try seen.append(a, key);
                     try nx.append(a, v);
                 }
@@ -4464,7 +4635,7 @@ fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enum) {
                 };
             },
         }
-        if (findKeyIndexBoxed(out.items, &key)) |i| {
+        if (try findKeyIndexBoxedH(ctx.host, ctx.out, out.items, &key)) |i| {
             out.items[i].value = val;
         } else {
             try out.append(a, .{ .key = key, .value = val });
@@ -4519,7 +4690,7 @@ pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
         }
         return ok(dest);
     }
-    return ok(try makeMap(a, entries.items, false));
+    return ok(try makeMapH(ctx.host, ctx.out, a, entries.items, false));
 }
 
 pub fn coll_list_distinct(ctx: *CallCtx) Error!EvalResult {
@@ -4528,11 +4699,11 @@ pub fn coll_list_distinct(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    const g = it.borrow();
-    defer g.deinit();
+    const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
     var out: std.ArrayList(Value) = .empty;
-    for (g.get().items) |v| {
-        if (!containsBoxed(out.items, &v)) try out.append(a, v);
+    for (items) |v| {
+        if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
     }
     return ok(try makeListBorrowed(a, out, false));
 }
@@ -4828,8 +4999,8 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
         if (is_collection) {
-            if (!containsBoxed(removals.items, &v)) try out.append(a, v);
-        } else if (indexOfBoxed(removals.items, &v)) |pos| {
+            if (!try containsBoxedH(ctx.host, ctx.out, removals.items, &v)) try out.append(a, v);
+        } else if (try indexOfBoxedH(ctx.host, ctx.out, removals.items, &v)) |pos| {
             _ = removals.orderedRemove(pos);
         } else {
             try out.append(a, v);
@@ -5007,17 +5178,17 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const arg = ctx.args[1];
     switch (arg) {
         .List => |l| {
-            const g = l.items.borrow();
-            defer g.deinit();
-            for (g.get().items) |v| {
-                if (!containsBoxed(out.items, &v)) try out.append(a, v);
+            const src = try snapshotItems(a, l.items);
+            defer if (runtime.freeScratch()) a.free(src);
+            for (src) |v| {
+                if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
             }
         },
         .Set => |s| {
-            const g = s.items.borrow();
-            defer g.deinit();
-            for (g.get().items) |v| {
-                if (!containsBoxed(out.items, &v)) try out.append(a, v);
+            const src = try snapshotItems(a, s.items);
+            defer if (runtime.freeScratch()) a.free(src);
+            for (src) |v| {
+                if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
             }
         },
         .Array, .Range, .Sequence => {
@@ -5027,11 +5198,11 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
             };
             defer if (runtime.freeScratch()) a.free(xs);
             for (xs) |v| {
-                if (!containsBoxed(out.items, &v)) try out.append(a, v);
+                if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
             }
         },
         else => {
-            if (!containsBoxed(out.items, &arg)) try out.append(a, arg);
+            if (!try containsBoxedH(ctx.host, ctx.out, out.items, &arg)) try out.append(a, arg);
         },
     }
     // `out` holds borrowed elements (snapshot/args); the new set owns one ref
@@ -5074,7 +5245,7 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     const src = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
-        if (!containsBoxed(removals.items, &v)) try out.append(a, v);
+        if (!try containsBoxedH(ctx.host, ctx.out, removals.items, &v)) try out.append(a, v);
     }
     // `out` holds borrowed elements (snapshot/args); the new set owns one ref
     // per element, so retain each before adopting the backing.
@@ -5104,7 +5275,7 @@ pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
     const src = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
-        if (containsBoxed(other.items, &v)) try out.append(a, v);
+        if (try containsBoxedH(ctx.host, ctx.out, other.items, &v)) try out.append(a, v);
     }
     // `out` holds borrowed elements (snapshot/args); the new set owns one ref
     // per element, so retain each before adopting the backing.
@@ -5140,9 +5311,9 @@ pub fn coll_set_contains(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("contains requires an argument");
     const needle = ctx.args[1];
-    const g = it.borrow();
-    defer g.deinit();
-    return ok(.{ .Bool = containsBoxed(g.get().items, &needle) });
+    const items = try snapshotItems(ctx.allocator, it);
+    defer if (runtime.freeScratch()) ctx.allocator.free(items);
+    return ok(.{ .Bool = try containsBoxedH(ctx.host, ctx.out, items, &needle) });
 }
 
 pub fn coll_set_sorted(ctx: *CallCtx) Error!EvalResult {
@@ -5153,7 +5324,7 @@ pub fn coll_set_sorted(ctx: *CallCtx) Error!EvalResult {
     };
     const copy = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(copy);
-    if (try sortValuesNatural(a, copy)) |e| return e;
+    if (try sortListHostAware(ctx, copy)) |e| return e;
     return ok(try makeList(a, copy, false));
 }
 pub fn coll_set_sorted_descending(ctx: *CallCtx) Error!EvalResult {
@@ -5180,9 +5351,13 @@ pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("add requires an argument");
     const arg = ctx.args[1];
+    // Snapshot for the membership check (dispatching `equals` re-enters the VM,
+    // which must not happen under the mutable borrow); then borrow to append.
+    const snap = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(snap);
+    if (try containsBoxedH(ctx.host, ctx.out, snap, &arg)) return ok(.{ .Bool = false });
     const g = it.borrowMut();
     defer g.deinit();
-    if (containsBoxed(g.get().items, &arg)) return ok(.{ .Bool = false });
     // The set owns one reference per element; retain the borrowed argument.
     if (runtime.reclaimEnabled()) arg.retain();
     try g.get().append(a, arg);
@@ -5314,11 +5489,21 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
             },
         }
     };
+    // Decide keep/drop per element under a snapshot (membership dispatches a
+    // user `equals` that re-enters the VM, which must not run under the mutable
+    // borrow); then compact in place under one borrow. Single-threaded, so the
+    // snapshot's order matches the live list.
+    const snap = try snapshotItems(a, items);
+    defer if (runtime.freeScratch()) a.free(snap);
+    const keep_flags = try a.alloc(bool, snap.len);
+    defer if (runtime.freeScratch()) a.free(keep_flags);
+    for (snap, 0..) |v, i| {
+        const present = try containsBoxedH(ctx.host, ctx.out, other, &v);
+        keep_flags[i] = if (retain) present else !present;
+    }
     var changed = false;
     {
-        const g = it_mut: {
-            break :it_mut items.borrowMut();
-        };
+        const g = items.borrowMut();
         defer g.deinit();
         const list = g.get();
         const before = list.items.len;
@@ -5326,9 +5511,7 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
         var r: usize = 0;
         while (r < list.items.len) : (r += 1) {
             const v = list.items[r];
-            const present = containsBoxed(other, &v);
-            const keep = if (retain) present else !present;
-            if (keep) {
+            if (r < keep_flags.len and keep_flags[r]) {
                 list.items[w] = v;
                 w += 1;
             } else if (runtime.reclaimEnabled()) {
@@ -5452,7 +5635,7 @@ pub fn coll_map_plus(ctx: *CallCtx) Error!EvalResult {
         },
         else => return typeErr("Map.plus expects a Pair, Map, or Iterable<Pair>"),
     }
-    return ok(try makeMap(a, out.items, false));
+    return ok(try makeMapH(ctx.host, ctx.out, a, out.items, false));
 }
 
 pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
@@ -5482,7 +5665,7 @@ pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
     for (src) |kv| {
         if (!containsBoxed(keys.items, &kv.key)) try out.append(a, kv);
     }
-    return ok(try makeMap(a, out.items, false));
+    return ok(try makeMapH(ctx.host, ctx.out, a, out.items, false));
 }
 
 pub fn coll_map_size(ctx: *CallCtx) Error!EvalResult {
@@ -6084,10 +6267,10 @@ pub fn coll_list_contains_all(ctx: *CallCtx) Error!EvalResult {
     };
     const other = (try collectColl(a, if (ctx.args.len > 1) ctx.args[1] else null)) orelse
         return typeErr("containsAll requires a collection");
-    const g = it.borrow();
-    defer g.deinit();
+    const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
     for (other) |o| {
-        if (!containsBoxed(g.get().items, &o)) return ok(.{ .Bool = false });
+        if (!try containsBoxedH(ctx.host, ctx.out, items, &o)) return ok(.{ .Bool = false });
     }
     return ok(.{ .Bool = true });
 }
@@ -6114,7 +6297,9 @@ pub fn coll_list_to_set(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSetVL(a, it, false));
+    const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
+    return ok(try makeSetH(ctx.host, ctx.out, a, items, false));
 }
 pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -6305,10 +6490,10 @@ pub fn coll_set_contains_all(ctx: *CallCtx) Error!EvalResult {
     };
     const other = (try collectColl(a, if (ctx.args.len > 1) ctx.args[1] else null)) orelse
         return typeErr("containsAll requires a collection");
-    const g = it.borrow();
-    defer g.deinit();
+    const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
     for (other) |o| {
-        if (!containsBoxed(g.get().items, &o)) return ok(.{ .Bool = false });
+        if (!try containsBoxedH(ctx.host, ctx.out, items, &o)) return ok(.{ .Bool = false });
     }
     return ok(.{ .Bool = true });
 }
@@ -6373,18 +6558,30 @@ pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
             .items => |x| x,
             .err => |e| return e,
         };
-    const g = it.borrowMut();
-    defer g.deinit();
-    var changed = false;
+    // Collect the genuinely-new items under a snapshot (dispatching key
+    // `equals` re-enters the VM and must not run under the mutable borrow),
+    // checking against the growing `seen` set; then append them in one borrow.
+    const initial = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(initial);
+    var seen: std.ArrayList(Value) = .empty;
+    defer seen.deinit(a);
+    try seen.appendSlice(a, initial);
+    var new_items: std.ArrayList(Value) = .empty;
+    defer new_items.deinit(a);
     for (to_add) |v| {
-        if (!containsBoxed(g.get().items, &v)) {
-            // The set owns one ref per element; `to_add` is a borrowed snapshot.
-            if (runtime.reclaimEnabled()) v.retain();
-            try g.get().append(a, v);
-            changed = true;
+        if (!try containsBoxedH(ctx.host, ctx.out, seen.items, &v)) {
+            try seen.append(a, v);
+            try new_items.append(a, v);
         }
     }
-    return ok(.{ .Bool = changed });
+    if (new_items.items.len == 0) return ok(.{ .Bool = false });
+    const g = it.borrowMut();
+    defer g.deinit();
+    for (new_items.items) |v| {
+        if (runtime.reclaimEnabled()) v.retain();
+        try g.get().append(a, v);
+    }
+    return ok(.{ .Bool = true });
 }
 
 // =====================================================================
@@ -6723,7 +6920,7 @@ pub fn array_content_equals(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(xb);
     if (xa.len != xb.len) return ok(.{ .Bool = false });
     for (xa, xb) |*x, *y| {
-        if (!eqBoxed(x, y)) return ok(.{ .Bool = false });
+        if (!try eqBoxedH(ctx.host, ctx.out, x, y)) return ok(.{ .Bool = false });
     }
     return ok(.{ .Bool = true });
 }
@@ -6947,7 +7144,7 @@ pub fn array_contains(ctx: *CallCtx) Error!EvalResult {
     };
     defer if (runtime.freeScratch()) a.free(items);
     const needle = coerceNeedleToArrayKind(ctx.args[1], arrayPrimOf(ctx.args[0]));
-    return ok(.{ .Bool = containsBoxed(items, &needle) });
+    return ok(.{ .Bool = try containsBoxedH(ctx.host, ctx.out, items, &needle) });
 }
 
 pub fn array_contains_all(ctx: *CallCtx) Error!EvalResult {
