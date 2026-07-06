@@ -41,6 +41,16 @@ Other `AnnotationTarget` entries (CLASS, FUNCTION, ...) contribute nothing to `U
 
 ## A. `@all:` use-site meta-target for properties
 
+Implemented in KLIO: the parser accepts `all` as a use-site target (and
+rejects the `@all:[...]` bracket form with
+`INAPPLICABLE_ALL_TARGET_IN_MULTI_ANNOTATION`), typeck enforces the anchor
+rule and expansion diagnostics, and lowering expands `@all:` over the
+per-anchor annotation records on the runtime class metadata
+(`ClassParamDef.anchors` / `PropertyDef.anchors`). The shared U(A) /
+expansion / defaulting machinery lives in `src/ast/annotation_targets.zig`.
+Coverage: `zig build itest-annotation_targets` (matrix rows A1-A12), parser
+and typeck unit tests.
+
 ### Anchor rule
 
 `@all:A` is legal only on a **member or top-level property declaration**, including a
@@ -132,6 +142,17 @@ annotations) must report exactly the listed targets; all other targets report no
 ---
 
 ## B. Defaulting rules for annotations without a use-site target
+
+Implemented in KLIO (LV 2.4 mode only): typeck runs the defaulting
+algorithm per property declaration (with per-anchor repetition checking
+after `@all:` expansion), and lowering records the defaulted placements on
+the same per-anchor runtime metadata. The reflective JSON serializer reads
+the property anchor, so `@SerialName("...")` is honored under target-less,
+`@property:`, and `@all:` placements (`examples/serial_names.kt`,
+`zig build itest-json_reified_inline`). Coverage:
+`zig build itest-annotation_targets` (matrix rows B1-B12). Top-level
+properties keep no runtime anchor table yet; their placement is enforced
+in typeck and pinned by the shared machinery's unit tests.
 
 Applies to an annotation entry `@A` written with **no** use-site target on a property or
 primary-constructor property. Only the `param`, `property`, `field` (and `delegate`)

@@ -758,6 +758,44 @@ test "annotation_array_form" {
     try testing.expectEqualStrings("B", p.annotations[1].path[0].name);
 }
 
+test "annotation_all_use_site_target" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(), "class C(@all:Foo val x: Int)\n@all:Bar(\"v\") val top: Int = 1\n");
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const cp = out.file.decls[0].Class.primary_params[0];
+    try testing.expectEqual(@as(usize, 1), cp.annotations.len);
+    try testing.expectEqual(ast.AnnotationUseSite.All, cp.annotations[0].use_site.?);
+    try testing.expectEqualStrings("Foo", cp.annotations[0].path[0].name);
+    const tp = out.file.decls[1].Property;
+    try testing.expectEqual(ast.AnnotationUseSite.All, tp.annotations[0].use_site.?);
+    try testing.expectEqual(@as(usize, 1), tp.annotations[0].args.len);
+}
+
+test "annotation_all_multi_bracket_rejected" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(), "class C(@all:[A B] val x: Int)\n");
+    try testing.expect(out.parser.diagnostics.hasErrors());
+    var found = false;
+    for (out.parser.diagnostics.diags()) |d| {
+        const f = d.factory orelse continue;
+        if (std.mem.eql(u8, f.name, "INAPPLICABLE_ALL_TARGET_IN_MULTI_ANNOTATION")) {
+            try testing.expectEqualStrings(
+                "Multiple annotation syntax with '@all:' use-site target is forbidden, use '@all:A1 @all:A2 ...' instead.",
+                d.message,
+            );
+            found = true;
+        }
+    }
+    try testing.expect(found);
+    // Recovery: both bracketed annotations still parse onto the param.
+    const cp = out.file.decls[0].Class.primary_params[0];
+    try testing.expectEqual(@as(usize, 2), cp.annotations.len);
+}
+
 test "when_subject_binding_parsed" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

@@ -156,6 +156,20 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
     const a = self.allocator;
     switch (decl.*) {
         .Property => |p| {
+            // `@all:` is a property meta-target; local properties have no
+            // constructor parameter, backing field, or accessors to
+            // expand over.
+            for (p.annotations) |*ann| {
+                if (ann.use_site != null and ann.use_site.? == .All) {
+                    var d = Diagnostic.err(
+                        "'@all:' annotations cannot be applied to local properties, only member or top-level properties are allowed.",
+                        ann.span,
+                    );
+                    _ = d.withCode(codes.TYPE_INAPPLICABLE_ALL_TARGET);
+                    _ = d.withFactory(&factories.INAPPLICABLE_ALL_TARGET);
+                    try self.diagnostics.emit(a, d);
+                }
+            }
             var annot: ?Type = if (p.ty) |*t| try convertTypeRefLossyH(a, t) else null;
             defer if (annot) |*an| an.deinit(a);
 

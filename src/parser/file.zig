@@ -486,6 +486,15 @@ fn parseAnnotationSetCtx(p: *Parser, in_type_position: bool) ?[]Annotation {
         return null;
     const use_site = tryParseAnnotationUseSite(p);
     if (std.meta.activeTag(support.peekKind(p).*) == .LBracket) {
+        if (use_site != null and use_site.? == .All) {
+            support.errWithFactory(
+                p,
+                &diagnostics.generated.INAPPLICABLE_ALL_TARGET_IN_MULTI_ANNOTATION,
+                "E0017",
+                "Multiple annotation syntax with '@all:' use-site target is forbidden, use '@all:A1 @all:A2 ...' instead.",
+                support.currentSpan(p),
+            );
+        }
         _ = support.bump(p);
         var anns: std.ArrayList(Annotation) = .empty;
         while (true) {
@@ -542,6 +551,8 @@ pub fn tryParseAnnotationUseSite(p: *Parser) ?AnnotationUseSite {
         .Delegate
     else if (std.mem.eql(u8, t, "file"))
         .File
+    else if (std.mem.eql(u8, t, "all"))
+        .All
     else
         return null;
     _ = support.bump(p);

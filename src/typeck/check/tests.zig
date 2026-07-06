@@ -2695,3 +2695,176 @@ test "ebf_read_outside_class_public_type_ok" {
     defer c.deinit();
     try testing.expect(!c.hasFactory("UNRESOLVED_REFERENCE"));
 }
+
+// ---------------------------------------------------------------------------
+// Annotation use-site targeting: `@all:` expansion and LV 2.4 defaulting.
+// ---------------------------------------------------------------------------
+
+/// `@Target(AnnotationTarget.<entries>) annotation class <name>`
+fn targetAnnotationClass(b: *Builder, name: []const u8, entries: []const []const u8) ast.Class {
+    var args: std.ArrayList(Expr) = .empty;
+    for (entries) |e| {
+        args.append(b.a(), b.member(b.path("AnnotationTarget"), e)) catch unreachable;
+    }
+    var c = b.class(name);
+    c.is_annotation = true;
+    c.annotations = b.slice(Annotation, &.{b.annotation("Target", args.items)});
+    return c;
+}
+
+fn annotationWithSite(b: *Builder, use_site: ?ast.AnnotationUseSite, name: []const u8) Annotation {
+    var ann = b.annotation(name, &.{});
+    ann.use_site = use_site;
+    return ann;
+}
+
+test "annotation_all_target_expands_without_diagnostics" {
+    // @Target(VALUE_PARAMETER, PROPERTY, FIELD, PROPERTY_GETTER) annotation class Wide
+    // class U(@all:Wide val e: String)
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const wide = targetAnnotationClass(&b, "Wide", &.{ "VALUE_PARAMETER", "PROPERTY", "FIELD", "PROPERTY_GETTER" });
+    var u = b.class("U");
+    var cp = b.valParam("e", b.ty("String"));
+    cp.annotations = b.slice(Annotation, &.{annotationWithSite(&b, .All, "Wide")});
+    u.primary_params = b.slice(ast.ClassParam, &.{cp});
+    const f = b.file(&.{ .{ .Class = wide }, .{ .Class = u } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(!c.hasErrors());
+}
+
+test "annotation_all_target_nothing_applicable_rejected" {
+    // A5: @Target(FUNCTION) annotation class FunOnly
+    // class U(@all:FunOnly val e: String)
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const fun_only = targetAnnotationClass(&b, "FunOnly", &.{"FUNCTION"});
+    var u = b.class("U");
+    var cp = b.valParam("e", b.ty("String"));
+    cp.annotations = b.slice(Annotation, &.{annotationWithSite(&b, .All, "FunOnly")});
+    u.primary_params = b.slice(ast.ClassParam, &.{cp});
+    const f = b.file(&.{ .{ .Class = fun_only }, .{ .Class = u } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("WRONG_ANNOTATION_TARGET_WITH_USE_SITE_TARGET"));
+}
+
+test "annotation_all_target_on_plain_ctor_param_rejected" {
+    // A11: class U(@all:Wide x: String) — no val/var.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const wide = targetAnnotationClass(&b, "Wide", &.{ "VALUE_PARAMETER", "PROPERTY" });
+    var u = b.class("U");
+    var cp = b.plainCtorParam("x", b.ty("String"));
+    cp.annotations = b.slice(Annotation, &.{annotationWithSite(&b, .All, "Wide")});
+    u.primary_params = b.slice(ast.ClassParam, &.{cp});
+    const f = b.file(&.{ .{ .Class = wide }, .{ .Class = u } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("INAPPLICABLE_ALL_TARGET"));
+    try testing.expect(c.hasCode(codes.TYPE_INAPPLICABLE_ALL_TARGET));
+}
+
+test "annotation_all_target_on_local_property_rejected" {
+    // A7: fun f() { @all:Wide val x = 1 }
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const wide = targetAnnotationClass(&b, "Wide", &.{ "VALUE_PARAMETER", "PROPERTY" });
+    var local = b.prop(false, "x", null, b.intLit(1));
+    local.annotations = b.slice(Annotation, &.{annotationWithSite(&b, .All, "Wide")});
+    const f_decl = b.funBlock("f", &.{}, null, &.{.{ .Decl = .{ .Property = b.dup(Property, local) } }});
+    const f = b.file(&.{ .{ .Class = wide }, .{ .Function = f_decl } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("INAPPLICABLE_ALL_TARGET"));
+}
+
+test "annotation_all_plus_field_repeats_on_backing_field" {
+    // A10: class U(@all:FieldOnly @field:FieldOnly val e: String)
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const field_only = targetAnnotationClass(&b, "FieldOnly", &.{"FIELD"});
+    var u = b.class("U");
+    var cp = b.valParam("e", b.ty("String"));
+    cp.annotations = b.slice(Annotation, &.{
+        annotationWithSite(&b, .All, "FieldOnly"),
+        annotationWithSite(&b, .Field, "FieldOnly"),
+    });
+    u.primary_params = b.slice(ast.ClassParam, &.{cp});
+    const f = b.file(&.{ .{ .Class = field_only }, .{ .Class = u } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("REPEATED_ANNOTATION"));
+}
+
+test "annotation_defaulting_param_field_accepted_on_ctor_property" {
+    // B2/B11: @Target(VALUE_PARAMETER, FIELD) annotation class PF
+    // class C(@PF val x: Int) — param + field, no diagnostic.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const pf = targetAnnotationClass(&b, "PF", &.{ "VALUE_PARAMETER", "FIELD" });
+    var cls = b.class("C");
+    var cp = b.valParam("x", b.ty("Int"));
+    cp.annotations = b.slice(Annotation, &.{b.annotation("PF", &.{})});
+    cls.primary_params = b.slice(ast.ClassParam, &.{cp});
+    const f = b.file(&.{ .{ .Class = pf }, .{ .Class = cls } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(!c.hasErrors());
+}
+
+test "annotation_defaulting_getter_only_rejected_on_member_property" {
+    // B8: @Target(PROPERTY_GETTER) annotation class G
+    // class C { @G val x = 1 } — never defaults to `get`.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const g = targetAnnotationClass(&b, "G", &.{"PROPERTY_GETTER"});
+    var cls = b.class("C");
+    var member = b.prop(false, "x", null, b.intLit(1));
+    member.annotations = b.slice(Annotation, &.{b.annotation("G", &.{})});
+    cls.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, member) }});
+    const f = b.file(&.{ .{ .Class = g }, .{ .Class = cls } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("WRONG_ANNOTATION_TARGET"));
+}
+
+test "annotation_defaulting_field_only_needs_backing_field" {
+    // B7: class C { @F val x: Int get() = 1 } — F targets FIELD only.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const fcls = targetAnnotationClass(&b, "F", &.{"FIELD"});
+    var cls = b.class("C");
+    var member = b.prop(false, "x", b.ty("Int"), null);
+    member.getter = b.dup(Accessor, .{
+        .params = &.{},
+        .return_type = null,
+        .body = .{ .Expr = b.intLit(1) },
+        .visibility = null,
+        .is_inline = false,
+        .annotations = &.{},
+        .span = b.ts(),
+    });
+    member.annotations = b.slice(Annotation, &.{b.annotation("F", &.{})});
+    cls.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, member) }});
+    const f = b.file(&.{ .{ .Class = fcls }, .{ .Class = cls } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("WRONG_ANNOTATION_TARGET"));
+}
+
+test "annotation_explicit_use_site_disables_defaulting" {
+    // B12: class C(@param:PPF val x: Int) — no diagnostic.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const ppf = targetAnnotationClass(&b, "PPF", &.{ "VALUE_PARAMETER", "PROPERTY", "FIELD" });
+    var cls = b.class("C");
+    var cp = b.valParam("x", b.ty("Int"));
+    cp.annotations = b.slice(Annotation, &.{annotationWithSite(&b, .Param, "PPF")});
+    cls.primary_params = b.slice(ast.ClassParam, &.{cp});
+    const f = b.file(&.{ .{ .Class = ppf }, .{ .Class = cls } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(!c.hasErrors());
+}

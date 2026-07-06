@@ -2051,7 +2051,7 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
-        const def = try buildClassDef(module, a, c, fqn_overrides, package_prefix, &object_spans, globals_for_capture);
+        const def = try buildClassDef(module, a, c, fqn_overrides, package_prefix, &object_spans, globals_for_capture, &file_classes);
         try new_defs.append(a, def);
         const fqn_g = def.borrow();
         const def_fqn = fqn_g.get().fqn;
@@ -2772,6 +2772,137 @@ fn collectCompanionOwnMembers(c: *const ast.Class, own: *StringSet) Allocator.Er
     }
 }
 
+/// Resolve the `@Target` entry names of the annotation class `leaf` from
+/// the build's class universe (user files plus base/pack classes). `null`
+/// when the class is unknown or declares no `@Target` — both admit the
+/// default use-site set.
+fn annotationTargetEntries(
+    a: Allocator,
+    file_classes: *const FileClasses,
+    leaf: []const u8,
+) Allocator.Error!?[]const []const u8 {
+    const ref = file_classes.get(leaf) orelse return null;
+    const cls = ref.get();
+    if (!cls.is_annotation) return null;
+    for (cls.annotations) |*ann| {
+        if (ann.path.len == 0) continue;
+        if (!std.mem.eql(u8, ann.path[ann.path.len - 1].name, "Target")) continue;
+        var names: std.ArrayList([]const u8) = .empty;
+        for (ann.args) |*arg| {
+            switch (arg.*) {
+                .Path => |p| if (p.segments.len > 0) {
+                    try names.append(a, p.segments[p.segments.len - 1].name);
+                },
+                .Member => |m| try names.append(a, m.name.name),
+                else => {},
+            }
+        }
+        return try names.toOwnedSlice(a);
+    }
+    return null;
+}
+
+/// Lower one source annotation entry to a runtime record: resolved FQN
+/// candidates plus resolved constructor arguments.
+fn annotationRecordFor(
+    module: *Module,
+    a: Allocator,
+    ann: *const ast.Annotation,
+) Allocator.Error!runtime.AnnotationRecord {
+    var args = try a.alloc(runtime.AnnotationArg, ann.args.len);
+    for (ann.args, 0..) |*arg, i| {
+        args[i] = switch (arg.*) {
+            .StringTemplate => |st| blk: {
+                if (st.parts.len == 0) break :blk .{ .Str = "" };
+                if (st.parts.len == 1 and st.parts[0] == .Text) {
+                    break :blk .{ .Str = st.parts[0].Text };
+                }
+                break :blk .Other;
+            },
+            .IntLit => |il| .{ .Int = il.value },
+            .BoolLit => |bl| .{ .Bool = bl.value },
+            .Path => |p| if (p.segments.len > 0)
+                runtime.AnnotationArg{ .EnumEntry = p.segments[p.segments.len - 1].name }
+            else
+                .Other,
+            .Member => |m| .{ .EnumEntry = m.name.name },
+            else => .Other,
+        };
+    }
+    const arg_names = try a.alloc(?[]const u8, ann.arg_names.len);
+    @memcpy(arg_names, ann.arg_names);
+    return .{
+        .names = try ir.lower.resolveAnnotationNames(module, ann[0..1]),
+        .args = args,
+        .arg_names = arg_names,
+    };
+}
+
+/// Assign every annotation entry of one property declaration to its final
+/// anchors (`@all:` expansion, explicit use-site, or the LV 2.4 defaulting
+/// rule) and collect the per-anchor records.
+fn buildPropertyAnchors(
+    module: *Module,
+    a: Allocator,
+    file_classes: *const FileClasses,
+    anns: []const ast.Annotation,
+    shape: ast.annotation_targets.PropertyShape,
+) Allocator.Error!runtime.PropertyAnchors {
+    if (anns.len == 0) return .{};
+    const at = ast.annotation_targets;
+    var lists: [7]std.ArrayList(runtime.AnnotationRecord) = @splat(.empty);
+    const anchor_fields = [_][]const u8{ "param", "property", "field", "get", "set", "setparam", "delegate" };
+    for (anns) |*ann| {
+        if (ann.path.len == 0) continue;
+        const leaf = ann.path[ann.path.len - 1].name;
+        var placement = at.Placement{};
+        if (ann.use_site) |us| switch (us) {
+            .All => {
+                if (shape.is_delegated) continue;
+                const u = at.useSiteSet(try annotationTargetEntries(a, file_classes, leaf));
+                placement = at.expandAll(u, shape);
+            },
+            .Field => placement.field = true,
+            .Property => placement.property = true,
+            .Get => placement.get = true,
+            .Set => placement.set = true,
+            .Param => placement.param = true,
+            .SetParam => placement.setparam = true,
+            .Delegate => placement.delegate = true,
+            .Receiver, .File => continue,
+        } else {
+            const u = at.useSiteSet(try annotationTargetEntries(a, file_classes, leaf));
+            placement = at.defaultPlacement(u, shape);
+        }
+        if (placement.isEmpty()) continue;
+        const rec = try annotationRecordFor(module, a, ann);
+        inline for (anchor_fields, 0..) |fname, i| {
+            if (@field(placement, fname)) try lists[i].append(a, rec);
+        }
+    }
+    return .{
+        .param = try lists[0].toOwnedSlice(a),
+        .property = try lists[1].toOwnedSlice(a),
+        .field = try lists[2].toOwnedSlice(a),
+        .get = try lists[3].toOwnedSlice(a),
+        .set = try lists[4].toOwnedSlice(a),
+        .setparam = try lists[5].toOwnedSlice(a),
+        .delegate = try lists[6].toOwnedSlice(a),
+    };
+}
+
+/// Backing-field presence for a body property, as target assignment sees
+/// it: an initializer, an explicit `field` clause, or any defaulted
+/// accessor supplies one; delegated / abstract properties and properties
+/// with only custom accessor bodies have none.
+fn memberHasBackingField(p: *const ast.Property) bool {
+    if (p.delegate != null or p.is_abstract or p.is_expect or p.receiver_type != null) return false;
+    if (p.init != null or p.explicit_field != null) return true;
+    if (p.getter == null) return true;
+    if (p.mutable and p.setter == null) return true;
+    return false;
+}
+
 fn buildClassDef(
     module: *Module,
     a: Allocator,
@@ -2780,6 +2911,7 @@ fn buildClassDef(
     package_prefix: []const u8,
     object_spans: *const std.ArrayList(Span),
     globals_for_capture: ObjRef(Env),
+    file_classes: *const FileClasses,
 ) Allocator.Error!ObjRef(ClassDef) {
     var primary_params = try a.alloc(ClassParamDef, c.primary_params.len);
     for (c.primary_params, 0..) |*p, i| {
@@ -2789,6 +2921,12 @@ fn buildClassDef(
             .default = if (p.default) |*e| FF(ast.Expr).fromPtr(e) else null,
             .declared_type = p.ty.name.name,
             .declared_shape = try TypeShape.fromTypeRef(a, &p.ty),
+            .anchors = if (p.property) |is_var| try buildPropertyAnchors(module, a, file_classes, p.annotations, .{
+                .is_ctor_property = true,
+                .is_var = is_var,
+                .has_backing_field = true,
+                .in_annotation_class = c.is_annotation,
+            }) else .{},
         };
     }
     var body_props: std.ArrayList(PropertyDef) = .empty;
@@ -2811,6 +2949,11 @@ fn buildClassDef(
             .is_abstract = p.is_abstract,
             .is_lateinit = p.is_lateinit,
             .primitive_zero = primitiveZeroFor(p),
+            .anchors = try buildPropertyAnchors(module, a, file_classes, p.annotations, .{
+                .is_var = p.mutable,
+                .has_backing_field = memberHasBackingField(p),
+                .is_delegated = p.delegate != null,
+            }),
         });
     }
 

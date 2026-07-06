@@ -128,10 +128,9 @@ fn valueToJson(v: *const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!Js
                 return .{ .ok = try jsonString(a, cls.name) };
             }
             var map: JsonObjectMap = .empty;
-            for (cls.primary_params) |p| {
+            for (cls.primary_params) |*p| {
                 if (p.property == null) continue;
-                const name = p.name;
-                const pv_r = try readProp(v, name, ctx);
+                const pv_r = try readProp(v, p.name, ctx);
                 const pv = switch (pv_r) {
                     .ok => |val| val,
                     .err => |e| return .{ .err = e },
@@ -141,7 +140,7 @@ fn valueToJson(v: *const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!Js
                     .ok => |val| val,
                     .err => |e| return .{ .err = e },
                 };
-                try map.put(a, try a.dupe(u8, name), jv);
+                try map.put(a, try a.dupe(u8, serialFieldName(p)), jv);
             }
             return .{ .ok = .{ .object = map } };
         },
@@ -426,6 +425,19 @@ fn decodeNumber(f: f64, i: i64, is_int: bool, ty: ?[]const u8) Value {
     return .{ .Double = f };
 }
 
+/// The wire name of a constructor property: the value of a
+/// `@SerialName("...")` on the property anchor (where the LV 2.4 target
+/// assignment puts a target-less, `@property:`, or `@all:` entry —
+/// `SerialName` is `@Target(PROPERTY, CLASS)`), else the property name.
+fn serialFieldName(p: *const runtime.ClassParamDef) []const u8 {
+    for (p.anchors.property) |*rec| {
+        if (rec.is("kotlinx.serialization.SerialName") or rec.is("SerialName")) {
+            if (rec.stringArg("value")) |s| return s;
+        }
+    }
+    return p.name;
+}
+
 /// Construct an instance of `cls_val` from a JSON object, decoding each
 /// primary-constructor property by its declared type shape.
 fn decodeObject(map: JsonObjectMap, cls_val: *const Value, ctx: *CallCtx) Error!DecodeResult {
@@ -435,11 +447,11 @@ fn decodeObject(map: JsonObjectMap, cls_val: *const Value, ctx: *CallCtx) Error!
     defer cls_ref.deinit();
     const cls = cls_ref.asPtr();
     var args: std.ArrayList(Value) = .empty;
-    for (cls.primary_params) |p| {
+    for (cls.primary_params) |*p| {
         if (p.property == null) continue;
         const shape: ?*const TypeShape = if (p.declared_shape) |*s| s else null;
         const v: Value = blk: {
-            if (map.get(p.name)) |jv| {
+            if (map.get(serialFieldName(p))) |jv| {
                 const r = try decodeField(&jv, shape, ctx);
                 switch (r) {
                     .ok => |val| break :blk val,
@@ -852,6 +864,35 @@ test "decodeField decodes an unknown object to a string-keyed map" {
     const g = r.ok.Map.entries.borrow();
     defer g.deinit();
     try testing.expectEqual(@as(usize, 2), g.get().pairs.items.len);
+}
+
+test "serialFieldName reads @SerialName from the property anchor" {
+    const recs = [_]runtime.AnnotationRecord{.{
+        .names = &.{ "kotlinx.serialization.SerialName", "SerialName" },
+        .args = &.{.{ .Str = "years" }},
+        .arg_names = &.{null},
+    }};
+    var p = prop("age");
+    p.property = true;
+    p.anchors = .{ .property = &recs };
+    try testing.expectEqualStrings("years", serialFieldName(&p));
+
+    // A record on another anchor (param) does not rename the field.
+    var q = prop("name");
+    q.property = true;
+    q.anchors = .{ .param = &recs };
+    try testing.expectEqualStrings("name", serialFieldName(&q));
+
+    // A different annotation on the property anchor is ignored.
+    const other = [_]runtime.AnnotationRecord{.{
+        .names = &.{"Wide"},
+        .args = &.{},
+        .arg_names = &.{},
+    }};
+    var r = prop("id");
+    r.property = true;
+    r.anchors = .{ .property = &other };
+    try testing.expectEqualStrings("id", serialFieldName(&r));
 }
 
 test "ctorParamNames returns property names in declaration order" {

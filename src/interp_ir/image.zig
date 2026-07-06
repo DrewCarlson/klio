@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 16;
+pub const FORMAT_VERSION: u32 = 18;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -685,6 +685,7 @@ const PropertyImage = struct {
     is_abstract: bool,
     is_lateinit: bool,
     primitive_zero: ?ValueImage,
+    anchors: runtime.PropertyAnchors,
 };
 
 const ClassParamImage = struct {
@@ -693,6 +694,7 @@ const ClassParamImage = struct {
     default: ?FF(ast.Expr),
     declared_type: ?[]const u8,
     declared_shape: ?TypeShape,
+    anchors: runtime.PropertyAnchors,
 };
 
 const DelegateImage = struct {
@@ -1629,6 +1631,7 @@ fn classDefToImage(
             .default = p.default,
             .declared_type = p.declared_type,
             .declared_shape = p.declared_shape,
+            .anchors = p.anchors,
         };
     }
 
@@ -1657,6 +1660,7 @@ fn classDefToImage(
             .is_abstract = p.is_abstract,
             .is_lateinit = p.is_lateinit,
             .primitive_zero = zero,
+            .anchors = p.anchors,
         };
     }
 
@@ -2027,6 +2031,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
                         .default = p.default,
                         .declared_type = p.declared_type,
                         .declared_shape = p.declared_shape,
+                        .anchors = p.anchors,
                     };
                 }
                 break :blk params;
@@ -2045,6 +2050,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
                         .is_abstract = p.is_abstract,
                         .is_lateinit = p.is_lateinit,
                         .primitive_zero = if (p.primitive_zero) |z| try scalarFromImage(z) else null,
+                        .anchors = p.anchors,
                     };
                 }
                 break :blk props;

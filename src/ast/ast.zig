@@ -33,7 +33,16 @@ pub const AnnotationUseSite = enum {
     SetParam,
     Delegate,
     File,
+    /// `@all:Foo` — the property meta-target: expands over every
+    /// applicable anchor of a member/top-level property (constructor
+    /// parameter, the property, its backing field, getter, and setter
+    /// parameter). See `annotation_targets.expandAll`.
+    All,
 };
+
+/// Use-site targeting machinery: U(A) derivation from `@Target`, `@all:`
+/// expansion, and the defaulting rule for target-less property annotations.
+pub const annotation_targets = @import("annotation_targets.zig");
 
 /// A single `@Foo(args)` / `@use-site:Foo` annotation at a declaration
 /// site. Values inside are parsed best-effort; downstream passes treat
@@ -1001,4 +1010,8 @@ test "recursive expr nodes box through pointers" {
     const u = Expr{ .Unary = .{ .op = .Neg, .expr = &lit, .span = Span.init(f, 0, 2) } };
     try std.testing.expectEqual(UnOp.Neg, u.Unary.op);
     try std.testing.expectEqual(@as(i64, 1), u.Unary.expr.IntLit.value);
+}
+
+test {
+    _ = annotation_targets;
 }
