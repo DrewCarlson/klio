@@ -1,90 +1,63 @@
 # Stdlib strategy
 
-The Kotlin stdlib is **the** runtime surface a program has access to. We aim to ship a complete, performant implementation that behaves exactly like Kotlin 2.4.0's stdlib on the JVM where semantics are platform-agnostic.
+The Kotlin stdlib is **the** runtime surface a program has access to. klio ships a complete implementation that behaves exactly like Kotlin 2.4.0's stdlib on the JVM where semantics are platform-agnostic.
 
 ## Guiding principles
 
-1. **Native by default.** Like CPython implements `len`, `dict`, `str.split`, and the rest in C, we implement Kotlin stdlib functions in **Rust**, not as interpreted Kotlin. The interpreter calls these as intrinsics. Interpreted-Kotlin fallbacks exist only as a transitional stopgap or for trivial wrappers; the steady state is "all of stdlib is in Rust."
+1. **Upstream source is the implementation.** The stdlib pack's Kotlin source is the upstream tree itself (`kotlin/libraries/stdlib`, pinned at v2.4.0) plus klio-authored actuals under `kotlin-klio/`, interpreted like any other Kotlin. Hand-written Zig intrinsics (`src/stdlib/implementations/`) shadow individual functions at dispatch where host access (IO, clock, threads) or performance demands a native body. This inverts the original plan (all-native, CPython-style): interpreting upstream keeps behavior exactly aligned and makes version bumps a re-pin, not a rewrite.
 
-2. **Auto-generate the API surface from upstream sources.** The Kotlin stdlib is too large to maintain by hand and the upstream tree is structured for codegen. We mine `kotlin/libraries/stdlib/` to produce:
-   - The list of every public symbol (top-level functions, extension functions, classes, interfaces, properties, type aliases) along with its fully qualified name, signature, modifiers, and Kotlin source span (for diagnostics).
-   - A registration table the interpreter loads at startup to resolve `kotlin.*` names to Rust implementations.
-   - Per-function Rust stubs the human then fills in (or that the generator implements directly when the upstream definition is purely mechanical).
+2. **The API surface is mined, not maintained by hand.** `stdlib_gen` reads `kotlin/libraries/stdlib/` and produces the symbol index (`SymbolEntry` per public symbol: FQN, kind, signature, modifiers, source span) that the resolver and the Vm's dispatch consult. Bumping Kotlin versions regenerates the surface mechanically.
 
-3. **Pin to Kotlin 2.4.0.** The generator reads from the `kotlin/` checkout already pinned at that tag. Bumping Kotlin versions is a deliberate, tracked operation that regenerates the surface and forces us to address any new or changed symbols.
+3. **Pin to Kotlin 2.4.0.** The `kotlin/` submodule is pinned at the tag; bumping is a deliberate, tracked operation.
 
-4. **Coverage is enforced, not aspirational.** A `coverage` report compares the generated symbol inventory against the set with real Rust implementations. CI fails when implementations regress (a previously-implemented symbol becomes unimplemented) and surfaces the unimplemented set as a single number we drive to zero.
+4. **Coverage is enforced by upstream's own tests.** The upstream stdlib `commonTest` suite (117 files, ~2,150 tests) runs directly under the interpreter. `src/itests/stdlib_commontest.zig` ratchets the pass count (never lower it); `scripts/commontest-sweep.py` gives per-file iteration. The suite passes per-file at 100% as of 2026-07-06.
 
 ## Sources of truth in the `kotlin/` checkout
 
 | Path                                                                | Role                                                                                                |
 | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `libraries/stdlib/common/src/kotlin/`                               | Hand-written headers: `KotlinH.kt`, `MathH.kt`, `TextH.kt`, `SequencesH.kt`, `ExceptionsH.kt`, etc. Declares the common surface (often with `expect`). |
-| `libraries/stdlib/common/src/generated/`                            | JetBrains-generated files: `_Collections.kt`, `_Arrays.kt`, `_Sequences.kt`, `_Maps.kt`, `_Ranges.kt`, `_Strings.kt`, `_Comparisons.kt`, and unsigned-variant siblings. These are highly regular and easiest to consume. |
+| `libraries/stdlib/common/src/kotlin/`                               | Hand-written headers declaring the common surface (often with `expect`).                            |
+| `libraries/stdlib/common/src/generated/`                            | JetBrains-generated files: `_Collections.kt`, `_Arrays.kt`, `_Sequences.kt`, `_Maps.kt`, `_Ranges.kt`, `_Strings.kt`, `_Comparisons.kt`, and unsigned-variant siblings. |
 | `libraries/stdlib/src/kotlin/`                                      | Pure-Kotlin definitions shared across platforms (no `expect`).                                      |
 | `libraries/stdlib/jvm/src/`                                         | JVM `actual` implementations — read **only** to disambiguate semantics, never linked.               |
-| `libraries/tools/kotlin-stdlib-gen/`                                | JetBrains' own generator. Study it for the templates and naming conventions; do not run it.         |
+| `libraries/stdlib/test/`                                            | The `commonTest` suite klio runs as its conformance gate.                                           |
+| `libraries/kotlin.test/`                                            | The `kotlin.test` API shipped as the kotlin.test pack.                                              |
 
 ## Architecture
 
-A new crate, `klio-stdlib`, ships the implementations and a build-time companion `klio-stdlib-gen` produces the registration tables.
+Three Zig modules plus the pack machinery deliver the stdlib
+(details in `docs/architecture/stdlib.md`):
 
-```
-crates/
-  klio-stdlib-gen/      Binary that reads kotlin/libraries/stdlib/, produces Rust.
-  klio-stdlib/          Hand-written Rust intrinsics + generated/ submodule of
-                       registration tables and per-function stubs.
-```
+- **`stdlib`** — the native intrinsics keyed by FQN, the
+  `HostBindings` registry, and the implicit-import package list.
+- **`stdlib_gen`** — mines the upstream tree into the symbol index
+  committed under `src/stdlib/`.
+- **`stdlib_pack`** — resolves the pack bytes the interpreter loads
+  at startup: `KLIO_STDLIB_PACK` override, else a fresh build from
+  the cwd checkout (so in-repo stdlib edits need no rebuild), else
+  the bytes embedded into the binary by `build.zig`.
 
-### `klio-stdlib-gen`
-
-A standalone binary (so generation runs only when invoked, not on every build). Inputs: the `kotlin/` checkout path. Outputs: Rust files under `crates/klio-stdlib/src/generated/`, committed to the repo for reviewability.
-
-Pipeline:
-
-1. **Walk** the curated set of stdlib source roots (common headers + `generated/` + shared `src/kotlin/`).
-2. **Parse** each `.kt` file enough to extract declarations and their signatures. Once `klio-parser` is mature enough, we use it directly — until then, a focused subset parser inside the generator handles declarations only (the upstream `generated/` files are particularly regular, so this is tractable).
-3. **Normalize** declarations into a stable schema: FQN, kind (function / property / class / typealias), receiver type, parameter list (name + type + default-arity), return type, modifiers (`inline`, `infix`, `operator`, `tailrec`, …), source span.
-4. **Emit** Rust modules:
-   - `generated/registry.rs` — a `pub static STDLIB_SYMBOLS: &[SymbolEntry]` indexing every symbol.
-   - `generated/sig/*.rs` — typed signature descriptors for each function (so the typechecker / dispatcher don't have to re-parse).
-   - `generated/stubs/*.rs` — `pub fn name(...) -> Result<Value, RuntimeError> { Err(RuntimeError::Unimplemented("kotlin.foo.bar")) }` for any symbol without a hand-written Rust implementation.
-5. **Coverage report** — `klio-stdlib-gen coverage` walks the registry and prints implemented / unimplemented counts and the unimplemented FQNs.
-
-### `klio-stdlib`
-
-Layout:
-
-```
-crates/klio-stdlib/src/
-  lib.rs               Registers everything with the interpreter.
-  numerics/            Int, Long, Short, Byte, unsigned variants, Float, Double, math.
-  text/                String, StringBuilder, CharSequence, Char ops, regex.
-  collections/         List, MutableList, Map, Set, ArrayList, HashMap, etc.
-  sequences/           Sequence + intermediate / terminal ops.
-  ranges/              IntRange, LongRange, CharRange, progressions.
-  io/                  println / readLine / minimal IO surface.
-  exceptions/          Throwable hierarchy.
-  generated/           Output of klio-stdlib-gen (do not edit by hand).
-```
-
-### Interpreter integration
-
-- On boot, the interpreter loads `STDLIB_SYMBOLS` and populates a global resolver keyed by FQN.
-- Calls to `kotlin.io.println`, `kotlin.collections.listOf`, etc. dispatch directly to the Rust implementation — no AST walking through stdlib code, no per-call interpretation cost.
-- Non-`kotlin.*` imports fail with a clear diagnostic ("third-party libraries are not supported"). This matches the project scope captured in `ARCHITECTURE.md`.
+At dispatch, `stdlib.implementation(fqn)` is the single resolution
+path: when an intrinsic exists for a FQN it shadows the lowered
+Kotlin body, otherwise the interpreted upstream source runs. The
+lowered stdlib is baked to a content-addressed image under
+`~/.klio/cache` so runs after the first skip re-lowering it.
 
 ## Implementation discipline
 
-For every batch of stdlib symbols we implement:
+For every stdlib gap that closes:
 
-1. **Generate first.** Re-run `klio-stdlib-gen` so the registry and stubs reflect the upstream truth.
-2. **Implement in Rust.** Replace stubs with real Rust functions. Match Kotlin/JVM semantics: integer overflow wraps, `Double` follows IEEE-754, `String` is UTF-16 in observable behavior even if backed by Rust's UTF-8 internally.
-3. **Test exhaustively.** Per the project-wide testing discipline: unit tests in `klio-stdlib`, end-to-end `.kt` programs in `examples/` and the workspace corpus, snapshot tests where output is large. Cross-check against running the same snippet under real Kotlin where reasonable (recorded as expected output in the example file's header).
-4. **Track coverage.** Each PR notes the delta: "+N implemented, -M stubs."
+1. **Prefer consuming more upstream source** over adding an
+   intrinsic; an intrinsic is for host access or measured hot paths.
+2. **Match Kotlin/JVM semantics exactly**: integer overflow wraps,
+   `Double`/`Float` follow IEEE-754 with JVM formatting, `String` is
+   UTF-16 in observable behavior.
+3. **Test through upstream's own suite** — the commonTest ratchet
+   only goes up — plus parity corpus programs for anything
+   user-visible.
 
 ## What we are explicitly *not* doing
 
 - Loading the upstream stdlib's compiled `.klib` / `.jar` artifacts.
-- Implementing Kotlin/JVM-specific stdlib pieces that depend on the JVM runtime (e.g. `java.*` interop helpers). These are out of scope.
-- Interpreting the upstream Kotlin source as our stdlib at runtime. We read it as input to codegen; we do not ship it as runtime data.
+- Implementing JVM-runtime-dependent pieces (`java.*` interop
+  helpers) beyond what upstream's common surface requires.

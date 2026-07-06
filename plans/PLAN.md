@@ -1,18 +1,18 @@
 # Running Plan
 
-Living document covering **outstanding work only**. Historical milestone records (M0–M21) live in `docs/PLAN-archive.md`. Update as work lands; once a milestone here completes, summarize it briefly into the archive and clear the entry here.
+Living document covering **outstanding work only**. Historical milestone records live in `PLAN-archive.md`. Update as work lands; once a milestone here completes, summarize it briefly into the archive and clear the entry here.
 
 ## Target version & scope
 
-- **Target Kotlin version:** 2.3.21. Pinned via a local checkout of [JetBrains/kotlin](https://github.com/JetBrains/kotlin) at tag `v2.3.21` in `kotlin/` (gitignored).
-- **In scope:** the Kotlin language itself, plus a built-in implementation of the Kotlin stdlib (primarily the `common/` surface under `kotlin/libraries/stdlib/`).
-- **Out of scope (for now):** loading or interoperating with third-party Kotlin / JVM libraries — no Maven resolution, no `.jar` / `.klib` consumption, no classpath.
+- **Target Kotlin version:** 2.4.0. Pinned via the `kotlin/` submodule at tag `v2.4.0` (sparse: `libraries/stdlib` + `libraries/kotlin.test`).
+- **In scope:** the Kotlin language itself, the Kotlin stdlib interpreted from the upstream `common/` sources plus native intrinsics, and the bundled library packs under `kotlin-klio/` (kotlin.test, kotlinx-*, ktor, compose-runtime).
+- **Out of scope (for now):** JVM interop — no Maven resolution, no `.jar` / `.klib` consumption, no classpath. Libraries reach klio as `.klio-pack`s built from Kotlin source.
 
 ## Current state
 
-- 270+ parity-corpus programs + examples byte-identical against `kotlinc-native 2.3.21`.
-- `cargo test --workspace` green.
-- Pipeline: `lexer → parser → resolver → typecheck → interp`.
+- 532 parity-corpus programs + 142 examples byte-identical against `kotlinc` 2.4.0; the upstream stdlib commonTest suite (117 files, ~2,150 tests) passes per-file under the interpreter.
+- `zig build test-all` green (unit + integration suites).
+- Run pipeline: `lexer → parser → ir (lowering) → interp_ir (Vm)`; `resolver → typeck` serve `klio check` and the `KLIO_EAGER=1` run mode.
 - Diagnostic surface: T0001–T0117, W0001–W0007, R0001–R0015, P00xx parser codes.
 
 ## Sections completed
@@ -268,16 +268,16 @@ M-CFA Phase 5 (smart-cast) produces the inputs M-Constraints Phase 5 consumes; M
 
 - Land milestones via small PR-sized changes; keep `main` always green.
 - Drive design of non-trivial subsystems with role-based adversarial agents (e.g. *Language Designer*, *Compiler Programmer*) before implementing.
-- Every milestone update: tick boxes, add discoveries, retire stale items. Once complete, fold a one-paragraph summary into `docs/PLAN-archive.md` and clear the entry here.
+- Every milestone update: tick boxes, add discoveries, retire stale items. Once complete, fold a one-paragraph summary into `PLAN-archive.md` and clear the entry here.
 
 ## Testing discipline
 
 Every language feature ships with:
 
-1. **Unit tests** in the owning crate covering success paths, all spec-listed edge cases, and every diagnostic the code can emit.
+1. **Unit tests** in the owning module (Zig `test {}` blocks) covering success paths, all spec-listed edge cases, and every diagnostic the code can emit.
 2. **End-to-end tests** that drive the full pipeline and assert observable behavior (stdout, return values, diagnostics with codes).
-3. **A growing `.kt` corpus.** Per-crate snapshot corpora plus the workspace `crates/klio-parity/tests/corpus/`. The corpus only grows.
-4. **Negative tests** for every error path under `crates/klio-typeck/tests/negative/`.
+3. **A growing `.kt` corpus.** `tests/fixtures/parity_corpus/` plus `examples/`, swept against `kotlinc` by the parity harness. The corpus only grows.
+4. **Negative tests** for every error path under `tests/fixtures/typeck_negative/` (run by `src/itests/typeck_negative.zig`).
 
 A feature is not "done" if removing or breaking it leaves the test suite green.
 
