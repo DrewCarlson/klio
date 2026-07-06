@@ -14,6 +14,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.ComposeNode
 import androidx.compose.runtime.Recomposer
+import androidx.compose.runtime.key
 
 // ----- color -----
 
@@ -381,6 +382,34 @@ fun Text(text: String, color: Color, modifier: Modifier) {
 @Composable
 fun Text(text: String, color: Color) {
     Text(text, color, Modifier.None)
+}
+
+/**
+ * A lazy vertical list: only the items in the scrolled-into-view window are
+ * composed (the item content for off-screen indices never runs), so a list of
+ * thousands emits only a handful of nodes. Each visible item is keyed by its
+ * index so its remembered state follows it across scroll. Changing [scrollOffset]
+ * and recomposing brings a different window into view.
+ */
+@Composable
+fun LazyColumn(
+    itemCount: Int,
+    itemHeight: Int,
+    viewportHeight: Int,
+    scrollOffset: Int,
+    modifier: Modifier,
+    itemContent: @Composable (Int) -> Unit,
+) {
+    val first = scrollOffset / itemHeight
+    val windowCount = (viewportHeight + itemHeight - 1) / itemHeight + 1
+    Column(modifier) {
+        var i = first
+        val last = first + windowCount
+        while (i < last && i < itemCount) {
+            key(i) { itemContent(i) }
+            i += 1
+        }
+    }
 }
 
 @Composable

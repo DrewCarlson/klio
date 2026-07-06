@@ -181,6 +181,13 @@ invokes its `onClick`, and recomposes + re-renders. A `Button` composable + a si
 click drives the full loop — input → state → recompose → draw (`N 0` → `N 1` → `N 2`) — the
 same loop a real Compose UI runs, headless and deterministic.
 
+**Foundation Lazy\*** (`examples/compose_ui_lazy.kt`, baked corpus): `LazyColumn` composes
+only the items scrolled into view (off-screen item content never runs — a 100-item list
+emits ~5 nodes, proven by a composed-item counter), each keyed by index; changing the
+scroll offset recomposes a different window. This is the lazy/constraint-driven content N2
+was built for (a full `SubcomposeLayout` that composes during the measure pass is a further
+refinement).
+
 The real `androidx.compose.ui` is **not** in the vendored sparse checkout (only compose
 `runtime` is), and it is a Skia/native stack of hundreds of files, so these increments are
 a klio-authored ui-core proving the architecture runs on klio end-to-end (layout + draw +
