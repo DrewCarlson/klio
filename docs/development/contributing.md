@@ -56,8 +56,7 @@ code. See [Diagnostics](../architecture/diagnostics.md).
 ## Zig conventions
 
 klio began as a Rust codebase and was fully ported to Zig; the port
-is complete (`plans/ZIG-MIGRATION-PLAN.md` is the historical
-record). The conventions that outlived it:
+is complete. The conventions that outlived it:
 
 - One module per subsystem: `src/<name>/<name>.zig` is the root
   file and re-exports the module's public API. Cross-module use goes
