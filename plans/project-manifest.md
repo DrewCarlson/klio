@@ -72,19 +72,29 @@ Extend the existing manifest (same `klio.toml`, additive):
   source sets (main + `[[test]]` for `test`, + actuals) into the load set →
   hand the composed file list to the EXISTING `runTestFiles` / run pipeline.
 
-## Runner ergonomics (the only genuinely new engine work)
+## Runner ergonomics
+
+The DEFAULT `klio test <project>` is a single in-process run of the composed
+module — fast, simple, correct. The existing global run deadline
+(`runtime.startRunDeadline()`) is the only safety net needed against a runaway
+test; a genuinely hanging or stack-overflowing test is an interpreter/test BUG
+to fix in the grind, not something to paper over with per-test process
+isolation. (Composing atomicfu as one module already fixed its cross-file
+failures AND surfaced a real test-runner class-collision bug — resolving bugs,
+not hiding them, is the point.)
 
 - `--filter <glob>` on `Class`, `Class.method`, or file — native; retires the
   sweep's filtering.
-- Isolation with correct composition: compile the whole module ONCE (so
-  cross-file resolution holds), then run each test under a per-test watchdog
-  timeout so a single runaway test (1M-iteration stress loops) cannot sink the
-  suite. With `--jobs > 1`, shard the composed module's tests across worker
-  sub-processes. This is what the Zig harness's process pool did; it moves into
-  klio.
+- `--isolate` (opt-in, debugging): run each test/file in its own sub-process
+  with a per-test timeout, to pinpoint WHICH test hangs or crashes. Off by
+  default. `--jobs N` parallel sub-processes compose with it. This is what the
+  Zig harness's process pool did; it becomes an optional aid, not the norm.
 - `--format=json` machine-readable summary (counts + per-test status +
   failure reasons) for CI. A commonTest itest becomes
   `klio test <library> --format=json` + a ratchet assertion.
+- The runner must never SILENTLY drop tests: a discovered `@Test` that fails to
+  register (name collision, load failure) has to surface, not vanish into an
+  all-green count. (First instance fixed: the simple-name class-index collision.)
 - Keep `--eager`/`--opt`/`--feature`/`--virtual-time` as they are.
 
 ## Phased implementation
@@ -108,7 +118,15 @@ Extend the existing manifest (same `klio.toml`, additive):
 
 ## Status
 
-- [ ] Phase 1 — manifest + resolver
-- [ ] Phase 2 — runner ergonomics
-- [ ] Phase 3 — migrate harness + packs; retire the sweep
-- [ ] Phase 4 — grind each pack's commonTest to 100%
+- [x] Phase 1 — manifest + resolver. `[[test]]` in the schema/parser;
+  `src/cli/project.zig` resolver; `klio test <project>` composes the active
+  test sets against the built+installed pack. atomicfu runs 67/67 in project
+  mode. Path-dep auto-build is a remaining refinement (deps currently relied on
+  as pre-installed).
+- [x] Test-runner correctness — collect a class's tests from its own decl (not
+  a same-named class in another package); "no tests found" for empty runs.
+- [ ] Phase 2 — runner ergonomics: `--filter`, `--isolate` (opt-in), json.
+- [ ] Phase 3 — migrate harness + packs; retire the sweep.
+- [ ] Phase 4 — grind each pack's commonTest to 100%. Real bugs surfaced by
+  composed runs to fix (NOT worked around): the io/serialization stack-overflow
+  crashes, the datetime `isLeapYear` cross-package resolution ambiguity.
