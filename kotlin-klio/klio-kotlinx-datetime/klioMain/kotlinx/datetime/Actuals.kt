@@ -20,6 +20,7 @@
 
 package kotlinx.datetime
 
+import kotlinx.datetime.internal.isLeapYear
 import kotlin.time.Instant
 
 // --- internal native helpers (bound natively by the klio host) ----
@@ -154,10 +155,10 @@ actual class LocalDate(
     }
 }
 
-internal fun isLeapYear(year: Int): Boolean =
-    (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0)
-
-internal fun daysInMonth(year: Int, month: Int): Int = when (month) {
+// `isLeapYear` is consumed from `kotlinx.datetime.internal` (imported above)
+// rather than redeclared here, so a test importing both packages sees one
+// declaration — matching upstream.
+private fun daysInMonth(year: Int, month: Int): Int = when (month) {
     1, 3, 5, 7, 8, 10, 12 -> 31
     4, 6, 9, 11 -> 30
     else -> if (isLeapYear(year)) 29 else 28
