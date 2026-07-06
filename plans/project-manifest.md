@@ -130,6 +130,20 @@ not hiding them, is the point.)
   `--feature X`, default = all feature modules). Remaining: `--isolate`
   (opt-in debug), `--format=json`.
 - [ ] Phase 3 — migrate harness + packs; retire the sweep.
-- [ ] Phase 4 — grind each pack's commonTest to 100%. Real bugs surfaced by
-  composed runs to fix (NOT worked around): the io/serialization stack-overflow
-  crashes, the datetime `isLeapYear` cross-package resolution ambiguity.
+- [~] Phase 4 — grind each pack's commonTest to 100%. Interpreter bugs found +
+  fixed (not worked around):
+  - Low-priority overload vs constructor (a general resolution bug): a
+    `@LowPriorityInOverloadResolution` deprecated factory could statically bind
+    over a same-name class constructor and self-recurse to a stack overflow
+    (kotlinx-datetime `fun LocalDate`/`LocalDateTime`). Fixed across
+    resolveCall / bare-call lowering / callNamedOverload / lookupGlobalById.
+    Datetime composed run now COMPLETES: 72/523 (was: crash). Grind = library
+    gaps (TimeZone.UTC/FixedOffsetTimeZone, format pkg, offsets).
+  - datetime isLeapYear cross-package ambiguity — fixed (consumed upstream).
+  Pack states in project mode:
+  - atomicfu 67/67 (100%).
+  - datetime 72/523 completes (library grind).
+  - io / serialization: a SEPARATE composition-only crash remains (no single
+    file crashes; deep-stack/null on the fully composed module — not the
+    low-priority bug). Needs isolation to the triggering combination.
+  - coroutines / ktor: need test-base actuals before they run.
