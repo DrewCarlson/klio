@@ -425,6 +425,24 @@ fn isNumericHead(pn: []const u8) bool {
     return false;
 }
 
+fn signedIntHead(n: []const u8) bool {
+    return std.mem.eql(u8, n, "Byte") or std.mem.eql(u8, n, "Short") or
+        std.mem.eql(u8, n, "Int") or std.mem.eql(u8, n, "Long");
+}
+
+fn unsignedIntHead(n: []const u8) bool {
+    return std.mem.eql(u8, n, "UByte") or std.mem.eql(u8, n, "UShort") or
+        std.mem.eql(u8, n, "UInt") or std.mem.eql(u8, n, "ULong");
+}
+
+/// Two integer heads of the same signedness (both signed or both unsigned),
+/// so a runtime value of one may serve a parameter of the other (klio stores
+/// all widths uniformly). Excludes cross-signedness (`Int`↛`UByte`) and floats.
+fn sameSignednessInt(a: []const u8, b: []const u8) bool {
+    return (signedIntHead(a) and signedIntHead(b)) or
+        (unsignedIntHead(a) and unsignedIntHead(b));
+}
+
 /// Literal-kind evidence for a (param, literal arg) pair: a numeric literal
 /// matches any numeric parameter head, a string literal `String` /
 /// `CharSequence`, and so on. Null (no conclusion) otherwise — like the
@@ -501,6 +519,15 @@ fn scoreArg(param_ty: *const TypeRef, arg: *const ArgShape, scope: *const Applic
     if (std.mem.eql(u8, nm, "Long") and std.mem.eql(u8, v_ty, "Int")) return 40;
     if ((std.mem.eql(u8, nm, "Double") or std.mem.eql(u8, nm, "Float")) and std.mem.eql(u8, v_ty, "Int")) return 30;
     if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
+    // Same-signedness integer cross-width (e.g. Int -> Byte/Short) is
+    // applicable at a low score: klio stores every integer width uniformly, and
+    // the literal coercion kotlinc validated at compile time is lost by the
+    // time a plain runtime value reaches member dispatch — so `append(1)` must
+    // still bind `append(byte: Byte)`. Restricted to the same signedness so a
+    // signed `Int` does NOT match an unsigned `UByte` param (kotlinc forbids
+    // that without `1u`). Below the exact head match (100) and the widen rules
+    // above, so an exact numeric overload always wins.
+    if (sameSignednessInt(nm, v_ty)) return 20;
 
     // A callable argument against a function-typed parameter. The member
     // scorer does not treat a `$bound_ref$` head as callable.
