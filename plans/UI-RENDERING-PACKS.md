@@ -35,7 +35,45 @@ real tree.
 `endNode`, no `Applier`, and `KlioComposition.setContent` runs side effects only. This
 is the single primitive to build first; nothing UI works without it.
 
-## 1. Phase N1 — the node-emission layer (the unblocker)
+## 1. Phase N1 — the node-emission layer (the unblocker) — DONE
+
+Landed and green (`examples/compose_nodes.kt`, baked `tests/corpus/expected/compose_nodes.out`).
+The node-emission layer is entirely in the klioMain pack — **no compose-specific
+interpreter code was needed** (the existing `host_call_func.zig` `@Composable`
+bracketing already threads the composer; `ComposeNode`/`createNode`/`endNode` are
+ordinary `currentComposer` member calls). What landed:
+
+- **`klioMain/androidx/compose/runtime/Applier.kt`** — `Applier<N>` + `AbstractApplier<T>`
+  matching upstream (`current`/`down`/`up`/`insertTopDown`/`insertBottomUp`/`remove`/
+  `move`/`clear`/`apply`), so consumer packs (Mosaic, Compose-UI) bind against it.
+- **Composer node ops** (`Composer.kt`) — `inserting`, `applier`, `startNode`/
+  `startReusableNode`/`createNode`/`useNode`/`endNode`, `startReplaceableGroup`/
+  `endReplaceableGroup`. `KlioComposer` gained a per-applier-node **emit-context stack**
+  and a synchronous **child reconciler**: each open node collects the node-groups emitted
+  under it this pass, and on close its applier child list is brought to that order via
+  `insertTopDown`/`remove`/`move` (identity diff). A skipped composable re-lists the
+  node-groups it contributed last pass (`contributedNodes`) so its subtree is retained;
+  a composable that ran but dropped a child prunes the vanished group. `GroupNode` stores
+  its node + child order across passes.
+- **`Updater`/`SkippableUpdater` + `ComposeNode`/`ReusableComposeNode`** (`Composables.kt`)
+  — `set`/`update` slot-memoize their value (via `changed`) so a prop setter runs on insert
+  or when the value changed; the node prop is applied through `applier.current`.
+- **`Composition(applier, parent)`** (`Composition.kt`) — `KlioComposition` holds an
+  applier; the root applier-node children reconcile after the content body each pass;
+  `dispose` clears the applier. Logic-only compositions (no applier) are unaffected.
+
+Two general interpreter gaps this surfaced (fixed in the resolver/VM, **not** compose code):
+- **Named-argument receiver lambdas** lost their receiver-type inference — `argFnArities`
+  (and siblings) bailed whenever any arg was named, so a `Updater<T>.() -> Unit` passed as
+  `update = { … }` was treated as an `it`-lambda and its bare member accesses
+  (`set(t){ text = it }`) fell through to unresolved globals. Fixed by mapping named args
+  to their parameters (`mapArgsToParams` in `src/ir/lower/expr.zig`).
+- **Member-vs-param name collision by arity** — `Updater<T>(c).update()` where `update` is
+  both a 2-arg member and a 0-arg receiver-lambda param: `CallMemberOrValue` tried the
+  member, missed on arity, and errored instead of invoking the value. Fixed in
+  `src/ir/eval.zig` to fall back to the invocable value on any member dispatch-miss.
+
+### Original N1 sketch (for reference)
 
 Add to the compose-runtime pack + the interpreter hook:
 

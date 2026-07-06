@@ -2171,17 +2171,96 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
     return null;
 }
 
+/// Whether any argument in the call is passed by name.
+fn anyNamedArg(arg_names: []const ?[]const u8) bool {
+    for (arg_names) |an| if (an != null) return true;
+    return false;
+}
+
+/// Map each argument to the callee parameter it fills, honoring Kotlin's
+/// named-argument rules: a named argument matches the parameter of that name; an
+/// unnamed trailing lambda binds the last parameter; the remaining unnamed
+/// (positional) arguments fill the still-unassigned parameters left to right.
+/// `params` is the callee's parameter slice with any receiver already removed.
+/// Returns a per-argument target index (parallel to `args`), null for an
+/// argument whose parameter can't be determined. Caller frees the slice.
+fn mapArgsToParams(
+    b: *FuncBuilder,
+    params: []const ir.Param,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+) Allocator.Error!?[]?usize {
+    const out = try b.allocator.alloc(?usize, args.len);
+    for (out) |*o| o.* = null;
+    const used = try b.allocator.alloc(bool, params.len);
+    defer b.allocator.free(used);
+    for (used) |*u| u.* = false;
+    // 1. Named arguments bind their same-named parameter.
+    for (args, 0..) |_, j| {
+        const an = if (j < arg_names.len) arg_names[j] else null;
+        if (an) |name| {
+            for (params, 0..) |p, idx| {
+                if (std.mem.eql(u8, p.name, name)) {
+                    out[j] = idx;
+                    used[idx] = true;
+                    break;
+                }
+            }
+        }
+    }
+    // 2. An unnamed trailing lambda binds the last (still-free) parameter.
+    var trailing_done = false;
+    if (args.len != 0) {
+        const last = args.len - 1;
+        const last_named = last < arg_names.len and arg_names[last] != null;
+        const last_lambda = args[last] == .Lambda or args[last] == .AnonFun;
+        if (!last_named and last_lambda and params.len != 0 and !used[params.len - 1]) {
+            out[last] = params.len - 1;
+            used[params.len - 1] = true;
+            trailing_done = true;
+        }
+    }
+    // 3. Remaining unnamed arguments fill the free parameters front to back.
+    var pidx: usize = 0;
+    for (args, 0..) |_, j| {
+        const an = if (j < arg_names.len) arg_names[j] else null;
+        if (an != null) continue;
+        if (trailing_done and j == args.len - 1) continue;
+        while (pidx < params.len and used[pidx]) pidx += 1;
+        if (pidx < params.len) {
+            out[j] = pidx;
+            used[pidx] = true;
+            pidx += 1;
+        }
+    }
+    return out;
+}
+
 fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]i16 {
     if (args.len == 0) return null;
-    for (arg_names) |an| if (an != null) return null;
     for (args) |*a| if (a.* == .Spread) return null;
     if (func.params.len < recv_offset) return null;
     const params = func.params[recv_offset..];
+    const out = try b.allocator.alloc(i16, args.len);
+    for (out) |*o| o.* = -1;
+    // Named arguments: resolve each lambda's expected arity through its target
+    // parameter (by name) so a receiver lambda passed by name is still detected
+    // as arity-0 — otherwise it is mistaken for an `it`-lambda and its bare
+    // member accesses fall through to unresolved globals.
+    if (anyNamedArg(arg_names)) {
+        const map = (try mapArgsToParams(b, params, args, arg_names)) orelse {
+            b.allocator.free(out);
+            return null;
+        };
+        defer b.allocator.free(map);
+        for (out, map) |*o, m| {
+            if (m) |pi| o.* = fnTypeArityAlias(b, params[pi].ty) orelse -1;
+        }
+        return out;
+    }
     // A trailing lambda fills the last function-typed parameter even when
     // earlier defaulted parameters are omitted; align the trailing lambda
     // with the last parameter and the leading args from the front.
-    const out = try b.allocator.alloc(i16, args.len);
-    for (out) |*o| o.* = -1;
     const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
     if (trailing_lambda and args.len <= params.len) {
         // Leading positional args map 1:1 from the front.
@@ -2194,6 +2273,7 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
     } else if (args.len == params.len) {
         for (params, out) |p, *o| o.* = fnTypeArityAlias(b, p.ty) orelse -1;
     } else {
+        b.allocator.free(out);
         return null;
     }
     return out;

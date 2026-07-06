@@ -127,13 +127,21 @@ public class Recomposer(
     }
 }
 
-internal class KlioComposition(private val parent: Recomposer) : Composition {
+internal class KlioComposition(
+    private val parent: Recomposer,
+    applier: Applier<*>? = null,
+) : Composition {
     val composer: KlioComposer = KlioComposer()
+    private val applier: Applier<*>? = applier
     private var content: (@Composable () -> Unit)? = null
     private var disposed: Boolean = false
     private var writeObserverHandle: (() -> Unit)? = null
 
     init {
+        if (applier != null) {
+            @Suppress("UNCHECKED_CAST")
+            composer.applierNode = applier as Applier<Any?>
+        }
         parent.registerComposition(this)
     }
 
@@ -192,6 +200,7 @@ internal class KlioComposition(private val parent: Recomposer) : Composition {
         if (disposed) return
         disposed = true
         composer.disposeAll()
+        applier?.clear()
         content = null
         writeObserverHandle?.invoke()
         writeObserverHandle = null
@@ -199,5 +208,9 @@ internal class KlioComposition(private val parent: Recomposer) : Composition {
     }
 }
 
-/** Create a composition whose recomposition is driven by [parent]. */
+/** Create a logic-only composition (no node emission) driven by [parent]. */
 public fun Composition(parent: Recomposer): Composition = KlioComposition(parent)
+
+/** Create a composition that emits into [applier]'s node tree, driven by [parent]. */
+public fun Composition(applier: Applier<*>, parent: Recomposer): Composition =
+    KlioComposition(parent, applier)

@@ -3309,15 +3309,31 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             } else {
                 orAudit("CallMemberOrValue", name_str, "member", 0, &recv);
                 const r = try host.callMemberNamed(allocator, &recv, name_str, user_args, names);
-                if (fb_misfit and r == .err and r.err == .Unimplemented and
-                    std.mem.indexOf(u8, r.err.Unimplemented, "Vm::") != null)
-                {
-                    // Nothing else serves the name: the local wins after
-                    // all (its acceptance proof was wrong — a hidden
-                    // default). Discard the miss and invoke it.
+                const member_missed = r == .err and r.err == .Unimplemented and
+                    std.mem.indexOf(u8, r.err.Unimplemented, "Vm::") != null;
+                // The member exists by name but no overload serves this call
+                // (arity/type). When the same-named local is an invocable
+                // function value, it is the intended target — Kotlin resolves
+                // `up.update()` to a `Up.() -> Unit` param over the 2-arg member
+                // `update(value, block)`. Discard the member miss and invoke the
+                // value (its receiver is the call receiver).
+                if (member_missed and fb_invocable) {
                     freeDispatchMissMsg(allocator, r.err.Unimplemented);
                     orAudit("CallMemberOrValue", name_str, "value_after_miss", -1, &recv);
-                    switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
+                    if (fb == .Class) {
+                        const adapted = try allocator.alloc(Value, user_args.len + 1);
+                        defer allocator.free(adapted);
+                        adapted[0] = recv;
+                        @memcpy(adapted[1..], user_args);
+                        const nn = try allocator.alloc(?[]const u8, names.len + 1);
+                        defer allocator.free(nn);
+                        nn[0] = null;
+                        @memcpy(nn[1..], names);
+                        switch (try host.callValueNamed(allocator, &fb, adapted, nn)) {
+                            .ok => |rv| try frame.write(cmv.dst, rv),
+                            .err => |e| return raiseStep(frame, e),
+                        }
+                    } else switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
                         .ok => |rv| try frame.write(cmv.dst, rv),
                         .err => |e| return raiseStep(frame, e),
                     }

@@ -1,0 +1,35 @@
+== initial (nodesCreated=6) ==
+Box
+  Text[hello]
+  Text[optional]
+  Text[a#0]
+  Text[b#1]
+  Text[c#2]
+== after label -> world (nodesCreated=6) ==
+Box
+  Text[world]
+  Text[optional]
+  Text[a#0]
+  Text[b#1]
+  Text[c#2]
+== after hide optional (nodesCreated=6) ==
+Box
+  Text[world]
+  Text[a#0]
+  Text[b#1]
+  Text[c#2]
+== after show optional (nodesCreated=7) ==
+Box
+  Text[world]
+  Text[optional]
+  Text[a#0]
+  Text[b#1]
+  Text[c#2]
+== after reorder c,a,b (nodesCreated=7) ==
+Box
+  Text[world]
+  Text[optional]
+  Text[c#2]
+  Text[a#0]
+  Text[b#1]
+disposed; root children = 0
