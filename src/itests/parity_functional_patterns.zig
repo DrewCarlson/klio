@@ -1,6 +1,5 @@
 //! Functional-style patterns: pipelines, immutable builders, Option-
-//! like Result handling, recursive structures. Ported from
-//! the Rust suite.
+//! like Result handling, recursive structures.
 
 const std = @import("std");
 const parity = @import("parity");

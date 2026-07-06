@@ -1,5 +1,4 @@
 //! Ranges, arrays, progressions, and primitive array specializations.
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

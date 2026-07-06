@@ -1,7 +1,5 @@
 //! Visibility modifiers parity: private/internal/protected access
 //! constraints, file-private top-level, package-private (internal).
-//!
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");
@@ -17,8 +15,7 @@ var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
 /// Write `src` to a unique temp `.kt` file, run it through the klio pipeline,
-/// and assert the captured stdout equals `expected`. Mirrors the Rust
-/// `assert_klio` helper (write_src + run_with_packs + assert_eq).
+/// and assert the captured stdout equals `expected`.
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
     // is reclaimed instead of accumulating across this file's tests. Safe:

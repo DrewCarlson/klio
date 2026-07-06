@@ -1,5 +1,4 @@
 //! Operator edge cases and conversions.
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

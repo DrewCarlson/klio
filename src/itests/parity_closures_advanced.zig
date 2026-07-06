@@ -1,8 +1,6 @@
 //! Advanced closure patterns: mutual captures, scope-fn chaining
 //! with `this` reassignment, lambdas stored and invoked later,
 //! enclosed-by-loop iteration variables.
-//!
-//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

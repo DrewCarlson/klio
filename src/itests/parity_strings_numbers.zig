@@ -1,6 +1,4 @@
 //! String manipulation, number parsing, regex, char operations.
-//!
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

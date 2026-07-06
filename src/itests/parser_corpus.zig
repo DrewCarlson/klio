@@ -1,8 +1,7 @@
-//! Parser corpus tests (port of the Rust suite). Each `.kt`
+//! Parser corpus tests. Each `.kt`
 //! snippet is parsed end-to-end and the pretty-printed AST + any diagnostics are
-//! compared against the checked-in expected rendering. The Rust original used
-//! `insta` snapshots; here the embedded source string and its expected output
-//! are kept inline per test, faithful to the snapshot `expression:`/body pair.
+//! compared against the checked-in expected rendering; the embedded source
+//! string and its expected output are kept inline per test.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -28,7 +27,7 @@ const FunctionBody = ast.FunctionBody;
 const WhenPatternKind = ast.WhenPatternKind;
 
 /// Lex + parse `src` and produce the pretty-printed AST followed by any
-/// diagnostics, mirroring the Rust `render`. Allocates into `arena`.
+/// diagnostics. Allocates into `arena`.
 fn render(arena: Allocator, src: []const u8) ![]u8 {
     const id = span.FileId.from(0);
     var lx = try lexer.Lexer.init(arena, id, src);
@@ -41,8 +40,8 @@ fn render(arena: Allocator, src: []const u8) ![]u8 {
     var printer = Printer{ .out = &out, .arena = arena, .indent = 0 };
     try printer.file(&file_ast);
 
-    // Lexer diagnostics first, then parser diagnostics (matches the Rust order:
-    // `lexed.diagnostics` extended with the parser diagnostics).
+    // Lexer diagnostics first, then parser diagnostics: `lexed.diagnostics`
+    // extended with the parser diagnostics.
     const lex_diags = lexed.diagnostics.diags();
     const parse_diags = p.diagnostics.diags();
     if (lex_diags.len + parse_diags.len != 0) {
@@ -599,9 +598,8 @@ fn renderAssignOp(op: AssignOp) []const u8 {
     };
 }
 
-/// Render a string the way Rust's `{:?}` formats a `&str`: wrapped in double
-/// quotes with `\`, `"`, newline, tab, carriage-return and other control
-/// characters escaped.
+/// Render a string wrapped in double quotes with `\`, `"`, newline, tab,
+/// carriage-return and other control characters escaped.
 fn debugStr(arena: Allocator, s: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.append(arena, '"');
@@ -625,8 +623,7 @@ fn debugStr(arena: Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// Render a char the way Rust's `{:?}` formats a `char`: wrapped in single
-/// quotes with common escapes.
+/// Render a char wrapped in single quotes with common escapes.
 fn debugChar(arena: Allocator, value: u16) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.append(arena, '\'');

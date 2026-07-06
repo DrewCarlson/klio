@@ -1,7 +1,5 @@
 //! DSL and operator coverage: infix, operator overloads, builder
 //! receiver chains, invoke convention, get/set conventions.
-//!
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

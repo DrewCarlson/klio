@@ -3,8 +3,6 @@
 //! `kotlin.concurrent.atomics` `expect` classes the stdlib pack carried,
 //! so a user import failed at runtime; the stdlib pack no longer bundles
 //! those array `expect`s.
-//!
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

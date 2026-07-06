@@ -1,8 +1,6 @@
 //! Lambda + dispatch parity: lambda over receiver, lambda inside
 //! generic dispatch, suspended lambda captures, member-ref to
 //! generic methods, scope function chaining with explicit this@.
-//!
-//! Ported from the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

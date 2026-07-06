@@ -4,8 +4,6 @@
 //! `fill` and `encodeToByteArray` / `toByteArray` / `decodeToString`
 //! without a klio-runnable body; before the host actuals landed every
 //! one silently no-opped (a `ByteArray` copy left the destination zeroed).
-//!
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

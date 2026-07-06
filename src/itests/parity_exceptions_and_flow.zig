@@ -1,7 +1,5 @@
 //! Exception handling, finally semantics, multi-catch, rethrow,
 //! try-as-expression, and exception inside lambda capture.
-//!
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

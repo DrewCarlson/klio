@@ -1,6 +1,5 @@
 //! Inner / nested class scoping: outer-this resolution, qualified
 //! this@Outer, inner-class members capturing outer fields.
-//! Ported from the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

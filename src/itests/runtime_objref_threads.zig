@@ -1,5 +1,5 @@
-//! Real-OS-thread stress + ordering tests for `ObjRef` (port of the Rust
-//! suite). Exercises the actual `std`-backed reader/writer cell across
+//! Real-OS-thread stress + ordering tests for `ObjRef`. Exercises the actual
+//! `std`-backed reader/writer cell across
 //! genuine threads through the public `runtime` module API.
 //!
 //! `ObjRef` does its own ref-counted heap allocation/free, so these use the

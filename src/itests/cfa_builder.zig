@@ -1,9 +1,6 @@
-//! Port of the Rust suite.
-//!
 //! Exercises the IR + builder by constructing canonical CFG shapes by
-//! hand and asserting their printed form. The Rust tests use
-//! `insta::assert_snapshot!`; here the corresponding `.snap` bodies are
-//! embedded as expected strings and compared with the printer output.
+//! hand and asserting their printed form; expected outputs are embedded
+//! as strings and compared with the printer output.
 //! Arena per test so the leak-checking allocator never runs the pipeline.
 
 const std = @import("std");
