@@ -275,7 +275,7 @@ package-less user scripts take structurally different mangling/retain branches i
 the same build.
 
 **One instance of this class is fixed and regression-protected — not live.**
-`plans/KTOR-UPSTREAM.md:232-246` documents what it calls "the load-order bug":
+The ktor "load-order bug":
 consuming `ContentTypes.kt` (which contains a nested `object Application`) broke
 the server's `Application.routing` extension. Its root cause is NOT `rel_path`
 sort order — `pack_cache.zig:560-626` iterates `bundle.files` in bundle order and
@@ -399,8 +399,7 @@ receiver class by two different keys — FQN
 what makes pack-mangled classes layout-sensitive. `extensionFnFallback`
 (`:3692-3711`) admits any func whose first param is named `"this"` and whose
 `member_ext_owner_class` gate is absent, conflating synthesized method receivers
-with synthesized extension receivers — the ktor double-`execute` root cause noted
-in `plans/KTOR-UPSTREAM.md`.
+with synthesized extension receivers — the ktor double-`execute` root cause.
 
 ### 3.5 Receiver / `this` sources (three competing origins)
 
