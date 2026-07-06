@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const ast = @import("ast");
+const diagnostics = @import("diagnostics");
 const lexer = @import("lexer");
 const span = @import("span");
 
@@ -573,13 +574,41 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
     } else null;
     var init: ?Expr = null;
     var delegate: ?Expr = null;
-    if (is(peekKind(p), .Eq)) {
+    var explicit_field: ?ast.ExplicitField = null;
+    // Explicit-backing-field clause in the initializer slot, ahead of any
+    // `=` / `by`: `field[: Type][= init]`, same line or the next. Local
+    // properties (`allow_accessors == false`) cannot declare one — the
+    // clause shape is recognized and rejected so `val xs: List<Int>` +
+    // `field = …` reports the misuse instead of a stray assignment.
+    if (scanFieldClause(p, !allow_accessors)) |scan| {
+        explicit_field = parseFieldClause(p, scan, allow_accessors);
+    }
+    if (explicit_field == null and is(peekKind(p), .Eq)) {
         _ = bump(p);
         skipNl(p);
         init = exprmod.parseExpr(p);
-    } else if (peekIdentText(p)) |t| {
-        if (std.mem.eql(u8, t, "by")) {
-            _ = bump(p);
+    } else if (explicit_field == null) {
+        if (peekIdentText(p)) |t| {
+            if (std.mem.eql(u8, t, "by")) {
+                _ = bump(p);
+                skipNl(p);
+                delegate = exprmod.parseExpr(p);
+            }
+        }
+    }
+    if (allow_accessors and explicit_field == null and (init != null or delegate != null)) {
+        // Initializer-first order: `val x: Int = 5` + `field = 6`. Parsed
+        // so the property-initializer-with-field diagnostic can name both.
+        if (scanFieldClause(p, false)) |scan| {
+            explicit_field = parseFieldClause(p, scan, allow_accessors);
+        }
+    }
+    if (explicit_field != null and delegate == null) {
+        // A delegate written after the field clause (`field: Int = 1` +
+        // `by lazy { 2 }`) still parses; the checker rejects the pair.
+        if (nextSignificantIsBy(p)) {
+            skipNl(p);
+            _ = bump(p); // `by`
             skipNl(p);
             delegate = exprmod.parseExpr(p);
         }
@@ -589,6 +618,11 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
     else
         PropertyAccessors{ .getter = null, .setter = null, .setter_visibility = null };
     const end = p.tokens[p.pos -| 1].span;
+    const ef_boxed: ?*ast.ExplicitField = if (explicit_field) |efv| blk: {
+        const e = p.allocator.create(ast.ExplicitField) catch @panic("OOM");
+        e.* = efv;
+        break :blk e;
+    } else null;
     const delegate_boxed: ?*Expr = if (delegate) |dv| blk: {
         const e = p.allocator.create(Expr) catch @panic("OOM");
         e.* = dv;
@@ -622,10 +656,139 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
         .is_expect = flags.is_expect,
         .is_actual = flags.is_actual,
         .setter_visibility = accessors.setter_visibility,
+        .explicit_field = ef_boxed,
         .visibility = flags.visibility,
         .annotations = flags.annotations.items,
         .span = kw_tok.span.join(end),
     };
+}
+
+/// Result of `scanFieldClause`: where the `field` keyword sits and where
+/// any (illegal) modifier list ahead of it begins.
+const FieldScan = struct {
+    field_idx: usize,
+    first_mod_idx: ?usize,
+};
+
+/// Modifier soft keywords that users plausibly write ahead of a `field`
+/// clause. None are legal there; the parser reports each and moves on.
+fn isFieldClauseModifier(t: []const u8) bool {
+    const mods = [_][]const u8{
+        "public", "private", "protected", "internal", "lateinit",
+        "open",   "final",   "abstract",  "const",    "inline",
+    };
+    for (mods) |m| {
+        if (std.mem.eql(u8, t, m)) return true;
+    }
+    return false;
+}
+
+/// Lookahead (across newlines, skipping modifier soft keywords) for an
+/// explicit-backing-field clause: the contextual keyword `field` in the
+/// initializer slot. Does not advance `p.pos`.
+///
+/// `require_marker` demands a `:` or `=` right after `field` — used for
+/// local properties, where a bare `field` line is an ordinary expression
+/// statement (and inside accessor bodies the name is the backing-field
+/// expression, so the clause is never recognized there).
+fn scanFieldClause(p: *const Parser, require_marker: bool) ?FieldScan {
+    if (require_marker and p.in_accessor_body) return null;
+    var i = p.pos;
+    while (kindAt(p, i)) |k| {
+        if (!is(&k, .Newline)) break;
+        i += 1;
+    }
+    var first_mod: ?usize = null;
+    while (kindAt(p, i)) |k| {
+        if (!is(&k, .Ident)) break;
+        const t = text(p, p.tokens[i].span);
+        if (!isFieldClauseModifier(t)) break;
+        if (first_mod == null) first_mod = i;
+        i += 1;
+        while (kindAt(p, i)) |k2| {
+            if (!is(&k2, .Newline)) break;
+            i += 1;
+        }
+    }
+    const k = kindAt(p, i) orelse return null;
+    if (!is(&k, .Ident)) return null;
+    if (!std.mem.eql(u8, text(p, p.tokens[i].span), "field")) return null;
+    const next = kindAt(p, i + 1) orelse return null;
+    const has_marker = is(&next, .Colon) or is(&next, .Eq);
+    if (!has_marker) {
+        if (require_marker) return null;
+        // A bare `field` (the field takes the property's type) only reads
+        // as a clause when it clearly ends there.
+        switch (next) {
+            .Newline, .Semicolon, .RBrace, .Eof => {},
+            else => return null,
+        }
+    }
+    return .{ .field_idx = i, .first_mod_idx = first_mod };
+}
+
+/// Consume and build the field clause `scanFieldClause` located. On a local
+/// property the clause is a syntax error: it is reported at the `field`
+/// token, consumed for recovery, and dropped (`null`). Modifiers written
+/// ahead of `field` are each rejected — the stable surface admits none.
+fn parseFieldClause(p: *Parser, scan: FieldScan, allow_accessors: bool) ?ast.ExplicitField {
+    skipNl(p);
+    while (p.pos < scan.field_idx) {
+        const tok = bump(p);
+        if (is(&tok.kind, .Ident)) {
+            const t = text(p, tok.span);
+            if (isFieldClauseModifier(t)) {
+                const msg = std.fmt.allocPrint(
+                    p.allocator,
+                    "Modifier '{s}' is not applicable to 'backing field'",
+                    .{t},
+                ) catch "modifier is not applicable to 'backing field'";
+                support.errWithFactory(
+                    p,
+                    &diagnostics.generated.WRONG_MODIFIER_TARGET,
+                    "E0016",
+                    msg,
+                    tok.span,
+                );
+            }
+        }
+        skipNl(p);
+    }
+    const field_tok = bump(p); // `field`
+    if (!allow_accessors) {
+        support.err(
+            p,
+            "E0015",
+            "explicit backing fields are not allowed on local properties",
+            field_tok.span,
+        );
+    }
+    var fty: ?TypeRef = null;
+    if (is(peekKind(p), .Colon)) {
+        _ = bump(p);
+        fty = types.parseType(p);
+    }
+    var finit: ?Expr = null;
+    if (is(peekKind(p), .Eq)) {
+        _ = bump(p);
+        skipNl(p);
+        finit = exprmod.parseExpr(p);
+    }
+    if (!allow_accessors) return null;
+    return .{ .ty = fty, .init = finit, .span = field_tok.span };
+}
+
+/// True when, skipping newlines from the cursor, the next significant
+/// token is the soft keyword `by`. Does not advance `p.pos`.
+fn nextSignificantIsBy(p: *const Parser) bool {
+    var i = p.pos;
+    while (kindAt(p, i)) |k| {
+        if (!is(&k, .Newline)) break;
+        i += 1;
+    }
+    const k = kindAt(p, i) orelse return false;
+    if (!is(&k, .Ident)) return false;
+    return std.mem.eql(u8, text(p, p.tokens[i].span), "by");
 }
 
 /// Parse the optional extension receiver preceding a property name.
@@ -859,6 +1022,9 @@ fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
             break :blk types.parseType(p);
         } else null;
         skipNl(p);
+        const saved_iab = p.in_accessor_body;
+        p.in_accessor_body = true;
+        defer p.in_accessor_body = saved_iab;
         const body: FunctionBody = if (is(peekKind(p), .Eq)) blk: {
             _ = bump(p);
             skipNl(p);

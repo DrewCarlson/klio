@@ -223,6 +223,12 @@ pub fn checkCall(
             var recv_ty = try expr_mod.checkExpr(self, m.receiver, null);
             recv_ty.deinit(self.allocator);
         }
+        // A receiver that reads an explicit-backing-field property outside
+        // its declaring scope has the property's PUBLIC type: the member
+        // must resolve on that type, not on the field type.
+        if (self.ebf_outside.get(m.receiver.span())) |info| {
+            try enforceEbfPublicMember(self, &info, mname, args.len, m.name.span);
+        }
         if (self.list_elem.get(m.receiver.span())) |elem| {
             if (std.mem.eql(u8, mname, "map")) {
                 if (args.len > 0) {
@@ -371,6 +377,80 @@ pub fn checkCall(
 fn isScopeFn(name: []const u8) bool {
     return std.mem.eql(u8, name, "let") or std.mem.eql(u8, name, "run") or
         std.mem.eql(u8, name, "apply") or std.mem.eql(u8, name, "also");
+}
+
+/// Resolve a member call against the PUBLIC type of an explicit-backing-
+/// field property read outside its declaring scope. The narrowed (field)
+/// type is not visible there, so a member that only the field type
+/// supplies is an unresolved reference.
+fn enforceEbfPublicMember(
+    self: *Checker,
+    info: *const root.EbfOutside,
+    name: []const u8,
+    arg_count: usize,
+    sp: Span,
+) Allocator.Error!void {
+    const head = info.head orelse return;
+    // Universal callables on every type (Any members, scope functions).
+    const universal = [_][]const u8{
+        "toString", "hashCode", "equals", "let",    "run",
+        "apply",    "also",     "takeIf", "takeUnless", "to",
+    };
+    for (universal) |u| {
+        if (std.mem.eql(u8, name, u)) return;
+    }
+    if (readOnlyCollectionLacks(head, name)) {
+        return emitEbfUnresolved(self, name, info.display, sp);
+    }
+    if (self.classes.contains(head)) {
+        if (try visibility.lookupMemberThroughChain(self, self.allocator, head, name)) |found| {
+            var t = found[0];
+            t.deinit(self.allocator);
+            return;
+        }
+        var cands: std.ArrayList(expr_mod.ExtensionCandidate) = .empty;
+        defer cands.deinit(self.allocator);
+        try expr_mod.lookupExtensionCandidates(self, head, name, arg_count, &cands);
+        if (cands.items.len != 0) return;
+        return emitEbfUnresolved(self, name, info.display, sp);
+    }
+}
+
+fn emitEbfUnresolved(self: *Checker, name: []const u8, display: []const u8, sp: Span) Allocator.Error!void {
+    const msg = try std.fmt.allocPrint(
+        self.allocator,
+        "unresolved reference `{s}` on `{s}`",
+        .{ name, display },
+    );
+    var d = Diagnostic.err(msg, sp);
+    _ = d.withCode(codes.TYPE_UNRESOLVED_REFERENCE);
+    _ = d.withFactory(&diagnostics.generated.UNRESOLVED_REFERENCE);
+    try self.diagnostics.emit(self.allocator, d);
+}
+
+/// The mutation API the read-only kotlin.collections interfaces do NOT
+/// declare — it exists only on their Mutable* subtypes.
+fn readOnlyCollectionLacks(head: []const u8, name: []const u8) bool {
+    const read_only = [_][]const u8{ "List", "Collection", "Iterable", "Set", "Map" };
+    var is_read_only = false;
+    for (read_only) |r| {
+        if (std.mem.eql(u8, head, r)) {
+            is_read_only = true;
+            break;
+        }
+    }
+    if (!is_read_only) return false;
+    const mutators = [_][]const u8{
+        "add",        "addAll",      "addFirst", "addLast",     "remove",
+        "removeAt",   "removeAll",   "removeFirst", "removeLast", "retainAll",
+        "clear",      "set",         "put",      "putAll",      "putIfAbsent",
+        "replaceAll", "removeIf",    "sort",     "getOrPut",    "merge",
+        "replace",    "fill",        "shuffle",
+    };
+    for (mutators) |m| {
+        if (std.mem.eql(u8, name, m)) return true;
+    }
+    return false;
 }
 
 fn putListElem(self: *Checker, sp: Span, ty: Type) Allocator.Error!void {

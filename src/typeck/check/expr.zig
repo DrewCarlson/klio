@@ -403,6 +403,24 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                         const anns: []const ast.Annotation = self.prop_annotations.get(name) orelse &.{};
                         try visibility.checkPublishedApiUse(self, name, vf.visibility, anns, sp);
                     }
+                    // Explicit-backing-field property read outside its
+                    // declaring file (or where narrowing is off): serve the
+                    // public type and record the site so member calls check
+                    // against it.
+                    if (b.ebf) |ebf| {
+                        if (sp.file.int() != ebf.file.int() or self.field_narrow_off > 0) {
+                            if (ebf.public_class) |c| {
+                                try self.expr_class.put(sp, c);
+                            }
+                            try self.ebf_outside.put(sp, .{
+                                .head = ebf.public_class,
+                                .display = ebf.public_display,
+                            });
+                            var owned = ty;
+                            owned.deinit(a);
+                            return ebf.public_ty.clone(a);
+                        }
+                    }
                     // Definite-assignment check: the CFG's VIA analysis is
                     // authoritative. It returns None when the place isn't
                     // tracked (parameter, top-level property), Some(true)
@@ -1226,6 +1244,29 @@ pub fn checkMemberAccess(
                 if (found[1]) |cn| {
                     try self.expr_class.put(member_span, cn);
                 }
+                // Explicit backing field: inside the declaring class's
+                // scope the read narrows to the field type; outside, the
+                // public type stands and the site is recorded so member
+                // calls resolve against it.
+                if (try lookupMemberEbf(self, class, name)) |hit| {
+                    const inside = self.field_narrow_off == 0 and classStackContains(self, hit.decl_class);
+                    if (inside) {
+                        result.deinit(a);
+                        result = try hit.ebf.field_ty.clone(a);
+                        if (hit.ebf.field_class) |cn| {
+                            try self.expr_class.put(member_span, cn);
+                        }
+                    } else {
+                        const head: ?[]const u8 = switch (result.nonNull().*) {
+                            .Generic => |g| g.name,
+                            else => found[1],
+                        };
+                        try self.ebf_outside.put(member_span, .{
+                            .head = head,
+                            .display = hit.ebf.public_display,
+                        });
+                    }
+                }
             }
             try visibility.checkMemberVisibility(self, class, name, class, member_span);
         }
@@ -1243,6 +1284,44 @@ pub fn checkMemberAccess(
         return result.asNullable(a);
     }
     return result;
+}
+
+/// Walk `class`'s supertype chain for an explicit-backing-field record on
+/// member `name`. Returns the record plus the class that declares it (the
+/// anchor of the narrowing scope).
+pub fn lookupMemberEbf(
+    self: *const Checker,
+    class: []const u8,
+    name: []const u8,
+) Allocator.Error!?struct { decl_class: []const u8, ebf: root.EbfMember } {
+    const a = self.allocator;
+    var seen = std.StringHashMap(void).init(a);
+    defer seen.deinit();
+    var frontier: std.ArrayList([]const u8) = .empty;
+    defer frontier.deinit(a);
+    try frontier.append(a, class);
+    var steps: usize = 0;
+    while (frontier.pop()) |c| {
+        if (steps > 64) break;
+        steps += 1;
+        if ((try seen.getOrPut(c)).found_existing) continue;
+        const info = self.classes.get(c) orelse continue;
+        if (info.member_ebf.get(name)) |hit| {
+            return .{ .decl_class = c, .ebf = hit };
+        }
+        if (info.members.contains(name)) return null;
+        for (info.supertypes.items) |s| try frontier.append(a, s);
+    }
+    return null;
+}
+
+/// True when the class named `name` encloses the code currently being
+/// checked (the class body, its methods, init blocks, and companions).
+pub fn classStackContains(self: *const Checker, name: []const u8) bool {
+    for (self.class_stack.items) |c| {
+        if (std.mem.eql(u8, c, name)) return true;
+    }
+    return false;
 }
 
 pub fn lookupExtensionProperty(

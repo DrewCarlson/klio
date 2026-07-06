@@ -2930,7 +2930,12 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         for (members) |*m| {
             if (m.* != .Property) continue;
             const p = m.Property;
-            const init_expr = if (p.init) |*e| e else continue;
+            const init_expr: *const ast.Expr = if (p.init) |*e|
+                e
+            else if (p.explicit_field) |ef|
+                (if (ef.init) |*finit| finit else continue)
+            else
+                continue;
             const is_lit = (try simpleLiteral(allocator, init_expr)) != null;
             if (is_lit) continue;
             // A bare one-segment name resolvable from the captured scope is
@@ -3059,10 +3064,16 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         for (members) |*m| {
             if (m.* != .Property) continue;
             const p = m.Property;
+            const storage_init: ?*const ast.Expr = if (p.init) |*e|
+                e
+            else if (p.explicit_field) |ef|
+                (if (ef.init) |*finit| finit else null)
+            else
+                null;
             try body_props.append(allocator, .{
                 .name = p.name.name,
                 .mutable = p.mutable,
-                .init = if (p.init) |*e| FF(ast.Expr).fromPtr(e) else null,
+                .init = if (storage_init) |e| FF(ast.Expr).fromPtr(e) else null,
                 .getter = if (p.getter) |g| FF(ast.Accessor).fromPtr(g) else null,
                 .setter = if (p.setter) |s| FF(ast.Accessor).fromPtr(s) else null,
                 .delegate = if (p.delegate) |e| FF(ast.Expr).fromPtr(e) else null,

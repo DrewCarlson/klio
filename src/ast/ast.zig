@@ -267,8 +267,29 @@ pub const Property = struct {
     /// `private set` / `protected set` etc. on a `var`. None means the
     /// setter inherits the property visibility.
     setter_visibility: ?Visibility,
+    /// Explicit backing field clause in the initializer slot:
+    /// `val items: List<String>` + `field = mutableListOf()`. The field is
+    /// the property's storage; reads inside the declaring scope see the
+    /// field type, reads outside see the property type. Boxed — present on
+    /// almost no property, so an inline struct would tax every `Property`
+    /// node for nothing.
+    explicit_field: ?*ExplicitField = null,
     visibility: Visibility,
     annotations: []Annotation,
+    span: Span,
+};
+
+/// `field[: Type][= init]` clause of a property declaration (member and
+/// top-level `val` properties only; rejected by the parser on constructor
+/// and local properties).
+pub const ExplicitField = struct {
+    /// Declared field type. When omitted it is inferred from `init`, or
+    /// defaults to the property's own type.
+    ty: ?TypeRef,
+    /// Field initializer. When absent the field must be definitely
+    /// assigned in every construction path (init blocks).
+    init: ?Expr,
+    /// Span of the `field` keyword token.
     span: Span,
 };
 

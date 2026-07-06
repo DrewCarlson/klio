@@ -97,6 +97,8 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .inference_session = null,
         .builder_inference_active = false,
         .lambda_depth = 0,
+        .ebf_outside = std.AutoHashMap(root.Span, root.EbfOutside).init(allocator),
+        .field_narrow_off = 0,
         .query_scratch = query_scratch,
     };
 }

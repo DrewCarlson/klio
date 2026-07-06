@@ -764,6 +764,30 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
             .annotations = &.{},
             .qualified_path = null,
         };
+        // An explicit-backing-field clause is never legal on a constructor
+        // property: reject `val xs: List<Int> field: MutableList<Int> = …`
+        // at the `field` token and consume the clause to recover.
+        if (std.meta.activeTag(support.peekKind(p).*) == .Ident and
+            std.mem.eql(u8, support.text(p, support.currentSpan(p)), "field"))
+        {
+            const is_clause = p.pos + 1 < p.tokens.len and switch (p.tokens[p.pos + 1].kind) {
+                .Colon, .Eq => true,
+                else => false,
+            };
+            if (is_clause) {
+                const field_tok = support.bump(p);
+                support.err(
+                    p,
+                    "E0015",
+                    "explicit backing fields are not allowed on constructor properties",
+                    field_tok.span,
+                );
+                if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
+                    _ = support.bump(p);
+                    _ = types.parseType(p);
+                }
+            }
+        }
         var default: ?Expr = null;
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .Eq) {

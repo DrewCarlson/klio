@@ -139,6 +139,7 @@ const itests_files = [_]Itest{
     .{ .name = "parity_threaded_litmus", .dirs = &.{"tests/fixtures/threaded_litmus"}, .weight = 15 },
     .{ .name = "parity_type_system_shapes" },
     .{ .name = "parity_visibility_modifiers" },
+    .{ .name = "explicit_backing_fields" },
     .{ .name = "resolve_ambiguity" },
     .{ .name = "parser_corpus", .parity_data = false, .interprets = false },
     .{ .name = "runtime_objref_threads", .parity_data = false, .interprets = false },

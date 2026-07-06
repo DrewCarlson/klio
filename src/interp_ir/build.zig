@@ -1963,9 +1963,23 @@ fn buildModuleWithOverrides(
         for (c.members) |*m| {
             if (m.* != .Property) continue;
             const p = m.Property;
-            if (p.init) |*init| {
+            // An explicit backing field's initializer IS the property's
+            // storage initializer.
+            const storage_init: ?*const ast.Expr = if (p.init) |*init|
+                init
+            else if (p.explicit_field) |ef|
+                (if (ef.init) |*finit| finit else null)
+            else
+                null;
+            const storage_init_ty: ?ast.TypeRef = if (p.init != null)
+                p.ty
+            else if (p.explicit_field) |ef|
+                (ef.ty orelse p.ty)
+            else
+                p.ty;
+            if (storage_init) |init| {
                 const nm = try std.fmt.allocPrint(a, "__init_prop_{s}_{s}", .{ c.name.name, p.name.name });
-                const fid = try ir.lower.lowerAccessorExprEnclosing(module, c.name.name, &own_members, body_enclosing, prop_init_params.items, init, nm, p.ty);
+                const fid = try ir.lower.lowerAccessorExprEnclosing(module, c.name.name, &own_members, body_enclosing, prop_init_params.items, init, nm, storage_init_ty);
                 try body_prop_inits.put(.{ .a = c.name.name, .b = p.name.name }, fid);
                 if (body_prop_dual) try body_prop_inits.put(.{ .a = body_prop_cfqn, .b = p.name.name }, fid);
             } else if (p.delegate) |delegate| {
@@ -2424,7 +2438,13 @@ fn buildModuleWithOverrides(
         const tp_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
         const prev_tp_pkg = ir.lower.decl.setLowerSelfPackage(tp_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_tp_pkg);
-        if (p.init) |*init| {
+        const storage_init: ?*const ast.Expr = if (p.init) |*init|
+            init
+        else if (p.explicit_field) |ef|
+            (if (ef.init) |*finit| finit else null)
+        else
+            null;
+        if (storage_init) |init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, init, nm);
             // Annotated: default from the declared type. Unannotated: infer
@@ -2775,10 +2795,16 @@ fn buildClassDef(
     for (c.members) |*m| {
         if (m.* != .Property) continue;
         const p = m.Property;
+        const storage_init: ?*const ast.Expr = if (p.init) |*e|
+            e
+        else if (p.explicit_field) |ef|
+            (if (ef.init) |*finit| finit else null)
+        else
+            null;
         try body_props.append(a, .{
             .name = p.name.name,
             .mutable = p.mutable,
-            .init = if (p.init) |*e| FF(ast.Expr).fromPtr(e) else null,
+            .init = if (storage_init) |e| FF(ast.Expr).fromPtr(e) else null,
             .getter = if (p.getter) |g| FF(ast.Accessor).fromPtr(g) else null,
             .setter = if (p.setter) |s| FF(ast.Accessor).fromPtr(s) else null,
             .delegate = if (p.delegate) |e| FF(ast.Expr).fromPtr(e) else null,
