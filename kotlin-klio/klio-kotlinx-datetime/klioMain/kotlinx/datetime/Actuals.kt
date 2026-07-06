@@ -155,11 +155,20 @@ actual class LocalDate(
             val neg = s.startsWith("-")
             val body = if (neg) s.substring(1) else s
             val parts = body.split("-")
-            if (parts.size != 3) {
-                throw IllegalArgumentException("Invalid ISO-8601 date: $input")
-            }
-            val year = parts[0].toInt() * (if (neg) -1 else 1)
-            return LocalDate(year, parts[1].toInt(), parts[2].toInt())
+            if (parts.size != 3) throw DateTimeFormatException("Invalid ISO-8601 date: $input")
+            // ISO: 4-digit year (a signed year with more digits is only valid
+            // via the leading `-`; a leading `+` or padded width is rejected),
+            // 2-digit month and day, all digits.
+            val yStr = parts[0]; val mStr = parts[1]; val dStr = parts[2]
+            if (yStr.length < 4 || mStr.length != 2 || dStr.length != 2 ||
+                !yStr.all { it in '0'..'9' } || !mStr.all { it in '0'..'9' } || !dStr.all { it in '0'..'9' })
+                throw DateTimeFormatException("Invalid ISO-8601 date: $input")
+            val yMag = yStr.toIntOrNull() ?: throw DateTimeFormatException("Invalid ISO-8601 date: $input")
+            val year = if (neg) -yMag else yMag
+            val month = mStr.toInt(); val day = dStr.toInt()
+            if (year !in -999_999..999_999 || month !in 1..12 || day !in 1..daysInMonth(year, month))
+                throw DateTimeFormatException("Invalid ISO-8601 date: $input")
+            return LocalDate(year, month, day)
         }
 
         fun fromEpochDays(epochDays: Long): LocalDate = dateFromEpochDays(epochDays)
@@ -325,23 +334,30 @@ actual class LocalTime(
         // ISO-8601 `HH:mm[:ss[.fff…]]`.
         fun parse(input: CharSequence): LocalTime {
             val parts = input.toString().split(":")
-            if (parts.size < 2) {
-                throw IllegalArgumentException("Invalid ISO-8601 time: $input")
+            if (parts.size < 2 || parts.size > 3) throw DateTimeFormatException("Invalid ISO-8601 time: $input")
+            fun digits2(x: String): Int {
+                if (x.length != 2 || !x.all { it in '0'..'9' }) throw DateTimeFormatException("Invalid ISO-8601 time: $input")
+                return x.toInt()
             }
-            val hour = parts[0].toInt()
-            val minute = parts[1].toInt()
+            val hour = digits2(parts[0])
+            val minute = digits2(parts[1])
             var second = 0
             var nanos = 0
-            if (parts.size >= 3) {
+            if (parts.size == 3) {
                 val sec = parts[2]
                 val dot = sec.indexOf('.')
                 if (dot >= 0) {
-                    second = sec.substring(0, dot).toInt()
-                    nanos = sec.substring(dot + 1).padEnd(9, '0').substring(0, 9).toInt()
+                    second = digits2(sec.substring(0, dot))
+                    val frac = sec.substring(dot + 1)
+                    if (frac.isEmpty() || frac.length > 9 || !frac.all { it in '0'..'9' })
+                        throw DateTimeFormatException("Invalid ISO-8601 time: $input")
+                    nanos = frac.padEnd(9, '0').toInt()
                 } else {
-                    second = sec.toInt()
+                    second = digits2(sec)
                 }
             }
+            if (hour !in 0..23 || minute !in 0..59 || second !in 0..59)
+                throw DateTimeFormatException("Invalid ISO-8601 time: $input")
             return LocalTime(hour, minute, second, nanos)
         }
     }
@@ -391,9 +407,7 @@ actual class LocalDateTime(
         fun parse(input: CharSequence): LocalDateTime {
             val s = input.toString()
             val t = s.indexOf('T')
-            if (t < 0) {
-                throw IllegalArgumentException("Invalid ISO-8601 date-time: $input")
-            }
+            if (t < 0) throw DateTimeFormatException("Invalid ISO-8601 date-time: $input")
             return LocalDateTime(LocalDate.parse(s.substring(0, t)), LocalTime.parse(s.substring(t + 1)))
         }
     }
