@@ -51,3 +51,4 @@
 [submodule "kotlin-klio/klio-mosaic/upstream"]
 	path = kotlin-klio/klio-mosaic/upstream
 	url = https://github.com/JakeWharton/mosaic
+	update = none

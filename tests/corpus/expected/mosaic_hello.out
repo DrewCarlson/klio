@@ -1,0 +1,12 @@
+--- frame 0 ---
+Hello, mosaic!
+count is 0    
+[]            
+--- frame 1 (count=3) ---
+Hello, mosaic!
+count is 3    
+[###]         
+--- frame 2 (count=7) ---
+Hello, mosaic!
+count is 7    
+[#######]     

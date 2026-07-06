@@ -111,25 +111,39 @@ the e2e corpus.
 child compositions and recompose them. Skippable for Mosaic's first cut; required before
 `LazyColumn`/constraints-based UI.
 
-## 3. Phase M — the Mosaic pack (terminal UI; the right first target)
+## 3. Phase M — the Mosaic pack (terminal UI) — DONE
 
-Mosaic (`com.jakewharton.mosaic`) is small, has **no Skia/native dependency**, and
-exercises N1 end-to-end with a tiny surface. It is the correctness proof for node
-emission.
+The correctness proof for node emission: a `Text`/`Row`/`Column` tree emits
+`MosaicNode`s through `ComposeNode` into a `MosaicNodeApplier`, which
+measures/lays-out/renders to text; a state write + recompose re-renders the
+changed nodes in place. Green (`examples/mosaic_hello.kt`, baked
+`tests/corpus/expected/mosaic_hello.out`).
 
-- **Vendor** `mosaic-runtime` (commonMain) into a `kotlin-klio/klio-mosaic` pack.
-- **Node + applier as klio actuals:** `MosaicNode` (a box/text/row/column node with
-  layout fields) + a `MosaicNodeApplier`. Most of mosaic-runtime's node/layout/measure is
-  pure Kotlin and consumes verbatim once N1's emit path works.
-- **Renderer as a klio actual / host intrinsic:** the ANSI/terminal renderer
-  (`Terminal`, the diff-based frame output) — a thin klioMain + a Zig host binding for
-  raw stdout/size if needed (a print-based renderer suffices for deterministic tests).
-- **Driver:** `runMosaic { … }` sets up a `Recomposer` (have it) + the `MosaicNodeApplier`
-  + a render-on-frame loop on the `BroadcastFrameClock` (have it).
-- **Acceptance:** `examples/mosaic_hello.kt` renders text + a recomposing counter to a
-  deterministic captured buffer; corpus-baked.
+- **Vendored** mosaic **0.3.0** (the small pre-layout-engine cut — 6 files, JVM,
+  deps just compose-runtime + coroutines; the current 0.19 is a full
+  layout/measure/draw/Modifier engine, out of scope for a node-emission proof) as
+  a submodule at `kotlin-klio/klio-mosaic/upstream`.
+- **Consumed** the pure core verbatim: `nodes.kt` (`MosaicNode`/`TextNode`/`BoxNode`
+  + `MosaicNodeApplier`), `components.kt` (`Text`/`Row`/`Column`, `Color`/`TextStyle`),
+  `canvas.kt` (the text canvas). klioMain supplies the JVM codepoint/`Character`
+  APIs klio's stdlib lacks, and a synchronous `mosaicRenderer` (replacing the
+  jansi/`runBlocking` terminal loop) that composes into the node tree and renders
+  frames to a plain-text buffer read straight off the canvas cells.
+- **Interpreter fixes this surfaced** (general, not mosaic-specific): the
+  compose-runtime reconciler now calls both `insertTopDown`/`insertBottomUp` (mosaic
+  inserts bottom-up); and a range argument now refutes a scalar-param override so a
+  class overriding one overload of a method with inherited interface-default
+  overloads (`canvas[Int,Int]` vs `canvas[IntRange,IntRange]`) dispatches correctly.
 
-Mosaic depends on `androidx.collection` (see §5) and the compose runtime; both present.
+**Known follow-up (pack-image bug, documented not worked around):** an imported
+companion `val` — `import TextStyle.Companion.None` — does **not** alias the
+class-qualified singleton `TextStyle.None` in a *baked* pack image (they compare
+`!==`); it is correct when the pack loads from source. This spuriously fired
+`style != None` in the consumed ANSI renderer. The `mosaicRenderer` sidesteps it by
+building plain text from the canvas cells (no colour path), which is also what a
+deterministic captured buffer wants; the underlying image aliasing needs a real
+fix before colour/style output is exercised (repro: a companion `val` singleton
+imported via `import X.Companion.Y` and compared with `===`).
 
 ## 4. Phase S — the Compose UI / Skia stack (large; after N1+N2)
 

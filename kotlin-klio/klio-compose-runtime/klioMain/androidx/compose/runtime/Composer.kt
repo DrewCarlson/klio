@@ -430,7 +430,12 @@ internal class KlioComposer : Composer {
             val g = newOrder[t]
             val cur = shadow.indexOf(g)
             if (cur == -1) {
+                // An applier implements exactly one of insertTopDown / insertBottomUp
+                // (the other is a no-op). The child's own subtree is already built
+                // by the time it is inserted here, so call both and let the applier
+                // use whichever it implements.
                 applier.insertTopDown(t, g.node)
+                applier.insertBottomUp(t, g.node)
                 shadow.add(t, g)
             } else if (cur != t) {
                 val toArg = if (cur > t) t else t + 1
