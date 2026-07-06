@@ -416,3 +416,36 @@ fun Instant.minusPeriod(period: DateTimePeriod, timeZone: TimeZone): Instant = p
     ),
     timeZone,
 )
+
+// Upstream-named calendar arithmetic (Instant.kt is format/internal-heavy and
+// not consumed, so these are supplied directly). The 2-arg shape is distinct
+// from the `kotlin.time.Instant.plus(Duration)` member by arity.
+fun Instant.plus(period: DateTimePeriod, timeZone: TimeZone): Instant = plusPeriod(period, timeZone)
+fun Instant.minus(period: DateTimePeriod, timeZone: TimeZone): Instant = minusPeriod(period, timeZone)
+
+/** The offset from UTC, in whole seconds, at a specific moment in a time zone. */
+class UtcOffset internal constructor(val totalSeconds: Int) {
+    override fun toString(): String {
+        if (totalSeconds == 0) return "Z"
+        val sign = if (totalSeconds < 0) "-" else "+"
+        val abs = if (totalSeconds < 0) -totalSeconds else totalSeconds
+        val hh = (abs / 3600).toString().padStart(2, '0')
+        val mm = ((abs % 3600) / 60).toString().padStart(2, '0')
+        val s = abs % 60
+        return if (s == 0) "$sign$hh:$mm" else "$sign$hh:$mm:${s.toString().padStart(2, '0')}"
+    }
+    override fun equals(other: Any?): Boolean = other is UtcOffset && other.totalSeconds == totalSeconds
+    override fun hashCode(): Int = totalSeconds
+
+    companion object {
+        val ZERO: UtcOffset = UtcOffset(0)
+    }
+}
+
+/** The wall-clock offset of [timeZone] from UTC at this instant. */
+fun Instant.offsetIn(timeZone: TimeZone): UtcOffset {
+    val ldt = toLocalDateTime(timeZone)
+    val localSeconds = ldt.date.toEpochDays() * 86400L +
+        ldt.hour.toLong() * 3600L + ldt.minute.toLong() * 60L + ldt.second.toLong()
+    return UtcOffset((localSeconds - epochSeconds).toInt())
+}
