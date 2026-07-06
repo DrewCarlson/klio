@@ -168,12 +168,12 @@ imported via `import X.Companion.Y` and compared with `===`).
 The plan's stated first increment ("ui-core (LayoutNode + measure/layout) on a headless
 software canvas → deterministic pixel-dump tests → foundation primitives") is landed and
 green: the `klio.compose.ui` pack (`examples/compose_ui.kt`, baked corpus). A
-`Row`/`Column`/`Box` `@Composable` tree emits `LayoutNode`s through the compose runtime's
-node path (`ComposeNode` → `LayoutNodeApplier`); a **measure** pass sizes + places them
-under `Constraints` (arrangement + `Modifier` size/padding/fill), a **draw** pass paints
-backgrounds into a software `PixelCanvas`, and the buffer dumps deterministically as ASCII.
-A state write recomposes and re-renders (a box's colour flips) — the same
-node-emission + measure/layout/draw path a real Compose UI uses.
+`Column`/`Row`/`Box`/`Text` `@Composable` tree emits `LayoutNode`s through the compose
+runtime's node path (`ComposeNode` → `LayoutNodeApplier`); a **measure** pass sizes + places
+them under `Constraints` (arrangement + `Modifier` size/padding/fill), a **draw** pass paints
+backgrounds and 3×5 bitmap-font `Text` into a software `PixelCanvas`, and the buffer dumps
+deterministically as ASCII. A state write recomposes and re-renders (the counter text
+updates) — the same node-emission + measure/layout/draw path a real Compose UI uses.
 
 The real `androidx.compose.ui` is **not** in the vendored sparse checkout (only compose
 `runtime` is), and it is a Skia/native stack of hundreds of files, so this increment is a

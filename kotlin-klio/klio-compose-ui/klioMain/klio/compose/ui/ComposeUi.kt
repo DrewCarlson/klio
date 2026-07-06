@@ -49,6 +49,43 @@ private fun charFor(argb: Int): Char {
     }
 }
 
+// ----- bitmap font (3x5 glyphs) -----
+
+// Each glyph is 5 rows of 3 columns, packed as 3 low bits per row (bit 2 = left).
+private fun glyph(c: Char): IntArray {
+    return when (c) {
+        '0' -> intArrayOf(7, 5, 5, 5, 7)
+        '1' -> intArrayOf(2, 6, 2, 2, 7)
+        '2' -> intArrayOf(7, 1, 7, 4, 7)
+        '3' -> intArrayOf(7, 1, 7, 1, 7)
+        '4' -> intArrayOf(5, 5, 7, 1, 1)
+        '5' -> intArrayOf(7, 4, 7, 1, 7)
+        '6' -> intArrayOf(7, 4, 7, 5, 7)
+        '7' -> intArrayOf(7, 1, 2, 2, 2)
+        '8' -> intArrayOf(7, 5, 7, 5, 7)
+        '9' -> intArrayOf(7, 5, 7, 1, 7)
+        'A' -> intArrayOf(2, 5, 7, 5, 5)
+        'C' -> intArrayOf(7, 4, 4, 4, 7)
+        'E' -> intArrayOf(7, 4, 7, 4, 7)
+        'H' -> intArrayOf(5, 5, 7, 5, 5)
+        'I' -> intArrayOf(7, 2, 2, 2, 7)
+        'K' -> intArrayOf(5, 5, 6, 5, 5)
+        'L' -> intArrayOf(4, 4, 4, 4, 7)
+        'N' -> intArrayOf(5, 7, 7, 7, 5)
+        'O' -> intArrayOf(7, 5, 5, 5, 7)
+        'R' -> intArrayOf(7, 5, 7, 6, 5)
+        'T' -> intArrayOf(7, 2, 2, 2, 2)
+        'U' -> intArrayOf(5, 5, 5, 5, 7)
+        'Y' -> intArrayOf(5, 5, 2, 2, 2)
+        ' ' -> intArrayOf(0, 0, 0, 0, 0)
+        else -> intArrayOf(7, 5, 5, 5, 7) // unknown → filled box outline
+    }
+}
+
+private const val GLYPH_W = 3
+private const val GLYPH_H = 5
+private const val GLYPH_ADVANCE = 4 // 3px glyph + 1px gap
+
 // ----- geometry -----
 
 /** Measurement bounds handed down the tree during the measure pass. */
@@ -138,6 +175,8 @@ class LayoutNode {
     var measuredHeight = 0
     var offsetX = 0
     var offsetY = 0
+    var text: String = ""
+    var textColor: Color? = null
 
     fun measure(constraints: Constraints) {
         val pad = modifier.padding
@@ -151,6 +190,10 @@ class LayoutNode {
 
         var contentW = 0
         var contentH = 0
+        if (text.isNotEmpty()) {
+            contentW = text.length * GLYPH_ADVANCE - 1
+            contentH = GLYPH_H
+        }
         if (arrangement == "Row") {
             var cursor = 0
             for (child in children) {
@@ -192,6 +235,28 @@ class LayoutNode {
     fun draw(canvas: PixelCanvas, originX: Int, originY: Int) {
         val bg = modifier.background
         if (bg != null) canvas.fillRect(originX, originY, measuredWidth, measuredHeight, bg.argb)
+        val pad = modifier.padding
+        if (text.isNotEmpty()) {
+            val fg = textColor ?: Color.White
+            var penX = originX + pad
+            var i = 0
+            while (i < text.length) {
+                val rows = glyph(text[i])
+                var gy = 0
+                while (gy < GLYPH_H) {
+                    val bits = rows[gy]
+                    var gx = 0
+                    while (gx < GLYPH_W) {
+                        val on = (bits shr (GLYPH_W - 1 - gx)) and 1
+                        if (on != 0) canvas.fillRect(penX + gx, originY + pad + gy, 1, 1, fg.argb)
+                        gx += 1
+                    }
+                    gy += 1
+                }
+                penX += GLYPH_ADVANCE
+                i += 1
+            }
+        }
         for (child in children) {
             child.draw(canvas, originX + child.offsetX, originY + child.offsetY)
         }
@@ -274,6 +339,27 @@ fun Column(modifier: Modifier, content: @Composable () -> Unit) {
         update = { set(modifier) { this.modifier = it } },
         content = content,
     )
+}
+
+@Composable
+fun Text(text: String, color: Color, modifier: Modifier) {
+    ComposeNode<LayoutNode, LayoutNodeApplier>(
+        factory = {
+            val n = LayoutNode()
+            n.arrangement = "Box"
+            n
+        },
+        update = {
+            set(text) { this.text = it }
+            set(color) { this.textColor = it }
+            set(modifier) { this.modifier = it }
+        },
+    )
+}
+
+@Composable
+fun Text(text: String, color: Color) {
+    Text(text, color, Modifier.None)
 }
 
 // ----- driver -----
