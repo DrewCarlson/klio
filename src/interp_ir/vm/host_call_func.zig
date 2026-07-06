@@ -102,6 +102,41 @@ fn funcDefaults(self: *VmHost, func: FuncId) ?[]?FuncId {
 // Vararg packing.
 // -------------------------------------------------------------------------
 
+/// The primitive-array kind for a vararg element type, or null for a reference
+/// element (which stays a boxed `Array`). Kotlin materializes `vararg Byte` AS
+/// a `ByteArray`, so the packed value must carry the primitive kind — otherwise
+/// a plain `Array` fails to match a `ByteArray`/`IntArray`/… parameter at a
+/// later call (a `fun f(vararg b: Byte) = g(b)` would then miss `g(ByteArray)`).
+fn varargPrimKind(elem: []const u8) ?runtime.PrimitiveArrayKind {
+    const K = runtime.PrimitiveArrayKind;
+    const table = [_]struct { n: []const u8, k: K }{
+        .{ .n = "Byte", .k = .Byte },       .{ .n = "Int", .k = .Int },
+        .{ .n = "Long", .k = .Long },       .{ .n = "Short", .k = .Short },
+        .{ .n = "Double", .k = .Double },   .{ .n = "Float", .k = .Float },
+        .{ .n = "Boolean", .k = .Boolean }, .{ .n = "Char", .k = .Char },
+        .{ .n = "UByte", .k = .UByte },     .{ .n = "UInt", .k = .UInt },
+        .{ .n = "ULong", .k = .ULong },     .{ .n = "UShort", .k = .UShort },
+    };
+    for (table) |e| {
+        if (std.mem.eql(u8, elem, e.n)) return e.k;
+    }
+    return null;
+}
+
+/// Build the packed vararg value from an owned list of element values: a
+/// primitive `ByteArray`/`IntArray`/… when `elem_ty` is a primitive, else a
+/// boxed `Array`. Mirrors `collections.makeArrayFromArrayList`'s ownership.
+fn packVarargArray(allocator: Allocator, elem_ty: []const u8, list: std.ArrayList(Value)) Allocator.Error!Value {
+    if (varargPrimKind(elem_ty)) |k| {
+        var l = list;
+        const v = try runtime.ArrayData.initPacked(allocator, k, l.items);
+        if (runtime.reclaimEnabled()) for (l.items) |e| e.release(allocator);
+        l.deinit(allocator);
+        return v;
+    }
+    return runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, list));
+}
+
 /// Collapse the trailing positional args of a vararg call into a single
 /// `Array` slot. Consumes `args` (an owned `ArrayList`), returning the
 /// packed list. A `f(*arr)` spread (a lone `Array` already in the slot)
@@ -124,7 +159,8 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
     while (j < args.items.len) : (j += 1) {
         try rest.append(allocator, args.items[j]);
     }
-    try out.append(allocator, runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, rest)));
+    const velem = func.params[n_params - 1].ty.name;
+    try out.append(allocator, try packVarargArray(allocator, velem, rest));
     args.deinit(allocator);
     return out;
 }
@@ -1285,13 +1321,14 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                 positional_idx += 1;
             }
             if (vararg_pos) |vp| {
+                const velem = params[vp].ty.name;
                 if (hit_vararg) {
                     var acc: std.ArrayList(Value) = .empty;
                     try acc.appendSlice(allocator, vararg_acc.items);
-                    slots[vp] = runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, acc));
+                    slots[vp] = try packVarargArray(allocator, velem, acc);
                 } else if (slots[vp] == null) {
                     const empty_acc: std.ArrayList(Value) = .empty;
-                    slots[vp] = runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, empty_acc));
+                    slots[vp] = try packVarargArray(allocator, velem, empty_acc);
                 }
             }
 
