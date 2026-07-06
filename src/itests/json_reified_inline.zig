@@ -125,6 +125,47 @@ test "reified Json round-trip in a plain program body" {
     );
 }
 
+test "@SerialName renames keys on encode and decode" {
+    // kotlinc emits the serial name as the wire key for every placement it
+    // honors: no use-site target (defaults to the property anchor —
+    // SerialName is @Target(PROPERTY, CLASS), so `param` never applies),
+    // explicit @property:, and @all: (expands to the property anchor only).
+    try runProgram("json_serial_names",
+        \\import kotlinx.serialization.SerialName
+        \\import kotlinx.serialization.Serializable
+        \\import kotlinx.serialization.json.Json
+        \\
+        \\@Serializable
+        \\data class Person(val name: String, @SerialName("years") val age: Int)
+        \\
+        \\@Serializable
+        \\data class Handle(@property:SerialName("first_name") val firstName: String)
+        \\
+        \\@Serializable
+        \\data class Alias(@all:SerialName("nick") val nickname: String)
+        \\
+        \\fun main() {
+        \\    val p = Person("amy", 31)
+        \\    val s = Json.encodeToString(p)
+        \\    println(s)
+        \\    println(Json.decodeFromString<Person>(s))
+        \\    println(Json.encodeToString(Handle("bo")))
+        \\    println(Json.decodeFromString<Handle>("""{"first_name":"kay"}"""))
+        \\    println(Json.encodeToString(Alias("zed")))
+        \\    println(Json.decodeFromString<Alias>("""{"nick":"rem"}"""))
+        \\}
+        \\
+    ,
+        \\{"name":"amy","years":31}
+        \\Person(name=amy, age=31)
+        \\{"first_name":"bo"}
+        \\Handle(firstName=kay)
+        \\{"nick":"zed"}
+        \\Alias(nickname=rem)
+        \\
+    );
+}
+
 test "reified Json calls inside a hook-style lambda with no expected type" {
     try runProgram("json_hook",
         \\import kotlinx.serialization.Serializable

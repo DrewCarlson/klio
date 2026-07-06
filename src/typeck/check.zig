@@ -402,6 +402,7 @@ pub const codes = struct {
     pub const TYPE_SUPER_QUALIFIER_NOT_SUPERTYPE = "T0073";
     pub const TYPE_ASSIGNMENT_IN_EXPRESSION_CONTEXT = "T0117";
     pub const TYPE_EXPLICIT_BACKING_FIELD = "T0118";
+    pub const TYPE_INAPPLICABLE_ALL_TARGET = "T0119";
     pub const WARN_DEPRECATED = "W0006";
     pub const WARN_OPT_IN = "W0007";
     pub const WARN_REDUNDANT_EXPLICIT_BACKING_FIELD = "W0008";

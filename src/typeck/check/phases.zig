@@ -2277,20 +2277,24 @@ fn extractAnnotationTargets(allocator: Allocator, e: *const Expr, out: *std.Arra
 
 // === @Target / @Repeatable walk ===========================================
 
+/// Whether a property declaration is a class member or top-level; drives
+/// the target description in `WRONG_ANNOTATION_TARGET` messages.
+const PropContainer = enum { TopLevel, Member };
+
 fn annotationWalkFile(self: *Checker, meta: *const std.StringHashMap(AnnotationMeta), file: *const KotlinFile) Allocator.Error!void {
     try annotationCheckSet(self, meta, &.{}, .File);
     for (file.decls) |*d| {
-        try annotationWalkDecl(self, meta, d);
+        try annotationWalkDecl(self, meta, d, .TopLevel);
     }
 }
 
-fn annotationWalkDecl(self: *Checker, meta: *const std.StringHashMap(AnnotationMeta), d: *const Decl) Allocator.Error!void {
+fn annotationWalkDecl(self: *Checker, meta: *const std.StringHashMap(AnnotationMeta), d: *const Decl, container: PropContainer) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| try annotationWalkFunction(self, meta, f),
-        .Property => |p| try annotationWalkProperty(self, meta, p, false),
+        .Property => |p| try annotationWalkProperty(self, meta, p, container),
         .Class => |*c| try annotationWalkClass(self, meta, c),
         .Object => |*o| {
-            for (o.members) |*m| try annotationWalkDecl(self, meta, m);
+            for (o.members) |*m| try annotationWalkDecl(self, meta, m, .Member);
         },
         .TypeAlias => |*a| {
             try annotationCheckSet(self, meta, a.annotations, .TypeAlias);
@@ -2304,9 +2308,12 @@ fn annotationWalkFunction(self: *Checker, meta: *const std.StringHashMap(Annotat
     for (f.params) |*p| try annotationCheckSet(self, meta, p.annotations, .ValueParameter);
 }
 
-fn annotationWalkProperty(self: *Checker, meta: *const std.StringHashMap(AnnotationMeta), p: *const Property, local: bool) Allocator.Error!void {
-    const site: AnnotationTarget = if (local) .LocalVariable else .Property;
-    try annotationCheckSet(self, meta, p.annotations, site);
+fn annotationWalkProperty(self: *Checker, meta: *const std.StringHashMap(AnnotationMeta), p: *const Property, container: PropContainer) Allocator.Error!void {
+    try checkPropertyAnnotationSet(self, meta, p.annotations, .{
+        .is_var = p.mutable,
+        .has_backing_field = annotationShapeHasBackingField(p),
+        .is_delegated = p.delegate != null,
+    }, container);
     if (p.getter) |g| try annotationCheckSet(self, meta, g.annotations, .PropertyGetter);
     if (p.setter) |s| try annotationCheckSet(self, meta, s.annotations, .PropertySetter);
 }
@@ -2315,13 +2322,34 @@ fn annotationWalkClass(self: *Checker, meta: *const std.StringHashMap(Annotation
     const site: AnnotationTarget = if (c.is_annotation) .AnnotationClass else .Class;
     try annotationCheckSet(self, meta, c.annotations, site);
     for (c.type_params) |*tp| try annotationCheckSet(self, meta, tp.annotations, .TypeParameter);
-    for (c.primary_params) |*p| try annotationCheckSet(self, meta, p.annotations, .ValueParameter);
+    for (c.primary_params) |*p| {
+        if (p.property) |is_var| {
+            try checkPropertyAnnotationSet(self, meta, p.annotations, .{
+                .is_ctor_property = true,
+                .is_var = is_var,
+                .has_backing_field = true,
+                .in_annotation_class = c.is_annotation,
+            }, .Member);
+        } else {
+            try annotationCheckSetMsg(self, meta, p.annotations, .ValueParameter, "constructor parameters without corresponding property (consider adding val/var)");
+        }
+    }
     for (c.secondary_ctors) |*sc| {
         try annotationCheckSet(self, meta, sc.annotations, .Constructor);
         for (sc.params) |*p| try annotationCheckSet(self, meta, p.annotations, .ValueParameter);
     }
     for (c.enum_entries) |*e| try annotationCheckSet(self, meta, e.annotations, .Property);
-    for (c.members) |*m| try annotationWalkDecl(self, meta, m);
+    for (c.members) |*m| try annotationWalkDecl(self, meta, m, .Member);
+}
+
+/// Backing-field presence as target assignment sees it: an explicit
+/// `field` clause always supplies one; a delegated / abstract / expect
+/// property never has one; otherwise the accessor-shape rule
+/// (`propertyHasBackingField`) decides.
+fn annotationShapeHasBackingField(p: *const Property) bool {
+    if (p.delegate != null or p.is_abstract or p.is_expect) return false;
+    if (p.explicit_field != null) return true;
+    return propertyHasBackingField(p);
 }
 
 fn annotationCheckSet(
@@ -2330,11 +2358,33 @@ fn annotationCheckSet(
     anns: []const Annotation,
     site: AnnotationTarget,
 ) Allocator.Error!void {
+    const all_msg: []const u8 = switch (site) {
+        .ValueParameter => "value parameters, only properties are allowed",
+        .LocalVariable => "local properties, only member or top-level properties are allowed",
+        else => "elements other than properties",
+    };
+    try annotationCheckSetMsg(self, meta, anns, site, all_msg);
+}
+
+/// The plain (non-property-declaration) annotation-set check: `@Target`
+/// applicability against the declaration site kind, `@all:` rejection
+/// with the site-specific message, and per-site repetition.
+fn annotationCheckSetMsg(
+    self: *Checker,
+    meta: *const std.StringHashMap(AnnotationMeta),
+    anns: []const Annotation,
+    site: AnnotationTarget,
+    all_msg: []const u8,
+) Allocator.Error!void {
     const a = self.allocator;
     var counts = std.StringHashMap(Span).init(a);
     defer counts.deinit();
     for (anns) |*ann| {
         const leaf = if (ann.path.len > 0) ann.path[ann.path.len - 1].name else continue;
+        if (ann.use_site != null and ann.use_site.? == .All) {
+            try emitInapplicableAllTarget(self, all_msg, ann.span);
+            continue;
+        }
         // @Target check — only when we know the annotation class and it
         // carries a @Target list.
         if (meta.get(leaf)) |m| {
@@ -2384,6 +2434,240 @@ fn targetsContain(targets: []const AnnotationTarget, site: AnnotationTarget) boo
         if (t == site) return true;
     }
     return false;
+}
+
+pub fn emitInapplicableAllTarget(self: *Checker, what: []const u8, sp: Span) Allocator.Error!void {
+    const msg = try std.fmt.allocPrint(
+        self.allocator,
+        "'@all:' annotations cannot be applied to {s}.",
+        .{what},
+    );
+    var d = Diagnostic.err(msg, sp);
+    _ = d.withCode(codes.TYPE_INAPPLICABLE_ALL_TARGET);
+    _ = d.withFactory(&diagnostics.generated.INAPPLICABLE_ALL_TARGET);
+    try self.diagnostics.emit(self.allocator, d);
+}
+
+const at = ast.annotation_targets;
+
+/// Convert a declared `@Target` list into the use-site target set U(A).
+/// `null` targets (no `@Target` on the class) admit everything but `file`.
+fn useSiteSetFor(targets: ?[]const AnnotationTarget) at.UseSiteSet {
+    const list = targets orelse return at.UseSiteSet.no_target;
+    var u = at.UseSiteSet{};
+    for (list) |t| {
+        switch (t) {
+            .Field => {
+                u.field = true;
+                u.delegate = true;
+            },
+            .Property => u.property = true,
+            .PropertyGetter => u.get = true,
+            .PropertySetter => u.set = true,
+            .ValueParameter => {
+                u.param = true;
+                u.receiver = true;
+                u.setparam = true;
+            },
+            .File => u.file = true,
+            else => {},
+        }
+    }
+    return u;
+}
+
+/// kotlinc's lowercase target description, used in the applicable-targets
+/// tail of `WRONG_ANNOTATION_TARGET` messages.
+fn targetDescription(t: AnnotationTarget) []const u8 {
+    return switch (t) {
+        .Class => "class",
+        .AnnotationClass => "annotation class",
+        .TypeParameter => "type parameter",
+        .Property => "property",
+        .Field => "field",
+        .LocalVariable => "local variable",
+        .ValueParameter => "value parameter",
+        .Constructor => "constructor",
+        .Function => "function",
+        .PropertyGetter => "property getter",
+        .PropertySetter => "property setter",
+        .Type => "type usage",
+        .Expression => "expression",
+        .File => "file",
+        .TypeAlias => "typealias",
+    };
+}
+
+fn joinTargetDescriptions(a: Allocator, targets: []const AnnotationTarget) Allocator.Error![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(a);
+    for (targets, 0..) |t, i| {
+        if (i > 0) try buf.appendSlice(a, ", ");
+        try buf.appendSlice(a, targetDescription(t));
+    }
+    return buf.toOwnedSlice(a);
+}
+
+/// kotlinc's description of the property declaration itself, used as the
+/// `{0}` of `WRONG_ANNOTATION_TARGET`.
+fn propertyTargetDescription(shape: at.PropertyShape, container: PropContainer) []const u8 {
+    const member = shape.is_ctor_property or container == .Member;
+    if (shape.is_delegated) {
+        return if (member) "member property with delegate" else "top level property with delegate";
+    }
+    if (shape.has_backing_field) {
+        return if (member) "member property with backing field" else "top level property with backing field";
+    }
+    return if (member) "member property without backing field or delegate" else "top level property without backing field or delegate";
+}
+
+/// Source spelling of an explicit use-site target.
+fn useSiteSpelling(us: ast.AnnotationUseSite) []const u8 {
+    return switch (us) {
+        .Field => "field",
+        .Property => "property",
+        .Get => "get",
+        .Set => "set",
+        .Receiver => "receiver",
+        .Param => "param",
+        .SetParam => "setparam",
+        .Delegate => "delegate",
+        .File => "file",
+        .All => "all",
+    };
+}
+
+/// Target assignment for the annotation entries of one property
+/// declaration (member, top-level, or primary-constructor `val`/`var`):
+/// `@all:` expansion, the LV 2.4 defaulting rule for target-less entries,
+/// explicit use-site applicability, and per-anchor repetition.
+fn checkPropertyAnnotationSet(
+    self: *Checker,
+    meta: *const std.StringHashMap(AnnotationMeta),
+    anns: []const Annotation,
+    shape: at.PropertyShape,
+    container: PropContainer,
+) Allocator.Error!void {
+    const a = self.allocator;
+    // Per-anchor first-occurrence spans, keyed by annotation leaf name.
+    var seen = [_]std.StringHashMap(Span){std.StringHashMap(Span).init(a)} ** 8;
+    defer for (&seen) |*m| m.deinit();
+    const anchor_fields = [_][]const u8{ "param", "property", "field", "get", "set", "setparam", "delegate", "receiver" };
+
+    for (anns) |*ann| {
+        const leaf = if (ann.path.len > 0) ann.path[ann.path.len - 1].name else continue;
+        const m = meta.get(leaf);
+        const known_targets: ?[]const AnnotationTarget = if (m) |mm| mm.targets else null;
+        const u = useSiteSetFor(known_targets);
+
+        var placement = at.Placement{};
+        if (ann.use_site) |us| switch (us) {
+            .All => {
+                if (shape.is_delegated) {
+                    try emitInapplicableAllTarget(self, "delegated properties", ann.span);
+                    continue;
+                }
+                placement = at.expandAll(u, shape);
+                if (placement.isEmpty()) {
+                    const list = try joinTargetDescriptions(a, known_targets orelse &.{});
+                    const msg = try std.fmt.allocPrint(
+                        a,
+                        "This annotation is not applicable to target 'property' and use-site target '@all'. Applicable targets: {s}",
+                        .{list},
+                    );
+                    var d = Diagnostic.err(msg, ann.span);
+                    _ = d.withCode(codes.TYPE_ANNOTATION_TARGET_MISMATCH);
+                    _ = d.withFactory(&diagnostics.generated.WRONG_ANNOTATION_TARGET_WITH_USE_SITE_TARGET);
+                    try self.diagnostics.emit(a, d);
+                    continue;
+                }
+            },
+            else => {
+                const admitted = switch (us) {
+                    .Field => u.field,
+                    .Property => u.property,
+                    .Get => u.get,
+                    .Set => u.set,
+                    .Receiver => u.receiver,
+                    .Param => u.param,
+                    .SetParam => u.setparam,
+                    .Delegate => u.delegate,
+                    .File => u.file,
+                    .All => unreachable,
+                };
+                if (!admitted and known_targets != null) {
+                    const list = try joinTargetDescriptions(a, known_targets.?);
+                    const msg = try std.fmt.allocPrint(
+                        a,
+                        "This annotation is not applicable to target '{s}' and use-site target '@{s}'. Applicable targets: {s}",
+                        .{ propertyTargetDescription(shape, container), useSiteSpelling(us), list },
+                    );
+                    var d = Diagnostic.err(msg, ann.span);
+                    _ = d.withCode(codes.TYPE_ANNOTATION_TARGET_MISMATCH);
+                    _ = d.withFactory(&diagnostics.generated.WRONG_ANNOTATION_TARGET_WITH_USE_SITE_TARGET);
+                    try self.diagnostics.emit(a, d);
+                    continue;
+                }
+                switch (us) {
+                    .Field => placement.field = true,
+                    .Property => placement.property = true,
+                    .Get => placement.get = true,
+                    .Set => placement.set = true,
+                    .Receiver => placement.receiver = true,
+                    .Param => placement.param = true,
+                    .SetParam => placement.setparam = true,
+                    .Delegate => placement.delegate = true,
+                    .File, .All => {},
+                }
+            },
+        } else {
+            placement = at.defaultPlacement(u, shape);
+            if (placement.isEmpty()) {
+                // Nothing to default to: the entry stays on the property
+                // declaration, where plain target checking rejects an
+                // annotation that cannot target a property. Only known
+                // classes with an explicit @Target can fail here.
+                if (known_targets) |targets| {
+                    const list = try joinTargetDescriptions(a, targets);
+                    const msg = try std.fmt.allocPrint(
+                        a,
+                        "This annotation is not applicable to target '{s}'. Applicable targets: {s}",
+                        .{ propertyTargetDescription(shape, container), list },
+                    );
+                    var d = Diagnostic.err(msg, ann.span);
+                    _ = d.withCode(codes.TYPE_ANNOTATION_TARGET_MISMATCH);
+                    _ = d.withFactory(&diagnostics.generated.WRONG_ANNOTATION_TARGET);
+                    try self.diagnostics.emit(a, d);
+                }
+                continue;
+            }
+        }
+
+        // Per-anchor repetition: a non-repeatable annotation may reach a
+        // given anchor only once, whatever mix of `@all:` / explicit /
+        // defaulted entries put it there.
+        var repeated: ?Span = null;
+        inline for (anchor_fields, 0..) |fname, i| {
+            if (@field(placement, fname)) {
+                const gop = try seen[i].getOrPut(leaf);
+                if (gop.found_existing) {
+                    if (repeated == null) repeated = gop.value_ptr.*;
+                } else {
+                    gop.value_ptr.* = ann.span;
+                }
+            }
+        }
+        if (repeated) |prev_span| {
+            const non_repeatable = if (m) |mm| !mm.repeatable else false;
+            if (non_repeatable) {
+                var d = Diagnostic.err("This annotation is not repeatable.", ann.span);
+                _ = d.withCode(codes.TYPE_ANNOTATION_NOT_REPEATABLE);
+                _ = d.withFactory(&diagnostics.generated.REPEATED_ANNOTATION);
+                _ = try d.withLabel(a, prev_span, "previously applied here");
+                try self.diagnostics.emit(a, d);
+            }
+        }
+    }
 }
 
 // === opt-in collectors ====================================================

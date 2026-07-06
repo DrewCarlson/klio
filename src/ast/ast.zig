@@ -33,7 +33,16 @@ pub const AnnotationUseSite = enum {
     SetParam,
     Delegate,
     File,
+    /// `@all:Foo` — the property meta-target: expands over every
+    /// applicable anchor of a member/top-level property (constructor
+    /// parameter, the property, its backing field, getter, and setter
+    /// parameter). See `annotation_targets.expandAll`.
+    All,
 };
+
+/// Use-site targeting machinery: U(A) derivation from `@Target`, `@all:`
+/// expansion, and the defaulting rule for target-less property annotations.
+pub const annotation_targets = @import("annotation_targets.zig");
 
 /// A single `@Foo(args)` / `@use-site:Foo` annotation at a declaration
 /// site. Values inside are parsed best-effort; downstream passes treat
@@ -63,6 +72,16 @@ pub const ImportDecl = struct {
     path: []Ident,
     alias: ?Ident,
     wildcard: bool,
+    span: Span,
+};
+
+/// One entry of a `context(name: Type, ...)` modifier clause on a
+/// function or property declaration. A `name` of `"_"` declares an
+/// anonymous context parameter: it participates in context resolution
+/// but is not accessible by name.
+pub const ContextParam = struct {
+    name: Ident,
+    ty: TypeRef,
     span: Span,
 };
 
@@ -100,6 +119,10 @@ pub const Function = struct {
     /// body; the type checker walks the receiver's class chain to find
     /// matching extensions at member-call sites.
     receiver_type: ?TypeRef,
+    /// `context(a: A, b: B)` modifier clause. Context parameters are in
+    /// scope by name in the body (never as implicit receivers) and are
+    /// filled implicitly at call sites from the enclosing scope tower.
+    context_params: []ContextParam = &.{},
     /// Generic type parameters declared on this function: `fun <T> id(x: T): T`.
     type_params: []TypeParam,
     /// `where` clause bounds: `fun <T> foo() where T : Foo, T : Bar`.
@@ -214,6 +237,10 @@ pub const Param = struct {
 pub const Property = struct {
     mutable: bool,
     name: Ident,
+    /// `context(a: A)` modifier clause. The clause belongs to the
+    /// property as a whole: both accessors see the parameters. A
+    /// contextual property has no backing field.
+    context_params: []ContextParam = &.{},
     /// Receiver type for an extension property declared as
     /// `val T.foo: U get() = ...`. `None` for member/top-level properties.
     /// Extension properties may not have an initializer, delegate, or
@@ -521,6 +548,11 @@ pub const FunctionTypeRef = struct {
     params: []TypeRef,
     ret: TypeRef,
     is_suspend: bool,
+    /// Leading `context(A, B)` block of a contextual function type
+    /// `context(A, B) R.(P) -> T`. Types only — named entries are
+    /// rejected by the parser. The type is equivalent to the flattened
+    /// function type `(A, B, R, P) -> T`.
+    context_params: []TypeRef = &.{},
     span: Span,
 };
 
@@ -1001,4 +1033,8 @@ test "recursive expr nodes box through pointers" {
     const u = Expr{ .Unary = .{ .op = .Neg, .expr = &lit, .span = Span.init(f, 0, 2) } };
     try std.testing.expectEqual(UnOp.Neg, u.Unary.op);
     try std.testing.expectEqual(@as(i64, 1), u.Unary.expr.IntLit.value);
+}
+
+test {
+    _ = annotation_targets;
 }

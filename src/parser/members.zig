@@ -514,8 +514,8 @@ pub fn parseProperty(p: *Parser) ?Property {
 /// Parse a local `val`/`var`. Local properties cannot declare `get`/`set`
 /// accessors, so a following `get(...)`/`set(...)` is a separate statement
 /// (e.g. a call to a function named `set`) and must not be consumed.
-pub fn parseLocalProperty(p: *Parser) ?Property {
-    return parsePropertyInner(p, ModifierFlags{}, false);
+pub fn parseLocalProperty(p: *Parser, flags: ModifierFlags) ?Property {
+    return parsePropertyInner(p, flags, false);
 }
 
 pub fn parsePropertyWithFlags(p: *Parser, flags: ModifierFlags) ?Property {

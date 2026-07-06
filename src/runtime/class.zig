@@ -221,6 +221,74 @@ pub const ClassParamDef = struct {
     declared_type: ?[]const u8,
     /// The full declared-type shape, including generic args and nullability.
     declared_shape: ?TypeShape,
+    /// Per-anchor annotation records for a constructor property, after
+    /// use-site target assignment (`@all:` expansion / defaulting).
+    anchors: PropertyAnchors = .{},
+};
+
+/// One resolved constructor argument of an annotation application.
+/// Runtime-retained so reflection-driven consumers (the serializer's
+/// `@SerialName`, validation libraries) can read annotation values.
+pub const AnnotationArg = union(enum) {
+    /// A string literal (`@SerialName("years")`).
+    Str: []const u8,
+    Int: i64,
+    Bool: bool,
+    /// The trailing segment of a dotted path (`AnnotationTarget.PROPERTY`
+    /// records `"PROPERTY"`).
+    EnumEntry: []const u8,
+    /// Any argument shape the lowering does not resolve to a value.
+    Other,
+};
+
+/// One annotation application recorded against a specific anchor.
+pub const AnnotationRecord = struct {
+    /// Resolved fully-qualified candidate names for the annotation class
+    /// (import-expanded, always ending with the source spelling).
+    names: []const []const u8,
+    /// Resolved constructor arguments in source order.
+    args: []const AnnotationArg = &.{},
+    /// Parallel to `args`: the argument name for named arguments.
+    arg_names: []const ?[]const u8 = &.{},
+
+    /// Whether any resolved candidate matches `name` exactly.
+    pub fn is(self: *const AnnotationRecord, name: []const u8) bool {
+        for (self.names) |n| {
+            if (std.mem.eql(u8, n, name)) return true;
+        }
+        return false;
+    }
+
+    /// The value of the string argument named `param`, or the first
+    /// positional string argument when no argument names were written.
+    pub fn stringArg(self: *const AnnotationRecord, param: []const u8) ?[]const u8 {
+        for (self.args, 0..) |arg, i| {
+            if (arg != .Str) continue;
+            const nm: ?[]const u8 = if (i < self.arg_names.len) self.arg_names[i] else null;
+            if (nm == null or std.mem.eql(u8, nm.?, param)) return arg.Str;
+        }
+        return null;
+    }
+};
+
+/// The distinct anchors annotations of one property land on after
+/// use-site target assignment. Slices are arena-owned and immutable.
+pub const PropertyAnchors = struct {
+    param: []const AnnotationRecord = &.{},
+    property: []const AnnotationRecord = &.{},
+    field: []const AnnotationRecord = &.{},
+    get: []const AnnotationRecord = &.{},
+    set: []const AnnotationRecord = &.{},
+    setparam: []const AnnotationRecord = &.{},
+    delegate: []const AnnotationRecord = &.{},
+
+    /// The first record on the property anchor matching `name`.
+    pub fn propertyRecord(self: *const PropertyAnchors, name: []const u8) ?*const AnnotationRecord {
+        for (self.property) |*rec| {
+            if (rec.is(name)) return rec;
+        }
+        return null;
+    }
 };
 
 /// A structural view of a declared type retained for reflection.
@@ -290,6 +358,8 @@ pub const PropertyDef = struct {
     /// Declared non-nullable primitive zero value for a property with no
     /// initializer.
     primitive_zero: ?Value,
+    /// Per-anchor annotation records after use-site target assignment.
+    anchors: PropertyAnchors = .{},
 };
 
 pub const InstanceData = struct {
