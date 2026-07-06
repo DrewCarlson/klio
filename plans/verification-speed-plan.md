@@ -72,5 +72,6 @@ and decisions here.
 - 2026-07-04: measurements above; shipped `scripts/commontest-sweep.py`
   (filtered dual-eager sweeps, replaces session-local perfile/perfail),
   `scripts/gate.sh` (one full-gate entry point), `scripts/prune-zig-cache.sh`
-  (152 GB → 68 GB on first run). Old Rust-era `klio-parity-sweep.sh` and
-  `klio-guard.sh` still reference cargo — candidates for deletion or port.
+  (152 GB → 68 GB on first run). Old Rust-era `klio-parity-sweep.sh` deleted
+  (parity runs through the `itest-parity_*` suites and `corpus_check.py`);
+  `klio-guard.sh` and `klio-smoke.sh` repointed at `zig-out/bin/klio`.

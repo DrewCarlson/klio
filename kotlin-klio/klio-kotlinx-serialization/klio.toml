@@ -44,7 +44,7 @@ include = [
 # excluded reified-generic upstream files would otherwise provide,
 # plus actuals for the internal `expect`s in Platform.common.kt and
 # the reflective `serializer()` entrypoints (the compiler-plugin
-# replacement; backed by the host intrinsic in src/lib.rs).
+# replacement; backed by the host intrinsics in src/kotlinx_serialization).
 [[source]]
 root = "klioMain"
 

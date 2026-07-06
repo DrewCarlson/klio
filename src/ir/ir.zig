@@ -2317,7 +2317,7 @@ pub const Module = struct {
 
     // -----------------------------------------------------------------
     // `resolveCall` — the single index-primary, type-aware, 3-tier
-    // bare-call resolver (docs/plans/p3-resolvecall-design.md §1). Built
+    // bare-call resolver (plans/p3-resolvecall-design.md §1). Built
     // additively and shadowed behind KLIO_RESOLVE_AUDIT against the
     // current lowering ladder until zero-disagreement; the legacy ladder
     // stays the live pick until the flip.

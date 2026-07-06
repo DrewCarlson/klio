@@ -1,7 +1,7 @@
 site_name: klio
 site_description: An experimental Kotlin interpreter written in Zig.
 site_url: https://klio.dev/
-repo_url: https://github.com/DrewCarlson/kt-exp
+repo_url: https://github.com/DrewCarlson/klio
 remote_branch: gh-pages
 docs_dir: docs
 edit_uri: edit/main/docs/
@@ -48,7 +48,7 @@ extra:
   klio_version: !ENV [VERSION, '0.1.0']
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/DrewCarlson/kt-exp
+      link: https://github.com/DrewCarlson/klio
 
 nav:
   - Home: index.md
@@ -56,6 +56,7 @@ nav:
     - Installation: getting-started/installation.md
     - Hello, world: getting-started/hello-world.md
     - CLI Tour: getting-started/cli.md
+    - Testing Your Code: testing.md
   - Architecture:
     - Pipeline Overview: architecture/pipeline.md
     - The Vm: architecture/interpreter.md
@@ -63,6 +64,7 @@ nav:
     - Concurrency: architecture/concurrency.md
     - Memory Model: architecture/memory-model.md
     - Diagnostics: architecture/diagnostics.md
+    - Performance: architecture/performance.md
   - Packs:
     - What is a Pack?: packs/overview.md
     - Pack Format: packs/format.md
@@ -74,6 +76,7 @@ nav:
       - kotlinx.io: packs/shipped/io.md
       - kotlinx.datetime: packs/shipped/datetime.md
       - kotlinx.coroutines: packs/shipped/coroutines.md
+      - kotlinx.serialization: packs/shipped/serialization.md
       - io.ktor: packs/shipped/ktor.md
       - androidx.compose.runtime: packs/shipped/compose-runtime.md
   - Development:
