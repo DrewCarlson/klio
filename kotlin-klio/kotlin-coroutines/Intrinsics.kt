@@ -126,42 +126,41 @@ internal fun <T> startBlock(completion: Continuation<T>, body: () -> T): Any? {
     // activation is parked, not failed); the pop then runs when the
     // resumed body finally completes, and the driving pump truncates
     // any push left by an activation abandoned mid-park.
-    // No enclosing pump: plain code (DeepRecursive's `runCallLoop`) is
-    // driving this suspend block itself, so the block becomes its own
-    // root. A synchronous completion returns the value below exactly as
-    // the in-pump path does. A genuine suspension parks the root inside
-    // the intrinsic and COROUTINE_SUSPENDED is returned to the caller —
-    // and because the caller's frames then move on (they were NOT
-    // captured by the park), the resumed tail must deliver the eventual
-    // result to `completion` itself. The `suspended` flag is written
-    // after the start returns and read by the tail after the resume: the
-    // captured cell makes the async case (and only it) resume the
-    // completion, keeping the synchronous no-double-complete contract.
-    if (!__klio_co_hasDriver()) {
-        var suspended = false
-        val r = __klio_co_startRootOrSuspended(completion) {
-            __klio_co_pushScope(completion)
-            try {
-                val v = body()
-                if (suspended) completion.resumeWith(Result.success(v))
-                v
-            } catch (e: Throwable) {
-                if (!suspended) throw e
-                completion.resumeWith(Result.failure(e))
-                null
-            } finally {
-                __klio_co_popScope()
-            }
+    //
+    // The body ALWAYS becomes its own activation, enclosing pump or not.
+    // `startCoroutineUninterceptedOrReturn` owes its caller COROUTINE_SUSPENDED
+    // when the body suspends, so the caller can carry on — and klio PARKS an
+    // activation rather than unwinding it, so running `body()` inline under an
+    // enclosing pump parked the CALLER along with it and the call never returned.
+    // `runTest` starts its test body UNDISPATCHED and only THEN launches the
+    // coroutine that drives `TestCoroutineScheduler`; with the caller parked that
+    // driver was never launched, so every test needing the scheduler — every
+    // `join`, `coroutineScope`, `withContext` awaiting a child — deadlocked.
+    //
+    // `__klio_co_startRootOrSuspended` runs the body as its own root, drives it to
+    // quiescence, and reports a still-parked body as COROUTINE_SUSPENDED. Because
+    // the caller's frames then move on (they were NOT captured by the park), the
+    // resumed tail must deliver the eventual result to `completion` itself. The
+    // `suspended` flag is written after the start returns and read by the tail
+    // after the resume: the captured cell makes the async case (and only it)
+    // resume the completion, keeping the synchronous no-double-complete contract.
+    var suspended = false
+    val r = __klio_co_startRootOrSuspended(completion) {
+        __klio_co_pushScope(completion)
+        try {
+            val v = body()
+            if (suspended) completion.resumeWith(Result.success(v))
+            v
+        } catch (e: Throwable) {
+            if (!suspended) throw e
+            completion.resumeWith(Result.failure(e))
+            null
+        } finally {
+            __klio_co_popScope()
         }
-        if (r === kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) suspended = true
-        return r
     }
-    __klio_co_pushScope(completion)
-    try {
-        return body()
-    } finally {
-        __klio_co_popScope()
-    }
+    if (r === kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) suspended = true
+    return r
 }
 
 @PublishedApi

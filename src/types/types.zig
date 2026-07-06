@@ -120,7 +120,7 @@ pub const Type = union(enum) {
     /// not cascade.
     Unresolved,
 
-    /// Structural equality, mirroring Rust's derived `PartialEq`/`Eq`.
+    /// Structural equality.
     pub fn eql(self: Type, other: Type) bool {
         if (@as(std.meta.Tag(Type), self) != @as(std.meta.Tag(Type), other)) {
             return false;
@@ -159,8 +159,7 @@ pub const Type = union(enum) {
         };
     }
 
-    /// Deep copy, mirroring Rust's derived `Clone`. The result owns its heap
-    /// data; free it with `deinit`.
+    /// Deep copy. The result owns its heap data; free it with `deinit`.
     pub fn clone(self: Type, allocator: Allocator) Allocator.Error!Type {
         return switch (self) {
             .Unit, .Boolean, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .Char, .String, .Any, .Nothing, .Unresolved => self,
@@ -495,7 +494,7 @@ pub const TypeError = union(enum) {
 };
 
 /// `union(enum)` result for the typing utilities: a `Type` on success or a
-/// `TypeError` data value on failure. Mirrors Rust's `Result<Type, TypeError>`.
+/// `TypeError` data value on failure.
 pub const TypeResult = union(enum) {
     ok: Type,
     err: TypeError,

@@ -506,10 +506,9 @@ pub fn cfgDeclaredTypes(self: *const Checker, allocator: Allocator) Allocator.Er
     return out;
 }
 
-/// Owned per-place declared-type table mirroring Rust's
-/// `HashMap<Place, Type>`. Bridged to the smart-cast pass via
-/// `map()`, which yields a borrowed `PlaceTypeMap` over the
-/// owned entries.
+/// Owned per-place declared-type table (a `Place` to `Type` map). Bridged to
+/// the smart-cast pass via `map()`, which yields a borrowed `PlaceTypeMap`
+/// over the owned entries.
 pub const DeclaredTypes = struct {
     entries: std.ArrayList(smartcast.PlaceTypeMap.Entry),
 

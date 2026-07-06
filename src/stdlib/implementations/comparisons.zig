@@ -81,9 +81,24 @@ fn isNull(v: Value) bool {
     return v == .Null;
 }
 
+/// Anything Kotlin can invoke as a key selector. A selector is very often a
+/// property REFERENCE rather than a lambda — `compareValuesBy(a, b,
+/// TestDispatchEvent::time, TestDispatchEvent::count)` is how the test
+/// scheduler orders its event heap — and a `KProperty1<T, R>` is a `(T) -> R`.
+/// Accepting only `IrClosure` rejected every reference form, though
+/// `invokeCallable` dispatches all of them (`map(E::time)` has always worked).
+/// Mirrors `interp_ir.valueIsCallable`, which the stdlib layer cannot import.
 fn isCallable(v: Value) bool {
     return switch (v) {
-        .IrClosure => true,
+        .IrClosure, .Function, .Intrinsic, .BoundMethod, .PropertyRef => true,
+        // `E::time` — an UNBOUND property reference — lowers to a synth instance
+        // carrying `__bound_receiver__` (the owning class). It is the `KProperty1`
+        // Kotlin passes as a `(T) -> R`, and `invokeCallable` dispatches it.
+        .Instance => |inst| blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            break :blk g.get().get("__bound_receiver__") != null;
+        },
         else => false,
     };
 }

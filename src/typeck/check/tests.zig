@@ -2,8 +2,7 @@
 //!
 //! The typeck module's dependency graph excludes the lexer and parser, so
 //! these tests build the `KotlinFile` AST directly with small helpers rather
-//! than parsing source text. Each helper mirrors a syntactic form; the
-//! assertions match the upstream Rust `#[test]` cases one for one, with the
+//! than parsing source text. Each helper mirrors a syntactic form, with the
 //! corresponding source program reproduced in a comment.
 
 const std = @import("std");
@@ -624,9 +623,9 @@ const Checked = struct {
     }
 };
 
-/// Mirror of the Rust `check_src`: resolve, then typecheck, the given file.
-/// Everything the resolver and checker allocate lands on a private arena so
-/// the whole run is torn down with a single `deinit`.
+/// Resolve, then typecheck, the given file. Everything the resolver and
+/// checker allocate lands on a private arena so the whole run is torn down
+/// with a single `deinit`.
 fn checkFile(gpa: std.mem.Allocator, f: *const KotlinFile) Checked {
     const arena = gpa.create(std.heap.ArenaAllocator) catch unreachable;
     arena.* = std.heap.ArenaAllocator.init(gpa);

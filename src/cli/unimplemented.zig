@@ -163,11 +163,11 @@ const Scan = struct {
     }
 };
 
-/// Member names the interpreter resolves directly in `Vm::call_member`
+/// Member names the interpreter resolves directly in `callMember`
 /// (hardcoded arms), not through the binding table — so an `expect` for one
 /// is already served and must not be reported. Mirrors the `("name", arity)`
-/// arms in `klio-interp-ir`'s `host_call_member.rs`; kept here as an explicit
-/// list since those arms are not otherwise enumerable.
+/// arms in `host_call_member.zig`; kept here as an explicit list since those
+/// arms are not otherwise enumerable.
 const INTERP_BUILTIN_MEMBERS = [_][]const u8{
     // Reified enum reflection, resolved in `call_func_typed` (not a binding).
     "enumValues",
@@ -415,10 +415,8 @@ pub fn runCheckUnimplemented(
     }
 
     // Order primarily by package prefix (everything before the last `.`),
-    // then by full display name. This reproduces the
-    // BTreeMap<pkg, Vec<&Missing>> grouping the Rust builds from a
-    // display-sorted list: packages in sorted order, and each package's
-    // entries in display order.
+    // then by full display name: packages in sorted order, and each
+    // package's entries in display order.
     std.mem.sort(Missing, missing.items, {}, missingPkgLessThan);
 
     io.printStdout(

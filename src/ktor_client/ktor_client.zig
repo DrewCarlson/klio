@@ -37,9 +37,8 @@ const Allocator = std.mem.Allocator;
 const c = std.c;
 const posix = std.posix;
 
-/// Build the FQN -> `StdlibFn` registry for the ktor-client pack. Mirrors
-/// the Rust `host_bindings!` macro expansion: each `"fqn" => function`
-/// pair is registered into a fresh `HostBindings`.
+/// Build the FQN -> `StdlibFn` registry for the ktor-client pack. Each
+/// `"fqn" => function` pair is registered into a fresh `HostBindings`.
 pub fn hostBindings(allocator: Allocator) Allocator.Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("io.ktor.client.engine.__kktor_request", request);
@@ -96,7 +95,7 @@ fn arg_string(allocator: Allocator, ctx: *const CallCtx, idx: usize) Allocator.E
 }
 
 /// Read the `idx`th argument as an `Array<String>`. Non-string items
-/// become empty strings, matching the Rust fallback. Returns owned copies.
+/// become empty strings. Returns owned copies.
 fn arg_string_array(allocator: Allocator, ctx: *const CallCtx, idx: usize) Allocator.Error!ArgResult([][]const u8) {
     if (idx < ctx.args.len) {
         switch (ctx.args[idx]) {
@@ -966,7 +965,7 @@ fn strAt(allocator: Allocator, slice: []const Value, i: usize) Allocator.Error![
 // when the binding starts returning typed arrays.
 fn _kind_in_scope(_: PrimitiveArrayKind) void {}
 
-/// Write `s` to stderr (best-effort), mirroring Rust's `eprintln!`.
+/// Write `s` to stderr (best-effort).
 fn stderrPrint(s: []const u8) void {
     var off: usize = 0;
     while (off < s.len) {

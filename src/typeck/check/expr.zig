@@ -47,7 +47,7 @@ const substituteTypeParams = helpers.substituteTypeParams;
 const typeHasCompoundAssign = helpers.typeHasCompoundAssign;
 
 /// A `*const Type` for the `Boolean` expectation passed to condition
-/// subexpressions, mirroring Rust's `Some(&Type::Boolean)`.
+/// subexpressions.
 const boolean_ty: Type = .Boolean;
 
 /// Emit a diagnostic carrying a freshly-allocated message and legacy code.

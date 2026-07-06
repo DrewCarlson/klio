@@ -1165,7 +1165,7 @@ fn joinPath(allocator: std.mem.Allocator, path: []const ast.Ident) ![]const u8 {
 //
 // The resolver's dependency graph excludes the lexer/parser, so the tests
 // build the `KotlinFile` AST directly with small helpers rather than parsing
-// source text. The assertions mirror the upstream Rust `#[test]` cases.
+// source text.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
