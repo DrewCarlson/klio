@@ -365,6 +365,7 @@ class TimeZone internal constructor(val id: String) {
     override fun hashCode(): Int = id.hashCode()
 
     companion object {
+        val UTC: TimeZone = TimeZone("UTC")
         fun currentSystemDefault(): TimeZone = TimeZone(__kxdt_currentSystemTimeZoneId())
         fun of(zoneId: String): TimeZone {
             if (!__kxdt_validateTimeZone(zoneId)) {
