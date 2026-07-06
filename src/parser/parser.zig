@@ -204,6 +204,14 @@ pub const ModifierFlags = struct {
     /// deprecation warning when the source wrote `inline class`, since
     /// `inline class` is an alias for `value class`.
     inline_span: ?span.Span = null,
+    /// Parsed `context(name: Type, ...)` modifier clause. Attached to the
+    /// following function/property declaration; rejected on classes,
+    /// objects, type aliases, and constructors.
+    context_params: []ast.ContextParam = &.{},
+    /// Span of the `context(...)` clause when one was consumed. Used both
+    /// for rejection diagnostics on invalid positions and to detect a
+    /// second clause (`MULTIPLE_CONTEXT_LISTS`).
+    context_span: ?span.Span = null,
     visibility: Visibility = Visibility.default,
     annotations: std.ArrayList(Annotation) = .empty,
 };
