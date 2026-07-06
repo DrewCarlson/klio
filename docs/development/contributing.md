@@ -32,12 +32,13 @@ a pinned one. See [Testing](testing.md).
    end-to-end.
 4. Add at least one `examples/` program demonstrating it with
    deterministic output, and update `examples/README.md`.
-5. Run `zig build test` and the parity sweep. A feature is
-   not done until tests fail when it is reverted.
+5. Run `scripts/gate.sh` (or the targeted subset from the
+   [iteration playbook](testing.md)). A feature is not done until
+   tests fail when it is reverted.
 
 ## Adding a pack
 
-1. `klio pack new src/mylib --id mylib` to scaffold.
+1. `klio pack new kotlin-klio/klio-mylib --id mylib` to scaffold.
 2. Edit `klio.toml` and the Kotlin shim under `klioMain/`.
 3. For native bindings, add a Zig module exposing
    `hostBindings()` and wire it into the CLI's
@@ -51,6 +52,28 @@ User-facing diagnostic messages must not cite the Kotlin Language
 Specification. Phrase the problem and the fix in user-actionable
 terms; spec references belong in `///` comments above the emitting
 code. See [Diagnostics](../architecture/diagnostics.md).
+
+## Zig conventions
+
+klio began as a Rust codebase and was fully ported to Zig; the port
+is complete (`plans/ZIG-MIGRATION-PLAN.md` is the historical
+record). The conventions that outlived it:
+
+- One module per subsystem: `src/<name>/<name>.zig` is the root
+  file and re-exports the module's public API. Cross-module use goes
+  through `@import("span")`, `@import("ast")`, … as registered in
+  `build.zig`'s `mod_list`; intra-module files use relative
+  `@import("foo.zig")`.
+- Diagnostics are **data**, not Zig errors: user-facing parse/type
+  errors collect into a `DiagnosticSink`. Reserve Zig `error` values
+  for out-of-memory, IO, and truly exceptional control flow.
+- Thread `std.mem.Allocator` explicitly. Prefer an arena per phase
+  (parse, lower, eval); every type that owns heap memory outside an
+  arena gets a `deinit`. Document ownership at API boundaries.
+- Containers default to the unmanaged `std.ArrayList(T)` (allocator
+  passed to `append`/`deinit`); hash maps use the managed API
+  (`.init(allocator)`).
+- snake_case fields, camelCase functions/methods, TitleCase types.
 
 ## Style
 

@@ -44,6 +44,12 @@ Execution is a switch over `Inst`:
   blocks.
 - Coroutine suspend/resume against the scheduler.
 
+Under the default `fast` profile, hot loop bodies and whole
+functions are compiled to native code by the tiered JIT (x86-64 and
+AArch64 backends), and the heap is managed by a precise tracing
+mark-sweep collector. Both are gated by the `--opt` profile; see
+[Performance](performance.md).
+
 ## Values
 
 Runtime values are `runtime.Value`: the Kotlin primitives

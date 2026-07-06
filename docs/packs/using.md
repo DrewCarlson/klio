@@ -17,11 +17,15 @@ Verify it landed:
 
 ```sh
 $ klio pack list
-io.ktor.client            3.2.0       abi 1   deps stdlib
-kotlinx.atomicfu          0.32.1      abi 1   deps stdlib
-kotlinx.coroutines        1.11.0      abi 1   deps stdlib
-kotlinx.datetime          0.8.0       abi 1   deps stdlib
-kotlinx.io                0.9.0       abi 1   deps stdlib
+androidx.collection               1.11.1      abi 1  deps stdlib, kotlinx.atomicfu
+androidx.compose.runtime          1.11.1      abi 1  deps stdlib, kotlinx.coroutines, androidx.collection
+io.ktor                           3.5.1       abi 1  deps stdlib, kotlinx.coroutines, kotlinx.atomicfu, kotlinx.io
+kotlin.test                       2.4.0       abi 1  deps stdlib
+kotlinx.atomicfu                  0.33.0      abi 1  deps stdlib
+kotlinx.coroutines                1.11.0      abi 1  deps stdlib
+kotlinx.datetime                  0.8.0       abi 1  deps stdlib, kotlinx.serialization
+kotlinx.io                        0.9.1       abi 1  deps stdlib
+kotlinx.serialization             1.11.0      abi 1  deps stdlib
 ```
 
 ## Loading from a one-off path
@@ -36,11 +40,30 @@ KLIO_PACKS=/path/to/foo.klio-pack klio run app.kt
 `KLIO_PACKS` accepts a colon-separated list of paths. These are
 loaded after the stdlib pack and before the cached packs.
 
+## Feature-gated surfaces
+
+A pack can gate parts of its source behind named features
+(`[features]` in its `klio.toml`). Nothing gated loads by default;
+enable a feature per run with `--feature <pack>/<feature>`
+(repeatable, accepted by `klio run`, `klio test`, and `klio check`):
+
+```sh
+klio run --feature kotlinx.serialization/json app.kt
+klio run --feature io.ktor/client fetch.kt
+```
+
+Features can require other features (enabling `io.ktor/client`
+transitively pulls `http`, `utils`, `io`, and `events`) and can pull
+features of dependency packs (the ktor `*-serialization` features
+enable `kotlinx.serialization/json`). The shipped feature tables are
+on each pack's page, e.g. [io.ktor](shipped/ktor.md) and
+[kotlinx.serialization](shipped/serialization.md).
+
 ## Removing a pack
 
 ```sh
 klio pack remove kotlinx.atomicfu
-klio pack remove kotlinx.atomicfu --version 0.32.1   # exact match
+klio pack remove kotlinx.atomicfu --version 0.33.0   # exact match
 ```
 
 ## Verifying a pack
@@ -82,7 +105,7 @@ sections:
   - bindings stored=...
   - manifest stored=...
   - sources  stored=...
-manifest: library=kotlinx.io version=0.9.0 abi=1 implicit=[]
+manifest: library=kotlinx.io version=0.9.1 abi=1 implicit=[]
 bindings: 18 entries
 ```
 

@@ -32,12 +32,12 @@ without re-running the parser or typechecker.
 
 ## Kinds of packs
 
-| Kind            | Example                    | Loaded by                                      |
-|-----------------|----------------------------|------------------------------------------------|
-| Embedded stdlib | `stdlib.klio-pack`         | Built into the `klio` binary; always active.   |
-| Kotlinx libs    | `kotlinx.io.klio-pack`     | Built from the project; `klio pack install`.   |
-| Opt-in modules  | `io.ktor.client.klio-pack` | Same flow; not loaded unless the user asks.    |
-| Third-party     | Anything you build         | `klio pack install <file>`.                    |
+| Kind             | Example                | Loaded by                                      |
+|------------------|------------------------|------------------------------------------------|
+| Embedded stdlib  | `stdlib.klio-pack`     | Built into the `klio` binary; always active.   |
+| Bundled libs     | `kotlinx.io.klio-pack` | Built from `kotlin-klio/`; `klio pack install`. |
+| Feature-gated    | `io.ktor.klio-pack`    | Same flow; gated surfaces load per run via `--feature`. |
+| Third-party      | Anything you build     | `klio pack install <file>`.                    |
 
 The same format, the same loader, the same dispatch path — only the
 content and the install flow differ.
@@ -50,8 +50,10 @@ content and the install flow differ.
 - **Binding manifest.** `klio.toml`'s `[bindings]` table is
   serialised into the `bindings` section so the loader can resolve
   each FQN against a host's `HostBindings` registry.
-- **Manifest.** Library id, version, ABI version, dependencies, and
-  implicit packages.
+- **Manifest.** Library id, version, ABI version, dependencies,
+  implicit packages, and any feature definitions (named source
+  subsets a consumer opts into with `--feature <id>/<name>`; see
+  [Using packs](using.md)).
 
 ## What does not go in a pack
 

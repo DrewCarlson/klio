@@ -8,14 +8,29 @@ the live list.
 | Command                 | Purpose                                                                                  |
 |-------------------------|------------------------------------------------------------------------------------------|
 | `klio run <files...>`   | Execute one or more Kotlin files as a single module.                                     |
+| `klio test <file\|dir...>` | Run `kotlin.test` `@Test` functions; see [Testing](../testing.md).                    |
 | `klio check <files...>` | Resolve + type-check, emit diagnostics. Exits non-zero on error. `--format plain\|json\|sarif`. |
 | `klio lex <file>`       | Print the lexer's token stream.                                                          |
 | `klio parse <file>`     | Print the parser's AST.                                                                  |
+| `klio dump-ir <file>`   | Lower a file and print its IR without executing (`--func N` for one function); tallies DIRECT vs DYNAMIC call sites. |
 | `klio repl`             | Placeholder prompt — currently echoes input; not yet a live evaluator.                   |
 | `klio bake [files...]`  | Pre-bake the stdlib image cache (see below). `klio run` does this automatically on first use. |
 
 `klio run` accepts a legacy `--ir-vm` flag for backwards
 compatibility; it is ignored, because the IR Vm is the only run path.
+`klio run` also takes `--virtual-time` (deterministic virtual time
+for coroutines) and `--feature <pack>/<feature>` (enable a
+feature-gated pack surface, repeatable); `klio test` accepts the
+same two.
+
+### Performance profile
+
+Every command accepts `--opt <fast|safe|off>` (equivalently the
+`KLIO_OPT` env var): `fast` enables the JIT tiers and the tracing
+GC, `safe` keeps the GC but stays on the interpreter, `off` is the
+interpreter over a never-free arena. `klio run` defaults to `fast`,
+`klio test` to `safe`. See
+[Performance](../architecture/performance.md).
 
 ### The stdlib image cache
 
@@ -71,6 +86,14 @@ The interpreter resolves its stdlib pack in this order:
 
 ## Environment variables
 
+- `KLIO_OPT=fast|safe|off` — the performance profile, same values as
+  `--opt`. The granular overrides `KLIO_JIT`, `KLIO_FUNC_JIT`, and
+  `KLIO_RECLAIM` layer on top for diagnosis
+  ([details](../architecture/performance.md)).
+- `KLIO_EAGER=1` — run the resolver and type checker ahead of
+  lowering on the `run`/`test` path, so lowering consumes
+  type-derived resolution answers; files the checker cannot finish
+  fall back to lazy lowering.
 - `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack` — use an on-disk
   stdlib pack instead of the checkout or the embedded bytes. Useful
   when iterating on a pack without rebuilding the binary.

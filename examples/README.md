@@ -2,8 +2,8 @@
 
 Runnable `.kt` programs that exercise klio through the real `klio`
 binary. Every program here produces deterministic output and passes
-the `klio-parity` sweep — its stdout is byte-identical to `kotlinc`
-(Kotlin 2.3.21). The set grows monotonically: every new language
+the parity sweep — its stdout is byte-identical to `kotlinc`
+(Kotlin 2.4.0). The set grows monotonically: every new language
 feature lands with at least one example demonstrating it end-to-end.
 
 Run any program with:

@@ -2,7 +2,12 @@
 
 The Kotlin standard library is delivered as a pack
 (`stdlib.klio-pack`) that's embedded into the `klio` binary at build
-time. Three modules collaborate to produce it:
+time. The pack's Kotlin source is the upstream stdlib itself
+(`kotlin/libraries/stdlib`, pinned at v2.4.0) plus klio-authored
+actuals under `kotlin-klio/`; that source is interpreted like any
+other Kotlin, and hand-written Zig intrinsics shadow individual
+functions at dispatch where a native implementation is needed for
+host access or speed. Three modules collaborate to produce the pack:
 
 | Module          | Role                                                                                            |
 |-----------------|-------------------------------------------------------------------------------------------------|
@@ -66,3 +71,12 @@ which is what kotlinx packs use to declare their packages visible.
 For library-shaped surface area, prefer a pack over a stdlib
 intrinsic: the pack carries documentation, ships with a binding
 manifest, and stays out of `stdlib`'s static surface.
+
+## Verification
+
+The stdlib's behavior is held to upstream by running the upstream
+stdlib's own `commonTest` suite (117 files, ~2,150 tests) directly
+under the interpreter — `src/itests/stdlib_commontest.zig` enforces
+a ratcheted pass count, and `scripts/commontest-sweep.py` runs
+per-file sweeps during iteration. See
+[Testing and verification](../development/testing.md).

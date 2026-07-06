@@ -7,9 +7,11 @@ representation, and executes that IR directly. There is no JVM, no
 Kotlin/Native, and no separate compile step — the same Zig pipeline
 that parses your code also runs it.
 
-It targets Kotlin **2.4.0**. Coverage is broad enough to run
-non-trivial programs, but klio is an experiment, not a drop-in
-replacement for `kotlinc`.
+It targets Kotlin **2.4.0** with essentially full language coverage:
+for interpreting Kotlin programs, klio is a drop-in replacement for
+`kotlinc` — the same source, the same output. The project is still
+experimental; the claim is held up by continuous verification against
+`kotlinc` itself (see below), not by decree.
 
 ## Quick start
 
@@ -36,15 +38,19 @@ fun main() {
 | Command                    | What it does                                            |
 | -------------------------- | ------------------------------------------------------- |
 | `klio run <file...>`       | Execute a `.kt` file, or a set of files as one module   |
+| `klio test <file\|dir...>` | Run `kotlin.test` `@Test` functions                     |
 | `klio check <file...>`     | Resolve + type-check, emit diagnostics (plain/json/sarif) |
 | `klio lex <file>`          | Print the token stream                                  |
 | `klio parse <file>`        | Print the AST                                           |
+| `klio dump-ir <file>`      | Lower a file and print its IR without executing         |
+| `klio bake [file...]`      | Pre-bake the stdlib image cache                         |
 | `klio repl`                | Interactive prompt (placeholder; see note below)        |
 | `klio pack <subcommand>`   | Build, install, inspect, verify, publish, and fetch packs |
 
 `klio check` exits non-zero on any error and is the integration point
 for editors and CI. `klio run` lexes, parses, lowers to IR, and
-executes; type-checking is not on the run path today.
+executes. Every command takes `--opt <fast|safe|off>` (also the
+`KLIO_OPT` env var) to select the performance profile — see below.
 
 > The REPL is currently a placeholder that echoes input. Use
 > `klio run` for real execution.
@@ -64,37 +70,52 @@ program output
 `klio check` additionally runs the `resolver` module (name binding,
 imports) and the `typeck` module (type system, smart casts, inference)
 over the AST to produce diagnostics. The execution path is IR-only:
-the Vm never walks an AST.
+the Vm never walks an AST. Setting `KLIO_EAGER=1` runs the resolver
+and type checker ahead of lowering on the run path too, so lowering
+consumes type-derived answers instead of deferring resolution to
+runtime.
 
-## What works
+## Performance
 
-- Classes, data classes, sealed classes, enums, objects, companion
-  objects, inner classes, anonymous objects, nested and local classes.
-- Generics with declaration-site variance, where-clauses, and reified
-  type parameters in `inline` functions.
-- Functions: top-level, member, extension, anonymous, and lambdas
-  with `inline` / `crossinline` / `noinline`. Top-level overloads
-  resolve by argument type, so the upstream `kotlinx.atomicfu`
-  `atomic(Int)` / `atomic(Long)` / `atomic(Boolean)` / `atomic<T>`
-  overload set works verbatim.
-- Coroutines: `suspend fun`, `runBlocking`, `suspendCoroutine`, full
-  state-machine lowering, and ANF normalization so suspending calls
-  compose inside expressions and string templates.
-- Smart casts, including multi-`is` `when` arms, exhaustive `when`
-  over sealed types, and `Nothing`-typed control flow.
-- Property delegates: `by lazy`, `Delegates.observable` /
-  `Delegates.notNull`, and user-defined `getValue` / `setValue` /
-  `provideDelegate` as members or extensions.
-- Reflection: `Foo::class`, `Foo::method`, `Foo::prop`,
-  `KFunction.call`, `KMutableProperty1.set`, and `KClass` member
-  introspection.
-- Direct and mutual tail-call optimization for `tailrec fun`.
+The `--opt` flag (or `KLIO_OPT`) selects one bundled profile:
 
-Correctness is enforced two ways: the `klio-parity` harness runs
-every corpus program (532) and example (142) through both `kotlinc`
-and klio and diffs stdout against Kotlin 2.4.0, and the upstream
-stdlib's own `commonTest` suite (117 files) runs directly under the
-interpreter.
+| Profile  | JIT                    | Memory                        |
+| -------- | ---------------------- | ----------------------------- |
+| `fast`   | loop + whole-function  | tracing GC (default)          |
+| `safe`   | off (interpreter only) | tracing GC                    |
+| `off`    | off                    | never-free arena              |
+
+- **JIT** (`src/jit/`): a tiered native compiler with two backends —
+  x86-64 (System V) and AArch64 — selected at comptime, sharing one
+  emitter API so the loop/function compiler in `src/ir/jit_loop.zig`
+  stays arch-neutral. Executable memory is W^X (`MAP_JIT` on macOS).
+  Any unsupported shape falls back to the interpreter.
+- **GC** (`src/runtime/gc.zig`): a precise, stop-the-world, non-moving
+  mark-sweep collector over the runtime object heap; memory is freed
+  by reachability, so reference cycles are collected.
+
+## Language coverage
+
+klio implements the Kotlin language essentially in full: classes in
+all their forms (data, sealed, enum, inner, local, anonymous, value),
+generics with variance and reified type parameters, lambdas and
+`inline`/`crossinline`/`noinline`, coroutines with full state-machine
+lowering, smart casts and sealed-`when` exhaustiveness, property
+delegates, destructuring, operator conventions, reflection
+(`::class`, callable references, `KClass` introspection), `tailrec`,
+expect/actual, and the rest. Kotlin concurrency runs on real OS
+threads with a documented memory model at least as strong as the JMM
+([docs/architecture/memory-model.md](docs/architecture/memory-model.md)).
+
+Kotlin 2.4 language additions — explicit backing fields, the `@all`
+annotation use-site target, the new annotation use-site defaulting,
+and context parameters — are in progress and not yet supported.
+
+Correctness is enforced two ways: the parity harness runs every
+corpus program (532) and example (142) through both `kotlinc` and
+klio and diffs stdout against Kotlin 2.4.0, and the upstream stdlib's
+own `commonTest` suite (117 files, ~2,150 tests) runs directly under
+the interpreter — at 100% per-file pass rate.
 
 ## Packs
 
@@ -164,18 +185,24 @@ src/
   typeck           Type checker (klio check)
   cfa              Control- and data-flow analyses
   types            Type system + constraint solver
-  ir               AST → register IR lowering
+  ir               AST → register IR lowering (+ applicability,
+                   the shared overload-resolution engine)
+  jit              Tiered native compiler: x86-64 + AArch64 emitters
   interp_ir        IR Vm: the execution engine
-  runtime          Runtime Value, instance data, output sink
+  runtime          Runtime Value, instance data, GC, perf profiles
   stdlib           Native Zig intrinsics + symbol index
   stdlib_gen       Mines upstream Kotlin into the symbol index
   stdlib_pack      Embeds the stdlib .klio-pack
   pack             Pack format: writer, reader, schema
   kotlinx_*        Per-library binding modules
-  ktor_client      Opt-in HTTP client pack + bindings
+  compose_runtime  Compose runtime host bindings
+  ktor_client      HTTP client bindings for the io.ktor pack
+  test_runner      The klio test @Test runner
   cli              The `klio` binary
   parity           Cross-checks every program against kotlinc
-  bench            Benchmarks
+  bench            Benchmark harness
+  e2e              Runs examples/ against baked expected output
+  itests           Integration suites, one test binary per file
   main.zig         Binary entry point
 ```
 
@@ -203,6 +230,14 @@ parity tests skip. The `stdlib_gen` module needs a checkout of
 [JetBrains/kotlin](https://github.com/JetBrains/kotlin) at the target
 tag; without it the registry uses the symbol index already committed
 under `src/stdlib/`.
+
+## Documentation
+
+The full documentation lives under [`docs/`](docs/index.md):
+getting started, the architecture (pipeline, Vm, performance,
+concurrency, memory model), the pack system, and the development
+workflow. Running plan documents and design records live under
+`plans/`.
 
 ## Reference sources
 

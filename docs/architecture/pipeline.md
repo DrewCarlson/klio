@@ -21,7 +21,16 @@ program output
 The Vm executes the lowered IR directly. There is no AST evaluator
 and no bytecode VM — `ir` lowers every supported construct
 (classes, lambdas, suspend state machines, reflection, delegates) to
-structured IR instructions, and the Vm dispatches on them.
+structured IR instructions, and the Vm dispatches on them. Under the
+default `fast` profile, hot loops and functions additionally compile
+to native code through the tiered JIT; see
+[Performance](performance.md).
+
+With `KLIO_EAGER=1` the run path also executes the resolver and type
+checker ahead of lowering, and lowering consumes their answers
+(call targets, receiver types) instead of deferring those decisions
+to runtime; files the checker cannot finish fall back to the lazy
+path.
 
 | Module       | Responsibility                                                              |
 |--------------|------------------------------------------------------------------------------|
@@ -52,9 +61,10 @@ non-zero on any error.
 | `cfa`       | Control- and data-flow analyses (definite assignment, reachability) used by type checking. |
 | `types`     | Kotlin `Type` model, variance, inference constraint kinds.                    |
 
-Type-checking is not on the execution path today: a program that
-type-checks clean and a program that merely parses both run through
-the same Vm.
+Type-checking does not gate execution: a program that type-checks
+clean and a program that merely parses both run through the same Vm
+(under `KLIO_EAGER=1` the checker runs on the run path too, but as
+an accuracy upgrade for lowering, never as a gate).
 
 ## Stdlib and packs
 
@@ -94,8 +104,15 @@ the originating pass — `L0001`, `P0044`, `R0003`, `T0050`. See
 ## Testing
 
 - Unit tests live alongside each module as `test {}` blocks.
-- The `parity` module runs every `.kt` under `tests/corpus/` and
-  `examples/` through both `kotlinc` and klio and diffs stdout. A
-  green parity sweep is the primary correctness gate.
+- The `parity` module runs every `.kt` under
+  `tests/fixtures/parity_corpus/` and `examples/` through both
+  `kotlinc` and klio and diffs stdout. A green parity sweep is a
+  primary correctness gate.
+- The upstream stdlib's own `commonTest` suite runs directly under
+  the interpreter (`src/itests/stdlib_commontest.zig`, driven ad hoc
+  by `scripts/commontest-sweep.py`).
 - Negative tests in `src/itests/typeck_negative.zig` lock diagnostic
   wording and codes.
+
+See [Testing and verification](../development/testing.md) for the
+full workflow.

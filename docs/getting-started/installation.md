@@ -11,8 +11,10 @@ from source.
 ## Build from source
 
 ```sh
-git clone https://github.com/DrewCarlson/kt-exp
-cd kt-exp
+git clone https://github.com/DrewCarlson/klio
+cd klio
+git submodule update --init --recursive   # kotlinx + ktor vendor sources
+./scripts/init-kotlin-submodule.sh        # upstream Kotlin stdlib (sparse)
 zig build
 ```
 
@@ -31,16 +33,20 @@ Run the tests once to confirm your toolchain matches:
 zig build test
 ```
 
-## Optional: install the ktor-client pack
+## Optional: install the bundled library packs
 
-`io.ktor.client` is not loaded by default. Build and install it once
-to give your programs HTTP support:
+The project bundles kotlin.test, kotlinx-atomicfu,
+kotlinx-coroutines, kotlinx-datetime, kotlinx-io,
+kotlinx-serialization, ktor, the Compose runtime, and
+androidx-collection as pack definitions under `kotlin-klio/`. Build
+and install the ones your programs need:
 
 ```sh
-./zig-out/bin/klio pack build src/ktor_client
-./zig-out/bin/klio pack install target/packs/io.ktor.client.klio-pack
+./zig-out/bin/klio pack build kotlin-klio/klio-kotlinx-coroutines
+./zig-out/bin/klio pack install target/packs/kotlinx.coroutines.klio-pack
 ```
 
-The same flow applies to kotlinx.atomicfu, kotlinx.io,
-kotlinx.datetime, and kotlinx.coroutines — they all ship as packs
-inside the project.
+The ktor pack is feature-gated: install it the same way
+(`kotlin-klio/klio-ktor`), then enable what a program uses per run,
+e.g. `klio run --feature io.ktor/client program.kt`. See
+[Using packs](../packs/using.md).

@@ -1,31 +1,37 @@
 # kotlinx.datetime
 
-The `kotlinx.datetime` pack covers `Instant`, `LocalDateTime`,
-`LocalDate`, `LocalTime`, `TimeZone`, `Duration`, and the `Clock`
-surface. The Kotlin shim implements arithmetic and accessors in
-pure Kotlin against a small set of native helpers:
+The `kotlinx.datetime` pack (0.8.0) covers `Instant`,
+`LocalDateTime`, `LocalDate`, `LocalTime`, `TimeZone`, and the
+`Clock` surface, with `kotlin.time.Duration` arithmetic coming from
+the stdlib. The self-contained upstream common sources (the
+`Month` / `DayOfWeek` enums, the exception types, the value-type
+declarations) are consumed from the in-pack submodule; klio supplies
+the matching actuals plus a small set of native helpers:
 
 - System clock over the platform time source
 - IANA tz conversion and host tz detection
 - ISO-8601 rendering and parsing of `Instant`
 - tz id validation
 
+The pack depends on `kotlinx.serialization` so the datetime value
+types stay reflectively `@Serializable`.
+
 ## Surface
 
 ```kotlin
+import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
-import kotlinx.datetime.SystemClock
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 import kotlinx.datetime.toInstant
-import kotlinx.datetime.Duration
+import kotlin.time.Duration.Companion.hours
 
 fun main() {
-    val now = SystemClock.now()
+    val now = Clock.System.now()
     println("now=${now}")
 
     val ms = Instant.fromEpochMilliseconds(1_700_000_000_000L)
-    val later = ms + Duration.hours(2L)
+    val later = ms + 2.hours
     println("delta_min=${(later - ms).inWholeMinutes}")
 
     val utc = TimeZone.of("UTC")
@@ -41,13 +47,16 @@ Available types:
 
 | Type              | Highlights                                                                |
 |-------------------|---------------------------------------------------------------------------|
-| `Instant`         | `epochSeconds`, `nanosecondsOfSecond`, `+/-`, `Companion.parse/fromEpochMilliseconds`. |
-| `Duration`        | `inWholeSeconds`, `inWholeMilliseconds`, `inWholeMinutes`, factory funs.   |
+| `Instant`         | `epochSeconds`, `nanosecondsOfSecond`, `+/-` with `Duration`, `Companion.parse/fromEpochMilliseconds`. |
 | `LocalDate`       | `year`, `monthNumber`, `dayOfMonth`, ISO `toString`.                       |
 | `LocalTime`       | `hour`, `minute`, `second`, `nanosecond`.                                  |
 | `LocalDateTime`   | Pair of `LocalDate` and `LocalTime` with delegation to both.               |
 | `TimeZone`        | `id`, `Companion.of(id)`, `Companion.currentSystemDefault()`.              |
-| `SystemClock`     | `now(): Instant` — singleton implementing `Clock`.                         |
+| `Clock`           | `Clock.System.now(): Instant`.                                             |
+
+`Duration` itself is `kotlin.time.Duration` from the stdlib,
+including the extension-property constructors (`2.hours`,
+`30.minutes`) and the `inWhole*` accessors.
 
 ## Install
 
@@ -55,14 +64,3 @@ Available types:
 ./zig-out/bin/klio pack build kotlin-klio/klio-kotlinx-datetime
 ./zig-out/bin/klio pack install target/packs/kotlinx.datetime.klio-pack
 ```
-
-## Notes
-
-- klio's shim uses `SystemClock` instead of `Clock.System` because
-  pack source files load alphabetically and the latter's nested
-  object pattern collides with eager companion-object init. The
-  semantics are identical.
-- Duration construction uses explicit factory functions
-  (`Duration.hours(2L)`) rather than the `kotlin.time` extension
-  property form. The latter requires `kotlin.time` integration that
-  belongs in stdlib coverage.
