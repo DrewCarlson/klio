@@ -79,7 +79,7 @@ include = [
 # upstream `expect class` LocalDate / LocalTime / LocalDateTime, plus
 # the still-supplied Instant / TimeZone / Duration / Clock /
 # DateTimePeriod / DateTimeUnit and the conversion extensions. Bodies
-# are thin Kotlin over the Rust host bindings in src/lib.rs (system
+# are thin Kotlin over the native host bindings in src/kotlinx_datetime (system
 # clock, chrono-backed tz conversion, ISO parse/format, calendar
 # arithmetic) plus standard proleptic-Gregorian day arithmetic for the
 # LocalDate epoch/day-of-week/day-of-year accessors. Month / DayOfWeek

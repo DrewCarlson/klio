@@ -7,7 +7,7 @@ representation, and executes that IR directly. There is no JVM, no
 Kotlin/Native, and no separate compile step — the same Zig pipeline
 that parses your code also runs it.
 
-It targets Kotlin **2.3.21**. Coverage is broad enough to run
+It targets Kotlin **2.4.0**. Coverage is broad enough to run
 non-trivial programs, but klio is an experiment, not a drop-in
 replacement for `kotlinc`.
 
@@ -90,10 +90,11 @@ the Vm never walks an AST.
   introspection.
 - Direct and mutual tail-call optimization for `tailrec fun`.
 
-Correctness is enforced by the `klio-parity` harness, which runs
-every corpus and example program through both `kotlinc` and klio and
-diffs stdout. The current sweep is **353/353** (285 corpus + 68
-examples) against Kotlin 2.3.21.
+Correctness is enforced two ways: the `klio-parity` harness runs
+every corpus program (532) and example (142) through both `kotlinc`
+and klio and diffs stdout against Kotlin 2.4.0, and the upstream
+stdlib's own `commonTest` suite (117 files) runs directly under the
+interpreter.
 
 ## Packs
 
@@ -104,8 +105,8 @@ embedded into the `klio` binary, so every `klio run` starts with the
 stdlib already loaded.
 
 ```sh
-./zig-out/bin/klio pack build src/kotlinx_atomicfu
-./zig-out/bin/klio pack install zig-out/packs/kotlinx.atomicfu.klio-pack
+./zig-out/bin/klio pack build kotlin-klio/klio-kotlinx-atomicfu
+./zig-out/bin/klio pack install target/packs/kotlinx.atomicfu.klio-pack
 ./zig-out/bin/klio run examples/atomic_counter.kt
 ```
 
@@ -119,26 +120,32 @@ or `KLIO_PACKS` to load extra packs without installing them.
 See [`docs/packs/`](docs/packs/overview.md) for the format and
 authoring guide.
 
-### Bundled kotlinx libraries
+### Bundled libraries
 
-Vendored as git submodules under `third-party/kotlinx/`:
+Each library lives under `kotlin-klio/klio-<name>/` as a pack
+definition: a `klio.toml` manifest, the upstream sources as a git
+submodule, and klio-authored actuals/shims where the library needs a
+platform layer.
 
-| Library            | Pinned version | Native bindings |
-| ------------------ | -------------- | --------------- |
-| kotlinx-atomicfu   | 0.32.1         | full coverage   |
-| kotlinx-io         | 0.9.0          | Buffer surface  |
-| kotlinx-datetime   | 0.8.0          | scaffold only   |
-| kotlinx-coroutines | 1.11.0         | scaffold only   |
+| Library                  | Pinned version | Platform layer                          |
+| ------------------------ | -------------- | --------------------------------------- |
+| kotlin.test              | 2.4.0          | asserter actuals (from `kotlin/`)       |
+| kotlinx-atomicfu         | 0.33.0         | full native coverage                    |
+| kotlinx-coroutines       | 1.11.0         | upstream common sources + actuals       |
+| kotlinx-datetime         | 0.8.0          | clock, tz conversion, ISO parse/format  |
+| kotlinx-io               | 0.9.1          | Buffer surface                          |
+| kotlinx-serialization    | 1.11.0         | reflective serializer (no plugin)       |
+| ktor                     | 3.5.1          | opt-in client/server pack               |
+| compose-runtime          | 1.11.1         | runtime common sources                  |
+| androidx-collection      | 1.11.1         | consumed by compose-runtime             |
 
 ```sh
 git submodule update --init --recursive
 ```
 
-`atomicfu` and `io` ship Kotlin shims plus working Zig
-implementations of the platform-specific operations. `datetime` and
-`coroutines` have module scaffolds and submodule pins but empty
-binding tables. `io.ktor.client` ships as an opt-in pack and is not
-loaded by default.
+`io.ktor` ships as an opt-in pack and is not loaded by default;
+feature-gated pack surfaces (e.g. `kotlinx.serialization/json`) are
+enabled per run with `--feature`.
 
 ## Source layout
 
@@ -188,7 +195,8 @@ The interpreter reads upstream Kotlin's stdlib sources from
 `kotlin/libraries/stdlib` at build/run time. `kotlin` is a submodule, but
 the full JetBrains/kotlin repo is ~5GB, so it is marked `update = none` and
 populated by `scripts/init-kotlin-submodule.sh` as a sparse, blobless clone
-of just `libraries/stdlib` at the pinned tag.
+of just `libraries/stdlib` + `libraries/kotlin.test` at the pinned tag
+(`v2.4.0`).
 
 The `parity` module needs a `kotlinc` on `PATH`; without one the
 parity tests skip. The `stdlib_gen` module needs a checkout of

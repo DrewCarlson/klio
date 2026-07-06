@@ -1,6 +1,6 @@
 # Stdlib strategy
 
-The Kotlin stdlib is **the** runtime surface a program has access to. We aim to ship a complete, performant implementation that behaves exactly like Kotlin 2.3.21's stdlib on the JVM where semantics are platform-agnostic.
+The Kotlin stdlib is **the** runtime surface a program has access to. We aim to ship a complete, performant implementation that behaves exactly like Kotlin 2.4.0's stdlib on the JVM where semantics are platform-agnostic.
 
 ## Guiding principles
 
@@ -11,7 +11,7 @@ The Kotlin stdlib is **the** runtime surface a program has access to. We aim to 
    - A registration table the interpreter loads at startup to resolve `kotlin.*` names to Rust implementations.
    - Per-function Rust stubs the human then fills in (or that the generator implements directly when the upstream definition is purely mechanical).
 
-3. **Pin to Kotlin 2.3.21.** The generator reads from the `kotlin/` checkout already pinned at that tag. Bumping Kotlin versions is a deliberate, tracked operation that regenerates the surface and forces us to address any new or changed symbols.
+3. **Pin to Kotlin 2.4.0.** The generator reads from the `kotlin/` checkout already pinned at that tag. Bumping Kotlin versions is a deliberate, tracked operation that regenerates the surface and forces us to address any new or changed symbols.
 
 4. **Coverage is enforced, not aspirational.** A `coverage` report compares the generated symbol inventory against the set with real Rust implementations. CI fails when implementations regress (a previously-implemented symbol becomes unimplemented) and surfaces the unimplemented set as a single number we drive to zero.
 

@@ -74,8 +74,8 @@ cargo bench -p klio-bench --bench memory_profile --features dhat
 
 End-to-end runs can be compared to the official Kotlin compilers. Both are auto-downloaded on first use; **neither is assumed on `PATH`**.
 
-- `kotlinc-native` 2.3.21 — extracted under `~/.konan/` (managed by `klio-parity`).
-- `kotlinc` JVM 2.3.21 — extracted under `target/bench-cache/kotlinc-2.3.21/`. The JVM runner additionally needs a `java` binary; the bench harness looks at `JAVA_HOME` then `PATH` and reports `NoJava` if neither is available.
+- `kotlinc-native` 2.4.0 — extracted under `~/.konan/` (managed by `klio-parity`).
+- `kotlinc` JVM 2.4.0 — extracted under `target/bench-cache/kotlinc-2.4.0/`. The JVM runner additionally needs a `java` binary; the bench harness looks at `JAVA_HOME` then `PATH` and reports `NoJava` if neither is available.
 
 ```sh
 cargo run --release -p klio-bench --features ref -- --full --json --out current.json

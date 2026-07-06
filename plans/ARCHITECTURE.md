@@ -60,11 +60,11 @@ The `klio` binary. Subcommands: `lex`, `parse`, `run`, `repl`. Owns the `SourceM
 Two sibling directories live next to the workspace and are gitignored:
 
 - `kotlin-language-spec/` — spec PDFs by section.
-- `kotlin/` — JetBrains/kotlin at tag **v2.3.21**, our target language version.
+- `kotlin/` — JetBrains/kotlin at tag **v2.4.0**, our target language version.
 
 ### Target Kotlin version
 
-Everything we implement targets **Kotlin 2.3.21**. When the spec PDFs and the `kotlin/` source disagree, the source wins, because that is what real Kotlin code is compiled against today.
+Everything we implement targets **Kotlin 2.4.0**. When the spec PDFs and the `kotlin/` source disagree, the source wins, because that is what real Kotlin code is compiled against today.
 
 ### Using the `kotlin/` checkout
 
@@ -76,7 +76,7 @@ Everything we implement targets **Kotlin 2.3.21**. When the spec PDFs and the `k
 The `klio-stdlib` crate exposes the Kotlin stdlib to the interpreter. Headline decisions:
 
 - **Native, not interpreted.** Every stdlib function is implemented in **Rust**, like CPython implements its standard library in C. The interpreter dispatches `kotlin.*` calls directly to Rust intrinsics; we do not interpret upstream Kotlin source at runtime.
-- **Auto-generated API surface.** A companion binary, `klio-stdlib-gen`, reads `kotlin/libraries/stdlib/` and emits the registration tables, signature descriptors, and per-function stubs under `crates/klio-stdlib/src/generated/`. Humans then replace the stubs with hand-written Rust implementations. This keeps the surface aligned with Kotlin 2.3.21 mechanically rather than by hand.
+- **Auto-generated API surface.** A companion binary, `klio-stdlib-gen`, reads `kotlin/libraries/stdlib/` and emits the registration tables, signature descriptors, and per-function stubs under `src/stdlib/generated/`. Humans then replace the stubs with hand-written Zig implementations. This keeps the surface aligned with Kotlin 2.4.0 mechanically rather than by hand.
 - **`kotlin/` is input, never linked.** We consume the upstream tree as source for codegen and as a semantics reference. We do not call into JVM / JS / Native runtimes.
 
 Full details: see [`docs/STDLIB.md`](STDLIB.md).
