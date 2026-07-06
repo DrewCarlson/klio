@@ -7,11 +7,9 @@
 //! arguments, callable references to contextual declarations) are asserted
 //! to produce their rejection diagnostics.
 //!
-//! Deferred: the fully-explicit positional invocation of a multi-context
-//! contextual function-type value (matrix row T14's `f("s", 1, true)`),
-//! which needs lambda context-parameter adoption from the expected type.
-//! The implicit-invocation form and the single-context contextual
-//! function-type row (T13) are covered.
+//! All 24 matrix rows are covered, including T14's fully-positional
+//! invocation of a multi-context contextual function-type value, which
+//! splits its leading context arguments onto the context stack (`CtxCall`).
 
 const std = @import("std");
 const parity = @import("parity");
@@ -262,19 +260,20 @@ test "t13_contextof_through_contextual_function_type" {
     try assertKlio("t13", src, "go\n");
 }
 
-// T14 (partial) — implicit invocation of a contextual function-type value.
-// The fully-explicit positional call `f("s", 1, true)` needs lambda
-// context-parameter adoption from the expected type and is deferred; the
-// implicit form resolves its contexts from scope.
-test "t14_implicit_invocation_contextual_function_type" {
+// T14 — invocation of a contextual function-type value both ways: the
+// fully-positional call `f("s", 1, true)` splits its leading context args
+// onto the context stack, and the implicit call `f(false)` resolves its
+// contexts from the enclosing scope.
+test "t14_invocation_contextual_function_type" {
     const src =
         \\fun call(f: context(String, Int) (Boolean) -> Unit) {
+        \\    f("s", 1, true)
         \\    context("t") { with(2) { f(false) } }
         \\}
         \\fun main() = call { b -> println("$b ${contextOf<String>()} ${contextOf<Int>()}") }
         \\
     ;
-    try assertKlio("t14", src, "false t 2\n");
+    try assertKlio("t14", src, "true s 1\nfalse t 2\n");
 }
 
 // T15 — overloads differing only in context: shadow warning + call ambiguity.

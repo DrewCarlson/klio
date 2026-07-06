@@ -2399,6 +2399,7 @@ fn instDst(inst: *const Inst) ?Reg {
         .CallMemberOrValue => |x| x.dst,
         .NewInstance => |x| x.dst,
         .CtxScope => |x| x.dst,
+        .CtxCall => |x| x.dst,
         else => null,
     };
 }
@@ -3458,6 +3459,28 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             host.ctxStackTruncate(mark);
             switch (try res) {
                 .ok => |rv| try frame.write(cs.dst, rv),
+                .err => |e| return raiseStep(frame, e),
+            }
+        },
+        .CtxCall => |cc| {
+            if (comptime !@hasDecl(H, "ctxPush")) {
+                try frame.write(cc.dst, .Null);
+                return .cont;
+            }
+            const mark = host.ctxStackLen();
+            var i: u32 = 0;
+            while (i < cc.n_ctx) : (i += 1) {
+                const v = frame.read(Reg.from(cc.args.int() + i));
+                try host.ctxPush(v);
+            }
+            const call_n = cc.n_args - cc.n_ctx;
+            const call_args = try readArgRun(allocator, frame, Reg.from(cc.args.int() + cc.n_ctx), call_n);
+            defer allocator.free(call_args);
+            var callee_v = frame.read(cc.callee);
+            const res = host.callValue(allocator, &callee_v, call_args);
+            host.ctxStackTruncate(mark);
+            switch (try res) {
+                .ok => |rv| try frame.write(cc.dst, rv),
                 .err => |e| return raiseStep(frame, e),
             }
         },

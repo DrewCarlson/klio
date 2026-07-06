@@ -185,6 +185,10 @@ pub const LocalFnOverload = struct {
     has_vararg: bool,
 };
 
+/// The split of a param's contextual function type `context(C..) (A..) -> R`
+/// into its context-parameter count and ordinary-parameter count.
+pub const ContextFnShape = struct { n_ctx: usize, n_regular: usize };
+
 pub const FuncBuilder = struct {
     allocator: Allocator,
     module: *Module,
@@ -331,6 +335,7 @@ pub const FuncBuilder = struct {
     /// receiver.
     receiver_lambda_params: StringSet,
     receiver_lambda_arity: std.StringHashMap(usize),
+    context_fn_params: std.StringHashMap(ContextFnShape),
     /// Params (and locals) whose declared type is an unconstrained
     /// generic type-parameter (`T` of a `fun <T : Comparable<T>>`).
     /// Kotlin desugars a comparison operator on such an operand to
@@ -490,6 +495,7 @@ pub const FuncBuilder = struct {
             .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
             .receiver_lambda_arity = std.StringHashMap(usize).init(allocator),
+            .context_fn_params = std.StringHashMap(ContextFnShape).init(allocator),
             .generic_typed_params = StringSet.init(allocator),
             .non_fn_params = StringSet.init(allocator),
             .reified_type_binds = StringRegMap.init(allocator),
@@ -559,6 +565,7 @@ pub const FuncBuilder = struct {
         self.local_ext_fns.deinit();
         self.receiver_lambda_params.deinit();
         self.receiver_lambda_arity.deinit();
+        self.context_fn_params.deinit();
         self.generic_typed_params.deinit();
         self.non_fn_params.deinit();
         self.reified_type_binds.deinit();
@@ -1101,6 +1108,16 @@ pub const FuncBuilder = struct {
     }
     pub fn receiverLambdaArity(self: *const FuncBuilder, name: []const u8) ?usize {
         return self.receiver_lambda_arity.get(name);
+    }
+    /// Record that param `name` has a contextual function type
+    /// `context(C..) (A..) -> R`: `n_ctx` leading context types and
+    /// `n_regular` ordinary parameter types. A fully-positional call
+    /// `name(c.., a..)` with `n_ctx + n_regular` args lowers to `CtxCall`.
+    pub fn markContextFnParam(self: *FuncBuilder, name: []const u8, n_ctx: usize, n_regular: usize) Allocator.Error!void {
+        try self.context_fn_params.put(name, .{ .n_ctx = n_ctx, .n_regular = n_regular });
+    }
+    pub fn contextFnParam(self: *const FuncBuilder, name: []const u8) ?ContextFnShape {
+        return self.context_fn_params.get(name);
     }
     pub fn isReceiverLambdaParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.receiver_lambda_params.contains(name);

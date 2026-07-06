@@ -1098,6 +1098,13 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
                 try b.markReceiverLambdaParam(p.name.name);
                 if (p.ty.function) |fnty| try b.markReceiverLambdaArity(p.name.name, fnty.params.len);
             }
+            // A param typed as a contextual function type: a fully-positional
+            // call `p(c.., a..)` splits its leading context args from the
+            // ordinary ones (`CtxCall`). Receiver-typed contextual types are
+            // out of scope for the positional form.
+            if (ft.context_params.len != 0 and ft.receiver == null) {
+                try b.markContextFnParam(p.name.name, ft.context_params.len, ft.params.len);
+            }
         }
     }
     // A param whose declared type is one of the function's own generic

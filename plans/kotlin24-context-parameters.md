@@ -626,10 +626,10 @@ Declarations and implicit resolution are implemented end to end.
   (`UNSUPPORTED` explicit context arguments,
   `CALLABLE_REFERENCE_TO_CONTEXTUAL_DECLARATION`).
 
-Test matrix: rows T1–T13 and T15–T24 pass (`src/itests/context_parameters.zig`).
-Deferred: the fully-explicit positional invocation of a multi-context
-contextual function-type value — matrix row T14's `f("s", 1, true)` — which
-needs a lambda to adopt its context parameters from the expected function
-type and push its leading positional arguments as context values. The
-implicit-invocation form of T14 and the single-context contextual
-function-type row (T13) are covered.
+Test matrix: all 24 rows pass (`src/itests/context_parameters.zig`). T14's
+fully-positional invocation of a multi-context contextual function-type
+value (`f("s", 1, true)`) lowers to a `CtxCall` op: a call site whose
+callee is a parameter of contextual function type, passed `n_ctx +
+n_regular` positional arguments, pushes its leading `n_ctx` arguments onto
+the context stack and invokes the value with the rest. The implicit form
+(`f(false)`, contexts from scope) keeps the ordinary value-call path.

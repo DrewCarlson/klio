@@ -5,3 +5,5 @@
 string=scope-A int=42
 current=answer
 report for service#7
+b=true positional 1
+b=false from-scope 2
