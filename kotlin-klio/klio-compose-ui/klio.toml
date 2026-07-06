@@ -1,0 +1,24 @@
+# klio.compose.ui — a minimal Compose UI core on a headless software canvas.
+#
+# The first increment of the Compose-UI stack (plans/UI-RENDERING-PACKS.md §4):
+# LayoutNode + measure/layout/draw emitted through the compose runtime's node
+# path (ComposeNode -> Applier), a Modifier chain, and a DrawScope over a software
+# pixel buffer with a deterministic ASCII pixel-dump. The real androidx.compose.ui
+# (a Skia/native stack of hundreds of files) is not in the vendored sparse
+# checkout; this klio-authored layer proves the ui-core architecture runs on klio
+# end-to-end, deterministically and headless — native Skia, windowing, and the
+# full foundation/material surface are deferred.
+[library]
+id = "klio.compose.ui"
+version = "0.1.0"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "klioMain"
+
+[[deps]]
+id = "stdlib"
+[[deps]]
+id = "androidx.compose.runtime"
