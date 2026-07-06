@@ -134,10 +134,6 @@ pub const lowerReceiver = expr.lowerReceiver;
 pub const lowerBlock = expr.lowerBlock;
 pub const lowerStmt = stmt.lowerStmt;
 
-// -------------------------------------------------------------------------
-// Tests (mirrors the Rust crate's `lower/mod.rs` `mod tests`)
-// -------------------------------------------------------------------------
-
 const testing = std.testing;
 const span = @import("span");
 

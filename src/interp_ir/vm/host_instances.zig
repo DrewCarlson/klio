@@ -87,8 +87,8 @@ fn ctorGuardPop() void {
 }
 
 // -------------------------------------------------------------------------
-// Small accessors mirroring the Rust borrows of `self.classes` and
-// `self.prog`. Each returns a fresh handle / copy; the caller frees.
+// Small accessors over `self.classes` and `self.prog`. Each returns a
+// fresh handle / copy; the caller frees.
 // -------------------------------------------------------------------------
 
 /// Look up a runtime `ClassDef` by simple name, returning a fresh handle.
@@ -280,7 +280,7 @@ fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator
 }
 
 // -------------------------------------------------------------------------
-// Free helpers ported from `lib.rs` — used only by the construction flow.
+// Free helpers used only by the construction flow.
 // -------------------------------------------------------------------------
 
 fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) Allocator.Error!?Value {
@@ -416,8 +416,8 @@ fn packPrimaryCtorVarargs(self: *VmHost, class_fqn: ?[]const u8, class_name: []c
 }
 
 // -------------------------------------------------------------------------
-// `vmhost.rs` methods this flow depends on. Ported here (faithful) so the
-// construction path is self-contained; they read shared `VmHost` state.
+// Methods this flow depends on, kept here so the construction path is
+// self-contained; they read shared `VmHost` state.
 // -------------------------------------------------------------------------
 
 fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
@@ -580,10 +580,6 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     }
     return null;
 }
-
-// -------------------------------------------------------------------------
-// Construction-chain helpers ported from `vmhost.rs`.
-// -------------------------------------------------------------------------
 
 fn isBuiltinThrowableName(name: []const u8) bool {
     const names = [_][]const u8{
@@ -1745,6 +1741,23 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
             }
         }
         if (ctor_unsatisfiable) {
+            // The primary ctor cannot take these argument TYPES, but a
+            // secondary ctor might: `LocalDate(Int, Month, Int)` matches the
+            // secondary `(year, month: Month, day)`, not the primary
+            // `(year, monthNumber: Int, day)`. Dispatch the secondary BEFORE
+            // falling to a same-named factory function — a deprecated
+            // `@LowPriorityInOverloadResolution fun Name(...) = Name(...)`
+            // factory would otherwise self-recurse without bound.
+            if (!ctorGuardContains(class_name)) {
+                const cid: ?ClassId = blk: {
+                    const mg = self.module.borrow();
+                    defer mg.deinit();
+                    break :blk mg.get().classIdByFqn(classDefFqn(class_def));
+                };
+                if (cid) |c| {
+                    if (try dispatchSecondaryCtor(self, allocator, c, class_def, effective.items, outer_hint)) |res| return res;
+                }
+            }
             if (try pickFactory(self, allocator, class_name, effective.items, true)) |fid| {
                 const module_ref = self.module.clone();
                 defer module_ref.deinit();
@@ -2599,7 +2612,7 @@ fn isThrowableChainName(name: []const u8) bool {
 }
 
 // -------------------------------------------------------------------------
-// `build_object` lives in `host_classes.rs`; the vtable routes it here.
+// The vtable routes `build_object` here.
 // -------------------------------------------------------------------------
 
 /// `(class, member)` key for `anon_methods`, unit-separated. Must match

@@ -1277,7 +1277,7 @@ pub const Module = struct {
         return out__;
     }
 
-    /// Mirrors Rust's `#[derive(Default)]` constructor.
+    /// Default-valued constructor.
     pub fn default(allocator: Allocator) Module {
         return Module.init(allocator);
     }
@@ -2046,6 +2046,18 @@ pub const Module = struct {
             };
         }
 
+        /// Deferred because every candidate that matched is
+        /// `@LowPriorityInOverloadResolution` / a deprecated stub. Binding the
+        /// heuristic here would statically pick such a stub over a same-name
+        /// class constructor (kotlinx-datetime's `fun LocalDateTime`), which
+        /// self-recurses; the caller must emit a dynamic call instead.
+        pub fn lowPriorityOnly(self: BareCallResolution) bool {
+            return switch (self.outcome) {
+                .deferred => |r| r == .low_priority_only,
+                .resolved => false,
+            };
+        }
+
         fn deferred(reason: ResolveDeferReason) BareCallResolution {
             return .{ .outcome = .{ .deferred = reason } };
         }
@@ -2704,10 +2716,22 @@ pub const Module = struct {
             }
             break :blk self.preferredBareTargetLike(h, index_pick);
         } else null;
+        // A `@LowPriorityInOverloadResolution` / deprecated-stub function never
+        // statically binds when a same-name class constructor exists: kotlinc
+        // ranks the constructor above it, and a stub whose body re-calls the
+        // name (kotlinx-datetime's `fun LocalDateTime(...) = LocalDateTime(...)`)
+        // would self-recurse. Drop to a dynamic emit so runtime binds the
+        // constructor. The index never resolves TO a low-priority candidate
+        // (it skips them), so this only overrides a phase-B heuristic pick.
+        const target_lp: ?FuncId = if (target) |t| blk: {
+            const tf = self.funcById(t) orelse break :blk t;
+            if (tf.low_priority and self.classId(name) != null) break :blk null;
+            break :blk t;
+        } else null;
         const tier: u8 = if (ires.tier != 255) ires.tier else self.lowestVisibleTier(name, caller_pkg, caller_file);
 
         // Phase C — EMIT FORM.
-        var res = try self.emitFormFor(alloc, name, caller_pkg, caller_file, target, tier, reason, ires.tier_count, args, ctx);
+        var res = try self.emitFormFor(alloc, name, caller_pkg, caller_file, target_lp, tier, reason, ires.tier_count, args, ctx);
         if (res.emit_form == .Call) {
             // A declared-receiver-matched extension pick is Kotlin's static
             // resolution — final like a cast pick; the runtime value-typed
@@ -3089,8 +3113,7 @@ pub const Module = struct {
     /// String consts are *owned* by the pool: the byte slice is duped
     /// into `allocator` (the module's long-lived allocator) so callers
     /// may free their temporary name/text buffer after interning.
-    /// `Module.deinit` frees these copies, matching how Rust's
-    /// `Const::String(String)` owns and drops its data.
+    /// `Module.deinit` frees these copies.
     pub fn internConst(self: *Module, allocator: Allocator, c: Const) Allocator.Error!ConstId {
         for (self.consts.items, 0..) |k, i| {
             if (Const.eql(k, c)) return ConstId.from(@intCast(i));
@@ -3202,7 +3225,7 @@ fn pkgHeadIs(pkg: []const u8, head: []const u8) bool {
 }
 
 /// Index into a slice by a `u32` id, returning a pointer or `null`
-/// when out of range. Mirrors Rust's `slice.get(idx)`.
+/// when out of range.
 fn idGet(comptime T: type, items: []const T, idx: u32) ?*const T {
     if (idx >= items.len) return null;
     return &items[idx];
@@ -3684,10 +3707,6 @@ pub const Const = union(enum) {
         };
     }
 };
-
-// -------------------------------------------------------------------------
-// Tests (mirrors the Rust crate's `lib.rs` `mod tests`)
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 

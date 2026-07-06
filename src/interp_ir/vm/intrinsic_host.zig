@@ -135,9 +135,9 @@ fn spawnSeed(self: *VmIntrinsicHost) SendableVmSeed {
 // EvalError -> RuntimeError mapping.
 // -------------------------------------------------------------------------
 
-/// Map an `EvalError` onto the runtime's `RuntimeError`, mirroring the
-/// Rust match arms (`Throw -> Thrown`, `NonLocalReturn -> Return`, every
-/// other variant rendered as a `Type` error).
+/// Map an `EvalError` onto the runtime's `RuntimeError`: `Throw -> Thrown`,
+/// `NonLocalReturn -> Return`, every other variant rendered as a `Type`
+/// error.
 fn runtimeErrorFromEval(e: EvalError) RuntimeError {
     return switch (e) {
         .Throw => |v| .{ .Thrown = v },

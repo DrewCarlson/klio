@@ -2,9 +2,8 @@
 //! on-demand top-level property init, spawned-thread join, and the
 //! spawned-thread liveness check.
 //!
-//! In Rust the `impl Host for VmHost` glue lived here; in Zig the IR
-//! evaluator is generic over its host type and `vmhost.zig` aliases the
-//! per-operation free functions over `*VmHost` as `VmHost` methods, so
+//! The IR evaluator is generic over its host type and `vmhost.zig` aliases
+//! the per-operation free functions over `*VmHost` as `VmHost` methods, so
 //! this file holds the inherent free functions that are not part of that
 //! dispatch surface.
 
@@ -89,7 +88,7 @@ fn typedDefaultValue(kind: build.TypedDefault) ?Value {
 }
 
 /// Top-level property initializers currently executing on this thread —
-/// breaks initializer cycles, mirroring Rust's `IN_PROGRESS` thread-local.
+/// breaks initializer cycles.
 /// Stores the program-image-owned key slices (run-stable, shared by the
 /// `prog` handle), so the entries outlive the borrowed `name` slice without
 /// per-key duplication. Page-allocator backed and cleared capacity-retaining

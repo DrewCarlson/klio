@@ -47,9 +47,8 @@ const EvalResult = ir.eval.EvalResult;
 const EvalError = ir.eval.EvalError;
 
 // -------------------------------------------------------------------------
-// Thread-local resolution state. In Rust these live as file-spanning
-// thread-locals in `lib.rs`/`host_globals.rs`; the slices of that state
-// member-dispatch reads/writes are kept here.
+// Thread-local resolution state kept here for the member-dispatch
+// fallbacks below.
 // -------------------------------------------------------------------------
 
 /// Guards `materializeUserMap` re-entry while the Map fallback runs.
@@ -325,9 +324,8 @@ fn mapRuntimeError(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalEr
 }
 
 // -------------------------------------------------------------------------
-// Pure helpers ported from `lib.rs` (their Rust home is the crate root;
-// they are pure functions over `Value` / `Module` and live here so the
-// member-dispatch file is self-contained).
+// Pure helpers: pure functions over `Value` / `Module` that live here so
+// the member-dispatch file is self-contained.
 // -------------------------------------------------------------------------
 
 fn isCallable(v: *const Value) bool {
@@ -729,7 +727,7 @@ fn rangeElem(cur: i64, kind: RangeKind) Value {
 }
 
 // -------------------------------------------------------------------------
-// Self-contained `VmHost` helpers (their Rust home is this file).
+// Self-contained `VmHost` helpers.
 // -------------------------------------------------------------------------
 
 /// Default-arg thunk slots for `method` as declared on a supertype of the
@@ -1787,7 +1785,7 @@ pub fn popOuterThis() void {
 }
 
 // -------------------------------------------------------------------------
-// Overload scoring + method/extension selection (ported from `vmhost.rs`).
+// Overload scoring + method/extension selection.
 // -------------------------------------------------------------------------
 
 /// Score an arg/param compatibility for overload resolution. Higher is
@@ -2127,6 +2125,20 @@ fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     return false;
 }
 
+/// Nominal interfaces klio models a Kotlin array as satisfying (so the stdlib
+/// `Array<T>.first()` / iteration extensions bind). An array vs one of these is
+/// NOT a definite type mismatch, unlike an array vs an arbitrary user interface.
+fn isArrayRelatedIface(pn: []const u8) bool {
+    const set = [_][]const u8{
+        "Iterable", "MutableIterable", "Collection", "MutableCollection",
+        "Sequence", "Comparable", "CharSequence", "Serializable", "Cloneable",
+    };
+    for (set) |s| {
+        if (std.mem.eql(u8, pn, s)) return true;
+    }
+    return false;
+}
+
 pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
     var pn = param_ty.name;
     // A qualified reference (`Owner.Pocket`) names a lifted nested/inner
@@ -2172,6 +2184,14 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // literal may carry a narrower tag than the declared type (`f(5)`
     // binding `f(n: Long)`).
     if (builtinKindMismatch(pn, arg)) return true;
+    // A range/progression argument (`0..3`) is definitely not a scalar or array
+    // builtin parameter (Int/Long/String/Array/…). Without this, a class that
+    // overrides one overload — `get(Int, Int)` — of a method whose other
+    // overloads are inherited interface defaults — `get(IntRange, IntRange)` —
+    // captures a range-indexed call: the lone own candidate matches on arity, so
+    // the hierarchy walk never reaches the inherited range overload. Refuting the
+    // scalar param lets the walk fall through to it.
+    if (arg.* == .Range and overload_match.builtinParamKind(pn) != null) return true;
     // Only adjudicate when the parameter names a known user class.
     {
         const cg = self.classes.borrow();
@@ -2180,6 +2200,14 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     }
     const inst = switch (arg.*) {
         .Instance => |i| i,
+        // A Kotlin array satisfies no NOMINAL user/pack interface, so an
+        // `Array`/`XxxArray` argument offered such a parameter is a definite
+        // mismatch — decline the lone member `Buffer.readTo(RawSink, Long)` so
+        // the extension `Source.readTo(ByteArray, startIndex, endIndex)` binds.
+        // EXCEPT the collection interfaces klio DOES model arrays against
+        // (`Iterable`/`Collection`/`Sequence`, which back `Array.first()` and
+        // friends) and any array-named param — those stay non-definite.
+        .Array => return std.mem.indexOf(u8, pn, "Array") == null and !isArrayRelatedIface(pn),
         else => return false,
     };
     var start: []const u8 = undefined;
@@ -2571,6 +2599,19 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 }
                 // A cached miss falls through to the probe ladder (stdlib /
                 // extension / field), but `irMethodWalk` will skip the walk.
+            }
+            // Member-miss that resolved to a top-level extension: dispatch it
+            // here, before the whole builtin probe ladder, exactly as the
+            // member fast path above does. Same owner-independence guards the
+            // cache was populated under.
+            if (!strict_ext and !no_ext and static_recv == null and declared_recv == null) {
+                if (extMethodCacheGet(self, k)) |fid| {
+                    // A top-level extension's `param[0]` is its receiver, so the
+                    // member invoker binds `[receiver] ++ args` correctly — and
+                    // it builds the frame args in one allocation (no prepend
+                    // scratch slice), matching the member fast path's speed.
+                    if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
+                }
             }
         }
     }
@@ -4130,6 +4171,15 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         }
         cg.deinit();
     }
+    // Companion-extension receiver: `fun LocalDate.Companion.Format(...)` called
+    // as `LocalDate.Format { }`. Its declared receiver is `<Class>.Companion`,
+    // so add that probe name; `extensionTargetsAny` then matches it (by the
+    // "Companion" simple name), the companion singleton is constructed, and the
+    // extension dispatches on it. A false match against another class's
+    // companion extension simply misses on this companion and falls through.
+    var comp_probe_buf: [160]u8 = undefined;
+    const comp_probe = std.fmt.bufPrint(&comp_probe_buf, "{s}.Companion", .{cls_name}) catch cls_name;
+    try probe_classes.append(allocator, comp_probe);
     var comp_name: ?[]const u8 = null;
     {
         const mg = self.module.borrow();
@@ -6583,17 +6633,34 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
 fn methodArgSig(args: []const Value) ?u64 {
     if (args.len == 0) return 0;
     if (args.len > 12) return null;
-    var sig: u64 = @as(u64, args.len) << 56;
-    for (args, 0..) |*a, i| {
-        const tag: u64 = switch (a.*) {
-            .Int => 1,    .Long => 2,   .Double => 3, .Float => 4,
-            .Short => 5,  .Byte => 6,   .Char => 7,   .Bool => 8,
-            .UInt => 9,   .ULong => 10, .UShort => 11, .UByte => 12,
+    // Hash a per-arg type discriminator. Primitives contribute their tag;
+    // an `Instance` also folds in its class identity, so an overload picked
+    // by the argument's class (`LocalDate.plus(DatePeriod)` vs
+    // `LocalDate.plus(DateTimeUnit)`) gets a distinct, cacheable key rather
+    // than the pre-hash scheme's "non-primitive → no key" bail. Any other
+    // value shape yields no key (that call re-resolves) so the cache never
+    // conflates argument types the overload dispatch would distinguish.
+    var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15 +% args.len);
+    for (args) |*a| {
+        const tag: u8 = switch (a.*) {
+            .Int => 1,   .Long => 2,   .Double => 3,  .Float => 4,
+            .Short => 5, .Byte => 6,   .Char => 7,    .Bool => 8,
+            .UInt => 9,  .ULong => 10, .UShort => 11, .UByte => 12,
+            .Instance => 13,
             else => return null,
         };
-        sig |= tag << @intCast(i * 4);
+        h.update((&tag)[0..1]);
+        if (a.* == .Instance) {
+            const g = a.Instance.borrow();
+            const id = g.get().class.identity();
+            g.deinit();
+            h.update(std.mem.asBytes(&id));
+        }
     }
-    return sig;
+    const v = h.final();
+    // 0 is reserved for the empty-arg case; the key also carries `n_args`,
+    // so a non-empty sig colliding to 0 stays distinct from `args.len == 0`.
+    return if (v == 0) 1 else v;
 }
 
 fn instanceMethodKey(receiver: *const Value, name: []const u8, args: []const Value) ?root_mod.ProgramImage.InstanceMethodKey {
@@ -6626,6 +6693,18 @@ fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceM
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().instance_method_cache.put(key, raw) catch {};
+}
+
+fn extMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return pg.get().ext_method_cache.get(key);
+}
+
+fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: u32) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    pg.get().ext_method_cache.put(key, fid) catch {};
 }
 
 fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?root_mod.ProgramImage.MemberResolveEntry {
@@ -7388,8 +7467,32 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
 
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
     const want = args.len + 1;
+
+    // Inline-cache fast path. A prior *owner-independent* resolution of this
+    // (receiver class, name, arg types) to a top-level extension dispatches
+    // straight through `callFuncRec`, skipping the candidate collection, the
+    // enclosing-owner set allocation, and the filter/score passes below —
+    // the dominant cost of extension-heavy hot loops. Only keyed when no
+    // receiver override is in play (a static/declared receiver, or the strict
+    // bare-name probe, can resolve the same names differently).
+    const cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
+        if (!strict_ext and static_recv == null and declared_recv == null)
+            instanceMethodKey(receiver, name, args)
+        else
+            null;
+    if (cache_key) |k| {
+        if (extMethodCacheGet(self, k)) |fid| {
+            if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
+        }
+    }
+
     var visible_owners = try enclosingOwnerSet(self, allocator);
     defer visible_owners.deinit();
+
+    // Whether any candidate for this name is a member-extension (its
+    // visibility/selection depends on the enclosing-`this` chain). When one
+    // exists the resolution is context-dependent and must not be cached.
+    var saw_member_ext = false;
 
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(allocator);
@@ -7400,6 +7503,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         for (mod.funcsBySimpleName(name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+            if (isMemberExt(mod, fid)) saw_member_ext = true;
             if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
             // An unsettled bodyless header is not executable — selecting
             // it would re-enter `callFunc`'s bodyless ladder and cycle,
@@ -7671,6 +7775,13 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                 ir.eval.pushEnclosing(&inst);
                 pushed_owner = true;
             }
+        }
+        // Memoize an owner-independent pick: no member-extension competes for
+        // this name and the winner is itself top-level, so the (receiver
+        // class, name, arg types) key fully determines the target. A future
+        // call hits the fast path above and skips this whole resolution.
+        if (!pushed_owner and !saw_member_ext) {
+            if (cache_key) |k| extMethodCachePut(self, k, @intFromEnum(c.fid));
         }
         const r = try callFuncRec(self, allocator, mod, c.fid, all);
         if (pushed_owner) ir.eval.popEnclosing();

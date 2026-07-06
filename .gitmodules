@@ -48,3 +48,6 @@
 	update = none
 	shallow = true
 	branch = v1.11.1
+[submodule "kotlin-klio/klio-mosaic/upstream"]
+	path = kotlin-klio/klio-mosaic/upstream
+	url = https://github.com/JakeWharton/mosaic

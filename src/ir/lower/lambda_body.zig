@@ -28,7 +28,7 @@ pub const LocalFnOverloadTable = std.StringHashMap(std.ArrayList(build.LocalFnOv
 
 /// The lexically enclosing class context handed to a lambda body so an
 /// enclosing-class member out-prioritises a same-named imported
-/// extension. Mirrors Rust's `Option<(String, HashSet<String>)>`.
+/// extension.
 pub const EnclosingOwner = struct {
     class: []const u8,
     members: StringSet,
@@ -43,7 +43,7 @@ fn moduleAllocator(module: *Module) Allocator {
 
 /// The product of lowering a lambda body: the body `Func`'s id plus the
 /// capture-name list (in `LoadCapture` index order) the construction site
-/// must snapshot. Mirrors Rust's `(FuncId, Vec<String>)`.
+/// must snapshot.
 pub const LoweredLambda = struct {
     func: FuncId,
     captures: [][]const u8,

@@ -602,6 +602,18 @@ fn argIsProven(arg: *const ArgShape) bool {
 /// mismatch. Reproduces `host_call_func.zig` `overloadScore`: the arity /
 /// default / trailing-lambda gates and the positional per-arg scoring, with the
 /// under-application `-1` folded into `points`.
+/// The element `TypeRef` a vararg parameter's declared (materialized array)
+/// type carries: `ByteArray` -> `Byte`, `Array<T>` -> `T`, etc. A non-array
+/// declared type is returned unchanged (already an element).
+fn varargElementRef(param_ty: *const TypeRef) TypeRef {
+    const n = param_ty.name;
+    const eq = std.mem.eql;
+    const elem: ?[]const u8 =
+        if (eq(u8, n, "ByteArray")) "Byte" else if (eq(u8, n, "ShortArray")) "Short" else if (eq(u8, n, "IntArray")) "Int" else if (eq(u8, n, "LongArray")) "Long" else if (eq(u8, n, "FloatArray")) "Float" else if (eq(u8, n, "DoubleArray")) "Double" else if (eq(u8, n, "CharArray")) "Char" else if (eq(u8, n, "BooleanArray")) "Boolean" else if (eq(u8, n, "UByteArray")) "UByte" else if (eq(u8, n, "UShortArray")) "UShort" else if (eq(u8, n, "UIntArray")) "UInt" else if (eq(u8, n, "ULongArray")) "ULong" else if ((eq(u8, n, "Array") or eq(u8, n, "Array?")) and param_ty.args.len > 0) param_ty.args[0].name else null;
+    if (elem) |e| return .{ .name = e, .nullable = param_ty.nullable, .args = &.{} };
+    return param_ty.*;
+}
+
 pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
     if (scope.named) return applicableNamed(sig, args, scope);
     if (scope.rank_extensions) return applicableExtension(sig, args, scope);
@@ -673,11 +685,30 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
     var total: i32 = if (params.len == args.len) 0 else -1;
     var proven: u16 = 0;
     var unknown: u16 = 0;
+    // A trailing vararg absorbs the args from its own position onward. Each
+    // absorbed arg is a single ELEMENT (scored against the element type), UNLESS
+    // it is a spread (`*arr`), which feeds the whole array (scored against the
+    // array/param type). This is why a non-spread `ByteArray` cannot satisfy a
+    // `vararg Byte` — it is not a `Byte` — so a same-named class constructor
+    // taking `(ByteArray, …)` wins instead of the factory silently absorbing it.
+    const vp: ?usize = if (last_vararg) params.len - 1 else null;
     var idx: usize = 0;
     while (idx < params.len and idx < args.len) : (idx += 1) {
+        if (vp != null and idx == vp.?) break;
         const sc = scoreArg(&params[idx].ty, &args[idx], &scope) orelse return null;
         total += sc;
         if (argIsProven(&args[idx])) proven += 1 else unknown += 1;
+    }
+    if (vp) |v| {
+        const elem = varargElementRef(&params[v].ty);
+        var k: usize = v;
+        while (k < args.len) : (k += 1) {
+            const a = &args[k];
+            const target: *const TypeRef = if (a.is_spread) &params[v].ty else &elem;
+            const sc = scoreArg(target, a, &scope) orelse return null;
+            total += sc;
+            if (argIsProven(a)) proven += 1 else unknown += 1;
+        }
     }
     return .{
         .points = total,

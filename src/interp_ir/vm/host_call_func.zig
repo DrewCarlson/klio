@@ -99,8 +99,43 @@ fn funcDefaults(self: *VmHost, func: FuncId) ?[]?FuncId {
 }
 
 // -------------------------------------------------------------------------
-// Vararg packing (mirrors `pack_vararg_args` in lib.rs).
+// Vararg packing.
 // -------------------------------------------------------------------------
+
+/// The primitive-array kind for a vararg element type, or null for a reference
+/// element (which stays a boxed `Array`). Kotlin materializes `vararg Byte` AS
+/// a `ByteArray`, so the packed value must carry the primitive kind — otherwise
+/// a plain `Array` fails to match a `ByteArray`/`IntArray`/… parameter at a
+/// later call (a `fun f(vararg b: Byte) = g(b)` would then miss `g(ByteArray)`).
+fn varargPrimKind(elem: []const u8) ?runtime.PrimitiveArrayKind {
+    const K = runtime.PrimitiveArrayKind;
+    const table = [_]struct { n: []const u8, k: K }{
+        .{ .n = "Byte", .k = .Byte },       .{ .n = "Int", .k = .Int },
+        .{ .n = "Long", .k = .Long },       .{ .n = "Short", .k = .Short },
+        .{ .n = "Double", .k = .Double },   .{ .n = "Float", .k = .Float },
+        .{ .n = "Boolean", .k = .Boolean }, .{ .n = "Char", .k = .Char },
+        .{ .n = "UByte", .k = .UByte },     .{ .n = "UInt", .k = .UInt },
+        .{ .n = "ULong", .k = .ULong },     .{ .n = "UShort", .k = .UShort },
+    };
+    for (table) |e| {
+        if (std.mem.eql(u8, elem, e.n)) return e.k;
+    }
+    return null;
+}
+
+/// Build the packed vararg value from an owned list of element values: a
+/// primitive `ByteArray`/`IntArray`/… when `elem_ty` is a primitive, else a
+/// boxed `Array`. Mirrors `collections.makeArrayFromArrayList`'s ownership.
+fn packVarargArray(allocator: Allocator, elem_ty: []const u8, list: std.ArrayList(Value)) Allocator.Error!Value {
+    if (varargPrimKind(elem_ty)) |k| {
+        var l = list;
+        const v = try runtime.ArrayData.initPacked(allocator, k, l.items);
+        if (runtime.reclaimEnabled()) for (l.items) |e| e.release(allocator);
+        l.deinit(allocator);
+        return v;
+    }
+    return runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, list));
+}
 
 /// Collapse the trailing positional args of a vararg call into a single
 /// `Array` slot. Consumes `args` (an owned `ArrayList`), returning the
@@ -124,14 +159,14 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
     while (j < args.items.len) : (j += 1) {
         try rest.append(allocator, args.items[j]);
     }
-    try out.append(allocator, runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, rest)));
+    const velem = func.params[n_params - 1].ty.name;
+    try out.append(allocator, try packVarargArray(allocator, velem, rest));
     args.deinit(allocator);
     return out;
 }
 
 // -------------------------------------------------------------------------
-// Intrinsic resolution + dispatch (mirror `lookup_intrinsic` /
-// `dispatch_intrinsic` in vmhost.rs).
+// Intrinsic resolution + dispatch.
 // -------------------------------------------------------------------------
 
 /// Look up an intrinsic by FQN. Probes the pack-supplied
@@ -469,8 +504,7 @@ fn linkAuditOn() bool {
 }
 
 // -------------------------------------------------------------------------
-// Overload scoring + selection (mirror `overload_score_arg`,
-// `overload_score`, `pick_overload` in vmhost.rs).
+// Overload scoring + selection.
 // -------------------------------------------------------------------------
 
 fn simpleName(name: []const u8) []const u8 {
@@ -1287,13 +1321,14 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                 positional_idx += 1;
             }
             if (vararg_pos) |vp| {
+                const velem = params[vp].ty.name;
                 if (hit_vararg) {
                     var acc: std.ArrayList(Value) = .empty;
                     try acc.appendSlice(allocator, vararg_acc.items);
-                    slots[vp] = runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, acc));
+                    slots[vp] = try packVarargArray(allocator, velem, acc);
                 } else if (slots[vp] == null) {
                     const empty_acc: std.ArrayList(Value) = .empty;
-                    slots[vp] = runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, empty_acc));
+                    slots[vp] = try packVarargArray(allocator, velem, empty_acc);
                 }
             }
 
@@ -1571,7 +1606,7 @@ fn attachDeclaredElemTypes(module: *const Module, func: FuncId, type_args: []con
     runtime.attachDeclaredElemTypes(f.fqn, type_args, &result.ok);
 }
 
-pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
+pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool) Allocator.Error!MaybeValueResult {
     // An anon-object/side-module frame carries no top-level func index;
     // the overload set lives in the main module, so collect there.
     const mg = self.module.borrow();
@@ -1597,24 +1632,56 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         .refine = applicRefineCb,
         .subtype = applicSubtypeCb,
     };
-    var best_func: ?FuncId = null;
-    var best_score: i32 = 0;
+    // `@LowPriorityInOverloadResolution` / deprecated-ERROR|HIDDEN overloads are
+    // only chosen when nothing ordinary applies, and a same-named class
+    // constructor outranks them (kotlinc). Score ordinary and low-priority
+    // candidates apart: an applicable ordinary overload always wins; a
+    // low-priority one is used only when no ordinary applies AND no same-named
+    // constructor exists — otherwise decline so the caller's constructor path
+    // binds. Without this a deprecated stub `fun LocalDate(...) = LocalDate(...)`
+    // re-picks itself across the two low-priority overloads and self-recurses.
+    var best_ord: ?FuncId = null;
+    var best_ord_score: i32 = 0;
+    var best_low: ?FuncId = null;
+    var best_low_score: i32 = 0;
     for (candidates) |cand| {
         // A receiver-taking candidate whose declared receiver names a
         // builtin shape the first arg definitely is not (UIntArray.fill
         // offered a plain Array) is disqualified outright.
+        var is_low = false;
         if (funcAt(eff, cand)) |cf| {
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
                 host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
+            is_low = cf.low_priority;
         }
         if (positionalPoints(self, eff, cand, shapes, scope)) |total| {
-            if (best_func == null or total > best_score) {
-                best_func = cand;
-                best_score = total;
+            if (is_low) {
+                if (best_low == null or total > best_low_score) {
+                    best_low = cand;
+                    best_low_score = total;
+                }
+            } else if (best_ord == null or total > best_ord_score) {
+                best_ord = cand;
+                best_ord_score = total;
             }
         }
     }
-    const func = best_func orelse return .{ .ok = null };
+    const func = best_ord orelse fallback: {
+        // Only fall to a low-priority overload when nothing better can bind: no
+        // ordinary overload applied AND no same-name class constructor exists
+        // (the caller's `ctor_name` — a lowering-resolved class — is the
+        // reliable signal; `classId` can miss across a pack boundary). Declining
+        // lets the caller's constructor path win, so a deprecated stub that
+        // calls the constructor by name cannot re-pick itself and recurse.
+        if (best_low) |low| {
+            // Check the MAIN module for a same-name class (the pack's classes
+            // live there; `eff` may be a side module whose class index misses
+            // them). A class means a constructor the caller will bind.
+            const has_class = ctor_name or mg.get().classId(name) != null;
+            if (!has_class) break :fallback low;
+        }
+        return .{ .ok = null };
+    };
 
     if (trace.enabled(name)) {
         trace.emit("global-overload {s} -> fid={d} (of {d} candidates)", .{ name, func.int(), candidates.len });

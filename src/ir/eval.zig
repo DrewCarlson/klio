@@ -4006,6 +4006,33 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 }
             }
         }
+        // Smart-cast pass: a DEFERRED bare extension call (no committed target)
+        // inside an extension body pinned the DECLARED receiver type for the
+        // strict/lenient probes. When those found nothing, the receiver value
+        // may be a subtype the receiver was narrowed to by a smart-cast
+        // (`fun Source.f() { if (this is Buffer) commonReadUtf8CodePoint() }`,
+        // whose target is `fun Buffer.commonReadUtf8CodePoint()`), so retry by
+        // the receiver's RUNTIME type. Guarded to `resolved == null` and no
+        // committed extension: there is no static candidate to conflict with,
+        // so this cannot re-pick a sibling the static evidence excluded.
+        if (resolved == null and static_recv_ty != null and committed_ext_h == null) {
+            for (cands) |c| {
+                switch (try host.callMemberStrictExt(allocator, &c.v, name_str, arg_values, names, null)) {
+                    .ok => |v| {
+                        orAudit("CallMemberOrGlobal", name_str, "smartcast_ext", c.depth, &c.v);
+                        resolved = v;
+                        break;
+                    },
+                    .err => |e| switch (e) {
+                        .Suspended, .CalleeFailed, .Throw, .NonLocalReturn, .LabeledReturn => return raiseStep(frame, e),
+                        .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
+                        else => if (first_real_err == null) {
+                            first_real_err = e;
+                        },
+                    },
+                }
+            }
+        }
     }
     var result: Value = undefined;
     if (resolved == null) {
@@ -4034,7 +4061,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // Overloaded top-level function: select by runtime arg types
         // before falling back to the single global value baked in at
         // lower time.
-        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names)) {
+        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names, is_ctor_name)) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
         };
@@ -4058,9 +4085,16 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk null;
                 break :blk fid;
             };
+            // A constructor-name call (`Foo(args)` where `Foo` is a class) must
+            // bind the class for construction — never a published companion
+            // singleton. Pass `is_ctor_name` as `ctor_ref` so `lookupGlobalById`
+            // skips the class's companion-object singleton (which it otherwise
+            // returns for a class-value read); otherwise, once the companion has
+            // been published (e.g. a prior `Foo.member` access), `Foo(args)`
+            // resolves to `Companion.invoke` instead of constructing.
             const by_id: ?Value = if ((cmg.class != null or by_id_func != null) and
                 !host.isShadowingCapture(name_str))
-                host.lookupGlobalById(allocator, by_id_func, cmg.class, false)
+                host.lookupGlobalById(allocator, by_id_func, cmg.class, is_ctor_name)
             else
                 null;
             const global = if (by_id != null) by_id else switch (try host.lookupGlobalThrowing(allocator, name_str)) {
@@ -4830,7 +4864,7 @@ fn compoundAssignMethod(op: BinOp) ?[]const u8 {
 }
 
 /// Render a value into an owned string the way Kotlin's `toString` /
-/// string templates do. Mirrors the Rust `render_value`.
+/// string templates do.
 fn renderValue(allocator: Allocator, v: *const Value) Allocator.Error![]const u8 {
     return switch (v.*) {
         .Unit => allocator.dupe(u8, "kotlin.Unit"),
@@ -5329,8 +5363,7 @@ fn widenFloat(v: *const Value) Value {
     };
 }
 
-/// Rust `wrapping_div`: truncating integer division with `MIN / -1`
-/// wrapping to `MIN`.
+/// Truncating integer division with `MIN / -1` wrapping to `MIN`.
 fn divTruncI64(a: i64, b: i64) i64 {
     if (a == std.math.minInt(i64) and b == -1) return std.math.minInt(i64);
     return @divTrunc(a, b);
@@ -5375,9 +5408,8 @@ pub const ReceiverShape = struct { n_params: usize, first_is_this: bool };
 /// default host for the bare `eval` entry. A concrete second host type
 /// alongside the interpreter's `VmHost`: every method is the trait-default
 /// the old vtable returned when a slot was `null`
-/// (`Unsupported`/`null`/`false`/empty), so all dispatch paths behave
-/// exactly like Rust's `NullHost`. The evaluator is generic over the host
-/// type and calls these as plain comptime-duck-typed methods.
+/// (`Unsupported`/`null`/`false`/empty). The evaluator is generic over the
+/// host type and calls these as plain comptime-duck-typed methods.
 pub const NullHost = struct {
     pub fn callValue(self: *NullHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
         _ = .{ self, allocator, callee, args };
@@ -5627,8 +5659,8 @@ pub const NullHost = struct {
         return self.callFuncNamed(allocator, module, func, args, arg_names);
     }
 
-    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
-        _ = .{ self, allocator, module, name, args, arg_names };
+    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool) Allocator.Error!MaybeValueResult {
+        _ = .{ self, allocator, module, name, args, arg_names, ctor_name };
         return .{ .ok = null };
     }
 
@@ -5686,10 +5718,6 @@ pub const NullHost = struct {
 pub fn nullHost() NullHost {
     return .{};
 }
-
-// -------------------------------------------------------------------------
-// Tests (mirrors the Rust crate's `eval.rs` `mod tests`)
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 const FuncBuilder = ir.build.FuncBuilder;
