@@ -382,6 +382,20 @@ pub const Inst = union(enum) {
     /// receives the block's result. Context values are made available for
     /// context resolution only, never as implicit receivers.
     CtxScope: struct { dst: Reg, ctx_args: Reg, n_ctx: u32, block: Reg },
+    /// Fully-positional invocation of a contextual function-type value:
+    /// `f(c0, c1, a0, ...)` where `f: context(C0, C1) (A0, ...) -> R`. The
+    /// leading `n_ctx` args are pushed as context values, `callee` is
+    /// invoked with the remaining `n_args - n_ctx` args, then the pushed
+    /// contexts are popped. `args` is one contiguous run so the register
+    /// visitor keeps every operand live.
+    CtxCall: struct {
+        dst: Reg,
+        callee: Reg,
+        args: Reg,
+        n_args: u32,
+        n_ctx: u32,
+        arg_names: []?ConstId = &.{},
+    },
     /// `!!` not-null assertion.
     NotNullAssert: struct { dst: Reg, src: Reg },
     /// Marker for the evaluator's debugger / tracing hook.

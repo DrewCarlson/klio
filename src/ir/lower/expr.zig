@@ -2759,6 +2759,33 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // Fully-positional call of a contextual function-type value:
+    // `f(c0, c1, a0)` where `f: context(C0, C1) (A0) -> R`. When the arg
+    // count matches the flattened `n_ctx + n_regular`, split the leading
+    // context args onto the context stack (`CtxCall`); the implicit form
+    // `f(a0)` (contexts from scope) has only `n_regular` args and falls
+    // through to the ordinary value-call path.
+    if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1 and ast_type_args.len == 0) {
+        const cname = callee.Path.segments[0].name;
+        if (b.contextFnParam(cname)) |shape| {
+            if (b.resolve(cname)) |callee_reg| {
+                if (args.len == shape.n_ctx + shape.n_regular and !lastArgIsLambda(args)) {
+                    b.module.has_context_decls = true;
+                    const run = try lowerArgRun(b, args);
+                    const dst = b.allocReg();
+                    try b.push(.{ .CtxCall = .{
+                        .dst = dst,
+                        .callee = callee_reg,
+                        .args = run[0],
+                        .n_args = run[1],
+                        .n_ctx = @intCast(shape.n_ctx),
+                    } });
+                    return dst;
+                }
+            }
+        }
+    }
+
     // Scope-true callee rewrite: a bare ctor/factory head naming a mangled
     // nested class (`Node(...)` inside its declaring class's subtree) or a
     // renamed file-private class/typealias resolves to the mangled lift

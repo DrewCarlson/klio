@@ -41,6 +41,13 @@ class Service {
     fun run() = report()
 }
 
+// A value of contextual function type can be invoked two ways: with its
+// contexts supplied positionally, or with them resolved from scope.
+fun invokeBoth(f: context(String, Int) (Boolean) -> Unit) {
+    f("positional", 1, true)
+    context("from-scope") { context(2) { f(false) } }
+}
+
 fun main() {
     val logger = ConsoleLogger()
     context(logger) {
@@ -63,4 +70,7 @@ fun main() {
 
     // The dispatch receiver satisfies a member's context parameter.
     Service().run()
+
+    // Positional then implicit invocation of a contextual function value.
+    invokeBoth { b -> println("b=$b ${contextOf<String>()} ${contextOf<Int>()}") }
 }
