@@ -1,6 +1,7 @@
-# Testing
+# Testing and verification
 
-klio's correctness rests on four layers.
+klio's correctness rests on five layers, and the tooling under
+`scripts/` keeps every check in the minutes range.
 
 ## 1. Unit tests
 
@@ -45,7 +46,7 @@ case.
 
 ## 3. Corpus + parity sweep
 
-The `parity` module is the primary correctness gate:
+The `parity` module is a primary correctness gate:
 
 - Walks every `.kt` under `tests/fixtures/parity_corpus/` and
   `examples/`.
@@ -66,12 +67,29 @@ so it rides the integration suite, not the fast unit step).
 The corpus only grows. Removing a `.kt` from it is a deliberate act
 that requires reviewer sign-off.
 
-## 4. Pack smoke tests
+## 4. Stdlib commonTest suite
+
+The upstream stdlib's own `commonTest` sources
+(`kotlin/libraries/stdlib/test`, 117 files, ~2,150 tests) run
+directly under the interpreter through `klio test`. Two entry
+points:
+
+- `zig build itest-stdlib_commontest` — the canonical ratcheted
+  suite (`src/itests/stdlib_commontest.zig` enforces a minimum pass
+  count that only goes up).
+- `scripts/commontest-sweep.py BIN` — the iteration driver: per-file
+  pass counts and failed test names for any klio binary.
+  `--filter <File>` runs one file (~16 s), `--passes` prints
+  per-file counts, and `--eager both` runs the whole corpus under
+  eager resolution OFF and ON and reports any divergence between the
+  two modes.
+
+## 5. Pack smoke tests
 
 Every pack ships a smoke flow:
 
 ```sh
-./zig-out/bin/klio pack build src/kotlinx_datetime
+./zig-out/bin/klio pack build kotlin-klio/klio-kotlinx-datetime
 ./zig-out/bin/klio pack verify target/packs/kotlinx.datetime.klio-pack \
     --smoke tests/fixtures/<smoke>.kt
 ```
@@ -79,6 +97,13 @@ Every pack ships a smoke flow:
 `pack verify` re-decodes every section through the loader; with
 `--smoke` it also runs a program against the pack, exercising both
 binding resolution and the shipped Kotlin source.
+
+## Checking one module in isolation
+
+`python3 scripts/zigcheck.py <module>` compiles and tests a single
+Zig module with its dependency graph wired via explicit `-M` flags —
+no `build.zig` edit, no rebuilding of unrelated modules. Pass
+`--build-only` to just compile.
 
 ## Harness build modes and the shared stdlib base
 
@@ -129,11 +154,24 @@ Two mechanisms keep the suite fast:
   `src/interp_ir/image.zig`. Set `KLIO_STDLIB_IMAGE=0` to disable and
   `KLIO_TRACE_STDLIB_IMAGE=1` to trace.
 
-## Before committing
+## The iteration playbook
 
-```sh
-zig build
-zig build test
-```
+Match the check to the size of the change
+(`plans/verification-speed-plan.md` is the working record):
 
-CI runs the same flow on every PR, plus the parity sweep.
+- **Edit-repro loop** (fixing one bug, running one program):
+  `zig build klio-harness -Dharness-optimize=Debug` (~16 s per
+  rebuild, installs as `zig-out/bin/klio-harness-Debug`). The Debug
+  interpreter runs ~4x slower — fine for single repros.
+- **Targeted commontest check** (one file, both eager modes):
+  `python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest --eager both`
+- **One suite**: `zig build itest-<name>`. Never build `itest-bin`
+  (all standalone itest binaries) during iteration.
+- **Full gate before a commit**: `scripts/gate.sh` — unit tests, the
+  litmus/e2e/examples/ktor/concurrency suites, then the commontest
+  dual eager gate. `--no-sweep` skips the slow tail.
+- **Cache**: `scripts/prune-zig-cache.sh [days]` when `.zig-cache`
+  grows unreasonably (Zig has no cache GC of its own).
+
+CI runs `zig build test-all`, sharded across parallel jobs with
+`-Ditest-shard=K/N`.

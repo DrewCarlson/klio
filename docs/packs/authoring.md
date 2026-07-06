@@ -48,6 +48,7 @@ The fields that matter:
 | `source_roots`      | Glob-relative directories of `.kt` files. Defaults to `["src"]`.      |
 | `[[deps]]`          | Library ids this pack depends on. The loader topo-sorts them.         |
 | `[bindings]`        | `"FQN" = "host_symbol"` lines for native intrinsics.                  |
+| `[features]`        | Named, opt-in source subsets (`name = { sources = [...] }`, optionally `requires = [...]`). Consumers enable them with `--feature <id>/<name>`. |
 
 ## 3. Write the Kotlin source
 

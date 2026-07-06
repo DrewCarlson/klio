@@ -1,16 +1,19 @@
 # kotlinx.io
 
-The `kotlinx.io` pack provides a `Buffer` modelled after
-upstream's FIFO byte queue. Bytes are stored in a byte
-`std.ArrayList(u8)` attached to each `Buffer` instance through
-`InstanceData.native_state`, which keeps both `pushBack` and
-`popFront` amortised O(1).
+The `kotlinx.io` pack ships upstream kotlinx-io 0.9.1's common
+sources, consumed directly from the in-pack git submodule: the
+segment-based `Buffer`, the `Source` / `Sink` / `RawSource` /
+`RawSink` hierarchy with their extension surfaces, UTF-8 codecs, and
+the `ByteString` module (`ByteString`, `ByteStringBuilder`).
+klio-authored actuals under `klioMain` supply the platform layer.
 
 ## Surface
 
 ```kotlin
 import kotlinx.io.Buffer
-import kotlinx.io.encodeToByteString
+import kotlinx.io.Source
+import kotlinx.io.readString
+import kotlinx.io.bytestring.encodeToByteString
 
 fun main() {
     val b = Buffer()
@@ -18,10 +21,12 @@ fun main() {
     b.writeLong(1_000_000_000_000L)
     b.writeString("kt")
 
-    println("size=${b.size()}")
     println("int=${b.readInt()}")
     println("long=${b.readLong()}")
-    println("string=${b.readString()}")
+
+    val s: Source = b            // a Buffer is a Source (and a Sink)
+    println("string=${s.readString()}")
+    println("size=${b.size}")
 
     val snap = "hello".encodeToByteString()
     println("encoded.size=${snap.size}")
@@ -29,20 +34,13 @@ fun main() {
 }
 ```
 
-Available operations:
-
-| Group     | Methods                                                          |
-|-----------|------------------------------------------------------------------|
-| Sizing    | `size()`, `isEmpty()`, `isNotEmpty()`, `clear()`                  |
-| Write     | `writeByte`, `writeShort`, `writeInt`, `writeLong`, `writeString` |
-| Read      | `readByte`, `readShort`, `readInt`, `readLong`, `readString`      |
-| Snapshot  | `snapshot()` returns a `ByteString` copy                          |
-| Pipe      | `copyTo(sink: Buffer)`                                            |
-
-Top-level:
-
-- `String.encodeToByteString(): ByteString`
-- `ByteString.decodeToString(): String`
+Because the surface is the real upstream common code, the upstream
+semantics apply: `Buffer` is a FIFO of segments implementing both
+`Source` and `Sink`, `size` is a property, reads consume, `peek()`
+gives a non-consuming `Source`, and the primitive read/write
+extensions (`writeByte` … `writeDouble`, string and byte-array
+codecs) are available. The ktor pack builds its channel layer on
+this pack.
 
 ## Install
 
@@ -53,7 +51,7 @@ Top-level:
 
 ## Out of scope (for now)
 
-- `Source` / `Sink` interfaces.
-- Async pipelining (kotlinx-io's own async surface is not shipped;
-  klio's ktor pack covers the async channel shapes).
-- Codec support beyond `String` (UTF-8) and big-endian primitives.
+- The filesystem source set beyond the common declarations
+  (`files/FileSystem.kt` / `files/Paths.kt` are included as parsed
+  surface; platform file IO is not wired).
+- kotlinx-io's platform-specific source sets and tests.

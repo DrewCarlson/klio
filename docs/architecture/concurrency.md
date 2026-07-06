@@ -247,8 +247,9 @@ This is validated by three gates:
   and the cross-OS-thread channel bridge), each asserting exact
   stdout and verified against the kotlinc-JVM oracle where plain
   kotlinx semantics allow.
-- **Single-thread benchmark** — the fixed `bench` corpus, diffable
-  against a baseline (`klio-bench --diff`), guards the common path
+- **Single-thread benchmark** — the fixed bench corpus
+  (`tests/fixtures/bench_corpus`, run by `zig build itest-bench`,
+  diffable against `benches-baseline/HEAD.json`) guards the common path
   against regression; the adaptive cell's UNSHARED fast path keeps
   it at the pre-parallel cost.
 
@@ -256,19 +257,13 @@ The normative litmus statements live in
 [memory-model.md](memory-model.md). The production backing is the
 adaptive reference-counted cell.
 
-## Status & known gaps
+## Status
 
-`launch`, `delay`, `join`, real-thread dispatch, and the memory
-model are working and gated. **`job.cancel()` and `withTimeout` /
-`withTimeoutOrNull` are not yet end-to-end.** The blocker is a
-per-activation coroutine-context model: the running coroutine's
-`CoroutineContext` must travel with the activation rather than in a
-single shared interceptor slot, so a child's `delay`
-`CancellableContinuationImpl` registers with the correct `Job` and
-the root is not wrongly cancelled. The full inventory, root-cause
-analysis, and the ordered plan — including the inline/crossinline
-and script-vs-pack-unification prerequisites this depends on — are
-in [../development/stabilization-plan.md](../development/stabilization-plan.md).
-Do not add library-type-specific branches to `ir` /
-`interp_ir` to work around these; fix the general mechanism per
-that plan.
+`launch`, `async`/`await`, `delay`, `join`, `job.cancel()`,
+`withTimeout` / `withTimeoutOrNull`, real-thread dispatch,
+`Channel`, `Flow`, and the memory model are working and gated —
+cancellation and timeouts run the consumed upstream common code
+end-to-end. The design record for the coroutine engine is
+`plans/COROUTINE-MODEL.md`. Do not add library-type-specific
+branches to `ir` / `interp_ir` to work around a coroutine bug; fix
+the general mechanism.

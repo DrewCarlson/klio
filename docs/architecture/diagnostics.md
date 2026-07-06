@@ -13,8 +13,8 @@ which renders to plain text, JSON, or SARIF.
 | `T00xx`| Typechecker           |
 | `W00xx`| Typechecker warnings  |
 
-The full catalog (with the source spans that emit each code) lives at
-[`plans/DIAGNOSTICS.md`](https://github.com/DrewCarlson/kt-exp/blob/main/plans/DIAGNOSTICS.md).
+The full catalog (with the source spans that emit each code) lives
+at `plans/DIAGNOSTICS.md` in the repository.
 
 ## Wording rules
 

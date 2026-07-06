@@ -27,12 +27,15 @@ Available:
 
 | Group        | Members                                                                 |
 |--------------|-------------------------------------------------------------------------|
-| Builders     | `runBlocking` (interpreter intrinsic), `launch`, `async`                |
+| Builders     | `runBlocking` (interpreter intrinsic), `launch`, `async`, `withContext`, `coroutineScope`, `supervisorScope` |
 | Scope        | `CoroutineScope`, `GlobalScope`, `CoroutineScope(context)`               |
-| Job          | `Job`, `CompletableJob`, `Deferred<T>`                                  |
+| Job          | `Job`, `CompletableJob`, `Deferred<T>`, `cancel`, `join`, `await`, structured cancellation |
 | Dispatchers  | `Dispatchers.Default`, `Main`, `IO`, `Unconfined`, `limitedParallelism(n)` |
-| Time         | `delay(ms: Long)`, `yield()` (cooperative reschedule)                   |
-| Channel      | `Channel<T>()`, `send`, `trySend`, `receive`, `close`, `isClosedForReceive` |
+| Time         | `delay(ms: Long)`, `yield()`, `withTimeout`, `withTimeoutOrNull`        |
+| Channel      | `Channel<T>()`, `send`, `trySend`, `receive`, `close`, iteration, `invokeOnClose` |
+| Select       | `select` over `onReceive` / `onSend` / `onTimeout`                      |
+| Flow         | `flow`, the operator surface, `SharedFlow` / `StateFlow` on hot sources |
+| Sync         | `Mutex`, `Semaphore` (`withPermit`)                                     |
 
 ## Execution semantics
 
@@ -70,8 +73,8 @@ driver and one per dispatcher worker task:
 - `delay(millis)` parks the coroutine on its pump's clock — sibling
   coroutines keep running while it waits.
 
-See `docs/architecture/concurrency.md` for the full model
-(the suspension engine and the cross-thread value rules).
+See [Concurrency](../../architecture/concurrency.md) for the full
+model (the suspension engine and the cross-thread value rules).
 
 ## Install
 
