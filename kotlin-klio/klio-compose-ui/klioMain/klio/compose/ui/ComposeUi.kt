@@ -145,6 +145,18 @@ class PixelCanvas(val width: Int, val height: Int) {
         }
         return sb.toString()
     }
+
+    /** One hex digit per pixel (the colour index), row-major — the compact
+     * encoding the native PPM writer consumes. */
+    fun toHex(): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < pixels.size) {
+            sb.append(('0'.code + pixels[i]).toChar())
+            i += 1
+        }
+        return sb.toString()
+    }
 }
 
 // ----- modifier -----
@@ -490,13 +502,26 @@ class UiRenderer internal constructor(
 ) {
     private val hits = ArrayList<HitRegion>()
 
-    /** Measure/layout + draw the current tree, returning an ASCII pixel dump. */
-    fun render(): String {
+    /** Measure/layout + draw the current tree into a fresh pixel canvas. */
+    private fun renderCanvas(): PixelCanvas {
         root.measure(Constraints(width, width, height, height))
         val canvas = PixelCanvas(width, height)
         hits.clear()
         root.draw(canvas, 0, 0, hits)
-        return canvas.toAscii()
+        return canvas
+    }
+
+    /** Measure/layout + draw the current tree, returning an ASCII pixel dump. */
+    fun render(): String = renderCanvas().toAscii()
+
+    /**
+     * Render to a real P6 PPM image at [path] (scaled [scale]x per pixel) via the
+     * native rendering sink, returning a checksum of the encoded bytes — the
+     * headless offscreen-surface dump.
+     */
+    fun savePpm(path: String, scale: Int): Long {
+        val canvas = renderCanvas()
+        return __composeui_writePpm(path, canvas.width, canvas.height, canvas.toHex(), scale)
     }
 
     /** Recompose after a state write, then render the next frame. */
