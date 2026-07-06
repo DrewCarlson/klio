@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
 # Fast klio-only smoke sweep: run every example + corpus .kt through the
 # prebuilt klio binary under a memory/time guard, in parallel, and
-# report which files crash, error, OOM, or time out. No cargo rebuild,
+# report which files crash, error, OOM, or time out. No rebuild,
 # no kotlinc — a seconds-scale signal for the crash/OOM/regression bug
 # class that the kotlinc-diff parity suite is too slow to iterate on.
 #
 # Usage: klio-smoke.sh [dir ...]   (default: examples + the parity corpus)
 # Env:   RSS_CAP_KB (default 1200000), TIMEOUT_S (default 12),
-#        JOBS (default: CPU count), KLIO_BIN (default target/release/klio)
+#        JOBS (default: CPU count), KLIO_BIN (default zig-out/bin/klio)
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RSS_CAP_KB="${RSS_CAP_KB:-1200000}"
 TIMEOUT_S="${TIMEOUT_S:-12}"
 JOBS="${JOBS:-$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
-KLIO_BIN="${KLIO_BIN:-$ROOT/target/release/klio}"
-[ -x "$KLIO_BIN" ] || KLIO_BIN="$ROOT/target/debug/klio"
+KLIO_BIN="${KLIO_BIN:-$ROOT/zig-out/bin/klio}"
 GUARD="$ROOT/scripts/klio-guard.sh"
 
 if [ "$#" -gt 0 ]; then DIRS=("$@"); else

@@ -144,11 +144,18 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // caller's class must not resolve to another package's
             // file-private `object State`). A same-named top-level
             // property keeps the name-keyed read — the property wins in
-            // value position.
-            const cls_pick: ?ir.ClassId = if (isTopLevelProp(n))
-                b.module.classIdExactImport(n, segments[0].span.file)
-            else
-                b.module.classIdIndexed(n, b.self_package, segments[0].span.file);
+            // value position — but only when it is at least as visible
+            // as the class at this site: a materialised stdlib property
+            // from an unimported package (`kotlin.math.E` at the shipped
+            // tier) must not outrank a user classifier named `E`.
+            const cls_pick: ?ir.ClassId = blk: {
+                if (isTopLevelProp(n)) {
+                    const pt = b.module.topLevelPropRefTier(n, b.self_package, segments[0].span.file) orelse 255;
+                    const ct = b.module.classRefTier(n, b.self_package, segments[0].span.file) orelse 255;
+                    if (pt <= ct) break :blk b.module.classIdExactImport(n, segments[0].span.file);
+                }
+                break :blk b.module.classIdIndexed(n, b.self_package, segments[0].span.file);
+            };
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cls_pick } });
             return dst;
         }

@@ -46,9 +46,34 @@ The fields that matter:
 | `abi`               | Bump when your bindings change shape.                                 |
 | `implicit_packages` | Packages always visible to consumers (rare).                          |
 | `source_roots`      | Glob-relative directories of `.kt` files. Defaults to `["src"]`.      |
+| `[[source]]`        | A packed source set: `root` + optional `include` (file list relative to `root`). Repeatable; use instead of `source_roots` for finer control. |
 | `[[deps]]`          | Library ids this pack depends on. The loader topo-sorts them.         |
 | `[bindings]`        | `"FQN" = "host_symbol"` lines for native intrinsics.                  |
 | `[features]`        | Named, opt-in source subsets (`name = { sources = [...] }`, optionally `requires = [...]`). Consumers enable them with `--feature <id>/<name>`. |
+| `[[test]]`          | A test source set for `klio test <project>`: `root` + optional `include`, optional `feature = "<name>"` (composed only when that feature is active; untagged = core, always active). Test sources are never packed. |
+
+### Testing the project
+
+With one or more `[[test]]` stanzas, `klio test <project-dir>` builds+installs
+the pack, composes the active test sources into one module, and runs every
+`@Test`:
+
+```toml
+[[test]]
+root = "upstream/core/common/test"
+
+[[test]]
+root = "upstream/feature/common/test"
+feature = "myfeature"   # only composed under --feature <id>/myfeature (or --all)
+```
+
+```sh
+klio test .                              # this project
+klio test . --filter MyTest --format json
+klio test . --isolate --timeout 5        # per-test sub-process, pinpoint a hang
+```
+
+See [Testing with KLIO](../testing.md#project-mode) for the full runner surface.
 
 ## 3. Write the Kotlin source
 

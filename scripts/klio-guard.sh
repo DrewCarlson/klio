@@ -12,8 +12,7 @@ FILE="${1:?usage: klio-guard.sh <file.kt> [rss_cap_kb] [timeout_s] [klio_bin]}"
 CAP_KB="${2:-1500000}"
 TIMEOUT_S="${3:-15}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${4:-$ROOT/target/release/klio}"
-[ -x "$BIN" ] || BIN="$ROOT/target/debug/klio"
+BIN="${4:-$ROOT/zig-out/bin/klio}"
 
 OUT="$(mktemp)"
 "$BIN" run "$FILE" >"$OUT" 2>&1 &
