@@ -5143,6 +5143,8 @@ fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?b
     if (l.* == .Double and r.* == .Double) return Pair.cmpFloat(op, l.Double, r.Double);
     if (l.* == .Float and r.* == .Float) return Pair.cmpFloat(op, @as(f64, l.Float), @as(f64, r.Float));
     if (l.* == .Char and r.* == .Char) return Pair.cmpOrder(op, std.math.order(l.Char, r.Char));
+    // `Boolean` is `Comparable`: `false < true` (compareTo ordinal order).
+    if (l.* == .Bool and r.* == .Bool) return Pair.cmpOrder(op, std.math.order(@intFromBool(l.Bool), @intFromBool(r.Bool)));
     if (l.* == .UInt and r.* == .UInt) return Pair.cmpOrder(op, std.math.order(l.UInt, r.UInt));
     if (l.* == .ULong and r.* == .ULong) return Pair.cmpOrder(op, std.math.order(l.ULong, r.ULong));
     if (l.* == .UShort and r.* == .UShort) return Pair.cmpOrder(op, std.math.order(l.UShort, r.UShort));
