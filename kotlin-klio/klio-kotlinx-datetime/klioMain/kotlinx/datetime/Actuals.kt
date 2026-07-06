@@ -287,6 +287,26 @@ actual class LocalTime(
         val MIN: LocalTime = LocalTime(0, 0, 0, 0)
         val MAX: LocalTime = LocalTime(23, 59, 59, 999_999_999)
 
+        fun fromSecondOfDay(secondOfDay: Int): LocalTime {
+            if (secondOfDay < 0 || secondOfDay > 86_399)
+                throw IllegalArgumentException("Invalid value: secondOfDay=$secondOfDay")
+            return LocalTime(secondOfDay / 3600, (secondOfDay % 3600) / 60, secondOfDay % 60, 0)
+        }
+
+        fun fromMillisecondOfDay(millisecondOfDay: Int): LocalTime {
+            if (millisecondOfDay < 0 || millisecondOfDay > 86_399_999)
+                throw IllegalArgumentException("Invalid value: millisecondOfDay=$millisecondOfDay")
+            val sec = millisecondOfDay / 1_000
+            return LocalTime(sec / 3600, (sec % 3600) / 60, sec % 60, (millisecondOfDay % 1_000) * 1_000_000)
+        }
+
+        fun fromNanosecondOfDay(nanosecondOfDay: Long): LocalTime {
+            if (nanosecondOfDay < 0 || nanosecondOfDay > 86_399_999_999_999L)
+                throw IllegalArgumentException("Invalid value: nanosecondOfDay=$nanosecondOfDay")
+            val sec = (nanosecondOfDay / 1_000_000_000L).toInt()
+            return LocalTime(sec / 3600, (sec % 3600) / 60, sec % 60, (nanosecondOfDay % 1_000_000_000L).toInt())
+        }
+
         // ISO-8601 `HH:mm[:ss[.fff…]]`.
         fun parse(input: CharSequence): LocalTime {
             val parts = input.toString().split(":")
