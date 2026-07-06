@@ -210,6 +210,37 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
     }, .weight = 40 },
+    // Each bundled library's own commonTest sources run through a child
+    // `klio test` against its installed pack (see commontest_support.zig).
+    .{ .name = "atomicfu_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 30 },
+    .{ .name = "io_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-io",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 30 },
+    .{ .name = "datetime_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-datetime",
+        "kotlin-klio/klio-kotlinx-serialization",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 30 },
+    .{ .name = "serialization_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-serialization",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 40 },
+    .{ .name = "coroutines_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 90 },
+    .{ .name = "ktor_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-ktor",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-io",
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 90 },
 };
 
 /// Read by every parity-pipeline run: the stdlib pack is built at runtime from
