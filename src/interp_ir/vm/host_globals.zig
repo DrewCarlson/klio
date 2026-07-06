@@ -730,7 +730,22 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
 /// name-keyed path).
 pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, class: ?ir.ClassId, ctor_ref: bool) ?Value {
     if (func) |fid| {
-        if (funcValueById(self, allocator, fid)) |v| return v;
+        // A `@LowPriorityInOverloadResolution` / deprecated-stub function is
+        // never bound by id: it must not outrank a same-name class constructor
+        // (kotlinc), and a stub whose body calls the constructor by name would
+        // re-bind itself and recurse without bound (kotlinx-datetime's
+        // deprecated `fun LocalDateTime(...)`). Skip it so the class leg — or,
+        // when the committed class id is absent, the caller's name-keyed lookup
+        // — finds the constructor instead.
+        const is_low = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const cf = mg.get().funcById(fid) orelse break :blk false;
+            break :blk cf.low_priority;
+        };
+        if (!is_low) {
+            if (funcValueById(self, allocator, fid)) |v| return v;
+        }
     }
     if (class) |cid| {
         // The id table is the authoritative singleton read: publication

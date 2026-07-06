@@ -1569,7 +1569,7 @@ fn attachDeclaredElemTypes(module: *const Module, func: FuncId, type_args: []con
     runtime.attachDeclaredElemTypes(f.fqn, type_args, &result.ok);
 }
 
-pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
+pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool) Allocator.Error!MaybeValueResult {
     // An anon-object/side-module frame carries no top-level func index;
     // the overload set lives in the main module, so collect there.
     const mg = self.module.borrow();
@@ -1595,24 +1595,56 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         .refine = applicRefineCb,
         .subtype = applicSubtypeCb,
     };
-    var best_func: ?FuncId = null;
-    var best_score: i32 = 0;
+    // `@LowPriorityInOverloadResolution` / deprecated-ERROR|HIDDEN overloads are
+    // only chosen when nothing ordinary applies, and a same-named class
+    // constructor outranks them (kotlinc). Score ordinary and low-priority
+    // candidates apart: an applicable ordinary overload always wins; a
+    // low-priority one is used only when no ordinary applies AND no same-named
+    // constructor exists — otherwise decline so the caller's constructor path
+    // binds. Without this a deprecated stub `fun LocalDate(...) = LocalDate(...)`
+    // re-picks itself across the two low-priority overloads and self-recurses.
+    var best_ord: ?FuncId = null;
+    var best_ord_score: i32 = 0;
+    var best_low: ?FuncId = null;
+    var best_low_score: i32 = 0;
     for (candidates) |cand| {
         // A receiver-taking candidate whose declared receiver names a
         // builtin shape the first arg definitely is not (UIntArray.fill
         // offered a plain Array) is disqualified outright.
+        var is_low = false;
         if (funcAt(eff, cand)) |cf| {
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
                 host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
+            is_low = cf.low_priority;
         }
         if (positionalPoints(self, eff, cand, shapes, scope)) |total| {
-            if (best_func == null or total > best_score) {
-                best_func = cand;
-                best_score = total;
+            if (is_low) {
+                if (best_low == null or total > best_low_score) {
+                    best_low = cand;
+                    best_low_score = total;
+                }
+            } else if (best_ord == null or total > best_ord_score) {
+                best_ord = cand;
+                best_ord_score = total;
             }
         }
     }
-    const func = best_func orelse return .{ .ok = null };
+    const func = best_ord orelse fallback: {
+        // Only fall to a low-priority overload when nothing better can bind: no
+        // ordinary overload applied AND no same-name class constructor exists
+        // (the caller's `ctor_name` — a lowering-resolved class — is the
+        // reliable signal; `classId` can miss across a pack boundary). Declining
+        // lets the caller's constructor path win, so a deprecated stub that
+        // calls the constructor by name cannot re-pick itself and recurse.
+        if (best_low) |low| {
+            // Check the MAIN module for a same-name class (the pack's classes
+            // live there; `eff` may be a side module whose class index misses
+            // them). A class means a constructor the caller will bind.
+            const has_class = ctor_name or mg.get().classId(name) != null;
+            if (!has_class) break :fallback low;
+        }
+        return .{ .ok = null };
+    };
 
     if (trace.enabled(name)) {
         trace.emit("global-overload {s} -> fid={d} (of {d} candidates)", .{ name, func.int(), candidates.len });

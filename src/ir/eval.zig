@@ -4034,7 +4034,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // Overloaded top-level function: select by runtime arg types
         // before falling back to the single global value baked in at
         // lower time.
-        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names)) {
+        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names, is_ctor_name)) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
         };
@@ -5625,8 +5625,8 @@ pub const NullHost = struct {
         return self.callFuncNamed(allocator, module, func, args, arg_names);
     }
 
-    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!MaybeValueResult {
-        _ = .{ self, allocator, module, name, args, arg_names };
+    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool) Allocator.Error!MaybeValueResult {
+        _ = .{ self, allocator, module, name, args, arg_names, ctor_name };
         return .{ .ok = null };
     }
 

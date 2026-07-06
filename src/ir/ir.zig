@@ -2046,6 +2046,18 @@ pub const Module = struct {
             };
         }
 
+        /// Deferred because every candidate that matched is
+        /// `@LowPriorityInOverloadResolution` / a deprecated stub. Binding the
+        /// heuristic here would statically pick such a stub over a same-name
+        /// class constructor (kotlinx-datetime's `fun LocalDateTime`), which
+        /// self-recurses; the caller must emit a dynamic call instead.
+        pub fn lowPriorityOnly(self: BareCallResolution) bool {
+            return switch (self.outcome) {
+                .deferred => |r| r == .low_priority_only,
+                .resolved => false,
+            };
+        }
+
         fn deferred(reason: ResolveDeferReason) BareCallResolution {
             return .{ .outcome = .{ .deferred = reason } };
         }
@@ -2704,10 +2716,22 @@ pub const Module = struct {
             }
             break :blk self.preferredBareTargetLike(h, index_pick);
         } else null;
+        // A `@LowPriorityInOverloadResolution` / deprecated-stub function never
+        // statically binds when a same-name class constructor exists: kotlinc
+        // ranks the constructor above it, and a stub whose body re-calls the
+        // name (kotlinx-datetime's `fun LocalDateTime(...) = LocalDateTime(...)`)
+        // would self-recurse. Drop to a dynamic emit so runtime binds the
+        // constructor. The index never resolves TO a low-priority candidate
+        // (it skips them), so this only overrides a phase-B heuristic pick.
+        const target_lp: ?FuncId = if (target) |t| blk: {
+            const tf = self.funcById(t) orelse break :blk t;
+            if (tf.low_priority and self.classId(name) != null) break :blk null;
+            break :blk t;
+        } else null;
         const tier: u8 = if (ires.tier != 255) ires.tier else self.lowestVisibleTier(name, caller_pkg, caller_file);
 
         // Phase C — EMIT FORM.
-        var res = try self.emitFormFor(alloc, name, caller_pkg, caller_file, target, tier, reason, ires.tier_count, args, ctx);
+        var res = try self.emitFormFor(alloc, name, caller_pkg, caller_file, target_lp, tier, reason, ires.tier_count, args, ctx);
         if (res.emit_form == .Call) {
             // A declared-receiver-matched extension pick is Kotlin's static
             // resolution — final like a cast pick; the runtime value-typed

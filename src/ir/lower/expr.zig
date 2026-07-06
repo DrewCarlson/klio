@@ -3128,6 +3128,22 @@ fn lowerCallWithWritebackPath(
             preferredBareTarget(b, heur, ires.pick())
         else
             ires.pick();
+        // A DEFERRED resolution must never statically bind a low-priority
+        // heuristic. `@LowPriorityInOverloadResolution` / deprecated stubs are
+        // outranked by a same-name class constructor and by any ordinary
+        // overload; the index defers (e.g. `default_param_shape` when the
+        // constructor carries defaults, or `low_priority_only`) precisely
+        // because runtime must decide. Binding the stub statically makes a
+        // stub whose body re-calls the name self-recurse (kotlinx-datetime's
+        // `fun LocalDateTime`). Leave unbound so a dynamic `CallMemberOrGlobal`
+        // resolves the constructor / intended overload.
+        if (bound_id) |bid| {
+            if (ires.pick() == null) {
+                if (b.module.funcById(bid)) |bf| {
+                    if (bf.low_priority) bound_id = null;
+                }
+            }
+        }
         if (bound_id) |bid| {
             _ = try recordOutOfScopeCall(b, segments[0].name, segments[0].span, bid, ires);
         }
