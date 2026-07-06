@@ -1827,7 +1827,7 @@ test "formatMin renders a min-version suffix" {
     try std.testing.expectEqualStrings(" (>=1.2.0)", some);
 }
 
-test "strSliceDebug mirrors Rust slice debug" {
+test "strSliceDebug renders a quoted, comma-separated list" {
     const a = std.testing.allocator;
     var items = [_][]const u8{ "kotlin", "kotlin.collections" };
     const out = strSliceDebug(a, &items);

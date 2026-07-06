@@ -385,7 +385,7 @@ test "render emits factory consts and table" {
     try testing.expect(std.mem.indexOf(u8, out, "    &B_FACTORY,") != null);
 }
 
-test "render escapes backslashes like rust debug" {
+test "render escapes backslashes in message templates" {
     const factories = [_]Factory{
         .{ .name = "X", .severity = .Error, .message = "line\\nbreak" },
     };
