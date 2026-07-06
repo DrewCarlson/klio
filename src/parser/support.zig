@@ -1,9 +1,7 @@
 //! Shared cursor / peek / expect / recovery helpers for the parser.
 //!
-//! In Rust these were inherent `impl` methods on `Parser` living in
-//! `parse/support.rs`. Here they are free functions over `*Parser`,
-//! matching the calling convention used across the parser's sibling
-//! files (e.g. `support.peekKind(p)`).
+//! Free functions over `*Parser`, matching the calling convention used
+//! across the parser's sibling files (e.g. `support.peekKind(p)`).
 
 const std = @import("std");
 

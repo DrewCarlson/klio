@@ -53,8 +53,8 @@ const SwitchArm = ir.SwitchArm;
 const Symbol = ir.Symbol;
 const Terminator = ir.Terminator;
 
-/// A `(start, end)` span key for the side-table maps. Mirrors Rust's
-/// `(u32, u32)` tuple key (file-relative offsets).
+/// A `(start, end)` span key for the side-table maps (file-relative
+/// offsets).
 pub const SpanKey = struct { start: u32, end: u32 };
 
 /// Position of a node within the CFG: the block plus the node index.

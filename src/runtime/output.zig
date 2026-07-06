@@ -1,17 +1,15 @@
 //! Output sink for the interpreter and stdlib, plus the Kotlin-compatible
 //! number/char rendering re-exports the `Value` Display path leans on.
 //!
-//! `Output` is the Rust trait; in Zig it is a small vtable struct
-//! (`ctx` + `*const VTable`) so the interpreter, the recording sink, the
-//! stdout sink, and the test capture sink all present the same `{write,
-//! writeln}` interface to intrinsics.
+//! `Output` is a small vtable struct (`ctx` + `*const VTable`) so the
+//! interpreter, the recording sink, the stdout sink, and the test capture
+//! sink all present the same `{write, writeln}` interface to intrinsics.
 
 const std = @import("std");
 const float_fmt = @import("float_fmt.zig");
 
-/// Output sink interface. A `{ctx, vtable}` pair mirroring Rust's
-/// `&mut dyn Output`. `writeln` writes a string followed by a newline;
-/// `write` writes with no trailing newline.
+/// Output sink interface. A `{ctx, vtable}` pair. `writeln` writes a
+/// string followed by a newline; `write` writes with no trailing newline.
 pub const Output = struct {
     ctx: *anyopaque,
     vtable: *const VTable,

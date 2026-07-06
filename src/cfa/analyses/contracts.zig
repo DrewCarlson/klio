@@ -53,9 +53,8 @@ pub const UserInlineContracts = std.StringHashMap([]const []const u8);
 /// trailing-lambda inline scheme to user contracts so a `val` assigned
 /// inside the lambda is observed as definitely assigned at the call site.
 ///
-/// Rust modelled this as a `thread_local!` cell installed by the build
-/// driver before lowering; the port keeps the same single-build-at-a-time
-/// contract with module-level state.
+/// This holds module-level state under a single-build-at-a-time
+/// contract: the build driver installs it before lowering starts.
 var user_inline_contracts: ?UserInlineContracts = null;
 
 /// Replace the user-contract registry. Called once per module build,

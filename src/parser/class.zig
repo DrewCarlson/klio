@@ -1,8 +1,7 @@
 //! Class / interface / object / enum declaration parsing, including
 //! supertype lists, primary-constructor params, and class bodies.
 //!
-//! Ported from `parse/class.rs`. The Rust inherent `impl` methods become
-//! free functions over `*Parser`.
+//! Free functions over `*Parser`.
 
 const std = @import("std");
 
@@ -339,6 +338,10 @@ pub fn parseEnumClassBody(p: *Parser) EnumClassBody {
                 if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
                     break;
                 }
+                // An enum entry may pass named constructor arguments
+                // (`ENTRY(1, "x", viaBroadcast = true)`); consume and drop the
+                // `name =` label — entry args bind positionally here.
+                _ = expr.tryConsumeNamedArgName(p);
                 const a = expr.parseExpr(p) orelse break;
                 args.append(p.allocator, a) catch @panic("OOM");
                 support.skipNl(p);

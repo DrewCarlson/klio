@@ -33,8 +33,8 @@ const SpanKeyContext = struct {
     }
 };
 
-/// Span-keyed type map mirroring Rust's `HashMap<(u32, u32), Type>`.
-/// The typechecker collects its span→Type results into this shape.
+/// Span-keyed type map. The typechecker collects its span→Type results
+/// into this shape.
 pub const TypeMap = std.HashMap(SpanKey, Type, SpanKeyContext, std.hash_map.default_max_load_percentage);
 
 pub const Reachability = struct {

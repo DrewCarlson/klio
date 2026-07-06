@@ -1,8 +1,7 @@
 //! Member declaration parsing: functions, properties (with accessors),
 //! secondary constructors, value/function parameters.
 //!
-//! Ported from `parse/members.rs`. The Rust inherent `impl Parser` methods
-//! become free functions over `*Parser`.
+//! Free functions over `*Parser`.
 
 const std = @import("std");
 
@@ -224,8 +223,8 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
     }
 }
 
-/// Thin wrapper matching the Rust tri-state `Option<Option<TypeRef>>` shape:
-/// returns `null` on parse failure, otherwise the optional receiver type.
+/// Thin tri-state wrapper: returns `null` on parse failure, otherwise the
+/// optional receiver type.
 fn parseFunReceiver(p: *Parser) ??TypeRef {
     return switch (parseFunReceiverResult(p)) {
         .failure => null,
@@ -391,7 +390,7 @@ pub fn parseParamList(p: *Parser) []Param {
 }
 
 /// Synthesise the `Any?` placeholder used when a param's type is missing or
-/// elided. Mirrors the two identical literals in the Rust source.
+/// elided.
 fn anyPlaceholder(name_span: span.Span) TypeRef {
     return TypeRef{
         .name = Ident{ .name = "Any", .span = name_span },
@@ -802,6 +801,13 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
         p.suppress_qualified_path = true;
         var ty = types.parseType(p);
         p.suppress_qualified_path = saved_sqp;
+        // Accumulate the receiver's full dotted class path. `parseType` under
+        // suppression takes only the first segment, so a nested receiver
+        // (`LineHeightStyle.Alignment.Companion.Saver`) would otherwise lose
+        // the middle segments and mis-parse the property name.
+        var path: std.ArrayList(u8) = .empty;
+        defer path.deinit(p.allocator);
+        if (ty) |t| path.appendSlice(p.allocator, t.name.name) catch @panic("OOM");
         if (is(peekKind(p), .QuestionDot)) {
             if (ty) |*t| {
                 t.nullable = true;
@@ -812,6 +818,22 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
             }
         } else {
             _ = expect(p, .Dot, "`.`") orelse return .failure;
+            // Consume intermediate qualifier segments: an ident followed by
+            // `.<ident>` is part of the receiver's class path, not the property
+            // name. Stop at `Companion` (handled below) and at the final
+            // segment (the property name, followed by the declaration body).
+            while (true) {
+                const here = peekIdentText(p) orelse break;
+                if (std.mem.eql(u8, here, "Companion")) break;
+                const k1 = kindAt(p, p.pos + 1) orelse break;
+                const k2 = kindAt(p, p.pos + 2) orelse break;
+                if (!is(&k1, .Dot) or !is(&k2, .Ident)) break;
+                const seg = parseIdent(p, "type") orelse break;
+                _ = bump(p); // `.`
+                path.append(p.allocator, '.') catch @panic("OOM");
+                path.appendSlice(p.allocator, seg.name) catch @panic("OOM");
+                if (ty) |*t| t.name = seg;
+            }
         }
         // A Companion-qualified receiver (`String.Companion.foo`, stdlib
         // TextH.kt's `String.Companion.CASE_INSENSITIVE_ORDER`): the receiver
@@ -829,8 +851,15 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
             _ = bump(p); // `Companion`
             _ = bump(p); // `.`
             skipNl(p);
+            path.appendSlice(p.allocator, ".Companion") catch @panic("OOM");
             if (ty) |*t| {
-                t.qualified_path = std.fmt.allocPrint(p.allocator, "{s}.Companion", .{t.name.name}) catch @panic("OOM");
+                t.qualified_path = p.allocator.dupe(u8, path.items) catch @panic("OOM");
+            }
+        } else if (std.mem.indexOfScalar(u8, path.items, '.') != null) {
+            // A multi-segment receiver with no companion (`A.B.foo`): retain the
+            // full path so the resolver targets the nested class, not just `A`.
+            if (ty) |*t| {
+                t.qualified_path = p.allocator.dupe(u8, path.items) catch @panic("OOM");
             }
         }
         skipNl(p);

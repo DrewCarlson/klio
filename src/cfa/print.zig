@@ -177,9 +177,7 @@ fn formatPattern(w: Out, p: Pattern) Allocator.Error!void {
     }
 }
 
-/// Render a type the way Rust's derived `{:?}` does. `print_cfg`
-/// formats every type through `Debug`, not `Display`, so the output
-/// must match the derived shape exactly: tuple variants render as
+/// Render a type in a stable debug shape: tuple variants render as
 /// `Name(inner)`, struct variants as `Name { field: value, ... }`,
 /// vectors as `[a, b]`, and strings quoted.
 fn formatType(w: Out, t: Type) Allocator.Error!void {
@@ -249,10 +247,9 @@ fn formatGenericArg(w: Out, a: GenericArg) Allocator.Error!void {
     try w.writeAll(" }");
 }
 
-/// Render a string the way Rust's `Debug for str` does: wrapped in
-/// double quotes with the standard escapes. The names that reach this
-/// path are type-parameter and class identifiers, but the escaping is
-/// faithful for any content.
+/// Render a string wrapped in double quotes with the standard escapes.
+/// The names that reach this path are type-parameter and class
+/// identifiers, but the escaping is faithful for any content.
 fn formatStrDebug(w: Out, s: []const u8) Allocator.Error!void {
     try w.writeAll("\"");
     for (s) |c| {

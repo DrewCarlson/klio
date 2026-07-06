@@ -2,11 +2,10 @@
 //! stdlib path evaluates against, its helper enums/structs, and the
 //! `RuntimeError` data type.
 //!
-//! Reference handles: Rust `Arc<T>` / `ObjRef<T>` both map to
-//! `ObjRef(T)` (the refcounted, interior-mutable, lock-mediated cell).
-//! Rust `Box<Value>` maps to `*Value`. Shared-immutable AST nodes
-//! (`Arc<klio_ast::Function>` etc.) map to `*const ast.X` pointers, owned
-//! by the parse/lower arena.
+//! Reference handles: `ObjRef(T)` is the refcounted, interior-mutable,
+//! lock-mediated cell; `*Value` is an owning pointer to a single boxed
+//! value. Shared-immutable AST nodes map to `*const ast.X` pointers,
+//! owned by the parse/lower arena.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -336,8 +335,8 @@ pub const MapStore = struct {
 
 /// `ObjRef<MapStore>` — shared, growable map entry storage with a hash index.
 pub const MapEntries = ObjRef(MapStore);
-/// A refcounted box holding a single `Value` (Rust `Box<Value>` mapped to a
-/// shared handle). Used for the component slots of `Pair`/`Triple`/`MapEntry`/
+/// A refcounted box holding a single `Value`, shared by handle. Used for
+/// the component slots of `Pair`/`Triple`/`MapEntry`/
 /// `Result`/`Exception.cause`/`BoundMethod.receiver`/`Sequence` generators so a
 /// copy of the enclosing value shares the box by refcount and releasing the
 /// last copy recursively frees the boxed `Value` (via `ObjRef(Value).deinit` →
@@ -1507,7 +1506,7 @@ pub const Value = union(enum) {
         return ValueBox.init(allocator, v);
     }
 
-    /// Reference-counting increment (Rust `Clone`): bump the strong count of
+    /// Reference-counting increment: bump the strong count of
     /// every refcounted handle this value holds, returning another owning
     /// copy of the same value graph. Primitives and the immutable program
     /// graph (`Class`) are no-ops. Owning-`*Value` variants
@@ -1646,7 +1645,7 @@ pub const Value = union(enum) {
         }
     }
 
-    /// Reference-counting decrement (Rust `Drop`): drop one owning handle to
+    /// Reference-counting decrement: drop one owning handle to
     /// this value graph. When a handle's strong count reaches zero its
     /// payload `deinit` recursively releases what it owns. The dual of
     /// `retain`; primitives, `Class`, and the not-yet-refcounted
@@ -2410,7 +2409,7 @@ pub const Value = union(enum) {
     }
 
     /// Render this value the way Kotlin's `toString` / string templates do,
-    /// writing into `writer`. Mirrors the Rust `Display` impl.
+    /// writing into `writer`.
     pub fn writeTo(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .Cell => |c| {
@@ -2930,9 +2929,9 @@ fn instanceEq(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) bool {
 }
 
 /// Runtime error data. RuntimeError is DATA, never a Zig `error`; the
-/// control-flow signals (`Return`, `Break`, …) are modeled as variants
-/// exactly as in Rust. Heap-owning payloads borrow the interpreter's
-/// arena; the message strings are borrowed slices.
+/// control-flow signals (`Return`, `Break`, …) are modeled as variants.
+/// Heap-owning payloads borrow the interpreter's arena; the message
+/// strings are borrowed slices.
 pub const RuntimeError = union(enum) {
     Unbound: []const u8,
     Type: []const u8,

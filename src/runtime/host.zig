@@ -1,10 +1,10 @@
-//! Side-channels the runtime exposes to Rust-native stdlib intrinsics:
+//! Side-channels the runtime exposes to native stdlib intrinsics:
 //! the `StdlibFn` pointer, the `CallCtx` it receives, and the
 //! `IntrinsicHost` it calls back through.
 //!
-//! The Rust `IntrinsicHost` trait becomes a `{ctx, vtable}` pair. Trait
-//! methods that carried a default body keep that default by letting the
-//! vtable slot be optional (`null` = use the default).
+//! `IntrinsicHost` is a `{ctx, vtable}` pair. Methods that carry a default
+//! body keep that default by letting the vtable slot be optional (`null`
+//! = use the default).
 
 const std = @import("std");
 const value_mod = @import("value.zig");
@@ -25,7 +25,7 @@ pub const BuilderStepResult = union(enum) {
     err: RuntimeError,
 };
 
-/// Function pointer signature for a Rust-native stdlib intrinsic.
+/// Function pointer signature for a native stdlib intrinsic.
 ///
 /// `CallCtx.args` carries the call arguments. For member access the
 /// receiver is `args[0]`, with any further user arguments following.
@@ -44,9 +44,8 @@ pub const CallCtx = struct {
 };
 
 /// Side-channel the runtime exposes to stdlib intrinsics. A `{ctx,
-/// vtable}` pair mirroring Rust's `&mut dyn IntrinsicHost`. Vtable slots
-/// that were trait defaults are optional; `null` selects the default
-/// behavior implemented in the wrapper methods below.
+/// vtable}` pair. Vtable slots that default are optional; `null` selects
+/// the default behavior implemented in the wrapper methods below.
 pub const IntrinsicHost = struct {
     ctx: *anyopaque,
     vtable: *const VTable,

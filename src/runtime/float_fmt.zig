@@ -16,8 +16,8 @@ const std = @import("std");
 /// up to a 128-bit `(hi, lo)` significand.
 const POW10_MIN_K: i32 = -292;
 
-/// A 128-bit power-of-ten significand: `.{ hi, lo }` 64-bit words, matching
-/// the Rust `(u64, u64)` tuple ordering (`[0]` is high, `[1]` is low).
+/// A 128-bit power-of-ten significand: `.{ hi, lo }` 64-bit words,
+/// `[0]` high and `[1]` low.
 const Pow10 = [2]u64;
 
 /// `ceil(2^-r . 10^k)` for `k` in `[-292, 324]`, as `(hi, lo)` 64-bit words.

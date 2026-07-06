@@ -131,8 +131,8 @@ pub const MaybeUnassignedEntry = struct {
     }
 };
 
-/// Ordered `Place -> Vec<BlockId>` collection mirroring Rust's
-/// `BTreeMap<Place, Vec<BlockId>>` iteration order.
+/// Ordered `Place -> []BlockId` collection, iterated in sorted-key
+/// order.
 pub const MaybeUnassigned = struct {
     entries: std.ArrayList(MaybeUnassignedEntry) = .empty,
 
