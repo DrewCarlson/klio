@@ -13,7 +13,7 @@ your code also runs it.
 - **IR-based execution.** Source is lowered by `klio-ir` into a
   register IR that `klio-interp-ir`'s Vm runs. The Vm never walks an
   AST.
-- **Spec-driven.** The Kotlin Language Specification (2.3.21) and the
+- **Spec-driven.** The Kotlin Language Specification (2.4.0) and the
   upstream Kotlin source are the references. Every supported feature
   ships with corpus tests that byte-match `kotlinc`.
 - **Pack-based standard library.** The stdlib lives in a versioned
@@ -39,7 +39,7 @@ your code also runs it.
 
 ## Status
 
-Experimental, tracking Kotlin **2.3.21**. The `parity` harness
+Experimental, tracking Kotlin **2.4.0**. The `parity` harness
 runs every corpus and example program through both `kotlinc` and
 klio and diffs stdout. Coverage is broad enough to run non-trivial
 programs but klio is not a `kotlinc` replacement.
