@@ -59,3 +59,7 @@ id = "stdlib"
 [features]
 default = []
 json = { sources = ["klioMain/kotlinx/serialization/json"] }
+
+# commonTest sources for `klio test` (not packed).
+[[test]]
+root = "upstream/core/commonTest"

@@ -92,3 +92,9 @@ id = "stdlib"
 
 [[deps]]
 id = "kotlinx.serialization"
+
+# commonTest sources for `klio test` (not packed).
+[[test]]
+root = "upstream/core/common/test"
+[[test]]
+root = "upstream/core/commonKotlin/test"
