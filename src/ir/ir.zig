@@ -1809,7 +1809,6 @@ pub const Module = struct {
         "kotlin.ranges",
         "kotlin.sequences",
         "kotlin.text",
-        "kotlin.math",
     };
 
     fn isDefaultImportPackage(pkg: []const u8) bool {

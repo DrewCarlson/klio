@@ -212,7 +212,6 @@ pub const IMPLICITLY_IMPORTED_PACKAGES = [_][]const u8{
     "kotlin.ranges",
     "kotlin.sequences",
     "kotlin.text",
-    "kotlin.math",
 };
 
 /// Returns true when `package_path` is one of the implicitly imported
@@ -670,13 +669,14 @@ test "implicitly imported packages match spec list" {
         "kotlin.ranges",
         "kotlin.sequences",
         "kotlin.text",
-        "kotlin.math",
     };
     try testing.expectEqual(expected.len, IMPLICITLY_IMPORTED_PACKAGES.len);
     for (expected, IMPLICITLY_IMPORTED_PACKAGES) |a, b| {
         try testing.expectEqualStrings(a, b);
     }
-    try testing.expect(isImplicitlyImportedPackage("kotlin.math"));
+    // `kotlin.math` is NOT default-imported: `PI` / `E` need an explicit
+    // import, and a user declaration named `E` must win over `kotlin.math.E`.
+    try testing.expect(!isImplicitlyImportedPackage("kotlin.math"));
     try testing.expect(!isImplicitlyImportedPackage("kotlin.reflect"));
     try testing.expect(!isImplicitlyImportedPackage("kotlin.math.foo"));
 }
