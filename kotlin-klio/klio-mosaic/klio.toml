@@ -1,0 +1,36 @@
+# com.jakewharton.mosaic — a terminal UI toolkit built on androidx.compose.runtime.
+# Vendored at 0.3.0 (the small pre-layout-engine cut): a node tree of
+# TextNode/BoxNode emitted through `ComposeNode` into a `MosaicNodeApplier`, plus
+# a text canvas renderer. This is the node-emission (Applier) path exercised
+# end-to-end — the correctness proof for the compose-runtime node layer.
+[library]
+id = "com.jakewharton.mosaic"
+version = "0.3.0"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+# The pure rendering core, consumed straight from upstream: the node tree +
+# applier (nodes.kt), the Text/Row/Column composables + Color/TextStyle
+# (components.kt), and the text canvas + ANSI surface renderer (canvas.kt).
+# Excluded: output.kt (jansi terminal writer), mosaic.kt (the runBlocking async
+# terminal loop) — replaced by a synchronous klioMain renderer; Static.kt
+# (Flow-driven static content) — not needed for the node-emission proof.
+[[source]]
+root = "upstream/mosaic-runtime/src/main/kotlin"
+include = [
+    "com/jakewharton/mosaic/nodes.kt",
+    "com/jakewharton/mosaic/components.kt",
+    "com/jakewharton/mosaic/canvas.kt",
+]
+
+# klio-supplied layer: the JVM codepoint/Character APIs the core uses (klio's
+# stdlib is common/native-based) + a synchronous `mosaicRenderer` driver that
+# composes into the node tree and renders frames to a String.
+[[source]]
+root = "klioMain"
+
+[[deps]]
+id = "stdlib"
+[[deps]]
+id = "androidx.compose.runtime"

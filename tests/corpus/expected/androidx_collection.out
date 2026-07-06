@@ -1,0 +1,9 @@
+scatterMap: size=3 b=20 hasC=true
+scatterSet: size=3 has3=true has2=false
+objectList: size=3 [1]=y last=z
+intList: sorted=[1, 3, 4, 5, 8] sum=21 first=1
+intList: desc=[8, 5, 4, 3, 1]
+intIntMap: size=2 g10=101 g20=200
+orderedSet: size=3 order=first second third
+sparseArray: size=3 g5=five gMissing=null
+lru: size=2 a=1 bEvicted=true c=3

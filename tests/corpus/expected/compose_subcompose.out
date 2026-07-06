@@ -1,0 +1,7 @@
+initial:
+  parent: ParentRoot{Label[parent]}
+  child:  ChildRoot{Label[child=0]}
+after count=42 + recompose:
+  parent: ParentRoot{Label[parent]}
+  child:  ChildRoot{Label[child=42]}
+disposed; child children=0

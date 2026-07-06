@@ -269,6 +269,7 @@ const kotlinx_pack_dirs = [_][]const u8{
     "kotlin-klio/klio-kotlinx-io",
     "kotlin-klio/klio-androidx-collection",
     "kotlin-klio/klio-compose-runtime",
+    "kotlin-klio/klio-mosaic",
 };
 
 /// Environment variables the interpreter and runtime read per-process (via
