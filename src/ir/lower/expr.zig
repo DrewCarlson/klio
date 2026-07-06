@@ -1,8 +1,8 @@
 //! Expression lowering — the central recursive dispatch. Every sibling
-//! lower file calls back into `lowerExpr`. Faithful port of the Rust
-//! `lower/expr.rs`: literals, binary / unary primitive operations, paths,
-//! member access, calls (including the overload-resolution ladder),
-//! when / if / try as expressions, lambdas, and the remaining grammar.
+//! lower file calls back into `lowerExpr`. Covers literals, binary /
+//! unary primitive operations, paths, member access, calls (including
+//! the overload-resolution ladder), when / if / try as expressions,
+//! lambdas, and the remaining grammar.
 
 const std = @import("std");
 const ast = @import("ast");

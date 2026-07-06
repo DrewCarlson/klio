@@ -1348,10 +1348,8 @@ pub fn overrideClosureThis(self: *VmHost, v: *const Value, new_this: *const Valu
 }
 
 // -------------------------------------------------------------------------
-// Internal helpers used by the value-call paths above. These mirror the
-// `VmHost::dispatch_intrinsic` method (`vmhost.rs`) and the `lib.rs`
-// `pad_args_with_defaults` / `simple_literal` free functions; they live
-// here so the value-call logic is self-contained.
+// Internal helpers used by the value-call paths above. They live here so
+// the value-call logic is self-contained.
 // -------------------------------------------------------------------------
 
 /// Monotonic instance identity, mirroring `instance_id_counter.fetch_add(_, Relaxed) + 1`.
@@ -1396,7 +1394,7 @@ fn intrinsicHostDeinit(h: *VmIntrinsicHost) void {
     h.threads.deinit();
 }
 
-/// Invoke a Rust-native stdlib intrinsic, mapping its `RuntimeError`
+/// Invoke a native stdlib intrinsic, mapping its `RuntimeError`
 /// control-flow signals back into the IR evaluator's `EvalError`.
 fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(self.allocator, "intrinsic_call_value", fqn, null, null, args);

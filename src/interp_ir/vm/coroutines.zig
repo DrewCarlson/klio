@@ -29,8 +29,7 @@ const TimeMode = root.TimeMode;
 const INDEFINITE: i64 = std.math.maxInt(i64);
 
 /// Raw monotonic clock reading in nanoseconds. Backs the `Wall`-mode
-/// origin and elapsed-since-origin reading (the Rust
-/// `std::time::Instant`).
+/// origin and elapsed-since-origin reading.
 fn monotonicNanos() i128 {
     return runtime.clockMonotonicNanos();
 }
@@ -49,8 +48,7 @@ fn sleepMillis(millis: u64) void {
 /// worker is still outstanding.
 ///
 /// Shared by `ObjRef` handle (atomic strong count) so it is safe to
-/// hold from a worker thread while the driver also holds it; this is
-/// the Rust `Arc<DriverWakeup>`.
+/// hold from a worker thread while the driver also holds it.
 pub const DriverWakeup = struct {
     mailbox: SpinMutex = .{},
     mailbox_entries: std.ArrayList(MailboxEntry) = .empty,
@@ -1095,10 +1093,8 @@ pub const CooperativeInterceptor = struct {
 // `runBlocking`). Drives Layer-1 activations: it never inspects the
 // suspend mechanism, only parks / resumes through the interceptor seam.
 //
-// The Rust crate keeps this loop in `vm/intrinsic_host.rs` with the
-// `CooperativeInterceptor` stack, active-scope stack, and persisted-park
-// table living in `lib.rs`'s thread-locals. The Zig port co-locates the
-// whole driver with its machinery here.
+// The loop, its `CooperativeInterceptor` stack, active-scope stack, and
+// persisted-park table are all co-located here.
 // -------------------------------------------------------------------------
 
 const vmhost = @import("vmhost.zig");
@@ -1110,7 +1106,7 @@ const RuntimeEvalResult = runtime.EvalResult;
 const EvalError = ir.eval.EvalError;
 
 /// This thread's coroutine interceptor stack — one entry per nested
-/// `runBlocking` / driven root (`with_coro` over the Rust `EXEC.coro`).
+/// `runBlocking` / driven root.
 /// Backed by the page allocator: the stack itself is thread-lifetime and
 /// holds at most a handful of entries; each interceptor's own maps use
 /// the run allocator passed to `CooperativeInterceptor.new`.
@@ -1118,8 +1114,8 @@ threadlocal var coro_stack: std.ArrayList(CooperativeInterceptor) = .empty;
 
 /// Stack of the active coroutine's `CoroutineScope` value (the driven
 /// root scope). The suspend-implicit `coroutineContext` read redirects to
-/// the active scope's context via this stack (the Rust
-/// `ACTIVE_CORO_SCOPE`). Page-allocator backed for the same reason.
+/// the active scope's context via this stack. Page-allocator backed for
+/// the same reason.
 threadlocal var active_scope_stack: std.ArrayList(Value) = .empty;
 
 fn coroStackAllocator() Allocator {
@@ -1259,9 +1255,9 @@ fn coroPop() ?ObjRef(DriverWakeup) {
     return wakeup;
 }
 
-/// The active coroutine scope (top of the driver stack), if any. Mirrors
-/// the Rust `active_coro_scope`. Public so the field-read path
-/// (`coroutineContext` redirect) can consult the real stack.
+/// The active coroutine scope (top of the driver stack), if any. Public
+/// so the field-read path (`coroutineContext` redirect) can consult the
+/// real stack.
 pub fn activeCoroScope() ?Value {
     if (active_scope_stack.items.len == 0) return null;
     return active_scope_stack.items[active_scope_stack.items.len - 1];
@@ -1301,8 +1297,7 @@ fn restoreScopeDelta(delta: []const Value) void {
 
 /// RAII-style scope guard: pushes the driven coroutine's scope for the
 /// lifetime of a `driveRoot` activation so the `coroutineContext`
-/// intrinsic resolves to it. Only `Instance` scopes are pushed, matching
-/// the Rust `ActiveScopeGuard::enter`.
+/// intrinsic resolves to it. Only `Instance` scopes are pushed.
 const ActiveScopeGuard = struct {
     pushed: bool,
 
@@ -1321,9 +1316,8 @@ const ActiveScopeGuard = struct {
     }
 };
 
-/// Map an `EvalError` onto the runtime's `RuntimeError`, mirroring the
-/// Rust `map_err` closure in `drive_root` (`Throw -> Thrown`,
-/// `NonLocalReturn -> Return`, every other variant rendered as `Type`).
+/// Map an `EvalError` onto the runtime's `RuntimeError`: `Throw -> Thrown`,
+/// `NonLocalReturn -> Return`, every other variant rendered as `Type`.
 fn mapDriverErr(allocator: Allocator, e: EvalError) RuntimeError {
     return switch (e) {
         .Throw => |v| .{ .Thrown = v },

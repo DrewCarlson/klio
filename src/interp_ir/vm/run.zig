@@ -106,8 +106,7 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
 
         // Move every dispatch-time side table into the program image. Each
         // map is swapped with a fresh empty so the `BuiltModule`'s own
-        // `deinit` is a no-op for the moved table (matching Rust's
-        // by-value move in `from_built`).
+        // `deinit` is a no-op for the moved table.
         prog.body_prop_inits.deinit();
         prog.body_prop_inits = built.body_prop_inits;
         built.body_prop_inits = build.PairFuncMap.init(allocator);
@@ -640,9 +639,9 @@ pub fn vmRunCalls(
     return prep;
 }
 
-/// Join every outstanding spawned/dispatched worker thread, mirroring the
-/// join-all loop at the end of Rust's `Vm::run`. If `main` succeeded but a
-/// child threw, the child's error is surfaced; if `main` already failed,
+/// Join every outstanding spawned/dispatched worker thread, called at the
+/// end of `vmRunInner`. If `main` succeeded but a child threw, the
+/// child's error is surfaced; if `main` already failed,
 /// child errors are swallowed (the original failure wins).
 ///
 /// After the last worker has joined this is the only run-boundary seam that
@@ -724,8 +723,7 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     return out;
 }
 
-/// Render a child thread's `RuntimeError` into a `VmError.Eval` message,
-/// mirroring Rust's `VmError::Eval(format!("{e}"))`.
+/// Render a child thread's `RuntimeError` into a `VmError.Eval` message.
 fn vmEvalMessage(allocator: Allocator, e: RuntimeError) []const u8 {
     return switch (e) {
         .Unbound => |s| s,
@@ -738,8 +736,7 @@ fn vmEvalMessage(allocator: Allocator, e: RuntimeError) []const u8 {
     };
 }
 
-/// Format an `EvalError` into a `VmError`, mirroring the Rust
-/// `From<EvalError> for VmError` conversion (a thrown exception renders
+/// Format an `EvalError` into a `VmError` (a thrown exception renders
 /// its fqn + message).
 fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
     switch (e) {

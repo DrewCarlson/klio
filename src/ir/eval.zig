@@ -4830,7 +4830,7 @@ fn compoundAssignMethod(op: BinOp) ?[]const u8 {
 }
 
 /// Render a value into an owned string the way Kotlin's `toString` /
-/// string templates do. Mirrors the Rust `render_value`.
+/// string templates do.
 fn renderValue(allocator: Allocator, v: *const Value) Allocator.Error![]const u8 {
     return switch (v.*) {
         .Unit => allocator.dupe(u8, "kotlin.Unit"),
@@ -5329,8 +5329,7 @@ fn widenFloat(v: *const Value) Value {
     };
 }
 
-/// Rust `wrapping_div`: truncating integer division with `MIN / -1`
-/// wrapping to `MIN`.
+/// Truncating integer division with `MIN / -1` wrapping to `MIN`.
 fn divTruncI64(a: i64, b: i64) i64 {
     if (a == std.math.minInt(i64) and b == -1) return std.math.minInt(i64);
     return @divTrunc(a, b);
@@ -5375,9 +5374,8 @@ pub const ReceiverShape = struct { n_params: usize, first_is_this: bool };
 /// default host for the bare `eval` entry. A concrete second host type
 /// alongside the interpreter's `VmHost`: every method is the trait-default
 /// the old vtable returned when a slot was `null`
-/// (`Unsupported`/`null`/`false`/empty), so all dispatch paths behave
-/// exactly like Rust's `NullHost`. The evaluator is generic over the host
-/// type and calls these as plain comptime-duck-typed methods.
+/// (`Unsupported`/`null`/`false`/empty). The evaluator is generic over the
+/// host type and calls these as plain comptime-duck-typed methods.
 pub const NullHost = struct {
     pub fn callValue(self: *NullHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
         _ = .{ self, allocator, callee, args };
@@ -5686,10 +5684,6 @@ pub const NullHost = struct {
 pub fn nullHost() NullHost {
     return .{};
 }
-
-// -------------------------------------------------------------------------
-// Tests (mirrors the Rust crate's `eval.rs` `mod tests`)
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 const FuncBuilder = ir.build.FuncBuilder;

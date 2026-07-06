@@ -3,8 +3,8 @@
 //! properties, and the inner-class outer-chain fallbacks.
 //!
 //! Free functions over `*VmHost`, aliased as `VmHost` methods by
-//! `vmhost.zig` and invoked directly by the generic IR evaluator. Mirrors the ordered field-resolution dispatch chain
-//! of `host_fields.rs` (get/set/member-ref).
+//! `vmhost.zig` and invoked directly by the generic IR evaluator.
+//! Implements the ordered field-resolution dispatch chain (get/set/member-ref).
 
 const std = @import("std");
 
@@ -52,11 +52,10 @@ inline fn errRes(e: EvalError) EvalResult {
 // -------------------------------------------------------------------------
 // Thread-local resolution guards.
 //
-// Mirror the crate-private thread-locals `host_fields.rs` and `lib.rs`
-// use to bound the heuristic field-resolution recursion and to expose
-// the suspend-implicit coroutine scope / displaced enclosing `this`.
-// They are empty/false until the coroutine driver and the access-
-// enclosing machinery push onto them, matching Rust's default state.
+// Bound the heuristic field-resolution recursion and expose the
+// suspend-implicit coroutine scope / displaced enclosing `this`. They
+// are empty/false until the coroutine driver and the access-enclosing
+// machinery push onto them, matching the default state at process start.
 // -------------------------------------------------------------------------
 
 /// `(instance id, field name)` pairs currently being resolved through
@@ -99,7 +98,7 @@ fn outerThisLast(self: *VmHost) ?Value {
 /// Run `f` only if `(id, name)` is not already being resolved through
 /// the `get_field` heuristic fallbacks; pushes/pops the pair so the
 /// recursion is bounded by the distinct instances on the stack. Returns
-/// `null` (Rust `None`) when the pair is already active.
+/// `null` when the pair is already active.
 fn withFieldResolvePair(
     self: *VmHost,
     allocator: Allocator,
@@ -128,10 +127,6 @@ fn withFieldResolvePair(
     }
     return r;
 }
-
-// -------------------------------------------------------------------------
-// Small helpers shared with the Rust source's inline closures.
-// -------------------------------------------------------------------------
 
 /// Last `.`-delimited segment of a dotted name (`a.b.c` -> `c`).
 fn lastSegment(s: []const u8) []const u8 {
@@ -2921,9 +2916,9 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
 // Small shared helpers.
 // -------------------------------------------------------------------------
 
-/// Anon-method registry key `"<class>\u{1f}<method>"`. The Zig anon
-/// registry is keyed on a single string; mirror the Rust `(class, name)`
-/// tuple via a unit-separated concatenation cached per-call.
+/// Anon-method registry key `"<class>\u{1f}<method>"`. The registry is
+/// keyed on a single string, built as a unit-separated concatenation of
+/// `(class, name)` cached per-call.
 threadlocal var anon_key_buf: [512]u8 = undefined;
 fn anonKey(class_name: []const u8, method: []const u8) []const u8 {
     return std.fmt.bufPrint(&anon_key_buf, "{s}\u{1f}{s}", .{ class_name, method }) catch class_name;
@@ -3034,9 +3029,8 @@ fn collectionLen(receiver: *const Value) ?i64 {
 // -------------------------------------------------------------------------
 // Tests
 //
-// `host_fields.rs` carries no `#[test]` blocks; these exercise the
-// faithful behaviors of the ported dispatch chain that do not require a
-// fully wired Vm (the foundation's stubbed siblings).
+// These exercise dispatch-chain behaviors that do not require a fully
+// wired Vm (the foundation's stubbed siblings).
 // -------------------------------------------------------------------------
 
 const testing = std.testing;

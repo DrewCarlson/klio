@@ -1289,11 +1289,10 @@ pub fn isLowPriorityOverload(f: *const ast.Function) bool {
     return false;
 }
 
-/// Mirror of the Rust `format!("{e:?}").contains("ERROR")` probe used to
-/// detect `@Deprecated(level = DeprecationLevel.ERROR)`, extended to
-/// `DeprecationLevel.HIDDEN` (not a source-level candidate either): walk
-/// the argument expression looking for an identifier / string literal
-/// that contains either level name.
+/// Probe used to detect `@Deprecated(level = DeprecationLevel.ERROR)`,
+/// extended to `DeprecationLevel.HIDDEN` (not a source-level candidate
+/// either): walk the argument expression looking for an identifier /
+/// string literal that contains either level name.
 fn exprMentionsErrorOrHidden(e: *const ast.Expr) bool {
     switch (e.*) {
         .Path => |p| {
@@ -1328,7 +1327,7 @@ fn exprMentionsErrorOrHidden(e: *const ast.Expr) bool {
 }
 
 /// Push `(name, id)` into the parallel `func_name_index` keyed by simple
-/// name, mirroring Rust's `func_name_index.entry(nm).or_default().push(id)`.
+/// name.
 fn funcNameIndexPush(module: *Module, name: []const u8, id: FuncId) Allocator.Error!void {
     const a = module.registry.allocator;
     const gop = try module.func_name_index.getOrPut(name);

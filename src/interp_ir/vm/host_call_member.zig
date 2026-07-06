@@ -47,9 +47,8 @@ const EvalResult = ir.eval.EvalResult;
 const EvalError = ir.eval.EvalError;
 
 // -------------------------------------------------------------------------
-// Thread-local resolution state. In Rust these live as file-spanning
-// thread-locals in `lib.rs`/`host_globals.rs`; the slices of that state
-// member-dispatch reads/writes are kept here.
+// Thread-local resolution state kept here for the member-dispatch
+// fallbacks below.
 // -------------------------------------------------------------------------
 
 /// Guards `materializeUserMap` re-entry while the Map fallback runs.
@@ -325,9 +324,8 @@ fn mapRuntimeError(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalEr
 }
 
 // -------------------------------------------------------------------------
-// Pure helpers ported from `lib.rs` (their Rust home is the crate root;
-// they are pure functions over `Value` / `Module` and live here so the
-// member-dispatch file is self-contained).
+// Pure helpers: pure functions over `Value` / `Module` that live here so
+// the member-dispatch file is self-contained.
 // -------------------------------------------------------------------------
 
 fn isCallable(v: *const Value) bool {
@@ -729,7 +727,7 @@ fn rangeElem(cur: i64, kind: RangeKind) Value {
 }
 
 // -------------------------------------------------------------------------
-// Self-contained `VmHost` helpers (their Rust home is this file).
+// Self-contained `VmHost` helpers.
 // -------------------------------------------------------------------------
 
 /// Default-arg thunk slots for `method` as declared on a supertype of the
@@ -1787,7 +1785,7 @@ pub fn popOuterThis() void {
 }
 
 // -------------------------------------------------------------------------
-// Overload scoring + method/extension selection (ported from `vmhost.rs`).
+// Overload scoring + method/extension selection.
 // -------------------------------------------------------------------------
 
 /// Score an arg/param compatibility for overload resolution. Higher is

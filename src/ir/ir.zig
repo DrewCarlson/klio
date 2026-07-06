@@ -1277,7 +1277,7 @@ pub const Module = struct {
         return out__;
     }
 
-    /// Mirrors Rust's `#[derive(Default)]` constructor.
+    /// Default-valued constructor.
     pub fn default(allocator: Allocator) Module {
         return Module.init(allocator);
     }
@@ -3089,8 +3089,7 @@ pub const Module = struct {
     /// String consts are *owned* by the pool: the byte slice is duped
     /// into `allocator` (the module's long-lived allocator) so callers
     /// may free their temporary name/text buffer after interning.
-    /// `Module.deinit` frees these copies, matching how Rust's
-    /// `Const::String(String)` owns and drops its data.
+    /// `Module.deinit` frees these copies.
     pub fn internConst(self: *Module, allocator: Allocator, c: Const) Allocator.Error!ConstId {
         for (self.consts.items, 0..) |k, i| {
             if (Const.eql(k, c)) return ConstId.from(@intCast(i));
@@ -3202,7 +3201,7 @@ fn pkgHeadIs(pkg: []const u8, head: []const u8) bool {
 }
 
 /// Index into a slice by a `u32` id, returning a pointer or `null`
-/// when out of range. Mirrors Rust's `slice.get(idx)`.
+/// when out of range.
 fn idGet(comptime T: type, items: []const T, idx: u32) ?*const T {
     if (idx >= items.len) return null;
     return &items[idx];
@@ -3684,10 +3683,6 @@ pub const Const = union(enum) {
         };
     }
 };
-
-// -------------------------------------------------------------------------
-// Tests (mirrors the Rust crate's `lib.rs` `mod tests`)
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 

@@ -5,13 +5,12 @@
 //!
 //! Free functions over `*VmHost`, aliased as `VmHost` methods by
 //! `vmhost.zig` and invoked directly by the generic IR evaluator.
-//! The name-resolution probe chain in `lookupGlobal`
-//! mirrors the Rust `lookup_global`: cached global, first-access
-//! `object` init, top-level-property init, delegate auto-resolve, user
-//! class/function, stdlib FQN probes, the loaded-pack overlay, the
-//! synthetic `Thread`/`Delegates` surfaces, primitive type names and
-//! their companion constants, package-qualified bare refs, and
-//! typealias follow.
+//! The name-resolution probe chain in `lookupGlobal` runs: cached
+//! global, first-access `object` init, top-level-property init,
+//! delegate auto-resolve, user class/function, stdlib FQN probes, the
+//! loaded-pack overlay, the synthetic `Thread`/`Delegates` surfaces,
+//! primitive type names and their companion constants, package-qualified
+//! bare refs, and typealias follow.
 
 const std = @import("std");
 
@@ -493,9 +492,8 @@ fn markObjectFailed(self: *VmHost, name: []const u8) void {
 }
 
 // -------------------------------------------------------------------------
-// Intrinsic resolution / dispatch. The Rust equivalents live on `VmHost`
-// in `vmhost.rs`; the resolution chain in `lookupGlobal` calls them, so
-// they are kept here as file-local helpers over `*VmHost`.
+// Intrinsic resolution / dispatch. The resolution chain in `lookupGlobal`
+// calls them, so they are kept here as file-local helpers over `*VmHost`.
 // -------------------------------------------------------------------------
 
 /// Look up an intrinsic by FQN. Probes the pack-supplied
@@ -579,8 +577,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
     };
 }
 
-/// Render a non-control-flow `RuntimeError` to the message text the Rust
-/// `format!("{other}")` conversion produces.
+/// Render a non-control-flow `RuntimeError` to its message text.
 fn runtimeErrorMessage(allocator: Allocator, e: RuntimeError) []const u8 {
     return switch (e) {
         .Unbound => |s| s,

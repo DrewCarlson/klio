@@ -1538,7 +1538,7 @@ fn cloneStringSet(allocator: Allocator, src: *const StringSet) Allocator.Error!S
 }
 
 // -------------------------------------------------------------------------
-// TypeRef builder constructors (mirrors the Rust `impl TypeRef`).
+// TypeRef builder constructors.
 // -------------------------------------------------------------------------
 
 pub fn typeUnit() TypeRef {

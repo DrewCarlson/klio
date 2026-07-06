@@ -891,7 +891,7 @@ pub const ObjectStates = ObjRef(std.StringHashMap(ObjectInitState));
 /// reads resolve through. Publication order: id table first, then names.
 pub const SingletonsById = ObjRef(std.AutoHashMap(u32, runtime.Value));
 
-/// Vm-level errors. Carried as data, mirroring Rust's `VmError`.
+/// Vm-level errors, carried as data.
 pub const VmError = union(enum) {
     /// main function not found in module
     InvalidMain,
@@ -1017,10 +1017,6 @@ pub const SendableVmSeed = struct {
         };
     }
 };
-
-// -------------------------------------------------------------------------
-// Free helpers ported from lib.rs
-// -------------------------------------------------------------------------
 
 /// Whether `name` names a property (not a function) reachable on
 /// `receiver`'s class. Walks the parent chain and declared supertypes.
@@ -1227,10 +1223,6 @@ pub fn isCancellationException(v: *const Value) bool {
         else => return false,
     }
 }
-
-// -------------------------------------------------------------------------
-// Tests (mirror the Rust crate's lib.rs `mod tests`)
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 

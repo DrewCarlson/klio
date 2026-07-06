@@ -99,7 +99,7 @@ fn funcDefaults(self: *VmHost, func: FuncId) ?[]?FuncId {
 }
 
 // -------------------------------------------------------------------------
-// Vararg packing (mirrors `pack_vararg_args` in lib.rs).
+// Vararg packing.
 // -------------------------------------------------------------------------
 
 /// Collapse the trailing positional args of a vararg call into a single
@@ -130,8 +130,7 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
 }
 
 // -------------------------------------------------------------------------
-// Intrinsic resolution + dispatch (mirror `lookup_intrinsic` /
-// `dispatch_intrinsic` in vmhost.rs).
+// Intrinsic resolution + dispatch.
 // -------------------------------------------------------------------------
 
 /// Look up an intrinsic by FQN. Probes the pack-supplied
@@ -469,8 +468,7 @@ fn linkAuditOn() bool {
 }
 
 // -------------------------------------------------------------------------
-// Overload scoring + selection (mirror `overload_score_arg`,
-// `overload_score`, `pick_overload` in vmhost.rs).
+// Overload scoring + selection.
 // -------------------------------------------------------------------------
 
 fn simpleName(name: []const u8) []const u8 {

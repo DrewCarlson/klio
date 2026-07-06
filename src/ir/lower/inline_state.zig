@@ -3,10 +3,9 @@
 //! Kept apart from the main lowering module because they are pure state
 //! primitives — no `FuncBuilder` or IR-side dependency.
 //!
-//! Rust modelled these as `thread_local!` cells set by the build driver
-//! before body lowering; the port keeps the same single-build-at-a-time
-//! contract with module-level state. The driver installs the tables once
-//! per build, then lowers bodies serially.
+//! These use module-level state under a single-build-at-a-time contract:
+//! the driver installs the tables once per build, then lowers bodies
+//! serially.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -346,10 +345,9 @@ pub fn inlineFnAstForRecvExt(
     return pickByShapeNarrowed(cands, call, recv_ty, require_receiver, multi_recv);
 }
 
-/// Predicate mirroring the Rust narrowing filter: drop top-level
-/// overloads for a member call, and (when overloads differ by receiver
-/// and the call's receiver type is known) keep only matching-receiver
-/// overloads.
+/// Narrowing filter predicate: drop top-level overloads for a member
+/// call, and (when overloads differ by receiver and the call's receiver
+/// type is known) keep only matching-receiver overloads.
 fn keepNarrowed(
     f: *const ast.Function,
     recv_ty: ?[]const u8,

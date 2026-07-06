@@ -902,7 +902,7 @@ fn buildModuleWithOverrides(
     const module_ref = if (seed) |*s| s.module else try ObjRef(Module).init(allocator, Module.default(allocator));
     // The ObjRef holds the only handle during the build and nothing else
     // borrows it, so a raw pointer into the cell is a stable `*Module` for
-    // the lowering driver (mirrors Rust owning `module` then `Arc::new`).
+    // the lowering driver.
     const module: *Module = &module_ref.cell.data;
     const a = module.registry.allocator;
     const base_funcs_len = module.funcs.items.len;
@@ -3188,7 +3188,7 @@ fn slotsEql(x: []const ?FuncId, y: []const ?FuncId) bool {
 }
 
 /// Decide whether a declaration survives the `expect`/stub-drop retain
-/// pass. Mirrors the Rust `all_decls.retain(...)` closure.
+/// pass.
 fn retainDecl(
     a: Allocator,
     d: *const Decl,
