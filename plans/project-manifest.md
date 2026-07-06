@@ -125,7 +125,10 @@ not hiding them, is the point.)
   as pre-installed).
 - [x] Test-runner correctness — collect a class's tests from its own decl (not
   a same-named class in another package); "no tests found" for empty runs.
-- [ ] Phase 2 — runner ergonomics: `--filter`, `--isolate` (opt-in), json.
+- [~] Phase 2 — runner ergonomics: `--filter` DONE (class + method name
+  substring, retires the sweep's filter); feature selection DONE (`--all` /
+  `--feature X`, default = all feature modules). Remaining: `--isolate`
+  (opt-in debug), `--format=json`.
 - [ ] Phase 3 — migrate harness + packs; retire the sweep.
 - [ ] Phase 4 — grind each pack's commonTest to 100%. Real bugs surfaced by
   composed runs to fix (NOT worked around): the io/serialization stack-overflow
