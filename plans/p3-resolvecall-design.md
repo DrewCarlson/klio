@@ -1,6 +1,6 @@
 # P3 — `Module.resolveCall`: the single index-primary, type-aware, 3-tier bare-call resolver
 
-Target-architecture item 3 (`docs/resolution-unification-plan.md:238-245`). One resolver
+Target-architecture item 3 (`plans/resolution-unification-plan.md:238-245`). One resolver
 that tiers candidates by Kotlin scope, ranks the best non-empty tier with the shared
 `applicability.applicable()` (P2, already live at runtime — `host_call_member.zig:2170`),
 and returns a `Resolution{ target, confidence, candidate_set, emit_form }`. It consolidates

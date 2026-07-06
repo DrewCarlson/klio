@@ -1,6 +1,9 @@
 # KLIO Rust → Zig migration plan
 
-Living document. Tracks the per-crate port from `crates/*` (Rust) to `src/*` (Zig).
+COMPLETE. Every crate below is ported, the Rust tree is deleted, and the
+interpreter is pure Zig. This is the historical record of the per-crate port
+from `crates/*` (Rust) to `src/*` (Zig); modules added after the port
+(`jit`, `applicability`, `compose_runtime`, `test_runner`) are not listed.
 
 ## Status legend
 - ⬜ not started · 🟡 in progress · 🟦 ported (compiles) · ✅ ported + tests green · ⬛ removed (Rust deleted)
