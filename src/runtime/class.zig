@@ -681,7 +681,7 @@ const testing = std.testing;
 /// A `ClassDef` wrapped in an `ObjRef` plus the inner cells it owns, so a
 /// test can tear everything down with `deinit`. The owned `methods` and
 /// `body_properties` slices are kept here for the same reason — `ClassDef`
-/// has no destructor, mirroring the Rust arena-owned layout.
+/// has no destructor; it is arena-owned.
 const ClassFixture = struct {
     handle: ObjRef(ClassDef),
     env: ObjRef(Env),

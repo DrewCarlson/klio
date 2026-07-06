@@ -391,7 +391,7 @@ fn gcFinalizeData(comptime U: type, data: *U, a: std.mem.Allocator) void {
 }
 
 /// Error returned by `ObjRef.tryBorrowMut` when the cell is already
-/// borrowed (mirrors Rust's `BorrowMutError` / `std::cell::BorrowMutError`).
+/// borrowed.
 pub const BorrowMutError = error{AlreadyBorrowed};
 
 /// Handle to a shared, interior-mutable Kotlin heap object.
@@ -400,7 +400,7 @@ pub const BorrowMutError = error{AlreadyBorrowed};
 /// the backing control block when it reaches zero. The handle itself is
 /// a plain pointer-sized value; copying the struct without going through
 /// `clone` does NOT bump the count, so copy only when you also `deinit`
-/// exactly once per logical owner (the Rust `Clone`/`Drop` discipline).
+/// exactly once per logical owner.
 pub fn ObjRef(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -479,15 +479,14 @@ pub fn ObjRef(comptime T: type) type {
         }
 
         /// Increment the strong count and return another handle to the
-        /// same cell (Rust's `Clone for ObjRef` / `Arc::clone`).
+        /// same cell.
         pub fn clone(self: Self) Self {
             _ = self.cell.refcount.fetchAdd(1, .monotonic);
             return .{ .cell = self.cell };
         }
 
         /// Drop one handle: decrement the strong count and, when it hits
-        /// zero, run `T.deinit` if present and free the control block
-        /// (Rust's `Drop for Arc`).
+        /// zero, run `T.deinit` if present and free the control block.
         ///
         /// Under the arena fast path (`reclaimEnabled() == false`) this
         /// returns immediately without the atomic decrement, the payload

@@ -1,8 +1,7 @@
 //! Top-level file parsing: package header, imports, top-level
 //! declarations, modifier/annotation scanning, and `typealias`.
 //!
-//! Ported from `parse/file.rs`. The Rust inherent `impl` methods become
-//! free functions over `*Parser`; the entry point is `file.parseFile(p)`.
+//! Free functions over `*Parser`; the entry point is `file.parseFile(p)`.
 
 const std = @import("std");
 
@@ -50,7 +49,7 @@ fn atKeyword(p: *const Parser, want: Keyword) bool {
 }
 
 /// The kind of the token at offset `off` from the cursor, or `null` when
-/// out of range. Mirrors Rust's `self.tokens.get(self.pos + off)`.
+/// out of range.
 fn kindAt(p: *const Parser, off: usize) ?TokenKind {
     const idx = p.pos + off;
     if (idx >= p.tokens.len) return null;
@@ -65,8 +64,7 @@ fn prevSpan(p: *const Parser) Span {
 }
 
 /// Parse the whole compilation unit. Diagnostics accumulate on
-/// `p.diagnostics`. Mirrors the Rust `parse_file`, which consumed `self`
-/// and returned `(KotlinFile, DiagnosticSink)`.
+/// `p.diagnostics`.
 pub fn parseFile(p: *Parser) KotlinFile {
     support.skipNl(p);
     const start = support.currentSpan(p);

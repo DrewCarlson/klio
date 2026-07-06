@@ -2,8 +2,7 @@
 //! `while`/`do-while`, `try`/`catch`/`finally`, `throw`, `return`,
 //! `break`, `continue`, labels, and lambda literals.
 //!
-//! Ported from `parse/control.rs`. The Rust inherent `impl` methods become
-//! free functions over `*Parser`.
+//! Free functions over `*Parser`.
 
 const std = @import("std");
 
@@ -30,10 +29,10 @@ const TypeRef = ast.TypeRef;
 const Annotation = ast.Annotation;
 const Span = span.Span;
 
-// Cross-module parse entry points live in sibling files that are ported
-// independently. Until each sibling exposes its public function the calls
-// below resolve to local no-op fallbacks, keeping the module compiling; once
-// the sibling lands the real implementation is used automatically.
+// Cross-module parse entry points live in sibling files. Until each sibling
+// exposes its public function the calls below resolve to local no-op
+// fallbacks, keeping the module compiling; once the sibling lands the real
+// implementation is used automatically.
 
 fn parseExpr(p: *Parser) ?Expr {
     if (@hasDecl(root.expr, "parseExpr")) return root.expr.parseExpr(p);
@@ -80,7 +79,7 @@ fn parseAnnotations(p: *Parser) []Annotation {
 
 // Heap helpers --------------------------------------------------------------
 
-/// Allocate a single `Expr` on the parser arena (`Box::new` in Rust).
+/// Allocate a single `Expr` on the parser arena.
 fn box(p: *Parser, e: Expr) *Expr {
     const ptr = p.allocator.create(Expr) catch @panic("OOM in parser");
     ptr.* = e;

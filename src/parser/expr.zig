@@ -1,7 +1,7 @@
 //! Pratt expression parser (precedence climbing) and operator handling.
 //!
-//! Ported from `parse/expr.rs`. Free functions over `*Parser`; the entry
-//! point is `expr.parseExpr(p)`, returning `?Expr` (Rust `Option<Expr>`).
+//! Free functions over `*Parser`; the entry point is `expr.parseExpr(p)`,
+//! returning `?Expr`.
 
 const std = @import("std");
 
@@ -28,7 +28,7 @@ const Keyword = lexer.Keyword;
 const TokenKind = lexer.TokenKind;
 const Span = span.Span;
 
-/// Box an expression onto the parser arena, matching Rust's `Box::new`.
+/// Box an expression onto the parser arena.
 fn boxExpr(p: *Parser, e: Expr) *Expr {
     const ptr = p.allocator.create(Expr) catch @panic("OOM boxing expr");
     ptr.* = e;
@@ -88,7 +88,7 @@ fn skipAnnotationTokens(p: *const Parser, i: usize) usize {
     return j;
 }
 
-// ---- cross-module helpers (resolved against sibling modules once ported) ----
+// ---- cross-module helpers (resolved against sibling modules once filled in) ----
 //
 // These functions live in sibling parse files (`types`, `file`, `control`,
 // `primary`). Until those modules are filled they are gated through

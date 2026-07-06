@@ -1,8 +1,7 @@
 //! Class / interface / object / enum declaration parsing, including
 //! supertype lists, primary-constructor params, and class bodies.
 //!
-//! Ported from `parse/class.rs`. The Rust inherent `impl` methods become
-//! free functions over `*Parser`.
+//! Free functions over `*Parser`.
 
 const std = @import("std");
 

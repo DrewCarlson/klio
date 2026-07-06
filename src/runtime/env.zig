@@ -1,7 +1,7 @@
 //! Lexical environment: a scope of named bindings with a parent chain.
 //!
-//! `Env` is shared and interior-mutable in the runtime (the Rust type is
-//! reached through `ObjRef<Env>`), so the parent link is `?ObjRef(Env)`.
+//! `Env` is shared and interior-mutable in the runtime, so the parent
+//! link is `?ObjRef(Env)`.
 
 const std = @import("std");
 const objcell = @import("objcell.zig");

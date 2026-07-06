@@ -2,7 +2,7 @@
 //! expressions, lambdas, string templates, `this`/`super`, callable and
 //! member references, object/anonymous-function expressions.
 //!
-//! Ported from `parse/primary.rs`. Free functions over `*Parser`.
+//! Free functions over `*Parser`.
 
 const std = @import("std");
 
@@ -380,8 +380,7 @@ pub fn parseStringTemplate(p: *Parser) ?Expr {
 
 // ---------- small text helpers ----------
 
-/// Trim every trailing character that appears in `chars` (Rust
-/// `trim_end_matches(['L', 'u', 'U'])`).
+/// Trim every trailing character that appears in `chars`.
 fn trimEndAny(s: []const u8, chars: []const u8) []const u8 {
     var end = s.len;
     while (end > 0 and std.mem.indexOfScalar(u8, chars, s[end - 1]) != null) {
@@ -390,8 +389,7 @@ fn trimEndAny(s: []const u8, chars: []const u8) []const u8 {
     return s[0..end];
 }
 
-/// Strip a single leading `prefix` if present (Rust `trim_start_matches`
-/// on a fixed two-char prefix, which matches at most once here).
+/// Strip a single leading `prefix` if present; matches at most once here.
 fn trimStartPrefix(s: []const u8, prefix: []const u8) []const u8 {
     if (std.mem.startsWith(u8, s, prefix)) {
         return s[prefix.len..];
@@ -426,10 +424,8 @@ fn filterOutChars(p: *Parser, s: []const u8, drop: []const u8) []const u8 {
 }
 
 /// Parse `s` as a signed 64-bit integer in `radix`, returning `null` on
-/// overflow / invalid digits (Rust `i64::from_str_radix(...).unwrap_or_else`).
-/// Mirrors the Rust path where the digit text is unsigned but stored as
-/// `i64`: values up to `u64::MAX` that overflow `i64` are rejected, same as
-/// `from_str_radix` for a target without the magnitude.
+/// overflow or invalid digits. The digit text is unsigned but stored as
+/// `i64`: values up to `u64::MAX` that overflow `i64` are rejected.
 fn parseI64Radix(s: []const u8, radix: u8) ?i64 {
     return std.fmt.parseInt(i64, s, radix) catch null;
 }

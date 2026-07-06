@@ -22,11 +22,10 @@
 //! brackets they are skipped freely; at statement positions they terminate
 //! a statement.
 //!
-//! The Rust crate spread the recursive-descent methods across `parse/*.rs`
-//! inherent `impl` blocks. Here they live in sibling files as free
-//! functions over `*Parser` (e.g. `expr.parseExpr(p)`, `file.parseFile(p)`).
-//! This root file owns the `Parser` struct, the modifier-flag helpers, the
-//! top-level entry point, and the crate-level tests.
+//! The recursive-descent methods live in sibling files as free functions
+//! over `*Parser` (e.g. `expr.parseExpr(p)`, `file.parseFile(p)`). This
+//! root file owns the `Parser` struct, the modifier-flag helpers, the
+//! top-level entry point, and the module-level tests.
 
 const std = @import("std");
 
@@ -149,8 +148,7 @@ pub const Parser = struct {
     }
 
     /// Parse the whole compilation unit. The diagnostics produced are left
-    /// on `self.diagnostics`; the Rust signature returned them as the second
-    /// tuple element.
+    /// on `self.diagnostics`.
     pub fn parseFile(self: *Parser) KotlinFile {
         return file.parseFile(self);
     }
@@ -244,7 +242,7 @@ pub fn isTrailingLambdaCallable(e: *const Expr) bool {
 }
 
 // -------------------------------------------------------------------------
-// Tests (mirrors the Rust crate's `lib.rs` `mod tests`)
+// Tests
 // -------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -252,7 +250,7 @@ const testing = std.testing;
 /// True while the sibling parse modules are still stubs. Full-pipeline
 /// tests (which drive the whole recursive-descent grammar) are skipped
 /// until the fill agents complete the siblings; flip this to `false` once
-/// they do and the lib.rs-derived tests below run for real.
+/// they do and the tests below run for real.
 const siblings_stubbed = false;
 
 const ParseOut = struct {

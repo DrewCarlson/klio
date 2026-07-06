@@ -1,7 +1,7 @@
 //! Statement and block parsing: local declarations, assignments,
 //! destructuring declarations, and statement-separator handling.
 //!
-//! Ported from `parse/stmt.rs`. Free functions over `*Parser`.
+//! Free functions over `*Parser`.
 
 const std = @import("std");
 

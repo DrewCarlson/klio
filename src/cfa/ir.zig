@@ -145,9 +145,8 @@ pub const Place = union(enum) {
         }
     }
 
-    /// Total order mirroring Rust's `Ord for Place`. The Rust impl
-    /// orders by the `Debug` rendering; we reproduce the same
-    /// structural ordering directly. Returns `std.math.Order`.
+    /// Total order over `Place` values, ordered by their structural
+    /// rendering. Returns `std.math.Order`.
     pub fn order(self: Place, other: Place) std.math.Order {
         return orderStructural(self, other);
     }

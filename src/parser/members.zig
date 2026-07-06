@@ -1,8 +1,7 @@
 //! Member declaration parsing: functions, properties (with accessors),
 //! secondary constructors, value/function parameters.
 //!
-//! Ported from `parse/members.rs`. The Rust inherent `impl Parser` methods
-//! become free functions over `*Parser`.
+//! Free functions over `*Parser`.
 
 const std = @import("std");
 
@@ -224,8 +223,8 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
     }
 }
 
-/// Thin wrapper matching the Rust tri-state `Option<Option<TypeRef>>` shape:
-/// returns `null` on parse failure, otherwise the optional receiver type.
+/// Thin tri-state wrapper: returns `null` on parse failure, otherwise the
+/// optional receiver type.
 fn parseFunReceiver(p: *Parser) ??TypeRef {
     return switch (parseFunReceiverResult(p)) {
         .failure => null,
@@ -391,7 +390,7 @@ pub fn parseParamList(p: *Parser) []Param {
 }
 
 /// Synthesise the `Any?` placeholder used when a param's type is missing or
-/// elided. Mirrors the two identical literals in the Rust source.
+/// elided.
 fn anyPlaceholder(name_span: span.Span) TypeRef {
     return TypeRef{
         .name = Ident{ .name = "Any", .span = name_span },

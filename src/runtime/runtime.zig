@@ -1,9 +1,9 @@
 //! Shared runtime types for the interpreter and the stdlib.
 //!
 //! `Value`, `RuntimeError`, the `Output` sink, and `Env` live here so that
-//! the stdlib can express Rust-native intrinsics in terms of the same
+//! the stdlib can express native intrinsics in terms of the same
 //! types the interpreter evaluates against, without either depending on
-//! the other. Mirrors the Rust crate's `lib.rs` `pub use ...::*`.
+//! the other.
 
 const std = @import("std");
 
@@ -212,7 +212,7 @@ test {
 }
 
 // -------------------------------------------------------------------------
-// Tests (mirrors the Rust crate's `lib.rs` `mod tests`)
+// Tests
 // -------------------------------------------------------------------------
 
 const testing = std.testing;

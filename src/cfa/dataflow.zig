@@ -27,7 +27,7 @@ const Place = ir.Place;
 const Terminator = ir.Terminator;
 
 // A monotone lattice value must expose `bottom`, `join`, `eql`, and
-// `clone`, mirroring Rust's `Lattice: Clone`. `join` returns `true`
+// `clone`. `join` returns `true`
 // when the receiver was changed by the join — the worklist relies
 // on this to know when to re-enqueue successors. `clone` takes an
 // allocator (a no-op for trivially-copyable lattices).
@@ -94,8 +94,8 @@ pub fn Flat(comptime T: type) type {
     };
 }
 
-/// Comparator used to keep a `MapLattice` ordered like Rust's
-/// `BTreeMap`. `K` must expose `pub fn order(self: K, other: K)
+/// Comparator used to keep a `MapLattice` ordered (like a sorted map).
+/// `K` must expose `pub fn order(self: K, other: K)
 /// std.math.Order` (matching `Place.order`) for the ordered form, or
 /// be an integer / enum for `std.math.order`.
 fn keyOrder(comptime K: type, a: K, b: K) std.math.Order {

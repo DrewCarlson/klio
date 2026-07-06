@@ -1,7 +1,7 @@
 //! Type-reference parsing: simple/qualified types, nullable markers,
 //! generic arguments, function types, and type parameters.
 //!
-//! Ported from `parse/types.rs`. Free functions over `*Parser`.
+//! Free functions over `*Parser`.
 
 const std = @import("std");
 
@@ -612,7 +612,7 @@ pub fn parseParensOrFunctionType(p: *Parser, start: Span) ?TypeRef {
 }
 
 /// Result of `parseFunctionTypeParams`: the parameter type list plus
-/// both paren tokens. Mirrors the Rust tuple `(Vec<TypeRef>, Token, Token)`.
+/// both paren tokens.
 pub const FunctionTypeParams = struct {
     params: []TypeRef,
     lp: Token,

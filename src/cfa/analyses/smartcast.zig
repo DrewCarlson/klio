@@ -304,10 +304,9 @@ fn unionOf(allocator: Allocator, a: Type, b: Type) Allocator.Error!Type {
 
 pub const SmartCastLattice = dataflow.MapLattice(Place, SmartCastFact);
 
-/// Ordered per-place declared-type map, mirroring Rust's
-/// `HashMap<Place, Type>`. Borrows place keys and types — entries are
-/// not owned by the map, matching the borrowed reference the Rust
-/// transfer holds.
+/// Ordered per-place declared-type map. Borrows place keys and types —
+/// entries are not owned by the map; the transfer holds the borrowed
+/// reference.
 pub const PlaceTypeMap = struct {
     pub const Entry = struct { key: Place, value: Type };
     entries: []const Entry,

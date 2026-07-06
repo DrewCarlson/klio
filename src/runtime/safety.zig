@@ -27,7 +27,7 @@ const proc_env = @import("proc_env.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Default RSS cap, matching the Rust harness's 6 GiB. The in-process harnesses
+/// Default RSS cap: 6 GiB. The in-process harnesses
 /// (differential / e2e / fuzz) run the whole corpus through one long-lived
 /// process, but each program is run on a per-program arena that is reset (or
 /// destroyed) between programs, so the resident peak is a single program's
@@ -37,7 +37,7 @@ const Allocator = std.mem.Allocator;
 /// the legacy `KLIO_PARITY_RSS_CAP_KB`) to raise or lower the bound.
 const DEFAULT_RSS_CAP_KB: u64 = 6 * 1024 * 1024;
 
-/// How often the watchdogs sample, in nanoseconds (100ms — same as Rust).
+/// How often the watchdogs sample, in nanoseconds (100ms).
 const POLL_NS: u64 = 100 * std.time.ns_per_ms;
 
 var memory_watchdog_started = std.atomic.Value(bool).init(false);
@@ -212,8 +212,8 @@ pub const CapResult = union(enum) {
 
 /// Spawn `argv`, capturing stdout/stderr while draining both pipes so a
 /// chatty child cannot deadlock on a full pipe buffer, and killing the child
-/// if it outlives `timeout_ms` (0 = no timeout). Mirrors the Rust
-/// `run_capped`. The caller owns `done.stdout` / `done.stderr`.
+/// if it outlives `timeout_ms` (0 = no timeout). The caller owns
+/// `done.stdout` / `done.stderr`.
 pub fn runCapped(
     allocator: Allocator,
     io: std.Io,
