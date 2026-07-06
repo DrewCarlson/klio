@@ -7,7 +7,7 @@ Author role: Compose runtime + UI toolkit architect. Grounded in the live code
 The compose **runtime** (state, recomposition, remember, `key`, effects,
 CompositionLocal, `derivedStateOf`, observable collections, the async Recomposer +
 frame clock, `snapshotFlow`/`collectAsState`, and `@Composable` content lambdas) is
-functional and green — see COMPOSE-RUNTIME.md. This document is the plan for what sits
+functional and green. This document is the plan for what sits
 **on top** of it to actually render UI.
 
 ## 0. The one foundational gap: node emission (the Applier)

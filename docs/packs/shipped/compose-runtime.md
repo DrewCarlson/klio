@@ -97,4 +97,4 @@ MVCC snapshot transaction API and movable content. See
 `plans/UI-RENDERING-PACKS.md` for that plan.
 
 See `examples/compose_*.kt` for runnable demonstrations of each feature, and
-`plans/COMPOSE-RUNTIME.md` + `plans/UI-RENDERING-PACKS.md` for the design and roadmap.
+`plans/UI-RENDERING-PACKS.md` for the rendering roadmap.

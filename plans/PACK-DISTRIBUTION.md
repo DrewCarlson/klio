@@ -1,7 +1,7 @@
 # Pack distribution — native consolidation, application binaries, workspaces, dependency sources
 
 Status: design. Continues [`PACK-ROADMAP.md`](./PACK-ROADMAP.md)
-(phases 6–12) and builds on [`PACK-DESIGN.md`](./PACK-DESIGN.md). The
+(phases 6–12). The
 roadmap delivered the container format, the binding registry, the
 embedded stdlib, and per-FQN native bindings. This document plans four
 capabilities, numbered 13–16 to continue the roadmap, sharing its gate
