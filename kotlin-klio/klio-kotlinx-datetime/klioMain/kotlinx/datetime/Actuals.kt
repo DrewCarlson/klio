@@ -403,6 +403,15 @@ actual class LocalDateTime(
 
         fun parseOrNull(input: CharSequence): LocalDateTime? = try { parse(input) } catch (e: Exception) { null }
 
+        fun orNull(year: Int, monthNumber: Int, day: Int, hour: Int, minute: Int, second: Int = 0, nanosecond: Int = 0): LocalDateTime? {
+            val d = LocalDate.orNull(year, monthNumber, day) ?: return null
+            val t = LocalTime.orNull(hour, minute, second, nanosecond) ?: return null
+            return LocalDateTime(d, t)
+        }
+
+        fun orNull(year: Int, month: Month, day: Int, hour: Int, minute: Int, second: Int = 0, nanosecond: Int = 0): LocalDateTime? =
+            orNull(year, month.number, day, hour, minute, second, nanosecond)
+
         // ISO-8601 `<date>T<time>`.
         fun parse(input: CharSequence): LocalDateTime {
             val s = input.toString()
