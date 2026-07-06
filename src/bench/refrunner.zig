@@ -29,8 +29,7 @@ pub const RefError = union(enum) {
         }
     }
 
-    /// Render the error the way the Rust `Display` impl does. Caller owns
-    /// the returned bytes.
+    /// Render the error message. Caller owns the returned bytes.
     pub fn message(self: RefError, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return switch (self) {
             .Io => |s| std.fmt.allocPrint(allocator, "io: {s}", .{s}),
@@ -115,7 +114,7 @@ fn procEnvMap(allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!
 
 /// Locate the requested `kotlinc` via the `parity` install machinery. The
 /// returned path is owned by the caller. The label prefixes any install
-/// error, matching the Rust `RefError::Install(format!("...: {e}"))`.
+/// error.
 fn findKotlinc(allocator: std.mem.Allocator, kind: parity.KotlincKind, label: []const u8) std.mem.Allocator.Error!RefResultPath {
     const r = try parity.findKotlincKind(allocator, kind);
     switch (r) {

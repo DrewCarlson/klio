@@ -15,8 +15,8 @@ const PackError = pack.PackError;
 const PackWriter = pack.PackWriter;
 const section_names = pack.section_names;
 
-/// The library version embedded in the pack manifest. The Rust build stamped
-/// this from `CARGO_PKG_VERSION`; here it is the in-tree stdlib version.
+/// The library version embedded in the pack manifest: the in-tree stdlib
+/// version.
 pub const LIBRARY_VERSION: []const u8 = "0.1.0";
 
 /// The stdlib source manifest (curated upstream files, klio actuals, and
@@ -30,9 +30,9 @@ pub const KLIO_STDLIB_DIR = stdlib_sources.KLIO_STDLIB_DIR;
 
 /// Build a deterministic pack for the in-process Kotlin standard library.
 ///
-/// `compress_symbols` is accepted for source compatibility with the Rust
-/// builder; this build has no zstd encoder so every section is stored
-/// uncompressed. On failure `result` is set and `null` is returned.
+/// `compress_symbols` is accepted for source compatibility, but this build
+/// has no zstd encoder so every section is stored uncompressed. On failure
+/// `result` is set and `null` is returned.
 pub fn buildStdlibPack(
     allocator: std.mem.Allocator,
     compress_symbols: bool,

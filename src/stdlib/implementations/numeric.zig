@@ -18,9 +18,9 @@ const Allocator = std.mem.Allocator;
 // Local result/helper plumbing
 // ============================================================
 
-/// `Result<T, RuntimeError>` for the fallible non-`Value` helpers that
-/// the Rust file expresses with `?`. The intrinsics surface OOM as a Zig
-/// error and the `RuntimeError` as data via `EvalResult`.
+/// `Result<T, RuntimeError>` for the fallible non-`Value` helpers. The
+/// intrinsics surface OOM as a Zig error and the `RuntimeError` as data via
+/// `EvalResult`.
 fn Res(comptime T: type) type {
     return union(enum) {
         ok: T,
@@ -91,7 +91,7 @@ fn arityErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloc
 
 /// Build an exception `Value`. Mirrors `implementations::make_exception`.
 /// `message`, when present, must be allocator-owned for the program
-/// lifetime (the arena), matching Rust's `Arc<String>`.
+/// lifetime (the arena).
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
     return .{ .Exception = .{
         .fqn = try runtime.strInit(allocator, fqn),
@@ -102,7 +102,7 @@ fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Al
 
 /// Kotlin's `compareTo` total order over floating values. NaN sorts as the
 /// greatest value and `-0.0 < 0.0`, unlike the IEEE `<`/`>` operators.
-/// Returns `-1`/`0`/`1` to match the Rust `Ordering as i64`/`as i32` casts.
+/// Returns `-1`/`0`/`1` for less/equal/greater.
 fn kotlinFloatTotalCmp(a: f64, b: f64) i64 {
     if (a < b) return -1;
     if (a > b) return 1;
@@ -1186,8 +1186,8 @@ pub fn num_count_one_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(Value.newInt(@as(i64, n)));
 }
 
-/// Render the `{what} requires an integer, got {other:?}` type error.
-/// The Rust `{other:?}` debug form is the variant tag name.
+/// Render the `{what} requires an integer, got {other}` type error; `{other}`
+/// is the value's variant tag name.
 fn countTypeErr(allocator: Allocator, what: []const u8, other: Value) Allocator.Error!RuntimeError {
     return typeErr(allocator, "{s} requires an integer, got {s}", .{ what, @tagName(other) });
 }

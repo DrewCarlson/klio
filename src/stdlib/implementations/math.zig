@@ -110,8 +110,7 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
     if (floating) {
         const x = numeric_as_f64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
         const y = numeric_as_f64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
-        // Kotlin's minOf/maxOf use Math.min/max, which propagate NaN — unlike
-        // Rust's f64::min/max which return the non-NaN operand.
+        // Kotlin's minOf/maxOf use Math.min/max, which propagate NaN.
         const r: f64 = if (std.math.isNan(x) or std.math.isNan(y))
             std.math.nan(f64)
         else if (x == 0.0 and y == 0.0)
@@ -607,8 +606,7 @@ fn roundTiesEven(x: f64) f64 {
 }
 
 pub fn math_round(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // Kotlin's kotlin.math.round rounds half to even (IEEE rint), unlike
-    // Rust's round() which rounds half away from zero.
+    // Kotlin's kotlin.math.round rounds half to even (IEEE rint).
     return unaryDouble(ctx, "round", roundTiesEven);
 }
 pub fn math_truncate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -619,7 +617,7 @@ pub fn math_hypot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 /// Kotlin's sign preserves a signed/NaN zero: sign(0.0)=0.0, sign(-0.0)=-0.0,
-/// sign(NaN)=NaN. Rust's `signum()` returns ±1.0 for zero, so special-case it.
+/// sign(NaN)=NaN, so zero and NaN are special-cased below.
 fn fsign(n: f64) f64 {
     if (n == 0.0 or std.math.isNan(n)) {
         return n;
@@ -914,10 +912,7 @@ pub fn math_atan2(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 // ------------------------------------------------------------
-// Shared helpers ported alongside the math intrinsics that use them.
-// These mirror the cross-module helpers in the Rust crate
-// (`numeric::recv_double`, `exceptions::make_exception`,
-// `collections::{compare_values, compare_host_aware}`).
+// Shared helpers used by the math intrinsics above.
 // ------------------------------------------------------------
 
 /// `numeric::recv_double` — the receiver as f64, or a `Type` error.

@@ -16,11 +16,10 @@ pub fn time_system_millis(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .{ .Long = runtime.clockWallMillis() } };
 }
 
-/// Process-global monotonic origin in nanoseconds, fixed on first read.
-/// Mirrors the Rust `OnceLock<Instant>`: only differences between
-/// readings are meaningful, and the "zero" is pinned the first time the
-/// intrinsic runs. The sentinel `0` marks "not yet set"; a single
-/// compare-exchange installs the first reading as the origin.
+/// Process-global monotonic origin in nanoseconds, fixed on first read. Only
+/// differences between readings are meaningful, and the "zero" is pinned the
+/// first time the intrinsic runs. The sentinel `0` marks "not yet set"; a
+/// single compare-exchange installs the first reading as the origin.
 const MonotonicOrigin = struct {
     var origin_nanos: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 

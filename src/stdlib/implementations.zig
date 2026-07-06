@@ -35,7 +35,7 @@ pub const stringbuilder = @import("implementations/stringbuilder.zig");
 pub const time = @import("implementations/time.zig");
 
 /// Internal helpers the interpreter's higher-order ops re-export through
-/// the stdlib root. Mirrors the Rust `pub use` lines.
+/// the stdlib root.
 pub const compare_values = collections.compare_values;
 pub const materialise_sequence = collections.materialise_sequence;
 pub const materialise_sequence_bounded = collections.materialise_sequence_bounded;

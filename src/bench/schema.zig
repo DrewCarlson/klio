@@ -13,8 +13,8 @@ pub const BenchRecord = struct {
     ref_kotlinc_native_ns: ?u64 = null,
     ref_kotlinc_jvm_ns: ?u64 = null,
 
-    /// Serialize one record as a JSON object, skipping null optionals to
-    /// match the Rust `#[serde(skip_serializing_if = "Option::is_none")]`.
+    /// Serialize one record as a JSON object; null optionals are omitted
+    /// from the output.
     pub fn writeJson(self: *const BenchRecord, w: *std.Io.Writer, indent: usize) std.Io.Writer.Error!void {
         try writeIndent(w, indent);
         try w.writeAll("{\n");

@@ -60,8 +60,8 @@ fn thrown(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator
     return errResult(.{ .Thrown = try makeException(allocator, fqn, message) });
 }
 
-/// The `StringBuilder` receiver in `args[0]`, or `null`. Mirrors Rust's
-/// `sb_arg`; the caller turns `null` into a `Type` error via `sbTypeError`.
+/// The `StringBuilder` receiver in `args[0]`, or `null`; the caller turns
+/// `null` into a `Type` error via `sbTypeError`.
 fn sbArg(args: []const Value) ?StringBuilderRef {
     if (args.len > 0) {
         if (args[0] == .StringBuilder) return args[0].StringBuilder;
@@ -119,8 +119,6 @@ fn charUnitToString(allocator: Allocator, unit: u16) Allocator.Error![]u8 {
     return runtime.charUnitToString(allocator, unit);
 }
 
-/// Number of Kotlin `Char`s — UTF-8 string `chars().count()` counts each
-/// astral scalar as one `char`, matching Rust's `str::chars`.
 /// Number of Kotlin `Char`s = UTF-16 code units: an astral scalar is two units
 /// (a surrogate pair), a lone WTF-8 surrogate and any BMP scalar are one. For a
 /// surrogate-free string this equals the scalar count, so normal text is
@@ -163,7 +161,7 @@ fn displayValue(allocator: Allocator, v: Value) Allocator.Error![]u8 {
     return v.display(allocator);
 }
 
-/// Append `v` to a UTF-8 buffer, mirroring Rust `append_value`.
+/// Append `v` to a UTF-8 buffer.
 fn appendValue(buf: *Buffer, allocator: Allocator, v: Value) Allocator.Error!void {
     switch (v) {
         .Null => try buf.appendSlice(allocator, "null"),

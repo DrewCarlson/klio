@@ -105,9 +105,8 @@ fn reportDiff(allocator: std.mem.Allocator, io: std.Io, base_path: []const u8, r
     return null;
 }
 
-/// Library entry point. Returns the process exit code. Mirrors the Rust
-/// `main` but takes args + allocator explicitly so the orchestrator wires
-/// the real executable.
+/// Library entry point. Returns the process exit code. Takes args +
+/// allocator explicitly so the orchestrator wires the real executable.
 pub fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) u8 {
     // Cap the bench process's RSS so a runaway corpus entry can't OOM the
     // machine. Call-once.

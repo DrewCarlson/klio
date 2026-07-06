@@ -57,8 +57,7 @@ pub const ParityError = union(enum) {
         }
     }
 
-    /// Render the error the way the Rust `Display` impl does. Caller owns the
-    /// returned bytes.
+    /// Render the error message. Caller owns the returned bytes.
     pub fn message(self: ParityError, allocator: Allocator) Allocator.Error![]u8 {
         return switch (self) {
             .NoKotlinc => allocator.dupe(
@@ -169,9 +168,8 @@ fn termOk(term: std.process.Child.Term) bool {
     };
 }
 
-/// The workspace root. The Rust harness derives this from
-/// `CARGO_MANIFEST_DIR`'s grandparent; here we run from the workspace
-/// directory, so the current directory is the root.
+/// The workspace root; resolves to the current directory, since we run from
+/// the workspace directory.
 fn workspaceRoot(allocator: Allocator) Allocator.Error![]u8 {
     return allocator.dupe(u8, ".");
 }
@@ -719,8 +717,8 @@ pub fn PResult(comptime T: type) type {
     };
 }
 
-/// `Result<T, String>` carried as data, for the klio-side runners whose Rust
-/// signatures return `Result<String, String>`.
+/// `Result<T, String>` carried as data, for the klio-side runners that
+/// return a plain string on error.
 pub fn SResult(comptime T: type) type {
     return union(enum) {
         ok: T,
@@ -927,9 +925,9 @@ pub fn kotlincOutput(allocator: Allocator, io: Io, file: []const u8) Allocator.E
 
 // ---------------------- stdout capture sink ----------------------
 
-/// Stdout sink that captures every `println` line for parity diffing. Faithful
-/// port of the Rust `CaptureOutput`: lines accumulate in `cur` and split on
-/// `\n`, trimming the trailing `\n` per line.
+/// Stdout sink that captures every `println` line for parity diffing. Lines
+/// accumulate in `cur` and split on `\n`, trimming the trailing `\n` per
+/// line.
 pub const CaptureOutput = struct {
     lines: std.ArrayList([]u8),
     cur: std.ArrayList(u8),
@@ -2267,8 +2265,8 @@ fn registerAstPackage(arena: Allocator, file_ast: *const KotlinFile) Allocator.E
 /// packs (coroutines, atomicfu, io) loaded from source and their host bindings
 /// installed.
 pub fn runWithPacks(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
-    // `runInMode` runs `main` on a 64 MiB worker stack (the Zig equivalent of
-    // the Rust harness's `stacker::grow`), so deep recursion has headroom.
+    // `runInMode` runs `main` on a 64 MiB worker stack, so deep recursion has
+    // headroom.
     return runInMode(allocator, io, file, .SourcePacks);
 }
 
@@ -2879,7 +2877,7 @@ pub fn runSweep(allocator: Allocator, io: Io, label: []const u8, paths: []const 
     return .{ .ok = .{ .results = results } };
 }
 
-// ---------------------- additional ported tests ----------------------
+// ---------------------- additional tests ----------------------
 
 test "plain_value_class_gets_annotation" {
     const out = try injectJvmInline(std.testing.allocator, "value class UserId(val raw: Int)\n");
@@ -2986,7 +2984,7 @@ test "KotlincKind binary and env names" {
     try std.testing.expectEqualStrings("KLIO_KOTLINC_NATIVE", KotlincKind.Native.envOverride());
 }
 
-test "ParityError messages render like the Rust Display impl" {
+test "ParityError messages render the expected display text" {
     const a = std.testing.allocator;
     {
         const m = try (ParityError{ .NoKotlinc = {} }).message(a);
