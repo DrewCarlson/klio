@@ -1,0 +1,7 @@
+== ready ==
+[log] hello
+[log] start build
+[log] done build
+string=scope-A int=42
+current=answer
+report for service#7
