@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const ast = @import("ast");
+const diagnostics = @import("diagnostics");
 
 const root = @import("parser.zig");
 const support = @import("support.zig");
@@ -75,6 +76,38 @@ pub fn parseClass(
         type_params = types.parseTypeParams(p, false);
     }
     skipNlIfHeaderContinues(p);
+    // A `context(...)` clause on the primary constructor is unsupported.
+    if (support.peekKeywordIdent(p, "context") and
+        p.pos + 1 < p.tokens.len and std.meta.activeTag(p.tokens[p.pos + 1].kind) == .LParen)
+    {
+        const ctx_start = support.currentSpan(p);
+        _ = support.bump(p); // `context`
+        var depth: i32 = 0;
+        while (true) {
+            const t = support.peekKind(p).*;
+            switch (std.meta.activeTag(t)) {
+                .LParen => depth += 1,
+                .RParen => {
+                    depth -= 1;
+                    _ = support.bump(p);
+                    if (depth == 0) break;
+                    continue;
+                },
+                .Eof => break,
+                else => {},
+            }
+            _ = support.bump(p);
+        }
+        const ctx_end = p.tokens[p.pos -| 1].span;
+        support.errWithFactory(
+            p,
+            &diagnostics.generated.UNSUPPORTED,
+            "E0307",
+            "Context parameters on constructors are unsupported.",
+            ctx_start.join(ctx_end),
+        );
+        skipNlIfHeaderContinues(p);
+    }
     skipPrimaryCtorAnnotations(p);
     const primary_ctor_visibility = parsePrimaryCtorHeader(p);
     var primary_params: []ClassParam = &.{};

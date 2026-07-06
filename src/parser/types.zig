@@ -285,6 +285,20 @@ pub fn parseCallTypeArgs(p: *Parser) []TypeRef {
 
 pub fn parseType(p: *Parser) ?TypeRef {
     support.skipNl(p);
+    // Contextual function type: `context(A, B) [suspend] [R.](P) -> T`. The
+    // leading `context(...)` block carries types only (named entries are
+    // rejected); the whole type is equivalent to the flattened function type.
+    if (support.peekKeywordIdent(p, "context") and
+        p.pos + 1 < p.tokens.len and isKind(p.tokens[p.pos + 1].kind, .LParen))
+    {
+        const ctx = parseFunctionTypeContextBlock(p);
+        support.skipNl(p);
+        const rest = parseType(p) orelse return null;
+        if (rest.function) |ft| {
+            ft.context_params = ctx;
+        }
+        return rest;
+    }
     // Soft-keyword `suspend` before a function type — accepted on the
     // type-reference syntax even when downstream enforcement of the
     // suspending colouring at this site is a future addition.
@@ -604,6 +618,55 @@ pub const FunctionTypeParams = struct {
     lp: Token,
     rp: Token,
 };
+
+/// Parse the leading `context(A, B)` block of a contextual function type.
+/// Types only — a named entry (`name: Type`, `_: Type`) is rejected with
+/// `NAMED_CONTEXT_PARAMETER_IN_FUNCTION_TYPE` but its type is still parsed.
+/// The cursor is at `context`; the `(` follows.
+pub fn parseFunctionTypeContextBlock(p: *Parser) []TypeRef {
+    _ = support.bump(p); // `context`
+    _ = support.bump(p); // `(`
+    var items: std.ArrayList(TypeRef) = .empty;
+    while (true) {
+        support.skipNl(p);
+        if (isKind(peekKind(p), .RParen)) break;
+        // Reject a named entry `name : Type` / `_ : Type`.
+        if (isKind(peekKind(p), .Ident)) {
+            var j = p.pos + 1;
+            while (j < p.tokens.len and isKind(p.tokens[j].kind, .Newline)) j += 1;
+            if (j < p.tokens.len and isKind(p.tokens[j].kind, .Colon)) {
+                const nm = support.currentSpan(p);
+                _ = support.bump(p); // name
+                support.skipNl(p);
+                _ = support.bump(p); // `:`
+                support.skipNl(p);
+                const ty = parseType(p) orelse break;
+                support.errWithFactory(
+                    p,
+                    &@import("diagnostics").generated.NAMED_CONTEXT_PARAMETER_IN_FUNCTION_TYPE,
+                    "E0306",
+                    "Named context parameters in function types are unsupported. Use syntax 'context(Type)' instead.",
+                    nm.join(ty.span),
+                );
+                items.append(p.allocator, ty) catch @panic("OOM");
+                support.skipNl(p);
+                if (isKind(peekKind(p), .Comma)) {
+                    _ = support.bump(p);
+                    continue;
+                }
+                break;
+            }
+        }
+        const t = parseType(p) orelse break;
+        items.append(p.allocator, t) catch @panic("OOM");
+        support.skipNl(p);
+        if (isKind(peekKind(p), .Comma)) {
+            _ = support.bump(p);
+        } else break;
+    }
+    _ = support.expect(p, .RParen, "`)`");
+    return items.toOwnedSlice(p.allocator) catch @panic("OOM");
+}
 
 /// Parse `( T1, T2, ... )` returning the list of parameter types and
 /// both paren spans. Used for the receiver-typed function-type tail.

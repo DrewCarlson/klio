@@ -11,6 +11,7 @@ const build = @import("../build.zig");
 
 const decl = @import("decl.zig");
 const expr_mod = @import("expr.zig");
+const ast_scan = @import("ast_scan.zig");
 
 const Allocator = std.mem.Allocator;
 const Module = ir.Module;
@@ -58,9 +59,19 @@ fn cloneOwnMembers(allocator: Allocator, src: *const StringSet) Allocator.Error!
 /// body returns the expression's value. The synthetic function is
 /// pushed onto the module so a downstream caller can invoke it via
 /// `eval_with` against `module.funcs[id]`.
+/// Emit a contextual property accessor's context-load prologue when the
+/// declaration lowering stashed its context parameters. A no-op otherwise.
+fn consumePendingCtx(b: *FuncBuilder) Allocator.Error!void {
+    if (b.module.pending_ctx) |pc| {
+        b.module.pending_ctx = null;
+        try decl.emitContextParamLoads(b, pc.params, pc.type_params);
+    }
+}
+
 pub fn lowerExprAsThunk(module: *Module, expr: *const Expr, name: []const u8) Allocator.Error!FuncId {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
+    try consumePendingCtx(&b);
     const v = try lowerExpr(&b, expr);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
@@ -72,6 +83,7 @@ pub fn lowerExprAsThunk(module: *Module, expr: *const Expr, name: []const u8) Al
 pub fn lowerBlockAsThunk(module: *Module, block: *const ast.Block, name: []const u8) Allocator.Error!FuncId {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
+    try consumePendingCtx(&b);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
@@ -88,6 +100,7 @@ pub fn lowerBlockAsUnaryThunk(
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
     try bindParams(&b, &.{param_name});
+    try consumePendingCtx(&b);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
@@ -136,6 +149,7 @@ pub fn lowerExprAsParamThunkScoped(
     var b = try FuncBuilder.init(allocator, module);
     defer b.deinit();
     try bindParams(&b, params);
+    try consumePendingCtx(&b);
     b.setParamThunk(true);
     if (owner_class) |owner| {
         b.setOwnerClass(owner);
@@ -177,6 +191,10 @@ pub fn lowerInitBlockWithParams(
     b.setOwnerClass(owner_class);
     b.setRecvTy(owner_class);
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
+    // Box body `var`s (and params) a nested lambda mutates into shared cells,
+    // exactly as a normal function body does — otherwise a `var` an init block
+    // mutates from inside a lambda captures a copy and the write is lost.
+    try setInitBlockBoxedVars(&b, allocator, params, block);
     try bindParams(&b, params);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
@@ -211,12 +229,32 @@ pub fn lowerInitBlock(
     defer b.deinit();
     b.setOwnerClass(owner_class);
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
+    try setInitBlockBoxedVars(&b, allocator, &.{"this"}, block);
     try bindParams(&b, &.{"this"});
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
     func.has_receiver_param = true;
     return pushFunc(module, func);
+}
+
+/// Compute the set of `var`s (body decls plus params) that a nested lambda in
+/// the init block mutates, and mark them for boxing so the lambda closes over
+/// a shared cell. Mirrors the body-`var` boxing in `lowerFunctionBody`.
+fn setInitBlockBoxedVars(
+    b: *FuncBuilder,
+    allocator: Allocator,
+    params: []const []const u8,
+    block: *const ast.Block,
+) Allocator.Error!void {
+    var boxed = try ast_scan.computeBoxedVars(allocator, block.stmts);
+    var assigned = StringSet.init(allocator);
+    defer assigned.deinit();
+    try ast_scan.namesAssignedInLambdas(block.stmts, &assigned);
+    for (params) |pname| {
+        if (assigned.contains(pname)) try boxed.put(pname, {});
+    }
+    b.setBoxedVars(boxed);
 }
 
 /// Lower an instance accessor body.

@@ -1518,3 +1518,166 @@ test "ebf: backing-field assignment in accessor body is not a clause" {
     try testing.expect(p.explicit_field == null);
     try testing.expect(p.setter != null);
 }
+
+// -------- context parameters --------
+
+test "ctx: named context clause on a top-level function" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\context(logger: Logger) fun say(m: String) = logger.log(m)
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const f = out.file.decls[0].Function;
+    try testing.expectEqual(@as(usize, 1), f.context_params.len);
+    try testing.expectEqualStrings("logger", f.context_params[0].name.name);
+    try testing.expectEqualStrings("Logger", f.context_params[0].ty.name.name);
+}
+
+test "ctx: anonymous and multi-param context clause" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\context(a: String, _: Any) fun f() {}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const f = out.file.decls[0].Function;
+    try testing.expectEqual(@as(usize, 2), f.context_params.len);
+    try testing.expectEqualStrings("a", f.context_params[0].name.name);
+    try testing.expectEqualStrings("_", f.context_params[1].name.name);
+}
+
+test "ctx: context clause on a property with accessor" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\context(u: Users) val firstUser: String get() = u.byId(1)
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Property;
+    try testing.expectEqual(@as(usize, 1), p.context_params.len);
+    try testing.expectEqualStrings("u", p.context_params[0].name.name);
+}
+
+test "ctx: bare-type entry rejected as CONTEXT_PARAMETER_WITHOUT_NAME" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\context(String) fun f() {}
+    );
+    var found = false;
+    for (out.parser.diagnostics.diags()) |d| {
+        if (d.factory) |fac| {
+            if (std.mem.eql(u8, fac.name, "CONTEXT_PARAMETER_WITHOUT_NAME")) found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "ctx: default value rejected as CONTEXT_PARAMETER_WITH_DEFAULT" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\context(a: A = A()) fun f() {}
+    );
+    var found = false;
+    for (out.parser.diagnostics.diags()) |d| {
+        if (d.factory) |fac| {
+            if (std.mem.eql(u8, fac.name, "CONTEXT_PARAMETER_WITH_DEFAULT")) found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "ctx: vararg modifier rejected as WRONG_MODIFIER_TARGET" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\context(vararg a: String) fun f() {}
+    );
+    var found = false;
+    for (out.parser.diagnostics.diags()) |d| {
+        if (d.factory) |fac| {
+            if (std.mem.eql(u8, fac.name, "WRONG_MODIFIER_TARGET")) found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "ctx: two context lists rejected as MULTIPLE_CONTEXT_LISTS" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\context(a: A) context(b: A) fun f() {}
+    );
+    var found = false;
+    for (out.parser.diagnostics.diags()) |d| {
+        if (d.factory) |fac| {
+            if (std.mem.eql(u8, fac.name, "MULTIPLE_CONTEXT_LISTS")) found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "ctx: statement-level call is not a context clause" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun main() {
+        \\    context("v") { println(contextOf<String>()) }
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const body = out.file.decls[0].Function.body.?.Block;
+    // The single statement is an expression (the call), not a declaration.
+    try testing.expect(body.stmts.len == 1);
+    try testing.expect(body.stmts[0] != .Decl);
+}
+
+test "ctx: statement-level local contextual function" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun main() {
+        \\    context(c: Int) fun local() = println(c)
+        \\    context(7) { local() }
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const body = out.file.decls[0].Function.body.?.Block;
+    try testing.expect(body.stmts[0] == .Decl);
+    const local = body.stmts[0].Decl.Function;
+    try testing.expectEqual(@as(usize, 1), local.context_params.len);
+    try testing.expectEqualStrings("c", local.context_params[0].name.name);
+    // The second statement is the stdlib `context(...)` call.
+    try testing.expect(body.stmts[1] != .Decl);
+}
+
+test "ctx: contextual function type parses context block" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun call(f: context(String, Int) (Boolean) -> Unit) {}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const f = out.file.decls[0].Function;
+    const pty = f.params[0].ty;
+    try testing.expect(pty.function != null);
+    try testing.expectEqual(@as(usize, 2), pty.function.?.context_params.len);
+    try testing.expectEqual(@as(usize, 1), pty.function.?.params.len);
+}
+
+test "ctx: named entry in function-type context block rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun call(f: context(s: String) () -> Unit) {}
+    );
+    var found = false;
+    for (out.parser.diagnostics.diags()) |d| {
+        if (d.factory) |fac| {
+            if (std.mem.eql(u8, fac.name, "NAMED_CONTEXT_PARAMETER_IN_FUNCTION_TYPE")) found = true;
+        }
+    }
+    try testing.expect(found);
+}

@@ -1323,6 +1323,20 @@ pub fn evalWithCapturesChained(
     frame.module_arc = owning;
     try frame.activateChain(chain_seed);
     defer frame.deactivateChain();
+    // Context-parameter resolution: a contextual program feeds each frame's
+    // dispatch/extension receiver into the context stack so a contextual
+    // callee resolves it as a context argument (KEEP: receivers are context
+    // sources). The frame's pushes unwind on any exit, including errors.
+    const ctx_mark: usize = if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0;
+    if (comptime @hasDecl(H, "ctxPush")) {
+        if (module.has_context_decls) {
+            if (comptime @hasDecl(H, "ctxActivate")) host.ctxActivate(true);
+            if (func.has_receiver_param and frame.params.items.len > 0) {
+                host.ctxPush(frame.params.items[0]) catch {};
+            }
+        }
+    }
+    defer if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(ctx_mark);
     const cur = func.entry;
     var result = try runFrame(H, allocator, module, &frame, &try_stack, cur, 0, host);
     // A labeled return whose target is this function exits it as a
@@ -2384,6 +2398,7 @@ fn instDst(inst: *const Inst) ?Reg {
         .CallValueOrMember => |x| x.dst,
         .CallMemberOrValue => |x| x.dst,
         .NewInstance => |x| x.dst,
+        .CtxScope => |x| x.dst,
         else => null,
     };
 }
@@ -3416,6 +3431,35 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const v = frame.read(io.src);
             const is = host.instanceOf(&v, io.ty);
             try frame.write(io.dst, .{ .Bool = is });
+        },
+        .CtxLoad => |cl| {
+            if (comptime !@hasDecl(H, "ctxResolve")) {
+                try frame.write(cl.dst, .Null);
+                return .cont;
+            }
+            const ty_name = constStr(frame.module, cl.ty) orelse "";
+            const v = host.ctxResolve(ty_name, cl.erased) orelse Value.Null;
+            v.retain();
+            try frame.write(cl.dst, v);
+        },
+        .CtxScope => |cs| {
+            if (comptime !@hasDecl(H, "ctxPush")) {
+                try frame.write(cs.dst, .Null);
+                return .cont;
+            }
+            const mark = host.ctxStackLen();
+            var i: u32 = 0;
+            while (i < cs.n_ctx) : (i += 1) {
+                const v = frame.read(Reg.from(cs.ctx_args.int() + i));
+                try host.ctxPush(v);
+            }
+            var block = frame.read(cs.block);
+            const res = host.callValue(allocator, &block, &.{});
+            host.ctxStackTruncate(mark);
+            switch (try res) {
+                .ok => |rv| try frame.write(cs.dst, rv),
+                .err => |e| return raiseStep(frame, e),
+            }
         },
         .Cast => |cast| {
             const v = frame.read(cast.src);

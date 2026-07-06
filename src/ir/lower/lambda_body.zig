@@ -317,6 +317,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     }
     b.setBoxedVars(boxed);
     try decl.bindParams(&b, names.items);
+    // A local contextual function's context parameters, stashed by its
+    // declaration lowering, bind here before the body statements lower.
+    if (module.pending_ctx) |pc| {
+        module.pending_ctx = null;
+        try decl.emitContextParamLoads(&b, pc.params, pc.type_params);
+    }
     // A lambda parameter (including the implicit `it`) statically typed as a
     // broad collection (`Iterable`/`Collection`) yields a `List` from `+`/`-`
     // even over a runtime `Set`; record it so the operator lowering coerces it.

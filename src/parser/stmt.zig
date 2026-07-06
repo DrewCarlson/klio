@@ -71,7 +71,7 @@ pub fn skipStmtSeparators(p: *Parser) void {
 // Single match-dispatch over statement-leading tokens; splitting would fragment it.
 pub fn parseStmt(p: *Parser) ?Stmt {
     const save = p.pos;
-    const flags = file.skipModifiersWithFlags(p);
+    const flags = file.skipModifiersWithFlagsLevel(p, true);
     switch (support.peekKind(p).*) {
         .Keyword => |kw| switch (kw) {
             .Val, .Var => {

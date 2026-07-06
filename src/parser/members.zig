@@ -90,6 +90,7 @@ pub fn parseFun(p: *Parser, flags: ModifierFlags) ?Function {
     return Function{
         .name = name,
         .receiver_type = receiver_type,
+        .context_params = flags.context_params,
         .type_params = type_params,
         .where_bounds = where_bounds,
         .params = params,
@@ -641,6 +642,7 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
     return Property{
         .mutable = mutable,
         .name = name,
+        .context_params = flags.context_params,
         .receiver_type = receiver_type,
         .ty = ty,
         .init = init,
