@@ -8,3 +8,4 @@ target/
 scripts/__pycache__/
 .claude/
 .pi-lens/
+/CLAUDE.md
