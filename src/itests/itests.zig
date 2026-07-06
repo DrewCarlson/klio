@@ -40,6 +40,7 @@ test {
     _ = @import("parity_threaded_litmus.zig");
     _ = @import("parity_type_system_shapes.zig");
     _ = @import("parity_visibility_modifiers.zig");
+    _ = @import("explicit_backing_fields.zig");
     _ = @import("typeck_negative.zig");
     _ = @import("parser_corpus.zig");
     _ = @import("cfa_smartcast.zig");

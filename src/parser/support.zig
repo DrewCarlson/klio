@@ -123,6 +123,21 @@ pub fn err(p: *Parser, code: []const u8, msg: []const u8, sp: Span) void {
     p.diagnostics.emit(p.allocator, d) catch {};
 }
 
+/// Like `err`, but also tags the diagnostic with a compiler-named factory
+/// so downstream consumers can match on the stable diagnostic name.
+pub fn errWithFactory(
+    p: *Parser,
+    factory: *const diagnostics.DiagnosticFactory,
+    code: []const u8,
+    msg: []const u8,
+    sp: Span,
+) void {
+    var d = Diagnostic.err(msg, sp);
+    _ = d.withCode(code);
+    _ = d.withFactory(factory);
+    p.diagnostics.emit(p.allocator, d) catch {};
+}
+
 pub fn expect(p: *Parser, kind: TokenKind, what: []const u8) ?Token {
     skipNl(p);
     if (std.meta.activeTag(peekKind(p).*) == std.meta.activeTag(kind)) {

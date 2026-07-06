@@ -143,12 +143,44 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                     .return_class = cn,
                 });
             } else {
+                // An explicit backing field narrows same-file reads to the
+                // field type; the public (property) type rides along for
+                // reads outside the declaring file.
+                var bound_ty = ty;
+                var bound_cn = cn;
+                var ebf: ?root.EbfBinding = null;
+                if (p.explicit_field) |ef| {
+                    const disp = if (p.ty) |*pt| try helpers.typeRefDisplay(self.allocator, pt) else p.name.name;
+                    if (ef.ty) |*ft| {
+                        bound_ty = try convertTypeRefLossy(self.allocator, ft);
+                        bound_cn = classNameFromTyperef(ft);
+                        ebf = .{
+                            .public_ty = ty,
+                            .public_class = cn,
+                            .public_display = disp,
+                            .file = p.name.span.file,
+                        };
+                    } else if (ef.init != null and p.ty != null) {
+                        // Field type inferred from the initializer: the
+                        // narrowed head is resolved when the initializer is
+                        // checked; until then reads stay tolerant.
+                        bound_ty = Type.Unresolved;
+                        bound_cn = null;
+                        ebf = .{
+                            .public_ty = ty,
+                            .public_class = cn,
+                            .public_display = disp,
+                            .file = p.name.span.file,
+                        };
+                    }
+                }
                 try self.frames.items[0].bindings.put(p.name.name, .{
-                    .ty = ty,
+                    .ty = bound_ty,
                     .mutable = p.mutable,
                     .decl_span = p.name.span,
-                    .class_name = cn,
+                    .class_name = bound_cn,
                     .decl_type_name = null,
+                    .ebf = ebf,
                 });
                 try self.prop_visibility.put(p.name.name, .{ .visibility = p.visibility, .file = p.name.span.file });
                 if (p.setter_visibility) |sv| {
@@ -483,6 +515,18 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                 if (p.ty) |*pt| {
                     if (classNameFromTyperef(pt)) |cn| try info.member_class.put(p.name.name, cn);
                 }
+                if (p.explicit_field) |ef| {
+                    // The public (property) type stays in `members`; reads
+                    // inside the declaring scope get the field type.
+                    const fty = if (ef.ty) |*ft| try convertTypeRefLossy(self.allocator, ft) else Type.Unresolved;
+                    const fcn = if (ef.ty) |*ft| classNameFromTyperef(ft) else null;
+                    const disp = if (p.ty) |*pt| try helpers.typeRefDisplay(self.allocator, pt) else p.name.name;
+                    try info.member_ebf.put(p.name.name, .{
+                        .field_ty = fty,
+                        .field_class = fcn,
+                        .public_display = disp,
+                    });
+                }
                 const implicit_open = info.is_interface or info.is_abstract or p.is_abstract or p.is_override;
                 try info.member_flags.put(p.name.name, .{
                     .is_open = p.is_open or implicit_open,
@@ -533,12 +577,40 @@ pub fn checkTopLevelProperty(self: *Checker, p: *const Property) Allocator.Error
             }
         }
     }
+    if (p.explicit_field) |ef| {
+        if (ef.init) |*finit| {
+            var want: ?Type = if (ef.ty) |*ft| try convertTypeRefLossy(self.allocator, ft) else null;
+            defer if (want) |*a| a.deinit(self.allocator);
+            var fty = try self.checkExpr(finit, if (want) |*a| a else null);
+            defer fty.deinit(self.allocator);
+            if (want) |*a| {
+                try checkAssignable(self, &fty, a, finit.span());
+            } else {
+                // The narrowed binding's type is inferred from the field
+                // initializer (`field = mutableListOf(1)`).
+                if (self.frames.items[0].bindings.getPtr(p.name.name)) |b| {
+                    if (b.ty == .Unresolved) {
+                        b.ty = try fty.clone(self.allocator);
+                    }
+                }
+            }
+        }
+        // A top-level field with no initializer has no construction path
+        // that could assign it.
+        if (ef.init == null) {
+            var d = Diagnostic.err("Field must be initialized.", ef.span);
+            _ = d.withCode(codes.TYPE_VAR_NOT_DEFINITELY_ASSIGNED);
+            _ = d.withFactory(&diagnostics.generated.EXPLICIT_FIELD_MUST_BE_INITIALIZED);
+            try self.diagnostics.emit(self.allocator, d);
+        }
+    }
     if (p.delegate) |d| {
         var dt = try self.checkExpr(d, null);
         dt.deinit(self.allocator);
         try checkDelegateOperator(self, p, d);
     }
     try checkLateinit(self, p);
+    try checkExplicitBackingField(self, p, false);
     try checkAccessorReturnTypes(self, p);
 }
 
@@ -818,9 +890,14 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
     for (f.type_params) |*tp| try all_tps.put(tp.name.name, {});
     try self.type_params_in_scope.append(self.allocator, all_tps);
 
+    // Explicit-backing-field narrowing is off inside non-private inline
+    // functions: the inlined body may execute outside the declaring scope.
+    const suppress_field_narrow = f.is_inline and f.visibility != .Private;
+    if (suppress_field_narrow) self.field_narrow_off += 1;
     if (f.body) |*body| {
         try checkFunctionBody(self, f, body, &declared_return);
     }
+    if (suppress_field_narrow) self.field_narrow_off -= 1;
 
     {
         var t = self.fn_return_stack.pop().?;
@@ -1290,6 +1367,10 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
     for (c.members) |*m| {
         if (m.* == .Property) try checkLateinit(self, m.Property);
     }
+    // Explicit-backing-field rules.
+    for (c.members) |*m| {
+        if (m.* == .Property) try checkExplicitBackingField(self, m.Property, c.is_interface);
+    }
     // Accessor return-type annotation.
     for (c.members) |*m| {
         if (m.* == .Property) try checkAccessorReturnTypes(self, m.Property);
@@ -1316,7 +1397,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         }
     }
     // Body properties bind in declaration order.
-    var uninitialized_properties: std.ArrayList(struct { name: []const u8, sp: Span }) = .empty;
+    var uninitialized_properties: std.ArrayList(struct { name: []const u8, sp: Span, explicit_field: bool }) = .empty;
     defer uninitialized_properties.deinit(self.allocator);
     for (c.members) |*m| {
         if (m.* != .Property) continue;
@@ -1330,17 +1411,41 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
                 a.deinit(self.allocator);
             }
         }
-        const has_init = p.init != null or p.delegate != null or p.is_lateinit or p.is_abstract or p.getter != null or c.is_interface or c.is_abstract;
+        // An explicit field's initializer checks against the FIELD type.
+        if (p.explicit_field) |ef| {
+            if (ef.init) |*finit| {
+                var want: ?Type = if (ef.ty) |*ft| try convertTypeRefLossy(self.allocator, ft) else null;
+                var fty = try self.checkExpr(finit, if (want) |*a| a else null);
+                defer fty.deinit(self.allocator);
+                if (want) |*a| {
+                    try checkAssignable(self, &fty, a, finit.span());
+                    a.deinit(self.allocator);
+                }
+            }
+        }
+        const ef_has_init = if (p.explicit_field) |ef| ef.init != null else false;
+        const has_init = p.init != null or ef_has_init or p.delegate != null or p.is_lateinit or p.is_abstract or p.getter != null or c.is_interface or c.is_abstract;
         if (!has_init) {
-            const pty = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
+            // For an explicit field the declaring scope (the class body,
+            // including init blocks) sees — and assigns — the field type.
+            const narrow_tr: ?*const ast.TypeRef = if (p.explicit_field) |ef|
+                (if (ef.ty) |*ft| ft else null)
+            else
+                null;
+            const bind_tr: ?*const ast.TypeRef = narrow_tr orelse (if (p.ty) |*pt| @as(?*const ast.TypeRef, pt) else null);
+            const pty = if (bind_tr) |tr| try convertTypeRefLossy(self.allocator, tr) else Type.Unresolved;
             try currentFrame(self).bindings.put(p.name.name, .{
                 .ty = pty,
                 .mutable = p.mutable,
                 .decl_span = p.name.span,
-                .class_name = if (p.ty) |*pt| classNameFromTyperef(pt) else null,
+                .class_name = if (bind_tr) |tr| classNameFromTyperef(tr) else null,
                 .decl_type_name = null,
             });
-            try uninitialized_properties.append(self.allocator, .{ .name = p.name.name, .sp = p.name.span });
+            try uninitialized_properties.append(self.allocator, .{
+                .name = p.name.name,
+                .sp = if (p.explicit_field) |ef| ef.span else p.name.span,
+                .explicit_field = p.explicit_field != null,
+            });
         }
         try handleAccessors(self, p);
     }
@@ -1391,8 +1496,15 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         for (uninitialized_properties.items) |up| {
             const cfg_says_unassigned = (try cfgViaUnassignedAtExit(self, init_cfg_span, up.name)) orelse true;
             if (cfg_says_unassigned) {
-                const msg = try std.fmt.allocPrint(self.allocator, "Property `{s}` must be initialized", .{up.name});
-                try emitError(self, msg, up.sp, codes.TYPE_VAR_NOT_DEFINITELY_ASSIGNED);
+                if (up.explicit_field) {
+                    var d = Diagnostic.err("Field must be initialized.", up.sp);
+                    _ = d.withCode(codes.TYPE_VAR_NOT_DEFINITELY_ASSIGNED);
+                    _ = d.withFactory(&diagnostics.generated.EXPLICIT_FIELD_MUST_BE_INITIALIZED);
+                    try self.diagnostics.emit(self.allocator, d);
+                } else {
+                    const msg = try std.fmt.allocPrint(self.allocator, "Property `{s}` must be initialized", .{up.name});
+                    try emitError(self, msg, up.sp, codes.TYPE_VAR_NOT_DEFINITELY_ASSIGNED);
+                }
             }
         }
     }
@@ -1721,6 +1833,220 @@ pub fn checkLateinit(self: *Checker, p: *const Property) Allocator.Error!void {
     }
 }
 
+fn emitEbf(
+    self: *Checker,
+    factory: *const diagnostics.DiagnosticFactory,
+    msg: []const u8,
+    sp: Span,
+) Allocator.Error!void {
+    var d = Diagnostic.err(msg, sp);
+    _ = d.withCode(codes.TYPE_EXPLICIT_BACKING_FIELD);
+    _ = d.withFactory(factory);
+    try self.diagnostics.emit(self.allocator, d);
+}
+
+/// Static rules for a property declared with an explicit backing field
+/// (`val p: Tp` + `field: Tf = init`). The shipped surface admits only
+/// final, non-private, non-extension `val` member/top-level properties
+/// with no accessor bodies, no property initializer, and no delegate; the
+/// field type must be a subtype of the property type.
+pub fn checkExplicitBackingField(self: *Checker, p: *const Property, in_interface: bool) Allocator.Error!void {
+    const ef = p.explicit_field orelse return;
+    const g = diagnostics.generated;
+    if (p.mutable) {
+        try emitEbf(self, &g.VAR_PROPERTY_WITH_EXPLICIT_BACKING_FIELD, "Only 'val' properties with explicit backing fields are supported.", p.span);
+    }
+    if (p.getter) |acc| {
+        try emitEbf(self, &g.PROPERTY_WITH_EXPLICIT_FIELD_AND_ACCESSORS, "Properties with explicit backing fields cannot have accessors.", acc.span);
+    }
+    if (p.setter) |acc| {
+        try emitEbf(self, &g.PROPERTY_WITH_EXPLICIT_FIELD_AND_ACCESSORS, "Properties with explicit backing fields cannot have accessors.", acc.span);
+    }
+    if (p.init) |*init| {
+        try emitEbf(self, &g.PROPERTY_INITIALIZER_WITH_EXPLICIT_FIELD_DECLARATION, "Property initializers are prohibited for properties with explicit backing field declaration.", init.span());
+    }
+    if (p.is_open or p.is_override) {
+        try emitEbf(self, &g.NON_FINAL_PROPERTY_WITH_EXPLICIT_BACKING_FIELD, "Properties with explicit backing fields must be final.", p.name.span);
+    }
+    if (p.is_abstract) {
+        try emitEbf(self, &g.EXPLICIT_BACKING_FIELD_IN_ABSTRACT_PROPERTY, "Abstract property cannot have a backing field.", ef.span);
+    }
+    if (in_interface) {
+        try emitEbf(self, &g.EXPLICIT_BACKING_FIELD_IN_INTERFACE, "Backing fields inside interfaces are prohibited.", ef.span);
+    }
+    if (p.receiver_type != null) {
+        try emitEbf(self, &g.EXPLICIT_BACKING_FIELD_IN_EXTENSION, "Extension properties cannot have a backing field.", ef.span);
+    }
+    if (p.is_expect) {
+        try emitEbf(self, &g.EXPECT_PROPERTY_WITH_EXPLICIT_BACKING_FIELD, "'expect' properties are not allowed to declare explicit backing fields.", p.name.span);
+    }
+    if (p.delegate != null) {
+        try emitEbf(self, &g.BACKING_FIELD_FOR_DELEGATED_PROPERTY, "Delegated properties cannot have explicit backing field declarations.", ef.span);
+    }
+    if (p.visibility == .Private) {
+        try emitEbf(self, &g.EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE, "Private properties cannot have explicit backing fields.", p.name.span);
+    }
+    if (p.ty) |*pt| {
+        if (ef.ty) |*ft| {
+            if (helpers.typeRefEql(ft, pt)) {
+                var d = Diagnostic.warning("Explicit backing field declaration is unnecessary if it has the same type as the property.", ef.span);
+                _ = d.withCode(codes.WARN_REDUNDANT_EXPLICIT_BACKING_FIELD);
+                _ = d.withFactory(&diagnostics.generated.REDUNDANT_EXPLICIT_BACKING_FIELD);
+                try self.diagnostics.emit(self.allocator, d);
+            } else if (!try fieldTypeRefConforms(self, ft, pt)) {
+                try emitEbf(self, &g.INCONSISTENT_BACKING_FIELD_TYPE, "The type of the backing field must be a subtype of the property's type.", pt.span);
+            }
+        } else if (ef.init == null) {
+            // Bare `field` takes the property's own type — always redundant.
+            var d = Diagnostic.warning("Explicit backing field declaration is unnecessary if it has the same type as the property.", ef.span);
+            _ = d.withCode(codes.WARN_REDUNDANT_EXPLICIT_BACKING_FIELD);
+            _ = d.withFactory(&diagnostics.generated.REDUNDANT_EXPLICIT_BACKING_FIELD);
+            try self.diagnostics.emit(self.allocator, d);
+        }
+    }
+}
+
+/// Is the field type a subtype of the property type? Works on the source
+/// type references (the lossy `Type` conversion collapses class types).
+/// Exact equality is handled by the caller (it is the redundancy warning,
+/// not an error). Unknown shapes stay permissive — only relations the
+/// checker positively knows to be wrong (disjoint scalars, unrelated
+/// user classes) report an inconsistency.
+fn fieldTypeRefConforms(self: *Checker, ft: *const TypeRef, pt: *const TypeRef) Allocator.Error!bool {
+    if (ft.function != null or pt.function != null) return true;
+    if (ft.nullable and !pt.nullable) return false;
+    const fb = builtinByName(ft.name.name);
+    const pb = builtinByName(pt.name.name);
+    if (pb) |pty| {
+        if (pty == .Any) return true;
+        if (pty == .Nothing) return false;
+        const fty = fb orelse return false;
+        return @as(std.meta.Tag(Type), fty) == @as(std.meta.Tag(Type), pty);
+    }
+    const pname = pt.name.name;
+    if (typeParamInScope(self, pname)) return true;
+    if (std.mem.eql(u8, pname, "Number")) {
+        const fty = fb orelse return false;
+        return switch (fty) {
+            .Int, .Long, .Short, .Byte, .Double, .Float => true,
+            else => false,
+        };
+    }
+    if (std.mem.eql(u8, pname, "CharSequence")) {
+        if (fb) |fty| return fty == .String;
+        return std.mem.eql(u8, ft.name.name, "StringBuilder");
+    }
+    if (std.mem.eql(u8, pname, "Comparable")) return true;
+    if (fb != null) {
+        // A scalar field under a class-typed property: wrong for a user
+        // class, permissive for stdlib interfaces the checker cannot see.
+        return !self.classes.contains(pname) and !isBuiltinCollectionHead(pname);
+    }
+    const fname = ft.name.name;
+    if (typeParamInScope(self, fname)) return true;
+    if (builtinChainContains(fname, pname)) {
+        return typeArgsCompatible(ft.type_args, pt.type_args);
+    }
+    if (try isSubtypeOf(self, fname, pname)) return true;
+    // Both heads known (user classes / builtin collection interfaces) with
+    // no subtype path: a real inconsistency. Anything else is out of the
+    // checker's sight and stays permissive.
+    const fname_known = self.classes.contains(fname) or isBuiltinCollectionHead(fname);
+    const pname_known = self.classes.contains(pname) or isBuiltinCollectionHead(pname);
+    return !(fname_known and pname_known);
+}
+
+/// Is `name` a generic type parameter of the enclosing declaration(s)?
+fn typeParamInScope(self: *const Checker, name: []const u8) bool {
+    for (self.type_params_in_scope.items) |s| {
+        if (s.contains(name)) return true;
+    }
+    return false;
+}
+
+fn isBuiltinCollectionHead(name: []const u8) bool {
+    const heads = [_][]const u8{
+        "Iterable",   "MutableIterable",   "Collection", "MutableCollection",
+        "List",       "MutableList",       "Set",        "MutableSet",
+        "Map",        "MutableMap",        "ArrayList",  "ArrayDeque",
+        "HashSet",    "LinkedHashSet",     "HashMap",    "LinkedHashMap",
+    };
+    for (heads) |h| {
+        if (std.mem.eql(u8, h, name)) return true;
+    }
+    return false;
+}
+
+/// Covariant-leaning type-argument compatibility for the builtin
+/// collection chain (`List<out E>` and friends): exact matches and
+/// star projections pass; two distinct scalar heads conflict; anything
+/// else stays permissive.
+fn typeArgsCompatible(sub_args: []const ast.TypeArg, sup_args: []const ast.TypeArg) bool {
+    if (sub_args.len != sup_args.len) return true;
+    for (sub_args, sup_args) |*l, *r| {
+        if (l.is_star or r.is_star) continue;
+        if (helpers.typeRefEql(&l.ty, &r.ty)) continue;
+        const lb = builtinByName(l.ty.name.name);
+        const rb = builtinByName(r.ty.name.name);
+        if (lb != null and rb != null) {
+            // Covariant reading: a narrower numeric under Number is fine,
+            // but two distinct scalars conflict.
+            if (rb.? == .Any) continue;
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Transitive walk of the builtin kotlin.collections interface hierarchy:
+/// is `sup` reachable from `sub`?
+fn builtinChainContains(sub: []const u8, sup: []const u8) bool {
+    const supersOf = struct {
+        fn f(name: []const u8) []const []const u8 {
+            const P = struct { n: []const u8, s: []const []const u8 };
+            const table = [_]P{
+                .{ .n = "MutableList", .s = &.{ "List", "MutableCollection" } },
+                .{ .n = "ArrayList", .s = &.{"MutableList"} },
+                .{ .n = "ArrayDeque", .s = &.{"MutableList"} },
+                .{ .n = "List", .s = &.{"Collection"} },
+                .{ .n = "MutableSet", .s = &.{ "Set", "MutableCollection" } },
+                .{ .n = "HashSet", .s = &.{"MutableSet"} },
+                .{ .n = "LinkedHashSet", .s = &.{"MutableSet"} },
+                .{ .n = "Set", .s = &.{"Collection"} },
+                .{ .n = "MutableCollection", .s = &.{ "Collection", "MutableIterable" } },
+                .{ .n = "Collection", .s = &.{"Iterable"} },
+                .{ .n = "MutableIterable", .s = &.{"Iterable"} },
+                .{ .n = "MutableMap", .s = &.{"Map"} },
+                .{ .n = "HashMap", .s = &.{"MutableMap"} },
+                .{ .n = "LinkedHashMap", .s = &.{"MutableMap"} },
+            };
+            for (table) |e| {
+                if (std.mem.eql(u8, e.n, name)) return e.s;
+            }
+            return &.{};
+        }
+    }.f;
+    var frontier: [16][]const u8 = undefined;
+    var n: usize = 0;
+    frontier[n] = sub;
+    n += 1;
+    var steps: usize = 0;
+    while (n > 0) {
+        n -= 1;
+        const cur = frontier[n];
+        steps += 1;
+        if (steps > 32) break;
+        for (supersOf(cur)) |s| {
+            if (std.mem.eql(u8, s, sup)) return true;
+            if (n < frontier.len) {
+                frontier[n] = s;
+                n += 1;
+            }
+        }
+    }
+    return false;
+}
+
 /// Enforce that an accessor's explicit return-type annotation matches
 /// the property's declared type.
 pub fn checkAccessorReturnTypes(self: *Checker, p: *const Property) Allocator.Error!void {
@@ -1891,6 +2217,18 @@ pub fn checkObject(self: *Checker, o: *const ObjectDecl) Allocator.Error!void {
                         a.deinit(self.allocator);
                     }
                 }
+                if (p.explicit_field) |ef| {
+                    if (ef.init) |*finit| {
+                        var want: ?Type = if (ef.ty) |*ft| try convertTypeRefLossy(self.allocator, ft) else null;
+                        var fty = try self.checkExpr(finit, if (want) |*a| a else null);
+                        defer fty.deinit(self.allocator);
+                        if (want) |*a| {
+                            try checkAssignable(self, &fty, a, finit.span());
+                            a.deinit(self.allocator);
+                        }
+                    }
+                }
+                try checkExplicitBackingField(self, p, false);
                 try handleAccessors(self, p);
             },
             .Function => |*f| try checkFunction(self, f),

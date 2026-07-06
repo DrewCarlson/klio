@@ -245,6 +245,13 @@ Expected = exact final placement under LV 2.4 (reflection-observable), or diagno
 
 ## C. Explicit backing fields
 
+Implemented in KLIO: the parser accepts the field clause on member/top-level
+properties (syntax error on constructor/local properties), typeck enforces the
+static-rule table and the scope-narrowing access rule below, and lowering
+treats the field initializer as the property's storage initializer. Coverage:
+`zig build itest-explicit_backing_fields` (the full test matrix C), parser and
+typeck unit tests, and `examples/backing_fields.kt`.
+
 ### Status and history
 
 Stable at LV 2.4 (preview in 2.3 behind `-Xexplicit-backing-fields`). The shipped design is

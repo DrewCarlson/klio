@@ -75,6 +75,11 @@ pub const Parser = struct {
     /// separates the qualifier itself). Keeps qualified type refs
     /// working everywhere else.
     suppress_qualified_path: bool,
+    /// When `true`, the cursor is inside a property accessor body, where
+    /// `field` is the backing-field expression. Local-property parsing
+    /// then never mistakes a `field = value` assignment statement for an
+    /// explicit-backing-field clause.
+    in_accessor_body: bool,
     /// Per-token flag: `true` when the token sits inside an unclosed
     /// `(` or `[` (not `{`). Kotlin treats newlines as soft inside
     /// round/square brackets — an expression may break before or after
@@ -137,6 +142,7 @@ pub const Parser = struct {
             .diagnostics = DiagnosticSink.init(),
             .suppress_trailing_lambda = false,
             .suppress_qualified_path = false,
+            .in_accessor_body = false,
             .nl_soft = nl_soft,
         };
         return p;
@@ -1260,4 +1266,209 @@ test {
     _ = expr;
     _ = primary;
     _ = control;
+}
+
+// -------------------------------------------------------------------------
+// Explicit backing fields
+// -------------------------------------------------------------------------
+
+test "ebf: member property field clause with initializer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class Cart {
+        \\    val items: List<String>
+        \\        field = mutableListOf<String>()
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Class.members[0].Property;
+    const ef = p.explicit_field.?;
+    try testing.expect(ef.ty == null);
+    try testing.expect(ef.init != null);
+    try testing.expect(p.init == null);
+}
+
+test "ebf: field clause with type and initializer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class C {
+        \\    val n: Number
+        \\        field: Int = 1
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Class.members[0].Property;
+    const ef = p.explicit_field.?;
+    try testing.expectEqualStrings("Int", ef.ty.?.name.name);
+    try testing.expect(ef.init != null);
+}
+
+test "ebf: deferred field clause (type only)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class C {
+        \\    val ns: List<Int>
+        \\        field: MutableList<Int>
+        \\    init { ns = mutableListOf(1) }
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Class.members[0].Property;
+    const ef = p.explicit_field.?;
+    try testing.expectEqualStrings("MutableList", ef.ty.?.name.name);
+    try testing.expect(ef.init == null);
+}
+
+test "ebf: bare field clause" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class C {
+        \\    val n: Int
+        \\        field
+        \\    init { n = 1 }
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Class.members[0].Property;
+    const ef = p.explicit_field.?;
+    try testing.expect(ef.ty == null);
+    try testing.expect(ef.init == null);
+}
+
+test "ebf: top-level property field clause" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\val top: List<Int>
+        \\    field = mutableListOf(1)
+        \\fun main() { println(top) }
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Property;
+    try testing.expect(p.explicit_field != null);
+    try testing.expect(out.file.decls[1] == .Function);
+}
+
+test "ebf: initializer plus field clause both recorded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class C {
+        \\    val n: Int = 5
+        \\        field = 6
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Class.members[0].Property;
+    try testing.expect(p.init != null);
+    try testing.expect(p.explicit_field != null);
+}
+
+test "ebf: field clause followed by delegate both recorded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class C {
+        \\    val n: Number
+        \\        field: Int = 1
+        \\        by lazy { 2 }
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Class.members[0].Property;
+    try testing.expect(p.explicit_field != null);
+    try testing.expect(p.delegate != null);
+}
+
+test "ebf: getter after field clause still parses" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class C {
+        \\    val n: Number
+        \\        field: Int = 1
+        \\        get() = 5
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Class.members[0].Property;
+    try testing.expect(p.explicit_field != null);
+    try testing.expect(p.getter != null);
+}
+
+test "ebf: constructor property field clause is a syntax error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(
+        arena.allocator(),
+        "class C(val xs: List<Int> field: MutableList<Int> = mutableListOf())",
+    );
+    try testing.expect(out.parser.diagnostics.hasErrors());
+    var found = false;
+    for (out.parser.diagnostics.diags()) |d| {
+        if (std.mem.indexOf(u8, d.message, "constructor properties") != null) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "ebf: local property field clause is a syntax error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun f() {
+        \\    val xs: List<Int>
+        \\        field = mutableListOf<Int>()
+        \\}
+    );
+    try testing.expect(out.parser.diagnostics.hasErrors());
+    var found = false;
+    for (out.parser.diagnostics.diags()) |d| {
+        if (std.mem.indexOf(u8, d.message, "local properties") != null) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "ebf: modifier ahead of field clause rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class C {
+        \\    val n: Number
+        \\        internal field = 1
+        \\}
+    );
+    try testing.expect(out.parser.diagnostics.hasErrors());
+    var found = false;
+    for (out.parser.diagnostics.diags()) |d| {
+        if (d.factory) |f| {
+            if (std.mem.eql(u8, f.name, "WRONG_MODIFIER_TARGET")) found = true;
+        }
+    }
+    try testing.expect(found);
+    // The clause itself still lands on the property.
+    const p = out.file.decls[0].Class.members[0].Property;
+    try testing.expect(p.explicit_field != null);
+}
+
+test "ebf: backing-field assignment in accessor body is not a clause" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class K {
+        \\    var w: Int = 1
+        \\        set(v) {
+        \\            val old: Int
+        \\            field = v
+        \\            old = field
+        \\        }
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Class.members[0].Property;
+    try testing.expect(p.explicit_field == null);
+    try testing.expect(p.setter != null);
 }

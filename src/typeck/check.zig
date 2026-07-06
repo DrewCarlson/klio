@@ -401,8 +401,10 @@ pub const codes = struct {
     pub const TYPE_ASSIGN_OPERATOR_AMBIGUITY = "T0079";
     pub const TYPE_SUPER_QUALIFIER_NOT_SUPERTYPE = "T0073";
     pub const TYPE_ASSIGNMENT_IN_EXPRESSION_CONTEXT = "T0117";
+    pub const TYPE_EXPLICIT_BACKING_FIELD = "T0118";
     pub const WARN_DEPRECATED = "W0006";
     pub const WARN_OPT_IN = "W0007";
+    pub const WARN_REDUNDANT_EXPLICIT_BACKING_FIELD = "W0008";
 };
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -436,6 +438,42 @@ pub const Binding = struct {
     /// runtime-availability checks recover the spelling that
     /// `convertTypeRefLossy` collapsed to `Type.Unresolved`.
     decl_type_name: ?[]const u8,
+    /// Set for a top-level property with an explicit backing field: `ty`
+    /// above is the (narrowed) field type; this carries the public view.
+    /// Reads outside the declaring file — or where narrowing is switched
+    /// off — see the public type instead.
+    ebf: ?EbfBinding = null,
+};
+
+/// Public view of a top-level explicit-backing-field property (the frame
+/// binding itself holds the narrowed field type).
+pub const EbfBinding = struct {
+    public_ty: Type,
+    public_class: ?[]const u8,
+    /// Rendered public type for diagnostics (`List<Int>`).
+    public_display: []const u8,
+    /// File the property is declared in — narrowing is file-scoped.
+    file: FileId,
+};
+
+/// Per-member record of an explicit backing field: the narrowed (field)
+/// type served to reads inside the declaring class's scope. The `members`
+/// map keeps the public (property) type.
+pub const EbfMember = struct {
+    field_ty: Type,
+    field_class: ?[]const u8,
+    /// Rendered public (property) type for diagnostics.
+    public_display: []const u8,
+};
+
+/// Recorded at a property-read site that resolved OUTSIDE the declaring
+/// scope of an explicit-backing-field property: member calls on that read
+/// must resolve against the public type.
+pub const EbfOutside = struct {
+    /// Head class/interface name of the public type (`List`, user class).
+    head: ?[]const u8,
+    /// Rendered public type for diagnostics (`List<String>`).
+    display: []const u8,
 };
 
 /// One extension declaration on a given receiver type.
@@ -557,6 +595,9 @@ pub const ClassInfo = struct {
     /// Member name -> user-class name when the member's declared type
     /// names a user class.
     member_class: std.StringHashMap([]const u8),
+    /// Member name -> explicit-backing-field record. Present only for
+    /// properties declared with a `field` clause.
+    member_ebf: std.StringHashMap(EbfMember),
     /// Names of supertypes (raw — interfaces or classes).
     supertypes: std.ArrayList([]const u8) = .empty,
     /// Typed supertypes paired with type-arg lists, in declaration order.
@@ -590,6 +631,7 @@ pub const ClassInfo = struct {
             .member_flags = std.StringHashMap(MemberFlags).init(allocator),
             .member_sigs = std.StringHashMap(MemberSig).init(allocator),
             .member_class = std.StringHashMap([]const u8).init(allocator),
+            .member_ebf = std.StringHashMap(EbfMember).init(allocator),
             .member_visibility = std.StringHashMap(Visibility).init(allocator),
         };
     }
@@ -738,6 +780,15 @@ pub const Checker = struct {
     /// (user DSL builders), so resolution against same-named top-level
     /// functions stays tolerant when no candidate's arity admits the call.
     lambda_depth: usize,
+    /// Property-read sites of explicit-backing-field properties resolved
+    /// outside their declaring scope, keyed by the read expression's span.
+    /// Member calls on such a receiver must resolve against the public
+    /// (property) type.
+    ebf_outside: std.AutoHashMap(Span, EbfOutside),
+    /// Depth of enclosing non-private `inline` functions. Explicit-
+    /// backing-field narrowing is switched off inside them: the inlined
+    /// body may land outside the declaring scope.
+    field_narrow_off: usize,
     /// Retained arena for per-query CFG-analysis scratch (smart-cast / VIA /
     /// reachability solves). Reset at the start of each query via
     /// `narrowing.queryScratch`; torn down by the typecheck entry points once

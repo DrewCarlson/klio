@@ -89,6 +89,7 @@ Run any program with:
 |--------------------------------|-------------------------------------------------------------|
 | `delegates.kt`                 | Custom getters/setters, `by lazy`, `Delegates.observable`/`notNull`, user delegate classes. |
 | `accessor_return_type.kt`      | Accessor return-type inference.                             |
+| `backing_fields.kt`            | Explicit backing fields (`val items: List<T>` + `field = mutableListOf()`): field-typed reads inside the declaring scope, subtyped field types, deferred init-block assignment, top-level fields. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |
 | `safe_assign.kt`               | Safe-call assignment.                                       |
 

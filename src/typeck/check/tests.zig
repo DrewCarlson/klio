@@ -597,6 +597,15 @@ const Checked = struct {
         return false;
     }
 
+    fn hasFactory(self: *const Checked, name: []const u8) bool {
+        for (self.tc.diagnostics.diags()) |d| {
+            if (d.factory) |f| {
+                if (std.mem.eql(u8, f.name, name)) return true;
+            }
+        }
+        return false;
+    }
+
     fn countCode(self: *const Checked, code: []const u8) usize {
         var n: usize = 0;
         for (self.tc.diagnostics.diags()) |d| {
@@ -2528,4 +2537,161 @@ test "module: same-package same-signature functions across files still conflict"
     var c = checkModule(testing.allocator, &.{ file_a, file_b });
     defer c.deinit();
     try testing.expect(c.countCode(codes.TYPE_CONFLICTING_OVERLOADS) >= 1);
+}
+
+// ---------------------------------------------------------------------------
+// Explicit backing fields
+// ---------------------------------------------------------------------------
+
+fn ebfOf(b: *Builder, t: ?TypeRef, init_e: ?Expr) *ast.ExplicitField {
+    return b.dup(ast.ExplicitField, .{ .ty = t, .init = init_e, .span = b.ts() });
+}
+
+test "ebf_var_property_flagged" {
+    // class C { var n: Number  field: Int = 1 }
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var c0 = b.class("C");
+    var n = b.prop(true, "n", b.ty("Number"), null);
+    n.explicit_field = ebfOf(&b, b.ty("Int"), b.intLit(1));
+    c0.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, n) }});
+    const f = b.file(&.{.{ .Class = c0 }});
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("VAR_PROPERTY_WITH_EXPLICIT_BACKING_FIELD"));
+}
+
+test "ebf_inconsistent_type_flagged" {
+    // class C { val n: Int  field: String = "x" }
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var c0 = b.class("C");
+    var n = b.prop(false, "n", b.ty("Int"), null);
+    n.explicit_field = ebfOf(&b, b.ty("String"), b.str("x"));
+    c0.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, n) }});
+    const f = b.file(&.{.{ .Class = c0 }});
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("INCONSISTENT_BACKING_FIELD_TYPE"));
+}
+
+test "ebf_redundant_same_type_warns" {
+    // class C { val n: Int  field: Int = 1 }
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var c0 = b.class("C");
+    var n = b.prop(false, "n", b.ty("Int"), null);
+    n.explicit_field = ebfOf(&b, b.ty("Int"), b.intLit(1));
+    c0.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, n) }});
+    const f = b.file(&.{.{ .Class = c0 }});
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("REDUNDANT_EXPLICIT_BACKING_FIELD"));
+    try testing.expect(!c.hasFactory("INCONSISTENT_BACKING_FIELD_TYPE"));
+}
+
+test "ebf_mutable_collection_subtype_ok" {
+    // class C { val ns: List<Int>  field: MutableList<Int> = mutableListOf(1) }
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var c0 = b.class("C");
+    var ns = b.prop(false, "ns", b.tyArgs("List", &.{b.ty("Int")}), null);
+    ns.explicit_field = ebfOf(
+        &b,
+        b.tyArgs("MutableList", &.{b.ty("Int")}),
+        b.call(b.path("mutableListOf"), &.{b.intLit(1)}),
+    );
+    c0.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, ns) }});
+    const f = b.file(&.{.{ .Class = c0 }});
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(!c.hasFactory("INCONSISTENT_BACKING_FIELD_TYPE"));
+    try testing.expect(!c.hasFactory("REDUNDANT_EXPLICIT_BACKING_FIELD"));
+}
+
+test "ebf_field_must_be_initialized" {
+    // class C { val ns: List<Int>  field: MutableList<Int> }  (no init path)
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var c0 = b.class("C");
+    var ns = b.prop(false, "ns", b.tyArgs("List", &.{b.ty("Int")}), null);
+    ns.explicit_field = ebfOf(&b, b.tyArgs("MutableList", &.{b.ty("Int")}), null);
+    c0.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, ns) }});
+    const f = b.file(&.{.{ .Class = c0 }});
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("EXPLICIT_FIELD_MUST_BE_INITIALIZED"));
+}
+
+test "ebf_private_property_flagged" {
+    // class C { private val n: Number  field: Int = 1 }
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var c0 = b.class("C");
+    var n = b.prop(false, "n", b.ty("Number"), null);
+    n.visibility = .Private;
+    n.explicit_field = ebfOf(&b, b.ty("Int"), b.intLit(1));
+    c0.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, n) }});
+    const f = b.file(&.{.{ .Class = c0 }});
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE"));
+}
+
+test "ebf_delegate_flagged" {
+    // class C { val n: Number  field: Int = 1  by lazy { 2 } }
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var c0 = b.class("C");
+    var n = b.prop(false, "n", b.ty("Number"), null);
+    n.explicit_field = ebfOf(&b, b.ty("Int"), b.intLit(1));
+    n.delegate = b.dup(Expr, b.call(b.path("lazy"), &.{b.intLit(2)}));
+    c0.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, n) }});
+    const f = b.file(&.{.{ .Class = c0 }});
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("BACKING_FIELD_FOR_DELEGATED_PROPERTY"));
+}
+
+test "ebf_no_narrowing_outside_class" {
+    // class Cart { val items: List<String>  field: MutableList<String> = mutableListOf() }
+    // fun main() { Cart().items.add("b") }  — `add` unresolved on List<String>.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var cart = b.class("Cart");
+    var items = b.prop(false, "items", b.tyArgs("List", &.{b.ty("String")}), null);
+    items.explicit_field = ebfOf(
+        &b,
+        b.tyArgs("MutableList", &.{b.ty("String")}),
+        b.call(b.path("mutableListOf"), &.{}),
+    );
+    cart.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, items) }});
+    const main = b.funBlock("main", &.{}, null, &.{
+        b.exprStmt(b.call(b.member(b.member(b.call(b.path("Cart"), &.{}), "items"), "add"), &.{b.str("b")})),
+    });
+    const f = b.file(&.{ .{ .Class = cart }, .{ .Function = main } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(c.hasFactory("UNRESOLVED_REFERENCE"));
+}
+
+test "ebf_read_outside_class_public_type_ok" {
+    // Same shape, but a read-only member call resolves fine outside.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var cart = b.class("Cart");
+    var items = b.prop(false, "items", b.tyArgs("List", &.{b.ty("String")}), null);
+    items.explicit_field = ebfOf(
+        &b,
+        b.tyArgs("MutableList", &.{b.ty("String")}),
+        b.call(b.path("mutableListOf"), &.{}),
+    );
+    cart.members = b.slice(Decl, &.{.{ .Property = b.dup(Property, items) }});
+    const main = b.funBlock("main", &.{}, null, &.{
+        b.exprStmt(b.call(b.member(b.member(b.call(b.path("Cart"), &.{}), "items"), "isEmpty"), &.{})),
+    });
+    const f = b.file(&.{ .{ .Class = cart }, .{ .Function = main } });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(!c.hasFactory("UNRESOLVED_REFERENCE"));
 }

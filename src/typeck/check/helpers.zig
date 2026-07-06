@@ -187,6 +187,49 @@ pub fn classNameFromTyperef(t: *const TypeRef) ?[]const u8 {
     return t.name.name;
 }
 
+/// Structural equality of two source type references: same head name,
+/// nullability, and type-argument list. Function-typed references never
+/// compare equal (their shape lives behind the boxed `function` payload,
+/// and no consumer of this needs to distinguish two of them).
+pub fn typeRefEql(a: *const TypeRef, b: *const TypeRef) bool {
+    if (a.function != null or b.function != null) return false;
+    if (a.nullable != b.nullable) return false;
+    if (!std.mem.eql(u8, a.name.name, b.name.name)) return false;
+    if (a.type_args.len != b.type_args.len) return false;
+    for (a.type_args, b.type_args) |*x, *y| {
+        if (x.is_star != y.is_star) return false;
+        if (x.is_star) continue;
+        if (!typeRefEql(&x.ty, &y.ty)) return false;
+    }
+    return true;
+}
+
+/// Render a source type reference as the user wrote it structurally:
+/// `List<String>`, `Map<Int, String?>?`.
+pub fn typeRefDisplay(allocator: Allocator, t: *const TypeRef) Allocator.Error![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    typeRefWrite(&aw.writer, t) catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
+}
+
+fn typeRefWrite(w: *std.Io.Writer, t: *const TypeRef) std.Io.Writer.Error!void {
+    try w.writeAll(t.name.name);
+    if (t.type_args.len != 0) {
+        try w.writeAll("<");
+        for (t.type_args, 0..) |*arg, i| {
+            if (i != 0) try w.writeAll(", ");
+            if (arg.is_star) {
+                try w.writeAll("*");
+            } else {
+                try typeRefWrite(w, &arg.ty);
+            }
+        }
+        try w.writeAll(">");
+    }
+    if (t.nullable) try w.writeAll("?");
+}
+
 /// Walk a lambda body for a non-local `return`.
 pub fn scanLambdaStmtsForReturn(stmts: []const Stmt) bool {
     for (stmts) |s| {
