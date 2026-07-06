@@ -710,6 +710,7 @@ fn materialiseSequenceBounded(
                 // Drive a FRESH cursor so this materialisation is independent of
                 // any other consumption of the same (re-iterable) Sequence.
                 const bstate = try collections.freshBuilderState(host, allocator, bstate0);
+                try collections.pinBuilderState(allocator, bstate);
                 while (true) {
                     if (takeCapReached(seq.ops, st.taken)) break;
                     const step = try host.builderStep(bstate, out);
@@ -877,6 +878,7 @@ fn materialiseSequenceBounded(
         },
         .Builder => |bstate0| {
             const bstate = try collections.freshBuilderState(host, allocator, bstate0);
+            try collections.pinBuilderState(allocator, bstate);
             while (true) {
                 const step = try host.builderStep(bstate, out);
                 switch (step) {

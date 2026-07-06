@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 14;
+pub const FORMAT_VERSION: u32 = 15;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";

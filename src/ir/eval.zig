@@ -250,11 +250,18 @@ fn acquireRegs(allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value
             regs_pool.items.len -= 1;
             var list: std.ArrayList(Value) = .{ .items = buf[0..0], .capacity = buf.len };
             list.appendNTimes(ra, .Unit, n) catch unreachable; // capacity already fits
+            // Re-enters the traced set (see releaseRegs).
+            if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting) runtime.gc.noteExternalBytes(buf.len * @sizeOf(Value));
             return list;
         }
     }
     var regs: std.ArrayList(Value) = .empty;
     try regs.appendNTimes(ra, .Unit, n);
+    // Fresh (non-pooled) buffer: advance the collector's Appel trigger.
+    // These bytes live outside the sweep registry but are traced through
+    // the frame chain; without this a deep suspended chain keeps the
+    // trigger at its floor and every collection re-marks the whole chain.
+    if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes(regs.capacity * @sizeOf(Value));
     return regs;
 }
 
@@ -272,6 +279,9 @@ fn releaseRegs(allocator: Allocator, regs: *std.ArrayList(Value)) void {
     if (pool_ok) {
         const buf = regs.allocatedSlice();
         regs.* = .empty;
+        // Leaves the traced set (pooled, no live values) — shrink the
+        // collector's external-live estimate to match.
+        if (gc_pool and runtime.gc.external_accounting) runtime.gc.noteExternalFreed(buf.len * @sizeOf(Value));
         regs_pool.append(ra, buf) catch {
             ra.free(buf);
         };
@@ -299,6 +309,8 @@ const ResumeFrames = struct {
     prev: ?*ResumeFrames,
     frames: *const std.ArrayList(FrameSnapshot),
     head: *const usize,
+    /// Unconsumed inherited segments of the in-flight resume.
+    tails: *const ?*TailSeg,
 };
 threadlocal var resuming: ?*ResumeFrames = null;
 
@@ -343,6 +355,10 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
     // Not-yet-rebuilt snapshots of every in-flight resume on this thread.
     var r = anchor.resuming.*;
     while (r) |node| : (r = node.prev) {
+        var seg = node.tails.*;
+        while (seg) |t| : (seg = t.next) {
+            for (t.frames.items[t.head..]) |snap| gcMarkSnapshot(snap, m);
+        }
         const head = node.head.*;
         const items = node.frames.items;
         var i = head;
@@ -836,9 +852,23 @@ pub const FrameSnapshot = struct {
 /// (outermost first, innermost last) plus the token the interceptor
 /// uses to resume it. Pure suspend mechanism: it carries no thread,
 /// dispatcher, or timing policy of its own.
+/// One inherited segment of not-yet-resumed outer frame snapshots. When a
+/// resumed activation re-suspends, the remaining outer snapshots are NOT
+/// copied into the new state (that copy made deep recursion quadratic —
+/// every DeepRecursive level re-copied the whole parked chain); the
+/// segment is linked here in O(1) and consumed by the next resume.
+pub const TailSeg = struct {
+    frames: std.ArrayList(FrameSnapshot),
+    /// First unconsumed index into `frames`.
+    head: usize,
+    next: ?*TailSeg,
+};
+
 pub const SuspendState = struct {
     token: u64,
     frames: std.ArrayList(FrameSnapshot) = .empty,
+    /// Inherited outer segments, innermost-first (resumed after `frames`).
+    tails: ?*TailSeg = null,
     /// Opaque Layer-2 resume directive, set by the suspending API and
     /// interpreted only by the interceptor — never by Layer 1. The
     /// default cooperative interceptor reads it as virtual-time
@@ -863,6 +893,18 @@ pub const SuspendState = struct {
         }
         for (self.frames.items) |snap| freeSnapshotBuffers(snap, allocator);
         self.frames.deinit(allocator);
+        var seg = self.tails;
+        self.tails = null;
+        while (seg) |t| {
+            const next = t.next;
+            if (runtime.reclaimEnabled()) {
+                for (t.frames.items[t.head..]) |snap| releaseSnapshotValues(snap, allocator);
+            }
+            for (t.frames.items[t.head..]) |snap| freeSnapshotBuffers(snap, allocator);
+            t.frames.deinit(allocator);
+            allocator.destroy(t);
+            seg = next;
+        }
     }
 };
 
@@ -885,13 +927,19 @@ fn retainSnapshotValues(snap: FrameSnapshot) void {
 /// it: a parked continuation is the chain's sole keeper while parked). Driven by
 /// the coroutine root provider for every persisted/active parked activation.
 pub fn gcMarkSuspendState(state: *const SuspendState, m: *runtime.gc.Marker) void {
-    for (state.frames.items) |snap| {
-        for (snap.regs) |v| v.gcMark(m);
-        for (snap.params) |v| v.gcMark(m);
-        for (snap.captures) |v| v.gcMark(m);
-        for (snap.enclosing_this) |e| e.v.gcMark(m);
-        markFrameClosure(snap.closure_id, m);
+    for (state.frames.items) |snap| gcMarkSnapshot(snap, m);
+    var seg = state.tails;
+    while (seg) |t| : (seg = t.next) {
+        for (t.frames.items[t.head..]) |snap| gcMarkSnapshot(snap, m);
     }
+}
+
+fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
+    for (snap.regs) |v| v.gcMark(m);
+    for (snap.params) |v| v.gcMark(m);
+    for (snap.captures) |v| v.gcMark(m);
+    for (snap.enclosing_this) |e| e.v.gcMark(m);
+    markFrameClosure(snap.closure_id, m);
 }
 
 /// `runtime.gc.markSuspendHook` thunk: mark a builder continuation held as an
@@ -925,6 +973,7 @@ fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
 /// where `free` would rewind a bump pointer, leaves them.
 fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
     if (!runtime.freeScratch()) return;
+    if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalFreed((snap.regs.len + snap.params.len + snap.captures.len) * @sizeOf(Value));
     allocator.free(snap.regs);
     allocator.free(snap.params);
     allocator.free(snap.captures);
@@ -1315,14 +1364,32 @@ pub fn resumeContinuation(
     var carry = resume_value;
     // `frames` is innermost-first (the deepest activation snapshots
     // itself first as `Suspended` unwinds). Resume the innermost, then
-    // feed its return value to the next-outer frame, and so on.
+    // feed its return value to the next-outer frame, and so on. When the
+    // fresh list is drained, consumption continues through the inherited
+    // `tails` segments (see `TailSeg`) — one segment at a time, promoting
+    // each into `frames`/`head` so the loop and the GC root see one shape.
     var frames = state.frames;
+    var tails: ?*TailSeg = state.tails;
+    // Ownership of both moves into this resume; the state must not tear
+    // them down (or double-free segments a re-suspend hands to the inner
+    // continuation).
+    state.tails = null;
     defer frames.deinit(allocator);
+    defer {
+        var seg = tails;
+        while (seg) |t| {
+            const next = t.next;
+            t.frames.deinit(allocator);
+            allocator.destroy(t);
+            seg = next;
+        }
+    }
     var head: usize = 0;
-    // Root the not-yet-rebuilt outer snapshots (`frames.items[head..]`) for the
-    // duration of the resume: they are out of the park registry and not yet on
-    // the frame chain, so an inner frame's collection would otherwise sweep them.
-    var resume_node = ResumeFrames{ .prev = resuming, .frames = &frames, .head = &head };
+    // Root the not-yet-rebuilt outer snapshots (`frames.items[head..]` and
+    // the unconsumed tail segments) for the duration of the resume: they are
+    // out of the park registry and not yet on the frame chain, so an inner
+    // frame's collection would otherwise sweep them.
+    var resume_node = ResumeFrames{ .prev = resuming, .frames = &frames, .head = &head, .tails = &tails };
     if (runtime.gc.gc_enabled) {
         gcInstallFrameRoot();
         resuming = &resume_node;
@@ -1332,7 +1399,17 @@ pub fn resumeContinuation(
     };
     var first = true;
     var pending_throw_from_inner: ?Value = null;
-    while (head < frames.items.len) {
+    while (true) {
+        if (head >= frames.items.len) {
+            // Promote the next inherited segment.
+            const seg = tails orelse break;
+            tails = seg.next;
+            frames.deinit(allocator);
+            frames = seg.frames;
+            head = seg.head;
+            allocator.destroy(seg);
+            continue;
+        }
         const snap = frames.items[head];
         head += 1;
         // Resolve the frame's `FuncId` against the module it was lowered
@@ -1397,10 +1474,21 @@ pub fn resumeContinuation(
                 .Suspended => |inner| {
                     // Re-suspended before this frame finished. The newly
                     // captured inner frames stay innermost-first; the
-                    // still-pending outer frames sit after them.
-                    var i = head;
-                    while (i < frames.items.len) : (i += 1) {
-                        try inner.frames.append(allocator, frames.items[i]);
+                    // still-pending outer snapshots are LINKED as an
+                    // inherited segment in O(1) — copying them here made
+                    // deep recursion quadratic in the parked depth.
+                    if (head < frames.items.len or tails != null) {
+                        const seg = try allocator.create(TailSeg);
+                        seg.* = .{ .frames = frames, .head = head, .next = tails };
+                        frames = .empty;
+                        head = 0;
+                        tails = null;
+                        // Append to the END of inner's (short) existing
+                        // chain: inner's own inherited segments are deeper
+                        // (inner-more) than ours.
+                        var slot: *?*TailSeg = &inner.tails;
+                        while (slot.*) |t| slot = &t.next;
+                        slot.* = seg;
                     }
                     return errResult(.{ .Suspended = inner });
                 },
@@ -1409,7 +1497,7 @@ pub fn resumeContinuation(
                     // restored try-stack: a `try { suspendingCall() }
                     // catch (e) { … }` should see exceptions raised after
                     // the parked call resumes.
-                    if (head >= frames.items.len) {
+                    if (head >= frames.items.len and tails == null) {
                         return errResult(.{ .Throw = exc });
                     }
                     pending_throw_from_inner = exc;
@@ -1898,6 +1986,14 @@ fn runFrameInner(
             }
         }
         const block = &func.blocks[cur.int()];
+        // Normal flow into a catch-only try's join: pop the body's
+        // entry (a throw path already consumed it — the scan then finds
+        // nothing). See `Block.catch_done_for`.
+        if (block.catch_done_for) |body| {
+            if (rpositionByBody(try_stack.items, body)) |p| {
+                _ = try_stack.orderedRemove(p);
+            }
+        }
         const insts: []const Inst = block.insts;
         const term = block.terminator;
         const finally = block.finally;
@@ -1968,8 +2064,18 @@ fn runFrameInner(
                             .module = frame.module_arc,
                             .block = cur,
                             .inst_idx = idx + 1,
-                            .regs = try allocator.dupe(Value, frame.regs.items),
-                            .params = try allocator.dupe(Value, frame.params.items),
+                            .regs = blk: {
+                                // Suspension snapshots are the dominant
+                                // allocation of deep suspended chains;
+                                // advance the collector's trigger (see
+                                // acquireRegs).
+                                if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes(frame.regs.items.len * @sizeOf(Value));
+                                break :blk try allocator.dupe(Value, frame.regs.items);
+                            },
+                            .params = blk: {
+                                if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes((frame.params.items.len + frame.captures.items.len) * @sizeOf(Value));
+                                break :blk try allocator.dupe(Value, frame.params.items);
+                            },
                             .captures = try allocator.dupe(Value, frame.captures.items),
                             .enclosing_this = try allocator.dupe(EnclosingEntry, frame.enclosing_this.items),
                             .try_stack = try allocator.dupe(TryFrame, try_stack.items),

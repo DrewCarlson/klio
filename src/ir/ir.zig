@@ -723,6 +723,15 @@ pub const Block = struct {
     /// entry — the matching key for the `TryFrame.body` the eval
     /// popped.
     finally_done_for: ?BlockId = null,
+    /// When this block is the JOIN of a catch-only try (no finally),
+    /// this carries the try body's entry block. Normal flow arriving
+    /// here pops that body's `TryFrame` — without the marker a
+    /// catch-only entry only left the stack via a throw, so a loop
+    /// body's `try { } catch { }` grew the stack by one per iteration
+    /// (and every Goto's finally scan walked it: quadratic in
+    /// iterations for a long-lived frame like DeepRecursive's
+    /// runCallLoop).
+    catch_done_for: ?BlockId = null,
 };
 
 /// A function body in IR form.

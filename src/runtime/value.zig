@@ -978,6 +978,7 @@ pub const SeqIterState = struct {
         self.seq.gcMark(m);
         if (self.buffered) |b| b.gcMark(m);
         if (self.gen_cur) |g| g.gcMark(m);
+        if (self.iter_obj) |v| v.gcMark(m);
         if (self.iter_left) |v| v.gcMark(m);
         if (self.iter_right) |v| v.gcMark(m);
     }
@@ -991,6 +992,7 @@ pub const SeqIterState = struct {
             self.seq.release(a);
             if (self.buffered) |b| b.release(a);
             if (self.gen_cur) |g| g.release(a);
+            if (self.iter_obj) |v| v.release(a);
             if (self.iter_left) |v| v.release(a);
             if (self.iter_right) |v| v.release(a);
         }
