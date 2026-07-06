@@ -33,6 +33,11 @@ pub const MangledMap = std.StringHashMap([]const u8);
 
 const dummySpan = Span.init(FileId.from(0), 0, 0);
 
+/// How a bare `field` reference in an accessor body maps onto storage:
+/// instance accessors read/write `this.__klio_field__<prop>`; top-level
+/// accessors read/write the `__klio_topfield__<prop>` global binding.
+pub const FieldSubst = enum { this_member, global };
+
 /// Replace every bare `field` identifier in `expr` with
 /// `this.__klio_field__<prop_name>`. Used by accessor-body lowering so
 /// the IR thunk reads / writes the backing field on the receiver.
@@ -41,77 +46,99 @@ const dummySpan = Span.init(FileId.from(0), 0, 0);
 pub fn substituteFieldWithThis(allocator: Allocator, prop_name: []const u8, expr: *const Expr) Allocator.Error!*Expr {
     const out = try allocator.create(Expr);
     out.* = expr.*;
-    try walkField(allocator, out, prop_name);
+    try walkField(allocator, out, prop_name, .this_member);
     return out;
 }
 
-/// Rewrite a bare `field` reference to a synthetic `this.__klio_field__<prop>`
-/// member access. The Vm's get_field / set_field detect the
-/// `__klio_field__` prefix and skip the custom-getter/setter dispatch.
-pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8) Allocator.Error!void {
+/// Replace every bare `field` identifier in `expr` with the raw global
+/// storage name `__klio_topfield__<prop_name>`. Used by top-level
+/// accessor-body lowering; the storage binding itself is registered
+/// under that raw key, so the read/write bypasses accessor dispatch.
+pub fn substituteFieldWithGlobal(allocator: Allocator, prop_name: []const u8, expr: *const Expr) Allocator.Error!*Expr {
+    const out = try allocator.create(Expr);
+    out.* = expr.*;
+    try walkField(allocator, out, prop_name, .global);
+    return out;
+}
+
+/// Rewrite a bare `field` reference per `mode` (see `FieldSubst`). The Vm's
+/// get_field / set_field detect the `__klio_field__` prefix and skip the
+/// custom-getter/setter dispatch; `__klio_topfield__` is the storage key
+/// itself for top-level properties.
+pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSubst) Allocator.Error!void {
     if (e.* == .Path) {
         const p = e.Path;
         if (p.segments.len == 1 and std.mem.eql(u8, p.segments[0].name, "field")) {
-            const backing = try std.fmt.allocPrint(allocator, "__klio_field__{s}", .{prop});
-            const this_segs = try allocator.alloc(Ident, 1);
-            this_segs[0] = .{ .name = "this", .span = dummySpan };
-            const recv = try allocator.create(Expr);
-            recv.* = .{ .Path = .{ .segments = this_segs, .span = dummySpan } };
-            e.* = .{ .Member = .{
-                .receiver = recv,
-                .name = .{ .name = backing, .span = dummySpan },
-                .safe = false,
-                .span = dummySpan,
-            } };
+            switch (mode) {
+                .this_member => {
+                    const backing = try std.fmt.allocPrint(allocator, "__klio_field__{s}", .{prop});
+                    const this_segs = try allocator.alloc(Ident, 1);
+                    this_segs[0] = .{ .name = "this", .span = dummySpan };
+                    const recv = try allocator.create(Expr);
+                    recv.* = .{ .Path = .{ .segments = this_segs, .span = dummySpan } };
+                    e.* = .{ .Member = .{
+                        .receiver = recv,
+                        .name = .{ .name = backing, .span = dummySpan },
+                        .safe = false,
+                        .span = dummySpan,
+                    } };
+                },
+                .global => {
+                    const backing = try std.fmt.allocPrint(allocator, "__klio_topfield__{s}", .{prop});
+                    const segs = try allocator.alloc(Ident, 1);
+                    segs[0] = .{ .name = backing, .span = dummySpan };
+                    e.* = .{ .Path = .{ .segments = segs, .span = dummySpan } };
+                },
+            }
             return;
         }
     }
     switch (e.*) {
         .Call => |c| {
-            try walkField(allocator, c.callee, prop);
-            for (c.args) |*a| try walkField(allocator, a, prop);
+            try walkField(allocator, c.callee, prop, mode);
+            for (c.args) |*a| try walkField(allocator, a, prop, mode);
         },
-        .Member => |m| try walkField(allocator, m.receiver, prop),
+        .Member => |m| try walkField(allocator, m.receiver, prop, mode),
         .Binary => |b| {
-            try walkField(allocator, b.lhs, prop);
-            try walkField(allocator, b.rhs, prop);
+            try walkField(allocator, b.lhs, prop, mode);
+            try walkField(allocator, b.rhs, prop, mode);
         },
-        .Unary => |u| try walkField(allocator, u.expr, prop),
-        .Postfix => |u| try walkField(allocator, u.expr, prop),
-        .IsCheck => |u| try walkField(allocator, u.expr, prop),
-        .As => |u| try walkField(allocator, u.expr, prop),
-        .Spread => |u| try walkField(allocator, u.expr, prop),
+        .Unary => |u| try walkField(allocator, u.expr, prop, mode),
+        .Postfix => |u| try walkField(allocator, u.expr, prop, mode),
+        .IsCheck => |u| try walkField(allocator, u.expr, prop, mode),
+        .As => |u| try walkField(allocator, u.expr, prop, mode),
+        .Spread => |u| try walkField(allocator, u.expr, prop, mode),
         .If => |iff| {
-            try walkField(allocator, iff.cond, prop);
-            try walkField(allocator, iff.then_branch, prop);
-            if (iff.else_branch) |eb| try walkField(allocator, eb, prop);
+            try walkField(allocator, iff.cond, prop, mode);
+            try walkField(allocator, iff.then_branch, prop, mode);
+            if (iff.else_branch) |eb| try walkField(allocator, eb, prop, mode);
         },
         .Index => |ix| {
-            try walkField(allocator, ix.receiver, prop);
-            for (ix.args) |*a| try walkField(allocator, a, prop);
+            try walkField(allocator, ix.receiver, prop, mode);
+            for (ix.args) |*a| try walkField(allocator, a, prop, mode);
         },
         .Block => |*b| {
-            for (b.stmts) |*s| try walkFieldStmt(allocator, s, prop);
+            for (b.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
         },
         .StringTemplate => |st| {
             for (st.parts) |*part| {
-                if (part.* == .Interp) try walkField(allocator, part.Interp, prop);
+                if (part.* == .Interp) try walkField(allocator, part.Interp, prop, mode);
             }
         },
         .Return => |r| {
-            if (r.value) |v| try walkField(allocator, v, prop);
+            if (r.value) |v| try walkField(allocator, v, prop, mode);
         },
-        .Throw => |t| try walkField(allocator, t.value, prop),
+        .Throw => |t| try walkField(allocator, t.value, prop, mode),
         else => {},
     }
 }
 
-fn walkFieldStmt(allocator: Allocator, s: *Stmt, prop: []const u8) Allocator.Error!void {
+fn walkFieldStmt(allocator: Allocator, s: *Stmt, prop: []const u8, mode: FieldSubst) Allocator.Error!void {
     switch (s.*) {
-        .Expr => |*e| try walkField(allocator, e, prop),
+        .Expr => |*e| try walkField(allocator, e, prop, mode),
         .Assign => |*a| {
-            try walkField(allocator, &a.target, prop);
-            try walkField(allocator, &a.value, prop);
+            try walkField(allocator, &a.target, prop, mode);
+            try walkField(allocator, &a.value, prop, mode);
         },
         else => {},
     }
@@ -122,7 +149,7 @@ fn walkFieldStmt(allocator: Allocator, s: *Stmt, prop: []const u8) Allocator.Err
 /// reference replaced with the synthetic backing-slot access.
 pub fn rewriteBlockField(allocator: Allocator, block: *const Block, prop: []const u8) Allocator.Error!Block {
     const stmts = try allocator.dupe(Stmt, block.stmts);
-    for (stmts) |*s| try walkFieldStmt(allocator, s, prop);
+    for (stmts) |*s| try walkFieldStmt(allocator, s, prop, .this_member);
     return .{ .stmts = stmts, .span = block.span };
 }
 
