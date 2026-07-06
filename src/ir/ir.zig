@@ -3301,6 +3301,10 @@ pub const ModuleRegistry = struct {
     /// no backing field, no delegate). A `LoadGlobal` of such a name
     /// re-invokes the getter on every read.
     top_level_prop_getters: std.StringHashMap(FuncId),
+    /// Top-level `var` custom setters. A `StoreGlobal` of the property
+    /// name invokes the setter thunk; the thunk's own `field =` write
+    /// lands on the `__klio_topfield__<name>` storage binding.
+    top_level_prop_setters: std.StringHashMap(FuncId),
 
     allocator: Allocator,
 
@@ -3357,6 +3361,7 @@ pub const ModuleRegistry = struct {
             .class_const_inits = StrPairMap(Const).init(allocator),
             .top_level_prop_pkgs = std.StringHashMap(std.ArrayList(PropDecl)).init(allocator),
             .top_level_prop_getters = std.StringHashMap(FuncId).init(allocator),
+            .top_level_prop_setters = std.StringHashMap(FuncId).init(allocator),
             .allocator = allocator,
         };
     }
@@ -3457,6 +3462,7 @@ pub const ModuleRegistry = struct {
             self.top_level_prop_pkgs.deinit();
         }
         self.top_level_prop_getters.deinit();
+        self.top_level_prop_setters.deinit();
     }
 
     /// Clone for extension (see `Module.cloneForExtend`). Outer container
@@ -3584,6 +3590,8 @@ pub const ModuleRegistry = struct {
         {
             var it = self.top_level_prop_getters.iterator();
             while (it.next()) |e| try out.top_level_prop_getters.put(e.key_ptr.*, e.value_ptr.*);
+            var sit = self.top_level_prop_setters.iterator();
+            while (sit.next()) |e| try out.top_level_prop_setters.put(e.key_ptr.*, e.value_ptr.*);
         }
         return out;
     }

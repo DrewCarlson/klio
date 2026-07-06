@@ -2444,6 +2444,16 @@ fn buildModuleWithOverrides(
             (if (ef.init) |*finit| finit else null)
         else
             null;
+        // A custom accessor next to real storage moves the storage binding
+        // to the raw `__klio_topfield__<name>` key: a plain-name read then
+        // misses and re-runs the getter, and a plain-name write dispatches
+        // the setter; the accessor bodies' `field` reads/writes target the
+        // raw key directly.
+        const accessorized = p.setter != null or (p.getter != null and storage_init != null);
+        const storage_name = if (accessorized)
+            try std.fmt.allocPrint(a, "__klio_topfield__{s}", .{p.name.name})
+        else
+            p.name.name;
         if (storage_init) |init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, init, nm);
@@ -2453,22 +2463,48 @@ fn buildModuleWithOverrides(
             // driving the initializer out of order; non-literal unannotated
             // initializers keep the on-demand path (`.none`).
             const dflt = if (p.ty) |*t| typedDefaultFor(t) else typedDefaultForInit(init);
-            try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .default = dflt });
+            try top_level_props.append(a, .{ .name = storage_name, .func = fid, .default = dflt });
         } else if (p.delegate) |delegate| {
             try top_level_delegated_props.put(p.name.name, {});
             const nm = try std.fmt.allocPrint(a, "__top_prop_delegate_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, delegate, nm);
             try top_level_props.append(a, .{ .name = p.name.name, .func = fid });
-        } else if (p.getter) |getter| {
-            // A top-level `val`/`var` with only a custom getter has no
-            // backing field, so it is not a startup initializer; its 0-arg
-            // getter re-runs on each read. Register it for `LoadGlobal`.
-            const nm = try std.fmt.allocPrint(a, "__top_prop_get_{s}", .{p.name.name});
-            const fid = switch (getter.body) {
-                .Expr => |body| try ir.lower.lowerExprAsThunk(module, &body, nm),
-                .Block => |blk| try ir.lower.lowerBlockAsThunk(module, &blk, nm),
-            };
-            try module.registry.top_level_prop_getters.put(p.name.name, fid);
+        }
+        if (p.delegate == null) {
+            if (p.getter) |getter| {
+                // With storage, the getter re-runs on each plain-name read
+                // (the miss path) and its `field` reads the raw key; without
+                // storage it is the field-less computed-property form.
+                const nm = try std.fmt.allocPrint(a, "__top_prop_get_{s}", .{p.name.name});
+                const fid = switch (getter.body) {
+                    .Expr => |body| blk: {
+                        const rewritten = try lift.substituteFieldWithGlobal(a, p.name.name, &body);
+                        break :blk try ir.lower.lowerExprAsThunk(module, rewritten, nm);
+                    },
+                    .Block => |blk_body| blk: {
+                        var wrapped = ast.Expr{ .Block = blk_body };
+                        const rewritten = try lift.substituteFieldWithGlobal(a, p.name.name, &wrapped);
+                        break :blk try ir.lower.lowerBlockAsThunk(module, &rewritten.Block, nm);
+                    },
+                };
+                try module.registry.top_level_prop_getters.put(p.name.name, fid);
+            }
+            if (p.setter) |setter| {
+                const value_param = if (setter.params.len != 0) setter.params[0].name else "value";
+                const nm = try std.fmt.allocPrint(a, "__top_prop_set_{s}", .{p.name.name});
+                const fid = switch (setter.body) {
+                    .Expr => |body| blk: {
+                        const rewritten = try lift.substituteFieldWithGlobal(a, p.name.name, &body);
+                        break :blk try ir.lower.lowerExprAsParamThunk(module, &.{value_param}, rewritten, nm);
+                    },
+                    .Block => |blk_body| blk: {
+                        var wrapped = ast.Expr{ .Block = blk_body };
+                        const rewritten = try lift.substituteFieldWithGlobal(a, p.name.name, &wrapped);
+                        break :blk try ir.lower.lowerBlockAsUnaryThunk(module, value_param, &rewritten.Block, nm);
+                    },
+                };
+                try module.registry.top_level_prop_setters.put(p.name.name, fid);
+            }
         }
     }
 

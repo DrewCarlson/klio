@@ -33,6 +33,11 @@ pub const MangledMap = std.StringHashMap([]const u8);
 
 const dummySpan = Span.init(FileId.from(0), 0, 0);
 
+/// How a bare `field` reference in an accessor body maps onto storage:
+/// instance accessors read/write `this.__klio_field__<prop>`; top-level
+/// accessors read/write the `__klio_topfield__<prop>` global binding.
+pub const FieldSubst = enum { this_member, global };
+
 /// Replace every bare `field` identifier in `expr` with
 /// `this.__klio_field__<prop_name>`. Used by accessor-body lowering so
 /// the IR thunk reads / writes the backing field on the receiver.
@@ -41,79 +46,112 @@ const dummySpan = Span.init(FileId.from(0), 0, 0);
 pub fn substituteFieldWithThis(allocator: Allocator, prop_name: []const u8, expr: *const Expr) Allocator.Error!*Expr {
     const out = try allocator.create(Expr);
     out.* = expr.*;
-    try walkField(allocator, out, prop_name);
+    try walkField(allocator, out, prop_name, .this_member);
     return out;
 }
 
-/// Rewrite a bare `field` reference to a synthetic `this.__klio_field__<prop>`
-/// member access. The Vm's get_field / set_field detect the
-/// `__klio_field__` prefix and skip the custom-getter/setter dispatch.
-pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8) Allocator.Error!void {
+/// Replace every bare `field` identifier in `expr` with the raw global
+/// storage name `__klio_topfield__<prop_name>`. Used by top-level
+/// accessor-body lowering; the storage binding itself is registered
+/// under that raw key, so the read/write bypasses accessor dispatch.
+pub fn substituteFieldWithGlobal(allocator: Allocator, prop_name: []const u8, expr: *const Expr) Allocator.Error!*Expr {
+    const out = try allocator.create(Expr);
+    out.* = expr.*;
+    try walkField(allocator, out, prop_name, .global);
+    return out;
+}
+
+/// Rewrite a bare `field` reference per `mode` (see `FieldSubst`). The Vm's
+/// get_field / set_field detect the `__klio_field__` prefix and skip the
+/// custom-getter/setter dispatch; `__klio_topfield__` is the storage key
+/// itself for top-level properties.
+pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSubst) Allocator.Error!void {
     if (e.* == .Path) {
         const p = e.Path;
         if (p.segments.len == 1 and std.mem.eql(u8, p.segments[0].name, "field")) {
-            const backing = try std.fmt.allocPrint(allocator, "__klio_field__{s}", .{prop});
-            const this_segs = try allocator.alloc(Ident, 1);
-            this_segs[0] = .{ .name = "this", .span = dummySpan };
-            const recv = try allocator.create(Expr);
-            recv.* = .{ .Path = .{ .segments = this_segs, .span = dummySpan } };
-            e.* = .{ .Member = .{
-                .receiver = recv,
-                .name = .{ .name = backing, .span = dummySpan },
-                .safe = false,
-                .span = dummySpan,
-            } };
+            switch (mode) {
+                .this_member => {
+                    const backing = try std.fmt.allocPrint(allocator, "__klio_field__{s}", .{prop});
+                    const this_segs = try allocator.alloc(Ident, 1);
+                    this_segs[0] = .{ .name = "this", .span = dummySpan };
+                    const recv = try allocator.create(Expr);
+                    recv.* = .{ .Path = .{ .segments = this_segs, .span = dummySpan } };
+                    e.* = .{ .Member = .{
+                        .receiver = recv,
+                        .name = .{ .name = backing, .span = dummySpan },
+                        .safe = false,
+                        .span = dummySpan,
+                    } };
+                },
+                .global => {
+                    const backing = try std.fmt.allocPrint(allocator, "__klio_topfield__{s}", .{prop});
+                    const segs = try allocator.alloc(Ident, 1);
+                    segs[0] = .{ .name = backing, .span = dummySpan };
+                    e.* = .{ .Path = .{ .segments = segs, .span = dummySpan } };
+                },
+            }
             return;
         }
     }
     switch (e.*) {
         .Call => |c| {
-            try walkField(allocator, c.callee, prop);
-            for (c.args) |*a| try walkField(allocator, a, prop);
+            try walkField(allocator, c.callee, prop, mode);
+            for (c.args) |*a| try walkField(allocator, a, prop, mode);
         },
-        .Member => |m| try walkField(allocator, m.receiver, prop),
+        .Member => |m| try walkField(allocator, m.receiver, prop, mode),
         .Binary => |b| {
-            try walkField(allocator, b.lhs, prop);
-            try walkField(allocator, b.rhs, prop);
+            try walkField(allocator, b.lhs, prop, mode);
+            try walkField(allocator, b.rhs, prop, mode);
         },
-        .Unary => |u| try walkField(allocator, u.expr, prop),
-        .Postfix => |u| try walkField(allocator, u.expr, prop),
-        .IsCheck => |u| try walkField(allocator, u.expr, prop),
-        .As => |u| try walkField(allocator, u.expr, prop),
-        .Spread => |u| try walkField(allocator, u.expr, prop),
+        .Unary => |u| try walkField(allocator, u.expr, prop, mode),
+        .Postfix => |u| try walkField(allocator, u.expr, prop, mode),
+        .IsCheck => |u| try walkField(allocator, u.expr, prop, mode),
+        .As => |u| try walkField(allocator, u.expr, prop, mode),
+        .Spread => |u| try walkField(allocator, u.expr, prop, mode),
         .If => |iff| {
-            try walkField(allocator, iff.cond, prop);
-            try walkField(allocator, iff.then_branch, prop);
-            if (iff.else_branch) |eb| try walkField(allocator, eb, prop);
+            try walkField(allocator, iff.cond, prop, mode);
+            try walkField(allocator, iff.then_branch, prop, mode);
+            if (iff.else_branch) |eb| try walkField(allocator, eb, prop, mode);
         },
         .Index => |ix| {
-            try walkField(allocator, ix.receiver, prop);
-            for (ix.args) |*a| try walkField(allocator, a, prop);
+            try walkField(allocator, ix.receiver, prop, mode);
+            for (ix.args) |*a| try walkField(allocator, a, prop, mode);
         },
         .Block => |*b| {
-            for (b.stmts) |*s| try walkFieldStmt(allocator, s, prop);
+            for (b.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
         },
         .StringTemplate => |st| {
             for (st.parts) |*part| {
-                if (part.* == .Interp) try walkField(allocator, part.Interp, prop);
+                if (part.* == .Interp) try walkField(allocator, part.Interp, prop, mode);
             }
         },
         .Return => |r| {
-            if (r.value) |v| try walkField(allocator, v, prop);
+            if (r.value) |v| try walkField(allocator, v, prop, mode);
         },
-        .Throw => |t| try walkField(allocator, t.value, prop),
+        .Throw => |t| try walkField(allocator, t.value, prop, mode),
         else => {},
     }
 }
 
-fn walkFieldStmt(allocator: Allocator, s: *Stmt, prop: []const u8) Allocator.Error!void {
+fn walkFieldStmt(allocator: Allocator, s: *Stmt, prop: []const u8, mode: FieldSubst) Allocator.Error!void {
     switch (s.*) {
-        .Expr => |*e| try walkField(allocator, e, prop),
+        .Expr => |*e| try walkField(allocator, e, prop, mode),
         .Assign => |*a| {
-            try walkField(allocator, &a.target, prop);
-            try walkField(allocator, &a.value, prop);
+            try walkField(allocator, &a.target, prop, mode);
+            try walkField(allocator, &a.value, prop, mode);
         },
-        else => {},
+        // A local `val`/`var` in an accessor body (`val old = field`) carries
+        // its initializer in a `Decl.Property`; its `field` reference must be
+        // rewritten too. A local declaration cannot itself have custom
+        // accessors, so only the initializer / delegate is walked.
+        .Decl => |*d| {
+            if (d.* == .Property) {
+                const p = d.Property;
+                if (p.init) |*init| try walkField(allocator, init, prop, mode);
+                if (p.delegate) |del| try walkField(allocator, del, prop, mode);
+            }
+        },
+        .DestructuringDecl => |*dd| try walkField(allocator, &dd.init, prop, mode),
     }
 }
 
@@ -122,7 +160,7 @@ fn walkFieldStmt(allocator: Allocator, s: *Stmt, prop: []const u8) Allocator.Err
 /// reference replaced with the synthetic backing-slot access.
 pub fn rewriteBlockField(allocator: Allocator, block: *const Block, prop: []const u8) Allocator.Error!Block {
     const stmts = try allocator.dupe(Stmt, block.stmts);
-    for (stmts) |*s| try walkFieldStmt(allocator, s, prop);
+    for (stmts) |*s| try walkFieldStmt(allocator, s, prop, .this_member);
     return .{ .stmts = stmts, .span = block.span };
 }
 
@@ -332,16 +370,40 @@ pub fn liftClassRecursive(
                 // name would collide with a top-level type that is also
                 // extended through the qualified form.
                 const is_private = nested.visibility == .Private;
-                const collides = ctx.top_level_type_names.contains(nested.name.name) and
-                    ctx.used_qualified_supertypes.contains(qualified);
+                // A nested class with its OWN companion, referenced by bare name
+                // for a companion member (`Alignment.Proportional` inside
+                // `LineHeightStyle`, where `Alignment` is a nested value class),
+                // must mangle+alias UNCONDITIONALLY: a cross-module collision
+                // (its simple name vs another pack's top-level type, e.g.
+                // ui.Alignment loaded only once material3 pulls ui-core in beside
+                // ui-text) is NOT visible at this module's bake, so gating on a
+                // bake-visible collision misses it and the bare name resolves to
+                // the wrong same-named type at runtime. Mangling is safe: the
+                // class keeps its NESTED fqn (from the pre-lift span override),
+                // so external qualified refs still resolve, while bare refs in
+                // the declaring subtree rewrite through the alias. The
+                // qualified-supertype form is the older, narrower trigger.
+                const nested_has_companion = blk: {
+                    for (nested.members) |*nm| {
+                        if (nm.* == .Class and nm.Class.is_companion) break :blk true;
+                    }
+                    break :blk false;
+                };
+                const collides = nested_has_companion or
+                    (ctx.top_level_type_names.contains(nested.name.name) and
+                        ctx.used_qualified_supertypes.contains(qualified));
                 var lifted = nested.*;
                 if (is_private or collides) {
                     const mangled = try std.fmt.allocPrint(a, "{s}${s}", .{ c.name.name, nested.name.name });
                     try ctx.mangled_nested.put(qualified, mangled);
                     lifted.name = .{ .name = mangled, .span = nested.name.span };
-                    if (is_private) {
-                        try putAlias(ctx, c.name.name, nested.name.name, mangled);
-                    }
+                    // Register the bare-name alias whenever the class is mangled,
+                    // not only for a private one: a mangled nested class
+                    // referenced by bare name inside its declaring subtree (a
+                    // colliding value class read for a companion member) needs
+                    // the alias so `scopeTypeRename` rewrites the reference to
+                    // the mangled name.
+                    try putAlias(ctx, c.name.name, nested.name.name, mangled);
                 } else {
                     a.free(qualified);
                 }

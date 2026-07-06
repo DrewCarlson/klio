@@ -866,8 +866,25 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
     return null;
 }
 
-pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
+
+/// The effective lookup key for a top-level property read. A `var` with a
+/// custom setter but a DEFAULT getter keeps its storage under the raw
+/// `__klio_topfield__` key (so plain-name writes dispatch the setter); the
+/// plain-name read IS the raw-slot read. A property with a custom getter
+/// keeps the plain-name miss so the getter thunk dispatches instead.
+fn topPropReadKey(self: *VmHost, name: []const u8, buf: []u8) []const u8 {
+    const reg = &self.module.asPtr().registry;
+    if (reg.top_level_prop_setters.count() == 0) return name;
+    if (std.mem.startsWith(u8, name, "__klio_topfield__")) return name;
+    if (reg.top_level_prop_setters.get(name) == null) return name;
+    if (reg.top_level_prop_getters.get(name) != null) return name;
+    return std.fmt.bufPrint(buf, "__klio_topfield__{s}", .{name}) catch name;
+}
+
+pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
     const allocator = self.allocator;
+    var top_prop_buf: [256]u8 = undefined;
+    const name = topPropReadKey(self, name_in, &top_prop_buf);
 
     const cached: ?Value = blk: {
         const g = self.globals.borrow();
@@ -1130,6 +1147,42 @@ pub fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
 }
 
 pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value: Value) Allocator.Error!UnitResult {
+    if (!std.mem.startsWith(u8, name, "__klio_topfield__")) {
+        // A top-level `var` with a custom setter: the plain-name write runs
+        // the setter thunk. Its own `field =` write targets the raw
+        // `__klio_topfield__` storage key, which skips this dispatch.
+        const setter_fid: ?ir.FuncId = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().registry.top_level_prop_setters.get(name);
+        };
+        if (setter_fid) |fid| {
+            const r = try self.callFunc(allocator, self.module.asPtr(), fid, &.{value});
+            if (r == .err) return .{ .err = r.err };
+            return .{ .ok = {} };
+        }
+        // Storage moved to the raw key (custom getter over a backing
+        // field, default setter): a plain-name write with no plain
+        // binding lands on the raw storage binding.
+        const plain_exists = blk: {
+            const g = self.globals.borrow();
+            defer g.deinit();
+            break :blk g.get().lookup(name) != null;
+        };
+        if (!plain_exists) {
+            const raw = try std.fmt.allocPrint(allocator, "__klio_topfield__{s}", .{name});
+            const raw_exists = blk: {
+                const g = self.globals.borrow();
+                defer g.deinit();
+                break :blk g.get().lookup(raw) != null;
+            };
+            if (raw_exists) {
+                defer if (runtime.freeScratch()) allocator.free(raw);
+                return storeGlobal(self, allocator, raw, value);
+            }
+            if (runtime.freeScratch()) allocator.free(raw);
+        }
+    }
     if (registryHasDelegatedProp(self, name)) {
         const existing: ?Value = blk: {
             const g = self.globals.borrow();
@@ -1217,7 +1270,9 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
     return .{ .ok = {} };
 }
 
-pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name: []const u8) Allocator.Error!MaybeValueResult {
+pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []const u8) Allocator.Error!MaybeValueResult {
+    var top_prop_buf: [256]u8 = undefined;
+    const name = topPropReadKey(self, name_in, &top_prop_buf);
     const raw: ?Value = blk: {
         const g = self.globals.borrow();
         defer g.deinit();
