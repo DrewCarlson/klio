@@ -26,7 +26,7 @@
 	url = https://github.com/JetBrains/kotlin
 	update = none
 	shallow = true
-	branch = v2.3.21
+	branch = v2.4.0
 # Upstream Compose Multiplatform core: the compose runtime pack consumes
 # androidx.compose.runtime commonMain sources verbatim. The full
 # compose-multiplatform-core repo is a large androidx-derived monorepo, so a

@@ -5,7 +5,7 @@
 # prefix-matches its id, so the umbrella lets a server-only program
 # (which never imports `io.ktor.client.*`) still load the pack.
 id = "io.ktor"
-version = "3.5.0"
+version = "3.5.1"
 abi = 1
 implicit_packages = []
 source_roots = ["shim"]

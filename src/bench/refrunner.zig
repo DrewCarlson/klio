@@ -7,7 +7,7 @@
 const std = @import("std");
 const parity = @import("parity");
 
-pub const KOTLIN_JVM_VERSION: []const u8 = "2.3.21";
+pub const KOTLIN_JVM_VERSION: []const u8 = "2.4.0";
 
 /// Error outcomes for a reference-runner invocation. Carried as data so the
 /// caller decides how to surface it. Variants owning heap text document the
