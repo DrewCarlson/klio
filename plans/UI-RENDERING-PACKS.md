@@ -175,18 +175,26 @@ The pack IS vendored + installed (`kotlin-klio/klio-androidx-collection`, source
 source sets provide pure-Kotlin actuals for every `expect`). `MutableScatterMap`,
 `MutableObjectList`, etc. work. It is **not complete**:
 
-- **Bug: primitive-list `sort()` is a no-op.** `mutableIntListOf(3,1,2).sort()` leaves
-  `[3, 1, 2]`. Audit/fix the primitive `*List.sort()`/`sortDescending()` actuals (likely
-  an interpreter intrinsic or the `sort` lowering, not the pack). Probe before assuming
-  it is pack-side — `IntArray.sort()` should be checked too.
-- **No dedicated example/corpus.** Add `examples/androidx_collection.kt` exercising
-  `ScatterMap`/`ScatterSet`/`ObjectList`/the primitive lists/`SparseArrayCompat`/
-  `LruCache` with deterministic output; bake `tests/corpus/expected`.
-- **Coverage sweep.** The compose runtime only exercises the subset it needs. Sweep the
-  surface (the primitive `Int/Long/Float*` maps + lists, `MutableScatterSet`,
-  `OrderedScatterSet`, `SieveCache`/`LruCache`) for the same class of intrinsic gaps as
-  `sort()`. Each gap → a probe + fix.
-- Mark task #10 done only when the sweep + example + the `sort()` fix land.
+### §5 status — DONE
+
+- **`sort()` no-op — already fixed.** `mutableIntListOf(3,1,2).sort()` → `[1,2,3]`;
+  `sortDescending()`, `Float`/`Long` lists, and `IntArray.sort()` all verified. A main
+  commit since this plan was written resolved it.
+- **Example + corpus — landed.** `examples/androidx_collection.kt` (baked
+  `tests/corpus/expected/androidx_collection.out`) exercises scatter map/set, object +
+  primitive value lists (with `sort`/`sortDescending`), `MutableIntIntMap`,
+  `MutableOrderedScatterSet` (insertion order), `SparseArrayCompat`, and `LruCache` with
+  LRU eviction — all deterministic and correct.
+- **Coverage sweep — no klio intrinsic gaps.** Swept `ScatterMap`/`ScatterSet`/
+  `ObjectList`/the primitive `Int/Long/Float` lists + `IntSet`/`IntObjectMap`/`IntIntMap`/
+  `SparseArrayCompat`/`LruCache`/`SieveCache`/`OrderedScatterSet`; all execute correctly.
+  One faithful-to-upstream finding (not a klio gap): `MutableOrderedScatterSet.add` of an
+  *already-present* element calls `moveNodeToHead` without detaching the node from its
+  current order-list position, so a re-add corrupts iteration (drops a later element). A
+  logical trace of the consumed code produces exactly klio's result, and klio's `Long`
+  bit-packing round-trips correctly (`createLinkToNext`/`setLinkToPrevious`/`previousNode`),
+  so this is the consumed androidx code's own logic, reproduced verbatim — the example
+  therefore only exercises distinct adds.
 
 ## 6. Suggested order
 
