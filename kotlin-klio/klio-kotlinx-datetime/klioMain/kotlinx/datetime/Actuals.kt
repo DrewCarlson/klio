@@ -449,3 +449,30 @@ fun Instant.offsetIn(timeZone: TimeZone): UtcOffset {
         ldt.hour.toLong() * 3600L + ldt.minute.toLong() * 60L + ldt.second.toLong()
     return UtcOffset((localSeconds - epochSeconds).toInt())
 }
+
+/** The calendar period between two instants in [timeZone] (largest units first). */
+fun Instant.periodUntil(other: Instant, timeZone: TimeZone): DateTimePeriod {
+    val thisLdt = toLocalDateTime(timeZone)
+    val otherLdt = other.toLocalDateTime(timeZone)
+    // Apply the date difference at this time-of-day; a day too far/short is
+    // corrected below so the leftover is < 24h and lives in the time component.
+    val timeAfterDate = LocalDateTime(otherLdt.date, thisLdt.time).toInstant(timeZone)
+    val delta = when {
+        other > this && timeAfterDate > other -> -1
+        other < this && timeAfterDate < other -> 1
+        else -> 0
+    }
+    val endDate = if (delta != 0) dateFromEpochDays(otherLdt.date.toEpochDays() + delta) else otherLdt.date
+    val newInstant = LocalDateTime(endDate, thisLdt.time).toInstant(timeZone)
+    val nanoseconds = (other.epochSeconds - newInstant.epochSeconds) * 1_000_000_000L +
+        (other.nanosecondsOfSecond - newInstant.nanosecondsOfSecond).toLong()
+    val datePeriod = thisLdt.date.periodUntil(endDate)
+    return DateTimePeriod(
+        months = datePeriod.totalMonths.toInt(),
+        days = datePeriod.days,
+        nanoseconds = nanoseconds,
+    )
+}
+
+/** `other - this` as a calendar period in [timeZone]. */
+fun Instant.minus(other: Instant, timeZone: TimeZone): DateTimePeriod = other.periodUntil(this, timeZone)
