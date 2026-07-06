@@ -134,6 +134,9 @@ actual class LocalDate(
     override fun hashCode(): Int = year * 10000 + monthNumber * 100 + day
 
     companion object {
+        val MIN: LocalDate = LocalDate(-999_999, 1, 1)
+        val MAX: LocalDate = LocalDate(999_999, 12, 31)
+
         // ISO-8601 `yyyy-MM-dd` (with an optional leading `-` for a
         // negative proleptic year). The format-DSL overload's
         // `DateTimeFormat` parameter is intentionally unsupported; this
@@ -281,6 +284,9 @@ actual class LocalTime(
     override fun hashCode(): Int = (((hour * 60 + minute) * 60 + second) * 1_000_000_000) + nanosecond
 
     companion object {
+        val MIN: LocalTime = LocalTime(0, 0, 0, 0)
+        val MAX: LocalTime = LocalTime(23, 59, 59, 999_999_999)
+
         // ISO-8601 `HH:mm[:ss[.fff…]]`.
         fun parse(input: CharSequence): LocalTime {
             val parts = input.toString().split(":")
@@ -341,6 +347,9 @@ actual class LocalDateTime(
     override fun hashCode(): Int = date.hashCode() * 31 + time.hashCode()
 
     companion object {
+        val MIN: LocalDateTime = LocalDateTime(LocalDate.MIN, LocalTime.MIN)
+        val MAX: LocalDateTime = LocalDateTime(LocalDate.MAX, LocalTime.MAX)
+
         // ISO-8601 `<date>T<time>`.
         fun parse(input: CharSequence): LocalDateTime {
             val s = input.toString()
