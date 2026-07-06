@@ -238,3 +238,22 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
 pub const UPSTREAM_STDLIB_ROOT = "kotlin/libraries/stdlib";
 /// The `kotlin-klio` directory holding the klio-authored actuals.
 pub const KLIO_STDLIB_DIR = "kotlin-klio";
+
+/// The pinned upstream Kotlin release. The in-tree stdlib source carries a
+/// placeholder patch component (`KotlinVersion(major, minor, 255)`) that
+/// kotlinc's own build rewrites to the release version; the pack builder
+/// applies the same rewrite so `KotlinVersion.CURRENT` matches kotlinc.
+pub const KOTLIN_RELEASE = .{ .major = 2, .minor = 4, .patch = 0 };
+/// The placeholder expression as it appears in
+/// `src/kotlin/util/KotlinVersion.kt`, and the release value it becomes.
+pub const KOTLIN_VERSION_FILE = "src/kotlin/util/KotlinVersion.kt";
+pub const KOTLIN_VERSION_PLACEHOLDER = std.fmt.comptimePrint(
+    "KotlinVersion({d}, {d}, 255)",
+    .{ KOTLIN_RELEASE.major, KOTLIN_RELEASE.minor },
+);
+pub const KOTLIN_VERSION_STAMPED = std.fmt.comptimePrint(
+    "KotlinVersion({d}, {d}, {d})",
+    .{ KOTLIN_RELEASE.major, KOTLIN_RELEASE.minor, KOTLIN_RELEASE.patch },
+);
+
+const std = @import("std");
