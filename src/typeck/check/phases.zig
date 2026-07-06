@@ -2113,9 +2113,9 @@ pub fn walkExprForGenerics(self: *Checker, e: *const Expr) Allocator.Error!void 
 // ============================================================================
 // Annotation collectors / walkers.
 //
-// These mirror the standalone collectors that the multi-phase driver in the
-// Rust source consumes from the annotation-check module. They are private to
-// the driver and operate over read-only views of the AST.
+// These mirror the standalone collectors that the multi-phase driver consumes
+// from the annotation-check module. They are private to the driver and
+// operate over read-only views of the AST.
 // ============================================================================
 
 const OptInLevel = enum { Warning, Error };
@@ -3110,7 +3110,7 @@ fn extractDeprecationLevel(e: *const Expr) ?DeprecationLevel {
 
 /// Concatenate the Text parts of a pure-text string-literal template into
 /// an owned string. Returns null when any non-Text (interpolated) part is
-/// present. Mirrors the Rust collector.
+/// present.
 fn extractStringLiteral(allocator: Allocator, e: *const Expr) Allocator.Error!?[]const u8 {
     if (e.* == .StringTemplate) {
         const parts = e.StringTemplate.parts;

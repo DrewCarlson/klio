@@ -62,8 +62,7 @@ fn lessByFactoryName(_: void, a: Factory, b: Factory) bool {
 
 /// Parse a `FirErrors.kt`-shaped file. Returns `(name → severity)` for every
 /// `val NAME: KtDiagnosticFactoryN<…> = KtDiagnosticFactoryN("NAME", SEVERITY, …)`
-/// declaration we recognize, sorted by name with later duplicates winning
-/// (matching the Rust `BTreeMap` insert semantics).
+/// declaration we recognize, sorted by name with later duplicates winning.
 ///
 /// The returned slice and every `name` it borrows are owned by the caller and
 /// must be freed (see `freeSeverityEntries`).
@@ -201,8 +200,7 @@ fn lookupMessage(messages: []const MessageEntry, name: []const u8) ?[]const u8 {
 
 /// Read and parse the upstream `FirErrors.kt` / `FirErrorsDefaultMessages.kt`
 /// under `stdlib_root`, producing the sorted factory table. Missing or
-/// unreadable files are treated as empty, mirroring the Rust
-/// `unwrap_or_default`.
+/// unreadable files are treated as empty.
 ///
 /// The returned factories and the strings they own must be freed with
 /// `freeFactories`.
@@ -251,9 +249,9 @@ pub fn freeFactories(allocator: Allocator, factories: []Factory) void {
     allocator.free(factories);
 }
 
-/// Append a Zig string literal for `s` to `out`, matching Rust's `{:?}` Debug
-/// escaping (`\` → `\\`, `"` → `\"`, control chars as escapes). The escapes
-/// produced are all valid Zig string escapes.
+/// Append a Zig string literal for `s` to `out`, escaping (`\` → `\\`,
+/// `"` → `\"`, control chars as escapes). The escapes produced are all
+/// valid Zig string escapes.
 fn writeEscaped(out: *std.ArrayList(u8), allocator: Allocator, s: []const u8) Allocator.Error!void {
     try out.append(allocator, '"');
     for (s) |c| {

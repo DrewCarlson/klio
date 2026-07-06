@@ -1689,8 +1689,7 @@ fn schedulerDrainCount(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = Value.newInt(@as(i64, n)) };
 }
 
-/// The `(fqn, fn)` binding table — the faithful translation of the Rust
-/// `host_bindings!` invocation.
+/// The `(fqn, fn)` binding table for the coroutines pack's host bindings.
 const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_delayMillis", .f = delayMillis },
     .{ .fqn = "kotlinx.coroutines.__kxco_currentTimeMillis", .f = currentTimeMillis },

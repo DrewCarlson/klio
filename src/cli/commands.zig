@@ -58,8 +58,7 @@ pub const DiagFormat = enum {
 };
 
 /// Read a source file into the map, returning its `FileId`. On failure
-/// the error is printed to stderr and `null` is returned, mirroring the
-/// Rust `load` helper.
+/// the error is printed to stderr and `null` is returned.
 fn load(gpa: std.mem.Allocator, map: *SourceMap, path: []const u8) ?FileId {
     const src = io.readFile(gpa, path) catch |e| {
         io.printStderr(gpa, "error: cannot read {s}: {s}\n", .{ path, @errorName(e) });

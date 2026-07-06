@@ -1,7 +1,7 @@
 //! `klio-diagnostics-gen build` — mines kotlinc factory declarations and
 //! emits `src/diagnostics/generated/factories.zig`.
 //!
-//! Ported as a `pub fn run` taking parsed arguments, not a real `main`.
+//! Exposes a `pub fn run` taking parsed arguments, not a real `main`.
 
 const std = @import("std");
 
@@ -10,7 +10,7 @@ const gen = @import("diagnostics_gen.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-/// Exit codes mirroring the Rust binary's `ExitCode` usage.
+/// Exit codes for the diagnostics-gen CLI.
 pub const SUCCESS: u8 = 0;
 pub const FAILURE: u8 = 1;
 pub const USAGE: u8 = 2;
@@ -28,8 +28,7 @@ pub const Cmd = union(enum) {
     };
 };
 
-/// Parse a raw argument vector (excluding the program name) into a `Cmd`,
-/// matching the Rust `main`'s subcommand + flag handling.
+/// Parse a raw argument vector (excluding the program name) into a `Cmd`.
 pub fn parseArgs(args: []const []const u8) Cmd {
     const cmd_name = if (args.len >= 1) args[0] else "build";
     const rest: []const []const u8 = if (args.len > 1) args[1..] else &.{};

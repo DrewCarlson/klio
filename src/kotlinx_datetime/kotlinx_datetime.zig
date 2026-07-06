@@ -239,8 +239,7 @@ fn epochFromCivil(p: Parts) i64 {
 // -------------------------------------------------------------------------
 
 /// UTC offset in seconds for a tz id at a given UTC instant. `"Z"` / `"UTC"`
-/// are offset 0. Unknown ids return null so callers fall back to UTC, matching
-/// the Rust path where `parse_tz` returned `None`.
+/// are offset 0. Unknown ids return null so callers fall back to UTC.
 fn tzOffsetAtUtc(allocator: std.mem.Allocator, id: []const u8, epoch_sec: i64) ?i32 {
     if (std.mem.eql(u8, id, "Z") or std.mem.eql(u8, id, "UTC")) return 0;
     const data = readZoneInfo(allocator, id) catch return null;

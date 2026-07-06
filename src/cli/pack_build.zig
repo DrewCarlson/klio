@@ -5,10 +5,10 @@
 //! command apiece; the cache helpers it dispatches to (`inspect_pack`,
 //! `install_pack_into_cache`, …) live in `pack_cache.zig`.
 //!
-//! This build has no zstd codec, so every section that the Rust builder
-//! stored as `Compression.Zstd` is stored uncompressed here (same caveat
-//! as the embedded stdlib pack builder). `migrate` re-emits plain
-//! sections and `train-dict` reports the missing encoder as data.
+//! This build has no zstd codec, so every section that would otherwise use
+//! `Compression.Zstd` is stored uncompressed here (same caveat as the
+//! embedded stdlib pack builder). `migrate` re-emits plain sections and
+//! `train-dict` reports the missing encoder as data.
 
 const std = @import("std");
 
@@ -102,8 +102,7 @@ pub const PackCmd = union(enum) {
 };
 
 /// A failure carried as data. Owned by `gpa`; rendered by the dispatch
-/// arm and then freed. Mirrors the Rust `String` error returned by every
-/// pack helper.
+/// arm and then freed.
 const Failure = []u8;
 
 fn fail(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Failure {
@@ -272,8 +271,7 @@ pub fn runPack(gpa: std.mem.Allocator, cmd: PackCmd) u8 {
 }
 
 /// `Result<T, String>` for the helpers whose success carries a value (a
-/// path, bytes). Mirrors the Rust signatures; reuses the same `.ok`/`.err`
-/// shape as `pack_cache.PathResult`.
+/// path, bytes). Reuses the same `.ok`/`.err` shape as `pack_cache.PathResult`.
 fn Outcome(comptime T: type) type {
     return union(enum) {
         ok: T,
@@ -1277,8 +1275,7 @@ fn buildAstBundle(a: std.mem.Allocator, files: []const schema.SourceFile) schema
 
 /// Run typecheck over the parsed AST bundle and produce the
 /// per-expression type map. Best-effort: any file whose typecheck reports
-/// errors causes the whole bundle to be skipped, mirroring the Rust
-/// builder. Allocated from `a`.
+/// errors causes the whole bundle to be skipped. Allocated from `a`.
 fn buildTypeckBundle(a: std.mem.Allocator, asts: []const KotlinFile) schema.TypeckBundle {
     if (asts.len == 0) return .{};
     // `a` is a build-scoped arena: the resolver and checker allocate their
@@ -1396,8 +1393,8 @@ fn lessBinding(_: void, a: schema.Binding, b: schema.Binding) bool {
 
 fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) PathResult {
     // Everything the build allocates lives in this arena and is freed at
-    // scope exit, matching the Rust function's drop-at-return ownership.
-    // The single survivor is the returned `out_path`, allocated from gpa.
+    // scope exit. The single survivor is the returned `out_path`, allocated
+    // from gpa.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1478,17 +1475,17 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     const ast_bytes = (schema.encode(schema.AstBundle, a, &ast_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
-    // Frozen typeck. Collect the parsed `KotlinFile`s directly; the Rust
-    // builder cloned them, but in the arena the bundle's files outlive
-    // this call, so a borrow is faithful and cheaper.
+    // Frozen typeck. Collect the parsed `KotlinFile`s directly: in the
+    // arena the bundle's files outlive this call, so a borrow is cheaper
+    // than a clone.
     const asts = a.alloc(KotlinFile, ast_bundle.files.len) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     for (ast_bundle.files, asts) |f, *dst| dst.* = f.kotlin_file;
     const typeck_bundle = buildTypeckBundle(a, asts);
     const typeck_bytes = (schema.encode(schema.TypeckBundle, a, &typeck_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
-    // Assemble. The Rust builder zstd-compressed SOURCES/AST/TYPECK; this
-    // build has no zstd codec, so every section is stored uncompressed.
+    // Assemble. This build has no zstd codec, so every section is stored
+    // uncompressed.
     var writer = PackWriter.init(a);
     defer writer.deinit();
     _ = writer.addRaw(section_names.MANIFEST, manifest_bytes.items) catch return .{ .err = fail(gpa, "out of memory", .{}) };

@@ -43,9 +43,9 @@ const ktor_client = @import("ktor_client");
 const io = @import("io.zig");
 const qualified_refs = @import("qualified_refs.zig");
 
-/// Per-`library_id` set of feature names a consumer requested (cargo
-/// style). Seeds the loader's feature resolution; default features are
-/// added on top unless a request opts out.
+/// Per-`library_id` set of feature names a consumer requested. Seeds the
+/// loader's feature resolution; default features are added on top unless
+/// a request opts out.
 ///
 /// Maps `library_id` -> set of requested feature names.
 pub const RequestedFeatures = std.StringHashMap(std.StringHashMap(void));
@@ -131,8 +131,8 @@ pub const ManifestResult = union(enum) {
 // ---------------------------------------------------------------------
 
 /// Read one environment variable from the parent process. Returns an
-/// owned copy of the value or `null`. Mirrors Rust's `std::env::var_os`
-/// for the few variables this module consults (`HOME`, `KLIO_PACK_DIAG`).
+/// owned copy of the value or `null`, for the few variables this module
+/// consults (`HOME`, `KLIO_PACK_DIAG`).
 fn getEnvVar(allocator: Allocator, name: []const u8) ?[]u8 {
     return runtime.procEnvGetVar(allocator, name) catch null;
 }
@@ -436,9 +436,9 @@ fn loadEmbeddedStdlibSources(
     }
 }
 
-/// True when any prefix in `prefixes` matches `pkg` by the same
-/// bidirectional dotted-prefix rule the Rust loader uses: `imp == pkg`,
-/// `imp` starts with `pkg.`, or `pkg` starts with `imp.`.
+/// True when any prefix in `prefixes` matches `pkg` by the bidirectional
+/// dotted-prefix rule: `imp == pkg`, `imp` starts with `pkg.`, or `pkg`
+/// starts with `imp.`.
 pub fn importPrefixMatches(
     allocator: Allocator,
     prefixes: *const std.StringHashMap(void),
@@ -873,15 +873,15 @@ fn loadPackCandidate(
 // ---------------------------------------------------------------------
 
 /// Walk the local pack cache, parse each pack's sources, and build a
-/// `HostBindings` populated with the Rust-side bindings each pack
+/// `HostBindings` populated with the native bindings each pack
 /// declares. The caller prepends the returned ASTs to the user's AST
 /// list before lowering so pack declarations participate in IR build.
 /// Only packs whose imports actually appear in the user's source (or are
 /// pulled in transitively) are loaded.
 ///
 /// `requested_features` maps a `library_id` to the feature names the
-/// consumer asked for (cargo style); a pack's feature-gated source roots
-/// load only when their feature is active.
+/// consumer asked for; a pack's feature-gated source roots load only
+/// when their feature is active.
 pub fn loadInstalledPacks(
     gpa: Allocator,
     user_asts: []const KotlinFile,
@@ -1355,8 +1355,8 @@ pub fn installPackIntoCache(allocator: Allocator, src: []const u8) PathResult {
 // cache index sidecar
 // ---------------------------------------------------------------------
 
-/// One entry in the sidecar `index.json`. Field names match the Rust
-/// struct so the serialized form is identical.
+/// One entry in the sidecar `index.json`. Field names are fixed so the
+/// serialized form stays stable across versions.
 const CacheIndexEntry = struct {
     library_id: []const u8,
     version: []const u8,
@@ -1638,8 +1638,8 @@ fn voidMemErr(allocator: Allocator) VoidResult {
     return .{ .err = allocator.dupe(u8, "out of memory") catch "" };
 }
 
-/// Render a `[][]const u8` the way Rust's `{:?}` does for a slice of
-/// strings: `["a", "b"]`. Owned by the caller.
+/// Render a `[][]const u8` as a debug-style slice of strings:
+/// `["a", "b"]`. Owned by the caller.
 fn strSliceDebug(allocator: Allocator, slice: [][]const u8) []u8 {
     var buf: std.ArrayList(u8) = .empty;
     buf.append(allocator, '[') catch return allocator.dupe(u8, "[]") catch "";
