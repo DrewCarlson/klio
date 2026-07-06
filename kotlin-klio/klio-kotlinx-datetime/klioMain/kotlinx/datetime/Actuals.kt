@@ -433,6 +433,10 @@ class TimeZone internal constructor(val id: String) {
     override fun equals(other: Any?): Boolean = (other is TimeZone) && other.id == id
     override fun hashCode(): Int = id.hashCode()
 
+    // Two-receiver conversions: usable as `with(zone) { ldt.toInstant() }`.
+    fun Instant.toLocalDateTime(): LocalDateTime = this.toLocalDateTime(this@TimeZone)
+    fun LocalDateTime.toInstant(): Instant = this.toInstant(this@TimeZone)
+
     companion object {
         val UTC: TimeZone = TimeZone("UTC")
         fun currentSystemDefault(): TimeZone = TimeZone(__kxdt_currentSystemTimeZoneId())
