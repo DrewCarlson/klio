@@ -6,3 +6,5 @@ zig-out/
 zig-pkg/
 target/
 scripts/__pycache__/
+.claude/
+.pi-lens/
