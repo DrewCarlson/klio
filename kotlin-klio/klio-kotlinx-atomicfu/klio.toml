@@ -28,3 +28,7 @@ root = "klioMain"
 
 [[deps]]
 id = "stdlib"
+
+# commonTest sources for `klio test` (not packed).
+[[test]]
+root = "upstream/atomicfu/src/commonTest/kotlin"

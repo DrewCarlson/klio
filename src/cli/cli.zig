@@ -22,6 +22,7 @@ const pack_cache = @import("pack_cache.zig");
 const RequestedFeatures = pack_cache.RequestedFeatures;
 
 const pack_build = @import("pack_build.zig");
+const project = @import("project.zig");
 const PackCmd = pack_build.PackCmd;
 
 const stdlib_image = @import("stdlib_image.zig");
@@ -275,11 +276,33 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var requested = parseRequestedFeatures(gpa, feature_specs.items);
     defer deinitRequestedFeatures(&requested);
 
-    if (paths.items.len == 0) {
-        printErr(gpa, "usage: klio test <file.kt | dir> [...]\n", .{});
-        return 2;
+    // No path → the project in the current directory.
+    if (paths.items.len == 0) paths.append(gpa, ".") catch return 2;
+
+    // Project mode: a single directory carrying `klio.toml` (with `[[test]]`
+    // sets) runs that project's composed test sources against its
+    // built+installed pack — no hand-listed files. `planTest` returns null for
+    // a plain file/dir, so the normal path handles everything else.
+    if (paths.items.len == 1) {
+        if (project.planTest(gpa, paths.items[0], &requested)) |plan| {
+            if (buildAndInstallProjectPack(gpa, plan.project_dir, plan.pack_id)) |code| {
+                if (code != 0) return code;
+            }
+            return commands.runTestFiles(gpa, plan.roots, &requested, only_files.items);
+        }
     }
     return commands.runTestFiles(gpa, paths.items, &requested, only_files.items);
+}
+
+/// Build the project pack from `dir` and install it so its API resolves in
+/// the project's tests. Returns the failing exit code, or 0/null on success.
+fn buildAndInstallProjectPack(gpa: std.mem.Allocator, dir: []const u8, id: []const u8) ?u8 {
+    if (id.len == 0) return null; // not a library project — nothing to install
+    const b = pack_build.runPack(gpa, .{ .Build = .{ .dir = dir } });
+    if (b != 0) return b;
+    const artifact = std.fmt.allocPrint(gpa, "target/packs/{s}.klio-pack", .{id}) catch return 2;
+    defer gpa.free(artifact);
+    return pack_build.runPack(gpa, .{ .Install = .{ .pack = artifact } });
 }
 
 fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
