@@ -1,11 +1,11 @@
-site_name: klio
+site_name: Klio
 site_description: An experimental Kotlin interpreter written in Zig.
 site_url: https://klio.dev/
-repo_url: https://github.com/DrewCarlson/klio
+repo_url: https://drewcarlson.github.io/klio/
 remote_branch: gh-pages
 docs_dir: docs
 edit_uri: edit/main/docs/
-copyright: 'Copyright &copy; 2026 klio Maintainers'
+copyright: 'Copyright &copy; 2026 Klio Contributors'
 
 theme:
   name: material
@@ -45,6 +45,8 @@ plugins:
   - markdownextradata: {}
 
 extra:
+  version:
+    provider: mike
   klio_version: !ENV [VERSION, '0.1.0']
   social:
     - icon: fontawesome/brands/github

@@ -254,4 +254,4 @@ workflow. Running plan documents and design records live under
 
 ## License
 
-MIT OR Apache-2.0.
+MIT, see [LICENSE](LICENSE).
