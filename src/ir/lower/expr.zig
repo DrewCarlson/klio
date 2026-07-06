@@ -3139,8 +3139,17 @@ fn lowerCallWithWritebackPath(
         // resolves the constructor / intended overload.
         if (bound_id) |bid| {
             if (ires.pick() == null) {
+                const same_class = b.module.classId(segments[0].name) != null;
                 if (b.module.funcById(bid)) |bf| {
-                    if (bf.low_priority) bound_id = null;
+                    // A low-priority stub is outranked by the constructor and by
+                    // any ordinary overload. A same-named class constructor is
+                    // part of the overload set too: when the index defers and a
+                    // class exists, never let a factory function bind statically
+                    // (a `vararg` factory would otherwise absorb the args a
+                    // constructor should take, e.g. `ByteString(bytes, 0, n)`
+                    // binding `fun ByteString(vararg Byte)`). Leave it for the
+                    // runtime `CallMemberOrGlobal`, which scores the constructor.
+                    if (bf.low_priority or same_class) bound_id = null;
                 }
             }
         }
@@ -3820,10 +3829,13 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // An abstract/interface/sealed class never constructs, so it
             // does not compete with the function candidates.
             if (cls.is_abstract) break :blk false;
-            // The class competes only when its primary constructor can
-            // actually take this argument count — a `HexFormat { … }`
-            // builder call beside a multi-param internal constructor has
-            // no constructor candidate and commits statically.
+            // The class competes when its primary constructor can take this
+            // argument count, OR when the count exceeds the primary arity — a
+            // secondary constructor (not visible in the IR class, which carries
+            // only the primary) may accept it (`ByteString(bytes, 0, n)` binds
+            // the `(ByteArray, Int, Int)` secondary, not `fun ByteString(vararg
+            // Byte)`). Deferring an over-primary count to runtime is safe: when
+            // no constructor actually matches, the runtime falls to the factory.
             var required: usize = 0;
             var has_vararg = false;
             for (cls.primary_params) |*p| {
@@ -3833,7 +3845,8 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
                 if (!p.has_default) required += 1;
             }
-            break :blk args.len >= required and (has_vararg or args.len <= cls.primary_params.len);
+            break :blk (args.len >= required and (has_vararg or args.len <= cls.primary_params.len)) or
+                args.len > cls.primary_params.len;
         };
 
     // Path-callee with a registered top-level fn → Call{func}.
