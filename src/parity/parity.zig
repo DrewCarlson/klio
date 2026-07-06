@@ -1150,7 +1150,7 @@ const PackSource = struct { path: []u8, text: []u8 };
 
 /// The in-repo kotlinx pack directories, in load order.
 /// Number of in-repo packs the parity pipeline can load from source.
-pub const N_PACK_DIRS = 6;
+pub const N_PACK_DIRS = 7;
 
 fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
     const ws = try workspaceRoot(arena);
@@ -1161,6 +1161,7 @@ fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-runtime" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-androidx-collection" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-mosaic" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui" }),
     };
 }
 

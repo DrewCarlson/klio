@@ -163,6 +163,28 @@ imported via `import X.Companion.Y` and compared with `===`).
 
 ## 4. Phase S — the Compose UI / Skia stack (large; after N1+N2)
 
+### First increment — DONE (ui-core on a headless software canvas)
+
+The plan's stated first increment ("ui-core (LayoutNode + measure/layout) on a headless
+software canvas → deterministic pixel-dump tests → foundation primitives") is landed and
+green: the `klio.compose.ui` pack (`examples/compose_ui.kt`, baked corpus). A
+`Row`/`Column`/`Box` `@Composable` tree emits `LayoutNode`s through the compose runtime's
+node path (`ComposeNode` → `LayoutNodeApplier`); a **measure** pass sizes + places them
+under `Constraints` (arrangement + `Modifier` size/padding/fill), a **draw** pass paints
+backgrounds into a software `PixelCanvas`, and the buffer dumps deterministically as ASCII.
+A state write recomposes and re-renders (a box's colour flips) — the same
+node-emission + measure/layout/draw path a real Compose UI uses.
+
+The real `androidx.compose.ui` is **not** in the vendored sparse checkout (only compose
+`runtime` is), and it is a Skia/native stack of hundreds of files, so this increment is a
+klio-authored ui-core proving the architecture runs on klio end-to-end. Still ahead in S
+(each its own large step): the native **Skia** binding (this increment uses a software
+rasterizer, per the plan's "pure software rasterizer for a first cut"), text/font
+rendering, the full `Modifier.Node` chain + pointer/focus/semantics, windowing/input, and
+vendoring the real `compose.ui`/`foundation`/`material`.
+
+### Remaining S layers
+
 Feasible on this runtime but a **campaign**, not a step. Layered:
 
 - **`compose.ui`** — `LayoutNode` (emit via N1), the measure/layout/draw passes,
