@@ -206,7 +206,8 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
 fn collectClassMethods(
     gpa: Allocator,
     index: *const std.StringHashMap(ClassEntry),
-    class_name: []const u8,
+    cls: *const ast.Class,
+    imports: anytype,
     display_class: []const u8,
     methods: *std.ArrayList(Method),
     befores: *std.ArrayList([]const u8),
@@ -214,11 +215,13 @@ fn collectClassMethods(
     seen: *std.StringHashMap(void),
     visited: *std.StringHashMap(void),
 ) Allocator.Error!void {
-    if (visited.contains(class_name)) return;
-    try visited.put(class_name, {});
-    const entry = index.get(class_name) orelse return;
-    const imports = entry.imports;
-    for (entry.cls.members) |*m| {
+    if (visited.contains(cls.name.name)) return;
+    try visited.put(cls.name.name, {});
+    // Collect from the concrete class decl itself — NOT an `index.get` by
+    // simple name, which would resolve to a same-named class in a different
+    // package and silently drop this one's tests. The index is only for
+    // supertype recursion (Kotlin supertypes are referenced by simple name).
+    for (cls.members) |*m| {
         if (m.* != .Function) continue;
         const f = &m.Function;
         if (hasKotlinTestAnno(f.annotations, imports, "BeforeTest") and !seen.contains(f.name.name)) {
@@ -241,8 +244,9 @@ fn collectClassMethods(
             try seen.put(f.name.name, {});
         }
     }
-    for (entry.cls.supertypes) |*st| {
-        try collectClassMethods(gpa, index, st.name.name, display_class, methods, befores, afters, seen, visited);
+    for (cls.supertypes) |*st| {
+        const sup = index.get(st.name.name) orelse continue;
+        try collectClassMethods(gpa, index, sup.cls, sup.imports, display_class, methods, befores, afters, seen, visited);
     }
 }
 
@@ -261,7 +265,7 @@ fn discoverClass(
     defer seen.deinit();
     var visited = std.StringHashMap(void).init(gpa);
     defer visited.deinit();
-    try collectClassMethods(gpa, index, c.name.name, c.name.name, &methods, &befores, &afters, &seen, &visited);
+    try collectClassMethods(gpa, index, c, file.imports, c.name.name, &methods, &befores, &afters, &seen, &visited);
     if (methods.items.len == 0) {
         methods.deinit(gpa);
         befores.deinit(gpa);

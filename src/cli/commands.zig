@@ -512,6 +512,10 @@ fn runTestsOnBuilt(
         io.printStdout(gpa, "{s} {s}\n", .{ r.display, tag });
         if (r.detail) |d| io.printStdout(gpa, "    {s}\n", .{d});
     }
+    if (report.results.len == 0) {
+        io.printStdout(gpa, "no tests found\n", .{});
+        return 0;
+    }
     io.printStdout(gpa, "\n{d} tests, {d} passed, {d} failed, {d} skipped\n", .{
         report.results.len, report.passed, report.failed, report.skipped,
     });
