@@ -1,11 +1,11 @@
 [library]
 id = "kotlinx.io"
-version = "0.9.0"
+version = "0.9.1"
 abi = 1
 implicit_packages = []
 auto_bindings = true
 
-# Real upstream kotlinx-io 0.9.0 commonMain, consumed directly from
+# Real upstream kotlinx-io 0.9.1 commonMain, consumed directly from
 # the in-pack git submodule at `upstream/` (no vendored copies). The
 # curated `include` set is exactly the common sources klio's
 # `klioMain` actuals satisfy; the rest of the upstream tree (platform
