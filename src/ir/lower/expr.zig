@@ -1772,6 +1772,7 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     }
     b.attachCatches(cur_id, catch_handlers, finally_entry);
     if (finally_done) |done| b.setFinallyDoneFor(cur_id, done);
+    if (finally_entry == null and t.catches.len != 0) b.setCatchDoneFor(cur_id, exit);
     if (t.finally) |blk| try b.pushFinally(blk);
     const body_val = try lowerBlock(b, &t.body);
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });

@@ -198,9 +198,10 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
             if (matchesAny(ty.name, &.{
                 "IntProgression", "LongProgression", "CharProgression", "Iterable",
             })) return true;
-            // A `..` range (step 1) is also an XRange / ClosedRange; a downTo or
-            // stepped progression (step != 1) is only a progression.
-            if (r.step == 1 and matchesAny(ty.name, &.{
+            // A `..` range (step 1) is also an XRange / ClosedRange; a downTo,
+            // stepped, or reversed progression is only a progression — even
+            // with step 1 (`1..10 step 1` is an IntProgression, not IntRange).
+            if (r.step == 1 and !r.progression and matchesAny(ty.name, &.{
                 "IntRange", "LongRange", "CharRange", "ClosedRange", "OpenEndRange",
             })) return true;
         },

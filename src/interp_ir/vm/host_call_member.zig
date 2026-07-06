@@ -606,12 +606,24 @@ pub fn kotlinHashCode(v: *const Value) i32 {
             break :blk h;
         },
         .Range => |r| blk: {
-            const f: i32 = @truncate(r.start);
-            const l: i32 = @truncate(r.end);
-            const s: i32 = @truncate(r.step);
+            // Elements hash with their own Kotlin hashCode first: Long/ULong
+            // fold high and low words (`v xor (v ushr 32)`), Int/Char/UInt
+            // truncate. `(10L downTo 1L).hashCode()` needs step -1L to hash
+            // as 0, not -1.
+            const elem = struct {
+                fn hash(kind: RangeKind, x: i64) i32 {
+                    return switch (kind) {
+                        .Long, .ULong => @truncate(x ^ @as(i64, @bitCast(@as(u64, @bitCast(x)) >> 32))),
+                        .Int, .Char, .UInt => @truncate(x),
+                    };
+                }
+            };
+            const f: i32 = elem.hash(r.kind, r.start);
+            const l: i32 = elem.hash(r.kind, r.end);
+            const s: i32 = elem.hash(r.kind, r.step);
             const empty = if (r.step > 0) r.start > r.end else r.start < r.end;
             if (empty) break :blk @as(i32, -1);
-            if (r.step == 1) break :blk @as(i32, 31) *% f +% l;
+            if (r.step == 1 and !r.progression) break :blk @as(i32, 31) *% f +% l;
             break :blk (@as(i32, 31) *% (@as(i32, 31) *% f +% l)) +% s;
         },
         // `Map.Entry.hashCode()` is `key.hashCode() xor value.hashCode()`, so a
@@ -3203,14 +3215,6 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Stdlib member dispatch (type-FQN + package extension probes).
     if (try stdlibMemberDispatch(self, allocator, receiver, name, args)) |r| return r;
 
-    // Range → List re-dispatch.
-    if (receiver.* == .Range) {
-        const r = receiver.Range;
-        const items = try materialiseRangeItems(allocator, r.start, r.end, r.step, r.kind);
-        const as_list = try listOf(allocator, items, false);
-        return callMemberRec(self, allocator, &as_list, name, args);
-    }
-
     // Class-delegation pre-pass.
     if (receiver.* == .Instance) {
         if (try delegateForward(self, allocator, receiver, name, args, true)) |r| return r;
@@ -3223,6 +3227,19 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // sibling overload the static evidence excluded.
     if (!no_ext) {
         if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv)) |r| return r;
+    }
+
+    // Range → List re-dispatch: a last-resort member surface only. It must
+    // run after the extension fallback so receiver-generic extensions
+    // (`let`, `also`, the interpreted `Iterable` surface) keep the real
+    // progression receiver — materialising first would hand the callable a
+    // `List` and lose the receiver's identity (`first`/`last`/`step`,
+    // progression `hashCode`/`toString`).
+    if (receiver.* == .Range) {
+        const r = receiver.Range;
+        const items = try materialiseRangeItems(allocator, r.start, r.end, r.step, r.kind);
+        const as_list = try listOf(allocator, items, false);
+        return callMemberRec(self, allocator, &as_list, name, args);
     }
 
     // Class-delegation forwarding (swallow all errors).
@@ -4579,11 +4596,29 @@ fn compareValuesBuiltin(a: *const Value, b: *const Value) ?Ordering {
     if (a.isFloating() or b.isFloating()) {
         const x = floatOf(a) orelse return null;
         const y = floatOf(b) orelse return null;
-        return if (x < y) .lt else if (x > y) .gt else .eq;
+        return kotlinFloatTotalCmp(x, y);
     }
     const x = a.asI64() orelse (if (a.* == .Char) @as(i64, a.Char) else return null);
     const y = b.asI64() orelse (if (b.* == .Char) @as(i64, b.Char) else return null);
     return if (x < y) .lt else if (x > y) .gt else .eq;
+}
+
+/// Total order over IEEE-754 doubles matching Kotlin's `Double.compareTo`:
+/// `-0.0 < 0.0` and every `NaN` sorts above `+Infinity`.
+fn kotlinFloatTotalCmp(a: f64, b: f64) Ordering {
+    if (a < b) return .lt;
+    if (a > b) return .gt;
+    const bits = struct {
+        fn of(x: f64) i64 {
+            if (std.math.isNan(x)) return @bitCast(@as(u64, 0x7ff8_0000_0000_0000));
+            return @bitCast(x);
+        }
+    };
+    return switch (std.math.order(bits.of(a), bits.of(b))) {
+        .lt => .lt,
+        .eq => .eq,
+        .gt => .gt,
+    };
 }
 
 fn floatOf(v: *const Value) ?f64 {

@@ -3667,6 +3667,7 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             // Drive a FRESH cursor so this materialisation is independent of any
             // other consumption of the same (re-iterable) Sequence.
             const bstate = try freshBuilderState(host, a, bstate0);
+            try pinBuilderState(a, bstate);
             // Pull from the lazy builder one element at a time so an infinite
             // generator never materialises past the consumer's demand.
             while (true) {
@@ -3798,6 +3799,7 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
         },
         .Builder => |bstate0| {
             const bstate = try freshBuilderState(host, a, bstate0);
+            try pinBuilderState(a, bstate);
             while (true) {
                 const step = try host.builderStep(bstate, out);
                 switch (step) {
@@ -7496,6 +7498,17 @@ pub const seq_yield_iter_field = "__seq_yield_iter";
 /// is re-iterable (a fresh coroutine per `iterator()`); klio embeds one cursor
 /// in the Sequence, so each new consumption drives a clone, leaving the
 /// embedded template pristine.
+/// Pin a host-local fresh builder cursor for a drive loop: under the
+/// tracing GC the state cell's ONLY reference is a Zig local (invisible
+/// to the mark), so a collection during a pull would sweep it — and its
+/// scope — out from under the loop. The keepalive wrapper makes it a
+/// root for the enclosing mark/restore window.
+pub fn pinBuilderState(a: Allocator, state: runtime.BuilderStateRef) Allocator.Error!void {
+    if (!runtime.gc.gc_enabled) return;
+    const data = try ObjRef(runtime.SequenceData).init(a, .{ .source = .{ .Builder = state.clone() }, .ops = &.{} });
+    runtime.keepalivePush(.{ .Sequence = data });
+}
+
 pub fn freshBuilderState(host: IntrinsicHost, a: Allocator, template: runtime.BuilderStateRef) Allocator.Error!runtime.BuilderStateRef {
     const block: Value = blk: {
         const tg = template.borrow();

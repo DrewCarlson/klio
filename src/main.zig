@@ -123,6 +123,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             if (runtime.getenvSlice("KLIO_GC_NOFREE")) |v| {
                 runtime.gc.gc_nofree = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
+            if (runtime.getenvSlice("KLIO_GC_EXT")) |v| {
+                runtime.gc.external_accounting = v.len != 0 and !std.mem.eql(u8, v, "0");
+            }
             if (runtime.getenvSlice("KLIO_GC_POISON")) |v| {
                 runtime.gc.gc_poison = v.len != 0 and !std.mem.eql(u8, v, "0");
             }

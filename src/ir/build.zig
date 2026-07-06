@@ -1261,6 +1261,13 @@ pub const FuncBuilder = struct {
         self.blocks.items[cur].finally = finally;
     }
 
+    /// Mark `join` as the normal-flow exit of a catch-only try whose
+    /// body entry is `body_entry`, so the eval pops the body's
+    /// `TryFrame` when control arrives there.
+    pub fn setCatchDoneFor(self: *FuncBuilder, body_entry: BlockId, join: BlockId) void {
+        self.blocks.items[join.int()].catch_done_for = body_entry;
+    }
+
     /// Mark `done` as the post-finally sentinel for the try-region
     /// whose body's entry block is `body_entry`.
     pub fn setFinallyDoneFor(self: *FuncBuilder, body_entry: BlockId, done: BlockId) void {

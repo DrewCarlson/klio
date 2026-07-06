@@ -158,6 +158,34 @@ pub fn register(h: *GcHeader, bytes: usize) void {
     if (prev + bytes >= threshold) gc_pending.store(true, .monotonic);
 }
 
+/// Account heap growth the registry cannot see (frame register buffers
+/// and suspension snapshots live in libc storage so the collector never
+/// sweeps them, but they are traced through the frame chain and their
+/// growth must still advance the Appel trigger — otherwise a program
+/// building a deep suspended chain collects at the floor forever and
+/// re-marks the whole chain quadratically).
+pub fn noteExternalBytes(bytes: usize) void {
+    if (!gc_enabled) return;
+    _ = external_live.fetchAdd(bytes, .monotonic);
+    const prev = bytes_since_gc.fetchAdd(bytes, .monotonic);
+    if (prev + bytes >= threshold) gc_pending.store(true, .monotonic);
+}
+
+/// External (non-registry) bytes released back — keeps `external_live`
+/// tracking the traced-but-unswept footprint so the Appel threshold can
+/// include it.
+pub fn noteExternalFreed(bytes: usize) void {
+    if (!gc_enabled) return;
+    _ = external_live.fetchSub(@min(bytes, external_live.load(.monotonic)), .monotonic);
+}
+
+var external_live: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+
+/// Gate for the external-bytes Appel accounting (`KLIO_GC_EXT=1`).
+/// Default OFF: the added collection pressure exposed latent keepalive
+/// holes in host paths; enable to reproduce/diagnose them.
+pub var external_accounting: bool = false;
+
 /// Cheap poll at opcode-boundary safe points. Every ~64k polls it also
 /// probes for IDLE reclamation: a program that bursts (leaving a large
 /// heap) and then goes quiet never crosses the allocation threshold
@@ -470,7 +498,7 @@ pub fn collect() void {
     last_collect_ms.store(nowMillis(), .monotonic);
     bytes_since_gc.store(0, .monotonic);
     if (others != 0) stop_flag.store(false, .release);
-    threshold = @max(threshold_floor, live_bytes *| 2);
+    threshold = @max(threshold_floor, (live_bytes +| external_live.load(.monotonic)) *| 2);
     // Return the pages the swept cells freed back to the OS. The backing
     // allocator caches freed memory in its free-lists (RSS reflects the
     // allocation high-water, not the live set), so after a collection that
