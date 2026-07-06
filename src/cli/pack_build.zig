@@ -288,7 +288,7 @@ fn threadedIo(allocator: std.mem.Allocator) std.Io.Threaded {
 }
 
 /// Read a whole file relative to cwd into an owned buffer.
-fn readFileOwned(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+pub fn readFileOwned(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
     const tio = threaded.io();
@@ -947,11 +947,22 @@ const FeaturesToml = struct {
     defs: []FeatureTomlDef = &.{},
 };
 
-const LibraryToml = struct {
+/// A `[[test]]` source set: like `[[source]]` but for `klio test` only —
+/// never packed or symbol-indexed. `feature` scopes it to a pack feature
+/// (an untagged test set is core, always active).
+pub const TestRoot = struct {
+    root: []const u8 = "",
+    include: [][]const u8 = &.{},
+    exclude: [][]const u8 = &.{},
+    feature: []const u8 = "",
+};
+
+pub const LibraryToml = struct {
     library: LibraryHeader = .{},
     deps: []DepEntry = &.{},
     bindings: []BindingPair = &.{},
     source: []SourceRoot = &.{},
+    tests: []TestRoot = &.{},
     features: FeaturesToml = .{},
 };
 
@@ -961,15 +972,16 @@ const LibraryToml = struct {
 /// strings, or single-line arrays of double-quoted strings. Comments
 /// (`#`) and blank lines are skipped. Parses into `a`. Returns the error
 /// text on a malformed document.
-fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryToml) {
+pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryToml) {
     var cfg = LibraryToml{};
     var deps: std.ArrayList(DepEntry) = .empty;
     var bindings: std.ArrayList(BindingPair) = .empty;
     var sources: std.ArrayList(SourceRoot) = .empty;
+    var tests: std.ArrayList(TestRoot) = .empty;
     var feature_defs: std.ArrayList(FeatureTomlDef) = .empty;
 
     // Section context: which table the following key/value lines fill.
-    const Section = enum { none, library, dep, bindings, source, features, feature_def };
+    const Section = enum { none, library, dep, bindings, source, test_source, features, feature_def };
     var section: Section = .none;
 
     var line_it = std.mem.splitScalar(u8, text, '\n');
@@ -1008,6 +1020,9 @@ fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryToml)
                 } else if (std.mem.eql(u8, name, "source")) {
                     section = .source;
                     sources.append(a, .{ .root = "" }) catch return .{ .err = fail(a, "out of memory", .{}) };
+                } else if (std.mem.eql(u8, name, "test")) {
+                    section = .test_source;
+                    tests.append(a, .{}) catch return .{ .err = fail(a, "out of memory", .{}) };
                 } else {
                     section = .none;
                 }
@@ -1044,6 +1059,7 @@ fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryToml)
                 bindings.append(a, pair) catch return .{ .err = fail(a, "out of memory", .{}) };
             },
             .source => assignSource(a, &sources.items[sources.items.len - 1], key, val),
+            .test_source => assignTest(a, &tests.items[tests.items.len - 1], key, val),
             .features => {
                 if (std.mem.eql(u8, key, "default")) {
                     cfg.features.default = parseStrArray(a, val) catch return .{ .err = fail(a, "out of memory", .{}) };
@@ -1065,6 +1081,7 @@ fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryToml)
     std.mem.sort(BindingPair, bindings.items, {}, lessBindingPair);
     cfg.bindings = bindings.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
     cfg.source = sources.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
+    cfg.tests = tests.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
     std.mem.sort(FeatureTomlDef, feature_defs.items, {}, lessFeatureDef);
     cfg.features.defs = feature_defs.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
     return .{ .ok = cfg };
@@ -1157,6 +1174,18 @@ fn assignSource(a: std.mem.Allocator, s: *SourceRoot, key: []const u8, val: []co
         s.include = parseStrArray(a, val) catch &.{};
     } else if (std.mem.eql(u8, key, "exclude")) {
         s.exclude = parseStrArray(a, val) catch &.{};
+    }
+}
+
+fn assignTest(a: std.mem.Allocator, t: *TestRoot, key: []const u8, val: []const u8) void {
+    if (std.mem.eql(u8, key, "root")) {
+        t.root = tomlString(a, val);
+    } else if (std.mem.eql(u8, key, "include")) {
+        t.include = parseStrArray(a, val) catch &.{};
+    } else if (std.mem.eql(u8, key, "exclude")) {
+        t.exclude = parseStrArray(a, val) catch &.{};
+    } else if (std.mem.eql(u8, key, "feature")) {
+        t.feature = tomlString(a, val);
     }
 }
 

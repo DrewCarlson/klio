@@ -146,7 +146,14 @@ fn fileSelected(only_fids: []const u32, fid: u32) bool {
     return false;
 }
 
-fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.KotlinFile, only_fids: []const u32) Allocator.Error!Plan {
+/// `filter == null` runs everything; otherwise a test runs when its display
+/// name (a top-level `method`, or a class's `Class`) contains the substring.
+fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
+    const pat = filter orelse return true;
+    return std.mem.indexOf(u8, name, pat) != null;
+}
+
+fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.KotlinFile, only_fids: []const u32, filter: ?[]const u8) Allocator.Error!Plan {
     var top: std.ArrayList(TopTest) = .empty;
     var classes: std.ArrayList(ClassTests) = .empty;
 
@@ -174,6 +181,7 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
             switch (d.*) {
                 .Function => |*f| {
                     if (!hasKotlinTestAnno(f.annotations, file.imports, "Test")) continue;
+                    if (!filterMatches(filter, f.name.name)) continue;
                     const fqn = qualify(gpa, pkg, f.name.name);
                     defer gpa.free(fqn);
                     try top.append(gpa, .{
@@ -186,7 +194,7 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
                     // An abstract class is never instantiated directly; its
                     // tests run through concrete subclasses (below).
                     if (c.is_abstract) continue;
-                    const ct = try discoverClass(gpa, module, &index, file, c, pkg);
+                    const ct = try discoverClass(gpa, module, &index, file, c, pkg, filter);
                     if (ct) |found| try classes.append(gpa, found);
                 },
                 else => {},
@@ -257,6 +265,7 @@ fn discoverClass(
     file: *const ast.KotlinFile,
     c: *const ast.Class,
     pkg: []const u8,
+    filter: ?[]const u8,
 ) Allocator.Error!?ClassTests {
     var methods: std.ArrayList(Method) = .empty;
     var befores: std.ArrayList([]const u8) = .empty;
@@ -266,6 +275,24 @@ fn discoverClass(
     var visited = std.StringHashMap(void).init(gpa);
     defer visited.deinit();
     try collectClassMethods(gpa, index, c, file.imports, c.name.name, &methods, &befores, &afters, &seen, &visited);
+    // Method-level `--filter`: if the class name itself does not match, keep
+    // only the methods whose `Class.method` display matches (a class whose
+    // name matches keeps all its methods). Dropped methods are freed here.
+    if (filter) |pat| {
+        if (std.mem.indexOf(u8, c.name.name, pat) == null) {
+            var kept: usize = 0;
+            for (methods.items) |m| {
+                if (std.mem.indexOf(u8, m.display, pat) != null) {
+                    methods.items[kept] = m;
+                    kept += 1;
+                } else {
+                    gpa.free(m.display);
+                    gpa.free(m.name);
+                }
+            }
+            methods.shrinkRetainingCapacity(kept);
+        }
+    }
     if (methods.items.len == 0) {
         methods.deinit(gpa);
         befores.deinit(gpa);
@@ -315,6 +342,16 @@ const RunState = struct {
 
 /// Pull a printable `type: message` (or just `type`) out of a thrown value.
 fn describeThrow(gpa: Allocator, v: Value) []const u8 {
+    // Full rendered throwable (type, message, frames, causes) under
+    // KLIO_ERR_TRACE — a teardown-masked failure is undiagnosable from
+    // the type+message line alone.
+    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        if (ir.eval.formatThrowable(gpa, &v, &buf, false, 0)) {
+            if (gpa.dupe(u8, buf.items)) |owned| return owned else |_| {}
+        } else |_| {}
+    }
     const ty: []const u8 = v.exceptionFqn() orelse "exception";
     const msg: ?[]const u8 = switch (v) {
         .Exception => |e| if (e.message) |m| blk: {
@@ -423,17 +460,44 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
 /// Discover and run every `@Test` in `user_asts` against the prepared `vm`,
 /// writing test-program output to `out`. The returned `Report` is owned by
 /// the caller (`Report.deinit`).
+/// Discover the `@Test` display names WITHOUT running them (the `--isolate`
+/// driver spawns one sub-process per name). Caller owns each returned string
+/// and the slice.
+pub fn listTests(
+    gpa: Allocator,
+    vm: *Vm,
+    user_asts: []const ast.KotlinFile,
+    only_fids: []const u32,
+    filter: ?[]const u8,
+) Allocator.Error![][]const u8 {
+    var plan: Plan = blk: {
+        const mg = vm.module.borrow();
+        defer mg.deinit();
+        break :blk try discover(gpa, mg.get(), user_asts, only_fids, filter);
+    };
+    defer freePlan(gpa, &plan);
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
+    }
+    for (plan.top) |t| try names.append(gpa, try gpa.dupe(u8, t.display));
+    for (plan.classes) |c| for (c.methods) |m| try names.append(gpa, try gpa.dupe(u8, m.display));
+    return names.toOwnedSlice(gpa);
+}
+
 pub fn runTests(
     gpa: Allocator,
     vm: *Vm,
     user_asts: []const ast.KotlinFile,
     out: Output,
     only_fids: []const u32,
+    filter: ?[]const u8,
 ) Allocator.Error!Report {
     var plan: Plan = blk: {
         const mg = vm.module.borrow();
         defer mg.deinit();
-        break :blk try discover(gpa, mg.get(), user_asts, only_fids);
+        break :blk try discover(gpa, mg.get(), user_asts, only_fids, filter);
     };
     defer freePlan(gpa, &plan);
 

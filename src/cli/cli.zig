@@ -22,6 +22,7 @@ const pack_cache = @import("pack_cache.zig");
 const RequestedFeatures = pack_cache.RequestedFeatures;
 
 const pack_build = @import("pack_build.zig");
+const project = @import("project.zig");
 const PackCmd = pack_build.PackCmd;
 
 const stdlib_image = @import("stdlib_image.zig");
@@ -41,7 +42,10 @@ const USAGE =
     \\  dump-ir <file> [--func N]  Lower a file and print its IR (no execution),
     \\                             tallying DIRECT vs DYNAMIC call sites.
     \\  run <file...> [options]    Run one or more `.kt` source files.
-    \\  test <file|dir...>         Run `kotlin.test` `@Test` functions.
+    \\  test [path] [options]      Run `kotlin.test` `@Test` functions. A
+    \\                             project dir (with klio.toml) tests its
+    \\                             composed `[[test]]` sets; default `.`.
+    \\                             --all / --feature X select feature modules.
     \\  check <file...> [options]  Type-check `.kt` files and emit diagnostics.
     \\  bake [file...] [options]   Bake the stdlib image cache (`klio run` does
     \\                             this automatically on first use).
@@ -53,9 +57,16 @@ const USAGE =
     \\                             off: interpreter + never-free arena.
     \\
     \\Run options:
-    \\  --ir-vm                    Accepted for compatibility (no-op).
     \\  --virtual-time             Use deterministic virtual time for coroutines.
     \\  --feature <pack>/<feature> Enable a pack feature (repeatable).
+    \\
+    \\Test options:
+    \\  --filter <substring>         Run only tests whose Class/method/file matches.
+    \\  --format <plain|json>        plain (default) or a machine-readable JSON summary.
+    \\  --all / --feature <name>     Select which feature modules' tests to run.
+    \\  --list                       List discovered @Test names without running them.
+    \\  --isolate [--timeout <s>]    Debug: run each test in its own sub-process with a
+    \\                               per-test timeout (default 60s) to pinpoint a hang/crash.
     \\
     \\Check options:
     \\  --format <plain|json|sarif>  Output format for diagnostics.
@@ -105,7 +116,7 @@ pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
     } else if (std.mem.eql(u8, cmd, "run")) {
         return runRunCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "test")) {
-        return runTestCmd(gpa, rest);
+        return runTestCmd(gpa, rest, argv[0]);
     } else if (std.mem.eql(u8, cmd, "check")) {
         return runCheckCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "repl")) {
@@ -179,9 +190,7 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--ir-vm")) {
-            // Accepted for compatibility; the IR Vm is the only path.
-        } else if (std.mem.eql(u8, a, "--virtual-time")) {
+        if (std.mem.eql(u8, a, "--virtual-time")) {
             virtual_time = true;
         } else if (std.mem.eql(u8, a, "--feature")) {
             i += 1;
@@ -223,20 +232,92 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     return commands.runModuleFiles(gpa, files.items, &requested);
 }
 
-fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
+fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []const u8) u8 {
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(gpa);
     var feature_specs: std.ArrayList([]const u8) = .empty;
     defer feature_specs.deinit(gpa);
     var only_files: std.ArrayList([]const u8) = .empty;
     defer only_files.deinit(gpa);
+    // Bare `--feature X` (no `/`) selects a project's own feature module for a
+    // project-mode run; a `<pack>/<feat>` spec keeps its existing meaning.
+    var project_features: std.ArrayList([]const u8) = .empty;
+    defer project_features.deinit(gpa);
+    var all_features = false;
     var virtual_time = false;
+    var filter: ?[]const u8 = null;
+    var test_format: commands.TestFormat = .plain;
+    var list_only = false;
+    var isolate = false;
+    var jobs: usize = 1;
+    var timeout_s: u64 = 60;
+    _ = &jobs;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--virtual-time")) {
             virtual_time = true;
+        } else if (std.mem.eql(u8, a, "--format") or optionValue(a, "--format=") != null) {
+            const v = if (optionValue(a, "--format=")) |vv| vv else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    printErr(gpa, "error: --format requires a value (plain|json)\n", .{});
+                    return 2;
+                }
+                break :blk args[i];
+            };
+            if (std.mem.eql(u8, v, "json")) {
+                test_format = .json;
+            } else if (std.mem.eql(u8, v, "plain")) {
+                test_format = .plain;
+            } else {
+                printErr(gpa, "error: unknown --format `{s}` (use plain|json)\n", .{v});
+                return 2;
+            }
+        } else if (std.mem.eql(u8, a, "--list")) {
+            list_only = true;
+        } else if (std.mem.eql(u8, a, "--isolate")) {
+            isolate = true;
+        } else if (std.mem.eql(u8, a, "--jobs") or optionValue(a, "--jobs=") != null) {
+            const v = if (optionValue(a, "--jobs=")) |vv| vv else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    printErr(gpa, "error: --jobs requires a number\n", .{});
+                    return 2;
+                }
+                break :blk args[i];
+            };
+            jobs = std.fmt.parseInt(usize, v, 10) catch {
+                printErr(gpa, "error: --jobs must be a positive integer\n", .{});
+                return 2;
+            };
+            if (jobs == 0) jobs = 1;
+        } else if (std.mem.eql(u8, a, "--timeout") or optionValue(a, "--timeout=") != null) {
+            const v = if (optionValue(a, "--timeout=")) |vv| vv else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    printErr(gpa, "error: --timeout requires a number of seconds\n", .{});
+                    return 2;
+                }
+                break :blk args[i];
+            };
+            timeout_s = std.fmt.parseInt(u64, v, 10) catch {
+                printErr(gpa, "error: --timeout must be a positive integer (seconds)\n", .{});
+                return 2;
+            };
+            if (timeout_s == 0) timeout_s = 1;
+        } else if (std.mem.eql(u8, a, "--all")) {
+            all_features = true;
+        } else if (std.mem.eql(u8, a, "--filter")) {
+            i += 1;
+            if (i >= args.len) {
+                printErr(gpa, "error: --filter requires a name substring\n", .{});
+                return 2;
+            }
+            filter = args[i];
+        } else if (optionValue(a, "--filter=")) |v| {
+            filter = v;
         } else if (std.mem.eql(u8, a, "--only-file")) {
             i += 1;
             if (i >= args.len) {
@@ -249,12 +330,12 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, a, "--feature")) {
             i += 1;
             if (i >= args.len) {
-                printErr(gpa, "error: --feature requires a `<pack>/<feature>` value\n", .{});
+                printErr(gpa, "error: --feature requires a `<feature>` or `<pack>/<feature>` value\n", .{});
                 return 2;
             }
-            feature_specs.append(gpa, args[i]) catch return 2;
+            addFeatureSpec(gpa, args[i], &feature_specs, &project_features);
         } else if (optionValue(a, "--feature=")) |v| {
-            feature_specs.append(gpa, v) catch return 2;
+            addFeatureSpec(gpa, v, &feature_specs, &project_features);
         } else if (perfOptValue(a, args, &i)) |v| {
             if (runtime.perf.parseProfile(v) == null) {
                 printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
@@ -275,11 +356,97 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var requested = parseRequestedFeatures(gpa, feature_specs.items);
     defer deinitRequestedFeatures(&requested);
 
-    if (paths.items.len == 0) {
-        printErr(gpa, "usage: klio test <file.kt | dir> [...]\n", .{});
-        return 2;
+    // No path → the project in the current directory.
+    if (paths.items.len == 0) paths.append(gpa, ".") catch return 2;
+
+    // `--isolate` (opt-in debug): re-invoke `klio test` once per discovered
+    // test in its own sub-process with a per-test wall-clock timeout, to
+    // pinpoint which test hangs or crashes. The child re-parses the same base
+    // args (paths + feature/only-file selection) plus `--filter`.
+    if (isolate) {
+        var base: std.ArrayList([]const u8) = .empty;
+        defer base.deinit(gpa);
+        for (paths.items) |p| base.append(gpa, p) catch return 2;
+        if (all_features) base.append(gpa, "--all") catch return 2;
+        for (project_features.items) |fs| {
+            base.append(gpa, "--feature") catch return 2;
+            base.append(gpa, fs) catch return 2;
+        }
+        for (only_files.items) |of| {
+            base.append(gpa, "--only-file") catch return 2;
+            base.append(gpa, of) catch return 2;
+        }
+        if (filter) |f| {
+            base.append(gpa, "--filter") catch return 2;
+            base.append(gpa, f) catch return 2;
+        }
+        return commands.runTestsIsolated(gpa, self_exe, base.items, timeout_s);
     }
-    return commands.runTestFiles(gpa, paths.items, &requested, only_files.items);
+
+    // Project mode: a single directory carrying `klio.toml` (with `[[test]]`
+    // sets) runs that project's composed test sources against its
+    // built+installed pack — no hand-listed files. `planTest` returns null for
+    // a plain file/dir, so the normal path handles everything else.
+    //
+    // Feature selection: default (and `--all`) tests core + every feature
+    // module; `--feature X` narrows to core + the named feature(s).
+    if (paths.items.len == 1) {
+        const sel: project.FeatureSel = if (!all_features and project_features.items.len != 0)
+            .{ .selected = project_features.items }
+        else
+            .all;
+        if (project.planTest(gpa, paths.items[0], sel)) |plan| {
+            // Activate the tested features' sources so their tests compile.
+            activateFeatures(gpa, &requested, plan.pack_id, plan.active_features);
+            if (buildAndInstallProjectPack(gpa, plan.project_dir, plan.pack_id)) |code| {
+                if (code != 0) return code;
+            }
+            return commands.runTestFiles(gpa, plan.roots, &requested, only_files.items, filter, test_format, list_only);
+        }
+    }
+    return commands.runTestFiles(gpa, paths.items, &requested, only_files.items, filter, test_format, list_only);
+}
+
+/// Route a `--feature` value: `<pack>/<feat>` keeps its cross-pack meaning; a
+/// bare `<feat>` selects the current project's own feature module.
+fn addFeatureSpec(
+    gpa: std.mem.Allocator,
+    v: []const u8,
+    feature_specs: *std.ArrayList([]const u8),
+    project_features: *std.ArrayList([]const u8),
+) void {
+    if (std.mem.indexOfScalar(u8, v, '/') != null) {
+        feature_specs.append(gpa, v) catch {};
+    } else {
+        project_features.append(gpa, v) catch {};
+    }
+}
+
+/// Merge a project's active test features into the requested-feature set under
+/// its pack id, so the pack loader includes those feature modules' sources.
+fn activateFeatures(
+    gpa: std.mem.Allocator,
+    requested: *RequestedFeatures,
+    pack_id: []const u8,
+    features: []const []const u8,
+) void {
+    if (pack_id.len == 0 or features.len == 0) return;
+    const gop = requested.getOrPut(pack_id) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(gpa);
+    for (features) |f| {
+        if (!gop.value_ptr.contains(f)) gop.value_ptr.put(f, {}) catch {};
+    }
+}
+
+/// Build the project pack from `dir` and install it so its API resolves in
+/// the project's tests. Returns the failing exit code, or 0/null on success.
+fn buildAndInstallProjectPack(gpa: std.mem.Allocator, dir: []const u8, id: []const u8) ?u8 {
+    if (id.len == 0) return null; // not a library project — nothing to install
+    const b = pack_build.runPack(gpa, .{ .Build = .{ .dir = dir } });
+    if (b != 0) return b;
+    const artifact = std.fmt.allocPrint(gpa, "target/packs/{s}.klio-pack", .{id}) catch return 2;
+    defer gpa.free(artifact);
+    return pack_build.runPack(gpa, .{ .Install = .{ .pack = artifact } });
 }
 
 fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {

@@ -96,6 +96,29 @@ public fun <R, P, T> (suspend R.(P) -> T).startCoroutineUninterceptedOrReturn(
     return startBlock(completion) { receiver.block(param) }
 }
 
+// One VALUE parameter, no receiver — the shape kotlinx's
+// `startCoroutineUndispatched` starts (`suspend (R) -> T` from
+// `CoroutineStart.UNDISPATCHED`). Without this overload the start fell
+// through to an inline invoke with no coroutine boundary: the child's
+// first suspension parked the CALLER's frames along with its own, and
+// runTest's teardown then existed as two runnable copies (the double
+// `leave()` that masked every throwing test body's real failure).
+public fun <P, T> (suspend (P) -> T).startCoroutineUninterceptedOrReturn(
+    param: P,
+    completion: Continuation<T>
+): Any? {
+    val block = this
+    return startBlock(completion) { block(param) }
+}
+
+public fun <P, T> (suspend (P) -> T).createCoroutineUnintercepted(
+    param: P,
+    completion: Continuation<T>
+): Continuation<Unit> {
+    val block = this
+    return KlioStartContinuation(completion) { block(param) }
+}
+
 public fun <R, P, T> (suspend R.(P) -> T).createCoroutineUnintercepted(
     receiver: R,
     param: P,
@@ -145,14 +168,30 @@ internal fun <T> startBlock(completion: Continuation<T>, body: () -> T): Any? {
     // after the resume: the captured cell makes the async case (and only it)
     // resume the completion, keeping the synchronous no-double-complete contract.
     var suspended = false
+    var delivered = false
     val r = __klio_co_startRootOrSuspended(completion) {
         __klio_co_pushScope(completion)
         try {
             val v = body()
-            if (suspended) completion.resumeWith(Result.success(v))
+            // Exactly-once: a replayed resume of the parked body (a
+            // double-fired join/slot wakeup) must not complete the
+            // coroutine again — the first delivery already resumed the
+            // caller's tail inside this activation.
+            if (suspended && !delivered) {
+                delivered = true
+                completion.resumeWith(Result.success(v))
+            }
             v
         } catch (e: Throwable) {
-            if (!suspended) throw e
+            // Deliver only the BODY's own failure. Once the success
+            // delivery ran, `completion`'s coroutine already completed and
+            // resumed its caller's tail INSIDE this activation — a throw
+            // from that tail unwinding back through here must propagate
+            // outward, not complete the coroutine a second time (runTest's
+            // finally ran `leave()` twice and the bare check replaced the
+            // real failure of every throwing test body).
+            if (!suspended || delivered) throw e
+            delivered = true
             completion.resumeWith(Result.failure(e))
             null
         } finally {
