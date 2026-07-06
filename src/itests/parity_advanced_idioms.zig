@@ -1,8 +1,6 @@
 //! Advanced Kotlin idioms: data class equality and hashing,
 //! sequence laziness, reified generics, lateinit, contracts,
 //! reflection lite, scoping edges.
-//!
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

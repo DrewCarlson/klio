@@ -1,7 +1,5 @@
 //! Null safety, smart casts after null checks, type-erased nullable
 //! receivers, elvis returns, !! assertion.
-//!
-//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 
@@ -16,8 +14,8 @@ var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
 /// Run `src` through the in-process klio pipeline and assert stdout equals
-/// `expected`. Mirrors the Rust `assert_klio`: write the embedded source to a
-/// unique temp `.kt`, then `run_with_packs`.
+/// `expected`: write the embedded source to a unique temp `.kt`, then
+/// `runWithPacks`.
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
     // is reclaimed instead of accumulating across this file's tests. Safe:

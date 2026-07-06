@@ -2,8 +2,6 @@
 //! Any.toString, nullable Comparable, enum methods, sealed-class
 //! with inherited fields, `KClass` equality, type parameter T.foo
 //! resolution.
-//!
-//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 
@@ -18,8 +16,7 @@ var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
 /// Write `src` to a unique temp `.kt` path under this file's temp dir and run
-/// it through the klio pipeline, asserting stdout equals `expected`. Mirrors
-/// the Rust `assert_klio` helper.
+/// it through the klio pipeline, asserting stdout equals `expected`.
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
     // is reclaimed instead of accumulating across this file's tests. Safe:

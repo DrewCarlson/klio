@@ -1,7 +1,5 @@
 //! Collections-intensive parity: chain operations, fold variants,
 //! windowed iteration, partitioning, sortedBy variants.
-//!
-//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

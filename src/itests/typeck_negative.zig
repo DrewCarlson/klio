@@ -4,11 +4,11 @@
 //! at least one type-checker diagnostic carrying the expected legacy code.
 //! The fixtures are read from disk, run through the real pipeline
 //! lexer -> parser -> resolver -> typeck, and the emitted legacy codes are
-//! asserted against the expected ones — faithful to the Rust assertions.
+//! asserted against the expected ones.
 //!
 //! A handful of cases embed their source inline (the `pos_*` no-diagnostic
 //! cases) or merge two parsed files into one analysis unit (the cross-file
-//! visibility cases); those mirror the Rust tests exactly.
+//! visibility cases).
 
 const std = @import("std");
 
@@ -55,8 +55,8 @@ fn codesForFixture(a: std.mem.Allocator, name: []const u8) ![]const []const u8 {
     return codesForSource(a, FileId.from(0), src);
 }
 
-/// Merge two source files into one analysis unit (matching the Rust
-/// cross-file tests) and return the emitted legacy codes. Each source keeps
+/// Merge two source files into one analysis unit and return the emitted
+/// legacy codes. Each source keeps
 /// its own `FileId` so the visibility check, which keys off `Span::file`,
 /// sees them as distinct files.
 fn codesForMerged(a: std.mem.Allocator, src_a: []const u8, src_b: []const u8) ![]const []const u8 {

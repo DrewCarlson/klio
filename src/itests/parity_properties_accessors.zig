@@ -1,7 +1,6 @@
 //! Property + accessor parity: custom getters/setters, backing-field
 //! mutation, computed properties, lateinit, delegate setValue, open
 //! property override with getter.
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

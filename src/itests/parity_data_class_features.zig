@@ -1,8 +1,6 @@
 //! Data class feature parity: copy with named args, equals/hashCode
 //! by field, toString format, destructuring via componentN, copy with
 //! all defaults.
-//!
-//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

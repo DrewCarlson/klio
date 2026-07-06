@@ -1,7 +1,6 @@
 //! Realistic coroutine shapes drawn from kotlinx-coroutines patterns:
 //! cancellation race, supervisorScope, async with explicit start, channels,
-//! flow collection, parallel decomposition. Port of
-//! the Rust suite.
+//! flow collection, parallel decomposition.
 
 const std = @import("std");
 const parity = @import("parity");

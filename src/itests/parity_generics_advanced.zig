@@ -1,7 +1,6 @@
 //! Advanced generic scenarios: covariant/contravariant variance,
 //! star-projection, reified inline functions, bounds projection,
-//! generic function reified-class lookup. Ported from
-//! the Rust suite.
+//! generic function reified-class lookup.
 
 const std = @import("std");
 const parity = @import("parity");

@@ -1,6 +1,5 @@
 //! Inheritance + dispatch parity: super calls, diamond, generic
 //! inheritance, abstract/final/open interplay, companion through subclass.
-//! Ported from the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

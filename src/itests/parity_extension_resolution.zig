@@ -1,6 +1,6 @@
 //! Extension function resolution: top-level vs member, generic
 //! extension, extension on nullable, extension dispatched on
-//! interface. Ported from the Rust suite.
+//! interface.
 
 const std = @import("std");
 const parity = @import("parity");

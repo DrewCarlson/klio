@@ -4,8 +4,6 @@
 //! the buffer. Both run `commonReadUtf8`, whose body constructs arrays
 //! (`byteArrayOf`) and calls `min(limit, …)`. Bare `min(a, b)` here is
 //! `kotlin.math.min`. These tests pin the fixed behavior.
-//!
-//! Ported from the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

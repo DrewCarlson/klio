@@ -1,5 +1,3 @@
-//! Port of the Rust suite.
-//!
 //! Each test parses a small Kotlin function, lowers it, runs the
 //! smart-cast pass, and asserts on the per-place fact at a chosen
 //! block. Arena per test so the leak-checking allocator never runs the
