@@ -45,6 +45,7 @@ pub fn ranges_down_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .end = pair[1],
         .step = -1,
         .kind = rangeKindForArgs(ctx.args[0], ctx.args[1]),
+        .progression = true,
     } });
 }
 
@@ -84,6 +85,7 @@ pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             .end = normalized_end,
             .step = signed,
             .kind = r.kind,
+            .progression = true,
         } });
     }
     return typeErr("step requires IntRange . step(Int)");
@@ -144,11 +146,14 @@ pub const RangeView = struct {
     end: i64,
     step: i64,
     kind: RangeKind,
+    /// Mirrors `Value.Range.progression`; an `Instance`-backed view of a
+    /// `*Progression` class is always a progression.
+    progression: bool = false,
 };
 
 pub fn asRangeView(v: *const Value) ?RangeView {
     switch (v.*) {
-        .Range => |r| return .{ .start = r.start, .end = r.end, .step = r.step, .kind = r.kind },
+        .Range => |r| return .{ .start = r.start, .end = r.end, .step = r.step, .kind = r.kind, .progression = r.progression },
         .Instance => |inst| {
             const b = inst.borrow();
             defer b.deinit();
@@ -179,7 +184,8 @@ pub fn asRangeView(v: *const Value) ?RangeView {
             const start = num(data, &.{ "first", "start" }) orelse return null;
             const end = num(data, &.{ "last", "endInclusive" }) orelse return null;
             const step = num(data, &.{"step"}) orelse 1;
-            return .{ .start = start, .end = end, .step = step, .kind = kind };
+            const progression = std.mem.indexOf(u8, fqn, "Progression") != null;
+            return .{ .start = start, .end = end, .step = step, .kind = kind, .progression = progression };
         },
         else => return null,
     }
@@ -288,6 +294,7 @@ pub fn range_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .end = view.end,
         .step = view.step,
         .kind = view.kind,
+        .progression = view.progression,
     } };
     const s = try r.display(ctx.allocator);
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
@@ -329,6 +336,7 @@ pub fn range_reversed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .end = view.start,
         .step = -view.step,
         .kind = view.kind,
+        .progression = true,
     } });
 }
 

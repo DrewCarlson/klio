@@ -1287,6 +1287,11 @@ pub const Value = union(enum) {
         end: i64,
         step: i64,
         kind: RangeKind,
+        /// True when built as a progression (`step`, `downTo`, `reversed`)
+        /// rather than a `..` / `until` range. A step-1 progression is NOT
+        /// an `IntRange`: it renders as `1..10 step 1`, hashes with the
+        /// progression formula, and fails `is IntRange`.
+        progression: bool = false,
     },
     Function: struct {
         decl: *const ast.Function,
@@ -1954,11 +1959,11 @@ pub const Value = union(enum) {
             .Char => "kotlin.Char",
             .Null => "kotlin.Nothing",
             .Range => |r| switch (r.kind) {
-                .Int => if (r.step == 1) "kotlin.ranges.IntRange" else "kotlin.ranges.IntProgression",
-                .Long => if (r.step == 1) "kotlin.ranges.LongRange" else "kotlin.ranges.LongProgression",
-                .Char => if (r.step == 1) "kotlin.ranges.CharRange" else "kotlin.ranges.CharProgression",
-                .UInt => if (r.step == 1) "kotlin.ranges.UIntRange" else "kotlin.ranges.UIntProgression",
-                .ULong => if (r.step == 1) "kotlin.ranges.ULongRange" else "kotlin.ranges.ULongProgression",
+                .Int => if (r.step == 1 and !r.progression) "kotlin.ranges.IntRange" else "kotlin.ranges.IntProgression",
+                .Long => if (r.step == 1 and !r.progression) "kotlin.ranges.LongRange" else "kotlin.ranges.LongProgression",
+                .Char => if (r.step == 1 and !r.progression) "kotlin.ranges.CharRange" else "kotlin.ranges.CharProgression",
+                .UInt => if (r.step == 1 and !r.progression) "kotlin.ranges.UIntRange" else "kotlin.ranges.UIntProgression",
+                .ULong => if (r.step == 1 and !r.progression) "kotlin.ranges.ULongRange" else "kotlin.ranges.ULongProgression",
             },
             .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => "kotlin.Function",
             .Exception => "kotlin.Throwable",
@@ -2083,15 +2088,15 @@ pub const Value = union(enum) {
             // or `step`ped progression (step != 1) is only an XProgression.
             .Range => |r| switch (r.kind) {
                 .Int => matchesAny(name, &.{ "IntProgression", "Iterable", "Any" }) or
-                    (r.step == 1 and matchesAny(name, &.{ "IntRange", "ClosedRange" })),
+                    (r.step == 1 and !r.progression and matchesAny(name, &.{ "IntRange", "ClosedRange" })),
                 .Long => matchesAny(name, &.{ "LongProgression", "Iterable", "Any" }) or
-                    (r.step == 1 and matchesAny(name, &.{ "LongRange", "ClosedRange" })),
+                    (r.step == 1 and !r.progression and matchesAny(name, &.{ "LongRange", "ClosedRange" })),
                 .Char => matchesAny(name, &.{ "CharProgression", "Iterable", "Any" }) or
-                    (r.step == 1 and matchesAny(name, &.{ "CharRange", "ClosedRange" })),
+                    (r.step == 1 and !r.progression and matchesAny(name, &.{ "CharRange", "ClosedRange" })),
                 .UInt => matchesAny(name, &.{ "UIntProgression", "Iterable", "Any" }) or
-                    (r.step == 1 and matchesAny(name, &.{ "UIntRange", "ClosedRange" })),
+                    (r.step == 1 and !r.progression and matchesAny(name, &.{ "UIntRange", "ClosedRange" })),
                 .ULong => matchesAny(name, &.{ "ULongProgression", "Iterable", "Any" }) or
-                    (r.step == 1 and matchesAny(name, &.{ "ULongRange", "ClosedRange" })),
+                    (r.step == 1 and !r.progression and matchesAny(name, &.{ "ULongRange", "ClosedRange" })),
             },
             .List => |l| blk: {
                 if (std.mem.eql(u8, name, "EnumEntries")) break :blk l.enum_entries;
@@ -2434,7 +2439,7 @@ pub const Value = union(enum) {
             .Char => |v| try writeChar(writer, v),
             .Null => try writer.writeAll("null"),
             .Range => |r| {
-                if (r.step == 1) {
+                if (r.step == 1 and !r.progression) {
                     try writer.print("{d}..{d}", .{ r.start, r.end });
                 } else if (r.step > 0) {
                     try writer.print("{d}..{d} step {d}", .{ r.start, r.end, r.step });
