@@ -341,6 +341,7 @@ const TestRunCtx = struct {
     time_mode: interp_ir.TimeMode,
     reclaim: bool,
     only_fids: []const u32,
+    filter: ?[]const u8,
 };
 
 /// Big-stack worker entry: re-establish the thread-local coroutine time mode
@@ -348,7 +349,7 @@ const TestRunCtx = struct {
 fn testRunEntry(ctx: TestRunCtx) test_runner.Report {
     interp_ir.setCoroutineTimeMode(ctx.time_mode);
     runtime.setReclaim(ctx.reclaim);
-    return test_runner.runTests(ctx.gpa, ctx.vm, ctx.user_asts, ctx.out, ctx.only_fids) catch
+    return test_runner.runTests(ctx.gpa, ctx.vm, ctx.user_asts, ctx.out, ctx.only_fids, ctx.filter) catch
         test_runner.Report{ .results = &.{}, .passed = 0, .failed = 1, .skipped = 0 };
 }
 
@@ -360,6 +361,7 @@ pub fn runTestFiles(
     paths: []const []const u8,
     features: *const RequestedFeatures,
     only_files: []const []const u8,
+    filter: ?[]const u8,
 ) u8 {
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
@@ -401,7 +403,7 @@ pub fn runTestFiles(
                     }
                 }
             }
-            return runTestsOnBuilt(gpa, prep.built, prep.bindings, prep.map, prep.user_asts, image_fids.items);
+            return runTestsOnBuilt(gpa, prep.built, prep.bindings, prep.map, prep.user_asts, image_fids.items, filter);
         }
     }
 
@@ -448,7 +450,7 @@ pub fn runTestFiles(
 
     if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
-    return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items);
+    return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items, filter);
 }
 
 /// Tail shared by the legacy and image test paths: surface lowering-time
@@ -461,6 +463,7 @@ fn runTestsOnBuilt(
     map: *const SourceMap,
     user_asts: []const KotlinFile,
     only_fids: []const u32,
+    filter: ?[]const u8,
 ) u8 {
     const prev_reclaim = runtime.reclaimEnabled();
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
@@ -500,6 +503,7 @@ fn runTestsOnBuilt(
         .time_mode = interp_ir.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
         .only_fids = only_fids,
+        .filter = filter,
     });
     defer report.deinit(gpa);
 

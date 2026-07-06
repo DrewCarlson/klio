@@ -146,7 +146,14 @@ fn fileSelected(only_fids: []const u32, fid: u32) bool {
     return false;
 }
 
-fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.KotlinFile, only_fids: []const u32) Allocator.Error!Plan {
+/// `filter == null` runs everything; otherwise a test runs when its display
+/// name (a top-level `method`, or a class's `Class`) contains the substring.
+fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
+    const pat = filter orelse return true;
+    return std.mem.indexOf(u8, name, pat) != null;
+}
+
+fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.KotlinFile, only_fids: []const u32, filter: ?[]const u8) Allocator.Error!Plan {
     var top: std.ArrayList(TopTest) = .empty;
     var classes: std.ArrayList(ClassTests) = .empty;
 
@@ -174,6 +181,7 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
             switch (d.*) {
                 .Function => |*f| {
                     if (!hasKotlinTestAnno(f.annotations, file.imports, "Test")) continue;
+                    if (!filterMatches(filter, f.name.name)) continue;
                     const fqn = qualify(gpa, pkg, f.name.name);
                     defer gpa.free(fqn);
                     try top.append(gpa, .{
@@ -186,7 +194,7 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
                     // An abstract class is never instantiated directly; its
                     // tests run through concrete subclasses (below).
                     if (c.is_abstract) continue;
-                    const ct = try discoverClass(gpa, module, &index, file, c, pkg);
+                    const ct = try discoverClass(gpa, module, &index, file, c, pkg, filter);
                     if (ct) |found| try classes.append(gpa, found);
                 },
                 else => {},
@@ -257,6 +265,7 @@ fn discoverClass(
     file: *const ast.KotlinFile,
     c: *const ast.Class,
     pkg: []const u8,
+    filter: ?[]const u8,
 ) Allocator.Error!?ClassTests {
     var methods: std.ArrayList(Method) = .empty;
     var befores: std.ArrayList([]const u8) = .empty;
@@ -266,6 +275,24 @@ fn discoverClass(
     var visited = std.StringHashMap(void).init(gpa);
     defer visited.deinit();
     try collectClassMethods(gpa, index, c, file.imports, c.name.name, &methods, &befores, &afters, &seen, &visited);
+    // Method-level `--filter`: if the class name itself does not match, keep
+    // only the methods whose `Class.method` display matches (a class whose
+    // name matches keeps all its methods). Dropped methods are freed here.
+    if (filter) |pat| {
+        if (std.mem.indexOf(u8, c.name.name, pat) == null) {
+            var kept: usize = 0;
+            for (methods.items) |m| {
+                if (std.mem.indexOf(u8, m.display, pat) != null) {
+                    methods.items[kept] = m;
+                    kept += 1;
+                } else {
+                    gpa.free(m.display);
+                    gpa.free(m.name);
+                }
+            }
+            methods.shrinkRetainingCapacity(kept);
+        }
+    }
     if (methods.items.len == 0) {
         methods.deinit(gpa);
         befores.deinit(gpa);
@@ -429,11 +456,12 @@ pub fn runTests(
     user_asts: []const ast.KotlinFile,
     out: Output,
     only_fids: []const u32,
+    filter: ?[]const u8,
 ) Allocator.Error!Report {
     var plan: Plan = blk: {
         const mg = vm.module.borrow();
         defer mg.deinit();
-        break :blk try discover(gpa, mg.get(), user_asts, only_fids);
+        break :blk try discover(gpa, mg.get(), user_asts, only_fids, filter);
     };
     defer freePlan(gpa, &plan);
 

@@ -240,6 +240,7 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     defer project_features.deinit(gpa);
     var all_features = false;
     var virtual_time = false;
+    var filter: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -248,6 +249,15 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             virtual_time = true;
         } else if (std.mem.eql(u8, a, "--all")) {
             all_features = true;
+        } else if (std.mem.eql(u8, a, "--filter")) {
+            i += 1;
+            if (i >= args.len) {
+                printErr(gpa, "error: --filter requires a name substring\n", .{});
+                return 2;
+            }
+            filter = args[i];
+        } else if (optionValue(a, "--filter=")) |v| {
+            filter = v;
         } else if (std.mem.eql(u8, a, "--only-file")) {
             i += 1;
             if (i >= args.len) {
@@ -307,10 +317,10 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             if (buildAndInstallProjectPack(gpa, plan.project_dir, plan.pack_id)) |code| {
                 if (code != 0) return code;
             }
-            return commands.runTestFiles(gpa, plan.roots, &requested, only_files.items);
+            return commands.runTestFiles(gpa, plan.roots, &requested, only_files.items, filter);
         }
     }
-    return commands.runTestFiles(gpa, paths.items, &requested, only_files.items);
+    return commands.runTestFiles(gpa, paths.items, &requested, only_files.items, filter);
 }
 
 /// Route a `--feature` value: `<pack>/<feat>` keeps its cross-pack meaning; a
