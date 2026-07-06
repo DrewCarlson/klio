@@ -24,7 +24,7 @@ The JIT is built **on top of** the existing IR interpreter, never replacing it:
 
 ## Stages
 
-1. **Foundation (this commit).** `src/jit/jit.zig`: W^X executable memory
+1. **Foundation.** `src/jit/jit.zig`: W^X executable memory
    (`mmap` RW → write → `mprotect` RX) + a minimal x86-64 (System V) emitter.
    Unit-tested by emitting and calling a trivial function. No interpreter change.
 2. **Encoder breadth.** Registers, `mov`/`add`/`sub`/`imul`/`cmp`/`jcc`/`call`,
@@ -52,9 +52,7 @@ index with the live register file intact.
 
 Measured in `bench/memcompare`: CPython (a mature bytecode VM) is itself ~15×
 slower than node on the numeric workload. An interpreter cannot reach a JIT;
-native code generation with type specialization is required. This document is the
-deliberate, multi-session plan to build it incrementally without regressing the
-working interpreter.
+native code generation with type specialization is required.
 
 ## Whole-function mode (native recursion)
 

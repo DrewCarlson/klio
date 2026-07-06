@@ -10,6 +10,36 @@ keep the interim refcount path correct; the GC is the general, any-program answe
 > in the first design (verdicts: unsound, sound-with-fixes, unsound); ALL are folded into the design below.
 
 
+## Completed
+
+The shipped collector (design below, delivered through Stages 0–1 plus the
+multi-thread / coroutine / closure / host-temporary close-out):
+
+- STW tracing mark-sweep GC is the default reclaim mode (`src/runtime/gc.zig`:
+  GcHeader, Marker / shade / drain grey worklist, the `all_cells` intrusive
+  registry, `collect`, the epoch mark, and the KLIO_GC_STRESS / KLIO_GC_NOFREE /
+  KLIO_GC_POISON oracles). The default arena path is unchanged (the collector is
+  inert unless `gc_enabled`).
+- Multi-thread STW with thread roots: `stop_flag` / `parked_count` / `parkForStop`
+  rendezvous and `registerThreadRoot` / `markThreadRoots` bring real-threaded
+  programs (Dispatchers.Default, withContext(IO), cross-dispatcher channels) under
+  the collector byte-identically to the arena baseline.
+- Closure reclamation: `SharedClosures.reclaimDead` + free list and
+  `markClosureHook` keep the live closure set bounded (a slot is freed only after a
+  full mark proved no live value referenced its id).
+- Coroutine GC-root completeness: `markSuspendHook` / `freeSuspendHook` root parked
+  frame snapshots, scope deltas, queued launches, and pending resume values.
+- Per-request value graphs: anonymous-object captures moved onto the instance
+  (`InstanceData.anon_captures`) and anon class/method registrations keyed by the
+  source AST node, so a ktor server's live-cell counts stay flat across requests.
+- Slab page-return with idle hysteresis (`src/runtime/slab.zig`): same-size cells
+  grouped into slabs, `munmap` on last-free, and MAP_FIXED decommit of stably-idle
+  slab pages so RSS tracks the live set.
+
+Open next tier: Stage 2 (generational nursery) and Stage 3 (incremental/concurrent
+marking), both below.
+
+
 ## Chosen approach
 
 Precise-rooted, stop-the-world, non-moving tracing mark-sweep ("KGC") layered on the existing ObjRef/ControlBlock object model, with explicit per-thread and global root registries (NO conservative stack scan), GC deferred to opcode-boundary safe points, a cooperative multi-thread stop-the-world handshake reusing the existing abandon-poll machinery, and a staged path to a generational nursery. This is essentially Design 5/Design 4 unified, hardened with Design 1's epoch-mark and deferred-trigger rules and Design 3's generational stage, and deliberately rejecting Design 2/3's conservative native-stack scan.
@@ -57,24 +87,6 @@ REFCOUNT MIGRATION (remove RC as reclamation, keep handle/lock plumbing; gate wh
 ## Staged implementation
 
 
-### Stage 0: GcHeader, registry, and per-T trace/finalize thunks (no collection yet)
-
-**Files:** src/runtime/objcell.zig (ControlBlock prefix + GcHeader + gc_all_cells registry + initOwned thunk install + comptime @hasDecl(T,"gcTrace"/"gcFinalize") guard for non-Value payloads); src/runtime/gc.zig (NEW: GcHeader, Marker, markValue, the global registry, gc_bytes/gc_pending/gc_phase atomics, mode flags); src/runtime/value.zig (gcTrace driving a GC-mark variant of forEachChildCell that DOES visit backing for List/Set/MapEntry; gcFinalize stubs; promote MapBacking to ObjRef(MapBacking)); src/runtime/env.zig (gcTrace: vars values+parent; gcFinalize: vars.deinit only); src/runtime/class.zig (ClassDef.gcTrace/gcFinalize; InstanceData.gcTrace incl native_state hook + gcFinalize dropping child release; NativeBox optional gc_trace field); src/runtime/runtime.zig (re-exports)
-
-**Changes:** Add the non-generic GcHeader prefix to every ControlBlock and the intrusive gc_all_cells list; initOwned push-fronts each new cell and installs comptime-synthesized gc_trace/gc_finalize thunks. Author the ~15 hand-written gcTrace/gcFinalize thunks for non-Value payloads (Env, ClassDef, InstanceData, ObjectStates map, DriverWakeup, MapEntries, []ComparatorStep, the ?ObjRef(...) wrappers, NativeBox) and the Value-driven thunks for StringRef/ValueList/ValueBox/ValueSlice. ControlBlock fails at comptime if a registered T lacks gcTrace/gcFinalize. Promote MapBacking to a registered cell. NO safe points, NO sweep, NO behavior change — the registry just accumulates and thunks are installed but never called. Widen gc_mark to usize.
-
-**Validation:** zig build && zig build test stay green (registry is inert; arena/smp paths unchanged). python3 scripts/zigcheck.py runtime, value, class, env. Unit test in gc.zig: build a cyclic Instance↔Env graph, run markValue from a manual root, assert every reachable cell's gc_mark==epoch and unreachable cells stay white — pure mark, no free. Assert comptime guard: a throwaway ObjRef(StructWithoutGcTrace).initOwned fails to compile.
-
-
-### Stage 1: Minimal correct end-to-end STW mark-sweep GC (single + multi thread), all roots, KLIO_GC_STRESS
-
-**Files:** src/ir/eval.zig (frame_chain threadlocal + Frame.gc_link, push/pop in newWithCaptures/activate/deinit bracketing eval_depth; resuming_frames threadlocal set/cleared in resumeContinuation; opcode-boundary safe point at 891/925; markSuspendState reusing retainSnapshotValues walk); src/interp_ir/vm/scheduler.zig (pinned_task in thread GC record, pin under pool mutex at takeEligible return 289, cleared after child-Vm registration; idle-loop safe point); src/interp_ir/vm/coroutines.zig (register coro_stack/active_scope_stack/PersistedParked/SlotOwners.pending as roots + mark passes; pump-loop-top safe point); src/kotlinx_coroutines/kotlinx_coroutines.zig (coro_reg as first-class root provider: trace channels buffer/send_waiters/receive_iter_waiters under coro_reg_mutex); src/interp_ir/interp_ir.zig (gc_vms list, Vm register at vmNew/deregister at vmDeinit; SharedClosures→slot-map+free-list, weak trace + sweep-time slot reclaim; unify IrClosure capture cell with table cell); src/interp_ir/vm/host_call_value.zig + host_globals.zig (buildLambda/funcValueById allocate into freed slots; carry canonical cell); src/stdlib/implementations/*.zig (host_keepalive scopes around every accumulator/snapshot held across invoke*/callValueRec — collections grouping_fold/reduce/associate/groupBy/sortedBy/sumOf/comparator sort, iterableItems Map boxes, sequence/string/comparisons/regexp/result/control re-entry sites); src/interp_ir/vm/host_call_member.zig (comparator a/b/ka keepalive; MapEntries.writeThrough barrier funnel); src/interp_ir/vm/host_instances.zig (pin in-construction singleton shell on host_keepalive until published); src/runtime/objcell.zig (.gc AllocChoice arm; clone drops fetchAdd, deinit no-op under GC); src/main.zig (.gc allocator arm); src/runtime/class.zig (NativeBox.deinit calls trace-aware path; ensureNativeState Debug assert); build.zig (KLIO_GC_STRESS env passthrough like KLIO_RACE_JITTER)
-
-**Changes:** Wire every root source enumerated in the design and run a real STW mark-sweep at the deferred trigger. Implement the multi-thread handshake (gc_phase, stop_the_world, at_safepoint count from gc_threads, enterBlockingSafe/exitBlockingSafe). Implement gcFinalize-based sweep (shallow, no child release). Convert the closure registry to a slot-map with free-list and weak tracing so closures are reclaimable (the bounded-RSS fix). Mandatory host_keepalive scopes at every pure-host re-entry accumulator/snapshot site (the ~93 invoke + callValueRec sites), plus the comparator a/b/ka locals and the partial-singleton shell. Add the MapEntries.writeThrough barrier funnel (used by Stage 2 but installed now so all backing-map stores go through one path). Add KLIO_GC_STRESS=1 forcing a full collection at EVERY safe point.
-
-**Validation:** zig build && zig build test green under all of arena (default), smp+reclaim (KLIO_RECLAIM=smp, the differential oracle), and the new .gc mode (KLIO_RECLAIM=gc). Run the full corpus (tests/corpus/expected via scripts/corpus_check.py), fuzz_closures_suspend, and the parity/differential itest suites under KLIO_GC_STRESS=1 with .gc mode — any unrooted-Value bug crashes deterministically; output must match the smp+reclaim oracle byte-for-byte. A ktor server example served on every route under load shows flat RSS in .gc mode (the closure-registry + bounded-watermark fix); per-request closures and channel buffers are reclaimed. Debug assertion: host_keepalive empty at every top-level opcode boundary. Add a Zig test that creates a closure-per-iteration loop and asserts gc_cell_count returns to baseline after collection (closure slots reused).
-
-
 ### Stage 2: Generational nursery (throughput) with the complete write-barrier set
 
 **Files:** src/runtime/gc.zig (young bump region, remembered set, minor vs major collection, promotion); src/runtime/class.zig (InstanceData.define/set barrier); src/runtime/env.zig (Env.define barrier); src/runtime/value.zig (Cell write, ValueList append barriers; MapEntries.writeThrough barrier — already funneled in Stage 1); src/interp_ir/vm/host_call_member.zig (MapEntry.setValue routes through MapEntries.writeThrough); src/stdlib/implementations/collections.zig (syncMapView routes through MapEntries.writeThrough)
@@ -93,21 +105,6 @@ REFCOUNT MIGRATION (remove RC as reclamation, keep handle/lock plumbing; gate wh
 **Validation:** zig build test green. Corpus + parity under KLIO_GC_STRESS and a concurrent-mark stress (mutator runs during mark) against the smp+reclaim oracle. Latency benchmark: large steady-state heap (long-running server with a big old-gen) shows STW pause bounded to a fraction of a full mark; throughput regression vs Stage 2 stays within budget. ThreadSanitizer-equivalent (KLIO_RACE_JITTER + concurrent mark) finds no data race on gc_mark/lock.
 
 
-## Test strategy
-
-Differential oracle is the backbone: the still-freeing KLIO_RECLAIM=smp path (full refcount reclamation, validated by testing.allocator leak/UAF detection in zig build test) is the ground-truth output for every program. At each stage, run the entire corpus (tests/corpus/expected via scripts/corpus_check.py), every example, fuzz_closures_suspend, and the parity/differential itest suites in BOTH the smp oracle and the new .gc mode and assert byte-identical output and identical diagnostics.
-
-KLIO_GC_STRESS=1 forces a full collection at EVERY safe point (the analog of KLIO_RACE_JITTER), turning any unrooted-Value bug into an immediate deterministic crash rather than a rare interleaving — wired into build.zig the same way KLIO_RACE_JITTER is (build.zig:197 fuzz_env list), and run over the whole corpus + fuzz_closures_suspend before the .gc default is ever flipped. Stage 2 adds KLIO_GC_MINOR_STRESS to force a minor collection at every safe point so a missing write barrier (old→young pointer) crashes deterministically.
-
-Per-module: zig build test runs the Zig test {} blocks (each new gcTrace/gcFinalize thunk gets a unit test asserting every field is visited — build a graph, mark, assert reachable cells marked and unreachable cells swept). python3 scripts/zigcheck.py <module> verifies each touched module compiles in isolation. The comptime @hasDecl guard is itself a test: a throwaway registered payload without gcTrace must fail to compile.
-
-Cycle collection (the core win over refcounting) gets a dedicated test: a self-referential Instance (or Instance↔Env↔closure cycle) made unreachable must be reclaimed by the .gc path and leaked by smp+reclaim — the one program where the two paths legitimately diverge, asserted as such.
-
-Bounded-RSS validation: a ktor server example served on every route under sustained load in .gc mode must show FLAT RSS (sampled over thousands of requests), proving the closure-registry slot-map+free-list (Stage 1) and the allocation watermark trigger actually reclaim per-request closures and channel buffers. A Zig unit test for the closure registry asserts gc_cell_count and the free-list return to baseline after collecting a closure-per-iteration loop.
-
-Throughput validation: copy-heavy microbenchmarks (string-template concat, boxed Pair/Result churn, xs.map { } per element) must show .gc Stage 0/1 beating smp+reclaim (no per-copy atomic incref/decref) and Stage 2's nursery approaching arena raw speed while keeping the RSS the arena cannot.
-
-
 ## Residual risks
 
 1. Host-op keepalive completeness is the remaining manual obligation (~93 invoke + the callValueRec re-entry sites across 9+ stdlib/host files). The mechanism is mandatory (not the rejected frame-register routing), the Debug "host_keepalive empty at top-level opcode boundary" assertion plus the comptime/Debug lint catch leaks, and KLIO_GC_STRESS crashes a miss deterministically — but only if the corpus EXERCISES that exact path. Mitigation: the lint (any host fn with both an accumulator local and an invoke must open a keepalive scope) is the structural backstop; new stdlib ops cannot silently regress. Risk is reduced from the ~226 retain sites to an auditable, lint-enforced ~100, and a miss is a reproducible crash under stress, never a silent corruption.
@@ -121,355 +118,3 @@ Throughput validation: copy-heavy microbenchmarks (string-template concat, boxed
 5. Epoch-wrap is a non-issue for soundness (usize width makes it astronomically far; documented invariant: reachable cells are re-marked every collection so wrap can only delay, never prevent, reclamation of an unreachable cell — a bounded leak, never a UAF).
 
 6. Stage 2/3 concurrency: the Dijkstra/generational barriers add memory-ordering obligations between the shade CAS and the per-cell SpinRwLock; gc_mark is kept on its own word with specified ordering, but concurrent-mark correctness is the hardest-to-test part and is deliberately the LAST, optional stage — Stage 1 (STW, non-moving) is the complete, correct, bounded-RSS GC that can ship and become the default on its own.
-
-
-## Build status
-
-Implemented and validated:
-
-- Collector core (gc.zig): GcHeader epoch-mark, tri-color Marker with explicit
-  grey worklist, intrusive cell registry, Appel threshold with a tunable floor
-  (KLIO_GC_THRESHOLD_KB), permanent generation (the stdlib/class image built
-  before the program body is never swept), shallow gcFinalize sweep.
-- Test oracles: KLIO_GC_STRESS (collect every safe point), KLIO_GC_STRESS_EVERY=N
-  (every N safe points — narrow-window detection without the O(safe-points x
-  live) blowup), KLIO_GC_NOFREE (mark-only — isolates premature frees from
-  marking/sweep bugs), KLIO_GC_DEBUG (per-collection accounting + freed-type).
-- Single-thread roots: the eval frame chain (regs/params/captures/enclosing
-  receivers), the Vm program graph (globals, classes, class_default_outer, the
-  closure / anon-method / object-state side tables, the program image), the
-  host-op keepalive stack (Value / Value-slice / MapPair-slice / raw-cell
-  pins), and the host's active scope env swapped during member/object bodies.
-- Tracers: ClosureInfo, AnonMethodEntry, ObjectInitState, InstanceData,
-  ClassDef, Env, MapPair, ComparatorStep; gcMark additionally follows the
-  non-owning map-view backing edges (List/Set/MapEntry) that retain/release skip.
-- Coroutines: a root provider marks this thread's interceptor stack (parked
-  frame snapshots, scope deltas, queued launches, pending resume values), the
-  active scope stack, the persisted-continuation registry, and the slot-owner
-  wakeup mailboxes; SuspendState/DriverWakeup/CooperativeInterceptor markers.
-
-Validated: all 88 example programs run byte-identically to the arena baseline
-under aggressive collection (KLIO_GC_THRESHOLD_KB=64); the default arena path is
-unchanged (the collector is inert unless gc_enabled).
-
-Remaining:
-
-- host_keepalive completeness across the ~65 stdlib invoke / callValueRec
-  accumulator sites (narrow-window premature frees under full stress; realistic
-  thresholds already pass).
-- Multi-thread root visibility + stop-the-world. Each thread registers the
-  stable addresses of its threadlocal roots (frame_chain, host_keepalive,
-  coro_stack, active_scope_stack) into process-global intrusive lists at its
-  entry seam and unlinks at exit; the collector marks every registered thread's
-  roots (a parked/blocking thread's stack is stable, so reading it cross-thread
-  is sound). An STW handshake (stop flag + parked-count rendezvous, with
-  enterBlockingSafe/exitBlockingSafe bracketing the blocking primitives) ensures
-  no thread mutates mid-collection. Worker threads flip alloc_perm=false only
-  once their roots are visible — doing it earlier would let one thread's
-  collection sweep another's unrooted cells.
-- Closure side-table slot-map + free-list for bounded RSS (today the registry is
-  strong-rooted and append-only, so per-request closures leak — correct but not
-  yet flat-RSS).
-
-
-## Multi-thread + coroutine close-out
-
-The stop-the-world handshake (per-thread root records, parked-count rendezvous,
-blocking-safe brackets on timer sleeps / thread joins) brought real-threaded
-programs under the collector: 8-thread monitor counters, `Dispatchers.Default`
-parallelism, `withContext(IO)`, and cross-dispatcher channels all run
-byte-identically to the arena baseline under aggressive collection.
-
-The async-hammer fixture (`GlobalScope.async(Dispatchers.Default)` x1200 with
-`await`) surfaced the final correctness hole, caught as a DebugAllocator double
-free: `materializeInstance` builds an instance, then runs its body-property /
-init-block initializers (user code, hence safe points) while the half-built
-shell is reachable only through a host local. A collection there swept the
-instance and freed its field list, which construction then freed again. Object
-and companion singletons were anchored through the in-flight object-state table,
-but regular instances had no anchor — they are now pinned on the keepalive stack
-across construction. This was a latent single-thread bug the corpus rarely hit;
-aggressive multi-thread collection made it deterministic.
-
-Known residual (does not crash): host-scratch raw allocations (e.g. the
-`allocPrint` keys in the anon-method dispatch path) are freed only under
-`reclaimEnabled()`, which is off in GC mode, so they leak. They are not
-GC-managed cells, so sustained-load flat RSS needs those frees ungated for the
-GC path (or the scratch moved onto a per-call arena). The KLIO_GC_GUARD=dbg
-mode (route the GC's freeing backing through the checking allocator) is the
-tool that pinpoints both double-frees and these leaks.
-
-
-## RSS measurement (sustained allocation churn)
-
-`/tmp/sustained.kt` — 200k iterations each constructing an instance, a list, and
-a `map { }.filter { }` chain — measured with `scripts/gc_rss.sh`:
-
-- 200k iters: arena hits the 6 GB RSS cap and aborts (the arena never frees);
-  the GC completes at ~2.6 GB.
-- 20k iters: arena 945 MB, free 432 MB, **gc 385 MB** — the collector uses the
-  least of the three and is the only one that stays bounded as the count grows.
-
-Two effects remain on the way to truly flat RSS:
-
-1. The freeing backend is `smp_allocator`, which caches reclaimed pages rather
-   than returning them to the OS, so RSS reflects the allocation high-water mark
-   of the churn, not the live set (which the collector keeps to ~6 MB here).
-   This is an allocator-policy choice, not a leak; an arena-of-free-lists or a
-   periodic `madvise`/trim would tighten it.
-2. The live cell set grows ~430 cells per collection because the closure
-   side-table is append-only and strong-rooted: every `map`/`filter` lambda is
-   retained for the run. Bounded per run, unbounded for an infinitely-running
-   server, so the slot-map + free-list conversion (collectable closures keyed by
-   live `IrClosure` reachability, with the scheduler's in-flight task blocks
-   rooted so a dispatched closure is not pruned) is the remaining flat-RSS work.
-
-Host-op raw scratch (allocPrint keys, dup'd probe FQNs) is freed by the host run
-path; the anon-method dispatch keys were the one hot site still gated to the
-arena and are now freed unconditionally.
-
-
-## Collectable closures (bounded live set)
-
-The closure side-table was append-only and strong-rooted, pinning every lambda's
-captures for the whole run — the live cell set grew unboundedly in a map/filter
-loop (~430 cells per collection). Adversarially hardened (a design panel found
-fatal cross-thread and ordering holes in the first slot-map+free-list sketch),
-the landed mechanism is simpler and safer than a slot-map:
-
-- A closure is kept alive by ordinary reachability of its `IrClosure` Value.
-  `Value.gcMark` for an `IrClosure` invokes `runtime.gc.markClosureHook`, which
-  marks the side-table slot's capture store + receiver chain for that id. The
-  normal drain reaches this transitively — a closure captured by another closure
-  is marked when the outer's captures cell is drained — so no second pass and no
-  ordering hazard. A closure no live value references is never marked here, so
-  its captures cell goes white and is swept.
-- The spine tracer pins nothing (`ClosureInfo.gcTrace` is a no-op); the spine is
-  permanent metadata, never swept. Ids are monotonic and never reused, so no
-  free-list and no stale-id aliasing — a closure id any value still carries
-  always dispatches correctly.
-- Dispatched closures stay rooted across post→queue→dequeue→run: the pool FIFO
-  marks every queued task block, and a worker pins its in-flight block on the
-  keepalive stack (runVmTask / workerEntry).
-
-Result: the live set is flat (~16-20 cells across 345 collections over a
-200k-iteration instance+closure+collection churn loop, where the arena hits the
-6 GB cap and aborts). `marked` is flat (~1415). All 88 examples, the async
-dispatch hammer, and the real-threaded litmus fixtures stay correct under
-aggressive collection.
-
-Residual: process RSS still reflects the smp_allocator's reclaimed-page cache
-(the allocation high-water of the churn), not the live set — an allocator-policy
-refinement (trim/`madvise`, or an arena-of-free-lists), not a leak. The
-per-closure `ClosureInfo` metadata (a few words + two small slices) is not freed
-mid-run; it is bounded by distinct closure-creation events, dwarfed by the
-reclaimed capture data, and a follow-up could prune it once liveness is proven.
-
-## Memory-reclamation results (host temporaries, per-request graphs, RSS)
-
-The collector keeps the *reachable* set flat, but two non-cell growth sources
-remained; both are now closed under the GC, and RSS is tracked rather than the
-allocator's reclaimed-page cache.
-
-### Page-returning backing (`src/runtime/slab.zig`)
-
-The stock free-list allocators (`smp_allocator`, libc) never return reclaimed
-pages to the OS, so a long-running server's RSS grew with cumulative churn even
-though the live set stayed flat. The slab allocator groups same-size cells into
-`SLAB`-aligned slabs and `munmap`s a slab the instant its last cell is freed, so
-RSS tracks the live set. It is the default GC backing (`KLIO_GC_ALLOC` selects
-`smp`/`gpa`/`calloc`/`leaktrack` for comparison). Measured: a `smp`-backed ktor
-server's RSS grows to >1 GB over a few hundred requests; the slab keeps the live
-cell set flat.
-
-### Host temporaries (`freeScratch`)
-
-The per-call host scratch the Rust→Zig port left unfreed (probe FQNs, arg/prepend
-arrays, error messages) was gated on `reclaimEnabled()`, which is OFF under the
-GC, so it leaked through the freeing backend. Split the predicate:
-`freeScratch()` frees raw scratch whenever the backend actually frees (reclaim OR
-GC) while value-graph ownership stays on `reclaimEnabled()`. The 48 raw-free
-sites use `freeScratch()`, and the previously-unfreed prepend-array /
-extension-dispatch / string-concat-rendering scratch in the member-dispatch and
-eval paths is now freed. A stdlib loop (`listOf().map{}.filter{}` + map build)
-drops from ~6.5 KB/iter to flat (147 MB at 200 K iterations, ~the 116 MB at 20 K
-plus fragmentation noise).
-
-### Per-request value graphs (anonymous objects)
-
-Two registries rooted per-request anonymous-object state forever:
-- captures were stored in the process-global `anon_methods` registry keyed by a
-  per-instance class name, so every request's value graph (the call, params,
-  deserialized bodies) stayed reachable. Moved onto the instance
-  (`InstanceData.anon_captures`), reclaimed with it.
-- the class + method registrations used a per-instance `$anon$<id>` name, so
-  `classes`/`anon_methods` gained never-released entries per instantiation. Keyed
-  by the source AST node instead (the lowered IR is identical for every
-  instantiation of a site), so the first instantiation registers and later ones
-  reuse.
-
-Result: a ktor server's live-cell counts stay flat across requests (`InstanceData`,
-`Module`, `ClassDef`, `Env`: constant instead of growing ~linearly — measured
-flat over 240+ requests where they previously grew ~55×).
-
-## Host-keepalive narrow windows (host re-entry) — largely closed
-
-A value a host op holds in a Zig local across a re-entrant `evalWith` /
-`invokeCallable` is swept if a collection fires during that inner eval, then
-reused (a hard fault under the slab's `munmap`; a wrong-type cell otherwise).
-Reproduced deterministically with `KLIO_GC_STRESS_EVERY=N`. Found and closed
-(each via the `KLIO_GC_ALLOC=leaktrack` locator + the segfault handler under
-`KLIO_SEGV_TRACE`):
-
-- the lazy-Sequence pipeline accumulator + in-flight value (`pumpItem`,
-  `applySeqOp`) — crashed ktor routing setup (`splitToSequence().map{}.toList()`);
-- the anonymous-object init / property / super-arg thunk sub-module
-  (`runAnonThunk`) held as a raw `frame.module` pointer — crashed serving;
-- the source items of a streamed sequence.
-
-A ktor server now survives routing setup and thousands of requests under the GC,
-where it formerly crashed at startup or within a few hundred requests. A rare
-intermittent crash remains at large request counts (~thousands), surfaced only
-by the normal 8 MB-threshold collection timing (not by aggressive stress, which
-serves cleanly) — the last unrooted host-local in the sustained request path,
-the same class as those above, to be pinned the same way.
-
-## Host-temporary reclamation in the ktor request path — in progress
-
-With the value graph flat (live cells constant across requests) and the leaks
-above closed, a ktor server's RSS growth dropped from ~8.5 MB/request (arena, the
-as-found number) to ~100 KB/request — the remaining per-request host scratch the
-collector cannot reclaim (it is raw, not a cell). Closed so far: the
-member-dispatch and field-resolution miss messages, the `anonMethodDispatch`
-lookup key, the `invokeAnonMethod` / `irMethodWalk` packed-arg buffers, the
-map-get key snapshot, and the parent-ctor packed args. The leaktrack locator
-shows the remaining per-request sites:
-
-- the closure side-table is append-only (monotonic ids, no reuse), so each
-  per-request lambda's `ClosureInfo` (capture-name dupe + chain) accumulates —
-  needs GC-confirmed-dead slot reclamation (a free-list keyed by the
-  mark epoch);
-- the anon-object init / property / super-arg thunks are re-lowered per instance
-  (only the methods + class are site-cached) — needs caching the thunk side
-  modules per source site;
-- per-intrinsic internal scratch (`dispatchIntrinsic` callees) and ctor / eval
-  arg arrays — the long tail of the host reconciliation, each a `freeScratch()`
-  free or an accumulator the GC cannot see.
-
-This is the §11 host-temporary reconciliation, now scoped concretely to the
-sites above rather than the whole interpreter.
-
-## Session update: crash root-caused, side-table bounded, residual characterized
-
-**The intermittent crash is fixed.** It was a use-after-free in
-`materializeInstance`: the packed parent-ctor-arg buffer was freed under the
-freeing allocator and then `cur_args` was pointed at it, so the next chain level
-read its super-args from freed memory. With the page-returning slab the region
-is eventually unmapped, turning the read into a hard fault after sustained
-construction (the server faulted deterministically at ~1176 requests). `cur_args`
-now points at the live chain-owned copy. A parallel 60 000-request load and the
-GC-stress corpus both run clean.
-
-**Leaks closed this session (all were freed only under the reference-counting
-path, so the collector — which never owns them — leaked them):**
-- coroutine frame-snapshot slice buffers (`regs`/`params`/`captures`/
-  `enclosing_this`/`try_stack`) on every suspend/resume;
-- the ktor client's owned response strings per request;
-- the duped body-property array in anon-object construction.
-
-**Closure side-table now bounded.** `reclaimDead` feeds GC-confirmed-dead slots
-to a free list that `push` reuses, so the spine stays bounded by the live
-closure set instead of growing per closure-creation event (was ~58 MB after a
-few thousand requests). Reuse is sound: a slot is freed only after a full mark
-proved no live value referenced its id, and a marked closure value always marks
-its slot, so a reused id can never alias a live value.
-
-**Anon-object thunks site-cached.** The complex-property / `init`-block /
-super-arg thunks are lowered once per `object` source site and kept alive by a
-GC root, instead of re-lowered (and leaked, since a swept Module cell frees only
-its header) per instantiation. The caches are AST-address-keyed and so are
-cleared at each run boundary (a stale cross-run entry was a use-after-free).
-
-**Residual ktor RSS, precisely characterized.** With every fix above, a ktor
-server's live cell count is flat (~2700 across a 40 000-request run, verified via
-`KLIO_GC_DEBUG`), so there is no value-graph leak. RSS still grows ~50 KB/request
-(slab) / more under libc — raw host-temporaries in the dispatch hot path that the
-collector never owns and an explicit free does not yet reclaim (the §11 tail).
-The per-allocation leak locators (`leaktrack`, the new cell tracer) cannot
-pinpoint these under the concurrent-server workload: tracking every cell
-contends with the stop-the-world sweep and starves collection, inflating the run
-rather than reporting it. A non-perturbing (sampled, lock-sharded) per-allocation
-tracker, or a per-request/per-coroutine-tree arena that frees host scratch
-wholesale (§12.4 option 2), is the next investment.
-
-**Diagnostic tooling added (all gated, off by default):** `KLIO_SLAB_TRACE`
-(records the capture stack of every live slab/large mmap and dumps the top sites
-on signal — sees allocations that bypass `leaktrack` or the sweep);
-`KLIO_CELL_TRACE` (per-cell allocation tracking at the slab's guaranteed-paired
-free path); `KLIO_SERVE_MAX` (bounded serve so a leak run reaches its report).
-
-**Pre-existing coroutine GC root holes (unchanged, the §12 frontier).** Under
-*aggressive* stress (`KLIO_GC_STRESS_EVERY=200`-300) three suspend/`async`/`launch`
-examples premature-free a receiver/closure (confirmed: `KLIO_GC_NOFREE=1` makes
-them pass). The window is narrow — they pass at the normal collection cadence —
-so a reachable coroutine value is briefly unrooted during the resume handoff.
-Closing it is the structured-concurrency root-completeness work of §12.
-
-## Dispatch-path host-temporary leaks closed; slab page reclamation
-
-The §11 "raw host-temporaries in the dispatch hot path" tail is now largely
-closed, and the slab gained genuine page-return for partially-free regions.
-
-**Dispatch-path frees.** Several host helpers allocated scratch the collector
-never owns and never freed:
-- `eqIgnoreCase` dropped two `allocLowerString` copies (case-insensitive String
-  equals is heavy in HTTP header routing — the hottest site).
-- `userMethodNamed` / `instanceMethodWalkNamed` and the named stdlib-intrinsic
-  path built a receiver-prepended arg buffer plus a names buffer and never freed
-  them after `callFuncNamed` (which borrows both).
-- the intrinsic-name resolver duped the resolved fqn into `Intrinsic.fqn` (a raw
-  slice the collector never frees); the source string is already program-lifetime
-  so it is borrowed directly now, and every discarded bare-name intrinsic
-  reference stops leaking.
-- `firstSupertypeName` / `callSuper` duped the parent class name though the
-  contract borrows it and nothing frees the result.
-- the bound-closure call path (`with(recv){…}`, receiver-delivered-positionally)
-  leaked its prepended arg slice.
-- `kotlinx.serialization` `jsonEncode`/`jsonDecode` built their whole
-  `std.json.Value` scratch tree (and ran `parseFromSliceLeaky`) on the collector
-  heap and dropped it; both now use a call-scoped arena, with host re-entry and
-  the produced cells staying on the real allocator.
-
-**Slab page reclamation.** A slab unmapped only when its last live cell freed, so
-a region a few long-lived stragglers pinned kept its whole 256 KiB resident. The
-collector now decommits the all-free pages of slabs that have stayed mostly free
-for several consecutive passes (idle-pass hysteresis avoids churning slabs merely
-between two allocations). A reclaimed page is replaced by a fresh anonymous
-`MAP_FIXED` mapping — verified the only portable way to actually drop RSS, since
-`madvise(MADV_FREE/MADV_FREE_REUSABLE/DONTNEED)` leaves the pages counted
-resident on macOS (301 MB → 301 MB) while `MAP_FIXED` drops them (301 MB → 51 MB).
-The free cells whose intrusive link sat in a discarded page go dormant —
-re-committed and re-threaded on demand by `allocSmall` rather than mapping a
-fresh slab, so the address space stays bounded (an early revive-less version grew
-virtual memory ~34 KB/req and exhausted the VM map). Covered by a slab unit test
-(data integrity of a straggler through decommit + revive) and validated under
-`KLIO_GC_STRESS_EVERY=25` over a live ktor server.
-
-**Measurements (all fixes, tracing GC, `ps` RSS).**
-- Simple alloc-loop (2 000 000 iterations of `"item-$i" + mutableListOf`): peak
-  **123 MB, flat** — no per-iteration growth.
-- ktor 4-endpoint server: **~50 KB/req → ~13 KB/req** over 4000 requests
-  (275 MB → 335 MB), baseline ~50 MB lower than before the reclaim.
-- ktor `GET`-only: ~2.0 KB/req (the reclaim trims ~25% off the unreclaimed 2.7).
-
-**Residual, precisely characterized.** The live cell count is *flat* over long
-runs — `GET` ~2645, the 4-endpoint mix ~2795 across 1800 collections
-(`KLIO_GC_DEBUG`) — so there is **no value-graph leak**; the residual RSS growth
-is slab fragmentation: per-request medium-lived cells (response/call/coroutine
-state) land in fresh slabs and pin them, and the slope is independent of the GC
-threshold (1 MB vs 8 MB floors give the same slope, only a lower baseline). The
-page reclaim recovers the *stably*-idle stragglers but is neutral on the denser
-mixed workload, whose slabs stay above the reclaim's live fraction between
-collections. Fully flattening this needs either compaction (a moving collector,
-out of scope for the current non-moving design) or a per-request/per-coroutine
-arena that frees host scratch wholesale at the request boundary.
