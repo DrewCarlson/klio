@@ -606,9 +606,21 @@ pub fn kotlinHashCode(v: *const Value) i32 {
             break :blk h;
         },
         .Range => |r| blk: {
-            const f: i32 = @truncate(r.start);
-            const l: i32 = @truncate(r.end);
-            const s: i32 = @truncate(r.step);
+            // Elements hash with their own Kotlin hashCode first: Long/ULong
+            // fold high and low words (`v xor (v ushr 32)`), Int/Char/UInt
+            // truncate. `(10L downTo 1L).hashCode()` needs step -1L to hash
+            // as 0, not -1.
+            const elem = struct {
+                fn hash(kind: RangeKind, x: i64) i32 {
+                    return switch (kind) {
+                        .Long, .ULong => @truncate(x ^ @as(i64, @bitCast(@as(u64, @bitCast(x)) >> 32))),
+                        .Int, .Char, .UInt => @truncate(x),
+                    };
+                }
+            };
+            const f: i32 = elem.hash(r.kind, r.start);
+            const l: i32 = elem.hash(r.kind, r.end);
+            const s: i32 = elem.hash(r.kind, r.step);
             const empty = if (r.step > 0) r.start > r.end else r.start < r.end;
             if (empty) break :blk @as(i32, -1);
             if (r.step == 1 and !r.progression) break :blk @as(i32, 31) *% f +% l;
