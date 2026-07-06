@@ -7,9 +7,8 @@
 //!
 //! Memory model: heap-owning containers (`StringRef`, `ValueList`,
 //! `MapEntries`) are created via `ctx.allocator` and never freed
-//! individually — the interpreter drives an arena per eval phase, matching
-//! where the Rust `Arc`/`ObjRef` data dropped at scope exit. A plain
-//! `Value` copy shares the same backing handle, mirroring `Arc::clone`.
+//! individually — the interpreter drives an arena per eval phase instead. A
+//! plain `Value` copy shares the same backing handle.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -646,7 +645,7 @@ fn recvMapEntries(a: Allocator, args: []const Value, what: []const u8) Error!Map
 }
 
 // =====================================================================
-// Range iteration (local copy of ranges helpers; ranges.zig not ported)
+// Range iteration (local copy of ranges helpers; ranges.zig is not imported here)
 // =====================================================================
 
 /// Inclusive integer progression iterator state.
@@ -7481,8 +7480,8 @@ pub fn coll_max_with_or_null(ctx: *CallCtx) Error!EvalResult {
 // Public re-exports for the interpreter's higher-order ops
 // =====================================================================
 
-/// Natural-order comparison exposed under the Rust name. Returns an
-/// ordering or a `RuntimeError` (as data) for incomparable values.
+/// Natural-order comparison. Returns an ordering or a `RuntimeError` (as
+/// data) for incomparable values.
 pub fn compare_values(a: Allocator, x: Value, y: Value) Error!OrderResult {
     return compareValuesPublic(a, x, y);
 }

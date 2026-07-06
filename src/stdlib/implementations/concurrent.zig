@@ -25,8 +25,7 @@ const MonitorState = struct {
 /// One reentrant monitor: a spin mutex guarding its ownership state.
 /// A waiter that finds the monitor owned by another thread drops the
 /// guard and yields, then re-checks — the spin equivalent of a
-/// condition-variable wait. Mirrors the Rust `(Mutex<MonitorState>,
-/// Condvar)`.
+/// condition-variable wait.
 const Monitor = struct {
     mutex: SpinMutex = .{},
     state: MonitorState = .{ .owner = null, .depth = 0 },
@@ -35,8 +34,7 @@ const Monitor = struct {
 /// Process-wide monitor table keyed by the lock value's object
 /// identity. Value-type locks (no identity) all share a single
 /// monitor under the sentinel key `0`. The registry and its monitors
-/// live for the whole process, mirroring the Rust `static OnceLock`
-/// plus `Arc` monitors that are never dropped.
+/// live for the whole process and are never freed.
 const Registry = struct {
     var mutex: SpinMutex = .{};
     var map: ?std.AutoHashMap(usize, *Monitor) = null;

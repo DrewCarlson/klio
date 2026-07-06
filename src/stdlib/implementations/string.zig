@@ -30,8 +30,7 @@ const coalesceSurrogates = runtime.coalesceSurrogates;
 const Allocator = std.mem.Allocator;
 
 // ============================================================
-// Small data-construction helpers (mirrors the cross-module
-// `super::` helpers the Rust file imports).
+// Small data-construction helpers.
 // ============================================================
 
 fn errType(msg: []const u8) EvalResult {
@@ -1225,7 +1224,7 @@ pub fn string_reversed(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
-    // Reverse by Unicode scalar (Rust `chars().rev()`).
+    // Reverse by Unicode scalar.
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
     var i: usize = s.len;
@@ -2681,7 +2680,7 @@ fn insertCommasDecimal(allocator: Allocator, s: []const u8) Allocator.Error![]u8
     return out.toOwnedSlice(allocator);
 }
 
-/// Convert Rust/Zig `1.234e2` form into Java's `1.234e+02`. Owned slice.
+/// Convert Zig's `1.234e2` form into Java's `1.234e+02`. Owned slice.
 fn normalizeScientific(allocator: Allocator, s: []const u8, upper: bool) Allocator.Error![]u8 {
     const epos = std.mem.indexOfScalar(u8, s, 'e') orelse std.mem.indexOfScalar(u8, s, 'E');
     const mantissa = if (epos) |p| s[0..p] else s;
@@ -2867,9 +2866,9 @@ fn utf8Lossy(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// Map every scalar of `s` to upper- or lower-case. Owned slice. Matches
-/// Rust `to_uppercase`/`to_lowercase` for ASCII and the common 1:1 Latin
-/// mappings; non-1:1 expansions fall back to the scalar unchanged.
+/// Map every scalar of `s` to upper- or lower-case. Owned slice. Covers
+/// ASCII and the common 1:1 Latin mappings; non-1:1 expansions fall back to
+/// the scalar unchanged.
 fn mapCase(allocator: Allocator, s: []const u8, upper: bool) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -2962,8 +2961,7 @@ fn scalarToUpper(cp: u21) u21 {
     return char.upperScalar(cp);
 }
 
-/// Unicode whitespace test matching Rust's `char::is_whitespace` for the
-/// scalars Kotlin programs encounter.
+/// Unicode whitespace test for the scalars Kotlin programs encounter.
 fn isWhitespace(cp: u21) bool {
     return switch (cp) {
         0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0, 0x1680 => true,
@@ -3037,12 +3035,13 @@ fn replaceAllIgnoreCase(allocator: Allocator, s: []const u8, old: []const u8, ne
 }
 
 /// Replace occurrences of `old` with `new`, up to `max` (null = all). An
-/// empty `old` matches the Rust `str::replace` behaviour. Owned slice.
+/// empty `old` inserts `new` between every char and at both ends. Owned
+/// slice.
 fn replaceAll(allocator: Allocator, s: []const u8, old: []const u8, new: []const u8, max: ?usize) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     if (old.len == 0) {
-        // Rust inserts `new` between every char and at both ends.
+        // Insert `new` between every char and at both ends.
         var count: usize = 0;
         try out.appendSlice(allocator, new);
         count += 1;

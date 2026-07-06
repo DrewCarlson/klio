@@ -29,7 +29,7 @@ fn typeErr(msg: []const u8) EvalResult {
 /// Build a `Value.Exception` for `fqn` with an optional message. The `fqn`
 /// and (when present) `message` slices are copied into fresh refcounted
 /// handles allocated from `allocator`. Re-exported for sibling intrinsic
-/// modules the way Rust's `super::make_exception` is shared.
+/// modules.
 pub fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]const u8) std.mem.Allocator.Error!Value {
     return .{ .Exception = .{
         .fqn = try runtime.strInit(allocator, fqn),
@@ -104,7 +104,7 @@ fn messageOf(allocator: std.mem.Allocator, v: *const Value) std.mem.Allocator.Er
 
 /// Free a message handle built by `messageOf`. The cell owns its bytes and
 /// frees them on the last `deinit`. Used on the error path that discards a
-/// half-built exception, mirroring Rust dropping the unused `Option<String>`.
+/// half-built exception.
 fn freeMessage(allocator: std.mem.Allocator, m: StringRef) void {
     _ = allocator;
     m.deinit();

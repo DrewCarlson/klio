@@ -6,7 +6,7 @@
 //! Char predicates follow kotlinc-native 2.3.21 semantics, driven by
 //! Unicode general categories rather than ASCII shortcuts. The category
 //! and case-mapping tables embedded at the bottom of this file are the
-//! `unicode_general_category` 1.1.0 data and Rust's `char` case mappings.
+//! `unicode_general_category` 1.1.0 data and generated char case mappings.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -187,8 +187,7 @@ pub fn ktIsDigit(c: u21) bool {
 
 // kotlinc-native 2.3.21 whitespace table (from stdlib/native-wasm
 // _WhitespaceChars.kt). A fixed enumerated set -- not Java's
-// Character.isWhitespace (which excludes NBSP) and not Rust's
-// char::is_whitespace (which excludes 0x1C..=0x1F).
+// Character.isWhitespace (which excludes NBSP).
 pub fn ktIsWhitespace(c: u21) bool {
     const code: u32 = c;
     return (code >= 0x0009 and code <= 0x000D) or
@@ -384,8 +383,8 @@ fn charDigitRadix(allocator: std.mem.Allocator, args: []const Value) std.mem.All
     return .{ .radix = @intCast(radix) };
 }
 
-/// `char::to_digit(radix)`: digit value of an ASCII alphanumeric, mirroring
-/// Rust's stdlib which only recognizes `0-9`, `a-z`, `A-Z`.
+/// Digit value of an ASCII alphanumeric (or its fullwidth form) under
+/// `radix`.
 fn toDigit(c: u21, radix: u32) ?u32 {
     const digit: u32 = switch (c) {
         '0'...'9' => c - '0',
@@ -662,11 +661,10 @@ pub fn char_titlecase_char(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .Char = unit });
 }
 
-/// Render a UTF-8 string the way Rust's `{:?}` (`str`'s `Debug`) does:
-/// wrapped in double quotes with `"`, `\`, and the C0/C1 control codes
-/// escaped (`\t`/`\n`/`\r` specially, the rest as `\u{..}`). Every other
-/// scalar is passed through verbatim, matching Rust for all printable
-/// characters. Caller owns the returned slice.
+/// Render a UTF-8 string as a double-quoted debug form: wrapped in double
+/// quotes with `"`, `\`, and the C0/C1 control codes escaped (`\t`/`\n`/`\r`
+/// specially, the rest as `\u{..}`). Every other scalar is passed through
+/// verbatim. Caller owns the returned slice.
 fn rustDebugString(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -1015,7 +1013,7 @@ test "getProgressionLastElement rejects a zero step" {
 }
 
 
-// ----- Generated Unicode tables (unicode_general_category 1.1.0 + Rust char case maps) -----
+// ----- Generated Unicode tables (unicode_general_category 1.1.0 + char case maps) -----
 
 const letter_table = [_]Range{
     .{ 0x41, 0x5A }, .{ 0x61, 0x7A }, .{ 0xAA, 0xAA }, .{ 0xB5, 0xB5 }, 

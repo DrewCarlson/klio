@@ -52,8 +52,8 @@ pub const PackReader = struct {
     /// Construct a reader by loading the file at `path` into a single
     /// owned allocation, then delegating to `fromBytes`. The mmap-backed
     /// constructor for large packs is reserved for a later stage. On a
-    /// file-read failure `result` is set to `.Compression` (mirroring the
-    /// Rust `from_path`) and `null` is returned.
+    /// file-read failure `result` is set to `.Compression` and `null` is
+    /// returned.
     pub fn fromPath(allocator: Allocator, path: []const u8, result: *PackError) Allocator.Error!?PackReader {
         var threaded: std.Io.Threaded = .init(allocator, .{});
         defer threaded.deinit();

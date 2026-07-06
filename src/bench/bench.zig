@@ -34,9 +34,9 @@ pub const BenchRecord = schema.BenchRecord;
 pub const BenchReport = schema.BenchReport;
 pub const RegressionLevel = schema.RegressionLevel;
 
-/// Output sink that captures lines. Mirrors the Rust `CaptureOutput`: a
-/// `write` accumulates into a pending buffer and every embedded `\n`
-/// flushes one line (with the trailing newline trimmed).
+/// Output sink that captures lines. A `write` accumulates into a pending
+/// buffer and every embedded `\n` flushes one line (with the trailing
+/// newline trimmed).
 const CaptureOutput = struct {
     lines: std.ArrayList([]const u8) = .empty,
     cur: std.ArrayList(u8) = .empty,

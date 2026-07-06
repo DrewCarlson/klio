@@ -29,7 +29,7 @@ pub const generated = @import("generated/mod.zig");
 pub const implementations = @import("implementations.zig");
 pub const pack_builder = @import("pack_builder.zig");
 
-// Per-area documentation shims (mirror the Rust submodule layout).
+// Per-area documentation shims.
 pub const collections = @import("collections.zig");
 pub const exceptions = @import("exceptions.zig");
 pub const io = @import("io.zig");

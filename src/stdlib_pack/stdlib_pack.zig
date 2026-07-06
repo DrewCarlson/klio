@@ -1,9 +1,9 @@
 //! Embedded stdlib pack.
 //!
-//! The interpreter ships with the stdlib pack baked into the binary, the
-//! same shape the Rust build produced with `build.rs` + `include_bytes!`:
-//! the top-level build.zig runs `embed_gen` over the repo source checkout
-//! and wires the bytes in through the `stdlib_embedded` module.
+//! The interpreter ships with the stdlib pack baked into the binary,
+//! embedded at build time: the top-level build.zig runs `embed_gen` over
+//! the repo source checkout and wires the bytes in through the
+//! `stdlib_embedded` module.
 //!
 //! `stdlibPackBytes` resolves the pack in this order:
 //!   1. `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack` — an explicit on-disk
@@ -64,7 +64,7 @@ pub fn stdlibPackBytes(allocator: Allocator, env: ?*const EnvMap, result: *PackE
 /// embedded pack adds packages (or future kotlinx packs declare their own)
 /// callers automatically see the union. The returned slice and each of its
 /// strings are owned by the caller and freed with `allocator`. Any failure
-/// yields an empty slice, mirroring the Rust fall-through.
+/// yields an empty slice.
 pub fn embeddedImplicitPackages(allocator: Allocator, env: ?*const EnvMap) Allocator.Error![][]const u8 {
     var err: PackError = undefined;
     const bytes = (try stdlibPackBytes(allocator, env, &err)) orelse return &.{};

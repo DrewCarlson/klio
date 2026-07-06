@@ -6,7 +6,7 @@
 //! * `coverage` prints implemented / total counts from the current generated
 //!   registry.
 //!
-//! Ported as a `pub fn run` taking parsed arguments, not a real `main`.
+//! Exposes a `pub fn run` taking parsed arguments, not a real `main`.
 
 const std = @import("std");
 
@@ -18,7 +18,7 @@ const emit = @import("emit.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-/// Exit codes mirroring the Rust binary's `ExitCode` usage.
+/// Process exit codes for this tool.
 pub const SUCCESS: u8 = 0;
 pub const FAILURE: u8 = 1;
 pub const STDLIB_MISSING: u8 = 2;
@@ -52,9 +52,8 @@ pub fn run(
     };
 }
 
-/// Workspace root, two directories up from the crate manifest dir. Matches the
-/// Rust `workspace_root` helper; here it resolves relative to the cwd, which
-/// the generator is run from.
+/// Workspace root; resolves relative to the cwd, which the generator is
+/// run from.
 fn workspaceRoot(allocator: Allocator) Allocator.Error![]const u8 {
     return allocator.dupe(u8, ".");
 }

@@ -4,7 +4,7 @@ const std = @import("std");
 
 /// Errors produced while encoding or decoding a pack. Modeled as data so
 /// callers can match on the variant and render the matching message; the
-/// `format` method reproduces the Rust `#[error("...")]` text.
+/// `format` method renders the error text.
 pub const PackError = union(enum) {
     /// pack header is truncated or shorter than expected
     Truncated,
@@ -63,7 +63,7 @@ pub const PackError = union(enum) {
     }
 };
 
-test "error messages match the Rust display text" {
+test "error messages render the expected display text" {
     const a = std.testing.allocator;
     const Case = struct { err: PackError, want: []const u8 };
     const cases = [_]Case{

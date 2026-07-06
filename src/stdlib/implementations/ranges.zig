@@ -382,7 +382,7 @@ pub fn range_sum(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 // ============================================================
-// Local helpers re-exported by the Rust `super::` import.
+// Local helpers.
 // ============================================================
 
 fn makeList(items: ValueList, mutable: bool) Value {
@@ -395,8 +395,8 @@ fn makeList(items: ValueList, mutable: bool) Value {
 }
 
 /// Lazy iterator over an inclusive integer progression with a signed step.
-/// Mirrors the Rust `range_iter_int`: empty when `step == 0` or the bounds
-/// are crossed; `cur` advances by a saturating add.
+/// Empty when `step == 0` or the bounds are crossed; `cur` advances by a
+/// saturating add.
 const RangeIntIter = struct {
     cur: i64,
     end: i64,

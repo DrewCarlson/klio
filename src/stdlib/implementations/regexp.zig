@@ -1,12 +1,12 @@
 //! Regex / MatchResult / MatchGroup stdlib intrinsics.
 //!
-//! Kotlin's `kotlin.text.Regex` family. The Rust port leaned on the `regex`
-//! crate; Zig has no such engine in std, so a self-contained backtracking
-//! matcher lives here behind the opaque `RegexData.engine` handle. It
-//! supports the constructs Kotlin programs actually reach: literals,
-//! escapes, character classes, anchors, word boundaries, alternation,
-//! greedy/lazy quantifiers, and (named) capture groups. Matching is
-//! Unicode-codepoint aware and reports byte offsets, mirroring the crate.
+//! Implements Kotlin's `kotlin.text.Regex` family. Zig has no regex engine
+//! in std, so a self-contained backtracking matcher lives here behind the
+//! opaque `RegexData.engine` handle. It supports the constructs Kotlin
+//! programs actually reach: literals, escapes, character classes, anchors,
+//! word boundaries, alternation, greedy/lazy quantifiers, and (named)
+//! capture groups. Matching is Unicode-codepoint aware and reports byte
+//! offsets.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -153,7 +153,7 @@ const BuiltinClass = enum { digit, not_digit, word, not_word, space, not_space }
 const Node = union(enum) {
     /// Match a single literal codepoint.
     literal: u21,
-    /// `.` — any codepoint except newline (Rust's default; no `(?s)`).
+    /// `.` — any codepoint except newline; no `(?s)` (dotall) support.
     any,
     /// A bracket character class.
     class: struct { items: []ClassItem, negated: bool },
@@ -1069,8 +1069,7 @@ fn progFromRegex(r: ObjRef(RegexData)) ?*Program {
 // Pattern preprocessing & literal escaping
 // ============================================================
 
-/// Escape a literal string into a regex that matches it verbatim (the
-/// effect of Rust's `regex::escape`).
+/// Escape a literal string into a regex that matches it verbatim.
 fn regexEscapeLiteral(allocator: std.mem.Allocator, lit: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -1308,7 +1307,7 @@ fn expandKotlinReplacement(
     prog: *const Program,
     groups: []const ?MatchGroupData,
 ) ![]u8 {
-    // Operate on codepoints to mirror the Rust char-vector logic.
+    // Work with codepoints rather than raw bytes.
     var cps: std.ArrayList(u21) = .empty;
     defer cps.deinit(allocator);
     {

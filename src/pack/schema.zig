@@ -40,9 +40,9 @@ pub const PackManifest = struct {
     /// Other packs this pack depends on, by `library_id`. Loader walks
     /// these in topological order.
     dependencies: []PackDependency = &.{},
-    /// Features active when a consumer requests none (cargo-style
-    /// `default = [...]`). Empty means everything not gated by a feature
-    /// (the "core") loads and no feature-gated source loads by default.
+    /// Features active when a consumer requests none (`default = [...]`).
+    /// Empty means everything not gated by a feature (the "core") loads and
+    /// no feature-gated source loads by default.
     default_features: [][]const u8 = &.{},
     /// Named features this pack provides. A source file is gated when its
     /// `rel_path` matches some feature's `sources`; such a file loads only
@@ -84,8 +84,7 @@ pub const PackDependency = struct {
     library_id: []const u8,
     /// Optional minimum semantic version. Empty when any version is OK.
     min_version: []const u8,
-    /// Features of the dependency to activate (cargo-style
-    /// `features = [...]`).
+    /// Features of the dependency to activate (`features = [...]`).
     features: [][]const u8 = &.{},
     /// Whether the dependency's `default_features` are also activated.
     default_features: bool,
@@ -107,7 +106,7 @@ pub const PackDependency = struct {
 
 /// One named feature: the source-path prefixes it gates, the other packs
 /// it pulls in when active, and the sibling features it transitively
-/// enables. Mirrors a cargo feature / a kotlinx Gradle member module.
+/// enables. Mirrors a kotlinx Gradle member module.
 pub const FeatureDef = struct {
     name: []const u8 = "",
     /// `rel_path` prefix patterns (matched like `[[source]]` includes)
@@ -520,7 +519,7 @@ fn freeStrSlice(allocator: Allocator, slice: [][]const u8) void {
     allocator.free(slice);
 }
 
-test "ModifierBits bit positions match the Rust layout" {
+test "ModifierBits bit positions match the expected layout" {
     try std.testing.expectEqual(@as(u32, 1 << 0), (ModifierBits{ .PUBLIC = true }).bits());
     try std.testing.expectEqual(@as(u32, 1 << 3), (ModifierBits{ .PRIVATE = true }).bits());
     try std.testing.expectEqual(@as(u32, 1 << 15), (ModifierBits{ .SUSPEND = true }).bits());
