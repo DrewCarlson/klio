@@ -21,7 +21,7 @@ include = [
 ]
 
 # klio-supplied platform actuals for every consumed upstream `expect`.
-# Bodies are thin Kotlin; the Rust host bindings in src/lib.rs win at
+# Bodies are thin Kotlin; the host bindings in src/kotlinx_atomicfu win at
 # dispatch for the atomic ops.
 [[source]]
 root = "klioMain"
