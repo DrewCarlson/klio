@@ -4058,9 +4058,16 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk null;
                 break :blk fid;
             };
+            // A constructor-name call (`Foo(args)` where `Foo` is a class) must
+            // bind the class for construction — never a published companion
+            // singleton. Pass `is_ctor_name` as `ctor_ref` so `lookupGlobalById`
+            // skips the class's companion-object singleton (which it otherwise
+            // returns for a class-value read); otherwise, once the companion has
+            // been published (e.g. a prior `Foo.member` access), `Foo(args)`
+            // resolves to `Companion.invoke` instead of constructing.
             const by_id: ?Value = if ((cmg.class != null or by_id_func != null) and
                 !host.isShadowingCapture(name_str))
-                host.lookupGlobalById(allocator, by_id_func, cmg.class, false)
+                host.lookupGlobalById(allocator, by_id_func, cmg.class, is_ctor_name)
             else
                 null;
             const global = if (by_id != null) by_id else switch (try host.lookupGlobalThrowing(allocator, name_str)) {
