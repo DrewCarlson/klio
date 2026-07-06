@@ -42,7 +42,10 @@ const USAGE =
     \\  dump-ir <file> [--func N]  Lower a file and print its IR (no execution),
     \\                             tallying DIRECT vs DYNAMIC call sites.
     \\  run <file...> [options]    Run one or more `.kt` source files.
-    \\  test <file|dir...>         Run `kotlin.test` `@Test` functions.
+    \\  test [path] [options]      Run `kotlin.test` `@Test` functions. A
+    \\                             project dir (with klio.toml) tests its
+    \\                             composed `[[test]]` sets; default `.`.
+    \\                             --all / --feature X select feature modules.
     \\  check <file...> [options]  Type-check `.kt` files and emit diagnostics.
     \\  bake [file...] [options]   Bake the stdlib image cache (`klio run` does
     \\                             this automatically on first use).
@@ -231,6 +234,11 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     defer feature_specs.deinit(gpa);
     var only_files: std.ArrayList([]const u8) = .empty;
     defer only_files.deinit(gpa);
+    // Bare `--feature X` (no `/`) selects a project's own feature module for a
+    // project-mode run; a `<pack>/<feat>` spec keeps its existing meaning.
+    var project_features: std.ArrayList([]const u8) = .empty;
+    defer project_features.deinit(gpa);
+    var all_features = false;
     var virtual_time = false;
 
     var i: usize = 0;
@@ -238,6 +246,8 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         const a = args[i];
         if (std.mem.eql(u8, a, "--virtual-time")) {
             virtual_time = true;
+        } else if (std.mem.eql(u8, a, "--all")) {
+            all_features = true;
         } else if (std.mem.eql(u8, a, "--only-file")) {
             i += 1;
             if (i >= args.len) {
@@ -250,12 +260,12 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, a, "--feature")) {
             i += 1;
             if (i >= args.len) {
-                printErr(gpa, "error: --feature requires a `<pack>/<feature>` value\n", .{});
+                printErr(gpa, "error: --feature requires a `<feature>` or `<pack>/<feature>` value\n", .{});
                 return 2;
             }
-            feature_specs.append(gpa, args[i]) catch return 2;
+            addFeatureSpec(gpa, args[i], &feature_specs, &project_features);
         } else if (optionValue(a, "--feature=")) |v| {
-            feature_specs.append(gpa, v) catch return 2;
+            addFeatureSpec(gpa, v, &feature_specs, &project_features);
         } else if (perfOptValue(a, args, &i)) |v| {
             if (runtime.perf.parseProfile(v) == null) {
                 printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
@@ -283,8 +293,17 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     // sets) runs that project's composed test sources against its
     // built+installed pack — no hand-listed files. `planTest` returns null for
     // a plain file/dir, so the normal path handles everything else.
+    //
+    // Feature selection: default (and `--all`) tests core + every feature
+    // module; `--feature X` narrows to core + the named feature(s).
     if (paths.items.len == 1) {
-        if (project.planTest(gpa, paths.items[0], &requested)) |plan| {
+        const sel: project.FeatureSel = if (!all_features and project_features.items.len != 0)
+            .{ .selected = project_features.items }
+        else
+            .all;
+        if (project.planTest(gpa, paths.items[0], sel)) |plan| {
+            // Activate the tested features' sources so their tests compile.
+            activateFeatures(gpa, &requested, plan.pack_id, plan.active_features);
             if (buildAndInstallProjectPack(gpa, plan.project_dir, plan.pack_id)) |code| {
                 if (code != 0) return code;
             }
@@ -292,6 +311,37 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         }
     }
     return commands.runTestFiles(gpa, paths.items, &requested, only_files.items);
+}
+
+/// Route a `--feature` value: `<pack>/<feat>` keeps its cross-pack meaning; a
+/// bare `<feat>` selects the current project's own feature module.
+fn addFeatureSpec(
+    gpa: std.mem.Allocator,
+    v: []const u8,
+    feature_specs: *std.ArrayList([]const u8),
+    project_features: *std.ArrayList([]const u8),
+) void {
+    if (std.mem.indexOfScalar(u8, v, '/') != null) {
+        feature_specs.append(gpa, v) catch {};
+    } else {
+        project_features.append(gpa, v) catch {};
+    }
+}
+
+/// Merge a project's active test features into the requested-feature set under
+/// its pack id, so the pack loader includes those feature modules' sources.
+fn activateFeatures(
+    gpa: std.mem.Allocator,
+    requested: *RequestedFeatures,
+    pack_id: []const u8,
+    features: []const []const u8,
+) void {
+    if (pack_id.len == 0 or features.len == 0) return;
+    const gop = requested.getOrPut(pack_id) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(gpa);
+    for (features) |f| {
+        if (!gop.value_ptr.contains(f)) gop.value_ptr.put(f, {}) catch {};
+    }
 }
 
 /// Build the project pack from `dir` and install it so its API resolves in

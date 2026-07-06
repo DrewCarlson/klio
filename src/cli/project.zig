@@ -9,10 +9,16 @@
 
 const std = @import("std");
 const pack_build = @import("pack_build.zig");
-const pack_cache = @import("pack_cache.zig");
 
 const Allocator = std.mem.Allocator;
-const RequestedFeatures = pack_cache.RequestedFeatures;
+
+/// Which features' tests to compose for a `klio test` run.
+pub const FeatureSel = union(enum) {
+    /// Core + every feature module (the default, and `--all`).
+    all,
+    /// Core + exactly these features (`--feature X` one or more times).
+    selected: []const []const u8,
+};
 
 pub const TestPlan = struct {
     /// Project directory (holds `klio.toml`). Its pack is built+installed so
@@ -22,29 +28,35 @@ pub const TestPlan = struct {
     pack_id: []const u8,
     /// Composed test source roots (project-dir-joined; core + active features).
     roots: []const []const u8,
+    /// Features whose sources must be activated so their tests compile — the
+    /// caller adds these to the requested-feature set before the pack loads.
+    active_features: []const []const u8,
 };
 
-fn featureActive(
-    feature: []const u8,
-    pack_id: []const u8,
-    manifest: *const pack_build.LibraryToml,
-    features: *const RequestedFeatures,
-) bool {
-    if (feature.len == 0) return true;
-    for (manifest.features.default) |d| {
-        if (std.mem.eql(u8, d, feature)) return true;
+fn featureSelected(feature: []const u8, sel: FeatureSel, manifest: *const pack_build.LibraryToml) bool {
+    if (feature.len == 0) return true; // core is always active
+    switch (sel) {
+        .all => {
+            // Active iff it is a declared feature of this project.
+            for (manifest.features.defs) |d| {
+                if (std.mem.eql(u8, d.name, feature)) return true;
+            }
+            return false;
+        },
+        .selected => |names| {
+            for (names) |n| {
+                if (std.mem.eql(u8, n, feature)) return true;
+            }
+            return false;
+        },
     }
-    if (features.get(pack_id)) |set| {
-        if (set.contains(feature)) return true;
-    }
-    return false;
 }
 
-/// Compose the active `[[test]]` roots of the project at `dir`. Returns null
-/// when `dir` has no readable manifest or declares no tests (the caller then
-/// falls back to treating `dir` as a bare source directory). Allocations are
-/// in `a`.
-pub fn planTest(a: Allocator, dir: []const u8, features: *const RequestedFeatures) ?TestPlan {
+/// Compose the active `[[test]]` roots of the project at `dir` under the given
+/// feature selection. Returns null when `dir` has no readable manifest or
+/// declares no tests (the caller then falls back to treating `dir` as a bare
+/// source directory). Allocations are in `a`.
+pub fn planTest(a: Allocator, dir: []const u8, sel: FeatureSel) ?TestPlan {
     const toml_path = std.fs.path.join(a, &.{ dir, "klio.toml" }) catch return null;
     const text = pack_build.readFileOwned(a, toml_path) orelse return null;
     const manifest = switch (pack_build.parseLibraryToml(a, text)) {
@@ -54,11 +66,22 @@ pub fn planTest(a: Allocator, dir: []const u8, features: *const RequestedFeature
     if (manifest.tests.len == 0) return null;
 
     var roots: std.ArrayList([]const u8) = .empty;
+    var active: std.ArrayList([]const u8) = .empty;
     for (manifest.tests) |t| {
         if (t.root.len == 0) continue;
-        if (!featureActive(t.feature, manifest.library.id, &manifest, features)) continue;
+        if (!featureSelected(t.feature, sel, &manifest)) continue;
         const joined = std.fs.path.join(a, &.{ dir, t.root }) catch continue;
         roots.append(a, joined) catch continue;
+        if (t.feature.len != 0) {
+            const dup = a.dupe(u8, t.feature) catch continue;
+            // De-dup: a feature with several test roots activates once.
+            var seen = false;
+            for (active.items) |x| if (std.mem.eql(u8, x, dup)) {
+                seen = true;
+                break;
+            };
+            if (!seen) active.append(a, dup) catch {};
+        }
     }
     if (roots.items.len == 0) return null;
 
@@ -66,5 +89,6 @@ pub fn planTest(a: Allocator, dir: []const u8, features: *const RequestedFeature
         .project_dir = a.dupe(u8, dir) catch return null,
         .pack_id = a.dupe(u8, manifest.library.id) catch return null,
         .roots = roots.toOwnedSlice(a) catch return null,
+        .active_features = active.toOwnedSlice(a) catch return null,
     };
 }
