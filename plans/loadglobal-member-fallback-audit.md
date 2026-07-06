@@ -14,38 +14,37 @@ Bare-name call lowering must classify the callee: local, member-on-`this`, inlin
 or top-level. Several lowering paths end with `else → LoadGlobal` as the last
 resort. When a path **fails to recognize that the name is an own (incl. inherited)
 member**, it falls to `LoadGlobal` and produces `unresolved global <name>` at
-runtime — even though the correct lowering is `CallMember` on `this`.
+runtime — even though the correct lowering is `CallMember` on `this`. The
+structural cause is **duplicate/parallel call-lowering paths that do not all share
+the member-resolution logic.**
 
-The structural cause is **duplicate/parallel call-lowering paths that do not all
-share the member-resolution logic.** The main implicit-`this` path
-(`lowerImplicitThisCall`) guards with `hasOwnMember → CallMember`; sibling paths
-that don't are bugs waiting to fire.
+## Completed
 
-### Confirmed instance (fixed)
-
+The main bare-call path is unified: `lowerImplicitThisCall` and the general
+bare-call route now go through the shared `Module.resolveCall` engine
+(`src/ir/lower/expr.zig`), so member-vs-global for the common path is decided in
+one place. The confirmed writeback-path instance is fixed:
 `lowerCallWithWritebackPath` (the path taken when a trailing lambda mutates a
-captured local) resolved the callee only through the global func index. An
-inherited inline member (`forEachSlotLocked` in kotlinx.coroutines `SharedFlow`,
-whose lambda mutates a captured `var`) is never in that index, so the call fell to
-`LoadGlobal`. Fixed in `interp: writeback call path dispatches an enclosing-class
-member on this` (78dc2988) by adding the `hasOwnMember + this-in-scope → CallMember`
-guard before the `LoadGlobal` fallback.
+captured local) carries the `hasOwnMember` + `this`-in-scope → `CallMember` guard
+before its `LoadGlobal` fallback (`src/ir/lower/expr.zig`, ~`:3216`), so an
+inherited inline member whose lambda mutates a captured `var` (e.g.
+`forEachSlotLocked` in kotlinx.coroutines `SharedFlow`) no longer falls to an
+unresolved global.
 
-## To audit
+## Open
 
-Other callee-as-global fallback sites in `src/ir/lower/expr.zig` that load the
-callee via `LoadGlobal` after resolution "fails", to confirm each has a
-`hasOwnMember` (own + inherited member, with a receiver in scope) guard first:
+`lowerCallWithWritebackPath` is still a **separate parallel path that does not
+route through `resolveCall`** — it hand-rolls its own member guard. The structural
+risk the audit named (duplicate call-lowering paths that do not share the
+member-resolution logic) therefore still exists for the writeback path, and its
+other callee-as-global fallback sites have not been re-audited since the file was
+refactored.
 
-- `expr.zig:3698`
-- `expr.zig:4789`
-- `expr.zig:4812`
-- `expr.zig:4836`
+To close:
 
-For each: determine whether the path is reachable for a bare member/inline name
-(member-on-`this`); if so, route to `CallMember` before the `LoadGlobal` fallback,
-matching `lowerImplicitThisCall`. Add a regression test per site (inherited member
-fn called bare under the shape that selects that path).
-
-Longer term: factor the `local → member → inline → top-level` classification into a
-single shared helper so the sibling paths can't drift.
+- Route `lowerCallWithWritebackPath` through the shared `resolveCall` engine (the
+  single `local → member → inline → top-level` classifier), or confirm every
+  `LoadGlobal` fallback it still reaches for a bare member/inline name is guarded
+  by `hasOwnMember` (own + inherited, receiver in scope) first.
+- Add a regression test per remaining fallback site: an inherited member fn called
+  bare under the shape that selects that path.

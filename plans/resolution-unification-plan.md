@@ -63,114 +63,40 @@ sig index, receiver type)** — zero name-list lookups remain in the dispatch/re
 path, and any two run-modes (lazy lowering, eager typeck, runtime) pick the same target
 for every non-runtime-polymorphic call.
 
-## Execution status (as of 2026-07-02, HEAD 0a77d0fe)
+## Completed (landed P0–P9)
 
-### Post-flip regression sweep (fixed forward)
+The static-representation, one-engine, tiered-execution work below landed and
+is committed to `main`; the stdlib commonTest canonical passes 100% per-file
+(2,150). Summary of what shipped:
 
-The first full-suite sweep after the flip surfaced five latent breaks; all are
-fixed on `main` with the mechanism, not the symptom:
-
-- `value::class` on a builtin throwable collapsed to `kotlin.Throwable`
-  (static `typeFqn` instead of the exception's dynamic `fqn`) — `43b7cbd5`.
-- `applicableExtension` bound args purely positionally: a lambda-only call
-  (`produce {}`) marked every candidate inapplicable and the ranking decayed
-  to noise tiers, picking the deprecated `produce(context: Job, …)` overload.
-  The extension scorer now applies the trailing-lambda-to-last-param rule with
-  the defaulted-gap check, like the member and global scorers — `143c1da3`.
-- Deferred bare calls (`CallMemberOrGlobal`) lowered arguments with no
-  expected-arity readout, so a trailing receiver lambda kept its parser-
-  injected `it` bound to the receiver (`repeat(3) { launch { ch.send(it) } }`
-  sent the coroutine). Both deferred emit paths now read per-arg lambda
-  arities; `overloadHostingTrailingLambda` accepts a defaulted gap — `07e0debe`.
-- A backtick-quoted user parameter named `this` created a receiver context and
-  bare calls member-dispatched through it; kotlinc rejects them — `0a77d0fe`.
-- The lazy-forest resolver held one global section, so loading a second stdlib
-  image in one process (the parity harness loads both gate variants) re-pointed
-  earlier refs at the wrong tables — slot-registered sections, `ee0a0489`.
-- A capitalized bare callee skipped member dispatch outright (ktor's
-  `HttpResponseValidator { … }` DSL extension) — gate on a class actually
-  existing, `8619b33c`; the scope-qualified property walk picked an unrelated
-  private supertype getter (`HttpClientEngineBase`'s `closed` vs the
-  `HttpClientEngine` interface's private `closed`) — privates skip the virtual
-  walk via `instance_prop_private`, `5bfd4125`.
-
-Still open from the same fallout window (worktree-bisected to before this
-sweep; both reproduce at the pre-sweep baseline `36405ff4`):
-
-- ktor_client_get / ktor_server: `HttpClient().close()` reads its private
-  `closed = atomic(false)` field as a raw `Boolean` (isolated repros of every
-  suspected shape pass; needs instance-field-table instrumentation).
-- e2e corpus 13/140 (was 14/140 pre-sweep): 11 compose examples fail with
-  `unresolved global Recomposer/Composition/mutableStateOf`; `flow_operators`
-  and `sequence_iterator_builder` fail with `Vm::get_field … on
-  kotlin.Function` — a bare name resolving to a function value where an
-  instance was expected.
-
-Everything below is committed to `main`. The stdlib commonTest canonical is at
-**2010 passed / 102 files / 0 build-blocked** (pre-campaign baseline 2006; the dip-and-
-recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof) → 2001 →
-2005 (P3 flip) → 2010). The four previously-wedged integration suites
-(ktor_channel_async, concurrency_stress, stdlib_image, parity_threaded_litmus) all pass.
-
-### Landed
-
-- **Test-suite split** (`77c72071`): `zig build test` = fast unit tests (~5s);
-  `zig build itest` = integration suite; `zig build test-all` = both (CI + nightly).
-- **P1 — canonical index ordering** (`f0bcf680`): top-level function headers register
-  BEFORE class-body lowering, so method bodies resolve against the complete index.
-  Includes the `memberShadowPossible` guard (a resolved top-level extension a member
-  could shadow defers to the runtime member-first walk).
-- **P2 — one shared applicability engine** (`45cfb7d4` design; `1f45c590`/`6adbf93a`/
-  `ac12ba20` audit slices; `7f232070` fast sweep tool; `4416a752` flip):
-  `src/ir/applicability.zig` (`ArgShape`/`Score`/`SigView`/`ApplicabilityScope`/
-  `builtinSupersOf`/`applicable()`) is the LIVE scorer for `pickOverload`,
-  `pickNamedOverloadId`, `pickMethodOverload`, and `scoreExtCandidates`. Each was
-  proven zero-divergence over all 102 stdlib files before flipping; the legacy scorers
-  and the duplicate member builtin-supertype table are deleted (~535 lines).
-- **P3 — `Module.resolveCall`** (`6f9be02c` shadowed; `11cc3bc3` flip; `8cc7e264`
-  ladder retired): bare-call lowering is ONE path — `buildArgShapes` →
-  `resolveCall` (Phase A index → Phase B applicability → Phase C emit form, all in
-  `ir.zig` ~2145) → four pure emitters (`emitCall`/`emitCallMember`/
-  `emitMemberOrGlobal`/`emitValueCall`). The heuristic ladder (`findCand`/`arityMatch`/
-  `arityMatchTl`/`fallbackByDeclArity`/`preferredBareTarget`/`HeurRung`) is deleted
-  (~340 lines). `ResolveCtx` carries the receiver-context bits incl. `in_tailrec_body`.
-  NOTE: as built, resolveCall is LADDER-primary (reproduces the legacy pick exactly,
-  proven by the `call2` audit); the design's index-primary/type-aware refinement waits
-  on static types (P7). Declared-type evidence (`ArgShape.ty`) is used ADDITIVE-ONLY.
-- **Surfaced-regression ledger** (P1/P3 completing the index exposed latent same-name
-  resolution bugs; each fixed forward, no reverts):
-  - `T.append(vararg CharSequence?)` self-recursion in StringBuilder builders →
-    the P1 member-precedence guard (`f0bcf680`).
-  - `error(msg)` in a `runCatching{}` lambda binding `kotlin.error` over the class
-    member → bare-name calls to ACTUAL own/enclosing members dispatch member-first
-    (`8ad59646`); gate on `hasEnclosingMember`, NOT "unknown receiver could have it"
-    (the broad version regressed −229 by stealing top-level helpers and inline params).
-  - FloorDivMod: IrClosure named-arg reorder + `shadowed_by_local` no longer prepends
-    `this` for a plain captured local fn (`fc54c9dd`).
-  - NaN total order (`f356d963`): new `kotlin-klio/kotlin-comparisons/
-    ComparisonsActuals.kt` (the common `_Comparisons.kt` is all bodyless expects —
-    there was NO body to resolve to); `Resolution.ty_proven` → `Call{exact}` so the
-    runtime value-typed re-pick cannot override a declared-type-proven pick;
-    `linkResolvedForms` guard narrowed so a generic body-bearing overload sharing an
-    FQN with an intrinsic binding keeps its body. NaNPropagationTest 28/28.
-  - TestTimeSource reified splice (`e7457a11`): the outer-writing-lambda writeback
-    pre-dispatch ran before inline expansion (stealing the reified binding), and
-    `callFuncTyped`'s type-arg bind used raw `lookupGlobal` (ctor Intrinsic instead of
-    the Class). Locked by `examples/reified.kt` `probeAfterFailure`.
-  - ktor event-loop wedge (`d57e853f`): `runSafely` inside the function-typed-receiver
-    extension `startCoroutineCancellable` deferred to the runtime probe, whose SAM arm
-    invoked the suspend BLOCK instead of the top-level fn → coroutine completed
-    nothing, `runBlocking` parked forever. Function-typed receivers (except
-    `invoke`/`call`) are excluded from `unknown_receiver`. Regression test in
-    `parity_extension_resolution`.
-  - threaded_litmus cluster, 25 programs (`f9ec89f0`): when resolveCall DEFERS
-    (target=null), the downstream member-first path was gated on
-    `funcId(name)==null` — false post-P1 whenever ANY top-level fn shares the name
-    (bare `close(permission)` in JobSupport's `NodeList.notifyCompletion`
-    member-extension, member inherited from another FILE so `own_members` cannot see
-    it) → fell to a bare-name VALUE load whose this-lookup misses METHODS. A
-    resolver-deferred bare call in a receiver context now routes member-first
-    regardless of the index.
+- **Test-suite split**: `zig build test` (fast unit), `itest` (integration),
+  `test-all` (both).
+- **P1 — canonical index ordering**: top-level function headers register before
+  class-body lowering, so method bodies resolve against the complete index;
+  `memberShadowPossible` guard defers a resolved top-level extension a member
+  could shadow to the runtime member-first walk.
+- **P2 — one shared applicability engine** (`src/ir/applicability.zig`):
+  `ArgShape`/`Score`/`SigView`/`builtinSupersOf`/`applicable()` is the live
+  scorer for `pickOverload`, `pickNamedOverloadId`, `pickMethodOverload`, and
+  `scoreExtCandidates`; the legacy scorers and the duplicate member
+  builtin-supertype table are deleted.
+- **P3 — `Module.resolveCall`**: bare-call lowering is one path
+  (`buildArgShapes` → `resolveCall` Phase A index / Phase B applicability /
+  Phase C emit form → the four pure emitters `emitCall`/`emitCallMember`/
+  `emitMemberOrGlobal`/`emitValueCall`).
+- **P4 — DeclSig substrate**: hierarchy-precise member-shadow
+  (`memberShadowPossible`/`anyReceiverClassDeclares`, own + lifted-outer
+  chains), declared-nullability evidence, and the `declared_recv` channel that
+  constrains extension selection by the receiver's declared type.
+- **P5 — distinct field storage**: private shadows and initialized
+  `override val`s each keep their own cell under owner-mangled keys; `super.x`
+  reads the base's cell.
+- **P7 — eager half**: `TypeCheck.resolved_calls` records the overload
+  checker's pick per call span. The consumption half (typeck-informed
+  lowering) is tracked in `eager-resolution-plan.md`.
+- **P8 — hatch deletions**: the tailrec name-list arm, `concreteSibling`,
+  `isPrimitiveConv`, the duplicate builtin-supertype table, the `is_ctor_name`
+  classId arm, and the `instance_prop_private`-era stopgaps are gone.
 
 ### Verification infrastructure (use these; the canonical alone is NOT enough)
 
@@ -196,48 +122,17 @@ recover arc ran 2006 → 2000 (P1) → 1997 (P2, behavior-neutral by audit proof
   run-arm diff between the two binaries → one env-gated debug print at the suspect
   fallback dumping the gate flags → minimal repro or direct fix.
 
-### Final state (2026-07-03)
+### Host-builtin and lazy-mode boundaries (kept by design)
 
-Every phase of this plan is landed or boundary-recorded; nothing remains open.
+Not every name list is a hatch. `isAliasName`, `CONTROL_INTRINSICS`, the
+Throwable lists, and the single builtin-supers table are the **host-builtin
+boundary**: metadata about Zig-implemented entities the Kotlin index cannot
+contain without declaring Kotlin headers for the whole host surface (P10 step 2
+territory). The `class_member_names` fallbacks are the **lazy-mode conservative
+boundary** (unknown receivers are real in lazy mode, per the two-modes design).
+`shadowed_inline_names` is a dynamic per-program mechanism, not a name list.
 
-- **P0-P6**: landed (parity harness; canonical index + receiver-type
-  member-vs-global; shared applicability; resolveCall; distinct-keyed fields;
-  position-agnostic varargs; reified positions).
-- **P4 complete**: DeclSig substrate; hierarchy-precise member-shadow (own +
-  lifted-outer chains, completeness proven); the Group-1 two-question flip
-  (`memberShadowPossible` / `anyReceiverClassDeclares`); declared-nullability
-  evidence; the `declared_recv` channel — qualified calls constrain extension
-  selection by the receiver's DECLARED type through a field separate from
-  `static_recv` (whose walk meaning is the extension-body receiver).
-- **P5 complete**: private shadows and initialized `override val`s each keep
-  their own storage cell under owner-mangled keys (`c_shadow` 1/2/1/1, var
-  form 11/99, override form 2/2/1/2 — all permanent inheritance tests);
-  `super.x` reads the base's cell; the interface-skip method-walk case is
-  verified correct for legal Kotlin.
-- **P7**: the eager half landed — `TypeCheck.resolved_calls` records the
-  overload checker's pick per call span (one oracle, recorded once). The
-  consumption half activates when a driver runs typeck and lowering together;
-  no pipeline does today (`klio run`/`test` are lazy by the plan's own
-  "when present" design, `klio check` never lowers), so a consumption seam
-  now would be the unused abstraction this plan forbids shipping.
-- **P8**: deleted — the tailrec name-list arm, `concreteSibling`,
-  `isPrimitiveConv`, the duplicate builtin-supertype table (merged into
-  `applicability.builtinSupersOf`), the `is_ctor_name` classId arm, and the
-  `instance_prop_private`-era stopgaps subsumed by real mechanisms;
-  `prefer_member` was already gone. RECLASSIFIED, not deleted: `isAliasName`,
-  `CONTROL_INTRINSICS`, the Throwable lists, and the single builtin-supers
-  table are the **host-builtin boundary** — metadata about Zig-implemented
-  entities the Kotlin index inherently cannot contain (deleting them means
-  declaring Kotlin headers for the whole host surface, which is P9-scale).
-  The `class_member_names` fallbacks are the **lazy-mode conservative
-  boundary** (unknown receivers are real in lazy mode, per the two-modes
-  design). `shadowed_inline_names` is a dynamic per-program mechanism, not a
-  name list.
-- **P9/P10**: optional by the plan's own text ("Optional, post-resolution …
-  Gated on a dispatch-bottleneck measurement and a startup/RSS
-  justification") — no measurement has motivated them.
-
-### Open work, in order
+## Open work, in order
 
 0. **P10 — the no-holes symbol table (intrinsics become symbols). THE PRIORITY.**
    The direct order (2026-07-04): get resolution and execution in line with the
@@ -1267,55 +1162,3 @@ commit constraint is relaxed.
   `Error`/`Exception`/`Random` constructs via its own declaration; named args on a
   function-typed value diagnose rather than silently drop.
 
-## P1+P4 investigation (findings that constrain the real fix)
-
-A full attempt landed and was reverted. Findings:
-
-- **The lowerer is largely untyped**, so a scope-function receiver's type
-  (`with(x){ memberOfX() }`) is unknown at the call site — which is *why* the runtime
-  probe exists and why the eager mode (typeck) is the amplifier that removes it. A naive
-  `class_member_names` → `hasOwnMember` swap regresses scope-receiver member calls
-  (`with(Box()){ greet() }` bound the top-level `greet`).
-- **A workable signal exists:** `receiverRebindActive()` on the FuncBuilder —
-  `capturesThisSlot() or isParamThunk()` OR the in-scope `this` resolving at a scope
-  depth other than the function's own-`this` scope (`own_this_scope`). It narrows the
-  member-shadowable gate safely in plain method bodies while keeping the
-  over-approximation where a non-enclosing receiver is in scope.
-- **P1 and P4 are coupled.** Completing the index during class-body lowering flips
-  member-vs-global decisions because the lowering still decides by the heuristic. The
-  reorder alone regressed a stdlib inner-class outer-member call
-  (`AbstractMutableList.IteratorImpl` reaching the list's `get`). P1+P4 must land
-  together with EVERY member-preference site made receiver-type-aware. Reproduced as the
-  nested-`it` −16 in the grind campaign: the reorder makes method-body bare calls resolve
-  statically (`emitBareFuncCall`→global) instead of via runtime `CallMemberOrGlobal`
-  (member-first), changing overload resolution for ~16 tests. That −16 is the coupling,
-  not a bug in the reorder.
-
-Resume by reinstating `receiverRebindActive`/`own_this_scope`, the gate + `prefer_member`
-changes, and the index reorder together, driving the inner-class outer-member site (and
-any the full sweep surfaces) to green — accepting a mid-flight dip.
-
-## Landed slices
-
-- **RC-F (reified inference from parameter positions).** `inferReifiedTypeArgs` now
-  unifies each declared value-parameter type (recursing into function-typed params'
-  parameter lists) against actual argument / lambda-parameter-annotation types before
-  the return-type fallback. Locked by `examples/reified_param_inference.kt`.
-- **RC-B slice (type-aware class-vs-factory).** `shadowedByClass` consults the candidate
-  factory's declared parameter types against the literal argument kinds; a factory whose
-  parameter type cannot accept a literal argument is not applicable, so `Box(5)`
-  constructs the class. Locked by `examples/class_factory_overload.kt`.
-- **RC-E (non-final vararg).** The binders are vararg-position-aware: `callFuncNamed`
-  enters its reorder-aware binder on a non-final vararg; `pickMethodOverload` binds the
-  prefix positionally, the vararg consumes the remaining positional args, post-vararg
-  params take defaults; `invokeMethodFuncId` routes a non-final-vararg member call
-  through the reorder-aware binder. Locked by `examples/vararg_nonfinal.kt`.
-- **RC-A slices.** Cross-package class-name collision (`reserveClassFqn` FQN-keyed
-  reservation + FQN-aware stub reuse; `shadowedByClass` resolves through
-  `classIdIndexed`). Locked by `tests/fixtures/dispatch/class_name_collision.kt`.
-  Step 4 (`fea12203`) removed the `intrinsic_owns_all` hatch. Arity-aware
-  member-vs-global (`de327622`, `collectMemberArities` + `own_member_arity` mask): a
-  0-arg member no longer shadows a 1-arg top-level fn. The old plan's base→extend
-  `func_index` drop attribution was wrong: `cloneForExtend` carries `func_index`; the
-  real root is intra-build phase ordering (RC-A) plus `klio test` not routing through
-  the extend assembly.

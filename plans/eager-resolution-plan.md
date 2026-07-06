@@ -22,152 +22,97 @@ stdlib-corpus failure cluster of the past campaign lived in that layer:
 - picks that flip between builds (hash-order-dependent iteration), which by
   definition cannot be hardened test-by-test.
 
-The fix the user commissioned: make typeck the eager mode of the one engine,
-let lowering consume its answers, and replace the heuristics with systems.
-No one-off patches for global/bare member handling.
+The fix: make typeck the eager mode of the one engine, let lowering consume its
+answers, and replace the heuristics with systems. No one-off patches for
+global/bare member handling.
 
-## Architecture
+## Completed (E0–E3)
 
-Pipeline today: `run`/`test` = parse → lower → eval (lazy; typeck never runs).
-`check` = parse → resolve → typeck (never lowers). The two sides resolve in
-separate universes: typeck works off the resolver's `Resolution`+`FnSig`s;
-lowering works off the IR module index (`FuncId`/`ClassId`).
+- **Identity substrate (E0).** Typeck records, per resolved call site,
+  `Span(call) → ResolvedCall{decl_span, render}` in `resolved_calls`
+  (`src/typeck/check.zig`, filled in `expr_calls.zig`); lowering maintains
+  `decl_span → FuncId` (`func_by_decl_span` + `eagerCallTarget`, `src/ir/ir.zig`).
+  Composing the two gives lowering an exact, type-derived `FuncId` per call site
+  with no shared symbol table and no name keys. `Span(expr) → Type` supplies
+  declared/inferred types for receivers, arguments, and parameters.
+- **Typeck in the run pipeline (E1).** `KLIO_EAGER=1` runs resolver+typeck over
+  the user files ahead of lowering (`src/cli/commands.zig`); results land on the
+  module as `eager: ?EagerInfo`. Typeck failures never gate execution — any file
+  typeck cannot finish falls back to lazy lowering. `KLIO_EAGER_AUDIT` /
+  `KLIO_EAGER_HITS` are wired; the parity harness runs with `KLIO_EAGER=1`.
+- **Consumption seams (E2), live:** seam 1 (declared-type evidence — receiver /
+  argument typing consults `Span → Type` ahead of the AST string probes,
+  additive-only with primitives excluded) and seam 2 (bare-call commitment —
+  `resolveCall` consults the identity channel first; the deferred CMG form is
+  emitted only where typeck had no answer).
+- **Zero-disagreement audit (E3).** `KLIO_EAGER_AUDIT=1` computes both answers
+  wherever both exist and prints disagreements (reusing `KLIO_RESOLVE_AUDIT`
+  plumbing); each seam flips only at zero disagreements and the audit stays wired
+  as the permanent regression tripwire.
 
-Target pipeline: `run`/`test` = parse → resolve → typeck → lower(consuming
-typeck) → eval. Typeck failures never block execution: any file typeck cannot
-finish falls back to today's lazy lowering (recorded, auditable) — eagerness
-is an accuracy upgrade, not a gate.
+The still-open consumption seams (E2 seams 3–5: member-vs-global, param
+classification, classifier reads) advance behind E4 below as their trust surface
+is completed.
 
-### The identity channel: call-span → decl-span → FuncId
+## Open work
 
-Typeck cannot know `FuncId`s (it runs before lowering, on resolver output).
-The bridge is source identity: every declaration has a span, both universes
-see the same AST. Typeck records, per resolved call site,
-`Span(call) → Span(decl)` (plus the rendered signature it already records).
-Lowering maintains `Span(decl) → FuncId` as it lowers declarations (it
-already knows each func's source span). Composing the two gives lowering an
-exact, type-derived `FuncId` commitment per call site with no shared symbol
-table and no name keys.
+### E4 — heuristic replacement
 
-Similarly `Span(expr) → Type` (typeck's existing `types` map) gives lowering
-declared/inferred types for receivers, arguments, and parameters — the
-evidence the applicability engine currently reconstructs from AST string
-probes (`argDeclTypeRef`, `local_decl_types`, `local_decl_nullable`).
+Each runtime heuristic narrows to the truly-dynamic residue or is deleted,
+battery-gated; every narrowing's prerequisite is that the identity/type channel
+covers the heuristic's full decision context first. Queue state:
 
-## Phases
+- **implicit-this redirect: LANDED** — the member-shadow record gate walks
+  declared AND inherited members (`classChainHasMember`), and a
+  channel-committed `.plain` target skips the redirect.
+- **closure +1-arity rebind: MEASURED AND KEPT.** Under live HTTP traffic the
+  ktor pipeline fires it 174 times across a short request set — the arm IS the
+  runtime's receiver-binding for host-driven invocations, not a deletable
+  heuristic. The hardening path is to thread declared receiver-shapes into
+  `ClosureInfo` (an explicit `has_receiver` bit from the lambda's declared type)
+  so the binding stops being an arity+capture guess; queued as an enhancement.
+- **`CallMemberOrValue` exact emission: attempted twice, reverted twice.**
+  First: the hierarchy sets cannot disprove EXTENSIONS (stdlib extensions on the
+  receiver's type win over a local callable — the MinMax family measured it).
+  Second: the extension-candidate index (`Module.extCouldApply` — landed, kept)
+  is itself unsound at lowering time against the image's lazily-decoded func
+  headers: a deferred `IntArray.min` header carries no receiver param until its
+  body decodes, so the index answered "no extension" while one existed
+  (`elements.min()` bound the Int param named `min`). The TRUE precondition is
+  header-complete func metadata at lowering time — the resolution plan's P10
+  step 2 / resolved-flat-sections territory. The race stays until then.
+- **literal-coercion gap: NEUTRALIZED** — the only live path was eager primitive
+  fills, which the channel excludes. The enhancement that would let primitives
+  fill is a numeric-family-aware evidence comparison in applicability (Int
+  evidence vs Byte param is not definite for literal-typed values); worthwhile,
+  canonical-gated, not urgent.
 
-- **E0 — Identity substrate.** Typeck's `resolved_calls` gains the decl-span
-  identity (`Span(call) → ResolvedCall{decl_span, render}`); the checker's
-  `FnSig` carries the declaring function's span (threaded from the resolver's
-  decl records). Lowering records `decl_span → FuncId` in the module as it
-  lowers. Unit-tested round trip: an overloaded call's pick maps to the right
-  `FuncId`.
+With the seams live, the endgame per heuristic: `CallMemberOrValue`'s
+invocability guessing → exact emission per typeck (member, value-with-receiver,
+or ctor), guessing kept only for spans with no eager answer; the closure
+"+1 arity → receiver" rebind → explicit receiver-binding from declared types;
+the `hasOwnMember` implicit-this arm → typeck's member answer; the CMG
+unknown-receiver fallbacks and `class_member_names` → deleted once receiver
+types cover the corpus.
 
-- **E1 — Typeck in the run pipeline (off by default).** `klio run`/`test`
-  under `KLIO_EAGER=1` run resolver+typeck over the user files (the stdlib
-  stays image-loaded and is not re-typechecked; typeck already resolves
-  stdlib callees through the resolver's builtin headers, as `klio check`
-  does today). Results land on the module as `eager: ?EagerInfo` (the maps
-  above, per file). A typeck panic or unresolved file simply leaves its
-  spans absent. Perf is measured on the corpus before any default flip.
+### E5 — registry systems (typeck-independent, start immediately)
 
-- **E2 — Consumption seams.** One at a time, each gated on E3's audit and
-  the full battery; the lazy path stays the fallback for spans typeck did
-  not answer:
-  1. **Declared-type evidence**: receiver/argument typing consults
-     `Span → Type` ahead of the AST string probes. STATUS: LIVE,
-     additive-only with primitives excluded. The type-head audit showed
-     the only both-exist deltas are the legitimate declared-wider class
-     (kotlinc resolves against the STATIC DECLARED type, so the AST
-     answer wins where both exist); the fill channel's one failure class
-     was literal-typed primitive evidence breaking exact-match
-     applicability — a head cannot carry literalness, so primitive heads
-     never fill. FOLLOW-UP (E4 queue): the applicability engine's
-     literal-coercion gap (primitive evidence treated as exact) is a real
-     lazy-engine issue deserving its own fix.
-  2. **Bare-call commitment**: `resolveCall` consults the identity channel
-     first; a typeck-committed target lowers as a direct call — the deferred
-     CMG form is emitted only where typeck also had no answer.
-  3. **Member-vs-global**: the receiver's type answers the membership
-     question; the `class_member_names` conservative fallbacks become
-     unreachable where types exist.
-  4. **Param classification**: fn-typed / receiver-fn-typed / arity for
-     every param (top-level, member, local, lambda) from typeck — replacing
-     the `receiver_lambda_params` / `non_fn_params` marking system.
-  5. **Classifier reads**: `C` vs `::C` vs nested-class references resolve
-     through typeck's scope answer — subsuming `scopedClassIdForRead`.
+Two structural fixes the heuristics currently paper over; unstarted:
 
-- **E3 — Zero-disagreement audit.** `KLIO_EAGER_AUDIT=1` computes both
-  answers wherever both exist and prints disagreements (reusing the
-  `KLIO_RESOLVE_AUDIT` plumbing). Each E2 seam flips only at zero
-  disagreements across the corpus battery; the audit stays wired as the
-  permanent regression tripwire.
-
-- **E4 — Heuristic replacement.** STATUS of the first attempt: narrowing
-  the implicit-this redirect on a channel-committed plain target broke
-  eager-ON ArraysTest — typeck's member-shadow record gate checks only
-  DECLARED members per class, not INHERITED ones, so a channel record can
-  exist where a real inherited member shadows. Every E4 narrowing has the
-  same shape of prerequisite: the channel's trust surface must cover the
-  heuristic's full decision context first (here: typeck needs the
-  inherited-member view). The E4 queue and each item's prerequisite:
-  QUEUE STATE:
-  - implicit-this redirect: LANDED — the record gate walks declared AND
-    inherited members (classChainHasMember), and a channel-committed
-    .plain target skips the redirect.
-  - closure +1-arity rebind: MEASURED AND KEPT. Under live HTTP traffic
-    the ktor pipeline fires it 174 times across a short request set —
-    the arm IS the runtime's receiver-binding for host-driven
-    invocations, not a deletable heuristic. The hardening path is to
-    thread declared receiver-shapes into ClosureInfo (an explicit
-    has_receiver bit from the lambda's declared type) so the binding
-    stops being an arity+capture guess; queued as an enhancement.
-  - CallMemberOrValue exact emission: attempted twice, reverted twice,
-    each with a measured finding. First: the hierarchy sets cannot
-    disprove EXTENSIONS (stdlib extensions on the receiver's type win
-    over a local callable — the MinMax family measured it). Second: the
-    extension-candidate index (Module.extCouldApply — landed, kept) is
-    itself unsound at lowering time against the IMAGE's lazily-decoded
-    func headers: a deferred `IntArray.min` header carries no receiver
-    param until its body decodes, so the index answered "no extension"
-    while one existed (`elements.min()` bound the Int param named `min`).
-    The TRUE precondition is header-complete func metadata at lowering
-    time — the old plan's P9 (resolved/flat sections) territory. The
-    race stays until then.
-  - literal-coercion gap: NEUTRALIZED — the only live path was eager
-    primitive fills, which the channel excludes. The enhancement that
-    would let primitives fill is a numeric-family-aware evidence
-    comparison in applicability (Int evidence vs Byte param is not
-    definite for literal-typed values); worthwhile, canonical-gated,
-    not urgent.
- With seams live, each runtime heuristic is
-  narrowed to the truly-dynamic residue or deleted, battery-gated:
-  - `CallMemberOrValue`'s invocability guessing → exact emission per typeck
-    (member, value-with-receiver, or ctor), the guessing arm kept only for
-    spans with no eager answer;
-  - the closure "+1 arity → receiver" rebind → explicit receiver-binding
-    emitted from declared types;
-  - the `hasOwnMember` implicit-this arm → typeck's member answer;
-  - the CMG unknown-receiver fallbacks and `class_member_names` → deleted
-    once receiver types cover the corpus (the old plan's P8 endgame).
-
-- **E5 — Registry systems (typeck-independent, start immediately).** Two
-  structural fixes the heuristics currently paper over:
-  1. **One mangling, one lookup.** Nested classifiers register under a single
-     canonical qualified form; every simple-name probe goes through one
-     scope-walking lookup function (subsuming the `$`/`.` double-probe).
-  2. **Id-keyed globals.** Class/object/companion singletons are keyed by
-     `ClassId` in an id-keyed table; the name-keyed `globals` map becomes a
-     view for user bindings only. Kills publication shadowing (a companion
-     init can never change what a committed class read yields) and removes
-     hash-order sensitivity from classifier reads.
+1. **One mangling, one lookup.** Nested classifiers register under a single
+   canonical qualified form; every simple-name probe goes through one
+   scope-walking lookup function (subsuming the `$`/`.` double-probe).
+2. **Id-keyed globals.** Class/object/companion singletons are keyed by
+   `ClassId` in an id-keyed table; the name-keyed `globals` map becomes a view
+   for user bindings only. Kills publication shadowing (a companion init can
+   never change what a committed class read yields) and removes hash-order
+   sensitivity from classifier reads.
 
 ## Verification
 
-Every step: `zig build test`, the itest battery (litmus, e2e, corpus,
-lambdas, inheritance, ext_res, object_init, ktor, typeck_negative), and the
-per-file stdlib canonical (gains-only). The eager default flip additionally
-requires zero `KLIO_EAGER_AUDIT` disagreements over the whole stdlib corpus
-and a corpus wall-time measurement within budget. The stdlib failure
-inventory (scratchpad perfail) is the campaign scoreboard: the goal is the
-clusters dying by system, not by patch.
+Every step: `zig build test`, the itest battery (litmus, e2e, corpus, lambdas,
+inheritance, ext_res, object_init, ktor, typeck_negative), and the per-file
+stdlib canonical (gains-only). An eager default flip additionally requires zero
+`KLIO_EAGER_AUDIT` disagreements over the whole stdlib corpus and a corpus
+wall-time measurement within budget. The goal is the failure clusters dying by
+system, not by patch.
