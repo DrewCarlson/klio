@@ -137,6 +137,15 @@ actual class LocalDate(
         val MIN: LocalDate = LocalDate(-999_999, 1, 1)
         val MAX: LocalDate = LocalDate(999_999, 12, 31)
 
+        fun orNull(year: Int, monthNumber: Int, day: Int): LocalDate? =
+            if (year in -999_999..999_999 && monthNumber in 1..12 &&
+                day in 1..monthNumber.monthLength(isLeapYear(year)))
+                LocalDate(year, monthNumber, day) else null
+
+        fun orNull(year: Int, month: Month, day: Int): LocalDate? = orNull(year, month.number, day)
+
+        fun parseOrNull(input: CharSequence): LocalDate? = try { parse(input) } catch (e: Exception) { null }
+
         // ISO-8601 `yyyy-MM-dd` (with an optional leading `-` for a
         // negative proleptic year). The format-DSL overload's
         // `DateTimeFormat` parameter is intentionally unsupported; this
@@ -307,6 +316,12 @@ actual class LocalTime(
             return LocalTime(sec / 3600, (sec % 3600) / 60, sec % 60, (nanosecondOfDay % 1_000_000_000L).toInt())
         }
 
+        fun orNull(hour: Int, minute: Int, second: Int = 0, nanosecond: Int = 0): LocalTime? =
+            if (hour in 0..23 && minute in 0..59 && second in 0..59 && nanosecond in 0..999_999_999)
+                LocalTime(hour, minute, second, nanosecond) else null
+
+        fun parseOrNull(input: CharSequence): LocalTime? = try { parse(input) } catch (e: Exception) { null }
+
         // ISO-8601 `HH:mm[:ss[.fff…]]`.
         fun parse(input: CharSequence): LocalTime {
             val parts = input.toString().split(":")
@@ -369,6 +384,8 @@ actual class LocalDateTime(
     companion object {
         val MIN: LocalDateTime = LocalDateTime(LocalDate.MIN, LocalTime.MIN)
         val MAX: LocalDateTime = LocalDateTime(LocalDate.MAX, LocalTime.MAX)
+
+        fun parseOrNull(input: CharSequence): LocalDateTime? = try { parse(input) } catch (e: Exception) { null }
 
         // ISO-8601 `<date>T<time>`.
         fun parse(input: CharSequence): LocalDateTime {
