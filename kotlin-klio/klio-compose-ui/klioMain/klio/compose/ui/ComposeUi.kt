@@ -13,7 +13,9 @@ import androidx.compose.runtime.AbstractApplier
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.ComposeNode
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Recomposer
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.key
 
 // ----- color -----
@@ -436,6 +438,43 @@ fun Button(label: String, modifier: Modifier, onClick: () -> Unit) {
     Box(modifier.clickable(onClick).padding(1)) {
         Text(label, Color.White, Modifier.None)
     }
+}
+
+// ----- material (a themed layer on the foundation, via CompositionLocal) -----
+
+/** A material-style colour scheme, provided to a subtree by [MaterialTheme]. */
+class ColorScheme(
+    val primary: Color,
+    val surface: Color,
+    val onSurface: Color,
+    val outline: Color,
+)
+
+val defaultColorScheme: ColorScheme = ColorScheme(Color.Blue, Color.Gray, Color.Black, Color.White)
+
+/** The nearest [ColorScheme]; themed components read it via `.current`. */
+val LocalColorScheme = compositionLocalOf { defaultColorScheme }
+
+/** Provide [scheme] to [content] and everything it composes. */
+@Composable
+fun MaterialTheme(scheme: ColorScheme, content: @Composable () -> Unit) {
+    CompositionLocalProvider(LocalColorScheme provides scheme) {
+        content()
+    }
+}
+
+/** A surface card: the theme's surface fill + outline border + padding. */
+@Composable
+fun Card(modifier: Modifier, content: @Composable () -> Unit) {
+    val scheme = LocalColorScheme.current
+    Box(modifier.background(scheme.surface).border(scheme.outline).padding(1), content)
+}
+
+/** A filled button in the theme's primary colour. */
+@Composable
+fun PrimaryButton(label: String, onClick: () -> Unit) {
+    val scheme = LocalColorScheme.current
+    Button(label, Modifier.None.background(scheme.primary), onClick)
 }
 
 // ----- driver -----

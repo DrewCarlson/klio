@@ -188,6 +188,13 @@ scroll offset recomposes a different window. This is the lazy/constraint-driven 
 was built for (a full `SubcomposeLayout` that composes during the measure pass is a further
 refinement).
 
+**Paint + material** (`examples/compose_ui_material.kt`, baked corpus): the software paint
+backend does fills + 1px stroke outlines (`Modifier.border`, `PixelCanvas.strokeRect`) +
+`Spacer`; on top, a `MaterialTheme` provides a `ColorScheme` through the compose runtime's
+`CompositionLocal`, and `Card`/`PrimaryButton`/`Text` read it via `.current`, so the same
+UI renders in a light or dark palette — the material-on-foundation layering, themed by
+CompositionLocal.
+
 The real `androidx.compose.ui` is **not** in the vendored sparse checkout (only compose
 `runtime` is), and it is a Skia/native stack of hundreds of files, so these increments are
 a klio-authored ui-core proving the architecture runs on klio end-to-end (layout + draw +
