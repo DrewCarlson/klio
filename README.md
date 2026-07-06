@@ -107,9 +107,12 @@ expect/actual, and the rest. Kotlin concurrency runs on real OS
 threads with a documented memory model at least as strong as the JMM
 ([docs/architecture/memory-model.md](docs/architecture/memory-model.md)).
 
-Kotlin 2.4 language additions — explicit backing fields, the `@all`
-annotation use-site target, the new annotation use-site defaulting,
-and context parameters — are in progress and not yet supported.
+The Kotlin 2.4 language additions are supported: explicit backing
+fields, the `@all` annotation use-site target, the new annotation
+use-site defaulting rules, and context parameters (declarations and
+implicit resolution; explicit context arguments and callable
+references to contextual declarations are diagnosed as unsupported,
+matching a compiler that has not yet stabilized them).
 
 Correctness is enforced two ways: the parity harness runs every
 corpus program (532) and example (142) through both `kotlinc` and
