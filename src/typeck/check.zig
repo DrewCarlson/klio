@@ -61,6 +61,7 @@ const expr_calls = @import("check/expr_calls.zig");
 const annotations = @import("check/annotations.zig");
 const visibility = @import("check/visibility.zig");
 const narrowing = @import("check/narrowing.zig");
+pub const context_params = @import("check/context_params.zig");
 
 pub const helpers = @import("check/helpers.zig");
 
@@ -532,6 +533,10 @@ pub const FnSig = struct {
     /// True when the function is declared `inline` and the parameter at the
     /// same index is marked `crossinline`.
     is_crossinline_param: []bool,
+    /// Declared context-parameter type names, in order. Two overloads whose
+    /// context type-sets differ are NOT conflicting (they are shadowed
+    /// contextual overloads instead).
+    context_types: []const []const u8 = &.{},
 };
 
 /// Detailed per-member signature used by override-rule diagnostics

@@ -141,6 +141,7 @@ const itests_files = [_]Itest{
     .{ .name = "parity_visibility_modifiers" },
     .{ .name = "explicit_backing_fields" },
     .{ .name = "annotation_targets" },
+    .{ .name = "context_parameters" },
     .{ .name = "resolve_ambiguity" },
     .{ .name = "parser_corpus", .parity_data = false, .interprets = false },
     .{ .name = "runtime_objref_threads", .parity_data = false, .interprets = false },

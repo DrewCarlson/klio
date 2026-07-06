@@ -370,10 +370,41 @@ pub fn parseTypealias(
 
 /// Recognize leading annotations and soft modifiers, capturing the flags
 /// that affect how the declaration is parsed (`data`, `companion`).
+///
+/// `at_stmt_level` is true when parsing a statement, where `context(...)`
+/// followed by anything other than a `name: Type` list is a CALL to the
+/// stdlib `context` function, not a context-parameter clause: the loop then
+/// stops without consuming so the expression parser sees it.
 pub fn skipModifiersWithFlags(p: *Parser) ModifierFlags {
+    return skipModifiersWithFlagsLevel(p, false);
+}
+
+pub fn skipModifiersWithFlagsLevel(p: *Parser, at_stmt_level: bool) ModifierFlags {
     var flags = ModifierFlags{};
     while (true) {
         support.skipNl(p);
+        // `context(...)` modifier clause. At statement level it is a clause
+        // only when it looks like `context(name: Type, ...)`; otherwise it is
+        // a call to the stdlib `context` function and the loop stops here.
+        if (support.peekKeywordIdent(p, "context") and
+            kindAt(p, 1) != null and std.meta.activeTag(kindAt(p, 1).?) == .LParen)
+        {
+            if (at_stmt_level and !contextParenIsClause(p)) return flags;
+            const parsed = parseContextClause(p);
+            if (flags.context_span != null) {
+                support.errWithFactory(
+                    p,
+                    &diagnostics.generated.MULTIPLE_CONTEXT_LISTS,
+                    "E0301",
+                    "Multiple context parameter lists are forbidden. Put all context parameters in one list.",
+                    parsed.span,
+                );
+            } else {
+                flags.context_params = parsed.params;
+                flags.context_span = parsed.span;
+            }
+            continue;
+        }
         if (support.peekKind(p).*.isAt()) {
             if (parseAnnotationSet(p)) |anns| {
                 flags.annotations.appendSlice(p.allocator, anns) catch @panic("OOM");
@@ -464,6 +495,175 @@ pub fn skipModifiersWithFlags(p: *Parser) ModifierFlags {
             else => return flags,
         }
     }
+}
+
+/// Advance a token index past a balanced `(...)` starting at `start`
+/// (which must index a `(`). Returns the index just after the matching `)`.
+fn skipBalancedParenIdx(p: *const Parser, start: usize) usize {
+    var depth: i32 = 0;
+    var i = start;
+    while (i < p.tokens.len) : (i += 1) {
+        switch (std.meta.activeTag(p.tokens[i].kind)) {
+            .LParen => depth += 1,
+            .RParen => {
+                depth -= 1;
+                if (depth == 0) return i + 1;
+            },
+            .Eof => return i,
+            else => {},
+        }
+    }
+    return i;
+}
+
+/// Peek (without consuming) whether the `context(` at the cursor opens a
+/// context-parameter clause — every element begins `[annotations]
+/// [modifiers] name :` — rather than a call to the stdlib `context`
+/// function. `p.pos` is the `context` ident, `p.pos+1` the `(`.
+fn contextParenIsClause(p: *const Parser) bool {
+    var i = p.pos + 2; // first token inside `(`
+    while (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .Newline) i += 1;
+    // `context()` — an empty list is never a valid call; treat as a clause so
+    // the empty-list diagnostic fires.
+    if (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .RParen) return true;
+    // Skip leading annotations and the parameter modifiers that may precede a
+    // context parameter name.
+    while (i < p.tokens.len) {
+        const tok = p.tokens[i];
+        if (tok.kind.isAt()) {
+            i += 1;
+            while (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .Ident) {
+                i += 1;
+                if (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .Dot) {
+                    i += 1;
+                } else break;
+            }
+            if (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .LParen)
+                i = skipBalancedParenIdx(p, i);
+            continue;
+        }
+        if (std.meta.activeTag(tok.kind) == .Keyword and
+            (tok.kind.Keyword == .Val or tok.kind.Keyword == .Var))
+        {
+            i += 1;
+            continue;
+        }
+        if (std.meta.activeTag(tok.kind) == .Ident) {
+            const t = support.text(p, tok.span);
+            if (std.mem.eql(u8, t, "noinline") or std.mem.eql(u8, t, "crossinline") or
+                std.mem.eql(u8, t, "vararg"))
+            {
+                i += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    // A context-parameter entry is `name :`. `_` lexes as an `Ident`.
+    if (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .Ident) {
+        var j = i + 1;
+        while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Newline) j += 1;
+        if (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Colon) return true;
+    }
+    return false;
+}
+
+const ContextClause = struct { params: []ast.ContextParam, span: Span };
+
+/// Parse a `context(name: Type, ...)` modifier clause. The cursor is at the
+/// `context` soft keyword; the `(` follows. Bad forms are diagnosed but the
+/// clause is still consumed so the following declaration parses.
+fn parseContextClause(p: *Parser) ContextClause {
+    const kw = support.bump(p); // `context`
+    _ = support.bump(p); // `(`
+    var list: std.ArrayList(ast.ContextParam) = .empty;
+    support.skipNl(p);
+    if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
+        const rp = support.bump(p);
+        support.err(p, "E0302", "Empty context parameter list", kw.span.join(rp.span));
+        return .{ .params = &.{}, .span = kw.span.join(rp.span) };
+    }
+    while (true) {
+        support.skipNl(p);
+        if (support.peekKind(p).isAt()) {
+            _ = parseAnnotations(p);
+            support.skipNl(p);
+        }
+        // Parameter modifiers: `noinline`/`crossinline` are accepted (and
+        // ignored — inlining context parameters is unsupported); anything
+        // else is rejected.
+        while (true) {
+            const tok = support.peek(p);
+            if (std.meta.activeTag(tok.kind) == .Keyword and
+                (tok.kind.Keyword == .Val or tok.kind.Keyword == .Var))
+            {
+                const mtxt = support.text(p, tok.span);
+                const msg = std.fmt.allocPrint(p.allocator, "Modifier '{s}' is not applicable to 'context parameter'", .{mtxt}) catch "modifier not applicable to context parameter";
+                support.errWithFactory(p, &diagnostics.generated.WRONG_MODIFIER_TARGET, "E0303", msg, tok.span);
+                _ = support.bump(p);
+                continue;
+            }
+            if (std.meta.activeTag(tok.kind) == .Ident) {
+                const t = support.text(p, tok.span);
+                if (std.mem.eql(u8, t, "noinline") or std.mem.eql(u8, t, "crossinline")) {
+                    _ = support.bump(p);
+                    continue;
+                }
+                if (std.mem.eql(u8, t, "vararg")) {
+                    support.errWithFactory(p, &diagnostics.generated.WRONG_MODIFIER_TARGET, "E0303", "Modifier 'vararg' is not applicable to 'context parameter'", tok.span);
+                    _ = support.bump(p);
+                    continue;
+                }
+            }
+            break;
+        }
+        // `name : Type` — or a bare type (the legacy context-receiver form).
+        const named = std.meta.activeTag(support.peekKind(p).*) == .Ident and blk: {
+            var j = p.pos + 1;
+            while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Newline) j += 1;
+            break :blk j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Colon;
+        };
+        if (named) {
+            const name = support.parseIdent(p, "context parameter name").?;
+            support.skipNl(p);
+            _ = support.bump(p); // `:`
+            support.skipNl(p);
+            const ty = types.parseType(p) orelse ast.TypeRef{
+                .name = .{ .name = "Any", .span = name.span },
+                .nullable = false,
+                .span = name.span,
+                .type_args = &.{},
+                .function = null,
+                .definitely_non_null = false,
+                .annotations = &.{},
+                .qualified_path = null,
+            };
+            var pspan = name.span.join(ty.span);
+            if (std.meta.activeTag(support.peekKind(p).*) == .Eq) {
+                _ = support.bump(p); // `=`
+                support.skipNl(p);
+                const def = expr.parseExpr(p);
+                if (def) |d| pspan = pspan.join(d.span());
+                support.errWithFactory(p, &diagnostics.generated.CONTEXT_PARAMETER_WITH_DEFAULT, "E0304", "Context parameters cannot have default values.", pspan);
+            }
+            list.append(p.allocator, .{ .name = name, .ty = ty, .span = pspan }) catch @panic("OOM");
+        } else {
+            const start = support.currentSpan(p);
+            const ty = types.parseType(p) orelse break;
+            support.errWithFactory(p, &diagnostics.generated.CONTEXT_PARAMETER_WITHOUT_NAME, "E0305", "Context parameters must be named. Use '_' to declare an anonymous context parameter.", start.join(ty.span));
+            list.append(p.allocator, .{ .name = .{ .name = "_", .span = ty.span }, .ty = ty, .span = ty.span }) catch @panic("OOM");
+        }
+        support.skipNl(p);
+        if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
+            _ = support.bump(p);
+            support.skipNl(p);
+            if (std.meta.activeTag(support.peekKind(p).*) == .RParen) break;
+            continue;
+        }
+        break;
+    }
+    const rp = support.expect(p, .RParen, "`)`") orelse support.peek(p).*;
+    return .{ .params = list.toOwnedSlice(p.allocator) catch @panic("OOM"), .span = kw.span.join(rp.span) };
 }
 
 /// Parse one annotation set at the cursor. The cursor must be at an

@@ -302,6 +302,12 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         const encl_recv = b.capturesThisSlot() or
             (!b.this_is_plain_param and b.resolve("this") != null) or
             b.ownerClass() != null or b.isParamThunk() or b.recvTy() != null;
+        // A local contextual function binds its context parameters in the
+        // body; stash them for the shared lambda-body lowering to consume.
+        if (f.context_params.len != 0) {
+            b.module.has_context_decls = true;
+            b.module.pending_ctx = .{ .params = f.context_params, .type_params = f.type_params };
+        }
         const lowered = try lowerLambdaBodyCapturingKindWith(
             b.module,
             param_idents,

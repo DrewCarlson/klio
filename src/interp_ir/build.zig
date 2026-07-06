@@ -2471,10 +2471,13 @@ fn buildModuleWithOverrides(
             try top_level_props.append(a, .{ .name = p.name.name, .func = fid });
         }
         if (p.delegate == null) {
+            if (p.context_params.len != 0) module.has_context_decls = true;
             if (p.getter) |getter| {
                 // With storage, the getter re-runs on each plain-name read
                 // (the miss path) and its `field` reads the raw key; without
                 // storage it is the field-less computed-property form.
+                if (p.context_params.len != 0)
+                    module.pending_ctx = .{ .params = p.context_params, .type_params = &.{} };
                 const nm = try std.fmt.allocPrint(a, "__top_prop_get_{s}", .{p.name.name});
                 const fid = switch (getter.body) {
                     .Expr => |body| blk: {
@@ -2491,6 +2494,8 @@ fn buildModuleWithOverrides(
             }
             if (p.setter) |setter| {
                 const value_param = if (setter.params.len != 0) setter.params[0].name else "value";
+                if (p.context_params.len != 0)
+                    module.pending_ctx = .{ .params = p.context_params, .type_params = &.{} };
                 const nm = try std.fmt.allocPrint(a, "__top_prop_set_{s}", .{p.name.name});
                 const fid = switch (setter.body) {
                     .Expr => |body| blk: {

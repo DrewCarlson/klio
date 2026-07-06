@@ -489,6 +489,12 @@ const Resolver = struct {
                 try key_buf.append(self.strs(), '|');
                 try key_buf.appendSlice(self.strs(), p.ty.name.name);
             }
+            // Context parameters are part of the signature: two overloads that
+            // differ only in their context clause are distinct declarations.
+            for (f.context_params) |cp| {
+                try key_buf.append(self.strs(), '^');
+                try key_buf.appendSlice(self.strs(), cp.ty.name.name);
+            }
             const key = key_buf.items;
             const probe = SigKey{ .scope = scope.int(), .key = key };
             if (self.fn_sig_keys.contains(probe)) {
@@ -662,9 +668,20 @@ const Resolver = struct {
         }
     }
 
+    /// Context parameters are in scope by name in the declaration body,
+    /// in the same scope level as the value parameters. Anonymous (`_`)
+    /// parameters resolve for context lookup only and are not named.
+    fn declareContextParams(self: *Resolver, scope: ScopeId, cps: []const ast.ContextParam) ResolveError!void {
+        for (cps) |*cp| {
+            if (std.mem.eql(u8, cp.name.name, "_")) continue;
+            _ = try self.declare(scope, cp.name.name, .Parameter, cp.name.span, true);
+        }
+    }
+
     fn resolveFunction(self: *Resolver, parent: ScopeId, f: *const Function) ResolveError!void {
         const kind: ScopeKind = if (f.receiver_type != null) .ImplicitReceiver else .Function;
         const fn_scope = try self.pushScope(parent, kind);
+        try self.declareContextParams(fn_scope, f.context_params);
         for (f.params) |*p| {
             try self.resolveParam(fn_scope, p);
         }
@@ -693,15 +710,16 @@ const Resolver = struct {
             try self.resolveExpr(scope, p_init);
         }
         if (p.getter) |getter| {
-            try self.resolveAccessor(scope, getter, p.receiver_type != null);
+            try self.resolveAccessor(scope, getter, p.receiver_type != null, p.context_params);
         }
         if (p.setter) |setter| {
-            try self.resolveAccessor(scope, setter, p.receiver_type != null);
+            try self.resolveAccessor(scope, setter, p.receiver_type != null, p.context_params);
         }
     }
 
-    fn resolveAccessor(self: *Resolver, parent: ScopeId, acc: *const ast.Accessor, has_receiver: bool) ResolveError!void {
+    fn resolveAccessor(self: *Resolver, parent: ScopeId, acc: *const ast.Accessor, has_receiver: bool, context_params: []const ast.ContextParam) ResolveError!void {
         const scope = try self.pushScope(parent, if (has_receiver) ScopeKind.ImplicitReceiver else .Function);
+        try self.declareContextParams(scope, context_params);
         for (acc.params) |p| {
             _ = try self.declare(scope, p.name, .Parameter, p.span, true);
         }
@@ -993,6 +1011,7 @@ const Resolver = struct {
         switch (decl.*) {
             .Function => |*f| {
                 const fn_scope = try self.pushScope(scope, .Block);
+                try self.declareContextParams(fn_scope, f.context_params);
                 for (f.params) |p| {
                     const sym = try self.addSymbol(p.name.name, .Parameter, p.name.span);
                     try self.scopes.items[fn_scope.int()].bindings.put(p.name.name, sym);

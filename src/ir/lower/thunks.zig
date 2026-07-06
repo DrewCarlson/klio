@@ -58,9 +58,19 @@ fn cloneOwnMembers(allocator: Allocator, src: *const StringSet) Allocator.Error!
 /// body returns the expression's value. The synthetic function is
 /// pushed onto the module so a downstream caller can invoke it via
 /// `eval_with` against `module.funcs[id]`.
+/// Emit a contextual property accessor's context-load prologue when the
+/// declaration lowering stashed its context parameters. A no-op otherwise.
+fn consumePendingCtx(b: *FuncBuilder) Allocator.Error!void {
+    if (b.module.pending_ctx) |pc| {
+        b.module.pending_ctx = null;
+        try decl.emitContextParamLoads(b, pc.params, pc.type_params);
+    }
+}
+
 pub fn lowerExprAsThunk(module: *Module, expr: *const Expr, name: []const u8) Allocator.Error!FuncId {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
+    try consumePendingCtx(&b);
     const v = try lowerExpr(&b, expr);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
@@ -72,6 +82,7 @@ pub fn lowerExprAsThunk(module: *Module, expr: *const Expr, name: []const u8) Al
 pub fn lowerBlockAsThunk(module: *Module, block: *const ast.Block, name: []const u8) Allocator.Error!FuncId {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
+    try consumePendingCtx(&b);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
@@ -88,6 +99,7 @@ pub fn lowerBlockAsUnaryThunk(
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
     try bindParams(&b, &.{param_name});
+    try consumePendingCtx(&b);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
@@ -136,6 +148,7 @@ pub fn lowerExprAsParamThunkScoped(
     var b = try FuncBuilder.init(allocator, module);
     defer b.deinit();
     try bindParams(&b, params);
+    try consumePendingCtx(&b);
     b.setParamThunk(true);
     if (owner_class) |owner| {
         b.setOwnerClass(owner);

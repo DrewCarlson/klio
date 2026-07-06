@@ -6,6 +6,7 @@ const std = @import("std");
 const span = @import("span");
 const ast = @import("ast");
 const types = @import("types");
+const diagnostics = @import("diagnostics");
 
 const root = @import("../check.zig");
 const helpers = @import("helpers.zig");
@@ -633,6 +634,24 @@ pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
                 if (a_va != b_va) {
                     continue;
                 }
+                // Context parameters are part of the signature: two overloads
+                // whose context type-sets differ do NOT conflict. When one is
+                // applicable whenever the other is (one has a subset of the
+                // other's contexts), the more-constrained one is shadowed.
+                if (!contextTypesEqual(a.context_types, b.context_types)) {
+                    const more: ?Span = if (contextSubset(b.context_types, a.context_types))
+                        a.decl_span
+                    else if (contextSubset(a.context_types, b.context_types))
+                        b.decl_span
+                    else
+                        null;
+                    if (more) |sp| {
+                        var w = Diagnostic.warning("The following overloads conflict with this contextual declaration. Calls will be ambiguous because context arguments are not used for overload resolution.", sp);
+                        _ = w.withFactory(&diagnostics.generated.CONTEXTUAL_OVERLOAD_SHADOWED);
+                        try self.diagnostics.emit(self.allocator, w);
+                    }
+                    continue;
+                }
                 if (a.decl_span) |sa| {
                     if (b.decl_span) |sb| {
                         try pairs.append(self.allocator, .{ .a = sa, .b = sb, .name = name });
@@ -662,6 +681,25 @@ fn sameDeclPackage(self: *Checker, a: ?Span, b: ?Span) bool {
     const pa = self.file_packages.get(sa.file.int()) orelse "";
     const pb = self.file_packages.get(sb.file.int()) orelse "";
     return std.mem.eql(u8, pa, pb);
+}
+
+/// Do two context type-lists denote the same multiset of types?
+fn contextTypesEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    return contextSubset(a, b) and contextSubset(b, a);
+}
+
+/// Is every type in `sub` also present in `sup` (multiset-ish membership)?
+/// Used to detect when one contextual overload is applicable whenever
+/// another is.
+fn contextSubset(sub: []const []const u8, sup: []const []const u8) bool {
+    outer: for (sub) |s| {
+        for (sup) |t| {
+            if (std.mem.eql(u8, s, t)) continue :outer;
+        }
+        return false;
+    }
+    return true;
 }
 
 fn countTrue(flags: []const bool) usize {

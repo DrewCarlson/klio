@@ -596,3 +596,40 @@ context(a: String, b: Int) fun f() {}
 fun main() { f() }
 ```
 Errors: two `NO_CONTEXT_ARGUMENT` (for `a` and for `b`) on `f`.
+
+## 11. Implementation status (KLIO)
+
+Declarations and implicit resolution are implemented end to end.
+
+- Parser: the `context(...)` modifier clause on functions (incl. local),
+  accessor-only properties, and the leading `context(A, B)` block of a
+  contextual function type; the statement-level call-vs-clause
+  disambiguation (`context(x) { … }` call vs `context(c: T) fun …`
+  declaration); structural rejections (`MULTIPLE_CONTEXT_LISTS`,
+  `CONTEXT_PARAMETER_WITH_DEFAULT`, `WRONG_MODIFIER_TARGET`,
+  `CONTEXT_PARAMETER_WITHOUT_NAME`, `NAMED_CONTEXT_PARAMETER_IN_FUNCTION_TYPE`,
+  constructor `context` clause `UNSUPPORTED`).
+- Resolver: context parameters are in scope by name in the body (functions,
+  members, local functions, both property accessors); the overload key
+  includes context types so context-differing overloads are not
+  redeclarations.
+- Runtime: a thread-local context stack (`CtxLoad`/`CtxScope` ir ops plus a
+  per-frame receiver push) drives resolution. `context(v…) { block }` and
+  `contextOf<T>()` are lowered directly; named context parameters load from
+  the nearest compatible in-scope value; dispatch/extension/`with` receivers
+  are context sources.
+- Typeck: static resolution surfaces `NO_CONTEXT_ARGUMENT`,
+  `AMBIGUOUS_CONTEXT_ARGUMENT`, `RECEIVER_SHADOWED_BY_CONTEXT_PARAMETER`,
+  `CONTEXT_PARAMETERS_WITH_BACKING_FIELD`, `NOTHING_TO_OVERRIDE` +
+  `PARAMETER_NAME_CHANGED_ON_OVERRIDE`, `CONTEXTUAL_OVERLOAD_SHADOWED` +
+  `OVERLOAD_RESOLUTION_AMBIGUITY`, and the excluded-form diagnostics
+  (`UNSUPPORTED` explicit context arguments,
+  `CALLABLE_REFERENCE_TO_CONTEXTUAL_DECLARATION`).
+
+Test matrix: rows T1–T13 and T15–T24 pass (`src/itests/context_parameters.zig`).
+Deferred: the fully-explicit positional invocation of a multi-context
+contextual function-type value — matrix row T14's `f("s", 1, true)` — which
+needs a lambda to adopt its context parameters from the expected function
+type and push its leading positional arguments as context values. The
+implicit-invocation form of T14 and the single-context contextual
+function-type row (T13) are covered.

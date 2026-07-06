@@ -368,6 +368,20 @@ pub const Inst = union(enum) {
     },
     /// `is T` check; result is a `Bool`.
     InstanceOf: struct { dst: Reg, src: Reg, ty: TypeRef },
+    /// Resolve the nearest in-scope context value whose runtime type is a
+    /// subtype of `ty` and write it to `dst`. Emitted for a named context
+    /// parameter's binding in a contextual declaration's body and for
+    /// `contextOf<T>()`. `erased` (a generic context-parameter type, or a
+    /// `*` type argument) takes the innermost value regardless of type.
+    /// Writes `.Null` when no compatible value is in scope — an unresolved
+    /// context is diagnosed statically by typeck, not here.
+    CtxLoad: struct { dst: Reg, ty: ConstId, erased: bool = false },
+    /// The stdlib `context(v..., block)`: push the `n_ctx` context values in
+    /// the register run at `ctx_args` onto the context stack, invoke the
+    /// callable in `block` with no value arguments, then pop them. `dst`
+    /// receives the block's result. Context values are made available for
+    /// context resolution only, never as implicit receivers.
+    CtxScope: struct { dst: Reg, ctx_args: Reg, n_ctx: u32, block: Reg },
     /// `!!` not-null assertion.
     NotNullAssert: struct { dst: Reg, src: Reg },
     /// Marker for the evaluator's debugger / tracing hook.
@@ -952,8 +966,24 @@ fn headAllUpper(s_: []const u8) bool {
     return true;
 }
 
+/// A local contextual function's context parameters, threaded from
+/// declaration lowering into the shared lambda-body lowering.
+pub const PendingCtx = struct {
+    params: []const ast.ContextParam,
+    type_params: []const ast.TypeParam,
+};
+
 pub const Module = struct {
     funcs: std.ArrayList(Func) = .empty,
+    /// True when any declaration in this module has a `context(...)`
+    /// parameter clause. Gates the per-frame receiver push that feeds the
+    /// context-resolution stack, so non-context programs pay nothing.
+    has_context_decls: bool = false,
+    /// Lowering-only scratch: a local contextual function's context
+    /// parameters, stashed just before its body lowers through the shared
+    /// lambda-body path and consumed there to emit the context-load
+    /// prologue. Not serialized.
+    pending_ctx: ?PendingCtx = null,
     /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
     /// self-contained, decoded on first execution. Borrows the image buffer;
     /// empty unless this module was loaded from an image.

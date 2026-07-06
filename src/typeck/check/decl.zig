@@ -317,6 +317,8 @@ pub fn signatureOf(self: *Checker, f: *const Function) Allocator.Error!FnSig {
     } else {
         @memset(is_crossinline_param, false);
     }
+    const context_types = try self.allocator.alloc([]const u8, f.context_params.len);
+    for (f.context_params, 0..) |*cp, i| context_types[i] = cp.ty.name.name;
     return .{
         .params = params,
         .has_default = has_default,
@@ -332,6 +334,7 @@ pub fn signatureOf(self: *Checker, f: *const Function) Allocator.Error!FnSig {
         .is_suspend = f.is_suspend,
         .is_extension = f.receiver_type != null,
         .is_crossinline_param = is_crossinline_param,
+        .context_types = context_types,
     };
 }
 

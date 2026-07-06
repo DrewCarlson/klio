@@ -220,6 +220,8 @@ pub fn run(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
     for (file.decls) |*d| {
         try checkCtorParamScopeDecl(self, d);
     }
+    // Context-parameter position rules and static context-argument resolution.
+    try @import("context_params.zig").checkContextParameters(self, file);
 }
 
 pub fn checkCtorParamScopeDecl(self: *Checker, d: *const Decl) Allocator.Error!void {

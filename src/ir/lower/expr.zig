@@ -2728,6 +2728,37 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const ast_type_args = call.type_args;
     const is_infix = call.is_infix;
 
+    // Context parameters: the stdlib `context(v..., block)` scope function
+    // and `contextOf<T>()` accessor lower to dedicated context-stack ops so
+    // implicit resolution is driven by the runtime stack, not overload
+    // resolution. Only when the name is not shadowed by a local/outer.
+    if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1) {
+        const cname = callee.Path.segments[0].name;
+        if (b.resolve(cname) == null and !b.knowsOuter(cname)) {
+            if (std.mem.eql(u8, cname, "contextOf") and args.len == 0 and ast_type_args.len == 1) {
+                b.module.has_context_decls = true;
+                const dst = b.allocReg();
+                const ty_const = try b.module.internConst(b.allocator, .{ .String = ast_type_args[0].name.name });
+                try b.push(.{ .CtxLoad = .{ .dst = dst, .ty = ty_const, .erased = false } });
+                return dst;
+            }
+            if (std.mem.eql(u8, cname, "context") and args.len >= 2 and lastArgIsLambda(args)) {
+                b.module.has_context_decls = true;
+                const run = try lowerArgRun(b, args);
+                const n_ctx: u32 = @intCast(args.len - 1);
+                const block_reg = Reg.from(run[0].int() + n_ctx);
+                const dst = b.allocReg();
+                try b.push(.{ .CtxScope = .{
+                    .dst = dst,
+                    .ctx_args = run[0],
+                    .n_ctx = n_ctx,
+                    .block = block_reg,
+                } });
+                return dst;
+            }
+        }
+    }
+
     // Scope-true callee rewrite: a bare ctor/factory head naming a mangled
     // nested class (`Node(...)` inside its declaring class's subtree) or a
     // renamed file-private class/typealias resolves to the mangled lift

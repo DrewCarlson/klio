@@ -918,6 +918,13 @@ pub fn closureParamsDisproven(self: *VmHost, callee: *const Value, args: []const
 
 pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     _ = arg_names;
+    // A receiver-lambda's receiver (`with(r) { … }`, `r.apply { … }`) is an
+    // implicit receiver, hence a context-argument source for a contextual
+    // callee inside the block. Feed it into the context stack for the
+    // block's duration; the push unwinds on every return path.
+    const ctx_mark = self.ctxStackLen();
+    defer self.ctxStackTruncate(ctx_mark);
+    if (self.ctxIsActive()) self.ctxPush(this_value.*) catch {};
     // Explicit-receiver receiver-lambda call (`block(receiver, p)` for a
     // `R.(P) -> T`, exactly one extra leading arg): bind `this_value`
     // into the `this` capture as a fallback and dispatch on the MAIN

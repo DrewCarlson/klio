@@ -112,6 +112,40 @@ pub fn bindParams(b: *FuncBuilder, names: []const []const u8) Allocator.Error!vo
     }
 }
 
+/// Emit the prologue that binds a contextual declaration's context
+/// parameters. Each named parameter loads the nearest in-scope context
+/// value of its declared type (`CtxLoad`) and binds the name so the body
+/// references it directly. `_` parameters resolve for `contextOf` and
+/// nested calls but are not bound by name. The caller flags the module as
+/// context-using (excluding the stdlib `context`/`contextOf` intrinsics) so
+/// the runtime feeds receivers into the context stack only when a real
+/// contextual declaration is present.
+pub fn emitContextParamLoads(
+    b: *FuncBuilder,
+    context_params: []const ast.ContextParam,
+    type_params: []const ast.TypeParam,
+) Allocator.Error!void {
+    if (context_params.len == 0) return;
+    for (context_params) |*cp| {
+        const dst = b.allocReg();
+        var erased = cp.ty.function != null;
+        for (type_params) |*tp| {
+            if (std.mem.eql(u8, tp.name.name, cp.ty.name.name)) {
+                erased = true;
+                break;
+            }
+        }
+        const ty_name = try loweredTypeName(b.allocator, &cp.ty);
+        const ty_const = try b.module.internConst(b.allocator, .{ .String = ty_name });
+        try b.push(.{ .CtxLoad = .{ .dst = dst, .ty = ty_const, .erased = erased } });
+        if (!std.mem.eql(u8, cp.name.name, "_")) {
+            try b.bind(cp.name.name, dst);
+            try b.setLocalDeclType(cp.name.name, cp.ty.name.name);
+            if (cp.ty.nullable) try b.setLocalDeclNullable(cp.name.name);
+        }
+    }
+}
+
 /// Lower a Kotlin class declaration into an IR Class. Methods are
 /// lowered as Funcs with a synthetic `<receiver>` first parameter
 /// (the constructor params are lifted onto the Class's
@@ -1041,6 +1075,16 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             const label = try std.fmt.allocPrint(a, "this@{s}", .{f.name.name});
             try b.bind(label, this_reg);
         }
+    }
+    try emitContextParamLoads(&b, f.context_params, f.type_params);
+    // A user contextual declaration makes receivers context sources; the
+    // stdlib `context`/`contextOf` intrinsics resolve without the runtime
+    // receiver stack, so they must not flip the module-wide gate.
+    if (f.context_params.len != 0 and
+        !std.mem.eql(u8, f.name.name, "context") and
+        !std.mem.eql(u8, f.name.name, "contextOf"))
+    {
+        b.module.has_context_decls = true;
     }
     // A param whose declared type is a receiver-typed function
     // (`block: T.() -> R`) carries that fact so a bare call `block(...)`
