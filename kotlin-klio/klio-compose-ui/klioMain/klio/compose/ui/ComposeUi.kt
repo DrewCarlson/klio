@@ -148,18 +148,30 @@ class Modifier private constructor(
     val background: Color?,
     val fillMaxWidth: Boolean,
     val fillMaxHeight: Boolean,
+    val onClick: (() -> Unit)?,
 ) {
-    fun size(w: Int, h: Int): Modifier = Modifier(w, h, padding, background, fillMaxWidth, fillMaxHeight)
-    fun width(w: Int): Modifier = Modifier(w, height, padding, background, fillMaxWidth, fillMaxHeight)
-    fun height(h: Int): Modifier = Modifier(width, h, padding, background, fillMaxWidth, fillMaxHeight)
-    fun padding(p: Int): Modifier = Modifier(width, height, p, background, fillMaxWidth, fillMaxHeight)
-    fun background(c: Color): Modifier = Modifier(width, height, padding, c, fillMaxWidth, fillMaxHeight)
-    fun fillMaxWidth(): Modifier = Modifier(width, height, padding, background, true, fillMaxHeight)
-    fun fillMaxHeight(): Modifier = Modifier(width, height, padding, background, fillMaxWidth, true)
-    fun fillMaxSize(): Modifier = Modifier(width, height, padding, background, true, true)
+    private fun copy(
+        width: Int = this.width,
+        height: Int = this.height,
+        padding: Int = this.padding,
+        background: Color? = this.background,
+        fillMaxWidth: Boolean = this.fillMaxWidth,
+        fillMaxHeight: Boolean = this.fillMaxHeight,
+        onClick: (() -> Unit)? = this.onClick,
+    ): Modifier = Modifier(width, height, padding, background, fillMaxWidth, fillMaxHeight, onClick)
+
+    fun size(w: Int, h: Int): Modifier = copy(width = w, height = h)
+    fun width(w: Int): Modifier = copy(width = w)
+    fun height(h: Int): Modifier = copy(height = h)
+    fun padding(p: Int): Modifier = copy(padding = p)
+    fun background(c: Color): Modifier = copy(background = c)
+    fun fillMaxWidth(): Modifier = copy(fillMaxWidth = true)
+    fun fillMaxHeight(): Modifier = copy(fillMaxHeight = true)
+    fun fillMaxSize(): Modifier = copy(fillMaxWidth = true, fillMaxHeight = true)
+    fun clickable(onClick: () -> Unit): Modifier = copy(onClick = onClick)
 
     companion object {
-        val None = Modifier(-1, -1, 0, null, false, false)
+        val None = Modifier(-1, -1, 0, null, false, false, null)
     }
 }
 
@@ -232,9 +244,13 @@ class LayoutNode {
         measuredHeight = clamp(wantH, constraints.minHeight, constraints.maxHeight)
     }
 
-    fun draw(canvas: PixelCanvas, originX: Int, originY: Int) {
+    fun draw(canvas: PixelCanvas, originX: Int, originY: Int, hits: MutableList<HitRegion>) {
         val bg = modifier.background
         if (bg != null) canvas.fillRect(originX, originY, measuredWidth, measuredHeight, bg.argb)
+        val onClick = modifier.onClick
+        if (onClick != null) {
+            hits.add(HitRegion(originX, originY, measuredWidth, measuredHeight, onClick))
+        }
         val pad = modifier.padding
         if (text.isNotEmpty()) {
             val fg = textColor ?: Color.White
@@ -258,9 +274,14 @@ class LayoutNode {
             }
         }
         for (child in children) {
-            child.draw(canvas, originX + child.offsetX, originY + child.offsetY)
+            child.draw(canvas, originX + child.offsetX, originY + child.offsetY, hits)
         }
     }
+}
+
+/** A clickable region collected during the draw pass (absolute bounds + handler). */
+class HitRegion(val x: Int, val y: Int, val w: Int, val h: Int, val onClick: () -> Unit) {
+    fun contains(px: Int, py: Int): Boolean = px >= x && px < x + w && py >= y && py < y + h
 }
 
 class LayoutNodeApplier(root: LayoutNode) : AbstractApplier<LayoutNode>(root) {
@@ -362,6 +383,13 @@ fun Text(text: String, color: Color) {
     Text(text, color, Modifier.None)
 }
 
+@Composable
+fun Button(label: String, modifier: Modifier, onClick: () -> Unit) {
+    Box(modifier.clickable(onClick).padding(1)) {
+        Text(label, Color.White, Modifier.None)
+    }
+}
+
 // ----- driver -----
 
 /** Drives one composition into a LayoutNode tree, measures + lays it out under a
@@ -373,17 +401,38 @@ class UiRenderer internal constructor(
     private val recomposer: Recomposer,
     private val composition: Composition,
 ) {
+    private val hits = ArrayList<HitRegion>()
+
     /** Measure/layout + draw the current tree, returning an ASCII pixel dump. */
     fun render(): String {
         root.measure(Constraints(width, width, height, height))
         val canvas = PixelCanvas(width, height)
-        root.draw(canvas, 0, 0)
+        hits.clear()
+        root.draw(canvas, 0, 0, hits)
         return canvas.toAscii()
     }
 
     /** Recompose after a state write, then render the next frame. */
     fun recomposeRender(): String {
         recomposer.recompose()
+        return render()
+    }
+
+    /**
+     * Dispatch a pointer click at ([px], [py]) to the topmost clickable region
+     * hit (regions are collected front-to-back during draw, so the last match is
+     * on top), then recompose + re-render. Returns the new frame, or the current
+     * one if nothing was hit.
+     */
+    fun click(px: Int, py: Int): String {
+        var handler: (() -> Unit)? = null
+        for (region in hits) {
+            if (region.contains(px, py)) handler = region.onClick
+        }
+        if (handler != null) {
+            handler()
+            return recomposeRender()
+        }
         return render()
     }
 

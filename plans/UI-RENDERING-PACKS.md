@@ -175,13 +175,20 @@ backgrounds and 3×5 bitmap-font `Text` into a software `PixelCanvas`, and the b
 deterministically as ASCII. A state write recomposes and re-renders (the counter text
 updates) — the same node-emission + measure/layout/draw path a real Compose UI uses.
 
+**Pointer input** (`examples/compose_ui_click.kt`, baked corpus): `Modifier.clickable`
+records a hit region during draw; `UiRenderer.click(x, y)` hit-tests the topmost region,
+invokes its `onClick`, and recomposes + re-renders. A `Button` composable + a simulated
+click drives the full loop — input → state → recompose → draw (`N 0` → `N 1` → `N 2`) — the
+same loop a real Compose UI runs, headless and deterministic.
+
 The real `androidx.compose.ui` is **not** in the vendored sparse checkout (only compose
-`runtime` is), and it is a Skia/native stack of hundreds of files, so this increment is a
-klio-authored ui-core proving the architecture runs on klio end-to-end. Still ahead in S
-(each its own large step): the native **Skia** binding (this increment uses a software
-rasterizer, per the plan's "pure software rasterizer for a first cut"), text/font
-rendering, the full `Modifier.Node` chain + pointer/focus/semantics, windowing/input, and
-vendoring the real `compose.ui`/`foundation`/`material`.
+`runtime` is), and it is a Skia/native stack of hundreds of files, so these increments are
+a klio-authored ui-core proving the architecture runs on klio end-to-end (layout + draw +
+text + recomposition + pointer input). Still ahead in S (each its own large step): the
+native **Skia** binding (these increments use a software rasterizer, per the plan's "pure
+software rasterizer for a first cut"), real font/glyph shaping, the full `Modifier.Node`
+chain + focus/semantics, windowing + a live input event loop, and vendoring the real
+`compose.ui`/`foundation`/`material`.
 
 ### Remaining S layers
 
