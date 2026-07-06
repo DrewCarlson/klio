@@ -2125,6 +2125,20 @@ fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     return false;
 }
 
+/// Nominal interfaces klio models a Kotlin array as satisfying (so the stdlib
+/// `Array<T>.first()` / iteration extensions bind). An array vs one of these is
+/// NOT a definite type mismatch, unlike an array vs an arbitrary user interface.
+fn isArrayRelatedIface(pn: []const u8) bool {
+    const set = [_][]const u8{
+        "Iterable", "MutableIterable", "Collection", "MutableCollection",
+        "Sequence", "Comparable", "CharSequence", "Serializable", "Cloneable",
+    };
+    for (set) |s| {
+        if (std.mem.eql(u8, pn, s)) return true;
+    }
+    return false;
+}
+
 pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
     var pn = param_ty.name;
     // A qualified reference (`Owner.Pocket`) names a lifted nested/inner
@@ -2178,6 +2192,14 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     }
     const inst = switch (arg.*) {
         .Instance => |i| i,
+        // A Kotlin array satisfies no NOMINAL user/pack interface, so an
+        // `Array`/`XxxArray` argument offered such a parameter is a definite
+        // mismatch — decline the lone member `Buffer.readTo(RawSink, Long)` so
+        // the extension `Source.readTo(ByteArray, startIndex, endIndex)` binds.
+        // EXCEPT the collection interfaces klio DOES model arrays against
+        // (`Iterable`/`Collection`/`Sequence`, which back `Array.first()` and
+        // friends) and any array-named param — those stay non-definite.
+        .Array => return std.mem.indexOf(u8, pn, "Array") == null and !isArrayRelatedIface(pn),
         else => return false,
     };
     var start: []const u8 = undefined;
