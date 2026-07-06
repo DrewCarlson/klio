@@ -2184,6 +2184,14 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // literal may carry a narrower tag than the declared type (`f(5)`
     // binding `f(n: Long)`).
     if (builtinKindMismatch(pn, arg)) return true;
+    // A range/progression argument (`0..3`) is definitely not a scalar or array
+    // builtin parameter (Int/Long/String/Array/…). Without this, a class that
+    // overrides one overload — `get(Int, Int)` — of a method whose other
+    // overloads are inherited interface defaults — `get(IntRange, IntRange)` —
+    // captures a range-indexed call: the lone own candidate matches on arity, so
+    // the hierarchy walk never reaches the inherited range overload. Refuting the
+    // scalar param lets the walk fall through to it.
+    if (arg.* == .Range and overload_match.builtinParamKind(pn) != null) return true;
     // Only adjudicate when the parameter names a known user class.
     {
         const cg = self.classes.borrow();
