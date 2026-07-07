@@ -379,6 +379,10 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
             base.append(gpa, "--only-file") catch return 2;
             base.append(gpa, of) catch return 2;
         }
+        if (filter) |f| {
+            base.append(gpa, "--filter") catch return 2;
+            base.append(gpa, f) catch return 2;
+        }
         return commands.runTestsIsolated(gpa, self_exe, base.items, timeout_s);
     }
 
