@@ -1049,6 +1049,8 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
     // source that follows, so it must precede the source file.
     if (os == .macos and want_cocoa) run.addArgs(&.{ "-DKLIO_COCOA", "-x", "objective-c++" });
     run.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
+    // The bundled fallback font, baked into a byte array (scripts/gen-font-data.py).
+    run.addFileArg(b.path("src/compose_ui/font_data.cpp"));
     run.addArg("-o");
     const so = run.addOutputFileArg(skiaLibName(os));
 

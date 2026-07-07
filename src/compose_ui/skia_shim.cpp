@@ -101,6 +101,12 @@ const char* const kFontCandidates[] = {
     nullptr,
 };
 
+// The bundled fallback font (Noto Sans Mono, Latin subset), embedded by build.zig
+// as a byte array so text renders on hosts with no system fonts. Size 0 if the
+// font asset was unavailable at build time.
+extern "C" const unsigned char klio_embedded_font[];
+extern "C" const unsigned int klio_embedded_font_size;
+
 // Process-global font state, loaded once.
 sk_sp<SkFontMgr> g_fontMgr;
 sk_sp<SkTypeface> g_typeface;
@@ -114,6 +120,13 @@ void ensureFonts() {
         if (const char* env = std::getenv("KLIO_SKIA_FONT")) {
             g_typeface = g_fontMgr->makeFromFile(env, 0);
         }
+        // The bundled font is the default (self-contained, deterministic), used
+        // unless $KLIO_SKIA_FONT overrode it above.
+        if (!g_typeface && klio_embedded_font_size > 0) {
+            auto data = SkData::MakeWithoutCopy(klio_embedded_font, klio_embedded_font_size);
+            g_typeface = g_fontMgr->makeFromData(std::move(data));
+        }
+        // Last resort: a system font (only reached if the bundle is absent/failed).
         for (int i = 0; !g_typeface && kFontCandidates[i] != nullptr; ++i) {
             g_typeface = g_fontMgr->makeFromFile(kFontCandidates[i], 0);
         }
