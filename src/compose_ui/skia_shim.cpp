@@ -8,9 +8,10 @@
 // Colors are 0xAARRGGBB (Compose's packed ARGB). Coordinates are pixels.
 
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "include/core/SkCanvas.h"
 #include "include/core/SkColor.h"
@@ -34,8 +35,6 @@ namespace {
 
 struct KlioSurface {
     sk_sp<SkSurface> surface;
-    sk_sp<SkFontMgr> fontMgr;
-    sk_sp<SkTypeface> typeface;
 };
 
 // Common system font paths tried (in order) for text rendering, since the empty
@@ -53,6 +52,53 @@ const char* const kFontCandidates[] = {
     "C:\\Windows\\Fonts\\arial.ttf",
     nullptr,
 };
+
+// Process-global font state, loaded once.
+sk_sp<SkFontMgr> g_fontMgr;
+sk_sp<SkTypeface> g_typeface;
+bool g_fonts_tried = false;
+
+void ensureFonts() {
+    if (g_fonts_tried) return;
+    g_fonts_tried = true;
+    g_fontMgr = SkFontMgr_New_Custom_Empty();
+    if (g_fontMgr) {
+        if (const char* env = std::getenv("KLIO_SKIA_FONT")) {
+            g_typeface = g_fontMgr->makeFromFile(env, 0);
+        }
+        for (int i = 0; !g_typeface && kFontCandidates[i] != nullptr; ++i) {
+            g_typeface = g_fontMgr->makeFromFile(kFontCandidates[i], 0);
+        }
+    }
+}
+
+// A wrapped paragraph's line spacing.
+constexpr float kLineSpacing = 1.3f;
+
+// Greedily word-wrap `utf8` into lines that fit `width` px at font `font`.
+std::vector<std::string> wrapLines(const char* utf8, float width, const SkFont& font) {
+    std::vector<std::string> lines;
+    const std::string text(utf8);
+    std::string cur;
+    size_t i = 0;
+    while (i <= text.size()) {
+        const size_t sp = text.find(' ', i);
+        const bool last = (sp == std::string::npos);
+        const std::string word = text.substr(i, last ? std::string::npos : sp - i);
+        const std::string candidate = cur.empty() ? word : cur + " " + word;
+        const float w = font.measureText(candidate.c_str(), candidate.size(), SkTextEncoding::kUTF8);
+        if (w > width && !cur.empty()) {
+            lines.push_back(cur);
+            cur = word;
+        } else {
+            cur = candidate;
+        }
+        if (last) break;
+        i = sp + 1;
+    }
+    if (!cur.empty()) lines.push_back(cur);
+    return lines;
+}
 
 inline SkColor toColor(uint32_t argb) { return static_cast<SkColor>(argb); }
 
@@ -82,18 +128,7 @@ KlioSurface* klio_skia_new(int width, int height) {
         delete s;
         return nullptr;
     }
-    // A self-contained font manager (no system fontconfig dependency); load a
-    // typeface from $KLIO_SKIA_FONT or the first available system font. A miss
-    // leaves typeface null and text ops no-op.
-    s->fontMgr = SkFontMgr_New_Custom_Empty();
-    if (s->fontMgr) {
-        if (const char* env = std::getenv("KLIO_SKIA_FONT")) {
-            s->typeface = s->fontMgr->makeFromFile(env, 0);
-        }
-        for (int i = 0; !s->typeface && kFontCandidates[i] != nullptr; ++i) {
-            s->typeface = s->fontMgr->makeFromFile(kFontCandidates[i], 0);
-        }
-    }
+    ensureFonts();
     return s;
 }
 
@@ -142,13 +177,43 @@ void klio_skia_draw_line(KlioSurface* s, float x0, float y0, float x1, float y1,
 
 // Baseline-left text. `x`,`y` is the baseline origin. No-op if no typeface.
 void klio_skia_draw_text(KlioSurface* s, const char* utf8, float x, float y, float size, uint32_t argb) {
-    if (!s || !utf8 || !s->typeface) return;
-    SkFont font(s->typeface, size);
+    if (!s || !utf8 || !g_typeface) return;
+    SkFont font(g_typeface, size);
     font.setEdging(SkFont::Edging::kAntiAlias);
     SkPaint p;
     fillPaint(p, argb);
     s->surface->getCanvas()->drawSimpleText(
         utf8, std::strlen(utf8), SkTextEncoding::kUTF8, x, y, font, p);
+}
+
+// Lay out UTF-8 text within `width` px (word-wrapped, aligned: 0 left, 1 center,
+// 2 right) and paint it with its top-left at (x, y). No-op without a font.
+void klio_skia_draw_paragraph(KlioSurface* s, const char* utf8, float x, float y, float width, float size, uint32_t argb, int align) {
+    if (!s || !utf8 || !g_typeface) return;
+    SkFont font(g_typeface, size);
+    font.setEdging(SkFont::Edging::kAntiAlias);
+    SkPaint p;
+    fillPaint(p, argb);
+    const auto lines = wrapLines(utf8, width, font);
+    float baseline = y + size;  // first line's baseline sits `size` below the top
+    for (const auto& line : lines) {
+        const float lw = font.measureText(line.c_str(), line.size(), SkTextEncoding::kUTF8);
+        float lx = x;
+        if (align == 1) lx = x + (width - lw) * 0.5f;
+        else if (align == 2) lx = x + (width - lw);
+        s->surface->getCanvas()->drawSimpleText(line.c_str(), line.size(), SkTextEncoding::kUTF8, lx, baseline, font, p);
+        baseline += size * kLineSpacing;
+    }
+}
+
+// The laid-out height (px) of `utf8` wrapped to `width` at `size`. 0 without a
+// font. No surface needed, so the layout pass can call it to size a paragraph.
+float klio_skia_measure_paragraph(const char* utf8, float width, float size) {
+    ensureFonts();
+    if (!utf8 || !g_typeface) return 0;
+    SkFont font(g_typeface, size);
+    const int n = static_cast<int>(wrapLines(utf8, width, font).size());
+    return n * size * kLineSpacing;
 }
 
 // Encode the surface to a PNG file. Returns 0 on success, nonzero on failure.

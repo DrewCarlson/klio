@@ -24,6 +24,7 @@ fn ok(v: Value) EvalResult {
 pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("klio.compose.ui.__composeui_skiaRender", skiaRender);
+    try b.register("klio.compose.ui.__composeui_measureText", measureText);
     try b.register("klio.compose.ui.__composeui_winOpen", winOpen);
     try b.register("klio.compose.ui.__composeui_winRender", winRender);
     try b.register("klio.compose.ui.__composeui_winPoll", winPoll);
@@ -61,6 +62,8 @@ const Skia = struct {
     fillCircle: *const fn (?*SkSurface, f32, f32, f32, u32) callconv(.c) void,
     drawLine: *const fn (?*SkSurface, f32, f32, f32, f32, f32, u32) callconv(.c) void,
     drawText: *const fn (?*SkSurface, [*:0]const u8, f32, f32, f32, u32) callconv(.c) void,
+    drawParagraph: *const fn (?*SkSurface, [*:0]const u8, f32, f32, f32, f32, u32, c_int) callconv(.c) void,
+    measureParagraph: *const fn ([*:0]const u8, f32, f32) callconv(.c) f32,
     savePng: *const fn (?*SkSurface, [*:0]const u8) callconv(.c) c_int,
     encodePng: *const fn (?*SkSurface, *usize) callconv(.c) ?[*]u8,
     freeBuffer: *const fn ([*]u8) callconv(.c) void,
@@ -106,6 +109,8 @@ fn loadSkia() ?*Skia {
         .fillCircle = F.get(&lib, "fillCircle", "klio_skia_fill_circle") orelse return skiaLoadFail(&lib),
         .drawLine = F.get(&lib, "drawLine", "klio_skia_draw_line") orelse return skiaLoadFail(&lib),
         .drawText = F.get(&lib, "drawText", "klio_skia_draw_text") orelse return skiaLoadFail(&lib),
+        .drawParagraph = F.get(&lib, "drawParagraph", "klio_skia_draw_paragraph") orelse return skiaLoadFail(&lib),
+        .measureParagraph = F.get(&lib, "measureParagraph", "klio_skia_measure_paragraph") orelse return skiaLoadFail(&lib),
         .savePng = F.get(&lib, "savePng", "klio_skia_save_png") orelse return skiaLoadFail(&lib),
         .encodePng = F.get(&lib, "encodePng", "klio_skia_encode_png") orelse return skiaLoadFail(&lib),
         .freeBuffer = F.get(&lib, "freeBuffer", "klio_skia_free_buffer") orelse return skiaLoadFail(&lib),
@@ -185,6 +190,22 @@ fn skiaRender(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(@bitCast(h)));
 }
 
+/// `__composeui_measureText(text, width, size): Long` — the wrapped height (px,
+/// ceil'd) of `text` laid out to `width` at font `size`. 0 when Skia is
+/// unavailable, so the caller can fall back to an estimate.
+fn measureText(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3 or ctx.args[0] != .String) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const tg = ctx.args[0].String.borrow();
+    defer tg.deinit();
+    const text_z = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
+    defer ctx.allocator.free(text_z);
+    const width: f32 = @floatFromInt(@max(1, argInt(ctx.args[1])));
+    const size: f32 = @floatFromInt(@max(1, argInt(ctx.args[2])));
+    const h = skia.measureParagraph(text_z.ptr, width, size);
+    return ok(Value.newLong(@intFromFloat(@ceil(h))));
+}
+
 fn replay(skia: *Skia, surface: *SkSurface, list: []const u8) void {
     var lines = std.mem.splitScalar(u8, list, '\n');
     while (lines.next()) |line| {
@@ -239,6 +260,19 @@ fn replay(skia: *Skia, surface: *SkSurface, list: []const u8) void {
             @memcpy(buf[0..n], s[0..n]);
             buf[n] = 0;
             skia.drawText(surface, @ptrCast(&buf), x, y, size, color);
+        } else if (std.mem.eql(u8, op, "para")) {
+            const x = parseF32(it.next() orelse continue);
+            const y = parseF32(it.next() orelse continue);
+            const w = parseF32(it.next() orelse continue);
+            const size = parseF32(it.next() orelse continue);
+            const alignment: c_int = std.fmt.parseInt(c_int, it.next() orelse continue, 10) catch 0;
+            const color = parseU32Hex(it.next() orelse continue);
+            const s = std.mem.trimStart(u8, it.rest(), " ");
+            var buf: [2048]u8 = undefined;
+            const n = @min(s.len, buf.len - 1);
+            @memcpy(buf[0..n], s[0..n]);
+            buf[n] = 0;
+            skia.drawParagraph(surface, @ptrCast(&buf), x, y, w, size, color, alignment);
         }
     }
 }
@@ -315,11 +349,12 @@ test "hostBindings registers the skia render + windowing sinks" {
     var b = try hostBindings(testing.allocator);
     defer b.deinit();
     try testing.expect(b.resolve("klio.compose.ui.__composeui_skiaRender") != null);
+    try testing.expect(b.resolve("klio.compose.ui.__composeui_measureText") != null);
     try testing.expect(b.resolve("klio.compose.ui.__composeui_winOpen") != null);
     try testing.expect(b.resolve("klio.compose.ui.__composeui_winRender") != null);
     try testing.expect(b.resolve("klio.compose.ui.__composeui_winPoll") != null);
     try testing.expect(b.resolve("klio.compose.ui.__composeui_winClose") != null);
-    try testing.expectEqual(@as(usize, 5), b.len());
+    try testing.expectEqual(@as(usize, 6), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

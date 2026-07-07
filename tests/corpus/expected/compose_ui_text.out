@@ -1,0 +1,5 @@
+rect 0 0 64 68 FF10141A
+para 2 2 60 5 0 FFFFFFFF The quick brown fox jumps over the lazy dog and wraps neatly.
+para 2 39 60 5 1 FF00BCD4 A centered heading
+para 2 55 60 5 2 FF4CAF50 right aligned note
+

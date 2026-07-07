@@ -169,9 +169,20 @@ types. A `TextField` composable (click to focus, type, Backspace). Demo:
 updates it + a greeting, the button highlights on hover, and the window resizes +
 relayouts.
 
-Later: a GPU surface (`libskia_ganesh_ext` + GL/EGL), bundling a `.ttf` +
-`skparagraph` text layout (wrapping/alignment), macOS (Cocoa) / windows (Win32)
-window backends, and verifying the macos/windows shim recipes on those hosts.
+**Better text — DONE (word-wrap).** A `Paragraph` composable lays out word-wrapped,
+multi-line, aligned (left/center/right) text within a fixed width. The shim
+(`klio_skia_draw_paragraph` / `klio_skia_measure_paragraph`) greedily wraps with
+`SkFont::measureText` and paints line by line; the pack emits a `para` display-list
+op and sizes the box via a `__composeui_measureText` intrinsic (real font metrics
+when the backend is loaded, else a nominal-advance estimate for headless layout).
+Demo/corpus: `examples/compose_ui_text.kt`. (skparagraph proper was tried first but
+the prebuilt libs' bundled ICU data ships under a skiko-renamed symbol
+`icudt_skiko74_dat` that ICU's loader does not pick up, so full shaping/BiDi is
+deferred; SkFont wrapping covers Latin UI text.)
+
+Later: a GPU surface (`libskia_ganesh_ext` + GL/EGL), bundling a `.ttf` for
+fontless hosts, macOS (Cocoa) / windows (Win32) window backends, and verifying the
+macos/windows shim recipes on those hosts.
 
 ### Vendor the real compose.ui / foundation / material
 

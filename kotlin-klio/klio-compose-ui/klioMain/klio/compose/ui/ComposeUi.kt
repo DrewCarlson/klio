@@ -84,6 +84,14 @@ class DisplayList {
             .append(hex(argb)).append(' ').append(s).append('\n')
     }
 
+    // Word-wrapped, aligned text (align: 0 left, 1 center, 2 right) with its
+    // top-left at (x, y), wrapped within w px.
+    fun paragraph(x: Int, y: Int, w: Int, size: Int, align: Int, argb: Int, s: String) {
+        sb.append("para ").append(x).append(' ').append(y).append(' ').append(w).append(' ')
+            .append(size).append(' ').append(align).append(' ').append(hex(argb)).append(' ')
+            .append(s).append('\n')
+    }
+
     fun encoded(): String = sb.toString()
 }
 
@@ -103,6 +111,17 @@ private fun clamp(value: Int, lo: Int, hi: Int): Int {
 // agree without a font-metric round trip through the backend.
 private const val GLYPH_H = 5
 private const val GLYPH_ADVANCE = 4 // per-character width incl. gap
+
+// The wrapped height (layout units) of [s] word-wrapped to [width]. Uses the Skia
+// backend's real font metrics when available; otherwise estimates from the nominal
+// mono advance so headless layout (no backend) still sizes paragraphs.
+private fun paragraphHeight(s: String, width: Int): Int {
+    val measured = __composeui_measureText(s, width, GLYPH_H).toInt()
+    if (measured > 0) return measured
+    val perLine = if (width / GLYPH_ADVANCE > 0) width / GLYPH_ADVANCE else 1
+    val lines = (s.length + perLine - 1) / perLine
+    return (if (lines < 1) 1 else lines) * ((GLYPH_H * 13 + 9) / 10)
+}
 
 // ----- modifier -----
 
@@ -173,6 +192,8 @@ class LayoutNode {
     var offsetY = 0
     var text: String = ""
     var textColor: Color? = null
+    var wrapWidth = 0 // >0: paragraph mode, word-wrapped to this width (layout units)
+    var textAlign = 0 // 0 left, 1 center, 2 right
 
     fun measure(constraints: Constraints) {
         val pad = modifier.padding
@@ -187,8 +208,13 @@ class LayoutNode {
         var contentW = 0
         var contentH = 0
         if (text.isNotEmpty()) {
-            contentW = text.length * GLYPH_ADVANCE - 1
-            contentH = GLYPH_H
+            if (wrapWidth > 0) {
+                contentW = wrapWidth
+                contentH = paragraphHeight(text, wrapWidth)
+            } else {
+                contentW = text.length * GLYPH_ADVANCE - 1
+                contentH = GLYPH_H
+            }
         }
         if (arrangement == "Row") {
             var cursor = 0
@@ -257,11 +283,17 @@ class LayoutNode {
         if (text.isNotEmpty()) {
             val fg = textColor ?: Color.White
             val size = GLYPH_H * scale
-            // Skia text origin is the baseline; place it a glyph-height below the
-            // padded top-left so it sits inside the box.
-            val tx = (originX + pad) * scale
-            val baseline = (originY + pad) * scale + size
-            list.drawText(tx, baseline, size, fg.argb, text)
+            if (wrapWidth > 0) {
+                // Paragraph: the backend wraps within w px and offsets the baseline
+                // itself, so pass the padded top-left as the origin.
+                list.paragraph((originX + pad) * scale, (originY + pad) * scale, wrapWidth * scale, size, textAlign, fg.argb, text)
+            } else {
+                // Skia text origin is the baseline; place it a glyph-height below
+                // the padded top-left so it sits inside the box.
+                val tx = (originX + pad) * scale
+                val baseline = (originY + pad) * scale + size
+                list.drawText(tx, baseline, size, fg.argb, text)
+            }
         }
         for (child in children) {
             child.draw(list, originX + child.offsetX, originY + child.offsetY, scale, hits)
@@ -385,6 +417,40 @@ fun Text(text: String, color: Color, modifier: Modifier) {
 @Composable
 fun Text(text: String, color: Color) {
     Text(text, color, Modifier.None)
+}
+
+// Text alignment for [Paragraph].
+const val ALIGN_LEFT = 0
+const val ALIGN_CENTER = 1
+const val ALIGN_RIGHT = 2
+
+/**
+ * Word-wrapped, multi-line text laid out within [width] layout units and aligned
+ * ([ALIGN_LEFT]/[ALIGN_CENTER]/[ALIGN_RIGHT]). The Skia backend wraps on real font
+ * metrics; headless layout estimates the line count. Unlike [Text] (single line),
+ * this grows in height to fit.
+ */
+@Composable
+fun Paragraph(text: String, color: Color, width: Int, align: Int, modifier: Modifier) {
+    ComposeNode<LayoutNode, LayoutNodeApplier>(
+        factory = {
+            val n = LayoutNode()
+            n.arrangement = "Box"
+            n
+        },
+        update = {
+            set(text) { this.text = it }
+            set(color) { this.textColor = it }
+            set(width) { this.wrapWidth = it }
+            set(align) { this.textAlign = it }
+            set(modifier) { this.modifier = it }
+        },
+    )
+}
+
+@Composable
+fun Paragraph(text: String, color: Color, width: Int) {
+    Paragraph(text, color, width, ALIGN_LEFT, Modifier.None)
 }
 
 /**
