@@ -159,6 +159,15 @@ fn evalGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value)
         const msg = try std.fmt.allocPrint(allocator, "getter FuncId {d} out of range", .{fid.int()});
         return errRes(.{ .Type = msg });
     };
+    // Pin the receiver as a GC root across the getter's re-entrant evaluation.
+    // A getter body allocates and hits safe points; the only handle to the
+    // receiver here is this native local (the frame-chain walk cannot see it
+    // until the new frame's params are installed), so a collection mid-getter
+    // would otherwise sweep it — and everything transitively reachable through
+    // it, which the getter is about to read.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePush(receiver);
     var args: std.ArrayList(Value) = .empty;
     defer args.deinit(allocator);
     try args.append(allocator, receiver);
