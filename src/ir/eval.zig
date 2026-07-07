@@ -4006,6 +4006,33 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 }
             }
         }
+        // Smart-cast pass: a DEFERRED bare extension call (no committed target)
+        // inside an extension body pinned the DECLARED receiver type for the
+        // strict/lenient probes. When those found nothing, the receiver value
+        // may be a subtype the receiver was narrowed to by a smart-cast
+        // (`fun Source.f() { if (this is Buffer) commonReadUtf8CodePoint() }`,
+        // whose target is `fun Buffer.commonReadUtf8CodePoint()`), so retry by
+        // the receiver's RUNTIME type. Guarded to `resolved == null` and no
+        // committed extension: there is no static candidate to conflict with,
+        // so this cannot re-pick a sibling the static evidence excluded.
+        if (resolved == null and static_recv_ty != null and committed_ext_h == null) {
+            for (cands) |c| {
+                switch (try host.callMemberStrictExt(allocator, &c.v, name_str, arg_values, names, null)) {
+                    .ok => |v| {
+                        orAudit("CallMemberOrGlobal", name_str, "smartcast_ext", c.depth, &c.v);
+                        resolved = v;
+                        break;
+                    },
+                    .err => |e| switch (e) {
+                        .Suspended, .CalleeFailed, .Throw, .NonLocalReturn, .LabeledReturn => return raiseStep(frame, e),
+                        .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
+                        else => if (first_real_err == null) {
+                            first_real_err = e;
+                        },
+                    },
+                }
+            }
+        }
     }
     var result: Value = undefined;
     if (resolved == null) {
