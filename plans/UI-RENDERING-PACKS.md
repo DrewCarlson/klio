@@ -135,9 +135,31 @@ hashes. CI runs `scripts/fetch-skia.sh` once (like the kotlin checkout).
    (renamed from `_ppm`) prints the list + calls `savePng`. The corpus was
    regenerated; check_examples/differential/e2e green.
 
-Later: a GPU surface (`libskia_ganesh_ext` + GL/EGL), a platform window + live input
-event loop, bundling a `.ttf` + `skparagraph` text layout, and verifying the macos/
-windows shim recipes on those hosts.
+**Windowing — DONE (X11).** A live on-screen window + input loop: the shim
+(`skia_shim.cpp`, `-DKLIO_X11` when build.zig finds the X11 headers/lib) opens an X
+window and blits the Skia raster surface (N32 premul == X TrueColor BGRX) with
+XPutImage; `klio_win_open`/`_surface`/`_present`/`_poll`/`_close`. Zig wraps them as
+`__composeui_win{Open,Render,Poll,Close}` host intrinsics; the pack's `runApp(w, h,
+scale, title, maxFrames, content)` runs the render → present → poll → dispatch loop.
+`examples/compose_ui_window.kt` — verified end-to-end (screenshotted): a real
+window renders the UI, and xdotool clicks on the ADD button drive
+hit-test → state → recompose → redraw (COUNT increments live). Headless-safe:
+`winOpen` returns 0 with no backend, so `runApp` returns immediately (no corpus
+output). macOS (Cocoa) / windows (Win32) window backends are the per-OS follow-up.
+
+**Open bug this surfaced (compose runtime, not windowing):** `var x by remember {
+mutableStateOf(0) }` inside a `@Composable` does not persist writes across
+recomposition — reads show the initial value forever. Isolated: standalone `var x by
+mutableStateOf(0)` works (0→5→8); `val s = remember { mutableStateOf(0) }` + `s.value`
+works and recomposes; ONLY the `by` + `remember` + composable combination fails. So
+the property-delegate desugaring of a `remember`ed `MutableState` mis-slots or
+mis-binds the delegate in the composition. `compose_ui_window.kt` uses the working
+`remember { mutableStateOf }` + `.value` form; the `by` form needs the interpreter
+fix.
+
+Later: a GPU surface (`libskia_ganesh_ext` + GL/EGL), keyboard/pointer-move/resize
+input, bundling a `.ttf` + `skparagraph` text layout, macOS/windows window backends,
+and verifying the macos/windows shim recipes on those hosts.
 
 ### Vendor the real compose.ui / foundation / material
 

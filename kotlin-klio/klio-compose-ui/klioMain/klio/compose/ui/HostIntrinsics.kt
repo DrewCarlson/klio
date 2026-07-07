@@ -19,6 +19,25 @@ internal fun __composeui_skiaRender(
 /// Render a raw draw-op display list to a PNG via the Skia backend. Ops are
 /// newline-separated; colors are 8-hex-digit ARGB:
 ///   clear AARRGGBB · rect x y w h C · srect x y w h stroke C · rrect x y w h rx ry C
-///   · circle cx cy r C · line x0 y0 x1 y1 stroke C
+///   · circle cx cy r C · line x0 y0 x1 y1 stroke C · text x y size C <utf8>
 fun renderDisplayListToPng(path: String, width: Int, height: Int, displayList: String): Long =
     __composeui_skiaRender(path, width, height, displayList)
+
+// Windowing intrinsics (Skia + X11 backend). All degrade gracefully (winOpen
+// returns 0, winPoll reports close) when no windowing backend is present.
+
+// Opens a window and returns its handle (0 on failure).
+internal fun __composeui_winOpen(width: Int, height: Int, title: String): Long =
+    error("intrinsic klio.compose.ui.__composeui_winOpen not installed")
+
+// Replays the display list into the window's surface and presents it.
+internal fun __composeui_winRender(handle: Long, displayList: String): Long =
+    error("intrinsic klio.compose.ui.__composeui_winRender not installed")
+
+// Waits up to timeoutMs for an event; returns (type << 32) | (x << 16) | y,
+// type 0 none, 1 click, 2 close.
+internal fun __composeui_winPoll(handle: Long, timeoutMs: Int): Long =
+    error("intrinsic klio.compose.ui.__composeui_winPoll not installed")
+
+internal fun __composeui_winClose(handle: Long): Long =
+    error("intrinsic klio.compose.ui.__composeui_winClose not installed")

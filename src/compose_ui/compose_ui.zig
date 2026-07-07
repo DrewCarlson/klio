@@ -24,6 +24,10 @@ fn ok(v: Value) EvalResult {
 pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("klio.compose.ui.__composeui_skiaRender", skiaRender);
+    try b.register("klio.compose.ui.__composeui_winOpen", winOpen);
+    try b.register("klio.compose.ui.__composeui_winRender", winRender);
+    try b.register("klio.compose.ui.__composeui_winPoll", winPoll);
+    try b.register("klio.compose.ui.__composeui_winClose", winClose);
     return b;
 }
 
@@ -43,6 +47,7 @@ fn argInt(v: Value) i64 {
 // ---------------------------------------------------------------------------
 
 const SkSurface = anyopaque;
+const SkWindow = anyopaque;
 
 /// The dlopened Skia shim entry points (see src/compose_ui/skia_shim.cpp).
 const Skia = struct {
@@ -59,6 +64,11 @@ const Skia = struct {
     savePng: *const fn (?*SkSurface, [*:0]const u8) callconv(.c) c_int,
     encodePng: *const fn (?*SkSurface, *usize) callconv(.c) ?[*]u8,
     freeBuffer: *const fn ([*]u8) callconv(.c) void,
+    winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
+    winSurface: *const fn (?*SkWindow) callconv(.c) ?*SkSurface,
+    winPresent: *const fn (?*SkWindow) callconv(.c) void,
+    winPoll: *const fn (?*SkWindow, c_int, *c_int, *c_int) callconv(.c) c_int,
+    winClose: *const fn (?*SkWindow) callconv(.c) void,
 };
 
 var skia_state: ?Skia = null;
@@ -99,6 +109,11 @@ fn loadSkia() ?*Skia {
         .savePng = F.get(&lib, "savePng", "klio_skia_save_png") orelse return skiaLoadFail(&lib),
         .encodePng = F.get(&lib, "encodePng", "klio_skia_encode_png") orelse return skiaLoadFail(&lib),
         .freeBuffer = F.get(&lib, "freeBuffer", "klio_skia_free_buffer") orelse return skiaLoadFail(&lib),
+        .winOpen = F.get(&lib, "winOpen", "klio_win_open") orelse return skiaLoadFail(&lib),
+        .winSurface = F.get(&lib, "winSurface", "klio_win_surface") orelse return skiaLoadFail(&lib),
+        .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
+        .winPoll = F.get(&lib, "winPoll", "klio_win_poll") orelse return skiaLoadFail(&lib),
+        .winClose = F.get(&lib, "winClose", "klio_win_close") orelse return skiaLoadFail(&lib),
     };
     skia_state = s;
     return &skia_state.?;
@@ -228,13 +243,83 @@ fn replay(skia: *Skia, surface: *SkSurface, list: []const u8) void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Windowing intrinsics — open an on-screen window, replay a display list into
+// it each frame, and pump input events. The window handle is passed to Kotlin as
+// a Long (the KlioWindow pointer). All no-op / report "closed" when Skia or a
+// windowing backend is unavailable, so a headless build degrades gracefully.
+// ---------------------------------------------------------------------------
+
+/// `__composeui_winOpen(width, height, title): Long` — the window handle, or 0.
+fn winOpen(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3 or ctx.args[2] != .String) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const w: c_int = @intCast(@max(1, argInt(ctx.args[0])));
+    const h: c_int = @intCast(@max(1, argInt(ctx.args[1])));
+    const tg = ctx.args[2].String.borrow();
+    defer tg.deinit();
+    const title_z = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
+    defer ctx.allocator.free(title_z);
+    const win = skia.winOpen(w, h, title_z.ptr) orelse return ok(Value.newLong(0));
+    return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(win)))));
+}
+
+/// `__composeui_winRender(handle, displayList): Long` — replay the list into the
+/// window's surface and present it. Returns 1 on success, 0 otherwise.
+fn winRender(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const surface = skia.winSurface(win) orelse return ok(Value.newLong(0));
+    const dg = ctx.args[1].String.borrow();
+    defer dg.deinit();
+    replay(skia, surface, dg.get().bytes);
+    skia.winPresent(win);
+    return ok(Value.newLong(1));
+}
+
+/// `__composeui_winPoll(handle, timeoutMs): Long` — wait up to timeoutMs for an
+/// event; returns `(type << 32) | (x << 16) | y` where type is 0 none, 1 click,
+/// 2 close.
+fn winPoll(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newLong(2 << 32));
+    const skia = loadSkia() orelse return ok(Value.newLong(2 << 32));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(2 << 32));
+    const timeout: c_int = @intCast(@max(0, argInt(ctx.args[1])));
+    var x: c_int = 0;
+    var y: c_int = 0;
+    const t = skia.winPoll(win, timeout, &x, &y);
+    const packed_ev: i64 = (@as(i64, t) << 32) |
+        (@as(i64, @intCast(std.math.clamp(x, 0, 0xFFFF))) << 16) |
+        @as(i64, @intCast(std.math.clamp(y, 0, 0xFFFF)));
+    return ok(Value.newLong(packed_ev));
+}
+
+/// `__composeui_winClose(handle): Long`
+fn winClose(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (winHandle(ctx.args[0])) |win| skia.winClose(win);
+    return ok(Value.newLong(0));
+}
+
+fn winHandle(v: Value) ?*SkWindow {
+    const h: u64 = @bitCast(argInt(v));
+    if (h == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(h)));
+}
+
 const testing = std.testing;
 
-test "hostBindings registers the skia render sink" {
+test "hostBindings registers the skia render + windowing sinks" {
     var b = try hostBindings(testing.allocator);
     defer b.deinit();
     try testing.expect(b.resolve("klio.compose.ui.__composeui_skiaRender") != null);
-    try testing.expectEqual(@as(usize, 1), b.len());
+    try testing.expect(b.resolve("klio.compose.ui.__composeui_winOpen") != null);
+    try testing.expect(b.resolve("klio.compose.ui.__composeui_winRender") != null);
+    try testing.expect(b.resolve("klio.compose.ui.__composeui_winPoll") != null);
+    try testing.expect(b.resolve("klio.compose.ui.__composeui_winClose") != null);
+    try testing.expectEqual(@as(usize, 5), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

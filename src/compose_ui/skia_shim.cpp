@@ -8,6 +8,7 @@
 // Colors are 0xAARRGGBB (Compose's packed ARGB). Coordinates are pixels.
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -181,3 +182,129 @@ uint8_t* klio_skia_encode_png(KlioSurface* s, size_t* out_len) {
 void klio_skia_free_buffer(uint8_t* buf) { std::free(buf); }
 
 }  // extern "C"
+
+// ---------------------------------------------------------------------------
+// Windowing — a live on-screen surface + input event loop. X11 only for now
+// (enabled by -DKLIO_X11 when build.zig finds the X11 headers + lib); the raster
+// surface (N32 premul == X TrueColor BGRX) is blitted with XPutImage. macOS
+// (Cocoa) / Windows (Win32) get their own backends later; without a backend the
+// window functions return failure so the pack falls back to headless rendering.
+// ---------------------------------------------------------------------------
+
+#if defined(KLIO_X11)
+
+#include <sys/select.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+
+struct KlioWindow {
+    Display* dpy;
+    Window win;
+    GC gc;
+    Atom wmDelete;
+    int w;
+    int h;
+    KlioSurface* surface;
+};
+
+extern "C" {
+
+KlioWindow* klio_win_open(int w, int h, const char* title) {
+    if (w <= 0 || h <= 0) return nullptr;
+    Display* dpy = XOpenDisplay(nullptr);
+    if (!dpy) return nullptr;
+    int screen = DefaultScreen(dpy);
+    Window root = RootWindow(dpy, screen);
+    Window win = XCreateSimpleWindow(dpy, root, 0, 0, static_cast<unsigned>(w),
+                                     static_cast<unsigned>(h), 0,
+                                     BlackPixel(dpy, screen), BlackPixel(dpy, screen));
+    if (title) XStoreName(dpy, win, title);
+    XSelectInput(dpy, win, ExposureMask | ButtonPressMask | KeyPressMask | StructureNotifyMask);
+    Atom wmDelete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(dpy, win, &wmDelete, 1);
+    XMapWindow(dpy, win);
+    GC gc = XCreateGC(dpy, win, 0, nullptr);
+    XFlush(dpy);
+
+    auto* kw = new KlioWindow{dpy, win, gc, wmDelete, w, h, nullptr};
+    kw->surface = klio_skia_new(w, h);
+    if (!kw->surface) {
+        XCloseDisplay(dpy);
+        delete kw;
+        return nullptr;
+    }
+    return kw;
+}
+
+// The surface the caller replays the display list onto before presenting.
+KlioSurface* klio_win_surface(KlioWindow* kw) { return kw ? kw->surface : nullptr; }
+
+// Blit the surface to the window.
+void klio_win_present(KlioWindow* kw) {
+    if (!kw || !kw->surface) return;
+    SkPixmap pm;
+    if (!kw->surface->surface->peekPixels(&pm)) return;
+    Visual* visual = DefaultVisual(kw->dpy, DefaultScreen(kw->dpy));
+    XImage* img = XCreateImage(kw->dpy, visual, 24, ZPixmap, 0,
+                               const_cast<char*>(static_cast<const char*>(pm.addr())),
+                               static_cast<unsigned>(kw->w), static_cast<unsigned>(kw->h),
+                               32, static_cast<int>(pm.rowBytes()));
+    if (!img) return;
+    XPutImage(kw->dpy, kw->win, kw->gc, img, 0, 0, 0, 0,
+              static_cast<unsigned>(kw->w), static_cast<unsigned>(kw->h));
+    img->data = nullptr;  // Skia owns the pixels; don't let XDestroyImage free them.
+    XDestroyImage(img);
+    XFlush(kw->dpy);
+}
+
+// Wait up to timeoutMs for one event. Returns: 0 none/redraw, 1 click (writes
+// *outX/*outY), 2 close requested.
+int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outX, int* outY) {
+    if (!kw) return 2;
+    if (!XPending(kw->dpy)) {
+        int fd = ConnectionNumber(kw->dpy);
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+        struct timeval tv;
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        select(fd + 1, &fds, nullptr, nullptr, &tv);
+        if (!XPending(kw->dpy)) return 0;
+    }
+    XEvent ev;
+    XNextEvent(kw->dpy, &ev);
+    if (ev.type == ButtonPress) {
+        if (outX) *outX = ev.xbutton.x;
+        if (outY) *outY = ev.xbutton.y;
+        return 1;
+    }
+    if (ev.type == ClientMessage &&
+        static_cast<Atom>(ev.xclient.data.l[0]) == kw->wmDelete) {
+        return 2;
+    }
+    return 0;  // Expose / configure / key — the caller re-presents each loop.
+}
+
+void klio_win_close(KlioWindow* kw) {
+    if (!kw) return;
+    if (kw->surface) klio_skia_free(kw->surface);
+    XFreeGC(kw->dpy, kw->gc);
+    XDestroyWindow(kw->dpy, kw->win);
+    XCloseDisplay(kw->dpy);
+    delete kw;
+}
+
+}  // extern "C"
+
+#else  // no windowing backend (non-X11 build)
+
+extern "C" {
+void* klio_win_open(int, int, const char*) { return nullptr; }
+void* klio_win_surface(void*) { return nullptr; }
+void klio_win_present(void*) {}
+int klio_win_poll(void*, int, int*, int*) { return 2; }
+void klio_win_close(void*) {}
+}  // extern "C"
+
+#endif

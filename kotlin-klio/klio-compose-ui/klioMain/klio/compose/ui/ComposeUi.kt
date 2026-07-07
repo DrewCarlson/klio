@@ -512,6 +512,47 @@ class UiRenderer internal constructor(
     }
 }
 
+/**
+ * Open a window ([width]*[scale] x [height]*[scale] px) and run the Compose UI
+ * event loop: render the current frame via Skia, present it, wait for input, and
+ * dispatch pointer clicks (→ state write → recompose → redraw) until the window is
+ * closed. Runs at most [maxFrames] loop iterations (a negative value runs until
+ * close), which keeps it testable/headless — with no windowing backend
+ * (`winOpen` returns 0) it returns immediately.
+ */
+fun runApp(
+    width: Int,
+    height: Int,
+    scale: Int,
+    title: String,
+    maxFrames: Int,
+    content: @Composable () -> Unit,
+) {
+    val ui = uiRenderer(width, height, content)
+    val handle = __composeui_winOpen(width * scale, height * scale, title)
+    if (handle == 0L) {
+        ui.dispose()
+        return
+    }
+    var frame = 0
+    var running = true
+    while (running && (maxFrames < 0 || frame < maxFrames)) {
+        __composeui_winRender(handle, ui.displayList(scale))
+        val ev = __composeui_winPoll(handle, 100)
+        val type = (ev shr 32).toInt()
+        if (type == 2) {
+            running = false
+        } else if (type == 1) {
+            val x = ((ev shr 16) and 0xFFFF).toInt() / scale
+            val y = (ev and 0xFFFF).toInt() / scale
+            ui.click(x, y, scale)
+        }
+        frame += 1
+    }
+    __composeui_winClose(handle)
+    ui.dispose()
+}
+
 /** Compose [content] into a UI tree rendered onto a [width] x [height] canvas. */
 fun uiRenderer(width: Int, height: Int, content: @Composable () -> Unit): UiRenderer {
     val root = LayoutNode()
