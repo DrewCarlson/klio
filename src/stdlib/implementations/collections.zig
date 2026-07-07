@@ -2417,7 +2417,7 @@ fn mapOfImpl(ctx: *CallCtx, mutable: bool, who: []const u8) Error!EvalResult {
     // Entries hold borrowed key/value (read from the Pair args the caller owns).
     // Dedupe over the still-borrowed entries, then makeMapBorrowed retains the
     // survivors so the map owns one ref per key+value.
-    return ok(try makeMapBorrowed(a, try dedupeMapInPlace(a, entries), mutable));
+    return ok(try makeMapBorrowed(a, try dedupeMapInPlaceH(ctx.host, ctx.out, a, entries), mutable));
 }
 
 /// Apply make_map dedupe semantics to an already-collected entry list.
@@ -2425,6 +2425,19 @@ fn dedupeMapInPlace(a: Allocator, entries: std.ArrayList(MapPair)) Error!std.Arr
     var out: std.ArrayList(MapPair) = .empty;
     for (entries.items) |kv| {
         if (findKeyIndexBoxed(out.items, &kv.key)) |i| {
+            out.items[i].value = kv.value;
+        } else {
+            try out.append(a, kv);
+        }
+    }
+    return out;
+}
+
+/// `dedupeMapInPlace` honouring a user key `equals` (dispatched through the VM).
+fn dedupeMapInPlaceH(host: IntrinsicHost, out_w: Output, a: Allocator, entries: std.ArrayList(MapPair)) Error!std.ArrayList(MapPair) {
+    var out: std.ArrayList(MapPair) = .empty;
+    for (entries.items) |kv| {
+        if (try findKeyIndexBoxedH(host, out_w, out.items, &kv.key)) |i| {
             out.items[i].value = kv.value;
         } else {
             try out.append(a, kv);
