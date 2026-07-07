@@ -13,3 +13,6 @@ root = "klioMain"
 
 [[deps]]
 id = "stdlib"
+
+[[test]]
+root = "upstream/kotlinx-coroutines-core/common/test"
