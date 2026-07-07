@@ -2690,7 +2690,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     // `equals`), dispatch on the Instance instead. Structural
                     // equality is symmetric, so the result is identical and a
                     // builtin receiver need not implement `equals(Instance)`.
-                    const swap = (bo.op == .Eq or bo.op == .BoxedEq) and l != .Instance and r == .Instance;
+                    const swap = (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) and l != .Instance and r == .Instance;
                     const recv_ptr = if (swap) &r else &l;
                     const arg_val = if (swap) l else r;
                     // Strict extension dispatch: an operator extension whose
@@ -2713,10 +2713,12 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                                         .err => |e2| return raiseStep(frame, e2),
                                     }
                                     result = l;
-                                } else if (bo.op == .Eq or bo.op == .BoxedEq) {
+                                } else if (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) {
                                     // No user `equals` surface: Kotlin's
-                                    // default is structural/identity equality.
-                                    result = .{ .Bool = if (bo.op == .BoxedEq)
+                                    // default is structural/identity equality
+                                    // (`!=` negates it below).
+                                    const boxed = bo.op == .BoxedEq or bo.op == .BoxedNotEq;
+                                    result = .{ .Bool = if (boxed)
                                         Value.structuralEqBoxed(&l, &r)
                                     else
                                         Value.structuralEq(&l, &r) };
@@ -2733,6 +2735,8 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                         .LessEq => .{ .Bool = if (valueToI64(&result)) |i| i <= 0 else false },
                         .Greater => .{ .Bool = if (valueToI64(&result)) |i| i > 0 else false },
                         .GreaterEq => .{ .Bool = if (valueToI64(&result)) |i| i >= 0 else false },
+                        // `!=`: negate the `equals` result.
+                        .NotEq, .BoxedNotEq => if (result == .Bool) Value{ .Bool = !result.Bool } else result,
                         else => result,
                     };
                     try frame.write(bo.dst, final_val);
@@ -4859,6 +4863,10 @@ fn operatorMethod(op: BinOp) ?[]const u8 {
         .Div => "div",
         .Mod => "rem",
         .Eq, .BoxedEq => "equals",
+        // `!=` dispatches `equals` too, then negates (see the operator-method
+        // caller); without this a user `!=` fell through to structural/identity
+        // comparison and `a != b` was true even when `a == b`.
+        .NotEq, .BoxedNotEq => "equals",
         .Less, .LessEq, .Greater, .GreaterEq => "compareTo",
         .RangeTo => "rangeTo",
         .RangeUntil => "rangeUntil",
