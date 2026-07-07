@@ -39,9 +39,12 @@ internal fun __klsx_construct(kClass: Any?, args: List<Any?>): Any? =
     error("intrinsic kotlinx.serialization.__klsx_construct not installed")
 
 // A minimal SerialDescriptor over a fixed element-name list. Kind is
-// StructureKind.CLASS; element descriptors fall back to `this` (the
-// reflective path never inspects nested element descriptors — it
-// recurses through DynamicValueSerializer at decode time instead).
+// StructureKind.CLASS. The reflective path is type-erased (element values
+// flow through DynamicValueSerializer at encode/decode time), so it cannot
+// name the concrete per-element type; `getElementDescriptor` returns a
+// neutral 0-element descriptor. It must NOT return `this` — a consumer that
+// walks element descriptors (e.g. a descriptor-equality test) would then
+// recurse without bound.
 internal class ReflectiveDescriptor(
     override val serialName: String,
     private val names: List<String>
@@ -51,9 +54,24 @@ internal class ReflectiveDescriptor(
     override fun getElementName(index: Int): String = names[index]
     override fun getElementIndex(name: String): Int = names.indexOf(name)
     override fun getElementAnnotations(index: Int): List<Annotation> = emptyList()
-    override fun getElementDescriptor(index: Int): SerialDescriptor = this
+    override fun getElementDescriptor(index: Int): SerialDescriptor = ReflectiveElementDescriptor
     override fun isElementOptional(index: Int): Boolean = false
     override fun toString(): String = "ReflectiveDescriptor($serialName)"
+}
+
+// The neutral, terminal element descriptor the type-erased reflective path
+// hands back for every element: zero elements, so a recursive descriptor walk
+// terminates instead of looping through `this`.
+internal object ReflectiveElementDescriptor : SerialDescriptor {
+    override val serialName: String get() = "kotlinx.serialization.Dynamic"
+    override val kind: SerialKind get() = StructureKind.CLASS
+    override val elementsCount: Int get() = 0
+    override fun getElementName(index: Int): String = throw IndexOutOfBoundsException()
+    override fun getElementIndex(name: String): Int = -1
+    override fun getElementAnnotations(index: Int): List<Annotation> = emptyList()
+    override fun getElementDescriptor(index: Int): SerialDescriptor = throw IndexOutOfBoundsException()
+    override fun isElementOptional(index: Int): Boolean = false
+    override fun toString(): String = "ReflectiveElementDescriptor"
 }
 
 // Serializes any single element by routing through the format's
