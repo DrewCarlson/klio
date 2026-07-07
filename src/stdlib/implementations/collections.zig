@@ -2951,11 +2951,47 @@ pub fn coll_array_join_to_string(ctx: *CallCtx) Error!EvalResult {
     return joinToStringImpl(ctx, items, false);
 }
 
+/// Render one collection element/key/value: a user Instance via its own
+/// `toString()` (dispatched through the VM); everything else via `display`.
+/// Caller owns the returned slice.
+fn elemPiece(ctx: *CallCtx, v: Value) Error![]u8 {
+    const a = ctx.allocator;
+    if (v == .Instance) {
+        if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |mr| {
+            if (mr == .ok and mr.ok == .String) {
+                const g = mr.ok.String.borrow();
+                defer g.deinit();
+                return try a.dupe(u8, g.get().bytes);
+            }
+        }
+    }
+    return try display(a, v);
+}
+
 fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
     if (try sublistComodGuard(a, &ctx.args[0])) |e| return e;
     const recv = ctx.args[0];
+    if (recv == .Map) {
+        const entries = try snapshotEntries(a, recv.Map.entries);
+        defer a.free(entries);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(a);
+        try out.append(a, '{');
+        for (entries, 0..) |kv, i| {
+            if (i > 0) try out.appendSlice(a, ", ");
+            const kp = if (Value.referenceEq(&kv.key, &recv)) try a.dupe(u8, "(this Map)") else try elemPiece(ctx, kv.key);
+            defer if (runtime.freeScratch()) a.free(kp);
+            try out.appendSlice(a, kp);
+            try out.append(a, '=');
+            const vp = if (Value.referenceEq(&kv.value, &recv)) try a.dupe(u8, "(this Map)") else try elemPiece(ctx, kv.value);
+            defer if (runtime.freeScratch()) a.free(vp);
+            try out.appendSlice(a, vp);
+        }
+        try out.append(a, '}');
+        return ok(try makeStringOwned(a, try out.toOwnedSlice(a)));
+    }
     // A List/Set element that is a user Instance must render via its own
     // `toString()` (dispatched through the VM), not the Zig-level `display`
     // formatter, which prints `ClassName@id` for a non-data class. Primitives
