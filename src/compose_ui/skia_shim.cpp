@@ -37,6 +37,22 @@ struct KlioSurface {
     sk_sp<SkTypeface> typeface;
 };
 
+// Common system font paths tried (in order) for text rendering, since the empty
+// SkFontMgr ships no faces. $KLIO_SKIA_FONT overrides. A miss leaves text unpainted
+// (the display list still carries the text op).
+const char* const kFontCandidates[] = {
+    "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/System/Library/Fonts/SFNSMono.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "C:\\Windows\\Fonts\\consola.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+    nullptr,
+};
+
 inline SkColor toColor(uint32_t argb) { return static_cast<SkColor>(argb); }
 
 inline void fillPaint(SkPaint& p, uint32_t argb) {
@@ -65,11 +81,17 @@ KlioSurface* klio_skia_new(int width, int height) {
         delete s;
         return nullptr;
     }
-    // A self-contained font manager (no system fontconfig dependency). Typeface
-    // lookup may still be null on a fontless build; text ops then no-op.
+    // A self-contained font manager (no system fontconfig dependency); load a
+    // typeface from $KLIO_SKIA_FONT or the first available system font. A miss
+    // leaves typeface null and text ops no-op.
     s->fontMgr = SkFontMgr_New_Custom_Empty();
     if (s->fontMgr) {
-        s->typeface = s->fontMgr->legacyMakeTypeface(nullptr, SkFontStyle());
+        if (const char* env = std::getenv("KLIO_SKIA_FONT")) {
+            s->typeface = s->fontMgr->makeFromFile(env, 0);
+        }
+        for (int i = 0; !s->typeface && kFontCandidates[i] != nullptr; ++i) {
+            s->typeface = s->fontMgr->makeFromFile(kFontCandidates[i], 0);
+        }
     }
     return s;
 }

@@ -34,11 +34,11 @@ fun main() {
 
     val lightUi = uiRenderer(18, 12) { MaterialTheme(light) { Screen() } }
     println("--- light theme ---")
-    println(lightUi.render())
+    println(lightUi.displayList())
     lightUi.dispose()
 
     val darkUi = uiRenderer(18, 12) { MaterialTheme(dark) { Screen() } }
     println("--- dark theme ---")
-    println(darkUi.render())
+    println(darkUi.displayList())
     darkUi.dispose()
 }

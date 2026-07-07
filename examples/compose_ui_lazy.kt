@@ -34,12 +34,12 @@ fun main() {
     }
 
     println("--- scroll=0 (top of 100) ---")
-    println(ui.render())
+    println(ui.displayList())
     println("items composed: " + itemsComposed + " of 100")
 
     scroll.value = 50
     println("--- scroll=50 (window shifted down 10) ---")
-    println(ui.recomposeRender())
+    println(ui.recomposeDisplayList())
     println("items composed total: " + itemsComposed + " of 100")
 
     ui.dispose()
