@@ -2681,6 +2681,27 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 try frame.write(bo.dst, .{ .Bool = b });
                 return .cont;
             }
+            // Collection `==` / `!=`: compare element/entry-wise so a user
+            // `equals` override fires (bare structural equality treats a
+            // non-data Instance by identity, so `setOf(P)==setOf(P)`, map value
+            // equality, and nested collections would be wrong).
+            // Set/Map `==` / `!=`: compare element/entry-wise so a user
+            // `equals` override fires (bare structural equality treats a
+            // non-data Instance by identity, so `setOf(P)==setOf(P)` and map
+            // value equality would be wrong). Restricted to a Set/Map operand:
+            // List equality already dispatches element `equals` via
+            // `collectionsEqualHostAware` and its array/sublist views need the
+            // established path.
+            if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+                isSetOrMap(&l) and isSetOrMap(&r))
+            {
+                if (comptime @hasDecl(H, "deepValueEquals")) {
+                    const eq = try host.deepValueEquals(allocator, &l, &r);
+                    const neg = bo.op == .NotEq or bo.op == .BoxedNotEq;
+                    try frame.write(bo.dst, .{ .Bool = if (neg) !eq else eq });
+                    return .cont;
+                }
+            }
             if (operatorMethod(bo.op)) |method| {
                 if (l == .Instance or r == .Instance) {
                     // `a == b` dispatches `a.equals(b)`, but a builtin
@@ -4857,6 +4878,10 @@ fn typeParamCastPasses(comptime H: type, frame: *const Frame, ty: TypeRef, host:
     if (isErasedTypeParamName(ty.name)) return true;
     if (!host.isConcreteCastTarget(ty.name)) return true;
     return false;
+}
+
+fn isSetOrMap(v: *const Value) bool {
+    return v.* == .Set or v.* == .Map;
 }
 
 fn operatorMethod(op: BinOp) ?[]const u8 {

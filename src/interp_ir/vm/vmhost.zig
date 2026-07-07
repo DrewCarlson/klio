@@ -286,6 +286,7 @@ pub const VmHost = struct {
     pub const closureParamsDisproven = host_call_value.closureParamsDisproven;
     pub const callValueNamedTyped = host_call_value.callValueNamedTyped;
     pub const collectionsEqualHostAware = host_call_member.collectionsEqualHostAware;
+    pub const deepValueEquals = host_call_member.deepValueEquals;
     pub const callValueWithThis = host_call_value.callValueWithThis;
     pub const callMember = host_call_member.callMember;
     pub const callMemberNamed = host_call_member.callMemberNamed;

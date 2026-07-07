@@ -209,6 +209,92 @@ fn callMemberRec(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     return callMember(self, allocator, receiver, name, args);
 }
 
+/// Recursive value equality: dispatches a user `equals` override for Instance
+/// operands and compares List/Set/Map element/entry-wise (so `setOf(P)==setOf(P)`
+/// and nested collections honour element `equals`, which bare structural
+/// equality — identity for a non-data Instance — does not). Collections are
+/// compared under a live borrow (never a heap snapshot, which the GC would not
+/// root across the nested VM dispatch), mirroring `collectionsEqualHostAware`.
+pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!bool {
+    if (a.* == .Instance or b.* == .Instance) {
+        if (a.* == .Instance and b.* == .Instance) {
+            switch (try callMemberRec(self, allocator, a, "equals", &.{b.*})) {
+                .ok => |v| return v == .Bool and v.Bool,
+                .err => {},
+            }
+        }
+        return Value.structuralEqBoxed(a, b);
+    }
+    switch (a.*) {
+        .List => {
+            if (b.* != .List) return Value.structuralEqBoxed(a, b);
+            // Sync array-backed / sublist views to their live backing store
+            // before reading (mirrors structuralEqBoxed); otherwise an
+            // `IntArray.asList()` view or a `subList` compares stale contents.
+            a.refreshArrayView();
+            b.refreshArrayView();
+            a.refreshSublistView();
+            b.refreshSublistView();
+            const ga = a.List.items.borrow();
+            defer ga.deinit();
+            const gb = b.List.items.borrow();
+            defer gb.deinit();
+            const xa = ga.get().items;
+            const xb = gb.get().items;
+            if (xa.len != xb.len) return false;
+            for (xa, xb) |*ea, *eb| {
+                if (!try deepValueEquals(self, allocator, ea, eb)) return false;
+            }
+            return true;
+        },
+        .Set => {
+            if (b.* != .Set) return Value.structuralEqBoxed(a, b);
+            const ga = a.Set.items.borrow();
+            defer ga.deinit();
+            const gb = b.Set.items.borrow();
+            defer gb.deinit();
+            const xa = ga.get().items;
+            const xb = gb.get().items;
+            if (xa.len != xb.len) return false;
+            for (xa) |*ea| {
+                var found = false;
+                for (xb) |*eb| {
+                    if (try deepValueEquals(self, allocator, ea, eb)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return false;
+            }
+            return true;
+        },
+        .Map => {
+            if (b.* != .Map) return Value.structuralEqBoxed(a, b);
+            const ga = a.Map.entries.borrow();
+            defer ga.deinit();
+            const gb = b.Map.entries.borrow();
+            defer gb.deinit();
+            const pa = ga.get().pairs.items;
+            const pb = gb.get().pairs.items;
+            if (pa.len != pb.len) return false;
+            for (pa) |*ka| {
+                var found = false;
+                for (pb) |*kb| {
+                    if (try deepValueEquals(self, allocator, &ka.key, &kb.key) and
+                        try deepValueEquals(self, allocator, &ka.value, &kb.value))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return false;
+            }
+            return true;
+        },
+        else => return Value.structuralEqBoxed(a, b),
+    }
+}
+
 fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     return self.callValue(allocator, callee, args);
 }
