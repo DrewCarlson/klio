@@ -5195,6 +5195,48 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
         }
     }
 
+    // FQN-precedence for a UNIQUE import whose leaf has MULTIPLE overloads (or is
+    // an intrinsic), so `funcIdByFqn` above found no single FuncId to route to.
+    // `import kotlin.math.max` names 4+ overloads: the import is a real in-scope
+    // symbol, but a same-name unimported `other.max(Dp, Dp)` can still preempt it
+    // in the applicability/fallback ladder (body-bearing, while the intrinsic
+    // overloads are unrankable header stubs). Re-lower the call qualified to the
+    // imported FQN so overload resolution reaches the imported symbol, bypassing
+    // the invisible candidate. Order-independent (decided from this file's imports)
+    // and gated on the import actually naming in-scope funcs, so it never invents
+    // a target.
+    if (imported_func_id == null and !shadowed_by_class and segments.len == 1 and
+        b.module.funcsBySimpleName(name0).len >= 1)
+    {
+        const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
+        if (alias_paths.len == 1 and alias_paths[0].segs.len >= 2) {
+            // The import resolves to real funcs of that FQN (a multi-overload
+            // symbol), OR to a stdlib intrinsic the func index does not enumerate
+            // (`isAliasName`, e.g. kotlin.math.max). Either way the qualified call
+            // reaches it.
+            var import_resolves = ir.isAliasName(name0);
+            if (!import_resolves) {
+                for (b.module.funcsBySimpleName(name0)) |cid| {
+                    const cf = b.module.funcById(cid) orelse continue;
+                    if (std.mem.eql(u8, cf.fqn, alias_paths[0].fqn)) {
+                        import_resolves = true;
+                        break;
+                    }
+                }
+            }
+            if (import_resolves) {
+                const new_segs = try b.allocator.alloc(ast.Ident, alias_paths[0].segs.len);
+                for (alias_paths[0].segs, 0..) |s, i| new_segs[i] = .{ .name = s, .span = segments[0].span };
+                const new_callee = try b.allocator.create(Expr);
+                new_callee.* = Expr{ .Path = .{ .segments = new_segs, .span = callee.Path.span } };
+                var new_call = call;
+                new_call.callee = new_callee;
+                const rewritten = Expr{ .Call = new_call };
+                return try lowerCall(b, &rewritten);
+            }
+        }
+    }
+
     // Bare-call resolution through the unified resolver. `resolveCall` folds
     // the scope index, the applicability ladder and the member-vs-global emit
     // decision into one query; the switch below routes its verdict to a single
