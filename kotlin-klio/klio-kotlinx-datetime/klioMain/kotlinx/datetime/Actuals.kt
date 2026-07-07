@@ -500,6 +500,32 @@ fun Instant.minusPeriod(period: DateTimePeriod, timeZone: TimeZone): Instant = p
 fun Instant.plus(period: DateTimePeriod, timeZone: TimeZone): Instant = plusPeriod(period, timeZone)
 fun Instant.minus(period: DateTimePeriod, timeZone: TimeZone): Instant = minusPeriod(period, timeZone)
 
+// Unit-based arithmetic. A `TimeBased` unit is timezone-independent (a fixed
+// nanosecond span); `DayBased` / `MonthBased` need the zone for calendar math.
+// The nanosecond span is split into whole seconds + a nanos remainder so a
+// large multiple (`plus(2^32, NANOSECOND)`) does not overflow.
+fun Instant.plus(value: Long, unit: DateTimeUnit.TimeBased): Instant {
+    val secondsPerUnit = unit.nanoseconds / 1_000_000_000L
+    val nanosRem = unit.nanoseconds % 1_000_000_000L
+    val addSeconds = value * secondsPerUnit + (value * nanosRem) / 1_000_000_000L
+    val addNanos = (value * nanosRem) % 1_000_000_000L
+    val r = __kxdt_addPeriod(epochSeconds, nanosecondsOfSecond, 0, 0, 0, 0, 0, addSeconds, addNanos, "UTC")
+    return Instant.fromEpochSeconds(r[0], r[1])
+}
+fun Instant.plus(value: Int, unit: DateTimeUnit.TimeBased): Instant = plus(value.toLong(), unit)
+fun Instant.minus(value: Long, unit: DateTimeUnit.TimeBased): Instant = plus(-value, unit)
+fun Instant.minus(value: Int, unit: DateTimeUnit.TimeBased): Instant = plus(-value.toLong(), unit)
+
+fun Instant.plus(value: Long, unit: DateTimeUnit, timeZone: TimeZone): Instant = when (unit) {
+    is DateTimeUnit.TimeBased -> plus(value, unit)
+    is DateTimeUnit.DayBased -> plusPeriod(DatePeriod(days = (value * unit.days).toInt()), timeZone)
+    is DateTimeUnit.MonthBased -> plusPeriod(DatePeriod(months = (value * unit.months).toInt()), timeZone)
+    else -> throw IllegalArgumentException("Unsupported DateTimeUnit: $unit")
+}
+fun Instant.plus(value: Int, unit: DateTimeUnit, timeZone: TimeZone): Instant = plus(value.toLong(), unit, timeZone)
+fun Instant.minus(value: Long, unit: DateTimeUnit, timeZone: TimeZone): Instant = plus(-value, unit, timeZone)
+fun Instant.minus(value: Int, unit: DateTimeUnit, timeZone: TimeZone): Instant = plus(-value.toLong(), unit, timeZone)
+
 /** The offset from UTC, in whole seconds, at a specific moment in a time zone. */
 class UtcOffset internal constructor(val totalSeconds: Int) {
     override fun toString(): String {
